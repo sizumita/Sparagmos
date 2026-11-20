@@ -67,12 +67,14 @@ Usage:
 
 import argparse
 import concurrent.futures
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -1160,6 +1162,17 @@ def fill_result_revisions(rec, header, revs, path, driver_bin, out):
 # passes; a revision removed by an ignore-/only- condition does not
 # run, as in compiletest.
 #
+# Tests carrying `//@ add-minicore` are attempted the way compiletest
+# runs them: the suite's minicore stub crate
+# (tests/auxiliary/minicore.rs) is built with the pinned rustc under
+# the test's own edition and compile-flags (plus the
+# minicore-compile-flags), and the resulting rlib is forwarded to the
+# driver's embedded rustc as `--extern minicore=...` together with
+# the `-Cpanic=abort` / `-Cforce-unwind-tables=yes` pair compiletest
+# adds for no_core tests. Builds are cached per flag variant; a
+# variant that fails to build leaves its tests not attempted with
+# that reason, never judged against a missing extern.
+#
 # What stage 2 deliberately does not do: compare compiler output with
 # the test's `.stderr` snapshot, check `//~` error annotations, apply
 # rustfix suggestions (`.fixed`), or compare mir-opt `.mir` dumps and
@@ -1219,8 +1232,8 @@ def stage2_blocker(view, rec):
     and forwarded to the driver, and revisions are judged per
     revision by fill_result_stage2.
     """
-    if view.has("add-minicore") or view.has("add-core-stubs"):
-        return "add-minicore (test links the minicore stub crate)"
+    if view.has("add-core-stubs"):
+        return "add-core-stubs (test links the core stub crate)"
     if view.has("ignore-test"):
         return "ignore-test (compiletest itself never runs this test)"
     if view.has("rustc-env"):
@@ -1424,7 +1437,120 @@ def judge_compile(expectation, conv):
     raise ValueError(f"unknown expectation {expectation!r}")
 
 
-def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions):
+MINICORE_BUILD_TIMEOUT = 120
+
+_MINICORE_LOCK = threading.Lock()
+_MINICORE_RESULTS = {}
+
+
+def minicore_cache_dir():
+    """Where prebuilt minicore rlibs are cached, keyed by content and
+    flag variant so a re-run reuses them across processes."""
+    env = os.environ.get("SPARGASMOS_MINICORE_CACHE")
+    if env:
+        return Path(env)
+    return Path.home() / ".cache" / "sparagmos-minicore"
+
+
+def _is_rlib(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read(8) == b"!<arch>\n"
+    except OSError:
+        return False
+
+
+def minicore_rlib(rust_dir, edition, flags, minicore_flags):
+    """The prebuilt minicore rlib for one flag variant.
+
+    Returns (path, None) on success, or (None, reason) when the build
+    fails. compiletest builds minicore per test, with the test's own
+    compile-flags; the runner caches per (edition, compile-flags,
+    minicore-compile-flags) variant instead, which is the same set of
+    distinct builds. A failed build is reported, never papered over:
+    judging a test against a missing `--extern` would fabricate
+    passes on failure-expecting tests.
+    """
+    key = (edition, tuple(flags), tuple(minicore_flags))
+    with _MINICORE_LOCK:
+        if key in _MINICORE_RESULTS:
+            return _MINICORE_RESULTS[key]
+    result = _build_minicore(rust_dir, edition, flags, minicore_flags)
+    with _MINICORE_LOCK:
+        _MINICORE_RESULTS.setdefault(key, result)
+        return _MINICORE_RESULTS[key]
+
+
+def _build_minicore(rust_dir, edition, flags, minicore_flags):
+    src = rust_dir / "tests" / "auxiliary" / "minicore.rs"
+    if not src.exists():
+        return (None, f"minicore source not found at {src}")
+    digest = hashlib.sha256()
+    digest.update(src.read_bytes())
+    digest.update(repr((edition, list(flags),
+                        list(minicore_flags))).encode())
+    out_dir = minicore_cache_dir() / digest.hexdigest()[:16]
+    rlib = out_dir / "libminicore.rlib"
+    if _is_rlib(rlib):
+        return (rlib, None)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=out_dir, suffix=".rlib")
+    os.close(fd)
+    tmp = Path(tmp_name)
+    # The flag order mirrors compiletest's build_minicore: the
+    # panic/unwind pair and the test's compile-flags come from
+    # make_compile_args, then `--crate-type rlib`, a final
+    # `-Cpanic=abort` and the minicore-compile-flags are appended.
+    argv = rustc_cmd() + [
+        str(src),
+        "--edition", edition,
+        "-Cpanic=abort",
+        "-Cforce-unwind-tables=yes",
+        *flags,
+        "--crate-type", "rlib",
+        "-Cpanic=abort",
+        *minicore_flags,
+        "-o", str(tmp),
+    ]
+    res = run_cmd(argv, timeout=MINICORE_BUILD_TIMEOUT,
+                  env_extra=BOOTSTRAP_ENV)
+    if res["timeout"] or res["exit_code"] != 0 or not _is_rlib(tmp):
+        tmp.unlink(missing_ok=True)
+        first = first_error_line(res["stderr"])
+        return (None, "minicore build failed (edition "
+                f"{edition}, compile-flags {list(flags)}, "
+                f"minicore-compile-flags {list(minicore_flags)}): "
+                f"{first or 'no rlib produced'}")
+    os.replace(tmp, rlib)
+    return (rlib, None)
+
+
+def minicore_test_args(view, rust_dir, edition, flags):
+    """The extra rustc arguments an add-minicore view's conversion
+    needs: the panic/unwind pair and `--extern minicore=<rlib>`.
+
+    Returns (args, None), or (None, reason) when the arguments cannot
+    be produced (a minicore-compile-flags `--edition`, which
+    compiletest itself rejects, or a failed minicore build); the
+    caller reports the test as not attempted with that reason.
+    """
+    mc_flags = []
+    for v in view.values("minicore-compile-flags"):
+        mc_flags.extend(split_flags(v))
+    for t in mc_flags:
+        if t == "--edition" or t.startswith("--edition="):
+            return (None, "minicore-compile-flags specify --edition "
+                    "(compiletest rejects this; the edition directive "
+                    "governs both compilations)")
+    rlib, err = minicore_rlib(rust_dir, edition, flags, mc_flags)
+    if err is not None:
+        return (None, err)
+    return (["-Cpanic=abort", "-Cforce-unwind-tables=yes",
+             "--extern", f"minicore={rlib}"], None)
+
+
+def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
+                   rust_dir):
     """Judge one directive view of a compile-check record.
 
     `revision` is the revision name this view belongs to (None for a
@@ -1469,6 +1595,14 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions):
     args = []
     if revision is not None:
         args += revision_args(view, revision, all_revisions)
+    if view.has("add-minicore"):
+        mc_args, mc_err = minicore_test_args(view, rust_dir, edition,
+                                             flags)
+        if mc_err is not None:
+            res["reason"] = mc_err
+            res["bucket"] = "not attempted (minicore build)"
+            return res
+        args += mc_args
     args += flags
     conv = convert_side(path, edition, driver_bin, rustc_args=args)
     verdict, reason, bucket = judge_compile(expectation, conv)
@@ -1519,7 +1653,7 @@ def fill_result_stage2(rec, rust_dir, driver_bin, out):
     revs = header.revisions()
     if not revs:
         res = stage2_attempt(rec, header.view(None), path, driver_bin,
-                             None, [])
+                             None, [], rust_dir)
         for key in ("status", "reason", "bucket", "expectation",
                     "driver"):
             if key in res:
@@ -1528,7 +1662,7 @@ def fill_result_stage2(rec, rust_dir, driver_bin, out):
     per_rev = {}
     for rev in revs:
         per_rev[rev] = stage2_attempt(rec, header.view(rev), path,
-                                      driver_bin, rev, revs)
+                                      driver_bin, rev, revs, rust_dir)
     out["revisions"] = {
         rev: {k: r[k] for k in ("status", "reason", "bucket",
                                 "expectation") if r.get(k)}

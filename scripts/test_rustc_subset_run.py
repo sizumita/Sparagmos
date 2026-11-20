@@ -264,10 +264,14 @@ class Stage2BlockerTests(unittest.TestCase):
         h = header("//@ compile-flags: -Z unstable-options\n")
         self.assertIsNone(run.stage2_blocker(h.view(None), self.rec()))
 
-    def test_add_minicore_blocks(self):
+    def test_add_minicore_no_longer_blocks(self):
+        # add-minicore tests are attempted with a prebuilt minicore
+        # rlib (see MinicoreTests); add-core-stubs still blocks.
         h = header("//@ add-minicore\n")
-        self.assertIn("minicore", run.stage2_blocker(h.view(None),
-                                                     self.rec()))
+        self.assertIsNone(run.stage2_blocker(h.view(None), self.rec()))
+        h = header("//@ add-core-stubs\n")
+        self.assertIn("core stub", run.stage2_blocker(h.view(None),
+                                                      self.rec()))
 
     def test_rustc_env_blocks(self):
         h = header("//@ rustc-env: FOO=1\n")
@@ -275,9 +279,14 @@ class Stage2BlockerTests(unittest.TestCase):
                                                       self.rec()))
 
     def test_scoped_blocker_only_blocks_its_revision(self):
+        h = header("//@ revisions: a b\n//@[a] add-core-stubs\n")
+        self.assertIn("core stub", run.stage2_blocker(h.view("a"),
+                                                      self.rec()))
+        self.assertIsNone(run.stage2_blocker(h.view("b"), self.rec()))
+        # A scoped add-minicore applies its rlib to that revision
+        # only, via minicore_test_args; it blocks neither revision.
         h = header("//@ revisions: a b\n//@[a] add-minicore\n")
-        self.assertIn("minicore", run.stage2_blocker(h.view("a"),
-                                                     self.rec()))
+        self.assertIsNone(run.stage2_blocker(h.view("a"), self.rec()))
         self.assertIsNone(run.stage2_blocker(h.view("b"), self.rec()))
 
     def test_revisions_no_longer_block(self):
@@ -293,6 +302,117 @@ def conv(**kw):
             "ice": False, "stderr": "", "stdout": ""}
     base.update(kw)
     return base
+
+
+class MinicoreTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(self.enterContext(__import__("tempfile")
+                                         .TemporaryDirectory()))
+        (self.tmp / "tests" / "auxiliary").mkdir(parents=True)
+        (self.tmp / "tests" / "auxiliary" / "minicore.rs").write_text(
+            "#![no_core]\n")
+        self.cache = self.tmp / "cache"
+        os = __import__("os")
+        self._old_env = os.environ.get("SPARGASMOS_MINICORE_CACHE")
+        os.environ["SPARGASMOS_MINICORE_CACHE"] = str(self.cache)
+        self.addCleanup(self._restore_env)
+        run._MINICORE_RESULTS.clear()
+        self.addCleanup(run._MINICORE_RESULTS.clear)
+
+    def _restore_env(self):
+        os = __import__("os")
+        if self._old_env is None:
+            os.environ.pop("SPARGASMOS_MINICORE_CACHE", None)
+        else:
+            os.environ["SPARGASMOS_MINICORE_CACHE"] = self._old_env
+
+    def stub_rustc(self, ok=True):
+        calls = []
+
+        def fake_run_cmd(argv, **kw):
+            calls.append(argv)
+            if ok:
+                out = Path(argv[argv.index("-o") + 1])
+                out.write_bytes(b"!<arch>\n" + b"fake rlib")
+                return {"exit_code": 0, "stdout": "", "stderr": "",
+                        "timeout": False}
+            return {"exit_code": 1, "stdout": "",
+                    "stderr": "error: boom\n", "timeout": False}
+
+        orig = run.run_cmd
+        run.run_cmd = fake_run_cmd
+        self.addCleanup(setattr, run, "run_cmd", orig)
+        return calls
+
+    def test_build_then_cache_hit(self):
+        calls = self.stub_rustc()
+        rlib, err = run.minicore_rlib(self.tmp, "2021", [], [])
+        self.assertIsNone(err)
+        self.assertTrue(run._is_rlib(rlib))
+        self.assertEqual(len(calls), 1)
+        argv = calls[0]
+        self.assertIn("--crate-type", argv)
+        self.assertIn("rlib", argv)
+        self.assertIn("-Cpanic=abort", argv)
+        # A second call for the same variant builds nothing, in this
+        # process or (via the on-disk cache) a fresh one.
+        rlib2, err2 = run.minicore_rlib(self.tmp, "2021", [], [])
+        self.assertEqual((rlib2, err2), (rlib, None))
+        run._MINICORE_RESULTS.clear()
+        rlib3, err3 = run.minicore_rlib(self.tmp, "2021", [], [])
+        self.assertEqual((rlib3, err3), (rlib, None))
+        self.assertEqual(len(calls), 1)
+
+    def test_flag_variant_builds_separately(self):
+        calls = self.stub_rustc()
+        a, _ = run.minicore_rlib(self.tmp, "2021", [], [])
+        b, _ = run.minicore_rlib(self.tmp, "2021", ["-Copt-level=3"], [])
+        self.assertNotEqual(a, b)
+        self.assertEqual(len(calls), 2)
+
+    def test_build_failure_is_a_reason_not_a_path(self):
+        self.stub_rustc(ok=False)
+        rlib, err = run.minicore_rlib(self.tmp, "2021", [], [])
+        self.assertIsNone(rlib)
+        self.assertIn("minicore build failed", err)
+        self.assertIn("error: boom", err)
+
+    def test_missing_source_is_a_reason(self):
+        rlib, err = run.minicore_rlib(self.tmp / "nope", "2021", [], [])
+        self.assertIsNone(rlib)
+        self.assertIn("not found", err)
+
+    def test_test_args_shape(self):
+        orig = run.minicore_rlib
+        run.minicore_rlib = lambda *a: (Path("/fake/libminicore.rlib"),
+                                        None)
+        self.addCleanup(setattr, run, "minicore_rlib", orig)
+        h = header("//@ add-minicore\n")
+        args, err = run.minicore_test_args(h.view(None), self.tmp,
+                                           "2021", [])
+        self.assertIsNone(err)
+        self.assertEqual(args, ["-Cpanic=abort",
+                                "-Cforce-unwind-tables=yes",
+                                "--extern",
+                                "minicore=/fake/libminicore.rlib"])
+
+    def test_test_args_edition_in_minicore_flags_rejected(self):
+        h = header("//@ add-minicore\n"
+                   "//@ minicore-compile-flags: --edition 2021\n")
+        args, err = run.minicore_test_args(h.view(None), self.tmp,
+                                           "2021", [])
+        self.assertIsNone(args)
+        self.assertIn("--edition", err)
+
+    def test_test_args_build_failure_propagates(self):
+        orig = run.minicore_rlib
+        run.minicore_rlib = lambda *a: (None, "minicore build failed: x")
+        self.addCleanup(setattr, run, "minicore_rlib", orig)
+        h = header("//@ add-minicore\n")
+        args, err = run.minicore_test_args(h.view(None), self.tmp,
+                                           "2021", [])
+        self.assertIsNone(args)
+        self.assertIn("minicore build failed", err)
 
 
 class JudgeCompileTests(unittest.TestCase):
@@ -404,6 +524,54 @@ class ProcessStage2Tests(unittest.TestCase):
                                     Path("/fake/driver"), stage2=True)
         finally:
             run.convert_side = orig
+
+    def run_with_conv_capture(self, rec, conv_result):
+        captured = {}
+
+        def stub(path, edition, driver_bin, rustc_args=()):
+            captured["rustc_args"] = list(rustc_args)
+            return conv_result
+
+        orig = run.convert_side
+        run.convert_side = stub
+        try:
+            res = run.process_test(rec, self.rust_dir,
+                                   Path("/fake/driver"), stage2=True)
+        finally:
+            run.convert_side = orig
+        return res, captured
+
+    def test_add_minicore_forwards_extern_and_panic_args(self):
+        rec = self.write_test("//@ add-minicore\n//@ check-pass\n"
+                              "fn main() {}\n")
+        orig = run.minicore_rlib
+        run.minicore_rlib = lambda *a: (
+            Path("/fake/libminicore.rlib"), None)
+        try:
+            res, captured = self.run_with_conv_capture(rec, conv())
+        finally:
+            run.minicore_rlib = orig
+        self.assertEqual(res["status"], "pass")
+        args = captured["rustc_args"]
+        self.assertIn("-Cpanic=abort", args)
+        self.assertIn("-Cforce-unwind-tables=yes", args)
+        i = args.index("--extern")
+        self.assertEqual(args[i + 1], "minicore=/fake/libminicore.rlib")
+
+    def test_add_minicore_build_failure_is_not_attempted(self):
+        rec = self.write_test("//@ add-minicore\n//@ check-fail\n"
+                              "fn main() {}\n")
+        orig = run.minicore_rlib
+        run.minicore_rlib = lambda *a: (None, "minicore build failed: x")
+        try:
+            res, captured = self.run_with_conv_capture(rec, conv())
+        finally:
+            run.minicore_rlib = orig
+        # Never judged: a missing extern would fabricate a pass on
+        # this failure-expecting test.
+        self.assertEqual(res["status"], "not-attempted")
+        self.assertEqual(res["bucket"], "not attempted (minicore build)")
+        self.assertNotIn("rustc_args", captured)
 
     def test_check_fail_clean_rejection_passes(self):
         rec = self.write_test("//@ check-fail\nfn main() { let x: u8 = \"s\"; }\n")
