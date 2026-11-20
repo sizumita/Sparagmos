@@ -167,41 +167,40 @@ mod tests {
         }
     }
 
-    /// Write a fake `sparagmos-driver` shell script with the given
-    /// stdout/stderr/exit behaviour, so the exit-code mapping can be
-    /// tested without the real driver.
+    /// Path to a fake `sparagmos-driver` fixture script (under
+    /// `tests/fixtures/`) with a fixed stdout/stderr/exit behaviour, so
+    /// the exit-code mapping can be tested without the real driver.
+    ///
+    /// The scripts are static fixtures rather than files written by
+    /// the test process: a just-written script cannot always be
+    /// executed immediately. While this process has the script open
+    /// for writing, a child forked by a parallel test inherits the
+    /// write descriptor, and the kernel refuses the `execve` with
+    /// ETXTBSY ("Text file busy") until that child execs or exits.
+    /// A fixture checked out with the crate is never opened for
+    /// writing here, so the race cannot occur.
     #[cfg(unix)]
-    fn fake_driver(dir: &Path, body: &str) -> PathBuf {
+    fn fake_driver(name: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
-        let path = dir.join("fake-driver");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join(name);
+        // The executable bit is recorded in git; re-assert it in case
+        // the checkout lost it. chmod does not open the file, so this
+        // cannot reintroduce the write/exec race described above.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
 
     #[cfg(unix)]
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "sparagmos-harness-runner-{}-{tag}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    #[cfg(unix)]
     #[test]
     fn exit_zero_and_101_become_run_results() {
-        let dir = temp_dir("ok");
-        let ok = InterpRunner::with_driver_bin(fake_driver(&dir, "exit 0"));
+        let ok = InterpRunner::with_driver_bin(fake_driver("fake-driver-exit-0.sh"));
         let res = ok.run(&case("arith_int.rs")).expect("exit 0 is a result");
         assert_eq!(res.exit_code, Some(0));
 
-        let dir = temp_dir("panic");
-        let panicky = InterpRunner::with_driver_bin(fake_driver(
-            &dir,
-            "echo \"thread 'main' panicked: boom\" >&2\nexit 101",
-        ));
+        let panicky = InterpRunner::with_driver_bin(fake_driver("fake-driver-exit-101.sh"));
         let res = panicky
             .run(&case("arith_int.rs"))
             .expect("exit 101 is a result");
@@ -212,11 +211,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn exit_two_is_unsupported_with_the_drivers_reason() {
-        let dir = temp_dir("unsupported");
-        let runner = InterpRunner::with_driver_bin(fake_driver(
-            &dir,
-            "echo 'sparagmos-driver run: unsupported: some variant' >&2\nexit 2",
-        ));
+        let runner = InterpRunner::with_driver_bin(fake_driver("fake-driver-exit-2.sh"));
         let err = runner
             .run(&case("arith_int.rs"))
             .expect_err("exit 2 is unsupported");
@@ -231,11 +226,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn other_exit_codes_are_unsupported_with_stderr() {
-        let dir = temp_dir("crash");
-        let runner = InterpRunner::with_driver_bin(fake_driver(
-            &dir,
-            "echo 'internal explosion' >&2\nexit 1",
-        ));
+        let runner = InterpRunner::with_driver_bin(fake_driver("fake-driver-exit-1.sh"));
         let err = runner
             .run(&case("arith_int.rs"))
             .expect_err("exit 1 is unsupported");
