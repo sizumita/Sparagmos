@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""Unit tests for scripts/variant-matrix.py.
+
+Run: python3 -m unittest scripts.test_variant_matrix
+(the parsing tests read the real docs/COVERAGE.md and sparagmos-mir
+sources, so they also guard the denominator against silent drift.)
+"""
+
+import importlib.util
+import os
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+
+spec = importlib.util.spec_from_file_location(
+    "variant_matrix", os.path.join(HERE, "variant-matrix.py")
+)
+vm = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(vm)
+
+
+class DenominatorTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(REPO, "docs", "COVERAGE.md")) as f:
+            cls.denom = vm.parse_denominator(f.read())
+
+    def test_total_is_40(self):
+        self.assertEqual(sum(len(v) for v in self.denom.values()), 40)
+
+    def test_per_enum_counts(self):
+        self.assertEqual(len(self.denom["StatementKind"]), 12)
+        self.assertEqual(len(self.denom["TerminatorKind"]), 15)
+        self.assertEqual(len(self.denom["Rvalue"]), 13)
+
+    def test_spot_members(self):
+        self.assertIn("BackwardIncompatibleDropHint", self.denom["StatementKind"])
+        self.assertIn("UnwindResume", self.denom["TerminatorKind"])
+        self.assertIn("WrapUnsafeBinder", self.denom["Rvalue"])
+        self.assertNotIn("Retag", self.denom["StatementKind"])
+
+
+class EnumParseTest(unittest.TestCase):
+    def parse(self, rel, enum):
+        with open(os.path.join(REPO, rel)) as f:
+            return vm.parse_enum_variants(f.read(), enum)
+
+    def test_statement_kind(self):
+        names = self.parse("crates/sparagmos-mir/src/statement.rs", "StatementKind")
+        self.assertIn("Retag", names)  # sparagmos-mir-only variant
+        self.assertNotIn("BackwardIncompatibleDropHint", names)
+        self.assertEqual(len(names), 12)
+
+    def test_terminator_kind_struct_variants(self):
+        names = self.parse("crates/sparagmos-mir/src/terminator.rs", "TerminatorKind")
+        self.assertEqual(len(names), 15)
+        for n in ("Goto", "SwitchInt", "Resume", "Terminate", "TailCall", "InlineAsm"):
+            self.assertIn(n, names)
+
+    def test_rvalue(self):
+        names = self.parse("crates/sparagmos-mir/src/rvalue.rs", "Rvalue")
+        self.assertEqual(len(names), 15)
+        self.assertIn("CheckedBinaryOp", names)  # sparagmos-mir-only
+
+
+class MappingTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(REPO, "docs", "COVERAGE.md")) as f:
+            vm.DENOMINATOR = vm.parse_denominator(f.read())
+
+    def test_renamed_terminators(self):
+        self.assertEqual(vm.sm_to_denominator("TerminatorKind", "Resume"), "UnwindResume")
+        self.assertEqual(vm.sm_to_denominator("TerminatorKind", "Terminate"), "UnwindTerminate")
+
+    def test_identity_and_extras(self):
+        self.assertEqual(vm.sm_to_denominator("Rvalue", "BinaryOp"), "BinaryOp")
+        self.assertIsNone(vm.sm_to_denominator("Rvalue", "CheckedBinaryOp"))
+        self.assertIsNone(vm.sm_to_denominator("StatementKind", "Retag"))
+
+
+class StripRustTest(unittest.TestCase):
+    def test_comments_and_strings_removed(self):
+        src = 'let a = "Rvalue::BinaryOp"; // TerminatorKind::Call\n/* x */ 1'
+        out = vm.strip_rust(src)
+        self.assertNotIn("BinaryOp", out)
+        self.assertNotIn("Call", out)
+        self.assertIn("1", out)
+
+    def test_lifetimes_survive(self):
+        out = vm.strip_rust("fn f<'a>(x: &'a u8) -> &'a u8 { x }")
+        self.assertIn("&'a u8", out)
+
+
+if __name__ == "__main__":
+    unittest.main()

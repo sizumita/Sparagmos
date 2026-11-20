@@ -159,7 +159,95 @@ never 型 `!`、inline asm) を書き、fleur 上で
    仮数えせず、JIT 完了まで未実装として扱う。厳しい側に倒す)。
 
 指標1の率 = 実装済みバリアント数 / 40 × 100 (小数第1位まで)。
-現在の値: **未測定** (骨格のみで各レーンが実装中のため、0 とも断定しない)。
+現在の値: **25.0% (実装済み 10/40)** (2026-11-21 実測。バリアント別の内訳は次のマトリクス)。
+
+
+### バリアント別マトリクス (2026-11-21 実測)
+
+手順: `scripts/variant-matrix.py` で機械集計した
+(再現: `python3 scripts/variant-matrix.py`。cargo test を実際に実行し、
+通過したテストだけを数える)。
+
+- ドライバ変換: sparagmos-driver の変換コード (convert.rs) に、その
+  バリアントを受けて sparagmos-mir の対応バリアントを構築する分岐が
+  あるかを走査した。分岐があっても変換エラーが常に記録されるもの
+  (InlineAsm、Reborrow) は不可とした。Repeat は繰り返し回数が定数評価
+  できない場合にのみ、Cast は CastKind::BoxDerefTransmute の場合にのみ
+  エラーになるため条件付きとした。
+- interp / JIT の意味論テスト: 両クレートのテストコードを走査し、
+  sparagmos-mir のバリアントを構築してエンジンで実行しているテストを
+  数えた。ヘルパー関数経由の構築は呼び出し関係をたどって帰属させた。
+  JIT のパリティテストは interp と JIT の両方を実行して同じ期待値を
+  検証するため、両方の根拠として数えた。
+- エラーを期待するテストは原則として数えない。ただし guest panic
+  (InterpError::Panic) を検証するテストは意味論テストとして数えた。
+  Unsupported やホスト側エラーの検証は数えていない。この区別は対象
+  テストを個別に確認し、スクリプト内に根拠付きで記録した。
+- interp 内部 IR だけを対象とするテストと、ハーネスのコーパス実行は、
+  sparagmos-mir のバリアントを直接構築しないため数えていない。
+
+結果: **実装済み 10/40 = 25.0%**、部分的 5 (すべて interp のみ)、
+未対応 25。
+
+**StatementKind (12)**
+
+| バリアント | ドライバ変換 | interp テスト | JIT テスト | 状態 |
+|---|---|---|---|---|
+| Assign | ○ | ○ 31件 (mir_convert_tests::plain_add_converts_and_runs 他) | ○ 11件 (mir_jit::recursive_fib 他) | 実装済み |
+| FakeRead | ○ | × | × | 未対応 |
+| SetDiscriminant | ○ | × | × | 未対応 |
+| StorageLive | ○ | × | × | 未対応 |
+| StorageDead | ○ | × | × | 未対応 |
+| PlaceMention | ○ | × | × | 未対応 |
+| AscribeUserType | ○ | × | × | 未対応 |
+| Coverage | ○ | × | × | 未対応 |
+| Intrinsic | ○ | × | × | 未対応 |
+| ConstEvalCounter | ○ | × | × | 未対応 |
+| Nop | ○ | × | × | 未対応 |
+| BackwardIncompatibleDropHint | × (型なし) | × | × | 未対応 |
+
+**TerminatorKind (15)**
+
+| バリアント | ドライバ変換 | interp テスト | JIT テスト | 状態 |
+|---|---|---|---|---|
+| Goto | ○ | ○ 4件 (mir_convert_tests::loop_sum_to_10 他) | ○ mir_jit::loop_sum | 実装済み |
+| SwitchInt | ○ | ○ 8件 (mir_convert_tests::if_else_max 他) | ○ 3件 (mir_jit::switch_on_char 他) | 実装済み |
+| UnwindResume | ○ | × | × | 未対応 |
+| UnwindTerminate | ○ | × | × | 未対応 |
+| Return | ○ | ○ 32件 | ○ 11件 (mir_jit::recursive_fib 他) | 実装済み |
+| Unreachable | ○ | × | × | 未対応 |
+| Drop | ○ | ○ print_support_tests::string_drop_executes_as_a_jump | × | 部分的 |
+| Call | ○ | ○ 7件 (mir_convert_tests::recursive_fib_via_fndef_calls 他) | ○ 2件 (mir_jit::recursive_fib 他) | 実装済み |
+| TailCall | × (分岐なし) | × | × | 未対応 |
+| Assert | ○ | ○ 11件 (mir_convert_tests::checked_add_overflow_is_a_guest_panic 他) | ○ 6件 (mir_jit::checked_add_ok_and_overflow_panic 他) | 実装済み |
+| Yield | × (分岐なし) | × | × | 未対応 |
+| CoroutineDrop | × (分岐なし) | × | × | 未対応 |
+| FalseEdge | × (分岐なし) | × | × | 未対応 |
+| FalseUnwind | × (分岐なし) | × | × | 未対応 |
+| InlineAsm | × (変換エラー) | × | × | 未対応 |
+
+**Rvalue (13)**
+
+| バリアント | ドライバ変換 | interp テスト | JIT テスト | 状態 |
+|---|---|---|---|---|
+| Use | ○ | ○ 24件 | ○ 7件 (mir_jit::loop_sum 他) | 実装済み |
+| Repeat | △ 条件付き | ○ mir_convert_tests::tuple_and_array_aggregates_and_repeat | × | 部分的 |
+| Ref | ○ | ○ 3件 (print_support_tests::write_through_mut_ref_across_frames 他) | × | 部分的 |
+| ThreadLocalRef | ○ | × | × | 未対応 |
+| RawPtr | ○ | × | × | 未対応 |
+| Cast | △ 条件付き | ○ 3件 (mir_convert_tests::int_to_int_cast_widens_and_truncates 他) | ○ 2件 (mir_jit::casts_and_guarded_division 他) | 実装済み |
+| BinaryOp | ○ | ○ 19件 | ○ 7件 (mir_jit::recursive_fib 他) | 実装済み |
+| UnaryOp | ○ | ○ mir_jit::negation | ○ mir_jit::negation | 実装済み |
+| Discriminant | ○ | ○ print_support_tests::range_inclusive_next_loop_sums | × | 部分的 |
+| Aggregate | ○ | ○ 5件 (mir_convert_tests::tuple_and_array_aggregates_and_repeat 他) | × | 部分的 |
+| CopyForDeref | ○ | × | × | 未対応 |
+| WrapUnsafeBinder | × (型なし) | × | × | 未対応 |
+| Reborrow | × (型なし・変換エラー) | × | × | 未対応 |
+
+母数外の sparagmos-mir 独自バリアント (StatementKind::Retag、
+Rvalue::Len / CheckedBinaryOp / NullaryOp / ShallowInitBox) は
+このマトリクスに含めない。CheckedBinaryOp を使うテストは、
+同時に構築される Assign / Assert 等の根拠として現れる。
 
 ---
 
@@ -468,7 +556,7 @@ dump が得られても変換済み関数が 0 件だったものが 157 件あ�
 
 | 指標 | 母数 | 現在値 |
 |---|---|---|
-| 指標1 MIR バリアント網羅率 | 40 (確定) | 未測定 (実装中) |
+| 指標1 MIR バリアント網羅率 | 40 (確定) | 25.0% (10/40, 2026-11-21 実測) |
 | 副指標1b サブ enum | 上表の通り (確定) | 未測定 (BinOp の出現実測 15/26 のみ) |
 | 指標2(a) 自前コーパス | 36 (tests/corpus) | 100.0% (36/36, 2026-11-21 実測) |
 | 指標2(b) rustc テストサブセット | 24,937 (2026-11-20 機械抽出) | 2.161% (539/24,937, 2026-11-21 実測) |
