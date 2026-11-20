@@ -2162,3 +2162,93 @@ fn constant_shift_amounts_keep_their_own_type() {
         Value::Int(12)
     );
 }
+
+/// `expose_addr_of` helper body: locals _0 usize ret, _1 i32,
+/// _2 i32, _3 &i32, _4 *const i32, _5 usize; returns the
+/// PointerExposeProvenance cast of a raw pointer to local `which`
+/// (1 or 2) — the `ptr as usize` shape.
+fn expose_addr_of_body(which: u32) -> mir::Body {
+    let ref_i32 = mir::Ty::Ref(mir::Region::Erased, Box::new(i32_ty()), mir::Mutability::Not);
+    let raw_i32 = mir::Ty::RawPtr(Box::new(i32_ty()), mir::Mutability::Not);
+    mir::Body::new(
+        decls(&[usize_ty(), i32_ty(), i32_ty(), ref_i32, raw_i32.clone(), usize_ty()]),
+        0,
+        vec![block(
+            vec![
+                assign(place(1), mir::Rvalue::Use(const_i32(5))),
+                assign(place(2), mir::Rvalue::Use(const_i32(7))),
+                assign(
+                    place(3),
+                    mir::Rvalue::Ref(mir::Region::Erased, mir::BorrowKind::Shared, place(which)),
+                ),
+                assign(
+                    place(4),
+                    mir::Rvalue::Cast(mir::CastKind::PtrToPtr, copy(3), raw_i32.clone()),
+                ),
+                assign(
+                    place(5),
+                    mir::Rvalue::Cast(mir::CastKind::PointerExposeProvenance, copy(4), usize_ty()),
+                ),
+                assign(place(0), mir::Rvalue::Use(copy(5))),
+            ],
+            ret(),
+        )],
+    )
+}
+
+#[test]
+fn expose_provenance_pointer_to_usize_is_aligned_stable_and_distinct() {
+    // `ptr as usize` (PointerExposeProvenance) yields the
+    // pointer's synthetic address, like the pointer-to-integer
+    // transmute: aligned, stable per target, distinct per place.
+    // Alignment assertions in guest code (`addr % align == 0`,
+    // e.g. std::mem::align_of checks on raw pointers) read it.
+    let mut prog = MirProgram::new();
+    prog.add("expose1", expose_addr_of_body(1));
+    let a1 = interpret_mir(&prog, "expose1", vec![]).expect("expose1 must run");
+    let mut prog = MirProgram::new();
+    prog.add("expose2", expose_addr_of_body(2));
+    let a2 = interpret_mir(&prog, "expose2", vec![]).expect("expose2 must run");
+    let (Value::Uint(a1), Value::Uint(a2)) = (a1, a2) else {
+        panic!("expected usize results");
+    };
+    assert_ne!(a1, 0, "a place address is never null");
+    assert_eq!(a1 % 4096, 0, "address must satisfy alignment checks");
+    assert_eq!(a2 % 4096, 0, "address must satisfy alignment checks");
+    assert_ne!(a1, a2, "distinct places get distinct addresses");
+}
+
+#[test]
+fn expose_provenance_non_pointer_stays_unsupported() {
+    // Only a pointer source is modelled; exposing an integer
+    // keeps failing explicitly.
+    let body = mir::Body::new(
+        decls(&[usize_ty(), i32_ty()]),
+        0,
+        vec![block(
+            vec![
+                assign(place(1), mir::Rvalue::Use(const_i32(7))),
+                assign(
+                    place(0),
+                    mir::Rvalue::Cast(
+                        mir::CastKind::PointerExposeProvenance,
+                        copy(1),
+                        usize_ty(),
+                    ),
+                ),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("bad_expose", body);
+    let err = interpret_mir(&prog, "bad_expose", vec![])
+        .expect_err("non-pointer expose must stay unsupported");
+    assert!(
+        matches!(
+            err,
+            MirRunError::Interp(InterpError::UnsupportedRvalue { .. })
+        ),
+        "expected UnsupportedRvalue, got {err}"
+    );
+}

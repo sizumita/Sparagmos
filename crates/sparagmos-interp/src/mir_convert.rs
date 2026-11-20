@@ -1399,6 +1399,34 @@ impl<'a> Converter<'a> {
                     // emits around dereferences reduce to. Every
                     // other transmute shape stays an explicit
                     // unsupported rvalue.
+                    // `ptr as usize`: exposing a pointer's
+                    // provenance yields its address as an integer,
+                    // which this value model evaluates to the
+                    // pointer's synthetic address (see `eval_cast`)
+                    // — the same treatment as the pointer-to-
+                    // integer transmute below. This is the cast
+                    // rustc emits for `ptr as usize` in user code
+                    // (e.g. alignment checks on raw pointers).
+                    // The reverse direction (an integer cast back
+                    // to a pointer, PointerWithExposedProvenance)
+                    // stays an explicit unsupported: an address
+                    // names no place in this model.
+                    mir::CastKind::PointerExposeProvenance
+                        if matches!(
+                            ctx.as_ref(),
+                            Some(mir::Ty::Ref(..) | mir::Ty::RawPtr(..))
+                        ) =>
+                    {
+                        match self.convert_ty(target, "cast target") {
+                            Ok(t @ (ir::Ty::Int(_) | ir::Ty::Uint(_))) => {
+                                ir::Rvalue::Cast(v, t)
+                            }
+                            _ => ir::Rvalue::Unsupported(format!(
+                                "Cast {}",
+                                kind.name()
+                            )),
+                        }
+                    }
                     mir::CastKind::Transmute
                         if matches!(
                             ctx.as_ref(),
