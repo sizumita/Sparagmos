@@ -114,6 +114,24 @@ impl UintTy {
     }
 }
 
+/// Floating-point types. Only the two widths Rust code computes
+/// with in practice here; `f16` / `f128` stay unsupported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FloatTy {
+    F32,
+    F64,
+}
+
+impl FloatTy {
+    /// Width in bits.
+    pub fn bits(self) -> u32 {
+        match self {
+            FloatTy::F32 => 32,
+            FloatTy::F64 => 64,
+        }
+    }
+}
+
 /// The type model used for width / overflow semantics and for
 /// validating values written to places.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -122,6 +140,7 @@ pub enum Ty {
     Bool,
     Int(IntTy),
     Uint(UintTy),
+    Float(FloatTy),
     /// Tuple type, e.g. the `(T, bool)` produced by a checked operation.
     Tuple(Vec<Ty>),
     Never,
@@ -239,6 +258,9 @@ pub enum Constant {
     Bool(bool),
     Int(i128),
     Uint(u128),
+    /// A floating-point constant, stored widened to `f64` (an `f32`
+    /// value widens exactly, so nothing is lost).
+    Float(f64),
     /// String data (a `str` / `&str` constant).
     Str(String),
     /// Raw bytes (a byte-array constant, e.g. an fmt pieces template).

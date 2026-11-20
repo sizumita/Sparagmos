@@ -118,6 +118,13 @@ pub enum Value {
     Int(i128),
     /// Unsigned integer (also `char`, stored as its code point).
     Uint(u128),
+    /// A floating-point value, stored as `f64`. An `f32` value is
+    /// stored as its exact `f64` widening; writes to an `f32` place
+    /// round back (see `normalize_for_ty` in `interp`), and `f32`
+    /// arithmetic rounds each result, which is exact for + - * / %
+    /// by the double-rounding theorem (53 intermediate bits is more
+    /// than twice 24).
+    Float(f64),
     /// A tuple, or an array (arrays ride as tuples of their elements;
     /// the length lives in the declared type).
     Tuple(Vec<Value>),
@@ -154,6 +161,7 @@ impl Value {
             Value::Bool(_) => "bool",
             Value::Int(_) => "signed integer",
             Value::Uint(_) => "unsigned integer",
+            Value::Float(_) => "float",
             Value::Tuple(_) => "tuple",
             Value::Str(_) => "string",
             Value::Bytes(_) => "bytes",
@@ -231,6 +239,7 @@ impl fmt::Display for Value {
             Value::Bool(b) => write!(f, "{b}"),
             Value::Int(v) => write!(f, "{v}"),
             Value::Uint(v) => write!(f, "{v}"),
+            Value::Float(v) => write!(f, "{v}"),
             Value::Tuple(items) => {
                 write!(f, "(")?;
                 for (i, item) in items.iter().enumerate() {

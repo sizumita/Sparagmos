@@ -931,8 +931,8 @@ impl<'a> Interpreter<'a> {
             FmtTrait::LowerHex => self.format_radix(value, ty, 16, "0x", options),
             FmtTrait::UpperHex => self.format_radix(value, ty, 16, "0X", options),
             FmtTrait::Binary => self.format_radix(value, ty, 2, "0b", options),
-            FmtTrait::LowerExp => self.format_exp(value, false, options),
-            FmtTrait::UpperExp => self.format_exp(value, true, options),
+            FmtTrait::LowerExp => self.format_exp(value, ty, false, options),
+            FmtTrait::UpperExp => self.format_exp(value, ty, true, options),
         }
     }
 
@@ -954,6 +954,7 @@ impl<'a> Interpreter<'a> {
                 }
             }
             Value::Bool(b) => Ok(pad_str(bool_str(*b), options)),
+            Value::Float(v) => Ok(format_float(*v, ty, options, false)),
             Value::Str(s) => Ok(pad_str(s, options)),
             Value::FmtArguments(inner) => {
                 let text = self.format_arguments(frames, inner)?;
@@ -967,7 +968,7 @@ impl<'a> Interpreter<'a> {
             )),
             other => Err(InterpError::type_mismatch(
                 "Display formatting",
-                "integer, bool, string or char value",
+                "integer, bool, float, string or char value",
                 other.kind_name(),
             )),
         }
@@ -1005,6 +1006,7 @@ impl<'a> Interpreter<'a> {
                 }
             }
             Value::Bool(b) => Ok(pad_str(bool_str(*b), options)),
+            Value::Float(v) => Ok(format_float(*v, ty, options, true)),
             Value::Str(s) => {
                 // Precision truncates the string (in chars) before
                 // it is escaped and quoted.
@@ -1013,6 +1015,15 @@ impl<'a> Interpreter<'a> {
                     None => s.clone(),
                 };
                 Ok(pad_width(&format!("{truncated:?}"), options))
+            }
+            // Arrays ride as tuple values; the type tag is what
+            // distinguishes `[T; N]` / `[T]` from a tuple, and core's
+            // Debug for an array uses brackets, not parentheses.
+            // The tag names the type the fmt argument was built
+            // over, which may sit behind references (`&mut [i32; 4]`
+            // for `println!("{:#?}", mref)`), so strip those first.
+            Value::Tuple(_) if pointee_tag(ty).starts_with('[') => {
+                self.format_debug_seq(frames, value, options, indent, '[', ']')
             }
             Value::Tuple(_) => self.format_debug_seq(frames, value, options, indent, '(', ')'),
             Value::FmtArguments(inner) => {
@@ -1024,7 +1035,7 @@ impl<'a> Interpreter<'a> {
             )),
             other => Err(InterpError::type_mismatch(
                 "Debug formatting",
-                "integer, bool, string, char or tuple value",
+                "integer, bool, float, string, char or tuple value",
                 other.kind_name(),
             )),
         }
@@ -1050,20 +1061,45 @@ impl<'a> Interpreter<'a> {
         }
     }
 
-    /// Exponential formatting of an integer value (`{:e}` / `{:E}`).
+    /// Exponential formatting of an integer or float value
+    /// (`{:e}` / `{:E}`).
     fn format_exp(
         &self,
         value: &Value,
+        ty: &str,
         upper: bool,
         options: &FmtOptions,
     ) -> InterpResult<String> {
+        if let Value::Float(v) = value {
+            let body = if ty == "f32" {
+                let x = *v as f32;
+                match (options.precision(), upper) {
+                    (Some(p), false) => format!("{:.*e}", p as usize, x),
+                    (Some(p), true) => format!("{:.*E}", p as usize, x),
+                    (None, false) => format!("{x:e}"),
+                    (None, true) => format!("{x:E}"),
+                }
+            } else {
+                match (options.precision(), upper) {
+                    (Some(p), false) => format!("{:.*e}", p as usize, v),
+                    (Some(p), true) => format!("{:.*E}", p as usize, v),
+                    (None, false) => format!("{v:e}"),
+                    (None, true) => format!("{v:E}"),
+                }
+            };
+            let (negative, digits) = match body.strip_prefix('-') {
+                Some(rest) => (true, rest.to_string()),
+                None => (false, body),
+            };
+            return Ok(pad_integral(negative, "", &digits, options));
+        }
         let (negative, digits) = match value {
             Value::Int(v) => (*v < 0, v.unsigned_abs().to_string()),
             Value::Uint(v) => (false, v.to_string()),
             other => {
                 return Err(InterpError::type_mismatch(
                     "exponential formatting",
-                    "integer value",
+                    "integer or float value",
                     other.kind_name(),
                 ))
             }
@@ -1339,6 +1375,62 @@ fn finish_int(negative: bool, mut digits: String, prefix: &str, options: &FmtOpt
         options.flags &= !SIGN_AWARE_ZERO_PAD;
     }
     pad_integral(negative, prefix, &digits, &options)
+}
+
+/// A type tag with any reference / raw-pointer layers stripped:
+/// the tag of the value a fmt argument ultimately formats.
+fn pointee_tag(ty: &str) -> &str {
+    let mut ty = ty;
+    loop {
+        ty = ty.trim_start();
+        if let Some(rest) = ty.strip_prefix("&mut ") {
+            ty = rest;
+        } else if let Some(rest) = ty.strip_prefix('&') {
+            ty = rest;
+        } else if let Some(rest) = ty.strip_prefix("*const ") {
+            ty = rest;
+        } else if let Some(rest) = ty.strip_prefix("*mut ") {
+            ty = rest;
+        } else {
+            return ty;
+        }
+    }
+}
+
+/// Display/Debug formatting of a float value. The host formatter is
+/// the same std code the native binary runs, so the
+/// shortest-round-trip rendering matches exactly; `ty` selects the
+/// width because an `f32` value is stored widened to `f64` and must
+/// be narrowed back first (`0.1f32` prints as `0.1`, not as the
+/// widened `0.10000000149011612`). NaN ignores the sign flag and
+/// precision in core's float formatting; width still applies.
+fn format_float(v: f64, ty: &str, options: &FmtOptions, debug: bool) -> String {
+    if v.is_nan() {
+        let mut options = *options;
+        options.flags &= !(SIGN_PLUS | SIGN_AWARE_ZERO_PAD);
+        return pad_integral(false, "", "NaN", &options);
+    }
+    let body = if ty == "f32" {
+        let x = v as f32;
+        match (options.precision(), debug) {
+            (Some(p), false) => format!("{:.*}", p as usize, x),
+            (Some(p), true) => format!("{:.*?}", p as usize, x),
+            (None, false) => format!("{x}"),
+            (None, true) => format!("{x:?}"),
+        }
+    } else {
+        match (options.precision(), debug) {
+            (Some(p), false) => format!("{:.*}", p as usize, v),
+            (Some(p), true) => format!("{:.*?}", p as usize, v),
+            (None, false) => format!("{v}"),
+            (None, true) => format!("{v:?}"),
+        }
+    };
+    let (negative, digits) = match body.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, body.as_str()),
+    };
+    pad_integral(negative, "", digits, options)
 }
 
 /// The body of an exponential rendering: `1.23e2`, `0e0`, ...

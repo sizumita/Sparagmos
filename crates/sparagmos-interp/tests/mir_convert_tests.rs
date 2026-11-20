@@ -466,15 +466,18 @@ fn tuple_and_array_aggregates_and_repeat() {
 // ----- explicit failures (nothing is silently skipped) ---------------------------
 
 #[test]
-fn float_local_is_a_conversion_error() {
+fn f16_local_is_a_conversion_error() {
+    // f32 / f64 locals convert and execute (see float_tests.rs);
+    // f16 stays outside the type model and must fail conversion
+    // with an explicit reason.
     let body = mir::Body::new(
-        decls(&[mir::Ty::Float(mir::FloatTy::F64)]),
+        decls(&[mir::Ty::Float(mir::FloatTy::F16)]),
         0,
         vec![block(vec![], ret())],
     );
     let mut prog = MirProgram::new();
     prog.add("f", body);
-    let err = convert_program(&prog).expect_err("float local must not convert");
+    let err = convert_program(&prog).expect_err("f16 local must not convert");
     assert!(
         matches!(err, ConvertError::UnsupportedType { .. }),
         "expected UnsupportedType, got {err}"

@@ -117,10 +117,12 @@ impl MirProgram {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConvertError {
     /// A local (or cast target / tuple element) has a type the IR's
-    /// type model cannot represent (floats, trait objects, closures, ...).
+    /// type model cannot represent (trait objects, closures,
+    /// coroutines, `f16` / `f128`, ...).
     UnsupportedType { context: String, ty: String },
-    /// A constant form the IR cannot represent (strings, pointers,
-    /// floats, unevaluated / type constants outside call position, ...).
+    /// A constant form the IR cannot represent (pointers, `f16` /
+    /// `f128` float constants, unevaluated / type constants outside
+    /// call position, ...).
     UnsupportedConstant { kind: String },
     /// A place projection the IR cannot represent.
     UnsupportedProjection { kind: String },
@@ -178,6 +180,12 @@ impl From<InterpError> for MirRunError {
         MirRunError::Interp(e)
     }
 }
+
+/// Resource bound on `Rvalue::Repeat` element counts, mirroring the
+/// interpreter's step / call-depth limits: past this many elements the
+/// aggregate is not materialised and the rvalue converts to an
+/// explicit unsupported error instead of aborting on allocation.
+const MAX_REPEAT_ELEMENTS: u64 = 1_000_000;
 
 /// Convert a whole MIR program into an interpreter [`ir::Program`].
 pub fn convert_program(program: &MirProgram) -> Result<ir::Program, ConvertError> {
@@ -312,6 +320,9 @@ impl<'a> Converter<'a> {
             mir::Ty::Bool => ir::Ty::Bool,
             mir::Ty::Int(it) => ir::Ty::Int(convert_int_ty(*it)),
             mir::Ty::Uint(ut) => ir::Ty::Uint(convert_uint_ty(*ut)),
+            // `f16` / `f128` fall through to the unsupported arm.
+            mir::Ty::Float(mir::FloatTy::F32) => ir::Ty::Float(ir::FloatTy::F32),
+            mir::Ty::Float(mir::FloatTy::F64) => ir::Ty::Float(ir::FloatTy::F64),
             // `char` is a 32-bit scalar; the IR models it as `u32`.
             mir::Ty::Char => ir::Ty::Uint(ir::UintTy::U32),
             mir::Ty::Never => ir::Ty::Never,
@@ -476,9 +487,15 @@ impl<'a> Converter<'a> {
         ctx: Option<&mir::Ty>,
     ) -> Result<ir::Constant, ConvertError> {
         match scalar {
-            mir::Scalar::Float { .. } => Err(ConvertError::UnsupportedConstant {
-                kind: "float constant".to_string(),
-            }),
+            mir::Scalar::Float { bits, ty } => match ty {
+                mir::FloatTy::F32 => {
+                    Ok(ir::Constant::Float(f32::from_bits(*bits as u32) as f64))
+                }
+                mir::FloatTy::F64 => Ok(ir::Constant::Float(f64::from_bits(*bits as u64))),
+                other => Err(ConvertError::UnsupportedConstant {
+                    kind: format!("{other:?} float constant"),
+                }),
+            },
             mir::Scalar::Ptr { .. } => Err(ConvertError::UnsupportedConstant {
                 kind: "pointer constant".to_string(),
             }),
@@ -634,10 +651,14 @@ impl<'a> Converter<'a> {
                     .or_else(|| dest_ty.cloned());
                 let v = self.convert_operand(body, operand, ctx.as_ref())?;
                 match kind {
-                    mir::CastKind::IntToInt => match self.convert_ty(target, "cast target") {
+                    mir::CastKind::IntToInt
+                    | mir::CastKind::FloatToInt
+                    | mir::CastKind::FloatToFloat
+                    | mir::CastKind::IntToFloat => match self.convert_ty(target, "cast target") {
                         Ok(t) => ir::Rvalue::Cast(v, t),
                         Err(_) => ir::Rvalue::Unsupported(format!(
-                            "Cast IntToInt to {}",
+                            "Cast {} to {}",
+                            kind.name(),
                             target.kind_name()
                         )),
                     },
@@ -705,14 +726,24 @@ impl<'a> Converter<'a> {
                 other => ir::Rvalue::Unsupported(format!("Aggregate {}", other.kind_name())),
             },
             R::Repeat(op, count) => {
-                let elem_ty = match dest_ty {
-                    Some(mir::Ty::Tuple(ts)) => ts.first().cloned(),
-                    Some(mir::Ty::Array(elem, _)) => Some((**elem).clone()),
-                    _ => None,
-                };
-                let v = self.convert_operand(body, op, elem_ty.as_ref())?;
-                let n = usize::try_from(*count).unwrap_or(usize::MAX);
-                ir::Rvalue::AggregateTuple(vec![v; n])
+                // A repeat count is guest-controlled input: a huge
+                // count (e.g. `[0u8; 1 << 40]`) would make the
+                // aggregate allocation abort the host process instead
+                // of failing the run. Like the interpreter's step and
+                // call-depth limits, the element count is a resource
+                // bound; past it the rvalue stays an explicit
+                // unsupported error.
+                if *count > MAX_REPEAT_ELEMENTS {
+                    ir::Rvalue::Unsupported(format!("Repeat of {count} elements"))
+                } else {
+                    let elem_ty = match dest_ty {
+                        Some(mir::Ty::Tuple(ts)) => ts.first().cloned(),
+                        Some(mir::Ty::Array(elem, _)) => Some((**elem).clone()),
+                        _ => None,
+                    };
+                    let v = self.convert_operand(body, op, elem_ty.as_ref())?;
+                    ir::Rvalue::AggregateTuple(vec![v; *count as usize])
+                }
             }
             R::Ref(_, _, place) => ir::Rvalue::Ref(self.convert_place(place)?),
             R::CopyForDeref(place) => ir::Rvalue::CopyForDeref(self.convert_place(place)?),
