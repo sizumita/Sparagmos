@@ -61,7 +61,10 @@
 //!   accounted for (a `Drop` impl without a converted body, a field
 //!   whose type no projection anywhere records, a type from another
 //!   crate that might hide an impl) keeps the terminator an explicit
-//!   error; nothing is dropped silently.
+//!   error; nothing is dropped silently. An explicit
+//!   `std::mem::drop` call is treated the same way: the dropped
+//!   type's glue is built at conversion and attached to the call, so
+//!   both paths run identical glue.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -1517,6 +1520,32 @@ impl<'a> Converter<'a> {
         DropGlueBuilder::build(self, ty)
     }
 
+    /// The drop glue of a `std::mem::drop` call's argument, mirroring
+    /// the `Drop` terminator's treatment of the same type:
+    /// `Ok(Some(glue))` when the argument is a place whose type's
+    /// glue conversion can account for (the interpreter runs it
+    /// against the argument place), `Ok(None)` when there is nothing
+    /// to run (a constant argument whose glue is trivial, so
+    /// discarding it is already faithful), and `Err(())` when the
+    /// glue cannot be accounted for.
+    fn mem_drop_glue(
+        &self,
+        body: &mir::Body,
+        arg: &mir::Operand,
+        ir_arg: &ir::Operand,
+        raw_generic_args: &[mir::Ty],
+    ) -> Result<Option<ir::DropGlue>, ()> {
+        let dropped_ty = self
+            .operand_place_ty(body, arg)
+            .or_else(|| raw_generic_args.first().cloned());
+        let glue = dropped_ty.and_then(|t| self.drop_glue(&t)).ok_or(())?;
+        match ir_arg {
+            ir::Operand::Copy(_) | ir::Operand::Move(_) => Ok(Some(glue)),
+            _ if glue.root == ir::DropPlan::Trivial => Ok(None),
+            _ => Err(()),
+        }
+    }
+
     /// The converted body of `adt_name`'s `Drop` impl, if the
     /// program has one. The driver's name for the impl is
     /// `<{adt_name} as std::ops::Drop>::drop` (the `core::` spelling
@@ -1652,12 +1681,48 @@ impl<'a> Converter<'a> {
                             let ctx = builtin_arg_ctx(kind, &raw_generic_args, i);
                             ir_args.push(self.convert_operand(body, arg, ctx.as_ref())?);
                         }
-                        ir::TerminatorKind::CallBuiltin {
-                            name: canonical,
-                            generic_args,
-                            args: ir_args,
-                            destination: self.convert_place(destination)?,
-                            target: target.map(|b| ir::BasicBlock(b.index())),
+                        // An explicit `std::mem::drop` runs the
+                        // dropped value's glue, exactly like a `Drop`
+                        // terminator for the same type: build the
+                        // glue now, while the type and the name
+                        // tables are at hand (see `mem_drop_glue`).
+                        // A call whose glue cannot be accounted for
+                        // stays unsupported instead of silently
+                        // discarding a value whose destructor has
+                        // observable effects.
+                        let mut unaccountable_drop = false;
+                        let drop_glue = if kind == crate::builtins::Builtin::MemDrop
+                            && args.len() == 1
+                        {
+                            match self.mem_drop_glue(
+                                body,
+                                &args[0],
+                                &ir_args[0],
+                                &raw_generic_args,
+                            ) {
+                                Ok(glue) => glue,
+                                Err(()) => {
+                                    unaccountable_drop = true;
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        if unaccountable_drop {
+                            ir::TerminatorKind::Unsupported(
+                                "Call to std::mem::drop (drop glue cannot be accounted for)"
+                                    .to_string(),
+                            )
+                        } else {
+                            ir::TerminatorKind::CallBuiltin {
+                                name: canonical,
+                                generic_args,
+                                args: ir_args,
+                                destination: self.convert_place(destination)?,
+                                target: target.map(|b| ir::BasicBlock(b.index())),
+                                drop_glue,
+                            }
                         }
                     } else {
                         ir::TerminatorKind::Unsupported(format!(

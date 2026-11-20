@@ -295,8 +295,12 @@ pub enum Builtin {
     ResultIsErr,
     /// `Option::take(&mut option) -> old value`.
     OptionTake,
-    /// `std::mem::drop(value)`: the value is consumed; dropping the
-    /// modelled std data types has no guest-observable effect.
+    /// `std::mem::drop(value)`: the value is consumed. When
+    /// conversion could account for the dropped type's drop glue,
+    /// the call carries it (`CallBuiltin::drop_glue`) and the
+    /// interpreter runs it before this dispatch is ever reached;
+    /// this arm is the glue-free remainder (scalars, constants),
+    /// where dropping has no guest-observable effect.
     MemDrop,
     /// `std::mem::swap(&mut a, &mut b)`.
     MemSwap,
