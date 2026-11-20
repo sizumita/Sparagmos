@@ -141,7 +141,9 @@ def measure_program(src: Path, work: Path, reps: dict) -> dict:
         times.append(t)
         codes.append(p.returncode)
         if p.returncode != 0 and not note:
-            note = (p.stderr.strip().splitlines() or [""])[0]
+            lines = [l for l in p.stderr.strip().splitlines() if l.strip()]
+            named = [l for l in lines if "unsupported" in l.lower()]
+            note = (named or lines or [""])[-1]
     r["driver_run_s"] = stats(times)
     r["driver_run_exit_codes"] = codes
     if note:
@@ -225,11 +227,16 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="sparagmos-bench-") as td:
         work = Path(td)
         for src in sorted(BENCH_DIR.glob("*.rs")):
-            results.append(measure_program(src, work, reps))
-    meta["loadavg_end"] = os.getloadavg()
-
-    out = {"meta": meta, "results": results}
-    Path(args.out).write_text(json.dumps(out, indent=2) + "\n")
+            try:
+                results.append(measure_program(src, work, reps))
+            except Exception as e:  # one bad program must not lose the rest
+                results.append({"program": src.name,
+                                "measurement_error": f"{type(e).__name__}: {e}"})
+                print(f"!! {src.name}: {e}", flush=True)
+            # Save incrementally: a late failure keeps earlier results.
+            meta["loadavg_end"] = os.getloadavg()
+            Path(args.out).write_text(
+                json.dumps({"meta": meta, "results": results}, indent=2) + "\n")
     print(f"wrote {args.out}")
 
     # Compact summary (medians; ratios against the native run time).
