@@ -73,6 +73,12 @@ pub struct MirProgram {
     /// (std callees, ADT types). Used to name ADT locals and to
     /// resolve calls into runtime support.
     pub fn_names: HashMap<mir::DefId, String>,
+    /// Discriminant values of the enum ADTs in the program, keyed by
+    /// `DefId` (variant index -> discriminant value), as recorded by
+    /// the driver. `Discriminant` rvalues are evaluated with these
+    /// values so they agree with the `SwitchInt` branch keys, which
+    /// carry discriminant values rather than variant indices.
+    pub adt_discriminants: mir::AdtDiscriminants,
 }
 
 impl MirProgram {
@@ -256,6 +262,8 @@ struct Converter<'a> {
     /// `DefId` -> name for every named item (the driver's table,
     /// including body-less callees and ADT types).
     names: &'a HashMap<mir::DefId, String>,
+    /// Discriminant tables of the program (see `MirProgram`).
+    discriminants: &'a mir::AdtDiscriminants,
 }
 
 impl<'a> Converter<'a> {
@@ -272,6 +280,7 @@ impl<'a> Converter<'a> {
             bodies,
             def_names,
             names: &program.fn_names,
+            discriminants: &program.adt_discriminants,
         }
     }
 
@@ -774,7 +783,23 @@ impl<'a> Converter<'a> {
             R::ThreadLocalRef(def) => ir::Rvalue::Unsupported(format!("ThreadLocalRef {def}")),
             R::Len(place) => ir::Rvalue::Len(self.convert_place(place)?),
             R::NullaryOp(op, _) => ir::Rvalue::Unsupported(format!("NullaryOp {}", op.kind_name())),
-            R::Discriminant(place) => ir::Rvalue::Discriminant(self.convert_place(place)?),
+            R::Discriminant(place) => {
+                let converted = self.convert_place(place)?;
+                // Bake the discriminant table of the enum into the
+                // rvalue: at execution time the place type is no
+                // longer available, and the table is what separates
+                // the discriminant value from the variant index.
+                // No table (hand-built programs, non-ADT places)
+                // leaves the table empty, which the interpreter
+                // reads as "values are the variant indices".
+                let discriminants = match self.place_ty(body, place) {
+                    Some(mir::Ty::Adt(def, _)) => {
+                        self.discriminants.get(&def).cloned().unwrap_or_default()
+                    }
+                    _ => Vec::new(),
+                };
+                ir::Rvalue::Discriminant(converted, discriminants)
+            }
             R::ShallowInitBox(_, _) => ir::Rvalue::Unsupported("ShallowInitBox rvalue".to_string()),
         })
     }
