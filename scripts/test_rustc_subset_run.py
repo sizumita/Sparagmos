@@ -579,6 +579,29 @@ class CompileExpectationTests(unittest.TestCase):
                 run.compile_expectation(suite, header("fn main() {}\n")),
                 "success", suite)
 
+    def test_incremental_revision_kinds(self):
+        # compiletest's IncrRevKind: the revision name's prefix
+        # fixes the compile outcome (cpass/bpass/rpass succeed,
+        # bfail fails).
+        cases = [("rpass1", "success"), ("rpass2", "success"),
+                 ("bpass1", "success"), ("cpass2", "success"),
+                 ("bfail1", "failure"), ("bfail2", "failure")]
+        for rev, want in cases:
+            h = header(f"//@ revisions: {rev}\n")
+            self.assertEqual(
+                run.compile_expectation("incremental", h.view(rev)),
+                want, rev)
+
+    def test_incremental_unknown_revision_kind_not_judgable(self):
+        h = header("//@ revisions: xpass1\n")
+        self.assertIsNone(
+            run.compile_expectation("incremental", h.view("xpass1")))
+
+    def test_incremental_without_revision_not_judgable(self):
+        h = header("fn main() {}\n")
+        self.assertIsNone(
+            run.compile_expectation("incremental", h.view(None)))
+
 
 class Stage2BlockerTests(unittest.TestCase):
     def rec(self):
@@ -929,12 +952,104 @@ class ProcessStage2Tests(unittest.TestCase):
         self.assertEqual(res["status"], "not-attempted")
         self.assertIn("multi-file", res["bucket"])
 
-    def test_incremental_suite_not_attempted(self):
+    def test_incremental_without_revisions_not_attempted(self):
         rec = self.write_test("fn main() {}\n", suite="incremental")
         res = run.process_test(rec, self.rust_dir, Path("/fake/driver"),
                                stage2=True)
         self.assertEqual(res["status"], "not-attempted")
-        self.assertIn("incremental", res["bucket"])
+        self.assertIn("revisions", res["reason"])
+
+    def test_incremental_dep_graph_assertion_not_attempted(self):
+        rec = self.write_test(
+            "//@ revisions: rpass1 rpass2\n"
+            "#![feature(rustc_attrs)]\n"
+            "#[rustc_clean(cfg=\"rpass2\")]\n"
+            "pub fn f() {}\nfn main() {}\n",
+            suite="incremental")
+        res = run.process_test(rec, self.rust_dir, Path("/fake/driver"),
+                               stage2=True)
+        self.assertEqual(res["status"], "not-attempted")
+        self.assertIn("dep-graph", res["bucket"])
+        self.assertIn("rustc_clean", res["reason"])
+
+    def test_incremental_partition_assertion_not_attempted(self):
+        rec = self.write_test(
+            "//@ revisions: rpass1 rpass2\n"
+            "#![feature(rustc_attrs)]\n"
+            "#![rustc_partition_reused(module=\"t\", cfg=\"rpass2\")]\n"
+            "fn main() {}\n",
+            suite="incremental")
+        res = run.process_test(rec, self.rust_dir, Path("/fake/driver"),
+                               stage2=True)
+        self.assertEqual(res["status"], "not-attempted")
+        self.assertIn("dep-graph", res["bucket"])
+        self.assertIn("rustc_partition_reused", res["reason"])
+
+    def test_incremental_aux_dep_graph_assertion_not_attempted(self):
+        rec = self.write_test(
+            "//@ revisions: rpass1 rpass2\n"
+            "//@ aux-build: a.rs\n"
+            "extern crate a;\nfn main() {}\n",
+            suite="incremental")
+        rec["single_file"] = False
+        aux_dir = self.rust_dir / "tests" / "ui" / "auxiliary"
+        aux_dir.mkdir()
+        (aux_dir / "a.rs").write_text(
+            "#![feature(rustc_attrs)]\n"
+            "#[rustc_clean(cfg=\"rpass2\")]\n"
+            "pub fn g() {}\n")
+        res = run.process_test(rec, self.rust_dir, Path("/fake/driver"),
+                               stage2=True)
+        self.assertEqual(res["status"], "not-attempted")
+        self.assertIn("dep-graph", res["bucket"])
+        self.assertIn("a.rs", res["reason"])
+
+    def test_incremental_assert_incr_state_loaded_not_attempted(self):
+        rec = self.write_test(
+            "//@ revisions: bpass1 bpass2\n"
+            "//@ [bpass2] compile-flags: -Zassert-incr-state=loaded\n"
+            "fn main() {}\n",
+            suite="incremental")
+        res = run.process_test(rec, self.rust_dir, Path("/fake/driver"),
+                               stage2=True)
+        self.assertEqual(res["status"], "not-attempted")
+        self.assertIn("cache-state", res["bucket"])
+
+    def test_incremental_assert_incr_state_not_loaded_is_judged(self):
+        # =not-loaded asserts a fresh start, which an independent
+        # conversion satisfies by construction.
+        rec = self.write_test(
+            "//@ revisions: bpass1 bpass2\n"
+            "//@ [bpass1] compile-flags: -Zassert-incr-state=not-loaded\n"
+            "//@ [bpass2] compile-flags: -Zassert-incr-state=not-loaded\n"
+            "fn main() {}\n",
+            suite="incremental")
+        res = self.run_with_conv(rec, conv())
+        self.assertEqual(res["status"], "pass")
+
+    def test_incremental_revisions_judged_per_revision(self):
+        rec = self.write_test(
+            "//@ revisions: rpass1 bfail2\nfn main() {}\n",
+            suite="incremental")
+
+        def stub(path, edition, driver_bin, rustc_args=(), aux_specs=()):
+            if "bfail2" in rustc_args:
+                return conv(exit_code=1, compilation_failed=True,
+                            converted=None, skipped=None)
+            return conv()
+
+        orig = run.convert_side
+        run.convert_side = stub
+        try:
+            res = run.process_test(rec, self.rust_dir,
+                                   Path("/fake/driver"), stage2=True)
+        finally:
+            run.convert_side = orig
+        self.assertEqual(res["status"], "pass")
+        self.assertEqual(res["revisions"]["rpass1"]["expectation"],
+                         "success")
+        self.assertEqual(res["revisions"]["bfail2"]["expectation"],
+                         "failure")
 
     def test_compile_check_without_stage2_stays_out_of_scope(self):
         rec = self.write_test("//@ check-fail\nfn main() {}\n")

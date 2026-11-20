@@ -1320,6 +1320,64 @@ stage 1 も compile-flags を両側 (ネイティブ rustc とドライバ) へ
 ドライバの panic 捕捉の統合で fail が 24 件から 2 件に減った
 ことも含まれる。
 
+#### stage 2: incremental スイートの revision 単位判定 (2026-11-21、lane/incremental-suite)
+
+incremental スイート (180 件) は「セッションをまたぐ再コンパイルに
+依存する」という理由で stage 2 から一律に対象外だった。これを
+やめ、revision 単位で判定するようにした。根拠は compiletest 自身の
+判定方法 (src/tools/compiletest/src/runtest/incremental.rs) である:
+各 revision の成否は、revision 名の接頭辞が決める種類
+(cpass/bpass/rpass はコンパイル成功、bfail はクリーンな失敗) で
+決まる。revision 群は 1 つの incremental ディレクトリを共有するが、
+キャッシュが温まっているかどうかは「その revision のソースが
+コンパイルできるか」を変えない。rpass は compiletest では
+コンパイル後にバイナリも実行するが、stage 2 は他のスイートと
+同様にコンパイル成否だけを判定する (出力照合も行わない、という
+既存の割り切りと同じ)。
+
+対象外として残るのは、判定そのものがセッション間に持ち越される
+状態で定義されているテストで、一律の除外ではなくテストごとに
+理由を記録する:
+
+- dep-graph 表明を持つテスト 81 件: テストファイルまたは補助
+  クレート内の #[rustc_clean] / #[rustc_dirty] /
+  #![rustc_partition_reused] / #![rustc_partition_codegened]。
+  -Z query-dep-graph の下では、前セッションから読み込んだ
+  dep-graph との比較で成否が決まるため、独立した revision 単位の
+  変換では再現できない (内訳: rustc_clean 60 件、
+  rustc_partition_reused 27 件、rustc_partition_codegened 16 件、
+  rustc_dirty 0 件、重複を除き 81 件)。
+- 起動時のキャッシュ状態を表明するテスト 1 件:
+  -Zassert-incr-state=loaded を要求する
+  issue-85360-eval-obligation-ice.rs。=not-loaded の表明は
+  独立変換が構成上満たすので妨げにならない。
+
+実測 (対象を incremental に絞った実行 subset-cl-incremental.json と
+全体実行 subset-cl.json で一致、ドライバは現行 main):
+判定に入った 98 件のうち pass 64 件、fail 9 件、unsupported 21 件。
+残りは対象外 82 件 (上記) と、既存の汎用ブロッカーによる
+未実行 4 件 (rustc-env 3 件、proc-macro 補助クレートのビルド
+失敗 1 件)。bfail revision は 21 件がクリーンな失敗として
+pass し、失敗した 4 件は delayed_span_bug (failure-status 101 の
+delayed bug で、クリーンな失敗ではない) と link_order
+(補助クレートのリンク順序で決まる成否で、コンパイル成否では
+ない) である。fail 9 件の残りはドライバ側の不一致
+(lto / thinlto / delegation テストでの E0432、ICE 1 件、
+Stable MIR エラー 1 件) で、いずれも正直な不一致として記録する。
+unsupported 21 件は単相化 instance 不在・const パラメータ・
+InlineAsm など、他スイートと同じ変換側の上限である。
+
+全体実行の指標2(b) は 69.86% (both11 の 65.204% から上昇) だが、
+この差の大半は both11 以降に統合された他レーンの増分であり、
+本レーン単独の寄与は incremental の pass 0 件 → 64 件である。
+both11 との比較で pass から後退した 64 件は本変更の回帰では
+ないことを、変更前のランナーを同じドライバで再実行して
+全件ステータス一致で確認した (外国ターゲット revision の
+未実行化、polonius の変換未完の露呈、false-pass の訂正など、
+both11 以降の main 変更によるもの)。survey スクリプトに変更は
+ない (incremental は元々 compile-check に分類されており、
+除外はランナー側だけにあった)。
+
 ---
 
 #### Drop ターミネータ残件の census と修正 (Lane BS、2026-11-21)
