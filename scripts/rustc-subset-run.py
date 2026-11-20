@@ -1078,6 +1078,7 @@ def snapshot_flags(path, text):
 
 
 _CONVERTED_RE = re.compile(r"^converted: (\d+), skipped: (\d+)$", re.M)
+_TARGET_RE = re.compile(r"^target-crate converted: (\d+), skipped: (\d+)$", re.M)
 
 
 def convert_side(path, edition, driver_bin, rustc_args=()):
@@ -1113,6 +1114,23 @@ def convert_side(path, edition, driver_bin, rustc_args=()):
     if m:
         out["converted"] = int(m.group(1))
         out["skipped"] = int(m.group(2))
+        tm = _TARGET_RE.search(res["stdout"])
+        if tm:
+            out["target_converted"] = int(tm.group(1))
+            out["target_skipped"] = int(tm.group(2))
+            ttotals = []
+            in_tsection = False
+            for line in res["stdout"].splitlines():
+                if line == "target-crate unsupported:":
+                    in_tsection = True
+                    continue
+                if in_tsection:
+                    mm = re.match(r"^  (.+): (\d+)$", line)
+                    if mm:
+                        ttotals.append((mm.group(1), int(mm.group(2))))
+                    else:
+                        in_tsection = False
+            out["target_skip_totals"] = sorted(ttotals, key=lambda kv: -kv[1])
         totals = []
         in_section = False
         for line in res["stdout"].splitlines():
@@ -1167,14 +1185,23 @@ def judge_compile(expectation, conv):
                 return ("fail",
                         "driver exit 0 without a conversion report",
                         "driver error")
-            if conv["skipped"] == 0:
+            # Conversion completeness is judged on the target
+            # crate's own functions when the driver reports them:
+            # collected library bodies (Lane AG) are precompiled
+            # code, and their skips do not make the target crate's
+            # compilation incomplete.
+            skipped = conv.get("target_skipped")
+            if skipped is None:
+                skipped = conv["skipped"]
+            if skipped == 0:
                 return ("pass", "", "")
+            totals_list = conv.get("target_skip_totals") or conv["skip_totals"]
             totals = ", ".join(f"{short_kind(k)} x{n}"
-                               for k, n in conv["skip_totals"][:5])
+                               for k, n in totals_list[:5])
             return ("unsupported",
-                    f"conversion incomplete: {conv['skipped']} "
+                    f"conversion incomplete: {skipped} "
                     f"function(s) skipped ({totals})",
-                    skip_bucket(conv["skip_totals"]))
+                    skip_bucket(totals_list))
         if code == 1:
             first = first_error_line(conv["stderr"])
             return ("fail",

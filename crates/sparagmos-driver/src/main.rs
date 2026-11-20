@@ -94,6 +94,14 @@ struct Collected {
     /// crate may define its own `main`-named function, which is not
     /// the program's entry point.
     local_body_count: usize,
+    /// Number of leading entries of `report.functions` that belong
+    /// to the target crate itself (the rest are auxiliary-crate and
+    /// collected library functions). Compile verdicts judge
+    /// conversion completeness on the target crate, the way
+    /// compiletest does: the library is precompiled, so a collected
+    /// library body that stays unconverted does not make the
+    /// target crate's compilation incomplete.
+    local_report_count: usize,
 }
 
 static COLLECTED: OnceLock<Mutex<Option<Collected>>> = OnceLock::new();
@@ -429,6 +437,7 @@ fn collect() -> ControlFlow<()> {
     }
 
     let local_body_count = bodies.len();
+    let local_report_count = report.functions.len();
 
     // Collect the bodies of non-local functions reachable from the
     // converted local bodies (std / core / alloc and other library
@@ -504,6 +513,7 @@ fn collect() -> ControlFlow<()> {
         body_def_ids,
         body_def_names,
         local_body_count,
+        local_report_count,
         def_names: conv.def_names.clone(),
         adt_discriminants: conv.adt_discriminants.clone(),
     });
@@ -1015,6 +1025,30 @@ fn main() {
                 c.report.converted_count(),
                 c.report.skipped_count()
             );
+            {
+                let target = &c.report.functions[..c.local_report_count];
+                let t_converted = target
+                    .iter()
+                    .filter(|f| matches!(f.outcome, FnOutcome::Converted))
+                    .count();
+                let t_skipped = target.len() - t_converted;
+                println!("target-crate converted: {t_converted}, skipped: {t_skipped}");
+                if t_skipped > 0 {
+                    let mut totals: std::collections::BTreeMap<&str, usize> =
+                        std::collections::BTreeMap::new();
+                    for f in target {
+                        if let FnOutcome::Skipped { reasons } = &f.outcome {
+                            for (k, v) in reasons {
+                                *totals.entry(k.as_str()).or_default() += v;
+                            }
+                        }
+                    }
+                    println!("target-crate unsupported:");
+                    for (k, v) in &totals {
+                        println!("  {k}: {v}");
+                    }
+                }
+            }
             let totals = c.report.unsupported_totals();
             if !totals.is_empty() {
                 println!("unsupported:");
