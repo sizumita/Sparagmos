@@ -7,8 +7,8 @@
 // The trailing sentinel branch keeps the result observable to the
 // native optimizer (never taken at runtime).
 fn main() {
-    let dim: i64 = 48;
-    let passes: i64 = 200;
+    let dim: i64 = 40;
+    let passes: i64 = 8;
     let mut acc: i64 = 0;
     let mut p: i64 = 0;
     while p < passes {

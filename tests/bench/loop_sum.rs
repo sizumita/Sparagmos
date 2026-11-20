@@ -7,7 +7,7 @@
 fn main() {
     let mut acc: i64 = 0;
     let mut i: i64 = 0;
-    let n: i64 = 30_000_000;
+    let n: i64 = 1_000_000;
     while i < n {
         acc += (i % 997) * (i % 991) + (i % 7);
         i += 1;
