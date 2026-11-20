@@ -27,6 +27,11 @@ pub enum InterpError {
     CallDepthExceeded { limit: usize },
     /// A call named a function that is not in the program.
     UnknownFunction { name: String },
+    /// A call named a function whose body could not be converted;
+    /// `reason` is the conversion failure, carried along so it
+    /// surfaces with its cause at the call site instead of failing
+    /// the whole program before execution starts.
+    UnconvertedFunction { name: String, reason: String },
     /// A terminator jumped to a basic block that does not exist.
     UnknownBlock { func: String, block: usize },
     /// A place referred to a local outside the frame.
@@ -86,6 +91,9 @@ impl fmt::Display for InterpError {
                 write!(f, "call depth limit exceeded ({limit} frames)")
             }
             InterpError::UnknownFunction { name } => write!(f, "unknown function `{name}`"),
+            InterpError::UnconvertedFunction { name, reason } => {
+                write!(f, "call to `{name}`, whose body could not be converted: {reason}")
+            }
             InterpError::UnknownBlock { func, block } => {
                 write!(f, "unknown basic block bb{block} in function `{func}`")
             }

@@ -591,6 +591,13 @@ impl Body {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Program {
     pub functions: HashMap<String, Body>,
+    /// Functions that exist in the source program but whose bodies
+    /// could not be converted, keyed by name, with the reason
+    /// conversion failed. They deliberately hold no body: a function
+    /// that is never called does not affect the run, and calling one
+    /// fails with the recorded reason (see
+    /// []).
+    pub unconverted: HashMap<String, String>,
 }
 
 impl Program {
@@ -603,5 +610,20 @@ impl Program {
     }
     pub fn get(&self, name: &str) -> Option<&Body> {
         self.functions.get(name)
+    }
+    /// Record a function whose body could not be converted, with
+    /// the reason conversion failed. See [].
+    pub fn add_unconverted(
+        &mut self,
+        name: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> &mut Self {
+        self.unconverted.insert(name.into(), reason.into());
+        self
+    }
+    /// The recorded conversion-failure reason for , if its
+    /// body could not be converted.
+    pub fn unconverted_reason(&self, name: &str) -> Option<&str> {
+        self.unconverted.get(name).map(String::as_str)
     }
 }
