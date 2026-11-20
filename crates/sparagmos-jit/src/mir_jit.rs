@@ -31,6 +31,20 @@
 //! semantics — which are exactly Rust's — with no normalisation
 //! step in the lowering.
 //!
+//! A thin reference or raw pointer is one word: the stack address
+//! of the pointee's slot. Taking a reference emits the backend's
+//! slot-address instruction, and reading or writing through
+//! exactly one dereference loads or stores through that address,
+//! so the access lands on the original place — the interpreter's
+//! model of a reference, where reads and writes reach the place
+//! the reference was taken of. This holds across a call, too: a
+//! caller's frame outlives the call, so a callee writing through
+//! a pointer argument writes the caller's place. Fat references
+//! (to slices, `str` or trait objects), a projection *through* a
+//! dereference (a field of a pointed-to value) and a second
+//! dereference stay unsupported, as do pointees that are not a
+//! single scalar leaf.
+//!
 //! # Panics
 //!
 //! A guest panic (failed `Assert`, checked-arithmetic overflow via
@@ -57,13 +71,16 @@
 //! # Scope
 //!
 //! Supported: integer / `bool` / `char` / `f32` / `f64` /
-//! tuple-of-supported locals; `Use`, plain and checked `BinaryOp`,
-//! `UnaryOp`, `IntToInt` / `FloatToInt` / `IntToFloat` /
-//! `FloatToFloat` casts, tuple aggregates; `Goto`, `SwitchInt`,
-//! `Call` (within the program, up to six arguments), `Assert`,
-//! `Drop` of scalar values, `Return`.
-//! Anything else — `f16` / `f128`, 128-bit integers, references and
-//! places through them, ADTs, slices, aggregates other than tuples,
+//! tuple-of-supported locals; thin references and raw pointers to
+//! scalar places; `Use`, plain and checked `BinaryOp`, `UnaryOp`,
+//! `IntToInt` / `FloatToInt` / `IntToFloat` / `FloatToFloat`
+//! casts and the address-preserving pointer casts, tuple
+//! aggregates; `Goto`, `SwitchInt`, `Call` (within the program,
+//! up to six arguments), `Assert`, `Drop` of scalar values,
+//! `Return`.
+//! Anything else — `f16` / `f128`, 128-bit integers, fat
+//! references, projections through a dereference, ADTs, slices,
+//! aggregates other than tuples,
 //! calls to functions outside the program, and so on — fails the
 //! whole function's compilation with [`JitError::Unsupported`]
 //! naming the construct. There is deliberately no partial or
@@ -353,6 +370,18 @@ fn flatten(ty: &mir::Ty, fname: &str) -> Result<usize, JitError> {
         }
         // A never-typed value is never produced; it occupies no leaf.
         mir::Ty::Never => Ok(0),
+        mir::Ty::Ref(_, pointee, _) | mir::Ty::RawPtr(pointee, _) => {
+            // A thin reference / raw pointer is one word: the
+            // pointee slot's address. A fat pointee (a slice, `str`
+            // or a trait object) would need a second word for its
+            // metadata and stays unsupported.
+            match &**pointee {
+                mir::Ty::Str | mir::Ty::Slice(_) | mir::Ty::Dynamic(..) => {
+                    Err(unsup(fname, "fat reference / pointer type"))
+                }
+                _ => Ok(1),
+            }
+        }
         mir::Ty::Float(mir::FloatTy::F32) | mir::Ty::Float(mir::FloatTy::F64) => Ok(1),
         mir::Ty::Float(mir::FloatTy::F16) => {
             Err(unsup(fname, "16-bit floating-point type"))
@@ -697,7 +726,49 @@ impl<'a> FnLower<'a> {
         Ok((first + offset as u32, count, ty))
     }
 
+    /// Resolve a place that goes through a dereference: local
+    /// projections up to a single `Deref`, and nothing after it.
+    /// Returns the slot holding the pointer and the pointee type,
+    /// or `None` when the place has no `Deref` at all. Any other
+    /// shape involving a `Deref` — a projection after it, a second
+    /// `Deref` — is an explicit error: those need address
+    /// arithmetic on the pointee's layout, which the slot model
+    /// does not have.
+    fn deref_place(&self, place: &mir::Place) -> Result<Option<(u32, mir::Ty)>, JitError> {
+        let Some(pos) = place
+            .projection
+            .iter()
+            .position(|e| matches!(e, mir::PlaceElem::Deref))
+        else {
+            return Ok(None);
+        };
+        if pos + 1 != place.projection.len() {
+            return Err(self.err("projection through a dereference"));
+        }
+        let base = mir::Place {
+            local: place.local,
+            projection: place.projection[..pos].to_vec(),
+        };
+        let (slot, count, ty) = self.place_leaves(&base)?;
+        if count != 1 {
+            return Err(self.err("dereference of a multi-word pointer value"));
+        }
+        let pointee = match &ty {
+            mir::Ty::Ref(_, pointee, _) | mir::Ty::RawPtr(pointee, _) => (**pointee).clone(),
+            _ => {
+                return Err(self.err(&format!(
+                    "dereference of a non-pointer type {}",
+                    ty.kind_name()
+                )))
+            }
+        };
+        Ok(Some((slot, pointee)))
+    }
+
     fn place_ty(&self, place: &mir::Place) -> Result<mir::Ty, JitError> {
+        if let Some((_, ty)) = self.deref_place(place)? {
+            return Ok(ty);
+        }
         Ok(self.place_leaves(place)?.2)
     }
 
@@ -735,6 +806,22 @@ impl<'a> FnLower<'a> {
     fn operand_value(&mut self, op: &mir::Operand, ctx: &mir::Ty) -> Result<u32, JitError> {
         match op {
             mir::Operand::Copy(p) | mir::Operand::Move(p) => {
+                if let Some((ptr_slot, pointee_ty)) = self.deref_place(p)? {
+                    if flatten(&pointee_ty, &self.func.name)? != 1 {
+                        return Err(
+                            self.err("operand of aggregate type in scalar position")
+                        );
+                    }
+                    // The word at the pointer is the pointee's
+                    // canonical form, exactly as if it had been
+                    // read from its own slot.
+                    let dst = self.fresh();
+                    self.emit(Instr::LoadPtr {
+                        dst,
+                        ptr: IrOperand::Value(ptr_slot),
+                    });
+                    return Ok(dst);
+                }
                 let (first, count, _) = self.place_leaves(p)?;
                 if count != 1 {
                     return Err(self.err("operand of aggregate type in scalar position"));
@@ -890,13 +977,119 @@ impl<'a> FnLower<'a> {
         }
     }
 
+    /// The value of a fresh reference to `target`: the stack
+    /// address of the target place's first leaf slot, or the
+    /// pointer's own value when the target is itself a dereference
+    /// (`&*p` is `p`).
+    fn ref_value(&mut self, target: &mir::Place) -> Result<u32, JitError> {
+        if let Some((ptr_slot, _)) = self.deref_place(target)? {
+            return Ok(ptr_slot);
+        }
+        let (first, _, _) = self.place_leaves(target)?;
+        let dst = self.fresh();
+        self.emit(Instr::SlotAddr { dst, slot: first });
+        Ok(dst)
+    }
+
+    /// `place = &target` / `place = &raw target`: the reference
+    /// value is the target's slot address (see [`Self::ref_value`]).
+    fn lower_ref_creation(
+        &mut self,
+        place: &mir::Place,
+        target: &mir::Place,
+    ) -> Result<(), JitError> {
+        let (dst, count, _) = self.place_leaves(place)?;
+        if count != 1 {
+            return Err(self.err("reference value does not fit in one slot"));
+        }
+        let v = self.ref_value(target)?;
+        self.emit(Instr::Copy {
+            dst,
+            src: IrOperand::Value(v),
+        });
+        Ok(())
+    }
+
+    /// Lower `*ptr = rvalue`, where `ptr_slot` holds the pointer
+    /// and the pointee is a single scalar leaf: compute the value
+    /// into a scratch slot with the ordinary rvalue lowerings, then
+    /// store it through the pointer so the write lands on the
+    /// original place.
+    fn lower_assign_through_ptr(
+        &mut self,
+        ptr_slot: u32,
+        pointee_ty: &mir::Ty,
+        rvalue: &mir::Rvalue,
+    ) -> Result<(), JitError> {
+        use mir::Rvalue as R;
+        if flatten(pointee_ty, &self.func.name)? != 1 {
+            return Err(self.err("assignment through a pointer to an aggregate value"));
+        }
+        let tmp = self.fresh();
+        match rvalue {
+            R::Use(op) => {
+                let v = self.operand_value(op, pointee_ty)?;
+                self.emit(Instr::Copy {
+                    dst: tmp,
+                    src: IrOperand::Value(v),
+                });
+            }
+            R::BinaryOp(op, pair) => {
+                let (lhs, rhs) = &**pair;
+                self.lower_binop_to(tmp, pointee_ty, *op, lhs, rhs)?;
+            }
+            R::UnaryOp(op, operand) => {
+                self.lower_unop_to(tmp, pointee_ty, *op, operand)?;
+            }
+            R::Cast(kind, operand, target) => {
+                self.lower_cast_to(tmp, kind, operand, target)?;
+            }
+            R::Ref(_, _, target) | R::RawPtr(_, target) => {
+                let v = self.ref_value(target)?;
+                self.emit(Instr::Copy {
+                    dst: tmp,
+                    src: IrOperand::Value(v),
+                });
+            }
+            other => {
+                return Err(self.err(&format!(
+                    "{} rvalue assigned through a dereference",
+                    other.kind_name()
+                )));
+            }
+        }
+        self.emit(Instr::StorePtr {
+            ptr: IrOperand::Value(ptr_slot),
+            src: IrOperand::Value(tmp),
+        });
+        Ok(())
+    }
+
     fn lower_assign(&mut self, place: &mir::Place, rvalue: &mir::Rvalue) -> Result<(), JitError> {
         use mir::Rvalue as R;
+        // An assignment through a dereference (`*p = ...`) computes
+        // the value into a scratch slot and stores it through the
+        // pointer, so the write lands on the original place.
+        if let Some((ptr_slot, pointee_ty)) = self.deref_place(place)? {
+            return self.lower_assign_through_ptr(ptr_slot, &pointee_ty, rvalue);
+        }
         match rvalue {
             R::Use(op) => {
                 let (dst, dst_count, dst_ty) = self.place_leaves(place)?;
                 match op {
                     mir::Operand::Copy(p) | mir::Operand::Move(p) => {
+                        if let Some((ptr_slot, _)) = self.deref_place(p)? {
+                            if dst_count != 1 {
+                                return Err(
+                                    self.err("Use copy with mismatched value shapes")
+                                );
+                            }
+                            self.emit(Instr::LoadPtr {
+                                dst,
+                                ptr: IrOperand::Value(ptr_slot),
+                            });
+                            return Ok(());
+                        }
                         let (src, src_count, _) = self.place_leaves(p)?;
                         if src_count != dst_count {
                             return Err(self.err("Use copy with mismatched value shapes"));
@@ -924,19 +1117,33 @@ impl<'a> FnLower<'a> {
             }
             R::BinaryOp(op, pair) => {
                 let (lhs, rhs) = &**pair;
-                self.lower_binop(place, *op, lhs, rhs)
+                let (dst, _, dst_ty) = self.place_leaves(place)?;
+                self.lower_binop_to(dst, &dst_ty, *op, lhs, rhs)
             }
             R::CheckedBinaryOp(op, pair) => {
                 let (lhs, rhs) = &**pair;
-                self.lower_checked_binop(place, *op, lhs, rhs)
+                let (dst, _, dst_ty) = self.place_leaves(place)?;
+                self.lower_checked_binop_to(dst, &dst_ty, *op, lhs, rhs)
             }
-            R::UnaryOp(op, operand) => self.lower_unop(place, *op, operand),
-            R::Cast(kind, operand, target) => self.lower_cast(place, kind, operand, target),
+            R::UnaryOp(op, operand) => {
+                let (dst, count, dst_ty) = self.place_leaves(place)?;
+                if count != 1 {
+                    return Err(self.err("unary operation on an aggregate value"));
+                }
+                self.lower_unop_to(dst, &dst_ty, *op, operand)
+            }
+            R::Cast(kind, operand, target) => {
+                let (dst, count, _) = self.place_leaves(place)?;
+                if count != 1 {
+                    return Err(self.err("cast of an aggregate value"));
+                }
+                self.lower_cast_to(dst, kind, operand, target)
+            }
             R::Aggregate(kind, ops) => self.lower_aggregate(place, kind, ops),
             R::Repeat(..) => Err(self.err("Repeat rvalue")),
-            R::Ref(..) => Err(self.err("Ref rvalue")),
+            R::Ref(_, _, target) => self.lower_ref_creation(place, target),
             R::ThreadLocalRef(_) => Err(self.err("ThreadLocalRef rvalue")),
-            R::RawPtr(..) => Err(self.err("RawPtr rvalue")),
+            R::RawPtr(_, target) => self.lower_ref_creation(place, target),
             R::Len(_) => Err(self.err("Len rvalue")),
             R::Discriminant(_) => Err(self.err("Discriminant rvalue")),
             R::NullaryOp(..) => Err(self.err("NullaryOp rvalue")),
@@ -957,24 +1164,24 @@ impl<'a> FnLower<'a> {
         }
     }
 
-    fn lower_checked_binop(
+    fn lower_checked_binop_to(
         &mut self,
-        place: &mir::Place,
+        dst: u32,
+        dst_ty: &mir::Ty,
         op: mir::BinOp,
         lhs: &mir::Operand,
         rhs: &mir::Operand,
     ) -> Result<(), JitError> {
         if matches!(op, mir::BinOp::Shl | mir::BinOp::Shr) {
-            return self.lower_checked_shift(place, op == mir::BinOp::Shl, lhs, rhs);
+            return self.lower_checked_shift_to(dst, dst_ty, op == mir::BinOp::Shl, lhs, rhs);
         }
         let Some(base) = Self::checked_base(op) else {
             return Err(self.err(&format!("checked operation {op:?}")));
         };
-        let (dst, count, dst_ty) = self.place_leaves(place)?;
-        let mir::Ty::Tuple(fields) = &dst_ty else {
+        let mir::Ty::Tuple(fields) = dst_ty else {
             return Err(self.err("checked operation result is not a (value, bool) tuple"));
         };
-        if count != 2 || fields.len() != 2 {
+        if fields.len() != 2 {
             return Err(self.err("checked operation result is not a (value, bool) tuple"));
         }
         let val_ty = fields[0].clone();
@@ -994,9 +1201,10 @@ impl<'a> FnLower<'a> {
         Ok(())
     }
 
-    fn lower_binop(
+    fn lower_binop_to(
         &mut self,
-        place: &mir::Place,
+        dst: u32,
+        dst_ty: &mir::Ty,
         op: mir::BinOp,
         lhs: &mir::Operand,
         rhs: &mir::Operand,
@@ -1007,10 +1215,9 @@ impl<'a> FnLower<'a> {
         if Self::checked_base(op).is_some()
             && matches!(op, M::AddWithOverflow | M::SubWithOverflow | M::MulWithOverflow)
         {
-            return self.lower_checked_binop(place, op, lhs, rhs);
+            return self.lower_checked_binop_to(dst, dst_ty, op, lhs, rhs);
         }
-        let (dst, count, dst_ty) = self.place_leaves(place)?;
-        if count != 1 {
+        if flatten(dst_ty, &self.func.name)? != 1 {
             return Err(self.err("binary operation on an aggregate value"));
         }
         let is_compare = matches!(op, M::Eq | M::Ne | M::Lt | M::Le | M::Gt | M::Ge);
@@ -1066,10 +1273,10 @@ impl<'a> FnLower<'a> {
                     lhs: IrOperand::Value(lv),
                     rhs: IrOperand::Value(rv),
                 });
-                self.normalize(dst, &dst_ty);
+                self.normalize(dst, dst_ty);
             }
             M::Div | M::Rem => {
-                self.lower_div_rem(dst, op == M::Rem, lv, rv, kind, &dst_ty)?;
+                self.lower_div_rem(dst, op == M::Rem, lv, rv, kind, dst_ty)?;
             }
             M::Shl | M::ShlUnchecked | M::Shr | M::ShrUnchecked => {
                 self.lower_shift(
@@ -1078,7 +1285,7 @@ impl<'a> FnLower<'a> {
                     lv,
                     rv,
                     kind,
-                    &dst_ty,
+                    dst_ty,
                 )?;
             }
             M::Eq | M::Ne | M::Lt | M::Le | M::Gt | M::Ge => {
@@ -1374,18 +1581,18 @@ impl<'a> FnLower<'a> {
     /// Checked shift (`CheckedBinaryOp` with `Shl` / `Shr`): the
     /// value wraps (the amount is taken modulo the width) and the
     /// flag reports an overshift or, for `Shl`, bits shifted out.
-    fn lower_checked_shift(
+    fn lower_checked_shift_to(
         &mut self,
-        place: &mir::Place,
+        dst: u32,
+        dst_ty: &mir::Ty,
         is_shl: bool,
         lhs: &mir::Operand,
         rhs: &mir::Operand,
     ) -> Result<(), JitError> {
-        let (dst, count, dst_ty) = self.place_leaves(place)?;
-        let mir::Ty::Tuple(fields) = &dst_ty else {
+        let mir::Ty::Tuple(fields) = dst_ty else {
             return Err(self.err("checked operation result is not a (value, bool) tuple"));
         };
-        if count != 2 || fields.len() != 2 {
+        if fields.len() != 2 {
             return Err(self.err("checked operation result is not a (value, bool) tuple"));
         }
         let val_ty = fields[0].clone();
@@ -1456,25 +1663,22 @@ impl<'a> FnLower<'a> {
         Ok(())
     }
 
-    fn lower_unop(
+    fn lower_unop_to(
         &mut self,
-        place: &mir::Place,
+        dst: u32,
+        dst_ty: &mir::Ty,
         op: mir::UnOp,
         operand: &mir::Operand,
     ) -> Result<(), JitError> {
-        let (dst, count, dst_ty) = self.place_leaves(place)?;
-        if count != 1 {
-            return Err(self.err("unary operation on an aggregate value"));
-        }
         match op {
             mir::UnOp::Neg => {
-                if let Some(fk) = float_kind(&dst_ty) {
+                if let Some(fk) = float_kind(dst_ty) {
                     // Float negation is an exact sign-bit flip (it
                     // applies to NaNs and zeroes alike), so it lowers
                     // to an integer xor on the value's bit pattern:
                     // the sign bit for f64, bit 31 for f32 (whose
                     // canonical form keeps the upper half zero).
-                    let v = self.operand_value(operand, &dst_ty)?;
+                    let v = self.operand_value(operand, dst_ty)?;
                     let mask = match fk {
                         IrFloatKind::F64 => i64::MIN,
                         IrFloatKind::F32 => 0x8000_0000,
@@ -1490,8 +1694,8 @@ impl<'a> FnLower<'a> {
                 let mir::Ty::Int(it) = dst_ty else {
                     return Err(self.err("Neg on a non-signed-integer type"));
                 };
-                let bits = int_bits(it);
-                let v = self.operand_value(operand, &dst_ty)?;
+                let bits = int_bits(*it);
+                let v = self.operand_value(operand, dst_ty)?;
                 // Negating the type's minimum overflows; the
                 // interpreter panics.
                 let min = if bits == 64 {
@@ -1522,11 +1726,11 @@ impl<'a> FnLower<'a> {
                     op: IrUnOp::Neg,
                     src: IrOperand::Value(v),
                 });
-                self.normalize(dst, &dst_ty);
+                self.normalize(dst, dst_ty);
                 Ok(())
             }
             mir::UnOp::Not => {
-                let v = self.operand_value(operand, &dst_ty)?;
+                let v = self.operand_value(operand, dst_ty)?;
                 if matches!(dst_ty, mir::Ty::Bool) {
                     // Logical not on a canonical 0/1 value.
                     self.emit(Instr::BinOp {
@@ -1541,7 +1745,7 @@ impl<'a> FnLower<'a> {
                         op: IrUnOp::Not,
                         src: IrOperand::Value(v),
                     });
-                    self.normalize(dst, &dst_ty);
+                    self.normalize(dst, dst_ty);
                 }
                 Ok(())
             }
@@ -1549,17 +1753,13 @@ impl<'a> FnLower<'a> {
         }
     }
 
-    fn lower_cast(
+    fn lower_cast_to(
         &mut self,
-        place: &mir::Place,
+        dst: u32,
         kind: &mir::CastKind,
         operand: &mir::Operand,
         target: &mir::Ty,
     ) -> Result<(), JitError> {
-        let (dst, count, _) = self.place_leaves(place)?;
-        if count != 1 {
-            return Err(self.err("cast of an aggregate value"));
-        }
         match kind {
             mir::CastKind::IntToInt => {
                 if int_kind(target).is_none() {
@@ -1656,6 +1856,27 @@ impl<'a> FnLower<'a> {
                 }
                 Ok(())
             }
+            // Pointer casts that keep the address word unchanged:
+            // the interpreter converts exactly these to a plain
+            // `Use`, and a JIT pointer *is* the address word, so
+            // the cast is a copy. Unsize coercions would have to
+            // build a fat pointer and stay unsupported, as do the
+            // provenance casts, which the interpreter also rejects.
+            mir::CastKind::PtrToPtr
+            | mir::CastKind::PointerCoercion(
+                mir::PointerCoercion::MutToConstPointer
+                | mir::PointerCoercion::ArrayToPointer,
+            ) => {
+                let src_ty = self
+                    .operand_place_ty(operand)
+                    .unwrap_or_else(|| target.clone());
+                let v = self.operand_value(operand, &src_ty)?;
+                self.emit(Instr::Copy {
+                    dst,
+                    src: IrOperand::Value(v),
+                });
+                Ok(())
+            }
             other => Err(self.err(&format!("cast {other:?}"))),
         }
     }
@@ -1746,7 +1967,10 @@ impl<'a> FnLower<'a> {
             T::Drop { place, target, .. } => {
                 // Dropping a scalar/tuple-of-scalars value runs no
                 // code; anything else is outside the supported range.
-                self.place_leaves(place)?;
+                // Dropping through a dereference runs no code either.
+                if self.deref_place(place)?.is_none() {
+                    self.place_leaves(place)?;
+                }
                 self.seal_terminator(IrTerminator::Jump(target.index() as u32));
                 Ok(())
             }
@@ -1870,7 +2094,18 @@ impl<'a> FnLower<'a> {
         if ir_args.len() > 6 {
             return Err(self.err("call with more than 6 arguments"));
         }
-        let (dst, count, _) = self.place_leaves(destination)?;
+        // A call whose destination is a dereference (`*p = f()`)
+        // receives into a scratch slot and stores through the
+        // pointer after the panic check, so a panicking callee
+        // leaves the pointee untouched.
+        let deref_dst = self.deref_place(destination)?;
+        let (dst, count) = match &deref_dst {
+            Some(_) => (self.fresh(), 1),
+            None => {
+                let (dst, count, _) = self.place_leaves(destination)?;
+                (dst, count)
+            }
+        };
         if count > 1 {
             return Err(self.err("call returning a multi-word value"));
         }
@@ -1881,6 +2116,12 @@ impl<'a> FnLower<'a> {
             args: ir_args,
         });
         self.emit(Instr::CheckPanic);
+        if let Some((ptr_slot, _)) = deref_dst {
+            self.emit(Instr::StorePtr {
+                ptr: IrOperand::Value(ptr_slot),
+                src: IrOperand::Value(dst),
+            });
+        }
         match target {
             Some(t) => self.seal_terminator(IrTerminator::Jump(t.index() as u32)),
             None => self.seal_terminator(IrTerminator::Unreachable),
