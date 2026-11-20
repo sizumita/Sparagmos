@@ -1,184 +1,285 @@
 //! The harness's Sparagmos runner on the project's main path.
 //!
-//! Main path: `.rs` --(Stable MIR driver, Lane I)--> `sparagmos-mir`
-//! bodies --(sparagmos-interp)--> execution result. This module is the
-//! execution half of that path: [`run_mir_program`] executes a
-//! [`MirProgram`] in the interpreter and shapes the outcome as a
-//! [`RunResult`].
+//! Main path: `.rs` --(Stable MIR driver)--> `sparagmos-mir` bodies
+//! --(sparagmos-interp)--> execution result. The driver performs the
+//! whole path in its own process (`sparagmos-driver run <file.rs>`:
+//! it converts with Stable MIR and executes `main` in the
+//! interpreter), so this runner is a thin subprocess adapter over the
+//! driver's exit-code contract:
 //!
-//! [`InterpRunner`] is the [`SparagmosRunner`] used for corpus cases.
-//! Until the driver is integrated it cannot obtain MIR for a `.rs`
-//! file, so it honestly reports every case as unsupported ("awaiting
-//! sparagmos-driver") instead of guessing output. Once Lane I lands,
-//! `run` will feed the driver's MIR into [`run_mir_program`]; nothing
-//! else in the harness changes. There is deliberately no other input
-//! path (project rule: main path only).
+//! * exit 0 → the guest program terminated normally;
+//! * exit 101 → the guest program panicked (message on stderr);
+//! * exit 2 → conversion or execution is unsupported (concrete reason
+//!   on stderr) — mapped to [`UnsupportedReason::Feature`], never to a
+//!   faked result;
+//! * any other exit code → the driver itself failed; also reported as
+//!   unsupported-with-reason, with the driver's stderr included.
+//!
+//! The driver binary is *not* built by the harness (it needs the
+//! pinned 1.100.0 toolchain and its own workspace). Resolution order:
+//! an explicitly configured path ([`InterpRunner::with_driver_bin`]),
+//! the `SPARAGMOS_DRIVER_BIN` environment variable, then the default
+//! location inside a checkout,
+//! `crates/sparagmos-driver/target/debug/sparagmos-driver`. If no
+//! binary is found, every case is honestly `Unsupported` with a
+//! "driver binary not found" reason.
 
-use sparagmos_interp::mir_convert::{convert_program, MirProgram};
-use sparagmos_interp::{InterpError, Interpreter, Value};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::{CorpusCase, RunResult, SparagmosRunner, UnsupportedReason};
 
-/// Corpus runner executing driver-produced MIR in the interpreter.
-/// See the module docs for its current (driver-waiting) behaviour.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct InterpRunner;
+/// Environment variable naming an explicit `sparagmos-driver` binary.
+pub const DRIVER_BIN_ENV: &str = "SPARAGMOS_DRIVER_BIN";
 
-impl SparagmosRunner for InterpRunner {
-    fn run(&self, case: &CorpusCase) -> Result<RunResult, UnsupportedReason> {
+/// Corpus runner that executes cases through the Stable MIR driver
+/// (see the module docs for the exit-code contract).
+#[derive(Debug, Clone, Default)]
+pub struct InterpRunner {
+    driver_bin: Option<PathBuf>,
+}
+
+impl InterpRunner {
+    /// Runner resolving the driver binary from `SPARAGMOS_DRIVER_BIN`
+    /// or the default in-checkout location.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Runner using an explicit driver binary path (used by tests and
+    /// by callers with a non-standard checkout layout).
+    pub fn with_driver_bin(path: impl Into<PathBuf>) -> Self {
+        Self {
+            driver_bin: Some(path.into()),
+        }
+    }
+
+    fn resolve_driver_bin(&self) -> Result<PathBuf, UnsupportedReason> {
+        if let Some(p) = &self.driver_bin {
+            return found_or_reason(p);
+        }
+        if let Some(p) = std::env::var_os(DRIVER_BIN_ENV) {
+            return found_or_reason(&PathBuf::from(p));
+        }
+        found_or_reason(&default_driver_bin())
+    }
+}
+
+fn found_or_reason(p: &Path) -> Result<PathBuf, UnsupportedReason> {
+    if p.is_file() {
+        Ok(p.to_path_buf())
+    } else {
         Err(UnsupportedReason::Feature(format!(
-            "awaiting Stable MIR driver (sparagmos-driver, Lane I): no MIR for `{}` yet",
-            case.name
+            "driver binary not found: {} (build crates/sparagmos-driver with the pinned \
+             1.100.0 toolchain, or set {DRIVER_BIN_ENV})",
+            p.display()
         )))
     }
 }
 
-/// Execute `entry` (a zero-argument function, e.g. `main`) of a MIR
-/// program obtained via the driver, in the interpreter, and shape the
-/// outcome as a [`RunResult`]:
-///
-/// * normal return of `()` → exit code 0, empty stdout (output produced
-///   by guest `println!` calls is *not* modelled yet — such calls are
-///   unresolved callees and surface as `Unsupported`, never as faked
-///   output);
-/// * a guest panic → exit code 101 (the real Rust panic exit code) with
-///   the panic message on stderr;
-/// * anything the interpreter/converter cannot execute yet →
-///   [`UnsupportedReason::Feature`] with the concrete reason.
-pub fn run_mir_program(program: &MirProgram, entry: &str) -> Result<RunResult, UnsupportedReason> {
-    let ir_program =
-        convert_program(program).map_err(|e| UnsupportedReason::Feature(e.to_string()))?;
-    let mut interp = Interpreter::new(&ir_program);
-    match interp.run(entry, Vec::new()) {
-        Ok(Value::Unit) => Ok(RunResult {
-            stdout: String::new(),
-            stderr: String::new(),
-            exit_code: Some(0),
-        }),
-        Ok(other) => Err(UnsupportedReason::Feature(format!(
-            "entry `{entry}` returned {other}, expected ()"
-        ))),
-        Err(InterpError::Panic { message }) => Ok(RunResult {
-            stdout: String::new(),
-            stderr: format!("thread 'main' panicked at sparagmos-interp:\n{message}\n"),
-            exit_code: Some(101),
-        }),
-        Err(e) => Err(UnsupportedReason::Feature(e.to_string())),
+/// Default driver location inside a checkout:
+/// `<repo>/crates/sparagmos-driver/target/debug/sparagmos-driver`,
+/// resolved relative to this crate (`crates/sparagmos-harness`).
+pub fn default_driver_bin() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("crates")
+        .join("sparagmos-driver")
+        .join("target")
+        .join("debug")
+        .join("sparagmos-driver")
+}
+
+/// Extract the driver's own reason lines from its stderr (rustc
+/// diagnostics and warnings share the stream; the driver prefixes its
+/// run-mode reasons with `sparagmos-driver run:`).
+fn driver_reason(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| l.contains("sparagmos-driver run:"))
+        .collect();
+    if lines.is_empty() {
+        format!(
+            "driver reported unsupported (exit 2) without a reason line: {}",
+            stderr.trim()
+        )
+    } else {
+        lines.join("; ")
+    }
+}
+
+impl SparagmosRunner for InterpRunner {
+    fn run(&self, case: &CorpusCase) -> Result<RunResult, UnsupportedReason> {
+        let bin = self.resolve_driver_bin()?;
+        let output = Command::new(&bin)
+            .arg("run")
+            .arg(&case.path)
+            .output()
+            .map_err(|e| {
+                UnsupportedReason::Feature(format!("failed to spawn driver {}: {e}", bin.display()))
+            })?;
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        match output.status.code() {
+            Some(0) => Ok(RunResult {
+                stdout,
+                stderr,
+                exit_code: Some(0),
+            }),
+            Some(101) => Ok(RunResult {
+                stdout,
+                stderr,
+                exit_code: Some(101),
+            }),
+            Some(2) => Err(UnsupportedReason::Feature(driver_reason(&stderr))),
+            other => Err(UnsupportedReason::Feature(format!(
+                "driver failed (exit {other:?}): {}",
+                stderr.trim()
+            ))),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sparagmos_interp::MirFunction;
-    use sparagmos_mir as mir;
+    use crate::{evaluate_case, CaseStatus};
     use std::path::PathBuf;
 
-    fn unit_const() -> mir::Operand {
-        mir::Operand::constant(mir::Constant::from_value(mir::ConstValue::ZeroSized))
-    }
-
-    fn block(stmts: Vec<mir::Statement>, kind: mir::TerminatorKind) -> mir::BasicBlockData {
-        let mut bb = mir::BasicBlockData::new(mir::Terminator::new(kind));
-        bb.statements = stmts;
-        bb
-    }
-
-    fn set_unit() -> mir::Statement {
-        mir::Statement::assign(
-            mir::Place::from_local(mir::Local(0)),
-            mir::Rvalue::Use(unit_const()),
-        )
-    }
-
-    fn program_with_main(body: mir::Body) -> MirProgram {
-        let mut prog = MirProgram::new();
-        prog.functions.push(MirFunction {
-            name: "main".to_string(),
-            def_id: None,
-            body,
-        });
-        prog
+    fn case(name: &str) -> CorpusCase {
+        CorpusCase::new(crate::default_corpus_dir().join(name))
     }
 
     #[test]
-    fn unit_main_exits_zero() {
-        let body = mir::Body::new(
-            vec![mir::LocalDecl::new(mir::Ty::unit())],
-            0,
-            vec![block(vec![set_unit()], mir::TerminatorKind::Return)],
-        );
-        let res = run_mir_program(&program_with_main(body), "main").expect("unit main runs");
+    fn missing_driver_binary_is_unsupported_with_reason() {
+        let runner = InterpRunner::with_driver_bin("/nonexistent/sparagmos-driver");
+        let err = runner
+            .run(&case("arith_int.rs"))
+            .expect_err("no binary, no execution");
+        match err {
+            UnsupportedReason::Feature(what) => {
+                assert!(what.contains("driver binary not found"), "reason: {what}");
+                assert!(what.contains("sparagmos-driver"), "reason: {what}");
+            }
+            other => panic!("expected Feature reason, got {other}"),
+        }
+    }
+
+    /// Write a fake `sparagmos-driver` shell script with the given
+    /// stdout/stderr/exit behaviour, so the exit-code mapping can be
+    /// tested without the real driver.
+    #[cfg(unix)]
+    fn fake_driver(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake-driver");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sparagmos-harness-runner-{}-{tag}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_zero_and_101_become_run_results() {
+        let dir = temp_dir("ok");
+        let ok = InterpRunner::with_driver_bin(fake_driver(&dir, "exit 0"));
+        let res = ok.run(&case("arith_int.rs")).expect("exit 0 is a result");
         assert_eq!(res.exit_code, Some(0));
-        assert_eq!(res.stdout, "");
-    }
 
-    #[test]
-    fn panicking_main_exits_101_with_message() {
-        let body = mir::Body::new(
-            vec![
-                mir::LocalDecl::new(mir::Ty::unit()),
-                mir::LocalDecl::new(mir::Ty::Bool),
-            ],
-            0,
-            vec![
-                block(
-                    vec![],
-                    mir::TerminatorKind::Assert {
-                        cond: mir::Operand::constant(mir::Constant::bool(false)),
-                        expected: true,
-                        msg: Box::new(mir::AssertMessage::Custom("boom".to_string())),
-                        target: mir::BasicBlock(1),
-                        unwind: mir::UnwindAction::Continue,
-                    },
-                ),
-                block(vec![set_unit()], mir::TerminatorKind::Return),
-            ],
-        );
-        let res = run_mir_program(&program_with_main(body), "main").expect("panic is a run result");
+        let dir = temp_dir("panic");
+        let panicky = InterpRunner::with_driver_bin(fake_driver(
+            &dir,
+            "echo \"thread 'main' panicked: boom\" >&2\nexit 101",
+        ));
+        let res = panicky
+            .run(&case("arith_int.rs"))
+            .expect("exit 101 is a result");
         assert_eq!(res.exit_code, Some(101));
         assert!(res.stderr.contains("boom"), "stderr: {:?}", res.stderr);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn unsupported_main_reports_feature_not_a_fake_result() {
-        let body = mir::Body::new(
-            vec![
-                mir::LocalDecl::new(mir::Ty::unit()),
-                mir::LocalDecl::new(mir::Ty::Uint(mir::UintTy::U32)),
-            ],
-            0,
-            vec![block(
-                vec![],
-                mir::TerminatorKind::Drop {
-                    place: mir::Place::from_local(mir::Local(1)),
-                    target: mir::BasicBlock(0),
-                    unwind: mir::UnwindAction::Continue,
-                    replace: false,
-                },
-            )],
-        );
-        let err = run_mir_program(&program_with_main(body), "main")
-            .expect_err("Drop main must be unsupported");
+    fn exit_two_is_unsupported_with_the_drivers_reason() {
+        let dir = temp_dir("unsupported");
+        let runner = InterpRunner::with_driver_bin(fake_driver(
+            &dir,
+            "echo 'sparagmos-driver run: unsupported: some variant' >&2\nexit 2",
+        ));
+        let err = runner
+            .run(&case("arith_int.rs"))
+            .expect_err("exit 2 is unsupported");
         match err {
             UnsupportedReason::Feature(what) => {
-                assert!(what.contains("Drop"), "reason: {what}")
+                assert!(what.contains("some variant"), "reason: {what}")
             }
             other => panic!("expected Feature reason, got {other}"),
         }
     }
 
+    #[cfg(unix)]
     #[test]
-    fn corpus_runner_reports_driver_waiting() {
-        let case = CorpusCase::new(PathBuf::from("arith_int.rs"));
-        let err = InterpRunner
-            .run(&case)
-            .expect_err("no driver yet, so no execution");
+    fn other_exit_codes_are_unsupported_with_stderr() {
+        let dir = temp_dir("crash");
+        let runner = InterpRunner::with_driver_bin(fake_driver(
+            &dir,
+            "echo 'internal explosion' >&2\nexit 1",
+        ));
+        let err = runner
+            .run(&case("arith_int.rs"))
+            .expect_err("exit 1 is unsupported");
         match err {
             UnsupportedReason::Feature(what) => {
-                assert!(what.contains("sparagmos-driver"), "reason: {what}")
+                assert!(what.contains("driver failed"), "reason: {what}");
+                assert!(what.contains("internal explosion"), "reason: {what}");
             }
             other => panic!("expected Feature reason, got {other}"),
         }
+    }
+
+    /// End-to-end over the real driver, when one is resolvable. If no
+    /// driver binary exists in this environment, the runner must say
+    /// so honestly instead of passing anything.
+    #[test]
+    fn real_driver_measures_silent_cases() {
+        let runner = InterpRunner::new();
+        if runner.resolve_driver_bin().is_err() {
+            let err = runner
+                .run(&case("silent_fib.rs"))
+                .expect_err("without a driver nothing can run");
+            match err {
+                UnsupportedReason::Feature(what) => {
+                    assert!(what.contains("driver binary not found"), "reason: {what}")
+                }
+                other => panic!("expected Feature reason, got {other}"),
+            }
+            return;
+        }
+        // A guest panic in both worlds: native and Sparagmos agree on
+        // exit 101 and empty stdout.
+        let panic_case = evaluate_case(&case("silent_panic.rs"), &runner);
+        assert_eq!(
+            panic_case.status,
+            CaseStatus::Passed,
+            "silent_panic should pass end-to-end: {panic_case:?}"
+        );
+        // println! is not modelled yet: the case must come back
+        // Unsupported with a concrete reason, never a pass.
+        let hello = evaluate_case(&case("hello.rs"), &runner);
+        assert!(
+            matches!(hello.status, CaseStatus::Unsupported { .. }),
+            "hello must be unsupported until output is modelled: {hello:?}"
+        );
     }
 }

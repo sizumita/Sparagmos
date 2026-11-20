@@ -11,7 +11,7 @@
 
 pub mod interp_runner;
 
-pub use interp_runner::{run_mir_program, InterpRunner};
+pub use interp_runner::{default_driver_bin, InterpRunner, DRIVER_BIN_ENV};
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -86,12 +86,11 @@ impl fmt::Display for UnsupportedReason {
 /// Plug-in point for the execution lanes.
 ///
 /// On the project's main path, MIR for `case.path` is produced by the
-/// Stable MIR driver (Lane I, `sparagmos-driver`) as `sparagmos-mir`
-/// bodies and executed by the interpreter / JIT. [`InterpRunner`] is
-/// that runner; until the driver is integrated it reports every case
-/// as unsupported (awaiting the driver). Returning `Err` must stay
-/// cheap and honest: when in doubt, report unsupported instead of
-/// guessing output.
+/// Stable MIR driver (`sparagmos-driver`) as `sparagmos-mir` bodies
+/// and executed by the interpreter / JIT. [`InterpRunner`] is that
+/// runner: it drives the whole path through the driver binary's
+/// `run` mode. Returning `Err` must stay cheap and honest: when in
+/// doubt, report unsupported instead of guessing output.
 pub trait SparagmosRunner {
     fn run(&self, case: &CorpusCase) -> Result<RunResult, UnsupportedReason>;
 }
