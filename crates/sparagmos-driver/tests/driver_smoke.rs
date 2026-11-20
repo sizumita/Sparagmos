@@ -103,3 +103,48 @@ fn driver_converts_box_deref_transmute() {
         "dump shows the converted cast:\n{dump_text}"
     );
 }
+
+const CFG_FIXTURE: &str = r#"
+#[cfg(flag_on)]
+pub fn gated() -> u32 { 1 }
+pub fn plain() -> u32 { 2 }
+fn main() {}
+"#;
+
+#[test]
+fn driver_forwards_rustc_args() {
+    // A caller-supplied `--cfg` must reach the embedded rustc: the
+    // cfg-gated function is only converted when the flag is forwarded
+    // (this is how the subset runner honours `//@ compile-flags`).
+    let dir = std::env::temp_dir().join(format!(
+        "sparagmos-driver-rustc-arg-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("cfg.rs");
+    std::fs::write(&src, CFG_FIXTURE).unwrap();
+    let bin = env!("CARGO_BIN_EXE_sparagmos-driver");
+
+    let off = Command::new(bin).arg(&src).output().unwrap();
+    let off_stdout = String::from_utf8_lossy(&off.stdout);
+    assert!(off.status.success(), "driver failed: {off_stdout}");
+    assert!(
+        !off_stdout.contains("gated"),
+        "gated fn must be cfg'd out without the flag:\n{off_stdout}"
+    );
+
+    let on = Command::new(bin)
+        .arg(&src)
+        .arg("--rustc-arg")
+        .arg("--cfg")
+        .arg("--rustc-arg")
+        .arg("flag_on")
+        .output()
+        .unwrap();
+    let on_stdout = String::from_utf8_lossy(&on.stdout);
+    assert!(on.status.success(), "driver failed: {on_stdout}");
+    assert!(
+        on_stdout.contains("gated"),
+        "gated fn must be converted with the flag:\n{on_stdout}"
+    );
+}

@@ -26,8 +26,13 @@ metric-2(b) rate, whose denominator is always the full subset
 A test is *attempted* only when both sides can be run faithfully:
 
 - its header carries an unscoped run-pass / run-fail directive
-  (revisions, run-crash, compile-flags, run-flags, exec-env, stdin and
-  add-core-stubs are recorded as not-attempted reasons in stage 1);
+  (revisions, run-crash, run-flags, exec-env, stdin and
+  add-core-stubs are recorded as not-attempted reasons in stage 1;
+  a test's `compile-flags` are honoured in both stages by forwarding
+  them to the native rustc and, via the driver's `--rustc-arg`, to
+  the driver's embedded rustc — the position compiletest gives them;
+  stage 2 additionally judges revision tests per revision, with the
+  `--cfg <revision>` and `--check-cfg` arguments compiletest adds);
 - no `ignore-*` condition matches this host and every `only-*`
   condition is satisfied (otherwise the test is out of environment
   for x86_64-unknown-linux-gnu and is recorded as such);
@@ -107,6 +112,54 @@ class Header:
     def values(self, name):
         return self.unscoped.get(name, [])
 
+    def revisions(self):
+        """Revision names declared by `//@ revisions:`, in order."""
+        out = []
+        for v in self.values("revisions"):
+            out.extend(v.split())
+        return out
+
+    def view(self, revision):
+        """The directives visible for one revision (None = unscoped)."""
+        return HeaderView(self, revision)
+
+
+class HeaderView:
+    """The directive view of a Header for a single test revision.
+
+    Mirrors compiletest's `applies_to_test_revision`: an unscoped
+    directive applies to every revision, and a directive scoped with
+    `//@[rev]` applies only to revision `rev`. With revision=None
+    the view is the unscoped directives alone (scoped directives for
+    undeclared revisions never apply, as in compiletest). `has`,
+    `values` and `names` match the Header interface used by the
+    verdict logic; `values` lists unscoped values first, then the
+    revision's scoped values (compiletest processes lines in file
+    order, so a scoped value also wins for last-one-wins flags).
+    """
+
+    def __init__(self, header, revision):
+        self.header = header
+        self.revision = revision
+        names = set(header.unscoped)
+        if revision is not None:
+            for (rev, name) in header.scoped:
+                if rev == revision:
+                    names.add(name)
+        self.names = names
+
+    def has(self, name):
+        if name in self.header.unscoped:
+            return True
+        return (self.revision is not None
+                and (self.revision, name) in self.header.scoped)
+
+    def values(self, name):
+        vals = list(self.header.unscoped.get(name, []))
+        if self.revision is not None:
+            vals += self.header.scoped.get((self.revision, name), [])
+        return vals
+
 
 def run_mode(header):
     """The unscoped run mode of a test, or None."""
@@ -114,6 +167,92 @@ def run_mode(header):
         if header.has(mode):
             return mode
     return None
+
+
+# ---------------------------------------------------------------------------
+# compile-flags handling
+# ---------------------------------------------------------------------------
+
+HOST_TARGET = "x86_64-unknown-linux-gnu"
+
+
+def split_flags(flags):
+    """Split a compile-flags value the way compiletest does.
+
+    compiletest's split_flags: single-quoted segments keep their
+    spaces; everything else is split on whitespace.
+    """
+    out = []
+    for i, seg in enumerate(flags.split("'")):
+        if i % 2 == 1:
+            out.append(seg)
+        else:
+            out.extend(seg.split())
+    return out
+
+
+def compile_flags(view):
+    """All compile-flags tokens visible in a directive view."""
+    flags = []
+    for v in view.values("compile-flags"):
+        flags.extend(split_flags(v))
+    return flags
+
+
+def screen_flags(flags):
+    """Why this flag set cannot be honoured here, or None.
+
+    The driver forwards flags verbatim to its embedded rustc (and
+    stage 1 to the native rustc), so almost everything compiletest
+    accepts works unchanged. The exceptions are flags that would
+    replace the compilation itself or contradict the driver's fixed
+    invocation (its pinned sysroot and scratch output directory, the
+    one installed target).
+    """
+    i = 0
+    while i < len(flags):
+        t = flags[i]
+        nxt = flags[i + 1] if i + 1 < len(flags) else None
+        if t == "--target" or t.startswith("--target="):
+            tgt = t[len("--target="):] if t.startswith("--target=") else nxt
+            if tgt is not None and tgt != HOST_TARGET:
+                return (f"compile-flags specify --target {tgt} "
+                        "(that target is not installed on this host)")
+        elif t == "--print" or t.startswith("--print="):
+            return ("compile-flags request --print output (rustc "
+                    "prints target information instead of compiling)")
+        elif t == "--sysroot" or t.startswith("--sysroot="):
+            return ("compile-flags specify --sysroot (the driver "
+                    "pins the reference toolchain sysroot)")
+        elif t in ("-o", "--out-dir") or t.startswith("--out-dir="):
+            return ("compile-flags specify an output location (the "
+                    "driver uses its own scratch output directory)")
+        elif t.startswith("-Zunpretty") or (t == "-Z" and nxt is not None
+                                             and nxt.startswith("unpretty")):
+            return ("compile-flags request -Zunpretty output (rustc "
+                    "stops after printing, so no conversion is "
+                    "possible)")
+        i += 1
+    return None
+
+
+def normalize_revision(revision):
+    """The cfg name compiletest derives from a revision name."""
+    return revision.lower().replace("-", "_")
+
+
+def revision_args(view, revision, all_revisions):
+    """The rustc arguments compiletest adds for one revision run:
+    `--cfg <revision>` plus, unless the test opts out with
+    `no-auto-check-cfg`, a `--check-cfg` naming every revision."""
+    args = ["--cfg", normalize_revision(revision)]
+    if not view.has("no-auto-check-cfg"):
+        check = "cfg(test,FALSE"
+        for rev in all_revisions:
+            check += "," + normalize_revision(rev)
+        check += ")"
+        args += ["--check-cfg", check]
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -316,8 +455,6 @@ def stage1_blocker(header, survey_rec):
         return "no unscoped run-pass/run-fail directive"
     if mode == "run-crash":
         return "run-crash mode (crash reproduction is out of stage-1 scope)"
-    if header.has("compile-flags"):
-        return "compile-flags present (driver run mode takes no extra rustc flags)"
     if header.has("run-flags"):
         return "run-flags present (guest program arguments are not supported)"
     if header.has("exec-env"):
@@ -390,24 +527,29 @@ def sysroot_lib():
     return _SYSROOT_LIB
 
 
-def native_side(path, edition, workdir):
+def native_side(path, edition, workdir, extra_flags=()):
     """Compile and run natively. Returns (result_dict, error_reason).
 
     error_reason is None when the native run completed (whatever its
     exit code); otherwise a not-attempted reason string.
+    `extra_flags` are the test's compile-flags, appended last as
+    compiletest appends them.
     """
     binpath = Path(workdir) / "prog"
     lib = sysroot_lib()
     build = run_cmd(
         rustc_cmd() + ["--edition", edition, "-C", "opt-level=0"]
         + (["-L", lib] if lib else [])
-        + ["-o", str(binpath), str(path)],
+        + ["-o", str(binpath), str(path)] + list(extra_flags),
         timeout=NATIVE_COMPILE_TIMEOUT, env_extra=BOOTSTRAP_ENV)
     if build["timeout"]:
         return None, "native compile timed out"
     if build["exit_code"] != 0:
         first = first_error_line(build["stderr"])
         return None, f"native compile failed: {first}"
+    if extra_flags and not binpath.exists():
+        return None, ("native compile produced no binary (the "
+                      "compile-flags change what is emitted)")
     run_env = {}
     if lib:
         prev = os.environ.get("LD_LIBRARY_PATH", "")
@@ -419,14 +561,17 @@ def native_side(path, edition, workdir):
     return run, None
 
 
-def sparagmos_side(path, edition, driver_bin, cwd=None):
+def sparagmos_side(path, edition, driver_bin, cwd=None, rustc_args=()):
     """Run through the driver. Returns (result_dict, kind, reason).
 
     kind is "result" (exit 0/101), "unsupported" (driver exit 2),
-    "timeout", or "driver-error".
+    "timeout", or "driver-error". `rustc_args` are the test's
+    compile-flags, forwarded through the driver's `--rustc-arg`.
     """
-    res = run_cmd([str(driver_bin), "run", str(path),
-                   "--edition", edition],
+    argv = [str(driver_bin), "run", str(path), "--edition", edition]
+    for a in rustc_args:
+        argv += ["--rustc-arg", a]
+    res = run_cmd(argv,
                   timeout=DRIVER_TIMEOUT, cwd=cwd,
                   env_extra=BOOTSTRAP_ENV)
     if res["timeout"]:
@@ -583,8 +728,15 @@ def fill_result(rec, rust_dir, driver_bin, out):
     editions = header.values("edition")
     edition = editions[0].strip() if editions else "2021"
 
+    flags = compile_flags(header.view(None))
+    screened = screen_flags(flags)
+    if screened:
+        out["reason"] = screened
+        out["bucket"] = "not attempted (compile-flags)"
+        return
+
     with tempfile.TemporaryDirectory(prefix="subset-run-") as td:
-        native, err = native_side(path, edition, td)
+        native, err = native_side(path, edition, td, flags)
         if err:
             out["reason"] = err
             out["bucket"] = bucket_reason(err)
@@ -596,7 +748,8 @@ def fill_result(rec, rust_dir, driver_bin, out):
             out["bucket"] = "native run does not match mode expectation"
             out["native"] = {"exit_code": native["exit_code"]}
             return
-        got, kind, reason = sparagmos_side(path, edition, driver_bin, td)
+        got, kind, reason = sparagmos_side(path, edition, driver_bin, td,
+                                           rustc_args=flags)
         if kind == "unsupported":
             out["status"] = "unsupported"
             out["reason"] = reason
@@ -640,6 +793,16 @@ def fill_result(rec, rust_dir, driver_bin, out):
 # when the driver reports a clean compilation failure. A crashes test
 # passes when the compilation crashes the driver process the way it
 # crashes rustc under compiletest (exit code other than 0 or 1).
+#
+# Per-test compile-flags are forwarded to the driver's embedded
+# rustc (screened only for flags that would replace the compilation
+# itself: a non-host --target, --print, --sysroot, an output
+# location, -Zunpretty), and revision tests are judged once per
+# revision — with the revision's directive view, its compile-flags,
+# and the `--cfg <revision>` / `--check-cfg` arguments compiletest
+# adds. The record passes only when every revision that runs
+# passes; a revision removed by an ignore-/only- condition does not
+# run, as in compiletest.
 #
 # What stage 2 deliberately does not do: compare compiler output with
 # the test's `.stderr` snapshot, check `//~` error annotations, apply
@@ -690,23 +853,21 @@ def compile_expectation(suite, header):
     return "success"
 
 
-def stage2_blocker(header, rec):
-    """Why a compile-check record is not attempted in stage 2, or None.
+def stage2_blocker(view, rec):
+    """Why one revision view of a compile-check record is not
+    attempted in stage 2, or None.
 
-    Mirrors the stage-1 header policy: anything the driver's fixed
-    invocation cannot honour keeps the test out of the attempted set
-    (it still counts against the rate as not attempted).
+    Checked per revision view, so a directive scoped to one revision
+    only blocks that revision. compile-flags and revisions are no
+    longer blockers: flags are screened separately (screen_flags)
+    and forwarded to the driver, and revisions are judged per
+    revision by fill_result_stage2.
     """
-    if header.has("revisions") or any(
-            rev is not None for (rev, _n) in header.scoped):
-        return "revisions present (per-revision cfgs not run in stage 2)"
-    if header.has("compile-flags"):
-        return "compile-flags present (driver takes no extra rustc flags)"
-    if header.has("add-minicore") or header.has("add-core-stubs"):
+    if view.has("add-minicore") or view.has("add-core-stubs"):
         return "add-minicore (test links the minicore stub crate)"
-    if header.has("ignore-test"):
+    if view.has("ignore-test"):
         return "ignore-test (compiletest itself never runs this test)"
-    if header.has("rustc-env"):
+    if view.has("rustc-env"):
         return "rustc-env present (compiler environment is not modelled)"
     return None
 
@@ -746,7 +907,7 @@ def snapshot_flags(path, text):
 _CONVERTED_RE = re.compile(r"^converted: (\d+), skipped: (\d+)$", re.M)
 
 
-def convert_side(path, edition, driver_bin):
+def convert_side(path, edition, driver_bin, rustc_args=()):
     """Run the driver in convert-only mode and parse its report.
 
     Returns a dict with exit_code (None on timeout), converted and
@@ -754,9 +915,14 @@ def convert_side(path, edition, driver_bin):
     ([(kind, count)] from the report's `unsupported:` section, most
     frequent first), compilation_failed (the driver reported a clean
     compilation failure), ice (stderr shows an internal compiler
-    error), and stderr.
+    error), and stderr. `rustc_args` are forwarded to the driver's
+    embedded rustc through its `--rustc-arg` option (a test's
+    compile-flags and the per-revision arguments).
     """
-    res = run_cmd([str(driver_bin), str(path), "--edition", edition],
+    argv = [str(driver_bin), str(path), "--edition", edition]
+    for a in rustc_args:
+        argv += ["--rustc-arg", a]
+    res = run_cmd(argv,
                   timeout=CONVERT_TIMEOUT, env_extra=BOOTSTRAP_ENV)
     out = {
         "exit_code": res["exit_code"],
@@ -875,8 +1041,83 @@ def judge_compile(expectation, conv):
     raise ValueError(f"unknown expectation {expectation!r}")
 
 
+def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions):
+    """Judge one directive view of a compile-check record.
+
+    `revision` is the revision name this view belongs to (None for a
+    test without revisions) and `all_revisions` the test's declared
+    revisions. Returns a dict with status/reason/bucket, plus the
+    expectation and driver details when the conversion ran. A
+    "not-attempted" result carries the bucket that says why; the
+    "out of environment" bucket is kept distinct because the
+    revision-combining caller treats skipped revisions specially.
+    """
+    res = {"status": "not-attempted", "reason": "", "bucket": ""}
+    blocker = stage2_blocker(view, rec)
+    if blocker:
+        res["reason"] = blocker
+        res["bucket"] = "not attempted (header feature)"
+        return res
+    status, why = applicability(view)
+    if status == "out-of-environment":
+        res["reason"] = why
+        res["bucket"] = "out of environment"
+        return res
+    if status == "unevaluatable":
+        res["reason"] = why
+        res["bucket"] = "not attempted (unevaluatable condition)"
+        return res
+    expectation = compile_expectation(rec["suite"], view)
+    res["expectation"] = expectation
+    if expectation is None:
+        res["reason"] = ("verdict involves executing the program "
+                         "(run-fail-or-crash / run mode), which a "
+                         "compile outcome alone cannot judge")
+        res["bucket"] = "not attempted (verdict needs execution)"
+        return res
+    editions = view.values("edition")
+    edition = editions[-1].strip() if editions else "2021"
+    flags = compile_flags(view)
+    screened = screen_flags(flags)
+    if screened:
+        res["reason"] = screened
+        res["bucket"] = "not attempted (compile-flags)"
+        return res
+    args = []
+    if revision is not None:
+        args += revision_args(view, revision, all_revisions)
+    args += flags
+    conv = convert_side(path, edition, driver_bin, rustc_args=args)
+    verdict, reason, bucket = judge_compile(expectation, conv)
+    res["status"] = verdict
+    res["reason"] = reason
+    res["bucket"] = bucket
+    res["driver"] = {
+        "exit_code": conv["exit_code"],
+        "converted": conv["converted"],
+        "skipped": conv["skipped"],
+        "skip_totals": conv["skip_totals"],
+        "ice": conv["ice"],
+    }
+    if verdict == "fail":
+        res["driver"]["stderr_first"] = first_error_line(conv["stderr"])
+    return res
+
+
 def fill_result_stage2(rec, rust_dir, driver_bin, out):
-    """Stage-2 counterpart of fill_result for compile-check records."""
+    """Stage-2 counterpart of fill_result for compile-check records.
+
+    A test without revisions is judged once, on its unscoped view.
+    A revision test is judged once per revision — with that
+    revision's directive view, its compile-flags, and the `--cfg`
+    compiletest adds — and the record passes only when every
+    revision that runs passes (compiletest runs each revision as a
+    separate test instance; the subset counts the file once, so the
+    record aggregates its instances). A revision an ignore-/only-
+    condition removes from this host does not run, as in
+    compiletest; if any other revision cannot be attempted, the
+    record is not attempted, with that revision's reason.
+    """
     out["stage"] = 2
     path = rust_dir / rec["path"]
     text = path.read_text(errors="ignore")
@@ -892,44 +1133,50 @@ def fill_result_stage2(rec, rust_dir, driver_bin, out):
         out["bucket"] = "out of stage-2 scope (suite: incremental)"
         return
     header = Header(text)
-    blocker = stage2_blocker(header, rec)
-    if blocker:
-        out["reason"] = blocker
-        out["bucket"] = "not attempted (header feature)"
+    revs = header.revisions()
+    if not revs:
+        res = stage2_attempt(rec, header.view(None), path, driver_bin,
+                             None, [])
+        for key in ("status", "reason", "bucket", "expectation",
+                    "driver"):
+            if key in res:
+                out[key] = res[key]
         return
-    status, why = applicability(header)
-    if status == "out-of-environment":
-        out["reason"] = why
+    per_rev = {}
+    for rev in revs:
+        per_rev[rev] = stage2_attempt(rec, header.view(rev), path,
+                                      driver_bin, rev, revs)
+    out["revisions"] = {
+        rev: {k: r[k] for k in ("status", "reason", "bucket",
+                                "expectation") if r.get(k)}
+        for rev, r in per_rev.items()
+    }
+    expectations = {r.get("expectation") for r in per_rev.values()}
+    if len(expectations) == 1:
+        out["expectation"] = expectations.pop()
+    ran = {rev: r for rev, r in per_rev.items()
+           if r["bucket"] != "out of environment"}
+    if not ran:
+        first = next(iter(per_rev.values()))
+        out["reason"] = first["reason"]
         out["bucket"] = "out of environment"
         return
-    if status == "unevaluatable":
-        out["reason"] = why
-        out["bucket"] = "not attempted (unevaluatable condition)"
-        return
-    expectation = compile_expectation(rec["suite"], header)
-    out["expectation"] = expectation
-    if expectation is None:
-        out["reason"] = ("verdict involves executing the program "
-                         "(run-fail-or-crash / run mode), which a "
-                         "compile outcome alone cannot judge")
-        out["bucket"] = "not attempted (verdict needs execution)"
-        return
-    editions = header.values("edition")
-    edition = editions[0].strip() if editions else "2021"
-    conv = convert_side(path, edition, driver_bin)
-    verdict, reason, bucket = judge_compile(expectation, conv)
-    out["status"] = verdict
-    out["reason"] = reason
-    out["bucket"] = bucket
-    out["driver"] = {
-        "exit_code": conv["exit_code"],
-        "converted": conv["converted"],
-        "skipped": conv["skipped"],
-        "skip_totals": conv["skip_totals"],
-        "ice": conv["ice"],
-    }
-    if verdict == "fail":
-        out["driver"]["stderr_first"] = first_error_line(conv["stderr"])
+    for rev, r in ran.items():
+        if r["status"] == "not-attempted":
+            out["reason"] = f"revision {rev}: {r['reason']}"
+            out["bucket"] = r["bucket"]
+            return
+    for wanted in ("fail", "unsupported"):
+        for rev, r in ran.items():
+            if r["status"] == wanted:
+                out["status"] = wanted
+                out["reason"] = (f"revision {rev}: {r['reason']}"
+                                 if r["reason"] else "")
+                out["bucket"] = r["bucket"]
+                if "driver" in r:
+                    out["driver"] = r["driver"]
+                return
+    out["status"] = "pass"
 
 
 # ---------------------------------------------------------------------------
