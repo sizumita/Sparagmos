@@ -1269,3 +1269,432 @@ fn unreachable_block_not_taken_leaves_execution_intact() {
     check(&jit, &prog, "keep", &[5], vec![int(5)], Ok(5));
     check(&jit, &prog, "keep", &[0], vec![int(0)], Ok(0));
 }
+
+// ----- References and raw pointers: the pointer is the slot address ----------
+
+fn refty(inner: mir::Ty) -> mir::Ty {
+    mir::Ty::Ref(mir::Region::Erased, Box::new(inner), mir::Mutability::Not)
+}
+fn refmty(inner: mir::Ty) -> mir::Ty {
+    mir::Ty::Ref(mir::Region::Erased, Box::new(inner), mir::Mutability::Mut)
+}
+fn rawty(inner: mir::Ty, mutable: bool) -> mir::Ty {
+    mir::Ty::RawPtr(
+        Box::new(inner),
+        if mutable {
+            mir::Mutability::Mut
+        } else {
+            mir::Mutability::Not
+        },
+    )
+}
+fn dpl(n: u32) -> mir::Place {
+    pl(n).deref()
+}
+fn cpd(n: u32) -> mir::Operand {
+    mir::Operand::Copy(dpl(n))
+}
+fn shared(place: mir::Place) -> mir::Rvalue {
+    mir::Rvalue::Ref(mir::Region::Erased, mir::BorrowKind::Shared, place)
+}
+fn mutref(place: mir::Place) -> mir::Rvalue {
+    mir::Rvalue::Ref(mir::Region::Erased, mir::BorrowKind::mutable(), place)
+}
+
+#[test]
+fn raw_ptr_creation_reads_and_writes_through() {
+    let i32t = i(mir::IntTy::I32);
+    // fn read_raw() -> i32 { _1 = 41; _2 = &raw const _1; return *_2 }
+    let read_raw = spec(
+        "read_raw",
+        0,
+        0,
+        &[i32t.clone(), i32t.clone(), rawty(i32t.clone(), false)],
+        vec![bb(
+            vec![
+                assign(pl(1), mir::Rvalue::Use(i32c(41))),
+                assign(pl(2), mir::Rvalue::RawPtr(mir::Mutability::Not, pl(1))),
+                assign(pl(0), mir::Rvalue::Use(cpd(2))),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    // fn write_raw() -> i32 { _1 = 1; _2 = &raw mut _1; *_2 = 99; return _1 }
+    let write_raw = spec(
+        "write_raw",
+        1,
+        0,
+        &[i32t.clone(), i32t.clone(), rawty(i32t.clone(), true)],
+        vec![bb(
+            vec![
+                assign(pl(1), mir::Rvalue::Use(i32c(1))),
+                assign(pl(2), mir::Rvalue::RawPtr(mir::Mutability::Mut, pl(1))),
+                assign(dpl(2), mir::Rvalue::Use(i32c(99))),
+                assign(pl(0), mir::Rvalue::Use(cp(1))),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    let (jit, prog) = build(&[read_raw, write_raw]);
+    check(&jit, &prog, "read_raw", &[], vec![], Ok(41));
+    check(&jit, &prog, "write_raw", &[], vec![], Ok(99));
+}
+
+#[test]
+fn mut_ref_read_modify_write_reaches_the_place() {
+    let i32t = i(mir::IntTy::I32);
+    // fn bump() -> i32 { _1 = 10; _2 = &mut _1; *_2 = *_2 + 5; return _1 }
+    let bump = spec(
+        "bump",
+        0,
+        0,
+        &[i32t.clone(), i32t.clone(), refmty(i32t.clone())],
+        vec![bb(
+            vec![
+                assign(pl(1), mir::Rvalue::Use(i32c(10))),
+                assign(pl(2), mutref(pl(1))),
+                assign(
+                    dpl(2),
+                    mir::Rvalue::BinaryOp(mir::BinOp::Add, Box::new((cpd(2), i32c(5)))),
+                ),
+                assign(pl(0), mir::Rvalue::Use(cp(1))),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    let (jit, prog) = build(&[bump]);
+    check(&jit, &prog, "bump", &[], vec![], Ok(15));
+}
+
+#[test]
+fn ref_reassignment_reads_the_new_pointee() {
+    let i32t = i(mir::IntTy::I32);
+    // fn pick() -> i32 { _1 = 3; _2 = 4; _3 = &_1; _3 = &_2; return *_3 }
+    let pick = spec(
+        "pick",
+        0,
+        0,
+        &[i32t.clone(), i32t.clone(), i32t.clone(), refty(i32t.clone())],
+        vec![bb(
+            vec![
+                assign(pl(1), mir::Rvalue::Use(i32c(3))),
+                assign(pl(2), mir::Rvalue::Use(i32c(4))),
+                assign(pl(3), shared(pl(1))),
+                assign(pl(3), shared(pl(2))),
+                assign(pl(0), mir::Rvalue::Use(cpd(3))),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    let (jit, prog) = build(&[pick]);
+    check(&jit, &prog, "pick", &[], vec![], Ok(4));
+}
+
+#[test]
+fn ref_of_a_dereference_is_the_pointer_itself() {
+    let i32t = i(mir::IntTy::I32);
+    // fn f() -> i32 { _1 = 5; _2 = &mut _1; _3 = &mut *_2; *_3 = 6; return _1 }
+    let f = spec(
+        "ref_of_deref",
+        0,
+        0,
+        &[
+            i32t.clone(),
+            i32t.clone(),
+            refmty(i32t.clone()),
+            refmty(i32t.clone()),
+        ],
+        vec![bb(
+            vec![
+                assign(pl(1), mir::Rvalue::Use(i32c(5))),
+                assign(pl(2), mutref(pl(1))),
+                assign(pl(3), mutref(dpl(2))),
+                assign(dpl(3), mir::Rvalue::Use(i32c(6))),
+                assign(pl(0), mir::Rvalue::Use(cp(1))),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    let (jit, prog) = build(&[f]);
+    check(&jit, &prog, "ref_of_deref", &[], vec![], Ok(6));
+}
+
+#[test]
+fn ref_arguments_read_and_write_across_frames() {
+    let i32t = i(mir::IntTy::I32);
+    let unit = mir::Ty::Tuple(vec![]);
+    // fn incr(_1: &mut i32) { *_1 = *_1 + 1; return }
+    let incr = spec(
+        "incr",
+        0,
+        1,
+        &[unit.clone(), refmty(i32t.clone())],
+        vec![bb(
+            vec![assign(
+                dpl(1),
+                mir::Rvalue::BinaryOp(mir::BinOp::Add, Box::new((cpd(1), i32c(1)))),
+            )],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    // fn get(_1: &i32) -> i32 { return *_1 }
+    let get = spec(
+        "get",
+        1,
+        1,
+        &[i32t.clone(), refty(i32t.clone())],
+        vec![bb(
+            vec![assign(pl(0), mir::Rvalue::Use(cpd(1)))],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    // fn main_write() -> i32 { _1 = 41; _3 = &mut _1; incr(_3); return _1 }
+    let main_write = spec(
+        "main_write",
+        2,
+        0,
+        &[i32t.clone(), i32t.clone(), unit.clone(), refmty(i32t.clone())],
+        vec![
+            bb(
+                vec![
+                    assign(pl(1), mir::Rvalue::Use(i32c(41))),
+                    assign(pl(3), mutref(pl(1))),
+                ],
+                call_term(fndef(def(0)), vec![cp(3)], 2, 1),
+            ),
+            bb(
+                vec![assign(pl(0), mir::Rvalue::Use(cp(1)))],
+                mir::TerminatorKind::Return,
+            ),
+        ],
+    );
+    // fn main_read() -> i32 { _1 = 7; _2 = &_1; return get(_2) }
+    let main_read = spec(
+        "main_read",
+        3,
+        0,
+        &[i32t.clone(), i32t.clone(), refty(i32t.clone())],
+        vec![
+            bb(
+                vec![
+                    assign(pl(1), mir::Rvalue::Use(i32c(7))),
+                    assign(pl(2), shared(pl(1))),
+                ],
+                call_term(fndef(def(1)), vec![cp(2)], 0, 1),
+            ),
+            bb(vec![], mir::TerminatorKind::Return),
+        ],
+    );
+    let (jit, prog) = build(&[incr, get, main_write, main_read]);
+    check(&jit, &prog, "main_write", &[], vec![], Ok(42));
+    check(&jit, &prog, "main_read", &[], vec![], Ok(7));
+}
+
+#[test]
+fn ref_to_a_tuple_field_writes_the_field() {
+    let i32t = i(mir::IntTy::I32);
+    let pair = mir::Ty::Tuple(vec![i32t.clone(), i32t.clone()]);
+    // fn f() -> i32 { _1 = (10, 20); _2 = &mut _1.1; *_2 = 25; return _1.1 }
+    let f = spec(
+        "field_ref",
+        0,
+        0,
+        &[i32t.clone(), pair, refmty(i32t.clone())],
+        vec![bb(
+            vec![
+                assign(
+                    pl(1),
+                    mir::Rvalue::Aggregate(
+                        Box::new(mir::AggregateKind::Tuple),
+                        vec![i32c(10), i32c(20)],
+                    ),
+                ),
+                assign(pl(2), mutref(fld(1, 1, i32t.clone()))),
+                assign(dpl(2), mir::Rvalue::Use(i32c(25))),
+                assign(pl(0), mir::Rvalue::Use(cpf(1, 1, i32t.clone()))),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    let (jit, prog) = build(&[f]);
+    check(&jit, &prog, "field_ref", &[], vec![], Ok(25));
+}
+
+#[test]
+fn pointer_casts_keep_the_address() {
+    let i32t = i(mir::IntTy::I32);
+    // fn via_ptr_to_ptr() -> i32 {
+    //   _1 = 33; _2 = &raw mut _1; _3 = _2 as *const i32; return *_3 }
+    let f1 = spec(
+        "via_ptr_to_ptr",
+        0,
+        0,
+        &[
+            i32t.clone(),
+            i32t.clone(),
+            rawty(i32t.clone(), true),
+            rawty(i32t.clone(), false),
+        ],
+        vec![bb(
+            vec![
+                assign(pl(1), mir::Rvalue::Use(i32c(33))),
+                assign(pl(2), mir::Rvalue::RawPtr(mir::Mutability::Mut, pl(1))),
+                assign(
+                    pl(3),
+                    mir::Rvalue::Cast(mir::CastKind::PtrToPtr, cp(2), rawty(i32t.clone(), false)),
+                ),
+                assign(pl(0), mir::Rvalue::Use(cpd(3))),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    // fn via_coercion() -> i32 {
+    //   _1 = 34; _2 = &mut _1; _3 = _2 as *const i32; return *_3 }
+    let f2 = spec(
+        "via_coercion",
+        1,
+        0,
+        &[
+            i32t.clone(),
+            i32t.clone(),
+            refmty(i32t.clone()),
+            rawty(i32t.clone(), false),
+        ],
+        vec![bb(
+            vec![
+                assign(pl(1), mir::Rvalue::Use(i32c(34))),
+                assign(pl(2), mutref(pl(1))),
+                assign(
+                    pl(3),
+                    mir::Rvalue::Cast(
+                        mir::CastKind::PointerCoercion(
+                            mir::PointerCoercion::MutToConstPointer,
+                        ),
+                        cp(2),
+                        rawty(i32t.clone(), false),
+                    ),
+                ),
+                assign(pl(0), mir::Rvalue::Use(cpd(3))),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    let (jit, prog) = build(&[f1, f2]);
+    check(&jit, &prog, "via_ptr_to_ptr", &[], vec![], Ok(33));
+    check(&jit, &prog, "via_coercion", &[], vec![], Ok(34));
+}
+
+// ----- Shapes that stay unsupported -------------------------------------------
+
+fn jit_compile(specs: &[FnSpec]) -> Result<JitProgram, JitError> {
+    let names: HashMap<mir::DefId, String> = specs
+        .iter()
+        .map(|s| (def(s.def), s.name.to_string()))
+        .collect();
+    JitProgram::compile(&MirProgramInput {
+        functions: specs
+            .iter()
+            .map(|s| MirFunctionInput {
+                name: s.name.to_string(),
+                def_id: Some(def(s.def)),
+                body: s.body.clone(),
+            })
+            .collect(),
+        names,
+    })
+}
+
+#[test]
+fn fat_reference_is_unsupported() {
+    let i32t = i(mir::IntTy::I32);
+    let fat = mir::Ty::Ref(
+        mir::Region::Erased,
+        Box::new(mir::Ty::Slice(Box::new(i32t.clone()))),
+        mir::Mutability::Not,
+    );
+    let f = spec(
+        "fat",
+        0,
+        1,
+        &[i32t.clone(), fat],
+        vec![bb(
+            vec![assign(pl(0), mir::Rvalue::Use(i32c(0)))],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    match jit_compile(&[f]) {
+        Err(JitError::Unsupported(msg)) => assert!(msg.contains("fat"), "{msg}"),
+        Err(other) => panic!("expected Unsupported, got {other}"),
+        Ok(_) => panic!("expected Unsupported, but the program compiled"),
+    }
+}
+
+#[test]
+fn projection_through_a_dereference_is_unsupported() {
+    let i32t = i(mir::IntTy::I32);
+    let pair = mir::Ty::Tuple(vec![i32t.clone(), i32t.clone()]);
+    // fn f() -> i32 { _1 = (1, 2); _2 = &_1; return (*_2).0 }
+    let f = spec(
+        "proj_through",
+        0,
+        0,
+        &[i32t.clone(), pair.clone(), refty(pair)],
+        vec![bb(
+            vec![
+                assign(
+                    pl(1),
+                    mir::Rvalue::Aggregate(
+                        Box::new(mir::AggregateKind::Tuple),
+                        vec![i32c(1), i32c(2)],
+                    ),
+                ),
+                assign(pl(2), shared(pl(1))),
+                assign(
+                    pl(0),
+                    mir::Rvalue::Use(mir::Operand::Copy(dpl(2).field(0, i32t.clone()))),
+                ),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    match jit_compile(&[f]) {
+        Err(JitError::Unsupported(msg)) => {
+            assert!(msg.contains("through a dereference"), "{msg}")
+        }
+        Err(other) => panic!("expected Unsupported, got {other}"),
+        Ok(_) => panic!("expected Unsupported, but the program compiled"),
+    }
+}
+
+#[test]
+fn double_dereference_is_unsupported() {
+    let i32t = i(mir::IntTy::I32);
+    // fn f() -> i32 { _1 = 9; _2 = &_1; _3 = &_2; return **_3 }
+    let f = spec(
+        "double_deref",
+        0,
+        0,
+        &[
+            i32t.clone(),
+            i32t.clone(),
+            refty(i32t.clone()),
+            refty(refty(i32t.clone())),
+        ],
+        vec![bb(
+            vec![
+                assign(pl(1), mir::Rvalue::Use(i32c(9))),
+                assign(pl(2), shared(pl(1))),
+                assign(pl(3), shared(pl(2))),
+                assign(pl(0), mir::Rvalue::Use(mir::Operand::Copy(dpl(3).deref()))),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    match jit_compile(&[f]) {
+        Err(JitError::Unsupported(msg)) => {
+            assert!(msg.contains("through a dereference"), "{msg}")
+        }
+        Err(other) => panic!("expected Unsupported, got {other}"),
+        Ok(_) => panic!("expected Unsupported, but the program compiled"),
+    }
+}
