@@ -7,3 +7,6 @@ license.workspace = true
 [[bin]]
 name = "sparagmos"
 path = "src/main.rs"
+
+[dependencies]
+sparagmos-harness = { path = "../sparagmos-harness" }
