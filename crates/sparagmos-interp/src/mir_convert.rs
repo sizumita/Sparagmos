@@ -989,8 +989,15 @@ impl<'a> Converter<'a> {
                     .iter()
                     .enumerate()
                     .map(|(i, f)| {
+                        // A promoted array constant is represented
+                        // as a tuple of its elements (inside a
+                        // by-reference constant); under an `Array`
+                        // context every field takes the element type.
+                        // Without it the fields decode context-free,
+                        // which misreads the sign of 128-bit elements.
                         let elem_ctx = match ctx {
                             Some(mir::Ty::Tuple(ts)) => ts.get(i),
+                            Some(mir::Ty::Array(elem, _)) => Some(&**elem),
                             _ => None,
                         };
                         self.convert_const_value(f, elem_ctx)
