@@ -305,10 +305,201 @@ fn convert_all(
     program: &MirProgram,
 ) -> Result<(ir::Program, HashMap<String, ConvertError>), ConvertError> {
     let keys = program_keys(program)?;
+    // First phase: convert every body with trait-impl call
+    // resolution off (the historical behaviour), learning which
+    // bodies convert at all.
     let conv = Converter::new(program, &keys);
+    let (mut out, mut failures) = convert_each(&conv, program, &keys);
+    // Second phase: convert again with trait-impl call resolution
+    // on, restricted to the first phase's *clean* bodies (see
+    // `clean_targets`): bodies that converted and cannot, directly
+    // or transitively, run into an unmodelled construct or an
+    // unconverted body. Resolution only retargets calls, so the
+    // converted set is unchanged in principle; a body whose
+    // second-phase conversion unexpectedly fails keeps its
+    // first-phase form, and the failure records are reconciled with
+    // the merged program at the end.
+    let converted = clean_targets(&out);
+    if !converted.is_empty() {
+        let conv = Converter::with_impl_targets(program, &keys, converted);
+        let (resolved, _) = convert_each(&conv, program, &keys);
+        for (key, body) in resolved.functions {
+            out.unconverted.remove(&key);
+            out.functions.insert(key, body);
+        }
+    }
+    failures.retain(|key, _| !out.functions.contains_key(key));
+    Ok((out, failures))
+}
+
+/// The bodies of a first-phase program that trait-impl call
+/// resolution may target in the second phase (see `convert_all`):
+/// the *clean* bodies — running one can never hit an unmodelled
+/// construct or a body that is not itself clean.
+///
+/// A body is unclean when
+/// * it contains an unsupported statement or terminator (an
+///   unsupported rvalue rides inside an assignment statement),
+/// * a direct `Call` edge names a body that did not convert, or a
+///   body that is itself unclean, or
+/// * its drop glue (on a `Drop` terminator or a `mem::drop`
+///   builtin call) calls an unclean destructor, or contains glue
+///   conversion could not account for (`DropPlan::Unknown` /
+///   `DropPlan::Untyped`: executing it judges or fails on the
+///   value's own shape, which is exactly what resolution must not
+///   newly expose a caller to).
+///
+/// `CallBuiltin` edges are neutral (builtins are the fallback
+/// model itself), and so are `CallTrait` / `CallIndirect` edges
+/// and `Call`s whose target name is no program body at all: a
+/// vtable-dispatch call names the trait method, and the concrete
+/// target is chosen from the receiver's value at run time.
+/// Computed as a fixpoint: uncleanliness propagates backwards
+/// along call and destructor edges until nothing changes.
+fn clean_targets(program: &ir::Program) -> HashSet<String> {
+    // Direct edges from each body to the program bodies it can
+    // enter, plus the bodies that are unclean on their own.
+    let mut edges: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut unclean: HashSet<&str> = HashSet::new();
+    for (key, body) in &program.functions {
+        let mut targets: Vec<&str> = Vec::new();
+        for block in &body.blocks {
+            for stmt in &block.statements {
+                match &stmt.kind {
+                    ir::StatementKind::Unsupported(_)
+                    | ir::StatementKind::Assign(_, ir::Rvalue::Unsupported(_)) => {
+                        unclean.insert(key.as_str());
+                    }
+                    _ => {}
+                }
+            }
+            match &block.terminator {
+                ir::TerminatorKind::Unsupported(_) => {
+                    unclean.insert(key.as_str());
+                }
+                ir::TerminatorKind::Call { func, .. } => {
+                    // An edge only when the name is a program body
+                    // (converted, or recorded as unconverted); a
+                    // name in neither table is a vtable-dispatch
+                    // call, whose target the receiver's value
+                    // chooses at run time.
+                    if program.functions.contains_key(func)
+                        || program.unconverted.contains_key(func)
+                    {
+                        targets.push(func.as_str());
+                    }
+                }
+                ir::TerminatorKind::Drop { glue, .. } => {
+                    if !drop_glue_edges(glue, &mut targets) {
+                        unclean.insert(key.as_str());
+                    }
+                }
+                ir::TerminatorKind::CallBuiltin {
+                    drop_glue: Some(glue),
+                    ..
+                } => {
+                    if !drop_glue_edges(glue, &mut targets) {
+                        unclean.insert(key.as_str());
+                    }
+                }
+                _ => {}
+            }
+        }
+        edges.insert(key.as_str(), targets);
+    }
+    // Propagate: a body with an edge to an unconverted or unclean
+    // body is itself unclean.
+    loop {
+        let mut changed = false;
+        for (key, targets) in &edges {
+            if unclean.contains(key) {
+                continue;
+            }
+            if targets
+                .iter()
+                .any(|t| !program.functions.contains_key(*t) || unclean.contains(t))
+            {
+                unclean.insert(key);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    program
+        .functions
+        .keys()
+        .filter(|k| !unclean.contains(k.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Walk one terminator's drop glue, pushing the destructor bodies
+/// it can call onto `targets`. Returns `false` when the glue
+/// contains a plan conversion could not account for
+/// (`DropPlan::Unknown` / `DropPlan::Untyped`).
+fn drop_glue_edges<'a>(glue: &'a ir::DropGlue, targets: &mut Vec<&'a str>) -> bool {
+    fn walk<'a>(
+        plan: &'a ir::DropPlan,
+        adts: &'a [ir::DropPlan],
+        targets: &mut Vec<&'a str>,
+        seen: &mut HashSet<usize>,
+    ) -> bool {
+        match plan {
+            ir::DropPlan::Trivial => true,
+            ir::DropPlan::Unknown | ir::DropPlan::Untyped => false,
+            ir::DropPlan::Seq(plans) => plans.iter().all(|p| walk(p, adts, targets, seen)),
+            ir::DropPlan::At { plan, .. } => walk(plan, adts, targets, seen),
+            ir::DropPlan::CallDtor { func } => {
+                targets.push(func.as_str());
+                true
+            }
+            ir::DropPlan::Each { elem } => walk(elem, adts, targets, seen),
+            ir::DropPlan::Fields { fields, .. } => {
+                fields.iter().all(|p| walk(p, adts, targets, seen))
+            }
+            ir::DropPlan::Variants { variants } => {
+                variants.iter().all(|p| walk(p, adts, targets, seen))
+            }
+            // An ADT plan can refer to itself (recursive types);
+            // `seen` keeps the walk finite — a revisited plan's
+            // edges were collected by the first visit.
+            ir::DropPlan::Adt { index } => {
+                if !seen.insert(*index) {
+                    return true;
+                }
+                match adts.get(*index) {
+                    Some(plan) => walk(plan, adts, targets, seen),
+                    None => false,
+                }
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    if !walk(&glue.root, &glue.adts, targets, &mut seen) {
+        return false;
+    }
+    // Table entries the root never referenced are walked too, so
+    // their destructor edges and unaccounted plans count as well.
+    for (index, plan) in glue.adts.iter().enumerate() {
+        if seen.insert(index) && !walk(plan, &glue.adts, targets, &mut seen) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Convert every body of `program` with `conv`, isolating failures
+/// per body (see [`convert_program`]).
+fn convert_each(
+    conv: &Converter,
+    program: &MirProgram,
+    keys: &[String],
+) -> (ir::Program, HashMap<String, ConvertError>) {
     let mut out = ir::Program::new();
     let mut failures: HashMap<String, ConvertError> = HashMap::new();
-    for (func, key) in program.functions.iter().zip(&keys) {
+    for (func, key) in program.functions.iter().zip(keys) {
         match conv.convert_body(func, key) {
             Ok(body) => {
                 out.add_function(body);
@@ -319,7 +510,7 @@ fn convert_all(
             }
         }
     }
-    Ok((out, failures))
+    (out, failures)
 }
 
 /// Convert `program` and run `entry` with `args` in the interpreter.
@@ -735,6 +926,11 @@ struct Converter<'a> {
     /// completely, `Drop` impls included. `None` when the program
     /// has no `main` function.
     local_crate: Option<String>,
+    /// The bodies trait-impl call resolution may target (see
+    /// `resolve_impl_callee`): `None` disables resolution (the
+    /// first conversion phase in `convert_all`), `Some` restricts
+    /// it to the named bodies (the second phase).
+    impl_targets: Option<HashSet<String>>,
 }
 
 impl<'a> Converter<'a> {
@@ -764,7 +960,20 @@ impl<'a> Converter<'a> {
             discriminants: &program.adt_discriminants,
             adt_aggregates,
             local_crate,
+            impl_targets: None,
         }
+    }
+
+    /// A converter with trait-impl call resolution enabled,
+    /// restricted to `targets` (see `resolve_impl_callee`).
+    fn with_impl_targets(
+        program: &'a MirProgram,
+        keys: &[String],
+        targets: HashSet<String>,
+    ) -> Self {
+        let mut conv = Self::new(program, keys);
+        conv.impl_targets = Some(targets);
+        conv
     }
 
     fn convert_body(&self, func: &MirFunction, key: &str) -> Result<ir::Body, ConvertError> {
@@ -1682,6 +1891,133 @@ impl<'a> Converter<'a> {
         }
     }
 
+    /// Resolve a trait-method call whose func operand names the
+    /// trait item itself (which has no body) to the concrete impl
+    /// body the driver collected for the call's `Self` type, if the
+    /// program has one.
+    ///
+    /// MIR names such a call by the trait item (`std::ops::Index::
+    /// index` with generic arguments `[Self, Idx]`), while the
+    /// collected body is keyed by its instance name
+    /// (`<S as std::ops::Index<usize>>::index`). Without this step
+    /// the call falls through to the name-based builtin model of
+    /// the trait method, which is only faithful for receivers whose
+    /// impl bodies are not in the program (core's slice/array impls,
+    /// `Vec`): for a user-defined impl it silently computes the
+    /// builtin's semantics on the receiver instead — e.g. an
+    /// `Index` impl returning `&str` was executed as a slice index
+    /// into the receiver struct and panicked with a bogus
+    /// out-of-bounds message. A collected body, when one matches,
+    /// is the faithful semantics and wins over the builtin, exactly
+    /// as a `DefId`-resolved body does in `resolve_callee`.
+    fn resolve_impl_callee(&self, func: &mir::Operand) -> Option<String> {
+        // Resolution runs only in the second conversion phase,
+        // against the first phase's clean bodies (see
+        // `clean_targets`): resolving to an impl body that cannot
+        // itself convert — or that calls, however indirectly, a
+        // body that cannot — would trade a working builtin model
+        // of the trait method for an unconverted-body error. A
+        // derived `PartialEq` on a packed struct is the shape
+        // that pins this restriction: every eq body converts, but
+        // the manual impl calls a helper whose pointer cast the
+        // conversion leaves unsupported, while the builtin's
+        // structural comparison is exact.
+        let targets = self.impl_targets.as_ref()?;
+        let key = self.find_impl_callee(func)?;
+        targets.contains(&key).then_some(key)
+    }
+
+    /// Find the collected impl body for a trait-method call (see
+    /// `resolve_impl_callee` for when a found body may be used).
+    fn find_impl_callee(&self, func: &mir::Operand) -> Option<String> {
+        let (name, _, raw_generic_args) = self.resolve_external_callee(func)?;
+        let (trait_path, method) = name.rsplit_once("::")?;
+        if trait_path.is_empty() || method.is_empty() {
+            return None;
+        }
+        let self_ty = raw_generic_args.first()?;
+        let self_name = self.concrete_ty_name(self_ty);
+        // The impl's instance name spells the trait path as the
+        // impl wrote it: the call may name the trait through `std::`
+        // while the impl was recorded through `core::`, or the
+        // other way round, so try both spellings.
+        let mut paths = vec![trait_path.to_string()];
+        if let Some(rest) = trait_path.strip_prefix("std::") {
+            paths.push(format!("core::{rest}"));
+        } else if let Some(rest) = trait_path.strip_prefix("core::") {
+            paths.push(format!("std::{rest}"));
+        }
+        // The trait's own generic arguments (the func operand's
+        // arguments after `Self`), rendered as they appear in the
+        // impl name: `<S as std::ops::Index<usize>>::index`.
+        let trait_args: Vec<String> = raw_generic_args[1..]
+            .iter()
+            .map(|t| crate::builtins::ty_tag(t, self.names))
+            .collect();
+        for path in &paths {
+            if !trait_args.is_empty() {
+                let candidate = format!(
+                    "<{self_name} as {path}<{}>>::{method}",
+                    trait_args.join(", ")
+                );
+                if let Some(key) = self.find_body_key(&candidate) {
+                    return Some(key);
+                }
+            }
+            let candidate = format!("<{self_name} as {path}>::{method}");
+            if let Some(key) = self.find_body_key(&candidate) {
+                return Some(key);
+            }
+        }
+        // Fall back to a scan: exactly one impl body for this
+        // `Self` type and trait, under any generic-argument
+        // spelling (a defaulted trait argument, for one, is
+        // elided from the instance name but present in the call's
+        // generic arguments). An ambiguous scan resolves nothing.
+        for path in &paths {
+            if let Some(key) = self.scan_impl_key(&self_name, path, method) {
+                return Some(key);
+            }
+        }
+        None
+    }
+
+    /// The program key of a body stored under exactly `candidate`,
+    /// or under its `DefId`-disambiguated form (`candidate#DefId`,
+    /// see `program_keys`) when that form is unique.
+    fn find_body_key(&self, candidate: &str) -> Option<String> {
+        if self.bodies.contains_key(candidate) {
+            return Some(candidate.to_string());
+        }
+        let mut matches = self.bodies.keys().filter(|k| {
+            k.strip_prefix(candidate)
+                .is_some_and(|rest| rest.starts_with('#'))
+        });
+        match (matches.next(), matches.next()) {
+            (Some(key), None) => Some(key.clone()),
+            _ => None,
+        }
+    }
+
+    /// The unique body keyed as an impl of `trait_path` for
+    /// `self_name` with method `method`, under any generic-argument
+    /// spelling of the trait; `None` when there is not exactly one.
+    fn scan_impl_key(&self, self_name: &str, trait_path: &str, method: &str) -> Option<String> {
+        let prefix = format!("<{self_name} as {trait_path}");
+        let suffix = format!(">::{method}");
+        let mut found: Option<&String> = None;
+        for key in self.bodies.keys() {
+            let base = key.split('#').next().unwrap_or(key.as_str());
+            if base.starts_with(&prefix) && base.ends_with(&suffix) {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(key);
+            }
+        }
+        found.cloned()
+    }
+
     /// Resolve a callee that has no converted body through the
     /// driver's full name table (std/core functions): its display
     /// name, its rendered generic arguments, and the raw generic
@@ -1880,7 +2216,10 @@ impl<'a> Converter<'a> {
                         destination: self.convert_place(destination)?,
                         target: target.map(|b| ir::BasicBlock(b.index())),
                     }
-                } else if let Some(name) = self.resolve_callee(func) {
+                } else if let Some(name) = self
+                    .resolve_callee(func)
+                    .or_else(|| self.resolve_impl_callee(func))
+                {
                     let callee = self.bodies.get(&name);
                     let mut ir_args = Vec::with_capacity(args.len());
                     for (i, arg) in args.iter().enumerate() {

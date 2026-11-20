@@ -1597,3 +1597,56 @@ fn summary_mode_externally_demanded_instances_are_converted() {
         "the undemanded generic definition stays explicitly skipped: {unused}"
     );
 }
+
+// ----- dst-index impl resolution (Lane BY) -----
+
+const DST_INDEX_SRC: &str = r#"
+use std::fmt::Debug;
+use std::ops::Index;
+
+struct S;
+
+impl Index<usize> for S {
+    type Output = str;
+
+    fn index(&self, _: usize) -> &str {
+        "hello"
+    }
+}
+
+struct T;
+
+impl Index<usize> for T {
+    type Output = dyn Debug + 'static;
+
+    fn index(&self, _: usize) -> &(dyn Debug + 'static) {
+        static X: usize = 42;
+        &X as &(dyn Debug + 'static)
+    }
+}
+
+fn main() {
+    assert_eq!(&S[0], "hello");
+    let _ = &T[0];
+    println!("dst index ok");
+}
+"#;
+
+#[test]
+fn run_mode_index_impls_with_dst_outputs_execute() {
+    // The shape of tests/ui/dst/dst-index-success.rs (Issue #65):
+    // the Index calls name the trait item, whose name-based builtin
+    // model indexed the receiver struct itself and panicked with a
+    // bogus out-of-bounds message; the collected impl bodies must
+    // run instead, for both the `str` and the `dyn Debug` outputs.
+    let dir = temp_dir("dstindex");
+    let src = fixture(&dir, "dstindex.rs", DST_INDEX_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "dst index program must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "dst index ok\n");
+}
