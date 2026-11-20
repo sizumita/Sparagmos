@@ -774,3 +774,157 @@ class ResolveAuxSpecsTests(unittest.TestCase):
         specs, err = run.resolve_aux_specs(main)
         self.assertIsNone(err)
         self.assertEqual(specs, [])
+
+
+class ProcMacroExternTests(unittest.TestCase):
+    """Stage 2 reproduces compiletest's `//@ proc-macro:` handling:
+    the named auxiliary file is built as a proc-macro crate and
+    linked into the conversion with --extern."""
+
+    def setUp(self):
+        self.tmp = Path(self.enterContext(__import__("tempfile")
+                                          .TemporaryDirectory()))
+        self.dir = self.tmp / "tests" / "ui"
+        (self.dir / "auxiliary").mkdir(parents=True)
+        self.orig_build = run.build_proc_macro
+
+    def tearDown(self):
+        run.build_proc_macro = self.orig_build
+
+    def write(self, rel, body):
+        p = self.dir / rel
+        p.write_text(body)
+        return p
+
+    def stub_build(self, result):
+        calls = []
+
+        def fake(test_path, fname, edition):
+            calls.append((test_path, fname, edition))
+            return result
+
+        run.build_proc_macro = fake
+        return calls
+
+    def test_no_directive_means_no_extern_args(self):
+        run.build_proc_macro = lambda *a: (_ for _ in ()).throw(
+            AssertionError("build must not be called"))
+        view = run.Header("//@ check-pass\nfn main() {}\n").view(None)
+        args, err = run.proc_macro_extern_args(
+            self.dir / "t.rs", view, "2021")
+        self.assertEqual(args, [])
+        self.assertIsNone(err)
+
+    def test_extern_args_from_built_crate(self):
+        artifact = Path("/cache/libtest_macros.so")
+        calls = self.stub_build(("test_macros", artifact, None))
+        view = run.Header(
+            "//@ check-pass\n//@ proc-macro: test-macros.rs\n").view(None)
+        args, err = run.proc_macro_extern_args(
+            self.dir / "t.rs", view, "2021")
+        self.assertIsNone(err)
+        self.assertEqual(args, ["--extern", f"test_macros={artifact}",
+                                "-L", "dependency=/cache"])
+        self.assertEqual([c[1] for c in calls], ["test-macros.rs"])
+
+    def test_build_failure_is_a_not_attempted_reason(self):
+        self.stub_build((None, None, "some rustc error"))
+        view = run.Header(
+            "//@ check-pass\n//@ proc-macro: test-macros.rs\n").view(None)
+        args, err = run.proc_macro_extern_args(
+            self.dir / "t.rs", view, "2021")
+        self.assertEqual(args, [])
+        self.assertIn("could not be built", err)
+        self.assertIn("some rustc error", err)
+
+    def test_revision_scoped_directive_only_applies_to_its_revision(self):
+        self.stub_build(("test_macros", Path("/c/libtest_macros.so"),
+                         None))
+        h = run.Header("//@ revisions: a b\n"
+                       "//@[a] proc-macro: test-macros.rs\n")
+        args_b, err_b = run.proc_macro_extern_args(
+            self.dir / "t.rs", h.view("b"), "2021")
+        self.assertEqual(args_b, [])
+        self.assertIsNone(err_b)
+        args_a, err_a = run.proc_macro_extern_args(
+            self.dir / "t.rs", h.view("a"), "2021")
+        self.assertIsNone(err_a)
+        self.assertIn("--extern", args_a)
+
+    def test_chain_derives_crate_name_from_file_stem(self):
+        main = self.write("t.rs", "//@ check-pass\n")
+        self.write("auxiliary/test-macros.rs",
+                   "extern crate proc_macro;\n")
+        chain, err = run._proc_macro_chain(main, "test-macros.rs",
+                                           "2021")
+        self.assertIsNone(err)
+        self.assertEqual([(n, f) for n, _, f in chain],
+                         [("test_macros", "proc-macro")])
+
+    def test_chain_uses_declared_crate_name(self):
+        main = self.write("t.rs", "//@ check-pass\n")
+        self.write("auxiliary/weird-file.rs",
+                   "#![crate_name = \"custom_name\"]\n")
+        chain, err = run._proc_macro_chain(main, "weird-file.rs",
+                                           "2021")
+        self.assertIsNone(err)
+        self.assertEqual(chain[-1][0], "custom_name")
+
+    def test_chain_missing_file_is_an_error(self):
+        main = self.write("t.rs", "//@ check-pass\n")
+        chain, err = run._proc_macro_chain(main, "nope.rs", "2021")
+        self.assertIsNone(chain)
+        self.assertIn("not found", err)
+
+    def test_chain_builds_aux_deps_before_the_proc_macro(self):
+        main = self.write("t.rs", "//@ check-pass\n")
+        self.write("auxiliary/pm.rs",
+                   "//@ aux-build: dep.rs\nextern crate proc_macro;\n")
+        self.write("auxiliary/dep.rs", "pub fn f() {}\n")
+        chain, err = run._proc_macro_chain(main, "pm.rs", "2021")
+        self.assertIsNone(err)
+        self.assertEqual([(n, f) for n, _, f in chain],
+                         [("dep", None), ("pm", "proc-macro")])
+
+    def test_stage2_attempt_forwards_extern_to_convert_side(self):
+        rec_path = self.write(
+            "t.rs",
+            "//@ check-pass\n//@ proc-macro: test-macros.rs\n"
+            "fn main() {}\n")
+        rec = {"suite": "ui", "path": "tests/ui/t.rs",
+               "nature": "compile-check", "single_file": True,
+               "ffi": False, "env_excluded": False}
+        self.stub_build(("test_macros", Path("/c/libtest_macros.so"),
+                         None))
+        seen = {}
+        orig = run.convert_side
+
+        def capture(path, edition, driver_bin, rustc_args=()):
+            seen["args"] = list(rustc_args)
+            return conv()
+
+        run.convert_side = capture
+        try:
+            res = run.process_test(rec, self.tmp, Path("/fake/driver"),
+                                   stage2=True)
+        finally:
+            run.convert_side = orig
+        self.assertEqual(res["status"], "pass")
+        self.assertIn("--extern", seen["args"])
+        self.assertIn("test_macros=/c/libtest_macros.so", seen["args"])
+        self.assertEqual(rec_path.name, "t.rs")
+
+    def test_stage2_attempt_not_attempted_when_proc_macro_unbuildable(
+            self):
+        self.write("t.rs",
+                   "//@ check-pass\n//@ proc-macro: test-macros.rs\n"
+                   "fn main() {}\n")
+        rec = {"suite": "ui", "path": "tests/ui/t.rs",
+               "nature": "compile-check", "single_file": True,
+               "ffi": False, "env_excluded": False}
+        self.stub_build((None, None, "kaboom"))
+        res = run.process_test(rec, self.tmp, Path("/fake/driver"),
+                               stage2=True)
+        self.assertEqual(res["status"], "not-attempted")
+        self.assertIn("header feature", res["bucket"])
+        self.assertIn("kaboom", res["reason"])

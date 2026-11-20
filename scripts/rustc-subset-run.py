@@ -64,12 +64,14 @@ Usage:
 
 import argparse
 import concurrent.futures
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -644,6 +646,186 @@ def find_artifact(libdir, name):
         if best is None or rank < best[0]:
             best = (rank, cand)
     return best[1] if best else None
+
+
+# ---------------------------------------------------------------------------
+# Proc-macro auxiliary crates (stage 2)
+# ---------------------------------------------------------------------------
+
+_PROC_MACRO_CACHE = {}
+_PROC_MACRO_KEY_LOCKS = {}
+_PROC_MACRO_META_LOCK = threading.Lock()
+
+
+def _proc_macro_key_lock(key):
+    with _PROC_MACRO_META_LOCK:
+        return _PROC_MACRO_KEY_LOCKS.setdefault(key, threading.Lock())
+
+
+def _find_proc_macro_file(test_path, fname):
+    """Locate a `//@ proc-macro:` file the way compiletest does:
+    the `auxiliary/` subdirectory next to the test first, then the
+    test's own directory."""
+    test_dir = test_path.parent
+    for base in (test_dir / "auxiliary", test_dir):
+        cand = base / fname
+        if cand.is_file():
+            return cand
+    return None
+
+
+def _proc_macro_chain(test_path, fname, edition):
+    """Resolve one `//@ proc-macro:` directive to a build chain.
+
+    Returns (chain, error): chain is a list of (crate_name,
+    source_path, forced_crate_type) in dependency order -- the
+    auxiliary crates the proc-macro crate itself depends on first
+    (its own aux directives, resolved transitively), the proc-macro
+    crate last with its type forced to proc-macro, the treatment
+    compiletest's directive names. Which edition each crate is
+    built with is decided at build time from its own header.
+    """
+    src = _find_proc_macro_file(test_path, fname)
+    if src is None:
+        return None, f"proc-macro auxiliary file {fname} not found"
+    deps, err = resolve_aux_specs(src)
+    if err:
+        return None, err
+    text = src.read_text(errors="ignore")
+    name = declared_crate_name(text) or Path(fname).stem.replace("-", "_")
+    chain = [(n, pth, None) for (n, pth) in deps]
+    chain.append((name, src, "proc-macro"))
+    return chain, None
+
+
+def _build_proc_macro_chain(chain, edition, outdir):
+    """Build a resolved proc-macro chain into outdir.
+
+    Mirrors native_side's auxiliary-crate builds: dependency
+    order, each crate linked to the previous ones with --extern,
+    the crate's own compile-flags honoured, its own edition
+    directive winning over the test's. Returns (crate_name,
+    artifact, error) for the chain's last crate, the proc-macro
+    crate itself.
+    """
+    built = []
+    for cname, csrc, forced in chain:
+        text = csrc.read_text(errors="ignore")
+        eff_name = declared_crate_name(text) or cname
+        aux_view = Header(text).view(None)
+        editions = aux_view.values("edition")
+        ced = editions[-1].strip() if editions else edition
+        declared = declared_crate_type(text)
+        cmd = rustc_cmd() + ["--edition", ced, "--out-dir", str(outdir)]
+        lib = sysroot_lib()
+        if lib:
+            cmd += ["-L", lib]
+        cmd += ["-L", f"dependency={outdir}"]
+        if declared is None:
+            cmd += ["--crate-type", forced or "rlib"]
+        if declared_crate_name(text) is None:
+            cmd += ["--crate-name", cname]
+        for prev_name, prev_artifact in built:
+            if prev_artifact is not None:
+                cmd += ["--extern", f"{prev_name}={prev_artifact}"]
+        cmd += compile_flags(aux_view)
+        cmd += [str(csrc)]
+        build = run_cmd(cmd, timeout=NATIVE_COMPILE_TIMEOUT,
+                        env_extra=BOOTSTRAP_ENV)
+        if build["timeout"]:
+            return None, None, (f"build of auxiliary crate "
+                                f"`{eff_name}` timed out")
+        if build["exit_code"] != 0:
+            return None, None, (
+                f"build of auxiliary crate `{eff_name}` failed: "
+                f"{first_error_line(build['stderr'])}")
+        effective = forced or declared or "rlib"
+        artifact = (find_artifact(outdir, eff_name)
+                    if effective in ("rlib", "lib", "dylib", "proc-macro")
+                    else None)
+        built.append((eff_name, artifact))
+    name, artifact = built[-1]
+    if artifact is None:
+        return None, None, (f"build of proc-macro crate `{name}` "
+                            f"produced no linkable artifact")
+    return name, artifact, None
+
+
+def build_proc_macro(test_path, fname, edition):
+    """Build the proc-macro crate a `//@ proc-macro:` directive names.
+
+    Returns (crate_name, artifact, error). Builds are cached: the
+    same auxiliary crate backs many tests (test-macros.rs alone
+    serves dozens), so a key over the chain's source contents and
+    the test edition maps to one on-disk build shared by every
+    caller, across revisions and repeated runs.
+    """
+    chain, err = _proc_macro_chain(test_path, fname, edition)
+    if err:
+        return None, None, err
+    h = hashlib.sha256()
+    h.update(edition.encode())
+    for cname, csrc, forced in chain:
+        h.update(cname.encode())
+        h.update(csrc.read_bytes())
+        h.update((forced or "").encode())
+    key = h.hexdigest()[:24]
+    if key in _PROC_MACRO_CACHE:
+        return _PROC_MACRO_CACHE[key]
+    cache_dir = (Path(tempfile.gettempdir())
+                 / "sparagmos-proc-macro-cache" / key)
+    with _proc_macro_key_lock(key):
+        if key in _PROC_MACRO_CACHE:
+            return _PROC_MACRO_CACHE[key]
+        name = chain[-1][0]
+        result = None
+        if cache_dir.is_dir():
+            artifact = find_artifact(cache_dir, name)
+            if artifact is not None:
+                result = (name, artifact, None)
+        if result is None:
+            tmpdir = Path(tempfile.mkdtemp(prefix="sparagmos-pm-build-"))
+            name2, artifact2, err2 = _build_proc_macro_chain(
+                chain, edition, tmpdir)
+            if err2:
+                result = (None, None, err2)
+            else:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                for f in tmpdir.iterdir():
+                    f.replace(cache_dir / f.name)
+                result = (name2, cache_dir / artifact2.name, None)
+        _PROC_MACRO_CACHE[key] = result
+        return result
+
+
+def proc_macro_extern_args(test_path, view, edition):
+    """--extern arguments reproducing compiletest's `proc-macro:`
+    handling for one directive view, or a not-attempted reason.
+
+    compiletest compiles each file a `//@ proc-macro:` directive
+    names as a proc-macro crate and links it into the test's
+    compilation. Without that link the driver's rustc fails with
+    E0463 (can't find crate) on tests native rustc accepts, so the
+    conversion is attempted with the same --extern set compiletest
+    arranges. Returns (args, error).
+    """
+    fnames = [v.strip() for v in view.values("proc-macro")]
+    fnames = [f for f in fnames if f]
+    if not fnames:
+        return [], None
+    args = []
+    seen_dirs = set()
+    for fname in fnames:
+        name, artifact, err = build_proc_macro(test_path, fname, edition)
+        if err:
+            return [], (f"proc-macro auxiliary crate from {fname} "
+                        f"could not be built: {err}")
+        args += ["--extern", f"{name}={artifact}"]
+        dep_dir = str(artifact.parent)
+        if dep_dir not in seen_dirs:
+            seen_dirs.add(dep_dir)
+            args += ["-L", f"dependency={dep_dir}"]
+    return args, None
 
 
 def native_side(path, edition, workdir, extra_flags=(), aux_specs=()):
@@ -1287,6 +1469,12 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions):
     if revision is not None:
         args += revision_args(view, revision, all_revisions)
     args += flags
+    pm_args, pm_err = proc_macro_extern_args(path, view, edition)
+    if pm_err:
+        res["reason"] = pm_err
+        res["bucket"] = "not attempted (header feature)"
+        return res
+    args += pm_args
     conv = convert_side(path, edition, driver_bin, rustc_args=args)
     verdict, reason, bucket = judge_compile(expectation, conv)
     res["status"] = verdict
