@@ -667,6 +667,21 @@ impl<'a> Compiler<'a> {
                 }
                 self.store_float_result(*dst, *kind)?;
             }
+            Instr::SlotAddr { dst, slot } => {
+                let d = self.slot_disp(*slot)?;
+                self.e.lea(Reg::Rax, Reg::Rbp, d);
+                self.store_result(*dst)?;
+            }
+            Instr::LoadPtr { dst, ptr } => {
+                self.load_operand(Reg::Rax, *ptr)?;
+                self.e.mov_load(Reg::Rax, Reg::Rax, 0);
+                self.store_result(*dst)?;
+            }
+            Instr::StorePtr { ptr, src } => {
+                self.load_operand(Reg::Rax, *ptr)?;
+                self.load_operand(Reg::Rcx, *src)?;
+                self.e.mov_store(Reg::Rax, 0, Reg::Rcx);
+            }
             Instr::Call { dst, func, args } => {
                 if self.ctx.is_none() {
                     return Err(CompileError::ProgramOnly("Call"));
