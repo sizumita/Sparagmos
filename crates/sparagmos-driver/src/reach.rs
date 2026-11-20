@@ -328,7 +328,7 @@ pub fn collect_reachable(
 /// terminator whose func operand is a constant of `FnDef` type.
 /// Calls through places (function pointers, closures) have no
 /// `FnDef` target and are not call-graph edges here.
-fn call_targets(body: &mir::Body) -> Vec<(rustc_public::ty::FnDef, GenericArgs)> {
+pub fn call_targets(body: &mir::Body) -> Vec<(rustc_public::ty::FnDef, GenericArgs)> {
     let mut out = Vec::new();
     for bb in &body.blocks {
         let TerminatorKind::Call { func, .. } = &bb.terminator.kind else {
@@ -362,7 +362,7 @@ fn truncate(s: &str, max: usize) -> String {
 /// functions stay body-less, with the offending type recorded as
 /// the reason. ADT types are accepted without inspecting their
 /// arguments, matching how the runtime converts them (by name).
-fn unrepresentable_local(body: &sm::Body) -> Option<String> {
+pub fn unrepresentable_local(body: &sm::Body) -> Option<String> {
     /// The kind name of the first type inside `ty` that has no
     /// runtime representation, if any.
     fn offending(ty: &sm::Ty) -> Option<String> {

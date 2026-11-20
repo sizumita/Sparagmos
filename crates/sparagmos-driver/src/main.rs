@@ -71,6 +71,7 @@ use rustc_public::ty::{
     TyConstKind, TyKind,
 };
 use rustc_public::CrateDef;
+use rustc_public::ItemKind;
 
 use sparagmos_driver::convert::Converter;
 use sparagmos_driver::report::{ConversionReport, FnOutcome, FnReport};
@@ -485,6 +486,199 @@ fn ty_mentions_param(ty: &Ty) -> bool {
     }
 }
 
+/// A local function item that has no monomorphic instance as an
+/// item (a generic function definition): it is deferred during the
+/// item loop and accounted for by [`collect_local_instances`] once
+/// the instances its call sites demand are known.
+struct DeferredFn {
+    def: rustc_public::DefId,
+    name: String,
+    /// Index of this item's placeholder entry in the report.
+    report_idx: usize,
+}
+
+/// Cap on monomorphic instance bodies collected for generic local
+/// definitions per program, mirroring the reachability
+/// collection's cap for foreign bodies.
+const MAX_LOCAL_INSTANCES: usize = 1024;
+
+/// Convert the monomorphic instances of generic local function
+/// definitions that the program's bodies actually call.
+///
+/// A generic definition has no instance as an item, so the item
+/// loop cannot convert it; but every call site names the
+/// definition through an `FnDef` target with concrete generic
+/// arguments, and resolving those targets yields the instances
+/// the crate demands — the same mechanism the reachability
+/// collection uses for foreign functions. This pass walks the
+/// converted local bodies (and, transitively, the instance bodies
+/// themselves) for `FnDef` targets, resolves the ones belonging
+/// to deferred definitions, and converts each distinct instance,
+/// registering it under the same `(referenced definition,
+/// instance)` key call sites resolve through.
+///
+/// A deferred definition is then reported as converted when every
+/// instance demanded of it converted; when some instance could
+/// not be converted it stays skipped with that instance's
+/// reasons, and a definition nothing demands keeps the item
+/// loop's "no monomorphic instance available" record. The Stable
+/// MIR bodies of the converted instances are returned so the
+/// reachability collection can walk them for foreign targets too.
+fn collect_local_instances(
+    conv: &mut Converter,
+    report: &mut ConversionReport,
+    bodies: &mut Vec<(String, Body)>,
+    body_def_ids: &mut Vec<sparagmos_mir::DefId>,
+    body_def_names: &mut Vec<String>,
+    deferred: &[DeferredFn],
+    seeds: &[rustc_public::mir::Body],
+) -> Vec<rustc_public::mir::Body> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    /// Outcome accumulated for one deferred definition.
+    #[derive(Default)]
+    struct Demand {
+        converted: usize,
+        failures: BTreeMap<String, usize>,
+        first_counts: Option<(usize, usize, usize)>,
+    }
+
+    fn fail_all(
+        demands: &mut HashMap<rustc_public::DefId, Demand>,
+        owners: &[rustc_public::DefId],
+        reason: String,
+    ) {
+        for owner in owners {
+            *demands
+                .entry(*owner)
+                .or_default()
+                .failures
+                .entry(reason.clone())
+                .or_default() += 1;
+        }
+    }
+
+    let deferred_defs: HashSet<rustc_public::DefId> = deferred.iter().map(|d| d.def).collect();
+    let mut demands: HashMap<rustc_public::DefId, Demand> = HashMap::new();
+    let mut seen: HashSet<(rustc_public::DefId, Instance)> = HashSet::new();
+    let mut unresolved_seen: HashSet<(rustc_public::DefId, String)> = HashSet::new();
+    let mut plain_taken: HashSet<rustc_public::DefId> = HashSet::new();
+    let mut queue: VecDeque<rustc_public::mir::Body> = seeds.iter().cloned().collect();
+    let mut extra_seeds: Vec<rustc_public::mir::Body> = Vec::new();
+    let mut taken = 0usize;
+
+    while let Some(body) = queue.pop_front() {
+        for (def, args) in sparagmos_driver::reach::call_targets(&body) {
+            let referenced = def.def_id();
+            let inst = match Instance::resolve(def, &args) {
+                Ok(inst) => inst,
+                Err(_) => {
+                    if deferred_defs.contains(&referenced)
+                        && unresolved_seen.insert((referenced, format!("{args:?}")))
+                    {
+                        *demands
+                            .entry(referenced)
+                            .or_default()
+                            .failures
+                            .entry("instance resolution failed".to_string())
+                            .or_default() += 1;
+                    }
+                    continue;
+                }
+            };
+            let resolved = inst.def.def_id();
+            if !deferred_defs.contains(&referenced) && !deferred_defs.contains(&resolved) {
+                continue;
+            }
+            if !seen.insert((referenced, inst)) {
+                continue;
+            }
+            // The instance is credited to every deferred definition
+            // it belongs to: the referenced definition (a direct
+            // call, or a trait method whose default body this is)
+            // and the resolved definition when it differs (an impl
+            // method demanded through its trait).
+            let mut owners: Vec<rustc_public::DefId> = Vec::new();
+            if deferred_defs.contains(&referenced) {
+                owners.push(referenced);
+            }
+            if resolved != referenced && deferred_defs.contains(&resolved) {
+                owners.push(resolved);
+            }
+            if taken >= MAX_LOCAL_INSTANCES {
+                fail_all(&mut demands, &owners, "collection limit reached".to_string());
+                continue;
+            }
+            let Some(ibody) = inst.body() else {
+                fail_all(&mut demands, &owners, "no MIR body available".to_string());
+                continue;
+            };
+            match conv.convert_body(&ibody) {
+                Ok(converted) => {
+                    if let Some(what) = sparagmos_driver::reach::unrepresentable_local(&converted)
+                    {
+                        fail_all(
+                            &mut demands,
+                            &owners,
+                            format!("body uses a type the runtime cannot represent ({what})"),
+                        );
+                        continue;
+                    }
+                    taken += 1;
+                    queue.push_back(ibody.clone());
+                    extra_seeds.push(ibody.clone());
+                    let counts = (ibody.blocks.len(), ibody.locals().len(), ibody.arg_locals().len());
+                    // Display name: the first converted instance of
+                    // the referenced definition carries its plain
+                    // name; further instances are suffixed with the
+                    // instance name (the reachability collection's
+                    // rule for foreign instances).
+                    let ref_name = def.name();
+                    let display = if plain_taken.insert(referenced) {
+                        ref_name.clone()
+                    } else {
+                        format!("{} [{}]", ref_name, inst.name())
+                    };
+                    bodies.push((display, converted));
+                    body_def_ids.push(conv.instance_def_id(referenced, &inst));
+                    body_def_names.push(ref_name);
+                    for owner in &owners {
+                        let demand = demands.entry(*owner).or_default();
+                        demand.converted += 1;
+                        if demand.first_counts.is_none() {
+                            demand.first_counts = Some(counts);
+                        }
+                    }
+                }
+                Err(errs) => {
+                    for e in errs {
+                        fail_all(&mut demands, &owners, e);
+                    }
+                }
+            }
+        }
+    }
+
+    for dfn in deferred {
+        let Some(demand) = demands.get(&dfn.def) else {
+            continue;
+        };
+        let entry = &mut report.functions[dfn.report_idx];
+        if demand.converted > 0 && demand.failures.is_empty() {
+            let (blocks, locals, arg_count) = demand.first_counts.unwrap_or((0, 0, 0));
+            entry.blocks = blocks;
+            entry.locals = locals;
+            entry.arg_count = arg_count;
+            entry.outcome = FnOutcome::Converted;
+        } else {
+            entry.outcome = FnOutcome::Skipped {
+                reasons: demand.failures.clone(),
+            };
+        }
+    }
+    extra_seeds
+}
+
 fn collect() -> ControlFlow<()> {
     let mut conv = Converter::new();
     let mut report = ConversionReport::default();
@@ -499,6 +693,10 @@ fn collect() -> ControlFlow<()> {
     // Stable MIR bodies of the converted local functions; the
     // reachability collection walks their call graph afterwards.
     let mut seed_bodies: Vec<rustc_public::mir::Body> = Vec::new();
+
+    // Generic function definitions deferred by the item loop; the
+    // instance collection after the loop accounts for them.
+    let mut deferred: Vec<DeferredFn> = Vec::new();
 
     let items = rustc_public::all_local_items();
     for item in items.iter() {
@@ -519,6 +717,36 @@ fn collect() -> ControlFlow<()> {
             Err(_) => match closure_instance(item) {
                 ClosureAttempt::Instance(i) => i,
                 ClosureAttempt::NotClosure => {
+                    if matches!(item.kind(), ItemKind::Fn) {
+                        // A generic function definition: it has no
+                        // monomorphic instance as an item, but its
+                        // call sites may demand concrete instances.
+                        // Defer it: a placeholder report entry keeps
+                        // the target-crate accounting in place, and
+                        // the instance collection after this loop
+                        // fills in the outcome.
+                        let mut reasons = BTreeMap::new();
+                        reasons.insert(
+                            format!(
+                                "no monomorphic instance available (kind={:?})",
+                                item.kind()
+                            ),
+                            1,
+                        );
+                        deferred.push(DeferredFn {
+                            def: item.def_id(),
+                            name: name.clone(),
+                            report_idx: report.functions.len(),
+                        });
+                        report.functions.push(FnReport {
+                            name,
+                            blocks: 0,
+                            locals: 0,
+                            arg_count: 0,
+                            outcome: FnOutcome::Skipped { reasons },
+                        });
+                        continue;
+                    }
                     skip_fn(
                         &mut report,
                         &name,
@@ -580,10 +808,26 @@ fn collect() -> ControlFlow<()> {
     let local_body_count = bodies.len();
     let local_report_count = report.functions.len();
 
+    // Convert the monomorphic instances of the generic local
+    // function definitions that the converted bodies call; the
+    // instance bodies join the reachability seeds below, so the
+    // foreign functions they call are collected too.
+    let instance_seeds = collect_local_instances(
+        &mut conv,
+        &mut report,
+        &mut bodies,
+        &mut body_def_ids,
+        &mut body_def_names,
+        &deferred,
+        &seed_bodies,
+    );
+    let mut reach_seeds = seed_bodies;
+    reach_seeds.extend(instance_seeds);
+
     // Collect the bodies of non-local functions reachable from the
     // converted local bodies (std / core / alloc and other library
     // functions), so calls into them have bodies in the program too.
-    let reached = sparagmos_driver::reach::collect_reachable(&mut conv, &seed_bodies, &local_defs);
+    let reached = sparagmos_driver::reach::collect_reachable(&mut conv, &reach_seeds, &local_defs);
     bodies.extend(reached.bodies);
     body_def_ids.extend(reached.body_def_ids);
     body_def_names.extend(reached.body_def_names);
