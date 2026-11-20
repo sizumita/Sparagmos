@@ -2016,10 +2016,14 @@ fn eval_binary(
             Mul => a.checked_mul(b).map_or(true, |r| r < min || r > max),
             Div | Rem => a == min && b == -1,
             Shl => {
-                // Overflow if significant bits are shifted out of the
-                // declared width, i.e. shifting back does not restore `a`.
+                // Rust shift overflow is a property of the amount
+                // only: bits shifted out of the value are lost, never
+                // an overflow (`1 << 127 == i128::MIN`, no panic). An
+                // out-of-range amount returned early above, so in the
+                // reachable cases the flag is exactly `shift >= bits`
+                // (always false here).
                 let shift = u32::try_from(b).unwrap_or(u32::MAX);
-                shift >= bits || (shift < 128 && (wrap_signed(a << shift, bits) >> shift) != a)
+                shift >= bits
             }
             _ => false,
         };
@@ -2067,7 +2071,9 @@ fn eval_binary(
                 )));
             }
             let raw = if op == Shl { a << shift } else { a >> shift };
-            let overflowed = op == Shl && (wrap_unsigned(raw, bits) >> shift) != a;
+            // As in the signed arm: shift overflow is the amount
+            // only, and an out-of-range amount returned early above.
+            let overflowed = false;
             let result = Value::Uint(wrap_unsigned(raw, bits));
             if overflowed && !checked_form {
                 return Err(InterpError::panic(format!("arithmetic overflow in {op:?}")));
