@@ -1757,3 +1757,136 @@ fn run_mode_lifetime_parameterized_drop_impl_runs() {
         "the destructor's output must follow the body's"
     );
 }
+
+// ----- RefCell model (Lane CC) -----
+
+const REFCELL_SRC: &str = r#"
+use std::cell::RefCell;
+fn main() {
+    let mut c = RefCell::new(40);
+    {
+        let a = c.borrow();
+        let b = c.borrow();
+        println!("{}", *a + *b);
+    }
+    *c.borrow_mut() += 2;
+    let v = *c.borrow();
+    println!("{}", v);
+    let old = c.replace(7);
+    println!("{}", old);
+    {
+        let _m = c.borrow_mut();
+        println!("{}", c.try_borrow().is_err());
+        println!("{}", c.try_borrow_mut().is_err());
+    }
+    println!("{}", c.try_borrow().is_ok());
+    *c.get_mut() = 9;
+    let w = *c.borrow();
+    println!("{}", w);
+}
+"#;
+
+#[test]
+fn run_mode_refcell_borrow_discipline() {
+    let dir = temp_dir("refcell");
+    let src = fixture(&dir, "refcell.rs", REFCELL_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "RefCell program must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "80\n42\n42\ntrue\ntrue\ntrue\n9\n",
+        "shared borrows coexist, guards release on drop, try_borrow \
+         reports conflicts, replace/get_mut go through the cell"
+    );
+}
+
+const REFCELL_PANIC_SRC: &str = r#"
+use std::cell::RefCell;
+fn main() {
+    let c = RefCell::new(1);
+    let _a = c.borrow();
+    let _b = c.borrow_mut();
+}
+"#;
+
+#[test]
+fn run_mode_refcell_borrow_mut_conflict_panics() {
+    let dir = temp_dir("refcell-panic");
+    let src = fixture(&dir, "refcell_panic.rs", REFCELL_PANIC_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "borrow_mut while borrowed is a guest panic; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("RefCell already borrowed"),
+        "the panic carries Rust 1.100.0's exact message: {stderr}"
+    );
+}
+
+const REFCELL_MUT_PANIC_SRC: &str = r#"
+use std::cell::RefCell;
+fn main() {
+    let c = RefCell::new(1);
+    let _m = c.borrow_mut();
+    let _a = c.borrow();
+}
+"#;
+
+#[test]
+fn run_mode_refcell_borrow_while_mutable_panics() {
+    let dir = temp_dir("refcell-mut-panic");
+    let src = fixture(&dir, "refcell_mut_panic.rs", REFCELL_MUT_PANIC_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "borrow while mutably borrowed is a guest panic; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("RefCell already mutably borrowed"),
+        "the panic carries Rust 1.100.0's exact message: {stderr}"
+    );
+}
+
+const REFCELL_DROP_SRC: &str = r#"
+use std::cell::RefCell;
+struct D(i32);
+impl Drop for D {
+    fn drop(&mut self) {
+        println!("dropping {}", self.0);
+    }
+}
+fn main() {
+    let c = RefCell::new(D(5));
+    println!("borrowed {}", c.borrow().0);
+    drop(c);
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_refcell_drop_runs_inner_destructor() {
+    let dir = temp_dir("refcell-drop");
+    let src = fixture(&dir, "refcell_drop.rs", REFCELL_DROP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "RefCell<D> program must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "borrowed 5\ndropping 5\ndone\n",
+        "dropping the cell runs the wrapped value's destructor"
+    );
+}

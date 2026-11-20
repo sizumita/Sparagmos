@@ -2568,14 +2568,14 @@ fn builtin_arg_ctx(
         // Lane V: the value arguments of these builtins are the
         // callee's first generic parameter (the element / pointee /
         // cell type), so a literal argument takes that type.
-        Builtin::BoxNew | Builtin::ManuallyDropNew | Builtin::CellNew => {
+        Builtin::BoxNew | Builtin::ManuallyDropNew | Builtin::CellNew | Builtin::RefCellNew => {
             if arg_index == 0 {
                 raw_generic_args.first().cloned()
             } else {
                 None
             }
         }
-        Builtin::CellSet | Builtin::CellReplace | Builtin::VecPush => {
+        Builtin::CellSet | Builtin::CellReplace | Builtin::VecPush | Builtin::RefCellReplace => {
             if arg_index == 1 {
                 raw_generic_args.first().cloned()
             } else {
@@ -2891,9 +2891,31 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                     },
                 });
             }
+            "std::cell::Ref" | "core::cell::Ref" => {
+                return Some(P::RefCellRelease { mutable: false })
+            }
+            "std::cell::RefMut" | "core::cell::RefMut" => {
+                return Some(P::RefCellRelease { mutable: true })
+            }
+            "std::cell::RefCell" | "core::cell::RefCell" => {
+                // `RefCell` has no `Drop` impl of its own: the
+                // flag `Cell` is plain data, and the value's glue
+                // runs through the `UnsafeCell` field wrapper.
+                let inner = self.plan(args.first()?)?;
+                return Some(match inner {
+                    P::Trivial => P::Trivial,
+                    plan => P::At {
+                        path: vec![RefProj::Field(1), RefProj::Field(0)],
+                        plan: Box::new(plan),
+                    },
+                });
+            }
             "std::result::Result" => {
                 // Same value shape as `Option`: variant 0 is `Ok`,
                 // variant 1 is `Err`, the payload sits at field 0.
+                // (Needed so a `try_borrow` result holding a guard
+                // can be dropped: the guard's release is the Ok
+                // payload's glue.)
                 let ok = self.plan(args.first()?)?;
                 let err = self.plan(args.get(1)?)?;
                 return Some(match (ok, err) {
@@ -2902,6 +2924,14 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                         variants: vec![at_field0(ok), at_field0(err)],
                     },
                 });
+            }
+            // The `try_borrow` error types: unit structs with no
+            // fields and no `Drop` impl.
+            "std::cell::BorrowError" | "core::cell::BorrowError" => {
+                return Some(P::Trivial)
+            }
+            "std::cell::BorrowMutError" | "core::cell::BorrowMutError" => {
+                return Some(P::Trivial)
             }
             "std::ops::Range" | "std::ops::RangeInclusive" => {
                 let bound = self.plan(args.first()?)?;

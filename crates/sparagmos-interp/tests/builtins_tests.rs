@@ -314,6 +314,23 @@ fn registry_covers_the_modelled_callees() {
         ("std::cell::Cell::<T>::new", Builtin::CellNew),
         ("std::cell::Cell::<T>::get", Builtin::CellGet),
         ("std::cell::Cell::<T>::set", Builtin::CellSet),
+        ("std::cell::RefCell::<T>::new", Builtin::RefCellNew),
+        ("std::cell::RefCell::<T>::borrow", Builtin::RefCellBorrow),
+        (
+            "std::cell::RefCell::<T>::borrow_mut",
+            Builtin::RefCellBorrowMut,
+        ),
+        (
+            "std::cell::RefCell::<T>::try_borrow",
+            Builtin::RefCellTryBorrow,
+        ),
+        (
+            "std::cell::RefCell::<T>::try_borrow_mut",
+            Builtin::RefCellTryBorrowMut,
+        ),
+        ("std::cell::RefCell::<T>::get_mut", Builtin::RefCellGetMut),
+        ("std::cell::RefCell::<T>::replace", Builtin::RefCellReplace),
+        ("std::cell::RefCell::<T>::as_ptr", Builtin::RefCellAsPtr),
         ("std::option::Option::<T>::unwrap", Builtin::OptionUnwrap),
         ("core::option::Option::<T>::unwrap", Builtin::OptionUnwrap),
         ("std::result::Result::<T, E>::unwrap", Builtin::ResultUnwrap),
