@@ -33,8 +33,15 @@
 //!   no unwinding — a guest panic aborts the whole run as an
 //!   [`InterpError::Panic`], which is the oracle's model of a panic.
 //! * `AggregateKind::Array` becomes a tuple value (the IR has no distinct
-//!   array value; element reads through `Index` projections are still
-//!   rejected at run time, as before).
+//!   array value); `AggregateKind::Adt` becomes a variant + fields value.
+//! * Calls to functions without converted bodies resolve through the
+//!   driver's full name table: runtime-supported callees
+//!   ([`crate::builtins`]) become `CallBuiltin`; anything else stays an
+//!   unsupported call that names the function.
+//! * `Drop` converts only for types whose drop glue provably has no
+//!   guest-observable effect in this value model (plain data, `String`,
+//!   modelled std containers/iterators, and compositions of those);
+//!   other drops stay explicit errors.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -61,6 +68,11 @@ pub struct MirFunction {
 #[derive(Debug, Clone, Default)]
 pub struct MirProgram {
     pub functions: Vec<MirFunction>,
+    /// `DefId` -> display name for *every* named item the driver
+    /// knows, including functions and types without converted bodies
+    /// (std callees, ADT types). Used to name ADT locals and to
+    /// resolve calls into runtime support.
+    pub fn_names: HashMap<mir::DefId, String>,
 }
 
 impl MirProgram {
@@ -105,7 +117,7 @@ impl MirProgram {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConvertError {
     /// A local (or cast target / tuple element) has a type the IR's
-    /// scalar type model cannot represent (floats, ADTs, references, ...).
+    /// type model cannot represent (floats, trait objects, closures, ...).
     UnsupportedType { context: String, ty: String },
     /// A constant form the IR cannot represent (strings, pointers,
     /// floats, unevaluated / type constants outside call position, ...).
@@ -194,6 +206,38 @@ pub fn interpret_mir(
     Ok(interp.run(entry, args)?)
 }
 
+/// The outcome of a run that also captures the guest's stdout: the
+/// run result plus everything the guest printed before it returned
+/// or failed (a native program's output is likewise observable when
+/// it panics).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapturedRun {
+    pub result: Result<Value, MirRunError>,
+    pub stdout: String,
+}
+
+/// Like [`interpret_mir`], but also returns the captured guest stdout.
+pub fn interpret_mir_captured(
+    program: &MirProgram,
+    entry: &str,
+    args: Vec<Value>,
+) -> CapturedRun {
+    match convert_program(program) {
+        Ok(ir_program) => {
+            let mut interp = Interpreter::new(&ir_program);
+            let result = interp.run(entry, args).map_err(MirRunError::from);
+            CapturedRun {
+                result,
+                stdout: interp.output().to_string(),
+            }
+        }
+        Err(e) => CapturedRun {
+            result: Err(MirRunError::from(e)),
+            stdout: String::new(),
+        },
+    }
+}
+
 // ---------------------------------------------------------------------------
 
 struct Converter<'a> {
@@ -201,6 +245,9 @@ struct Converter<'a> {
     bodies: HashMap<String, &'a mir::Body>,
     /// `DefId` -> function name, for resolving `FnDef` call operands.
     def_names: HashMap<mir::DefId, String>,
+    /// `DefId` -> name for every named item (the driver's table,
+    /// including body-less callees and ADT types).
+    names: &'a HashMap<mir::DefId, String>,
 }
 
 impl<'a> Converter<'a> {
@@ -213,7 +260,11 @@ impl<'a> Converter<'a> {
                 def_names.insert(def, f.name.clone());
             }
         }
-        Converter { bodies, def_names }
+        Converter {
+            bodies,
+            def_names,
+            names: &program.fn_names,
+        }
     }
 
     fn convert_body(&self, func: &MirFunction) -> Result<ir::Body, ConvertError> {
@@ -272,6 +323,31 @@ impl<'a> Converter<'a> {
                 }
                 ir::Ty::Tuple(out)
             }
+            mir::Ty::Adt(def, _) => {
+                let name = self
+                    .names
+                    .get(def)
+                    .or_else(|| self.def_names.get(def))
+                    .cloned()
+                    .unwrap_or_else(|| format!("{def:?}"));
+                ir::Ty::Adt(name)
+            }
+            mir::Ty::Ref(_, inner, _) => {
+                ir::Ty::Ref(Box::new(self.convert_ty(inner, context)?))
+            }
+            // Raw pointers share the reference representation.
+            mir::Ty::RawPtr(inner, _) => {
+                ir::Ty::Ref(Box::new(self.convert_ty(inner, context)?))
+            }
+            mir::Ty::Str => ir::Ty::Str,
+            mir::Ty::Array(elem, len) => {
+                let n = match len {
+                    mir::ArrayLen::Known(n) => *n as u64,
+                    _ => return Err(unsupported()),
+                };
+                ir::Ty::Array(Box::new(self.convert_ty(elem, context)?), n)
+            }
+            mir::Ty::Slice(elem) => ir::Ty::Slice(Box::new(self.convert_ty(elem, context)?)),
             _ => return Err(unsupported()),
         })
     }
@@ -285,6 +361,13 @@ impl<'a> Converter<'a> {
                 mir::PlaceElem::Field(idx, _) => ir::ProjectionElem::Field(*idx as usize),
                 mir::PlaceElem::Deref => ir::ProjectionElem::Deref,
                 mir::PlaceElem::Index(local) => ir::ProjectionElem::Index(ir::Local(local.index())),
+                mir::PlaceElem::ConstantIndex {
+                    offset, from_end, ..
+                } => ir::ProjectionElem::ConstantIndex {
+                    offset: *offset as u64,
+                    from_end: *from_end,
+                },
+                mir::PlaceElem::Downcast(_, variant) => ir::ProjectionElem::Downcast(*variant),
                 other => {
                     return Err(ConvertError::UnsupportedProjection {
                         kind: other.kind_name().to_string(),
@@ -353,20 +436,31 @@ impl<'a> Converter<'a> {
             mir::ConstValue::Char(c) => ir::Constant::Uint(*c as u128),
             mir::ConstValue::ZeroSized => ir::Constant::Unit,
             mir::ConstValue::Scalar(s) => return self.convert_scalar(s, ctx),
-            mir::ConstValue::Str(_) => {
-                return Err(ConvertError::UnsupportedConstant {
-                    kind: "string constant".to_string(),
-                })
+            mir::ConstValue::Str(s) => ir::Constant::Str(s.clone()),
+            mir::ConstValue::Bytes(b) => {
+                // The bytes are the elements themselves only for
+                // byte-sized elements (the fmt pieces template is the
+                // canonical case); wider elements are packed
+                // little-endian encodings this layer does not decode.
+                if let Some(size) = pointee_elem_size(ctx) {
+                    if size != 1 {
+                        return Err(ConvertError::UnsupportedConstant {
+                            kind: format!("byte constant with {size}-byte elements"),
+                        });
+                    }
+                }
+                ir::Constant::Bytes(b.clone())
             }
-            mir::ConstValue::Bytes(_) => {
-                return Err(ConvertError::UnsupportedConstant {
-                    kind: "byte-string constant".to_string(),
-                })
-            }
-            mir::ConstValue::Slice { .. } => {
-                return Err(ConvertError::UnsupportedConstant {
-                    kind: "slice constant".to_string(),
-                })
+            mir::ConstValue::Slice { data, meta } => {
+                // A slice constant whose metadata equals its byte
+                // length is a byte slice.
+                if *meta as usize == data.len() {
+                    ir::Constant::Bytes(data.clone())
+                } else {
+                    return Err(ConvertError::UnsupportedConstant {
+                        kind: "slice constant with non-byte elements".to_string(),
+                    });
+                }
             }
             mir::ConstValue::ByRef { .. } => {
                 return Err(ConvertError::UnsupportedConstant {
@@ -531,9 +625,7 @@ impl<'a> Converter<'a> {
                 match op {
                     mir::UnOp::Not => ir::Rvalue::UnaryOp(ir::UnOp::Not, v),
                     mir::UnOp::Neg => ir::Rvalue::UnaryOp(ir::UnOp::Neg, v),
-                    mir::UnOp::PtrMetadata => {
-                        ir::Rvalue::Unsupported("UnaryOp PtrMetadata".to_string())
-                    }
+                    mir::UnOp::PtrMetadata => ir::Rvalue::UnaryOp(ir::UnOp::PtrMetadata, v),
                 }
             }
             R::Cast(kind, operand, target) => {
@@ -549,6 +641,17 @@ impl<'a> Converter<'a> {
                             target.kind_name()
                         )),
                     },
+                    mir::CastKind::PointerCoercion(mir::PointerCoercion::Unsize) => {
+                        ir::Rvalue::Unsize(v)
+                    }
+                    // These coercions do not change the reference
+                    // value in this model (a reference carries no
+                    // mutability or pointee type at run time).
+                    mir::CastKind::PointerCoercion(
+                        mir::PointerCoercion::MutToConstPointer
+                        | mir::PointerCoercion::ArrayToPointer,
+                    ) => ir::Rvalue::Use(v),
+                    mir::CastKind::PtrToPtr => ir::Rvalue::Use(v),
                     other => ir::Rvalue::Unsupported(format!("Cast {}", other.name())),
                 }
             }
@@ -556,6 +659,9 @@ impl<'a> Converter<'a> {
                 mir::AggregateKind::Tuple | mir::AggregateKind::Array(_) => {
                     let elem_tys: Vec<mir::Ty> = match dest_ty {
                         Some(mir::Ty::Tuple(ts)) => ts.clone(),
+                        Some(mir::Ty::Array(elem, _)) => {
+                            vec![(**elem).clone(); ops.len()]
+                        }
                         _ => Vec::new(),
                     };
                     let mut items = Vec::with_capacity(ops.len());
@@ -564,6 +670,37 @@ impl<'a> Converter<'a> {
                         items.push(self.convert_operand(body, op, ctx)?);
                     }
                     ir::Rvalue::AggregateTuple(items)
+                }
+                mir::AggregateKind::Adt {
+                    def,
+                    variant_index,
+                    generic_args,
+                    ..
+                } => {
+                    // For `Range` / `RangeInclusive` the two bound
+                    // fields are the ADT's single generic parameter;
+                    // typing literal bounds by it keeps them from
+                    // being read as unsigned by default.
+                    let bound_ty = {
+                        let name = self.names.get(def).map(String::as_str);
+                        if matches!(
+                            name,
+                            Some("std::ops::Range" | "std::ops::RangeInclusive")
+                        ) {
+                            generic_args.first()
+                        } else {
+                            None
+                        }
+                    };
+                    let mut fields = Vec::with_capacity(ops.len());
+                    for (i, op) in ops.iter().enumerate() {
+                        let ctx = if i < 2 { bound_ty } else { None };
+                        fields.push(self.convert_operand(body, op, ctx)?);
+                    }
+                    ir::Rvalue::AggregateAdt {
+                        variant: *variant_index,
+                        operands: fields,
+                    }
                 }
                 other => ir::Rvalue::Unsupported(format!("Aggregate {}", other.kind_name())),
             },
@@ -578,14 +715,13 @@ impl<'a> Converter<'a> {
                 ir::Rvalue::AggregateTuple(vec![v; n])
             }
             R::Ref(_, _, place) => ir::Rvalue::Ref(self.convert_place(place)?),
-            R::CopyForDeref(place) => {
-                ir::Rvalue::Use(ir::Operand::Copy(self.convert_place(place)?))
-            }
-            R::RawPtr(_, _) => ir::Rvalue::Unsupported("RawPtr rvalue".to_string()),
+            R::CopyForDeref(place) => ir::Rvalue::CopyForDeref(self.convert_place(place)?),
+            // Raw pointer creation shares the reference representation.
+            R::RawPtr(_, place) => ir::Rvalue::Ref(self.convert_place(place)?),
             R::ThreadLocalRef(def) => ir::Rvalue::Unsupported(format!("ThreadLocalRef {def}")),
-            R::Len(_) => ir::Rvalue::Unsupported("Len rvalue".to_string()),
+            R::Len(place) => ir::Rvalue::Len(self.convert_place(place)?),
             R::NullaryOp(op, _) => ir::Rvalue::Unsupported(format!("NullaryOp {}", op.kind_name())),
-            R::Discriminant(_) => ir::Rvalue::Unsupported("Discriminant rvalue".to_string()),
+            R::Discriminant(place) => ir::Rvalue::Discriminant(self.convert_place(place)?),
             R::ShallowInitBox(_, _) => ir::Rvalue::Unsupported("ShallowInitBox rvalue".to_string()),
         })
     }
@@ -621,8 +757,14 @@ impl<'a> Converter<'a> {
             | S::AscribeUserType(..)
             | S::Coverage
             | S::ConstEvalCounter => ir::Statement::nop(),
-            S::SetDiscriminant { .. } => ir::Statement {
-                kind: ir::StatementKind::Unsupported("SetDiscriminant".to_string()),
+            S::SetDiscriminant {
+                place,
+                variant_index,
+            } => ir::Statement {
+                kind: ir::StatementKind::SetDiscriminant {
+                    place: self.convert_place(place)?,
+                    variant: *variant_index,
+                },
             },
             S::Intrinsic(intr) => ir::Statement {
                 kind: ir::StatementKind::Unsupported(format!("Intrinsic {}", intr.kind_name())),
@@ -638,6 +780,77 @@ impl<'a> Converter<'a> {
             mir::ConstKind::Ty(mir::Ty::FnDef(def, _)) => self.def_names.get(def).cloned(),
             mir::ConstKind::Unevaluated { def, .. } => self.def_names.get(def).cloned(),
             _ => None,
+        }
+    }
+
+    /// Resolve a callee that has no converted body through the
+    /// driver's full name table (std/core functions): its display
+    /// name, its rendered generic arguments, and the raw generic
+    /// arguments (used to type literal arguments whose type the
+    /// callee's signature pins to a generic parameter).
+    fn resolve_external_callee(
+        &self,
+        func: &mir::Operand,
+    ) -> Option<(String, Vec<String>, Vec<mir::Ty>)> {
+        let mir::Operand::Constant(c) = func else {
+            return None;
+        };
+        match &c.literal {
+            mir::ConstKind::Ty(mir::Ty::FnDef(def, generic_args)) => {
+                let name = self.names.get(def).cloned()?;
+                let tags = generic_args
+                    .iter()
+                    .map(|t| crate::builtins::ty_tag(t, self.names))
+                    .collect();
+                Some((name, tags, generic_args.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether dropping a value of this type provably has no
+    /// guest-observable effect in this value model: plain data drops
+    /// nothing; references drop nothing; the listed std types only
+    /// deallocate or drop their (recursively unobservable) contents.
+    /// Anything else — user types that may implement `Drop`, closures,
+    /// trait objects — stays an explicit error.
+    fn drop_is_unobservable(&self, ty: &mir::Ty) -> bool {
+        match ty {
+            mir::Ty::Bool
+            | mir::Ty::Char
+            | mir::Ty::Int(_)
+            | mir::Ty::Uint(_)
+            | mir::Ty::Float(_)
+            | mir::Ty::Never
+            | mir::Ty::Str => true,
+            mir::Ty::Tuple(ts) => ts.iter().all(|t| self.drop_is_unobservable(t)),
+            mir::Ty::Array(elem, _) | mir::Ty::Slice(elem) => self.drop_is_unobservable(elem),
+            mir::Ty::Ref(..) | mir::Ty::RawPtr(..) | mir::Ty::FnDef(..) | mir::Ty::FnPtr(_) => {
+                true
+            }
+            mir::Ty::Adt(def, args) => {
+                let name = self
+                    .names
+                    .get(def)
+                    .or_else(|| self.def_names.get(def))
+                    .map(String::as_str);
+                let known = matches!(
+                    name,
+                    Some(
+                        "std::string::String"
+                            | "std::vec::Vec"
+                            | "std::boxed::Box"
+                            | "std::array::IntoIter"
+                            | "std::option::Option"
+                            | "std::fmt::Arguments"
+                            | "core::fmt::rt::Argument"
+                            | "std::ops::Range"
+                            | "std::ops::RangeInclusive"
+                    )
+                );
+                known && args.iter().all(|t| self.drop_is_unobservable(t))
+            }
+            _ => false,
         }
     }
 
@@ -674,8 +887,8 @@ impl<'a> Converter<'a> {
                 destination,
                 target,
                 ..
-            } => match self.resolve_callee(func) {
-                Some(name) => {
+            } => {
+                if let Some(name) = self.resolve_callee(func) {
                     let callee = self.bodies.get(&name);
                     let mut ir_args = Vec::with_capacity(args.len());
                     for (i, arg) in args.iter().enumerate() {
@@ -689,11 +902,34 @@ impl<'a> Converter<'a> {
                         destination: self.convert_place(destination)?,
                         target: target.map(|b| ir::BasicBlock(b.index())),
                     }
+                } else if let Some((name, generic_args, raw_generic_args)) =
+                    self.resolve_external_callee(func)
+                {
+                    let canonical = crate::builtins::canonical_name(&name);
+                    if let Some(kind) = crate::builtins::lookup(&canonical) {
+                        let mut ir_args = Vec::with_capacity(args.len());
+                        for (i, arg) in args.iter().enumerate() {
+                            let ctx = builtin_arg_ctx(kind, &raw_generic_args, i);
+                            ir_args.push(self.convert_operand(body, arg, ctx.as_ref())?);
+                        }
+                        ir::TerminatorKind::CallBuiltin {
+                            name: canonical,
+                            generic_args,
+                            args: ir_args,
+                            destination: self.convert_place(destination)?,
+                            target: target.map(|b| ir::BasicBlock(b.index())),
+                        }
+                    } else {
+                        ir::TerminatorKind::Unsupported(format!(
+                            "Call to {name} (no converted body)"
+                        ))
+                    }
+                } else {
+                    ir::TerminatorKind::Unsupported(
+                        "Call to unresolved function operand".to_string(),
+                    )
                 }
-                None => ir::TerminatorKind::Unsupported(
-                    "Call to unresolved function operand".to_string(),
-                ),
-            },
+            }
             T::Assert {
                 cond,
                 expected,
@@ -711,6 +947,16 @@ impl<'a> Converter<'a> {
             T::FalseEdge { real_target, .. } | T::FalseUnwind { real_target, .. } => {
                 ir::TerminatorKind::Goto {
                     target: ir::BasicBlock(real_target.index()),
+                }
+            }
+            T::Drop { place, target, .. }
+                if self
+                    .place_ty(body, place)
+                    .is_some_and(|t| self.drop_is_unobservable(&t)) =>
+            {
+                ir::TerminatorKind::Drop {
+                    place: self.convert_place(place)?,
+                    target: ir::BasicBlock(target.index()),
                 }
             }
             T::Drop { .. } => ir::TerminatorKind::Unsupported("Drop".to_string()),
@@ -808,6 +1054,50 @@ fn uint_ty_of_bits(bits: u32) -> Option<mir::UintTy> {
         128 => mir::UintTy::U128,
         _ => return None,
     })
+}
+
+/// The typing context for one argument of a runtime-support call.
+/// Most builtin arguments are places or string/byte constants, whose
+/// conversion does not depend on a context; the exceptions are
+/// literal arguments whose type the callee's signature pins to a
+/// generic parameter (`RangeInclusive::new`'s bounds are its `Idx`)
+/// or to a fixed type (`Argument::from_usize` takes `usize`).
+fn builtin_arg_ctx(
+    kind: crate::builtins::Builtin,
+    raw_generic_args: &[mir::Ty],
+    arg_index: usize,
+) -> Option<mir::Ty> {
+    use crate::builtins::Builtin;
+    match kind {
+        Builtin::RangeInclusiveNew => {
+            if arg_index < 2 {
+                raw_generic_args.first().cloned()
+            } else {
+                None
+            }
+        }
+        Builtin::ArgumentFromUsize => Some(mir::Ty::Uint(mir::UintTy::Usize)),
+        _ => None,
+    }
+}
+
+/// The element size in bytes of the pointee of a constant's context
+/// type, when it is a scalar-element array/slice behind any number of
+/// references. `None` when it cannot be derived.
+fn pointee_elem_size(ctx: Option<&mir::Ty>) -> Option<u64> {
+    match ctx {
+        Some(mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _)) => {
+            pointee_elem_size(Some(inner))
+        }
+        Some(mir::Ty::Array(elem, _) | mir::Ty::Slice(elem)) => match &**elem {
+            mir::Ty::Bool => Some(1),
+            mir::Ty::Char => Some(4),
+            mir::Ty::Int(it) => Some(u64::from(it.bits()) / 8),
+            mir::Ty::Uint(ut) => Some(u64::from(ut.bits()) / 8),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Sign-extend the low `bits` of `data` into an `i128`.

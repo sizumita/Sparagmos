@@ -7,16 +7,22 @@
 //! input instead of against expectations written by hand.
 //!
 //! The interpreter executes the minimal MIR-like IR defined in
-//! [`ir`], modelled on rustc MIR as of Rust 1.100.0. Implemented in this
-//! first cut:
+//! [`ir`], modelled on rustc MIR as of Rust 1.100.0. Implemented:
 //!
-//! * values: signed/unsigned integers (width-aware), bool, unit, tuples;
-//! * frames with a locals array, basic-block execution;
+//! * values: signed/unsigned integers (width-aware), bool, unit, tuples,
+//!   ADT aggregates (variant + fields), string/byte data, resolved
+//!   references and fat pointers, and the `fmt` value family;
+//! * frames with a locals array, basic-block execution; places resolve
+//!   across frames so references read and write through;
 //! * assignments, binary / unary / checked-binary operations
 //!   (overflow of a plain operation is a guest panic, a checked operation
-//!   yields `(value, overflowed)`), tuple aggregates, scalar casts;
+//!   yields `(value, overflowed)`), aggregates, scalar casts, unsizing
+//!   casts, `Len` / `Discriminant` / `PtrMetadata`;
 //! * terminators: `goto`, `switchInt`, intra-module `call`/`return`
-//!   (recursion included), `assert`, `return`, `unreachable`;
+//!   (recursion included), runtime-support calls ([`builtins`]: printing
+//!   and formatting, fmt argument construction, modelled std iterators),
+//!   `drop` (for types with provably unobservable drop glue), `assert`,
+//!   `return`, `unreachable`;
 //! * a step limit and a call-depth limit, so no input can hang the oracle;
 //! * explicit errors for every unimplemented statement / terminator /
 //!   rvalue / projection — nothing is silently skipped.
@@ -44,6 +50,7 @@
 //! `sparagmos-mir` bodies). The interpreter core (frames, arithmetic,
 //! limits) is unchanged by that layer.
 
+pub mod builtins;
 pub mod error;
 pub mod interp;
 pub mod ir;
@@ -57,6 +64,7 @@ pub use ir::{
     ProjectionElem, Rvalue, Statement, StatementKind, TerminatorKind, Ty, UnOp,
 };
 pub use mir_convert::{
-    convert_program, interpret_mir, ConvertError, MirFunction, MirProgram, MirRunError,
+    convert_program, interpret_mir, interpret_mir_captured, CapturedRun, ConvertError,
+    MirFunction, MirProgram, MirRunError,
 };
-pub use value::Value;
+pub use value::{FmtArguments, FmtTrait, RefProj, RefTarget, Value};
