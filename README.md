@@ -13,7 +13,7 @@ LLVM, no Wasmtime): Sparagmos emits x86_64 machine code itself.
 ## Layout
 
 - `crates/sparagmos-mir` — MIR type definitions (our own model of rustc MIR)
-- `crates/sparagmos-parse` — parser for textual MIR (`rustc --emit=mir`)
+- `crates/sparagmos-driver` — rustc driver that obtains MIR via Stable MIR (rustc_public) and converts it to our model; builds separately with the 1.100.0 toolchain
 - `crates/sparagmos-interp` — MIR interpreter (correctness oracle)
 - `crates/sparagmos-jit` — x86_64 baseline JIT (own assembler/emitter)
 - `crates/sparagmos-runtime` — allocation, panic, intrinsics, std support
