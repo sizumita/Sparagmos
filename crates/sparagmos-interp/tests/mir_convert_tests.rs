@@ -877,11 +877,7 @@ fn box_deref_body(tail: Vec<mir::Statement>) -> mir::Body {
         ),
         assign(
             place(7),
-            mir::Rvalue::Cast(
-                mir::CastKind::BoxDerefTransmute,
-                copy(6),
-                raw_ptr_i32_ty(),
-            ),
+            mir::Rvalue::Cast(mir::CastKind::BoxDerefTransmute, copy(6), raw_ptr_i32_ty()),
         ),
     ];
     stmts.extend(tail);
@@ -937,11 +933,7 @@ fn box_deref_transmute_rejects_non_wrapper() {
                 assign(place(1), mir::Rvalue::Use(const_i32(5))),
                 assign(
                     place(2),
-                    mir::Rvalue::Cast(
-                        mir::CastKind::BoxDerefTransmute,
-                        copy(1),
-                        raw_ptr_i32_ty(),
-                    ),
+                    mir::Rvalue::Cast(mir::CastKind::BoxDerefTransmute, copy(1), raw_ptr_i32_ty()),
                 ),
                 assign(place(0), mir::Rvalue::Use(const_i32(0))),
             ],
@@ -953,10 +945,7 @@ fn box_deref_transmute_rejects_non_wrapper() {
     let err = interpret_mir(&prog, "bad_cast", vec![])
         .expect_err("BoxDerefTransmute of an integer must fail");
     assert!(
-        matches!(
-            err,
-            MirRunError::Interp(InterpError::TypeMismatch { .. })
-        ),
+        matches!(err, MirRunError::Interp(InterpError::TypeMismatch { .. })),
         "expected a type mismatch, got {err}"
     );
 }
