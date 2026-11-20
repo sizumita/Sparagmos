@@ -799,8 +799,9 @@ class ProcMacroExternTests(unittest.TestCase):
     def stub_build(self, result):
         calls = []
 
-        def fake(test_path, fname, edition):
-            calls.append((test_path, fname, edition))
+        def fake(test_path, fname, edition, extra_externs=()):
+            calls.append((test_path, fname, edition,
+                          list(extra_externs)))
             return result
 
         run.build_proc_macro = fake
@@ -885,6 +886,36 @@ class ProcMacroExternTests(unittest.TestCase):
         self.assertIsNone(err)
         self.assertEqual([(n, f) for n, _, f in chain],
                          [("dep", None), ("pm", "proc-macro")])
+
+    def test_later_directive_build_sees_earlier_crate(self):
+        seen_extra = []
+
+        def fake(test_path, fname, edition, extra_externs=()):
+            seen_extra.append((fname, list(extra_externs)))
+            stem = fname[:-3].replace("-", "_")
+            return (stem, Path(f"/c/lib{stem}.so"), None)
+
+        run.build_proc_macro = fake
+        view = run.Header(
+            "//@ check-pass\n//@ proc-macro: first-pm.rs\n"
+            "//@ proc-macro: second-pm.rs\n").view(None)
+        args, err = run.proc_macro_extern_args(
+            self.dir / "t.rs", view, "2021")
+        self.assertIsNone(err)
+        self.assertEqual(seen_extra[0], ("first-pm.rs", []))
+        self.assertEqual(seen_extra[1][0], "second-pm.rs")
+        self.assertEqual(seen_extra[1][1],
+                         [("first_pm", Path("/c/libfirst_pm.so"))])
+        self.assertEqual(
+            args,
+            ["--extern", "first_pm=/c/libfirst_pm.so",
+             "-L", "dependency=/c",
+             "--extern", "second_pm=/c/libsecond_pm.so"])
+
+    def test_concrete_edition_of_range_and_plain(self):
+        self.assertEqual(run._concrete_edition("2015..2021"), "2021")
+        self.assertEqual(run._concrete_edition("2021"), "2021")
+        self.assertEqual(run._concrete_edition("2018"), "2018")
 
     def test_stage2_attempt_forwards_extern_to_convert_side(self):
         rec_path = self.write(

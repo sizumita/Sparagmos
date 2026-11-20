@@ -698,7 +698,19 @@ def _proc_macro_chain(test_path, fname, edition):
     return chain, None
 
 
-def _build_proc_macro_chain(chain, edition, outdir):
+def _concrete_edition(edition):
+    """The single edition a range directive (`2015..2021`) ends
+    at. compiletest runs one instance per edition in the range;
+    the subset collapses a test to one attempt, and its aux
+    builds use the range's last edition, the same value the
+    attempt's own edition selection takes from the directive."""
+    if ".." in edition:
+        return edition.rsplit("..", 1)[-1].strip()
+    return edition
+
+
+def _build_proc_macro_chain(chain, edition, outdir, extra_externs=()):
+
     """Build a resolved proc-macro chain into outdir.
 
     Mirrors native_side's auxiliary-crate builds: dependency
@@ -708,13 +720,14 @@ def _build_proc_macro_chain(chain, edition, outdir):
     artifact, error) for the chain's last crate, the proc-macro
     crate itself.
     """
-    built = []
+    built = list(extra_externs)
     for cname, csrc, forced in chain:
         text = csrc.read_text(errors="ignore")
         eff_name = declared_crate_name(text) or cname
         aux_view = Header(text).view(None)
         editions = aux_view.values("edition")
-        ced = editions[-1].strip() if editions else edition
+        ced = _concrete_edition(editions[-1].strip()) if editions \
+            else edition
         declared = declared_crate_type(text)
         cmd = rustc_cmd() + ["--edition", ced, "--out-dir", str(outdir)]
         lib = sysroot_lib()
@@ -725,9 +738,21 @@ def _build_proc_macro_chain(chain, edition, outdir):
             cmd += ["--crate-type", forced or "rlib"]
         if declared_crate_name(text) is None:
             cmd += ["--crate-name", cname]
+        # A distinct -C metadata keeps an auxiliary crate whose
+        # name matches the test crate's own name distinguishable
+        # from it (E0519); compiletest arranges the same
+        # distinction for same-named auxiliary crates.
+        meta = hashlib.sha256(str(csrc).encode()).hexdigest()[:12]
+        cmd += ["-C", f"metadata=sparagmos-aux-{meta}"]
         for prev_name, prev_artifact in built:
             if prev_artifact is not None:
                 cmd += ["--extern", f"{prev_name}={prev_artifact}"]
+        if forced is not None:
+            # compiletest links the proc_macro library crate into
+            # proc-macro auxiliary builds with a bare --extern, so
+            # sources may `use proc_macro::...` without declaring
+            # it; without it such sources fail with E0432.
+            cmd += ["--extern", "proc_macro"]
         cmd += compile_flags(aux_view)
         cmd += [str(csrc)]
         build = run_cmd(cmd, timeout=NATIVE_COMPILE_TIMEOUT,
@@ -751,20 +776,30 @@ def _build_proc_macro_chain(chain, edition, outdir):
     return name, artifact, None
 
 
-def build_proc_macro(test_path, fname, edition):
+def build_proc_macro(test_path, fname, edition, extra_externs=()):
     """Build the proc-macro crate a `//@ proc-macro:` directive names.
 
     Returns (crate_name, artifact, error). Builds are cached: the
     same auxiliary crate backs many tests (test-macros.rs alone
-    serves dozens), so a key over the chain's source contents and
-    the test edition maps to one on-disk build shared by every
-    caller, across revisions and repeated runs.
+    serves dozens), so a key over the chain's source contents, the
+    test edition and any crates built earlier for the same test
+    (extra_externs, which this crate is linked against) maps to
+    one on-disk build shared by every caller, across revisions
+    and repeated runs.
     """
+    edition = _concrete_edition(edition)
     chain, err = _proc_macro_chain(test_path, fname, edition)
     if err:
         return None, None, err
     h = hashlib.sha256()
+    # Recipe version: bump when the build recipe changes (crate
+    # metadata disambiguation, the bare proc_macro extern, ...),
+    # so artifacts built by an older recipe are never reused.
+    h.update(b"sparagmos-pm-recipe-2")
     h.update(edition.encode())
+    for prev_name, prev_artifact in extra_externs:
+        h.update(prev_name.encode())
+        h.update(str(prev_artifact).encode())
     for cname, csrc, forced in chain:
         h.update(cname.encode())
         h.update(csrc.read_bytes())
@@ -786,7 +821,7 @@ def build_proc_macro(test_path, fname, edition):
         if result is None:
             tmpdir = Path(tempfile.mkdtemp(prefix="sparagmos-pm-build-"))
             name2, artifact2, err2 = _build_proc_macro_chain(
-                chain, edition, tmpdir)
+                chain, edition, tmpdir, extra_externs)
             if err2:
                 result = (None, None, err2)
             else:
@@ -815,11 +850,18 @@ def proc_macro_extern_args(test_path, view, edition):
         return [], None
     args = []
     seen_dirs = set()
+    built = []
     for fname in fnames:
-        name, artifact, err = build_proc_macro(test_path, fname, edition)
+        # Directive order matters: a later proc-macro crate may
+        # use an earlier one (compiletest links each auxiliary
+        # build against the ones before it), so each build sees
+        # the crates already built for this view as externs.
+        name, artifact, err = build_proc_macro(
+            test_path, fname, edition, extra_externs=built)
         if err:
             return [], (f"proc-macro auxiliary crate from {fname} "
                         f"could not be built: {err}")
+        built.append((name, artifact))
         args += ["--extern", f"{name}={artifact}"]
         dep_dir = str(artifact.parent)
         if dep_dir not in seen_dirs:
