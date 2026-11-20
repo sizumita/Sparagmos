@@ -11,6 +11,12 @@
 //! unsigned types and `bool`), so the plain 64-bit operations below
 //! are exact for any integer type of up to 64 bits.
 //!
+//! A floating-point value occupies one slot too, holding its IEEE
+//! 754 bit pattern: all 64 bits for `f64`, the low 32 bits for `f32`
+//! with the upper half zero. The compiler moves the pattern into an
+//! SSE register, computes there, and stores the pattern back, so the
+//! slot invariant is the same canonical-form story as for integers.
+//!
 //! The IR is deliberately *not* SSA: an instruction may write into a
 //! value slot that was written before (MIR locals are mutable, and the
 //! lowering maps each MIR local leaf onto one value slot).
@@ -87,6 +93,44 @@ pub enum BinOp {
 pub enum UnOp {
     Neg,
     Not,
+}
+
+/// A floating-point format the backend computes in. (`f16` and
+/// `f128` have no SSE scalar form and stay unsupported.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatKind {
+    F32,
+    F64,
+}
+
+impl FloatKind {
+    pub const fn bits(self) -> u32 {
+        match self {
+            FloatKind::F32 => 32,
+            FloatKind::F64 => 64,
+        }
+    }
+}
+
+/// Floating-point binary operations. The arithmetic forms follow
+/// IEEE 754 as Rust exposes it: division by zero yields an infinity
+/// (or NaN for 0/0), overflow yields an infinity, and `Rem` is
+/// Rust's `%` (the exact `fmod` remainder, sign of the dividend).
+/// The comparisons yield 0 or 1 with Rust's NaN rule: every
+/// comparison involving a NaN is false, except `Ne`, which is true.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatBinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
 /// The integer operations that have a checked (overflow-flagged) form
@@ -174,6 +218,44 @@ pub enum Instr {
     /// scratch buffer and then recorded through the usual panic
     /// path. Program compiles only.
     PanicShiftOverflow { amount: Operand, bits: u32 },
+    /// `dst = lhs op rhs` on floating-point values of format `kind`.
+    /// Operands and the result are bit patterns in their slots (see
+    /// the module docs); for the comparison forms the result is the
+    /// integer 0 or 1.
+    FloatBinOp {
+        dst: Value,
+        op: FloatBinOp,
+        kind: FloatKind,
+        lhs: Operand,
+        rhs: Operand,
+    },
+    /// `dst = src as <int>`: Rust's float-to-integer cast, which
+    /// saturates at the target type's bounds and maps NaN to 0.
+    /// `kind` is the source float format, `int` the target type.
+    FloatToInt {
+        dst: Value,
+        kind: FloatKind,
+        src: Operand,
+        int: IntKind,
+    },
+    /// `dst = src as <float>`: an integer-to-float cast with
+    /// round-to-nearest-even, for a source of type `int` and a
+    /// result of format `kind`.
+    IntToFloat {
+        dst: Value,
+        kind: FloatKind,
+        src: Operand,
+        int: IntKind,
+    },
+    /// `dst = src as <float>`: a float-to-float conversion. Widening
+    /// (`f32` to `f64`) is exact; narrowing rounds to nearest even
+    /// and overflows to an infinity, as Rust's `as` does.
+    FloatToFloat {
+        dst: Value,
+        kind: FloatKind,
+        src: Operand,
+        src_kind: FloatKind,
+    },
 }
 
 /// How a basic block ends.
@@ -268,6 +350,23 @@ impl FunctionBuilder {
     /// slot, which the loop examples use for mutable loop variables).
     pub fn push_raw(&mut self, instr: Instr) {
         self.cur_instrs.push(instr);
+    }
+    pub fn float_binop(
+        &mut self,
+        op: FloatBinOp,
+        kind: FloatKind,
+        lhs: impl Into<Operand>,
+        rhs: impl Into<Operand>,
+    ) -> Value {
+        let dst = self.fresh();
+        self.cur_instrs.push(Instr::FloatBinOp {
+            dst,
+            op,
+            kind,
+            lhs: lhs.into(),
+            rhs: rhs.into(),
+        });
+        dst
     }
     pub fn unop(&mut self, op: UnOp, src: impl Into<Operand>) -> Value {
         let dst = self.fresh();

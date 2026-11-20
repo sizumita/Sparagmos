@@ -41,6 +41,40 @@ impl Reg {
     pub const SYSV_ARG_REGS: [Reg; 6] = [Reg::Rdi, Reg::Rsi, Reg::Rdx, Reg::Rcx, Reg::R8, Reg::R9];
 }
 
+/// An SSE register (xmm0..xmm15), identified by its 4-bit encoding
+/// (bit 3 is the REX.R / REX.B extension bit), like [`Reg`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum Xmm {
+    Xmm0 = 0,
+    Xmm1 = 1,
+    Xmm2 = 2,
+    Xmm3 = 3,
+    Xmm4 = 4,
+    Xmm5 = 5,
+    Xmm6 = 6,
+    Xmm7 = 7,
+    Xmm8 = 8,
+    Xmm9 = 9,
+    Xmm10 = 10,
+    Xmm11 = 11,
+    Xmm12 = 12,
+    Xmm13 = 13,
+    Xmm14 = 14,
+    Xmm15 = 15,
+}
+
+impl Xmm {
+    /// Low 3 bits used inside ModRM / opcode fields.
+    fn low3(self) -> u8 {
+        (self as u8) & 0b111
+    }
+    /// Extension bit (registers xmm8..xmm15).
+    fn ext(self) -> bool {
+        (self as u8) & 0b1000 != 0
+    }
+}
+
 /// Condition codes for `jcc` / `setcc` (the low nibble of the opcode).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -417,6 +451,201 @@ impl Emitter {
     pub fn movzx_rax_al(&mut self) {
         self.buf.emit_bytes(&[0x48, 0x0F, 0xB6, 0xC0]);
     }
+    /// `setcc r8` for the low byte of any general register: 0F 9x /r.
+    /// Only the low byte is written; the rest of the register is
+    /// unchanged (zero it with [`Emitter::movzx_rr`] afterwards when
+    /// a clean 0/1 word is needed).
+    pub fn setcc_reg(&mut self, r: Reg, cc: Cond) {
+        if r.ext() {
+            self.rex(false, false, false, true);
+        }
+        self.buf.emit_u8(0x0F);
+        self.buf.emit_u8(0x90 + cc as u8);
+        self.modrm(0b11, 0, r.low3());
+    }
+    /// `movzx dst, src8` (64-bit destination, byte source): REX.W 0F B6 /r
+    pub fn movzx_rr(&mut self, dst: Reg, src: Reg) {
+        self.rex(true, dst.ext(), false, src.ext());
+        self.buf.emit_bytes(&[0x0F, 0xB6]);
+        self.modrm_rr(dst, src);
+    }
+
+    // ---- SSE (scalar floating point) --------------------------------------
+    //
+    // Legacy SSE encodings: an optional operand-size prefix byte
+    // (F2 = double, F3 = single, 66 = packed-double integer forms),
+    // then an optional REX, then 0F and the opcode. The ModRM reg
+    // field holds the destination xmm register for arithmetic and
+    // loads, the source xmm register for stores.
+
+    /// Register-direct SSE instruction: [prefix] [REX] 0F opcode /r
+    /// with reg = `reg` and r/m = `rm` (both xmm).
+    fn sse_rr(&mut self, prefix: Option<u8>, opcode: u8, reg: Xmm, rm: Xmm) {
+        if let Some(p) = prefix {
+            self.buf.emit_u8(p);
+        }
+        if reg.ext() || rm.ext() {
+            self.rex(false, reg.ext(), false, rm.ext());
+        }
+        self.buf.emit_u8(0x0F);
+        self.buf.emit_u8(opcode);
+        self.modrm(0b11, reg.low3(), rm.low3());
+    }
+    /// SSE instruction with reg = `reg` (xmm) and r/m = `[base + disp]`.
+    fn sse_rm(&mut self, prefix: Option<u8>, opcode: u8, reg: Xmm, base: Reg, disp: i32) {
+        if let Some(p) = prefix {
+            self.buf.emit_u8(p);
+        }
+        if reg.ext() || base.ext() {
+            self.rex(false, reg.ext(), false, base.ext());
+        }
+        self.buf.emit_u8(0x0F);
+        self.buf.emit_u8(opcode);
+        self.modrm_mem(reg.low3(), base, disp);
+    }
+    /// SSE conversion between a 64-bit general register and an xmm
+    /// register: [prefix] REX.W 0F opcode /r. The two ModRM fields
+    /// are passed in encoding order as `(low3, ext)` pairs, because
+    /// which side is source vs destination depends on the opcode:
+    /// `cvttsd2si` puts the general register in the reg field, the
+    /// `cvtsi2sd` / `movq` forms put the xmm register there.
+    fn sse_cvt(&mut self, prefix: u8, opcode: u8, reg: (u8, bool), rm: (u8, bool)) {
+        self.buf.emit_u8(prefix);
+        self.rex(true, reg.1, false, rm.1);
+        self.buf.emit_u8(0x0F);
+        self.buf.emit_u8(opcode);
+        self.modrm(0b11, reg.0, rm.0);
+    }
+
+    /// `movsd dst, [base + disp]`: F2 0F 10 /r
+    pub fn movsd_load(&mut self, dst: Xmm, base: Reg, disp: i32) {
+        self.sse_rm(Some(0xF2), 0x10, dst, base, disp);
+    }
+    /// `movsd [base + disp], src`: F2 0F 11 /r
+    pub fn movsd_store(&mut self, base: Reg, disp: i32, src: Xmm) {
+        self.sse_rm(Some(0xF2), 0x11, src, base, disp);
+    }
+    /// `movss dst, [base + disp]`: F3 0F 10 /r
+    pub fn movss_load(&mut self, dst: Xmm, base: Reg, disp: i32) {
+        self.sse_rm(Some(0xF3), 0x10, dst, base, disp);
+    }
+    /// `movss [base + disp], src`: F3 0F 11 /r
+    pub fn movss_store(&mut self, base: Reg, disp: i32, src: Xmm) {
+        self.sse_rm(Some(0xF3), 0x11, src, base, disp);
+    }
+
+    /// Shared encoder for the scalar arithmetic family
+    /// (`dst = dst op src` in xmm registers).
+    fn sse_arith(&mut self, prefix: u8, opcode: u8, dst: Xmm, src: Xmm) {
+        self.sse_rr(Some(prefix), opcode, dst, src);
+    }
+    /// `addsd dst, src`: F2 0F 58 /r
+    pub fn addsd(&mut self, dst: Xmm, src: Xmm) {
+        self.sse_arith(0xF2, 0x58, dst, src);
+    }
+    /// `subsd dst, src`: F2 0F 5C /r
+    pub fn subsd(&mut self, dst: Xmm, src: Xmm) {
+        self.sse_arith(0xF2, 0x5C, dst, src);
+    }
+    /// `mulsd dst, src`: F2 0F 59 /r
+    pub fn mulsd(&mut self, dst: Xmm, src: Xmm) {
+        self.sse_arith(0xF2, 0x59, dst, src);
+    }
+    /// `divsd dst, src`: F2 0F 5E /r
+    pub fn divsd(&mut self, dst: Xmm, src: Xmm) {
+        self.sse_arith(0xF2, 0x5E, dst, src);
+    }
+    /// `addss dst, src`: F3 0F 58 /r
+    pub fn addss(&mut self, dst: Xmm, src: Xmm) {
+        self.sse_arith(0xF3, 0x58, dst, src);
+    }
+    /// `subss dst, src`: F3 0F 5C /r
+    pub fn subss(&mut self, dst: Xmm, src: Xmm) {
+        self.sse_arith(0xF3, 0x5C, dst, src);
+    }
+    /// `mulss dst, src`: F3 0F 59 /r
+    pub fn mulss(&mut self, dst: Xmm, src: Xmm) {
+        self.sse_arith(0xF3, 0x59, dst, src);
+    }
+    /// `divss dst, src`: F3 0F 5E /r
+    pub fn divss(&mut self, dst: Xmm, src: Xmm) {
+        self.sse_arith(0xF3, 0x5E, dst, src);
+    }
+
+    /// `ucomisd dst, src`: 66 0F 2E /r — compares dst with src and
+    /// sets EFLAGS like an unsigned comparison (PF set when either
+    /// operand is NaN). (0F 2E is UCOMISD; the 0F 2F form, COMISD,
+    /// additionally raises #IA on QNaN operands.)
+    pub fn ucomisd(&mut self, dst: Xmm, src: Xmm) {
+        self.sse_rr(Some(0x66), 0x2E, dst, src);
+    }
+    /// `ucomiss dst, src`: 0F 2E /r
+    pub fn ucomiss(&mut self, dst: Xmm, src: Xmm) {
+        self.sse_rr(None, 0x2E, dst, src);
+    }
+
+    /// `cvtss2sd dst, src` (f32 -> f64, exact): F3 0F 5A /r
+    pub fn cvtss2sd(&mut self, dst: Xmm, src: Xmm) {
+        self.sse_rr(Some(0xF3), 0x5A, dst, src);
+    }
+    /// `cvtsd2ss dst, src` (f64 -> f32, rounds to nearest even):
+    /// F2 0F 5A /r
+    pub fn cvtsd2ss(&mut self, dst: Xmm, src: Xmm) {
+        self.sse_rr(Some(0xF2), 0x5A, dst, src);
+    }
+    /// `cvttsd2si dst, src` (f64 -> i64, truncating; the indefinite
+    /// value i64::MIN on NaN / overflow): F2 REX.W 0F 2C /r
+    pub fn cvttsd2si(&mut self, dst: Reg, src: Xmm) {
+        self.sse_cvt(0xF2, 0x2C, (dst.low3(), dst.ext()), (src.low3(), src.ext()));
+    }
+    /// `cvttss2si dst, src` (f32 -> i64, truncating): F3 REX.W 0F 2C /r
+    pub fn cvttss2si(&mut self, dst: Reg, src: Xmm) {
+        self.sse_cvt(0xF3, 0x2C, (dst.low3(), dst.ext()), (src.low3(), src.ext()));
+    }
+    /// `cvtsi2sd dst, src` (i64 -> f64): F2 REX.W 0F 2A /r
+    pub fn cvtsi2sd(&mut self, dst: Xmm, src: Reg) {
+        self.sse_cvt(0xF2, 0x2A, (dst.low3(), dst.ext()), (src.low3(), src.ext()));
+    }
+    /// `cvtsi2ss dst, src` (i64 -> f32): F3 REX.W 0F 2A /r
+    pub fn cvtsi2ss(&mut self, dst: Xmm, src: Reg) {
+        self.sse_cvt(0xF3, 0x2A, (dst.low3(), dst.ext()), (src.low3(), src.ext()));
+    }
+    /// `movd dst, src32` (general register's low 32 bits into an xmm
+    /// register; the xmm register's other bits are zeroed):
+    /// 66 0F 6E /r
+    pub fn movd_xmm(&mut self, dst: Xmm, src: Reg) {
+        self.buf.emit_u8(0x66);
+        if dst.ext() || src.ext() {
+            self.rex(false, dst.ext(), false, src.ext());
+        }
+        self.buf.emit_u8(0x0F);
+        self.buf.emit_u8(0x6E);
+        self.modrm(0b11, dst.low3(), src.low3());
+    }
+    /// `movd dst32, src` (an xmm register's low 32 bits into a
+    /// general register, zero-extended): 66 0F 7E /r
+    pub fn movd_gpr(&mut self, dst: Reg, src: Xmm) {
+        self.buf.emit_u8(0x66);
+        if src.ext() || dst.ext() {
+            self.rex(false, src.ext(), false, dst.ext());
+        }
+        self.buf.emit_u8(0x0F);
+        self.buf.emit_u8(0x7E);
+        self.modrm(0b11, src.low3(), dst.low3());
+    }
+    /// `movq dst, src` (general register into an xmm register):
+    /// 66 REX.W 0F 6E /r
+    pub fn movq_xmm(&mut self, dst: Xmm, src: Reg) {
+        self.sse_cvt(0x66, 0x6E, (dst.low3(), dst.ext()), (src.low3(), src.ext()));
+    }
+    /// `movq dst, src` (an xmm register's low 64 bits into a general
+    /// register): 66 REX.W 0F 7E /r — the reg field holds the xmm
+    /// source, the r/m field the general-register destination. (This
+    /// is the 64-bit form of the `movd` store encoding; the 0F D6
+    /// form takes an xmm register as its r/m operand instead.)
+    pub fn movq_gpr(&mut self, dst: Reg, src: Xmm) {
+        self.sse_cvt(0x66, 0x7E, (src.low3(), src.ext()), (dst.low3(), dst.ext()));
+    }
 
     // ---- control flow ------------------------------------------------------------
     // Each branch encoder returns the offset of its rel32 field so callers can
@@ -575,6 +804,72 @@ mod tests {
         assert_eq!(
             enc(|e| e.lea(Reg::Rdx, Reg::Rbp, 256)),
             [0x48, 0x8D, 0x95, 0x00, 0x01, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn sse_bytes() {
+        // addsd xmm0, xmm1 = F2 0F 58 C1 ; subsd xmm1, xmm0 = F2 0F 5C C8
+        assert_eq!(enc(|e| e.addsd(Xmm::Xmm0, Xmm::Xmm1)), [0xF2, 0x0F, 0x58, 0xC1]);
+        assert_eq!(enc(|e| e.subsd(Xmm::Xmm1, Xmm::Xmm0)), [0xF2, 0x0F, 0x5C, 0xC8]);
+        // addss xmm0, xmm1 = F3 0F 58 C1 ; divss xmm0, xmm1 = F3 0F 5E C1
+        assert_eq!(enc(|e| e.addss(Xmm::Xmm0, Xmm::Xmm1)), [0xF3, 0x0F, 0x58, 0xC1]);
+        assert_eq!(enc(|e| e.divss(Xmm::Xmm0, Xmm::Xmm1)), [0xF3, 0x0F, 0x5E, 0xC1]);
+        // movsd xmm0, [rbp-8] = F2 0F 10 45 F8 ; movsd [rbp-8], xmm0 = F2 0F 11 45 F8
+        assert_eq!(
+            enc(|e| e.movsd_load(Xmm::Xmm0, Reg::Rbp, -8)),
+            [0xF2, 0x0F, 0x10, 0x45, 0xF8]
+        );
+        assert_eq!(
+            enc(|e| e.movsd_store(Reg::Rbp, -8, Xmm::Xmm0)),
+            [0xF2, 0x0F, 0x11, 0x45, 0xF8]
+        );
+        // movss xmm0, [rbp-8] = F3 0F 10 45 F8
+        assert_eq!(
+            enc(|e| e.movss_load(Xmm::Xmm0, Reg::Rbp, -8)),
+            [0xF3, 0x0F, 0x10, 0x45, 0xF8]
+        );
+        // ucomisd xmm0, xmm1 = 66 0F 2E C1 ; ucomiss xmm0, xmm1 = 0F 2E C1
+        assert_eq!(enc(|e| e.ucomisd(Xmm::Xmm0, Xmm::Xmm1)), [0x66, 0x0F, 0x2E, 0xC1]);
+        assert_eq!(enc(|e| e.ucomiss(Xmm::Xmm0, Xmm::Xmm1)), [0x0F, 0x2E, 0xC1]);
+        // cvtss2sd xmm0, xmm1 = F3 0F 5A C1 ; cvtsd2ss xmm0, xmm1 = F2 0F 5A C1
+        assert_eq!(enc(|e| e.cvtss2sd(Xmm::Xmm0, Xmm::Xmm1)), [0xF3, 0x0F, 0x5A, 0xC1]);
+        assert_eq!(enc(|e| e.cvtsd2ss(Xmm::Xmm0, Xmm::Xmm1)), [0xF2, 0x0F, 0x5A, 0xC1]);
+        // cvttsd2si rax, xmm0 = F2 48 0F 2C C0 ; cvttss2si rdx, xmm1 = F3 48 0F 2C D1
+        assert_eq!(
+            enc(|e| e.cvttsd2si(Reg::Rax, Xmm::Xmm0)),
+            [0xF2, 0x48, 0x0F, 0x2C, 0xC0]
+        );
+        assert_eq!(
+            enc(|e| e.cvttss2si(Reg::Rdx, Xmm::Xmm1)),
+            [0xF3, 0x48, 0x0F, 0x2C, 0xD1]
+        );
+        // cvtsi2sd xmm0, rax = F2 48 0F 2A C0 ; cvtsi2ss xmm1, rcx = F3 48 0F 2A C9
+        assert_eq!(
+            enc(|e| e.cvtsi2sd(Xmm::Xmm0, Reg::Rax)),
+            [0xF2, 0x48, 0x0F, 0x2A, 0xC0]
+        );
+        assert_eq!(
+            enc(|e| e.cvtsi2ss(Xmm::Xmm1, Reg::Rcx)),
+            [0xF3, 0x48, 0x0F, 0x2A, 0xC9]
+        );
+        // movd xmm0, eax = 66 0F 6E C0 ; movd eax, xmm0 = 66 0F 7E C0
+        assert_eq!(enc(|e| e.movd_xmm(Xmm::Xmm0, Reg::Rax)), [0x66, 0x0F, 0x6E, 0xC0]);
+        assert_eq!(enc(|e| e.movd_gpr(Reg::Rax, Xmm::Xmm0)), [0x66, 0x0F, 0x7E, 0xC0]);
+        // movq xmm0, rax = 66 48 0F 6E C0 ; movq rax, xmm0 = 66 48 0F 7E C0
+        assert_eq!(
+            enc(|e| e.movq_xmm(Xmm::Xmm0, Reg::Rax)),
+            [0x66, 0x48, 0x0F, 0x6E, 0xC0]
+        );
+        assert_eq!(
+            enc(|e| e.movq_gpr(Reg::Rax, Xmm::Xmm0)),
+            [0x66, 0x48, 0x0F, 0x7E, 0xC0]
+        );
+        // setp cl = 0F 9A C1 ; movzx rax, rcx = 48 0F B6 C1
+        assert_eq!(enc(|e| e.setcc_reg(Reg::Rcx, Cond::Parity)), [0x0F, 0x9A, 0xC1]);
+        assert_eq!(
+            enc(|e| e.movzx_rr(Reg::Rax, Reg::Rcx)),
+            [0x48, 0x0F, 0xB6, 0xC1]
         );
     }
 
