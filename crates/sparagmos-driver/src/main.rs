@@ -525,8 +525,25 @@ fn execute(c: &Collected) -> i32 {
 /// the declaration decides the artifact kind and the driver passes
 /// no `--crate-type` of its own.
 fn declared_crate_type(src: &str) -> Option<String> {
-    let idx = src.find("crate_type")?;
-    let rest = &src[idx + "crate_type".len()..];
+    declared_inner_attr(src, "crate_type")
+}
+
+/// The crate name an auxiliary source declares for itself
+/// (`#![crate_name = "..."]`), if any. When a source declares one,
+/// the declaration is the crate's name (compiletest links the crate
+/// under it, and the test refers to it by it), so the driver passes
+/// no `--crate-name` of its own — rustc rejects a `--crate-name`
+/// that differs from the declaration.
+fn declared_crate_name(src: &str) -> Option<String> {
+    declared_inner_attr(src, "crate_name")
+}
+
+/// Read an inner-attribute string value (`#![<attr> = "..."]`) from
+/// a source file: the first quoted string after the first
+/// occurrence of the attribute name.
+fn declared_inner_attr(src: &str, attr: &str) -> Option<String> {
+    let idx = src.find(attr)?;
+    let rest = &src[idx + attr.len()..];
     let q1 = rest.find('"')?;
     let rest = &rest[q1 + 1..];
     let q2 = rest.find('"')?;
@@ -578,6 +595,8 @@ fn compile_aux(
         .map_err(|e| format!("cannot read auxiliary source {src_path}: {e}"))?;
     let declared = declared_crate_type(&src_text);
     let effective_type = declared.as_deref().unwrap_or("rlib");
+    let declared_name = declared_crate_name(&src_text);
+    let effective_name = declared_name.as_deref().unwrap_or(name);
     let rustc = std::path::Path::new(sysroot).join("bin").join("rustc");
     let mut cmd = std::process::Command::new(&rustc);
     // `-Zalways-encode-mir` makes the compiler encode every
@@ -593,13 +612,15 @@ fn compile_aux(
     cmd.arg(src_path)
         .arg("-Zalways-encode-mir")
         .arg(format!("--edition={edition}"))
-        .arg(format!("--crate-name={name}"))
         .arg(format!("--out-dir={}", aux_dir.display()))
         .arg(format!("--sysroot={sysroot}"))
         .arg("-L")
         .arg(format!("dependency={}", aux_dir.display()));
     if declared.is_none() {
         cmd.arg("--crate-type=rlib");
+    }
+    if declared_name.is_none() {
+        cmd.arg(format!("--crate-name={name}"));
     }
     for prev in previous {
         if let Some(artifact) = &prev.artifact {
@@ -623,7 +644,7 @@ fn compile_aux(
     if let Ok(entries) = std::fs::read_dir(aux_dir) {
         for entry in entries.flatten() {
             let fname = entry.file_name().to_string_lossy().into_owned();
-            if !fname.starts_with(&format!("lib{name}.")) {
+            if !fname.starts_with(&format!("lib{effective_name}.")) {
                 continue;
             }
             let rank = match fname.rsplit('.').next() {
@@ -650,7 +671,7 @@ fn compile_aux(
         ));
     }
     Ok(AuxBuilt {
-        name: name.to_string(),
+        name: effective_name.to_string(),
         artifact: if link { artifact } else { None },
         collect,
     })
