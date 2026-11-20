@@ -774,3 +774,257 @@ class ResolveAuxSpecsTests(unittest.TestCase):
         specs, err = run.resolve_aux_specs(main)
         self.assertIsNone(err)
         self.assertEqual(specs, [])
+
+
+class ViewBlockerTests(unittest.TestCase):
+    def test_unscoped_mode_applies_to_every_revision(self):
+        h = header("//@ revisions: a b\n//@ run-pass\n")
+        self.assertIsNone(run.stage1_view_blocker(h.view("a")))
+        self.assertIsNone(run.stage1_view_blocker(h.view("b")))
+
+    def test_revision_without_a_mode_is_blocked(self):
+        h = header("//@ revisions: a b\n//@[a] run-pass\n")
+        self.assertIsNone(run.stage1_view_blocker(h.view("a")))
+        self.assertIn("no run-pass/run-fail",
+                      run.stage1_view_blocker(h.view("b")))
+
+    def test_scoped_blocker_only_blocks_its_revision(self):
+        h = header("//@ revisions: a b\n//@[a] run-pass\n"
+                   "//@[b] run-pass\n//@[a] run-flags: --foo\n")
+        self.assertIn("run-flags", run.stage1_view_blocker(h.view("a")))
+        self.assertIsNone(run.stage1_view_blocker(h.view("b")))
+
+    def test_scoped_run_crash_blocks_only_its_revision(self):
+        h = header("//@ revisions: a b\n//@[a] run-pass\n"
+                   "//@[b] run-crash\n")
+        self.assertIsNone(run.stage1_view_blocker(h.view("a")))
+        self.assertIn("run-crash", run.stage1_view_blocker(h.view("b")))
+
+    def test_scoped_only_directives_still_block_the_flat_path(self):
+        # stage1_blocker is unchanged: scoped directives on a test
+        # that declares no revisions keep the record unattempted.
+        rec = {"suite": "ui", "path": "tests/ui/x.rs", "nature": "exec",
+               "single_file": True, "ffi": False, "env_excluded": False}
+        h = header("//@[a] run-pass\n")
+        self.assertIn("revisions", run.stage1_blocker(h, rec))
+
+
+class ProcessStage1RevisionTests(unittest.TestCase):
+    """process_test on stage-1 revision tests, both sides stubbed."""
+
+    def setUp(self):
+        self.tmp = Path(self.enterContext(__import__("tempfile")
+                                         .TemporaryDirectory()))
+        (self.tmp / "tests" / "ui").mkdir(parents=True)
+        self.rust_dir = self.tmp
+        self.native_seen = []   # {"rev", "edition", "flags", "aux"}
+        self.driver_seen = []   # {"rev", "args", "aux"}
+
+    def write_test(self, body):
+        p = self.rust_dir / "tests" / "ui" / "t.rs"
+        p.write_text(body)
+        return {"suite": "ui", "path": "tests/ui/t.rs",
+                "nature": "exec", "single_file": True,
+                "ffi": False, "env_excluded": False}
+
+    @staticmethod
+    def revision_of(args):
+        return args[args.index("--cfg") + 1] if "--cfg" in args else None
+
+    def run_with_fakes(self, rec, native_fake=None, spar_fake=None):
+        orig_n, orig_s = run.native_side, run.sparagmos_side
+
+        def fake_native(path, edition, workdir, extra_flags=(),
+                        aux_specs=()):
+            seen = {"rev": self.revision_of(list(extra_flags)),
+                    "edition": edition, "flags": list(extra_flags),
+                    "aux": [name for name, _ in aux_specs]}
+            self.native_seen.append(seen)
+            if native_fake:
+                return native_fake(seen)
+            return ({"exit_code": 0, "stdout": "", "stderr": ""}, None)
+
+        def fake_spar(path, edition, driver_bin, cwd=None,
+                      rustc_args=(), aux_specs=()):
+            seen = {"rev": self.revision_of(list(rustc_args)),
+                    "args": list(rustc_args),
+                    "aux": [name for name, _ in aux_specs]}
+            self.driver_seen.append(seen)
+            if spar_fake:
+                return spar_fake(seen)
+            return ({"exit_code": 0, "stdout": "", "stderr": ""},
+                    "result", "")
+
+        run.native_side, run.sparagmos_side = fake_native, fake_spar
+        try:
+            return run.process_test(rec, self.rust_dir,
+                                    Path("/fake/driver"))
+        finally:
+            run.native_side, run.sparagmos_side = orig_n, orig_s
+
+    def test_all_revisions_pass(self):
+        rec = self.write_test(
+            "//@ revisions: a b\n//@[a] run-pass\n//@[b] run-pass\n"
+            "fn main() {}\n")
+        res = self.run_with_fakes(rec)
+        self.assertEqual(res["status"], "pass")
+        self.assertEqual(res["mode"], "run-pass")
+        self.assertEqual([s["rev"] for s in self.native_seen],
+                         ["a", "b"])
+        self.assertEqual([s["rev"] for s in self.driver_seen],
+                         ["a", "b"])
+        for s in self.native_seen:
+            self.assertIn("--check-cfg", s["flags"])
+        self.assertEqual(res["revisions"]["a"]["status"], "pass")
+        self.assertEqual(res["revisions"]["b"]["status"], "pass")
+
+    def test_one_revision_stdout_mismatch_fails(self):
+        rec = self.write_test(
+            "//@ revisions: a b\n//@[a] run-pass\n//@[b] run-pass\n"
+            "fn main() {}\n")
+
+        def spar(seen):
+            if seen["rev"] == "b":
+                return ({"exit_code": 0, "stdout": "wrong\n",
+                         "stderr": ""}, "result", "")
+            return ({"exit_code": 0, "stdout": "", "stderr": ""},
+                    "result", "")
+        res = self.run_with_fakes(rec, spar_fake=spar)
+        self.assertEqual(res["status"], "fail")
+        self.assertEqual(res["bucket"], "stdout mismatch")
+        self.assertIn("revision b", res["reason"])
+
+    def test_one_revision_unsupported(self):
+        rec = self.write_test(
+            "//@ revisions: a b\n//@[a] run-pass\n//@[b] run-pass\n"
+            "fn main() {}\n")
+
+        def spar(seen):
+            if seen["rev"] == "b":
+                return (None, "unsupported", "some conversion gap")
+            return ({"exit_code": 0, "stdout": "", "stderr": ""},
+                    "result", "")
+        res = self.run_with_fakes(rec, spar_fake=spar)
+        self.assertEqual(res["status"], "unsupported")
+        self.assertIn("revision b", res["reason"])
+
+    def test_out_of_environment_revision_is_skipped(self):
+        rec = self.write_test(
+            "//@ revisions: a b\n//@[a] run-pass\n//@[b] run-pass\n"
+            "//@[b] ignore-linux\nfn main() {}\n")
+        res = self.run_with_fakes(rec)
+        self.assertEqual(res["status"], "pass")
+        self.assertEqual([s["rev"] for s in self.native_seen], ["a"])
+
+    def test_all_revisions_out_of_environment(self):
+        rec = self.write_test(
+            "//@ revisions: a b\n//@ run-pass\n//@ ignore-linux\n"
+            "fn main() {}\n")
+        res = self.run_with_fakes(rec)
+        self.assertEqual(res["status"], "not-attempted")
+        self.assertEqual(res["bucket"], "out of environment")
+        self.assertEqual(self.native_seen, [])
+
+    def test_revision_without_a_run_mode_blocks_the_record(self):
+        rec = self.write_test(
+            "//@ revisions: a b\n//@[a] run-pass\nfn main() {}\n")
+        res = self.run_with_fakes(rec)
+        self.assertEqual(res["status"], "not-attempted")
+        self.assertEqual(res["bucket"],
+                         "not attempted (header feature)")
+        self.assertIn("revision b", res["reason"])
+        self.assertEqual([s["rev"] for s in self.native_seen], ["a"])
+
+    def test_scoped_flags_reach_only_their_revision(self):
+        rec = self.write_test(
+            "//@ revisions: a b\n//@[a] run-pass\n//@[b] run-pass\n"
+            "//@[a] compile-flags: -C opt-level=2\nfn main() {}\n")
+        res = self.run_with_fakes(rec)
+        self.assertEqual(res["status"], "pass")
+        by_rev = {s["rev"]: s["args"] for s in self.driver_seen}
+        self.assertIn("opt-level=2", by_rev["a"])
+        self.assertNotIn("opt-level=2", by_rev["b"])
+        # The revision arguments precede the compile-flags, the
+        # order stage 2 uses.
+        self.assertLess(by_rev["a"].index("--cfg"),
+                        by_rev["a"].index("opt-level=2"))
+
+    def test_unhonourable_scoped_flags_block_the_record(self):
+        rec = self.write_test(
+            "//@ revisions: a b\n//@[a] run-pass\n//@[b] run-pass\n"
+            "//@[b] compile-flags: --target aarch64-unknown-linux-gnu\n"
+            "fn main() {}\n")
+        res = self.run_with_fakes(rec)
+        self.assertEqual(res["status"], "not-attempted")
+        self.assertEqual(res["bucket"], "not attempted (compile-flags)")
+        self.assertIn("revision b", res["reason"])
+
+    def test_scoped_failure_status_is_per_revision(self):
+        rec = self.write_test(
+            "//@ revisions: a b\n//@ run-fail\n"
+            "//@[b] failure-status: 1\nfn main() {}\n")
+
+        def native(seen):
+            code = 1 if seen["rev"] == "b" else 101
+            return ({"exit_code": code, "stdout": "", "stderr": ""},
+                    None)
+
+        def spar(seen):
+            code = 1 if seen["rev"] == "b" else 101
+            return ({"exit_code": code, "stdout": "", "stderr": ""},
+                    "result", "")
+        res = self.run_with_fakes(rec, native_fake=native,
+                                  spar_fake=spar)
+        self.assertEqual(res["status"], "pass")
+        self.assertEqual(res["mode"], "run-fail")
+
+    def test_scoped_edition_is_used_for_its_revision(self):
+        rec = self.write_test(
+            "//@ revisions: a b\n//@[a] run-pass\n//@[b] run-pass\n"
+            "//@[b] edition: 2018\nfn main() {}\n")
+        res = self.run_with_fakes(rec)
+        self.assertEqual(res["status"], "pass")
+        editions = {s["rev"]: s["edition"] for s in self.native_seen}
+        self.assertEqual(editions, {"a": "2021", "b": "2018"})
+
+    def test_scoped_aux_resolves_for_its_revision(self):
+        (self.tmp / "tests" / "ui" / "auxiliary").mkdir()
+        (self.tmp / "tests" / "ui" / "auxiliary"
+         / "helper.rs").write_text("pub fn f() {}\n")
+        rec = self.write_test(
+            "//@ revisions: a b\n//@[a] run-pass\n//@[b] run-pass\n"
+            "//@[a] aux-build: helper.rs\nfn main() {}\n")
+        rec["single_file"] = False
+        res = self.run_with_fakes(rec)
+        self.assertEqual(res["status"], "pass")
+        aux = {s["rev"]: s["aux"] for s in self.native_seen}
+        self.assertEqual(aux, {"a": ["helper"], "b": []})
+
+
+class ResolveAuxSpecsRevisionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(self.enterContext(__import__("tempfile")
+                                         .TemporaryDirectory()))
+        self.dir = self.tmp / "tests" / "ui"
+        (self.dir / "auxiliary").mkdir(parents=True)
+
+    def write(self, rel, body):
+        p = self.dir / rel
+        p.write_text(body)
+        return p
+
+    def test_scoped_aux_directive_resolves_per_revision(self):
+        main = self.write(
+            "t.rs",
+            "//@ revisions: a b\n//@[a] aux-build: helper.rs\n")
+        self.write("auxiliary/helper.rs", "pub fn f() {}\n")
+        specs, err = run.resolve_aux_specs(main, "a")
+        self.assertIsNone(err)
+        self.assertEqual([name for name, _ in specs], ["helper"])
+        specs, err = run.resolve_aux_specs(main, "b")
+        self.assertIsNone(err)
+        self.assertEqual(specs, [])
+        # Without a revision, scoped directives do not resolve.
+        specs, err = run.resolve_aux_specs(main)
+        self.assertIsNone(err)
+        self.assertEqual(specs, [])
