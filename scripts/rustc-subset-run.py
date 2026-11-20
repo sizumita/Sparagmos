@@ -667,7 +667,8 @@ def aux_directives(header):
     return [(name, fname) for name, fname, _ in aux_entries(header)]
 
 
-def resolve_aux_specs(test_path, revision=None, top=None):
+def resolve_aux_specs(test_path, revision=None, top=None,
+                      top_proc_macro=True):
     """Resolve a test's auxiliary crates, transitively, deps first.
 
     Returns (specs, error): specs is a list of AuxSpec in
@@ -684,6 +685,9 @@ def resolve_aux_specs(test_path, revision=None, top=None):
     Header, or a HeaderView when a revision's scoped aux directives
     apply); the transitive directives of auxiliary files always come
     from the files themselves, scoped by `revision` when one is set.
+    With `top_proc_macro` false, `//@ proc-macro:` directives of the
+    test itself do not become specs (the caller builds those crates
+    itself); proc-macro directives of auxiliary files still do.
     """
     test_dir = test_path.parent
     specs = []
@@ -742,6 +746,13 @@ def resolve_aux_specs(test_path, revision=None, top=None):
         top_entries = aux_entries(top)
     else:
         top_entries = directives(test_path)
+    if not top_proc_macro:
+        # The caller builds the test's own `//@ proc-macro:` crates
+        # itself (stage 2's proc_macro_extern_args); forwarding
+        # those to the driver as --aux as well would build and link
+        # them twice. Proc-macro crates an auxiliary file names are
+        # transitive entries, not top entries, and stay.
+        top_entries = [e for e in top_entries if e[2] is None]
     for name, fname, crate_type in top_entries:
         err = visit(name, fname, test_dir, crate_type)
         if err:
@@ -760,6 +771,228 @@ def find_artifact(libdir, name):
         if best is None or rank < best[0]:
             best = (rank, cand)
     return best[1] if best else None
+
+
+# ---------------------------------------------------------------------------
+# Proc-macro auxiliary crates (stage 2)
+# ---------------------------------------------------------------------------
+
+_PROC_MACRO_CACHE = {}
+_PROC_MACRO_KEY_LOCKS = {}
+_PROC_MACRO_META_LOCK = threading.Lock()
+
+
+def _proc_macro_key_lock(key):
+    with _PROC_MACRO_META_LOCK:
+        return _PROC_MACRO_KEY_LOCKS.setdefault(key, threading.Lock())
+
+
+def _find_proc_macro_file(test_path, fname):
+    """Locate a `//@ proc-macro:` file the way compiletest does:
+    the `auxiliary/` subdirectory next to the test first, then the
+    test's own directory."""
+    test_dir = test_path.parent
+    for base in (test_dir / "auxiliary", test_dir):
+        cand = base / fname
+        if cand.is_file():
+            return cand
+    return None
+
+
+def _proc_macro_chain(test_path, fname, edition):
+    """Resolve one `//@ proc-macro:` directive to a build chain.
+
+    Returns (chain, error): chain is a list of (crate_name,
+    source_path, forced_crate_type) in dependency order -- the
+    auxiliary crates the proc-macro crate itself depends on first
+    (its own aux directives, resolved transitively), the proc-macro
+    crate last with its type forced to proc-macro, the treatment
+    compiletest's directive names. Which edition each crate is
+    built with is decided at build time from its own header.
+    """
+    src = _find_proc_macro_file(test_path, fname)
+    if src is None:
+        return None, f"proc-macro auxiliary file {fname} not found"
+    deps, err = resolve_aux_specs(src)
+    if err:
+        return None, err
+    text = src.read_text(errors="ignore")
+    name = declared_crate_name(text) or Path(fname).stem.replace("-", "_")
+    chain = [(spec.name, spec.path, spec.crate_type) for spec in deps]
+    chain.append((name, src, "proc-macro"))
+    return chain, None
+
+
+def _concrete_edition(edition):
+    """The single edition a range directive (`2015..2021`) ends
+    at. compiletest runs one instance per edition in the range;
+    the subset collapses a test to one attempt, and its aux
+    builds use the range's last edition, the same value the
+    attempt's own edition selection takes from the directive."""
+    if ".." in edition:
+        return edition.rsplit("..", 1)[-1].strip()
+    return edition
+
+
+def _build_proc_macro_chain(chain, edition, outdir, extra_externs=()):
+
+    """Build a resolved proc-macro chain into outdir.
+
+    Mirrors native_side's auxiliary-crate builds: dependency
+    order, each crate linked to the previous ones with --extern,
+    the crate's own compile-flags honoured, its own edition
+    directive winning over the test's. Returns (crate_name,
+    artifact, error) for the chain's last crate, the proc-macro
+    crate itself.
+    """
+    built = list(extra_externs)
+    for cname, csrc, forced in chain:
+        text = csrc.read_text(errors="ignore")
+        eff_name = declared_crate_name(text) or cname
+        aux_view = Header(text).view(None)
+        editions = aux_view.values("edition")
+        ced = _concrete_edition(editions[-1].strip()) if editions \
+            else edition
+        declared = declared_crate_type(text)
+        cmd = rustc_cmd() + ["--edition", ced, "--out-dir", str(outdir)]
+        lib = sysroot_lib()
+        if lib:
+            cmd += ["-L", lib]
+        cmd += ["-L", f"dependency={outdir}"]
+        if declared is None:
+            cmd += ["--crate-type", forced or "rlib"]
+        if declared_crate_name(text) is None:
+            cmd += ["--crate-name", cname]
+        # A distinct -C metadata keeps an auxiliary crate whose
+        # name matches the test crate's own name distinguishable
+        # from it (E0519); compiletest arranges the same
+        # distinction for same-named auxiliary crates.
+        meta = hashlib.sha256(str(csrc).encode()).hexdigest()[:12]
+        cmd += ["-C", f"metadata=sparagmos-aux-{meta}"]
+        for prev_name, prev_artifact in built:
+            if prev_artifact is not None:
+                cmd += ["--extern", f"{prev_name}={prev_artifact}"]
+        if forced is not None:
+            # compiletest links the proc_macro library crate into
+            # proc-macro auxiliary builds with a bare --extern, so
+            # sources may `use proc_macro::...` without declaring
+            # it; without it such sources fail with E0432.
+            cmd += ["--extern", "proc_macro"]
+        cmd += compile_flags(aux_view)
+        cmd += [str(csrc)]
+        build = run_cmd(cmd, timeout=NATIVE_COMPILE_TIMEOUT,
+                        env_extra=BOOTSTRAP_ENV)
+        if build["timeout"]:
+            return None, None, (f"build of auxiliary crate "
+                                f"`{eff_name}` timed out")
+        if build["exit_code"] != 0:
+            return None, None, (
+                f"build of auxiliary crate `{eff_name}` failed: "
+                f"{first_error_line(build['stderr'])}")
+        effective = forced or declared or "rlib"
+        artifact = (find_artifact(outdir, eff_name)
+                    if effective in ("rlib", "lib", "dylib", "proc-macro")
+                    else None)
+        built.append((eff_name, artifact))
+    name, artifact = built[-1]
+    if artifact is None:
+        return None, None, (f"build of proc-macro crate `{name}` "
+                            f"produced no linkable artifact")
+    return name, artifact, None
+
+
+def build_proc_macro(test_path, fname, edition, extra_externs=()):
+    """Build the proc-macro crate a `//@ proc-macro:` directive names.
+
+    Returns (crate_name, artifact, error). Builds are cached: the
+    same auxiliary crate backs many tests (test-macros.rs alone
+    serves dozens), so a key over the chain's source contents, the
+    test edition and any crates built earlier for the same test
+    (extra_externs, which this crate is linked against) maps to
+    one on-disk build shared by every caller, across revisions
+    and repeated runs.
+    """
+    edition = _concrete_edition(edition)
+    chain, err = _proc_macro_chain(test_path, fname, edition)
+    if err:
+        return None, None, err
+    h = hashlib.sha256()
+    # Recipe version: bump when the build recipe changes (crate
+    # metadata disambiguation, the bare proc_macro extern, ...),
+    # so artifacts built by an older recipe are never reused.
+    h.update(b"sparagmos-pm-recipe-2")
+    h.update(edition.encode())
+    for prev_name, prev_artifact in extra_externs:
+        h.update(prev_name.encode())
+        h.update(str(prev_artifact).encode())
+    for cname, csrc, forced in chain:
+        h.update(cname.encode())
+        h.update(csrc.read_bytes())
+        h.update((forced or "").encode())
+    key = h.hexdigest()[:24]
+    if key in _PROC_MACRO_CACHE:
+        return _PROC_MACRO_CACHE[key]
+    cache_dir = (Path(tempfile.gettempdir())
+                 / "sparagmos-proc-macro-cache" / key)
+    with _proc_macro_key_lock(key):
+        if key in _PROC_MACRO_CACHE:
+            return _PROC_MACRO_CACHE[key]
+        name = chain[-1][0]
+        result = None
+        if cache_dir.is_dir():
+            artifact = find_artifact(cache_dir, name)
+            if artifact is not None:
+                result = (name, artifact, None)
+        if result is None:
+            tmpdir = Path(tempfile.mkdtemp(prefix="sparagmos-pm-build-"))
+            name2, artifact2, err2 = _build_proc_macro_chain(
+                chain, edition, tmpdir, extra_externs)
+            if err2:
+                result = (None, None, err2)
+            else:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                for f in tmpdir.iterdir():
+                    f.replace(cache_dir / f.name)
+                result = (name2, cache_dir / artifact2.name, None)
+        _PROC_MACRO_CACHE[key] = result
+        return result
+
+
+def proc_macro_extern_args(test_path, view, edition):
+    """--extern arguments reproducing compiletest's `proc-macro:`
+    handling for one directive view, or a not-attempted reason.
+
+    compiletest compiles each file a `//@ proc-macro:` directive
+    names as a proc-macro crate and links it into the test's
+    compilation. Without that link the driver's rustc fails with
+    E0463 (can't find crate) on tests native rustc accepts, so the
+    conversion is attempted with the same --extern set compiletest
+    arranges. Returns (args, error).
+    """
+    fnames = [v.strip() for v in view.values("proc-macro")]
+    fnames = [f for f in fnames if f]
+    if not fnames:
+        return [], None
+    args = []
+    seen_dirs = set()
+    built = []
+    for fname in fnames:
+        # Directive order matters: a later proc-macro crate may
+        # use an earlier one (compiletest links each auxiliary
+        # build against the ones before it), so each build sees
+        # the crates already built for this view as externs.
+        name, artifact, err = build_proc_macro(
+            test_path, fname, edition, extra_externs=built)
+        if err:
+            return [], (f"proc-macro auxiliary crate from {fname} "
+                        f"could not be built: {err}")
+        built.append((name, artifact))
+        args += ["--extern", f"{name}={artifact}"]
+        dep_dir = str(artifact.parent)
+        if dep_dir not in seen_dirs:
+            seen_dirs.add(dep_dir)
+            args += ["-L", f"dependency={dep_dir}"]
+    return args, None
 
 
 def native_side(path, edition, workdir, extra_flags=(), aux_specs=()):
@@ -1704,13 +1937,20 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
         # view builds the auxiliary crates its own directives name
         # (a view naming none converts without auxiliaries).
         if aux_directives(view):
-            specs, aux_err = resolve_aux_specs(path, top=view)
+            specs, aux_err = resolve_aux_specs(path, top=view,
+                                               top_proc_macro=False)
             if aux_err:
                 res["reason"] = aux_err
                 res["bucket"] = "out of stage-2 scope (multi-file)"
                 return res
         else:
             specs = []
+    pm_args, pm_err = proc_macro_extern_args(path, view, edition)
+    if pm_err:
+        res["reason"] = pm_err
+        res["bucket"] = "not attempted (header feature)"
+        return res
+    args += pm_args
     conv = convert_side(path, edition, driver_bin, rustc_args=args,
                         aux_specs=specs)
     verdict, reason, bucket = judge_compile(expectation, conv)
@@ -1763,7 +2003,8 @@ def fill_result_stage2(rec, rust_dir, driver_bin, out):
     aux_specs = []
     aux_per_revision = False
     if not rec["single_file"]:
-        aux_specs, aux_err = resolve_aux_specs(path)
+        aux_specs, aux_err = resolve_aux_specs(path,
+                                               top_proc_macro=False)
         if aux_err:
             out["reason"] = aux_err
             out["bucket"] = "out of stage-2 scope (multi-file)"
@@ -1772,6 +2013,13 @@ def fill_result_stage2(rec, rust_dir, driver_bin, out):
             if any(name in ("aux-build", "aux-crate")
                    for (_rev, name) in header.scoped):
                 aux_per_revision = True
+            elif header.has("proc-macro") or any(
+                    name == "proc-macro"
+                    for (_rev, name) in header.scoped):
+                # proc-macro auxiliaries are built by the runner
+                # itself and forwarded as --extern inside
+                # stage2_attempt; they never go through --aux.
+                pass
             else:
                 out["reason"] = ("multi-file / auxiliary crates "
                                  "(not in stage-2 scope)")
