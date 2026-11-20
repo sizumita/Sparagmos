@@ -276,6 +276,24 @@ fn run_mode_log_syntax_output_stays_off_stdout() {
     // byte-identical to the guest's own output.
     let dir = temp_dir("logsyntax");
     let src = fixture(&dir, "logsyntax.rs", LOG_SYNTAX_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the program itself runs fine; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "guest marker\n",
+        "stdout carries the guest's output alone"
+    );
+    assert!(
+        stderr.contains("compile-time marker"),
+        "the log_syntax output is redirected to stderr: {stderr}"
+    );
+}
+
 const EXPLICIT_DISCRIMINANT_SRC: &str = r#"
 #[repr(i32)]
 enum E { A = 3, B = 7, C = -2 }
@@ -311,16 +329,6 @@ fn run_mode_explicit_discriminant_match() {
     assert_eq!(
         out.status.code(),
         Some(0),
-        "the program itself runs fine; stderr={stderr}"
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout),
-        "guest marker\n",
-        "stdout carries the guest's output alone"
-    );
-    assert!(
-        stderr.contains("compile-time marker"),
-        "the log_syntax output is redirected to stderr: {stderr}"
         "explicit-discriminant enums must run; stderr={stderr}"
     );
     assert_eq!(
