@@ -21,9 +21,11 @@
 use std::collections::HashMap;
 
 use rustc_public::mir;
+use rustc_public::mir::mono::Instance;
 use rustc_public::ty::{
-    AliasKind as SmirAliasKind, Allocation, ConstantKind, FloatTy as SmirFloatTy, GenericArgKind,
-    GenericArgs, IntTy as SmirIntTy, RigidTy, TyConstKind, TyKind, UintTy as SmirUintTy,
+    AliasKind as SmirAliasKind, Allocation, ConstantKind, FloatTy as SmirFloatTy, FnDef,
+    GenericArgKind, GenericArgs, IntTy as SmirIntTy, RigidTy, TyConstKind, TyKind,
+    UintTy as SmirUintTy,
 };
 use rustc_public_bridge::IndexedVal;
 use rustc_public::CrateDef;
@@ -33,6 +35,16 @@ use sparagmos_mir as sm;
 /// Per-run converter state (DefId assignment) plus per-function error bag.
 pub struct Converter {
     def_ids: HashMap<rustc_public::DefId, u32>,
+    /// Sparagmos ids of resolved function *instances*, keyed by the
+    /// referenced definition together with the instance it resolves
+    /// to: two monomorphizations of one generic function are
+    /// different call targets and must not share an id (the
+    /// interpreter resolves calls through these ids), while the id's
+    /// name stays the referenced definition's name — a trait method
+    /// call keeps the trait method's name even though the resolved
+    /// instance is an impl method, because builtin lookup and
+    /// diagnostics key on the referenced name.
+    instance_ids: HashMap<(rustc_public::DefId, Instance), u32>,
     pub def_names: Vec<String>,
     /// Unsupported hits of the function currently being converted.
     errors: Vec<String>,
@@ -48,6 +60,7 @@ impl Converter {
     pub fn new() -> Self {
         Self {
             def_ids: HashMap::new(),
+            instance_ids: HashMap::new(),
             def_names: Vec::new(),
             errors: Vec::new(),
         }
@@ -73,6 +86,39 @@ impl Converter {
 
     pub fn crate_def_id<D: CrateDef>(&mut self, def: &D) -> sm::DefId {
         self.def_id(def.def_id())
+    }
+
+    /// Map a resolved function instance, reached through the
+    /// definition `through`, to a Sparagmos `DefId`. The `def_names`
+    /// entry is `through`'s name (the spelling call sites and the
+    /// builtin registry use), so several instances of one generic
+    /// function share a name but never an id.
+    pub fn instance_def_id(
+        &mut self,
+        through: rustc_public::DefId,
+        inst: &Instance,
+    ) -> sm::DefId {
+        let key = (through, *inst);
+        if let Some(&idx) = self.instance_ids.get(&key) {
+            return sm::DefId::new(0, idx);
+        }
+        let idx = self.def_names.len() as u32;
+        self.instance_ids.insert(key, idx);
+        self.def_names.push(through.name());
+        sm::DefId::new(0, idx)
+    }
+
+    /// The Sparagmos `DefId` for an `FnDef` type as it appears in a
+    /// body: the id of the monomorphic instance the call resolves to.
+    /// When the instance cannot be resolved (the definition is not a
+    /// resolvable function item), falls back to the definition's own
+    /// id, which no converted body carries, so the call stays
+    /// unresolved downstream.
+    fn fn_def_id(&mut self, def: &FnDef, args: &GenericArgs) -> sm::DefId {
+        match Instance::resolve(*def, args) {
+            Ok(inst) => self.instance_def_id(def.def_id(), &inst),
+            Err(_) => self.def_id(def.def_id()),
+        }
     }
 
     /// Convert one Stable MIR body. On any unsupported construct, returns
@@ -805,7 +851,7 @@ impl Converter {
                 mutability(*m),
             ),
             RigidTy::FnDef(def, args) => {
-                let d = self.crate_def_id(def);
+                let d = self.fn_def_id(def, args);
                 sm::Ty::FnDef(d, self.type_args(args))
             }
             RigidTy::FnPtr(poly) => {
