@@ -1065,8 +1065,8 @@ impl<'a> Converter<'a> {
     /// typing context.
     ///
     /// In MIR both operands of a binary operation have the same type
-    /// (shift amounts aside; a shift amount's numeric value does not
-    /// depend on which integer type it is read as), and a literal
+    /// (shifts aside — their operands are typed separately by
+    /// `convert_shift_operands`), and a literal
     /// operand carries no type of its own in `sparagmos-mir` — how its
     /// bits are interpreted must come from the operation's context:
     ///
@@ -1116,6 +1116,51 @@ impl<'a> Converter<'a> {
         Ok((lhs, rhs))
     }
 
+    /// Convert the two operands of a shift (`Shl` / `Shr`, plain,
+    /// unchecked or checked).
+    ///
+    /// A shift is the one binary operation whose operands do not
+    /// share a type in MIR: the amount may have any integer type.
+    /// The shared-context conversion would mistype both sides — a
+    /// constant value read under the amount's type (when the amount
+    /// is a place), or a constant amount read under the value's
+    /// type, truncating it to the value's width and sign — so the
+    /// operands are typed separately:
+    ///
+    /// * The value takes the operation's own context: its place
+    ///   type, else the result type (a checked shift's `(T, bool)`
+    ///   result gives `T`).
+    /// * The amount keeps its own type. A place amount's runtime
+    ///   value already carries it, and a constant amount is
+    ///   converted with no context, which reads it in its own
+    ///   storage width (see `convert_scalar`). That reading is
+    ///   exact whenever the amount fits the value's width; an
+    ///   amount that does not fit — wider than the value, negative,
+    ///   or an unsigned amount whose top bit is set, read as a
+    ///   negative — is an overflowing shift under either reading,
+    ///   which execution reports the same way (see `eval_shift`).
+    fn convert_shift_operands(
+        &self,
+        body: &mir::Body,
+        pair: &(mir::Operand, mir::Operand),
+        dest_ty: Option<&mir::Ty>,
+        checked_result: bool,
+    ) -> Result<(ir::Operand, ir::Operand), ConvertError> {
+        let value_ctx = self.operand_place_ty(body, &pair.0).or_else(|| {
+            if checked_result {
+                match dest_ty {
+                    Some(mir::Ty::Tuple(ts)) => ts.first().cloned(),
+                    _ => None,
+                }
+            } else {
+                dest_ty.cloned()
+            }
+        });
+        let lhs = self.convert_operand(body, &pair.0, value_ctx.as_ref())?;
+        let rhs = self.convert_operand(body, &pair.1, None)?;
+        Ok((lhs, rhs))
+    }
+
     // ----- rvalues -----------------------------------------------------------
 
     fn convert_rvalue(
@@ -1128,13 +1173,17 @@ impl<'a> Converter<'a> {
         Ok(match rv {
             R::Use(op) => ir::Rvalue::Use(self.convert_operand(body, op, dest_ty)?),
             R::BinaryOp(op, pair) => {
-                let (lhs, rhs) = self.convert_binop_operands(
-                    body,
-                    pair,
-                    dest_ty,
-                    overflow_base(*op).is_some(),
-                    is_comparison(*op),
-                )?;
+                let (lhs, rhs) = if is_shift(*op) {
+                    self.convert_shift_operands(body, pair, dest_ty, false)?
+                } else {
+                    self.convert_binop_operands(
+                        body,
+                        pair,
+                        dest_ty,
+                        overflow_base(*op).is_some(),
+                        is_comparison(*op),
+                    )?
+                };
                 match overflow_base(*op) {
                     // `BinaryOp` with a *WithOverflow operator yields the
                     // `(value, overflowed)` tuple in rustc MIR, exactly
@@ -1148,13 +1197,17 @@ impl<'a> Converter<'a> {
                 }
             }
             R::CheckedBinaryOp(op, pair) => {
-                let (lhs, rhs) = self.convert_binop_operands(
-                    body,
-                    pair,
-                    dest_ty,
-                    true,
-                    is_comparison(*op),
-                )?;
+                let (lhs, rhs) = if is_shift(*op) {
+                    self.convert_shift_operands(body, pair, dest_ty, true)?
+                } else {
+                    self.convert_binop_operands(
+                        body,
+                        pair,
+                        dest_ty,
+                        true,
+                        is_comparison(*op),
+                    )?
+                };
                 match overflow_base(*op).or_else(|| plain_binop(*op)) {
                     Some(base) => ir::Rvalue::CheckedBinaryOp(base, Box::new((lhs, rhs))),
                     None => ir::Rvalue::Unsupported(format!("CheckedBinaryOp {}", op.name())),
@@ -1871,6 +1924,15 @@ fn overflow_base(op: mir::BinOp) -> Option<ir::BinOp> {
         M::MulWithOverflow => ir::BinOp::Mul,
         _ => return None,
     })
+}
+
+/// Whether a `mir` binary operator is a shift (`Shl` / `Shr` or an
+/// unchecked spelling): the one family whose operands do not share
+/// a type, converted by `convert_shift_operands` instead of
+/// `convert_binop_operands`.
+fn is_shift(op: mir::BinOp) -> bool {
+    use mir::BinOp as M;
+    matches!(op, M::Shl | M::Shr | M::ShlUnchecked | M::ShrUnchecked)
 }
 
 /// The IR operator for a plain (non-checked) `mir` binary operator.
