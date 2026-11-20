@@ -159,6 +159,7 @@ fn build(specs: &[FnSpec]) -> (JitProgram, sparagmos_interp::MirProgram) {
             })
             .collect(),
         fn_names: names,
+        adt_discriminants: Default::default(),
     };
     let jit = JitProgram::compile(&jit_in).expect("JIT compile failed");
     (jit, interp_in)

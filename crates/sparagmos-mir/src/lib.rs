@@ -34,6 +34,6 @@ pub use terminator::{
     TerminatorKind, UnwindAction, UnwindTerminateReason,
 };
 pub use ty::{
-    Abi, AdtDefId, AliasKind, ArrayLen, DefId, FloatTy, FnSig, IntTy, Mutability, Region, Safety,
-    Ty, UintTy,
+    Abi, AdtDefId, AdtDiscriminants, AliasKind, ArrayLen, DefId, DiscriminantValues, FloatTy,
+    FnSig, IntTy, Mutability, Region, Safety, Ty, UintTy,
 };

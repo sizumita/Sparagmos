@@ -18,6 +18,26 @@ impl fmt::Display for DefId {
 }
 pub type AdtDefId = DefId;
 
+/// Discriminant values of one ADT, indexed by variant index:
+/// `values[i]` is the discriminant of variant `i`, as reported by
+/// the compiler for that variant, stored as an `i128`. A
+/// `Discriminant` rvalue yields these values; the interpreter
+/// stores them through the discriminant type of the destination
+/// place, which canonicalises them for comparison against
+/// `SwitchInt` branch keys.
+///
+/// An enum without explicit discriminants has the sequential values
+/// `0, 1, 2, ...`; a struct has a single entry, `0`. Consumers that
+/// find no entry for an ADT treat the variant index itself as the
+/// value, which is exact for enums with sequential discriminants.
+pub type DiscriminantValues = Vec<i128>;
+
+/// Discriminant tables for the ADTs of a program, keyed by the
+/// `DefId` of the ADT. The driver fills one entry per enum it
+/// converts; the interpreter reads them when evaluating
+/// `Discriminant` rvalues.
+pub type AdtDiscriminants = std::collections::HashMap<AdtDefId, DiscriminantValues>;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum IntTy {
     I8,

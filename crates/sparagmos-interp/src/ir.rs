@@ -359,8 +359,13 @@ pub enum Rvalue {
     Ref(Place),
     /// The length of the value at a place (array / slice / `str`).
     Len(Place),
-    /// The discriminant of the enum value at a place.
-    Discriminant(Place),
+    /// The discriminant of the enum value at a place, with the
+    /// discriminant values of the enum indexed by variant index
+    /// (baked in at conversion time from the program's discriminant
+    /// tables). An empty table means the values are the variant
+    /// indices themselves, which is exact for enums whose
+    /// discriminants are the sequential defaults.
+    Discriminant(Place, Vec<i128>),
     /// `*place` read for a copy (rustc `CopyForDeref`): reads the
     /// place; when the value there is a reference, reads through it
     /// once more.
@@ -421,7 +426,11 @@ pub enum TerminatorKind {
     },
     SwitchInt {
         discr: Operand,
-        /// `(bit pattern of the discriminant, target block)` pairs.
+        /// `(discriminant value, target block)` pairs. Values are
+        /// in the canonical comparison form produced by
+        /// `Value::switch_bits` (sign-extended for signed
+        /// discriminant types); conversion normalises the raw MIR
+        /// bit patterns into this form.
         targets: Vec<(u128, BasicBlock)>,
         otherwise: BasicBlock,
     },

@@ -1064,3 +1064,85 @@ fn generic_struct_instantiations_keep_separate_field_types() {
         Value::Uint(7)
     );
 }
+// ----- SwitchInt keys and Discriminant values -------------------------------
+
+/// `fn pick(_1: i32) -> i32`, switching on `_1` with branch keys in
+/// the raw MIR storage form: the `-2` key is stored as the
+/// zero-extended bit pattern 4294967294.
+fn pick_body() -> mir::Body {
+    let switch = mir::TerminatorKind::SwitchInt {
+        discr: copy(1),
+        targets: mir::SwitchTargets::new(
+            vec![4294967294, 3],
+            vec![mir::BasicBlock(1), mir::BasicBlock(2)],
+            mir::BasicBlock(3),
+        ),
+    };
+    mir::Body::new(
+        decls(&[i32_ty(), i32_ty()]),
+        1,
+        vec![
+            block(vec![], switch),
+            block(
+                vec![assign(place(0), mir::Rvalue::Use(const_i32(300)))],
+                ret(),
+            ),
+            block(
+                vec![assign(place(0), mir::Rvalue::Use(const_i32(100)))],
+                ret(),
+            ),
+            block(
+                vec![assign(place(0), mir::Rvalue::Use(const_i32(0)))],
+                ret(),
+            ),
+        ],
+    )
+}
+
+#[test]
+fn switch_int_negative_key_hits_its_branch() {
+    let mut prog = MirProgram::new();
+    prog.add("pick", pick_body());
+    for (input, expected) in [(-2, 300), (3, 100), (9, 0)] {
+        let v = interpret_mir(&prog, "pick", vec![Value::Int(input)]).expect("pick runs");
+        assert_eq!(v, Value::Int(expected), "pick({input})");
+    }
+}
+
+/// `fn discr() -> i32 { _1 = const E::<variant>; _0 = Discriminant(_1); return }`
+/// for an enum whose recorded discriminants are `[3, 7, -2]`.
+fn discr_body(variant: u32) -> mir::Body {
+    let adt = mir::Ty::Adt(mir::DefId::new(0, 42), vec![]);
+    let konst = mir::Operand::Constant(Box::new(mir::Constant::from_value(
+        mir::ConstValue::Adt {
+            variant,
+            fields: vec![],
+        },
+    )));
+    mir::Body::new(
+        decls(&[i32_ty(), adt]),
+        0,
+        vec![block(
+            vec![
+                assign(place(1), mir::Rvalue::Use(konst)),
+                assign(place(0), mir::Rvalue::Discriminant(place(1))),
+            ],
+            ret(),
+        )],
+    )
+}
+
+#[test]
+fn discriminant_rvalue_yields_the_recorded_value() {
+    let mut prog = MirProgram::new();
+    prog.adt_discriminants
+        .insert(mir::DefId::new(0, 42), vec![3, 7, -2]);
+    prog.add("discr_c", discr_body(2));
+    prog.add("discr_a", discr_body(0));
+    // Variant index 2 has discriminant -2; the index itself (2) or
+    // the zero-extended pattern would both be wrong answers here.
+    let v = interpret_mir(&prog, "discr_c", vec![]).expect("discr_c runs");
+    assert_eq!(v, Value::Int(-2));
+    let v = interpret_mir(&prog, "discr_a", vec![]).expect("discr_a runs");
+    assert_eq!(v, Value::Int(3));
+}

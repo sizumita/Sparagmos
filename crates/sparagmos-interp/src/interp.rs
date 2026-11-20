@@ -984,10 +984,28 @@ impl<'a> Interpreter<'a> {
                 })?;
                 Ok(Value::Uint(len))
             }
-            Rvalue::Discriminant(place) => {
+            Rvalue::Discriminant(place, discriminants) => {
                 let value = self.read_place(frames, body, place)?;
                 match value {
-                    Value::Enum { variant, .. } => Ok(Value::Int(variant as i128)),
+                    Value::Enum { variant, .. } => {
+                        if discriminants.is_empty() {
+                            // No table was recorded for this enum:
+                            // its discriminants are the sequential
+                            // defaults, so the index is the value.
+                            Ok(Value::Int(variant as i128))
+                        } else {
+                            let discr = discriminants
+                                .get(variant as usize)
+                                .ok_or_else(|| {
+                                    InterpError::type_mismatch(
+                                        format!("Discriminant of {place}"),
+                                        "variant covered by the discriminant table",
+                                        format!("variant {variant}"),
+                                    )
+                                })?;
+                            Ok(Value::Int(*discr))
+                        }
+                    }
                     other => Err(InterpError::type_mismatch(
                         format!("Discriminant of {place}"),
                         "ADT value",

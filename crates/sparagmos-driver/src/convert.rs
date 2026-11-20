@@ -36,6 +36,12 @@ use sparagmos_mir as sm;
 pub struct Converter {
     def_ids: HashMap<rustc_public::DefId, u32>,
     pub def_names: Vec<String>,
+    /// Discriminant values of every enum ADT converted so far,
+    /// keyed by the converted `DefId` (variant index -> value).
+    /// Handed to the interpreter with the converted program: its
+    /// `Discriminant` rvalues must yield these values, because the
+    /// `SwitchInt` branch keys carry values, not variant indices.
+    pub adt_discriminants: sm::AdtDiscriminants,
     /// Unsupported hits of the function currently being converted.
     errors: Vec<String>,
 }
@@ -51,6 +57,7 @@ impl Converter {
         Self {
             def_ids: HashMap::new(),
             def_names: Vec::new(),
+            adt_discriminants: sm::AdtDiscriminants::new(),
             errors: Vec::new(),
         }
     }
@@ -1126,6 +1133,23 @@ impl Converter {
         }
     }
 
+    /// Record the discriminant values of an enum ADT under its
+    /// converted `DefId`, once per ADT. Structs and unions have no
+    /// `Discriminant` semantics to record (a struct value is its
+    /// single variant; unions are not modelled as enum values).
+    fn record_discriminants(&mut self, def: &AdtDef, id: sm::AdtDefId) {
+        if self.adt_discriminants.contains_key(&id) {
+            return;
+        }
+        if def.kind() != AdtKind::Enum {
+            return;
+        }
+        let values: Vec<i128> = (0..def.num_variants())
+            .map(|i| def.discriminant_for_variant(VariantIdx::to_val(i)).val as i128)
+            .collect();
+        self.adt_discriminants.insert(id, values);
+    }
+
     fn rigid_ty(&mut self, r: &RigidTy) -> sm::Ty {
         match r {
             RigidTy::Bool => sm::Ty::Bool,
@@ -1137,6 +1161,7 @@ impl Converter {
             RigidTy::Str => sm::Ty::Str,
             RigidTy::Adt(def, args) => {
                 let d = self.crate_def_id(def);
+                self.record_discriminants(def, d);
                 sm::Ty::Adt(d, self.type_args(args))
             }
             RigidTy::Foreign(def) => {

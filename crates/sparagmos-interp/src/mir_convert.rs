@@ -79,6 +79,12 @@ pub struct MirProgram {
     /// (std callees, ADT types). Used to name ADT locals and to
     /// resolve calls into runtime support.
     pub fn_names: HashMap<mir::DefId, String>,
+    /// Discriminant values of the enum ADTs in the program, keyed by
+    /// `DefId` (variant index -> discriminant value), as recorded by
+    /// the driver. `Discriminant` rvalues are evaluated with these
+    /// values so they agree with the `SwitchInt` branch keys, which
+    /// carry discriminant values rather than variant indices.
+    pub adt_discriminants: mir::AdtDiscriminants,
 }
 
 impl MirProgram {
@@ -192,6 +198,29 @@ impl From<InterpError> for MirRunError {
 /// aggregate is not materialised and the rvalue converts to an
 /// explicit unsupported error instead of aborting on allocation.
 const MAX_REPEAT_ELEMENTS: u64 = 1_000_000;
+
+/// Reduce a raw `SwitchInt` target value to the canonical form the
+/// interpreter compares against. MIR stores target values as the
+/// discriminant type's bit pattern, zero-extended to 128 bits
+/// (a `-2i32` branch key is stored as 4294967294), while the
+/// interpreter holds signed values sign-extended (`switch_bits`),
+/// so a signed type's keys are sign-extended here from the type's
+/// width. Unsigned and non-integer discriminants already agree.
+/// The JIT applies the same normalisation in its lowering.
+fn normalize_switch_value(v: u128, ty: Option<&mir::Ty>) -> u128 {
+    match ty {
+        Some(mir::Ty::Int(it)) => {
+            let bits = it.bits();
+            if bits >= 128 {
+                v
+            } else {
+                let shift = 128 - bits;
+                (((v << shift) as i128) >> shift) as u128
+            }
+        }
+        _ => v,
+    }
+}
 
 /// Convert a whole MIR program into an interpreter [`ir::Program`].
 pub fn convert_program(program: &MirProgram) -> Result<ir::Program, ConvertError> {
@@ -490,6 +519,8 @@ struct Converter<'a> {
     /// Declared ADT field types recovered from `Field` projections
     /// across the whole program (see [`AdtFieldTys`]).
     adt_fields: AdtFieldTys,
+    /// Discriminant tables of the program (see `MirProgram`).
+    discriminants: &'a mir::AdtDiscriminants,
 }
 
 impl<'a> Converter<'a> {
@@ -509,6 +540,7 @@ impl<'a> Converter<'a> {
             def_names,
             names: &program.fn_names,
             adt_fields,
+            discriminants: &program.adt_discriminants,
         }
     }
 
@@ -1024,7 +1056,23 @@ impl<'a> Converter<'a> {
             R::ThreadLocalRef(def) => ir::Rvalue::Unsupported(format!("ThreadLocalRef {def}")),
             R::Len(place) => ir::Rvalue::Len(self.convert_place(place)?),
             R::NullaryOp(op, _) => ir::Rvalue::Unsupported(format!("NullaryOp {}", op.kind_name())),
-            R::Discriminant(place) => ir::Rvalue::Discriminant(self.convert_place(place)?),
+            R::Discriminant(place) => {
+                let converted = self.convert_place(place)?;
+                // Bake the discriminant table of the enum into the
+                // rvalue: at execution time the place type is no
+                // longer available, and the table is what separates
+                // the discriminant value from the variant index.
+                // No table (hand-built programs, non-ADT places)
+                // leaves the table empty, which the interpreter
+                // reads as "values are the variant indices".
+                let discriminants = match self.place_ty(body, place) {
+                    Some(mir::Ty::Adt(def, _)) => {
+                        self.discriminants.get(&def).cloned().unwrap_or_default()
+                    }
+                    _ => Vec::new(),
+                };
+                ir::Rvalue::Discriminant(converted, discriminants)
+            }
             R::ShallowInitBox(_, _) => ir::Rvalue::Unsupported("ShallowInitBox rvalue".to_string()),
         })
     }
@@ -1173,7 +1221,7 @@ impl<'a> Converter<'a> {
                 let pairs = targets
                     .values
                     .iter()
-                    .copied()
+                    .map(|v| normalize_switch_value(*v, ctx.as_ref()))
                     .zip(targets.targets.iter().map(|b| ir::BasicBlock(b.index())))
                     .collect();
                 ir::TerminatorKind::SwitchInt {
