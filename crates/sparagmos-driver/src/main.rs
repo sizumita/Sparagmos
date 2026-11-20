@@ -42,6 +42,10 @@ use std::ops::ControlFlow;
 use std::sync::{Mutex, OnceLock};
 
 use rustc_public::mir::mono::Instance;
+use rustc_public::ty::{
+    ClosureKind, ExistentialPredicate, GenericArgKind, GenericArgs, IntTy, RigidTy, Ty,
+    TyConstKind, TyKind,
+};
 use rustc_public::CrateDef;
 
 use sparagmos_driver::convert::Converter;
@@ -218,6 +222,143 @@ impl StdoutToStderr {
     fn restore(&mut self) {}
 }
 
+/// Record `name` as skipped for one concrete `reason`.
+fn skip_fn(report: &mut ConversionReport, name: &str, reason: String) {
+    let mut reasons = BTreeMap::new();
+    reasons.insert(reason, 1);
+    report.functions.push(FnReport {
+        name: name.to_string(),
+        blocks: 0,
+        locals: 0,
+        arg_count: 0,
+        outcome: FnOutcome::Skipped { reasons },
+    });
+}
+
+/// What came of trying to instantiate an item as a closure after
+/// `Instance::try_from` rejected it.
+enum ClosureAttempt {
+    /// A monomorphic closure instance whose body can be converted.
+    Instance(Instance),
+    /// The item is not a closure at all.
+    NotClosure,
+    /// The item is a closure that stays skipped, with the reason.
+    Unsupported(String),
+}
+
+/// Instantiate a local closure item's body.
+///
+/// `Instance::try_from` rejects every closure item: a closure
+/// definition always carries generic parameters (its parent
+/// arguments plus its signature and capture types), so it never has
+/// a mono instance *as an item*. A closure defined in a concrete
+/// context can still be instantiated from the generic arguments of
+/// its own type via `Instance::resolve_closure`, requesting the
+/// closure's own kind so no `FnOnce` adapter shim is produced and
+/// the instance's body is the closure body itself. Closures whose
+/// arguments still mention generic parameters (defined inside a
+/// generic function, method or impl) have no single monomorphic
+/// body to collect — the same limitation as generic functions —
+/// and stay skipped. Async closures are coroutine closures; their
+/// bodies are coroutines, which are not converted.
+fn closure_instance(item: &rustc_public::CrateItem) -> ClosureAttempt {
+    match item.ty().kind() {
+        TyKind::RigidTy(RigidTy::CoroutineClosure(..)) => ClosureAttempt::Unsupported(
+            "async closure body is not converted (coroutine closures are unsupported)".to_string(),
+        ),
+        TyKind::RigidTy(RigidTy::Closure(def, args)) => {
+            if args_mention_params(&args) {
+                return ClosureAttempt::Unsupported(
+                    "closure is defined in a generic context (its generic arguments \
+                     still mention parameters); only monomorphic closures are converted"
+                        .to_string(),
+                );
+            }
+            let Some(kind) = closure_kind(&args) else {
+                return ClosureAttempt::Unsupported(
+                    "closure kind is not recoverable from its generic arguments".to_string(),
+                );
+            };
+            match Instance::resolve_closure(def, &args, kind) {
+                Ok(instance) => ClosureAttempt::Instance(instance),
+                Err(e) => {
+                    ClosureAttempt::Unsupported(format!("closure instance resolution failed: {e}"))
+                }
+            }
+        }
+        _ => ClosureAttempt::NotClosure,
+    }
+}
+
+/// The closure kind (`Fn` / `FnMut` / `FnOnce`) recorded in a
+/// closure type's generic arguments. rustc appends three synthetic
+/// arguments to a closure's parent arguments — the kind, the
+/// signature as a function-pointer type, and the tupled captures —
+/// and encodes the kind itself as an integer type: `i8` for `Fn`,
+/// `i16` for `FnMut`, `i32` for `FnOnce` (this is rustc's
+/// `Ty::from_closure_kind`; the encoding is part of the Stable MIR
+/// boundary this crate pins to Rust 1.100.0).
+fn closure_kind(args: &GenericArgs) -> Option<ClosureKind> {
+    let kind_arg = args.0.iter().rev().nth(2)?;
+    let GenericArgKind::Type(ty) = kind_arg else {
+        return None;
+    };
+    match ty.kind() {
+        TyKind::RigidTy(RigidTy::Int(IntTy::I8)) => Some(ClosureKind::Fn),
+        TyKind::RigidTy(RigidTy::Int(IntTy::I16)) => Some(ClosureKind::FnMut),
+        TyKind::RigidTy(RigidTy::Int(IntTy::I32)) => Some(ClosureKind::FnOnce),
+        _ => None,
+    }
+}
+
+/// Whether any generic argument still mentions a type or const
+/// parameter, i.e. the item is not fully monomorphic.
+fn args_mention_params(args: &GenericArgs) -> bool {
+    args.0.iter().any(|arg| match arg {
+        GenericArgKind::Type(ty) => ty_mentions_param(ty),
+        GenericArgKind::Const(konst) => const_mentions_param(konst),
+        GenericArgKind::Lifetime(_) => false,
+    })
+}
+
+fn const_mentions_param(konst: &rustc_public::ty::TyConst) -> bool {
+    match konst.kind() {
+        TyConstKind::Param(_) => true,
+        TyConstKind::Unevaluated(_, args) => args_mention_params(args),
+        TyConstKind::Value(ty, _) | TyConstKind::ZSTValue(ty) => ty_mentions_param(ty),
+        _ => false,
+    }
+}
+
+fn ty_mentions_param(ty: &Ty) -> bool {
+    match ty.kind() {
+        TyKind::Param(_) => true,
+        TyKind::Alias(_, alias) => args_mention_params(&alias.args),
+        TyKind::RigidTy(rigid) => match rigid {
+            RigidTy::Ref(_, inner, _) | RigidTy::RawPtr(inner, _) | RigidTy::Slice(inner) => {
+                ty_mentions_param(&inner)
+            }
+            RigidTy::Array(inner, len) => ty_mentions_param(&inner) || const_mentions_param(&len),
+            RigidTy::Pat(inner, _) => ty_mentions_param(&inner),
+            RigidTy::Tuple(elems) => elems.iter().any(ty_mentions_param),
+            RigidTy::FnPtr(sig) => sig.value.inputs_and_output.iter().any(ty_mentions_param),
+            RigidTy::Adt(_, args)
+            | RigidTy::FnDef(_, args)
+            | RigidTy::Closure(_, args)
+            | RigidTy::Coroutine(_, args)
+            | RigidTy::CoroutineClosure(_, args)
+            | RigidTy::CoroutineWitness(_, args) => args_mention_params(&args),
+            RigidTy::Dynamic(bounds, _) => bounds.iter().any(|b| match &b.value {
+                ExistentialPredicate::Trait(t) => args_mention_params(&t.generic_args),
+                ExistentialPredicate::Projection(p) => args_mention_params(&p.generic_args),
+                ExistentialPredicate::AutoTrait(_) => false,
+            }),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 fn collect() -> ControlFlow<()> {
     let mut conv = Converter::new();
     let mut report = ConversionReport::default();
@@ -233,21 +374,21 @@ fn collect() -> ControlFlow<()> {
         let def_id = conv.crate_def_id(item);
         let instance = match Instance::try_from(item.clone()) {
             Ok(i) => i,
-            Err(_) => {
-                let mut reasons = BTreeMap::new();
-                reasons.insert(
-                    format!("no monomorphic instance available (kind={:?})", item.kind()),
-                    1,
-                );
-                report.functions.push(FnReport {
-                    name,
-                    blocks: 0,
-                    locals: 0,
-                    arg_count: 0,
-                    outcome: FnOutcome::Skipped { reasons },
-                });
-                continue;
-            }
+            Err(_) => match closure_instance(item) {
+                ClosureAttempt::Instance(i) => i,
+                ClosureAttempt::NotClosure => {
+                    skip_fn(
+                        &mut report,
+                        &name,
+                        format!("no monomorphic instance available (kind={:?})", item.kind()),
+                    );
+                    continue;
+                }
+                ClosureAttempt::Unsupported(reason) => {
+                    skip_fn(&mut report, &name, reason);
+                    continue;
+                }
+            },
         };
         let Some(body) = instance.body() else {
             let mut reasons = BTreeMap::new();
