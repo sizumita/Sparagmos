@@ -695,6 +695,7 @@ impl<'a> Converter<'a> {
                         | mir::PointerCoercion::ArrayToPointer,
                     ) => ir::Rvalue::Use(v),
                     mir::CastKind::PtrToPtr => ir::Rvalue::Use(v),
+                    mir::CastKind::BoxDerefTransmute => ir::Rvalue::BoxDerefTransmute(v),
                     other => ir::Rvalue::Unsupported(format!("Cast {}", other.name())),
                 }
             }

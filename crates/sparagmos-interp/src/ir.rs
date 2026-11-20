@@ -355,6 +355,11 @@ pub enum Rvalue {
     /// The array-to-slice unsizing coercion: wraps the operand (a
     /// reference to an array) into a fat pointer carrying the length.
     Unsize(Operand),
+    /// `BoxDerefTransmute` cast: the operand is the chain of
+    /// single-field wrappers a `Box` keeps around its raw pointer
+    /// (`Unique` around `NonNull` around the pointer); yields the
+    /// raw pointer itself.
+    BoxDerefTransmute(Operand),
     /// `&place` (also raw-pointer creation): a resolved reference value.
     Ref(Place),
     /// The length of the value at a place (array / slice / `str`).

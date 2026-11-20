@@ -958,6 +958,28 @@ impl<'a> Interpreter<'a> {
                     )),
                 }
             }
+            Rvalue::BoxDerefTransmute(operand) => {
+                // The operand is the wrapper chain a `Box` keeps
+                // around its raw pointer (`Unique` around `NonNull`
+                // around the pointer itself); the cast yields the
+                // innermost pointer value unchanged.
+                let mut v = self.eval_operand(frames, body, operand)?;
+                loop {
+                    match v {
+                        Value::Ref(_) | Value::FatRef { .. } => break Ok(v),
+                        Value::Enum { mut fields, .. } if fields.len() == 1 => {
+                            v = fields.pop().expect("one field");
+                        }
+                        other => {
+                            break Err(InterpError::type_mismatch(
+                                "BoxDerefTransmute cast",
+                                "pointer wrapper (Unique/NonNull around a raw pointer)",
+                                other.kind_name(),
+                            ));
+                        }
+                    }
+                }
+            }
             Rvalue::Ref(place) => {
                 let target = self.resolve_place(frames, body, place)?;
                 match target {
