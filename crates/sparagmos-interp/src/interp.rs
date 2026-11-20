@@ -990,7 +990,7 @@ impl<'a> Interpreter<'a> {
                                 work.push((sub, P::Untyped));
                             }
                         }
-                        Some(Value::Enum { .. }) => {
+                        Some(Value::Enum { .. }) | Some(Value::Coroutine { .. }) => {
                             return Err(InterpError::UnsupportedTerminator {
                                 kind: "Drop".to_string(),
                             });
@@ -1027,9 +1027,11 @@ impl<'a> Interpreter<'a> {
                     let Some(value) = self.read_at(frames, &root, &path)? else {
                         continue;
                     };
+                    let is_coroutine = matches!(value, Value::Coroutine { .. });
                     let items = match value {
                         Value::Tuple(items) => items,
                         Value::Enum { fields, .. } => fields,
+                        Value::Coroutine { fields, .. } => fields,
                         other => {
                             return Err(InterpError::type_mismatch(
                                 "drop glue",
@@ -1038,7 +1040,9 @@ impl<'a> Interpreter<'a> {
                             ));
                         }
                     };
-                    if items.len() != fields.len() {
+                    if items.len() != fields.len()
+                        && !(is_coroutine && items.len() < fields.len())
+                    {
                         // With `complete`, conversion proved the
                         // field count, so a mismatch means the value
                         // is malformed; without it, the value holds
@@ -1052,6 +1056,13 @@ impl<'a> Interpreter<'a> {
                         });
                     }
                     for (i, field_plan) in fields.into_iter().enumerate().rev() {
+                        if i >= items.len() {
+                            // Only reachable for a coroutine value
+                            // whose storage is shorter than the plan:
+                            // the field was never written, so it
+                            // holds nothing to drop.
+                            continue;
+                        }
                         if field_plan != P::Trivial {
                             let mut sub = path.clone();
                             sub.push(RefProj::Field(i));
@@ -1090,6 +1101,7 @@ impl<'a> Interpreter<'a> {
                     };
                     let variant = match value {
                         Value::Enum { variant, .. } => variant,
+                        Value::Coroutine { variant, .. } => variant,
                         Value::Tuple(_) => 0,
                         other => {
                             return Err(InterpError::type_mismatch(
@@ -1226,6 +1238,19 @@ impl<'a> Interpreter<'a> {
                 let place_desc = describe_resolved(local, &projection);
                 let value = navigate_mut(slot, &projection, &func, &place_desc)?;
                 match value {
+                    Value::Coroutine {
+                        variant: current, ..
+                    } => {
+                        *current = *variant;
+                        // The state storage is shared between
+                        // states: the fields stay in place. The
+                        // transform sets the tag of the state it is
+                        // entering only after (or before) storing
+                        // that state's fields through downcast
+                        // projections, and values saved for later
+                        // states must survive this tag change.
+                        Ok(())
+                    }
                     Value::Enum {
                         variant: current,
                         fields,
@@ -1718,6 +1743,12 @@ impl<'a> Interpreter<'a> {
                 Ok(value)
             }
             (Some(Ty::Slice(_)), Value::FatRef { .. }) => Ok(value),
+            // Coroutine locals hold the state object itself. (A
+            // coroutine value also reaches places typed as the ADT
+            // wrappers around it - `Box`, `Pin` - as a field of the
+            // wrapper's aggregate value, which is checked as the
+            // wrapper, not here.)
+            (Some(Ty::Coroutine(_)), Value::Coroutine { .. }) => Ok(value),
             (Some(expected), other) => Err(InterpError::type_mismatch(
                 "assignment",
                 format!("{expected:?}"),
@@ -1864,6 +1895,16 @@ impl<'a> Interpreter<'a> {
                 Ok(Value::Closure {
                     def: def.clone(),
                     env,
+                })
+            }
+            Rvalue::CoroutineAggregate(operands) => {
+                let mut fields = Vec::with_capacity(operands.len());
+                for op in operands {
+                    fields.push(self.eval_operand(frames, body, op)?);
+                }
+                Ok(Value::Coroutine {
+                    variant: 0,
+                    fields,
                 })
             }
             Rvalue::Cast(operand, ty) => {
@@ -2050,7 +2091,7 @@ impl<'a> Interpreter<'a> {
             Rvalue::Discriminant(place, discriminants) => {
                 let value = self.read_place(frames, body, place)?;
                 match value {
-                    Value::Enum { variant, .. } => {
+                    Value::Enum { variant, .. } | Value::Coroutine { variant, .. } => {
                         if discriminants.is_empty() {
                             // No table was recorded for this enum:
                             // its discriminants are the sequential
@@ -2144,6 +2185,14 @@ pub(crate) fn project_value(
                         }
                     })?
                 }
+                Value::Coroutine { ref fields, .. } => {
+                    fields.get(*idx).cloned().ok_or_else(|| {
+                        InterpError::UninitializedRead {
+                            func: func.to_string(),
+                            place: place.to_string(),
+                        }
+                    })?
+                }
                 Value::Closure { ref env, .. } => {
                     env.get(*idx).cloned().ok_or_else(|| {
                         InterpError::UninitializedRead {
@@ -2197,6 +2246,12 @@ pub(crate) fn project_value(
                 }
             },
             RefProj::Downcast(variant) => match value {
+                // A coroutine's downcast names the state whose field
+                // layout the access uses; the storage is shared
+                // between states, so the access is valid whatever
+                // the current tag is (the body writes a state's
+                // fields before setting the tag to that state).
+                Value::Coroutine { .. } => value,
                 Value::Enum {
                     variant: current, ..
                 } => {
@@ -2243,6 +2298,16 @@ pub(crate) fn navigate_mut<'x>(
     let (step, rest) = projection.split_first().expect("non-empty");
     match step {
         RefProj::Field(idx) => {
+            if let Value::Coroutine { fields, .. } = slot {
+                // The state storage grows to the written slot: a
+                // state field stored for the first time extends the
+                // storage, and slots skipped over are uninitialized,
+                // like a field that has not been stored yet.
+                if fields.len() <= *idx {
+                    fields.resize(*idx + 1, Value::Uninit);
+                }
+                return navigate_mut(&mut fields[*idx], rest, func, place);
+            }
             let items = match slot {
                 Value::Tuple(items) => items,
                 Value::Enum { fields, .. } => fields,
@@ -2288,6 +2353,10 @@ pub(crate) fn navigate_mut<'x>(
             )),
         },
         RefProj::Downcast(variant) => match slot {
+            // See the read direction: a coroutine's field writes go
+            // through the downcast of the state being entered,
+            // whatever the current tag is.
+            Value::Coroutine { .. } => navigate_mut(slot, rest, func, place),
             Value::Enum {
                 variant: current, ..
             } => {
