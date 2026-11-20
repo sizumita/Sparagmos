@@ -311,6 +311,17 @@ impl<'a> Converter<'a> {
 
     // ----- types -----------------------------------------------------------
 
+    /// Display name for a `DefId` (function items, closure bodies,
+    /// ADT types): the driver's full name table first, then the
+    /// table of converted bodies, then the raw id.
+    fn def_display_name(&self, def: &mir::DefId) -> String {
+        self.names
+            .get(def)
+            .or_else(|| self.def_names.get(def))
+            .cloned()
+            .unwrap_or_else(|| format!("{def:?}"))
+    }
+
     fn convert_ty(&self, ty: &mir::Ty, context: &str) -> Result<ir::Ty, ConvertError> {
         let unsupported = || ConvertError::UnsupportedType {
             context: context.to_string(),
@@ -334,15 +345,14 @@ impl<'a> Converter<'a> {
                 }
                 ir::Ty::Tuple(out)
             }
-            mir::Ty::Adt(def, _) => {
-                let name = self
-                    .names
-                    .get(def)
-                    .or_else(|| self.def_names.get(def))
-                    .cloned()
-                    .unwrap_or_else(|| format!("{def:?}"));
-                ir::Ty::Adt(name)
-            }
+            mir::Ty::Adt(def, _) => ir::Ty::Adt(self.def_display_name(def)),
+            // Function pointers carry no signature in the IR; the
+            // callee's arity is checked at the call site.
+            mir::Ty::FnPtr(_) => ir::Ty::FnPtr,
+            // Function items and closures are named by the body they
+            // call, so a value of this type can be invoked.
+            mir::Ty::FnDef(def, _) => ir::Ty::FnDef(self.def_display_name(def)),
+            mir::Ty::Closure(def, _) => ir::Ty::Closure(self.def_display_name(def)),
             mir::Ty::Ref(_, inner, _) => {
                 ir::Ty::Ref(Box::new(self.convert_ty(inner, context)?))
             }
@@ -428,6 +438,12 @@ impl<'a> Converter<'a> {
     ) -> Result<ir::Constant, ConvertError> {
         match &constant.literal {
             mir::ConstKind::Value(v) => self.convert_const_value(v, ctx),
+            // A function item in operand position is a value (the
+            // zero-sized fn item, reifiable to a function pointer):
+            // it becomes a callable constant naming the function.
+            mir::ConstKind::Ty(mir::Ty::FnDef(def, _)) => {
+                Ok(ir::Constant::FnDef(self.def_display_name(def)))
+            }
             mir::ConstKind::Ty(t) => Err(ConvertError::UnsupportedConstant {
                 kind: format!("type constant {} outside call position", t.kind_name()),
             }),
@@ -695,6 +711,28 @@ impl<'a> Converter<'a> {
                         | mir::PointerCoercion::ArrayToPointer,
                     ) => ir::Rvalue::Use(v),
                     mir::CastKind::PtrToPtr => ir::Rvalue::Use(v),
+                    // Reifying a function item into a function
+                    // pointer does not change the value in this
+                    // model: both are the callable value naming the
+                    // function.
+                    mir::CastKind::PointerCoercion(
+                        mir::PointerCoercion::ReifyFnPointer,
+                    ) => ir::Rvalue::Use(v),
+                    // A non-capturing closure coerced to a function
+                    // pointer: with a place operand, the closure
+                    // value itself is the callable. The constant
+                    // form names no closure (the zero-sized constant
+                    // does not preserve the closure type), so it
+                    // stays an explicit unsupported.
+                    mir::CastKind::PointerCoercion(
+                        mir::PointerCoercion::ClosureFnPointer,
+                    ) => match operand {
+                        mir::Operand::Copy(_) | mir::Operand::Move(_) => ir::Rvalue::Use(v),
+                        mir::Operand::Constant(_) => ir::Rvalue::Unsupported(
+                            "Cast ClosureFnPointer of a zero-sized closure constant                              (the closure type is not preserved in the constant)"
+                                .to_string(),
+                        ),
+                    },
                     other => ir::Rvalue::Unsupported(format!("Cast {}", other.name())),
                 }
             }
@@ -742,6 +780,23 @@ impl<'a> Converter<'a> {
                     }
                     ir::Rvalue::AggregateAdt {
                         variant: *variant_index,
+                        operands: fields,
+                    }
+                }
+                mir::AggregateKind::Closure { def, generic_args } => {
+                    // The closure type's third generic argument is
+                    // the upvars tuple; its element types type the
+                    // capture operands.
+                    let upvar_tys: Vec<mir::Ty> = match generic_args.get(2) {
+                        Some(mir::Ty::Tuple(ts)) => ts.clone(),
+                        _ => Vec::new(),
+                    };
+                    let mut fields = Vec::with_capacity(ops.len());
+                    for (i, op) in ops.iter().enumerate() {
+                        fields.push(self.convert_operand(body, op, upvar_tys.get(i))?);
+                    }
+                    ir::Rvalue::ClosureAggregate {
+                        def: self.def_display_name(def),
                         operands: fields,
                     }
                 }
@@ -861,6 +916,31 @@ impl<'a> Converter<'a> {
         }
     }
 
+    /// Whether this call's func operand names an `Fn`-family trait
+    /// method (`Fn::call`, `FnMut::call_mut`, `FnOnce::call_once` in
+    /// their `std::ops` / `core::ops` spellings): returns the call
+    /// kind and the callee's raw generic arguments, whose first two
+    /// entries are the Self type and the argument tuple type (used
+    /// to type the receiver and tuple operands).
+    fn resolve_fn_trait_call(
+        &self,
+        func: &mir::Operand,
+    ) -> Option<(ir::FnCallKind, Vec<mir::Ty>)> {
+        let (name, _, raw_generic_args) = self.resolve_external_callee(func)?;
+        let canonical = crate::builtins::canonical_name(&name);
+        let kind = match canonical.as_str() {
+            "std::ops::Fn::call" | "core::ops::Fn::call" => ir::FnCallKind::Call,
+            "std::ops::FnMut::call_mut" | "core::ops::FnMut::call_mut" => {
+                ir::FnCallKind::CallMut
+            }
+            "std::ops::FnOnce::call_once" | "core::ops::FnOnce::call_once" => {
+                ir::FnCallKind::CallOnce
+            }
+            _ => return None,
+        };
+        Some((kind, raw_generic_args))
+    }
+
     /// Whether dropping a value of this type provably has no
     /// guest-observable effect in this value model: plain data drops
     /// nothing; references drop nothing; the listed std types only
@@ -877,6 +957,15 @@ impl<'a> Converter<'a> {
             | mir::Ty::Never
             | mir::Ty::Str => true,
             mir::Ty::Tuple(ts) => ts.iter().all(|t| self.drop_is_unobservable(t)),
+            // A closure's drop is the drop of its captures (the
+            // upvars tuple is the closure type's third generic
+            // argument).
+            mir::Ty::Closure(_, args) => match args.get(2) {
+                Some(mir::Ty::Tuple(ts)) => {
+                    ts.iter().all(|t| self.drop_is_unobservable(t))
+                }
+                _ => false,
+            },
             mir::Ty::Array(elem, _) | mir::Ty::Slice(elem) => self.drop_is_unobservable(elem),
             mir::Ty::Ref(..) | mir::Ty::RawPtr(..) | mir::Ty::FnDef(..) | mir::Ty::FnPtr(_) => {
                 true
@@ -941,7 +1030,24 @@ impl<'a> Converter<'a> {
                 target,
                 ..
             } => {
-                if let Some(name) = self.resolve_callee(func) {
+                // Indirect call through a callable value in a place
+                // (a function pointer, function item, or closure
+                // variable): the func operand is the callable itself.
+                if matches!(func, mir::Operand::Copy(_) | mir::Operand::Move(_)) {
+                    let func_ty = self.operand_place_ty(body, func);
+                    let param_tys = callable_param_tys(func_ty.as_ref());
+                    let ir_func = self.convert_operand(body, func, func_ty.as_ref())?;
+                    let mut ir_args = Vec::with_capacity(args.len());
+                    for (i, arg) in args.iter().enumerate() {
+                        ir_args.push(self.convert_operand(body, arg, param_tys.get(i))?);
+                    }
+                    ir::TerminatorKind::CallIndirect {
+                        func: ir_func,
+                        args: ir_args,
+                        destination: self.convert_place(destination)?,
+                        target: target.map(|b| ir::BasicBlock(b.index())),
+                    }
+                } else if let Some(name) = self.resolve_callee(func) {
                     let callee = self.bodies.get(&name);
                     let mut ir_args = Vec::with_capacity(args.len());
                     for (i, arg) in args.iter().enumerate() {
@@ -952,6 +1058,25 @@ impl<'a> Converter<'a> {
                     ir::TerminatorKind::Call {
                         func: name,
                         args: ir_args,
+                        destination: self.convert_place(destination)?,
+                        target: target.map(|b| ir::BasicBlock(b.index())),
+                    }
+                } else if let Some((kind, raw_generic_args)) = self
+                    .resolve_fn_trait_call(func)
+                    .filter(|_| args.len() == 2)
+                {
+                    // A call through the `Fn` / `FnMut` / `FnOnce`
+                    // trait methods — how rustc MIR calls a closure:
+                    // receiver (the callable or a reference to it)
+                    // plus the argument tuple.
+                    let receiver =
+                        self.convert_operand(body, &args[0], raw_generic_args.first())?;
+                    let tuple =
+                        self.convert_operand(body, &args[1], raw_generic_args.get(1))?;
+                    ir::TerminatorKind::CallTrait {
+                        kind,
+                        receiver,
+                        args: tuple,
                         destination: self.convert_place(destination)?,
                         target: target.map(|b| ir::BasicBlock(b.index())),
                     }
@@ -1115,6 +1240,25 @@ fn uint_ty_of_bits(bits: u32) -> Option<mir::UintTy> {
 /// literal arguments whose type the callee's signature pins to a
 /// generic parameter (`RangeInclusive::new`'s bounds are its `Idx`)
 /// or to a fixed type (`Argument::from_usize` takes `usize`).
+/// The parameter types of a callable place type, for typing call
+/// arguments whose literals carry no type of their own: a function
+/// pointer's inputs directly; a closure's parameters through its
+/// signature (whose single RustCall input is the parameter tuple).
+/// Empty when the type carries no signature (function items).
+fn callable_param_tys(ty: Option<&mir::Ty>) -> Vec<mir::Ty> {
+    match ty {
+        Some(mir::Ty::FnPtr(sig)) => sig.inputs.clone(),
+        Some(mir::Ty::Closure(_, args)) => match args.get(1) {
+            Some(mir::Ty::FnPtr(sig)) => match sig.inputs.first() {
+                Some(mir::Ty::Tuple(ts)) => ts.clone(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
 fn builtin_arg_ctx(
     kind: crate::builtins::Builtin,
     raw_generic_args: &[mir::Ty],
