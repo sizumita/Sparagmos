@@ -1411,3 +1411,112 @@ fn run_mode_trait_default_method_body() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "10 11 20 21\n");
 }
+
+// ----- anonymous constants (Lane BW) -----
+
+const NAMES: [&str; 2] = ["x", "yy"];
+const OPT: Option<&i32> = Some(&5);
+fn main() {
+    println!("{} {} {} {} {} {}", S1.a, S1.b, *R, B, NAMES[1],
+             match OPT { Some(r) => *r, None => 0 });
+}
+"#;
+
+const ANON_CONST_GENERIC_SRC: &str = r#"
+fn f<T>(x: T) -> usize {
+    let a = [0u32; 1 + 2];
+    a.len() + std::mem::size_of::<T>()
+}
+fn main() {
+    println!("{}", f::<u8>(0));
+}
+"#;
+
+#[test]
+fn summary_mode_generic_context_anon_consts_are_converted() {
+    // An anonymous constant inside a generic function requires
+    // monomorphization as an item, so it has no instance; its own
+    // MIR body is converted instead, and the target crate reports
+    // no skipped functions.
+    let dir = temp_dir("anon-const-generic");
+    let src = fixture(&dir, "anon_const_generic.rs", ANON_CONST_GENERIC_SRC);
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let konst = stdout
+        .lines()
+        .find(|l| l.contains("::{constant#0}:"))
+        .expect("summary lists the anonymous constant");
+    assert!(
+        konst.contains("[converted]"),
+        "the generic-context anonymous constant is converted: {konst}"
+    );
+    assert!(
+        stdout.contains("target-crate converted: 3, skipped: 0"),
+        "no target-crate function is skipped: {stdout}"
+    );
+}
+
+#[test]
+fn run_mode_generic_context_anon_const_executes() {
+    let dir = temp_dir("anon-const-generic-run");
+    let src = fixture(&dir, "anon_const_generic.rs", ANON_CONST_GENERIC_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the program must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "4\n");
+}
+
+const TRIVIAL_CONST_SRC: &str = r#"
+const N: usize = 3;
+static S: [u32; 3] = [4; 1 + 2];
+fn main() {
+    let a = [0u32; N];
+    println!("{}", a.len() + S.len());
+}
+"#;
+
+#[test]
+fn summary_mode_trivial_consts_are_converted_without_bodies() {
+    // Trivial constants (a literal, a path) have no MIR body
+    // anywhere by design; they are accounted as converted with no
+    // body instead of being reported as missing bodies, while the
+    // non-trivial constant of the static initializer keeps its
+    // real body.
+    let dir = temp_dir("trivial-consts");
+    let src = fixture(&dir, "trivial_consts.rs", TRIVIAL_CONST_SRC);
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let named = stdout
+        .lines()
+        .find(|l| l.starts_with("fn trivial_consts::N:"))
+        .expect("summary lists the named constant");
+    assert!(
+        named.contains("blocks=0") && named.contains("[converted]"),
+        "the trivial named constant is converted with no body: {named}"
+    );
+    let trivial = stdout
+        .lines()
+        .find(|l| l.contains("::S::{constant#0}:"))
+        .expect("summary lists the static type-length constant");
+    assert!(
+        trivial.contains("blocks=0") && trivial.contains("[converted]"),
+        "the trivial type-length constant is converted with no body: {trivial}"
+    );
+    let real = stdout
+        .lines()
+        .find(|l| l.contains("::S::{constant#1}:"))
+        .expect("summary lists the static initializer constant");
+    assert!(
+        real.contains("[converted]") && !real.contains("blocks=0"),
+        "the non-trivial constant keeps its converted body: {real}"
+    );
+    assert!(
+        stdout.contains("target-crate skipped: 0")
+            || stdout.contains("skipped: 0"),
+        "no target-crate function is skipped: {stdout}"
+    );
+}
