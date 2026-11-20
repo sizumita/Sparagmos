@@ -31,9 +31,9 @@ use std::collections::HashMap;
 use sparagmos_mir as mir;
 
 use crate::error::{InterpError, InterpResult};
-use crate::interp::{Frame, Interpreter};
+use crate::interp::{Frame, Interpreter, Resolved};
 use crate::ir::{Body, Operand};
-use crate::value::{FmtArguments, FmtTrait, Value};
+use crate::value::{FmtArguments, FmtTrait, RefProj, RefTarget, Value};
 
 // ---------------------------------------------------------------------------
 // Callee names
@@ -221,6 +221,109 @@ pub enum Builtin {
     Deref,
     /// `str::to_uppercase(&str) -> String`.
     ToUppercase,
+    /// `str::to_lowercase(&str) -> String`.
+    ToLowercase,
+    /// `core::panicking::panic(&str)`: raise a guest panic.
+    PanicStr,
+    /// `std::rt::panic_fmt(Arguments)` / `core::panicking::panic_fmt`:
+    /// raise a guest panic with the formatted message.
+    PanicFmt,
+    /// `core::panicking::assert_failed(kind, &left, &right, args)`:
+    /// raise a guest panic reporting the failed comparison.
+    AssertFailed,
+    /// `PartialEq::eq(&a, &b)`: semantic (derived) value equality.
+    PartialEqEq,
+    /// `PartialEq::ne(&a, &b)`.
+    PartialEqNe,
+    /// `PartialOrd::partial_cmp(&a, &b) -> Option<Ordering>`.
+    PartialCmp,
+    /// `Ord::cmp(&a, &b) -> Ordering`.
+    OrdCmp,
+    /// `PartialOrd::lt/le/gt/ge(&a, &b) -> bool`.
+    PartialOrdRel(RelOp),
+    /// `Clone::clone(&value)`: a copy of the pointee value.
+    CloneClone,
+    /// `Default::default()`: the default value of the type.
+    DefaultDefault,
+    /// `ToString::to_string(&value)` for the modelled `Display` types.
+    ToStringToString,
+    /// `Box::new(value)`: the box is an ADT aggregate holding its
+    /// pointee in this value model.
+    BoxNew,
+    /// `Vec::new()`: an empty vector (ADT aggregate of its elements).
+    VecNew,
+    /// `Vec::push(&mut vec, value)`.
+    VecPush,
+    /// `Vec::len(&vec)`.
+    VecLen,
+    /// `Vec::is_empty(&vec)`.
+    VecIsEmpty,
+    /// `core::slice::<impl [T]>::iter(&slice)`: a slice iterator state
+    /// (element snapshot + next index), the shape `Iterator::next`
+    /// consumes for `std::slice::Iter`.
+    SliceIter,
+    /// `std::iter::empty()`: an empty iterator.
+    IterEmpty,
+    /// `Index::index(&container, idx) -> &elem`.
+    IndexIndex,
+    /// `IndexMut::index_mut(&mut container, idx) -> &mut elem`
+    /// (containers whose elements are addressable places only).
+    IndexMut,
+    /// `std::ops::DerefMut::deref_mut(&mut value)` (modelled types).
+    DerefMut,
+    /// `Cell::new(value)`: a cell is an ADT aggregate of one field.
+    CellNew,
+    /// `Cell::get(&cell)`.
+    CellGet,
+    /// `Cell::set(&cell, value)`.
+    CellSet,
+    /// `Cell::replace(&cell, value) -> old value`.
+    CellReplace,
+    /// `Cell::into_inner(cell) -> value`.
+    CellIntoInner,
+    /// `Option::unwrap(option)`.
+    OptionUnwrap,
+    /// `Result::unwrap(result)`.
+    ResultUnwrap,
+    /// `Option::is_some(&option)`.
+    OptionIsSome,
+    /// `Option::is_none(&option)`.
+    OptionIsNone,
+    /// `Result::is_ok(&result)`.
+    ResultIsOk,
+    /// `Result::is_err(&result)`.
+    ResultIsErr,
+    /// `Option::take(&mut option) -> old value`.
+    OptionTake,
+    /// `std::mem::drop(value)`: the value is consumed; dropping the
+    /// modelled std data types has no guest-observable effect.
+    MemDrop,
+    /// `std::mem::swap(&mut a, &mut b)`.
+    MemSwap,
+    /// `std::mem::size_of::<T>()` (types with a known layout only).
+    MemSizeOf,
+    /// `std::mem::align_of::<T>()` (types with a known layout only).
+    MemAlignOf,
+    /// `std::mem::size_of_val(&value)`.
+    MemSizeOfVal,
+    /// `std::mem::needs_drop::<T>()` (types with a known answer only).
+    MemNeedsDrop,
+    /// `ManuallyDrop::new(value)`: an ADT aggregate of one field.
+    ManuallyDropNew,
+    /// `ToOwned::to_owned(&value)` for the modelled owned types.
+    ToOwned,
+    /// `std::convert::Into::into(value)`: shares the `From::from`
+    /// modelling (the blanket `Into` impl is `From` by definition).
+    IntoInto,
+}
+
+/// A relational operator selected by a `PartialOrd` method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelOp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
 /// Look a canonical callee name up in the registry.
@@ -253,6 +356,96 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
             Builtin::RangeInclusiveNew
         }
         _ if canonical.ends_with("::to_uppercase") => Builtin::ToUppercase,
+        _ if canonical.ends_with("::to_lowercase") => Builtin::ToLowercase,
+        // The panic path: these callees never return; the builtin
+        // raises the guest panic the call stands for.
+        "core::panicking::panic" => Builtin::PanicStr,
+        "std::rt::panic_fmt" | "core::panicking::panic_fmt" => Builtin::PanicFmt,
+        "core::panicking::assert_failed" => Builtin::AssertFailed,
+        // Comparison traits: the impls for the modelled data types
+        // are the derived ones, i.e. semantic value comparison.
+        _ if canonical.ends_with("::PartialEq::eq") => Builtin::PartialEqEq,
+        _ if canonical.ends_with("::PartialEq::ne") => Builtin::PartialEqNe,
+        _ if canonical.ends_with("::PartialOrd::partial_cmp") => Builtin::PartialCmp,
+        _ if canonical.ends_with("::PartialOrd::lt") => Builtin::PartialOrdRel(RelOp::Lt),
+        _ if canonical.ends_with("::PartialOrd::le") => Builtin::PartialOrdRel(RelOp::Le),
+        _ if canonical.ends_with("::PartialOrd::gt") => Builtin::PartialOrdRel(RelOp::Gt),
+        _ if canonical.ends_with("::PartialOrd::ge") => Builtin::PartialOrdRel(RelOp::Ge),
+        _ if canonical.ends_with("::Ord::cmp") => Builtin::OrdCmp,
+        _ if canonical.ends_with("::Clone::clone") => Builtin::CloneClone,
+        "std::default::Default::default" | "core::default::Default::default" => {
+            Builtin::DefaultDefault
+        }
+        "std::string::ToString::to_string" => Builtin::ToStringToString,
+        "std::convert::Into::into" => Builtin::IntoInto,
+        "std::borrow::ToOwned::to_owned" => Builtin::ToOwned,
+        _ if canonical.starts_with("std::boxed::Box") && canonical.ends_with(">::new") => {
+            Builtin::BoxNew
+        }
+        _ if canonical.starts_with("std::vec::Vec") && canonical.ends_with(">::new") => {
+            Builtin::VecNew
+        }
+        _ if canonical.starts_with("std::vec::Vec") && canonical.ends_with(">::push") => {
+            Builtin::VecPush
+        }
+        _ if canonical.starts_with("std::vec::Vec") && canonical.ends_with(">::len") => {
+            Builtin::VecLen
+        }
+        _ if canonical.starts_with("std::vec::Vec") && canonical.ends_with(">::is_empty") => {
+            Builtin::VecIsEmpty
+        }
+        _ if canonical.starts_with("core::slice::<impl") && canonical.ends_with(">::iter") => {
+            Builtin::SliceIter
+        }
+        "std::iter::empty" => Builtin::IterEmpty,
+        "std::ops::Index::index" => Builtin::IndexIndex,
+        "std::ops::IndexMut::index_mut" => Builtin::IndexMut,
+        "std::ops::DerefMut::deref_mut" => Builtin::DerefMut,
+        _ if canonical.starts_with("std::cell::Cell") && canonical.ends_with(">::new") => {
+            Builtin::CellNew
+        }
+        _ if canonical.starts_with("std::cell::Cell") && canonical.ends_with(">::get") => {
+            Builtin::CellGet
+        }
+        _ if canonical.starts_with("std::cell::Cell") && canonical.ends_with(">::set") => {
+            Builtin::CellSet
+        }
+        _ if canonical.starts_with("std::cell::Cell") && canonical.ends_with(">::replace") => {
+            Builtin::CellReplace
+        }
+        _ if canonical.starts_with("std::cell::Cell") && canonical.ends_with(">::into_inner") => {
+            Builtin::CellIntoInner
+        }
+        _ if canonical.contains("option::Option") && canonical.ends_with(">::unwrap") => {
+            Builtin::OptionUnwrap
+        }
+        _ if canonical.contains("result::Result") && canonical.ends_with(">::unwrap") => {
+            Builtin::ResultUnwrap
+        }
+        _ if canonical.contains("option::Option") && canonical.ends_with(">::is_some") => {
+            Builtin::OptionIsSome
+        }
+        _ if canonical.contains("option::Option") && canonical.ends_with(">::is_none") => {
+            Builtin::OptionIsNone
+        }
+        _ if canonical.contains("result::Result") && canonical.ends_with(">::is_ok") => {
+            Builtin::ResultIsOk
+        }
+        _ if canonical.contains("result::Result") && canonical.ends_with(">::is_err") => {
+            Builtin::ResultIsErr
+        }
+        _ if canonical.contains("option::Option") && canonical.ends_with(">::take") => {
+            Builtin::OptionTake
+        }
+        "std::mem::drop" => Builtin::MemDrop,
+        "std::mem::swap" => Builtin::MemSwap,
+        "std::mem::size_of" => Builtin::MemSizeOf,
+        "std::mem::align_of" => Builtin::MemAlignOf,
+        "std::mem::size_of_val" => Builtin::MemSizeOfVal,
+        "std::mem::needs_drop" => Builtin::MemNeedsDrop,
+        _ if canonical.starts_with("std::mem::ManuallyDrop") && canonical.ends_with(">::new") => {
+            Builtin::ManuallyDropNew
+        }
         _ => return None,
     })
 }
@@ -362,8 +555,11 @@ impl<'a> Interpreter<'a> {
                 let value = vals.into_iter().next().expect("arity checked");
                 if self_ty.starts_with("std::ops::Range<")
                     || self_ty.starts_with("std::ops::RangeInclusive<")
+                    || self_ty.starts_with("std::slice::Iter<")
                 {
-                    // A range is its own iterator in this model.
+                    // A range is its own iterator in this model, and a
+                    // slice iterator is already in `next`-ready shape
+                    // (built by the `slice::iter` runtime support).
                     Ok(value)
                 } else if self_ty.starts_with('[') {
                     // Array by value: iteration state is the element
@@ -392,7 +588,7 @@ impl<'a> Interpreter<'a> {
                 let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
                 self.iterator_next(frames, self_ty, &vals[0])
             }
-            Builtin::FromFrom => {
+            Builtin::FromFrom | Builtin::IntoInto => {
                 arity(1)?;
                 let target = generic_args.first().map(String::as_str).unwrap_or("");
                 let source = generic_args.get(1).map(String::as_str).unwrap_or("");
@@ -403,6 +599,33 @@ impl<'a> Interpreter<'a> {
                     && (target == "std::string::String" || target == "str" || target == "&str")
                 {
                     Ok(value)
+                } else if matches!(value, Value::Int(_) | Value::Uint(_)) && is_integer_tag(target)
+                {
+                    // The `From` impls between integer types are the
+                    // value-preserving ones; the stored value already
+                    // denotes the result (width/sign are applied when
+                    // the destination place is written).
+                    Ok(value)
+                } else if target.starts_with("std::vec::Vec<") {
+                    // `Vec::from([T; N])`: the array's elements become
+                    // the vector's.
+                    match value {
+                        Value::Tuple(items) => Ok(Value::Enum {
+                            variant: 0,
+                            fields: items,
+                        }),
+                        ref other => Err(InterpError::type_mismatch(
+                            "From::from to Vec",
+                            "array value",
+                            other.kind_name(),
+                        )),
+                    }
+                } else if target.starts_with("std::boxed::Box<") {
+                    // `Box::from(value)` is `Box::new` by definition.
+                    Ok(Value::Enum {
+                        variant: 0,
+                        fields: vec![value],
+                    })
                 } else {
                     Err(unsupported(format!(
                         "From::from from {source} to {target} is not runtime-supported"
@@ -433,6 +656,23 @@ impl<'a> Interpreter<'a> {
                         base: Box::new(vals.into_iter().next().expect("arity checked")),
                         len,
                     })
+                } else if self_ty.starts_with("std::boxed::Box<") {
+                    // A box in this model is an ADT aggregate holding
+                    // its pointee; `deref` yields a reference to that
+                    // pointee value (reads resolve against the value,
+                    // as they do for constant aggregates).
+                    let pointee = self.resolve_value(frames, &vals[0])?;
+                    match pointee {
+                        Value::Enum { fields, .. } if fields.len() == 1 => {
+                            let inner = fields.into_iter().next().expect("len checked");
+                            Ok(Value::Ref(RefTarget::Value(Box::new(inner))))
+                        }
+                        ref other => Err(InterpError::type_mismatch(
+                            "Deref::deref for Box",
+                            "boxed value",
+                            other.kind_name(),
+                        )),
+                    }
                 } else {
                     Err(unsupported(format!(
                         "Deref::deref for {self_ty} is not runtime-supported"
@@ -448,6 +688,558 @@ impl<'a> Interpreter<'a> {
                     _ => self.resolve_string(frames, &vals[0])?,
                 };
                 Ok(Value::Str(s.to_uppercase()))
+            }
+            Builtin::ToLowercase => {
+                arity(1)?;
+                let s = match &vals[0] {
+                    Value::Str(s) => s.clone(),
+                    _ => self.resolve_string(frames, &vals[0])?,
+                };
+                Ok(Value::Str(s.to_lowercase()))
+            }
+            Builtin::PanicStr => {
+                arity(1)?;
+                // `core::panicking::panic` takes the message as a
+                // string; formatted-panic shapes hand over a built
+                // `fmt::Arguments` instead.
+                let message = match &vals[0] {
+                    Value::FmtArguments(_) => {
+                        self.format_arguments(frames, expect_arguments(&vals[0], name)?)?
+                    }
+                    _ => self.resolve_string(frames, &vals[0])?,
+                };
+                Err(InterpError::panic(message))
+            }
+            Builtin::PanicFmt => {
+                arity(1)?;
+                let message =
+                    self.format_arguments(frames, expect_arguments(&vals[0], name)?)?;
+                Err(InterpError::panic(message))
+            }
+            Builtin::AssertFailed => {
+                arity(4)?;
+                // (kind, &left, &right, Option<fmt::Arguments>): the
+                // message mirrors core's: the comparison, the custom
+                // message when one was given, and both operands.
+                let kind_variant = match self.resolve_value(frames, &vals[0])? {
+                    Value::Enum { variant, .. } => variant,
+                    _ => u32::MAX,
+                };
+                let mut message = match kind_variant {
+                    0 => "assertion `left == right` failed".to_string(),
+                    1 => "assertion `left != right` failed".to_string(),
+                    2 => "assertion `left matches right` failed".to_string(),
+                    _ => "assertion failed".to_string(),
+                };
+                if let Value::Enum {
+                    variant: 1,
+                    fields,
+                } = self.resolve_value(frames, &vals[3])?
+                {
+                    if let Some(arg) = fields.into_iter().next() {
+                        if let Ok(text) =
+                            self.format_arguments(frames, expect_arguments(&arg, name)?)
+                        {
+                            message = format!("{message}: {text}");
+                        }
+                    }
+                }
+                let left = self.resolve_value(frames, &vals[1])?;
+                let right = self.resolve_value(frames, &vals[2])?;
+                message = format!("{message}\n  left: {left}\n right: {right}");
+                Err(InterpError::panic(message))
+            }
+            Builtin::PartialEqEq | Builtin::PartialEqNe => {
+                arity(2)?;
+                let eq = self.values_equal(frames, &vals[0], &vals[1])?;
+                Ok(Value::Bool(if kind == Builtin::PartialEqNe {
+                    !eq
+                } else {
+                    eq
+                }))
+            }
+            Builtin::PartialCmp => {
+                arity(2)?;
+                let ord = self.values_cmp(frames, &vals[0], &vals[1])?;
+                Ok(Value::Enum {
+                    variant: 1,
+                    fields: vec![ordering_value(ord)],
+                })
+            }
+            Builtin::OrdCmp => {
+                arity(2)?;
+                let ord = self.values_cmp(frames, &vals[0], &vals[1])?;
+                Ok(ordering_value(ord))
+            }
+            Builtin::PartialOrdRel(op) => {
+                arity(2)?;
+                let ord = self.values_cmp(frames, &vals[0], &vals[1])?;
+                Ok(Value::Bool(match op {
+                    RelOp::Lt => ord == Ordering::Less,
+                    RelOp::Le => ord != Ordering::Greater,
+                    RelOp::Gt => ord == Ordering::Greater,
+                    RelOp::Ge => ord != Ordering::Less,
+                }))
+            }
+            Builtin::CloneClone => {
+                arity(1)?;
+                match &vals[0] {
+                    // `&self`: the clone is a copy of the pointee
+                    // value (which may itself be a reference value
+                    // when `Self` is a reference type).
+                    Value::Ref(_) => {
+                        let target = self.deref_value(frames, &vals[0])?;
+                        self.read_resolved(frames, &target)
+                    }
+                    // A fat pointer clones as the pointer itself
+                    // (slices are `Clone` through their reference).
+                    other => Ok(other.clone()),
+                }
+            }
+            Builtin::DefaultDefault => {
+                arity(0)?;
+                let tag = generic_args.first().map(String::as_str).unwrap_or("");
+                match default_value_for_tag(tag) {
+                    Some(value) => Ok(value),
+                    None => Err(unsupported(format!(
+                        "Default::default for {tag} is not runtime-supported"
+                    ))),
+                }
+            }
+            Builtin::ToStringToString => {
+                arity(1)?;
+                let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
+                match self.resolve_value(frames, &vals[0])? {
+                    Value::Str(s) => Ok(Value::Str(s)),
+                    Value::Bool(b) => Ok(Value::Str(b.to_string())),
+                    Value::Int(v) => Ok(Value::Str(v.to_string())),
+                    Value::Uint(v) if self_ty == "char" => {
+                        match u32::try_from(v).ok().and_then(char::from_u32) {
+                            Some(c) => Ok(Value::Str(c.to_string())),
+                            None => Err(unsupported(
+                                "ToString::to_string for an invalid char value",
+                            )),
+                        }
+                    }
+                    Value::Uint(v) => Ok(Value::Str(v.to_string())),
+                    ref other => Err(unsupported(format!(
+                        "ToString::to_string for {self_ty} (a {}) is not runtime-supported",
+                        other.kind_name()
+                    ))),
+                }
+            }
+            Builtin::BoxNew | Builtin::ManuallyDropNew => {
+                arity(1)?;
+                // Both are one-field ADT aggregates in this model:
+                // a box holds its pointee, a `ManuallyDrop` its value.
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields: vec![vals.into_iter().next().expect("arity checked")],
+                })
+            }
+            Builtin::VecNew => {
+                arity(0)?;
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields: Vec::new(),
+                })
+            }
+            Builtin::VecPush => {
+                arity(2)?;
+                let target = self.deref_value(frames, &vals[0])?;
+                let state = self.read_resolved(frames, &target)?;
+                match state {
+                    Value::Enum {
+                        variant,
+                        mut fields,
+                    } => {
+                        fields.push(vals.into_iter().nth(1).expect("arity checked"));
+                        self.write_resolved(
+                            frames,
+                            &target,
+                            Value::Enum { variant, fields },
+                        )?;
+                        Ok(Value::Unit)
+                    }
+                    ref other => Err(InterpError::type_mismatch(
+                        "Vec::push",
+                        "vector value",
+                        other.kind_name(),
+                    )),
+                }
+            }
+            Builtin::VecLen | Builtin::VecIsEmpty => {
+                arity(1)?;
+                let value = self.resolve_value(frames, &vals[0])?;
+                let len = value.len().ok_or_else(|| {
+                    InterpError::type_mismatch(
+                        "Vec length",
+                        "vector value",
+                        value.kind_name(),
+                    )
+                })?;
+                if kind == Builtin::VecLen {
+                    Ok(Value::Uint(len))
+                } else {
+                    Ok(Value::Bool(len == 0))
+                }
+            }
+            Builtin::SliceIter => {
+                arity(1)?;
+                let (elems, _) = self.slice_elements(frames, &vals[0])?;
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Tuple(elems), Value::Uint(0)],
+                })
+            }
+            Builtin::IterEmpty => {
+                arity(0)?;
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields: Vec::new(),
+                })
+            }
+            Builtin::IndexIndex => {
+                arity(2)?;
+                let idx = expect_index(&vals[1], name)?;
+                let (elems, len) = self.slice_elements(frames, &vals[0])?;
+                if idx as u128 >= len {
+                    return Err(InterpError::panic(format!(
+                        "index out of bounds: the len is {len} but the index is {idx}"
+                    )));
+                }
+                // A shared element reference: reads resolve against
+                // the element value itself (the model has no separate
+                // heap place for it), as for constant aggregates.
+                let elem = elems.into_iter().nth(idx).expect("bounds checked");
+                Ok(Value::Ref(RefTarget::Value(Box::new(elem))))
+            }
+            Builtin::IndexMut => {
+                arity(2)?;
+                let idx = expect_index(&vals[1], name)?;
+                let target = match &vals[0] {
+                    Value::Ref(_) | Value::FatRef { .. } => {
+                        self.deref_value(frames, &vals[0])?
+                    }
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            "IndexMut::index_mut",
+                            "mutable reference",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                match target {
+                    Resolved::Place {
+                        frame_pos,
+                        local,
+                        projection,
+                    } => {
+                        let base = self.read_resolved(frames, &Resolved::Place {
+                            frame_pos,
+                            local,
+                            projection: projection.clone(),
+                        })?;
+                        let len = base.len().ok_or_else(|| {
+                            InterpError::type_mismatch(
+                                "IndexMut::index_mut",
+                                "indexable value",
+                                base.kind_name(),
+                            )
+                        })?;
+                        if idx as u128 >= len {
+                            return Err(InterpError::panic(format!(
+                                "index out of bounds: the len is {len} but the index is {idx}"
+                            )));
+                        }
+                        match base {
+                            // Only array (tuple) elements are
+                            // addressable places in this model; a
+                            // vector's elements live inside its
+                            // aggregate value and cannot be pointed
+                            // into, so those stay unsupported.
+                            Value::Tuple(_) => {
+                                let mut projection = projection;
+                                projection.push(RefProj::Index(idx));
+                                let frame_id = frames[frame_pos].id;
+                                Ok(Value::Ref(RefTarget::Place {
+                                    frame: frame_id,
+                                    local,
+                                    projection,
+                                }))
+                            }
+                            ref other => Err(unsupported(format!(
+                                "IndexMut::index_mut on a {} is not runtime-supported",
+                                other.kind_name()
+                            ))),
+                        }
+                    }
+                    Resolved::Value(_) => Err(unsupported(
+                        "IndexMut::index_mut on a constant aggregate is not runtime-supported",
+                    )),
+                }
+            }
+            Builtin::DerefMut => {
+                arity(1)?;
+                let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
+                if self_ty == "std::string::String" {
+                    // `&mut str` over the `String` place itself: reads
+                    // see the string data, writes replace it.
+                    Ok(vals.into_iter().next().expect("arity checked"))
+                } else if self_ty.starts_with("std::vec::Vec<") {
+                    let pointee = self.resolve_value(frames, &vals[0])?;
+                    let len = pointee.len().ok_or_else(|| {
+                        InterpError::type_mismatch(
+                            "DerefMut::deref_mut for Vec",
+                            "array value",
+                            pointee.kind_name(),
+                        )
+                    })?;
+                    Ok(Value::FatRef {
+                        base: Box::new(vals.into_iter().next().expect("arity checked")),
+                        len,
+                    })
+                } else if self_ty.starts_with("std::boxed::Box<") {
+                    let pointee = self.resolve_value(frames, &vals[0])?;
+                    match pointee {
+                        Value::Enum { fields, .. } if fields.len() == 1 => {
+                            let inner = fields.into_iter().next().expect("len checked");
+                            Ok(Value::Ref(RefTarget::Value(Box::new(inner))))
+                        }
+                        ref other => Err(InterpError::type_mismatch(
+                            "DerefMut::deref_mut for Box",
+                            "boxed value",
+                            other.kind_name(),
+                        )),
+                    }
+                } else {
+                    Err(unsupported(format!(
+                        "DerefMut::deref_mut for {self_ty} is not runtime-supported"
+                    )))
+                }
+            }
+            Builtin::CellNew => {
+                arity(1)?;
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields: vec![vals.into_iter().next().expect("arity checked")],
+                })
+            }
+            Builtin::CellGet | Builtin::CellIntoInner => {
+                arity(1)?;
+                match self.resolve_value(frames, &vals[0])? {
+                    Value::Enum { fields, .. } if fields.len() == 1 => {
+                        Ok(fields.into_iter().next().expect("len checked"))
+                    }
+                    ref other => Err(InterpError::type_mismatch(
+                        "Cell value",
+                        "cell aggregate",
+                        other.kind_name(),
+                    )),
+                }
+            }
+            Builtin::CellSet | Builtin::CellReplace => {
+                arity(2)?;
+                let target = self.deref_value(frames, &vals[0])?;
+                let state = self.read_resolved(frames, &target)?;
+                match state {
+                    Value::Enum { variant, fields } if fields.len() == 1 => {
+                        let old = fields.into_iter().next().expect("len checked");
+                        self.write_resolved(
+                            frames,
+                            &target,
+                            Value::Enum {
+                                variant,
+                                fields: vec![
+                                    vals.into_iter().nth(1).expect("arity checked"),
+                                ],
+                            },
+                        )?;
+                        if kind == Builtin::CellReplace {
+                            Ok(old)
+                        } else {
+                            Ok(Value::Unit)
+                        }
+                    }
+                    ref other => Err(InterpError::type_mismatch(
+                        "Cell::set",
+                        "cell aggregate",
+                        other.kind_name(),
+                    )),
+                }
+            }
+            Builtin::OptionUnwrap => {
+                arity(1)?;
+                match self.resolve_value(frames, &vals[0])? {
+                    Value::Enum { variant: 1, fields } if fields.len() == 1 => {
+                        Ok(fields.into_iter().next().expect("len checked"))
+                    }
+                    Value::Enum { variant: 0, .. } => Err(InterpError::panic(
+                        "called `Option::unwrap()` on a `None` value",
+                    )),
+                    ref other => Err(InterpError::type_mismatch(
+                        "Option::unwrap",
+                        "Option value",
+                        other.kind_name(),
+                    )),
+                }
+            }
+            Builtin::ResultUnwrap => {
+                arity(1)?;
+                match self.resolve_value(frames, &vals[0])? {
+                    Value::Enum { variant: 0, fields } if fields.len() == 1 => {
+                        Ok(fields.into_iter().next().expect("len checked"))
+                    }
+                    Value::Enum { variant: 1, fields } => {
+                        let err = fields
+                            .into_iter()
+                            .next()
+                            .unwrap_or(Value::Unit);
+                        Err(InterpError::panic(format!(
+                            "called `Result::unwrap()` on an `Err` value: {err}"
+                        )))
+                    }
+                    ref other => Err(InterpError::type_mismatch(
+                        "Result::unwrap",
+                        "Result value",
+                        other.kind_name(),
+                    )),
+                }
+            }
+            Builtin::OptionIsSome
+            | Builtin::OptionIsNone
+            | Builtin::ResultIsOk
+            | Builtin::ResultIsErr => {
+                arity(1)?;
+                match self.resolve_value(frames, &vals[0])? {
+                    Value::Enum { variant, .. } => Ok(Value::Bool(match kind {
+                        Builtin::OptionIsSome => variant == 1,
+                        Builtin::OptionIsNone => variant == 0,
+                        Builtin::ResultIsOk => variant == 0,
+                        _ => variant == 1,
+                    })),
+                    ref other => Err(InterpError::type_mismatch(
+                        "Option/Result variant check",
+                        "enum value",
+                        other.kind_name(),
+                    )),
+                }
+            }
+            Builtin::OptionTake => {
+                arity(1)?;
+                let target = self.deref_value(frames, &vals[0])?;
+                let old = self.read_resolved(frames, &target)?;
+                match old {
+                    Value::Enum { .. } => {
+                        self.write_resolved(frames, &target, none_value())?;
+                        Ok(old)
+                    }
+                    ref other => Err(InterpError::type_mismatch(
+                        "Option::take",
+                        "Option value",
+                        other.kind_name(),
+                    )),
+                }
+            }
+            Builtin::MemDrop => {
+                arity(1)?;
+                Ok(Value::Unit)
+            }
+            Builtin::MemSwap => {
+                arity(2)?;
+                let a = self.deref_value(frames, &vals[0])?;
+                let b = self.deref_value(frames, &vals[1])?;
+                let va = self.read_resolved(frames, &a)?;
+                let vb = self.read_resolved(frames, &b)?;
+                self.write_resolved(frames, &a, vb)?;
+                self.write_resolved(frames, &b, va)?;
+                Ok(Value::Unit)
+            }
+            Builtin::MemSizeOf | Builtin::MemAlignOf => {
+                arity(0)?;
+                let tag = generic_args.first().map(String::as_str).unwrap_or("");
+                match type_layout(tag) {
+                    Some((size, align)) => Ok(Value::Uint(if kind == Builtin::MemSizeOf {
+                        size
+                    } else {
+                        align
+                    })),
+                    None => Err(unsupported(format!(
+                        "size_of/align_of for {tag} is not runtime-supported"
+                    ))),
+                }
+            }
+            Builtin::MemSizeOfVal => {
+                arity(1)?;
+                let tag = generic_args.first().map(String::as_str).unwrap_or("");
+                if tag == "str" {
+                    let s = self.resolve_string(frames, &vals[0])?;
+                    Ok(Value::Uint(s.len() as u128))
+                } else if tag.starts_with('[') && tag.ends_with(']') && !tag.contains(';') {
+                    // A slice: element count × element size.
+                    let elem = &tag[1..tag.len() - 1];
+                    let (elem_size, _) = type_layout(elem).ok_or_else(|| {
+                        unsupported(format!(
+                            "size_of_val for {tag} is not runtime-supported"
+                        ))
+                    })?;
+                    let len = match &vals[0] {
+                        Value::FatRef { len, .. } => *len,
+                        _ => {
+                            let value = self.resolve_value(frames, &vals[0])?;
+                            value.len().ok_or_else(|| {
+                                InterpError::type_mismatch(
+                                    "size_of_val",
+                                    "slice value",
+                                    value.kind_name(),
+                                )
+                            })?
+                        }
+                    };
+                    Ok(Value::Uint(len * elem_size))
+                } else {
+                    match type_layout(tag) {
+                        Some((size, _)) => Ok(Value::Uint(size)),
+                        None => Err(unsupported(format!(
+                            "size_of_val for {tag} is not runtime-supported"
+                        ))),
+                    }
+                }
+            }
+            Builtin::MemNeedsDrop => {
+                arity(0)?;
+                let tag = generic_args.first().map(String::as_str).unwrap_or("");
+                match needs_drop_for_tag(tag) {
+                    Some(needs) => Ok(Value::Bool(needs)),
+                    None => Err(unsupported(format!(
+                        "needs_drop for {tag} is not runtime-supported"
+                    ))),
+                }
+            }
+            Builtin::ToOwned => {
+                arity(1)?;
+                match &vals[0] {
+                    // A slice: the owned form is a vector of the
+                    // elements.
+                    Value::FatRef { .. } => {
+                        let (elems, _) = self.slice_elements(frames, &vals[0])?;
+                        Ok(Value::Enum {
+                            variant: 0,
+                            fields: elems,
+                        })
+                    }
+                    Value::Ref(_) => {
+                        let target = self.deref_value(frames, &vals[0])?;
+                        match self.read_resolved(frames, &target)? {
+                            Value::Tuple(items) => Ok(Value::Enum {
+                                variant: 0,
+                                fields: items,
+                            }),
+                            other => Ok(other),
+                        }
+                    }
+                    other => Ok(other.clone()),
+                }
             }
         }
     }
@@ -504,7 +1296,12 @@ impl<'a> Interpreter<'a> {
                 Ordering::Less => (vec![increment(&start)?, end], some_value(start)),
                 _ => (fields, none_value()),
             }
-        } else if self_ty.starts_with("std::array::IntoIter<") {
+        } else if self_ty.starts_with("std::iter::Empty<") {
+            // An empty iterator yields `None` forever.
+            (fields, none_value())
+        } else if self_ty.starts_with("std::array::IntoIter<")
+            || self_ty.starts_with("std::slice::Iter<")
+        {
             if fields.len() != 2 {
                 return Err(InterpError::type_mismatch(
                     "array::IntoIter state",
@@ -555,6 +1352,163 @@ impl<'a> Interpreter<'a> {
         };
         self.write_resolved(frames, &target, new_state)?;
         Ok(result)
+    }
+
+    /// Semantic (derived `PartialEq`) equality of two values:
+    /// references are followed to the data they denote and aggregates
+    /// compare element-wise. This is the equality of the *data*, not
+    /// of the representation — exactly what the derived `PartialEq`
+    /// impls of the modelled types compute.
+    pub(crate) fn values_equal(
+        &self,
+        frames: &[Frame],
+        a: &Value,
+        b: &Value,
+    ) -> InterpResult<bool> {
+        if matches!(a, Value::FatRef { .. }) || matches!(b, Value::FatRef { .. }) {
+            let (ea, la) = self.slice_elements(frames, a)?;
+            let (eb, lb) = self.slice_elements(frames, b)?;
+            if la != lb {
+                return Ok(false);
+            }
+            for (x, y) in ea.iter().zip(eb.iter()) {
+                if !self.values_equal(frames, x, y)? {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
+        let a = self.resolve_value(frames, a)?;
+        let b = self.resolve_value(frames, b)?;
+        Ok(match (&a, &b) {
+            (Value::Unit, Value::Unit) => true,
+            (Value::Bool(x), Value::Bool(y)) => x == y,
+            (Value::Int(x), Value::Int(y)) => x == y,
+            (Value::Uint(x), Value::Uint(y)) => x == y,
+            (Value::Int(x), Value::Uint(y)) => int_uint_eq(*x, *y),
+            (Value::Uint(x), Value::Int(y)) => int_uint_eq(*y, *x),
+            (Value::Str(x), Value::Str(y)) => x == y,
+            (Value::Bytes(x), Value::Bytes(y)) => x == y,
+            (Value::Tuple(x), Value::Tuple(y)) => {
+                x.len() == y.len() && self.seq_equal(frames, x, y)?
+            }
+            (
+                Value::Enum {
+                    variant: va,
+                    fields: fa,
+                },
+                Value::Enum {
+                    variant: vb,
+                    fields: fb,
+                },
+            ) => va == vb && fa.len() == fb.len() && self.seq_equal(frames, fa, fb)?,
+            _ => {
+                return Err(InterpError::type_mismatch(
+                    "value equality",
+                    "comparable values",
+                    format!("{} and {}", a.kind_name(), b.kind_name()),
+                ))
+            }
+        })
+    }
+
+    fn seq_equal(&self, frames: &[Frame], a: &[Value], b: &[Value]) -> InterpResult<bool> {
+        for (x, y) in a.iter().zip(b.iter()) {
+            if !self.values_equal(frames, x, y)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Semantic (derived `Ord`) comparison of two values: integers
+    /// and booleans by value, strings byte-wise (as `str`'s `Ord`
+    /// is), aggregates lexicographically with enum variants ordered
+    /// by declaration order — the derived semantics.
+    pub(crate) fn values_cmp(
+        &self,
+        frames: &[Frame],
+        a: &Value,
+        b: &Value,
+    ) -> InterpResult<Ordering> {
+        if matches!(a, Value::FatRef { .. }) || matches!(b, Value::FatRef { .. }) {
+            let (ea, la) = self.slice_elements(frames, a)?;
+            let (eb, lb) = self.slice_elements(frames, b)?;
+            for (x, y) in ea.iter().zip(eb.iter()) {
+                match self.values_cmp(frames, x, y)? {
+                    Ordering::Equal => {}
+                    other => return Ok(other),
+                }
+            }
+            return Ok(la.cmp(&lb));
+        }
+        let a = self.resolve_value(frames, a)?;
+        let b = self.resolve_value(frames, b)?;
+        Ok(match (&a, &b) {
+            (Value::Unit, Value::Unit) => Ordering::Equal,
+            (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+            (Value::Int(x), Value::Int(y)) => x.cmp(y),
+            (Value::Uint(x), Value::Uint(y)) => x.cmp(y),
+            (Value::Int(x), Value::Uint(y)) => int_uint_cmp(*x, *y),
+            (Value::Uint(x), Value::Int(y)) => int_uint_cmp(*y, *x).reverse(),
+            (Value::Str(x), Value::Str(y)) => x.as_bytes().cmp(y.as_bytes()),
+            (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y),
+            (Value::Tuple(x), Value::Tuple(y)) => self.seq_cmp(frames, x, y)?,
+            (
+                Value::Enum {
+                    variant: va,
+                    fields: fa,
+                },
+                Value::Enum {
+                    variant: vb,
+                    fields: fb,
+                },
+            ) => match va.cmp(vb) {
+                Ordering::Equal => self.seq_cmp(frames, fa, fb)?,
+                other => other,
+            },
+            _ => {
+                return Err(InterpError::type_mismatch(
+                    "value comparison",
+                    "comparable values",
+                    format!("{} and {}", a.kind_name(), b.kind_name()),
+                ))
+            }
+        })
+    }
+
+    fn seq_cmp(&self, frames: &[Frame], a: &[Value], b: &[Value]) -> InterpResult<Ordering> {
+        for (x, y) in a.iter().zip(b.iter()) {
+            match self.values_cmp(frames, x, y)? {
+                Ordering::Equal => {}
+                other => return Ok(other),
+            }
+        }
+        Ok(a.len().cmp(&b.len()))
+    }
+
+    /// The elements a slice-like value denotes, with its length: a
+    /// fat reference contributes its base's elements truncated to the
+    /// carried length; any other value contributes its own elements.
+    fn slice_elements(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+    ) -> InterpResult<(Vec<Value>, u128)> {
+        match value {
+            Value::FatRef { base, len } => {
+                let base = self.resolve_value(frames, base)?;
+                let mut elems = value_elements(&base)?;
+                elems.truncate(*len as usize);
+                Ok((elems, *len))
+            }
+            _ => {
+                let resolved = self.resolve_value(frames, value)?;
+                let elems = value_elements(&resolved)?;
+                let len = elems.len() as u128;
+                Ok((elems, len))
+            }
+        }
     }
 
     /// Follow references in `value` until a non-reference value.
@@ -677,6 +1631,212 @@ fn none_value() -> Value {
         variant: 0,
         fields: Vec::new(),
     }
+}
+
+/// A `core::cmp::Ordering` as a value: the variants in declaration
+/// order (Less, Equal, Greater).
+fn ordering_value(ord: Ordering) -> Value {
+    Value::Enum {
+        variant: match ord {
+            Ordering::Less => 0,
+            Ordering::Equal => 1,
+            Ordering::Greater => 2,
+        },
+        fields: Vec::new(),
+    }
+}
+
+/// The element values of an aggregate-like value: tuple items, ADT
+/// fields, or the bytes of a byte/string value as integers.
+fn value_elements(value: &Value) -> InterpResult<Vec<Value>> {
+    Ok(match value {
+        Value::Tuple(items) => items.clone(),
+        Value::Enum { fields, .. } => fields.clone(),
+        Value::Bytes(b) => b.iter().map(|byte| Value::Uint(*byte as u128)).collect(),
+        Value::Str(s) => s
+            .as_bytes()
+            .iter()
+            .map(|byte| Value::Uint(*byte as u128))
+            .collect(),
+        other => {
+            return Err(InterpError::type_mismatch(
+                "slice elements",
+                "aggregate, byte or string value",
+                other.kind_name(),
+            ))
+        }
+    })
+}
+
+fn int_uint_eq(x: i128, y: u128) -> bool {
+    x >= 0 && (x as u128) == y
+}
+
+fn int_uint_cmp(x: i128, y: u128) -> Ordering {
+    if x < 0 {
+        Ordering::Less
+    } else {
+        (x as u128).cmp(&y)
+    }
+}
+
+/// An integer index argument as a `usize`.
+fn expect_index(value: &Value, name: &str) -> InterpResult<usize> {
+    match value {
+        Value::Uint(v) => usize::try_from(*v).map_err(|_| {
+            InterpError::panic(format!("index {v} does not fit in usize"))
+        }),
+        Value::Int(v) if *v >= 0 => usize::try_from(*v).map_err(|_| {
+            InterpError::panic(format!("index {v} does not fit in usize"))
+        }),
+        other => Err(InterpError::type_mismatch(
+            format!("builtin {name}"),
+            "integer index",
+            other.kind_name(),
+        )),
+    }
+}
+
+/// Whether a rendered type tag names an integer type.
+fn is_integer_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64" | "u128"
+            | "usize"
+    )
+}
+
+/// Split a rendered type list on the commas that sit at nesting
+/// depth zero (for tuple/array type tags).
+fn split_top_level(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let tail = s[start..].trim();
+    if !tail.is_empty() {
+        parts.push(tail);
+    }
+    parts.into_iter().filter(|p| !p.is_empty()).collect()
+}
+
+/// The `Default` value for a rendered type tag, for the types whose
+/// default is fixed by the type alone in this value model.
+fn default_value_for_tag(tag: &str) -> Option<Value> {
+    let tag = tag.trim();
+    Some(match tag {
+        "bool" => Value::Bool(false),
+        "i8" | "i16" | "i32" | "i64" | "i128" | "isize" => Value::Int(0),
+        "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "char" => Value::Uint(0),
+        "()" => Value::Unit,
+        "std::string::String" => Value::Str(String::new()),
+        _ if tag.starts_with("std::vec::Vec<") => Value::Enum {
+            variant: 0,
+            fields: Vec::new(),
+        },
+        _ if tag.contains("option::Option<") => Value::Enum {
+            variant: 0,
+            fields: Vec::new(),
+        },
+        _ if tag.starts_with('(') && tag.ends_with(')') => {
+            let inner = &tag[1..tag.len() - 1];
+            let mut vals = Vec::new();
+            for part in split_top_level(inner) {
+                vals.push(default_value_for_tag(part)?);
+            }
+            Value::Tuple(vals)
+        }
+        _ if tag.starts_with('[') && tag.ends_with(']') => {
+            // `[T; N]`: an array of the element default.
+            let inner = &tag[1..tag.len() - 1];
+            let (elem, n) = inner.rsplit_once(';')?;
+            let n: usize = n.trim().parse().ok()?;
+            if n > 4096 {
+                return None;
+            }
+            let elem_default = default_value_for_tag(elem.trim())?;
+            Value::Tuple(vec![elem_default; n])
+        }
+        _ => return None,
+    })
+}
+
+/// The `(size, align)` of a rendered type tag on this platform
+/// (x86_64), for the types whose layout is fixed and known.
+fn type_layout(tag: &str) -> Option<(u128, u128)> {
+    let tag = tag.trim();
+    Some(match tag {
+        "bool" | "u8" | "i8" => (1, 1),
+        "u16" | "i16" => (2, 2),
+        "u32" | "i32" | "f32" | "char" => (4, 4),
+        "u64" | "i64" | "f64" | "usize" | "isize" => (8, 8),
+        "u128" | "i128" => (16, 16),
+        "()" => (0, 1),
+        "std::string::String" => (24, 8),
+        _ if tag.starts_with("std::vec::Vec<") => (24, 8),
+        _ if tag.starts_with("std::boxed::Box<") => (8, 8),
+        _ if tag.starts_with('&') => {
+            let inner = tag[1..].trim_start();
+            let inner = inner.strip_prefix("mut ").unwrap_or(inner);
+            if inner == "str" || inner.starts_with('[') {
+                (16, 8)
+            } else {
+                (8, 8)
+            }
+        }
+        _ if tag.starts_with("*const ") || tag.starts_with("*mut ") => {
+            let inner = tag.split_once(' ')?.1.trim();
+            if inner == "str" || inner.starts_with('[') {
+                (16, 8)
+            } else {
+                (8, 8)
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// Whether values of a rendered type tag need drop glue, for the
+/// types with a known answer: plain data never does; the standard
+/// owning containers do.
+fn needs_drop_for_tag(tag: &str) -> Option<bool> {
+    let tag = tag.trim();
+    if is_integer_tag(tag)
+        || matches!(tag, "bool" | "char" | "()" | "str")
+        || tag.starts_with('&')
+        || tag.starts_with("*const ")
+        || tag.starts_with("*mut ")
+    {
+        return Some(false);
+    }
+    const OWNING: &[&str] = &[
+        "std::string::String",
+        "std::vec::Vec<",
+        "std::boxed::Box<",
+        "std::collections::HashMap<",
+        "std::collections::BTreeMap<",
+        "std::collections::VecDeque<",
+        "std::cell::RefCell<",
+        "std::sync::Mutex<",
+        "std::sync::RwLock<",
+        "std::sync::Arc<",
+        "std::rc::Rc<",
+        "std::ffi::CString",
+    ];
+    if OWNING.iter().any(|prefix| tag.starts_with(prefix)) {
+        return Some(true);
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
