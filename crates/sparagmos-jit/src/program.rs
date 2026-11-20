@@ -272,6 +272,41 @@ mod tests {
     }
 
     #[test]
+    fn pair_return_and_call_pair() {
+        // fn callee(x) = (x + 1, x * 2): a two-word result.
+        let mut b = FunctionBuilder::new("callee", 1);
+        let x = b.param(0);
+        let a = b.binop(B::Add, x, Operand::Const(1));
+        let c = b.binop(B::Mul, x, Operand::Const(2));
+        let callee = b.finish(Terminator::Return {
+            value: a.into(),
+            second: Some(c.into()),
+        });
+        // fn caller(x) = callee(x).0 + callee(x).1 (one call).
+        let mut b = FunctionBuilder::new("caller", 1);
+        let x = b.param(0);
+        let d0 = b.fresh();
+        let d1 = b.fresh();
+        b.push_raw(Instr::Call {
+            dst: d0,
+            dst2: Some(d1),
+            func: 0,
+            args: vec![x.into()],
+        });
+        b.push_raw(Instr::CheckPanic);
+        let sum = b.binop(B::Add, d0, d1);
+        let caller = b.finish(Terminator::Return {
+            value: sum.into(),
+            second: None,
+        });
+        let prog = compile_program(&[callee, caller], vec![]).unwrap();
+        // The pair travels in RAX/RDX; `call` reads the first word.
+        assert_eq!(prog.call_pair(0, &[10]), Ok((11, 20)));
+        assert_eq!(prog.call(0, &[10]), Ok(11));
+        assert_eq!(prog.call(1, &[10]), Ok(31));
+    }
+
+    #[test]
     fn panic_propagates_through_calls() {
         // fn boom() = panic("kaboom"); fn mid() = boom(); fn top() = mid()
         let mut b = FunctionBuilder::new("boom", 0);
