@@ -211,13 +211,6 @@ pub enum Instr {
     /// function immediately (propagating a guest panic raised by a
     /// callee). Otherwise a no-op. Program compiles only.
     CheckPanic,
-    /// Guest panic with the shift-overflow message, whose text
-    /// depends on the runtime shift amount: "attempt to shift by
-    /// {amount} bits, which overflows the type width {bits}". The
-    /// message is formatted by a helper in the program layer into a
-    /// scratch buffer and then recorded through the usual panic
-    /// path. Program compiles only.
-    PanicShiftOverflow { amount: Operand, bits: u32 },
     /// `dst = lhs op rhs` on floating-point values of format `kind`.
     /// Operands and the result are bit patterns in their slots (see
     /// the module docs); for the comparison forms the result is the
