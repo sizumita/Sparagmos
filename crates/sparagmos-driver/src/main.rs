@@ -19,7 +19,16 @@
 //! auxiliary source file that is compiled as a library crate named
 //! `<name>` with the pinned rustc and linked into the main
 //! compilation with `--extern`, the way compiletest's
-//! `//@ aux-build:` / `//@ aux-crate:` directives do. Pass auxiliary
+//! `//@ aux-build:` / `//@ aux-crate:` directives do. Two optional
+//! per-crate attributes may follow the path, separated by `;`:
+//! `;crate-type=<type>` builds the crate as that crate type (the
+//! runner passes `proc-macro` for compiletest's `//@ proc-macro:`
+//! auxiliaries, whose sources do not declare a crate type), and
+//! `;edition=<ed>` builds it with that edition instead of the main
+//! `--edition` (compiletest builds each auxiliary crate with the
+//! edition its own `//@ edition:` directive declares). An in-source
+//! `#![crate_type]` declaration still decides the crate type when
+//! one is present. Pass auxiliary
 //! crates in dependency order (a crate before the crates that use
 //! it): each auxiliary compilation sees the previously built ones
 //! through `--extern`. The functions of auxiliary crates are
@@ -1107,6 +1116,49 @@ fn first_error_line(stderr: &str) -> String {
         .collect()
 }
 
+/// One `--aux` specification: the crate name and source path from
+/// `<name>=<file.rs>`, plus the optional per-crate attributes that
+/// followed the path (`;crate-type=<type>`, `;edition=<ed>`).
+struct AuxSpec {
+    name: String,
+    path: String,
+    crate_type: Option<String>,
+    edition: Option<String>,
+}
+
+/// Parse one `--aux` value: `<name>=<file.rs>` optionally followed
+/// by `;crate-type=<type>` and/or `;edition=<ed>` attributes.
+/// Anything else is a usage error.
+fn parse_aux_spec(spec: &str) -> Result<AuxSpec, String> {
+    let (name, rest) = spec
+        .split_once('=')
+        .filter(|(n, r)| !n.is_empty() && !r.is_empty())
+        .ok_or_else(|| format!("--aux needs a <name>=<file.rs> value, got: {spec}"))?;
+    let mut parts = rest.split(';');
+    let path = parts.next().unwrap_or("");
+    if path.is_empty() {
+        return Err(format!("--aux needs a <name>=<file.rs> value, got: {spec}"));
+    }
+    let mut parsed = AuxSpec {
+        name: name.to_string(),
+        path: path.to_string(),
+        crate_type: None,
+        edition: None,
+    };
+    for attr in parts {
+        let (key, value) = attr
+            .split_once('=')
+            .filter(|(_, v)| !v.is_empty())
+            .ok_or_else(|| format!("--aux attribute needs <key>=<value>, got: {attr}"))?;
+        match key {
+            "crate-type" => parsed.crate_type = Some(value.to_string()),
+            "edition" => parsed.edition = Some(value.to_string()),
+            _ => return Err(format!("unknown --aux attribute: {key}")),
+        }
+    }
+    Ok(parsed)
+}
+
 /// One compiled auxiliary crate.
 struct AuxBuilt {
     name: String,
@@ -1119,22 +1171,32 @@ struct AuxBuilt {
 }
 
 /// Compile one auxiliary source file with the pinned rustc, as a
-/// library crate named `name`, into `aux_dir`. Previously built
+/// library crate named `spec.name`, into `aux_dir`. Previously built
 /// auxiliary crates are visible through `--extern`, so callers pass
-/// the crates in dependency order. On failure, returns the first
+/// the crates in dependency order. The crate is built with
+/// `spec.edition` when the caller attached one (compiletest builds
+/// each auxiliary crate with its own edition) and with
+/// `default_edition` otherwise; its crate type is the source's own
+/// `#![crate_type]` declaration when present, else the caller's
+/// `spec.crate_type`, else `rlib`. On failure, returns the first
 /// compiler error line as the reason.
 fn compile_aux(
     sysroot: &str,
-    edition: &str,
+    default_edition: &str,
     aux_dir: &std::path::Path,
-    name: &str,
-    src_path: &str,
+    spec: &AuxSpec,
     previous: &[AuxBuilt],
 ) -> Result<AuxBuilt, String> {
+    let name = spec.name.as_str();
+    let src_path = spec.path.as_str();
+    let edition = spec.edition.as_deref().unwrap_or(default_edition);
     let src_text = std::fs::read_to_string(src_path)
         .map_err(|e| format!("cannot read auxiliary source {src_path}: {e}"))?;
     let declared = declared_crate_type(&src_text);
-    let effective_type = declared.as_deref().unwrap_or("rlib");
+    let effective_type = declared
+        .as_deref()
+        .or(spec.crate_type.as_deref())
+        .unwrap_or("rlib");
     let declared_name = declared_crate_name(&src_text);
     let effective_name = declared_name.as_deref().unwrap_or(name);
     let rustc = std::path::Path::new(sysroot).join("bin").join("rustc");
@@ -1157,7 +1219,7 @@ fn compile_aux(
         .arg("-L")
         .arg(format!("dependency={}", aux_dir.display()));
     if declared.is_none() {
-        cmd.arg("--crate-type=rlib");
+        cmd.arg(format!("--crate-type={effective_type}"));
     }
     if declared_name.is_none() {
         cmd.arg(format!("--crate-name={name}"));
@@ -1221,7 +1283,7 @@ fn main() {
     let argv: Vec<String> = std::env::args().collect();
     let run_mode = argv.get(1).map(|a| a == "run").unwrap_or(false);
     let mut input: Option<String> = None;
-    let mut aux_specs: Vec<(String, String)> = Vec::new();
+    let mut aux_specs: Vec<AuxSpec> = Vec::new();
     let mut dump_path: Option<String> = None;
     let mut edition = "2021".to_string();
     let mut sysroot: Option<String> = None;
@@ -1256,12 +1318,10 @@ fn main() {
                     eprintln!("--aux needs a <name>=<file.rs> value");
                     std::process::exit(2);
                 });
-                match spec.split_once('=') {
-                    Some((name, path)) if !name.is_empty() && !path.is_empty() => {
-                        aux_specs.push((name.to_string(), path.to_string()));
-                    }
-                    _ => {
-                        eprintln!("--aux needs a <name>=<file.rs> value, got: {spec}");
+                match parse_aux_spec(&spec) {
+                    Ok(parsed) => aux_specs.push(parsed),
+                    Err(reason) => {
+                        eprintln!("{reason}");
                         std::process::exit(2);
                     }
                 }
@@ -1274,7 +1334,7 @@ fn main() {
                 }));
             }
             "-h" | "--help" => {
-    println!("usage: sparagmos-driver [run] <file.rs> [--aux <name>=<file.rs>] [--rustc-arg <arg>] [--dump <path>] [--edition <ed>] [--sysroot <path>]");
+    println!("usage: sparagmos-driver [run] <file.rs> [--aux <name>=<file.rs>[;crate-type=<type>][;edition=<ed>]] [--rustc-arg <arg>] [--dump <path>] [--edition <ed>] [--sysroot <path>]");
                 return;
             }
             other if input.is_none() && !other.starts_with('-') => {
@@ -1308,8 +1368,8 @@ fn main() {
     let aux_dir = out_dir.join("aux");
     let _ = std::fs::create_dir_all(&aux_dir);
     let mut aux_built: Vec<AuxBuilt> = Vec::new();
-    for (name, src) in &aux_specs {
-        match compile_aux(&sysroot, &edition, &aux_dir, name, src, &aux_built) {
+    for spec in &aux_specs {
+        match compile_aux(&sysroot, &edition, &aux_dir, spec, &aux_built) {
             Ok(built) => aux_built.push(built),
             Err(reason) => {
                 if run_mode {

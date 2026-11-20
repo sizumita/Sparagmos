@@ -634,6 +634,36 @@ Self も本体経由で動く)、名前だけの builtin はカスタム
 機械 (RawVec 系)、チャネル、スレッドローカル、io、env は
 値モデルの境界として未対応のままである。
 
+aux クレート種別と aux 単位 edition の対応後の combined
+再実測 (2026-11-21、lane/aux-driver-gaps、`subset-bn.json`、
+--jobs 48、wall 96 秒): ドライバの `--aux` 指定を
+`name=path` の後ろに `;crate-type=<種別>` と `;edition=<版>`
+の属性を付けられる形に拡張した (属性なしは従来通りで
+後方互換)。ランナーは補助ファイル自身のヘッダも読むように
+なり、`//@ proc-macro:` を補助ファイルが名指しするケース
+(テスト自身の指令は stage 2 のランナー側ビルドが担い、
+ドライバへは二重に渡さない) と、補助ファイル自身の
+`//@ edition:` (aux 単位の edition がテストの edition に勝つ)
+を spec に載せてドライバとネイティブ側の両方へ渡す。
+結果は exec 1,469 → 1,482 件 (35.406% → 35.719%)、
+コンパイル時検証系 14,041 → 14,140 件 (76.593% → 77.133%)、
+全体 15,510 → 15,622 件 (62.195% → 62.646%) で、内訳は
+pass 化 114 件・後退 2 件である。この実測には both10 の後に
+統合された proc-macro ランナー側ビルドと FnOnce 環境の
+値渡しの増分も含まれる。後退 2 件のうち
+tests/ui/proc-macro/issue-59191-replace-root-with-fn.rs は
+proc-macro 対応の節で記録した偽 pass の是正 (E0463 の誤認)
+であり、tests/ui/closures/2229_closure_analysis/migrations/
+nested-copy-drops-83176.rs は補助ファイルを要しない単一
+ファイルの実行で drop glue 未対応に落ちたもので、本対応の
+範囲外である。名前で確認した対象ケースはいずれも pass に
+なった: tests/ui/imports/same-res-ambigious.rs
+(補助ファイル経由の proc-macro と aux edition)、
+tests/ui/editions/nested-macro-rules-edition.rs
+(revision ごとの aux edition)、実行系の
+tests/ui/proc-macro/crate-var.rs と meta-macro.rs
+(ドライバ自身が proc-macro 補助クレートをビルドする経路)。
+
 候補 3,699 件のうち両側を実行できたのは 2,823 件で、その内訳は
 pass 539、fail 18、unsupported 2,266 である。unsupported の
 理由の上位は、by-reference 定数 860 件、ローカルの型が未対応
