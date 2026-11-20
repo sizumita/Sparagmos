@@ -882,13 +882,15 @@ fn shifts_plain_and_checked() {
         vec![uint(1), uint(32)],
         Err("attempt to shift by 32 bits, which overflows the type width 32"),
     );
+    // Bits shifted out of the value are lost, not an overflow:
+    // 0x1_0000 << 16 wraps to 0 in u32, as in Rust.
     check(
         &jit,
         &prog,
         "shl_u32",
         &[0x1_0000, 16],
         vec![uint(0x1_0000), uint(16)],
-        Err("arithmetic overflow in Shl"),
+        Ok(0),
     );
     check(&jit, &prog, "shr_i32", &[-16, 2], vec![int(-16), int(2)], Ok(-4));
     check(
