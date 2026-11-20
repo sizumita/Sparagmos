@@ -1,5 +1,7 @@
 # Sparagmos
 
+[![CI](https://github.com/sizumita/Sparagmos/actions/workflows/ci.yml/badge.svg)](https://github.com/sizumita/Sparagmos/actions/workflows/ci.yml)
+
 A completely original JIT runtime based on Rust MIR, written in Rust itself.
 
 Goal: execute Rust 1.100.0 at the 99% level — ultimately running `rustc` itself
