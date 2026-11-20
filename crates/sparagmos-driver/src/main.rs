@@ -46,6 +46,9 @@ struct Collected {
     /// to the converted functions.
     body_def_ids: Vec<sparagmos_mir::DefId>,
     def_names: Vec<String>,
+    /// Discriminant values of the converted enum ADTs, for the
+    /// interpreter (see `Converter::adt_discriminants`).
+    adt_discriminants: sparagmos_mir::AdtDiscriminants,
 }
 
 static COLLECTED: OnceLock<Mutex<Option<Collected>>> = OnceLock::new();
@@ -138,6 +141,7 @@ fn collect() -> ControlFlow<()> {
         bodies,
         body_def_ids,
         def_names: conv.def_names.clone(),
+        adt_discriminants: conv.adt_discriminants.clone(),
     });
     ControlFlow::Continue(())
 }
@@ -200,6 +204,7 @@ fn execute(c: &Collected) -> i32 {
             name.clone(),
         );
     }
+    program.adt_discriminants = c.adt_discriminants.clone();
     let Some(entry) = c.bodies.iter().map(|(n, _)| n).find(|n| is_main(n)) else {
         for f in &c.report.functions {
             if is_main(&f.name) {
