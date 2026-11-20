@@ -800,6 +800,44 @@ Drop ターミネータ、Transmute キャスト、Subslice 射影、
 
 Lane BA/BG/BK/BH/BP/BJ 統合後の単一ラン再実測 (subset-both11.json、--jobs 48): 指標2(b) 全体 **62.195% → 65.204%** (16,260/24,937)。実行系 1,751/4,149 = 42.203%、コンパイル時検証系 14,509/18,332 = 79.146%。残りバケット上位: 単相化 instance 無し 1,346、評価不能条件 935 (Lane BM 対応中)、本体なし呼び出し 872、型不一致 235、interp 型モデル 256、Drop 未対応 54。 この実測の後に Lane BI (builtins round 2)、Lane BF (dyn 型モデル)、Lane BN (aux spec) が統合されており、増分は次回 combined 実測で確定する。
 
+#### Lane BY 再実測 (by3、2026-11-21、lane/dst-index-semantics)
+
+Issue #65 の修正: トレイト項目への呼び出しは、名前ベースの
+builtin に落ちる前に、呼び出しの Self 型について収集済みの
+impl 本体へ解決する (mir_convert の `resolve_impl_callee`)。
+builtin の構造比較・スライス index モデルは、ユーザー定義の
+impl がプログラム内にある場合に誤った結果を返していた
+(dst-index-success.rs: 0 フィールド構造体への index が
+長さ 0 のスライスとして扱われていた)。
+解決先は第 1 フェーズの clean な本体に限る: `clean_targets` が
+第 1 フェーズ IR 上の不動点で、本体自身・直接の Call 先・
+Drop グルーのデストラクタ先のいずれかが未対応構文
+(Unsupported 文 / 終端子、`Rvalue::Unsupported`) や未変換本体に
+触れる本体を伝播的に除く。CallBuiltin / CallTrait /
+CallIndirect と、プログラム本体でない名前への Call
+(vtable ディスパッチ) は中立。
+deriving-with-repr-packed-3.rs の形状がこの制限を決める:
+eq 本体はすべて変換できるが、手書き impl が呼ぶ `check_align`
+の PointerExposeProvenance キャストが未対応で、解決すると
+builtin の構造比較が正確な場面で実行時エラーになる。
+
+単一ラン再実測 (subset-by3.json、--jobs 48): 指標2(b) 全体
+**65.946%** (16,445/24,937)。both11 比 +185 件、回帰 0 件。
+実行系 1,924/4,149 = 46.373%、コンパイル時検証系
+14,521/18,332 = 79.211%。dst-index-success.rs と
+deriving-with-repr-packed-3.rs はどちらも pass。
+制限なしの 2 フェーズ実測 (by2、65.982%、16,454 件) と比べると
+10 件が both11 時点の状態 (未対応) に留まる。解決先の本体が
+推移的に clean でないため解決を見送ったもので、内訳は
+autoderef-method.rs、
+specialization-trait-item-not-implemented-rpass.rs、
+run-splat.rs、default-method/trivial.rs、
+traits/inheritance/{cross-trait-call, self-in-supertype,
+self, subst2}.rs、typeclasses-eq-example{,-static}.rs。
+clean 判定は第 1 フェーズ IR に対する経路非感応な近似であり、
+実行されない分岐に未対応構文を持つ本体も解決先から外れる。
+変換と clean 判定を共同不動点にする精緻化が今後の課題。
+
 #### stage 1 再実測: revisions の revision 単位判定 (2026-11-21)
 
 stage 1 も stage 2 と同様に、`//@ revisions:` を持つテストを
