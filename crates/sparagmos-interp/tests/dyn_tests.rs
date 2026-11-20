@@ -749,3 +749,61 @@ fn impl_resolution_skips_impl_bodies_that_do_not_convert() {
     let value = interpret_mir(&prog, "main", Vec::new()).expect("main runs");
     assert_eq!(value, Value::Bool(true));
 }
+
+const HELPER: mir::DefId = mir::DefId::new(0, 25);
+
+#[test]
+fn impl_resolution_skips_impl_bodies_calling_unconvertible_helpers() {
+    // The transitive shape of the packed-struct regression: the
+    // impl body itself converts, but it calls a helper whose body
+    // holds an unsupported rvalue — a `PointerExposeProvenance`
+    // cast, the `check_align` helper of
+    // `tests/ui/derives/deriving-with-repr-packed-3.rs`. Resolving
+    // the trait call to the impl body would run the helper and
+    // fail on the unsupported cast; the builtin's structural
+    // comparison is exact, so it must run instead. The impl
+    // returns false unconditionally, so two equal unit values
+    // comparing equal proves the builtin ran.
+    let helper = mir::Body::new(
+        decls(&[
+            mir::Ty::Uint(mir::UintTy::Usize),
+            mir::Ty::RawPtr(Box::new(i32_ty()), mir::Mutability::Not),
+        ]),
+        0,
+        vec![block(
+            vec![assign(
+                place(0),
+                mir::Rvalue::Cast(
+                    mir::CastKind::PointerExposeProvenance,
+                    copy(1),
+                    mir::Ty::Uint(mir::UintTy::Usize),
+                ),
+            )],
+            ret(),
+        )],
+    );
+    let eq_impl = mir::Body::new(
+        decls(&[
+            mir::Ty::Bool,
+            ref_ty(s_ty()),
+            ref_ty(s_ty()),
+            mir::Ty::Uint(mir::UintTy::Usize),
+        ]),
+        2,
+        vec![
+            block(Vec::new(), call(fndef_operand(HELPER, Vec::new()), Vec::new(), 3, 1)),
+            block(
+                vec![assign(place(0), mir::Rvalue::Use(const_bool(false)))],
+                ret(),
+            ),
+        ],
+    );
+    let mut prog = partial_eq_program();
+    prog.fn_names.insert(HELPER, "probe::helper".to_string());
+    prog.add("main", partial_eq_main());
+    prog.add("<probe::S as std::cmp::PartialEq>::eq", eq_impl);
+    prog.add_with_def_id("probe::helper", HELPER, helper);
+
+    let value = interpret_mir(&prog, "main", Vec::new()).expect("main runs");
+    assert_eq!(value, Value::Bool(true));
+}
