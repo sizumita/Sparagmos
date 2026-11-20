@@ -200,7 +200,8 @@ impl std::error::Error for JitCallError {}
 pub struct JitProgram {
     inner: CompiledProgram,
     index_by_name: HashMap<String, usize>,
-    /// Parameter count (MIR argument locals) per function.
+    /// Parameter word count (IR parameters) per function: one
+    /// word per scalar leaf of each MIR argument.
     param_counts: Vec<usize>,
     names: Vec<String>,
 }
@@ -248,6 +249,7 @@ impl JitProgram {
             );
             ir_funcs.push(lower.run()?);
         }
+        let param_counts: Vec<usize> = ir_funcs.iter().map(|f| f.param_count).collect();
         let inner = compile_program(&ir_funcs, messages.into_vec())?;
         Ok(JitProgram {
             inner,
@@ -257,7 +259,7 @@ impl JitProgram {
                 .enumerate()
                 .map(|(i, f)| (f.name.clone(), i))
                 .collect(),
-            param_counts: input.functions.iter().map(|f| f.body.arg_count).collect(),
+            param_counts,
             names: input.functions.iter().map(|f| f.name.clone()).collect(),
         })
     }
@@ -267,8 +269,10 @@ impl JitProgram {
         self.names.iter().map(|s| s.as_str()).collect()
     }
 
-    /// Call the function called `name` with one argument per MIR
-    /// parameter (unit parameters are passed as 0 and ignored).
+    /// Call the function called `name` with one word per scalar
+    /// leaf of each MIR parameter, in order (unit parameters are
+    /// passed as a dummy 0 word and ignored; a fat pointer
+    /// parameter is two words: the address, then the length).
     /// Arguments are the parameters' canonical 64-bit representations
     /// (sign-extended for signed types). The result is the return
     /// value's canonical representation (0 for a unit return).
@@ -405,11 +409,14 @@ fn flatten(ty: &mir::Ty, fname: &str) -> Result<usize, JitError> {
         mir::Ty::Never => Ok(0),
         mir::Ty::Ref(_, pointee, _) | mir::Ty::RawPtr(pointee, _) => {
             // A thin reference / raw pointer is one word: the
-            // pointee slot's address. A fat pointee (a slice, `str`
-            // or a trait object) would need a second word for its
-            // metadata and stays unsupported.
+            // pointee slot's address. A fat reference to a slice or
+            // `str` is two words: the address, then the length — the
+            // shape of the interpreter's `FatRef`. A trait object's
+            // metadata is a vtable pointer, not a length, and stays
+            // unsupported.
             match &**pointee {
-                mir::Ty::Str | mir::Ty::Slice(_) | mir::Ty::Dynamic(..) => {
+                mir::Ty::Str | mir::Ty::Slice(_) => Ok(2),
+                mir::Ty::Dynamic(..) => {
                     Err(unsup(fname, "fat reference / pointer type"))
                 }
                 _ => Ok(1),
@@ -603,6 +610,83 @@ fn assert_message_text(msg: &mir::AssertMessage) -> String {
 // Per-function lowering
 // ---------------------------------------------------------------------------
 
+/// Where the length word of a fat pointer lives: what a slice
+/// place's `Len` reads and its index bounds checks compare against.
+#[derive(Clone, Debug)]
+enum LenSrc {
+    /// A length known from the type (an array's declared length).
+    Const(u64),
+    /// The length word is this slot (a fat local's second word).
+    Slot(u32),
+    /// The length word is in memory, at this address (the second
+    /// word of a fat pair stored in memory).
+    Mem(Box<AddrExpr>),
+}
+
+/// How to compute the runtime address of a place in memory: a base
+/// pointer source, a constant leaf offset from it, and at most one
+/// dynamic index term (the index's value slot and the leaves per
+/// element). Every leaf is one 8-byte slot, in memory exactly as in
+/// a frame: a pointer in this model is always the address of a
+/// place's first leaf, and leaf `k` lies `8 * k` bytes *below* it,
+/// because the backend lays value slots out at descending addresses
+/// (`slot_disp` in the compiler). Offsets below are in leaves and
+/// are subtracted when an address is materialised.
+#[derive(Clone, Debug)]
+struct AddrExpr {
+    source: PtrSrc,
+    const_off: usize,
+    dyn_idx: Option<(IndexSrc, usize)>,
+}
+
+/// An index value for a dynamic index term or a bounds check:
+/// a value slot, or a constant (a literal index into a slice,
+/// whose length — and so whose bound — is a runtime value).
+#[derive(Clone, Debug)]
+enum IndexSrc {
+    Slot(u32),
+    Const(u64),
+}
+
+#[derive(Clone, Debug)]
+enum PtrSrc {
+    /// The base pointer is the value held in this slot.
+    Slot(u32),
+    /// The base pointer is the address of this slot itself.
+    SlotAddr(u32),
+    /// The base pointer is the word stored at this address (a
+    /// pointer stored in memory: the second dereference).
+    Loaded(Box<AddrExpr>),
+}
+
+/// A bounds check an indexed place needs before it is touched:
+/// the index value must be below the length, or the access is the
+/// interpreter's index panic.
+#[derive(Clone, Debug)]
+struct IndexCheck {
+    index: IndexSrc,
+    len: LenSrc,
+}
+
+/// A place resolved against the slot model.
+#[derive(Clone, Debug)]
+enum PlaceLoc {
+    /// Leaves of a local in the current frame.
+    Slots { first: u32, count: usize, ty: mir::Ty },
+    /// Leaves in memory, reached through at least one dereference
+    /// or a dynamic index. `count` is `None` for a slice / `str`
+    /// place itself, which has no word representation of its own;
+    /// `len` is the length source when the type is a slice / `str`;
+    /// `checks` are the bounds checks to emit before touching it.
+    Mem {
+        addr: AddrExpr,
+        count: Option<usize>,
+        ty: mir::Ty,
+        len: Option<LenSrc>,
+        checks: Vec<IndexCheck>,
+    },
+}
+
 struct FnLower<'a> {
     func: &'a MirFunctionInput,
     body: &'a mir::Body,
@@ -722,15 +806,22 @@ impl<'a> FnLower<'a> {
         // model). The return place and the remaining locals follow.
         let arg_count = body.arg_count;
         self.local_slots = vec![(0, 0); body.local_decls.len()];
+        // The IR parameter count: one register word per leaf of
+        // each argument (a unit argument still occupies a dummy
+        // word, as before; a fat argument occupies two).
+        let mut ir_param_count = 0usize;
         for idx in 1..=arg_count {
             let decl = &body.local_decls[idx];
             let count = flatten(&decl.ty, &self.func.name)?;
-            if count > 1 {
-                return Err(self.err("multi-word function argument"));
+            if count > 2 {
+                return Err(self.err("function argument with more than two words"));
             }
             let slot = self.fresh();
-            debug_assert_eq!(slot as usize, idx - 1);
+            for _ in 1..count.max(1) {
+                self.fresh();
+            }
             self.local_slots[idx] = (slot, count);
+            ir_param_count += count.max(1);
         }
         for idx in std::iter::once(0).chain(arg_count + 1..body.local_decls.len()) {
             let decl = &body.local_decls[idx];
@@ -768,7 +859,7 @@ impl<'a> FnLower<'a> {
             .collect();
         Ok(IrFunction {
             name: self.func.name.clone(),
-            param_count: arg_count,
+            param_count: ir_param_count,
             value_count: self.next_value as usize,
             blocks,
         })
@@ -776,13 +867,191 @@ impl<'a> FnLower<'a> {
 
     // ----- places, operands, constants -------------------------------------
 
-    /// Resolve a place to (first leaf slot, leaf count, type).
-    fn place_leaves(&self, place: &mir::Place) -> Result<(u32, usize, mir::Ty), JitError> {
-        let (first, _count) = self.local_slots[place.local.index()];
+    /// One in-frame projection step (`Field` / `ConstantIndex` /
+    /// `OpaqueCast` / `Subtype`) applied to a running leaf offset
+    /// and type. Shared by the frame segment of place resolution.
+    fn frame_step(
+        &self,
+        offset: &mut usize,
+        ty: &mut mir::Ty,
+        elem: &mir::PlaceElem,
+    ) -> Result<(), JitError> {
+        match elem {
+            mir::PlaceElem::Field(idx, field_ty) => {
+                let mir::Ty::Tuple(fields) = &*ty else {
+                    return Err(self.err(&format!(
+                        "Field projection on non-tuple type {}",
+                        ty.kind_name()
+                    )));
+                };
+                let idx = *idx as usize;
+                if idx >= fields.len() {
+                    return Err(self.err("Field projection index out of range"));
+                }
+                for f in &fields[..idx] {
+                    *offset += flatten(f, &self.func.name)?;
+                }
+                *ty = field_ty.clone();
+                Ok(())
+            }
+            mir::PlaceElem::ConstantIndex {
+                offset: idx,
+                min_length: _,
+                from_end,
+            } => {
+                let mir::Ty::Array(elem, len) = &*ty else {
+                    return Err(self.err(&format!(
+                        "ConstantIndex projection on non-array type {}",
+                        ty.kind_name()
+                    )));
+                };
+                let mir::ArrayLen::Known(len) = len else {
+                    return Err(
+                        self.err("ConstantIndex projection on an array of unknown length")
+                    );
+                };
+                // `from_end` offsets count back from one past the
+                // last element (offset 1 is the last element), as in
+                // rustc and the interpreter.
+                let idx = if *from_end {
+                    match len.checked_sub(*idx).filter(|i| *i < *len) {
+                        Some(i) => i,
+                        None => {
+                            return Err(self.err("ConstantIndex projection out of range"));
+                        }
+                    }
+                } else if idx < len {
+                    *idx
+                } else {
+                    return Err(self.err("ConstantIndex projection out of range"));
+                };
+                *offset += idx as usize * flatten(elem, &self.func.name)?;
+                *ty = (**elem).clone();
+                Ok(())
+            }
+            mir::PlaceElem::OpaqueCast(t) | mir::PlaceElem::Subtype(t) => {
+                *ty = t.clone();
+                Ok(())
+            }
+            other => Err(self.err(&format!("{} projection", other.kind_name()))),
+        }
+    }
+
+    /// The value slot of a dynamic `Index` projection's local. The
+    /// interpreter reads the index as a `usize`; the JIT supports
+    /// the unsigned integer index types (a signed index would need
+    /// the interpreter's negative-index message, which names the
+    /// place, so it stays an explicit error here).
+    fn index_slot(&self, local: mir::Local) -> Result<u32, JitError> {
+        let decl = &self.body.local_decls[local.index()];
+        if !matches!(decl.ty, mir::Ty::Uint(_)) {
+            return Err(self.err(&format!(
+                "Index projection with index type {}",
+                decl.ty.kind_name()
+            )));
+        }
+        let (slot, count) = self.local_slots[local.index()];
+        if count != 1 {
+            return Err(self.err("Index projection with a multi-word index"));
+        }
+        Ok(slot)
+    }
+
+    /// Resolve a place against the slot model: either leaves of a
+    /// local in the current frame, or leaves in memory, reached
+    /// through dereferences and dynamic indices. Pure (emits no
+    /// code); the memory form carries the bounds checks a use of
+    /// the place must emit first.
+    fn classify_place(&self, place: &mir::Place) -> Result<PlaceLoc, JitError> {
+        let (local_first, _) = self.local_slots[place.local.index()];
         let mut ty = self.body.local_decls[place.local.index()].ty.clone();
         let mut offset = 0usize;
-        for elem in &place.projection {
-            match elem {
+        let mut i = 0usize;
+        while i < place.projection.len() {
+            match &place.projection[i] {
+                mir::PlaceElem::Deref => {
+                    let pointee = match &ty {
+                        mir::Ty::Ref(_, pointee, _) | mir::Ty::RawPtr(pointee, _) => {
+                            (**pointee).clone()
+                        }
+                        _ => {
+                            return Err(self.err(&format!(
+                                "dereference of a non-pointer type {}",
+                                ty.kind_name()
+                            )));
+                        }
+                    };
+                    // Validates the pointer's own shape (a trait
+                    // object pointee is rejected by `flatten`).
+                    flatten(&ty, &self.func.name)?;
+                    let ptr_slot = local_first + offset as u32;
+                    let len = match &pointee {
+                        mir::Ty::Slice(_) | mir::Ty::Str => {
+                            Some(LenSrc::Slot(ptr_slot + 1))
+                        }
+                        _ => None,
+                    };
+                    let addr = AddrExpr {
+                        source: PtrSrc::Slot(ptr_slot),
+                        const_off: 0,
+                        dyn_idx: None,
+                    };
+                    return self.classify_mem(place, i + 1, addr, pointee, len, Vec::new());
+                }
+                mir::PlaceElem::Index(local) => {
+                    let mir::Ty::Array(elem, len) = &ty else {
+                        return Err(self.err(&format!(
+                            "Index projection on non-array type {}",
+                            ty.kind_name()
+                        )));
+                    };
+                    let mir::ArrayLen::Known(n) = len else {
+                        return Err(
+                            self.err("Index projection on an array of unknown length")
+                        );
+                    };
+                    let n = *n;
+                    let elem = (**elem).clone();
+                    let idx_slot = self.index_slot(*local)?;
+                    let per = flatten(&elem, &self.func.name)?;
+                    let addr = AddrExpr {
+                        source: PtrSrc::SlotAddr(local_first + offset as u32),
+                        const_off: 0,
+                        dyn_idx: Some((IndexSrc::Slot(idx_slot), per)),
+                    };
+                    let checks = vec![IndexCheck {
+                        index: IndexSrc::Slot(idx_slot),
+                        len: LenSrc::Const(n),
+                    }];
+                    return self.classify_mem(place, i + 1, addr, elem, None, checks);
+                }
+                elem => {
+                    self.frame_step(&mut offset, &mut ty, elem)?;
+                    i += 1;
+                }
+            }
+        }
+        let count = flatten(&ty, &self.func.name)?;
+        Ok(PlaceLoc::Slots {
+            first: local_first + offset as u32,
+            count,
+            ty,
+        })
+    }
+
+    /// Continue [`Self::classify_place`] in memory: the remaining
+    /// projections apply to the pointee at `addr`.
+    fn classify_mem(
+        &self,
+        place: &mir::Place,
+        mut i: usize,
+        mut addr: AddrExpr,
+        mut ty: mir::Ty,
+        mut len: Option<LenSrc>,
+        mut checks: Vec<IndexCheck>,
+    ) -> Result<PlaceLoc, JitError> {
+        while i < place.projection.len() {
+            match &place.projection[i] {
                 mir::PlaceElem::Field(idx, field_ty) => {
                     let mir::Ty::Tuple(fields) = &ty else {
                         return Err(self.err(&format!(
@@ -795,45 +1064,154 @@ impl<'a> FnLower<'a> {
                         return Err(self.err("Field projection index out of range"));
                     }
                     for f in &fields[..idx] {
-                        offset += flatten(f, &self.func.name)?;
+                        addr.const_off += flatten(f, &self.func.name)?;
                     }
                     ty = field_ty.clone();
+                    len = None;
                 }
                 mir::PlaceElem::ConstantIndex {
                     offset: idx,
                     min_length: _,
                     from_end,
                 } => {
-                    let mir::Ty::Array(elem, len) = &ty else {
+                    if matches!(ty, mir::Ty::Slice(_) | mir::Ty::Str) {
+                        // A literal index into a slice: the bound is
+                        // the runtime length, so the index becomes a
+                        // checked dynamic term with a constant index.
+                        if *from_end {
+                            return Err(
+                                self.err("ConstantIndex from the end of a slice")
+                            );
+                        }
+                        let (elem_ty, per) = match &ty {
+                            mir::Ty::Slice(elem) => {
+                                ((**elem).clone(), flatten(elem, &self.func.name)?)
+                            }
+                            _ => (mir::Ty::Uint(mir::UintTy::U8), 1),
+                        };
+                        let len_src = len.clone().ok_or_else(|| {
+                            self.err("index into a slice whose length is not available")
+                        })?;
+                        if addr.dyn_idx.is_some() {
+                            return Err(self.err("second dynamic index in one place"));
+                        }
+                        addr.dyn_idx = Some((IndexSrc::Const(*idx), per));
+                        checks.push(IndexCheck {
+                            index: IndexSrc::Const(*idx),
+                            len: len_src,
+                        });
+                        ty = elem_ty;
+                        len = None;
+                        i += 1;
+                        continue;
+                    }
+                    let mir::Ty::Array(elem, arr_len) = &ty else {
                         return Err(self.err(&format!(
                             "ConstantIndex projection on non-array type {}",
                             ty.kind_name()
                         )));
                     };
-                    let mir::ArrayLen::Known(len) = len else {
+                    let mir::ArrayLen::Known(arr_len) = arr_len else {
                         return Err(self.err(
                             "ConstantIndex projection on an array of unknown length",
                         ));
                     };
-                    // `from_end` offsets count back from one past
-                    // the last element (offset 1 is the last
-                    // element), as in rustc and the interpreter.
                     let idx = if *from_end {
-                        match len.checked_sub(*idx).filter(|i| *i < *len) {
-                            Some(i) => i,
+                        match arr_len.checked_sub(*idx).filter(|j| *j < *arr_len) {
+                            Some(j) => j,
                             None => {
                                 return Err(
                                     self.err("ConstantIndex projection out of range")
                                 );
                             }
                         }
-                    } else if idx < len {
+                    } else if idx < arr_len {
                         *idx
                     } else {
                         return Err(self.err("ConstantIndex projection out of range"));
                     };
-                    offset += idx as usize * flatten(elem, &self.func.name)?;
+                    addr.const_off += idx as usize * flatten(elem, &self.func.name)?;
                     ty = (**elem).clone();
+                    len = None;
+                }
+                mir::PlaceElem::Index(local) => {
+                    let (elem_ty, len_src) = match &ty {
+                        mir::Ty::Array(elem, arr_len) => {
+                            let mir::ArrayLen::Known(n) = arr_len else {
+                                return Err(self.err(
+                                    "Index projection on an array of unknown length",
+                                ));
+                            };
+                            ((**elem).clone(), LenSrc::Const(*n))
+                        }
+                        mir::Ty::Slice(elem) => {
+                            let l = len.clone().ok_or_else(|| {
+                                self.err("index into a slice whose length is not available")
+                            })?;
+                            ((**elem).clone(), l)
+                        }
+                        mir::Ty::Str => {
+                            let l = len.clone().ok_or_else(|| {
+                                self.err("index into a str whose length is not available")
+                            })?;
+                            (mir::Ty::Uint(mir::UintTy::U8), l)
+                        }
+                        _ => {
+                            return Err(self.err(&format!(
+                                "Index projection on non-array type {}",
+                                ty.kind_name()
+                            )));
+                        }
+                    };
+                    if addr.dyn_idx.is_some() {
+                        return Err(self.err("second dynamic index in one place"));
+                    }
+                    let idx_slot = self.index_slot(*local)?;
+                    let per = flatten(&elem_ty, &self.func.name)?;
+                    addr.dyn_idx = Some((IndexSrc::Slot(idx_slot), per));
+                    checks.push(IndexCheck {
+                        index: IndexSrc::Slot(idx_slot),
+                        len: len_src,
+                    });
+                    ty = elem_ty;
+                    len = None;
+                }
+                mir::PlaceElem::Deref => {
+                    let pointee = match &ty {
+                        mir::Ty::Ref(_, pointee, _) | mir::Ty::RawPtr(pointee, _) => {
+                            (**pointee).clone()
+                        }
+                        _ => {
+                            return Err(self.err(&format!(
+                                "dereference of a non-pointer type {}",
+                                ty.kind_name()
+                            )));
+                        }
+                    };
+                    // Rejects a trait-object pointee, as in frame.
+                    flatten(&ty, &self.func.name)?;
+                    let pair_addr = addr.clone();
+                    match &pointee {
+                        mir::Ty::Slice(_) | mir::Ty::Str => {
+                            let mut len_addr = addr.clone();
+                            len_addr.const_off += 1;
+                            addr = AddrExpr {
+                                source: PtrSrc::Loaded(Box::new(pair_addr)),
+                                const_off: 0,
+                                dyn_idx: None,
+                            };
+                            len = Some(LenSrc::Mem(Box::new(len_addr)));
+                        }
+                        _ => {
+                            addr = AddrExpr {
+                                source: PtrSrc::Loaded(Box::new(pair_addr)),
+                                const_off: 0,
+                                dyn_idx: None,
+                            };
+                            len = None;
+                        }
+                    }
+                    ty = pointee;
                 }
                 mir::PlaceElem::OpaqueCast(t) | mir::PlaceElem::Subtype(t) => {
                     ty = t.clone();
@@ -842,56 +1220,246 @@ impl<'a> FnLower<'a> {
                     return Err(self.err(&format!("{} projection", other.kind_name())));
                 }
             }
+            i += 1;
         }
-        let count = flatten(&ty, &self.func.name)?;
-        Ok((first + offset as u32, count, ty))
+        // A slice / `str` place itself has no word representation:
+        // it is only ever the target of a reference, a `Len`, or a
+        // further projection, and those read the pair from the
+        // address and length source instead.
+        let count = match &ty {
+            mir::Ty::Slice(_) | mir::Ty::Str => None,
+            _ => Some(flatten(&ty, &self.func.name)?),
+        };
+        Ok(PlaceLoc::Mem {
+            addr,
+            count,
+            ty,
+            len,
+            checks,
+        })
     }
 
-    /// Resolve a place that goes through a dereference: local
-    /// projections up to a single `Deref`, and nothing after it.
-    /// Returns the slot holding the pointer and the pointee type,
-    /// or `None` when the place has no `Deref` at all. Any other
-    /// shape involving a `Deref` — a projection after it, a second
-    /// `Deref` — is an explicit error: those need address
-    /// arithmetic on the pointee's layout, which the slot model
-    /// does not have.
-    fn deref_place(&self, place: &mir::Place) -> Result<Option<(u32, mir::Ty)>, JitError> {
-        let Some(pos) = place
-            .projection
-            .iter()
-            .position(|e| matches!(e, mir::PlaceElem::Deref))
-        else {
-            return Ok(None);
-        };
-        if pos + 1 != place.projection.len() {
-            return Err(self.err("projection through a dereference"));
+    /// Resolve a place to (first leaf slot, leaf count, type).
+    /// Frame places only: a place in memory is an error here, and
+    /// the callers that accept one classify it themselves.
+    fn place_leaves(&self, place: &mir::Place) -> Result<(u32, usize, mir::Ty), JitError> {
+        match self.classify_place(place)? {
+            PlaceLoc::Slots { first, count, ty } => Ok((first, count, ty)),
+            PlaceLoc::Mem { .. } => Err(self.err("place in memory (through a dereference or an index)")),
         }
-        let base = mir::Place {
-            local: place.local,
-            projection: place.projection[..pos].to_vec(),
-        };
-        let (slot, count, ty) = self.place_leaves(&base)?;
-        if count != 1 {
-            return Err(self.err("dereference of a multi-word pointer value"));
+    }
+
+
+    /// Emit the bounds checks a memory place needs, in projection
+    /// order. A failed check is the interpreter's index panic, with
+    /// the runtime length and index in the message.
+    fn emit_checks(&mut self, checks: &[IndexCheck]) {
+        for check in checks {
+            let len_v = self.len_value(&check.len);
+            let idx_v = match check.index {
+                IndexSrc::Slot(s) => s,
+                IndexSrc::Const(n) => {
+                    let d = self.fresh();
+                    self.emit(Instr::Const {
+                        dst: d,
+                        imm: n as i64,
+                    });
+                    d
+                }
+            };
+            let pblk = self.new_block();
+            self.seal_block(
+                pblk,
+                vec![Instr::PanicIndexOob {
+                    len: IrOperand::Value(len_v),
+                    index: IrOperand::Value(idx_v),
+                }],
+                IrTerminator::Unreachable,
+            );
+            let ok = self.fresh();
+            self.emit(Instr::BinOp {
+                dst: ok,
+                op: IrBinOp::LtU,
+                lhs: IrOperand::Value(idx_v),
+                rhs: IrOperand::Value(len_v),
+            });
+            let cont = self.new_block();
+            self.seal_and_continue(
+                IrTerminator::Branch {
+                    cond: IrOperand::Value(ok),
+                    then_blk: cont,
+                    else_blk: pblk,
+                },
+                cont,
+            );
         }
-        let pointee = match &ty {
-            mir::Ty::Ref(_, pointee, _) | mir::Ty::RawPtr(pointee, _) => (**pointee).clone(),
-            _ => {
-                return Err(self.err(&format!(
-                    "dereference of a non-pointer type {}",
-                    ty.kind_name()
-                )))
+    }
+
+    /// The value of a length source, materialised into a slot.
+    fn len_value(&mut self, len: &LenSrc) -> u32 {
+        match len {
+            LenSrc::Const(n) => {
+                let d = self.fresh();
+                self.emit(Instr::Const {
+                    dst: d,
+                    imm: *n as i64,
+                });
+                d
+            }
+            LenSrc::Slot(s) => *s,
+            LenSrc::Mem(a) => {
+                let addr = self.materialize_addr(a);
+                let d = self.fresh();
+                self.emit(Instr::LoadPtr {
+                    dst: d,
+                    ptr: IrOperand::Value(addr),
+                });
+                d
+            }
+        }
+    }
+
+    /// Emit the computation of a memory place's address; returns
+    /// the slot holding it. Bounds checks are *not* emitted here —
+    /// callers emit the place's checks first.
+    fn materialize_addr(&mut self, addr: &AddrExpr) -> u32 {
+        let mut base = match &addr.source {
+            PtrSrc::Slot(s) => *s,
+            PtrSrc::SlotAddr(s) => {
+                let d = self.fresh();
+                self.emit(Instr::SlotAddr { dst: d, slot: *s });
+                d
+            }
+            PtrSrc::Loaded(inner) => {
+                let a = self.materialize_addr(inner);
+                let d = self.fresh();
+                self.emit(Instr::LoadPtr {
+                    dst: d,
+                    ptr: IrOperand::Value(a),
+                });
+                d
             }
         };
-        Ok(Some((slot, pointee)))
+        if let Some((idx, per)) = &addr.dyn_idx {
+            let idx = match idx {
+                IndexSrc::Slot(s) => *s,
+                IndexSrc::Const(n) => {
+                    let d = self.fresh();
+                    self.emit(Instr::Const {
+                        dst: d,
+                        imm: *n as i64,
+                    });
+                    d
+                }
+            };
+            let per = *per;
+            let t = self.fresh();
+            self.emit(Instr::BinOp {
+                dst: t,
+                op: IrBinOp::Mul,
+                lhs: IrOperand::Value(idx),
+                rhs: IrOperand::Const((per * 8) as i64),
+            });
+            let d = self.fresh();
+            self.emit(Instr::BinOp {
+                dst: d,
+                op: IrBinOp::Sub,
+                lhs: IrOperand::Value(base),
+                rhs: IrOperand::Value(t),
+            });
+            base = d;
+        }
+        if addr.const_off != 0 {
+            let d = self.fresh();
+            self.emit(Instr::BinOp {
+                dst: d,
+                op: IrBinOp::Sub,
+                lhs: IrOperand::Value(base),
+                rhs: IrOperand::Const((addr.const_off * 8) as i64),
+            });
+            base = d;
+        }
+        base
     }
 
-    fn place_ty(&self, place: &mir::Place) -> Result<mir::Ty, JitError> {
-        if let Some((_, ty)) = self.deref_place(place)? {
-            return Ok(ty);
+    /// Load a memory place's leaves into consecutive slots starting
+    /// at `dst` (bounds checks first).
+    fn load_mem_to(&mut self, loc: &PlaceLoc, dst: u32) {
+        let PlaceLoc::Mem {
+            addr,
+            count,
+            checks,
+            ..
+        } = loc
+        else {
+            unreachable!("load_mem_to on a frame place")
+        };
+        let count = count.expect("load of an unsized place");
+        self.emit_checks(checks);
+        let base = self.materialize_addr(addr);
+        for k in 0..count as u32 {
+            let a = if k == 0 {
+                base
+            } else {
+                let d = self.fresh();
+                self.emit(Instr::BinOp {
+                    dst: d,
+                    op: IrBinOp::Sub,
+                    lhs: IrOperand::Value(base),
+                    rhs: IrOperand::Const((k * 8) as i64),
+                });
+                d
+            };
+            self.emit(Instr::LoadPtr {
+                dst: dst + k,
+                ptr: IrOperand::Value(a),
+            });
         }
-        Ok(self.place_leaves(place)?.2)
     }
+
+    /// Store consecutive slots starting at `src` into a memory
+    /// place (bounds checks first).
+    fn store_mem_from(&mut self, loc: &PlaceLoc, src: u32) {
+        let PlaceLoc::Mem {
+            addr,
+            count,
+            checks,
+            ..
+        } = loc
+        else {
+            unreachable!("store_mem_from on a frame place")
+        };
+        let count = count.expect("store of an unsized place");
+        self.emit_checks(checks);
+        let base = self.materialize_addr(addr);
+        for k in 0..count as u32 {
+            let a = if k == 0 {
+                base
+            } else {
+                let d = self.fresh();
+                self.emit(Instr::BinOp {
+                    dst: d,
+                    op: IrBinOp::Sub,
+                    lhs: IrOperand::Value(base),
+                    rhs: IrOperand::Const((k * 8) as i64),
+                });
+                d
+            };
+            self.emit(Instr::StorePtr {
+                ptr: IrOperand::Value(a),
+                src: IrOperand::Value(src + k),
+            });
+        }
+    }
+
+
+    fn place_ty(&self, place: &mir::Place) -> Result<mir::Ty, JitError> {
+        Ok(match self.classify_place(place)? {
+            PlaceLoc::Slots { ty, .. } => ty,
+            PlaceLoc::Mem { ty, .. } => ty,
+        })
+    }
+
 
     /// Best-effort type of an operand: from its place, when it has one.
     fn operand_place_ty(&self, op: &mir::Operand) -> Option<mir::Ty> {
@@ -927,27 +1495,30 @@ impl<'a> FnLower<'a> {
     fn operand_value(&mut self, op: &mir::Operand, ctx: &mir::Ty) -> Result<u32, JitError> {
         match op {
             mir::Operand::Copy(p) | mir::Operand::Move(p) => {
-                if let Some((ptr_slot, pointee_ty)) = self.deref_place(p)? {
-                    if flatten(&pointee_ty, &self.func.name)? != 1 {
-                        return Err(
-                            self.err("operand of aggregate type in scalar position")
-                        );
+                let loc = self.classify_place(p)?;
+                match &loc {
+                    PlaceLoc::Slots { first, count, .. } => {
+                        if *count != 1 {
+                            return Err(
+                                self.err("operand of aggregate type in scalar position")
+                            );
+                        }
+                        Ok(*first)
                     }
-                    // The word at the pointer is the pointee's
-                    // canonical form, exactly as if it had been
-                    // read from its own slot.
-                    let dst = self.fresh();
-                    self.emit(Instr::LoadPtr {
-                        dst,
-                        ptr: IrOperand::Value(ptr_slot),
-                    });
-                    return Ok(dst);
+                    PlaceLoc::Mem { count, .. } => {
+                        if *count != Some(1) {
+                            return Err(
+                                self.err("operand of aggregate type in scalar position")
+                            );
+                        }
+                        // The word at the address is the pointee's
+                        // canonical form, exactly as if it had been
+                        // read from its own slot.
+                        let dst = self.fresh();
+                        self.load_mem_to(&loc, dst);
+                        Ok(dst)
+                    }
                 }
-                let (first, count, _) = self.place_leaves(p)?;
-                if count != 1 {
-                    return Err(self.err("operand of aggregate type in scalar position"));
-                }
-                Ok(first)
             }
             mir::Operand::Constant(c) => {
                 let v = self.const_i64(c, ctx)?;
@@ -957,6 +1528,40 @@ impl<'a> FnLower<'a> {
             }
         }
     }
+
+    /// Materialise a two-word operand — a fat pointer value — as
+    /// (address word, length word) value slots.
+    fn operand_pair(&mut self, op: &mir::Operand) -> Result<(u32, u32), JitError> {
+        match op {
+            mir::Operand::Copy(p) | mir::Operand::Move(p) => {
+                let loc = self.classify_place(p)?;
+                match &loc {
+                    PlaceLoc::Slots { first, count, .. } => {
+                        if *count != 2 {
+                            return Err(
+                                self.err("operand of non-fat type in fat position")
+                            );
+                        }
+                        Ok((*first, *first + 1))
+                    }
+                    PlaceLoc::Mem { count, .. } => {
+                        if *count != Some(2) {
+                            return Err(
+                                self.err("operand of non-fat type in fat position")
+                            );
+                        }
+                        let a = self.fresh();
+                        let b = self.fresh();
+                        debug_assert_eq!(b, a + 1);
+                        self.load_mem_to(&loc, a);
+                        Ok((a, b))
+                    }
+                }
+            }
+            mir::Operand::Constant(_) => Err(self.err("fat pointer constant")),
+        }
+    }
+
 
     /// Interpret a constant under the type context it is used in.
     fn const_i64(&self, c: &mir::Constant, ctx: &mir::Ty) -> Result<i64, JitError> {
@@ -1123,117 +1728,291 @@ impl<'a> FnLower<'a> {
         }
     }
 
-    /// The value of a fresh reference to `target`: the stack
-    /// address of the target place's first leaf slot, or the
-    /// pointer's own value when the target is itself a dereference
-    /// (`&*p` is `p`).
+    /// The value of a fresh thin reference to `target`: the stack
+    /// address of the target place's first leaf, computed from the
+    /// place's resolution (for a target itself in memory — a field
+    /// of a pointee, a slice element — the materialised address).
     fn ref_value(&mut self, target: &mir::Place) -> Result<u32, JitError> {
-        if let Some((ptr_slot, _)) = self.deref_place(target)? {
-            return Ok(ptr_slot);
+        let loc = self.classify_place(target)?;
+        match &loc {
+            PlaceLoc::Slots { first, .. } => {
+                let dst = self.fresh();
+                self.emit(Instr::SlotAddr {
+                    dst,
+                    slot: *first,
+                });
+                Ok(dst)
+            }
+            PlaceLoc::Mem { addr, checks, .. } => {
+                self.emit_checks(checks);
+                Ok(self.materialize_addr(addr))
+            }
         }
-        let (first, _, _) = self.place_leaves(target)?;
-        let dst = self.fresh();
-        self.emit(Instr::SlotAddr { dst, slot: first });
-        Ok(dst)
+    }
+
+    /// The word(s) of a fresh reference of type `ref_ty` to
+    /// `target`: one word (the address) for a thin reference, two
+    /// (address, length) for a fat one. A fat reference's target is
+    /// an array place (its length is the array's), or a slice /
+    /// `str` place reached through a dereference (its length is
+    /// the source fat pointer's).
+    fn ref_words(
+        &mut self,
+        target: &mir::Place,
+        ref_ty: &mir::Ty,
+    ) -> Result<Vec<u32>, JitError> {
+        let pointee = match ref_ty {
+            mir::Ty::Ref(_, pointee, _) | mir::Ty::RawPtr(pointee, _) => (**pointee).clone(),
+            _ => {
+                return Err(self.err(&format!(
+                    "reference creation with non-pointer type {}",
+                    ref_ty.kind_name()
+                )));
+            }
+        };
+        if !matches!(pointee, mir::Ty::Slice(_) | mir::Ty::Str) {
+            return Ok(vec![self.ref_value(target)?]);
+        }
+        let loc = self.classify_place(target)?;
+        let (addr_v, len_v) = match &loc {
+            PlaceLoc::Slots { first, ty, .. } => {
+                let mir::Ty::Array(_, mir::ArrayLen::Known(n)) = ty else {
+                    return Err(self.err("fat reference to a non-array place"));
+                };
+                let n = *n;
+                let d = self.fresh();
+                self.emit(Instr::SlotAddr {
+                    dst: d,
+                    slot: *first,
+                });
+                (d, self.len_value(&LenSrc::Const(n)))
+            }
+            PlaceLoc::Mem { ty, len, addr, checks, .. } => {
+                let len_src = match ty {
+                    mir::Ty::Slice(_) | mir::Ty::Str => len.clone().ok_or_else(|| {
+                        self.err("fat reference to a slice place without a length")
+                    })?,
+                    mir::Ty::Array(_, mir::ArrayLen::Known(n)) => LenSrc::Const(*n),
+                    _ => return Err(self.err("fat reference to a non-array place")),
+                };
+                self.emit_checks(checks);
+                let a = self.materialize_addr(addr);
+                (a, self.len_value(&len_src))
+            }
+        };
+        Ok(vec![addr_v, len_v])
     }
 
     /// `place = &target` / `place = &raw target`: the reference
-    /// value is the target's slot address (see [`Self::ref_value`]).
+    /// value is the target's address (and, for a fat reference,
+    /// its length), as in [`Self::ref_words`].
     fn lower_ref_creation(
         &mut self,
         place: &mir::Place,
         target: &mir::Place,
     ) -> Result<(), JitError> {
-        let (dst, count, _) = self.place_leaves(place)?;
-        if count != 1 {
-            return Err(self.err("reference value does not fit in one slot"));
+        let (dst, count, dst_ty) = self.place_leaves(place)?;
+        let words = self.ref_words(target, &dst_ty)?;
+        if words.len() != count {
+            return Err(self.err("reference value shape mismatch"));
         }
-        let v = self.ref_value(target)?;
-        self.emit(Instr::Copy {
-            dst,
-            src: IrOperand::Value(v),
-        });
+        for (k, w) in words.iter().enumerate() {
+            self.emit(Instr::Copy {
+                dst: dst + k as u32,
+                src: IrOperand::Value(*w),
+            });
+        }
         Ok(())
     }
 
-    /// Lower `*ptr = rvalue`, where `ptr_slot` holds the pointer
-    /// and the pointee is a single scalar leaf: compute the value
-    /// into a scratch slot with the ordinary rvalue lowerings, then
-    /// store it through the pointer so the write lands on the
-    /// original place.
-    fn lower_assign_through_ptr(
+
+
+
+    /// The word(s) of an rvalue being assigned into a memory
+    /// place, computed into scratch slots with the ordinary rvalue
+    /// lowerings. Only the rvalue shapes the slot model can hold
+    /// are accepted; anything else is an explicit error.
+    fn rvalue_words(
         &mut self,
-        ptr_slot: u32,
-        pointee_ty: &mir::Ty,
         rvalue: &mir::Rvalue,
-    ) -> Result<(), JitError> {
+        dst_ty: &mir::Ty,
+        count: usize,
+    ) -> Result<Vec<u32>, JitError> {
         use mir::Rvalue as R;
-        if flatten(pointee_ty, &self.func.name)? != 1 {
-            return Err(self.err("assignment through a pointer to an aggregate value"));
-        }
-        let tmp = self.fresh();
         match rvalue {
-            R::Use(op) => {
-                let v = self.operand_value(op, pointee_ty)?;
-                self.emit(Instr::Copy {
-                    dst: tmp,
-                    src: IrOperand::Value(v),
-                });
-            }
+            R::Use(op) => match count {
+                1 => Ok(vec![self.operand_value(op, dst_ty)?]),
+                2 => {
+                    let (a, b) = self.operand_pair(op)?;
+                    Ok(vec![a, b])
+                }
+                _ => Err(self.err("assignment of an aggregate value through a dereference")),
+            },
             R::BinaryOp(op, pair) => {
+                if count != 1 {
+                    return Err(self.err("binary operation assigned through a dereference"));
+                }
                 let (lhs, rhs) = &**pair;
-                self.lower_binop_to(tmp, pointee_ty, *op, lhs, rhs)?;
+                let tmp = self.fresh();
+                self.lower_binop_to(tmp, dst_ty, *op, lhs, rhs)?;
+                Ok(vec![tmp])
             }
             R::UnaryOp(op, operand) => {
-                self.lower_unop_to(tmp, pointee_ty, *op, operand)?;
+                if count != 1 {
+                    return Err(self.err("unary operation assigned through a dereference"));
+                }
+                let tmp = self.fresh();
+                self.lower_unop_to(tmp, dst_ty, *op, operand)?;
+                Ok(vec![tmp])
             }
             R::Cast(kind, operand, target) => {
+                if count == 2 {
+                    let (a, b) = self.unsize_pair(kind, operand, target)?;
+                    return Ok(vec![a, b]);
+                }
+                if count != 1 {
+                    return Err(self.err("cast assigned through a dereference"));
+                }
+                let tmp = self.fresh();
                 self.lower_cast_to(tmp, kind, operand, target)?;
+                Ok(vec![tmp])
             }
             R::Ref(_, _, target) | R::RawPtr(_, target) => {
-                let v = self.ref_value(target)?;
-                self.emit(Instr::Copy {
-                    dst: tmp,
-                    src: IrOperand::Value(v),
-                });
+                let words = self.ref_words(target, dst_ty)?;
+                if words.len() != count {
+                    return Err(self.err("reference value shape mismatch"));
+                }
+                Ok(words)
             }
-            other => {
-                return Err(self.err(&format!(
-                    "{} rvalue assigned through a dereference",
-                    other.kind_name()
-                )));
-            }
+            other => Err(self.err(&format!(
+                "{} rvalue assigned through a dereference",
+                other.kind_name()
+            ))),
         }
-        self.emit(Instr::StorePtr {
-            ptr: IrOperand::Value(ptr_slot),
-            src: IrOperand::Value(tmp),
-        });
+    }
+
+    /// Lower `place = rvalue` for a place in memory: compute the
+    /// value into scratch slots with the ordinary rvalue lowerings,
+    /// then store it through the place's address, so the write
+    /// lands on the original place.
+    fn lower_assign_through_mem(
+        &mut self,
+        loc: &PlaceLoc,
+        rvalue: &mir::Rvalue,
+    ) -> Result<(), JitError> {
+        let PlaceLoc::Mem { count, ty, .. } = loc else {
+            unreachable!("lower_assign_through_mem on a frame place")
+        };
+        let Some(count) = *count else {
+            return Err(self.err("assignment to an unsized place"));
+        };
+        let ty = ty.clone();
+        let words = self.rvalue_words(rvalue, &ty, count)?;
+        // Store from consecutive scratch slots.
+        let base = self.fresh();
+        for _ in 1..count {
+            self.fresh();
+        }
+        for (k, w) in words.iter().enumerate() {
+            self.emit(Instr::Copy {
+                dst: base + k as u32,
+                src: IrOperand::Value(*w),
+            });
+        }
+        self.store_mem_from(loc, base);
         Ok(())
     }
+
+    /// `operand as &[T]` where the operand is a `&[T; N]`: the
+    /// pair is the operand's address word and the array's length.
+    /// Other unsize coercions (to a trait object, from a raw
+    /// pointer — the interpreter accepts only a reference source)
+    /// stay unsupported.
+    fn unsize_pair(
+        &mut self,
+        kind: &mir::CastKind,
+        operand: &mir::Operand,
+        target: &mir::Ty,
+    ) -> Result<(u32, u32), JitError> {
+        let mir::CastKind::PointerCoercion(mir::PointerCoercion::Unsize) = kind else {
+            return Err(self.err(&format!("cast {kind:?} with a two-word result")));
+        };
+        let src_ty = self
+            .operand_place_ty(operand)
+            .ok_or_else(|| self.err("Unsize cast with an unknown source type"))?;
+        let (mir::Ty::Ref(_, src_pointee, _), mir::Ty::Ref(_, dst_pointee, _)) =
+            (&src_ty, target)
+        else {
+            return Err(self.err("Unsize cast between non-reference types"));
+        };
+        match (&**src_pointee, &**dst_pointee) {
+            (mir::Ty::Array(elem, mir::ArrayLen::Known(n)), mir::Ty::Slice(elem2))
+                if elem == elem2 =>
+            {
+                let n = *n;
+                let addr = self.operand_value(operand, &src_ty)?;
+                let l = self.len_value(&LenSrc::Const(n));
+                Ok((addr, l))
+            }
+            _ => Err(self.err(&format!(
+                "Unsize cast from {} to {}",
+                src_pointee.kind_name(),
+                dst_pointee.kind_name()
+            ))),
+        }
+    }
+
+    /// The length of the value at `place`, for a `Len` rvalue: an
+    /// array's declared length, or a slice / `str` place's length
+    /// word.
+    fn len_of_place(&mut self, place: &mir::Place) -> Result<u32, JitError> {
+        let loc = self.classify_place(place)?;
+        match &loc {
+            PlaceLoc::Slots { ty, .. } => match ty {
+                mir::Ty::Array(_, mir::ArrayLen::Known(n)) => {
+                    Ok(self.len_value(&LenSrc::Const(*n)))
+                }
+                _ => Err(self.err(&format!("Len of type {}", ty.kind_name()))),
+            },
+            PlaceLoc::Mem { ty, len, .. } => match ty {
+                mir::Ty::Array(_, mir::ArrayLen::Known(n)) => {
+                    Ok(self.len_value(&LenSrc::Const(*n)))
+                }
+                mir::Ty::Slice(_) | mir::Ty::Str => {
+                    let l = len.clone().ok_or_else(|| {
+                        self.err("Len of a slice place without a length")
+                    })?;
+                    Ok(self.len_value(&l))
+                }
+                _ => Err(self.err(&format!("Len of type {}", ty.kind_name()))),
+            },
+        }
+    }
+
 
     fn lower_assign(&mut self, place: &mir::Place, rvalue: &mir::Rvalue) -> Result<(), JitError> {
         use mir::Rvalue as R;
-        // An assignment through a dereference (`*p = ...`) computes
-        // the value into a scratch slot and stores it through the
-        // pointer, so the write lands on the original place.
-        if let Some((ptr_slot, pointee_ty)) = self.deref_place(place)? {
-            return self.lower_assign_through_ptr(ptr_slot, &pointee_ty, rvalue);
+        // An assignment to a place in memory (`*p = ...`,
+        // `(*p).field = ...`, `arr[i] = ...`) computes the value
+        // into scratch slots and stores it through the place's
+        // address, so the write lands on the original place.
+        let dst_loc = self.classify_place(place)?;
+        if let PlaceLoc::Mem { .. } = dst_loc {
+            return self.lower_assign_through_mem(&dst_loc, rvalue);
         }
         match rvalue {
             R::Use(op) => {
                 let (dst, dst_count, dst_ty) = self.place_leaves(place)?;
                 match op {
                     mir::Operand::Copy(p) | mir::Operand::Move(p) => {
-                        if let Some((ptr_slot, _)) = self.deref_place(p)? {
-                            if dst_count != 1 {
+                        let src_loc = self.classify_place(p)?;
+                        if let PlaceLoc::Mem { count, .. } = &src_loc {
+                            if *count != Some(dst_count) {
                                 return Err(
                                     self.err("Use copy with mismatched value shapes")
                                 );
                             }
-                            self.emit(Instr::LoadPtr {
-                                dst,
-                                ptr: IrOperand::Value(ptr_slot),
-                            });
+                            self.load_mem_to(&src_loc, dst);
                             return Ok(());
                         }
                         let (src, src_count, _) = self.place_leaves(p)?;
@@ -1280,6 +2059,18 @@ impl<'a> FnLower<'a> {
             }
             R::Cast(kind, operand, target) => {
                 let (dst, count, _) = self.place_leaves(place)?;
+                if count == 2 {
+                    let (a, b) = self.unsize_pair(kind, operand, target)?;
+                    self.emit(Instr::Copy {
+                        dst,
+                        src: IrOperand::Value(a),
+                    });
+                    self.emit(Instr::Copy {
+                        dst: dst + 1,
+                        src: IrOperand::Value(b),
+                    });
+                    return Ok(());
+                }
                 if count != 1 {
                     return Err(self.err("cast of an aggregate value"));
                 }
@@ -1290,7 +2081,18 @@ impl<'a> FnLower<'a> {
             R::Ref(_, _, target) => self.lower_ref_creation(place, target),
             R::ThreadLocalRef(_) => Err(self.err("ThreadLocalRef rvalue")),
             R::RawPtr(_, target) => self.lower_ref_creation(place, target),
-            R::Len(_) => Err(self.err("Len rvalue")),
+            R::Len(len_place) => {
+                let (dst, count, _) = self.place_leaves(place)?;
+                if count != 1 {
+                    return Err(self.err("Len result is not a scalar"));
+                }
+                let v = self.len_of_place(len_place)?;
+                self.emit(Instr::Copy {
+                    dst,
+                    src: IrOperand::Value(v),
+                });
+                Ok(())
+            }
             R::Discriminant(src_place) => {
                 let (dst, dst_count, dst_ty) = self.place_leaves(place)?;
                 if dst_count != 1 {
@@ -1983,7 +2785,18 @@ impl<'a> FnLower<'a> {
                 }
                 Ok(())
             }
-            mir::UnOp::PtrMetadata => Err(self.err("PtrMetadata unary operation")),
+            mir::UnOp::PtrMetadata => {
+                // The metadata of a fat pointer value is its length
+                // word — the interpreter's `PtrMetadata` on a
+                // `FatRef`. A thin operand has no metadata and is
+                // rejected by `operand_pair`.
+                let (_, len) = self.operand_pair(operand)?;
+                self.emit(Instr::Copy {
+                    dst,
+                    src: IrOperand::Value(len),
+                });
+                Ok(())
+            }
         }
     }
 
@@ -2227,12 +3040,10 @@ impl<'a> FnLower<'a> {
                 Ok(())
             }
             T::Drop { place, target, .. } => {
-                // Dropping a scalar/tuple-of-scalars value runs no
-                // code; anything else is outside the supported range.
-                // Dropping through a dereference runs no code either.
-                if self.deref_place(place)?.is_none() {
-                    self.place_leaves(place)?;
-                }
+                // Dropping a value in the JIT's model runs no code
+                // (the model has no destructors); the place must
+                // still resolve, in frame or in memory.
+                self.classify_place(place)?;
                 self.seal_terminator(IrTerminator::Jump(target.index() as u32));
                 Ok(())
             }
@@ -2350,20 +3161,32 @@ impl<'a> FnLower<'a> {
                     let v = self.operand_value(arg, pty)?;
                     ir_args.push(IrOperand::Value(v));
                 }
-                _ => return Err(self.err("call with a multi-word argument")),
+                2 => {
+                    let (a, b) = self.operand_pair(arg)?;
+                    ir_args.push(IrOperand::Value(a));
+                    ir_args.push(IrOperand::Value(b));
+                }
+                _ => return Err(self.err("call with an argument of more than two words")),
             }
         }
         if ir_args.len() > 6 {
             return Err(self.err("call with more than 6 arguments"));
         }
-        // A call whose destination is a dereference (`*p = f()`)
+        // A call whose destination is in memory (`*p = f()`)
         // receives into a scratch slot and stores through the
-        // pointer after the panic check, so a panicking callee
-        // leaves the pointee untouched.
-        let deref_dst = self.deref_place(destination)?;
-        let (dst, count) = match &deref_dst {
-            Some(_) => (self.fresh(), 1),
-            None => {
+        // address after the panic check, so a panicking callee
+        // leaves the pointee untouched (and the destination's
+        // index is read after the call, as the interpreter reads
+        // it when the call returns).
+        let dst_loc = self.classify_place(destination)?;
+        let (dst, count) = match &dst_loc {
+            PlaceLoc::Mem { count, .. } => {
+                if *count != Some(1) {
+                    return Err(self.err("call returning a multi-word value"));
+                }
+                (self.fresh(), 1)
+            }
+            PlaceLoc::Slots { .. } => {
                 let (dst, count, _) = self.place_leaves(destination)?;
                 (dst, count)
             }
@@ -2378,11 +3201,8 @@ impl<'a> FnLower<'a> {
             args: ir_args,
         });
         self.emit(Instr::CheckPanic);
-        if let Some((ptr_slot, _)) = deref_dst {
-            self.emit(Instr::StorePtr {
-                ptr: IrOperand::Value(ptr_slot),
-                src: IrOperand::Value(dst),
-            });
+        if let PlaceLoc::Mem { .. } = &dst_loc {
+            self.store_mem_from(&dst_loc, dst);
         }
         match target {
             Some(t) => self.seal_terminator(IrTerminator::Jump(t.index() as u32)),
