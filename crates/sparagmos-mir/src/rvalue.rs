@@ -168,6 +168,11 @@ pub enum CastKind {
     FnPtrToPtr,
     Transmute,
     Subtype,
+    /// Extract the raw pointer inside a `Box`: the operand is the
+    /// `Unique<T>` field of the box (a chain of single-field wrappers
+    /// around a raw pointer) and the result is that raw pointer.
+    /// Emitted by rustc deref/drop elaboration for `Box` places.
+    BoxDerefTransmute,
 }
 impl CastKind {
     pub fn name(self) -> &'static str {
@@ -183,6 +188,7 @@ impl CastKind {
             Self::FnPtrToPtr => "FnPtrToPtr",
             Self::Transmute => "Transmute",
             Self::Subtype => "Subtype",
+            Self::BoxDerefTransmute => "BoxDerefTransmute",
         }
     }
     pub fn samples() -> Vec<CastKind> {
@@ -198,6 +204,7 @@ impl CastKind {
             Self::FnPtrToPtr,
             Self::Transmute,
             Self::Subtype,
+            Self::BoxDerefTransmute,
         ]
     }
 }
