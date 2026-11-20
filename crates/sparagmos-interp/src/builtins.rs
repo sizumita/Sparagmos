@@ -876,10 +876,10 @@ impl<'a> Interpreter<'a> {
                 if self_ty.starts_with("std::ops::Range<")
                     || self_ty.starts_with("std::ops::RangeInclusive<")
                     || self_ty.starts_with("std::slice::Iter<")
-                    || self_ty.starts_with("std::str::Chars<")
-                    || self_ty.starts_with("core::str::Chars<")
-                    || self_ty.starts_with("std::str::Bytes<")
-                    || self_ty.starts_with("core::str::Bytes<")
+                    || self_ty_is(self_ty, "std::str::Chars")
+                    || self_ty_is(self_ty, "core::str::Chars")
+                    || self_ty_is(self_ty, "std::str::Bytes")
+                    || self_ty_is(self_ty, "core::str::Bytes")
                 {
                     // A range is its own iterator in this model, and a
                     // slice / char / byte iterator is already in
@@ -1757,10 +1757,10 @@ impl<'a> Interpreter<'a> {
             (fields, none_value())
         } else if self_ty.starts_with("std::array::IntoIter<")
             || self_ty.starts_with("std::slice::Iter<")
-            || self_ty.starts_with("std::str::Chars<")
-            || self_ty.starts_with("core::str::Chars<")
-            || self_ty.starts_with("std::str::Bytes<")
-            || self_ty.starts_with("core::str::Bytes<")
+            || self_ty_is(self_ty, "std::str::Chars")
+            || self_ty_is(self_ty, "core::str::Chars")
+            || self_ty_is(self_ty, "std::str::Bytes")
+            || self_ty_is(self_ty, "core::str::Bytes")
         {
             if fields.len() != 2 {
                 return Err(InterpError::type_mismatch(
@@ -2066,6 +2066,17 @@ fn expect_arguments<'v>(value: &'v Value, name: &str) -> InterpResult<&'v FmtArg
             other.kind_name(),
         )),
     }
+}
+
+/// Whether a rendered Self type tag denotes the ADT `name`: either
+/// the bare name (a type whose generic arguments are all lifetimes
+/// renders without them, e.g. `std::str::Chars`) or `name<...>`
+/// with type arguments.
+fn self_ty_is(self_ty: &str, name: &str) -> bool {
+    self_ty == name
+        || self_ty
+            .strip_prefix(name)
+            .is_some_and(|rest| rest.starts_with('<'))
 }
 
 /// The fields of an iterator state value (ADT aggregate or tuple).
