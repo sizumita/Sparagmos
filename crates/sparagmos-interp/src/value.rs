@@ -77,6 +77,10 @@ pub enum RefTarget {
     /// or array). Reads resolve against the stored value; writes
     /// through it are an error.
     Value(Box<Value>),
+    /// The null pointer: denotes no place and no value. Produced by
+    /// `ptr::null` / `ptr::null_mut`; equal only to itself, and any
+    /// dereference of it is an explicit error.
+    Null,
 }
 
 impl RefTarget {
@@ -245,6 +249,7 @@ impl fmt::Display for RefTarget {
                 Ok(())
             }
             RefTarget::Value(_) => write!(f, "constant aggregate"),
+            RefTarget::Null => write!(f, "null pointer"),
         }
     }
 }

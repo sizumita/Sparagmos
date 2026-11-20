@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use sparagmos_interp::builtins::{canonical_name, lookup, Builtin, RelOp};
+use sparagmos_interp::builtins::{canonical_name, lookup, BitOp, Builtin, RelOp, SatOp};
 use sparagmos_interp::mir_convert::{interpret_mir, MirProgram};
 use sparagmos_interp::{InterpError, MirRunError, Value};
 use sparagmos_mir as mir;
@@ -1309,4 +1309,501 @@ fn index_mut_writes_an_array_element() {
     );
     let value = interpret_mir(&program(body), "main", vec![]).expect("run");
     assert_eq!(value, Value::Int(99));
+}
+
+// ----- Round 2: intrinsics, ops traits, Rc/Arc, zeroed, null (Lane BI) --------
+//
+// The second builtin census round: callees the combined subset
+// measurement (both8) reported as "call to function with no
+// converted body", modelled where the value model gives them
+// faithful, bounded semantics.
+
+const BLACK_BOX: mir::DefId = mir::DefId::new(0, 300);
+const STRING_NEW: mir::DefId = mir::DefId::new(0, 301);
+const CTPOP: mir::DefId = mir::DefId::new(0, 303);
+const CTLZ: mir::DefId = mir::DefId::new(0, 304);
+const CTTZ: mir::DefId = mir::DefId::new(0, 305);
+const BITREVERSE: mir::DefId = mir::DefId::new(0, 306);
+const BSWAP: mir::DefId = mir::DefId::new(0, 307);
+const SAT_ADD: mir::DefId = mir::DefId::new(0, 308);
+const SAT_SUB: mir::DefId = mir::DefId::new(0, 309);
+const ATOMIC_LOAD: mir::DefId = mir::DefId::new(0, 310);
+const ATOMIC_STORE: mir::DefId = mir::DefId::new(0, 311);
+const RC_TY: mir::DefId = mir::DefId::new(0, 318);
+const RC_NEW: mir::DefId = mir::DefId::new(0, 319);
+const ARC_TY: mir::DefId = mir::DefId::new(0, 320);
+const ARC_NEW: mir::DefId = mir::DefId::new(0, 321);
+const MEM_ZEROED: mir::DefId = mir::DefId::new(0, 322);
+const PTR_NULL: mir::DefId = mir::DefId::new(0, 323);
+
+fn names_bi() -> HashMap<mir::DefId, String> {
+    let mut names = std_names();
+    names.extend([
+        (BLACK_BOX, "std::intrinsics::black_box".to_string()),
+        (STRING_NEW, "std::string::String::new".to_string()),
+        (CTPOP, "std::intrinsics::ctpop".to_string()),
+        (CTLZ, "std::intrinsics::ctlz".to_string()),
+        (CTTZ, "std::intrinsics::cttz".to_string()),
+        (BITREVERSE, "std::intrinsics::bitreverse".to_string()),
+        (BSWAP, "std::intrinsics::bswap".to_string()),
+        (SAT_ADD, "std::intrinsics::saturating_add".to_string()),
+        (SAT_SUB, "std::intrinsics::saturating_sub".to_string()),
+        (ATOMIC_LOAD, "std::intrinsics::atomic_load".to_string()),
+        (ATOMIC_STORE, "std::intrinsics::atomic_store".to_string()),
+        (RC_TY, "std::rc::Rc".to_string()),
+        (RC_NEW, "std::rc::Rc::<T>::new".to_string()),
+        (ARC_TY, "std::sync::Arc".to_string()),
+        (ARC_NEW, "std::sync::Arc::<T>::new".to_string()),
+        (MEM_ZEROED, "std::mem::zeroed".to_string()),
+        (PTR_NULL, "std::ptr::null".to_string()),
+    ]);
+    names
+}
+
+fn program_bi(body: mir::Body) -> MirProgram {
+    let mut prog = MirProgram::new();
+    prog.add("main", body);
+    prog.fn_names = names_bi();
+    prog
+}
+
+/// `fn main() -> R { return call f::<G>(args) }` with the call's
+/// destination as the return place.
+fn unary_call(
+    def: mir::DefId,
+    generic: mir::Ty,
+    arg: mir::Operand,
+    ret_ty: mir::Ty,
+) -> MirProgram {
+    let body = mir::Body::new(
+        decls(&[ret_ty]),
+        0,
+        vec![
+            block(vec![], call(fndef(def, vec![generic]), vec![arg], 0, 1)),
+            block(vec![], ret()),
+        ],
+    );
+    program_bi(body)
+}
+
+fn binary_call(
+    def: mir::DefId,
+    generic: mir::Ty,
+    a: mir::Operand,
+    b: mir::Operand,
+    ret_ty: mir::Ty,
+) -> MirProgram {
+    let body = mir::Body::new(
+        decls(&[ret_ty]),
+        0,
+        vec![
+            block(vec![], call(fndef(def, vec![generic]), vec![a, b], 0, 1)),
+            block(vec![], ret()),
+        ],
+    );
+    program_bi(body)
+}
+
+fn u8_ty() -> mir::Ty {
+    mir::Ty::Uint(mir::UintTy::U8)
+}
+fn u16_ty() -> mir::Ty {
+    mir::Ty::Uint(mir::UintTy::U16)
+}
+fn u32_ty() -> mir::Ty {
+    mir::Ty::Uint(mir::UintTy::U32)
+}
+fn i8_ty() -> mir::Ty {
+    mir::Ty::Int(mir::IntTy::I8)
+}
+
+#[test]
+fn registry_round2_covers_the_new_callees() {
+    let cases: &[(&str, Builtin)] = &[
+        ("std::intrinsics::black_box", Builtin::BlackBox),
+        ("std::string::String::new", Builtin::StringNew),
+        ("std::intrinsics::ctpop", Builtin::IntBitOp(BitOp::CtPop)),
+        ("std::intrinsics::ctlz", Builtin::IntBitOp(BitOp::Ctlz)),
+        ("std::intrinsics::cttz", Builtin::IntBitOp(BitOp::Cttz)),
+        ("std::intrinsics::bitreverse", Builtin::IntBitOp(BitOp::BitReverse)),
+        ("std::intrinsics::bswap", Builtin::IntBitOp(BitOp::Bswap)),
+        ("std::intrinsics::saturating_add", Builtin::SaturatingArith(SatOp::Add)),
+        ("std::intrinsics::saturating_sub", Builtin::SaturatingArith(SatOp::Sub)),
+        ("std::intrinsics::atomic_load", Builtin::AtomicLoad),
+        ("std::intrinsics::atomic_store", Builtin::AtomicStore),
+        ("std::mem::zeroed", Builtin::MemZeroed),
+        ("std::ptr::null", Builtin::PtrNull),
+        ("std::ptr::null_mut", Builtin::PtrNull),
+        ("std::rc::Rc::<T>::new", Builtin::RcNew),
+        ("std::sync::Arc::<T>::new", Builtin::ArcNew),
+    ];
+    for (name, expected) in cases {
+        assert_eq!(
+            lookup(&canonical_name(name)),
+            Some(*expected),
+            "lookup for {name}"
+        );
+    }
+    // Deliberately unmodelled: allocation machinery (its callers
+    // write through the returned raw pointer, which the value
+    // model cannot serve), closure-taking callees (a builtin
+    // cannot invoke a guest closure), contract thunks, channels
+    // and thread-locals. The `std::ops` arithmetic traits are
+    // likewise not registered: their core default bodies are
+    // collected and executed as ordinary functions (which also
+    // covers reference and `Wrapping` Self types), and a
+    // name-only builtin would shadow custom impls.
+    for name in [
+        "std::ops::Add::add",
+        "std::ops::Mul::mul",
+        "std::ops::AddAssign::add_assign",
+        "std::ops::Neg::neg",
+        "std::ops::Not::not",
+        "std::alloc::Global::alloc_impl_runtime",
+        "std::intrinsics::contract_check_requires",
+        "std::iter::Iterator::map",
+        "std::iter::Iterator::fold",
+        "std::option::Option::<T>::map",
+        "std::sync::mpmc::channel",
+        "std::thread::LocalKey::<T>::with",
+        "std::intrinsics::caller_location",
+        "std::intrinsics::va_arg",
+    ] {
+        assert_eq!(lookup(&canonical_name(name)), None, "{name} stays unsupported");
+    }
+}
+
+#[test]
+fn black_box_passes_the_value_through() {
+    let prog = unary_call(BLACK_BOX, i32_ty(), const_i32(42), i32_ty());
+    assert_eq!(interpret_mir(&prog, "main", vec![]).expect("run"), Value::Int(42));
+    let prog = unary_call(BLACK_BOX, bool_ty(), mir::Operand::constant(
+        mir::Constant::from_value(mir::ConstValue::Bool(true)),
+    ), bool_ty());
+    assert_eq!(interpret_mir(&prog, "main", vec![]).expect("run"), Value::Bool(true));
+}
+
+#[test]
+fn string_new_builds_an_empty_string() {
+    let string_ty = mir::Ty::Adt(STRING_TY, vec![]);
+    let body = mir::Body::new(
+        decls(&[string_ty]),
+        0,
+        vec![
+            block(vec![], call(fndef(STRING_NEW, vec![]), vec![], 0, 1)),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_bi(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Str(String::new()));
+}
+
+#[test]
+fn bit_intrinsics_respect_the_type_width() {
+    // ctpop::<u8>(0b1011_0011) == 5
+    let prog = unary_call(CTPOP, u8_ty(), const_int(0b1011_0011, 1), u8_ty());
+    assert_eq!(interpret_mir(&prog, "main", vec![]).expect("run"), Value::Uint(5));
+    // ctpop::<i8>(-1) == 8: the count is over the i8 pattern, not
+    // the sign-extended storage.
+    let prog = unary_call(CTPOP, i8_ty(), const_int(0xFF, 1), i8_ty());
+    assert_eq!(interpret_mir(&prog, "main", vec![]).expect("run"), Value::Int(8));
+    // ctlz::<u32>(1) == 31
+    let prog = unary_call(CTLZ, u32_ty(), const_int(1, 4), u32_ty());
+    assert_eq!(interpret_mir(&prog, "main", vec![]).expect("run"), Value::Uint(31));
+    // cttz::<u16>(0) == 16 (the width, as in Rust's definition)
+    let prog = unary_call(CTTZ, u16_ty(), const_int(0, 2), u16_ty());
+    assert_eq!(interpret_mir(&prog, "main", vec![]).expect("run"), Value::Uint(16));
+    // cttz::<u32>(0x8000) == 15
+    let prog = unary_call(CTTZ, u32_ty(), const_int(0x8000, 4), u32_ty());
+    assert_eq!(interpret_mir(&prog, "main", vec![]).expect("run"), Value::Uint(15));
+    // bswap::<u32>(0x0102_0304) == 0x0403_0201
+    let prog = unary_call(BSWAP, u32_ty(), const_int(0x0102_0304, 4), u32_ty());
+    assert_eq!(
+        interpret_mir(&prog, "main", vec![]).expect("run"),
+        Value::Uint(0x0403_0201)
+    );
+    // bitreverse::<u8>(0b1011_0000) == 0b0000_1101
+    let prog = unary_call(BITREVERSE, u8_ty(), const_int(0b1011_0000, 1), u8_ty());
+    assert_eq!(interpret_mir(&prog, "main", vec![]).expect("run"), Value::Uint(0b0000_1101));
+}
+
+#[test]
+fn saturating_intrinsics_clamp_to_the_type_range() {
+    // saturating_add::<u8>(200, 100) == 255
+    let prog = binary_call(SAT_ADD, u8_ty(), const_int(200, 1), const_int(100, 1), u8_ty());
+    assert_eq!(interpret_mir(&prog, "main", vec![]).expect("run"), Value::Uint(255));
+    // saturating_sub::<i8>(-100, 50) == -128
+    let prog = binary_call(
+        SAT_SUB,
+        i8_ty(),
+        const_int((-100i8) as u8 as u128, 1),
+        const_int(50, 1),
+        i8_ty(),
+    );
+    assert_eq!(interpret_mir(&prog, "main", vec![]).expect("run"), Value::Int(-128));
+    // saturating_add::<i32>(5, 3) == 8 (no clamping in range)
+    let prog = binary_call(SAT_ADD, i32_ty(), const_i32(5), const_i32(3), i32_ty());
+    assert_eq!(interpret_mir(&prog, "main", vec![]).expect("run"), Value::Int(8));
+    // saturating_sub::<u32>(3, 5) == 0
+    let prog = binary_call(SAT_SUB, u32_ty(), const_int(3, 4), const_int(5, 4), u32_ty());
+    assert_eq!(interpret_mir(&prog, "main", vec![]).expect("run"), Value::Uint(0));
+}
+
+#[test]
+fn atomic_load_reads_the_pointee() {
+    // fn main() -> i32 { let x = 7; return atomic_load(&x); }
+    let body = mir::Body::new(
+        decls(&[i32_ty(), i32_ty(), ref_ty(i32_ty(), true)]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(place(1), mir::Rvalue::Use(const_i32(7))),
+                    assign(place(2), ref_rvalue(1, true)),
+                ],
+                call(fndef(ATOMIC_LOAD, vec![i32_ty()]), vec![move_(2)], 0, 1),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_bi(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Int(7));
+}
+
+#[test]
+fn atomic_store_writes_through_and_load_reads_back() {
+    // fn main() -> i32 {
+    //   let mut x = 7;
+    //   atomic_store(&mut x, 41);
+    //   return atomic_load(&x);
+    // }
+    let body = mir::Body::new(
+        decls(&[
+            i32_ty(),
+            i32_ty(),
+            ref_ty(i32_ty(), true),
+            mir::Ty::unit(),
+            ref_ty(i32_ty(), true),
+        ]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(place(1), mir::Rvalue::Use(const_i32(7))),
+                    assign(place(2), ref_rvalue(1, true)),
+                ],
+                call(
+                    fndef(ATOMIC_STORE, vec![i32_ty()]),
+                    vec![move_(2), const_i32(41)],
+                    3,
+                    1,
+                ),
+            ),
+            block(
+                vec![assign(place(4), ref_rvalue(1, true))],
+                call(fndef(ATOMIC_LOAD, vec![i32_ty()]), vec![move_(4)], 0, 2),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_bi(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Int(41));
+}
+
+#[test]
+fn rc_new_then_deref_reads_the_value() {
+    // fn main() -> i32 {
+    //   _1 = Rc::new(42);
+    //   _2 = Deref::deref(&_1);
+    //   return *_2;
+    // }
+    let rc_i32 = mir::Ty::Adt(RC_TY, vec![i32_ty()]);
+    let body = mir::Body::new(
+        decls(&[
+            i32_ty(),
+            rc_i32.clone(),
+            ref_ty(i32_ty(), false),
+            ref_ty(rc_i32.clone(), false),
+        ]),
+        0,
+        vec![
+            block(
+                vec![],
+                call(fndef(RC_NEW, vec![i32_ty()]), vec![const_i32(42)], 1, 1),
+            ),
+            block(
+                vec![assign(place(3), ref_rvalue(1, false))],
+                call(fndef(DEREF, vec![rc_i32]), vec![move_(3)], 2, 2),
+            ),
+            block(
+                vec![assign(
+                    place(0),
+                    mir::Rvalue::Use(mir::Operand::Copy(deref_place(2))),
+                )],
+                ret(),
+            ),
+        ],
+    );
+    let value = interpret_mir(&program_bi(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Int(42));
+}
+
+#[test]
+fn arc_new_then_deref_reads_the_value() {
+    // fn main() -> i32 {
+    //   _1 = Arc::new(7);
+    //   _2 = Deref::deref(&_1);
+    //   return *_2;
+    // }
+    let arc_i32 = mir::Ty::Adt(ARC_TY, vec![i32_ty()]);
+    let body = mir::Body::new(
+        decls(&[
+            i32_ty(),
+            arc_i32.clone(),
+            ref_ty(i32_ty(), false),
+            ref_ty(arc_i32.clone(), false),
+        ]),
+        0,
+        vec![
+            block(
+                vec![],
+                call(fndef(ARC_NEW, vec![i32_ty()]), vec![const_i32(7)], 1, 1),
+            ),
+            block(
+                vec![assign(place(3), ref_rvalue(1, false))],
+                call(fndef(DEREF, vec![arc_i32]), vec![move_(3)], 2, 2),
+            ),
+            block(
+                vec![assign(
+                    place(0),
+                    mir::Rvalue::Use(mir::Operand::Copy(deref_place(2))),
+                )],
+                ret(),
+            ),
+        ],
+    );
+    let value = interpret_mir(&program_bi(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Int(7));
+}
+
+#[test]
+fn mem_zeroed_builds_zero_values() {
+    // zeroed::<i32>() == 0
+    let body = mir::Body::new(
+        decls(&[i32_ty()]),
+        0,
+        vec![
+            block(vec![], call(fndef(MEM_ZEROED, vec![i32_ty()]), vec![], 0, 1)),
+            block(vec![], ret()),
+        ],
+    );
+    assert_eq!(
+        interpret_mir(&program_bi(body), "main", vec![]).expect("run"),
+        Value::Int(0)
+    );
+    // zeroed::<(u8, bool)>() == (0, false)
+    let pair_ty = mir::Ty::Tuple(vec![u8_ty(), bool_ty()]);
+    let body = mir::Body::new(
+        decls(&[pair_ty.clone()]),
+        0,
+        vec![
+            block(vec![], call(fndef(MEM_ZEROED, vec![pair_ty]), vec![], 0, 1)),
+            block(vec![], ret()),
+        ],
+    );
+    assert_eq!(
+        interpret_mir(&program_bi(body), "main", vec![]).expect("run"),
+        Value::Tuple(vec![Value::Uint(0), Value::Bool(false)])
+    );
+    // zeroed::<f64>() == 0.0
+    let f64_ty = mir::Ty::Float(mir::FloatTy::F64);
+    let body = mir::Body::new(
+        decls(&[f64_ty.clone()]),
+        0,
+        vec![
+            block(vec![], call(fndef(MEM_ZEROED, vec![f64_ty]), vec![], 0, 1)),
+            block(vec![], ret()),
+        ],
+    );
+    assert_eq!(
+        interpret_mir(&program_bi(body), "main", vec![]).expect("run"),
+        Value::Float(0.0)
+    );
+}
+
+#[test]
+fn ptr_null_compares_unequal_to_a_real_reference_and_equal_to_null() {
+    // fn main() -> bool {
+    //   _1 = 5;
+    //   _2 = ptr::null::<i32>();
+    //   return PartialEq::eq(&_2, &_1-as-pointer);
+    // }
+    // The compared values are the pointer itself and a reference
+    // to `_1` used as a pointer; equality is structural, and the
+    // null word 0 is not a reference.
+    let ptr_ty = mir::Ty::RawPtr(Box::new(i32_ty()), mir::Mutability::Not);
+    let body = mir::Body::new(
+        decls(&[
+            bool_ty(),
+            i32_ty(),
+            ptr_ty.clone(),
+            ref_ty(ptr_ty.clone(), false),
+            ref_ty(ptr_ty.clone(), false),
+            ptr_ty.clone(),
+        ]),
+        0,
+        vec![
+            block(
+                vec![assign(place(1), mir::Rvalue::Use(const_i32(5)))],
+                call(fndef(PTR_NULL, vec![i32_ty()]), vec![], 2, 1),
+            ),
+            block(
+                vec![
+                    // _5 = a raw pointer to _1, via a reference
+                    // place read (the value a `&_1 as *const i32`
+                    // holds in this model is the reference itself).
+                    assign(place(5), ref_rvalue(1, false)),
+                    assign(place(3), ref_rvalue(2, false)),
+                    assign(place(4), ref_rvalue(5, false)),
+                ],
+                call(
+                    fndef(PARTIAL_EQ, vec![ptr_ty.clone()]),
+                    vec![move_(3), move_(4)],
+                    0,
+                    2,
+                ),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    // _5 is declared as a raw pointer but assigned a reference
+    // rvalue; in this value model the two share a representation.
+    let value = interpret_mir(&program_bi(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Bool(false));
+
+    // null == null
+    let body = mir::Body::new(
+        decls(&[
+            bool_ty(),
+            ptr_ty.clone(),
+            ptr_ty.clone(),
+            ref_ty(ptr_ty.clone(), false),
+            ref_ty(ptr_ty.clone(), false),
+        ]),
+        0,
+        vec![
+            block(vec![], call(fndef(PTR_NULL, vec![i32_ty()]), vec![], 1, 1)),
+            block(vec![], call(fndef(PTR_NULL, vec![i32_ty()]), vec![], 2, 2)),
+            block(
+                vec![
+                    assign(place(3), ref_rvalue(1, false)),
+                    assign(place(4), ref_rvalue(2, false)),
+                ],
+                call(fndef(PARTIAL_EQ, vec![ptr_ty]), vec![move_(3), move_(4)], 0, 3),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_bi(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Bool(true));
 }

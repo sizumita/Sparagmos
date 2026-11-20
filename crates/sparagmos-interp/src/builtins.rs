@@ -324,6 +324,42 @@ pub enum Builtin {
     /// (`core::f64::<impl f64>::sqrt`), so it is carried here and the
     /// operation runs at that width.
     FloatMethod { f32: bool, op: FloatOp },
+    /// `std::intrinsics::black_box(value)`: the identity function.
+    /// The value passes through unchanged; the hint exists only to
+    /// block optimiser assumptions the interpreter does not make.
+    BlackBox,
+    /// `std::string::String::new()`: an empty string.
+    StringNew,
+    /// `Rc::new(value)`: a one-field ADT aggregate holding the
+    /// value, the same shape as `Box::new` in this model. The
+    /// reference count is not observable through the modelled
+    /// operations (`new`, `Deref`, `Clone` as a value copy).
+    RcNew,
+    /// `Arc::new(value)`: the `Rc` shape; the interpreter is
+    /// single-threaded, so the atomic count is unobservable too.
+    ArcNew,
+    /// An integer bit intrinsic (`ctpop`, `ctlz`, `cttz`,
+    /// `bitreverse`, `bswap`): a unary operation on the operand
+    /// type's bit pattern, at the type's own width.
+    IntBitOp(BitOp),
+    /// `std::intrinsics::saturating_add` / `saturating_sub`:
+    /// integer arithmetic clamped to the operand type's range.
+    SaturatingArith(SatOp),
+    /// `std::intrinsics::atomic_load(ptr)`: in this
+    /// single-threaded interpreter an atomic load is a plain read
+    /// through the pointer; the ordering only constrains
+    /// concurrent access, which cannot occur.
+    AtomicLoad,
+    /// `std::intrinsics::atomic_store(ptr, value)`: a plain
+    /// write through the pointer, as for `atomic_load`.
+    AtomicStore,
+    /// `std::mem::zeroed()`: the all-zero-bits value of a scalar
+    /// type, or of a tuple/array of scalar types.
+    MemZeroed,
+    /// `std::ptr::null()` / `std::ptr::null_mut()`: the null
+    /// pointer, a dedicated `RefTarget::Null` denoting no place
+    /// and no value.
+    PtrNull,
 }
 
 /// A relational operator selected by a `PartialOrd` method.
@@ -361,6 +397,25 @@ pub enum FloatOp {
     Max,
     ToBits,
     FromBits,
+}
+
+/// One integer bit intrinsic operation, selected by the
+/// intrinsic's name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BitOp {
+    CtPop,
+    Ctlz,
+    Cttz,
+    BitReverse,
+    Bswap,
+}
+
+/// A saturating arithmetic operation, selected by the
+/// intrinsic's name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SatOp {
+    Add,
+    Sub,
 }
 
 /// Look a canonical callee name up in the registry.
@@ -482,6 +537,25 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::mem::needs_drop" => Builtin::MemNeedsDrop,
         _ if canonical.starts_with("std::mem::ManuallyDrop") && canonical.ends_with(">::new") => {
             Builtin::ManuallyDropNew
+        }
+        "std::intrinsics::black_box" => Builtin::BlackBox,
+        "std::string::String::new" => Builtin::StringNew,
+        "std::intrinsics::ctpop" => Builtin::IntBitOp(BitOp::CtPop),
+        "std::intrinsics::ctlz" => Builtin::IntBitOp(BitOp::Ctlz),
+        "std::intrinsics::cttz" => Builtin::IntBitOp(BitOp::Cttz),
+        "std::intrinsics::bitreverse" => Builtin::IntBitOp(BitOp::BitReverse),
+        "std::intrinsics::bswap" => Builtin::IntBitOp(BitOp::Bswap),
+        "std::intrinsics::saturating_add" => Builtin::SaturatingArith(SatOp::Add),
+        "std::intrinsics::saturating_sub" => Builtin::SaturatingArith(SatOp::Sub),
+        "std::intrinsics::atomic_load" => Builtin::AtomicLoad,
+        "std::intrinsics::atomic_store" => Builtin::AtomicStore,
+        "std::mem::zeroed" => Builtin::MemZeroed,
+        "std::ptr::null" | "std::ptr::null_mut" => Builtin::PtrNull,
+        _ if canonical.starts_with("std::rc::Rc") && canonical.ends_with(">::new") => {
+            Builtin::RcNew
+        }
+        _ if canonical.starts_with("std::sync::Arc") && canonical.ends_with(">::new") => {
+            Builtin::ArcNew
         }
         _ => return float_method(canonical),
     })
@@ -907,6 +981,24 @@ impl<'a> Interpreter<'a> {
                             other.kind_name(),
                         )),
                     }
+                } else if self_ty.starts_with("std::rc::Rc<")
+                    || self_ty.starts_with("std::sync::Arc<")
+                {
+                    // The same one-field aggregate as `Box::new`
+                    // in this model: `deref` yields a reference to
+                    // the held value.
+                    let pointee = self.resolve_value(frames, &vals[0])?;
+                    match pointee {
+                        Value::Enum { fields, .. } if fields.len() == 1 => {
+                            let inner = fields.into_iter().next().expect("len checked");
+                            Ok(Value::Ref(RefTarget::Value(Box::new(inner))))
+                        }
+                        ref other => Err(InterpError::type_mismatch(
+                            "Deref::deref for Rc/Arc",
+                            "one-field aggregate",
+                            other.kind_name(),
+                        )),
+                    }
                 } else {
                     Err(unsupported(format!(
                         "Deref::deref for {self_ty} is not runtime-supported"
@@ -1062,7 +1154,7 @@ impl<'a> Interpreter<'a> {
                     ))),
                 }
             }
-            Builtin::BoxNew | Builtin::ManuallyDropNew => {
+            Builtin::BoxNew | Builtin::ManuallyDropNew | Builtin::RcNew | Builtin::ArcNew => {
                 arity(1)?;
                 // Both are one-field ADT aggregates in this model:
                 // a box holds its pointee, a `ManuallyDrop` its value.
@@ -1475,6 +1567,124 @@ impl<'a> Interpreter<'a> {
                     other => Ok(other.clone()),
                 }
             }
+            Builtin::BlackBox => {
+                arity(1)?;
+                Ok(vals.into_iter().next().expect("arity checked"))
+            }
+            Builtin::StringNew => {
+                arity(0)?;
+                Ok(Value::Str(String::new()))
+            }
+            Builtin::PtrNull => {
+                arity(0)?;
+                // The null pointer: a dedicated reference target
+                // denoting no place and no value. It is equal only
+                // to itself (see `values_equal`); dereferencing it
+                // is an explicit error, as a null dereference has
+                // no meaning in the value model.
+                Ok(Value::Ref(RefTarget::Null))
+            }
+            Builtin::MemZeroed => {
+                arity(0)?;
+                let tag = generic_args.first().map(String::as_str).unwrap_or("");
+                match zeroed_value_for_tag(tag) {
+                    Some(value) => Ok(value),
+                    None => Err(unsupported(format!(
+                        "mem::zeroed for {tag} is not runtime-supported"
+                    ))),
+                }
+            }
+            Builtin::IntBitOp(op) => {
+                arity(1)?;
+                let tag = generic_args.first().map(String::as_str).unwrap_or("");
+                let (bits, signed) = int_tag(tag).ok_or_else(|| {
+                    unsupported(format!("bit intrinsic for {tag} is not runtime-supported"))
+                })?;
+                let pattern = match vals[0] {
+                    Value::Int(v) => (v as u128) & bit_mask(bits),
+                    Value::Uint(v) => v & bit_mask(bits),
+                    ref other => {
+                        return Err(InterpError::type_mismatch(
+                            format!("builtin {name}"),
+                            "integer",
+                            other.kind_name(),
+                        ));
+                    }
+                };
+                let result = match op {
+                    BitOp::CtPop => pattern.count_ones() as u128,
+                    BitOp::Ctlz => (pattern.leading_zeros() - (128 - bits)) as u128,
+                    BitOp::Cttz => {
+                        if pattern == 0 {
+                            bits as u128
+                        } else {
+                            pattern.trailing_zeros() as u128
+                        }
+                    }
+                    BitOp::BitReverse => pattern.reverse_bits() >> (128 - bits),
+                    BitOp::Bswap => pattern.swap_bytes() >> (128 - bits),
+                };
+                Ok(if signed {
+                    Value::Int(sign_extend(result, bits))
+                } else {
+                    Value::Uint(result)
+                })
+            }
+            Builtin::SaturatingArith(op) => {
+                arity(2)?;
+                let tag = generic_args.first().map(String::as_str).unwrap_or("");
+                let (bits, signed) = int_tag(tag).ok_or_else(|| {
+                    unsupported(format!(
+                        "saturating arithmetic for {tag} is not runtime-supported"
+                    ))
+                })?;
+                if signed {
+                    let (a, b) = (as_i128(&vals[0], name)?, as_i128(&vals[1], name)?);
+                    let max = sign_extend(bit_mask(bits) >> 1, bits);
+                    let min = -max - 1;
+                    let r = match op {
+                        SatOp::Add => {
+                            if b > 0 && a > max - b {
+                                max
+                            } else if b < 0 && a < min - b {
+                                min
+                            } else {
+                                a + b
+                            }
+                        }
+                        SatOp::Sub => {
+                            if b < 0 && a > max + b {
+                                max
+                            } else if b > 0 && a < min + b {
+                                min
+                            } else {
+                                a - b
+                            }
+                        }
+                    };
+                    Ok(Value::Int(r))
+                } else {
+                    let (a, b) = (as_u128(&vals[0], name)?, as_u128(&vals[1], name)?);
+                    let max = bit_mask(bits);
+                    let r = match op {
+                        SatOp::Add => a.checked_add(b).map_or(max, |sum| sum.min(max)),
+                        SatOp::Sub => a.saturating_sub(b),
+                    };
+                    Ok(Value::Uint(r))
+                }
+            }
+            Builtin::AtomicLoad => {
+                arity(1)?;
+                let target = self.deref_value(frames, &vals[0])?;
+                self.read_resolved(frames, &target)
+            }
+            Builtin::AtomicStore => {
+                arity(2)?;
+                let target = self.deref_value(frames, &vals[0])?;
+                let value = vals.into_iter().nth(1).expect("arity checked");
+                self.write_resolved(frames, &target, value)?;
+                Ok(Value::Unit)
+            }
             Builtin::FloatMethod { f32, op } => exec_float_method(name, f32, op, &vals),
         }
     }
@@ -1616,6 +1826,8 @@ impl<'a> Interpreter<'a> {
         let a = self.resolve_value(frames, a)?;
         let b = self.resolve_value(frames, b)?;
         Ok(match (&a, &b) {
+            (Value::Ref(RefTarget::Null), Value::Ref(RefTarget::Null)) => true,
+            (Value::Ref(RefTarget::Null), _) | (_, Value::Ref(RefTarget::Null)) => false,
             (Value::Unit, Value::Unit) => true,
             (Value::Bool(x), Value::Bool(y)) => x == y,
             (Value::Int(x), Value::Int(y)) => x == y,
@@ -1755,6 +1967,9 @@ impl<'a> Interpreter<'a> {
         let mut value = value.clone();
         loop {
             match &value {
+                // The null pointer denotes no data; resolving it
+                // yields itself so equality can see it.
+                Value::Ref(RefTarget::Null) => return Ok(value),
                 Value::Ref(_) | Value::FatRef { .. } => {
                     let target = self.deref_value(frames, &value)?;
                     value = self.read_resolved(frames, &target)?;
@@ -1967,6 +2182,107 @@ fn split_top_level(s: &str) -> Vec<&str> {
 
 /// The `Default` value for a rendered type tag, for the types whose
 /// default is fixed by the type alone in this value model.
+/// The (bit width, signedness) of a primitive integer type tag
+/// as rendered by `ty_tag` (`i32`, `usize`, ...). `isize` /
+/// `usize` are 64-bit on every platform this runs on.
+fn int_tag(tag: &str) -> Option<(u32, bool)> {
+    Some(match tag {
+        "i8" => (8, true),
+        "i16" => (16, true),
+        "i32" => (32, true),
+        "i64" => (64, true),
+        "i128" => (128, true),
+        "isize" => (64, true),
+        "u8" => (8, false),
+        "u16" => (16, false),
+        "u32" => (32, false),
+        "u64" => (64, false),
+        "u128" => (128, false),
+        "usize" => (64, false),
+        _ => return None,
+    })
+}
+
+/// A mask of the low `bits` bits.
+fn bit_mask(bits: u32) -> u128 {
+    if bits >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << bits) - 1
+    }
+}
+
+/// Sign-extend the low `bits` bits of `pattern` to an `i128`.
+fn sign_extend(pattern: u128, bits: u32) -> i128 {
+    if bits >= 128 {
+        pattern as i128
+    } else {
+        let shift = 128 - bits;
+        ((pattern << shift) as i128) >> shift
+    }
+}
+
+fn as_i128(value: &Value, name: &str) -> InterpResult<i128> {
+    match value {
+        Value::Int(v) => Ok(*v),
+        Value::Uint(v) => Ok(*v as i128),
+        other => Err(InterpError::type_mismatch(
+            format!("builtin {name}"),
+            "integer",
+            other.kind_name(),
+        )),
+    }
+}
+
+fn as_u128(value: &Value, name: &str) -> InterpResult<u128> {
+    match value {
+        Value::Uint(v) => Ok(*v),
+        Value::Int(v) => Ok(*v as u128),
+        other => Err(InterpError::type_mismatch(
+            format!("builtin {name}"),
+            "integer",
+            other.kind_name(),
+        )),
+    }
+}
+
+/// The all-zero-bits value of the type `tag` names, for
+/// `mem::zeroed`: scalars, and tuples/arrays built from scalars.
+/// Anything else (an ADT whose zero bit pattern need not be a
+/// valid value, a reference, ...) stays unsupported.
+fn zeroed_value_for_tag(tag: &str) -> Option<Value> {
+    let tag = tag.trim();
+    Some(match tag {
+        "bool" => Value::Bool(false),
+        "i8" | "i16" | "i32" | "i64" | "i128" | "isize" => Value::Int(0),
+        "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "char" => Value::Uint(0),
+        "f32" | "f64" => Value::Float(0.0),
+        "()" => Value::Unit,
+        _ if tag.starts_with('(') && tag.ends_with(')') => {
+            let inner = &tag[1..tag.len() - 1];
+            let mut vals = Vec::new();
+            if !inner.trim().is_empty() {
+                for part in split_top_level(inner) {
+                    vals.push(zeroed_value_for_tag(part)?);
+                }
+            }
+            Value::Tuple(vals)
+        }
+        _ if tag.starts_with('[') && tag.ends_with(']') => {
+            let inner = &tag[1..tag.len() - 1];
+            let (elem, n) = inner.rsplit_once(';')?;
+            let n: usize = n.trim().parse().ok()?;
+            if n > 4096 {
+                return None;
+            }
+            let elem = zeroed_value_for_tag(elem)?;
+            Value::Tuple(vec![elem; n])
+        }
+        _ => return None,
+    })
+}
+
+
 fn default_value_for_tag(tag: &str) -> Option<Value> {
     let tag = tag.trim();
     Some(match tag {
