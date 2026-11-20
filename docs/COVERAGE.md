@@ -181,8 +181,106 @@ never 型 `!`、inline asm) を書き、fleur 上で
   理由を列挙して除外する。99% の目標はカテゴリ別ではなくサブセット
   全体に対して適用する。未対応で実行できないテストは fail として数え、
   母数から外さない。
-  母数の実数値は **未測定** であり、抽出スクリプトと共に確定する。
-  推測値は書かない。
+  母数の実数値は、下記「指標2(b) の母数実測」のとおり **24,937 件** で
+  確定した。
+
+### 指標2(b) の母数実測 (2026-11-20)
+
+出典: rust-lang/rust タグ `1.100.0` (commit
+`0ef1bc386059596dada8fb65b50425aab2ea637a`) の `tests/` ツリー。
+抽出は `scripts/rustc-subset-survey.py` で行った。同じチェックアウトに
+対して再実行すると同一の集計が得られることを確認済みである。再実行は
+`python3 scripts/rustc-subset-survey.py --rust-dir <チェックアウト>`
+(チェックアウトの取得手順はスクリプト冒頭に記載)。
+
+数え方は compiletest 自身の発見規則に合わせた。ファイル系スイートは
+`.rs` ファイル1件を1テストとし、`auxiliary` ディレクトリ配下と
+`compiletest-ignore-dir` のあるディレクトリ配下は数えない。run-make 系は
+`rmake.rs` を含むディレクトリ1件を1テストとする。rustdoc-gui は
+`.goml`、rustdoc-js-std は `.js` 1件を1テストとする。スイートの範囲は
+bootstrap のステップ定義 (`src/bootstrap/src/core/build_steps/test.rs`)
+にある22スイートで、`tests/auxiliary` はスイートではないため含めない。
+coverage スイートは coverage-map / coverage-run の2モードで同じ
+ファイルを実行するため、ファイル単位で1件と数えた。`//@ revisions:`
+で複数リビジョンに展開されるテストをリビジョン単位で数えた参考値は
+27,674 件である。
+
+抽出総数 24,940 件から、環境依存の3件を個別に除外した **24,937 件** が
+母数である。
+
+スイート別内訳 (母数、除外後):
+
+| スイート | 件数 |
+|---|---|
+| ui | 20,327 |
+| codegen-llvm | 843 |
+| rustdoc-html | 802 |
+| run-make | 538 |
+| rustdoc-ui | 440 |
+| mir-opt | 403 |
+| crashes | 209 |
+| rustdoc-json | 194 |
+| incremental | 180 |
+| debuginfo | 170 |
+| assembly-llvm | 169 |
+| rustdoc-gui | 152 |
+| pretty | 114 |
+| coverage | 108 |
+| ui-fulldeps | 80 |
+| rustdoc-js | 79 |
+| rustdoc-js-std | 68 |
+| codegen-units | 46 |
+| run-make-cargo | 12 |
+| assembly-gcc | 1 |
+| build-std | 1 |
+| coverage-run-rustdoc | 1 |
+| 合計 | 24,937 |
+
+assembly-gcc は実験的な GCC バックエンド向けのスイートで、既定の
+LLVM バックエンドでは compiletest 自身が実行対象から外す。タグ時点の
+スイート全体を母数とするため、ここでは含めている。
+
+合否の決まり方による分類 (母数):
+
+| 分類 | 件数 | 内容 |
+|---|---|---|
+| 実行系 (exec) | 4,149 | ui / ui-fulldeps の run-pass・run-fail・run-crash (4,040) と coverage 系 (109)。対象プログラムを実行し、その挙動が合否に関与する |
+| 実行系 (procedure) | 551 | run-make 系。レシピ (`rmake.rs`) を実行し、ビルドと実行の手順全体で合否が決まる |
+| 実行系 (exec-debugger) | 170 | debuginfo。デバッガ下でプログラムを実行し、デバッガ出力を照合する |
+| コンパイル時検証系 | 18,332 | 診断メッセージ、IR・アセンブリ・MIR ダンプ、整形結果など、コンパイル時出力の照合で合否が決まる (mir-opt、codegen、assembly、pretty、incremental、crashes、ui の診断系など) |
+| rustdoc 検証系 | 1,735 | rustdoc の出力 (HTML、JSON、検索インデックス、GUI、UI 診断) の照合で合否が決まる |
+
+分類の線引き: パスの定義は、ネイティブ実行と Sparagmos 実行の
+標準出力・標準エラー・終了コードの一致を要求する。この比較がそのまま
+適用できるのは、合否に対象プログラムの実行が関与する実行系
+(合計 4,870 件) だけである。コンパイル時検証系と rustdoc 検証系は
+プログラムを実行せず、合否の材料はコンパイル時出力・rustdoc 出力に
+なる。それでも「未対応で実行できないテストは母数から外さない」という
+定義に従い、両分類とも母数に含め、分類だけを分けて併記する。
+プラットフォーム限定 (`only-*` / `ignore-*`) と、コンパイラの
+ビルド構成に依存する `needs-*` は、環境依存とはみなさず母数に含める。
+このタグのスイートには、ネットワークを必要とするテストを表す指令
+(`needs-network` 等) は存在せず、run-make レシピにも外部サービスへの
+アクセスを行うものは無かった (下記の除外3件を除く)。
+
+形態別の内訳 (母数):
+
+- 単一ファイルで完結するもの: 23,047 件。補助ファイルや `auxiliary`
+  クレートを要するもの: 1,890 件。
+- ビルド手順を伴うもの (run-make 系): 551 件。
+- FFI を含むもの: 1,147 件 (実行系 332、コンパイル時検証系 765、
+  rustdoc 検証系 50)。`extern "C"` 等の宣言・使用、C ソースの同梱を
+  機械的に検出した。
+
+環境依存による除外 (3件、いずれも run-make-cargo):
+
+| テスト | 除外理由 |
+|---|---|
+| `tests/run-make-cargo/thumb-none-qemu` | QEMU によるシステムエミュレーションとファームウェアが必要。依存クレート (cortex-m、cortex-m-rt、cortex-m-semihosting、panic-halt) の取得 (ネットワーク) が必要 |
+| `tests/run-make-cargo/uefi-qemu` | QEMU と UEFI ファームウェアが必要。依存クレート `r-efi` の取得 (ネットワーク) が必要 |
+| `tests/run-make-cargo/x86_64-fortanix-unknown-sgx-lvi` | Intel SGX (`x86_64-fortanix-unknown-sgx`) のターゲット基盤が必要。ビルド依存クレート `cc` / `cmake` の取得 (ネットワーク) が必要 |
+
+分類できなかったテストは 0 件である (発見した全テストに分類が付いた)。
 
 ### パスの定義
 
@@ -256,5 +354,5 @@ M1〜M3 で整備する)。
 | 指標1 MIR バリアント網羅率 | 40 (確定) | 未測定 (実装中) |
 | 副指標1b サブ enum | 上表の通り (確定) | 未測定 (BinOp の出現実測 15/26 のみ) |
 | 指標2(a) 自前コーパス | tests/corpus の実ファイル数 | 未測定 |
-| 指標2(b) rustc テストサブセット | 未確定 (M4 で機械抽出) | 未測定 |
+| 指標2(b) rustc テストサブセット | 24,937 (2026-11-20 機械抽出) | 未測定 (実行はこれから) |
 | 指標3 std 機能網羅率 | 未確定 (出現ベース抽出を整備中) | 未測定 |
