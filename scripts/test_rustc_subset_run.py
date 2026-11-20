@@ -10,7 +10,10 @@ no toolchain or driver is needed.
 """
 
 import importlib.util
+import json
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -93,6 +96,322 @@ class ApplicabilityTests(unittest.TestCase):
         status, why = run.applicability(header("//@ needs-sanitizer-support\n"))
         self.assertEqual(status, "unevaluatable")
         self.assertIn("needs-sanitizer-support", why)
+
+
+class FakeFacts:
+    """Canned ToolchainFacts answers for eval_needs tests."""
+
+    def __init__(self, **kw):
+        self.kw = kw
+
+    def sanitizers(self):
+        return self.kw.get("sanitizers")
+
+    def sanitizer_runtime_present(self):
+        return self.kw.get("sanitizer_runtime")
+
+    def xray(self):
+        return self.kw.get("xray")
+
+    def dynamic_linking(self):
+        return self.kw.get("dynamic_linking")
+
+    def relocation_model(self):
+        return self.kw.get("relocation_model")
+
+    def profiler_runtime(self):
+        return self.kw.get("profiler_runtime")
+
+    def rust_lld(self):
+        return self.kw.get("rust_lld")
+
+    def git_hash(self):
+        return self.kw.get("git_hash")
+
+    def llvm_zstd(self):
+        return self.kw.get("llvm_zstd")
+
+    def has_mnemonic(self, mnemonic):
+        return self.kw.get("mnemonics", {}).get(mnemonic)
+
+    def supported_crate_types(self):
+        return self.kw.get("crate_types")
+
+    def target_has_atomic(self):
+        return self.kw.get("atomic")
+
+    def llvm_component_present(self, component):
+        return self.kw.get("components", {}).get(component)
+
+    def default_codegen_backend(self):
+        return self.kw.get("default_backend")
+
+
+def view(text):
+    return header(text).view(None)
+
+
+class NeedsEvalTests(unittest.TestCase):
+    def test_host_rules_need_no_facts(self):
+        v = view("//@ run-pass\n")
+        self.assertIs(run.eval_needs("needs-threads", v, None), True)
+        self.assertIs(run.eval_needs("needs-subprocess", v, None), True)
+        self.assertIs(run.eval_needs("needs-asm-support", v, None), True)
+        self.assertIs(run.eval_needs("needs-unwind", v, None), True)
+        self.assertIs(run.eval_needs("needs-deterministic-layouts",
+                                     v, None), True)
+        self.assertIs(run.eval_needs("needs-dlltool", v, None), False)
+        self.assertIs(run.eval_needs("needs-enzyme", v, None), False)
+        self.assertIs(run.eval_needs("needs-offload", v, None), False)
+        self.assertIs(run.eval_needs("needs-rustc-debug-assertions",
+                                     v, None), False)
+
+    def test_sanitizer_membership(self):
+        v = view("//@ run-pass\n")
+        f = FakeFacts(sanitizers={"address", "cfi"})
+        self.assertIs(run.eval_needs("needs-sanitizer-address", v, f),
+                      True)
+        self.assertIs(run.eval_needs("needs-sanitizer-memory", v, f),
+                      False)
+        self.assertIs(run.eval_needs("needs-sanitizer-kasan", v, f),
+                      False)
+        self.assertIsNone(run.eval_needs("needs-sanitizer-address",
+                                         v, None))
+        self.assertIsNone(run.eval_needs("needs-sanitizer-address",
+                                         v, FakeFacts()))
+
+    def test_sanitizer_support_needs_list_and_runtime(self):
+        v = view("//@ run-pass\n")
+        self.assertIs(run.eval_needs(
+            "needs-sanitizer-support", v,
+            FakeFacts(sanitizers={"address"}, sanitizer_runtime=True)),
+            True)
+        self.assertIs(run.eval_needs(
+            "needs-sanitizer-support", v,
+            FakeFacts(sanitizers={"address"}, sanitizer_runtime=False)),
+            False)
+        self.assertIs(run.eval_needs(
+            "needs-sanitizer-support", v,
+            FakeFacts(sanitizers=set(), sanitizer_runtime=True)), False)
+        self.assertIsNone(run.eval_needs(
+            "needs-sanitizer-support", v,
+            FakeFacts(sanitizers={"address"})))
+
+    def test_spec_fact_passthrough(self):
+        v = view("//@ run-pass\n")
+        f = FakeFacts(xray=True, dynamic_linking=False,
+                      relocation_model="pic", profiler_runtime=True,
+                      rust_lld=False, git_hash=True, llvm_zstd=False,
+                      mnemonics={"ret": True})
+        self.assertIs(run.eval_needs("needs-xray", v, f), True)
+        self.assertIs(run.eval_needs("needs-dynamic-linking", v, f),
+                      False)
+        self.assertIs(run.eval_needs("needs-relocation-model-pic",
+                                     v, f), True)
+        self.assertIs(run.eval_needs("needs-profiler-runtime", v, f),
+                      True)
+        self.assertIs(run.eval_needs("needs-rust-lld", v, f), False)
+        self.assertIs(run.eval_needs("needs-git-hash", v, f), True)
+        self.assertIs(run.eval_needs("needs-llvm-zstd", v, f), False)
+        self.assertIs(run.eval_needs("needs-asm-ret", v, f), True)
+        self.assertIsNone(run.eval_needs("needs-xray", v, FakeFacts()))
+
+    def test_crate_type_list(self):
+        v = view("//@ needs-crate-type: rlib, dylib\n")
+        full = FakeFacts(crate_types={"bin", "cdylib", "dylib", "lib",
+                                      "proc-macro", "rlib", "staticlib"})
+        self.assertIs(run.eval_needs("needs-crate-type", v, full), True)
+        self.assertIs(run.eval_needs(
+            "needs-crate-type", v, FakeFacts(crate_types={"rlib"})),
+            False)
+        self.assertIsNone(run.eval_needs("needs-crate-type", v, None))
+        bad = view("//@ needs-crate-type: nosuchtype\n")
+        self.assertIsNone(run.eval_needs("needs-crate-type", bad, full))
+        bare = view("//@ needs-crate-type\n")
+        self.assertIsNone(run.eval_needs("needs-crate-type", bare, full))
+
+    def test_target_has_atomic_list(self):
+        f = FakeFacts(atomic={"8", "16", "32", "64", "ptr"})
+        self.assertIs(run.eval_needs(
+            "needs-target-has-atomic",
+            view("//@ needs-target-has-atomic: 8, 64\n"), f), True)
+        self.assertIs(run.eval_needs(
+            "needs-target-has-atomic",
+            view("//@ needs-target-has-atomic: 128\n"), f), False)
+        self.assertIsNone(run.eval_needs(
+            "needs-target-has-atomic",
+            view("//@ needs-target-has-atomic: 7\n"), f))
+
+    def test_llvm_components(self):
+        v = view("//@ needs-llvm-components: x86 aarch64\n")
+        f = FakeFacts(components={"x86": True, "aarch64": True})
+        self.assertIs(run.eval_needs("needs-llvm-components", v, f),
+                      True)
+        f2 = FakeFacts(components={"x86": True, "aarch64": False})
+        self.assertIs(run.eval_needs("needs-llvm-components", v, f2),
+                      False)
+        # An unknown component name is undecidable, not absent.
+        v2 = view("//@ needs-llvm-components: x86 nosuchthing\n")
+        self.assertIsNone(run.eval_needs("needs-llvm-components",
+                                         v2, f))
+        self.assertIsNone(run.eval_needs("needs-llvm-components",
+                                         v, None))
+
+    def test_backends(self):
+        f = FakeFacts(default_backend="llvm")
+        self.assertIs(run.eval_needs(
+            "needs-backends", view("//@ needs-backends: llvm\n"), f),
+            True)
+        self.assertIs(run.eval_needs(
+            "needs-backends", view("//@ needs-backends: gcc\n"), f),
+            False)
+        self.assertIs(run.eval_needs(
+            "needs-backends",
+            view("//@ needs-backends: gcc llvm\n"), f), True)
+        self.assertIsNone(run.eval_needs(
+            "needs-backends", view("//@ needs-backends: llvm\n"),
+            FakeFacts()))
+        self.assertIsNone(run.eval_needs(
+            "needs-backends", view("//@ needs-backends: wat\n"), f))
+
+    def test_unknown_needs_stays_undecidable(self):
+        v = view("//@ run-pass\n")
+        self.assertIsNone(run.eval_needs("needs-std-remap-debuginfo",
+                                         v, FakeFacts()))
+        self.assertIsNone(run.eval_needs("needs-abort", v, FakeFacts()))
+
+    def test_applicability_outcomes(self):
+        status, why = run.applicability(
+            header("//@ run-pass\n//@ needs-enzyme\n"))
+        self.assertEqual(status, "out-of-environment")
+        self.assertIn("needs-enzyme", why)
+        status, _ = run.applicability(
+            header("//@ run-pass\n//@ needs-threads\n"))
+        self.assertEqual(status, "applicable")
+        f = FakeFacts(sanitizers={"address"})
+        status, _ = run.applicability(
+            header("//@ run-pass\n//@ needs-sanitizer-address\n"),
+            facts=f)
+        self.assertEqual(status, "applicable")
+        status, why = run.applicability(
+            header("//@ run-pass\n//@ needs-sanitizer-address\n"),
+            facts=FakeFacts(sanitizers=set()))
+        self.assertEqual(status, "out-of-environment")
+        self.assertIn("needs-sanitizer-address", why)
+
+
+class ToolchainFactsTests(unittest.TestCase):
+    """ToolchainFacts over a fixture toolchain: run_cmd is stubbed
+    with canned query answers and a fixture sysroot, so no real
+    rustc runs."""
+
+    def setUp(self):
+        self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.sysroot = self.tmp / "sysroot"
+        lib = (self.sysroot / "lib" / "rustlib"
+               / run.HOST_TARGET / "lib")
+        lib.mkdir(parents=True)
+        (lib / "libprofiler_builtins-deadbeef.rlib").write_bytes(b"x")
+        (lib / "librustc-stable_rt.asan.a").write_bytes(b"x")
+        bin_dir = (self.sysroot / "lib" / "rustlib"
+                   / run.HOST_TARGET / "bin")
+        bin_dir.mkdir(parents=True)
+        (bin_dir / "rust-lld").write_bytes(b"x")
+        self.calls = []
+        orig = run.run_cmd
+        run.run_cmd = self._fake_run_cmd
+        self.addCleanup(setattr, run, "run_cmd", orig)
+
+    def _fake_run_cmd(self, argv, **kw):
+        self.calls.append(argv)
+        ok = {"exit_code": 0, "stdout": "", "stderr": "",
+              "timeout": False}
+        def answer(stdout):
+            return {**ok, "stdout": stdout}
+        if "--print" in argv and "sysroot" in argv:
+            return answer(str(self.sysroot) + "\n")
+        if any("all-target-specs-json" in a for a in argv):
+            spec = {run.HOST_TARGET: {
+                "supported-sanitizers": ["address", "cfi"],
+                "supports-xray": True,
+                "dynamic-linking": True,
+                # no relocation-model: compiletest defaults to pic
+            }}
+            return answer(json.dumps(spec))
+        if any("supported-crate-types" in a for a in argv):
+            return answer("bin\nrlib\nstaticlib\n")
+        if "--print=backend-has-mnemonic:ret" in argv:
+            return answer("true\n")
+        if "--print=backend-has-zstd" in argv:
+            return answer("false\n")
+        if "--print" in argv and "cfg" in argv:
+            return answer('target_has_atomic="8"\n'
+                          'target_has_atomic="64"\n'
+                          'target_has_atomic="ptr"\n')
+        if "-vV" in argv:
+            return answer("rustc 1.100.0 (0ef1bc386 2026-11-09)\n"
+                          "commit-hash: 0ef1bc386\n")
+        if "--emit" in argv:
+            target = argv[argv.index("--target") + 1]
+            out = Path(argv[argv.index("-o") + 1])
+            if target == "m68k-unknown-linux-gnu":
+                return {**ok, "exit_code": 1,
+                        "stderr": "error: no m68k backend\n"}
+            out.write_bytes(b"fake object")
+            return ok
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    def test_queried_facts(self):
+        f = run.ToolchainFacts()
+        self.assertEqual(f.sysroot(), self.sysroot)
+        self.assertEqual(f.sanitizers(), {"address", "cfi"})
+        self.assertIs(f.xray(), True)
+        self.assertIs(f.dynamic_linking(), True)
+        self.assertEqual(f.relocation_model(), "pic")
+        self.assertEqual(f.supported_crate_types(),
+                         {"bin", "rlib", "staticlib"})
+        self.assertEqual(f.target_has_atomic(), {"8", "64", "ptr"})
+        self.assertIs(f.has_mnemonic("ret"), True)
+        self.assertIs(f.llvm_zstd(), False)
+        self.assertIs(f.git_hash(), True)
+
+    def test_sysroot_facts(self):
+        f = run.ToolchainFacts()
+        self.assertIs(f.profiler_runtime(), True)
+        self.assertIs(f.sanitizer_runtime_present(), True)
+        self.assertIs(f.rust_lld(), True)
+
+    def test_component_probes(self):
+        f = run.ToolchainFacts()
+        self.assertIs(f.llvm_component_present("x86"), True)
+        self.assertIs(f.llvm_component_present("m68k"), False)
+        self.assertIsNone(f.llvm_component_present("nosuchthing"))
+        self.assertEqual(f.default_codegen_backend(), "llvm")
+
+    def test_facts_compose_into_applicability(self):
+        f = run.ToolchainFacts()
+        status, _ = run.applicability(
+            header("//@ check-pass\n"
+                   "//@ needs-llvm-components: x86\n"), facts=f)
+        self.assertEqual(status, "applicable")
+        status, why = run.applicability(
+            header("//@ check-pass\n"
+                   "//@ needs-llvm-components: m68k\n"), facts=f)
+        self.assertEqual(status, "out-of-environment")
+        self.assertIn("needs-llvm-components", why)
+
+    def test_query_failure_is_undecidable_not_false(self):
+        orig = run.run_cmd
+        run.run_cmd = lambda argv, **kw: {
+            "exit_code": 1, "stdout": "", "stderr": "boom",
+            "timeout": False}
+        self.addCleanup(setattr, run, "run_cmd", orig)
+        f = run.ToolchainFacts()
+        self.assertIsNone(f.sanitizers())
+        self.assertIsNone(f.xray())
+        self.assertIsNone(f.supported_crate_types())
+        self.assertIsNone(f.llvm_component_present("x86"))
+        self.assertIsNone(f.default_codegen_backend())
 
 
 class JudgeTests(unittest.TestCase):

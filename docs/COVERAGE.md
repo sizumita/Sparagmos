@@ -664,6 +664,42 @@ tests/ui/editions/nested-macro-rules-edition.rs
 tests/ui/proc-macro/crate-var.rs と meta-macro.rs
 (ドライバ自身が proc-macro 補助クレートをビルドする経路)。
 
+needs-* 条件の評価を入れた combined 再実測 (both10-bm、
+2026-11-21、lane/needs-eval): `//@ needs-*` を一律に
+「評価できない条件」として未実行にしていたのをやめ、
+compiletest (src/tools/compiletest の directives/needs.rs)
+と同じ出典で評価するようにした。ターゲット同一性に対する
+compiletest 自身の規則 (needs-threads / needs-subprocess /
+needs-asm-support / needs-dlltool)、公式リリースビルドの
+構成 (needs-enzyme / needs-offload / rustc・std の
+debug-assertions は無効、レイアウトのランダム化は無効で
+needs-deterministic-layouts は成立)、ピン留めした rustc
+への問い合わせ (all-target-specs-json による sanitizer
+一覧・xray・動的リンク・再配置モデル、supported-crate-types、
+--print cfg の target_has_atomic、backend-has-mnemonic /
+backend-has-zstd、sysroot 内の profiler ランタイム・
+sanitizer ランタイム・rust-lld)、そして LLVM コンポーネント
+については代表ターゲットへの `#![no_core]` プローブの
+コード生成可否で判定する。条件が不成立なら compiletest が
+ignore するのと同じくプラットフォーム限定 (out of
+environment) に数え、判定できない条件だけが未実行に残る。
+結果: 「条件を評価できない未実行」は 902 → 0 件。
+その 902 件の行き先は、pass 217 (実行系 76、コンパイル時
+検証系 141。条件別では needs-subprocess 71、
+needs-llvm-components 45、needs-asm-support 42、
+needs-sanitizer-cfi 15、needs-sanitizer-address 12、
+needs-xray 8 など)、プラットフォーム限定 69 (enzyme、
+offload、rustc debug-assertions、未対応 sanitizer 等の
+不成立)、compile-flags による未実行 313 (needs-llvm-
+components が成立した外国ターゲット向けテストで、
+`--target` が未導入という実理由に付け替わったもの)、
+残りは実試行のうえで変換済み本体なし (150) や InlineAsm
+など本来の未対応に落ちた。全体は 14,898 → 15,139
+(+241) で 60.709%、実行系は 1,447 → 1,547 で 37.286%、
+コンパイル時検証系は 13,451 → 13,592 で 74.144%。
+both9 両実測 (minicore / revisions) に対して pass からの
+回帰は 0 件。
+
 候補 3,699 件のうち両側を実行できたのは 2,823 件で、その内訳は
 pass 539、fail 18、unsupported 2,266 である。unsupported の
 理由の上位は、by-reference 定数 860 件、ローカルの型が未対応
