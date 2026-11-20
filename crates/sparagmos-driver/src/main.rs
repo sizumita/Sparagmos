@@ -568,6 +568,14 @@ fn collect_local_instances(
     let mut taken = 0usize;
 
     while let Some(body) = queue.pop_front() {
+        // Instance resolution and body access go through the
+        // compiler's internals and can panic on exotic targets
+        // (higher-ranked and late-bound types are known cases).
+        // Isolate each scanned body: a panic abandons that body's
+        // remaining targets instead of the whole conversion, so
+        // instance collection can never make a crate convert worse
+        // than the item loop alone did.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         for (def, args) in sparagmos_driver::reach::call_targets(&body) {
             let referenced = def.def_id();
             let inst = match Instance::resolve(def, &args) {
@@ -607,6 +615,29 @@ fn collect_local_instances(
             }
             if taken >= MAX_LOCAL_INSTANCES {
                 fail_all(&mut demands, &owners, "collection limit reached".to_string());
+                continue;
+            }
+            // Mirror the reachability collection's guards before
+            // asking for the body: a virtual instance has no MIR
+            // body, and asking the compiler for one panics inside
+            // it (and the panic's ICE diagnostic poisons the whole
+            // compilation even when the unwind is caught).
+            if matches!(inst.kind, rustc_public::mir::mono::InstanceKind::Virtual { .. }) {
+                fail_all(
+                    &mut demands,
+                    &owners,
+                    "dynamic dispatch target (virtual instance)".to_string(),
+                );
+                continue;
+            }
+            if !inst.has_body() {
+                let reason = match inst.kind {
+                    rustc_public::mir::mono::InstanceKind::Intrinsic => {
+                        "compiler intrinsic (no fallback body)"
+                    }
+                    _ => "no MIR body available",
+                };
+                fail_all(&mut demands, &owners, reason.to_string());
                 continue;
             }
             let Some(ibody) = inst.body() else {
@@ -653,6 +684,14 @@ fn collect_local_instances(
                     }
                 }
             }
+        }
+        }));
+        if outcome.is_err() {
+            // The panic capture slot keeps the first panic's
+            // message; this panic was contained, so clear the
+            // slot — a later, genuinely fatal panic must report
+            // its own message.
+            let _ = take_captured_panic();
         }
     }
 
