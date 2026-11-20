@@ -362,6 +362,13 @@ fn collect() -> ControlFlow<()> {
     // and panics inside the compiler when it is instantiated.
     for crate_name in aux_crates() {
         for krate in rustc_public::find_crates(crate_name) {
+            // An auxiliary crate can share the main crate's name
+            // (see the E0519 note in `main`); `find_crates` then
+            // also returns the local crate, whose functions the loop
+            // above already collected.
+            if krate.is_local {
+                continue;
+            }
             for fn_def in krate.fn_defs() {
                 let name = fn_def.name();
                 let def_id = conv.crate_def_id(&fn_def);
@@ -796,6 +803,24 @@ fn main() {
             if let Some(artifact) = &built.artifact {
                 args.push("--extern".to_string());
                 args.push(format!("{}={}", built.name, artifact.display()));
+            }
+        }
+        // An auxiliary crate may carry the same name as the main
+        // crate (compiletest has tests whose aux file is the test
+        // file's own name, e.g. `llvm-pr32379.rs` with
+        // `aux-build:llvm_pr32379.rs`). Compiled with the same
+        // default `-C metadata`, rustc then rejects the main
+        // compilation with E0519 (the crate is indistinguishable
+        // from its dependency). compiletest distinguishes its test
+        // compilations with a per-test `-C metadata`; do the same
+        // for the main compilation when a name collision is present.
+        let main_crate_name = std::path::Path::new(&input)
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().replace('-', "_"));
+        if let Some(main_name) = main_crate_name {
+            if aux_built.iter().any(|b| b.name == main_name) {
+                args.push("-C".to_string());
+                args.push("metadata=sparagmos-main".to_string());
             }
         }
     }

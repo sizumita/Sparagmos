@@ -452,8 +452,13 @@ def resolve_aux_specs(test_path):
     visiting = set()
 
     def find_file(fname, from_dir):
-        for base in (from_dir, from_dir / "auxiliary",
-                     test_dir, test_dir / "auxiliary"):
+        # The `auxiliary/` subdirectory wins over the directory
+        # itself: a test file and its auxiliary file can share a
+        # name (tests/ui/associated-type-bounds has both fn-aux.rs
+        # the test and auxiliary/fn-aux.rs the auxiliary crate), and
+        # the auxiliary one is meant.
+        for base in (from_dir / "auxiliary", from_dir,
+                     test_dir / "auxiliary", test_dir):
             cand = base / fname
             if cand.is_file():
                 return cand
