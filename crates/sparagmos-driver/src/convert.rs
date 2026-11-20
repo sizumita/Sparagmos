@@ -883,6 +883,13 @@ impl Converter {
                 }
                 Some(sm::ConstValue::Tuple(fields))
             }
+            TyKind::RigidTy(RigidTy::Pat(inner, _)) => {
+                // Pattern types (e.g. the `usize is 0..=N` field of
+                // `core::num::niche_types` wrappers) share the inner
+                // type's representation; the stored value is the
+                // inner type's value.
+                self.decode_const(&inner, alloc, offset, depth)
+            }
             TyKind::RigidTy(RigidTy::Adt(def, args)) => {
                 self.decode_adt(&def, &args, ty, alloc, offset, depth)
             }
@@ -927,22 +934,17 @@ impl Converter {
                     tag_field,
                     variants,
                 } => {
-                    let _ = tag;
                     let (idx, offsets) = match tag_encoding {
                         TagEncoding::Direct => {
-                            let discr_ty = match ty.kind() {
-                                TyKind::RigidTy(r) => r.discriminant_ty(),
-                                _ => return None,
-                            };
-                            let (size, signed) = match discr_ty.kind() {
-                                TyKind::RigidTy(RigidTy::Int(t)) => {
-                                    (int_ty_size(&t)?, true)
-                                }
-                                TyKind::RigidTy(RigidTy::Uint(t)) => {
-                                    (uint_ty_size(&t)?, false)
-                                }
-                                _ => return None,
-                            };
+                            // The stored tag's width and signedness
+                            // come from the layout's tag scalar, not
+                            // from the enum's discriminant type:
+                            // rustc stores a small enum's tag in a
+                            // scalar narrower than the type-level
+                            // discriminant type (a fieldless enum
+                            // with two variants gets a 1-byte tag
+                            // while its discriminant type is isize).
+                            let (size, signed) = tag_scalar_size_signed(tag)?;
                             let tag_off = arbitrary_offsets(ty)?.get(*tag_field).copied()?;
                             let raw = read_uint_at(alloc, offset + tag_off, size)?;
                             let val = if signed { sign_extend(raw, size) } else { raw };
@@ -969,16 +971,19 @@ impl Converter {
                             niche_start,
                         } => {
                             let untagged = untagged_variant.to_index();
-                            let untagged_fields = &variants.get(untagged)?.offsets;
-                            let tag_off = untagged_fields.get(*tag_field)?.bytes();
-                            // The niche field's own size: read no
-                            // wider than the field type's layout.
-                            let untagged_def = def.variant(VariantIdx::to_val(untagged))?;
-                            let field_ty = untagged_def
-                                .fields()
-                                .get(*tag_field)?
-                                .ty_with_args(args);
-                            let size = field_ty.layout().ok()?.shape().size.bytes();
+                            // The niche scalar's absolute offset
+                            // within the enum is the layout's sole
+                            // top-level field offset (the layout
+                            // computation records the niche offset
+                            // there), and its width is the tag
+                            // scalar's width. The dataful variant's
+                            // field that *contains* the niche may
+                            // start earlier and be wider (a whole
+                            // `Layout` around its alignment word),
+                            // so neither its offset nor its size
+                            // identifies the niche itself.
+                            let tag_off = arbitrary_offsets(ty)?.get(*tag_field).copied()?;
+                            let (size, _) = tag_scalar_size_signed(tag)?;
                             if size == 0 || size > 16 { return None; }
                             let raw = read_uint_at(alloc, offset + tag_off, size)?;
                             let start = niche_variants.start().to_index();
@@ -1351,6 +1356,31 @@ const MAX_CONST_DEPTH: usize = 32;
 /// Pointer width in bytes on the target this driver runs for
 /// (x86_64); Stable MIR provenance entries are pointer-sized.
 const PTR_SIZE: usize = 8;
+
+/// Byte size and signedness of a layout tag scalar: the stored
+/// discriminant of a directly tagged enum, or the niche-carrying
+/// scalar of a niche-encoded one. Pointers count as unsigned
+/// pointer-sized integers; floats cannot be tags.
+fn tag_scalar_size_signed(tag: &rustc_public::abi::Scalar) -> Option<(usize, bool)> {
+    use rustc_public::abi::{IntegerLength, Primitive, Scalar};
+    let prim = match tag {
+        Scalar::Initialized { value, .. } | Scalar::Union { value } => value,
+    };
+    match prim {
+        Primitive::Int { length, signed } => {
+            let size = match length {
+                IntegerLength::I8 => 1,
+                IntegerLength::I16 => 2,
+                IntegerLength::I32 => 4,
+                IntegerLength::I64 => 8,
+                IntegerLength::I128 => 16,
+            };
+            Some((size, *signed))
+        }
+        Primitive::Pointer(_) => Some((PTR_SIZE, false)),
+        _ => None,
+    }
+}
 
 /// Read an unsigned integer of `size` bytes at `offset` in `alloc`.
 fn read_uint_at(alloc: &Allocation, offset: usize, size: usize) -> Option<u128> {
