@@ -12,9 +12,13 @@ always the driver binary's `run` mode.
 
 Input is the per-test classification produced by
 scripts/rustc-subset-survey.py (--json). Stage 1 covers tests the
-survey classified as nature="exec" that are single-file and in the
-ui / ui-fulldeps suites (the run-pass / run-fail / run-crash
-population). Stage 2 covers the nature="compile-check" population:
+survey classified as nature="exec" in the ui / ui-fulldeps suites
+(the run-pass / run-fail / run-crash population) that are either
+single-file or use auxiliary crates: `//@ aux-build:` /
+`//@ aux-crate:` directives are resolved transitively (an auxiliary
+file's own directives included), and the resulting crates are built
+by the native rustc for the oracle side and passed to the driver
+with `--aux` for the Sparagmos side, in dependency order. Stage 2 covers the nature="compile-check" population:
 each test is run through the driver's convert-only mode and the
 outcome is compared with the expectation compiletest derives from
 the test's directives (see the stage-2 section below). Everything
@@ -390,17 +394,169 @@ def sysroot_lib():
     return _SYSROOT_LIB
 
 
-def native_side(path, edition, workdir):
+CRATE_TYPE_RE = re.compile(r"crate_type\s*=\s*\"([^\"]+)\"")
+CRATE_NAME_RE = re.compile(r"crate_name\s*=\s*\"([^\"]+)\"")
+
+
+def declared_crate_type(text):
+    """The `#![crate_type = "..."]` an auxiliary source declares."""
+    m = CRATE_TYPE_RE.search(text)
+    return m.group(1) if m else None
+
+
+def declared_crate_name(text):
+    """The `#![crate_name = "..."]` an auxiliary source declares.
+
+    When a source declares one, the declaration is the crate's name
+    (compiletest links the crate under it); a differing --crate-name
+    flag is a rustc error, so none is passed.
+    """
+    m = CRATE_NAME_RE.search(text)
+    return m.group(1) if m else None
+
+
+def aux_directives(header):
+    """(crate_name, file_name) pairs from a header's aux directives.
+
+    `aux-build: foo-bar.rs` builds crate `foo_bar` (the file stem
+    with dashes as underscores, as compiletest derives it);
+    `aux-crate: name=file.rs` names the crate explicitly.
+    """
+    out = []
+    for value in header.values("aux-build"):
+        fname = value.strip()
+        if fname:
+            out.append((Path(fname).stem.replace("-", "_"), fname))
+    for value in header.values("aux-crate"):
+        value = value.strip()
+        if "=" in value:
+            name, fname = value.split("=", 1)
+            out.append((name.strip(), fname.strip()))
+    return out
+
+
+def resolve_aux_specs(test_path):
+    """Resolve a test's auxiliary crates, transitively, deps first.
+
+    Returns (specs, error): specs is a list of (crate_name, Path) in
+    dependency order (a crate before the crates that use it), the
+    order both process sides expect. Auxiliary files are looked up
+    next to the file whose directive names them, in that directory's
+    `auxiliary/` subdirectory, and next to the main test file (the
+    places compiletest looks). error is a not-attempted reason when
+    resolution fails.
+    """
+    test_dir = test_path.parent
+    specs = []
+    by_name = {}
+    visiting = set()
+
+    def find_file(fname, from_dir):
+        for base in (from_dir, from_dir / "auxiliary",
+                     test_dir, test_dir / "auxiliary"):
+            cand = base / fname
+            if cand.is_file():
+                return cand
+        return None
+
+    def visit(name, fname, from_dir):
+        path = find_file(fname, from_dir)
+        if path is None:
+            return (f"auxiliary file {fname} for crate `{name}` "
+                    f"not found")
+        if name in by_name:
+            if by_name[name] != path:
+                return (f"auxiliary crate `{name}` is provided by "
+                        f"two files: {by_name[name].name} and "
+                        f"{path.name}")
+            return None
+        if name in visiting:
+            return f"auxiliary crate dependency cycle at `{name}`"
+        visiting.add(name)
+        by_name[name] = path
+        header = Header(path.read_text(errors="ignore"))
+        for dep_name, dep_file in aux_directives(header):
+            err = visit(dep_name, dep_file, path.parent)
+            if err:
+                return err
+        visiting.discard(name)
+        specs.append((name, path))
+        return None
+
+    header = Header(test_path.read_text(errors="ignore"))
+    for name, fname in aux_directives(header):
+        err = visit(name, fname, test_dir)
+        if err:
+            return [], err
+    return specs, None
+
+
+def find_artifact(libdir, name):
+    """The linkable artifact a library compilation produced."""
+    best = None
+    for cand in Path(libdir).glob(f"lib{name}.*"):
+        rank = {"rlib": 0, "rmeta": 1, "so": 2, "dylib": 2,
+                "dll": 2}.get(cand.suffix.lstrip("."))
+        if rank is None:
+            continue
+        if best is None or rank < best[0]:
+            best = (rank, cand)
+    return best[1] if best else None
+
+
+def native_side(path, edition, workdir, aux_specs=()):
     """Compile and run natively. Returns (result_dict, error_reason).
 
     error_reason is None when the native run completed (whatever its
-    exit code); otherwise a not-attempted reason string.
+    exit code); otherwise a not-attempted reason string. Auxiliary
+    crates are compiled first, in dependency order, the way
+    compiletest builds them for the test's own compilation.
     """
     binpath = Path(workdir) / "prog"
     lib = sysroot_lib()
+    externs = []
+    if aux_specs:
+        auxdir = Path(workdir) / "auxlibs"
+        auxdir.mkdir()
+        built = []
+        for name, src in aux_specs:
+            text = src.read_text(errors="ignore")
+            declared = declared_crate_type(text)
+            eff_name = declared_crate_name(text) or name
+            cmd = rustc_cmd() + ["--edition", edition,
+                                 "--out-dir", str(auxdir)]
+            if lib:
+                cmd += ["-L", lib]
+            cmd += ["-L", f"dependency={auxdir}"]
+            if declared is None:
+                cmd += ["--crate-type", "rlib"]
+            if declared_crate_name(text) is None:
+                cmd += ["--crate-name", name]
+            for prev_name, prev_artifact in built:
+                if prev_artifact is not None:
+                    cmd += ["--extern", f"{prev_name}={prev_artifact}"]
+            cmd += [str(src)]
+            build = run_cmd(cmd, timeout=NATIVE_COMPILE_TIMEOUT,
+                            env_extra=BOOTSTRAP_ENV)
+            if build["timeout"]:
+                return None, "native compile timed out"
+            if build["exit_code"] != 0:
+                first = first_error_line(build["stderr"])
+                return None, f"native compile failed: {first}"
+            effective = declared or "rlib"
+            artifact = (find_artifact(auxdir, eff_name)
+                        if effective in ("rlib", "lib", "dylib",
+                                         "proc-macro")
+                        else None)
+            built.append((eff_name, artifact))
+            if artifact is not None:
+                externs += ["--extern", f"{eff_name}={artifact}"]
     build = run_cmd(
         rustc_cmd() + ["--edition", edition, "-C", "opt-level=0"]
         + (["-L", lib] if lib else [])
+        + (["-L", f"dependency={Path(workdir) / 'auxlibs'}"]
+           if aux_specs else [])
+        + externs
         + ["-o", str(binpath), str(path)],
         timeout=NATIVE_COMPILE_TIMEOUT, env_extra=BOOTSTRAP_ENV)
     if build["timeout"]:
@@ -419,14 +575,17 @@ def native_side(path, edition, workdir):
     return run, None
 
 
-def sparagmos_side(path, edition, driver_bin, cwd=None):
+def sparagmos_side(path, edition, driver_bin, cwd=None, aux_specs=()):
     """Run through the driver. Returns (result_dict, kind, reason).
 
     kind is "result" (exit 0/101), "unsupported" (driver exit 2),
-    "timeout", or "driver-error".
+    "timeout", or "driver-error". Auxiliary crates are handed to
+    the driver with `--aux`, in dependency order.
     """
-    res = run_cmd([str(driver_bin), "run", str(path),
-                   "--edition", edition],
+    argv = [str(driver_bin), "run", str(path), "--edition", edition]
+    for name, src in aux_specs:
+        argv += ["--aux", f"{name}={src}"]
+    res = run_cmd(argv,
                   timeout=DRIVER_TIMEOUT, cwd=cwd,
                   env_extra=BOOTSTRAP_ENV)
     if res["timeout"]:
@@ -554,16 +713,19 @@ def fill_result(rec, rust_dir, driver_bin, out):
                          "instrumentation; not in stage-1 scope)")
         out["bucket"] = "out of stage-1 scope (suite)"
         return
-    if not rec["single_file"]:
-        out["reason"] = "multi-file / auxiliary crates (not in stage-1 scope)"
-        out["bucket"] = "out of stage-1 scope (multi-file)"
-        return
-
     path = rust_dir / rec["path"]
     text = path.read_text(errors="ignore")
     header = Header(text)
     mode = run_mode(header)
     out["mode"] = mode
+
+    aux_specs = []
+    if not rec["single_file"]:
+        aux_specs, aux_err = resolve_aux_specs(path)
+        if aux_err:
+            out["reason"] = aux_err
+            out["bucket"] = "out of stage-1 scope (multi-file)"
+            return
 
     blocker = stage1_blocker(header, rec)
     if blocker:
@@ -580,11 +742,16 @@ def fill_result(rec, rust_dir, driver_bin, out):
         out["bucket"] = "not attempted (unevaluatable condition)"
         return
 
+    if not rec["single_file"] and not aux_specs:
+        out["reason"] = "multi-file / auxiliary crates (not in stage-1 scope)"
+        out["bucket"] = "out of stage-1 scope (multi-file)"
+        return
+
     editions = header.values("edition")
     edition = editions[0].strip() if editions else "2021"
 
     with tempfile.TemporaryDirectory(prefix="subset-run-") as td:
-        native, err = native_side(path, edition, td)
+        native, err = native_side(path, edition, td, aux_specs)
         if err:
             out["reason"] = err
             out["bucket"] = bucket_reason(err)
@@ -596,7 +763,8 @@ def fill_result(rec, rust_dir, driver_bin, out):
             out["bucket"] = "native run does not match mode expectation"
             out["native"] = {"exit_code": native["exit_code"]}
             return
-        got, kind, reason = sparagmos_side(path, edition, driver_bin, td)
+        got, kind, reason = sparagmos_side(path, edition, driver_bin, td,
+                                           aux_specs)
         if kind == "unsupported":
             out["status"] = "unsupported"
             out["reason"] = reason
@@ -969,11 +1137,26 @@ def main():
 
     # Stage-1 candidates are processed for real; every other record in
     # the denominator is carried through as not-attempted so the
-    # aggregate arithmetic covers the whole subset.
+    # aggregate arithmetic covers the whole subset. A non-single-file
+    # record is a candidate when its header carries auxiliary-crate
+    # directives (scoped ones included: process_test records those
+    # under the revisions blocker).
+    def has_aux_directives(r):
+        try:
+            text = (args.rust_dir / r["path"]).read_text(errors="ignore")
+        except OSError:
+            return False
+        header = Header(text)
+        if aux_directives(header):
+            return True
+        return any(name in ("aux-build", "aux-crate")
+                   for (_rev, name) in header.scoped)
+
     def is_candidate(r):
-        return (r["nature"] == "exec" and r["single_file"]
+        return (r["nature"] == "exec"
                 and r["suite"] in ("ui", "ui-fulldeps")
-                and not r["env_excluded"])
+                and not r["env_excluded"]
+                and (r["single_file"] or has_aux_directives(r)))
 
     def is_candidate2(r):
         return (r["nature"] == "compile-check"
