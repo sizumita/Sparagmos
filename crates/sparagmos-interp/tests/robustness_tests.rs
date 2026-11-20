@@ -197,14 +197,18 @@ fn closure_typed_local_converts() {
 }
 
 #[test]
-fn dynamic_typed_local_fails_conversion_with_reason() {
-    assert_unsupported_type(
-        body_with_local(mir::Ty::Dynamic(
-            vec!["std::fmt::Debug".to_string()],
-            Box::new(unit_ty()),
-            mir::Region::Erased,
-        )),
-        "Dynamic",
+fn dynamic_typed_local_converts() {
+    // Dyn-typed locals are part of the value model (a fat pointer
+    // carrying its vtable identity): they convert (execution
+    // coverage lives in `dyn_tests.rs`).
+    let body = body_with_local(mir::Ty::Dynamic(
+        vec!["std::fmt::Debug".to_string()],
+        Box::new(unit_ty()),
+        mir::Region::Erased,
+    ));
+    assert!(
+        convert_program(&program_with("typed", body)).is_ok(),
+        "dynamic-typed local must convert"
     );
 }
 

@@ -968,8 +968,14 @@ impl<'a> Interpreter<'a> {
                     // A box in this model is an ADT aggregate holding
                     // its pointee; `deref` yields a reference to that
                     // pointee value (reads resolve against the value,
-                    // as they do for constant aggregates).
+                    // as they do for constant aggregates). A
+                    // `Box<dyn Trait>` is the fat pointer itself, and
+                    // dereferencing it yields that pointer — the
+                    // `&dyn` the trait methods dispatch through.
                     let pointee = self.resolve_value(frames, &vals[0])?;
+                    if let Value::DynRef { .. } = pointee {
+                        return Ok(pointee);
+                    }
                     match pointee {
                         Value::Enum { fields, .. } if fields.len() == 1 => {
                             let inner = fields.into_iter().next().expect("len checked");
@@ -1327,6 +1333,11 @@ impl<'a> Interpreter<'a> {
                     })
                 } else if self_ty.starts_with("std::boxed::Box<") {
                     let pointee = self.resolve_value(frames, &vals[0])?;
+                    // As in `Deref`: a `Box<dyn Trait>` dereferences
+                    // to the fat pointer itself.
+                    if let Value::DynRef { .. } = pointee {
+                        return Ok(pointee);
+                    }
                     match pointee {
                         Value::Enum { fields, .. } if fields.len() == 1 => {
                             let inner = fields.into_iter().next().expect("len checked");

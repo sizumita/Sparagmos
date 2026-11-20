@@ -814,6 +814,20 @@ impl<'a> Converter<'a> {
             .unwrap_or_else(|| format!("{def:?}"))
     }
 
+    /// The name of a concrete type as it appears in the `Self`
+    /// position of its impl method names in the program
+    /// (`<{name} as Trait>::method`): the definition's display name
+    /// for a named type, the surface-syntax rendering otherwise.
+    fn concrete_ty_name(&self, ty: &mir::Ty) -> String {
+        match ty {
+            mir::Ty::Adt(def, _)
+            | mir::Ty::Closure(def, _)
+            | mir::Ty::FnDef(def, _)
+            | mir::Ty::Coroutine(def, _) => self.def_display_name(def),
+            other => crate::builtins::ty_tag(other, self.names),
+        }
+    }
+
     fn convert_ty(&self, ty: &mir::Ty, context: &str) -> Result<ir::Ty, ConvertError> {
         let unsupported = || ConvertError::UnsupportedType {
             context: context.to_string(),
@@ -867,6 +881,12 @@ impl<'a> Converter<'a> {
                 ir::Ty::Array(Box::new(self.convert_ty(elem, context)?), n)
             }
             mir::Ty::Slice(elem) => ir::Ty::Slice(Box::new(self.convert_ty(elem, context)?)),
+            // `dyn Trait` is representable: behind a reference it is
+            // a fat pointer whose value carries the concrete type;
+            // as a bare place type it names the unsized pointee a
+            // fat pointer's dereference reaches. Only the bounds'
+            // names are kept.
+            mir::Ty::Dynamic(traits, _, _) => ir::Ty::Dynamic(traits.clone()),
             _ => return Err(unsupported()),
         })
     }
@@ -1291,7 +1311,54 @@ impl<'a> Converter<'a> {
                         )),
                     },
                     mir::CastKind::PointerCoercion(mir::PointerCoercion::Unsize) => {
-                        ir::Rvalue::Unsize(v)
+                        match dyn_traits_in(target) {
+                            // Sized-to-`dyn`: the vtable identity is
+                            // decided here, where both types are
+                            // known — the concrete type from the
+                            // operand's type, the bounds from the
+                            // target.
+                            Some(traits) => {
+                                let source = self.operand_place_ty(body, operand);
+                                match source {
+                                    // A `dyn`-to-`dyn` coercion
+                                    // (supertrait upcast): the
+                                    // concrete type rides on the
+                                    // value; only the bounds change.
+                                    Some(src) if dyn_traits_in(&src).is_some() => {
+                                        ir::Rvalue::Unsize(
+                                            v,
+                                            ir::UnsizeMeta::Dyn {
+                                                concrete: None,
+                                                traits,
+                                            },
+                                        )
+                                    }
+                                    Some(src) => {
+                                        let pointee = unsize_pointee(&src);
+                                        ir::Rvalue::Unsize(
+                                            v,
+                                            ir::UnsizeMeta::Dyn {
+                                                concrete: Some(
+                                                    self.concrete_ty_name(pointee),
+                                                ),
+                                                traits,
+                                            },
+                                        )
+                                    }
+                                    // A constant operand does not
+                                    // preserve its type in this MIR
+                                    // form, so the concrete type
+                                    // cannot be named (the same
+                                    // limit as the ClosureFnPointer
+                                    // constant case below).
+                                    None => ir::Rvalue::Unsupported(format!(
+                                        "Cast Unsize to {} (the concrete type is not                                          preserved in the constant operand)",
+                                        target.kind_name()
+                                    )),
+                                }
+                            }
+                            None => ir::Rvalue::Unsize(v, ir::UnsizeMeta::Slice),
+                        }
                     }
                     // These coercions do not change the reference
                     // value in this model (a reference carries no
@@ -1800,6 +1867,26 @@ impl<'a> Converter<'a> {
                                 target: target.map(|b| ir::BasicBlock(b.index())),
                                 drop_glue,
                             }
+                        }
+                    } else if args.first().is_some_and(|a| {
+                        self.operand_place_ty(body, a)
+                            .is_some_and(|t| dyn_traits_in(&t).is_some())
+                    }) {
+                        // A method call on a `dyn Trait` value: the
+                        // callee is the trait method, which has no
+                        // body of its own. The call is a vtable
+                        // dispatch, resolved at run time against the
+                        // receiver's concrete type (see
+                        // `virtual_call_target` in the interpreter).
+                        let mut ir_args = Vec::with_capacity(args.len());
+                        for arg in args.iter() {
+                            ir_args.push(self.convert_operand(body, arg, None)?);
+                        }
+                        ir::TerminatorKind::Call {
+                            func: name,
+                            args: ir_args,
+                            destination: self.convert_place(destination)?,
+                            target: target.map(|b| ir::BasicBlock(b.index())),
                         }
                     } else {
                         ir::TerminatorKind::Unsupported(format!(
@@ -2398,5 +2485,30 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
             }
         }
         Some(collapse_fields(fields, count.is_some()))
+    }
+}
+
+/// The trait bounds of the `dyn` type inside `ty`, if any: the
+/// search goes through references and raw pointers and into ADT
+/// generic arguments (a `Box<dyn Trait>` / `Rc<dyn Trait>` target
+/// carries the `dyn` type in its argument).
+fn dyn_traits_in(ty: &mir::Ty) -> Option<Vec<String>> {
+    match ty {
+        mir::Ty::Dynamic(traits, _, _) => Some(traits.clone()),
+        mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _) => dyn_traits_in(inner),
+        mir::Ty::Adt(_, args) => args.iter().find_map(dyn_traits_in),
+        _ => None,
+    }
+}
+
+/// The sized pointee an unsizing coercion starts from: the inner
+/// type of a reference or raw pointer, the first generic argument
+/// of a pointer-shaped ADT (`Box`, `Rc`, `Arc` share the shape), or
+/// the type itself for a bare value operand.
+fn unsize_pointee(ty: &mir::Ty) -> &mir::Ty {
+    match ty {
+        mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _) => inner,
+        mir::Ty::Adt(_, args) => args.first().unwrap_or(ty),
+        other => other,
     }
 }

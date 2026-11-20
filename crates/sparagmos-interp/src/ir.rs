@@ -177,6 +177,14 @@ pub enum Ty {
     /// interpreter synthesises the (unique) empty-environment value
     /// when such a place is read.
     Closure(String, usize),
+    /// A `dyn Trait` type: the trait bounds' names (principal trait
+    /// first), as the driver renders them. The type is unsized: it
+    /// only appears behind a reference or raw pointer, or as the
+    /// type of a place reached through a fat pointer's dereference.
+    /// Values of this type are [`crate::value::Value::DynRef`] fat
+    /// pointers; the erased concrete type is carried by the value,
+    /// not the type.
+    Dynamic(Vec<String>),
 }
 
 impl Ty {
@@ -375,9 +383,10 @@ pub enum Rvalue {
     ClosureAggregate { def: String, operands: Vec<Operand> },
     /// An `as` cast to the given scalar type (wrapping, as in Rust).
     Cast(Operand, Ty),
-    /// The array-to-slice unsizing coercion: wraps the operand (a
-    /// reference to an array) into a fat pointer carrying the length.
-    Unsize(Operand),
+    /// An unsizing coercion (`PointerCoercion::Unsize`). The
+    /// metadata describes what the coercion attaches, decided at
+    /// conversion time from the source and target types.
+    Unsize(Operand, UnsizeMeta),
     /// `BoxDerefTransmute` cast: the operand is the chain of
     /// single-field wrappers a `Box` keeps around its raw pointer
     /// (`Unique` around `NonNull` around the pointer); yields the
@@ -409,6 +418,27 @@ impl Rvalue {
     pub fn checked_binary(op: BinOp, lhs: Operand, rhs: Operand) -> Rvalue {
         Rvalue::CheckedBinaryOp(op, Box::new((lhs, rhs)))
     }
+}
+
+/// What an [`Rvalue::Unsize`] coercion attaches to the operand,
+/// decided at conversion time from the source and target types
+/// (mir_convert): exactly the metadata a real fat pointer carries.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UnsizeMeta {
+    /// Array-to-slice unsizing: the metadata is the element count,
+    /// read off the pointee at run time.
+    Slice,
+    /// Sized-to-`dyn` unsizing: the metadata is the vtable, which
+    /// this model represents by its identity — the concrete type's
+    /// name (as the driver renders it, matching the `Self` spelling
+    /// of the concrete type's impl method names) and the target
+    /// type's trait bounds. `concrete` is `None` when the source is
+    /// itself a `dyn` value (a supertrait upcast): the value's own
+    /// concrete type carries over and only the bounds change.
+    Dyn {
+        concrete: Option<String>,
+        traits: Vec<String>,
+    },
 }
 
 /// Statement kinds (subset of rustc MIR `StatementKind`).

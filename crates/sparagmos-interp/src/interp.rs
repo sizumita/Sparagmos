@@ -343,6 +343,12 @@ impl<'a> Interpreter<'a> {
                     let (callable, env_ref) = match kind {
                         FnCallKind::CallOnce => {
                             let (value, env_ref) = self.eval_callable(&frames, body, &receiver)?;
+                            let (value, env_ref) =
+                                if matches!(value, Value::DynRef { .. }) {
+                                    self.dyn_callable(&frames, &value)?
+                                } else {
+                                    (value, env_ref)
+                                };
                             let env_ref = match self.consumed_env_arg(
                                 &mut frames,
                                 body,
@@ -360,7 +366,14 @@ impl<'a> Interpreter<'a> {
                                 Value::Ref(_) | Value::FatRef { .. } => {
                                     let resolved = self.deref_value(&frames, &recv)?;
                                     let value = self.read_resolved(&frames, &resolved)?;
-                                    (value, recv)
+                                    if matches!(value, Value::DynRef { .. }) {
+                                        self.dyn_callable(&frames, &value)?
+                                    } else {
+                                        (value, recv)
+                                    }
+                                }
+                                Value::DynRef { .. } => {
+                                    self.dyn_callable(&frames, &recv)?
                                 }
                                 value => {
                                     let env = self.callable_env_ref(
@@ -601,6 +614,51 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// Resolve a call that has no body under its own name against
+    /// a `dyn` receiver: the vtable lookup, with the fat pointer's
+    /// (concrete type, trait) pair standing in for the vtable.
+    ///
+    /// Returns `None` when the call is not a dynamic dispatch (the
+    /// first argument is not a dyn fat pointer, or the callee name
+    /// is not a trait method of the pointer's bounds and no impl
+    /// body matches). Returns `Some(Ok((impl_name, receiver)))` to
+    /// dispatch: the receiver is the fat pointer's data pointer.
+    /// Returns `Some(Err(_))` when the call is a dispatch through
+    /// the pointer but the concrete implementation body is not in
+    /// the program — the explicit boundary of the dyn model, hit at
+    /// the call, never at the value's declaration.
+    fn virtual_call_target(
+        &self,
+        func: &str,
+        args: &[Value],
+    ) -> Option<Result<(String, Value), InterpError>> {
+        let Value::DynRef {
+            base,
+            concrete,
+            traits,
+        } = args.first()?
+        else {
+            return None;
+        };
+        let (trait_path, method) = func.rsplit_once("::")?;
+        if trait_path.is_empty() || method.is_empty() {
+            return None;
+        }
+        let candidate = format!("<{concrete} as {trait_path}>::{method}");
+        if self.program.get(&candidate).is_some()
+            || self.program.unconverted_reason(&candidate).is_some()
+        {
+            return Some(Ok((candidate, (**base).clone())));
+        }
+        if traits.iter().any(|t| t == trait_path) {
+            return Some(Err(InterpError::UnsupportedDynamicDispatch {
+                method: func.to_string(),
+                concrete: concrete.clone(),
+            }));
+        }
+        None
+    }
+
     /// Push a call frame for `func` with already-evaluated argument
     /// values (placed at locals 1..), returning into `destination` /
     /// `target` of the current top frame when the callee returns.
@@ -613,11 +671,47 @@ impl<'a> Interpreter<'a> {
         destination: &Place,
         target: Option<BasicBlock>,
     ) -> InterpResult<()> {
-        let callee = self
-            .program
-            .get(func)
-            .cloned()
-            .ok_or_else(|| self.missing_body_error(func))?;
+        let callee = match self.program.get(func) {
+            Some(c) => c.clone(),
+            None => match self.virtual_call_target(func, &arg_values) {
+                // A vtable call: dispatch to the concrete type's
+                // impl body, with the fat pointer's data pointer as
+                // the receiver (the box aggregate itself for a
+                // by-value `Box<dyn>` receiver).
+                Some(Ok((impl_func, receiver))) => {
+                    // Shape the receiver the way the impl body's
+                    // `self` type expects: a reference receiver gets
+                    // a reference to the concrete value (through the
+                    // box aggregate for a `Box<dyn>`), a by-value
+                    // receiver gets the data pointer as it is.
+                    let receiver = match self
+                        .program
+                        .get(&impl_func)
+                        .and_then(|b| b.local_tys.get(1))
+                    {
+                        Some(Ty::Ref(..)) => match receiver {
+                            Value::Enum { fields, .. } if fields.len() == 1 => {
+                                Value::Ref(RefTarget::Value(Box::new(
+                                    fields.into_iter().next().expect("one field"),
+                                )))
+                            }
+                            other @ (Value::Ref(_)
+                            | Value::FatRef { .. }
+                            | Value::DynRef { .. }) => other,
+                            other => {
+                                Value::Ref(RefTarget::Value(Box::new(other)))
+                            }
+                        },
+                        _ => receiver,
+                    };
+                    let mut args = arg_values;
+                    args[0] = receiver;
+                    return self.start_call(frames, &impl_func, args, destination, target);
+                }
+                Some(Err(e)) => return Err(e),
+                None => return Err(self.missing_body_error(func)),
+            },
+        };
         if frames.len() >= self.config.max_call_depth {
             return Err(InterpError::CallDepthExceeded {
                 limit: self.config.max_call_depth,
@@ -660,6 +754,32 @@ impl<'a> Interpreter<'a> {
     /// semantics. (A body that takes its environment by value is
     /// the exception: `consumed_env_arg` passes the value itself
     /// and does clear the place.)
+
+    /// The callable value and environment reference behind a
+    /// `dyn Fn`-family fat pointer: the concrete value it denotes
+    /// (a closure value, for the payloads a program can contain),
+    /// referenced through the fat pointer's own base when that
+    /// base is a reference (a `&dyn Fn`), and as a value otherwise
+    /// (an owned `Box<dyn Fn>` — the closure value inside the box
+    /// aggregate; its captures are place references, so calls
+    /// through the copy still reach them).
+    fn dyn_callable(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+    ) -> InterpResult<(Value, Value)> {
+        let Value::DynRef { base, .. } = value else {
+            unreachable!("dyn_callable on a non-dyn value")
+        };
+        let resolved = self.deref_value(frames, value)?;
+        let callable = self.read_resolved(frames, &resolved)?;
+        let env = match &**base {
+            Value::Ref(_) | Value::FatRef { .. } => (**base).clone(),
+            _ => Value::Ref(RefTarget::Value(Box::new(callable.clone()))),
+        };
+        Ok((callable, env))
+    }
+
     fn eval_callable(
         &self,
         frames: &[Frame],
@@ -1384,6 +1504,17 @@ impl<'a> Interpreter<'a> {
                 Value::Tuple(_) => Ok(Resolved::Value(value.clone())),
                 _ => self.deref_value(frames, base),
             },
+            // Dereferencing a dyn fat pointer reaches the value it
+            // was formed over: through the base pointer for a
+            // reference or slice base, and to the held pointee for
+            // a box base (the box aggregate itself — exactly what
+            // `Deref::deref` for `Box` yields).
+            Value::DynRef { base, .. } => match &**base {
+                Value::Enum { fields, .. } if fields.len() == 1 => {
+                    Ok(Resolved::Value(fields[0].clone()))
+                }
+                _ => self.deref_value(frames, base),
+            },
             other => Err(InterpError::type_mismatch(
                 "dereference",
                 "reference",
@@ -1564,6 +1695,9 @@ impl<'a> Interpreter<'a> {
             // data (`String`), and the fmt value family.
             (Some(Ty::Adt(_)), Value::Enum { .. })
             | (Some(Ty::Adt(_)), Value::Str(_))
+            // A smart-pointer ADT over a `dyn` pointee (`Box<dyn
+            // Trait>`, `Rc<dyn Trait>`) holds the fat pointer.
+            | (Some(Ty::Adt(_)), Value::DynRef { .. })
             | (Some(Ty::Adt(_)), Value::FmtArg { .. })
             | (Some(Ty::Adt(_)), Value::FmtCount(_))
             | (Some(Ty::Adt(_)), Value::FmtArguments(_)) => Ok(value),
@@ -1573,6 +1707,7 @@ impl<'a> Interpreter<'a> {
             // a reference to a string place is a `Ref`).
             (Some(Ty::Ref(_)), Value::Ref(_))
             | (Some(Ty::Ref(_)), Value::FatRef { .. })
+            | (Some(Ty::Ref(_)), Value::DynRef { .. })
             | (Some(Ty::Ref(_)), Value::Str(_))
             | (Some(Ty::Ref(_)), Value::Bytes(_)) => Ok(value),
             (Some(Ty::Str), Value::Str(_)) => Ok(value),
@@ -1735,36 +1870,70 @@ impl<'a> Interpreter<'a> {
                 let v = self.eval_operand(frames, body, operand)?;
                 eval_cast(&v, ty)
             }
-            Rvalue::Unsize(operand) => {
+            Rvalue::Unsize(operand, meta) => {
                 let v = self.eval_operand(frames, body, operand)?;
-                match v {
-                    Value::Ref(_) => {
-                        let target = self.deref_value(frames, &v)?;
-                        let pointee = self.read_resolved(frames, &target)?;
-                        let len = pointee.len().ok_or_else(|| {
-                            InterpError::type_mismatch(
-                                "unsizing cast",
-                                "array pointee",
-                                pointee.kind_name(),
-                            )
-                        })?;
-                        Ok(Value::FatRef {
-                            base: Box::new(v),
-                            len,
-                        })
-                    }
-                    Value::Bytes(b) => {
-                        let len = b.len() as u128;
-                        Ok(Value::FatRef {
-                            base: Box::new(Value::Bytes(b)),
-                            len,
-                        })
-                    }
-                    other => Err(InterpError::type_mismatch(
-                        "unsizing cast",
-                        "reference to an array",
-                        other.kind_name(),
-                    )),
+                match meta {
+                    UnsizeMeta::Slice => match v {
+                        Value::Ref(_) => {
+                            let target = self.deref_value(frames, &v)?;
+                            let pointee = self.read_resolved(frames, &target)?;
+                            let len = pointee.len().ok_or_else(|| {
+                                InterpError::type_mismatch(
+                                    "unsizing cast",
+                                    "array pointee",
+                                    pointee.kind_name(),
+                                )
+                            })?;
+                            Ok(Value::FatRef {
+                                base: Box::new(v),
+                                len,
+                            })
+                        }
+                        Value::Bytes(b) => {
+                            let len = b.len() as u128;
+                            Ok(Value::FatRef {
+                                base: Box::new(Value::Bytes(b)),
+                                len,
+                            })
+                        }
+                        other => Err(InterpError::type_mismatch(
+                            "unsizing cast",
+                            "reference to an array",
+                            other.kind_name(),
+                        )),
+                    },
+                    UnsizeMeta::Dyn { concrete, traits } => match v {
+                        // A supertrait upcast: the data pointer and
+                        // the concrete type carry over; only the
+                        // bounds the pointer answers to change.
+                        Value::DynRef {
+                            base,
+                            concrete: existing,
+                            ..
+                        } => Ok(Value::DynRef {
+                            base,
+                            concrete: existing,
+                            traits: traits.clone(),
+                        }),
+                        Value::Ref(_) | Value::FatRef { .. } | Value::Enum { .. } => {
+                            let concrete = concrete.clone().ok_or_else(|| {
+                                InterpError::UnsupportedRvalue {
+                                    kind: "Unsize to dyn (no concrete type recorded)"
+                                        .to_string(),
+                                }
+                            })?;
+                            Ok(Value::DynRef {
+                                base: Box::new(v),
+                                concrete,
+                                traits: traits.clone(),
+                            })
+                        }
+                        other => Err(InterpError::type_mismatch(
+                            "unsizing cast to dyn",
+                            "reference, fat pointer or box value",
+                            other.kind_name(),
+                        )),
+                    },
                 }
             }
             Rvalue::BoxDerefTransmute(operand) => {
@@ -1789,6 +1958,9 @@ impl<'a> Interpreter<'a> {
                 let mut layers = 0usize;
                 loop {
                     match v {
+                        Value::DynRef { .. } => {
+                            break Ok(v)
+                        }
                         Value::Ref(_) | Value::FatRef { .. } => {
                             match &places {
                                 Some((_, pointee, depth)) if layers < *depth => {
@@ -1833,6 +2005,23 @@ impl<'a> Interpreter<'a> {
                 }
             }
             Rvalue::Ref(place) => {
+                // A borrow of exactly the place a dyn fat pointer
+                // points at (`&*r`, `&*box`) is the fat pointer
+                // itself: the result is again a `&dyn`, with the
+                // same data pointer and the same vtable identity.
+                if place.projection.len() == 1
+                    && matches!(place.projection[0], ProjectionElem::Deref)
+                {
+                    let head = Place {
+                        local: place.local,
+                        projection: Vec::new(),
+                    };
+                    if let Ok(value @ Value::DynRef { .. }) =
+                        self.read_place(frames, body, &head)
+                    {
+                        return Ok(value);
+                    }
+                }
                 let target = self.resolve_place(frames, body, place)?;
                 match target {
                     Resolved::Place {
@@ -1963,6 +2152,11 @@ pub(crate) fn project_value(
                         }
                     })?
                 }
+                // Field 0 of a fat pointer value is the pointer
+                // field of its smart-pointer wrapper (a `Box`'s
+                // `Unique`): in this model the `DynRef` *is* that
+                // pointer, metadata included.
+                Value::DynRef { .. } if *idx == 0 => value,
                 ref other => {
                     return Err(InterpError::type_mismatch(
                         format!("field projection on {place}"),

@@ -800,6 +800,39 @@ unsupported 79、未実行 57 になった。unsupported の上位は、
 (14,831 / 24,937) から 59.538% (14,847 / 24,937) へ上がった。
 コンパイル時検証系は 13,384 / 18,332 = 73.009% で不変。
 both8 から pass を失ったテストは全カテゴリで 0 件である。
+#### dyn Trait の型モデル (2026-11-21、lane/dyn-type-model)
+
+interp の型/値モデルに `dyn Trait` を組み込んだ。ドライバは
+vtable を実体化しないため、dyn 値はデータポインタと vtable の
+同一性 (具象型名とトレイト境界) を組にした fat ポインタ
+`Value::DynRef` として表す。`ir::Ty::Dynamic` が変換可能な
+ローカル型になり、Unsize 強制は変換時に Slice / Dyn を区別する
+メタを伴う。トレイトメソッド呼び出しは、具象型の impl 本体が
+プログラム内にあれば `<Concrete as Trait>::method` へ
+ディスパッチし (スーパートレイト・アップキャストを含む)、
+無ければ呼び出し地点で `UnsupportedDynamicDispatch` を返す。
+`Box<dyn Trait>` のレシーバ構築 (ポインタフィールド射影、
+`BoxDerefTransmute`、`&*_p`) と `dyn Fn` 系の呼び出しも通る。
+
+combined 再実測 (subset-bf、--jobs 48、both8 と同一 survey):
+exec は 1,447 件から 1,470 件 (34.876% から 35.430%)、
+全体は 59.474% から 59.566%。pass から他状態への後退は
+全カテゴリで 0 件。both8 で Dynamic が理由で unsupported
+だった exec 152 件の内訳は、pass 22 件、残りはより後段の
+境界への前進である: 変換済み本体の無い関数への呼び出し
+90 件、by-reference 定数 15 件、interp 変換時の型不一致
+12 件、Drop ターミネータ 6 件、未初期化読み 3 件、
+BoxDerefTransmute のオペランド形状 2 件、終了コード不一致
+1 件 (tests/ui/dst/dst-index-success.rs: 実行されるが結果が
+誤る。別途調査)、その他 1 件。
+
+明示的な境界として残るもの: 所有する dyn 値の Drop
+(Box<dyn> のスコープ終了時。vtable の drop エントリが
+必要で、具象型は実行時にしか決まらないため glue を静的に
+組めない)、トレイトのデフォルトメソッド本体 (ドライバが
+収集しないため impl 本体が存在せず、ディスパッチ地点で
+明示エラー)、`PtrMetadata` の dyn ポインタへの適用、
+vtable 同一性の等価比較、dyn 値の Display/Debug 整形。
 
 #### stage 2: コンパイル時検証系の実測 (2026-11-21)
 
