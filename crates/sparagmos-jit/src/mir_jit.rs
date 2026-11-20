@@ -1711,6 +1711,22 @@ impl<'a> FnLower<'a> {
                 place,
                 variant_index,
             } => {
+                let loc = self.classify_place(place)?;
+                if let PlaceLoc::Mem { count, ty, .. } = &loc {
+                    let mir::Ty::Adt(def, _) = ty else {
+                        return Err(self.err("SetDiscriminant on a non-ADT place"));
+                    };
+                    if *count != Some(1) {
+                        return Err(
+                            self.err("SetDiscriminant on an ADT with a payload shape")
+                        );
+                    }
+                    let tag = self.discriminant_value(*def, *variant_index)?;
+                    let tmp = self.fresh();
+                    self.emit(Instr::Const { dst: tmp, imm: tag });
+                    self.store_mem_from(&loc, tmp);
+                    return Ok(());
+                }
                 let (dst, count, ty) = self.place_leaves(place)?;
                 let mir::Ty::Adt(def, _) = &ty else {
                     return Err(self.err("SetDiscriminant on a non-ADT place"));
@@ -2098,6 +2114,22 @@ impl<'a> FnLower<'a> {
                 if dst_count != 1 {
                     return Err(self.err("Discriminant result is not a scalar"));
                 }
+                let src_loc = self.classify_place(src_place)?;
+                if let PlaceLoc::Mem { count, ty, .. } = &src_loc {
+                    if !matches!(ty, mir::Ty::Adt(..)) {
+                        return Err(self.err("Discriminant of a non-ADT place"));
+                    }
+                    if *count != Some(1) {
+                        return Err(
+                            self.err("Discriminant of an ADT with a payload shape")
+                        );
+                    }
+                    // The ADT's single leaf in memory holds the
+                    // discriminant value itself.
+                    self.load_mem_to(&src_loc, dst);
+                    self.normalize(dst, &dst_ty);
+                    return Ok(());
+                }
                 let (src, src_count, src_ty) = self.place_leaves(src_place)?;
                 if !matches!(src_ty, mir::Ty::Adt(..)) {
                     return Err(self.err("Discriminant of a non-ADT place"));
@@ -2119,7 +2151,35 @@ impl<'a> FnLower<'a> {
             }
             R::NullaryOp(..) => Err(self.err("NullaryOp rvalue")),
             R::ShallowInitBox(..) => Err(self.err("ShallowInitBox rvalue")),
-            R::CopyForDeref(_) => Err(self.err("CopyForDeref rvalue")),
+            R::CopyForDeref(src_place) => {
+                let (dst, count, dst_ty) = self.place_leaves(place)?;
+                let src_ty = self.place_ty(src_place)?;
+                if !matches!(src_ty, mir::Ty::Ref(..) | mir::Ty::RawPtr(..)) {
+                    // The interpreter's other arm: the place's own
+                    // value, as a `Use` copy.
+                    return self.lower_assign(
+                        place,
+                        &mir::Rvalue::Use(mir::Operand::Copy(src_place.clone())),
+                    );
+                }
+                // The value is the pointee: read through one
+                // dereference of the source place.
+                if count != 1 {
+                    return Err(self.err("CopyForDeref of an aggregate value"));
+                }
+                let mut projection = src_place.projection.clone();
+                projection.push(mir::PlaceElem::Deref);
+                let deref_place = mir::Place {
+                    local: src_place.local,
+                    projection,
+                };
+                let v = self.operand_value(&mir::Operand::Copy(deref_place), &dst_ty)?;
+                self.emit(Instr::Copy {
+                    dst,
+                    src: IrOperand::Value(v),
+                });
+                Ok(())
+            }
         }
     }
 

@@ -2263,6 +2263,72 @@ fn pointer_casts_keep_the_address() {
 
 // ----- Shapes that stay unsupported -------------------------------------------
 
+#[test]
+fn copy_for_deref_reads_the_pointee() {
+    let i32t = i(mir::IntTy::I32);
+    // fn f() -> i32 { _1 = 21; _2 = &_1; _0 = CopyForDeref(_2); return }
+    let f = spec(
+        "cfd",
+        0,
+        0,
+        &[i32t.clone(), i32t.clone(), refty(i32t.clone())],
+        vec![bb(
+            vec![
+                assign(pl(1), mir::Rvalue::Use(i32c(21))),
+                assign(pl(2), shared(pl(1))),
+                assign(pl(0), mir::Rvalue::CopyForDeref(pl(2))),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    let (jit, prog) = build(&[f]);
+    check(&jit, &prog, "cfd", &[], vec![], Ok(21));
+}
+
+#[test]
+fn discriminant_through_a_dereference() {
+    let i32t = i(mir::IntTy::I32);
+    // fn read_d() -> i64 { _1 = E::B; _2 = &_1; _0 = Discriminant(*_2); return }
+    // fn write_d() -> i64 { _1 = E::A; _2 = &mut _1; SetDiscriminant(*_2, 2); _0 = Discriminant(_1); return }
+    let i64t = i(mir::IntTy::I64);
+    let read_d = spec(
+        "read_d",
+        0,
+        0,
+        &[i64t.clone(), enum_ty(), refty(enum_ty())],
+        vec![bb(
+            vec![
+                adt_agg(1, 1),
+                assign(pl(2), shared(pl(1))),
+                assign(pl(0), mir::Rvalue::Discriminant(dpl(2))),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    let write_d = spec(
+        "write_d",
+        1,
+        0,
+        &[i64t.clone(), enum_ty(), refmty(enum_ty())],
+        vec![bb(
+            vec![
+                adt_agg(1, 0),
+                assign(pl(2), mutref(pl(1))),
+                mir::StatementKind::SetDiscriminant {
+                    place: Box::new(dpl(2)),
+                    variant_index: 2,
+                },
+                assign(pl(0), mir::Rvalue::Discriminant(pl(1))),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    let _ = i32t;
+    let (jit, prog) = build_with_table(&[read_d, write_d], discr_table());
+    check(&jit, &prog, "read_d", &[], vec![], Ok(7));
+    check(&jit, &prog, "write_d", &[], vec![], Ok(-2));
+}
+
 fn jit_compile(specs: &[FnSpec]) -> Result<JitProgram, JitError> {
     let names: HashMap<mir::DefId, String> = specs
         .iter()
