@@ -584,7 +584,7 @@ fn unsupported_rvalue_is_an_explicit_error() {
         0,
         vec![Ty::i64()],
         vec![bb(
-            vec![assign(0, Rvalue::Ref(Place::from_index(0)))],
+            vec![assign(0, Rvalue::Unsupported("frobnicate".to_string()))],
             ret(),
         )],
     );

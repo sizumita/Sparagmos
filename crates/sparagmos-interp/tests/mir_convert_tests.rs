@@ -482,13 +482,13 @@ fn float_local_is_a_conversion_error() {
 }
 
 #[test]
-fn constant_index_projection_is_a_conversion_error() {
-    // _0 = copy (_1[0]) with a ConstantIndex projection.
+fn subslice_projection_is_a_conversion_error() {
+    // _0 = copy (_1[0..1]) with a Subslice projection.
     let indexed = mir::Place {
         local: mir::Local(1),
-        projection: vec![mir::PlaceElem::ConstantIndex {
-            offset: 0,
-            min_length: 1,
+        projection: vec![mir::PlaceElem::Subslice {
+            from: 0,
+            to: 1,
             from_end: false,
         }],
     };
@@ -508,8 +508,7 @@ fn constant_index_projection_is_a_conversion_error() {
     );
     let mut prog = MirProgram::new();
     prog.add("idx", body);
-    // The Array local itself is also unrepresentable; either way the
-    // conversion must fail explicitly, never guess.
+    // The conversion must fail explicitly, never guess.
     let err = convert_program(&prog).expect_err("must not convert");
     assert!(
         matches!(
@@ -522,8 +521,15 @@ fn constant_index_projection_is_a_conversion_error() {
 
 #[test]
 fn drop_terminator_fails_at_execution_not_silently() {
+    // The dropped place has an ADT type the value model does not know:
+    // its drop glue might do anything, so the Drop stays an explicit
+    // execution error. (Drops of plain data and of modelled std types
+    // execute as plain jumps; see print_support_tests.)
     let body = mir::Body::new(
-        decls(&[mir::Ty::unit(), u32_ty()]),
+        decls(&[
+            mir::Ty::unit(),
+            mir::Ty::Adt(mir::DefId::new(0, 7), vec![]),
+        ]),
         0,
         vec![block(
             vec![],
@@ -571,9 +577,9 @@ fn unresolved_callee_fails_at_execution_not_silently() {
 }
 
 #[test]
-fn adt_aggregate_fails_at_execution_not_silently() {
-    // Destination is a tuple type so conversion itself succeeds; the Adt
-    // aggregate kind is what is unsupported.
+fn closure_aggregate_fails_at_execution_not_silently() {
+    // Destination is a tuple type so conversion itself succeeds; the
+    // Closure aggregate kind is what is unsupported.
     let body = mir::Body::new(
         decls(&[mir::Ty::Tuple(vec![u32_ty()])]),
         0,
@@ -581,12 +587,9 @@ fn adt_aggregate_fails_at_execution_not_silently() {
             vec![assign(
                 place(0),
                 mir::Rvalue::Aggregate(
-                    Box::new(mir::AggregateKind::Adt {
+                    Box::new(mir::AggregateKind::Closure {
                         def: mir::DefId::new(0, 1),
-                        variant_index: 0,
                         generic_args: vec![],
-                        user_ty: None,
-                        field_index: None,
                     }),
                     vec![const_u32(1)],
                 ),
@@ -596,7 +599,7 @@ fn adt_aggregate_fails_at_execution_not_silently() {
     );
     let mut prog = MirProgram::new();
     prog.add("mk", body);
-    let err = interpret_mir(&prog, "mk", vec![]).expect_err("Adt aggregate must fail");
+    let err = interpret_mir(&prog, "mk", vec![]).expect_err("Closure aggregate must fail");
     assert!(
         matches!(
             err,
