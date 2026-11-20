@@ -420,8 +420,6 @@ impl Statement {
     }
 }
 
-/// Terminator kinds (subset of rustc MIR `TerminatorKind`).
-#[derive(Debug, Clone, PartialEq)]
 /// Drop glue for one dropped value, built by `mir_convert` from the
 /// dropped type. The interpreter executes a plan against the value
 /// actually stored at the dropped place; a part that is uninitialized
@@ -437,6 +435,13 @@ pub enum DropPlan {
     /// variant whose type conversion could not establish). Executing
     /// it is an explicit error, never a silent skip.
     Unknown,
+    /// The type of this part (a field set by an aggregate and never
+    /// projected anywhere) is unrecorded, so no glue could be built
+    /// for it. Execution judges by the value's own shape: value kinds
+    /// that never carry glue (scalars, references, strings) pass,
+    /// tuples recurse into their elements, and an ADT value — which
+    /// might hide a destructor — is an explicit error.
+    Untyped,
     /// Run each plan in order.
     Seq(Vec<DropPlan>),
     /// Run `plan` against the sub-place at `path`, a projection from
@@ -482,6 +487,8 @@ pub struct DropGlue {
     pub adts: Vec<DropPlan>,
 }
 
+/// Terminator kinds (subset of rustc MIR `TerminatorKind`).
+#[derive(Debug, Clone, PartialEq)]
 pub enum TerminatorKind {
     Goto {
         target: BasicBlock,

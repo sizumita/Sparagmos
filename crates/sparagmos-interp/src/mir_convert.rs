@@ -552,7 +552,37 @@ impl AdtAggregateCounts {
     }
 }
 
-fn scan_body_aggregates(table: &mut AdtAggregateCounts, body: &mir::Body) {
+/// The declared type of a place, walking its projections the way
+/// `scan_place_fields` does. Used to type aggregate operands: an
+/// operand filled into field `i` of an ADT aggregate carries that
+/// field's declared type, so a construction site records field
+/// types that no `Field` projection anywhere ever reveals (a field
+/// that is only ever written, never read).
+fn operand_place_ty(body: &mir::Body, place: &mir::Place) -> Option<mir::Ty> {
+    let mut ty = body.local_decls.get(place.local.index())?.ty.clone();
+    for elem in &place.projection {
+        ty = match elem {
+            mir::PlaceElem::Field(_, t) => t.clone(),
+            mir::PlaceElem::Deref => match ty {
+                mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _) => *inner,
+                _ => return None,
+            },
+            mir::PlaceElem::Index(_) | mir::PlaceElem::ConstantIndex { .. } => match ty {
+                mir::Ty::Array(elem, _) | mir::Ty::Slice(elem) => *elem,
+                _ => return None,
+            },
+            mir::PlaceElem::Downcast(_, _) | mir::PlaceElem::Subslice { .. } => ty,
+            mir::PlaceElem::OpaqueCast(t) | mir::PlaceElem::Subtype(t) => t.clone(),
+        };
+    }
+    Some(ty)
+}
+
+fn scan_body_aggregates(
+    counts: &mut AdtAggregateCounts,
+    fields: &mut AdtFieldTys,
+    body: &mir::Body,
+) {
     for bb in &body.basic_blocks {
         for stmt in &bb.statements {
             if let mir::StatementKind::Assign(pair) = &stmt.kind {
@@ -565,7 +595,22 @@ fn scan_body_aggregates(table: &mut AdtAggregateCounts, body: &mir::Body) {
                         ..
                     } = &**kind
                     {
-                        table.record(*def, generic_args.clone(), *variant_index, ops.len());
+                        counts.record(*def, generic_args.clone(), *variant_index, ops.len());
+                        for (i, op) in ops.iter().enumerate() {
+                            if let Some(place) = op.place() {
+                                if let Some(ty) = operand_place_ty(body, place) {
+                                    fields.record(
+                                        AdtFieldKey {
+                                            def: *def,
+                                            generic_args: generic_args.clone(),
+                                            variant: *variant_index,
+                                            field: i as u32,
+                                        },
+                                        ty,
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -608,7 +653,7 @@ impl<'a> Converter<'a> {
                 def_names.insert(def, f.name.clone());
             }
             scan_body_fields(&mut adt_fields, &f.body);
-            scan_body_aggregates(&mut adt_aggregates, &f.body);
+            scan_body_aggregates(&mut adt_aggregates, &mut adt_fields, &f.body);
         }
         let local_crate = program
             .functions
@@ -1698,8 +1743,9 @@ fn collapse_seq(steps: Vec<ir::DropPlan>) -> ir::DropPlan {
 ///   by variant. An impl the name table records but the program
 ///   has no body for (a generic impl gets no monomorphic instance)
 ///   fails the build, as does an ADT from another crate whose impl
-///   the table cannot rule out, and a field whose type no
-///   projection anywhere in the program records.
+///   the table cannot rule out. A field whose type no projection
+///   anywhere records (only ever written) gets an `Untyped` plan,
+///   judged by its value's shape at run time.
 struct DropGlueBuilder<'c, 'a> {
     conv: &'c Converter<'a>,
     adts: Vec<ir::DropPlan>,
@@ -1912,18 +1958,11 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                     fields.push(self.plan(&ty)?);
                 }
                 None => {
-                    if count.is_some() {
-                        // An aggregate proves this field exists, but
-                        // no projection anywhere records its type:
-                        // its glue cannot be accounted for.
-                        return None;
-                    }
-                    // A gap between projected fields: its type is
-                    // unrecorded, so its glue is unaccounted for if
-                    // the value ever holds it (the `Fields` plan is
-                    // marked incomplete and this entry errors when
-                    // executed).
-                    fields.push(ir::DropPlan::Unknown);
+                    // No projection anywhere records this field's
+                    // type (it is only ever written, e.g. by an
+                    // aggregate with a literal). Its glue is judged
+                    // by the value's own shape at run time.
+                    fields.push(ir::DropPlan::Untyped);
                 }
             }
         }

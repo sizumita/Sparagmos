@@ -359,6 +359,7 @@ impl<'a> Interpreter<'a> {
                             &cont.adts,
                             cont.target,
                         )?;
+                        continue;
                     }
                     let frame = frames.pop().expect("frame");
                     let mut value = frame.locals.first().cloned().unwrap_or(Value::Uninit);
@@ -512,6 +513,29 @@ impl<'a> Interpreter<'a> {
             self.tick()?;
             match plan {
                 P::Trivial => {}
+                P::Untyped => {
+                    // The type of this part is unrecorded, so judge
+                    // by the value's own shape: kinds that never
+                    // carry glue pass, tuples recurse (a tuple has
+                    // no destructor of its own), and an ADT value
+                    // might hide a destructor — an explicit error.
+                    match self.read_at(frames, &root, &path)? {
+                        None => {}
+                        Some(Value::Tuple(items)) => {
+                            for i in (0..items.len()).rev() {
+                                let mut sub = path.clone();
+                                sub.push(RefProj::Index(i));
+                                work.push((sub, P::Untyped));
+                            }
+                        }
+                        Some(Value::Enum { .. }) => {
+                            return Err(InterpError::UnsupportedTerminator {
+                                kind: "Drop".to_string(),
+                            });
+                        }
+                        Some(_) => {}
+                    }
+                }
                 P::Unknown => {
                     return Err(InterpError::UnsupportedTerminator {
                         kind: "Drop".to_string(),
