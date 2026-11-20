@@ -745,7 +745,14 @@ impl<'a> Converter<'a> {
             mir::ConstValue::Tuple(fields) => ir::Constant::Tuple(
                 fields
                     .iter()
-                    .map(|f| self.convert_const_value(f, None))
+                    .enumerate()
+                    .map(|(i, f)| {
+                        let elem_ctx = match ctx {
+                            Some(mir::Ty::Tuple(ts)) => ts.get(i),
+                            _ => None,
+                        };
+                        self.convert_const_value(f, elem_ctx)
+                    })
                     .collect::<Result<_, _>>()?,
             ),
             mir::ConstValue::Adt { variant, fields } => ir::Constant::Adt {
@@ -756,12 +763,33 @@ impl<'a> Converter<'a> {
                     .collect::<Result<_, _>>()?,
             },
             mir::ConstValue::Ref(inner) => {
-                ir::Constant::Ref(Box::new(self.convert_const_value(inner, None)?))
+                // The pointee's declared type types the inner value:
+                // a scalar leaf carries raw bits with no signedness of
+                // its own, and a pointee is read back through a deref
+                // with no typed store in between to re-tag it, so
+                // dropping the context here would misread an unsigned
+                // leaf with its sign bit set as a negative signed
+                // value (a promoted `200.0f64 as u8` printing as -56).
+                let inner_ctx = match ctx {
+                    Some(mir::Ty::Ref(_, pointee, _) | mir::Ty::RawPtr(pointee, _)) => {
+                        Some(&**pointee)
+                    }
+                    _ => None,
+                };
+                ir::Constant::Ref(Box::new(self.convert_const_value(inner, inner_ctx)?))
             }
             mir::ConstValue::SliceVal(elems) => ir::Constant::SliceVal(
                 elems
                     .iter()
-                    .map(|e| self.convert_const_value(e, None))
+                    .map(|e| {
+                        let elem_ctx = match ctx {
+                            Some(mir::Ty::Array(elem, _) | mir::Ty::Slice(elem)) => {
+                                Some(&**elem)
+                            }
+                            _ => None,
+                        };
+                        self.convert_const_value(e, elem_ctx)
+                    })
                     .collect::<Result<_, _>>()?,
             ),
             mir::ConstValue::ByRef { .. } => {
