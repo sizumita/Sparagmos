@@ -734,6 +734,110 @@ fn collect_local_instances(
     extra_seeds
 }
 
+/// Register converted impl method bodies under the trait keys
+/// their call sites resolve through (Issue #64).
+///
+/// A call to a trait method names the trait declaration in its
+/// `FnDef` target, so body conversion keys the call by
+/// `(trait definition, resolved instance)`. The item loop instead
+/// converts an impl method as an item of its own and keys it by
+/// `(impl definition, instance)`. The two keys never meet, so a
+/// trait call failed with "no converted body" even though the impl
+/// body was in the program. (Generic impl methods escape this: the
+/// demanded-instance collection keys them by the referenced
+/// definition already, and the reachability collection does the
+/// same for foreign bodies. The item loop is the only registrar
+/// that keys by the resolved definition.)
+///
+/// This pass closes the gap the same way the rest of the driver
+/// keys bodies — by the referenced definition: it scans the
+/// converted bodies' Stable MIR call targets, and whenever a
+/// target resolves to an instance whose body is present under the
+/// resolved definition's key but not under the referenced
+/// definition's key, it registers a copy of that body under the
+/// referenced key. One pass suffices: the copy's own call targets
+/// are the original's, already keyed the same way. Aliases carry
+/// no report entries — the impl method's own entry already
+/// accounts for the body; the alias is the same body under the
+/// key call sites use.
+fn register_trait_key_aliases(
+    conv: &mut Converter,
+    bodies: &mut Vec<(String, Body)>,
+    body_def_ids: &mut Vec<sparagmos_mir::DefId>,
+    body_def_names: &mut Vec<String>,
+    sources: &[rustc_public::mir::Body],
+) {
+    use std::collections::{HashMap, HashSet};
+
+    let mut present: HashMap<sparagmos_mir::DefId, usize> = body_def_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (*id, i))
+        .collect();
+    let mut used_names: HashSet<String> = bodies.iter().map(|(n, _)| n.clone()).collect();
+
+    for source in sources {
+        // Instance resolution goes through the compiler's
+        // internals and can panic on exotic targets; isolate each
+        // scanned body exactly as the instance collection does, so
+        // aliasing can never make a crate convert worse.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut additions: Vec<(String, Body, sparagmos_mir::DefId, String)> = Vec::new();
+            let mut pending: HashSet<sparagmos_mir::DefId> = HashSet::new();
+            for (def, args) in sparagmos_driver::reach::call_targets(source) {
+                let referenced = def.def_id();
+                let Ok(inst) = Instance::resolve(def, &args) else {
+                    continue;
+                };
+                if matches!(inst.kind, rustc_public::mir::mono::InstanceKind::Virtual { .. }) {
+                    continue;
+                }
+                let resolved = inst.def.def_id();
+                if resolved == referenced {
+                    continue;
+                }
+                let call_key = conv.instance_def_id(referenced, &inst);
+                if present.contains_key(&call_key) || !pending.insert(call_key) {
+                    continue;
+                }
+                let impl_key = conv.instance_def_id(resolved, &inst);
+                if impl_key == call_key {
+                    continue;
+                }
+                let Some(&idx) = present.get(&impl_key) else {
+                    continue;
+                };
+                let ref_name = def.name();
+                let display = if used_names.insert(ref_name.clone()) {
+                    ref_name.clone()
+                } else {
+                    let suffixed = format!("{} [{}]", ref_name, inst.name());
+                    used_names.insert(suffixed.clone());
+                    suffixed
+                };
+                additions.push((display, bodies[idx].1.clone(), call_key, ref_name));
+            }
+            additions
+        }));
+        match outcome {
+            Ok(additions) => {
+                for (display, body, call_key, ref_name) in additions {
+                    present.insert(call_key, bodies.len());
+                    bodies.push((display, body));
+                    body_def_ids.push(call_key);
+                    body_def_names.push(ref_name);
+                }
+            }
+            Err(_) => {
+                // Contained panic: clear the capture slot, as the
+                // instance collection does — a later, genuinely
+                // fatal panic must report its own message.
+                let _ = take_captured_panic();
+            }
+        }
+    }
+}
+
 fn collect() -> ControlFlow<()> {
     let mut conv = Converter::new();
     let mut report = ConversionReport::default();
@@ -887,6 +991,20 @@ fn collect() -> ControlFlow<()> {
     body_def_ids.extend(reached.body_def_ids);
     body_def_names.extend(reached.body_def_names);
     report.functions.extend(reached.reports);
+
+    // Register converted impl method bodies under the trait keys
+    // their call sites resolve through (Issue #64). Demands can
+    // come from any converted body: local items, demanded local
+    // instances, and collected foreign bodies alike.
+    let mut alias_sources = reach_seeds;
+    alias_sources.extend(reached.stable_bodies.iter().cloned());
+    register_trait_key_aliases(
+        &mut conv,
+        &mut bodies,
+        &mut body_def_ids,
+        &mut body_def_names,
+        &alias_sources,
+    );
 
     // Auxiliary crates (--aux): the main compilation links them as
     // dependencies, so their functions live in this same Stable MIR

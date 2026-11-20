@@ -1428,6 +1428,27 @@ impl<'a> Converter<'a> {
                         mir::PointerCoercion::ClosureFnPointer,
                     ) => ir::Rvalue::Use(v),
                     mir::CastKind::BoxDerefTransmute => ir::Rvalue::BoxDerefTransmute(v),
+                    // `ptr as usize`: exposing a pointer's
+                    // provenance yields its address as an integer,
+                    // evaluated to the pointer's synthetic address
+                    // (`Rvalue::PtrToInt`) — the same treatment as
+                    // the pointer-to-integer transmute below. This
+                    // is the cast rustc emits for `ptr as usize` in
+                    // user code (e.g. alignment checks on raw
+                    // pointers). The reverse direction (an integer
+                    // cast back to a pointer,
+                    // PointerWithExposedProvenance) stays an
+                    // explicit unsupported: an address names no
+                    // place in this model. (Lane BV)
+                    mir::CastKind::PointerExposeProvenance => match (&ctx, target) {
+                        (
+                            Some(mir::Ty::RawPtr(..) | mir::Ty::Ref(..)),
+                            mir::Ty::Int(_) | mir::Ty::Uint(_),
+                        ) => ir::Rvalue::PtrToInt(v.clone()),
+                        _ => ir::Rvalue::Unsupported(
+                            "Cast PointerExposeProvenance".to_string(),
+                        ),
+                    },
                     // A pointer-to-integer `transmute` (what the
                     // compiler's UB precondition checks use to test a
                     // pointer for null / alignment) becomes the

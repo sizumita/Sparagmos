@@ -72,6 +72,13 @@ pub struct CollectedFns {
     pub body_def_names: Vec<String>,
     /// One report entry per distinct foreign target considered.
     pub reports: Vec<FnReport>,
+    /// The Stable MIR bodies of the successfully converted foreign
+    /// functions, parallel to `bodies`. Callers that need to walk
+    /// the foreign call graph once more (the trait-key alias pass
+    /// in the driver) use these; the converted bodies alone no
+    /// longer carry the `(referenced definition, instance)` pairs
+    /// their call targets were resolved through.
+    pub stable_bodies: Vec<mir::Body>,
     /// Whether the collection cap stopped further collection.
     pub limit_reached: bool,
 }
@@ -284,6 +291,7 @@ pub fn collect_reachable(
         body_def_ids: Vec::new(),
         body_def_names: Vec::new(),
         reports: Vec::new(),
+        stable_bodies: Vec::new(),
         limit_reached,
     };
     for (i, rec) in records.iter().enumerate() {
@@ -295,10 +303,11 @@ pub fn collect_reachable(
             RecordKind::NoBody { .. } => (0, 0, 0),
         };
         let outcome = match (&rec.kind, &converted[i], &failed[i]) {
-            (RecordKind::WithBody { inst, .. }, Some(_), _) => {
+            (RecordKind::WithBody { inst, body }, Some(_), _) => {
                 out.bodies.push((name.clone(), converted[i].clone().unwrap()));
                 out.body_def_ids.push(conv.instance_def_id(rec.def, inst));
                 out.body_def_names.push(rec.def_name.clone());
+                out.stable_bodies.push(body.clone());
                 FnOutcome::Converted
             }
             (RecordKind::WithBody { .. }, None, Some(reasons)) => {
