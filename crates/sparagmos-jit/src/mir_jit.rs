@@ -1023,6 +1023,12 @@ impl<'a> FnLower<'a> {
             mir::ConstValue::Scalar(mir::Scalar::Ptr { .. }) => {
                 return Err(self.err("pointer constant"));
             }
+            mir::ConstValue::FnDef(_) => {
+                return Err(self.err("function pointer constant"));
+            }
+            mir::ConstValue::Closure(_) => {
+                return Err(self.err("closure constant"));
+            }
             mir::ConstValue::Str(_) => return Err(self.err("string constant")),
             mir::ConstValue::Bytes(_) => return Err(self.err("byte-string constant")),
             mir::ConstValue::Slice { .. } => return Err(self.err("slice constant")),
