@@ -381,18 +381,71 @@ impl<'a> Interpreter<'a> {
                     args,
                     destination,
                     target,
+                    drop_glue,
                 } => {
-                    let result =
-                        self.exec_builtin(&mut frames, body, &name, &generic_args, &args)?;
-                    match target {
-                        Some(bb) => {
-                            self.write_place(&mut frames, body, &destination, result)?;
-                            Self::jump(&mut frames, body, bb)?;
-                        }
-                        None => {
+                    if let Some(glue) = drop_glue {
+                        // `std::mem::drop` with the dropped type's glue
+                        // attached by conversion: run it against the
+                        // argument place, exactly like a `Drop`
+                        // terminator — a destructor call suspends the
+                        // remaining glue on a `DropContinuation` and
+                        // resumes it when the destructor returns. The
+                        // call's own (unit) result is written first;
+                        // the destination is a different local from
+                        // the dropped argument place.
+                        let Some(bb) = target else {
                             return Err(InterpError::MissingContinuation {
                                 func: func_name.clone(),
                             });
+                        };
+                        let Some(operand) = args.first() else {
+                            return Err(InterpError::type_mismatch(
+                                "std::mem::drop",
+                                "one argument",
+                                "no arguments",
+                            ));
+                        };
+                        let place = match operand {
+                            Operand::Copy(place) | Operand::Move(place) => place,
+                            _ => {
+                                return Err(InterpError::type_mismatch(
+                                    "std::mem::drop",
+                                    "a place argument",
+                                    "a constant argument",
+                                ));
+                            }
+                        };
+                        let resolved = self.resolve_place(&frames, body, place)?;
+                        let root = match resolved {
+                            Resolved::Place {
+                                frame_pos,
+                                local,
+                                projection,
+                            } => RefTarget::place(frames[frame_pos].id, local, projection),
+                            Resolved::Value(_) => {
+                                return Err(InterpError::type_mismatch(
+                                    "std::mem::drop",
+                                    "a storage place",
+                                    "a constant aggregate",
+                                ));
+                            }
+                        };
+                        self.write_place(&mut frames, body, &destination, Value::Unit)?;
+                        let work = vec![(Vec::new(), glue.root.clone())];
+                        self.run_drop_glue(&mut frames, root, work, &glue.adts, bb)?;
+                    } else {
+                        let result =
+                            self.exec_builtin(&mut frames, body, &name, &generic_args, &args)?;
+                        match target {
+                            Some(bb) => {
+                                self.write_place(&mut frames, body, &destination, result)?;
+                                Self::jump(&mut frames, body, bb)?;
+                            }
+                            None => {
+                                return Err(InterpError::MissingContinuation {
+                                    func: func_name.clone(),
+                                });
+                            }
                         }
                     }
                 }

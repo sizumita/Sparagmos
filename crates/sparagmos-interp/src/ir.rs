@@ -587,6 +587,16 @@ pub enum TerminatorKind {
         args: Vec<Operand>,
         destination: Place,
         target: Option<BasicBlock>,
+        /// Drop glue of the single argument when the callee is
+        /// `std::mem::drop`: conversion builds the dropped type's
+        /// [`DropGlue`] and the interpreter runs it against the
+        /// argument place, exactly like a [`TerminatorKind::Drop`]
+        /// for that place. `None` for every other builtin, and for
+        /// a `mem::drop` whose argument is a constant with only
+        /// trivial glue (discarding it is already faithful). A
+        /// `mem::drop` whose glue conversion cannot account for
+        /// the dropped type stays `Unsupported` instead.
+        drop_glue: Option<DropGlue>,
     },
     /// Drop the value at a place, running its `glue` (converted
     /// destructor calls and field glue; see `mir_convert`), and
