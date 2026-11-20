@@ -737,6 +737,12 @@ impl<'a> Converter<'a> {
                 }
             }
             R::Aggregate(kind, ops) => match &**kind {
+                // The empty tuple is the unit value: its type
+                // converts to `Ty::Unit`, so the aggregate must
+                // produce `Value::Unit`, not an empty tuple value.
+                mir::AggregateKind::Tuple if ops.is_empty() => {
+                    ir::Rvalue::Use(ir::Operand::Constant(ir::Constant::Unit))
+                }
                 mir::AggregateKind::Tuple | mir::AggregateKind::Array(_) => {
                     let elem_tys: Vec<mir::Ty> = match dest_ty {
                         Some(mir::Ty::Tuple(ts)) => ts.clone(),
