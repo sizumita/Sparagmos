@@ -1804,3 +1804,97 @@ fn constant_shift_amounts_keep_their_own_type() {
         Value::Int(12)
     );
 }
+
+// ----- Transmute: pointer-to-integer only (Lane BO) ---------------------------
+
+fn usize_ty() -> mir::Ty {
+    mir::Ty::Uint(mir::UintTy::Usize)
+}
+
+#[test]
+fn transmute_pointer_to_int_yields_aligned_nonzero_address() {
+    // The compiler's UB precondition checks transmute a raw pointer
+    // to `usize` to test it for null and misalignment. The model
+    // answers with a synthetic address: non-zero and 4096-aligned.
+    // fn main() -> i32 {
+    //   _1 = 41; _2 = &raw mut _1;
+    //   _3 = transmute::<*mut i32, usize>(_2);
+    //   _4 = _3 & 4095; _5 = _3 == 0;
+    //   return if _5 { 1000 } else { _4 as i32 };   // 0
+    // }
+    let body = mir::Body::new(
+        decls(&[
+            i32_ty(),
+            i32_ty(),
+            raw_ptr_i32_ty(),
+            usize_ty(),
+            usize_ty(),
+            mir::Ty::Bool,
+            i32_ty(),
+        ]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(place(1), mir::Rvalue::Use(const_i32(41))),
+                    assign(
+                        place(2),
+                        mir::Rvalue::RawPtr(mir::Mutability::Mut, place(1)),
+                    ),
+                    assign(
+                        place(3),
+                        mir::Rvalue::Cast(mir::CastKind::Transmute, copy(2), usize_ty()),
+                    ),
+                    assign(place(4), binop(mir::BinOp::BitAnd, copy(3), const_int(4095, 8))),
+                    assign(place(5), binop(mir::BinOp::Eq, copy(3), const_int(0, 8))),
+                ],
+                switch_bool(copy(5), 1, 2),
+            ),
+            block(
+                vec![assign(
+                    place(0),
+                    mir::Rvalue::Cast(mir::CastKind::IntToInt, copy(4), i32_ty()),
+                )],
+                ret(),
+            ),
+            block(vec![assign(place(0), mir::Rvalue::Use(const_i32(1000)))], ret()),
+        ],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("ptr_addr", body);
+    let v = interpret_mir(&prog, "ptr_addr", vec![]).expect("ptr_addr must run");
+    assert_eq!(v, Value::Int(0));
+}
+
+#[test]
+fn transmute_between_non_pointers_stays_unsupported() {
+    // A transmute that is not pointer-to-integer (integer to
+    // integer of another width, integer to pointer) cannot be
+    // honoured by a value model with no byte representation; it
+    // stays an explicit conversion error naming the cast.
+    for target in [i64_ty(), raw_ptr_i32_ty()] {
+        let body = mir::Body::new(
+            decls(&[i32_ty(), i32_ty(), target.clone()]),
+            0,
+            vec![block(
+                vec![
+                    assign(place(1), mir::Rvalue::Use(const_i32(5))),
+                    assign(
+                        place(2),
+                        mir::Rvalue::Cast(mir::CastKind::Transmute, copy(1), target),
+                    ),
+                    assign(place(0), mir::Rvalue::Use(const_i32(0))),
+                ],
+                ret(),
+            )],
+        );
+        let mut prog = MirProgram::new();
+        prog.add("bad_transmute", body);
+        let err = interpret_mir(&prog, "bad_transmute", vec![])
+            .expect_err("non-pointer transmute must fail");
+        assert!(
+            format!("{err}").contains("Cast Transmute"),
+            "error names the cast: {err}"
+        );
+    }
+}
