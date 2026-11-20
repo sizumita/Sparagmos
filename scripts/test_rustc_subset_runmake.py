@@ -136,6 +136,16 @@ class HeaderGateTests(unittest.TestCase):
     def test_scoped_directive_is_unevaluatable(self):
         self.assertEqual(gate("//@[rev1] ignore-windows\n")[0], "uneval")
 
+    def test_compound_and_misc_conditions(self):
+        self.assertEqual(gate("//@ ignore-wasm\n")[0], "ok")
+        self.assertEqual(gate("//@ ignore-windows-gnu\n")[0], "ok")
+        self.assertEqual(gate("//@ only-windows-gnu\n")[0], "out")
+        self.assertEqual(gate("//@ ignore-sgx\n")[0], "ok")
+        self.assertEqual(gate("//@ ignore-nvptx64\n")[0], "ok")
+        self.assertEqual(gate("//@ only-nightly\n")[0], "out")
+        self.assertEqual(gate("//@ ignore-nightly\n")[0], "ok")
+        self.assertEqual(gate("//@ only-dist\n")[0], "ok")
+
 
 class ClassifyTests(unittest.TestCase):
     def test_bare_outfile_is_reducible(self):

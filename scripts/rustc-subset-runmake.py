@@ -136,8 +136,14 @@ KNOWN_TARGETS = {
     "x86_64-unknown-freebsd", "x86_64-unknown-netbsd",
     "x86_64-unknown-openbsd", "sparc64-unknown-linux-gnu",
     "mips64-unknown-linux-gnuabi64", "bpfeb-unknown-none",
-    "bpfel-unknown-none",
+    "bpfel-unknown-none", "aarch64-pc-windows-msvc",
+    "arm64ec-pc-windows-msvc", "wasm32-unknown-emscripten",
+    "x86_64-pc-windows-gnullvm", "aarch64-apple-ios-sim",
+    "aarch64-apple-tvos", "x86_64-unknown-uefi",
 }
+
+KNOWN_VENDORS = {"unknown", "pc", "apple", "nvidia", "fortanix",
+                 "sony", "amd", "intel", "w64"}
 
 KNOWN_OSES = {
     "linux", "windows", "macos", "ios", "tvos", "visionos", "watchos",
@@ -157,6 +163,7 @@ KNOWN_ARCHS = {
     "wasm32", "wasm64", "powerpc", "powerpc64", "s390x", "sparc64",
     "sparc32", "loongarch64", "loongarch32", "mips", "mips64", "mips32",
     "m68k", "csky", "hexagon", "bpf", "avr", "thumb", "xtensa",
+    "nvptx64",
 }
 
 
@@ -195,9 +202,38 @@ def cond_true(name):
         "i586": False,
         "thumb": False,
         "freestanding": False,
+        "wasm": False,
+        "sgx": False,
+        "pauthtest": False,
+        # compiler channel / build flavour of the installed release
+        "nightly": False,
+        "beta": False,
+        "stable": True,
+        "dev": False,
+        "dist": True,
+        "rustc-debug-assertions": False,
+        "stage0": False,
+        "stage1": False,
+        "stage2": True,
     }
     if name in specials:
         return specials[name]
+    if "-" in name:
+        # Compound condition such as "windows-gnu" (os-env) or
+        # "windows-msvc": every evaluatable part must match.
+        vals = []
+        for part in name.split("-"):
+            if part in KNOWN_OSES:
+                vals.append(part == HOST["os"])
+            elif part in KNOWN_ENVS and part:
+                vals.append(part == HOST["env"])
+            elif part in KNOWN_ARCHS:
+                vals.append(part == HOST["arch"])
+            elif part in KNOWN_VENDORS:
+                vals.append(part == HOST["vendor"])
+            else:
+                return None
+        return all(vals)
     return None
 
 
