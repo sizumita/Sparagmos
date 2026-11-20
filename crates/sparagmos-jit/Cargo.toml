@@ -10,3 +10,12 @@ license.workspace = true
 # code byte emitted by this crate is encoded by hand in `emitter.rs`.
 # No Cranelift / LLVM / Wasmtime or any other existing code generator is used.
 libc = "0.2"
+sparagmos-mir = { path = "../sparagmos-mir" }
+# Runtime support for JIT-compiled code: the panic path generated code
+# calls into (`sparagmos_panic`) and the shared panic record live here.
+sparagmos-runtime = { path = "../sparagmos-runtime" }
+
+[dev-dependencies]
+# Used only by the integration tests, to check JIT results against the
+# interpreter (the semantic oracle) on identical MIR inputs.
+sparagmos-interp = { path = "../sparagmos-interp" }

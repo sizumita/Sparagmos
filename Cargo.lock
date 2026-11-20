@@ -18,6 +18,10 @@ dependencies = [
 [[package]]
 name = "sparagmos-harness"
 version = "0.1.0"
+dependencies = [
+ "sparagmos-jit",
+ "sparagmos-mir",
+]
 
 [[package]]
 name = "sparagmos-interp"
@@ -31,6 +35,9 @@ name = "sparagmos-jit"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "sparagmos-interp",
+ "sparagmos-mir",
+ "sparagmos-runtime",
 ]
 
 [[package]]

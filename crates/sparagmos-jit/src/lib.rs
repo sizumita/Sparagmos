@@ -10,16 +10,18 @@
 //! in [`memory`] — an OS foundation, not a code generator. See that module
 //! for the note.
 //!
-//! Status / next connection point: Lane A's MIR types (against Rust
-//! 1.100.0's MIR) are still being finalised, so the compiler's current
-//! input is the crate-local IR in [`ir`]. Once the MIR types are fixed,
-//! the plan is a MIR -> IR lowering that feeds this backend unchanged
-//! (emitter and memory layers are IR-agnostic).
+//! The main entry point is [`mir_jit::JitProgram`]: it lowers
+//! `sparagmos-mir` bodies to the backend IR and compiles a whole
+//! program (multiple functions, calls between them, guest panics)
+//! through [`program`]. The single-function IR API ([`compile`],
+//! [`CompiledFunction`]) remains for the backend's own use and tests.
 
 pub mod compiler;
 pub mod emitter;
 pub mod ir;
 pub mod memory;
+pub mod mir_jit;
+pub mod program;
 
 pub use compiler::{compile, compile_to_bytes, CompileError, CompiledFunction};
 pub use emitter::{CodeBuffer, Cond, Emitter, Reg};
@@ -27,3 +29,5 @@ pub use ir::{
     BasicBlock, BinOp, BlockId, Function, FunctionBuilder, Instr, Operand, Terminator, UnOp, Value,
 };
 pub use memory::JitMemory;
+pub use mir_jit::{JitCallError, JitError, JitProgram, MirFunctionInput, MirProgramInput};
+pub use program::CompiledProgram;

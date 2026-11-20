@@ -9,9 +9,13 @@
 //!   under parallel development), the case is `Unsupported` — never counted
 //!   as passed. See [`SparagmosRunner`] for the plug-in point.
 
+pub mod dump_parse;
 pub mod interp_runner;
+pub mod jit_runner;
 
+pub use dump_parse::{parse_dump, DumpError, ParsedDump};
 pub use interp_runner::{default_driver_bin, InterpRunner, DRIVER_BIN_ENV};
+pub use jit_runner::JitRunner;
 
 use std::collections::BTreeMap;
 use std::fmt;

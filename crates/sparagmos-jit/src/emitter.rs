@@ -402,6 +402,12 @@ impl Emitter {
         self.buf.emit_u8(0xF7);
         self.modrm(0b11, 6, divisor.low3());
     }
+    /// `mul divisor` (unsigned): REX.W F7 /4 — product to rdx:rax.
+    pub fn mul(&mut self, divisor: Reg) {
+        self.rex(true, false, false, divisor.ext());
+        self.buf.emit_u8(0xF7);
+        self.modrm(0b11, 4, divisor.low3());
+    }
 
     /// `setcc al` for the given condition: 0F 9x C0
     pub fn setcc_al(&mut self, cc: Cond) {
