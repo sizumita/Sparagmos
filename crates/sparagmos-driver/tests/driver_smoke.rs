@@ -85,9 +85,13 @@ fn driver_converts_box_deref_transmute() {
         stdout.contains("fn box::main:") && stdout.contains("[converted]"),
         "main should be reported as converted:\n{stdout}"
     );
+    // Since Lane AG the report also lists callees the collector
+    // visited; builtin-covered callees appear as SKIPPED with that
+    // reason, which is not a conversion failure. What this test
+    // guards is that main itself converts despite the cast.
     assert!(
-        !stdout.contains("SKIPPED"),
-        "no function may be skipped:\n{stdout}"
+        !stdout.contains("fn box::main: SKIPPED"),
+        "main must not be skipped:\n{stdout}"
     );
     let dump_text = std::fs::read_to_string(&dump).expect("dump file written");
     assert!(

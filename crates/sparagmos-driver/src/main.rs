@@ -55,6 +55,11 @@ struct Collected {
     /// the converter; lets the interpreter resolve `FnDef` call targets
     /// to the converted functions.
     body_def_ids: Vec<sparagmos_mir::DefId>,
+    /// Definition name of each entry of `bodies` (same order). For
+    /// local items this equals the item name; for collected foreign
+    /// instances it is the definition name even when the display
+    /// name carries an instance suffix.
+    body_def_names: Vec<String>,
     def_names: Vec<String>,
     /// Discriminant values of the converted enum ADTs, for the
     /// interpreter (see `Converter::adt_discriminants`).
@@ -223,15 +228,31 @@ fn collect() -> ControlFlow<()> {
     let mut report = ConversionReport::default();
     let mut bodies: Vec<(String, Body)> = Vec::new();
     let mut body_def_ids: Vec<sparagmos_mir::DefId> = Vec::new();
+    let mut body_def_names: Vec<String> = Vec::new();
+    let local_defs: std::collections::HashSet<rustc_public::DefId> =
+        rustc_public::all_local_items()
+            .iter()
+            .map(|i| i.def_id())
+            .collect();
+    // Stable MIR bodies of the converted local functions; the
+    // reachability collection walks their call graph afterwards.
+    let mut seed_bodies: Vec<rustc_public::mir::Body> = Vec::new();
 
     let items = rustc_public::all_local_items();
     for item in items.iter() {
         let name = item.name();
+        let item_instance = Instance::try_from(item.clone());
         // Assign (or fetch) this item's Sparagmos DefId up front, so a
         // converted body can be handed to the interpreter together with
-        // the id that other bodies use to call it.
-        let def_id = conv.crate_def_id(item);
-        let instance = match Instance::try_from(item.clone()) {
+        // the id that other bodies use to call it. Function items are
+        // keyed by their resolved instance (the same key `FnDef` call
+        // targets resolve through); other items keep the definition's
+        // own id.
+        let def_id = match &item_instance {
+            Ok(inst) => conv.instance_def_id(item.def_id(), inst),
+            Err(_) => conv.crate_def_id(item),
+        };
+        let instance = match item_instance {
             Ok(i) => i,
             Err(_) => {
                 let mut reasons = BTreeMap::new();
@@ -266,8 +287,10 @@ fn collect() -> ControlFlow<()> {
         let arg_count = body.arg_locals().len();
         match conv.convert_body(&body) {
             Ok(converted) => {
+                seed_bodies.push(body);
                 bodies.push((name.clone(), converted));
                 body_def_ids.push(def_id);
+                body_def_names.push(item.def_id().name());
                 report.functions.push(FnReport {
                     name,
                     blocks,
@@ -292,10 +315,20 @@ fn collect() -> ControlFlow<()> {
         }
     }
 
+    // Collect the bodies of non-local functions reachable from the
+    // converted local bodies (std / core / alloc and other library
+    // functions), so calls into them have bodies in the program too.
+    let reached = sparagmos_driver::reach::collect_reachable(&mut conv, &seed_bodies, &local_defs);
+    bodies.extend(reached.bodies);
+    body_def_ids.extend(reached.body_def_ids);
+    body_def_names.extend(reached.body_def_names);
+    report.functions.extend(reached.reports);
+
     stash(Collected {
         report,
         bodies,
         body_def_ids,
+        body_def_names,
         def_names: conv.def_names.clone(),
         adt_discriminants: conv.adt_discriminants.clone(),
     });
@@ -311,7 +344,7 @@ fn is_main(name: &str) -> bool {
 /// the driver's `def_names` spelling. Used to make run-mode failure
 /// reasons concrete about *which* call could not be resolved.
 fn external_callees(c: &Collected) -> Vec<String> {
-    let defined: BTreeSet<&str> = c.bodies.iter().map(|(n, _)| n.as_str()).collect();
+    let defined: BTreeSet<&str> = c.body_def_names.iter().map(|n| n.as_str()).collect();
     let mut out: BTreeSet<String> = BTreeSet::new();
     for (_, body) in &c.bodies {
         for bb in &body.basic_blocks {
