@@ -762,3 +762,74 @@ fn run_mode_mem_drop_runs_destructors() {
         "explicit and scope-end drops interleave exactly as natively"
     );
 }
+
+// ----- generic function definitions (Lane BA) --------------------------------
+
+const GENERIC_CALLS_SRC: &str = r#"
+fn id<T>(x: T) -> T { x }
+fn first<T>(v: &[T]) -> &T { &v[0] }
+struct Wrap<T>(T);
+impl<T> Wrap<T> {
+    fn get(&self) -> &T { &self.0 }
+}
+fn main() {
+    let a = id::<u32>(3);
+    let b = id::<i64>(-4);
+    let w = Wrap::<u32>(9);
+    let arr = [10u32, 20, 30];
+    let c = *first(&arr);
+    println!("{}", a as i64 + b + *w.get() as i64 + c as i64);
+}
+"#;
+
+#[test]
+fn run_mode_generic_function_instances_execute() {
+    // Generic definitions have no instance as items; the instances
+    // their call sites demand are resolved and converted, so a
+    // program calling generic functions runs end to end.
+    let dir = temp_dir("generic-calls");
+    let src = fixture(&dir, "generic_calls.rs", GENERIC_CALLS_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "generic calls must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "18\n");
+}
+
+const GENERIC_UNUSED_SRC: &str = r#"
+fn used<T>(x: T) -> T { x }
+fn unused<T: Clone>(x: T) -> T { x.clone() }
+fn main() {
+    let _ = used::<u32>(1);
+}
+"#;
+
+#[test]
+fn summary_mode_demanded_generic_instances_are_converted() {
+    // The demanded definition is reported converted; a definition
+    // nothing demands keeps its no-instance record (it is not
+    // silently counted as converted).
+    let dir = temp_dir("generic-unused");
+    let src = fixture(&dir, "generic_unused.rs", GENERIC_UNUSED_SRC);
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let used = stdout
+        .lines()
+        .find(|l| l.starts_with("fn generic_unused::used:"))
+        .expect("summary lists the used generic definition");
+    assert!(
+        used.contains("[converted]"),
+        "the demanded generic definition is converted: {used}"
+    );
+    let unused = stdout
+        .lines()
+        .find(|l| l.starts_with("fn generic_unused::unused:"))
+        .expect("summary lists the unused generic definition");
+    assert!(
+        unused.contains("SKIPPED (no monomorphic instance available (kind=Fn)"),
+        "the undemanded generic definition stays explicitly skipped: {unused}"
+    );
+}
