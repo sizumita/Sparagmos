@@ -961,10 +961,39 @@ init-res-into-things、resource-in-struct、
 newtype-struct-drop-run で、いずれも通常の (ジェネリックでない、
 またはライフタイムのみの) ローカル ADT を落とすテストである。
 interp 側の変更 (dtor キー、Result / クロージャ glue) は
-単独では再現しない。要求パスが追加で変換したデストラクタ本体の
-登録キーが、mir_convert 側の「impl は知っているが本体が無い」
-判定と噛み合っていない可能性が高い。**このブランチは現状の
-まま統合しないこと。**
+単独では再現しない。
+
+**回帰の原因と修正 (コミット 2323538 / 365d24f)**: 原因は
+デストラクタ登録キーの「綴り」の不一致だった。ライフタイム
+のみをパラメータに持つ Drop impl (例: drop-scope-exit の
+shrinky_pointer<'a>) は、アイテム走査では宣言どおりの綴り
+`<...shrinky_pointer<'a> as std::ops::Drop>::drop` で登録
+される。要求パスは同じ instance を Instance::resolve で
+解決し直すが、その名前は消去されたライフタイムを `'_` と
+描く (`<...shrinky_pointer<'_> as std::ops::Drop>::drop`)。
+要求パスの重複チェックは名前の文字列一致だったため別物と
+判定し、同じデストラクタを2件登録した。mir_convert の
+dtor_body は、完全キーで引けない場合に「唯一の候補」を探す
+フォールバックを持ち、候補が2件あると曖昧として None を
+返すため、その型の Drop がすべて unsupported になっていた。
+修正は要求パス側で、名前ではなく DefId (instance_def_id が
+返し、変換済み本体と対で記録される識別子) が既に変換済み
+なら要求を飛ばすようにしたこと。名前チェックは第二の
+ガードとして残してある。回帰テストとして、ライフタイム
+パラメータ付き Drop impl をスコープ終了で落とすドライバ
+テスト (run_mode_lifetime_parameterized_drop_impl_runs、
+driver_run 26 → 27 件) を追加した。
+
+修正後の再実測 (subset-bs2.json、同じベース 6619de9):
+Drop バケットは 19 件 → 7 件。回帰した 9 件は全件 pass に
+戻り、subset-bs で pass だったものの悪化は 0 件、改善は
+ちょうど 9 件だった。4 件 (drop-order-comparisons-let-
+chains、issue-30018-nopanic、issue-90752、issue-90752-raw-
+ptr-shenanigans) は Drop の拒否が消えて後段の「変換された
+本体が無い関数への呼び出し」へ移行した。残る 7 件は
+dyn の drop など下記の既知の残件クラスである。検証は
+ワークスペース 336 件全パス、ドライバ 42 件全パス、
+コーパス 46/46。
 
 残件: クラス C (dyn の drop)、RefCell / Cow / Rc・Arc の
 glue、クラス E (builtin の型タグ表)、aux クレートのジェネリック
