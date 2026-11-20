@@ -49,6 +49,10 @@
 //!   as unconverted with its reason; calling it fails at execution
 //!   time with that reason, while the entry function's own failure
 //!   stays a whole-run conversion failure.
+//! * Functions are keyed by name. Bodies that share one name —
+//!   anonymous `const _` items, which the driver names by a single
+//!   shared item path — are disambiguated by their `DefId`, which
+//!   is also how references to them resolve (see [`program_keys`]).
 //! * `Drop` converts when conversion can account for the dropped
 //!   type's whole drop glue: plain data needs none, modelled std
 //!   containers drop their contents, and a user type's glue is its
@@ -148,7 +152,9 @@ pub enum ConvertError {
     UnsupportedConstant { kind: String },
     /// A place projection the IR cannot represent.
     UnsupportedProjection { kind: String },
-    /// Two functions with the same name in one program.
+    /// Two functions in one program that cannot be told apart:
+    /// they share a name, and no distinct `DefId` disambiguates
+    /// them (see [`program_keys`]).
     DuplicateFunction { name: String },
 }
 
@@ -238,9 +244,54 @@ fn normalize_switch_value(v: u128, ty: Option<&mir::Ty>) -> u128 {
 /// converted is recorded in the program's unconverted table with
 /// its failure reason instead of failing the whole conversion (see
 /// the module docs). Only a structurally malformed program — two
-/// functions with the same name — fails conversion as a whole.
+/// functions that neither name nor `DefId` can tell apart — fails
+/// conversion as a whole.
 pub fn convert_program(program: &MirProgram) -> Result<ir::Program, ConvertError> {
     Ok(convert_all(program)?.0)
+}
+
+/// The key each function of `program` is stored under in the
+/// converted program.
+///
+/// A function's key is its name — except when several functions
+/// share one name. That is the case for anonymous `const _` items:
+/// the driver names every one of them by the same item path (a
+/// crate's `::_`), while their bodies are distinct items. Bodies
+/// sharing a name are disambiguated by their `DefId`, which is
+/// also how every reference to them resolves (call and constant
+/// operands name a `DefId`, never the shared display name), so a
+/// reference still finds exactly its own body and the name-keyed
+/// tables stay coherent. A shared name whose bodies cannot be
+/// told apart by `DefId` — a missing id, or the same id twice —
+/// is a genuine duplicate and fails conversion as a whole.
+fn program_keys(program: &MirProgram) -> Result<Vec<String>, ConvertError> {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for f in &program.functions {
+        *counts.entry(f.name.as_str()).or_default() += 1;
+    }
+    let mut used: HashSet<String> = HashSet::new();
+    let mut keys = Vec::with_capacity(program.functions.len());
+    for f in &program.functions {
+        let key = if counts[f.name.as_str()] == 1 {
+            f.name.clone()
+        } else {
+            match f.def_id {
+                Some(def) => format!("{}#{def}", f.name),
+                None => {
+                    return Err(ConvertError::DuplicateFunction {
+                        name: f.name.clone(),
+                    });
+                }
+            }
+        };
+        if !used.insert(key.clone()) {
+            return Err(ConvertError::DuplicateFunction {
+                name: f.name.clone(),
+            });
+        }
+        keys.push(key);
+    }
+    Ok(keys)
 }
 
 /// [`convert_program`] plus the per-function conversion failures,
@@ -250,23 +301,18 @@ pub fn convert_program(program: &MirProgram) -> Result<ir::Program, ConvertError
 fn convert_all(
     program: &MirProgram,
 ) -> Result<(ir::Program, HashMap<String, ConvertError>), ConvertError> {
-    let conv = Converter::new(program);
+    let keys = program_keys(program)?;
+    let conv = Converter::new(program, &keys);
     let mut out = ir::Program::new();
     let mut failures: HashMap<String, ConvertError> = HashMap::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    for func in &program.functions {
-        if !seen.insert(func.name.clone()) {
-            return Err(ConvertError::DuplicateFunction {
-                name: func.name.clone(),
-            });
-        }
-        match conv.convert_body(func) {
+    for (func, key) in program.functions.iter().zip(&keys) {
+        match conv.convert_body(func, key) {
             Ok(body) => {
                 out.add_function(body);
             }
             Err(e) => {
-                out.add_unconverted(func.name.clone(), e.to_string());
-                failures.insert(func.name.clone(), e);
+                out.add_unconverted(key.clone(), e.to_string());
+                failures.insert(key.clone(), e);
             }
         }
     }
@@ -666,9 +712,9 @@ fn scan_body_aggregates(
 }
 
 struct Converter<'a> {
-    /// Function name -> body, for callee argument typing.
+    /// Program key -> body, for callee argument typing.
     bodies: HashMap<String, &'a mir::Body>,
-    /// `DefId` -> function name, for resolving `FnDef` call operands.
+    /// `DefId` -> program key, for resolving `FnDef` call operands.
     def_names: HashMap<mir::DefId, String>,
     /// `DefId` -> name for every named item (the driver's table,
     /// including body-less callees and ADT types).
@@ -689,15 +735,15 @@ struct Converter<'a> {
 }
 
 impl<'a> Converter<'a> {
-    fn new(program: &'a MirProgram) -> Self {
+    fn new(program: &'a MirProgram, keys: &[String]) -> Self {
         let mut bodies = HashMap::new();
         let mut def_names = HashMap::new();
         let mut adt_fields = AdtFieldTys::default();
         let mut adt_aggregates = AdtAggregateCounts::default();
-        for f in &program.functions {
-            bodies.insert(f.name.clone(), &f.body);
+        for (f, key) in program.functions.iter().zip(keys) {
+            bodies.insert(key.clone(), &f.body);
             if let Some(def) = f.def_id {
-                def_names.insert(def, f.name.clone());
+                def_names.insert(def, key.clone());
             }
             scan_body_fields(&mut adt_fields, &f.body);
             scan_body_aggregates(&mut adt_aggregates, &mut adt_fields, &f.body);
@@ -718,18 +764,18 @@ impl<'a> Converter<'a> {
         }
     }
 
-    fn convert_body(&self, func: &MirFunction) -> Result<ir::Body, ConvertError> {
+    fn convert_body(&self, func: &MirFunction, key: &str) -> Result<ir::Body, ConvertError> {
         let body = &func.body;
         let mut local_tys = Vec::with_capacity(body.local_decls.len());
         for (i, decl) in body.local_decls.iter().enumerate() {
-            local_tys.push(self.convert_ty(&decl.ty, &format!("local _{i} of `{}`", func.name))?);
+            local_tys.push(self.convert_ty(&decl.ty, &format!("local _{i} of `{key}`"))?);
         }
         let mut blocks = Vec::with_capacity(body.basic_blocks.len());
         for bb in &body.basic_blocks {
             blocks.push(self.convert_block(body, bb)?);
         }
         Ok(ir::Body::new(
-            func.name.clone(),
+            key.to_string(),
             body.arg_count,
             local_tys,
             blocks,
