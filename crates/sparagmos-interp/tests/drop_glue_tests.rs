@@ -120,6 +120,8 @@ const BOX_TY: mir::DefId = mir::DefId::new(0, 212);
 const STRING_TY: mir::DefId = mir::DefId::new(0, 214);
 const G_TY: mir::DefId = mir::DefId::new(0, 216);
 const W_TY: mir::DefId = mir::DefId::new(0, 218);
+const RESULT_TY: mir::DefId = mir::DefId::new(0, 220);
+const CLO_TY: mir::DefId = mir::DefId::new(0, 222);
 
 const D_DROP_NAME: &str = "<probe::D as std::ops::Drop>::drop";
 const OUTER_DROP_NAME: &str = "<probe::Outer as std::ops::Drop>::drop";
@@ -140,6 +142,8 @@ fn probe_names() -> HashMap<mir::DefId, String> {
         (STRING_TY, "std::string::String".to_string()),
         (G_TY, "probe::G".to_string()),
         (W_TY, "othercrate::W".to_string()),
+        (RESULT_TY, "std::result::Result".to_string()),
+        (CLO_TY, "probe::{closure#0}".to_string()),
     ])
 }
 
@@ -666,4 +670,305 @@ fn foreign_type_that_might_hide_an_impl_stays_unsupported() {
         ),
         "expected unsupported Drop, got {err}"
     );
+}
+
+// ----- generic destructors, several instantiations (Lane BS) -----------------
+
+/// Like `bump_dtor`, but the counter is scaled by `scale` before the
+/// id is added, so two instantiations of one generic destructor are
+/// observably different bodies.
+fn bump_dtor_scaled(self_ty: mir::Ty, sink_field: u32, id_field: u32, scale: i32) -> mir::Body {
+    mir::Body::new(
+        decls(&[
+            mir::Ty::unit(),
+            ref_ty(self_ty),
+            ref_ty(i32_ty()),
+            i32_ty(),
+            i32_ty(),
+            i32_ty(),
+        ]),
+        1,
+        vec![block(
+            vec![
+                assign(
+                    place(2),
+                    mir::Rvalue::Use(mir::Operand::Copy(
+                        place(1).deref().field(sink_field, ref_ty(i32_ty())),
+                    )),
+                ),
+                assign(
+                    place(3),
+                    mir::Rvalue::Use(mir::Operand::Copy(
+                        place(1).deref().field(id_field, i32_ty()),
+                    )),
+                ),
+                assign(
+                    place(4),
+                    mir::Rvalue::Use(mir::Operand::Copy(place(2).deref())),
+                ),
+                assign(
+                    place(5),
+                    mir::Rvalue::BinaryOp(
+                        mir::BinOp::Mul,
+                        Box::new((copy(4), const_i32(scale))),
+                    ),
+                ),
+                assign(
+                    place(5),
+                    mir::Rvalue::BinaryOp(
+                        mir::BinOp::Add,
+                        Box::new((copy(5), copy(3))),
+                    ),
+                ),
+                assign(place(2).deref(), mir::Rvalue::Use(copy(5))),
+            ],
+            ret(),
+        )],
+    )
+}
+
+fn const_u8(v: u8) -> mir::Operand {
+    mir::Operand::constant(mir::Constant::from_value(mir::ConstValue::Scalar(
+        mir::Scalar::Int {
+            data: v as u128,
+            size: 1,
+        },
+    )))
+}
+
+#[test]
+fn generic_dtor_two_instantiations_pick_their_own_bodies() {
+    // struct G<T> { sink: &mut i32, id: i32, marker: T } with a
+    // generic Drop impl. The program holds two monomorphizations of
+    // the destructor, `G<i32>` (counter *10 + id) and `G<u8>`
+    // (counter *100 + id); dropping each value must run its own
+    // instantiation: (0*10+3) = 3, then (3*100+4) = 304. Before the
+    // glue builder keyed destructors by their full instantiated
+    // name, two candidate bodies made the lookup give up and the
+    // drops were refused outright.
+    let u8_ty = mir::Ty::Uint(mir::UintTy::U8);
+    let g_i32 = mir::Ty::Adt(G_TY, vec![i32_ty()]);
+    let g_u8 = mir::Ty::Adt(G_TY, vec![u8_ty.clone()]);
+    let main = mir::Body::new(
+        decls(&[
+            i32_ty(),
+            i32_ty(),
+            ref_ty(i32_ty()),
+            g_i32.clone(),
+            ref_ty(i32_ty()),
+            g_u8.clone(),
+        ]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(place(1), mir::Rvalue::Use(const_i32(0))),
+                    assign(place(2), ref_rvalue(1)),
+                    assign(
+                        place(3),
+                        aggregate_adt(
+                            G_TY,
+                            0,
+                            vec![i32_ty()],
+                            vec![move_(2), const_i32(3), const_i32(0)],
+                        ),
+                    ),
+                    assign(place(4), ref_rvalue(1)),
+                    assign(
+                        place(5),
+                        aggregate_adt(
+                            G_TY,
+                            0,
+                            vec![u8_ty],
+                            vec![move_(4), const_i32(4), const_u8(0)],
+                        ),
+                    ),
+                ],
+                mir::TerminatorKind::Goto {
+                    target: mir::BasicBlock(1),
+                },
+            ),
+            block(vec![], drop(place(3), 2)),
+            block(vec![], drop(place(5), 3)),
+            block(vec![assign(place(0), mir::Rvalue::Use(copy(1)))], ret()),
+        ],
+    );
+    let value = run_main(
+        main,
+        &[
+            (
+                "<probe::G<i32> as std::ops::Drop>::drop",
+                bump_dtor_scaled(g_i32, 0, 1, 10),
+            ),
+            (
+                "<probe::G<u8> as std::ops::Drop>::drop",
+                bump_dtor_scaled(g_u8, 0, 1, 100),
+            ),
+        ],
+    )
+    .expect("run");
+    assert_eq!(value, Value::Int(304));
+}
+
+// ----- Result glue (Lane BS) ---------------------------------------------------
+
+#[test]
+fn result_payload_dtor_runs_for_ok_and_err() {
+    // Result<D, D>: the modelled glue follows the live variant and
+    // drops the payload at field 0, exactly like `Option`.
+    let result_ty = mir::Ty::Adt(RESULT_TY, vec![d_ty(), d_ty()]);
+    let build = |variant: u32, id: i32| {
+        mir::Body::new(
+            decls(&[i32_ty(), i32_ty(), ref_ty(i32_ty()), d_ty(), result_ty.clone()]),
+            0,
+            vec![
+                block(
+                    vec![
+                        assign(place(1), mir::Rvalue::Use(const_i32(0))),
+                        assign(place(2), ref_rvalue(1)),
+                        assign(
+                            place(3),
+                            aggregate_adt(D_TY, 0, vec![], vec![move_(2), const_i32(id)]),
+                        ),
+                        assign(
+                            place(4),
+                            aggregate_adt(
+                                RESULT_TY,
+                                variant,
+                                vec![d_ty(), d_ty()],
+                                vec![move_(3)],
+                            ),
+                        ),
+                    ],
+                    mir::TerminatorKind::Goto {
+                        target: mir::BasicBlock(1),
+                    },
+                ),
+                block(vec![], drop(place(4), 2)),
+                block(vec![assign(place(0), mir::Rvalue::Use(copy(1)))], ret()),
+            ],
+        )
+    };
+    let value = run_main(build(0, 5), &[(D_DROP_NAME, bump_dtor(d_ty(), 0, 1))]).expect("run Ok");
+    assert_eq!(value, Value::Int(5));
+    let value = run_main(build(1, 6), &[(D_DROP_NAME, bump_dtor(d_ty(), 0, 1))]).expect("run Err");
+    assert_eq!(value, Value::Int(6));
+}
+
+// ----- closure glue (Lane BS) ----------------------------------------------------
+
+fn closure_ty(upvars: Vec<mir::Ty>) -> mir::Ty {
+    mir::Ty::Closure(
+        CLO_TY,
+        vec![
+            mir::Ty::Int(mir::IntTy::I8),
+            mir::Ty::FnPtr(Box::new(mir::FnSig::new(
+                vec![mir::Ty::Tuple(vec![])],
+                mir::Ty::unit(),
+            ))),
+            mir::Ty::Tuple(upvars),
+        ],
+    )
+}
+
+fn closure_rvalue(clo_ty: &mir::Ty, ops: Vec<mir::Operand>) -> mir::Rvalue {
+    let generic_args = match clo_ty {
+        mir::Ty::Closure(_, args) => args.clone(),
+        _ => unreachable!(),
+    };
+    mir::Rvalue::Aggregate(
+        Box::new(mir::AggregateKind::Closure {
+            def: CLO_TY,
+            generic_args,
+        }),
+        ops,
+    )
+}
+
+#[test]
+fn closure_capture_dtor_runs() {
+    // A closure capturing a `D` by move: dropping the closure drops
+    // the capture. Before the glue builder planned `Ty::Closure`,
+    // this drop was refused.
+    let clo_ty = closure_ty(vec![d_ty()]);
+    let main = mir::Body::new(
+        decls(&[i32_ty(), i32_ty(), ref_ty(i32_ty()), d_ty(), clo_ty.clone()]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(place(1), mir::Rvalue::Use(const_i32(0))),
+                    assign(place(2), ref_rvalue(1)),
+                    assign(
+                        place(3),
+                        aggregate_adt(D_TY, 0, vec![], vec![move_(2), const_i32(9)]),
+                    ),
+                    assign(place(4), closure_rvalue(&clo_ty, vec![move_(3)])),
+                ],
+                mir::TerminatorKind::Goto {
+                    target: mir::BasicBlock(1),
+                },
+            ),
+            block(vec![], drop(place(4), 2)),
+            block(vec![assign(place(0), mir::Rvalue::Use(copy(1)))], ret()),
+        ],
+    );
+    let value = run_main(main, &[(D_DROP_NAME, bump_dtor(d_ty(), 0, 1))]).expect("run");
+    assert_eq!(value, Value::Int(9));
+}
+
+#[test]
+fn closure_partially_moved_capture_is_skipped() {
+    // A closure capturing two `D`s; the first capture is moved out
+    // (and never dropped), so dropping the closure must run only
+    // the second capture's destructor: the counter ends at 10, not
+    // 9*10+10 or 10*10+9.
+    let clo_ty = closure_ty(vec![d_ty(), d_ty()]);
+    let main = mir::Body::new(
+        decls(&[
+            i32_ty(),
+            i32_ty(),
+            ref_ty(i32_ty()),
+            d_ty(),
+            ref_ty(i32_ty()),
+            d_ty(),
+            clo_ty.clone(),
+            d_ty(),
+        ]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(place(1), mir::Rvalue::Use(const_i32(0))),
+                    assign(place(2), ref_rvalue(1)),
+                    assign(
+                        place(3),
+                        aggregate_adt(D_TY, 0, vec![], vec![move_(2), const_i32(9)]),
+                    ),
+                    assign(place(4), ref_rvalue(1)),
+                    assign(
+                        place(5),
+                        aggregate_adt(D_TY, 0, vec![], vec![move_(4), const_i32(10)]),
+                    ),
+                    assign(
+                        place(6),
+                        closure_rvalue(&clo_ty, vec![move_(3), move_(5)]),
+                    ),
+                    // Move capture 0 out of the closure; `_7` is
+                    // never dropped in this body.
+                    assign(
+                        place(7),
+                        mir::Rvalue::Use(mir::Operand::Move(place(6).field(0, d_ty()))),
+                    ),
+                ],
+                mir::TerminatorKind::Goto {
+                    target: mir::BasicBlock(1),
+                },
+            ),
+            block(vec![], drop(place(6), 2)),
+            block(vec![assign(place(0), mir::Rvalue::Use(copy(1)))], ret()),
+        ],
+    );
+    let value = run_main(main, &[(D_DROP_NAME, bump_dtor(d_ty(), 0, 1))]).expect("run");
+    assert_eq!(value, Value::Int(10));
 }

@@ -762,3 +762,69 @@ fn run_mode_mem_drop_runs_destructors() {
         "explicit and scope-end drops interleave exactly as natively"
     );
 }
+
+const GENERIC_DROP_SRC: &str = r#"
+struct G<T> { x: T }
+impl<T> Drop for G<T> {
+    fn drop(&mut self) { println!("dropped"); }
+}
+fn main() {
+    let _g = G { x: 1i32 };
+    println!("body");
+}
+"#;
+
+#[test]
+fn run_mode_generic_drop_impl_runs() {
+    // A generic `Drop` impl has no monomorphic instance among the
+    // crate's items and drop glue is not a call edge, so the driver
+    // must demand the instantiation the program drops (Lane BS).
+    // Before that pass existed this exited 2 with
+    // "unsupported terminator: Drop".
+    let dir = temp_dir("generic-drop");
+    let src = fixture(&dir, "generic_drop.rs", GENERIC_DROP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "generic Drop impl must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "body\ndropped\n",
+        "the destructor's output must follow the body's"
+    );
+}
+
+const TWO_INSTANCE_DROP_SRC: &str = r#"
+struct G<T> { x: T }
+impl<T> Drop for G<T> {
+    fn drop(&mut self) { println!("dropped"); }
+}
+fn main() {
+    let _a = G { x: 1i32 };
+    let _b = G { x: true };
+    println!("body");
+}
+"#;
+
+#[test]
+fn run_mode_two_instantiations_of_one_generic_drop_impl() {
+    // Two monomorphizations of one generic `Drop` impl in a single
+    // program: each drop must find its own instantiation's body.
+    let dir = temp_dir("two-instance-drop");
+    let src = fixture(&dir, "two_instance_drop.rs", TWO_INSTANCE_DROP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "both instantiations must drop; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "body\ndropped\ndropped\n",
+        "both destructors must run"
+    );
+}
