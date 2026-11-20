@@ -44,10 +44,15 @@
 //!   driver's full name table: runtime-supported callees
 //!   ([`crate::builtins`]) become `CallBuiltin`; anything else stays an
 //!   unsupported call that names the function.
-//! * `Drop` converts only for types whose drop glue provably has no
-//!   guest-observable effect in this value model (plain data, `String`,
-//!   modelled std containers/iterators, and compositions of those);
-//!   other drops stay explicit errors.
+//! * `Drop` converts when conversion can account for the dropped
+//!   type's whole drop glue: plain data needs none, modelled std
+//!   containers drop their contents, and a user type's glue is its
+//!   converted `Drop` impl body (when the program has one) followed
+//!   by its fields' glue. A type whose glue cannot be fully
+//!   accounted for (a `Drop` impl without a converted body, a field
+//!   whose type no projection anywhere records, a type from another
+//!   crate that might hide an impl) keeps the terminator an explicit
+//!   error; nothing is dropped silently.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -57,7 +62,7 @@ use sparagmos_mir as mir;
 use crate::error::InterpError;
 use crate::interp::Interpreter;
 use crate::ir;
-use crate::value::Value;
+use crate::value::{RefProj, Value};
 
 /// One function of a MIR program, as handed over by the driver: a display
 /// name (the interpreter keys functions by name), the `DefId` when known
@@ -508,6 +513,66 @@ fn scan_body_fields(table: &mut AdtFieldTys, body: &mir::Body) {
     }
 }
 
+/// Operand counts of ADT aggregate constructions, per
+/// (def, generic args, variant). An aggregate rvalue lists every
+/// field of the variant it builds, so its operand count proves how
+/// many fields that variant holds; drop-glue conversion uses it to
+/// check that the field types recovered from projections cover the
+/// whole variant.
+#[derive(Default)]
+struct AdtAggregateCounts {
+    entries: Vec<(mir::DefId, Vec<mir::Ty>, u32, usize)>,
+}
+
+impl AdtAggregateCounts {
+    fn record(
+        &mut self,
+        def: mir::DefId,
+        generic_args: Vec<mir::Ty>,
+        variant: u32,
+        count: usize,
+    ) {
+        // Construction sites of one variant must agree on its field
+        // count; the first sighting wins, as in `AdtFieldTys`.
+        if self
+            .entries
+            .iter()
+            .any(|(d, a, v, _)| *d == def && *a == generic_args && *v == variant)
+        {
+            return;
+        }
+        self.entries.push((def, generic_args, variant, count));
+    }
+
+    fn get(&self, def: mir::DefId, generic_args: &[mir::Ty], variant: u32) -> Option<usize> {
+        self.entries
+            .iter()
+            .find(|(d, a, v, _)| *d == def && a.as_slice() == generic_args && *v == variant)
+            .map(|e| e.3)
+    }
+}
+
+fn scan_body_aggregates(table: &mut AdtAggregateCounts, body: &mir::Body) {
+    for bb in &body.basic_blocks {
+        for stmt in &bb.statements {
+            if let mir::StatementKind::Assign(pair) = &stmt.kind {
+                let (_, rv) = &**pair;
+                if let mir::Rvalue::Aggregate(kind, ops) = rv {
+                    if let mir::AggregateKind::Adt {
+                        def,
+                        variant_index,
+                        generic_args,
+                        ..
+                    } = &**kind
+                    {
+                        table.record(*def, generic_args.clone(), *variant_index, ops.len());
+                    }
+                }
+            }
+        }
+    }
+}
+
 struct Converter<'a> {
     /// Function name -> body, for callee argument typing.
     bodies: HashMap<String, &'a mir::Body>,
@@ -521,6 +586,14 @@ struct Converter<'a> {
     adt_fields: AdtFieldTys,
     /// Discriminant tables of the program (see `MirProgram`).
     discriminants: &'a mir::AdtDiscriminants,
+    /// Operand counts of ADT aggregate constructions (see
+    /// [`AdtAggregateCounts`]).
+    adt_aggregates: AdtAggregateCounts,
+    /// First path segment of the entry function (`{crate}::main`):
+    /// the crate whose items the driver's name table enumerates
+    /// completely, `Drop` impls included. `None` when the program
+    /// has no `main` function.
+    local_crate: Option<String>,
 }
 
 impl<'a> Converter<'a> {
@@ -528,19 +601,28 @@ impl<'a> Converter<'a> {
         let mut bodies = HashMap::new();
         let mut def_names = HashMap::new();
         let mut adt_fields = AdtFieldTys::default();
+        let mut adt_aggregates = AdtAggregateCounts::default();
         for f in &program.functions {
             bodies.insert(f.name.clone(), &f.body);
             if let Some(def) = f.def_id {
                 def_names.insert(def, f.name.clone());
             }
             scan_body_fields(&mut adt_fields, &f.body);
+            scan_body_aggregates(&mut adt_aggregates, &f.body);
         }
+        let local_crate = program
+            .functions
+            .iter()
+            .find(|f| f.name == "main" || f.name.ends_with("::main"))
+            .map(|f| f.name.split("::").next().unwrap_or("").to_string());
         Converter {
             bodies,
             def_names,
             names: &program.fn_names,
             adt_fields,
             discriminants: &program.adt_discriminants,
+            adt_aggregates,
+            local_crate,
         }
     }
 
@@ -1159,49 +1241,50 @@ impl<'a> Converter<'a> {
         }
     }
 
-    /// Whether dropping a value of this type provably has no
-    /// guest-observable effect in this value model: plain data drops
-    /// nothing; references drop nothing; the listed std types only
-    /// deallocate or drop their (recursively unobservable) contents.
-    /// Anything else — user types that may implement `Drop`, closures,
-    /// trait objects — stays an explicit error.
-    fn drop_is_unobservable(&self, ty: &mir::Ty) -> bool {
-        match ty {
-            mir::Ty::Bool
-            | mir::Ty::Char
-            | mir::Ty::Int(_)
-            | mir::Ty::Uint(_)
-            | mir::Ty::Float(_)
-            | mir::Ty::Never
-            | mir::Ty::Str => true,
-            mir::Ty::Tuple(ts) => ts.iter().all(|t| self.drop_is_unobservable(t)),
-            mir::Ty::Array(elem, _) | mir::Ty::Slice(elem) => self.drop_is_unobservable(elem),
-            mir::Ty::Ref(..) | mir::Ty::RawPtr(..) | mir::Ty::FnDef(..) | mir::Ty::FnPtr(_) => {
-                true
+    /// Build the drop glue of the dropped type, if every part of
+    /// it can be accounted for (see [`DropGlueBuilder`]).
+    fn drop_glue(&self, ty: &mir::Ty) -> Option<ir::DropGlue> {
+        DropGlueBuilder::build(self, ty)
+    }
+
+    /// The converted body of `adt_name`'s `Drop` impl, if the
+    /// program has one. The driver's name for the impl is
+    /// `<{adt_name} as std::ops::Drop>::drop` (the `core::` spelling
+    /// of the trait path is accepted as well); a generic impl made
+    /// concrete for one type (`impl Drop for G<i32>`) is found by
+    /// the same pattern when it is the only candidate.
+    fn dtor_body(&self, adt_name: &str) -> Option<String> {
+        for trait_path in ["std::ops::Drop", "core::ops::Drop"] {
+            let key = format!("<{adt_name} as {trait_path}>::drop");
+            if self.bodies.contains_key(&key) {
+                return Some(key);
             }
-            mir::Ty::Adt(def, args) => {
-                let name = self
-                    .names
-                    .get(def)
-                    .or_else(|| self.def_names.get(def))
-                    .map(String::as_str);
-                let known = matches!(
-                    name,
-                    Some(
-                        "std::string::String"
-                            | "std::vec::Vec"
-                            | "std::boxed::Box"
-                            | "std::array::IntoIter"
-                            | "std::option::Option"
-                            | "std::fmt::Arguments"
-                            | "core::fmt::rt::Argument"
-                            | "std::ops::Range"
-                            | "std::ops::RangeInclusive"
-                    )
-                );
-                known && args.iter().all(|t| self.drop_is_unobservable(t))
-            }
-            _ => false,
+        }
+        let mut candidates = self
+            .bodies
+            .keys()
+            .filter(|k| is_dtor_name(k, adt_name));
+        match (candidates.next(), candidates.next()) {
+            (Some(only), None) => Some(only.clone()),
+            _ => None,
+        }
+    }
+
+    /// Whether the driver's name table records a `Drop` impl for
+    /// `adt_name` at all, under any generic spelling.
+    fn dtor_impl_known(&self, adt_name: &str) -> bool {
+        self.names.values().any(|n| is_dtor_name(n, adt_name))
+    }
+
+    /// Whether `name` (a type's driver name) belongs to the entry
+    /// crate. For the entry crate's types the name table is
+    /// complete, so a `Drop` impl that is absent from it does not
+    /// exist; for any other crate's type an impl could exist
+    /// unrecorded, and conversion must not assume there is none.
+    fn is_local_type(&self, name: &str) -> bool {
+        match &self.local_crate {
+            Some(k) => name.split("::").next() == Some(k.as_str()),
+            None => false,
         }
     }
 
@@ -1300,17 +1383,19 @@ impl<'a> Converter<'a> {
                     target: ir::BasicBlock(real_target.index()),
                 }
             }
-            T::Drop { place, target, .. }
-                if self
+            T::Drop { place, target, .. } => {
+                let glue = self
                     .place_ty(body, place)
-                    .is_some_and(|t| self.drop_is_unobservable(&t)) =>
-            {
-                ir::TerminatorKind::Drop {
-                    place: self.convert_place(place)?,
-                    target: ir::BasicBlock(target.index()),
+                    .and_then(|t| self.drop_glue(&t));
+                match glue {
+                    Some(glue) => ir::TerminatorKind::Drop {
+                        place: self.convert_place(place)?,
+                        target: ir::BasicBlock(target.index()),
+                        glue,
+                    },
+                    None => ir::TerminatorKind::Unsupported("Drop".to_string()),
                 }
             }
-            T::Drop { .. } => ir::TerminatorKind::Unsupported("Drop".to_string()),
             T::Resume => ir::TerminatorKind::Unsupported("Resume".to_string()),
             T::Terminate(k) => ir::TerminatorKind::Unsupported(format!("Terminate {k:?}")),
             T::Yield { .. } => ir::TerminatorKind::Unsupported("Yield".to_string()),
@@ -1536,4 +1621,312 @@ fn plain_binop(op: mir::BinOp) -> Option<ir::BinOp> {
         // before this function is consulted.
         M::AddWithOverflow | M::SubWithOverflow | M::MulWithOverflow => return None,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Drop glue construction
+// ---------------------------------------------------------------------------
+
+/// Whether `name` is the driver name of `adt_name`'s `Drop` impl:
+/// `<{adt_name} as std::ops::Drop>::drop`, with any generic
+/// argument list after the type name (the impl of a generic type is
+/// recorded with its parameter spellings, e.g. `<probe::G<T> as
+/// ...>::drop`). The `core::` spelling of the trait path is
+/// accepted as well.
+fn is_dtor_name(name: &str, adt_name: &str) -> bool {
+    for trait_path in ["std::ops::Drop", "core::ops::Drop"] {
+        let suffix = format!(" as {trait_path}>::drop");
+        let Some(head) = name.strip_suffix(&suffix) else {
+            continue;
+        };
+        if head == format!("<{adt_name}") {
+            return true;
+        }
+        if let Some(args) = head.strip_prefix(&format!("<{adt_name}<")) {
+            if args.ends_with('>') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Run `plan` against field 0 of the value it applies to (the
+/// pointee of a `Box`, the payload of `Option::Some`).
+fn at_field0(plan: ir::DropPlan) -> ir::DropPlan {
+    match plan {
+        ir::DropPlan::Trivial => ir::DropPlan::Trivial,
+        other => ir::DropPlan::At {
+            path: vec![RefProj::Field(0)],
+            plan: Box::new(other),
+        },
+    }
+}
+
+/// A `Fields` plan, collapsed to `Trivial` when no field has glue.
+fn collapse_fields(fields: Vec<ir::DropPlan>, complete: bool) -> ir::DropPlan {
+    if fields.iter().all(|f| *f == ir::DropPlan::Trivial) {
+        ir::DropPlan::Trivial
+    } else {
+        ir::DropPlan::Fields { fields, complete }
+    }
+}
+
+/// A sequence of glue steps, collapsed when at most one remains.
+fn collapse_seq(steps: Vec<ir::DropPlan>) -> ir::DropPlan {
+    let mut steps: Vec<ir::DropPlan> = steps
+        .into_iter()
+        .filter(|p| *p != ir::DropPlan::Trivial)
+        .collect();
+    match steps.len() {
+        0 => ir::DropPlan::Trivial,
+        1 => steps.pop().expect("one step"),
+        _ => ir::DropPlan::Seq(steps),
+    }
+}
+
+/// Builds the drop glue of one dropped type. Glue is built only
+/// when every part of the type is accounted for:
+///
+/// * scalars, references and function pointers have no glue;
+/// * tuples, arrays and slices glue their elements;
+/// * the modelled std types glue by their fixed shape (`Vec` its
+///   elements, `Box` its pointee, `Option` its payload, `Range` its
+///   bounds; `String`, `fmt` values and `ManuallyDrop` nothing);
+/// * any other ADT glues its converted `Drop` impl body (called
+///   first, as in rustc's drop glue) and then its fields, variant
+///   by variant. An impl the name table records but the program
+///   has no body for (a generic impl gets no monomorphic instance)
+///   fails the build, as does an ADT from another crate whose impl
+///   the table cannot rule out, and a field whose type no
+///   projection anywhere in the program records.
+struct DropGlueBuilder<'c, 'a> {
+    conv: &'c Converter<'a>,
+    adts: Vec<ir::DropPlan>,
+    adt_index: HashMap<String, usize>,
+}
+
+impl<'c, 'a> DropGlueBuilder<'c, 'a> {
+    fn build(conv: &'c Converter<'a>, ty: &mir::Ty) -> Option<ir::DropGlue> {
+        let mut builder = DropGlueBuilder {
+            conv,
+            adts: Vec::new(),
+            adt_index: HashMap::new(),
+        };
+        let root = builder.plan(ty)?;
+        Some(ir::DropGlue {
+            root,
+            adts: builder.adts,
+        })
+    }
+
+    fn plan(&mut self, ty: &mir::Ty) -> Option<ir::DropPlan> {
+        use ir::DropPlan as P;
+        match ty {
+            mir::Ty::Bool
+            | mir::Ty::Char
+            | mir::Ty::Int(_)
+            | mir::Ty::Uint(_)
+            | mir::Ty::Float(_)
+            | mir::Ty::Never
+            | mir::Ty::Str => Some(P::Trivial),
+            mir::Ty::Ref(..) | mir::Ty::RawPtr(..) | mir::Ty::FnDef(..) | mir::Ty::FnPtr(_) => {
+                Some(P::Trivial)
+            }
+            mir::Ty::Tuple(ts) => {
+                let mut fields = Vec::with_capacity(ts.len());
+                for t in ts {
+                    fields.push(self.plan(t)?);
+                }
+                Some(collapse_fields(fields, true))
+            }
+            mir::Ty::Array(elem, _) | mir::Ty::Slice(elem) => match self.plan(elem)? {
+                P::Trivial => Some(P::Trivial),
+                elem_plan => Some(P::Each {
+                    elem: Box::new(elem_plan),
+                }),
+            },
+            mir::Ty::Adt(def, args) => {
+                let key = format!("{ty:?}");
+                if let Some(&index) = self.adt_index.get(&key) {
+                    return Some(P::Adt { index });
+                }
+                let index = self.adts.len();
+                self.adt_index.insert(key, index);
+                // Placeholder while this ADT's fields are planned, so
+                // a recursive occurrence refers back to this entry.
+                self.adts.push(P::Trivial);
+                let plan = self.adt_plan(*def, args)?;
+                self.adts[index] = plan;
+                Some(P::Adt { index })
+            }
+            _ => None,
+        }
+    }
+
+    fn adt_plan(&mut self, def: mir::DefId, args: &[mir::Ty]) -> Option<ir::DropPlan> {
+        use ir::DropPlan as P;
+        let conv = self.conv;
+        let name = conv
+            .names
+            .get(&def)
+            .or_else(|| conv.def_names.get(&def))?
+            .clone();
+        // Modelled std types: their glue shape is fixed by the value
+        // model, not by a converted body.
+        match name.as_str() {
+            "std::string::String" => return Some(P::Trivial),
+            "std::fmt::Arguments" | "core::fmt::rt::Argument" => return Some(P::Trivial),
+            // `ManuallyDrop` is defined to run no glue at all.
+            "std::mem::ManuallyDrop" | "core::mem::ManuallyDrop" => return Some(P::Trivial),
+            "std::vec::Vec" => {
+                let elem = self.plan(args.first()?)?;
+                return Some(match elem {
+                    P::Trivial => P::Trivial,
+                    e => P::Each { elem: Box::new(e) },
+                });
+            }
+            "std::boxed::Box" => {
+                let inner = self.plan(args.first()?)?;
+                return Some(at_field0(inner));
+            }
+            "std::option::Option" => {
+                let inner = self.plan(args.first()?)?;
+                return Some(match inner {
+                    P::Trivial => P::Trivial,
+                    e => P::Variants {
+                        variants: vec![P::Trivial, at_field0(e)],
+                    },
+                });
+            }
+            "std::ops::Range" | "std::ops::RangeInclusive" => {
+                let bound = self.plan(args.first()?)?;
+                return Some(collapse_fields(vec![bound.clone(), bound], true));
+            }
+            "std::array::IntoIter" => {
+                // The modelled value does not expose the buffer's
+                // elements as fields, so only a trivial element
+                // type is accounted for.
+                let elem = self.plan(args.first()?)?;
+                return match elem {
+                    P::Trivial => Some(P::Trivial),
+                    _ => None,
+                };
+            }
+            _ => {}
+        }
+        // Any other ADT: its glue is its `Drop` impl (called first,
+        // as in rustc's drop glue) followed by its fields' glue.
+        let mut steps = Vec::new();
+        if let Some(func) = conv.dtor_body(&name) {
+            steps.push(P::CallDtor { func });
+        } else if conv.dtor_impl_known(&name) {
+            // The impl exists but has no converted body (a generic
+            // impl gets no monomorphic instance in the program):
+            // its effects can neither be executed nor ruled out.
+            return None;
+        } else if !conv.is_local_type(&name) {
+            // Not the entry crate's type: an impl could exist that
+            // the name table never recorded.
+            return None;
+        }
+        steps.push(self.variant_fields_plan(def, args)?);
+        Some(collapse_seq(steps))
+    }
+
+    /// The field glue of one ADT, across its variants: a single
+    /// `Fields` plan for a struct, a `Variants` plan for an enum.
+    fn variant_fields_plan(
+        &mut self,
+        def: mir::DefId,
+        args: &[mir::Ty],
+    ) -> Option<ir::DropPlan> {
+        use ir::DropPlan as P;
+        let conv = self.conv;
+        // Variant indices with any evidence in the program: field
+        // projections, aggregate constructions, the discriminant
+        // table. Variant 0 always exists (every ADT has one).
+        let mut variants: std::collections::BTreeSet<u32> = Default::default();
+        variants.insert(0);
+        for (key, _) in &conv.adt_fields.entries {
+            if key.def == def && key.generic_args.as_slice() == args {
+                variants.insert(key.variant);
+            }
+        }
+        for (d, a, v, _) in &conv.adt_aggregates.entries {
+            if *d == def && a.as_slice() == args {
+                variants.insert(*v);
+            }
+        }
+        if let Some(discs) = conv.discriminants.get(&def) {
+            for v in 0..discs.len() {
+                variants.insert(v as u32);
+            }
+        }
+        let max_v = *variants.iter().max().expect("variant 0 present");
+        let mut plans = Vec::new();
+        for v in 0..=max_v {
+            if !variants.contains(&v) {
+                // A variant index inside the discriminant range
+                // that nothing in the program ever constructs or
+                // projects: its fields are unaccounted for.
+                plans.push(P::Unknown);
+                continue;
+            }
+            plans.push(self.one_variant_fields(def, args, v)?);
+        }
+        if plans.len() == 1 {
+            Some(plans.pop().expect("one variant"))
+        } else {
+            Some(P::Variants { variants: plans })
+        }
+    }
+
+    /// The field glue of one variant of one ADT.
+    fn one_variant_fields(
+        &mut self,
+        def: mir::DefId,
+        args: &[mir::Ty],
+        variant: u32,
+    ) -> Option<ir::DropPlan> {
+        let conv = self.conv;
+        let count = conv.adt_aggregates.get(def, args, variant);
+        let field_count = match count {
+            Some(n) => n,
+            None => conv
+                .adt_fields
+                .entries
+                .iter()
+                .filter(|(key, _)| {
+                    key.def == def && key.generic_args.as_slice() == args && key.variant == variant
+                })
+                .map(|(key, _)| key.field as usize + 1)
+                .max()
+                .unwrap_or(0),
+        };
+        let mut fields = Vec::with_capacity(field_count);
+        for f in 0..field_count as u32 {
+            match conv.adt_fields.get(def, args, variant, f) {
+                Some(ty) => {
+                    let ty = ty.clone();
+                    fields.push(self.plan(&ty)?);
+                }
+                None => {
+                    if count.is_some() {
+                        // An aggregate proves this field exists, but
+                        // no projection anywhere records its type:
+                        // its glue cannot be accounted for.
+                        return None;
+                    }
+                    // A gap between projected fields: its type is
+                    // unrecorded, so its glue is unaccounted for if
+                    // the value ever holds it (the `Fields` plan is
+                    // marked incomplete and this entry errors when
+                    // executed).
+                    fields.push(ir::DropPlan::Unknown);
+                }
+            }
+        }
+        Some(collapse_fields(fields, count.is_some()))
+    }
 }
