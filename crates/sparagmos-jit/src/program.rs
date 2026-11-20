@@ -64,6 +64,25 @@ extern "C" fn format_shift_message(amount: u64, bits: u64, buf: *mut u8) -> usiz
     bytes.len()
 }
 
+/// The index-out-of-bounds message formatter the generated code
+/// calls: same buffer contract as [`format_shift_message`]. The
+/// wording matches the interpreter's message for an index outside
+/// an array or slice: both numbers are the runtime length and
+/// index, read as `usize` values.
+///
+/// # Safety
+/// `buf` must point to at least 128 writable bytes (the program's
+/// scratch buffer); the message is well under that.
+extern "C" fn format_index_message(len: u64, index: u64, buf: *mut u8) -> usize {
+    let text = format!("index out of bounds: the len is {len} but the index is {index}");
+    let bytes = text.as_bytes();
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.len().to_le_bytes().as_ptr(), buf, 8);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.add(8), bytes.len());
+    }
+    bytes.len()
+}
+
 /// A whole compiled program: executable image plus the state its
 /// generated code refers to by absolute address.
 pub struct CompiledProgram {
@@ -159,6 +178,7 @@ pub fn compile_program(
             .map(|s| (s.as_ptr() as usize, s.len()))
             .collect(),
         shift_fmt_fn: format_shift_message as usize,
+        index_fmt_fn: format_index_message as usize,
         shift_buf: shift_buf.as_ptr() as usize,
     };
 
