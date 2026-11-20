@@ -159,7 +159,7 @@ never 型 `!`、inline asm) を書き、fleur 上で
    仮数えせず、JIT 完了まで未実装として扱う。厳しい側に倒す)。
 
 指標1の率 = 実装済みバリアント数 / 40 × 100 (小数第1位まで)。
-現在の値: **52.5% (実装済み 21/40)** (2026-11-21 実測。バリアント別の内訳は次のマトリクス)。
+現在の値: **60.0% (実装済み 24/40)** (2026-11-21 実測。バリアント別の内訳は次のマトリクス)。
 
 
 ### バリアント別マトリクス (2026-11-21 実測)
@@ -186,8 +186,8 @@ never 型 `!`、inline asm) を書き、fleur 上で
 - interp 内部 IR だけを対象とするテストと、ハーネスのコーパス実行は、
   sparagmos-mir のバリアントを直接構築しないため数えていない。
 
-結果: **実装済み 21/40 = 52.5%**、部分的 5 (すべて interp のみ)、
-未対応 14。
+結果: **実装済み 24/40 = 60.0%**、部分的 3 (すべて interp のみ)、
+未対応 13。
 
 **StatementKind (12)**
 
@@ -195,7 +195,7 @@ never 型 `!`、inline asm) を書き、fleur 上で
 |---|---|---|---|---|
 | Assign | ○ | ○ 37件 (mir_convert_tests::checked_add_matches_rustc_shape 他) | ○ 15件 (mir_jit::casts_and_guarded_division 他) | 実装済み |
 | FakeRead | ○ | ○ mir_jit::storage_and_annotation_statements_do_not_affect_execution | ○ mir_jit::storage_and_annotation_statements_do_not_affect_execution | 実装済み |
-| SetDiscriminant | ○ | × | × | 未対応 |
+| SetDiscriminant | ○ | ○ mir_jit::set_discriminant_then_read 他 | ○ mir_jit::set_discriminant_then_read 他 | 実装済み |
 | StorageLive | ○ | ○ mir_jit::storage_and_annotation_statements_do_not_affect_execution | ○ mir_jit::storage_and_annotation_statements_do_not_affect_execution | 実装済み |
 | StorageDead | ○ | ○ mir_jit::storage_and_annotation_statements_do_not_affect_execution | ○ mir_jit::storage_and_annotation_statements_do_not_affect_execution | 実装済み |
 | PlaceMention | ○ | ○ mir_jit::storage_and_annotation_statements_do_not_affect_execution | ○ mir_jit::storage_and_annotation_statements_do_not_affect_execution | 実装済み |
@@ -233,14 +233,14 @@ never 型 `!`、inline asm) を書き、fleur 上で
 | バリアント | ドライバ変換 | interp テスト | JIT テスト | 状態 |
 |---|---|---|---|---|
 | Use | ○ | ○ 29件 (mir_convert_tests::checked_add_matches_rustc_shape 他) | ○ 10件 (mir_jit::checked_add_ok_and_overflow_panic 他) | 実装済み |
-| Repeat | △ 条件付き | ○ mir_convert_tests::tuple_and_array_aggregates_and_repeat | × | 部分的 |
+| Repeat | △ 条件付き | ○ mir_convert_tests::tuple_and_array_aggregates_and_repeat 他 | ○ mir_jit::repeat_const_elements_sum 他 | 実装済み |
 | Ref | ○ | ○ 4件 (mir_convert_tests::copy_for_deref_reads_through_reference_and_plain_place 他) | × | 部分的 |
 | ThreadLocalRef | ○ | × | × | 未対応 |
 | RawPtr | ○ | ○ mir_convert_tests::raw_ptr_creation_reads_and_writes_through | × | 部分的 |
 | Cast | △ 条件付き | ○ 3件 (mir_convert_tests::int_to_int_cast_widens_and_truncates 他) | ○ 2件 (mir_jit::casts_and_guarded_division 他) | 実装済み |
 | BinaryOp | ○ | ○ 23件 (mir_convert_tests::if_else_max 他) | ○ 11件 (mir_jit::casts_and_guarded_division 他) | 実装済み |
 | UnaryOp | ○ | ○ mir_jit::negation | ○ mir_jit::negation | 実装済み |
-| Discriminant | ○ | ○ print_support_tests::range_inclusive_next_loop_sums | × | 部分的 |
+| Discriminant | ○ | ○ print_support_tests::range_inclusive_next_loop_sums 他 | ○ mir_jit::discriminant_of_aggregate_and_constant 他 | 実装済み |
 | Aggregate | ○ | ○ 6件 (mir_convert_tests::tuple_and_array_aggregates_and_repeat 他) | ○ mir_jit::tuple_aggregate_fields_read_back | 実装済み |
 | CopyForDeref | ○ | ○ mir_convert_tests::copy_for_deref_reads_through_reference_and_plain_place | × | 部分的 |
 | WrapUnsafeBinder | × (型なし) | × | × | 未対応 |
@@ -816,7 +816,7 @@ dump が得られても変換済み関数が 0 件だったものが 157 件あ�
 
 | 指標 | 母数 | 現在値 |
 |---|---|---|
-| 指標1 MIR バリアント網羅率 | 40 (確定) | 52.5% (21/40, 2026-11-21 実測) |
+| 指標1 MIR バリアント網羅率 | 40 (確定) | 60.0% (24/40, 2026-11-21 実測) |
 | 副指標1b サブ enum | 上表の通り (確定) | 未測定 (BinOp の出現実測 15/26 のみ) |
 | 指標2(a) 自前コーパス | 45 (tests/corpus) | 100.0% (45/45, 2026-11-21 実測) |
 | 指標2(b) rustc テストサブセット | 24,937 (2026-11-20 機械抽出) | 48.358% (12,059/24,937, 2026-11-21 実測。コンパイル時検証系は成否レベルの一致で、照合系の扱いは stage 2 の節に記載) |
