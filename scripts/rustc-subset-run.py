@@ -2038,6 +2038,41 @@ _UI_SUCCESS_DIRECTIVES = ("check-pass", "build-pass")
 _UI_FAILURE_DIRECTIVES = ("check-fail", "build-fail")
 
 
+# Revision kinds of the incremental suite, in the order of
+# compiletest's IncrRevKind (src/tools/compiletest/src/runtest/
+# incremental.rs): the kind is a prefix of the revision name and
+# fixes the compile outcome that revision must produce.
+_INCREMENTAL_KINDS = (
+    ("cpass", "success"),
+    ("bfail", "failure"),
+    ("bpass", "success"),
+    ("rpass", "success"),
+)
+
+
+def incremental_expectation(view):
+    """The compile outcome one incremental revision must produce.
+
+    Mirrors compiletest's run_incremental_test: the revision name's
+    kind prefix decides whether that revision's compilation must
+    succeed (cpass/bpass/rpass) or fail (bfail), and for bfail the
+    failure must be a clean rejection. An rpass revision also runs
+    the compiled program in compiletest; stage 2 judges the compile
+    outcome only, the same reduction it applies to every suite
+    (compilation-output comparison is likewise not performed). A
+    revision name with no kind prefix is one compiletest itself
+    rejects, and a test without revisions has no per-revision
+    outcome at all; both return None (not judgable).
+    """
+    revision = getattr(view, "revision", None)
+    if revision is None:
+        return None
+    for prefix, expectation in _INCREMENTAL_KINDS:
+        if revision.startswith(prefix):
+            return expectation
+    return None
+
+
 def compile_expectation(suite, header):
     """The compile outcome compiletest expects of a compile-check test.
 
@@ -2048,6 +2083,8 @@ def compile_expectation(suite, header):
     """
     if suite == "crashes":
         return "crash"
+    if suite == "incremental":
+        return incremental_expectation(header)
     if suite in ("ui", "ui-fulldeps"):
         if header.has("run-fail-or-crash"):
             return None
@@ -2432,9 +2469,22 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
     expectation = compile_expectation(rec["suite"], view)
     res["expectation"] = expectation
     if expectation is None:
-        res["reason"] = ("verdict involves executing the program "
-                         "(run-fail-or-crash / run mode), which a "
-                         "compile outcome alone cannot judge")
+        if rec["suite"] == "incremental":
+            if revision is None:
+                res["reason"] = ("incremental test declares no "
+                                 "revisions, so there is no "
+                                 "per-revision compile outcome to "
+                                 "judge (compiletest requires a "
+                                 "revision list for this suite)")
+            else:
+                res["reason"] = (f"revision name {revision!r} does "
+                                 "not start with an incremental kind "
+                                 "(cpass/bfail/bpass/rpass), which "
+                                 "compiletest itself rejects")
+        else:
+            res["reason"] = ("verdict involves executing the program "
+                             "(run-fail-or-crash / run mode), which a "
+                             "compile outcome alone cannot judge")
         res["bucket"] = "not attempted (verdict needs execution)"
         return res
     editions = view.values("edition")
@@ -2514,6 +2564,125 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
     return res
 
 
+# ---------------------------------------------------------------------------
+# Incremental suite: verdicts defined over cross-session state
+# ---------------------------------------------------------------------------
+#
+# compiletest compiles an incremental test's revisions one after
+# another into a single shared incremental directory, so a later
+# revision starts from the earlier sessions' artifacts. Most
+# revisions' verdicts still reduce to a per-revision compile outcome
+# (see incremental_expectation): a warm cache does not change
+# whether a revision's source compiles. Two families are the
+# exception -- their verdict is *defined* over the state carried
+# between sessions, so independent per-revision conversions cannot
+# judge them:
+#
+# - Dep-graph assertions in the test's sources: #[rustc_clean] /
+#   #[rustc_dirty] on items, #![rustc_partition_reused] /
+#   #![rustc_partition_codegened] on the crate. Under
+#   -Z query-dep-graph rustc checks them against the dep graph
+#   loaded from the previous session: an item asserted clean whose
+#   fingerprint a source change altered is a compile error in that
+#   revision, and a codegen partition asserted reused that the
+#   cache does not hold is one too. A fresh conversion has no
+#   previous session, so the assertions cannot take their
+#   compiletest meaning.
+# - A revision whose compile-flags assert the cache state at
+#   startup: -Zassert-incr-state=loaded requires the previous
+#   session's cache to be present and loaded. (=not-loaded asserts
+#   the opposite, which a fresh conversion satisfies by
+#   construction, so it does not block.)
+
+_DEP_GRAPH_ASSERTION_RE = re.compile(
+    r"#\[!?\s*rustc_(clean|dirty|partition_reused|partition_codegened)\b")
+_ASSERT_INCR_STATE_LOADED_RE = re.compile(
+    r"assert-incr-state\s*=\s*loaded\b")
+
+
+def _aux_source_texts(test_path):
+    """(path, text) of the auxiliary crate sources a test builds.
+
+    Best effort, for classification only: the transitively resolved
+    specs when resolution succeeds, plus the files the test's own
+    aux directives (scoped ones included) name, found where
+    compiletest looks for them.
+    """
+    out = []
+    seen = set()
+
+    def add(path):
+        if path not in seen and path.is_file():
+            seen.add(path)
+            try:
+                out.append((path, path.read_text(errors="ignore")))
+            except OSError:
+                pass
+
+    specs, _err = resolve_aux_specs(test_path, top_proc_macro=False)
+    for spec in specs:
+        add(spec.path)
+    header = Header(test_path.read_text(errors="ignore"))
+    fnames = []
+    for name, values in ([(n, header.unscoped.get(n, []))
+                          for n in ("aux-build", "aux-crate",
+                                    "proc-macro")]
+                         + [(n, v) for (r, n), v in
+                            header.scoped.items()
+                            if n in ("aux-build", "aux-crate",
+                                     "proc-macro")]):
+        for value in values:
+            fname = value.strip().split("=")[-1].strip()
+            if fname:
+                fnames.append(fname)
+    test_dir = test_path.parent
+    for fname in fnames:
+        for base in (test_dir / "auxiliary", test_dir):
+            cand = base / fname
+            if cand.is_file():
+                add(cand)
+                break
+    return out
+
+
+def incremental_cross_session_blocker(test_path, text):
+    """Why an incremental test's verdict depends on state carried
+    between compilation sessions, or None.
+
+    Returns (reason, bucket). The check covers the test's own file
+    and the auxiliary crates it builds: any dep-graph assertion, or
+    a compile-flags assertion that the previous session's cache is
+    loaded at startup, makes the verdict cross-session by
+    definition.
+    """
+    for line in text.splitlines():
+        if line.lstrip().startswith("//@") and \
+                _ASSERT_INCR_STATE_LOADED_RE.search(line):
+            return ("compile-flags assert the incremental cache "
+                    "state at startup "
+                    "(-Zassert-incr-state=loaded): the revision "
+                    "must start from the previous session's cache, "
+                    "which independent per-revision conversions do "
+                    "not have",
+                    "out of stage-2 scope (incremental cache-state "
+                    "assertion)")
+    sources = [(test_path, text)] + _aux_source_texts(test_path)
+    for src_path, src_text in sources:
+        m = _DEP_GRAPH_ASSERTION_RE.search(src_text)
+        if m:
+            attr = "rustc_" + m.group(1)
+            where = ("the test file" if src_path == test_path
+                     else f"auxiliary file {src_path.name}")
+            return (f"dep-graph assertion #[{attr}] in {where}: "
+                    "under -Z query-dep-graph the verdict compares "
+                    "dep-graph state against the previous "
+                    "compilation session, which independent "
+                    "per-revision conversions cannot reproduce",
+                    "out of stage-2 scope (incremental dep-graph "
+                    "assertions)")
+    return None
+
+
 def fill_result_stage2(rec, rust_dir, driver_bin, out):
     """Stage-2 counterpart of fill_result for compile-check records.
 
@@ -2533,11 +2702,15 @@ def fill_result_stage2(rec, rust_dir, driver_bin, out):
     text = path.read_text(errors="ignore")
     out["snapshot"] = snapshot_flags(path, text)
     if rec["suite"] == "incremental":
-        out["reason"] = ("incremental suite: the verdict depends on "
-                         "recompilation across sessions, which a single "
-                         "conversion cannot judge")
-        out["bucket"] = "out of stage-2 scope (suite: incremental)"
-        return
+        # Most incremental revisions reduce to a per-revision
+        # compile outcome and are judged below like any other
+        # revision test; only verdicts defined over state carried
+        # between compilation sessions stay out of scope, each with
+        # its own reason.
+        blocker = incremental_cross_session_blocker(path, text)
+        if blocker:
+            out["reason"], out["bucket"] = blocker
+            return
     header = Header(text)
     # Auxiliary crates, as in stage 1: the test's aux directives are
     # resolved transitively and the crates handed to the driver with
