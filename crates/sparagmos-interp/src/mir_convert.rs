@@ -645,11 +645,19 @@ fn scan_place_fields(table: &mut AdtFieldTys, body: &mir::Body, place: &mir::Pla
     for elem in &place.projection {
         match elem {
             mir::PlaceElem::Field(idx, field_ty) => {
-                if let mir::Ty::Adt(def, args) = &ty {
+                // Coroutine places project the state object's fields
+                // the same way ADT places do; the table is keyed by
+                // the coroutine definition and its state (variant).
+                let owner = match &ty {
+                    mir::Ty::Adt(def, args) => Some((*def, args.clone())),
+                    mir::Ty::Coroutine(def, args) => Some((*def, args.clone())),
+                    _ => None,
+                };
+                if let Some((def, args)) = owner {
                     table.record(
                         AdtFieldKey {
-                            def: *def,
-                            generic_args: args.clone(),
+                            def,
+                            generic_args: args,
                             variant,
                             field: *idx,
                         },
@@ -875,22 +883,31 @@ fn scan_body_aggregates(
             if let mir::StatementKind::Assign(pair) = &stmt.kind {
                 let (_, rv) = &**pair;
                 if let mir::Rvalue::Aggregate(kind, ops) = rv {
-                    if let mir::AggregateKind::Adt {
-                        def,
-                        variant_index,
-                        generic_args,
-                        ..
-                    } = &**kind
-                    {
-                        counts.record(*def, generic_args.clone(), *variant_index, ops.len());
+                    // A coroutine creation aggregate is recorded as
+                    // its unresumed state (variant 0), like an ADT
+                    // aggregate of that variant.
+                    let aggregate_key = match &**kind {
+                        mir::AggregateKind::Adt {
+                            def,
+                            variant_index,
+                            generic_args,
+                            ..
+                        } => Some((*def, generic_args.clone(), *variant_index)),
+                        mir::AggregateKind::Coroutine { def, generic_args } => {
+                            Some((*def, generic_args.clone(), 0))
+                        }
+                        _ => None,
+                    };
+                    if let Some((def, generic_args, variant_index)) = aggregate_key {
+                        counts.record(def, generic_args.clone(), variant_index, ops.len());
                         for (i, op) in ops.iter().enumerate() {
                             if let Some(place) = op.place() {
                                 if let Some(ty) = operand_place_ty(body, place) {
                                     fields.record(
                                         AdtFieldKey {
-                                            def: *def,
+                                            def,
                                             generic_args: generic_args.clone(),
-                                            variant: *variant_index,
+                                            variant: variant_index,
                                             field: i as u32,
                                         },
                                         ty,
@@ -1096,6 +1113,13 @@ impl<'a> Converter<'a> {
             // fat pointer's dereference reaches. Only the bounds'
             // names are kept.
             mir::Ty::Dynamic(traits, _, _) => ir::Ty::Dynamic(traits.clone()),
+            // A coroutine type: the value is the state object the
+            // coroutine transform produces (see `ir::Ty::Coroutine`).
+            // Only the body's name is kept; the state layout is
+            // carried by the value, and the generic arguments (upvars,
+            // resume / yield / return types, witness) are not needed
+            // to execute the transformed body.
+            mir::Ty::Coroutine(def, _) => ir::Ty::Coroutine(self.def_display_name(def)),
             _ => return Err(unsupported()),
         })
     }
@@ -1758,6 +1782,26 @@ impl<'a> Converter<'a> {
                         def: self.def_display_name(def),
                         operands: fields,
                     }
+                }
+                mir::AggregateKind::Coroutine { def, generic_args } => {
+                    // The creation aggregate fills the unresumed
+                    // state's fields: the upvars. Their declared
+                    // types come from the field table (the coroutine
+                    // body's own projections of state 0), with the
+                    // upvars tuple - the coroutine type's first
+                    // generic argument - as the fallback.
+                    let upvar_tys: Vec<mir::Ty> = match generic_args.first() {
+                        Some(mir::Ty::Tuple(ts)) => ts.clone(),
+                        _ => Vec::new(),
+                    };
+                    let mut fields = Vec::with_capacity(ops.len());
+                    for (i, op) in ops.iter().enumerate() {
+                        let declared =
+                            self.adt_fields.get(*def, generic_args, 0, i as u32);
+                        let ctx = declared.or_else(|| upvar_tys.get(i));
+                        fields.push(self.convert_operand(body, op, ctx)?);
+                    }
+                    ir::Rvalue::CoroutineAggregate(fields)
                 }
                 other => ir::Rvalue::Unsupported(format!("Aggregate {}", other.kind_name())),
             },
@@ -2792,6 +2836,22 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                 self.adts[index] = plan;
                 Some(P::Adt { index })
             }
+            mir::Ty::Coroutine(def, args) => {
+                let key = format!("{ty:?}");
+                if let Some(&index) = self.adt_index.get(&key) {
+                    return Some(P::Adt { index });
+                }
+                let index = self.adts.len();
+                self.adt_index.insert(key, index);
+                // Placeholder while this coroutine's fields are
+                // planned, so a recursive occurrence (a future
+                // awaiting another future of the same type) refers
+                // back to this entry.
+                self.adts.push(P::Trivial);
+                let plan = self.coroutine_plan(*def, args)?;
+                self.adts[index] = plan;
+                Some(P::Adt { index })
+            }
             _ => None,
         }
     }
@@ -2878,18 +2938,16 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
         Some(collapse_seq(steps))
     }
 
-    /// The field glue of one ADT, across its variants: a single
-    /// `Fields` plan for a struct, a `Variants` plan for an enum.
-    fn variant_fields_plan(
-        &mut self,
+    /// Variant indices of one ADT / coroutine instantiation with
+    /// any evidence in the program: field projections, aggregate
+    /// constructions, the discriminant table. Variant 0 always
+    /// exists (every ADT and every coroutine has one).
+    fn evidenced_variants(
+        &self,
         def: mir::DefId,
         args: &[mir::Ty],
-    ) -> Option<ir::DropPlan> {
-        use ir::DropPlan as P;
+    ) -> std::collections::BTreeSet<u32> {
         let conv = self.conv;
-        // Variant indices with any evidence in the program: field
-        // projections, aggregate constructions, the discriminant
-        // table. Variant 0 always exists (every ADT has one).
         let mut variants: std::collections::BTreeSet<u32> = Default::default();
         variants.insert(0);
         for (key, _) in &conv.adt_fields.entries {
@@ -2907,6 +2965,47 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                 variants.insert(v as u32);
             }
         }
+        variants
+    }
+
+    /// The drop glue of one coroutine instantiation: the live
+    /// state's fields, state by state. Coroutine layouts are dense
+    /// (unresumed, one state per suspension point, then the returned
+    /// and panicked states), and a state's fields are all projected
+    /// by the body that saves or resumes it - so a state with no
+    /// evidence holds no fields to drop. The returned and panicked
+    /// states, which follow the last suspension state and never
+    /// hold fields (the unwinding path drops the live locals before
+    /// the tag is set to panicked), are covered by extending the
+    /// plan two past the last evidenced state.
+    fn coroutine_plan(
+        &mut self,
+        def: mir::DefId,
+        args: &[mir::Ty],
+    ) -> Option<ir::DropPlan> {
+        use ir::DropPlan as P;
+        let variants = self.evidenced_variants(def, args);
+        let max_v = *variants.iter().max().expect("variant 0 present") + 2;
+        let mut plans = Vec::new();
+        for v in 0..=max_v {
+            if !variants.contains(&v) {
+                plans.push(P::Trivial);
+                continue;
+            }
+            plans.push(self.one_variant_fields(def, args, v)?);
+        }
+        Some(P::Variants { variants: plans })
+    }
+
+    /// The field glue of one ADT, across its variants: a single
+    /// `Fields` plan for a struct, a `Variants` plan for an enum.
+    fn variant_fields_plan(
+        &mut self,
+        def: mir::DefId,
+        args: &[mir::Ty],
+    ) -> Option<ir::DropPlan> {
+        use ir::DropPlan as P;
+        let variants = self.evidenced_variants(def, args);
         let max_v = *variants.iter().max().expect("variant 0 present");
         let mut plans = Vec::new();
         for v in 0..=max_v {

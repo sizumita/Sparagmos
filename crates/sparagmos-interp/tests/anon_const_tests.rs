@@ -22,12 +22,14 @@ fn unit_ty() -> mir::Ty {
     mir::Ty::Tuple(Vec::new())
 }
 
-/// A coroutine type: outside the interpreter's type model, so
-/// any body holding one as a local fails conversion. (This fixture
-/// used a `dyn Trait` local until the Dynamic type model landed;
-/// a coroutine local keeps the same unconvertible-body role.)
+/// A coroutine witness type: outside the interpreter's type
+/// model, so any body holding one as a local fails conversion.
+/// (This fixture used a `dyn Trait` local until the Dynamic type
+/// model landed, then a coroutine local until coroutine state
+/// objects were modelled; the witness type keeps the same
+/// unconvertible-body role.)
 fn dyn_ty() -> mir::Ty {
-    mir::Ty::Coroutine(mir::DefId::new(0, 7), Vec::new())
+    mir::Ty::CoroutineWitness(mir::DefId::new(0, 7), Vec::new())
 }
 
 fn decls(tys: &[mir::Ty]) -> Vec<mir::LocalDecl> {

@@ -185,6 +185,18 @@ pub enum Ty {
     /// pointers; the erased concrete type is carried by the value,
     /// not the type.
     Dynamic(Vec<String>),
+    /// A coroutine type (an `async` block / `async fn` future, a
+    /// `gen` block): the coroutine body's name, as the driver
+    /// renders the definition. By the time a body reaches this
+    /// conversion, rustc's coroutine state transform has already run:
+    /// the value is the state object - a discriminant (the state:
+    /// unresumed, one per suspension point, returned, panicked) plus
+    /// the fields live in that state - and the coroutine body is an
+    /// ordinary function that dispatches on the discriminant, saves
+    /// state through downcast field writes, and returns
+    /// `Poll` / `CoroutineState` values. Values of this type are
+    /// [`crate::value::Value::Coroutine`].
+    Coroutine(String),
 }
 
 impl Ty {
@@ -423,6 +435,13 @@ pub enum Rvalue {
     /// place; when the value there is a reference, reads through it
     /// once more.
     CopyForDeref(Place),
+    /// Build a coroutine state object (`AggregateKind::Coroutine`):
+    /// the operands are the captured upvars, in field order. The
+    /// object starts in the unresumed state (variant 0), whose
+    /// fields are exactly the upvars; later states' fields are
+    /// written by the coroutine body itself through downcast field
+    /// writes.
+    CoroutineAggregate(Vec<Operand>),
     /// Any rvalue kind not modelled yet; executing it is an explicit error.
     Unsupported(String),
 }

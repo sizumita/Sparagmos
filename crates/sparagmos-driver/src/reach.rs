@@ -405,6 +405,12 @@ pub fn unrepresentable_local(body: &sm::Body) -> Option<String> {
             | sm::Ty::Never
             | sm::Ty::Str
             | sm::Ty::Dynamic(..)
+            // A coroutine type is representable: the interpreter
+            // models the state object the coroutine transform
+            // produces (its generic arguments - upvars, resume /
+            // yield / return types, witness - are not themselves
+            // locals and need no representation).
+            | sm::Ty::Coroutine(..)
             | sm::Ty::Adt(..) => None,
             sm::Ty::Float(ft) => match ft {
                 sm::FloatTy::F32 | sm::FloatTy::F64 => None,

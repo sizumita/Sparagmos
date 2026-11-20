@@ -178,10 +178,13 @@ fn body_with_local(ty: mir::Ty) -> mir::Body {
 }
 
 #[test]
-fn coroutine_typed_local_fails_conversion_with_reason() {
+fn coroutine_witness_typed_local_fails_conversion_with_reason() {
+    // Coroutine state objects themselves are modelled; the
+    // coroutine *witness* type is not, so a body holding one as
+    // a local still fails conversion.
     assert_unsupported_type(
-        body_with_local(mir::Ty::Coroutine(mir::DefId::new(0, 1), Vec::new())),
-        "Coroutine",
+        body_with_local(mir::Ty::CoroutineWitness(mir::DefId::new(0, 1), Vec::new())),
+        "CoroutineWitness",
     );
 }
 

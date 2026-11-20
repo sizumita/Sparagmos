@@ -53,6 +53,17 @@
 //!   reads its captures through field projections on it, exactly as
 //!   it reads `(*env).<field>` in rustc MIR.
 //!
+//! - [`Value::Coroutine`] is a coroutine state object (the value of
+//!   a future / generator): a state discriminant plus the fields
+//!   live in that state. Unlike [`Value::Enum`], its fields are the
+//!   shared state storage the coroutine transform lays out: the body
+//!   writes one state's fields through downcast projections *before*
+//!   the discriminant is set to that state, and setting the
+//!   discriminant never clears the fields - the transform relies on
+//!   values saved in the storage surviving the tag change, and on
+//!   field slots being addressed per (state, field) through explicit
+//!   copies whenever the layout moves a value between slots.
+//!
 //! - [`Value::FmtArguments`] is a built `std::fmt::Arguments` value:
 //!   either a plain string (`from_str`) or a pieces template plus the
 //!   snapshot of its argument array (`Arguments::new`).
@@ -191,6 +202,13 @@ pub enum Value {
     /// A closure value: the closure body's name plus the captured
     /// environment, in the field order of the closure aggregate.
     Closure { def: String, env: Vec<Value> },
+    /// A coroutine state object: the state discriminant (0 =
+    /// unresumed, then one per suspension point, then the returned
+    /// and panicked states - the exact numbering is the coroutine
+    /// layout's, read back by the body's entry `SwitchInt`) plus
+    /// the state storage fields. See the module docs for how this
+    /// differs from [`Value::Enum`].
+    Coroutine { variant: u32, fields: Vec<Value> },
 }
 
 impl Value {
@@ -214,6 +232,7 @@ impl Value {
             Value::FmtArguments(_) => "fmt arguments",
             Value::FnPtr(_) => "function pointer",
             Value::Closure { .. } => "closure",
+            Value::Coroutine { .. } => "coroutine",
         }
     }
 
@@ -322,6 +341,9 @@ impl fmt::Display for Value {
             Value::FnPtr(name) => write!(f, "<fn {name}>"),
             Value::Closure { def, env } => {
                 write!(f, "<closure {def} ({} captures)>", env.len())
+            }
+            Value::Coroutine { variant, fields } => {
+                write!(f, "<coroutine state {variant} ({} fields)>", fields.len())
             }
         }
     }
