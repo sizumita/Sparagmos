@@ -173,3 +173,123 @@ fn run_mode_materialised_constant_shapes() {
         "decoded constant values must match the source program"
     );
 }
+
+const TAIL_CALL_SRC: &str = r#"
+#![allow(incomplete_features)]
+#![feature(explicit_tail_calls)]
+fn countdown(n: u32) -> u32 {
+    if n == 0 { 0 } else { become countdown(n - 1) }
+}
+fn main() { let _ = countdown(3); }
+"#;
+
+const ASYNC_CLOSURE_SRC: &str = r#"
+fn main() {
+    let f = async move |x: i32| x + 1;
+    let _ = &f;
+}
+"#;
+
+const LOG_SYNTAX_SRC: &str = r#"
+#![feature(log_syntax)]
+fn main() {
+    log_syntax!("compile-time marker");
+    println!("guest marker");
+}
+"#;
+
+
+#[test]
+fn run_mode_tail_call_conversion_panic_exits_two() {
+    // Converting a `become` (explicit tail call) makes rustc_public
+    // panic (`unimplemented!()` in Stable MIR's terminator
+    // conversion). The driver must catch that panic at the compiler
+    // boundary and report it under the run-mode contract — exit 2
+    // with the panic message as the reason — instead of dying with
+    // the panic (exit 101 and a default panic dump on stderr).
+    let dir = temp_dir("tailcall");
+    let src = fixture(&dir, "tailcall.rs", TAIL_CALL_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a conversion panic is a conversion failure (exit 2), not a process panic; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("Stable MIR conversion panicked"),
+        "the reason names the conversion panic: {stderr}"
+    );
+    assert!(
+        stderr.contains("not implemented"),
+        "the reason carries the panic message: {stderr}"
+    );
+    assert!(
+        !stderr.contains("RUST_BACKTRACE"),
+        "the default panic dump is suppressed, the message is reported as the reason: {stderr}"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "run mode keeps stdout clean: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+
+#[test]
+fn run_mode_async_closure_conversion_panic_exits_two() {
+    // Async closures hit a different `unimplemented!()` inside
+    // Stable MIR (type conversion: "FIXME(async_closures)"). Same
+    // contract as the tail-call case: exit 2, panic message as the
+    // reason, no process panic.
+    let dir = temp_dir("asyncclosure");
+    let src = fixture(&dir, "asyncclosure.rs", ASYNC_CLOSURE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a conversion panic is a conversion failure (exit 2), not a process panic; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("Stable MIR conversion panicked"),
+        "the reason names the conversion panic: {stderr}"
+    );
+    assert!(
+        stderr.contains("async_closures"),
+        "the reason carries the panic message: {stderr}"
+    );
+    assert!(
+        !stderr.contains("RUST_BACKTRACE"),
+        "the default panic dump is suppressed, the message is reported as the reason: {stderr}"
+    );
+}
+
+
+#[test]
+fn run_mode_log_syntax_output_stays_off_stdout() {
+    // `log_syntax!` prints to the *compiler's* stdout at compile
+    // time. The compiler runs in-process, so without redirection
+    // that output would land in the driver's stdout — which run
+    // mode reserves for the guest program's output. It must appear
+    // on stderr (compiler-side diagnostics) instead, leaving stdout
+    // byte-identical to the guest's own output.
+    let dir = temp_dir("logsyntax");
+    let src = fixture(&dir, "logsyntax.rs", LOG_SYNTAX_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the program itself runs fine; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "guest marker\n",
+        "stdout carries the guest's output alone"
+    );
+    assert!(
+        stderr.contains("compile-time marker"),
+        "the log_syntax output is redirected to stderr: {stderr}"
+    );
+}

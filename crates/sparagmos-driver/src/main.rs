@@ -18,6 +18,16 @@
 //! stderr). Run mode writes the guest program's captured stdout to
 //! its own stdout (in every outcome — a native program's output is
 //! likewise observable when it panics).
+//!
+//! Conversion can also fail *inside* Stable MIR itself: some MIR
+//! constructs make `rustc_public` panic (`unimplemented!()`). Those
+//! panics are caught at the compiler-run boundary and reported like
+//! any other conversion failure (run mode: exit 2, with the panic
+//! message as the reason). While the compiler runs, its stdout is
+//! redirected to stderr: compile-time output (e.g. `log_syntax!`)
+//! is compiler-side diagnostics, and this process's stdout is
+//! reserved for the driver's report — in run mode, for the guest's
+//! output alone.
 
 #![feature(rustc_private)]
 
@@ -57,6 +67,152 @@ fn stash(c: Collected) {
 
 fn take() -> Option<Collected> {
     COLLECTED.get()?.lock().unwrap().take()
+}
+
+/// The process panic hook, as returned by `std::panic::take_hook`.
+type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static>;
+
+/// First panic message observed while the panic-capture hook is
+/// installed (see `begin_panic_capture`). The hook also fires for
+/// panics on the compiler's own threads and for panics the compiler
+/// handles internally; the recorded message is only consumed when a
+/// panic actually escapes the compiler run (the `catch_unwind` in
+/// `main`), so a handled panic never changes the outcome.
+static PANIC_CAPTURE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Format a panic as a concrete reason: the payload text when the
+/// payload is a string, plus the panic location when known. The
+/// compiler also panics with non-string marker payloads; those are
+/// reported as such, with the location still identifying where the
+/// conversion gave up.
+fn panic_reason(info: &std::panic::PanicHookInfo<'_>) -> String {
+    let message = if let Some(s) = info.payload().downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = info.payload().downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "panic with a non-string payload".to_string()
+    };
+    match info.location() {
+        Some(loc) => format!(
+            "{message} (panicked at {}:{}:{})",
+            loc.file(),
+            loc.line(),
+            loc.column()
+        ),
+        None => message,
+    }
+}
+
+/// Reason text from a caught panic payload, when it is a string.
+fn payload_reason(payload: &(dyn std::any::Any + Send)) -> Option<String> {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        Some((*s).to_string())
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        Some(s.clone())
+    } else {
+        None
+    }
+}
+
+/// Install a panic hook that records the first panic's message into
+/// `PANIC_CAPTURE` and prints nothing. While the compiler runs, the
+/// default panic dump must not leak into this process's stderr: run
+/// mode reserves stderr for the contract messages, and the captured
+/// message is reported as the conversion-failure reason instead.
+/// Returns the previous hook, to be restored by `end_panic_capture`
+/// as soon as the compiler run is over — panics outside the run
+/// (e.g. in the interpreter) keep the normal reporting.
+fn begin_panic_capture() -> PanicHook {
+    if let Ok(mut slot) = PANIC_CAPTURE.lock() {
+        *slot = None;
+    }
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|info| {
+        if let Ok(mut slot) = PANIC_CAPTURE.lock() {
+            if slot.is_none() {
+                *slot = Some(panic_reason(info));
+            }
+        }
+    }));
+    previous
+}
+
+fn end_panic_capture(previous: PanicHook) {
+    std::panic::set_hook(previous);
+}
+
+fn take_captured_panic() -> Option<String> {
+    PANIC_CAPTURE.lock().ok().and_then(|mut slot| slot.take())
+}
+
+/// Guard that points the process's stdout file descriptor at stderr
+/// for the duration of the compiler run. The compiler runs
+/// in-process, so anything it prints to *its* stdout at compile
+/// time (the `log_syntax!` macro is the known case) would otherwise
+/// land in this process's stdout — which run mode reserves for the
+/// guest program's output, and summary mode for the driver's own
+/// report. Compiler-side output is diagnostic in nature, so it
+/// belongs on stderr. Restore explicitly via `restore` once the run
+/// is over; dropping the guard restores as a safety net.
+#[cfg(unix)]
+struct StdoutToStderr {
+    saved: Option<std::os::unix::io::RawFd>,
+}
+
+#[cfg(unix)]
+impl StdoutToStderr {
+    fn new() -> Self {
+        use std::io::Write;
+        // Flush anything buffered before swapping the descriptor,
+        // so it cannot surface on the wrong stream afterwards.
+        let _ = std::io::stdout().flush();
+        let saved = unsafe { libc::dup(libc::STDOUT_FILENO) };
+        if saved < 0 {
+            return Self { saved: None };
+        }
+        if unsafe { libc::dup2(libc::STDERR_FILENO, libc::STDOUT_FILENO) } < 0 {
+            unsafe { libc::close(saved) };
+            return Self { saved: None };
+        }
+        Self { saved: Some(saved) }
+    }
+
+    fn restore(&mut self) {
+        use std::io::Write;
+        if let Some(saved) = self.saved.take() {
+            // Flush compile-time output still buffered in Rust's
+            // stdout handle so it goes to stderr, as intended,
+            // instead of leaking into the restored stdout.
+            let _ = std::io::stdout().flush();
+            unsafe {
+                libc::dup2(saved, libc::STDOUT_FILENO);
+                libc::close(saved);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for StdoutToStderr {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+/// No-op counterpart on non-Unix platforms (the driver is developed
+/// and measured on Linux; the descriptor swap has no portable
+/// equivalent there).
+#[cfg(not(unix))]
+struct StdoutToStderr;
+
+#[cfg(not(unix))]
+impl StdoutToStderr {
+    fn new() -> Self {
+        Self
+    }
+
+    fn restore(&mut self) {}
 }
 
 fn collect() -> ControlFlow<()> {
@@ -323,7 +479,39 @@ fn main() {
         format!("--out-dir={}", out_dir.display()),
         format!("--sysroot={sysroot}"),
     ];
-    let result = rustc_public::run!(args.as_slice(), collect);
+    // The compiler runs in-process, under two disciplines:
+    // - A panic raised inside Stable MIR conversion (the
+    //   `unimplemented!()`s hit by explicit tail calls, async
+    //   closures and generators) must not kill this process: it is
+    //   caught here and reported as a conversion failure, with the
+    //   panic message as the concrete reason (exit 2 in run mode).
+    // - Anything the compiler prints to its stdout at compile time
+    //   (e.g. `log_syntax!` output) is redirected to stderr: this
+    //   process's stdout is reserved for the driver's own report —
+    //   in run mode, for the guest program's output alone.
+    let previous_hook = begin_panic_capture();
+    let mut stdout_guard = StdoutToStderr::new();
+    let run_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rustc_public::run!(args.as_slice(), collect)
+    }));
+    stdout_guard.restore();
+    end_panic_capture(previous_hook);
+    let result = match run_outcome {
+        Ok(result) => result,
+        Err(payload) => {
+            let reason = take_captured_panic()
+                .or_else(|| payload_reason(&*payload))
+                .unwrap_or_else(|| "panic with a non-string payload".to_string());
+            if run_mode {
+                eprintln!(
+                    "sparagmos-driver run: unsupported: Stable MIR conversion panicked: {reason}"
+                );
+                std::process::exit(2);
+            }
+            eprintln!("sparagmos-driver: Stable MIR conversion panicked: {reason}");
+            std::process::exit(1);
+        }
+    };
     let collected = take();
     match (result, collected) {
         (Ok(()), Some(c)) => {
