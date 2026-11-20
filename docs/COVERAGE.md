@@ -763,6 +763,62 @@ C ABI の main と pthread FFI をドライバが未対応と返した)。
 に機械可読な形で残る。再実行は
 `python3 scripts/rustc-subset-runmake.py --survey-json <survey JSON> --rust-dir <チェックアウト> --driver-bin <ドライバ> --out <結果 JSON>`。
 
+### 指標2(b) exec-debugger カテゴリの実測 (2026-11-21)
+
+`scripts/rustc-subset-debugger.py` による分類と実測。exec-debugger
+カテゴリ (debuginfo スイート 170 件) の合否は、デバッガの
+セッションで決まる。compiletest はテストファイルを
+`//@ compile-flags: -g` でコンパイルしてデバッグ情報を持つ
+ネイティブバイナリを作り、ファイル内の `//@ <dbg>-command:` 行と
+`#break` 行から組み立てたスクリプトで GDB / LLDB / CDB
+(Windows のデバッガ) の下で実行し、`//@ <dbg>-check:` 行が
+デバッガの標準出力に順序通り現れるかを照合する。`<dbg>-repr:` は
+debugger_tester が横取りする擬似コマンドで、暗黙の照合行も生む。
+照合の対象は、バイナリのデバッグ情報をデバッガが描いた
+プログラムの状態であり、rustc の pretty printer や
+debugger_tester のスクリプト (src/etc) の振る舞いも含まれる。
+
+Sparagmos の主経路はネイティブバイナリもデバッグ情報も
+生成せず、デバッガのインターフェースも持たない。したがって
+このカテゴリで主経路が判定できるテストは無く、パスは
+0 / 170 = 0% である。170 件全てを未実行として fail に数え、
+母数から外していない。以下は全件の機械的な分類である。
+
+分類結果 (170 件):
+
+| 観点 | 内訳 |
+|---|---|
+| 合否の形 | デバッガ出力の照合 158、デバッガセッションの完走のみ 3、コンパイルとロードのみ 9 |
+| デバッガのスクリプトの組合せ | gdb+lldb 89、gdb のみ 28、gdb+lldb+cdb 15、cdb のみ 17、cdb+gdb 7、lldb のみ 4、cdb+lldb 1、なし 9 |
+| スクリプトを持つテスト | gdb 139、lldb 109、cdb 40 |
+| 照合行 / コマンド行 | 照合 3,054 行 (repr 由来の暗黙の照合 37 を含む)、コマンド 3,634 行 |
+| 追加の依存 | rustc の GDB pretty printer を使う 40、pretty printer を無効化 105、repr 擬似コマンド 2、should-fail 1、ignore-test 1、only-cdb 7 |
+| プログラムの形 | 単一ファイル 165、補助ファイル必須 5、FFI 2、複数リビジョン 14 |
+
+参考実測として、合否とは別に、対象プログラム自体が主経路で
+実行できるかを測った。対象は、単一ファイルでリビジョン指定が
+無く、この環境 (x86_64-unknown-linux-gnu) に適用でき、
+compile-flags がデバッグ情報の指定 (-g、`-C debuginfo` 系、
+`--crate-name`) の範囲に収まる 118 件で、ドライバの run
+モードで実行した (主経路はデバッグ情報を生成しないため、
+これらのフラグはドライバの動作を変えない)。結果は完走 38 件、
+panic 1 件、unsupported 79 件で、ドライバの異常終了と
+タイムアウトは 0 件だった。未実行の 52 件は、リビジョン指定
+(宣言またはスコープ付き指令) 31、only-cdb 7、複数ファイル 5、
+only-msvc 3、ignore-test 1、デバッグ情報以外の compile-flags
+5 である。unsupported の主因は主経路側の通常の未対応で、
+BoxDerefTransmute キャスト 15 件、本体の変換が無い関数への
+呼び出し (std::process::exit など)、Drop ターミネータ、
+Transmute キャスト、f16 定数が上位に並ぶ。この実測は
+プログラム自体の実行可否を示すだけであり、完走した
+プログラムにもデバッガのセッションと照合対象の出力は
+存在しないため、パスには数えない。
+
+測定条件: ドライバ実行のタイムアウトは 1 件あたり 60 秒、
+並列 48。テストごとの結果は結果 JSON に機械可読な形で残る。
+再実行は
+`python3 scripts/rustc-subset-debugger.py --survey-json <survey JSON> --rust-dir <チェックアウト> --driver-bin <ドライバ> --out <結果 JSON>`。
+
 ---
 
 ## 指標3: std 機能網羅率
