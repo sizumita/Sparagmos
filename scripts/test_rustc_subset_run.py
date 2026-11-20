@@ -208,5 +208,247 @@ class ProcessTestTests(unittest.TestCase):
         self.assertIn("nature", res["bucket"])
 
 
+
+
+class CompileExpectationTests(unittest.TestCase):
+    def test_ui_default_is_check_fail(self):
+        h = header("fn main() { let x: u8 = \"s\"; }\n")
+        self.assertEqual(run.compile_expectation("ui", h), "failure")
+
+    def test_ui_check_pass_and_build_pass(self):
+        self.assertEqual(
+            run.compile_expectation("ui", header("//@ check-pass\n")),
+            "success")
+        self.assertEqual(
+            run.compile_expectation("ui", header("//@ build-pass\n")),
+            "success")
+
+    def test_ui_explicit_failures(self):
+        self.assertEqual(
+            run.compile_expectation("ui", header("//@ check-fail\n")),
+            "failure")
+        self.assertEqual(
+            run.compile_expectation("ui", header("//@ build-fail\n")),
+            "failure")
+
+    def test_run_fail_or_crash_is_not_judgable(self):
+        h = header("//@ run-fail-or-crash\n")
+        self.assertIsNone(run.compile_expectation("ui", h))
+
+    def test_crashes_suite_expects_crash(self):
+        self.assertEqual(
+            run.compile_expectation("crashes", header("//@ known-bug: #1\n")),
+            "crash")
+
+    def test_output_suites_expect_success(self):
+        for suite in ("mir-opt", "codegen-llvm", "codegen-units",
+                      "assembly-llvm", "pretty"):
+            self.assertEqual(
+                run.compile_expectation(suite, header("fn main() {}\n")),
+                "success", suite)
+
+
+class Stage2BlockerTests(unittest.TestCase):
+    def rec(self):
+        return {"suite": "ui", "path": "tests/ui/x.rs",
+                "nature": "compile-check", "single_file": True,
+                "ffi": False, "env_excluded": False}
+
+    def test_plain_check_fail_has_no_blocker(self):
+        self.assertIsNone(run.stage2_blocker(header("//@ check-fail\n"),
+                                             self.rec()))
+
+    def test_compile_flags_block(self):
+        h = header("//@ compile-flags: -Z unstable-options\n")
+        self.assertIn("compile-flags", run.stage2_blocker(h, self.rec()))
+
+    def test_add_minicore_blocks(self):
+        h = header("//@ add-minicore\n")
+        self.assertIn("minicore", run.stage2_blocker(h, self.rec()))
+
+    def test_rustc_env_blocks(self):
+        h = header("//@ rustc-env: FOO=1\n")
+        self.assertIn("rustc-env", run.stage2_blocker(h, self.rec()))
+
+    def test_revisions_block(self):
+        h = header("//@ revisions: a b\n//@[a] check-pass\n")
+        self.assertIn("revisions", run.stage2_blocker(h, self.rec()))
+
+
+def conv(**kw):
+    base = {"exit_code": 0, "timeout": False, "converted": 3,
+            "skipped": 0, "skip_totals": [], "compilation_failed": False,
+            "ice": False, "stderr": "", "stdout": ""}
+    base.update(kw)
+    return base
+
+
+class JudgeCompileTests(unittest.TestCase):
+    def test_success_fully_converted_passes(self):
+        self.assertEqual(run.judge_compile("success", conv()),
+                         ("pass", "", ""))
+
+    def test_success_with_skips_is_unsupported(self):
+        status, reason, bucket = run.judge_compile(
+            "success",
+            conv(skipped=1,
+                 skip_totals=[("TerminatorKind::InlineAsm", 1)]))
+        self.assertEqual(status, "unsupported")
+        self.assertIn("InlineAsm", reason)
+        self.assertIn("InlineAsm", bucket)
+
+    def test_success_but_compilation_failed_is_fail(self):
+        status, _r, bucket = run.judge_compile(
+            "success", conv(exit_code=1, compilation_failed=True,
+                            converted=None, skipped=None,
+                            stderr="error[E0308]: mismatched types"))
+        self.assertEqual(status, "fail")
+        self.assertIn("compilation failed", bucket)
+
+    def test_success_but_driver_crash_is_fail(self):
+        status, _r, bucket = run.judge_compile(
+            "success", conv(exit_code=101, converted=None, skipped=None))
+        self.assertEqual(status, "fail")
+        self.assertEqual(bucket, "driver crash")
+
+    def test_failure_clean_rejection_passes(self):
+        status, _r, _b = run.judge_compile(
+            "failure", conv(exit_code=1, compilation_failed=True,
+                            converted=None, skipped=None))
+        self.assertEqual(status, "pass")
+
+    def test_failure_but_converted_is_fail(self):
+        status, _r, bucket = run.judge_compile("failure", conv())
+        self.assertEqual(status, "fail")
+        self.assertIn("conversion succeeded", bucket)
+
+    def test_failure_but_ice_is_fail(self):
+        status, _r, bucket = run.judge_compile(
+            "failure", conv(exit_code=101, ice=True, converted=None,
+                            skipped=None))
+        self.assertEqual(status, "fail")
+        self.assertIn("crash", bucket)
+
+    def test_crash_reproduced_passes(self):
+        status, _r, _b = run.judge_compile(
+            "crash", conv(exit_code=101, ice=True, converted=None,
+                          skipped=None))
+        self.assertEqual(status, "pass")
+
+    def test_crash_no_longer_crashes(self):
+        self.assertEqual(
+            run.judge_compile("crash", conv())[0], "fail")
+        self.assertEqual(
+            run.judge_compile(
+                "crash", conv(exit_code=1, compilation_failed=True,
+                              converted=None, skipped=None))[0],
+            "fail")
+
+    def test_timeout_is_fail(self):
+        status, _r, bucket = run.judge_compile(
+            "success", conv(exit_code=None, timeout=True))
+        self.assertEqual(status, "fail")
+        self.assertEqual(bucket, "timeout")
+
+
+class SnapshotFlagsTests(unittest.TestCase):
+    def test_flags_from_siblings_and_text(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            (d / "t.rs").write_text("//~^ ERROR mismatched types\n")
+            (d / "t.stderr").write_text("error: ...")
+            (d / "t.fixed").write_text("fn main() {}\n")
+            flags = run.snapshot_flags(d / "t.rs",
+                                       "//~^ ERROR mismatched types\n")
+            self.assertTrue(flags["stderr_snapshot"])
+            self.assertTrue(flags["fixed_file"])
+            self.assertTrue(flags["error_annotations"])
+            self.assertFalse(flags["mir_snapshot"])
+            self.assertFalse(flags["filecheck"])
+
+
+class ProcessStage2Tests(unittest.TestCase):
+    """process_test(stage2=True) with convert_side stubbed."""
+
+    def setUp(self):
+        self.tmp = Path(self.enterContext(__import__("tempfile")
+                                         .TemporaryDirectory()))
+        (self.tmp / "tests" / "ui").mkdir(parents=True)
+        self.rust_dir = self.tmp
+
+    def write_test(self, body, suite="ui"):
+        p = self.rust_dir / "tests" / "ui" / "t.rs"
+        p.write_text(body)
+        return {"suite": suite, "path": "tests/ui/t.rs",
+                "nature": "compile-check", "single_file": True,
+                "ffi": False, "env_excluded": False}
+
+    def run_with_conv(self, rec, conv_result):
+        orig = run.convert_side
+        run.convert_side = lambda *a: conv_result
+        try:
+            return run.process_test(rec, self.rust_dir,
+                                    Path("/fake/driver"), stage2=True)
+        finally:
+            run.convert_side = orig
+
+    def test_check_fail_clean_rejection_passes(self):
+        rec = self.write_test("//@ check-fail\nfn main() { let x: u8 = \"s\"; }\n")
+        res = self.run_with_conv(
+            rec, conv(exit_code=1, compilation_failed=True,
+                      converted=None, skipped=None))
+        self.assertEqual(res["status"], "pass")
+        self.assertEqual(res["stage"], 2)
+        self.assertEqual(res["expectation"], "failure")
+
+    def test_check_pass_incomplete_conversion_is_unsupported(self):
+        rec = self.write_test("//@ check-pass\nfn main() {}\n")
+        res = self.run_with_conv(
+            rec, conv(skipped=2,
+                      skip_totals=[("Rvalue::BinaryOp", 3)]))
+        self.assertEqual(res["status"], "unsupported")
+        self.assertIn("skipped", res["reason"])
+
+    def test_multi_file_not_attempted(self):
+        rec = self.write_test("//@ check-pass\nfn main() {}\n")
+        rec["single_file"] = False
+        res = run.process_test(rec, self.rust_dir, Path("/fake/driver"),
+                               stage2=True)
+        self.assertEqual(res["status"], "not-attempted")
+        self.assertIn("multi-file", res["bucket"])
+
+    def test_incremental_suite_not_attempted(self):
+        rec = self.write_test("fn main() {}\n", suite="incremental")
+        res = run.process_test(rec, self.rust_dir, Path("/fake/driver"),
+                               stage2=True)
+        self.assertEqual(res["status"], "not-attempted")
+        self.assertIn("incremental", res["bucket"])
+
+    def test_compile_check_without_stage2_stays_out_of_scope(self):
+        rec = self.write_test("//@ check-fail\nfn main() {}\n")
+        res = run.process_test(rec, self.rust_dir, Path("/fake/driver"))
+        self.assertEqual(res["status"], "not-attempted")
+        self.assertIn("nature", res["bucket"])
+
+
+
+
+class SkipBucketTests(unittest.TestCase):
+    def test_allocated_constant_kind_is_shortened(self):
+        totals = [("ConstantKind::Allocated (type Ty { id: 0, kind: "
+                   "RigidTy(Adt(AdtDef(DefId { id: 2 })) })", 1)]
+        self.assertEqual(run.skip_bucket(totals),
+                         "conversion incomplete (ConstantKind::Allocated)")
+
+    def test_by_reference_constant_bucket(self):
+        totals = [("unsupported constant: by-reference constant", 2)]
+        self.assertEqual(run.skip_bucket(totals),
+                         "unsupported constant: by-reference constant")
+
+    def test_no_totals(self):
+        self.assertIn("no skip reason", run.skip_bucket([]))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -11,13 +11,17 @@ status). Nothing here is a second execution path: the Sparagmos side is
 always the driver binary's `run` mode.
 
 Input is the per-test classification produced by
-scripts/rustc-subset-survey.py (--json). Stage 1 (this tool's current
-scope) covers tests the survey classified as nature="exec" that are
-single-file and in the ui / ui-fulldeps suites (the run-pass /
-run-fail / run-crash population). Everything else in the denominator
-is reported as not attempted, with a reason; unattempted and failed
-tests alike count against the overall metric-2(b) rate, whose
-denominator is always the full subset (24,937 at the 1.100.0 tag).
+scripts/rustc-subset-survey.py (--json). Stage 1 covers tests the
+survey classified as nature="exec" that are single-file and in the
+ui / ui-fulldeps suites (the run-pass / run-fail / run-crash
+population). Stage 2 covers the nature="compile-check" population:
+each test is run through the driver's convert-only mode and the
+outcome is compared with the expectation compiletest derives from
+the test's directives (see the stage-2 section below). Everything
+else in the denominator is reported as not attempted, with a reason;
+unattempted and failed tests alike count against the overall
+metric-2(b) rate, whose denominator is always the full subset
+(24,937 at the 1.100.0 tag).
 
 A test is *attempted* only when both sides can be run faithfully:
 
@@ -46,6 +50,7 @@ Usage:
         --rust-dir ~/rust-1.100.0-survey \
         --driver-bin crates/sparagmos-driver/target/debug/sparagmos-driver \
         --out subset-run-results.json [--jobs 48] [--limit N]
+        [--stages 1|2|both] [--stage2-limit N]
 """
 
 import argparse
@@ -509,7 +514,7 @@ def bucket_reason(reason):
 # Per-test driver
 # ---------------------------------------------------------------------------
 
-def process_test(rec, rust_dir, driver_bin):
+def process_test(rec, rust_dir, driver_bin, stage2=False):
     """Produce the result record for one survey record."""
     out = {
         "suite": rec["suite"],
@@ -521,11 +526,15 @@ def process_test(rec, rust_dir, driver_bin):
         "reason": "",
         "bucket": "",
         "mode": None,
+        "stage": 1,
         "seconds": 0.0,
     }
     t0 = time.time()
     try:
-        fill_result(rec, rust_dir, driver_bin, out)
+        if stage2 and rec["nature"] == "compile-check":
+            fill_result_stage2(rec, rust_dir, driver_bin, out)
+        else:
+            fill_result(rec, rust_dir, driver_bin, out)
     except Exception as e:  # a runner bug must not lose the whole run
         out["status"] = "not-attempted"
         out["reason"] = f"runner internal error: {e!r}"
@@ -612,6 +621,317 @@ def fill_result(rec, rust_dir, driver_bin, out):
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: compile-time verification tests (nature == "compile-check")
+# ---------------------------------------------------------------------------
+#
+# Stage 2 judges the compile-check population (ui diagnostics, mir-opt,
+# codegen, assembly, pretty, incremental, crashes) at the outcome level:
+# the driver's convert-only mode is run on the test and its result is
+# compared with the expectation compiletest itself derives from the
+# test (see compile_expectation). The driver delegates diagnostics to
+# the reference rustc, so bare compile success/failure would be close
+# to tautological; the Sparagmos-specific signal is conversion
+# completeness, so a success-expecting test only passes when the driver
+# compiles it *and* converts every local function (skipped == 0, i.e. a
+# complete MirProgram was obtained). A failure-expecting test passes
+# when the driver reports a clean compilation failure. A crashes test
+# passes when the compilation crashes the driver process the way it
+# crashes rustc under compiletest (exit code other than 0 or 1).
+#
+# What stage 2 deliberately does not do: compare compiler output with
+# the test's `.stderr` snapshot, check `//~` error annotations, apply
+# rustfix suggestions (`.fixed`), or compare mir-opt `.mir` dumps and
+# FileCheck patterns. compiletest's verdict includes those checks;
+# reimplementing its diagnostic normalisation faithfully is a separate
+# large subsystem, and the diagnostics themselves are produced by the
+# reference rustc the driver embeds, so the marginal signal over the
+# outcome-level result would measure the normaliser, not Sparagmos.
+# Instead, every compile-check record carries `snapshot` flags marking
+# which of those verifications its full compiletest verdict would
+# require, and the aggregates report how many records (and how many
+# stage-2 passes) carry them, so the unverified remainder is explicit.
+
+CONVERT_TIMEOUT = 60
+
+_UI_SUCCESS_DIRECTIVES = ("check-pass", "build-pass")
+_UI_FAILURE_DIRECTIVES = ("check-fail", "build-fail")
+
+
+def compile_expectation(suite, header):
+    """The compile outcome compiletest expects of a compile-check test.
+
+    Returns "success" (compilation must succeed), "failure" (it must
+    be rejected), "crash" (the compiler must crash, crashes suite), or
+    None when the verdict cannot be reduced to a compile outcome
+    (run-fail-or-crash involves executing the program).
+    """
+    if suite == "crashes":
+        return "crash"
+    if suite in ("ui", "ui-fulldeps"):
+        if header.has("run-fail-or-crash"):
+            return None
+        for name in _UI_SUCCESS_DIRECTIVES:
+            if header.has(name):
+                return "success"
+        for name in _UI_FAILURE_DIRECTIVES:
+            if header.has(name):
+                return "failure"
+        if run_mode(header) is not None:
+            return None  # run modes are stage-1 territory
+        # compiletest: UI tests default to check-fail when no
+        # pass/fail directive is present (directives.rs from_file).
+        return "failure"
+    # mir-opt, codegen-llvm, codegen-units, assembly-llvm, assembly-gcc
+    # and pretty tests are all verified against output produced by a
+    # successful compilation.
+    return "success"
+
+
+def stage2_blocker(header, rec):
+    """Why a compile-check record is not attempted in stage 2, or None.
+
+    Mirrors the stage-1 header policy: anything the driver's fixed
+    invocation cannot honour keeps the test out of the attempted set
+    (it still counts against the rate as not attempted).
+    """
+    if header.has("revisions") or any(
+            rev is not None for (rev, _n) in header.scoped):
+        return "revisions present (per-revision cfgs not run in stage 2)"
+    if header.has("compile-flags"):
+        return "compile-flags present (driver takes no extra rustc flags)"
+    if header.has("add-minicore") or header.has("add-core-stubs"):
+        return "add-minicore (test links the minicore stub crate)"
+    if header.has("ignore-test"):
+        return "ignore-test (compiletest itself never runs this test)"
+    if header.has("rustc-env"):
+        return "rustc-env present (compiler environment is not modelled)"
+    return None
+
+
+_DIR_LISTING_CACHE = {}
+
+
+def snapshot_flags(path, text):
+    """Which output verifications the full compiletest verdict needs.
+
+    `path` is the test file; sibling snapshot files are looked up next
+    to it. These flags are informational: stage 2 does not perform the
+    checks (see the stage-2 section comment), but reports their counts.
+    """
+    stem = path.name[:-3] if path.name.endswith(".rs") else path.name
+    parent = str(path.parent)
+    if parent not in _DIR_LISTING_CACHE:
+        try:
+            _DIR_LISTING_CACHE[parent] = [p.name for p in path.parent.iterdir()]
+        except OSError:
+            _DIR_LISTING_CACHE[parent] = []
+    sibs = [n for n in _DIR_LISTING_CACHE[parent]
+            if n.startswith(stem + ".")]
+    header = Header(text)
+    return {
+        "stderr_snapshot": any(n.endswith(".stderr") for n in sibs),
+        "fixed_file": any(n.endswith(".fixed") for n in sibs),
+        "mir_snapshot": any(n.endswith(".mir") for n in sibs),
+        "error_annotations": "//~" in text,
+        "filecheck": re.search(r"//\s*CHECK", text) is not None,
+        "run_rustfix": bool(header.has("run-rustfix")
+                            or header.has(
+                                "run-rustfix-only-machine-applicable")),
+    }
+
+
+_CONVERTED_RE = re.compile(r"^converted: (\d+), skipped: (\d+)$", re.M)
+
+
+def convert_side(path, edition, driver_bin):
+    """Run the driver in convert-only mode and parse its report.
+
+    Returns a dict with exit_code (None on timeout), converted and
+    skipped counts (None when no report was printed), skip_totals
+    ([(kind, count)] from the report's `unsupported:` section, most
+    frequent first), compilation_failed (the driver reported a clean
+    compilation failure), ice (stderr shows an internal compiler
+    error), and stderr.
+    """
+    res = run_cmd([str(driver_bin), str(path), "--edition", edition],
+                  timeout=CONVERT_TIMEOUT, env_extra=BOOTSTRAP_ENV)
+    out = {
+        "exit_code": res["exit_code"],
+        "timeout": res["timeout"],
+        "converted": None,
+        "skipped": None,
+        "skip_totals": [],
+        "compilation_failed": "sparagmos-driver: compilation failed"
+                              in res["stderr"],
+        "ice": "internal compiler error" in res["stderr"],
+        "stderr": res["stderr"],
+        "stdout": res["stdout"],
+    }
+    m = _CONVERTED_RE.search(res["stdout"])
+    if m:
+        out["converted"] = int(m.group(1))
+        out["skipped"] = int(m.group(2))
+        totals = []
+        in_section = False
+        for line in res["stdout"].splitlines():
+            if line == "unsupported:":
+                in_section = True
+                continue
+            if in_section:
+                mm = re.match(r"^  (.+): (\d+)$", line)
+                if mm:
+                    totals.append((mm.group(1), int(mm.group(2))))
+                else:
+                    in_section = False
+        out["skip_totals"] = sorted(totals, key=lambda kv: -kv[1])
+    return out
+
+
+def short_kind(kind):
+    """A skip-reason kind without its parenthesised detail."""
+    return kind.split(" (")[0]
+
+
+def skip_bucket(skip_totals):
+    """Aggregate bucket for a conversion-incomplete result."""
+    if not skip_totals:
+        return "conversion incomplete (no skip reason recorded)"
+    kind = short_kind(skip_totals[0][0])
+    low = kind.lower()
+    if "by-reference" in low or "byref" in low:
+        return "unsupported constant: by-reference constant"
+    if "boxdereftransmute" in low:
+        return "conversion incomplete (BoxDerefTransmute cast)"
+    if "inlineasm" in low:
+        return "conversion incomplete (InlineAsm)"
+    return f"conversion incomplete ({kind})"
+
+
+def judge_compile(expectation, conv):
+    """Compare a convert_side result with the expected outcome.
+
+    Returns (status, reason, bucket): status is "pass", "fail" or
+    "unsupported" (conversion incomplete on a success-expecting test,
+    the stage-1 analogue of the driver reporting exit 2).
+    """
+    if conv["timeout"] or conv["exit_code"] is None:
+        return ("fail",
+                f"driver timed out after {CONVERT_TIMEOUT}s",
+                "timeout")
+    code = conv["exit_code"]
+    if expectation == "success":
+        if code == 0:
+            if conv["skipped"] is None:
+                return ("fail",
+                        "driver exit 0 without a conversion report",
+                        "driver error")
+            if conv["skipped"] == 0:
+                return ("pass", "", "")
+            totals = ", ".join(f"{short_kind(k)} x{n}"
+                               for k, n in conv["skip_totals"][:5])
+            return ("unsupported",
+                    f"conversion incomplete: {conv['skipped']} "
+                    f"function(s) skipped ({totals})",
+                    skip_bucket(conv["skip_totals"]))
+        if code == 1:
+            first = first_error_line(conv["stderr"])
+            return ("fail",
+                    "expected compile success, but the driver "
+                    f"reported compilation failure: {first}",
+                    "expected success but compilation failed")
+        return ("fail",
+                f"driver crashed (exit {code}) on a "
+                "success-expecting test",
+                "driver crash")
+    if expectation == "failure":
+        if code == 1 and conv["compilation_failed"]:
+            return ("pass", "", "")
+        if code == 1:
+            return ("fail",
+                    "driver exit 1 without a compilation-failure report",
+                    "driver error")
+        if code == 0:
+            return ("fail",
+                    "expected compile failure, but the driver "
+                    "converted the test successfully",
+                    "expected failure but conversion succeeded")
+        return ("fail",
+                f"compiler crashed (exit {code}) instead of a clean "
+                "rejection on a failure-expecting test",
+                "compiler crash on failure-expecting test")
+    if expectation == "crash":
+        if code not in (0, 1):
+            return ("pass", "", "")
+        if code == 0:
+            return ("fail",
+                    "no longer crashes: the driver converted the test",
+                    "no crash (converted successfully)")
+        return ("fail",
+                "no longer crashes: clean compilation failure",
+                "no crash (clean rejection)")
+    raise ValueError(f"unknown expectation {expectation!r}")
+
+
+def fill_result_stage2(rec, rust_dir, driver_bin, out):
+    """Stage-2 counterpart of fill_result for compile-check records."""
+    out["stage"] = 2
+    path = rust_dir / rec["path"]
+    text = path.read_text(errors="ignore")
+    out["snapshot"] = snapshot_flags(path, text)
+    if not rec["single_file"]:
+        out["reason"] = "multi-file / auxiliary crates (not in stage-2 scope)"
+        out["bucket"] = "out of stage-2 scope (multi-file)"
+        return
+    if rec["suite"] == "incremental":
+        out["reason"] = ("incremental suite: the verdict depends on "
+                         "recompilation across sessions, which a single "
+                         "conversion cannot judge")
+        out["bucket"] = "out of stage-2 scope (suite: incremental)"
+        return
+    header = Header(text)
+    blocker = stage2_blocker(header, rec)
+    if blocker:
+        out["reason"] = blocker
+        out["bucket"] = "not attempted (header feature)"
+        return
+    status, why = applicability(header)
+    if status == "out-of-environment":
+        out["reason"] = why
+        out["bucket"] = "out of environment"
+        return
+    if status == "unevaluatable":
+        out["reason"] = why
+        out["bucket"] = "not attempted (unevaluatable condition)"
+        return
+    expectation = compile_expectation(rec["suite"], header)
+    out["expectation"] = expectation
+    if expectation is None:
+        out["reason"] = ("verdict involves executing the program "
+                         "(run-fail-or-crash / run mode), which a "
+                         "compile outcome alone cannot judge")
+        out["bucket"] = "not attempted (verdict needs execution)"
+        return
+    editions = header.values("edition")
+    edition = editions[0].strip() if editions else "2021"
+    conv = convert_side(path, edition, driver_bin)
+    verdict, reason, bucket = judge_compile(expectation, conv)
+    out["status"] = verdict
+    out["reason"] = reason
+    out["bucket"] = bucket
+    out["driver"] = {
+        "exit_code": conv["exit_code"],
+        "converted": conv["converted"],
+        "skipped": conv["skipped"],
+        "skip_totals": conv["skip_totals"],
+        "ice": conv["ice"],
+    }
+    if verdict == "fail":
+        out["driver"]["stderr_first"] = first_error_line(conv["stderr"])
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -631,7 +951,17 @@ def main():
     ap.add_argument("--limit", type=int, default=0,
                     help="only process the first N stage-1 candidates "
                          "(smoke runs); 0 = all")
+    ap.add_argument("--stages", choices=("1", "2", "both"),
+                    default="both",
+                    help="which stages to run (default: both)")
+    ap.add_argument("--stage2-limit", type=int, default=0,
+                    help="only process the first N stage-2 candidates "
+                         "(smoke runs); 0 = all")
     args = ap.parse_args()
+    args.driver_bin = args.driver_bin.resolve()
+    args.rust_dir = args.rust_dir.resolve()
+    stage1_on = args.stages in ("1", "both")
+    stage2_on = args.stages in ("2", "both")
 
     survey = json.loads(args.survey_json.read_text())
     records = survey["tests"]
@@ -645,15 +975,28 @@ def main():
                 and r["suite"] in ("ui", "ui-fulldeps")
                 and not r["env_excluded"])
 
-    all_candidates = [r for r in records if is_candidate(r)]
-    candidates = all_candidates[:args.limit] if args.limit         else all_candidates
+    def is_candidate2(r):
+        return (r["nature"] == "compile-check"
+                and not r["env_excluded"])
+
+    all_candidates = ([r for r in records if is_candidate(r)]
+                      if stage1_on else [])
+    candidates = (all_candidates[:args.limit] if args.limit
+                  else all_candidates)
     limited_out = all_candidates[len(candidates):]
+    all_candidates2 = ([r for r in records if is_candidate2(r)]
+                       if stage2_on else [])
+    candidates2 = (all_candidates2[:args.stage2_limit]
+                   if args.stage2_limit else all_candidates2)
+    limited_out2 = all_candidates2[len(candidates2):]
     others = [r for r in records
-              if not is_candidate(r) and not r["env_excluded"]]
+              if not is_candidate(r) and not r["env_excluded"]
+              and not (stage2_on and is_candidate2(r))]
 
     print(f"denominator: {denominator}; stage-1 candidates: "
-          f"{len(candidates)}; other records carried as not-attempted: "
-          f"{len(others)}", flush=True)
+          f"{len(candidates)}; stage-2 candidates: {len(candidates2)}; "
+          f"other records carried as not-attempted: {len(others)}",
+          flush=True)
 
     results = []
     t0 = time.time()
@@ -661,12 +1004,16 @@ def main():
             max_workers=args.jobs) as pool:
         futs = [pool.submit(process_test, r, args.rust_dir,
                             args.driver_bin) for r in candidates]
+        futs += [pool.submit(process_test, r, args.rust_dir,
+                             args.driver_bin, True)
+                 for r in candidates2]
+        total_jobs = len(candidates) + len(candidates2)
         done = 0
         for fut in concurrent.futures.as_completed(futs):
             results.append(fut.result())
             done += 1
-            if done % 250 == 0:
-                print(f"  {done}/{len(candidates)} "
+            if done % 500 == 0:
+                print(f"  {done}/{total_jobs} "
                       f"({time.time() - t0:.0f}s)", flush=True)
     wall = time.time() - t0
 
@@ -692,6 +1039,16 @@ def main():
             "mode": None, "seconds": 0.0,
         })
 
+    for r in limited_out2:
+        results.append({
+            "suite": r["suite"], "path": r["path"],
+            "nature": r["nature"], "single_file": r["single_file"],
+            "ffi": r["ffi"], "status": "not-attempted",
+            "reason": "beyond --stage2-limit (smoke run)",
+            "bucket": "not attempted (smoke-run limit)",
+            "mode": None, "stage": 2, "seconds": 0.0,
+        })
+
     results.sort(key=lambda r: r["path"])
     passed = sum(1 for r in results if r["status"] == "pass")
     failed = sum(1 for r in results if r["status"] == "fail")
@@ -712,6 +1069,27 @@ def main():
 
     cand_paths = {r["path"] for r in candidates}
     cand = [r for r in results if r["path"] in cand_paths]
+    cand2_paths = {r["path"] for r in candidates2}
+    cand2 = [r for r in results if r["path"] in cand2_paths]
+
+    snap_keys = ("stderr_snapshot", "error_annotations", "fixed_file",
+                 "mir_snapshot", "filecheck", "run_rustfix")
+
+    def snapshot_counts(rs):
+        counts = {k: sum(1 for r in rs if r.get("snapshot", {}).get(k))
+                  for k in snap_keys}
+        counts["any"] = sum(
+            1 for r in rs
+            if any(r.get("snapshot", {}).get(k) for k in snap_keys))
+        counts["records"] = len(rs)
+        return counts
+
+    cc_results = [r for r in results if r["nature"] == "compile-check"]
+    snapshot_verification = {
+        "compile_check_all": snapshot_counts(cc_results),
+        "stage2_passed": snapshot_counts(
+            [r for r in cc_results if r["status"] == "pass"]),
+    }
 
     def rate_block(rs):
         tot = len(rs)
@@ -739,6 +1117,12 @@ def main():
             round(100.0 * passed / denominator, 3) if denominator else 0.0,
         "stage1_candidates": len(candidates),
         "stage1_passed": sum(1 for r in cand if r["status"] == "pass"),
+        "stage2_candidates": len(candidates2),
+        "stage2_passed": sum(1 for r in cand2 if r["status"] == "pass"),
+        "compile_check_category": by_nature.get(
+            "compile-check",
+            {"total": 0, "passed": 0, "pass_rate_percent": 0.0}),
+        "snapshot_verification": snapshot_verification,
         "out_of_environment": sum(
             1 for r in results if r["bucket"] == "out of environment"),
         "exec_category": by_nature.get("exec",
