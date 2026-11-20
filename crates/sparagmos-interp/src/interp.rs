@@ -525,6 +525,51 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// Resolve a call that has no body under its own name against
+    /// a `dyn` receiver: the vtable lookup, with the fat pointer's
+    /// (concrete type, trait) pair standing in for the vtable.
+    ///
+    /// Returns `None` when the call is not a dynamic dispatch (the
+    /// first argument is not a dyn fat pointer, or the callee name
+    /// is not a trait method of the pointer's bounds and no impl
+    /// body matches). Returns `Some(Ok((impl_name, receiver)))` to
+    /// dispatch: the receiver is the fat pointer's data pointer.
+    /// Returns `Some(Err(_))` when the call is a dispatch through
+    /// the pointer but the concrete implementation body is not in
+    /// the program — the explicit boundary of the dyn model, hit at
+    /// the call, never at the value's declaration.
+    fn virtual_call_target(
+        &self,
+        func: &str,
+        args: &[Value],
+    ) -> Option<Result<(String, Value), InterpError>> {
+        let Value::DynRef {
+            base,
+            concrete,
+            traits,
+        } = args.first()?
+        else {
+            return None;
+        };
+        let (trait_path, method) = func.rsplit_once("::")?;
+        if trait_path.is_empty() || method.is_empty() {
+            return None;
+        }
+        let candidate = format!("<{concrete} as {trait_path}>::{method}");
+        if self.program.get(&candidate).is_some()
+            || self.program.unconverted_reason(&candidate).is_some()
+        {
+            return Some(Ok((candidate, (**base).clone())));
+        }
+        if traits.iter().any(|t| t == trait_path) {
+            return Some(Err(InterpError::UnsupportedDynamicDispatch {
+                method: func.to_string(),
+                concrete: concrete.clone(),
+            }));
+        }
+        None
+    }
+
     /// Push a call frame for `func` with already-evaluated argument
     /// values (placed at locals 1..), returning into `destination` /
     /// `target` of the current top frame when the callee returns.
@@ -537,11 +582,22 @@ impl<'a> Interpreter<'a> {
         destination: &Place,
         target: Option<BasicBlock>,
     ) -> InterpResult<()> {
-        let callee = self
-            .program
-            .get(func)
-            .cloned()
-            .ok_or_else(|| self.missing_body_error(func))?;
+        let callee = match self.program.get(func) {
+            Some(c) => c.clone(),
+            None => match self.virtual_call_target(func, &arg_values) {
+                // A vtable call: dispatch to the concrete type's
+                // impl body, with the fat pointer's data pointer as
+                // the receiver (the box aggregate itself for a
+                // by-value `Box<dyn>` receiver).
+                Some(Ok((impl_func, receiver))) => {
+                    let mut args = arg_values;
+                    args[0] = receiver;
+                    return self.start_call(frames, &impl_func, args, destination, target);
+                }
+                Some(Err(e)) => return Err(e),
+                None => return Err(self.missing_body_error(func)),
+            },
+        };
         if frames.len() >= self.config.max_call_depth {
             return Err(InterpError::CallDepthExceeded {
                 limit: self.config.max_call_depth,
@@ -1167,6 +1223,17 @@ impl<'a> Interpreter<'a> {
                 Value::Tuple(_) => Ok(Resolved::Value(value.clone())),
                 _ => self.deref_value(frames, base),
             },
+            // Dereferencing a dyn fat pointer reaches the value it
+            // was formed over: through the base pointer for a
+            // reference or slice base, and to the held pointee for
+            // a box base (the box aggregate itself — exactly what
+            // `Deref::deref` for `Box` yields).
+            Value::DynRef { base, .. } => match &**base {
+                Value::Enum { fields, .. } if fields.len() == 1 => {
+                    Ok(Resolved::Value(fields[0].clone()))
+                }
+                _ => self.deref_value(frames, base),
+            },
             other => Err(InterpError::type_mismatch(
                 "dereference",
                 "reference",
@@ -1356,6 +1423,7 @@ impl<'a> Interpreter<'a> {
             // a reference to a string place is a `Ref`).
             (Some(Ty::Ref(_)), Value::Ref(_))
             | (Some(Ty::Ref(_)), Value::FatRef { .. })
+            | (Some(Ty::Ref(_)), Value::DynRef { .. })
             | (Some(Ty::Ref(_)), Value::Str(_))
             | (Some(Ty::Ref(_)), Value::Bytes(_)) => Ok(value),
             (Some(Ty::Str), Value::Str(_)) => Ok(value),
@@ -1518,36 +1586,70 @@ impl<'a> Interpreter<'a> {
                 let v = self.eval_operand(frames, body, operand)?;
                 eval_cast(&v, ty)
             }
-            Rvalue::Unsize(operand) => {
+            Rvalue::Unsize(operand, meta) => {
                 let v = self.eval_operand(frames, body, operand)?;
-                match v {
-                    Value::Ref(_) => {
-                        let target = self.deref_value(frames, &v)?;
-                        let pointee = self.read_resolved(frames, &target)?;
-                        let len = pointee.len().ok_or_else(|| {
-                            InterpError::type_mismatch(
-                                "unsizing cast",
-                                "array pointee",
-                                pointee.kind_name(),
-                            )
-                        })?;
-                        Ok(Value::FatRef {
-                            base: Box::new(v),
-                            len,
-                        })
-                    }
-                    Value::Bytes(b) => {
-                        let len = b.len() as u128;
-                        Ok(Value::FatRef {
-                            base: Box::new(Value::Bytes(b)),
-                            len,
-                        })
-                    }
-                    other => Err(InterpError::type_mismatch(
-                        "unsizing cast",
-                        "reference to an array",
-                        other.kind_name(),
-                    )),
+                match meta {
+                    UnsizeMeta::Slice => match v {
+                        Value::Ref(_) => {
+                            let target = self.deref_value(frames, &v)?;
+                            let pointee = self.read_resolved(frames, &target)?;
+                            let len = pointee.len().ok_or_else(|| {
+                                InterpError::type_mismatch(
+                                    "unsizing cast",
+                                    "array pointee",
+                                    pointee.kind_name(),
+                                )
+                            })?;
+                            Ok(Value::FatRef {
+                                base: Box::new(v),
+                                len,
+                            })
+                        }
+                        Value::Bytes(b) => {
+                            let len = b.len() as u128;
+                            Ok(Value::FatRef {
+                                base: Box::new(Value::Bytes(b)),
+                                len,
+                            })
+                        }
+                        other => Err(InterpError::type_mismatch(
+                            "unsizing cast",
+                            "reference to an array",
+                            other.kind_name(),
+                        )),
+                    },
+                    UnsizeMeta::Dyn { concrete, traits } => match v {
+                        // A supertrait upcast: the data pointer and
+                        // the concrete type carry over; only the
+                        // bounds the pointer answers to change.
+                        Value::DynRef {
+                            base,
+                            concrete: existing,
+                            ..
+                        } => Ok(Value::DynRef {
+                            base,
+                            concrete: existing,
+                            traits: traits.clone(),
+                        }),
+                        Value::Ref(_) | Value::FatRef { .. } | Value::Enum { .. } => {
+                            let concrete = concrete.clone().ok_or_else(|| {
+                                InterpError::UnsupportedRvalue {
+                                    kind: "Unsize to dyn (no concrete type recorded)"
+                                        .to_string(),
+                                }
+                            })?;
+                            Ok(Value::DynRef {
+                                base: Box::new(v),
+                                concrete,
+                                traits: traits.clone(),
+                            })
+                        }
+                        other => Err(InterpError::type_mismatch(
+                            "unsizing cast to dyn",
+                            "reference, fat pointer or box value",
+                            other.kind_name(),
+                        )),
+                    },
                 }
             }
             Rvalue::BoxDerefTransmute(operand) => {
@@ -1573,6 +1675,23 @@ impl<'a> Interpreter<'a> {
                 }
             }
             Rvalue::Ref(place) => {
+                // A borrow of exactly the place a dyn fat pointer
+                // points at (`&*r`, `&*box`) is the fat pointer
+                // itself: the result is again a `&dyn`, with the
+                // same data pointer and the same vtable identity.
+                if place.projection.len() == 1
+                    && matches!(place.projection[0], ProjectionElem::Deref)
+                {
+                    let head = Place {
+                        local: place.local,
+                        projection: Vec::new(),
+                    };
+                    if let Ok(value @ Value::DynRef { .. }) =
+                        self.read_place(frames, body, &head)
+                    {
+                        return Ok(value);
+                    }
+                }
                 let target = self.resolve_place(frames, body, place)?;
                 match target {
                     Resolved::Place {

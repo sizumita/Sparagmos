@@ -373,6 +373,7 @@ fn unrepresentable_local(body: &sm::Body) -> Option<String> {
             | sm::Ty::Char
             | sm::Ty::Never
             | sm::Ty::Str
+            | sm::Ty::Dynamic(..)
             | sm::Ty::Adt(..) => None,
             sm::Ty::Float(ft) => match ft {
                 sm::FloatTy::F32 | sm::FloatTy::F64 => None,

@@ -48,6 +48,12 @@ pub enum InterpError {
     UnsupportedStatement { kind: String },
     /// A terminator kind this interpreter does not implement yet.
     UnsupportedTerminator { kind: String },
+    /// A method call through a `dyn Trait` value whose concrete
+    /// implementation body is not part of the program, so the
+    /// vtable entry cannot be resolved to a converted body. The
+    /// failure is at the dispatch (the call), never at the value's
+    /// declaration.
+    UnsupportedDynamicDispatch { method: String, concrete: String },
     /// An rvalue kind this interpreter does not implement yet.
     UnsupportedRvalue { kind: String },
     /// A place projection this interpreter does not implement yet.
@@ -119,6 +125,13 @@ impl fmt::Display for InterpError {
             }
             InterpError::UnsupportedTerminator { kind } => {
                 write!(f, "unsupported terminator: {kind}")
+            }
+            InterpError::UnsupportedDynamicDispatch { method, concrete } => {
+                write!(
+                    f,
+                    "dynamic dispatch of `{method}` on `{concrete}` is unsupported: \
+                     the concrete implementation body is not in the program"
+                )
             }
             InterpError::UnsupportedRvalue { kind } => write!(f, "unsupported rvalue: {kind}"),
             InterpError::UnsupportedProjection { kind } => {

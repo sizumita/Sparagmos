@@ -23,6 +23,12 @@
 //!   length metadata that `PtrMetadata` reads. The base is the
 //!   [`Value::Ref`] of an array place (from an unsizing cast) or the
 //!   aggregate value itself (from a slice constant).
+//! - [`Value::DynRef`] is a fat pointer to a `dyn Trait` value: a
+//!   base value plus the vtable identity (concrete type name and
+//!   trait bounds). A method call through it resolves the concrete
+//!   type's impl body in the program — the vtable lookup, with the
+//!   (concrete type, trait) pair standing in for the vtable pointer
+//!   the driver does not materialise.
 //! - [`Value::Enum`] is every ADT aggregate: structs use variant 0,
 //!   enums carry their variant index. Field projections read
 //!   `fields`, `Downcast` checks the variant, `Discriminant` reads it.
@@ -146,6 +152,20 @@ pub enum Value {
     Ref(RefTarget),
     /// A fat pointer (slice reference): base + element count.
     FatRef { base: Box<Value>, len: u128 },
+    /// A fat pointer to a `dyn Trait` value: the data pointer plus
+    /// the vtable identity. The driver does not materialise vtables,
+    /// so the vtable is represented by what it is a table *for*: the
+    /// concrete type's name (matching the `Self` spelling of its
+    /// impl method names in the program) and the trait bounds the
+    /// pointer was formed for. `base` is the data pointer in the
+    /// shape the sized value had: a [`Value::Ref`] for a reference
+    /// coercion, a [`Value::FatRef`] for a slice pointee, the box
+    /// aggregate itself for a `Box` coercion.
+    DynRef {
+        base: Box<Value>,
+        concrete: String,
+        traits: Vec<String>,
+    },
     /// An ADT value: variant index + field values.
     Enum { variant: u32, fields: Vec<Value> },
     /// A `core::fmt::rt::Argument` formatting a pointee.
@@ -183,6 +203,7 @@ impl Value {
             Value::Bytes(_) => "bytes",
             Value::Ref(_) => "reference",
             Value::FatRef { .. } => "slice reference",
+            Value::DynRef { .. } => "dyn reference",
             Value::Enum { .. } => "ADT value",
             Value::FmtArg { .. } => "fmt argument",
             Value::FmtCount(_) => "fmt count",
@@ -275,6 +296,9 @@ impl fmt::Display for Value {
             Value::Bytes(b) => write!(f, "b\"{}\"", String::from_utf8_lossy(b)),
             Value::Ref(target) => write!(f, "&({target})"),
             Value::FatRef { len, .. } => write!(f, "&[_; {len}]"),
+            Value::DynRef { traits, .. } => {
+                write!(f, "&dyn {}", traits.first().map(String::as_str).unwrap_or("?"))
+            }
             Value::Enum { variant, fields } => {
                 write!(f, "variant {variant} (")?;
                 for (i, field) in fields.iter().enumerate() {
