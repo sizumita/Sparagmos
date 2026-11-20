@@ -93,8 +93,17 @@ DRIVER_TIMEOUT = 60
 # Header directive parsing
 # ---------------------------------------------------------------------------
 
+# compiletest's directive parser (directives/line.rs) trims
+# whitespace after the `//@` prefix before looking for the optional
+# `[revision]` scope, so `//@ [lib] compile-flags: ...` and
+# `//@[lib] compile-flags: ...` are the same directive. The scope
+# group must therefore allow whitespace before the bracket: without
+# it, space-spelled scoped directives were dropped wholesale (their
+# absence was long masked in stage 2 by the driver's crate-type pin,
+# which supplied e.g. the `lib` shape a dropped
+# `[lib] compile-flags: --crate-type lib` would have named).
 DIRECTIVE_RE = re.compile(
-    r"^\s*//@(?:\[([^\]]+)\])?\s*([a-zA-Z][a-zA-Z0-9-]*)"
+    r"^\s*//@\s*(?:\[([^\]]+)\])?\s*([a-zA-Z][a-zA-Z0-9-]*)"
     r"(?:\s*:\s*(.*?)|\s*\((.*)\))?\s*$")
 
 RUN_MODES = ("run-pass", "run-fail", "run-crash")

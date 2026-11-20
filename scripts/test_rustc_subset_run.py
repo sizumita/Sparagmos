@@ -41,6 +41,18 @@ class HeaderTests(unittest.TestCase):
         h = header("// run-pass\n/* //@ run-fail */\n")
         self.assertIsNone(run.run_mode(h))
 
+    def test_scoped_directive_with_space_after_prefix(self):
+        # compiletest trims whitespace after `//@` before the
+        # optional [revision] scope, so `//@ [lib] compile-flags:`
+        # is the same directive as `//@[lib] compile-flags:`.
+        h = header("//@ revisions: lib bin\n"
+                   "//@ [lib] compile-flags: --crate-type lib\n"
+                   "//@[bin] compile-flags: --crate-type bin\n")
+        self.assertEqual(run.compile_flags(h.view("lib")),
+                         ["--crate-type", "lib"])
+        self.assertEqual(run.compile_flags(h.view("bin")),
+                         ["--crate-type", "bin"])
+
 
 class BlockerTests(unittest.TestCase):
     def rec(self):
