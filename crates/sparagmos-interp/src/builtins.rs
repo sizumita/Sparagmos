@@ -223,6 +223,52 @@ pub enum Builtin {
     ToUppercase,
     /// `str::to_lowercase(&str) -> String`.
     ToLowercase,
+    /// `String::new()`: the empty string. (`String` is the string
+    /// data itself in this value model, as for every method here:
+    /// the collected std bodies project the buffer/length/capacity
+    /// fields of the real struct, which the abstract value does not
+    /// have, so the methods are modelled here instead.)
+    StringNew,
+    /// `String::len(&String)`: the byte length of the string data.
+    StringLen,
+    /// `String::is_empty(&String)`.
+    StringIsEmpty,
+    /// `String::capacity(&String)`: allocation capacity is not
+    /// tracked by the abstract string model, so the call stays an
+    /// explicit unsupported error naming the method rather than a
+    /// projection failure inside the collected body.
+    StringCapacity,
+    /// `String::as_str(&String) -> &str`: the string data itself
+    /// (the same value `Deref` yields for a `String`).
+    StringAsStr,
+    /// `String::as_bytes(&String) -> &[u8]`: a byte view of the
+    /// string data.
+    StringAsBytes,
+    /// `String::into_bytes(String) -> Vec<u8>`: the string data as
+    /// a vector of bytes (the model's element aggregate).
+    StringIntoBytes,
+    /// `String::push_str(&mut String, &str)`.
+    StringPushStr,
+    /// `String::push(&mut String, char)`.
+    StringPush,
+    /// `str::len(&str)`: the byte length of the string data.
+    StrLen,
+    /// `str::is_empty(&str)`.
+    StrIsEmpty,
+    /// `str::as_bytes(&str) -> &[u8]`: a byte view of the string
+    /// data.
+    StrAsBytes,
+    /// `str::chars(&str)`: a char iterator state (the char values
+    /// plus the next index), the shape `Iterator::next` consumes
+    /// for `std::str::Chars`.
+    StrChars,
+    /// `str::bytes(&str)`: a byte iterator state, the shape
+    /// `Iterator::next` consumes for `std::str::Bytes`.
+    StrBytes,
+    /// `str::trim` / `trim_start` / `trim_end` (`&str -> &str`):
+    /// strip `char::is_whitespace` from the selected side(s); the
+    /// result is the stripped string data.
+    StrTrim(TrimSide),
     /// `core::panicking::panic(&str)`: raise a guest panic.
     PanicStr,
     /// `std::rt::panic_fmt(Arguments)` / `core::panicking::panic_fmt`:
@@ -335,6 +381,14 @@ pub enum RelOp {
     Ge,
 }
 
+/// Which end(s) of a string a `trim*` method strips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrimSide {
+    Both,
+    Start,
+    End,
+}
+
 /// One primitive float method operation, selected by the method name
 /// of an `f32` / `f64` inherent impl call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -414,6 +468,38 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
             Builtin::DefaultDefault
         }
         "std::string::ToString::to_string" => Builtin::ToStringToString,
+        // The `String` / `str` surface the abstract string value
+        // can answer directly. Registering a name here also keeps
+        // the driver from collecting the std body (see
+        // sparagmos-driver's reach pass), whose field projections
+        // on the buffer struct the abstract value cannot serve.
+        "std::string::String::new" | "alloc::string::String::new" => Builtin::StringNew,
+        "std::string::String::len" | "alloc::string::String::len" => Builtin::StringLen,
+        "std::string::String::is_empty" | "alloc::string::String::is_empty" => {
+            Builtin::StringIsEmpty
+        }
+        "std::string::String::capacity" | "alloc::string::String::capacity" => {
+            Builtin::StringCapacity
+        }
+        "std::string::String::as_str" | "alloc::string::String::as_str" => Builtin::StringAsStr,
+        "std::string::String::as_bytes" | "alloc::string::String::as_bytes" => {
+            Builtin::StringAsBytes
+        }
+        "std::string::String::into_bytes" | "alloc::string::String::into_bytes" => {
+            Builtin::StringIntoBytes
+        }
+        "std::string::String::push_str" | "alloc::string::String::push_str" => {
+            Builtin::StringPushStr
+        }
+        "std::string::String::push" | "alloc::string::String::push" => Builtin::StringPush,
+        "core::str::<impl str>::len" => Builtin::StrLen,
+        "core::str::<impl str>::is_empty" => Builtin::StrIsEmpty,
+        "core::str::<impl str>::as_bytes" => Builtin::StrAsBytes,
+        "core::str::<impl str>::chars" => Builtin::StrChars,
+        "core::str::<impl str>::bytes" => Builtin::StrBytes,
+        "core::str::<impl str>::trim" => Builtin::StrTrim(TrimSide::Both),
+        "core::str::<impl str>::trim_start" => Builtin::StrTrim(TrimSide::Start),
+        "core::str::<impl str>::trim_end" => Builtin::StrTrim(TrimSide::End),
         "std::convert::Into::into" => Builtin::IntoInto,
         "std::borrow::ToOwned::to_owned" => Builtin::ToOwned,
         _ if canonical.starts_with("std::boxed::Box") && canonical.ends_with(">::new") => {
@@ -790,10 +876,16 @@ impl<'a> Interpreter<'a> {
                 if self_ty.starts_with("std::ops::Range<")
                     || self_ty.starts_with("std::ops::RangeInclusive<")
                     || self_ty.starts_with("std::slice::Iter<")
+                    || self_ty.starts_with("std::str::Chars<")
+                    || self_ty.starts_with("core::str::Chars<")
+                    || self_ty.starts_with("std::str::Bytes<")
+                    || self_ty.starts_with("core::str::Bytes<")
                 {
                     // A range is its own iterator in this model, and a
-                    // slice iterator is already in `next`-ready shape
-                    // (built by the `slice::iter` runtime support).
+                    // slice / char / byte iterator is already in
+                    // `next`-ready shape (built by the `slice::iter`
+                    // runtime support, resp. the `str::chars` /
+                    // `str::bytes` runtime support).
                     Ok(value)
                 } else if self_ty.starts_with('[') {
                     // Array by value: iteration state is the element
@@ -930,6 +1022,135 @@ impl<'a> Interpreter<'a> {
                     _ => self.resolve_string(frames, &vals[0])?,
                 };
                 Ok(Value::Str(s.to_lowercase()))
+            }
+            Builtin::StringNew => {
+                arity(0)?;
+                Ok(Value::Str(String::new()))
+            }
+            Builtin::StringLen | Builtin::StrLen => {
+                arity(1)?;
+                let s = self.resolve_string(frames, &vals[0])?;
+                Ok(Value::Uint(s.len() as u128))
+            }
+            Builtin::StringIsEmpty | Builtin::StrIsEmpty => {
+                arity(1)?;
+                let s = self.resolve_string(frames, &vals[0])?;
+                Ok(Value::Bool(s.is_empty()))
+            }
+            Builtin::StringCapacity => {
+                arity(1)?;
+                Err(unsupported(format!(
+                    "{name}: allocation capacity is not tracked by \
+                     the abstract string model"
+                )))
+            }
+            Builtin::StringAsStr => {
+                arity(1)?;
+                let s = self.resolve_string(frames, &vals[0])?;
+                Ok(Value::Str(s))
+            }
+            Builtin::StringAsBytes | Builtin::StrAsBytes => {
+                arity(1)?;
+                self.string_bytes_ref(frames, &vals[0])
+            }
+            Builtin::StringIntoBytes => {
+                arity(1)?;
+                let s = self.resolve_string(frames, &vals[0])?;
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields: s
+                        .into_bytes()
+                        .into_iter()
+                        .map(|b| Value::Uint(b as u128))
+                        .collect(),
+                })
+            }
+            Builtin::StringPushStr => {
+                arity(2)?;
+                let suffix = self.resolve_string(frames, &vals[1])?;
+                let target = self.deref_value(frames, &vals[0])?;
+                match self.read_resolved(frames, &target)? {
+                    Value::Str(mut s) => {
+                        s.push_str(&suffix);
+                        self.write_resolved(frames, &target, Value::Str(s))?;
+                        Ok(Value::Unit)
+                    }
+                    ref other => Err(InterpError::type_mismatch(
+                        "String::push_str",
+                        "string value",
+                        other.kind_name(),
+                    )),
+                }
+            }
+            Builtin::StringPush => {
+                arity(2)?;
+                let c = match vals[1] {
+                    Value::Uint(v) => u32::try_from(v)
+                        .ok()
+                        .and_then(char::from_u32)
+                        .ok_or_else(|| {
+                            InterpError::type_mismatch(
+                                "String::push",
+                                "char",
+                                "invalid code point",
+                            )
+                        })?,
+                    ref other => {
+                        return Err(InterpError::type_mismatch(
+                            "String::push",
+                            "char",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                let target = self.deref_value(frames, &vals[0])?;
+                match self.read_resolved(frames, &target)? {
+                    Value::Str(mut s) => {
+                        s.push(c);
+                        self.write_resolved(frames, &target, Value::Str(s))?;
+                        Ok(Value::Unit)
+                    }
+                    ref other => Err(InterpError::type_mismatch(
+                        "String::push",
+                        "string value",
+                        other.kind_name(),
+                    )),
+                }
+            }
+            Builtin::StrChars => {
+                arity(1)?;
+                let s = self.resolve_string(frames, &vals[0])?;
+                let items = s
+                    .chars()
+                    .map(|c| Value::Uint(c as u32 as u128))
+                    .collect();
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Tuple(items), Value::Uint(0)],
+                })
+            }
+            Builtin::StrBytes => {
+                arity(1)?;
+                let s = self.resolve_string(frames, &vals[0])?;
+                let items = s
+                    .as_bytes()
+                    .iter()
+                    .map(|b| Value::Uint(*b as u128))
+                    .collect();
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Tuple(items), Value::Uint(0)],
+                })
+            }
+            Builtin::StrTrim(side) => {
+                arity(1)?;
+                let s = self.resolve_string(frames, &vals[0])?;
+                let out = match side {
+                    TrimSide::Both => s.trim(),
+                    TrimSide::Start => s.trim_start(),
+                    TrimSide::End => s.trim_end(),
+                };
+                Ok(Value::Str(out.to_string()))
             }
             Builtin::PanicStr => {
                 arity(1)?;
@@ -1536,6 +1757,10 @@ impl<'a> Interpreter<'a> {
             (fields, none_value())
         } else if self_ty.starts_with("std::array::IntoIter<")
             || self_ty.starts_with("std::slice::Iter<")
+            || self_ty.starts_with("std::str::Chars<")
+            || self_ty.starts_with("core::str::Chars<")
+            || self_ty.starts_with("std::str::Bytes<")
+            || self_ty.starts_with("core::str::Bytes<")
         {
             if fields.len() != 2 {
                 return Err(InterpError::type_mismatch(
@@ -1762,6 +1987,32 @@ impl<'a> Interpreter<'a> {
                 _ => return Ok(value),
             }
         }
+    }
+
+    /// The `&[u8]` value denoting a string value's bytes: a fat
+    /// reference over the receiver itself when the receiver is a
+    /// reference (element reads resolve through it to the string
+    /// data, as for a `Vec` deref), over the receiver's own base
+    /// when it is already a fat reference, or over a snapshot of
+    /// the bytes when the receiver is the string data itself (the
+    /// shape of a byte-slice constant).
+    fn string_bytes_ref(&self, frames: &[Frame], receiver: &Value) -> InterpResult<Value> {
+        let s = self.resolve_string(frames, receiver)?;
+        let len = s.len() as u128;
+        let base = match receiver {
+            Value::Ref(_) => receiver.clone(),
+            Value::FatRef { base, .. } => (**base).clone(),
+            _ => Value::Tuple(
+                s.as_bytes()
+                    .iter()
+                    .map(|b| Value::Uint(*b as u128))
+                    .collect(),
+            ),
+        };
+        Ok(Value::FatRef {
+            base: Box::new(base),
+            len,
+        })
     }
 
     /// The string data a value denotes: the value itself, or the
