@@ -9,12 +9,16 @@
 //!   (also implemented) turns into a panic, as rustc emits it.
 //! * Integer width comes from the destination local's declared [`Ty`];
 //!   without a declared width, values use the full `i128`/`u128` range.
+//! * Places are resolved against the whole frame stack: a reference
+//!   value names a frame by its unique id, so reads and writes through
+//!   references work across calls in both directions while the target
+//!   frame is live.
 //! * Execution is bounded by a step limit and a call-depth limit so a
 //!   looping program can never hang the oracle (or a test run).
 
 use crate::error::{InterpError, InterpResult};
 use crate::ir::*;
-use crate::value::Value;
+use crate::value::{RefProj, RefTarget, Value};
 
 /// Interpreter limits / configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,9 +39,13 @@ impl Default for InterpConfig {
 }
 
 /// One call frame: a function's locals plus where to resume.
-struct Frame {
-    func: String,
-    locals: Vec<Value>,
+pub(crate) struct Frame {
+    /// Unique id within the run; references name their target frame
+    /// by this id, so a frame keeps its identity when other frames
+    /// are pushed and popped around it.
+    pub(crate) id: u64,
+    pub(crate) func: String,
+    pub(crate) locals: Vec<Value>,
     block: usize,
     stmt: usize,
     /// Where (in the caller) the return value goes; `None` for the entry frame.
@@ -46,11 +54,28 @@ struct Frame {
     return_block: Option<BasicBlock>,
 }
 
+/// A place fully resolved against the frame stack: either a concrete
+/// slot (frame position + local + constant projection) or, when the
+/// resolution passed through a constant aggregate, the value itself.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Resolved {
+    Place {
+        frame_pos: usize,
+        local: usize,
+        projection: Vec<RefProj>,
+    },
+    Value(Value),
+}
+
 /// The interpreter state for one program.
 pub struct Interpreter<'a> {
     program: &'a Program,
     config: InterpConfig,
     steps: usize,
+    next_frame_id: u64,
+    /// Everything the guest wrote to its stdout (via the runtime
+    /// print support) during the most recent run.
+    output: String,
 }
 
 impl<'a> Interpreter<'a> {
@@ -63,12 +88,23 @@ impl<'a> Interpreter<'a> {
             program,
             config,
             steps: 0,
+            next_frame_id: 0,
+            output: String::new(),
         }
     }
 
     /// Steps consumed by the most recent (or current) run.
     pub fn steps_used(&self) -> usize {
         self.steps
+    }
+
+    /// The guest stdout captured during the most recent run.
+    pub fn output(&self) -> &str {
+        &self.output
+    }
+
+    pub(crate) fn push_output(&mut self, text: &str) {
+        self.output.push_str(text);
     }
 
     fn tick(&mut self) -> InterpResult<()> {
@@ -81,9 +117,17 @@ impl<'a> Interpreter<'a> {
         Ok(())
     }
 
+    fn fresh_frame_id(&mut self) -> u64 {
+        let id = self.next_frame_id;
+        self.next_frame_id += 1;
+        id
+    }
+
     /// Run `entry` with `args` and return the value of its return place.
     pub fn run(&mut self, entry: &str, args: Vec<Value>) -> InterpResult<Value> {
         self.steps = 0;
+        self.next_frame_id = 0;
+        self.output.clear();
         let body = self
             .program
             .get(entry)
@@ -101,7 +145,9 @@ impl<'a> Interpreter<'a> {
         for (i, arg) in args.into_iter().enumerate() {
             locals[i + 1] = arg;
         }
+        let entry_id = self.fresh_frame_id();
         let mut frames: Vec<Frame> = vec![Frame {
+            id: entry_id,
             func: entry.to_string(),
             locals,
             block: 0,
@@ -158,10 +204,7 @@ impl<'a> Interpreter<'a> {
                     targets,
                     otherwise,
                 } => {
-                    let value = {
-                        let frame = frames.last_mut().expect("frame");
-                        Self::eval_operand(frame, body, &discr)?
-                    };
+                    let value = self.eval_operand(&mut frames, body, &discr)?;
                     let bits = value.switch_bits().ok_or_else(|| {
                         InterpError::type_mismatch(
                             "SwitchInt discriminant",
@@ -193,11 +236,8 @@ impl<'a> Interpreter<'a> {
                         });
                     }
                     let mut arg_values = Vec::with_capacity(args.len());
-                    {
-                        let frame = frames.last_mut().expect("frame");
-                        for arg in &args {
-                            arg_values.push(Self::eval_operand(frame, body, arg)?);
-                        }
+                    for arg in &args {
+                        arg_values.push(self.eval_operand(&mut frames, body, arg)?);
                     }
                     if arg_values.len() != callee.arg_count {
                         return Err(InterpError::type_mismatch(
@@ -210,7 +250,9 @@ impl<'a> Interpreter<'a> {
                     for (i, v) in arg_values.into_iter().enumerate() {
                         locals[i + 1] = v;
                     }
+                    let frame_id = self.fresh_frame_id();
                     frames.push(Frame {
+                        id: frame_id,
                         func: func.clone(),
                         locals,
                         block: 0,
@@ -218,6 +260,41 @@ impl<'a> Interpreter<'a> {
                         return_dest: Some(destination),
                         return_block: target,
                     });
+                }
+                TerminatorKind::CallBuiltin {
+                    name,
+                    generic_args,
+                    args,
+                    destination,
+                    target,
+                } => {
+                    let result =
+                        self.exec_builtin(&mut frames, body, &name, &generic_args, &args)?;
+                    match target {
+                        Some(bb) => {
+                            self.write_place(&mut frames, body, &destination, result)?;
+                            Self::jump(&mut frames, body, bb)?;
+                        }
+                        None => {
+                            return Err(InterpError::MissingContinuation {
+                                func: func_name.clone(),
+                            });
+                        }
+                    }
+                }
+                TerminatorKind::Drop { place, target } => {
+                    // Conversion only emits this for types whose drop
+                    // glue has no guest-observable effect in this
+                    // value model (deallocation and payload teardown
+                    // of plain data). The place is dead afterwards, as
+                    // in MIR, so a direct local is cleared.
+                    if place.is_direct_local() {
+                        let frame = frames.last_mut().expect("frame");
+                        if let Some(slot) = frame.locals.get_mut(place.local.0) {
+                            *slot = Value::Uninit;
+                        }
+                    }
+                    Self::jump(&mut frames, body, target)?;
                 }
                 TerminatorKind::Return => {
                     let frame = frames.pop().expect("frame");
@@ -254,10 +331,7 @@ impl<'a> Interpreter<'a> {
                             name: caller_name.clone(),
                         }
                     })?;
-                    {
-                        let caller = frames.last_mut().expect("caller");
-                        Self::write_place(caller, &caller_body, &dest, value)?;
-                    }
+                    self.write_place(&mut frames, &caller_body, &dest, value)?;
                     match resume {
                         Some(bb) => Self::jump(&mut frames, &caller_body, bb)?,
                         None => {
@@ -274,10 +348,7 @@ impl<'a> Interpreter<'a> {
                     target,
                     message,
                 } => {
-                    let value = {
-                        let frame = frames.last_mut().expect("frame");
-                        Self::eval_operand(frame, body, &cond)?
-                    };
+                    let value = self.eval_operand(&mut frames, body, &cond)?;
                     let actual = value.as_bool().ok_or_else(|| {
                         InterpError::type_mismatch("Assert condition", "bool", value.kind_name())
                     })?;
@@ -307,136 +378,354 @@ impl<'a> Interpreter<'a> {
     }
 
     fn exec_statement(
-        &mut self,
+        &self,
         frames: &mut Vec<Frame>,
         body: &Body,
         statement: &Statement,
     ) -> InterpResult<()> {
         match &statement.kind {
             StatementKind::Assign(place, rvalue) => {
-                let frame = frames.last_mut().expect("frame");
                 let dest_ty = body.local_ty(place.local).cloned();
-                let value = Self::eval_rvalue(frame, body, rvalue, dest_ty.as_ref())?;
-                Self::write_place(frame, body, place, value)
+                let value = self.eval_rvalue(frames, body, rvalue, dest_ty.as_ref())?;
+                self.write_place(frames, body, place, value)
+            }
+            StatementKind::SetDiscriminant { place, variant } => {
+                let target = self.resolve_place(frames, body, place)?;
+                let Resolved::Place {
+                    frame_pos,
+                    local,
+                    projection,
+                } = target
+                else {
+                    return Err(InterpError::type_mismatch(
+                        format!("SetDiscriminant on {place}"),
+                        "mutable place",
+                        "constant aggregate",
+                    ));
+                };
+                let frame = &mut frames[frame_pos];
+                let func = frame.func.clone();
+                let slot = frame.locals.get_mut(local).ok_or_else(|| {
+                    InterpError::UnknownLocal {
+                        func: func.clone(),
+                        local,
+                    }
+                })?;
+                let place_desc = describe_resolved(local, &projection);
+                let value = navigate_mut(slot, &projection, &func, &place_desc)?;
+                match value {
+                    Value::Enum {
+                        variant: current,
+                        fields,
+                    } => {
+                        *current = *variant;
+                        // The old payload is invalidated, as in MIR.
+                        fields.clear();
+                        Ok(())
+                    }
+                    other => Err(InterpError::type_mismatch(
+                        format!("SetDiscriminant on {place}"),
+                        "ADT value",
+                        other.kind_name(),
+                    )),
+                }
             }
             // StorageLive / StorageDead are liveness hints in rustc MIR;
             // they do not change values. Nop is a no-op by definition.
             StatementKind::StorageLive(_) | StatementKind::StorageDead(_) | StatementKind::Nop => {
                 Ok(())
             }
-            StatementKind::Unsupported(kind) => {
-                Err(InterpError::UnsupportedStatement { kind: kind.clone() })
+            StatementKind::Unsupported(kind) => Err(InterpError::UnsupportedStatement {
+                kind: kind.clone(),
+            }),
+        }
+    }
+
+    // ----- place resolution --------------------------------------------------
+    //
+    // A place is resolved against the frame stack. `Field`, `Index`,
+    // `ConstantIndex` and `Downcast` steps accumulate as constant
+    // `RefProj` steps on a (frame, local) pair; a `Deref` step reads
+    // the reference value found there and continues at its target.
+    // `Index` locals are read in the *executing* frame: a place is
+    // syntactic to the function that contains it, so its index locals
+    // always live there, even when earlier steps crossed into another
+    // frame through a reference.
+
+    pub(crate) fn frame_pos(&self, frames: &[Frame], id: u64) -> InterpResult<usize> {
+        frames.iter().position(|f| f.id == id).ok_or_else(|| {
+            InterpError::type_mismatch(
+                "dereference",
+                "reference into a live frame",
+                format!("reference into finished frame #{id}"),
+            )
+        })
+    }
+
+    pub(crate) fn resolve_place(
+        &self,
+        frames: &[Frame],
+        body: &Body,
+        place: &Place,
+    ) -> InterpResult<Resolved> {
+        let mut cur = Resolved::Place {
+            frame_pos: frames.len() - 1,
+            local: place.local.0,
+            projection: Vec::new(),
+        };
+        for elem in &place.projection {
+            cur = match elem {
+                ProjectionElem::Field(idx) => {
+                    self.project_step(frames, cur, RefProj::Field(*idx), body, place)?
+                }
+                ProjectionElem::Index(local) => {
+                    let idx = self.read_index_local(frames, body, *local, place)?;
+                    self.project_step(frames, cur, RefProj::Index(idx), body, place)?
+                }
+                ProjectionElem::ConstantIndex { offset, from_end } => {
+                    let len = self
+                        .read_resolved(frames, &cur)?
+                        .len()
+                        .ok_or_else(|| {
+                            InterpError::type_mismatch(
+                                format!("constant index into {place}"),
+                                "array, slice or string value",
+                                "value without a length",
+                            )
+                        })?;
+                    let idx = if *from_end {
+                        len.checked_sub(*offset as u128).ok_or_else(|| {
+                            index_oob(len as usize, *offset as usize)
+                        })?
+                    } else {
+                        *offset as u128
+                    };
+                    let idx = usize::try_from(idx).map_err(|_| {
+                        InterpError::panic(format!(
+                            "index out of bounds: the len is {len} but the index is {idx}"
+                        ))
+                    })?;
+                    self.project_step(frames, cur, RefProj::Index(idx), body, place)?
+                }
+                ProjectionElem::Downcast(variant) => {
+                    self.project_step(frames, cur, RefProj::Downcast(*variant), body, place)?
+                }
+                ProjectionElem::Deref => {
+                    let value = self.read_resolved(frames, &cur)?;
+                    self.deref_value(frames, &value)?
+                }
+            };
+        }
+        Ok(cur)
+    }
+
+    fn project_step(
+        &self,
+        frames: &[Frame],
+        cur: Resolved,
+        step: RefProj,
+        body: &Body,
+        place: &Place,
+    ) -> InterpResult<Resolved> {
+        match cur {
+            Resolved::Place {
+                frame_pos,
+                local,
+                mut projection,
+            } => {
+                projection.push(step);
+                Ok(Resolved::Place {
+                    frame_pos,
+                    local,
+                    projection,
+                })
+            }
+            Resolved::Value(value) => {
+                let func = frames
+                    .last()
+                    .map(|f| f.func.clone())
+                    .unwrap_or_else(|| body.name.clone());
+                let projected = project_value(value, &[step], &func, &place.to_string())?;
+                Ok(Resolved::Value(projected))
             }
         }
     }
 
-    // ----- places & operands -------------------------------------------------
-
-    fn read_place(frame: &Frame, body: &Body, place: &Place) -> InterpResult<Value> {
-        let mut value =
-            frame
-                .locals
-                .get(place.local.0)
-                .cloned()
-                .ok_or_else(|| InterpError::UnknownLocal {
-                    func: body.name.clone(),
-                    local: place.local.0,
-                })?;
-        for elem in &place.projection {
-            match elem {
-                ProjectionElem::Field(idx) => match value {
-                    Value::Tuple(ref items) => {
-                        value = items.get(*idx).cloned().ok_or_else(|| {
-                            InterpError::UninitializedRead {
-                                func: body.name.clone(),
-                                place: place.to_string(),
-                            }
-                        })?;
-                    }
-                    ref other => {
-                        return Err(InterpError::type_mismatch(
-                            format!("field projection on {place}"),
-                            "tuple",
-                            other.kind_name(),
-                        ));
-                    }
-                },
-                ProjectionElem::Deref => {
-                    return Err(InterpError::UnsupportedProjection {
-                        kind: "Deref".into(),
-                    });
-                }
-                ProjectionElem::Index(_) => {
-                    return Err(InterpError::UnsupportedProjection {
-                        kind: "Index".into(),
-                    });
-                }
-            }
-        }
-        if value == Value::Uninit {
-            return Err(InterpError::UninitializedRead {
+    /// Read an `Index` projection's local in the executing frame.
+    fn read_index_local(
+        &self,
+        frames: &[Frame],
+        body: &Body,
+        local: Local,
+        place: &Place,
+    ) -> InterpResult<usize> {
+        let frame = frames.last().expect("frame");
+        let value = frame
+            .locals
+            .get(local.0)
+            .cloned()
+            .ok_or_else(|| InterpError::UnknownLocal {
+                func: body.name.clone(),
+                local: local.0,
+            })?;
+        match value {
+            Value::Uint(v) => usize::try_from(v).map_err(|_| {
+                InterpError::panic(format!("index {v} does not fit in usize"))
+            }),
+            Value::Int(v) if v >= 0 => usize::try_from(v).map_err(|_| {
+                InterpError::panic(format!("index {v} does not fit in usize"))
+            }),
+            Value::Int(v) => Err(InterpError::panic(format!(
+                "index out of bounds: negative index {v} used for {place}"
+            ))),
+            Value::Uninit => Err(InterpError::UninitializedRead {
                 func: body.name.clone(),
                 place: place.to_string(),
-            });
+            }),
+            other => Err(InterpError::type_mismatch(
+                format!("index of {place}"),
+                "integer index",
+                other.kind_name(),
+            )),
         }
-        Ok(value)
     }
 
-    fn write_place(
-        frame: &mut Frame,
+    /// Follow a reference value to what it points at.
+    pub(crate) fn deref_value(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+    ) -> InterpResult<Resolved> {
+        match value {
+            Value::Ref(RefTarget::Place {
+                frame,
+                local,
+                projection,
+            }) => Ok(Resolved::Place {
+                frame_pos: self.frame_pos(frames, *frame)?,
+                local: *local,
+                projection: projection.clone(),
+            }),
+            Value::Ref(RefTarget::Value(v)) => Ok(Resolved::Value((**v).clone())),
+            // Dereferencing a fat pointer reaches its base.
+            Value::FatRef { base, .. } => self.deref_value(frames, base),
+            other => Err(InterpError::type_mismatch(
+                "dereference",
+                "reference",
+                other.kind_name(),
+            )),
+        }
+    }
+
+    pub(crate) fn read_resolved(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+    ) -> InterpResult<Value> {
+        match target {
+            Resolved::Value(value) => {
+                if *value == Value::Uninit {
+                    return Err(InterpError::UninitializedRead {
+                        func: "<constant>".to_string(),
+                        place: "constant aggregate".to_string(),
+                    });
+                }
+                Ok(value.clone())
+            }
+            Resolved::Place {
+                frame_pos,
+                local,
+                projection,
+            } => {
+                let frame = &frames[*frame_pos];
+                let base = frame.locals.get(*local).cloned().ok_or_else(|| {
+                    InterpError::UnknownLocal {
+                        func: frame.func.clone(),
+                        local: *local,
+                    }
+                })?;
+                let place_desc = describe_resolved(*local, projection);
+                let value = project_value(base, projection, &frame.func, &place_desc)?;
+                if value == Value::Uninit {
+                    return Err(InterpError::UninitializedRead {
+                        func: frame.func.clone(),
+                        place: place_desc,
+                    });
+                }
+                Ok(value)
+            }
+        }
+    }
+
+    pub(crate) fn write_resolved(
+        &self,
+        frames: &mut Vec<Frame>,
+        target: &Resolved,
+        value: Value,
+    ) -> InterpResult<()> {
+        match target {
+            Resolved::Value(_) => Err(InterpError::type_mismatch(
+                "assignment",
+                "mutable place",
+                "constant aggregate",
+            )),
+            Resolved::Place {
+                frame_pos,
+                local,
+                projection,
+            } => {
+                if projection.is_empty() {
+                    // Direct local of the target frame: normalize
+                    // against that frame's declared type.
+                    let func = frames[*frame_pos].func.clone();
+                    let target_body = self.program.get(&func).cloned().ok_or_else(|| {
+                        InterpError::UnknownFunction { name: func.clone() }
+                    })?;
+                    let frame = &mut frames[*frame_pos];
+                    let slot = frame.locals.get_mut(*local).ok_or_else(|| {
+                        InterpError::UnknownLocal {
+                            func: func.clone(),
+                            local: *local,
+                        }
+                    })?;
+                    *slot = Self::normalize_for_ty(value, target_body.local_ty(Local(*local)))?;
+                    return Ok(());
+                }
+                let frame = &mut frames[*frame_pos];
+                let func = frame.func.clone();
+                let place_desc = describe_resolved(*local, projection);
+                let slot = frame.locals.get_mut(*local).ok_or_else(|| {
+                    InterpError::UnknownLocal {
+                        func: func.clone(),
+                        local: *local,
+                    }
+                })?;
+                let slot = navigate_mut(slot, projection, &func, &place_desc)?;
+                *slot = value;
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn read_place(
+        &self,
+        frames: &[Frame],
+        body: &Body,
+        place: &Place,
+    ) -> InterpResult<Value> {
+        let target = self.resolve_place(frames, body, place)?;
+        self.read_resolved(frames, &target)
+    }
+
+    pub(crate) fn write_place(
+        &self,
+        frames: &mut Vec<Frame>,
         body: &Body,
         place: &Place,
         value: Value,
     ) -> InterpResult<()> {
-        if place.projection.is_empty() {
-            let slot =
-                frame
-                    .locals
-                    .get_mut(place.local.0)
-                    .ok_or_else(|| InterpError::UnknownLocal {
-                        func: body.name.clone(),
-                        local: place.local.0,
-                    })?;
-            *slot = Self::normalize_for_ty(value, body.local_ty(place.local))?;
-            return Ok(());
-        }
-        // Projected write: walk to the parent value, then rebuild the field.
-        // Only a single trailing Field projection is supported in this cut.
-        if place.projection.len() == 1 {
-            if let ProjectionElem::Field(idx) = place.projection[0] {
-                let slot = frame.locals.get_mut(place.local.0).ok_or_else(|| {
-                    InterpError::UnknownLocal {
-                        func: body.name.clone(),
-                        local: place.local.0,
-                    }
-                })?;
-                return match slot {
-                    Value::Tuple(items) => {
-                        let field =
-                            items
-                                .get_mut(idx)
-                                .ok_or_else(|| InterpError::UninitializedRead {
-                                    func: body.name.clone(),
-                                    place: place.to_string(),
-                                })?;
-                        *field = value;
-                        Ok(())
-                    }
-                    Value::Uninit => Err(InterpError::UninitializedRead {
-                        func: body.name.clone(),
-                        place: place.to_string(),
-                    }),
-                    other => Err(InterpError::type_mismatch(
-                        format!("field write on {place}"),
-                        "tuple",
-                        other.kind_name(),
-                    )),
-                };
-            }
-        }
-        Err(InterpError::UnsupportedProjection {
-            kind: format!("{place} ({} projections)", place.projection.len()),
-        })
+        let target = self.resolve_place(frames, body, place)?;
+        self.write_resolved(frames, &target, value)
     }
 
     /// Validate / wrap a value being stored into a typed direct local.
@@ -448,6 +737,29 @@ impl<'a> Interpreter<'a> {
             | (None, _) => Ok(value),
             (Some(Ty::Int(it)), Value::Int(v)) => Ok(Value::Int(wrap_signed(*v, it.bits()))),
             (Some(Ty::Uint(ut)), Value::Uint(v)) => Ok(Value::Uint(*v & ut.max())),
+            // ADT locals hold the ADT value forms: aggregates, string
+            // data (`String`), and the fmt value family.
+            (Some(Ty::Adt(_)), Value::Enum { .. })
+            | (Some(Ty::Adt(_)), Value::Str(_))
+            | (Some(Ty::Adt(_)), Value::FmtArg { .. })
+            | (Some(Ty::Adt(_)), Value::FmtCount(_))
+            | (Some(Ty::Adt(_)), Value::FmtArguments(_)) => Ok(value),
+            // Reference locals hold resolved references, fat pointers,
+            // and — for `&str` and byte-array references — the string
+            // or byte data itself (a string constant *is* its value;
+            // a reference to a string place is a `Ref`).
+            (Some(Ty::Ref(_)), Value::Ref(_))
+            | (Some(Ty::Ref(_)), Value::FatRef { .. })
+            | (Some(Ty::Ref(_)), Value::Str(_))
+            | (Some(Ty::Ref(_)), Value::Bytes(_)) => Ok(value),
+            (Some(Ty::Str), Value::Str(_)) => Ok(value),
+            (Some(Ty::Array(_, n)), Value::Tuple(items)) if items.len() as u64 == *n => Ok(value),
+            (Some(Ty::Array(elem, n)), Value::Bytes(b))
+                if **elem == Ty::Uint(UintTy::U8) && b.len() as u64 == *n =>
+            {
+                Ok(value)
+            }
+            (Some(Ty::Slice(_)), Value::FatRef { .. }) => Ok(value),
             (Some(expected), other) => Err(InterpError::type_mismatch(
                 "assignment",
                 format!("{expected:?}"),
@@ -456,12 +768,18 @@ impl<'a> Interpreter<'a> {
         }
     }
 
-    fn eval_operand(frame: &mut Frame, body: &Body, operand: &Operand) -> InterpResult<Value> {
+    pub(crate) fn eval_operand(
+        &self,
+        frames: &mut Vec<Frame>,
+        body: &Body,
+        operand: &Operand,
+    ) -> InterpResult<Value> {
         match operand {
-            Operand::Copy(place) => Self::read_place(frame, body, place),
+            Operand::Copy(place) => self.read_place(frames, body, place),
             Operand::Move(place) => {
-                let value = Self::read_place(frame, body, place)?;
+                let value = self.read_place(frames, body, place)?;
                 if place.is_direct_local() {
+                    let frame = frames.last_mut().expect("frame");
                     if let Some(slot) = frame.locals.get_mut(place.local.0) {
                         *slot = Value::Uninit;
                     }
@@ -473,6 +791,8 @@ impl<'a> Interpreter<'a> {
                 Constant::Bool(b) => Value::Bool(*b),
                 Constant::Int(v) => Value::Int(*v),
                 Constant::Uint(v) => Value::Uint(*v),
+                Constant::Str(s) => Value::Str(s.clone()),
+                Constant::Bytes(b) => Value::Bytes(b.clone()),
             }),
         }
     }
@@ -480,42 +800,339 @@ impl<'a> Interpreter<'a> {
     // ----- rvalues -----------------------------------------------------------
 
     fn eval_rvalue(
-        frame: &mut Frame,
+        &self,
+        frames: &mut Vec<Frame>,
         body: &Body,
         rvalue: &Rvalue,
         dest_ty: Option<&Ty>,
     ) -> InterpResult<Value> {
         match rvalue {
-            Rvalue::Use(op) => Self::eval_operand(frame, body, op),
+            Rvalue::Use(op) => self.eval_operand(frames, body, op),
             Rvalue::BinaryOp(op, pair) => {
-                let lhs = Self::eval_operand(frame, body, &pair.0)?;
-                let rhs = Self::eval_operand(frame, body, &pair.1)?;
+                let lhs = self.eval_operand(frames, body, &pair.0)?;
+                let rhs = self.eval_operand(frames, body, &pair.1)?;
                 eval_binary(*op, &lhs, &rhs, dest_ty, false).map(|(v, _)| v)
             }
             Rvalue::CheckedBinaryOp(op, pair) => {
-                let lhs = Self::eval_operand(frame, body, &pair.0)?;
-                let rhs = Self::eval_operand(frame, body, &pair.1)?;
+                let lhs = self.eval_operand(frames, body, &pair.0)?;
+                let rhs = self.eval_operand(frames, body, &pair.1)?;
                 let (v, overflowed) = eval_binary(*op, &lhs, &rhs, dest_ty, true)?;
                 Ok(Value::Tuple(vec![v, Value::Bool(overflowed)]))
             }
+            Rvalue::UnaryOp(UnOp::PtrMetadata, operand) => {
+                let v = self.eval_operand(frames, body, operand)?;
+                match &v {
+                    Value::FatRef { len, .. } => Ok(Value::Uint(*len)),
+                    Value::Str(s) => Ok(Value::Uint(s.len() as u128)),
+                    other => Err(InterpError::type_mismatch(
+                        "PtrMetadata",
+                        "fat pointer",
+                        other.kind_name(),
+                    )),
+                }
+            }
             Rvalue::UnaryOp(op, operand) => {
-                let v = Self::eval_operand(frame, body, operand)?;
+                let v = self.eval_operand(frames, body, operand)?;
                 eval_unary(*op, &v, dest_ty)
             }
             Rvalue::AggregateTuple(operands) => {
                 let mut items = Vec::with_capacity(operands.len());
                 for op in operands {
-                    items.push(Self::eval_operand(frame, body, op)?);
+                    items.push(self.eval_operand(frames, body, op)?);
                 }
                 Ok(Value::Tuple(items))
             }
+            Rvalue::AggregateAdt { variant, operands } => {
+                let mut fields = Vec::with_capacity(operands.len());
+                for op in operands {
+                    fields.push(self.eval_operand(frames, body, op)?);
+                }
+                Ok(Value::Enum {
+                    variant: *variant,
+                    fields,
+                })
+            }
             Rvalue::Cast(operand, ty) => {
-                let v = Self::eval_operand(frame, body, operand)?;
+                let v = self.eval_operand(frames, body, operand)?;
                 eval_cast(&v, ty)
             }
-            Rvalue::Ref(_) => Err(InterpError::UnsupportedRvalue { kind: "Ref".into() }),
-            Rvalue::Unsupported(kind) => Err(InterpError::UnsupportedRvalue { kind: kind.clone() }),
+            Rvalue::Unsize(operand) => {
+                let v = self.eval_operand(frames, body, operand)?;
+                match v {
+                    Value::Ref(_) => {
+                        let target = self.deref_value(frames, &v)?;
+                        let pointee = self.read_resolved(frames, &target)?;
+                        let len = pointee.len().ok_or_else(|| {
+                            InterpError::type_mismatch(
+                                "unsizing cast",
+                                "array pointee",
+                                pointee.kind_name(),
+                            )
+                        })?;
+                        Ok(Value::FatRef {
+                            base: Box::new(v),
+                            len,
+                        })
+                    }
+                    Value::Bytes(b) => {
+                        let len = b.len() as u128;
+                        Ok(Value::FatRef {
+                            base: Box::new(Value::Bytes(b)),
+                            len,
+                        })
+                    }
+                    other => Err(InterpError::type_mismatch(
+                        "unsizing cast",
+                        "reference to an array",
+                        other.kind_name(),
+                    )),
+                }
+            }
+            Rvalue::Ref(place) => {
+                let target = self.resolve_place(frames, body, place)?;
+                match target {
+                    Resolved::Place {
+                        frame_pos,
+                        local,
+                        projection,
+                    } => Ok(Value::Ref(RefTarget::place(
+                        frames[frame_pos].id,
+                        local,
+                        projection,
+                    ))),
+                    Resolved::Value(value) => Ok(Value::Ref(RefTarget::Value(Box::new(value)))),
+                }
+            }
+            Rvalue::Len(place) => {
+                let value = self.read_place(frames, body, place)?;
+                let len = value.len().ok_or_else(|| {
+                    InterpError::type_mismatch(
+                        format!("Len of {place}"),
+                        "array, slice or string value",
+                        value.kind_name(),
+                    )
+                })?;
+                Ok(Value::Uint(len))
+            }
+            Rvalue::Discriminant(place) => {
+                let value = self.read_place(frames, body, place)?;
+                match value {
+                    Value::Enum { variant, .. } => Ok(Value::Int(variant as i128)),
+                    other => Err(InterpError::type_mismatch(
+                        format!("Discriminant of {place}"),
+                        "ADT value",
+                        other.kind_name(),
+                    )),
+                }
+            }
+            Rvalue::CopyForDeref(place) => {
+                let value = self.read_place(frames, body, place)?;
+                match &value {
+                    Value::Ref(_) | Value::FatRef { .. } => {
+                        let target = self.deref_value(frames, &value)?;
+                        self.read_resolved(frames, &target)
+                    }
+                    _ => Ok(value),
+                }
+            }
+            Rvalue::Unsupported(kind) => Err(InterpError::UnsupportedRvalue {
+                kind: kind.clone(),
+            }),
         }
+    }
+}
+
+/// Human-readable form of a resolved place, for error messages.
+pub(crate) fn describe_resolved(local: usize, projection: &[RefProj]) -> String {
+    let mut out = format!("_{local}");
+    for proj in projection {
+        match proj {
+            RefProj::Field(i) => out.push_str(&format!(".{i}")),
+            RefProj::Index(i) => out.push_str(&format!("[{i}]")),
+            RefProj::Downcast(v) => out.push_str(&format!(" as variant {v}")),
+        }
+    }
+    out
+}
+
+/// The guest panic rustc raises for an out-of-bounds index.
+fn index_oob(len: usize, index: usize) -> InterpError {
+    InterpError::panic(format!(
+        "index out of bounds: the len is {len} but the index is {index}"
+    ))
+}
+
+/// Apply constant projection steps to a value (read direction).
+pub(crate) fn project_value(
+    value: Value,
+    projection: &[RefProj],
+    func: &str,
+    place: &str,
+) -> InterpResult<Value> {
+    let mut value = value;
+    for step in projection {
+        if value == Value::Uninit {
+            return Err(InterpError::UninitializedRead {
+                func: func.to_string(),
+                place: place.to_string(),
+            });
+        }
+        value = match step {
+            RefProj::Field(idx) => match value {
+                Value::Tuple(ref items) => items.get(*idx).cloned().ok_or_else(|| {
+                    InterpError::UninitializedRead {
+                        func: func.to_string(),
+                        place: place.to_string(),
+                    }
+                })?,
+                Value::Enum { ref fields, .. } => {
+                    fields.get(*idx).cloned().ok_or_else(|| {
+                        InterpError::UninitializedRead {
+                            func: func.to_string(),
+                            place: place.to_string(),
+                        }
+                    })?
+                }
+                ref other => {
+                    return Err(InterpError::type_mismatch(
+                        format!("field projection on {place}"),
+                        "tuple or ADT value",
+                        other.kind_name(),
+                    ));
+                }
+            },
+            RefProj::Index(idx) => match value {
+                Value::Tuple(ref items) => items
+                    .get(*idx)
+                    .cloned()
+                    .ok_or_else(|| index_oob(items.len(), *idx))?,
+                Value::Bytes(ref b) => b
+                    .get(*idx)
+                    .map(|byte| Value::Uint(*byte as u128))
+                    .ok_or_else(|| index_oob(b.len(), *idx))?,
+                Value::Str(ref s) => s
+                    .as_bytes()
+                    .get(*idx)
+                    .map(|byte| Value::Uint(*byte as u128))
+                    .ok_or_else(|| index_oob(s.len(), *idx))?,
+                ref other => {
+                    return Err(InterpError::type_mismatch(
+                        format!("index projection on {place}"),
+                        "array, byte or string value",
+                        other.kind_name(),
+                    ));
+                }
+            },
+            RefProj::Downcast(variant) => match value {
+                Value::Enum {
+                    variant: current, ..
+                } => {
+                    if current != *variant {
+                        return Err(InterpError::type_mismatch(
+                            format!("downcast of {place}"),
+                            format!("variant {variant}"),
+                            format!("variant {current}"),
+                        ));
+                    }
+                    value
+                }
+                Value::Tuple(_) if *variant == 0 => value,
+                ref other => {
+                    return Err(InterpError::type_mismatch(
+                        format!("downcast of {place}"),
+                        "ADT value",
+                        other.kind_name(),
+                    ));
+                }
+            },
+        };
+    }
+    Ok(value)
+}
+
+/// Navigate a projection mutably inside a stored value and return the
+/// final slot (write direction).
+pub(crate) fn navigate_mut<'x>(
+    slot: &'x mut Value,
+    projection: &[RefProj],
+    func: &str,
+    place: &str,
+) -> InterpResult<&'x mut Value> {
+    if projection.is_empty() {
+        return Ok(slot);
+    }
+    if *slot == Value::Uninit {
+        return Err(InterpError::UninitializedRead {
+            func: func.to_string(),
+            place: place.to_string(),
+        });
+    }
+    let (step, rest) = projection.split_first().expect("non-empty");
+    match step {
+        RefProj::Field(idx) => {
+            let items = match slot {
+                Value::Tuple(items) => items,
+                Value::Enum { fields, .. } => fields,
+                other => {
+                    return Err(InterpError::type_mismatch(
+                        format!("field write on {place}"),
+                        "tuple or ADT value",
+                        other.kind_name(),
+                    ));
+                }
+            };
+            let item = items.get_mut(*idx).ok_or_else(|| InterpError::UninitializedRead {
+                func: func.to_string(),
+                place: place.to_string(),
+            })?;
+            navigate_mut(item, rest, func, place)
+        }
+        RefProj::Index(idx) => match slot {
+            Value::Tuple(items) => {
+                if *idx >= items.len() {
+                    return Err(index_oob(items.len(), *idx));
+                }
+                navigate_mut(&mut items[*idx], rest, func, place)
+            }
+            Value::Bytes(b) => {
+                if *idx >= b.len() {
+                    return Err(index_oob(b.len(), *idx));
+                }
+                // Byte payloads come from constants and have no
+                // `Value` slot to hand out; array locals built by
+                // aggregates are tuples and take the arm above.
+                Err(InterpError::type_mismatch(
+                    format!("index write on {place}"),
+                    "mutable array slot",
+                    "constant bytes",
+                ))
+            }
+            other => Err(InterpError::type_mismatch(
+                format!("index write on {place}"),
+                "array value",
+                other.kind_name(),
+            )),
+        },
+        RefProj::Downcast(variant) => match slot {
+            Value::Enum {
+                variant: current, ..
+            } => {
+                if current != variant {
+                    return Err(InterpError::type_mismatch(
+                        format!("downcast write on {place}"),
+                        format!("variant {variant}"),
+                        format!("variant {current}"),
+                    ));
+                }
+                navigate_mut(slot, rest, func, place)
+            }
+            Value::Tuple(_) if *variant == 0 => navigate_mut(slot, rest, func, place),
+            other => Err(InterpError::type_mismatch(
+                format!("downcast write on {place}"),
+                "ADT value",
+                other.kind_name(),
+            )),
+        },
     }
 }
 
@@ -580,6 +1197,22 @@ fn eval_binary(
                     format!("binary operation {op:?}"),
                     "integer operands",
                     "bool",
+                ))
+            }
+        };
+        return Ok((v, false));
+    }
+    // String equality (the only binary operations MIR performs on
+    // string data directly; ordering goes through library calls).
+    if let (Value::Str(a), Value::Str(b)) = (lhs, rhs) {
+        let v = match op {
+            Eq => Value::Bool(a == b),
+            Ne => Value::Bool(a != b),
+            _ => {
+                return Err(InterpError::type_mismatch(
+                    format!("binary operation {op:?}"),
+                    "integer operands",
+                    "string",
                 ))
             }
         };
@@ -766,6 +1399,11 @@ fn eval_unary(op: UnOp, v: &Value, dest_ty: Option<&Ty>) -> InterpResult<Value> 
         (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
         (UnOp::Not, Value::Int(a)) => Ok(Value::Int(wrap_signed(!a, signed_bits(dest_ty)))),
         (UnOp::Not, Value::Uint(a)) => Ok(Value::Uint(wrap_unsigned(!a, unsigned_bits(dest_ty)))),
+        (UnOp::PtrMetadata, _) => Err(InterpError::type_mismatch(
+            "PtrMetadata",
+            "fat pointer",
+            v.kind_name(),
+        )),
         _ => Err(InterpError::type_mismatch(
             format!("unary operation {op:?}"),
             "integer or bool",

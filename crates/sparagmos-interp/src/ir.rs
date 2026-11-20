@@ -9,10 +9,13 @@
 //! for the assumed Lane A API and the expected differences):
 //! * Functions are identified by name (`String`), not by `DefId`.
 //! * A call's callee is a plain name, not a constant `FnDef` operand.
-//! * Places only support tuple-field projection; deref / index /
-//!   downcast are representable but rejected at run time.
-//! * Types are reduced to the scalar [`Ty`] below (no ADTs, no references,
-//!   no lifetimes, no generics).
+//!   Calls into code with no converted body (std/core runtime support)
+//!   use the dedicated [`TerminatorKind::CallBuiltin`] instead.
+//! * Places support field / deref / index / constant-index / downcast
+//!   projections; references are resolved values (see
+//!   [`crate::value::RefTarget`]).
+//! * Types cover scalars, tuples, ADTs (by name), references, slices,
+//!   arrays and `str`; no lifetimes, no trait objects.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -111,7 +114,8 @@ impl UintTy {
     }
 }
 
-/// The scalar type model used for width / overflow semantics.
+/// The type model used for width / overflow semantics and for
+/// validating values written to places.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Ty {
     Unit,
@@ -121,6 +125,23 @@ pub enum Ty {
     /// Tuple type, e.g. the `(T, bool)` produced by a checked operation.
     Tuple(Vec<Ty>),
     Never,
+    /// A struct/enum/union type, identified by its full path as
+    /// rendered by the driver (e.g. `std::fmt::Arguments`). ADT values
+    /// are variant + fields; the name is what runtime support for
+    /// std types (iterators, `String`, ...) dispatches on.
+    Adt(String),
+    /// A reference or raw pointer to the given pointee type. The two
+    /// share one representation: a resolved [`crate::value::RefTarget`]
+    /// (or a fat pointer for slice pointees).
+    Ref(Box<Ty>),
+    /// A slice type `[T]`; only appears behind a reference.
+    Slice(Box<Ty>),
+    /// An array type `[T; N]` with a known length. Arrays are valued
+    /// as tuples of their elements.
+    Array(Box<Ty>, u64),
+    /// The `str` type; only appears behind a reference or as the type
+    /// of a string-data place.
+    Str,
 }
 
 impl Ty {
@@ -152,10 +173,14 @@ impl Ty {
 pub enum ProjectionElem {
     /// Tuple / aggregate field access, e.g. `_1.0`.
     Field(usize),
-    /// `*_1` — representable, not yet executable (explicit run-time error).
+    /// `*_1`: follow a reference value.
     Deref,
-    /// `_1[_2]` — representable, not yet executable.
+    /// `_1[_2]`: index by a local (read in the executing frame).
     Index(Local),
+    /// `_1[3]` / `_1[len - 2]`: index by a constant offset.
+    ConstantIndex { offset: u64, from_end: bool },
+    /// Project an enum value to one variant's fields.
+    Downcast(u32),
 }
 
 /// A place: a local plus a (possibly empty) projection chain.
@@ -193,6 +218,14 @@ impl fmt::Display for Place {
                 ProjectionElem::Field(i) => write!(f, ".{i}")?,
                 ProjectionElem::Deref => write!(f, ".*")?,
                 ProjectionElem::Index(l) => write!(f, "[{l}]")?,
+                ProjectionElem::ConstantIndex { offset, from_end } => {
+                    if *from_end {
+                        write!(f, "[len - {offset}]")?
+                    } else {
+                        write!(f, "[{offset}]")?
+                    }
+                }
+                ProjectionElem::Downcast(v) => write!(f, " as variant {v}")?,
             }
         }
         Ok(())
@@ -206,6 +239,10 @@ pub enum Constant {
     Bool(bool),
     Int(i128),
     Uint(u128),
+    /// String data (a `str` / `&str` constant).
+    Str(String),
+    /// Raw bytes (a byte-array constant, e.g. an fmt pieces template).
+    Bytes(Vec<u8>),
 }
 
 /// An operand: the right-hand side leaf of most rvalues.
@@ -266,6 +303,8 @@ pub enum BinOp {
 pub enum UnOp {
     Neg,
     Not,
+    /// `PtrMetadata`: the length metadata of a fat pointer.
+    PtrMetadata,
 }
 
 /// A right-hand side expression.
@@ -276,12 +315,26 @@ pub enum Rvalue {
     /// Like rustc MIR: yields a `(value, overflowed)` tuple, wrapping.
     CheckedBinaryOp(BinOp, Box<(Operand, Operand)>),
     UnaryOp(UnOp, Operand),
-    /// Build a tuple value from operands.
+    /// Build a tuple value from operands. Array aggregates ride as
+    /// tuples too (the length lives in the declared type).
     AggregateTuple(Vec<Operand>),
+    /// Build an ADT value: a variant index plus field values.
+    AggregateAdt { variant: u32, operands: Vec<Operand> },
     /// An `as` cast to the given scalar type (wrapping, as in Rust).
     Cast(Operand, Ty),
-    /// `&place` — representable, not yet executable.
+    /// The array-to-slice unsizing coercion: wraps the operand (a
+    /// reference to an array) into a fat pointer carrying the length.
+    Unsize(Operand),
+    /// `&place` (also raw-pointer creation): a resolved reference value.
     Ref(Place),
+    /// The length of the value at a place (array / slice / `str`).
+    Len(Place),
+    /// The discriminant of the enum value at a place.
+    Discriminant(Place),
+    /// `*place` read for a copy (rustc `CopyForDeref`): reads the
+    /// place; when the value there is a reference, reads through it
+    /// once more.
+    CopyForDeref(Place),
     /// Any rvalue kind not modelled yet; executing it is an explicit error.
     Unsupported(String),
 }
@@ -299,6 +352,9 @@ impl Rvalue {
 #[derive(Debug, Clone, PartialEq)]
 pub enum StatementKind {
     Assign(Place, Rvalue),
+    /// Set the discriminant of the enum value at a place, clearing
+    /// its fields (as in rustc MIR).
+    SetDiscriminant { place: Place, variant: u32 },
     /// Hint only in rustc MIR; a no-op here.
     StorageLive(Local),
     /// Hint only in rustc MIR; a no-op here.
@@ -346,6 +402,29 @@ pub enum TerminatorKind {
         destination: Place,
         /// Continuation block in the caller; `None` models a diverging call.
         target: Option<BasicBlock>,
+    },
+    /// A call into runtime support (std/core functions whose bodies
+    /// only exist in the standard library): printing/formatting, fmt
+    /// argument construction, iterator adapters over the modelled
+    /// std types, and similar. Dispatched by `name` (the canonical
+    /// callee path, generic lifetime groups stripped) in `builtins`.
+    CallBuiltin {
+        name: String,
+        /// Rendered generic arguments of the callee (type tags the
+        /// dispatch keys on, e.g. `std::ops::Range<usize>` for
+        /// `Iterator::next`).
+        generic_args: Vec<String>,
+        args: Vec<Operand>,
+        destination: Place,
+        target: Option<BasicBlock>,
+    },
+    /// Drop the value at a place and continue at `target`. Only
+    /// converted when the dropped type's glue provably has no
+    /// guest-observable effect in this value model (see
+    /// `mir_convert`); other drops stay explicit errors.
+    Drop {
+        place: Place,
+        target: BasicBlock,
     },
     Return,
     Unreachable,
