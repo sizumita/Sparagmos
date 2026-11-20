@@ -110,3 +110,66 @@ fn run_mode_silent_program_exits_zero() {
         String::from_utf8_lossy(&out.stdout)
     );
 }
+
+// ----- by-reference constants (Lane R) ---------------------------------------
+
+const PROMOTED_REF_SRC: &str = r#"
+fn main() {
+    let x = 10;
+    let y = x;
+    assert_eq!(y, 10);
+    let z: u8 = 255;
+    assert_eq!(z, 255);
+}
+"#;
+
+const CONST_SHAPES_SRC: &str = r#"
+struct S { a: i32, b: u8 }
+const S1: S = S { a: -2, b: 7 };
+const ARR: [i32; 3] = [10, 20, 30];
+const R: &i32 = &ARR[1];
+static A: usize = 42;
+static B: usize = A;
+const NAMES: [&str; 2] = ["x", "yy"];
+const OPT: Option<&i32> = Some(&5);
+fn main() {
+    println!("{} {} {} {} {} {}", S1.a, S1.b, *R, B, NAMES[1],
+             match OPT { Some(r) => *r, None => 0 });
+}
+"#;
+
+#[test]
+fn run_mode_promoted_ref_constant() {
+    // `assert_eq!` against a literal builds a promoted `&i32`
+    // constant; it must execute, not stop at the constant.
+    let dir = temp_dir("promoted");
+    let src = fixture(&dir, "promoted.rs", PROMOTED_REF_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "promoted reference constants must run; stderr={stderr}"
+    );
+}
+
+#[test]
+fn run_mode_materialised_constant_shapes() {
+    // Struct constants, a reference into the middle of an array
+    // constant, statics read by value, a `[&str]` constant and a
+    // niche-encoded `Option<&i32>` constant, all printed.
+    let dir = temp_dir("const-shapes");
+    let src = fixture(&dir, "const_shapes.rs", CONST_SHAPES_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "materialised constants must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "-2 7 20 42 yy 5\n",
+        "decoded constant values must match the source program"
+    );
+}

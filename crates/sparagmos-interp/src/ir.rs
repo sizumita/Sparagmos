@@ -265,6 +265,14 @@ pub enum Constant {
     Str(String),
     /// Raw bytes (a byte-array constant, e.g. an fmt pieces template).
     Bytes(Vec<u8>),
+    /// A tuple or array constant, element by element.
+    Tuple(Vec<Constant>),
+    /// An ADT constant: variant index plus field constants.
+    Adt { variant: u32, fields: Vec<Constant> },
+    /// A reference to a constant value.
+    Ref(Box<Constant>),
+    /// A slice constant with decoded (non-byte) elements.
+    SliceVal(Vec<Constant>),
 }
 
 /// An operand: the right-hand side leaf of most rvalues.

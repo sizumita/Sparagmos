@@ -20,13 +20,15 @@
 
 use std::collections::HashMap;
 
+use rustc_public::abi::{FieldsShape, TagEncoding, VariantsShape};
 use rustc_public::mir;
 use rustc_public::ty::{
-    AliasKind as SmirAliasKind, Allocation, ConstantKind, FloatTy as SmirFloatTy, GenericArgKind,
-    GenericArgs, IntTy as SmirIntTy, RigidTy, TyConstKind, TyKind, UintTy as SmirUintTy,
+    AdtDef, AdtKind, AliasKind as SmirAliasKind, Allocation, ConstantKind, FloatTy as SmirFloatTy,
+    GenericArgKind, GenericArgs, IntTy as SmirIntTy, RigidTy, TyConstKind, TyKind,
+    UintTy as SmirUintTy, VariantIdx,
 };
 use rustc_public_bridge::IndexedVal;
-use rustc_public::CrateDef;
+use rustc_public::{CrateDef, CrateDefType};
 
 use sparagmos_mir as sm;
 
@@ -597,6 +599,11 @@ impl Converter {
             }
             other => {
                 let _ = &other;
+                // Aggregate constants (tuples, arrays, ADTs) are
+                // decoded field by field, guided by the layout.
+                if let Some(v) = self.decode_const(ty, alloc, 0, 0) {
+                    return v;
+                }
                 self.err(format!(
                     "ConstantKind::Allocated (type {})",
                     short_ty(ty)
@@ -634,22 +641,31 @@ impl Converter {
         inner: &rustc_public::ty::Ty,
         alloc: &Allocation,
     ) -> sm::ConstValue {
-        // Fat-pointer shape: `&str` and `&[T]` literals.
+        // Fat-pointer shape: `&str` and `&[u8]` literals take the
+        // shortcut; every other shape falls through to the decoder
+        // below (a raw-byte slice of wider or non-scalar elements
+        // has no value form in the interpreter).
         if let Some((data, meta)) = self.read_fat_pointer(alloc) {
-            return match inner.kind() {
-                TyKind::RigidTy(RigidTy::Str) => match String::from_utf8(data) {
-                    Ok(s) => sm::ConstValue::Str(s),
-                    Err(_) => {
-                        self.err("ConstantKind::Allocated (&str, invalid UTF-8)");
-                        sm::ConstValue::ZeroSized
+            match inner.kind() {
+                TyKind::RigidTy(RigidTy::Str) => {
+                    return match String::from_utf8(data) {
+                        Ok(s) => sm::ConstValue::Str(s),
+                        Err(_) => {
+                            self.err("ConstantKind::Allocated (&str, invalid UTF-8)");
+                            sm::ConstValue::ZeroSized
+                        }
                     }
-                },
-                TyKind::RigidTy(RigidTy::Slice(_)) => sm::ConstValue::Slice { data, meta },
-                _ => {
-                    self.err("ConstantKind::Allocated (fat pointer, unexpected type)");
-                    sm::ConstValue::ZeroSized
                 }
-            };
+                TyKind::RigidTy(RigidTy::Slice(elem))
+                    if matches!(
+                        elem.kind(),
+                        TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8))
+                    ) =>
+                {
+                    return sm::ConstValue::Slice { data, meta };
+                }
+                _ => {}
+            }
         }
         // Thin-pointer shape: follow the provenance to the pointee.
         if let Some((_, prov)) = alloc.provenance.ptrs.first() {
@@ -669,25 +685,31 @@ impl Converter {
                         };
                     }
                     TyKind::RigidTy(RigidTy::Slice(elem)) if plain => {
-                        if let Some(size) = scalar_elem_layout(&elem) {
+                        if matches!(
+                            elem.kind(),
+                            TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8))
+                        ) {
                             return match pointee.raw_bytes() {
                                 Ok(data) => sm::ConstValue::Slice {
-                                    meta: (data.len() / size) as u64,
+                                    meta: data.len() as u64,
                                     data,
                                 },
                                 Err(_) => {
-                                    self.err("ConstantKind::Allocated (&[T], unreadable)");
+                                    self.err("ConstantKind::Allocated (&[u8], unreadable)");
                                     sm::ConstValue::ZeroSized
                                 }
                             };
                         }
                     }
                     TyKind::RigidTy(RigidTy::Array(elem, _)) if plain => {
-                        if scalar_elem_layout(&elem).is_some() {
+                        if matches!(
+                            elem.kind(),
+                            TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8))
+                        ) {
                             return match pointee.raw_bytes() {
                                 Ok(data) => sm::ConstValue::Bytes(data),
                                 Err(_) => {
-                                    self.err("ConstantKind::Allocated (&[T; N], unreadable)");
+                                    self.err("ConstantKind::Allocated (&[u8; N], unreadable)");
                                     sm::ConstValue::ZeroSized
                                 }
                             };
@@ -695,6 +717,13 @@ impl Converter {
                     }
                     _ => {}
                 }
+            }
+            // General shape: decode the pointee allocation by the
+            // inner type, guided by the type's layout. Anything the
+            // decoder cannot materialise keeps the exact `ByRef`
+            // identity and stays unsupported downstream.
+            if let Some(v) = self.decode_ref(inner, alloc, 0, 0) {
+                return v;
             }
             return sm::ConstValue::ByRef {
                 alloc_id,
@@ -706,6 +735,334 @@ impl Converter {
             short_ty(inner)
         ));
         sm::ConstValue::ZeroSized
+    }
+
+
+    /// Decode the value of type `ty` stored in `alloc` at `offset`
+    /// into a structured constant. Aggregates are laid out with the
+    /// type's own layout (`Ty::layout`), pointers are followed
+    /// through provenance, and enums are resolved through their tag
+    /// (direct or niche encoding). Returns `None` for anything that
+    /// has no faithful value form: unions, function pointers and
+    /// vtables, references to statics or functions, null pointers,
+    /// unsized values behind no pointer, and nesting deeper than
+    /// the depth budget (cyclic statics exhaust it).
+    fn decode_const(
+        &mut self,
+        ty: &rustc_public::ty::Ty,
+        alloc: &Allocation,
+        offset: usize,
+        depth: usize,
+    ) -> Option<sm::ConstValue> {
+        if depth > MAX_CONST_DEPTH {
+            return None;
+        }
+        match ty.kind() {
+            TyKind::RigidTy(RigidTy::Bool) => match read_uint_at(alloc, offset, 1)? {
+                0 => Some(sm::ConstValue::Bool(false)),
+                1 => Some(sm::ConstValue::Bool(true)),
+                _ => None,
+            },
+            TyKind::RigidTy(RigidTy::Char) => {
+                let v = read_uint_at(alloc, offset, 4)?;
+                char::from_u32(v as u32).map(sm::ConstValue::Char)
+            }
+            TyKind::RigidTy(RigidTy::Int(t)) => {
+                let size = int_ty_size(&t)?;
+                let raw = read_uint_at(alloc, offset, size)?;
+                Some(sm::ConstValue::Scalar(sm::Scalar::Int {
+                    data: sign_extend(raw, size),
+                    size: size as u8,
+                }))
+            }
+            TyKind::RigidTy(RigidTy::Uint(t)) => {
+                let size = uint_ty_size(&t)?;
+                let raw = read_uint_at(alloc, offset, size)?;
+                Some(sm::ConstValue::Scalar(sm::Scalar::Int {
+                    data: raw,
+                    size: size as u8,
+                }))
+            }
+            TyKind::RigidTy(RigidTy::Float(f)) => {
+                let size = match f {
+                    SmirFloatTy::F32 => 4,
+                    SmirFloatTy::F64 => 8,
+                    _ => return None,
+                };
+                let bits = read_uint_at(alloc, offset, size)?;
+                Some(sm::ConstValue::Scalar(sm::Scalar::Float {
+                    bits,
+                    ty: float_ty(f),
+                }))
+            }
+            TyKind::RigidTy(RigidTy::Ref(_, inner, _)) => {
+                self.decode_ref(&inner, alloc, offset, depth)
+            }
+            TyKind::RigidTy(RigidTy::RawPtr(inner, _)) => {
+                self.decode_ref(&inner, alloc, offset, depth)
+            }
+            TyKind::RigidTy(RigidTy::Array(elem, len)) => {
+                let count = len.eval_target_usize().ok()?;
+                let shape = ty.layout().ok()?.shape();
+                let FieldsShape::Array { stride, count: layout_count } = shape.fields else {
+                    return None;
+                };
+                if layout_count != count { return None; }
+                let mut elems = Vec::new();
+                for i in 0..count {
+                    elems.push(self.decode_const(
+                        &elem,
+                        alloc,
+                        offset + i as usize * stride.bytes(),
+                        depth + 1,
+                    )?);
+                }
+                Some(sm::ConstValue::Tuple(elems))
+            }
+            TyKind::RigidTy(RigidTy::Tuple(elems)) => {
+                if elems.is_empty() {
+                    return Some(sm::ConstValue::ZeroSized);
+                }
+                let offsets = arbitrary_offsets(ty)?;
+                if offsets.len() != elems.len() { return None; }
+                let mut fields = Vec::new();
+                for (elem, off) in elems.iter().zip(offsets) {
+                    fields.push(self.decode_const(elem, alloc, offset + off, depth + 1)?);
+                }
+                Some(sm::ConstValue::Tuple(fields))
+            }
+            TyKind::RigidTy(RigidTy::Adt(def, args)) => {
+                self.decode_adt(&def, &args, ty, alloc, offset, depth)
+            }
+            _ => None,
+        }
+    }
+
+    /// Decode an ADT value (struct or enum) at `offset` in `alloc`.
+    fn decode_adt(
+        &mut self,
+        def: &AdtDef,
+        args: &GenericArgs,
+        ty: &rustc_public::ty::Ty,
+        alloc: &Allocation,
+        offset: usize,
+        depth: usize,
+    ) -> Option<sm::ConstValue> {
+        let shape = ty.layout().ok()?.shape();
+        let (variant_idx, offsets): (usize, Vec<usize>) = match def.kind() {
+            AdtKind::Struct => {
+                let variant = def.variant(VariantIdx::to_val(0))?;
+                if variant.fields().is_empty() {
+                    return Some(sm::ConstValue::Adt { variant: 0, fields: Vec::new() });
+                }
+                (0, arbitrary_offsets(ty)?)
+            }
+            AdtKind::Enum => match &shape.variants {
+                VariantsShape::Single { index } => {
+                    let idx = index.to_index();
+                    let variant = def.variant(VariantIdx::to_val(idx))?;
+                    if variant.fields().is_empty() {
+                        return Some(sm::ConstValue::Adt {
+                            variant: idx as u32,
+                            fields: Vec::new(),
+                        });
+                    }
+                    (idx, arbitrary_offsets(ty)?)
+                }
+                VariantsShape::Multiple {
+                    tag,
+                    tag_encoding,
+                    tag_field,
+                    variants,
+                } => {
+                    let _ = tag;
+                    let (idx, offsets) = match tag_encoding {
+                        TagEncoding::Direct => {
+                            let discr_ty = match ty.kind() {
+                                TyKind::RigidTy(r) => r.discriminant_ty(),
+                                _ => return None,
+                            };
+                            let (size, signed) = match discr_ty.kind() {
+                                TyKind::RigidTy(RigidTy::Int(t)) => {
+                                    (int_ty_size(&t)?, true)
+                                }
+                                TyKind::RigidTy(RigidTy::Uint(t)) => {
+                                    (uint_ty_size(&t)?, false)
+                                }
+                                _ => return None,
+                            };
+                            let tag_off = arbitrary_offsets(ty)?.get(*tag_field).copied()?;
+                            let raw = read_uint_at(alloc, offset + tag_off, size)?;
+                            let val = if signed { sign_extend(raw, size) } else { raw };
+                            let mut found = None;
+                            for i in 0..def.num_variants() {
+                                let d = def.discriminant_for_variant(VariantIdx::to_val(i));
+                                if d.val == val {
+                                    found = Some(i);
+                                    break;
+                                }
+                            }
+                            let idx = found?;
+                            let offsets = variants
+                                .get(idx)?
+                                .offsets
+                                .iter()
+                                .map(|o| o.bytes())
+                                .collect();
+                            (idx, offsets)
+                        }
+                        TagEncoding::Niche {
+                            untagged_variant,
+                            niche_variants,
+                            niche_start,
+                        } => {
+                            let untagged = untagged_variant.to_index();
+                            let untagged_fields = &variants.get(untagged)?.offsets;
+                            let tag_off = untagged_fields.get(*tag_field)?.bytes();
+                            // The niche field's own size: read no
+                            // wider than the field type's layout.
+                            let untagged_def = def.variant(VariantIdx::to_val(untagged))?;
+                            let field_ty = untagged_def
+                                .fields()
+                                .get(*tag_field)?
+                                .ty_with_args(args);
+                            let size = field_ty.layout().ok()?.shape().size.bytes();
+                            if size == 0 || size > 16 { return None; }
+                            let raw = read_uint_at(alloc, offset + tag_off, size)?;
+                            let start = niche_variants.start().to_index();
+                            let end = niche_variants.end().to_index();
+                            // A provenance entry at the niche field
+                            // means the stored value is a real
+                            // pointer, not a niche encoding of
+                            // another variant (the `Option<&T>` case:
+                            // a non-null pointer reads back as
+                            // offset 0 in its target allocation).
+                            let has_prov = alloc
+                                .provenance
+                                .ptrs
+                                .iter()
+                                .any(|(o, _)| *o as usize == offset + tag_off);
+                            let idx = if !has_prov
+                                && raw >= *niche_start
+                                && raw - *niche_start <= (end - start) as u128
+                            {
+                                start + (raw - *niche_start) as usize
+                            } else {
+                                untagged
+                            };
+                            let offsets = variants
+                                .get(idx)?
+                                .offsets
+                                .iter()
+                                .map(|o| o.bytes())
+                                .collect();
+                            (idx, offsets)
+                        }
+                    };
+                    (idx, offsets)
+                }
+                VariantsShape::Empty => return None,
+            },
+            AdtKind::Union => return None,
+        };
+        let variant = def.variant(VariantIdx::to_val(variant_idx))?;
+        let fields = self.decode_fields(&variant, args, &offsets, alloc, offset, depth)?;
+        Some(sm::ConstValue::Adt {
+            variant: variant_idx as u32,
+            fields,
+        })
+    }
+
+    /// Decode the fields of one variant at the given offsets.
+    fn decode_fields(
+        &mut self,
+        variant: &rustc_public::ty::VariantDef,
+        args: &GenericArgs,
+        offsets: &[usize],
+        alloc: &Allocation,
+        offset: usize,
+        depth: usize,
+    ) -> Option<Vec<sm::ConstValue>> {
+        let fields = variant.fields();
+        if fields.len() != offsets.len() { return None; }
+        let mut out = Vec::new();
+        for (field, off) in fields.iter().zip(offsets) {
+            let fty = field.ty_with_args(args);
+            out.push(self.decode_const(&fty, alloc, offset + off, depth + 1)?);
+        }
+        Some(out)
+    }
+
+    /// Decode a reference (or raw pointer) stored in `alloc` at
+    /// `offset`, pointing at a value of type `inner`. The result is
+    /// the reference's value in the interpreter's model: string and
+    /// byte data directly, a fat slice value for decoded slices, and
+    /// `ConstValue::Ref` over the decoded pointee otherwise.
+    fn decode_ref(
+        &mut self,
+        inner: &rustc_public::ty::Ty,
+        alloc: &Allocation,
+        offset: usize,
+        depth: usize,
+    ) -> Option<sm::ConstValue> {
+        if depth > MAX_CONST_DEPTH {
+            return None;
+        }
+        let (_, prov) = alloc
+            .provenance
+            .ptrs
+            .iter()
+            .find(|(o, _)| *o as usize == offset)?;
+        let target_off = read_uint_at(alloc, offset, PTR_SIZE)? as usize;
+        let target = match mir::alloc::GlobalAlloc::from(prov.0) {
+            mir::alloc::GlobalAlloc::Memory(target) => target,
+            // A reference to a static: the pointee is the static's
+            // initializer allocation (the value a constant read of
+            // the static observes).
+            mir::alloc::GlobalAlloc::Static(def) => def.eval_initializer().ok()?,
+            // Functions and vtables are not materialised.
+            _ => return None,
+        };
+        match inner.kind() {
+            TyKind::RigidTy(RigidTy::Str) => {
+                let raw = target.raw_bytes().ok()?;
+                let bytes = raw.get(target_off..)?;
+                String::from_utf8(bytes.to_vec()).ok().map(sm::ConstValue::Str)
+            }
+            TyKind::RigidTy(RigidTy::Slice(elem)) => {
+                let count = read_uint_at(alloc, offset + PTR_SIZE, PTR_SIZE)? as usize;
+                if matches!(elem.kind(), TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8))) {
+                    let raw = target.raw_bytes().ok()?;
+                    let bytes = raw.get(target_off..target_off + count)?;
+                    return Some(sm::ConstValue::Bytes(bytes.to_vec()));
+                }
+                let stride = elem.layout().ok()?.shape().size.bytes();
+                if stride == 0 && count > 0 { return None; }
+                let mut elems = Vec::new();
+                for i in 0..count {
+                    elems.push(self.decode_const(
+                        &elem,
+                        &target,
+                        target_off + i * stride,
+                        depth + 1,
+                    )?);
+                }
+                Some(sm::ConstValue::SliceVal(elems))
+            }
+            TyKind::RigidTy(RigidTy::Array(elem, _))
+                if matches!(elem.kind(), TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8))) =>
+            {
+                // Byte arrays keep the established `Bytes` form (the
+                // fmt pieces template is the canonical case).
+                let raw = target.raw_bytes().ok()?;
+                let bytes = raw.get(target_off..)?;
+                Some(sm::ConstValue::Bytes(bytes.to_vec()))
+            }
+            _ => {
+                let pointee = self.decode_const(inner, &target, target_off, depth + 1)?;
+                Some(sm::ConstValue::Ref(Box::new(pointee)))
+            }
+        }
     }
 
     fn place(&mut self, p: &mir::Place) -> sm::Place {
@@ -919,6 +1276,68 @@ fn region_of(r: &rustc_public::ty::Region) -> sm::Region {
 
 /// Byte size of a scalar element type, for materializing array/slice
 /// constants. `None` for anything non-scalar (aggregates, pointers...).
+/// Depth budget for constant decoding: type nesting levels and
+/// pointer hops share it, so cyclic statics exhaust it and stay
+/// unsupported instead of recursing forever.
+const MAX_CONST_DEPTH: usize = 32;
+
+/// Pointer width in bytes on the target this driver runs for
+/// (x86_64); Stable MIR provenance entries are pointer-sized.
+const PTR_SIZE: usize = 8;
+
+/// Read an unsigned integer of `size` bytes at `offset` in `alloc`.
+fn read_uint_at(alloc: &Allocation, offset: usize, size: usize) -> Option<u128> {
+    if size == 0 || size > 16 {
+        return None;
+    }
+    alloc.read_partial_uint(offset..offset + size).ok()
+}
+
+/// Sign-extend a zero-extended value of `size` bytes to 128 bits
+/// (the storage convention of `Scalar::Int` for signed types).
+fn sign_extend(raw: u128, size: usize) -> u128 {
+    let bits = size * 8;
+    if bits >= 128 {
+        return raw;
+    }
+    if (raw >> (bits - 1)) & 1 == 1 {
+        raw | (u128::MAX << bits)
+    } else {
+        raw
+    }
+}
+
+fn int_ty_size(t: &SmirIntTy) -> Option<usize> {
+    Some(match t {
+        SmirIntTy::I8 => 1,
+        SmirIntTy::I16 => 2,
+        SmirIntTy::I32 => 4,
+        SmirIntTy::I64 | SmirIntTy::Isize => 8,
+        SmirIntTy::I128 => 16,
+    })
+}
+
+fn uint_ty_size(t: &SmirUintTy) -> Option<usize> {
+    Some(match t {
+        SmirUintTy::U8 => 1,
+        SmirUintTy::U16 => 2,
+        SmirUintTy::U32 => 4,
+        SmirUintTy::U64 | SmirUintTy::Usize => 8,
+        SmirUintTy::U128 => 16,
+    })
+}
+
+/// Field offsets of a type's layout, in definition order.
+fn arbitrary_offsets(ty: &rustc_public::ty::Ty) -> Option<Vec<usize>> {
+    let shape = ty.layout().ok()?.shape();
+    match shape.fields {
+        FieldsShape::Arbitrary { offsets } => {
+            Some(offsets.iter().map(|o| o.bytes()).collect())
+        }
+        _ => None,
+    }
+}
+
 fn scalar_elem_layout(ty: &rustc_public::ty::Ty) -> Option<usize> {
     match ty.kind() {
         TyKind::RigidTy(RigidTy::Bool) => Some(1),

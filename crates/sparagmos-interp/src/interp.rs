@@ -617,8 +617,15 @@ impl<'a> Interpreter<'a> {
                 projection: projection.clone(),
             }),
             Value::Ref(RefTarget::Value(v)) => Ok(Resolved::Value((**v).clone())),
-            // Dereferencing a fat pointer reaches its base.
-            Value::FatRef { base, .. } => self.deref_value(frames, base),
+            // Dereferencing a fat pointer whose base is a reference
+            // reaches through to the base place. A self-contained
+            // fat pointer (a slice constant: the base is the element
+            // aggregate itself) derefs to the slice value itself, so
+            // `Len` and index bounds see the fat pointer's length.
+            Value::FatRef { base, .. } => match &**base {
+                Value::Tuple(_) => Ok(Resolved::Value(value.clone())),
+                _ => self.deref_value(frames, base),
+            },
             other => Err(InterpError::type_mismatch(
                 "dereference",
                 "reference",
@@ -753,6 +760,17 @@ impl<'a> Interpreter<'a> {
                 Ok(Value::Float((*v as f32) as f64))
             }
             (Some(Ty::Float(FloatTy::F64)), Value::Float(_)) => Ok(value),
+            // An integer payload whose kind tag differs from the
+            // declared type: the bits are reinterpreted at the
+            // declared width. This arises for scalar leaves of
+            // structured constants, whose signedness is not stored
+            // in the constant itself; MIR places and their values
+            // always agree on width, so the declared type is the
+            // exact interpretation.
+            (Some(Ty::Int(it)), Value::Uint(v)) => {
+                Ok(Value::Int(wrap_signed(*v as i128, it.bits())))
+            }
+            (Some(Ty::Uint(ut)), Value::Int(v)) => Ok(Value::Uint((*v as u128) & ut.max())),
             // ADT locals hold the ADT value forms: aggregates, string
             // data (`String`), and the fmt value family.
             (Some(Ty::Adt(_)), Value::Enum { .. })
@@ -802,16 +820,51 @@ impl<'a> Interpreter<'a> {
                 }
                 Ok(value)
             }
-            Operand::Constant(c) => Ok(match c {
-                Constant::Unit => Value::Unit,
-                Constant::Bool(b) => Value::Bool(*b),
-                Constant::Int(v) => Value::Int(*v),
-                Constant::Uint(v) => Value::Uint(*v),
-                Constant::Float(v) => Value::Float(*v),
-                Constant::Str(s) => Value::Str(s.clone()),
-                Constant::Bytes(b) => Value::Bytes(b.clone()),
-            }),
+            Operand::Constant(c) => self.eval_constant(c),
         }
+    }
+
+    /// Evaluate a constant to a value. Structured constants recurse:
+    /// a reference constant becomes a reference to the constant value
+    /// it points at, a slice constant becomes a fat reference over
+    /// its element tuple.
+    fn eval_constant(&self, c: &Constant) -> InterpResult<Value> {
+        Ok(match c {
+            Constant::Unit => Value::Unit,
+            Constant::Bool(b) => Value::Bool(*b),
+            Constant::Int(v) => Value::Int(*v),
+            Constant::Uint(v) => Value::Uint(*v),
+            Constant::Float(v) => Value::Float(*v),
+            Constant::Str(s) => Value::Str(s.clone()),
+            Constant::Bytes(b) => Value::Bytes(b.clone()),
+            Constant::Tuple(fields) => Value::Tuple(
+                fields
+                    .iter()
+                    .map(|f| self.eval_constant(f))
+                    .collect::<InterpResult<Vec<_>>>()?,
+            ),
+            Constant::Adt { variant, fields } => Value::Enum {
+                variant: *variant,
+                fields: fields
+                    .iter()
+                    .map(|f| self.eval_constant(f))
+                    .collect::<InterpResult<Vec<_>>>()?,
+            },
+            Constant::Ref(inner) => {
+                Value::Ref(RefTarget::Value(Box::new(self.eval_constant(inner)?)))
+            }
+            Constant::SliceVal(elems) => {
+                let elems = elems
+                    .iter()
+                    .map(|e| self.eval_constant(e))
+                    .collect::<InterpResult<Vec<_>>>()?;
+                let len = elems.len() as u128;
+                Value::FatRef {
+                    base: Box::new(Value::Tuple(elems)),
+                    len,
+                }
+            }
+        })
     }
 
     // ----- rvalues -----------------------------------------------------------
@@ -1019,6 +1072,15 @@ pub(crate) fn project_value(
                 }
             },
             RefProj::Index(idx) => match value {
+                Value::FatRef {
+                    ref base,
+                    len,
+                } => {
+                    if *idx as u128 >= len {
+                        return Err(index_oob(len as usize, *idx));
+                    }
+                    project_value((**base).clone(), &[RefProj::Index(*idx)], func, place)?
+                }
                 Value::Tuple(ref items) => items
                     .get(*idx)
                     .cloned()

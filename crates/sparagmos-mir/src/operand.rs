@@ -33,6 +33,19 @@ pub enum ConstValue {
     Char(char),
     Str(String),
     Bytes(Vec<u8>),
+    /// A tuple or array value, element by element. Arrays ride as
+    /// their elements; the length lives in the type.
+    Tuple(Vec<ConstValue>),
+    /// An ADT value: variant index plus field values in definition
+    /// order.
+    Adt { variant: u32, fields: Vec<ConstValue> },
+    /// A thin reference (or raw pointer) to a constant value: the
+    /// materialised form of a reference constant whose pointee is
+    /// itself a constant value.
+    Ref(Box<ConstValue>),
+    /// A fat reference to decoded elements: a slice constant whose
+    /// elements are not plain bytes.
+    SliceVal(Vec<ConstValue>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
