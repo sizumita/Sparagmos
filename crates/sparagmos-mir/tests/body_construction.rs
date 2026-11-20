@@ -127,7 +127,10 @@ fn control_flow_shapes() {
     );
     assert!(body.basic_blocks[2].is_cleanup);
     assert_eq!(
-        coverage::total_variant_count(),
-        coverage::tables().iter().map(|(_, n)| n).sum::<usize>()
+        coverage::model_variant_total(),
+        coverage::model_tables().iter().map(|(_, n)| n).sum::<usize>()
     );
+    // The metric-1 denominator is a separate, fixed set: the 40 variants
+    // of rustc 1.100.0's three main MIR enums (docs/COVERAGE.md).
+    assert_eq!(coverage::metric1_variant_count(), 40);
 }
