@@ -1146,6 +1146,77 @@ impl<'a> Interpreter<'a> {
         })
     }
 
+    /// Classify a `BoxDerefTransmute` cast operand: when the
+    /// operand is a place naming a `Box` or one of its pointer
+    /// wrappers (`Unique` / `NonNull`), return the resolved operand
+    /// place, the resolved place of the pointee, and the number of
+    /// single-field wrapper layers an aggregate-built box value
+    /// carries above its pointer (the box itself carries 3 — Box,
+    /// Unique, NonNull — and each field already projected away
+    /// removes one). Returns `None` for any other operand, whose
+    /// cast keeps the strict wrapper-chain reading.
+    fn box_cast_places(
+        &self,
+        frames: &[Frame],
+        body: &Body,
+        operand: &Operand,
+    ) -> Option<(Resolved, Resolved, usize)> {
+        let place = match operand {
+            Operand::Copy(place) | Operand::Move(place) => place,
+            Operand::Constant(_) => return None,
+        };
+        let Ty::Adt(name) = body.local_ty(place.local)? else {
+            return None;
+        };
+        let segment = name.rsplit("::").next().unwrap_or(name.as_str());
+        let is_box = matches!(name.as_str(), "std::boxed::Box" | "alloc::boxed::Box");
+        let (depth, pointee_field) = match (segment, place.projection.as_slice()) {
+            ("Box", []) if is_box => (3, true),
+            ("Box", [ProjectionElem::Field(0)]) if is_box => (2, false),
+            ("Unique", []) => (2, false),
+            ("NonNull", []) => (1, false),
+            _ => return None,
+        };
+        let operand_target = self.resolve_place(frames, body, place).ok()?;
+        let Resolved::Place {
+            frame_pos,
+            local,
+            projection,
+        } = operand_target.clone()
+        else {
+            return None;
+        };
+        let mut pointee_projection = projection.clone();
+        if pointee_field {
+            pointee_projection.push(RefProj::Field(0));
+        }
+        let pointee_target = Resolved::Place {
+            frame_pos,
+            local,
+            projection: pointee_projection,
+        };
+        Some((operand_target, pointee_target, depth))
+    }
+
+    /// The reference value naming a resolved place (the value a
+    /// `BoxDerefTransmute` cast yields in the builtin box model).
+    fn pointee_ref(frames: &[Frame], target: &Resolved) -> Value {
+        match target {
+            Resolved::Place {
+                frame_pos,
+                local,
+                projection,
+            } => Value::Ref(RefTarget::place(
+                frames[*frame_pos].id,
+                *local,
+                projection.clone(),
+            )),
+            Resolved::Value(value) => {
+                Value::Ref(RefTarget::Value(Box::new(value.clone())))
+            }
+        }
+    }
+
     pub(crate) fn resolve_place(
         &self,
         frames: &[Frame],
@@ -1684,23 +1755,66 @@ impl<'a> Interpreter<'a> {
                 }
             }
             Rvalue::BoxDerefTransmute(operand) => {
-                // The operand is the wrapper chain a `Box` keeps
-                // around its raw pointer (`Unique` around `NonNull`
-                // around the pointer itself); the cast yields the
-                // innermost pointer value unchanged.
-                let mut v = self.eval_operand(frames, body, operand)?;
+                // The cast yields a pointer to the box's pointee.
+                // Two box shapes exist in this value model. A box
+                // built from its MIR aggregates is the wrapper chain
+                // `Unique` around `NonNull` around the pointer, and
+                // unwrapping the chain reaches the pointer value
+                // itself. A box made by the `Box::new` builtin instead
+                // holds its pointee directly as its single field, so
+                // the chain bottoms out at the pointee value (or at a
+                // reference that *is* the pointee, when the pointee
+                // is itself a reference); the result is then a
+                // reference to the pointee's place, which is what
+                // reading or writing through the extracted pointer
+                // must reach. `box_cast_places` tells the two apart:
+                // it reports how many wrapper layers an
+                // aggregate-built value carries above its pointer.
+                let places = self.box_cast_places(frames, body, operand);
+                let original = self.eval_operand(frames, body, operand)?;
+                let mut v = original.clone();
+                let mut layers = 0usize;
                 loop {
                     match v {
-                        Value::Ref(_) | Value::FatRef { .. } => break Ok(v),
+                        Value::Ref(_) | Value::FatRef { .. } => {
+                            match &places {
+                                Some((_, pointee, depth)) if layers < *depth => {
+                                    break Ok(Self::pointee_ref(
+                                        frames, pointee,
+                                    ));
+                                }
+                                _ => break Ok(v),
+                            }
+                        }
                         Value::Enum { mut fields, .. } if fields.len() == 1 => {
                             v = fields.pop().expect("one field");
+                            layers += 1;
                         }
-                        other => {
-                            break Err(InterpError::type_mismatch(
-                                "BoxDerefTransmute cast",
-                                "pointer wrapper (Unique/NonNull around a raw pointer)",
-                                other.kind_name(),
-                            ));
+                        _other => {
+                            match &places {
+                                Some((source, pointee, _)) => {
+                                    // A move out of the operand place
+                                    // cleared the storage the pointer
+                                    // must name; put the value back
+                                    // first so the pointee place is
+                                    // live again.
+                                    if matches!(operand, Operand::Move(_)) {
+                                        self.write_resolved(
+                                            frames,
+                                            source,
+                                            original,
+                                        )?;
+                                    }
+                                    break Ok(Self::pointee_ref(frames, pointee));
+                                }
+                                None => {
+                                    break Err(InterpError::type_mismatch(
+                                        "BoxDerefTransmute cast",
+                                        "pointer wrapper (Unique/NonNull around a raw pointer)",
+                                        _other.kind_name(),
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
@@ -2407,6 +2521,62 @@ fn float_to_uint(v: f64, bits: u32) -> u128 {
     }
 }
 
+/// A stand-in numeric address for a pointer value. Places in this
+/// value model have no real addresses, but an address is still
+/// observable through pointer-to-integer transmutes — most
+/// importantly the alignment precondition checks rustc emits
+/// around raw-pointer dereferences, which compute
+/// `addr & (align - 1) == 0`. The synthetic address is a pure
+/// function of the pointer's target: the same target always yields
+/// the same address, distinct targets yield distinct addresses
+/// (up to the mixing hash), and every address is a multiple of
+/// 4096, so the alignment check holds for any alignment a place
+/// in this model can carry. A reference to a constant aggregate
+/// has no place identity; it shares one reserved address.
+fn synthetic_addr(v: &Value) -> u128 {
+    fn mix(h: &mut u128, x: u128) {
+        // FNV-1a over the value's limbs.
+        for limb in [x as u64, (x >> 64) as u64] {
+            *h ^= limb as u128;
+            *h = h.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    let mut h: u128 = 0xcbf2_9ce4_8422_2325;
+    match v {
+        Value::Ref(RefTarget::Place {
+            frame,
+            local,
+            projection,
+        }) => {
+            mix(&mut h, *frame as u128);
+            mix(&mut h, *local as u128);
+            for step in projection {
+                let (tag, n) = match step {
+                    RefProj::Field(i) => (1u128, *i as u128),
+                    RefProj::Index(i) => (2u128, *i as u128),
+                    RefProj::Downcast(i) => (3u128, *i as u128),
+                };
+                mix(&mut h, tag);
+                mix(&mut h, n);
+            }
+        }
+        Value::Ref(RefTarget::Value(_)) => {
+            mix(&mut h, 0x5eed_5eed_5eed_5eed);
+        }
+        Value::FatRef { base, .. } => {
+            return synthetic_addr(base);
+        }
+        Value::FnPtr(name) => {
+            for b in name.bytes() {
+                mix(&mut h, b as u128);
+            }
+        }
+        _ => {}
+    }
+    const BASE: u128 = 0x1000_0000_0000;
+    BASE + (h % (1 << 40)) * 4096
+}
+
 fn eval_cast(v: &Value, ty: &Ty) -> InterpResult<Value> {
     match ty {
         Ty::Int(it) => {
@@ -2414,6 +2584,14 @@ fn eval_cast(v: &Value, ty: &Ty) -> InterpResult<Value> {
             // integer source.
             if let Value::Float(a) = v {
                 return Ok(Value::Int(float_to_int(*a, it.bits())));
+            }
+            // A pointer source (a pointer-to-integer transmute)
+            // yields the pointer's synthetic address.
+            if matches!(v, Value::Ref(_) | Value::FatRef { .. } | Value::FnPtr(_)) {
+                return Ok(Value::Int(wrap_signed(
+                    synthetic_addr(v) as i128,
+                    it.bits(),
+                )));
             }
             let raw = match v {
                 Value::Int(a) => *a,
@@ -2432,6 +2610,11 @@ fn eval_cast(v: &Value, ty: &Ty) -> InterpResult<Value> {
         Ty::Uint(ut) => {
             if let Value::Float(a) = v {
                 return Ok(Value::Uint(float_to_uint(*a, ut.bits())));
+            }
+            // A pointer source (a pointer-to-integer transmute)
+            // yields the pointer's synthetic address.
+            if matches!(v, Value::Ref(_) | Value::FatRef { .. } | Value::FnPtr(_)) {
+                return Ok(Value::Uint(wrap_unsigned(synthetic_addr(v), ut.bits())));
             }
             let raw = match v {
                 Value::Int(a) => *a as u128,
