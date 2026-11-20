@@ -432,5 +432,23 @@ class ProcessStage2Tests(unittest.TestCase):
         self.assertIn("nature", res["bucket"])
 
 
+
+
+class SkipBucketTests(unittest.TestCase):
+    def test_allocated_constant_kind_is_shortened(self):
+        totals = [("ConstantKind::Allocated (type Ty { id: 0, kind: "
+                   "RigidTy(Adt(AdtDef(DefId { id: 2 })) })", 1)]
+        self.assertEqual(run.skip_bucket(totals),
+                         "conversion incomplete (ConstantKind::Allocated)")
+
+    def test_by_reference_constant_bucket(self):
+        totals = [("unsupported constant: by-reference constant", 2)]
+        self.assertEqual(run.skip_bucket(totals),
+                         "unsupported constant: by-reference constant")
+
+    def test_no_totals(self):
+        self.assertIn("no skip reason", run.skip_bucket([]))
+
+
 if __name__ == "__main__":
     unittest.main()

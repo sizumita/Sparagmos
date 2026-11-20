@@ -790,11 +790,16 @@ def convert_side(path, edition, driver_bin):
     return out
 
 
+def short_kind(kind):
+    """A skip-reason kind without its parenthesised detail."""
+    return kind.split(" (")[0]
+
+
 def skip_bucket(skip_totals):
     """Aggregate bucket for a conversion-incomplete result."""
     if not skip_totals:
         return "conversion incomplete (no skip reason recorded)"
-    kind = skip_totals[0][0]
+    kind = short_kind(skip_totals[0][0])
     low = kind.lower()
     if "by-reference" in low or "byref" in low:
         return "unsupported constant: by-reference constant"
@@ -825,7 +830,7 @@ def judge_compile(expectation, conv):
                         "driver error")
             if conv["skipped"] == 0:
                 return ("pass", "", "")
-            totals = ", ".join(f"{k} x{n}"
+            totals = ", ".join(f"{short_kind(k)} x{n}"
                                for k, n in conv["skip_totals"][:5])
             return ("unsupported",
                     f"conversion incomplete: {conv['skipped']} "
@@ -920,6 +925,7 @@ def fill_result_stage2(rec, rust_dir, driver_bin, out):
         "exit_code": conv["exit_code"],
         "converted": conv["converted"],
         "skipped": conv["skipped"],
+        "skip_totals": conv["skip_totals"],
         "ice": conv["ice"],
     }
     if verdict == "fail":
@@ -952,6 +958,8 @@ def main():
                     help="only process the first N stage-2 candidates "
                          "(smoke runs); 0 = all")
     args = ap.parse_args()
+    args.driver_bin = args.driver_bin.resolve()
+    args.rust_dir = args.rust_dir.resolve()
     stage1_on = args.stages in ("1", "both")
     stage2_on = args.stages in ("2", "both")
 
