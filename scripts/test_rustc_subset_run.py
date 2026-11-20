@@ -123,6 +123,32 @@ class JudgeTests(unittest.TestCase):
         self.assertEqual(run.judge("run-fail", h, native, got)[0], "fail")
 
 
+class BucketReasonTests(unittest.TestCase):
+    def test_by_reference_constant_wins_over_callee_list(self):
+        reason = ("sparagmos-driver run: unsupported: MIR conversion "
+                  "failed: unsupported constant: by-reference constant; "
+                  "sparagmos-driver run: calls to functions with no "
+                  "converted body: std::io::_print")
+        self.assertEqual(run.bucket_reason(reason),
+                         "unsupported constant: by-reference constant")
+
+    def test_box_deref_transmute(self):
+        reason = ("sparagmos-driver run: unsupported: `main` was not "
+                  "converted (CastKind::BoxDerefTransmute x1)")
+        self.assertIn("BoxDerefTransmute", run.bucket_reason(reason))
+
+    def test_unconverted_callee(self):
+        reason = ("sparagmos-driver run: unsupported: call failed; "
+                  "sparagmos-driver run: calls to functions with no "
+                  "converted body: core::panicking::panic")
+        self.assertIn("no converted body", run.bucket_reason(reason))
+
+    def test_native_compile_failed(self):
+        self.assertEqual(
+            run.bucket_reason("native compile failed: error[E0308]"),
+            "native compile failed")
+
+
 class ProcessTestTests(unittest.TestCase):
     """process_test with both process sides stubbed."""
 

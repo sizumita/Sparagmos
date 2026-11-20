@@ -465,20 +465,39 @@ def normalize_reason(reason):
 
 
 def bucket_reason(reason):
-    """Coarse bucket for a driver/attempt reason string."""
+    """Coarse bucket for a driver/attempt reason string.
+
+    The driver prints its primary reason first and supplementary
+    lines (e.g. the unconverted-callees list) after it, so the first
+    segment decides the bucket; the full text is only consulted for
+    the patterns that have no primary line of their own.
+    """
+    first = reason.split("; sparagmos-driver run:")[0].lower()
     r = reason.lower()
+    if "by-reference constant" in first:
+        return "unsupported constant: by-reference constant"
+    if "boxdereftransmute" in first:
+        return "main not converted (BoxDerefTransmute cast)"
+    if "inlineasm" in first:
+        return "InlineAsm not supported"
+    if "unsupported terminator: drop" in first:
+        return "unsupported terminator: Drop"
+    if "unsupported type in local" in first:
+        return "unsupported type in local (interp type model)"
+    if "no monomorphic instance" in first:
+        return "no monomorphic instance available"
+    if "was not converted" in first:
+        return "main not converted (other conversion gap)"
+    if "conversion failed" in first or "mir conversion" in first:
+        return "MIR conversion failed (other)"
+    if "uninitialized" in first:
+        return "read of uninitialized place"
+    if "type mismatch" in first:
+        return "type mismatch in interp conversion"
     if "no converted body" in r or "calls to functions" in r:
         return "call to function with no converted body (std/core not modelled)"
-    if "unsupported type in local" in r:
-        return "unsupported type in local (interp type model)"
-    if "no monomorphic instance" in r:
-        return "no monomorphic instance available"
-    if "conversion failed" in r or "mir conversion" in r:
-        return "MIR conversion failed (other)"
-    if "uninitialized" in r:
-        return "read of uninitialized place"
-    if "type mismatch" in r:
-        return "type mismatch in interp conversion"
+    if "without a reason line" in r:
+        return "driver exit 2 without a run-mode reason (front-end failure)"
     if "timeout" in r or "timed out" in r:
         return "timeout"
     if "native compile failed" in r:
