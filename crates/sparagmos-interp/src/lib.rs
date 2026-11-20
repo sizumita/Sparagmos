@@ -43,10 +43,12 @@
 //! arithmetic, limits) is written to survive that swap unchanged.
 
 pub mod error;
+pub mod interp;
 pub mod ir;
 pub mod value;
 
 pub use error::{InterpError, InterpResult};
+pub use interp::{interpret, InterpConfig, Interpreter};
 pub use ir::{
     BasicBlock, BasicBlockData, BinOp, Body, Constant, Local, Operand, Place, Program,
     ProjectionElem, Rvalue, Statement, StatementKind, TerminatorKind, Ty, UnOp,
