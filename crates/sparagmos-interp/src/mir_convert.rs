@@ -1680,6 +1680,26 @@ impl<'a> Converter<'a> {
                             destination: self.convert_place(destination)?,
                             target: target.map(|b| ir::BasicBlock(b.index())),
                         }
+                    } else if args.first().is_some_and(|a| {
+                        self.operand_place_ty(body, a)
+                            .is_some_and(|t| dyn_traits_in(&t).is_some())
+                    }) {
+                        // A method call on a `dyn Trait` value: the
+                        // callee is the trait method, which has no
+                        // body of its own. The call is a vtable
+                        // dispatch, resolved at run time against the
+                        // receiver's concrete type (see
+                        // `virtual_call_target` in the interpreter).
+                        let mut ir_args = Vec::with_capacity(args.len());
+                        for arg in args.iter() {
+                            ir_args.push(self.convert_operand(body, arg, None)?);
+                        }
+                        ir::TerminatorKind::Call {
+                            func: name,
+                            args: ir_args,
+                            destination: self.convert_place(destination)?,
+                            target: target.map(|b| ir::BasicBlock(b.index())),
+                        }
                     } else {
                         ir::TerminatorKind::Unsupported(format!(
                             "Call to {name} (no converted body)"
