@@ -43,8 +43,13 @@ A test is *attempted* only when both sides can be run faithfully:
 - no `ignore-*` condition matches this host and every `only-*`
   condition is satisfied (otherwise the test is out of environment
   for x86_64-unknown-linux-gnu and is recorded as such);
-- `needs-*` conditions are either known to hold here or recorded as
-  unevaluatable (not attempted);
+- every `needs-*` condition is evaluated the way compiletest
+  evaluates it for the reference toolchain (compiletest's own
+  target rules, queries to the pinned rustc, and the release
+  build configuration); a condition that holds lets the test
+  run, one that fails makes the test out of environment
+  (compiletest would ignore it), and one that cannot be decided
+  is recorded as unevaluatable (not attempted);
 - the native compile succeeds and the native run's exit code matches
   the mode's expectation (otherwise the native oracle itself does not
   behave as the test expects, recorded with the compiler output).
@@ -280,11 +285,512 @@ HOST_TRUE_CFGS = {
     "target_endian=\"little\"", "64bit", "gnu",
 }
 
-# `needs-*` conditions known to hold on the measurement host.
-NEEDS_SATISFIED = {
-    "needs-run-enabled",   # we do run programs
-    "needs-unwind",        # the reference toolchain is built with unwinding
+# ---------------------------------------------------------------------------
+# needs-* conditions (compiletest's model, mirrored)
+# ---------------------------------------------------------------------------
+#
+# compiletest decides `//@ needs-*` directives in
+# src/tools/compiletest/src/directives/needs.rs from three kinds of
+# sources, and the runner mirrors each kind the same way:
+#
+# * rules in compiletest's own code over the target identity
+#   (has_threads, has_subprocess_support, has_asm_support,
+#   find_dlltool) -- applied to the host target below;
+# * queries to the compiler under test (its target-spec JSON, its
+#   supported crate types, its cfg list, its --print=backend-*
+#   answers, whether it can codegen for a target) and the contents
+#   of its sysroot -- ToolchainFacts performs exactly those queries
+#   against the pinned toolchain;
+# * build-configuration flags bootstrap passes to compiletest
+#   (--has-enzyme, --with-rustc-debug-assertions, ...). The
+#   reference toolchain is the official 1.100.0 release build,
+#   whose configuration is bootstrap's release configuration: the
+#   opt-in options in NEEDS_RELEASE_CONFIG are off (llvm.enzyme /
+#   llvm.offload are enabled only by dedicated experimental
+#   builds; rust / std debug assertions and layout randomization
+#   are opt-ins the release build does not take). They are
+#   constants here, the same status HOST_TRUE_CFGS has for cfg
+#   atoms.
+#
+# A condition that evaluates to False means compiletest would
+# ignore the test, so the record is out of environment, exactly
+# like an ignore-* match. A condition that cannot be decided
+# stays unevaluatable; nothing is guessed.
+
+_HOST_PARTS = HOST_TARGET.split("-")
+_HOST_ARCH = _HOST_PARTS[0]
+_HOST_OS = _HOST_PARTS[2] if len(_HOST_PARTS) > 2 else ""
+_HOST_ENV = _HOST_PARTS[3] if len(_HOST_PARTS) > 3 else ""
+
+# compiletest's has_asm_support arch list (common.rs).
+ASM_SUPPORTED_ARCHS = {
+    "x86", "x86_64", "arm", "aarch64", "arm64ec", "riscv32",
+    "riscv64", "loongarch32", "loongarch64", "s390x",
 }
+
+# needs-* conditions decided by compiletest's target rules and by
+# the release build configuration, for the host target. True means
+# the condition holds here; False means compiletest would ignore
+# the test on this host.
+NEEDS_HOST_RULES = {
+    "needs-run-enabled": True,    # we do run programs
+    "needs-unwind": True,         # the reference toolchain unwinds
+    # has_threads: only wasm targets without `-threads` lack them.
+    "needs-threads": not HOST_TARGET.startswith("wasm"),
+    # has_subprocess_support: denied only for sgx / wasm / emscripten.
+    "needs-subprocess": not (_HOST_ENV == "sgx"
+                             or _HOST_ARCH in ("wasm32", "wasm64")
+                             or _HOST_OS == "emscripten"),
+    "needs-asm-support": _HOST_ARCH in ASM_SUPPORTED_ARCHS,
+    # find_dlltool: dlltool exists only for *-windows-gnu targets.
+    "needs-dlltool": _HOST_OS == "windows" and _HOST_ENV == "gnu",
+    # Release build configuration (see the section comment).
+    "needs-deterministic-layouts": True,   # layouts are not randomized
+    "needs-rustc-debug-assertions": False,
+    "needs-std-debug-assertions": False,
+    "needs-enzyme": False,
+    "needs-offload": False,
+    # compiletest runner configuration: this runner never runs
+    # tests under wasmtime or clang, and always has symlinks and
+    # std for the host target.
+    "needs-force-clang-based-tests": False,
+    "needs-wasmtime": False,
+    "needs-symlink": True,
+    "needs-target-std": True,
+}
+
+# needs-sanitizer-* directive -> the name in the target spec's
+# `supported-sanitizers` list (compiletest's Sanitizer enum, in
+# kebab-case as the spec JSON spells it).
+SANITIZER_BY_DIRECTIVE = {
+    "needs-sanitizer-address": "address",
+    "needs-sanitizer-cfi": "cfi",
+    "needs-sanitizer-dataflow": "dataflow",
+    "needs-sanitizer-kcfi": "kcfi",
+    "needs-sanitizer-kasan": "kernel-address",
+    "needs-sanitizer-khwasan": "kernel-hwaddress",
+    "needs-sanitizer-leak": "leak",
+    "needs-sanitizer-memory": "memory",
+    "needs-sanitizer-thread": "thread",
+    "needs-sanitizer-hwaddress": "hwaddress",
+    "needs-sanitizer-memtag": "memtag",
+    "needs-sanitizer-realtime": "realtime",
+    "needs-sanitizer-shadow-call-stack": "shadow-call-stack",
+    "needs-sanitizer-safestack": "safestack",
+}
+
+KNOWN_CRATE_TYPES = {
+    "bin", "cdylib", "dylib", "lib", "proc-macro", "rlib", "staticlib",
+}
+KNOWN_ATOMIC_WIDTHS = {"8", "16", "32", "64", "128", "ptr"}
+KNOWN_CODEGEN_BACKENDS = {"llvm", "cranelift", "gcc"}
+
+# A `#![no_core]` crate with the lang items a bare function needs.
+# Compiling it to an object for a target exercises that target's
+# LLVM backend end to end, which is what an LLVM component's
+# presence in the build means; compiletest gets the component list
+# from the LLVM build, the runner probes the built compiler.
+_PROBE_SOURCE = """\
+#![feature(no_core, lang_items)]
+#![no_core]
+#[lang = "pointee_sized"]
+pub trait PointeeSized {}
+#[lang = "meta_sized"]
+pub trait MetaSized: PointeeSized {}
+#[lang = "sized"]
+pub trait Sized: MetaSized {}
+#[lang = "copy"]
+pub trait Copy {}
+#[lang = "freeze"]
+pub trait Freeze {}
+#[lang = "sync"]
+pub trait Sync {}
+#[no_mangle]
+pub fn f(x: u32) -> u32 { x }
+"""
+
+# LLVM component -> (representative target, extra rustc args) for
+# the codegen probe. avr and amdgpu targets require an explicit
+# -C target-cpu before they codegen anything.
+LLVM_COMPONENT_PROBES = {
+    "x86": ("x86_64-unknown-linux-gnu", ()),
+    "aarch64": ("aarch64-unknown-linux-gnu", ()),
+    "arm": ("armv7-unknown-linux-gnueabihf", ()),
+    "mips": ("mips64-unknown-linux-gnuabi64", ()),
+    "riscv": ("riscv64gc-unknown-linux-gnu", ()),
+    "powerpc": ("powerpc64le-unknown-linux-gnu", ()),
+    "sparc": ("sparc64-unknown-linux-gnu", ()),
+    "systemz": ("s390x-unknown-linux-gnu", ()),
+    "loongarch": ("loongarch64-unknown-linux-gnu", ()),
+    "webassembly": ("wasm32-unknown-unknown", ()),
+    "bpf": ("bpfeb-unknown-none", ()),
+    "nvptx": ("nvptx64-nvidia-cuda", ()),
+    "avr": ("avr-none", ("-C", "target-cpu=atmega328p")),
+    "amdgpu": ("amdgcn-amd-amdhsa", ("-C", "target-cpu=gfx900")),
+    "m68k": ("m68k-unknown-linux-gnu", ()),
+    "msp430": ("msp430-none-elf", ()),
+    "csky": ("csky-unknown-linux-gnuabiv2", ()),
+    "hexagon": ("hexagon-unknown-linux-musl", ()),
+    "xtensa": ("xtensa-esp32-espidf", ()),
+}
+
+FACTS_QUERY_TIMEOUT = 120
+PROBE_TIMEOUT = 60
+
+
+class ToolchainFacts:
+    """Facts about the pinned reference toolchain, obtained the way
+    compiletest obtains them: by querying the compiler and
+    inspecting its sysroot. Every accessor returns None when its
+    query fails, so the caller can leave a condition unevaluatable
+    instead of guessing. Results are computed lazily and cached;
+    the runner builds one instance per process (host_facts()).
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cache = {}
+
+    def _once(self, key, compute):
+        # Like minicore_rlib: the lock guards the cache only, never
+        # the computation -- accessors call each other (sanitizers
+        # reads target_spec, probes read sysroot), so holding the
+        # lock across compute() would self-deadlock. A fact may be
+        # computed twice under a race; the results are identical.
+        with self._lock:
+            if key in self._cache:
+                return self._cache[key]
+        result = compute()
+        with self._lock:
+            self._cache.setdefault(key, result)
+            return self._cache[key]
+
+    def _query(self, args, timeout=FACTS_QUERY_TIMEOUT):
+        """stdout of a rustc query against the pinned toolchain, or
+        None when the query fails."""
+        try:
+            res = run_cmd(rustc_cmd() + list(args), timeout=timeout,
+                          env_extra=BOOTSTRAP_ENV)
+        except Exception:
+            return None
+        if res["timeout"] or res["exit_code"] != 0:
+            return None
+        return res["stdout"]
+
+    def sysroot(self):
+        def compute():
+            out = self._query(["--print", "sysroot"], timeout=30)
+            return Path(out.strip()) if out else None
+        return self._once("sysroot", compute)
+
+    def target_lib_dir(self):
+        def compute():
+            root = self.sysroot()
+            if root is None:
+                return None
+            return root / "lib" / "rustlib" / HOST_TARGET / "lib"
+        return self._once("target_lib_dir", compute)
+
+    def _target_lib_listing(self):
+        def compute():
+            d = self.target_lib_dir()
+            if d is None:
+                return None
+            try:
+                return set(os.listdir(d))
+            except OSError:
+                return None
+        return self._once("target_lib_listing", compute)
+
+    def target_spec(self):
+        """The host entry of `--print=all-target-specs-json`, the
+        same document compiletest builds its TargetCfg from."""
+        def compute():
+            out = self._query(["-Zunstable-options",
+                               "--print=all-target-specs-json"])
+            if out is None:
+                return None
+            try:
+                return json.loads(out).get(HOST_TARGET)
+            except ValueError:
+                return None
+        return self._once("target_spec", compute)
+
+    def _spec_bool(self, key):
+        spec = self.target_spec()
+        if spec is None:
+            return None
+        return bool(spec.get(key, False))
+
+    def sanitizers(self):
+        """The target's supported sanitizers (target-spec field,
+        serde-defaulted to empty in compiletest)."""
+        def compute():
+            spec = self.target_spec()
+            if spec is None:
+                return None
+            return set(spec.get("supported-sanitizers", []))
+        return self._once("sanitizers", compute)
+
+    def xray(self):
+        return self._spec_bool("supports-xray")
+
+    def dynamic_linking(self):
+        return self._spec_bool("dynamic-linking")
+
+    def relocation_model(self):
+        def compute():
+            spec = self.target_spec()
+            if spec is None:
+                return None
+            # compiletest's serde default when the field is absent.
+            return spec.get("relocation-model", "pic")
+        return self._once("relocation_model", compute)
+
+    def supported_crate_types(self):
+        def compute():
+            out = self._query(["--target", HOST_TARGET,
+                               "--print=supported-crate-types",
+                               "-Zunstable-options"])
+            if out is None:
+                return None
+            return {ln.strip() for ln in out.splitlines() if ln.strip()}
+        return self._once("supported_crate_types", compute)
+
+    def target_has_atomic(self):
+        def compute():
+            out = self._query(["--target", HOST_TARGET,
+                               "--print", "cfg"])
+            if out is None:
+                return None
+            widths = set()
+            for ln in out.splitlines():
+                m = re.match(r'^target_has_atomic="([^"]+)"$', ln.strip())
+                if m:
+                    widths.add(m.group(1))
+            return widths
+        return self._once("target_has_atomic", compute)
+
+    def _backend_print_bool(self, request):
+        out = self._query(["--target", HOST_TARGET, "-Zunstable-options",
+                           f"--print={request}"], timeout=60)
+        if out is None:
+            return None
+        v = out.strip()
+        if v == "true":
+            return True
+        if v == "false":
+            return False
+        return None
+
+    def has_mnemonic(self, mnemonic):
+        return self._backend_print_bool(f"backend-has-mnemonic:{mnemonic}")
+
+    def llvm_zstd(self):
+        return self._backend_print_bool("backend-has-zstd")
+
+    def git_hash(self):
+        def compute():
+            try:
+                res = run_cmd(rustc_cmd() + ["-vV"], timeout=30)
+            except Exception:
+                return None
+            if res["timeout"] or res["exit_code"] != 0:
+                return None
+            return "commit-hash:" in res["stdout"]
+        return self._once("git_hash", compute)
+
+    def profiler_runtime(self):
+        """Whether the profiler runtime is shipped for the host
+        target (bootstrap's --profiler-runtime means the runtime
+        was built into this sysroot)."""
+        def compute():
+            names = self._target_lib_listing()
+            if names is None:
+                return None
+            return any(n.startswith("libprofiler_builtins")
+                       and n.endswith(".rlib") for n in names)
+        return self._once("profiler_runtime", compute)
+
+    def sanitizer_runtime_present(self):
+        """Whether sanitizer runtime archives are shipped for the
+        host target (bootstrap sets RUSTC_SANITIZER_SUPPORT when
+        sanitizers are enabled for the target, which is what puts
+        these archives and the spec's sanitizer list in place)."""
+        def compute():
+            names = self._target_lib_listing()
+            if names is None:
+                return None
+            return any("_rt." in n and n.endswith(".a") for n in names)
+        return self._once("sanitizer_runtime_present", compute)
+
+    def rust_lld(self):
+        def compute():
+            root = self.sysroot()
+            if root is None:
+                return None
+            return (root / "lib" / "rustlib" / HOST_TARGET / "bin"
+                    / "rust-lld").exists()
+        return self._once("rust_lld", compute)
+
+    def _probe_codegen(self, target, extra_args, emit):
+        """Compile the no_core probe for `target`, asking for the
+        given --emit kind. True when an output file was produced."""
+        key = ("probe", target, tuple(extra_args), emit)
+        def compute():
+            try:
+                with tempfile.TemporaryDirectory(
+                        prefix="subset-probe-") as td:
+                    src = Path(td) / "probe.rs"
+                    src.write_text(_PROBE_SOURCE)
+                    out = Path(td) / "probe.out"
+                    res = run_cmd(
+                        rustc_cmd() + [str(src), "--target", target,
+                                       "--crate-type", "lib",
+                                       "--emit", emit, "-o", str(out),
+                                       *extra_args],
+                        timeout=PROBE_TIMEOUT, env_extra=BOOTSTRAP_ENV)
+                    return (not res["timeout"] and res["exit_code"] == 0
+                            and out.exists())
+            except Exception:
+                return False
+        return self._once(key, compute)
+
+    def llvm_component_present(self, component):
+        """Whether an LLVM target component is part of this build,
+        probed by code-generating for a representative target.
+        None when the component has no probe (unknown name) or the
+        probe machinery itself fails on the host target."""
+        spec = LLVM_COMPONENT_PROBES.get(component)
+        if spec is None:
+            return None
+        host_target, host_extra = LLVM_COMPONENT_PROBES["x86"]
+        if not self._probe_codegen(host_target, host_extra, "obj"):
+            return None
+        target, extra = spec
+        return self._probe_codegen(target, extra, "obj")
+
+    def default_codegen_backend(self):
+        """The default codegen backend, probed: `--emit llvm-ir`
+        only succeeds when the default backend is LLVM. None when
+        the probe fails (the default is then some other backend,
+        which this runner does not distinguish)."""
+        def compute():
+            if self._probe_codegen(HOST_TARGET, (), "llvm-ir"):
+                return "llvm"
+            return None
+        return self._once("default_codegen_backend", compute)
+
+
+_HOST_FACTS = None
+
+
+def host_facts():
+    """The process-wide ToolchainFacts, or None before main()
+    initialises it (unit tests then see probed conditions as
+    unevaluatable, never as guessed)."""
+    return _HOST_FACTS
+
+
+def eval_needs(name, view, facts):
+    """Evaluate one `needs-*` directive the way compiletest does
+    for the reference toolchain.
+
+    Returns True (the condition holds; the test runs), False (the
+    condition fails; compiletest would ignore the test), or None
+    (the condition cannot be decided here). `view` supplies the
+    directive values for the value-carrying directives; `facts` is
+    a ToolchainFacts or None.
+    """
+    if name in NEEDS_HOST_RULES:
+        return NEEDS_HOST_RULES[name]
+    if name in SANITIZER_BY_DIRECTIVE:
+        if facts is None:
+            return None
+        sanitizers = facts.sanitizers()
+        if sanitizers is None:
+            return None
+        return SANITIZER_BY_DIRECTIVE[name] in sanitizers
+    if name == "needs-sanitizer-support":
+        if facts is None:
+            return None
+        sanitizers = facts.sanitizers()
+        runtime = facts.sanitizer_runtime_present()
+        if sanitizers is None or runtime is None:
+            return None
+        return bool(sanitizers) and runtime
+    if name == "needs-xray":
+        return None if facts is None else facts.xray()
+    if name == "needs-dynamic-linking":
+        return None if facts is None else facts.dynamic_linking()
+    if name == "needs-relocation-model-pic":
+        if facts is None:
+            return None
+        model = facts.relocation_model()
+        return None if model is None else model == "pic"
+    if name == "needs-profiler-runtime":
+        return None if facts is None else facts.profiler_runtime()
+    if name == "needs-rust-lld":
+        return None if facts is None else facts.rust_lld()
+    if name == "needs-git-hash":
+        return None if facts is None else facts.git_hash()
+    if name == "needs-llvm-zstd":
+        return None if facts is None else facts.llvm_zstd()
+    if name == "needs-asm-ret":
+        return None if facts is None else facts.has_mnemonic("ret")
+    if name == "needs-crate-type":
+        return _eval_needs_list(
+            view, name, KNOWN_CRATE_TYPES,
+            None if facts is None else facts.supported_crate_types())
+    if name == "needs-target-has-atomic":
+        return _eval_needs_list(
+            view, name, KNOWN_ATOMIC_WIDTHS,
+            None if facts is None else facts.target_has_atomic())
+    if name == "needs-llvm-components":
+        if facts is None:
+            return None
+        tokens = []
+        for value in view.values(name):
+            tokens.extend(value.split())
+        if not tokens:
+            return None
+        for token in tokens:
+            present = facts.llvm_component_present(token)
+            if present is None:
+                return None
+            if not present:
+                return False
+        return True
+    if name == "needs-backends":
+        tokens = []
+        for value in view.values(name):
+            tokens.extend(t.lower() for t in value.split())
+        if not tokens or any(t not in KNOWN_CODEGEN_BACKENDS
+                             for t in tokens):
+            return None
+        if facts is None:
+            return None
+        default = facts.default_codegen_backend()
+        if default is None:
+            return None
+        return default in tokens
+    return None
+
+
+def _eval_needs_list(view, name, known, available):
+    """Shared logic of the comma-separated needs-* directives
+    (needs-crate-type, needs-target-has-atomic): every listed item
+    must be a known value and must be available. An unknown item
+    makes the directive undecidable here (compiletest rejects it
+    outright); a missing value list is undecidable too."""
+    wanted = []
+    for value in view.values(name):
+        wanted.extend(t.strip() for t in value.split(",") if t.strip())
+    if not wanted or any(t not in known for t in wanted):
+        return None
+    if available is None:
+        return None
+    return all(t in available for t in wanted)
 
 # `ignore-*` suffixes that never match any host in compiletest's model
 # (they gate on the pass mode rather than the environment); for the
@@ -359,13 +865,20 @@ def split_top_level(s):
     return parts
 
 
-def applicability(header):
+def applicability(header, facts=None):
     """Decide whether a test applies to this host.
 
     Returns (status, reason): status is "applicable",
-    "out-of-environment" (an ignore matched or an only did not), or
-    "unevaluatable" (a needs-/condition could not be decided).
+    "out-of-environment" (an ignore matched, an only did not, or
+    a needs-* condition does not hold, so compiletest would ignore
+    the test), or "unevaluatable" (a needs-/condition could not
+    be decided). `facts` defaults to the process-wide toolchain
+    facts (host_facts()); unit tests pass canned facts or leave
+    them uninitialised, in which case probed conditions stay
+    unevaluatable.
     """
+    if facts is None:
+        facts = host_facts()
     for value in header.values("ignore-cfg"):
         v = eval_cfg_expr(value)
         if v is True:
@@ -406,8 +919,12 @@ def applicability(header):
                     "no only-* condition matches this host: " + ", ".join(onlys))
     for name in sorted(header.names):
         if name.startswith("needs-"):
-            if name in NEEDS_SATISFIED:
+            v = eval_needs(name, header, facts)
+            if v is True:
                 continue
+            if v is False:
+                return ("out-of-environment",
+                        f"{name} is not satisfied on this host")
             return ("unevaluatable", f"{name} cannot be verified on this host")
     return ("applicable", "")
 
@@ -1726,6 +2243,9 @@ def main():
     args.rust_dir = args.rust_dir.resolve()
     stage1_on = args.stages in ("1", "both")
     stage2_on = args.stages in ("2", "both")
+
+    global _HOST_FACTS
+    _HOST_FACTS = ToolchainFacts()
 
     survey = json.loads(args.survey_json.read_text())
     records = survey["tests"]
