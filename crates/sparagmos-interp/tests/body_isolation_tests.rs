@@ -26,13 +26,14 @@ fn unit_ty() -> mir::Ty {
     mir::Ty::Tuple(Vec::new())
 }
 
-/// A coroutine type: outside the interpreter's type model, so
-/// any body holding one as a local fails conversion. (The
-/// original fixture used a `dyn Trait` local — the shape that
-/// motivated per-body isolation — but `dyn` is modelled now, so
-/// the fixture uses a type that is still unrepresentable.)
+/// A coroutine witness type: outside the interpreter's type
+/// model, so any body holding one as a local fails conversion.
+/// (The original fixture used a `dyn Trait` local — the shape
+/// that motivated per-body isolation — but `dyn` and coroutines
+/// are modelled now, so the fixture uses a type that is still
+/// unrepresentable.)
 fn dyn_ty() -> mir::Ty {
-    mir::Ty::Coroutine(mir::DefId::new(0, 7), Vec::new())
+    mir::Ty::CoroutineWitness(mir::DefId::new(0, 7), Vec::new())
 }
 
 fn decls(tys: &[mir::Ty]) -> Vec<mir::LocalDecl> {
@@ -136,7 +137,7 @@ fn uncalled_unconvertible_body_does_not_fail_the_program() {
         .unconverted_reason("broken")
         .expect("the failure is recorded with its reason");
     assert!(
-        reason.contains("Coroutine"),
+        reason.contains("CoroutineWitness"),
         "the recorded reason names the unconvertible type: {reason}"
     );
 
@@ -157,7 +158,7 @@ fn calling_an_unconvertible_body_fails_with_its_reason() {
         MirRunError::Interp(InterpError::UnconvertedFunction { name, reason }) => {
             assert_eq!(name, "broken");
             assert!(
-                reason.contains("Coroutine"),
+                reason.contains("CoroutineWitness"),
                 "the call error carries the conversion reason: {reason}"
             );
         }
