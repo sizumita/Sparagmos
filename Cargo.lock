@@ -42,9 +42,5 @@ name = "sparagmos-mir"
 version = "0.1.0"
 
 [[package]]
-name = "sparagmos-parse"
-version = "0.1.0"
-
-[[package]]
 name = "sparagmos-runtime"
 version = "0.1.0"

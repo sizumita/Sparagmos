@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "crates/sparagmos-mir",
-    "crates/sparagmos-parse",
     "crates/sparagmos-interp",
     "crates/sparagmos-jit",
     "crates/sparagmos-runtime",
