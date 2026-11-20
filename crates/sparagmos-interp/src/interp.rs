@@ -1621,6 +1621,10 @@ impl<'a> Interpreter<'a> {
             Constant::Uint(v) => Value::Uint(*v),
             Constant::Float(v) => Value::Float(*v),
             Constant::FnDef(name) => Value::FnPtr(name.clone()),
+            Constant::Closure(def) => Value::Closure {
+                def: def.clone(),
+                env: Vec::new(),
+            },
             Constant::Str(s) => Value::Str(s.clone()),
             Constant::Bytes(b) => Value::Bytes(b.clone()),
             Constant::Tuple(fields) => Value::Tuple(
