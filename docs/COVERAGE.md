@@ -352,6 +352,64 @@ panic したケースである。
 残る。再実行は
 `python3 scripts/rustc-subset-run.py --survey-json <survey JSON> --rust-dir <チェックアウト> --driver-bin <ドライバ> --out <結果 JSON>`。
 
+
+### 指標2(b) procedure カテゴリの実測 (2026-11-21)
+
+`scripts/rustc-subset-runmake.py` による実測。procedure カテゴリ
+(run-make 系 551 件) のテストはプログラムではなくレシピ
+(`rmake.rs`) で、レシピ自身の手順と検証が合否を決める。
+Sparagmos の主経路が判定できるのはプログラムの実行だけなので、
+レシピの合否が「単一プログラムのコンパイルと実行」に帰着する
+ものだけを実測対象とし、それ以外は理由を付けて未実行に分類
+した (未実行は fail として数え、母数から外していない)。
+
+分類はレシピのソースに対する機械的な判定で、551 件全てに
+理由が付く。実測対象 (reducible) は次の全てを満たすレシピで
+ある: ヘッダ条件がこの環境 (x86_64-unknown-linux-gnu、ホストと
+ターゲットが同一) で成立する、`rustc()` ビルダによるコンパイル
+が 1 回だけで、使われるオプションが input / output / edition /
+crate_type("bin") の範囲内である、入力がテストディレクトリ内の
+単一の .rs ファイルである、生成されたバイナリが引数なしで
+1 回だけ実行される (標準出力に対するリテラル検証が連鎖して
+いる場合はそれも判定に含める)。
+
+判定は stage 1 と同じ基準で、テストディレクトリのコピー上で
+ネイティブ (rustc 1.100.0、レシピの edition、既定は 2015) の
+コンパイルと実行を行い、レシピの期待 (コンパイル成功、終了
+コード 0、標準出力検証) をネイティブ側が満たすことを確認した
+うえで、ドライバ実行の終了コードと標準出力がネイティブと
+一致すれば pass とする。
+
+分類結果 (551 件):
+
+| 分類 | 件数 | 内容 |
+|---|---|---|
+| reducible (実測対象) | 2 | 上記の形に帰着する |
+| external-tools | 173 | レシピが外部ツールを駆動する (rustdoc 59、LLVM ツール 43、C/C++ ライブラリのビルド 36、cc 22、cargo 9、汎用コマンド 4) |
+| not-single-program | 166 | コンパイルが複数回 145、コンパイルなし 11、bare_rustc / rustc_minicore の使用 7、`--extern` によるクレート連結 3 |
+| out-of-environment | 110 | ヘッダ条件がこの環境で成立しない (needs-enzyme 38、他のプラットフォーム限定、needs-force-clang-based-tests 6 など) |
+| compile-verdict-only | 67 | バイナリが実行されず、コンパイルの成否やコンパイラ出力が合否を決める (コンパイル失敗が期待されるもの 15 を含む) |
+| unevaluatable-gate | 21 | ヘッダ条件を機械的に評価できない (needs-llvm-components 18 など) |
+| recipe-shape | 7 | 文の数が多い、制御構造があるなど、上記の形に当てはまらない |
+| builder-options | 3 | ドライバで再現できないビルダオプション (引数、最適化指定、stdin 入力など) を使用 |
+| artifact-checks | 2 | バイナリの実行に加えて生成ファイルの diff が合否に入る |
+
+実測結果: 対象 2 件のうち pass 1 件 (bare-outfile)、
+unsupported 1 件 (forced-unwind-terminate-pof: `#![no_main]` の
+C ABI の main と pthread FFI をドライバが未対応と返した)。
+カテゴリのパス率は 1 / 551 = 0.18%。
+
+このカテゴリの合否の大半は、プログラムの実行ではなくビルド
+手順 (複数クレートの連結、外部ツール、生成物の検証) によって
+決まる。主経路の実行で判定できる範囲は上記の形に限られ、
+それ以外の 549 件は未実行として fail に数えている。
+
+測定条件: 処理時間は全体で約 1 秒。判定のタイムアウトは
+ネイティブのコンパイル 60 秒、ネイティブの実行 30 秒、
+ドライバ実行 60 秒 (1 件あたり)。テストごとの結果は結果 JSON
+に機械可読な形で残る。再実行は
+`python3 scripts/rustc-subset-runmake.py --survey-json <survey JSON> --rust-dir <チェックアウト> --driver-bin <ドライバ> --out <結果 JSON>`。
+
 ---
 
 ## 指標3: std 機能網羅率
