@@ -311,13 +311,15 @@ fn convert_all(
     let conv = Converter::new(program, &keys);
     let (mut out, mut failures) = convert_each(&conv, program, &keys);
     // Second phase: convert again with trait-impl call resolution
-    // on, restricted to the bodies that converted in the first
-    // phase (see `resolve_impl_callee`). Resolution only retargets
-    // calls, so the converted set is unchanged in principle; a
-    // body whose second-phase conversion unexpectedly fails keeps
-    // its first-phase form, and the failure records are reconciled
-    // with the merged program at the end.
-    let converted: HashSet<String> = out.functions.keys().cloned().collect();
+    // on, restricted to the first phase's *clean* bodies (see
+    // `clean_targets`): bodies that converted and cannot, directly
+    // or transitively, run into an unmodelled construct or an
+    // unconverted body. Resolution only retargets calls, so the
+    // converted set is unchanged in principle; a body whose
+    // second-phase conversion unexpectedly fails keeps its
+    // first-phase form, and the failure records are reconciled with
+    // the merged program at the end.
+    let converted = clean_targets(&out);
     if !converted.is_empty() {
         let conv = Converter::with_impl_targets(program, &keys, converted);
         let (resolved, _) = convert_each(&conv, program, &keys);
@@ -328,6 +330,164 @@ fn convert_all(
     }
     failures.retain(|key, _| !out.functions.contains_key(key));
     Ok((out, failures))
+}
+
+/// The bodies of a first-phase program that trait-impl call
+/// resolution may target in the second phase (see `convert_all`):
+/// the *clean* bodies — running one can never hit an unmodelled
+/// construct or a body that is not itself clean.
+///
+/// A body is unclean when
+/// * it contains an unsupported statement or terminator (an
+///   unsupported rvalue rides inside an assignment statement),
+/// * a direct `Call` edge names a body that did not convert, or a
+///   body that is itself unclean, or
+/// * its drop glue (on a `Drop` terminator or a `mem::drop`
+///   builtin call) calls an unclean destructor, or contains glue
+///   conversion could not account for (`DropPlan::Unknown` /
+///   `DropPlan::Untyped`: executing it judges or fails on the
+///   value's own shape, which is exactly what resolution must not
+///   newly expose a caller to).
+///
+/// `CallBuiltin` edges are neutral (builtins are the fallback
+/// model itself), and so are `CallTrait` / `CallIndirect` edges
+/// and `Call`s whose target name is no program body at all: a
+/// vtable-dispatch call names the trait method, and the concrete
+/// target is chosen from the receiver's value at run time.
+/// Computed as a fixpoint: uncleanliness propagates backwards
+/// along call and destructor edges until nothing changes.
+fn clean_targets(program: &ir::Program) -> HashSet<String> {
+    // Direct edges from each body to the program bodies it can
+    // enter, plus the bodies that are unclean on their own.
+    let mut edges: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut unclean: HashSet<&str> = HashSet::new();
+    for (key, body) in &program.functions {
+        let mut targets: Vec<&str> = Vec::new();
+        for block in &body.blocks {
+            for stmt in &block.statements {
+                match &stmt.kind {
+                    ir::StatementKind::Unsupported(_)
+                    | ir::StatementKind::Assign(_, ir::Rvalue::Unsupported(_)) => {
+                        unclean.insert(key.as_str());
+                    }
+                    _ => {}
+                }
+            }
+            match &block.terminator {
+                ir::TerminatorKind::Unsupported(_) => {
+                    unclean.insert(key.as_str());
+                }
+                ir::TerminatorKind::Call { func, .. } => {
+                    // An edge only when the name is a program body
+                    // (converted, or recorded as unconverted); a
+                    // name in neither table is a vtable-dispatch
+                    // call, whose target the receiver's value
+                    // chooses at run time.
+                    if program.functions.contains_key(func)
+                        || program.unconverted.contains_key(func)
+                    {
+                        targets.push(func.as_str());
+                    }
+                }
+                ir::TerminatorKind::Drop { glue, .. } => {
+                    if !drop_glue_edges(glue, &mut targets) {
+                        unclean.insert(key.as_str());
+                    }
+                }
+                ir::TerminatorKind::CallBuiltin {
+                    drop_glue: Some(glue),
+                    ..
+                } => {
+                    if !drop_glue_edges(glue, &mut targets) {
+                        unclean.insert(key.as_str());
+                    }
+                }
+                _ => {}
+            }
+        }
+        edges.insert(key.as_str(), targets);
+    }
+    // Propagate: a body with an edge to an unconverted or unclean
+    // body is itself unclean.
+    loop {
+        let mut changed = false;
+        for (key, targets) in &edges {
+            if unclean.contains(key) {
+                continue;
+            }
+            if targets
+                .iter()
+                .any(|t| !program.functions.contains_key(*t) || unclean.contains(t))
+            {
+                unclean.insert(key);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    program
+        .functions
+        .keys()
+        .filter(|k| !unclean.contains(k.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Walk one terminator's drop glue, pushing the destructor bodies
+/// it can call onto `targets`. Returns `false` when the glue
+/// contains a plan conversion could not account for
+/// (`DropPlan::Unknown` / `DropPlan::Untyped`).
+fn drop_glue_edges<'a>(glue: &'a ir::DropGlue, targets: &mut Vec<&'a str>) -> bool {
+    fn walk<'a>(
+        plan: &'a ir::DropPlan,
+        adts: &'a [ir::DropPlan],
+        targets: &mut Vec<&'a str>,
+        seen: &mut HashSet<usize>,
+    ) -> bool {
+        match plan {
+            ir::DropPlan::Trivial => true,
+            ir::DropPlan::Unknown | ir::DropPlan::Untyped => false,
+            ir::DropPlan::Seq(plans) => plans.iter().all(|p| walk(p, adts, targets, seen)),
+            ir::DropPlan::At { plan, .. } => walk(plan, adts, targets, seen),
+            ir::DropPlan::CallDtor { func } => {
+                targets.push(func.as_str());
+                true
+            }
+            ir::DropPlan::Each { elem } => walk(elem, adts, targets, seen),
+            ir::DropPlan::Fields { fields, .. } => {
+                fields.iter().all(|p| walk(p, adts, targets, seen))
+            }
+            ir::DropPlan::Variants { variants } => {
+                variants.iter().all(|p| walk(p, adts, targets, seen))
+            }
+            // An ADT plan can refer to itself (recursive types);
+            // `seen` keeps the walk finite — a revisited plan's
+            // edges were collected by the first visit.
+            ir::DropPlan::Adt { index } => {
+                if !seen.insert(*index) {
+                    return true;
+                }
+                match adts.get(*index) {
+                    Some(plan) => walk(plan, adts, targets, seen),
+                    None => false,
+                }
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    if !walk(&glue.root, &glue.adts, targets, &mut seen) {
+        return false;
+    }
+    // Table entries the root never referenced are walked too, so
+    // their destructor edges and unaccounted plans count as well.
+    for (index, plan) in glue.adts.iter().enumerate() {
+        if seen.insert(index) && !walk(plan, &glue.adts, targets, &mut seen) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Convert every body of `program` with `conv`, isolating failures
@@ -1678,14 +1838,16 @@ impl<'a> Converter<'a> {
     /// as a `DefId`-resolved body does in `resolve_callee`.
     fn resolve_impl_callee(&self, func: &mir::Operand) -> Option<String> {
         // Resolution runs only in the second conversion phase,
-        // against the bodies that converted in the first (see
-        // `convert_all`): resolving to an impl body that cannot
-        // itself convert would trade a working builtin model of
-        // the trait method for an unconverted-body error — a
-        // derived `PartialEq` on a packed struct, whose body the
-        // conversion rejects for its pointer casts while the
-        // structural-comparison builtin is exact, is the shape
-        // that pins this restriction.
+        // against the first phase's clean bodies (see
+        // `clean_targets`): resolving to an impl body that cannot
+        // itself convert — or that calls, however indirectly, a
+        // body that cannot — would trade a working builtin model
+        // of the trait method for an unconverted-body error. A
+        // derived `PartialEq` on a packed struct is the shape
+        // that pins this restriction: every eq body converts, but
+        // the manual impl calls a helper whose pointer cast the
+        // conversion leaves unsupported, while the builtin's
+        // structural comparison is exact.
         let targets = self.impl_targets.as_ref()?;
         let key = self.find_impl_callee(func)?;
         targets.contains(&key).then_some(key)
