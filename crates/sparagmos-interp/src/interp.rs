@@ -1055,6 +1055,8 @@ impl<'a> Interpreter<'a> {
                     let items = match value {
                         Value::Tuple(items) => items,
                         Value::Enum { fields, .. } => fields,
+                        // A closure's fields are its captures.
+                        Value::Closure { env, .. } => env,
                         other => {
                             return Err(InterpError::type_mismatch(
                                 "drop glue",

@@ -89,7 +89,7 @@ use rustc_public::ty::{
     ClosureKind, ExistentialPredicate, GenericArgKind, GenericArgs, IntTy, RigidTy, Ty,
     TyConstKind, TyKind,
 };
-use rustc_public::CrateDef;
+use rustc_public::{CrateDef, CrateDefType};
 use rustc_public::ItemKind;
 
 use sparagmos_driver::convert::Converter;
@@ -926,6 +926,248 @@ fn convert_local_body(
     }
 }
 
+/// The local crate's `Drop` impl methods, keyed by their full
+/// instance-style name (`<crate::Type as std::ops::Drop>::drop`).
+/// The trait method declaration itself is not among a crate's
+/// function definitions, but every impl method is, and resolving
+/// an impl method with the self type's generic arguments yields
+/// the monomorphic destructor instance directly.
+fn local_drop_impl_methods() -> std::collections::HashMap<String, rustc_public::ty::FnDef> {
+    let mut out = std::collections::HashMap::new();
+    for f in rustc_public::local_crate().fn_defs() {
+        let name = f.name();
+        if !(name.ends_with(" as std::ops::Drop>::drop")
+            || name.ends_with(" as core::ops::Drop>::drop"))
+        {
+            continue;
+        }
+        // `<crate::Type<Params> as ...::Drop>::drop`: the key is
+        // the self type's path without its parameter list.
+        let Some(rest) = name.strip_prefix('<') else {
+            continue;
+        };
+        let Some((self_part, _)) = rest.split_once(" as ") else {
+            continue;
+        };
+        let base = self_part.split('<').next().unwrap_or(self_part);
+        out.entry(base.to_string()).or_insert(f);
+    }
+    out
+}
+
+/// Cap on drop-impl bodies demanded per program, mirroring the
+/// reachability collection's cap.
+const MAX_DEMANDED_DTOR_BODIES: usize = 256;
+
+/// The type of the place a `Drop` terminator drops, following the
+/// place's projections. `None` when a projection's resulting type
+/// cannot be determined locally (the demand pass then simply does
+/// not see this drop; conversion reports it as before).
+fn drop_place_ty(body: &rustc_public::mir::Body, place: &rustc_public::mir::Place) -> Option<Ty> {
+    use rustc_public::mir::ProjectionElem as P;
+    let mut ty = body.locals().get(place.local)?.ty;
+    for elem in &place.projection {
+        ty = match elem {
+            P::Field(_, t) => *t,
+            P::Deref => match ty.kind() {
+                TyKind::RigidTy(RigidTy::Ref(_, inner, _)) => inner,
+                TyKind::RigidTy(RigidTy::RawPtr(inner, _)) => inner,
+                TyKind::RigidTy(RigidTy::Adt(def, ref args)) => {
+                    // `Box<T>` dereferences to `T`.
+                    if def.name() != "std::boxed::Box" {
+                        return None;
+                    }
+                    args.0.iter().find_map(|a| match a {
+                        GenericArgKind::Type(t) => Some(*t),
+                        _ => None,
+                    })?
+                }
+                _ => return None,
+            },
+            P::Index(_) | P::ConstantIndex { .. } | P::Subslice { .. } => match ty.kind() {
+                TyKind::RigidTy(RigidTy::Array(elem, _)) => elem,
+                TyKind::RigidTy(RigidTy::Slice(elem)) => elem,
+                _ => return None,
+            },
+            P::Downcast(_) => ty,
+            P::OpaqueCast(t) => *t,
+        };
+    }
+    Some(ty)
+}
+
+/// Collect every ADT instantiation in the type tree of `ty` —
+/// the type itself, its generic arguments, its variants' field
+/// types (with the arguments substituted), tuple elements, array
+/// elements and closure captures — as drop-impl demand candidates.
+/// References and raw pointers are not followed (their pointees
+/// are not dropped with the value), and aliases are left alone
+/// (their expansion is not available locally).
+fn drop_candidates(
+    ty: &Ty,
+    out: &mut Vec<(Ty, rustc_public::ty::AdtDef, GenericArgs)>,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    match ty.kind() {
+        TyKind::RigidTy(RigidTy::Adt(def, args)) => {
+            let key = format!("{:?} {:?}", def.def_id(), args);
+            if !seen.insert(key) {
+                return;
+            }
+            out.push((*ty, def, args.clone()));
+            for a in &args.0 {
+                if let GenericArgKind::Type(t) = a {
+                    drop_candidates(t, out, seen);
+                }
+            }
+            for variant in def.variants() {
+                for field in variant.fields() {
+                    drop_candidates(&field.ty_with_args(&args), out, seen);
+                }
+            }
+        }
+        TyKind::RigidTy(RigidTy::Tuple(ts)) => {
+            for t in &ts {
+                drop_candidates(t, out, seen);
+            }
+        }
+        TyKind::RigidTy(RigidTy::Array(elem, _) | RigidTy::Slice(elem)) => {
+            drop_candidates(&elem, out, seen);
+        }
+        TyKind::RigidTy(RigidTy::Closure(_, args)) => {
+            for a in &args.0 {
+                if let GenericArgKind::Type(t) = a {
+                    drop_candidates(t, out, seen);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Demand a converted body for the `Drop` impl of every local ADT
+/// instantiation that the converted bodies drop (see the call site
+/// in `collect`). Each demanded body is converted like a local item
+/// and added to the seed bodies, so the reachability collection
+/// walks its callees too; demanded bodies are scanned for further
+/// drops in turn. An ADT whose impl does not resolve, or whose
+/// instance has no body, is left as it was: the interpreter keeps
+/// refusing its drop with the reason it already reports.
+#[allow(clippy::too_many_arguments)]
+fn demand_drop_instances(
+    conv: &mut Converter,
+    report: &mut ConversionReport,
+    bodies: &mut Vec<(String, Body)>,
+    body_def_ids: &mut Vec<sparagmos_mir::DefId>,
+    body_def_names: &mut Vec<String>,
+    seed_bodies: &mut Vec<rustc_public::mir::Body>,
+) {
+    let local_crate = rustc_public::local_crate();
+    let local_crate_name = local_crate.name.as_str();
+    let impl_methods = local_drop_impl_methods();
+    if impl_methods.is_empty() {
+        return;
+    }
+    let mut seen_candidates: std::collections::HashSet<String> = Default::default();
+    let mut demanded = 0usize;
+    let mut scan_from = 0usize;
+    while scan_from < seed_bodies.len() {
+        let batch: Vec<rustc_public::mir::Body> = seed_bodies[scan_from..].to_vec();
+        scan_from = seed_bodies.len();
+        let mut candidates = Vec::new();
+        let mut seen = Default::default();
+        for body in &batch {
+            for bb in &body.blocks {
+                let rustc_public::mir::TerminatorKind::Drop { place, .. } = &bb.terminator.kind
+                else {
+                    continue;
+                };
+                if let Some(ty) = drop_place_ty(body, place) {
+                    drop_candidates(&ty, &mut candidates, &mut seen);
+                }
+            }
+        }
+        let mut added = false;
+        for (_, def, args) in candidates {
+            if demanded >= MAX_DEMANDED_DTOR_BODIES {
+                break;
+            }
+            // Only local types: for any other crate's type the
+            // interpreter cannot assume the collected body is the
+            // whole story (its value model owns the std types whose
+            // glue it can run at all). Type definitions are not
+            // items, so locality is judged by the name's crate
+            // segment, the same test the glue builder applies.
+            if def.name().split("::").next() != Some(local_crate_name) {
+                continue;
+            }
+            let key = format!("{:?} {:?}", def.def_id(), args);
+            if !seen_candidates.insert(key) {
+                continue;
+            }
+            if args_mention_params(&args) {
+                continue;
+            }
+            let Some(impl_fn) = impl_methods.get(&def.name()) else {
+                continue;
+            };
+            // The impl's generic parameters are the self type's, in
+            // declaration order, for the standard
+            // `impl<...> Drop for Type<...>` shape; a resolution
+            // failure simply means the shape differs or this ADT
+            // has no applicable impl, and a compiler panic on an
+            // odd instantiation must not take the whole conversion
+            // down with it.
+            let impl_fn = *impl_fn;
+            let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Instance::resolve(impl_fn, &args)
+                    .ok()
+                    .filter(|inst| inst.has_body())
+                    .and_then(|inst| inst.body().map(|body| (inst, body)))
+            }));
+            let Ok(Some((inst, sm_body))) = resolved else {
+                continue;
+            };
+            // Identity, not spelling: the item loop may already
+            // have converted this very instance under a differently
+            // spelled name (the item records the declared lifetime
+            // parameters, e.g. `<'a>`, where the resolved instance
+            // renders erased lifetimes as `'_`). Registering the
+            // same destructor twice leaves the interpreter's
+            // destructor lookup with two candidates, which it
+            // treats as ambiguous and refuses the drop, so an
+            // already-converted instance is skipped by its DefId.
+            let def_id = conv.instance_def_id(inst.def.def_id(), &inst);
+            if body_def_ids.contains(&def_id) {
+                continue;
+            }
+            let name = inst.name().to_string();
+            if bodies.iter().any(|(n, _)| n == &name) {
+                continue;
+            }
+            let before = bodies.len();
+            convert_item(
+                conv,
+                report,
+                bodies,
+                body_def_ids,
+                body_def_names,
+                name,
+                def_id,
+                Ok(Some(sm_body.clone())),
+            );
+            if bodies.len() > before {
+                seed_bodies.push(sm_body);
+                demanded += 1;
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+}
+
 /// Account for a constant that has no MIR body anywhere: a
 /// *trivial* constant (a literal, a path to another constant, a
 /// const parameter). rustc represents such constants without a
@@ -1092,6 +1334,22 @@ fn collect() -> ControlFlow<()> {
 
     let local_body_count = bodies.len();
     let local_report_count = report.functions.len();
+
+    // Demand monomorphic bodies for the `Drop` impls of the local
+    // types the converted bodies drop. A generic `Drop` impl is
+    // never instantiated by the item loop (it has no monomorphic
+    // instance as an item) and never reached by the call-graph
+    // collection (drop glue is not a call edge), so without this
+    // pass the interpreter's glue builder finds the impl recorded
+    // but bodiless and refuses the drop.
+    demand_drop_instances(
+        &mut conv,
+        &mut report,
+        &mut bodies,
+        &mut body_def_ids,
+        &mut body_def_names,
+        &mut seed_bodies,
+    );
 
     // Convert the monomorphic instances of the generic local
     // function definitions that the converted bodies call; the
