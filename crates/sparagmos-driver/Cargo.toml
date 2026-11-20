@@ -1,0 +1,18 @@
+[package]
+name = "sparagmos-driver"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Sparagmos rustc driver: obtains MIR via Stable MIR (rustc_public) and converts it to sparagmos-mir"
+
+# This crate is its own workspace on purpose: it must be built with the
+# pinned Rust 1.100.0 toolchain (+ rustc-dev, RUSTC_BOOTSTRAP=1), while the
+# rest of Sparagmos builds with the regular stable toolchain.
+[workspace]
+
+[dependencies]
+sparagmos-mir = { path = "../sparagmos-mir" }
+
+[[bin]]
+name = "sparagmos-driver"
+path = "src/main.rs"
