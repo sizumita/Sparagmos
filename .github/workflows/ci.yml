@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test:
+    name: build / test / fmt / clippy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Toolchain policy:
+      # - Building Sparagmos itself uses `stable` for now.
+      # - The project's MIR reference / coverage denominator is Rust
+      #   1.100.0 (released 2026-11-12; installed and verified on the
+      #   dev host via rustup, including `rustc --emit=mir`).
+      # - Therefore any CI step that GENERATES MIR (e.g. compiling the
+      #   corpus with `rustc --emit=mir`) MUST use toolchain 1.100.0,
+      #   not stable, so the MIR Sparagmos consumes never drifts from
+      #   the reference. When such a step is added, install it with:
+      #     uses: dtolnay/rust-toolchain@1.100.0
+      #   in a separate job/step from the stable build above.
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build workspace
+        run: cargo build --workspace --all-targets
+
+      - name: Test workspace
+        run: cargo test --workspace
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # Clippy is advisory for now: the codebase is in early scaffold stage
+      # and we do not want style lints to block parallel lane work.
+      # This step therefore does NOT fail the build (continue-on-error).
+      # TODO(lane/issues-ci): drop continue-on-error once all lanes have
+      # landed their first implementations and the tree is lint-clean.
+      - name: Clippy (advisory, does not fail the build yet)
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Coverage marker report
+        run: |
+          chmod +x scripts/coverage-report.sh
+          ./scripts/coverage-report.sh | tee coverage-report.md
+          cat coverage-report.md >> "$GITHUB_STEP_SUMMARY"
