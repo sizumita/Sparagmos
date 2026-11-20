@@ -1,15 +1,22 @@
-//! A small function IR used as the JIT's input for now.
+//! The JIT backend's function IR: the internal representation the
+//! x86_64 compiler ([`crate::compiler`]) consumes.
 //!
-//! Lane A's MIR types (`sparagmos-mir`) are not final yet, so this crate
-//! defines its own minimal SSA-flavoured IR: a function is a list of basic
-//! blocks, each block is a list of instructions plus a terminator. All
-//! values are signed 64-bit integers (`i64`), which keeps the first compiler
-//! honest and simple. When the MIR types are fixed, a MIR -> this IR
-//! lowering (or a direct MIR -> emitter backend) will replace this as the
-//! front door; the emitter and executable-memory layers stay unchanged.
+//! A function is a list of basic blocks, each block is a list of
+//! instructions plus a terminator. Every value lives in a fixed stack
+//! slot and is a raw 64-bit word; typed meaning (integer width and
+//! signedness) is carried by the operations that produce and consume
+//! the value, not by the value itself. The MIR front end
+//! ([`crate::mir_jit`]) keeps every integer in canonical form for its
+//! type (sign-extended for signed types, zero-extended / masked for
+//! unsigned types and `bool`), so the plain 64-bit operations below
+//! are exact for any integer type of up to 64 bits.
+//!
+//! The IR is deliberately *not* SSA: an instruction may write into a
+//! value slot that was written before (MIR locals are mutable, and the
+//! lowering maps each MIR local leaf onto one value slot).
 
-/// A virtual value (SSA-like): defined once by an instruction or by being a
-/// function parameter (parameters are values `0..params`).
+/// A virtual value (stack slot): defined by being a function parameter
+/// (parameters are values `0..param_count`) or by an instruction.
 pub type Value = u32;
 
 /// Block identifier (index into `Function::blocks`).
@@ -34,6 +41,12 @@ impl From<Value> for Operand {
 }
 
 /// Binary operations. Comparisons yield 0 or 1.
+///
+/// The plain arithmetic operations work on raw 64-bit words. Division
+/// and remainder come in signed (`Div` / `Rem`, truncating toward
+/// zero, like Rust's `/` and `%` on signed integers) and unsigned
+/// (`DivU` / `RemU`) forms; comparisons likewise come in signed and
+/// unsigned (`U`-suffixed) forms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
     Add,
@@ -43,6 +56,10 @@ pub enum BinOp {
     Div,
     /// Signed remainder (like Rust `%` on i64).
     Rem,
+    /// Unsigned division.
+    DivU,
+    /// Unsigned remainder.
+    RemU,
     And,
     Or,
     Xor,
@@ -59,6 +76,11 @@ pub enum BinOp {
     Le,
     Gt,
     Ge,
+    /// Unsigned comparisons.
+    LtU,
+    LeU,
+    GtU,
+    GeU,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,9 +89,35 @@ pub enum UnOp {
     Not,
 }
 
+/// The integer operations that have a checked (overflow-flagged) form
+/// in MIR: `a op b` yields the wrapped value plus a flag telling
+/// whether the true result fits the operation's type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckedOp {
+    Add,
+    Sub,
+    Mul,
+}
+
+/// An integer type as the backend needs it for a checked operation:
+/// the bit width of the MIR type and its signedness. The operands are
+/// in canonical form for this type (see the module docs), which is
+/// what makes the backend's overflow computation exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntKind {
+    pub bits: u8,
+    pub signed: bool,
+}
+
+impl IntKind {
+    pub const fn new(bits: u8, signed: bool) -> Self {
+        Self { bits, signed }
+    }
+}
+
 /// One instruction. Every instruction that produces a value names its
 /// destination value explicitly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Instr {
     /// `dst = imm`
     Const { dst: Value, imm: i64 },
@@ -84,6 +132,48 @@ pub enum Instr {
     },
     /// `dst = op src`
     UnOp { dst: Value, op: UnOp, src: Operand },
+    /// Checked arithmetic: computes `lhs op rhs` at the given integer
+    /// type, stores the wrapped value into `dst_val` and the overflow
+    /// flag (0 or 1) into `dst_flag`. This is the backend form of
+    /// MIR's `CheckedBinaryOp` and `*WithOverflow` operators, which
+    /// yield a `(value, bool)` pair.
+    CheckedBinOp {
+        dst_val: Value,
+        dst_flag: Value,
+        op: CheckedOp,
+        lhs: Operand,
+        rhs: Operand,
+        kind: IntKind,
+    },
+    /// Call function `func` (an index into the program's function
+    /// table) with the given arguments (at most six, passed in the
+    /// System V argument registers); the result lands in `dst`.
+    /// Only meaningful in a program compile ([`crate::program`]);
+    /// the single-function entry points reject it.
+    Call {
+        dst: Value,
+        func: u32,
+        args: Vec<Operand>,
+    },
+    /// Guest panic: record message `msg` (an index into the program's
+    /// message table) through the runtime's panic path, mark the
+    /// program's panic flag, and return from the current function
+    /// immediately. Callers are expected to follow a call with
+    /// [`Instr::CheckPanic`] so the panic propagates to the entry
+    /// point instead of execution continuing with dummy values.
+    /// Program compiles only, like [`Instr::Call`].
+    Panic { msg: u32 },
+    /// If the program's panic flag is set, return from the current
+    /// function immediately (propagating a guest panic raised by a
+    /// callee). Otherwise a no-op. Program compiles only.
+    CheckPanic,
+    /// Guest panic with the shift-overflow message, whose text
+    /// depends on the runtime shift amount: "attempt to shift by
+    /// {amount} bits, which overflows the type width {bits}". The
+    /// message is formatted by a helper in the program layer into a
+    /// scratch buffer and then recorded through the usual panic
+    /// path. Program compiles only.
+    PanicShiftOverflow { amount: Operand, bits: u32 },
 }
 
 /// How a basic block ends.

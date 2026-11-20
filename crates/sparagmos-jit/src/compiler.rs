@@ -1,4 +1,4 @@
-//! First compiler: lowers the crate-local IR ([`crate::ir`]) to x86_64
+//! Baseline compiler: lowers the backend IR ([`crate::ir`]) to x86_64
 //! machine code following the System V AMD64 calling convention.
 //!
 //! Strategy (deliberately simple — a baseline JIT):
@@ -12,19 +12,31 @@
 //! * Block terminators become jumps; branch fixups are patched once all
 //!   block offsets are known.
 //!
-//! When Lane A's MIR types (targeting Rust 1.100.0 MIR) are fixed, the
-//! intended connection is a MIR -> IR lowering feeding this same backend,
-//! or a second backend sharing `emitter` / `memory` unchanged.
+//! Two entry points share this code generator:
+//! * [`compile`] / [`compile_to_bytes`] compile a single self-contained
+//!   function. The program-only instructions ([`Instr::Call`],
+//!   [`Instr::Panic`], [`Instr::CheckPanic`]) are rejected there.
+//! * [`crate::program::compile_program`] compiles a whole table of
+//!   functions into one executable image, supplying a [`ProgramCtx`]
+//!   (panic flag address, panic runtime entry, message table) so calls
+//!   between the functions and guest panics work.
 
 use crate::emitter::{Cond, Emitter, Reg};
-use crate::ir::{BinOp, Function, Instr, Operand, Terminator, UnOp, Value};
+use crate::ir::{BinOp, CheckedOp, Function, Instr, Operand, Terminator, UnOp, Value};
 use crate::memory::JitMemory;
 
 #[derive(Debug)]
 pub enum CompileError {
     TooManyParams(usize),
+    TooManyArgs(usize),
     UnknownBlock(u32),
+    /// A call fixup referenced a function outside the program table.
+    UnknownFunction(u32),
     ValueOutOfRange(Value),
+    /// A program-only instruction was used in a single-function compile.
+    ProgramOnly(&'static str),
+    /// A panic instruction referenced a message outside the table.
+    BadMessageIndex(u32),
     Memory(std::io::Error),
 }
 
@@ -34,8 +46,16 @@ impl std::fmt::Display for CompileError {
             CompileError::TooManyParams(n) => {
                 write!(f, "too many parameters: {n} (max 6 register args for now)")
             }
+            CompileError::TooManyArgs(n) => {
+                write!(f, "too many call arguments: {n} (max 6 register args for now)")
+            }
             CompileError::UnknownBlock(b) => write!(f, "jump to unknown block {b}"),
+            CompileError::UnknownFunction(i) => write!(f, "call to unknown function index {i}"),
             CompileError::ValueOutOfRange(v) => write!(f, "value {v} out of range"),
+            CompileError::ProgramOnly(what) => {
+                write!(f, "{what} is only available in a program compile")
+            }
+            CompileError::BadMessageIndex(i) => write!(f, "panic message index {i} out of range"),
             CompileError::Memory(e) => write!(f, "jit memory error: {e}"),
         }
     }
@@ -46,6 +66,34 @@ impl From<std::io::Error> for CompileError {
         CompileError::Memory(e)
     }
 }
+
+/// Context a program compile hands to the code generator: where the
+/// program's panic state lives and how to reach the runtime's panic
+/// entry point. The addresses are embedded into the generated code as
+/// immediates, so everything they point at must outlive the compiled
+/// program (the owner is [`crate::program::CompiledProgram`]).
+#[derive(Debug, Clone)]
+pub struct ProgramCtx {
+    /// Address of the program's panic context: two `u64` words,
+    /// `[panicked: u64, message_index: u64]`.
+    pub flag_addr: usize,
+    /// Address of `sparagmos_panic` (the runtime's panic entry point).
+    pub panic_fn: usize,
+    /// Panic message table: `(ptr, len)` of each message's UTF-8 bytes.
+    pub messages: Vec<(usize, usize)>,
+    /// Address of the program layer's shift-message formatter:
+    /// `extern "C" fn(amount: u64, bits: u64, buf: *mut u8) -> usize`,
+    /// writing a length-prefixed message into `shift_buf` and
+    /// returning the message length.
+    pub shift_fmt_fn: usize,
+    /// Address of the scratch buffer the formatter writes into:
+    /// 8 length bytes (little-endian u64) followed by message bytes.
+    pub shift_buf: usize,
+}
+
+/// Call fixups produced when compiling one function of a program:
+/// `(rel32 field offset, callee function index)` pairs.
+pub(crate) type CallFixups = Vec<(usize, u32)>;
 
 /// A compiled function living in executable memory.
 pub struct CompiledFunction {
@@ -90,8 +138,11 @@ impl CompiledFunction {
 struct Compiler<'a> {
     func: &'a Function,
     e: Emitter,
+    ctx: Option<&'a ProgramCtx>,
     /// rel32 fixups: (field offset, target block id)
     fixups: Vec<(usize, u32)>,
+    /// call fixups: (field offset in this function's code, callee index)
+    call_fixups: Vec<(usize, u32)>,
     block_offsets: Vec<usize>,
 }
 
@@ -117,33 +168,38 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
-    fn store_result(&mut self, dst: Value) -> Result<(), CompileError> {
+    /// Store register `r` into value `dst`'s slot.
+    fn store_reg(&mut self, dst: Value, r: Reg) -> Result<(), CompileError> {
         let d = self.slot_disp(dst)?;
-        self.e.mov_store(Reg::Rbp, d, Reg::Rax);
+        self.e.mov_store(Reg::Rbp, d, r);
         Ok(())
     }
 
+    fn store_result(&mut self, dst: Value) -> Result<(), CompileError> {
+        self.store_reg(dst, Reg::Rax)
+    }
+
     fn compile_instr(&mut self, instr: &Instr) -> Result<(), CompileError> {
-        match *instr {
+        match instr {
             Instr::Const { dst, imm } => {
-                self.e.mov_imm(Reg::Rax, imm);
-                self.store_result(dst)?;
+                self.e.mov_imm(Reg::Rax, *imm);
+                self.store_result(*dst)?;
             }
             Instr::Copy { dst, src } => {
-                self.load_operand(Reg::Rax, src)?;
-                self.store_result(dst)?;
+                self.load_operand(Reg::Rax, *src)?;
+                self.store_result(*dst)?;
             }
             Instr::UnOp { dst, op, src } => {
-                self.load_operand(Reg::Rax, src)?;
+                self.load_operand(Reg::Rax, *src)?;
                 match op {
                     UnOp::Neg => self.e.neg(Reg::Rax),
                     UnOp::Not => self.e.not(Reg::Rax),
                 }
-                self.store_result(dst)?;
+                self.store_result(*dst)?;
             }
             Instr::BinOp { dst, op, lhs, rhs } => {
-                self.load_operand(Reg::Rax, lhs)?;
-                self.load_operand(Reg::Rcx, rhs)?;
+                self.load_operand(Reg::Rax, *lhs)?;
+                self.load_operand(Reg::Rcx, *rhs)?;
                 match op {
                     BinOp::Add => self.e.add_rr(Reg::Rax, Reg::Rcx),
                     BinOp::Sub => self.e.sub_rr(Reg::Rax, Reg::Rcx),
@@ -157,27 +213,198 @@ impl<'a> Compiler<'a> {
                         self.e.idiv(Reg::Rcx);
                         self.e.mov_rr(Reg::Rax, Reg::Rdx);
                     }
+                    BinOp::DivU => {
+                        // div divides rdx:rax; the dividend here is the
+                        // zero-extended operand in rax, so rdx must be 0.
+                        self.e.xor_rr(Reg::Rdx, Reg::Rdx);
+                        self.e.div(Reg::Rcx);
+                    }
+                    BinOp::RemU => {
+                        self.e.xor_rr(Reg::Rdx, Reg::Rdx);
+                        self.e.div(Reg::Rcx);
+                        self.e.mov_rr(Reg::Rax, Reg::Rdx);
+                    }
                     BinOp::And => self.e.and_rr(Reg::Rax, Reg::Rcx),
                     BinOp::Or => self.e.or_rr(Reg::Rax, Reg::Rcx),
                     BinOp::Xor => self.e.xor_rr(Reg::Rax, Reg::Rcx),
                     BinOp::Shl => self.e.shl_cl(Reg::Rax),
                     BinOp::Shr => self.e.shr_cl(Reg::Rax),
                     BinOp::Sar => self.e.sar_cl(Reg::Rax),
-                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                    BinOp::Eq
+                    | BinOp::Ne
+                    | BinOp::Lt
+                    | BinOp::Le
+                    | BinOp::Gt
+                    | BinOp::Ge
+                    | BinOp::LtU
+                    | BinOp::LeU
+                    | BinOp::GtU
+                    | BinOp::GeU => {
                         let cc = match op {
                             BinOp::Eq => Cond::Equal,
                             BinOp::Ne => Cond::NotEqual,
                             BinOp::Lt => Cond::Less,
                             BinOp::Le => Cond::LessOrEqual,
                             BinOp::Gt => Cond::Greater,
-                            _ => Cond::GreaterOrEqual,
+                            BinOp::Ge => Cond::GreaterOrEqual,
+                            BinOp::LtU => Cond::Below,
+                            BinOp::LeU => Cond::BelowOrEqual,
+                            BinOp::GtU => Cond::Above,
+                            _ => Cond::AboveOrEqual,
                         };
                         self.e.cmp_rr(Reg::Rax, Reg::Rcx);
                         self.e.setcc_al(cc);
                         self.e.movzx_rax_al();
                     }
                 }
-                self.store_result(dst)?;
+                self.store_result(*dst)?;
+            }
+            Instr::CheckedBinOp {
+                dst_val,
+                dst_flag,
+                op,
+                lhs,
+                rhs,
+                kind,
+            } => {
+                self.load_operand(Reg::Rax, *lhs)?;
+                self.load_operand(Reg::Rcx, *rhs)?;
+                let bits = kind.bits as u32;
+                if bits == 64 && !kind.signed && matches!(op, CheckedOp::Mul) {
+                    // Unsigned 64x64: the low half alone cannot reveal
+                    // overflow, so use the widening multiply and test
+                    // the high half in rdx afterwards.
+                    self.e.mul(Reg::Rcx);
+                    self.store_result(*dst_val)?;
+                    self.e.cmp_ri(Reg::Rdx, 0);
+                    self.e.setcc_al(Cond::NotEqual);
+                    self.e.movzx_rax_al();
+                    self.store_result(*dst_flag)?;
+                } else if bits == 64 {
+                    match op {
+                        CheckedOp::Add => self.e.add_rr(Reg::Rax, Reg::Rcx),
+                        CheckedOp::Sub => self.e.sub_rr(Reg::Rax, Reg::Rcx),
+                        CheckedOp::Mul => self.e.imul_rr(Reg::Rax, Reg::Rcx),
+                    }
+                    // The wrapped result is final at this width; the
+                    // flags from the operation carry the overflow bit
+                    // (OF for signed, CF for unsigned add/sub). Storing
+                    // the result first is safe: `mov` does not touch
+                    // flags, and setcc only rewrites al afterwards.
+                    self.store_result(*dst_val)?;
+                    let cc = if kind.signed {
+                        Cond::Overflow
+                    } else {
+                        Cond::Below
+                    };
+                    self.e.setcc_al(cc);
+                    self.e.movzx_rax_al();
+                    self.store_result(*dst_flag)?;
+                } else {
+                    // Narrower than 64 bits: the operands are canonical
+                    // (sign-/zero-extended), so the 64-bit operation is
+                    // exact. Overflow is "normalising the exact result
+                    // to the type's width changes it".
+                    match op {
+                        CheckedOp::Add => self.e.add_rr(Reg::Rax, Reg::Rcx),
+                        CheckedOp::Sub => self.e.sub_rr(Reg::Rax, Reg::Rcx),
+                        CheckedOp::Mul => self.e.imul_rr(Reg::Rax, Reg::Rcx),
+                    }
+                    self.e.mov_rr(Reg::Rcx, Reg::Rax);
+                    if kind.signed {
+                        let shift = 64 - bits;
+                        self.e.shl_imm(Reg::Rcx, shift as u8);
+                        self.e.sar_imm(Reg::Rcx, shift as u8);
+                    } else {
+                        let mask = ((1u128 << bits) - 1) as i64;
+                        self.e.mov_ri64(Reg::Rdx, mask);
+                        self.e.and_rr(Reg::Rcx, Reg::Rdx);
+                    }
+                    self.e.cmp_rr(Reg::Rax, Reg::Rcx);
+                    self.e.setcc_al(Cond::NotEqual);
+                    self.e.movzx_rax_al();
+                    // rax now holds the flag, rcx the wrapped value.
+                    self.store_reg(*dst_val, Reg::Rcx)?;
+                    self.store_result(*dst_flag)?;
+                }
+            }
+            Instr::Call { dst, func, args } => {
+                if self.ctx.is_none() {
+                    return Err(CompileError::ProgramOnly("Call"));
+                }
+                if args.len() > 6 {
+                    return Err(CompileError::TooManyArgs(args.len()));
+                }
+                for (i, a) in args.iter().enumerate() {
+                    self.load_operand(Reg::SYSV_ARG_REGS[i], *a)?;
+                }
+                let at = self.e.call_rel32();
+                self.call_fixups.push((at, *func));
+                self.store_result(*dst)?;
+            }
+            Instr::Panic { msg } => {
+                let ctx = self
+                    .ctx
+                    .ok_or(CompileError::ProgramOnly("Panic"))?;
+                let (ptr, len) = ctx
+                    .messages
+                    .get(*msg as usize)
+                    .copied()
+                    .ok_or(CompileError::BadMessageIndex(*msg))?;
+                // sparagmos_panic(msg_ptr, msg_len): records the panic
+                // in the runtime. Then record it in the program's own
+                // panic context (flag + message index) and return from
+                // this function; callers propagate via CheckPanic.
+                self.e.mov_ri64(Reg::Rdi, ptr as i64);
+                self.e.mov_ri64(Reg::Rsi, len as i64);
+                self.e.mov_ri64(Reg::Rax, ctx.panic_fn as i64);
+                self.e.call_r(Reg::Rax);
+                self.e.mov_ri64(Reg::Rax, ctx.flag_addr as i64);
+                self.e.mov_ri64(Reg::Rcx, 1);
+                self.e.mov_store(Reg::Rax, 0, Reg::Rcx);
+                self.e.mov_ri64(Reg::Rcx, *msg as i64);
+                self.e.mov_store(Reg::Rax, 8, Reg::Rcx);
+                self.e.leave();
+                self.e.ret();
+            }
+            Instr::CheckPanic => {
+                let ctx = self
+                    .ctx
+                    .ok_or(CompileError::ProgramOnly("CheckPanic"))?;
+                self.e.mov_ri64(Reg::Rax, ctx.flag_addr as i64);
+                self.e.mov_load(Reg::Rcx, Reg::Rax, 0);
+                self.e.test_rr(Reg::Rcx, Reg::Rcx);
+                let at = self.e.jcc_rel32(Cond::Equal);
+                self.e.leave();
+                self.e.ret();
+                let target = self.e.position();
+                self.e.buf.patch_rel32(at, target);
+            }
+            Instr::PanicShiftOverflow { amount, bits } => {
+                let ctx = self
+                    .ctx
+                    .ok_or(CompileError::ProgramOnly("PanicShiftOverflow"))?;
+                // Format the message into the program's scratch
+                // buffer, then record it through the runtime's panic
+                // path like a static message. The message index is
+                // the u64::MAX sentinel: the program layer reads the
+                // text back from the buffer instead of the table.
+                self.load_operand(Reg::Rdi, *amount)?;
+                self.e.mov_ri64(Reg::Rsi, *bits as i64);
+                self.e.mov_ri64(Reg::Rdx, ctx.shift_buf as i64);
+                self.e.mov_ri64(Reg::Rax, ctx.shift_fmt_fn as i64);
+                self.e.call_r(Reg::Rax);
+                self.e.mov_rr(Reg::Rsi, Reg::Rax);
+                self.e.mov_ri64(Reg::Rdi, (ctx.shift_buf + 8) as i64);
+                self.e.mov_ri64(Reg::Rax, ctx.panic_fn as i64);
+                self.e.call_r(Reg::Rax);
+                self.e.mov_ri64(Reg::Rax, ctx.flag_addr as i64);
+                self.e.mov_ri64(Reg::Rcx, 1);
+                self.e.mov_store(Reg::Rax, 0, Reg::Rcx);
+                self.e.mov_ri64(Reg::Rcx, -1);
+                self.e.mov_store(Reg::Rax, 8, Reg::Rcx);
+                self.e.leave();
+                self.e.ret();
             }
         }
         Ok(())
@@ -221,7 +448,7 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
-    fn compile(mut self) -> Result<Vec<u8>, CompileError> {
+    fn compile(mut self) -> Result<(Vec<u8>, CallFixups), CompileError> {
         let func = self.func;
         if func.param_count > 6 {
             return Err(CompileError::TooManyParams(func.param_count));
@@ -255,16 +482,40 @@ impl<'a> Compiler<'a> {
             let t = offsets[*target as usize];
             self.e.buf.patch_rel32(*at, t);
         }
-        Ok(self.e.buf.into_vec())
+        Ok((self.e.buf.into_vec(), self.call_fixups))
     }
 }
 
 /// Compile `func` to raw machine-code bytes (not yet executable).
+/// Program-only instructions are rejected with
+/// [`CompileError::ProgramOnly`].
 pub fn compile_to_bytes(func: &Function) -> Result<Vec<u8>, CompileError> {
     let c = Compiler {
         func,
         e: Emitter::new(),
+        ctx: None,
         fixups: Vec::new(),
+        call_fixups: Vec::new(),
+        block_offsets: vec![0; func.blocks.len()],
+    };
+    let (bytes, call_fixups) = c.compile()?;
+    debug_assert!(call_fixups.is_empty());
+    Ok(bytes)
+}
+
+/// Compile one function of a program with the program context.
+/// Returns the code bytes and the call fixups within them:
+/// `(rel32 field offset, callee function index)`.
+pub(crate) fn compile_with_ctx(
+    func: &Function,
+    ctx: &ProgramCtx,
+) -> Result<(Vec<u8>, CallFixups), CompileError> {
+    let c = Compiler {
+        func,
+        e: Emitter::new(),
+        ctx: Some(ctx),
+        fixups: Vec::new(),
+        call_fixups: Vec::new(),
         block_offsets: vec![0; func.blocks.len()],
     };
     c.compile()
