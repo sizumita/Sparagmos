@@ -1853,6 +1853,25 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
             res["bucket"] = "not attempted (minicore build)"
             return res
         args += mc_args
+    # Crate type: the driver's convert mode names none of its own
+    # (compiletest parity: compiletest passes no --crate-type for a
+    # test file, so a source-level #![crate_type] or the rustc
+    # default (bin) governs). Two suites are prescribed by
+    # compiletest itself and forwarded here. mir-opt is compiled as
+    # an rlib (make_compile_args passes --crate-type=rlib for the
+    # suite). A pretty test is never compiled as a binary at all --
+    # compiletest stops at -Zunpretty output, so no entry-point or
+    # reachability verdict exists to mirror; the conversion proxy
+    # keeps the lib shape for it (unless the test declares its own
+    # crate type, in flags or in the source). A test whose own
+    # compile-flags name a crate type keeps them in both cases.
+    if not any(a == "--crate-type" or a.startswith("--crate-type=")
+               for a in flags):
+        if rec["suite"] == "mir-opt":
+            args += ["--crate-type", "rlib"]
+        elif rec["suite"] == "pretty" and not declared_crate_type(
+                path.read_text(errors="ignore")):
+            args += ["--crate-type", "lib"]
     args += flags
     specs = aux_specs
     if aux_per_revision:
