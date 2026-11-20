@@ -2166,6 +2166,17 @@ fn eval_binary(
     ))
 }
 
+/// The guest panic message for a shift whose amount meets or
+/// exceeds the value's width: Rust 1.100.0's native wording, which
+/// names only the direction (the amount is not part of the text).
+fn shift_overflow_message(op: BinOp) -> &'static str {
+    if op == BinOp::Shl {
+        "attempt to shift left with overflow"
+    } else {
+        "attempt to shift right with overflow"
+    }
+}
+
 /// Evaluate a `Shl` / `Shr` operation.
 ///
 /// The value (left operand) keeps its own type and signedness: the
@@ -2178,13 +2189,15 @@ fn eval_binary(
 /// and `u32::MAX` stands in for it, which is at or above every
 /// type width and so reports an overflowing amount either way.
 ///
-/// An amount at or above the value's width is an overflow: the
-/// checked form yields the wrapped result (the amount taken modulo
-/// the width, the `wrapping_shl` / `wrapping_shr` reading) with the
-/// overflow flag set, and the plain form is a guest panic. For
-/// `Shl`, bits shifted out of the declared width are an arithmetic
-/// overflow as well, under the same checked/plain split as the
-/// other operators.
+/// An amount at or above the value's width is the only overflow a
+/// shift has: the checked form yields the wrapped result (the
+/// amount taken modulo the width, the `wrapping_shl` /
+/// `wrapping_shr` reading) with the overflow flag set, and the
+/// plain form is a guest panic with Rust 1.100.0's native message
+/// (`attempt to shift left with overflow` / `attempt to shift
+/// right with overflow`). Bits shifted out of the declared width
+/// are simply lost, as natively: they set neither the overflow
+/// flag nor a panic, in either form.
 fn eval_shift(
     op: BinOp,
     lhs: &Value,
@@ -2210,23 +2223,14 @@ fn eval_shift(
                     };
                     return Ok((Value::Int(wrapped), true));
                 }
-                return Err(InterpError::panic(format!(
-                    "attempt to shift by {shift} bits, which overflows the type width {bits}"
-                )));
+                return Err(InterpError::panic(shift_overflow_message(op)));
             }
             let raw = if op == BinOp::Shl {
                 wrap_signed(a << shift, bits)
             } else {
                 a >> shift
             };
-            // Overflow if significant bits are shifted out of the
-            // declared width, i.e. shifting back does not restore `a`.
-            let overflowed = op == BinOp::Shl && (wrap_signed(a << shift, bits) >> shift) != a;
-            let result = Value::Int(wrap_signed(raw, bits));
-            if overflowed && !checked_form {
-                return Err(InterpError::panic(format!("arithmetic overflow in {op:?}")));
-            }
-            Ok((result, overflowed))
+            Ok((Value::Int(wrap_signed(raw, bits)), false))
         }
         Value::Uint(a) => {
             let a = *a;
@@ -2240,21 +2244,14 @@ fn eval_shift(
                     };
                     return Ok((Value::Uint(wrapped), true));
                 }
-                return Err(InterpError::panic(format!(
-                    "attempt to shift by {shift} bits, which overflows the type width {bits}"
-                )));
+                return Err(InterpError::panic(shift_overflow_message(op)));
             }
             let raw = if op == BinOp::Shl {
                 a << shift
             } else {
                 a >> shift
             };
-            let overflowed = op == BinOp::Shl && (wrap_unsigned(raw, bits) >> shift) != a;
-            let result = Value::Uint(wrap_unsigned(raw, bits));
-            if overflowed && !checked_form {
-                return Err(InterpError::panic(format!("arithmetic overflow in {op:?}")));
-            }
-            Ok((result, overflowed))
+            Ok((Value::Uint(wrap_unsigned(raw, bits)), false))
         }
         _ => unreachable!("shift values are integer values"),
     }
