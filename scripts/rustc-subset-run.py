@@ -362,6 +362,28 @@ def rustc_cmd():
 
 BOOTSTRAP_ENV = {"RUSTC_BOOTSTRAP": "1"}
 
+_SYSROOT_LIB = None
+
+
+def sysroot_lib():
+    """The reference toolchain lib dir (libLLVM, librustc_driver).
+
+    ui-fulldeps tests link librustc_driver and its LLVM library; the
+    plain rustc invocation finds the crates but not -lLLVM, so the
+    native compile gets this dir as -L and the native run gets it in
+    LD_LIBRARY_PATH, the same setup compiletest arranges.
+    """
+    global _SYSROOT_LIB
+    if _SYSROOT_LIB is None:
+        try:
+            out = subprocess.run(
+                rustc_cmd() + ["--print", "sysroot"],
+                capture_output=True, text=True, timeout=30)
+            _SYSROOT_LIB = str(Path(out.stdout.strip()) / "lib")
+        except Exception:
+            _SYSROOT_LIB = ""
+    return _SYSROOT_LIB
+
 
 def native_side(path, edition, workdir):
     """Compile and run natively. Returns (result_dict, error_reason).
@@ -370,17 +392,23 @@ def native_side(path, edition, workdir):
     exit code); otherwise a not-attempted reason string.
     """
     binpath = Path(workdir) / "prog"
+    lib = sysroot_lib()
     build = run_cmd(
-        rustc_cmd() + ["--edition", edition, "-C", "opt-level=0",
-                       "-o", str(binpath), str(path)],
+        rustc_cmd() + ["--edition", edition, "-C", "opt-level=0"]
+        + (["-L", lib] if lib else [])
+        + ["-o", str(binpath), str(path)],
         timeout=NATIVE_COMPILE_TIMEOUT, env_extra=BOOTSTRAP_ENV)
     if build["timeout"]:
         return None, "native compile timed out"
     if build["exit_code"] != 0:
         first = first_error_line(build["stderr"])
         return None, f"native compile failed: {first}"
+    run_env = {}
+    if lib:
+        prev = os.environ.get("LD_LIBRARY_PATH", "")
+        run_env["LD_LIBRARY_PATH"] = lib + (":" + prev if prev else "")
     run = run_cmd([str(binpath)], timeout=NATIVE_RUN_TIMEOUT,
-                  cwd=str(workdir))
+                  cwd=str(workdir), env_extra=run_env)
     if run["timeout"]:
         return None, "native run timed out"
     return run, None
