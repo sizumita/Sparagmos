@@ -671,3 +671,43 @@ fn summary_mode_fnonce_closure_body_is_converted() {
         "the FnOnce closure body is converted: {line}"
     );
 }
+
+// ----- explicit mem::drop (Issue #61) ------------------------------------------
+
+const MEM_DROP_SRC: &str = r#"
+struct D(i32);
+impl Drop for D {
+    fn drop(&mut self) { println!("drop {}", self.0); }
+}
+fn main() {
+    let a = D(1);
+    let b = D(2);
+    std::mem::drop(a);
+    println!("middle");
+}
+"#;
+
+#[test]
+fn run_mode_mem_drop_runs_destructors() {
+    // An explicit std::mem::drop runs the same destructor as a
+    // scope-end drop: the explicitly dropped value's destructor
+    // runs at the call, and the remaining local drops afterwards,
+    // at scope end — the native interleaving, byte for byte. (The
+    // container cases are covered at the interpreter level in
+    // memdrop_glue_tests; a Vec of droppable elements additionally
+    // needs the runtime allocation path.)
+    let dir = temp_dir("memdrop");
+    let src = fixture(&dir, "memdrop.rs", MEM_DROP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "mem::drop program must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "drop 1\nmiddle\ndrop 2\n",
+        "explicit and scope-end drops interleave exactly as natively"
+    );
+}
