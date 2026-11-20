@@ -7,6 +7,22 @@
 //!   execute the program's `main` in the Sparagmos interpreter
 //!   (`sparagmos-interp`), in this process.
 //!
+//! Both modes also accept `--aux <name>=<file.rs>` (repeatable): an
+//! auxiliary source file that is compiled as a library crate named
+//! `<name>` with the pinned rustc and linked into the main
+//! compilation with `--extern`, the way compiletest's
+//! `//@ aux-build:` / `//@ aux-crate:` directives do. Pass auxiliary
+//! crates in dependency order (a crate before the crates that use
+//! it): each auxiliary compilation sees the previously built ones
+//! through `--extern`. The functions of auxiliary crates are
+//! converted into the same program as the main crate's functions,
+//! so calls from the main crate into an auxiliary crate execute in
+//! the interpreter like any other call. Auxiliary crates whose
+//! declared crate type is `proc-macro` or `cdylib` are compiled and
+//! linked the same way, but their functions are not converted:
+//! proc macros run inside the compiler at compile time, and a
+//! cdylib exposes no Rust API to call.
+//!
 //! Both modes compile `<file.rs>` as a single crate with the pinned
 //! Rust 1.100.0 toolchain, obtain every local function's MIR through
 //! Stable MIR (`rustc_public`), and convert it to `sparagmos_mir::Body`.
@@ -56,9 +72,24 @@ struct Collected {
     /// to the converted functions.
     body_def_ids: Vec<sparagmos_mir::DefId>,
     def_names: Vec<String>,
+    /// Number of leading entries of `bodies` that come from the main
+    /// crate itself (the rest are auxiliary-crate functions). The
+    /// entry point is only ever searched among these: an auxiliary
+    /// crate may define its own `main`-named function, which is not
+    /// the program's entry point.
+    local_body_count: usize,
 }
 
 static COLLECTED: OnceLock<Mutex<Option<Collected>>> = OnceLock::new();
+
+/// Names of the auxiliary crates (--aux) whose functions `collect`
+/// must convert into the program, in `--aux` order. Set by `main`
+/// before the compiler run; empty for single-file inputs.
+static AUX_CRATES: OnceLock<Vec<String>> = OnceLock::new();
+
+fn aux_crates() -> &'static [String] {
+    AUX_CRATES.get().map(|v| v.as_slice()).unwrap_or(&[])
+}
 
 fn stash(c: Collected) {
     let cell = COLLECTED.get_or_init(|| Mutex::new(None));
@@ -215,6 +246,78 @@ impl StdoutToStderr {
     fn restore(&mut self) {}
 }
 
+/// Convert one function (a local item or an auxiliary-crate
+/// function) and record the outcome. `body` is the function's
+/// monomorphic MIR body: `Err(reason)` records the function as
+/// skipped with that reason (no monomorphic instance), and
+/// `Ok(None)` records it as skipped with no body available.
+fn convert_item(
+    conv: &mut Converter,
+    report: &mut ConversionReport,
+    bodies: &mut Vec<(String, Body)>,
+    body_def_ids: &mut Vec<sparagmos_mir::DefId>,
+    name: String,
+    def_id: sparagmos_mir::DefId,
+    body: Result<Option<rustc_public::mir::Body>, String>,
+) {
+    let body = match body {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            let mut reasons = BTreeMap::new();
+            reasons.insert("no MIR body available".to_string(), 1);
+            report.functions.push(FnReport {
+                name,
+                blocks: 0,
+                locals: 0,
+                arg_count: 0,
+                outcome: FnOutcome::Skipped { reasons },
+            });
+            return;
+        }
+        Err(reason) => {
+            let mut reasons = BTreeMap::new();
+            reasons.insert(reason, 1);
+            report.functions.push(FnReport {
+                name,
+                blocks: 0,
+                locals: 0,
+                arg_count: 0,
+                outcome: FnOutcome::Skipped { reasons },
+            });
+            return;
+        }
+    };
+    let blocks = body.blocks.len();
+    let locals = body.locals().len();
+    let arg_count = body.arg_locals().len();
+    match conv.convert_body(&body) {
+        Ok(converted) => {
+            bodies.push((name.clone(), converted));
+            body_def_ids.push(def_id);
+            report.functions.push(FnReport {
+                name,
+                blocks,
+                locals,
+                arg_count,
+                outcome: FnOutcome::Converted,
+            });
+        }
+        Err(errs) => {
+            let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
+            for e in errs {
+                *reasons.entry(e).or_default() += 1;
+            }
+            report.functions.push(FnReport {
+                name,
+                blocks: 0,
+                locals: 0,
+                arg_count: 0,
+                outcome: FnOutcome::Skipped { reasons },
+            });
+        }
+    }
+}
+
 fn collect() -> ControlFlow<()> {
     let mut conv = Converter::new();
     let mut report = ConversionReport::default();
@@ -228,63 +331,63 @@ fn collect() -> ControlFlow<()> {
         // converted body can be handed to the interpreter together with
         // the id that other bodies use to call it.
         let def_id = conv.crate_def_id(item);
-        let instance = match Instance::try_from(item.clone()) {
-            Ok(i) => i,
-            Err(_) => {
-                let mut reasons = BTreeMap::new();
-                reasons.insert(
-                    format!("no monomorphic instance available (kind={:?})", item.kind()),
-                    1,
-                );
-                report.functions.push(FnReport {
-                    name,
-                    blocks: 0,
-                    locals: 0,
-                    arg_count: 0,
-                    outcome: FnOutcome::Skipped { reasons },
-                });
-                continue;
-            }
-        };
-        let Some(body) = instance.body() else {
-            let mut reasons = BTreeMap::new();
-            reasons.insert("no MIR body available".to_string(), 1);
-            report.functions.push(FnReport {
-                name,
-                blocks: 0,
-                locals: 0,
-                arg_count: 0,
-                outcome: FnOutcome::Skipped { reasons },
+        let body = Instance::try_from(item.clone())
+            .map(|instance| instance.body())
+            .map_err(|_| {
+                format!("no monomorphic instance available (kind={:?})", item.kind())
             });
-            continue;
-        };
-        let blocks = body.blocks.len();
-        let locals = body.locals().len();
-        let arg_count = body.arg_locals().len();
-        match conv.convert_body(&body) {
-            Ok(converted) => {
-                bodies.push((name.clone(), converted));
-                body_def_ids.push(def_id);
-                report.functions.push(FnReport {
-                    name,
-                    blocks,
-                    locals,
-                    arg_count,
-                    outcome: FnOutcome::Converted,
+        convert_item(
+            &mut conv,
+            &mut report,
+            &mut bodies,
+            &mut body_def_ids,
+            name,
+            def_id,
+            body,
+        );
+    }
+    let local_body_count = bodies.len();
+
+    // Auxiliary crates (--aux): the main compilation links them as
+    // dependencies, so their functions live in this same Stable MIR
+    // session and share the converter's DefId assignment with the
+    // local items. Convert them into the same program, after the
+    // local functions. A generic auxiliary function has no
+    // monomorphic body to convert and is recorded as skipped, the
+    // same treatment local generic functions get. Genericity is
+    // checked up front from the function's generic parameters (any
+    // type or const parameter, its own or an enclosing
+    // definition's): resolving a generic function to an instance
+    // with empty generic arguments hands back its polymorphic body
+    // and panics inside the compiler when it is instantiated.
+    for crate_name in aux_crates() {
+        for krate in rustc_public::find_crates(crate_name) {
+            for fn_def in krate.fn_defs() {
+                let name = fn_def.name();
+                let def_id = conv.crate_def_id(&fn_def);
+                let generic = fn_def.generics_of().params.iter().any(|param| {
+                    matches!(
+                        param.kind,
+                        rustc_public::ty::GenericParamDefKind::Type { .. }
+                            | rustc_public::ty::GenericParamDefKind::Const { .. }
+                    )
                 });
-            }
-            Err(errs) => {
-                let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
-                for e in errs {
-                    *reasons.entry(e).or_default() += 1;
-                }
-                report.functions.push(FnReport {
+                let body = if generic {
+                    Err("no monomorphic instance available \
+                         (auxiliary crate function)"
+                        .to_string())
+                } else {
+                    Ok(fn_def.body())
+                };
+                convert_item(
+                    &mut conv,
+                    &mut report,
+                    &mut bodies,
+                    &mut body_def_ids,
                     name,
-                    blocks,
-                    locals,
-                    arg_count,
-                    outcome: FnOutcome::Skipped { reasons },
-                });
+                    def_id,
+                    body,
+                );
             }
         }
     }
@@ -294,6 +397,7 @@ fn collect() -> ControlFlow<()> {
         bodies,
         body_def_ids,
         def_names: conv.def_names.clone(),
+        local_body_count,
     });
     ControlFlow::Continue(())
 }
@@ -356,7 +460,11 @@ fn execute(c: &Collected) -> i32 {
             name.clone(),
         );
     }
-    let Some(entry) = c.bodies.iter().map(|(n, _)| n).find(|n| is_main(n)) else {
+    let Some(entry) = c.bodies[..c.local_body_count]
+        .iter()
+        .map(|(n, _)| n)
+        .find(|n| is_main(n))
+    else {
         for f in &c.report.functions {
             if is_main(&f.name) {
                 if let FnOutcome::Skipped { reasons } = &f.outcome {
@@ -412,10 +520,147 @@ fn execute(c: &Collected) -> i32 {
     }
 }
 
+/// The crate type an auxiliary source declares for itself
+/// (`#![crate_type = "..."]`), if any. When a source declares one,
+/// the declaration decides the artifact kind and the driver passes
+/// no `--crate-type` of its own.
+fn declared_crate_type(src: &str) -> Option<String> {
+    let idx = src.find("crate_type")?;
+    let rest = &src[idx + "crate_type".len()..];
+    let q1 = rest.find('"')?;
+    let rest = &rest[q1 + 1..];
+    let q2 = rest.find('"')?;
+    Some(rest[..q2].to_string())
+}
+
+/// First `error` line of a compiler's stderr, for failure reasons.
+fn first_error_line(stderr: &str) -> String {
+    for line in stderr.lines() {
+        let line = line.trim();
+        if line.starts_with("error") {
+            return line.chars().take(200).collect();
+        }
+    }
+    stderr
+        .lines()
+        .next()
+        .unwrap_or("<no compiler output>")
+        .chars()
+        .take(200)
+        .collect()
+}
+
+/// One compiled auxiliary crate.
+struct AuxBuilt {
+    name: String,
+    /// Artifact to link with `--extern`; `None` for crate types
+    /// that expose no Rust API (cdylib and friends).
+    artifact: Option<std::path::PathBuf>,
+    /// Whether the crate's functions are guest code to convert
+    /// (false for proc-macro and cdylib crates).
+    collect: bool,
+}
+
+/// Compile one auxiliary source file with the pinned rustc, as a
+/// library crate named `name`, into `aux_dir`. Previously built
+/// auxiliary crates are visible through `--extern`, so callers pass
+/// the crates in dependency order. On failure, returns the first
+/// compiler error line as the reason.
+fn compile_aux(
+    sysroot: &str,
+    edition: &str,
+    aux_dir: &std::path::Path,
+    name: &str,
+    src_path: &str,
+    previous: &[AuxBuilt],
+) -> Result<AuxBuilt, String> {
+    let src_text = std::fs::read_to_string(src_path)
+        .map_err(|e| format!("cannot read auxiliary source {src_path}: {e}"))?;
+    let declared = declared_crate_type(&src_text);
+    let effective_type = declared.as_deref().unwrap_or("rlib");
+    let rustc = std::path::Path::new(sysroot).join("bin").join("rustc");
+    let mut cmd = std::process::Command::new(&rustc);
+    // `-Zalways-encode-mir` makes the compiler encode every
+    // function's MIR into the crate metadata; without it, the
+    // metadata of a library crate only carries MIR for generic and
+    // inline functions, and the main compilation's Stable MIR
+    // session would find no bodies for the auxiliary functions.
+    // The flag is unstable, so the auxiliary compilation runs with
+    // RUSTC_BOOTSTRAP=1 — the same condition this driver itself is
+    // built under, and the condition compiletest runs under (a
+    // development compiler).
+    cmd.env("RUSTC_BOOTSTRAP", "1");
+    cmd.arg(src_path)
+        .arg("-Zalways-encode-mir")
+        .arg(format!("--edition={edition}"))
+        .arg(format!("--crate-name={name}"))
+        .arg(format!("--out-dir={}", aux_dir.display()))
+        .arg(format!("--sysroot={sysroot}"))
+        .arg("-L")
+        .arg(format!("dependency={}", aux_dir.display()));
+    if declared.is_none() {
+        cmd.arg("--crate-type=rlib");
+    }
+    for prev in previous {
+        if let Some(artifact) = &prev.artifact {
+            cmd.arg("--extern")
+                .arg(format!("{}={}", prev.name, artifact.display()));
+        }
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| format!("failed to run rustc for auxiliary crate `{name}`: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!(
+            "auxiliary crate `{name}` failed to compile: {}",
+            first_error_line(&stderr)
+        ));
+    }
+    // Locate the produced artifact: lib<name>.rlib / .rmeta / .so.
+    let mut artifact: Option<std::path::PathBuf> = None;
+    let mut best_rank = u8::MAX;
+    if let Ok(entries) = std::fs::read_dir(aux_dir) {
+        for entry in entries.flatten() {
+            let fname = entry.file_name().to_string_lossy().into_owned();
+            if !fname.starts_with(&format!("lib{name}.")) {
+                continue;
+            }
+            let rank = match fname.rsplit('.').next() {
+                Some("rlib") => 0,
+                Some("rmeta") => 1,
+                Some("so") | Some("dylib") | Some("dll") => 2,
+                _ => continue,
+            };
+            if rank < best_rank {
+                best_rank = rank;
+                artifact = Some(entry.path());
+            }
+        }
+    }
+    let (link, collect) = match effective_type {
+        "rlib" | "lib" | "dylib" => (true, true),
+        "proc-macro" => (true, false),
+        _ => (false, false),
+    };
+    if link && artifact.is_none() {
+        return Err(format!(
+            "auxiliary crate `{name}` produced no linkable artifact in {}",
+            aux_dir.display()
+        ));
+    }
+    Ok(AuxBuilt {
+        name: name.to_string(),
+        artifact: if link { artifact } else { None },
+        collect,
+    })
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     let run_mode = argv.get(1).map(|a| a == "run").unwrap_or(false);
     let mut input: Option<String> = None;
+    let mut aux_specs: Vec<(String, String)> = Vec::new();
     let mut dump_path: Option<String> = None;
     let mut edition = "2021".to_string();
     let mut sysroot: Option<String> = None;
@@ -436,6 +681,22 @@ fn main() {
                     std::process::exit(2);
                 });
             }
+            "--aux" => {
+                i += 1;
+                let spec = argv.get(i).cloned().unwrap_or_else(|| {
+                    eprintln!("--aux needs a <name>=<file.rs> value");
+                    std::process::exit(2);
+                });
+                match spec.split_once('=') {
+                    Some((name, path)) if !name.is_empty() && !path.is_empty() => {
+                        aux_specs.push((name.to_string(), path.to_string()));
+                    }
+                    _ => {
+                        eprintln!("--aux needs a <name>=<file.rs> value, got: {spec}");
+                        std::process::exit(2);
+                    }
+                }
+            }
             "--sysroot" => {
                 i += 1;
                 sysroot = Some(argv.get(i).cloned().unwrap_or_else(|| {
@@ -444,7 +705,7 @@ fn main() {
                 }));
             }
             "-h" | "--help" => {
-                println!("usage: sparagmos-driver [run] <file.rs> [--dump <path>] [--edition <ed>] [--sysroot <path>]");
+                println!("usage: sparagmos-driver [run] <file.rs> [--aux <name>=<file.rs>] [--dump <path>] [--edition <ed>] [--sysroot <path>]");
                 return;
             }
             other if input.is_none() && !other.starts_with('-') => {
@@ -470,7 +731,35 @@ fn main() {
     // working directory.
     let out_dir = std::env::temp_dir().join(format!("sparagmos-driver-out-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&out_dir);
-    let args: Vec<String> = vec![
+
+    // Compile the auxiliary crates first, in the order given (each
+    // one sees the previously built ones through --extern), so the
+    // main compilation below can link them and `collect` can convert
+    // their functions from the same Stable MIR session.
+    let aux_dir = out_dir.join("aux");
+    let _ = std::fs::create_dir_all(&aux_dir);
+    let mut aux_built: Vec<AuxBuilt> = Vec::new();
+    for (name, src) in &aux_specs {
+        match compile_aux(&sysroot, &edition, &aux_dir, name, src, &aux_built) {
+            Ok(built) => aux_built.push(built),
+            Err(reason) => {
+                if run_mode {
+                    eprintln!("sparagmos-driver run: unsupported: {reason}");
+                    std::process::exit(2);
+                }
+                eprintln!("sparagmos-driver: {reason}");
+                std::process::exit(1);
+            }
+        }
+    }
+    let collect_names: Vec<String> = aux_built
+        .iter()
+        .filter(|b| b.collect)
+        .map(|b| b.name.clone())
+        .collect();
+    let _ = AUX_CRATES.set(collect_names);
+
+    let mut args: Vec<String> = vec![
         "sparagmos-driver".to_string(),
         input.clone(),
         format!("--edition={edition}"),
@@ -479,6 +768,16 @@ fn main() {
         format!("--out-dir={}", out_dir.display()),
         format!("--sysroot={sysroot}"),
     ];
+    if !aux_built.is_empty() {
+        args.push("-L".to_string());
+        args.push(format!("dependency={}", aux_dir.display()));
+        for built in &aux_built {
+            if let Some(artifact) = &built.artifact {
+                args.push("--extern".to_string());
+                args.push(format!("{}={}", built.name, artifact.display()));
+            }
+        }
+    }
     // The compiler runs in-process, under two disciplines:
     // - A panic raised inside Stable MIR conversion (the
     //   `unimplemented!()`s hit by explicit tail calls, async
