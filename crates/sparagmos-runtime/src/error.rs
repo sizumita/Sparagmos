@@ -100,10 +100,14 @@ pub fn propagate<T>(r: RuntimeResult<T>) -> RuntimeResult<T> {
 }
 
 #[cfg(test)]
+pub(crate) static PANIC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn panic_record_roundtrip() {
+        let _g = PANIC_TEST_LOCK.lock().unwrap();
         clear_last_panic();
         record_panic("boom", Some("a.rs:1".into()));
         assert_eq!(last_panic().unwrap().message, "boom");
@@ -124,6 +128,7 @@ mod tests {
     }
     #[test]
     fn propagate_records() {
+        let _g = PANIC_TEST_LOCK.lock().unwrap();
         clear_last_panic();
         let r: RuntimeResult<()> = Err(RuntimeError::Panic {
             message: "x".into(),

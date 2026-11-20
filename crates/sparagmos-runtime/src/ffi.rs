@@ -108,6 +108,7 @@ mod tests {
     }
     #[test]
     fn ffi_bounds_and_panic() {
+        let _g = crate::error::PANIC_TEST_LOCK.lock().unwrap();
         clear_last_panic();
         assert_eq!(sparagmos_bounds_check(1, 3), 0);
         assert_eq!(sparagmos_bounds_check(3, 3), -1);
@@ -121,6 +122,7 @@ mod tests {
     }
     #[test]
     fn ffi_zeroed_and_div() {
+        let _g = crate::error::PANIC_TEST_LOCK.lock().unwrap();
         let p = sparagmos_alloc_zeroed(16, 8);
         unsafe {
             assert_eq!(*(p as *mut u64), 0);
