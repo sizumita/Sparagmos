@@ -8,6 +8,7 @@ Three separate metrics (never blended into one number):
 2. Corpus / rustc test-suite pass rate (JIT result == native result).
 3. std feature coverage required by the corpus.
 
-Note: "Rust 1.100.0" is a future release. Until it ships, the MIR reference
-is Rust 1.99.1 (the closest toolchain available on the dev host); the
-denominators will be swapped when 1.100.0 is released.
+Note: Rust 1.100.0 was released on 2026-11-12
+(https://blog.rust-lang.org/2026/11/12/Rust-1.100.0/) and is installed on
+the dev host via rustup (verified: rustc/cargo 1.100.0, --emit=mir works).
+The MIR reference and all denominators are Rust 1.100.0 from the start.
