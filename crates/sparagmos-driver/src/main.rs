@@ -31,6 +31,16 @@
 //! proc macros run inside the compiler at compile time, and a
 //! cdylib exposes no Rust API to call.
 //!
+//! Crate type: run mode pins `--crate-type=lib` (unless the caller
+//! forwards one). Convert mode pins nothing, mirroring compiletest,
+//! which names no crate type for a test file: a forwarded
+//! `--crate-type` or a source-level `#![crate_type]` declaration
+//! governs when present, and rustc's default (bin) -- with its
+//! entry-point checks and dead-code reachability roots -- applies
+//! otherwise. To convert a library file in convert mode, forward
+//! `--rustc-arg --crate-type=rlib` (the subset runner does this for
+//! the mir-opt suite, as compiletest does).
+//!
 //! Both modes compile `<file.rs>` as a single crate with the pinned
 //! Rust 1.100.0 toolchain, obtain every local function's MIR through
 //! Stable MIR (`rustc_public`), and convert it to `sparagmos_mir::Body`.
@@ -1056,14 +1066,28 @@ fn main() {
         format!("--out-dir={}", out_dir.display()),
         format!("--sysroot={sysroot}"),
     ];
-    // The crate type is pinned to `lib` unless the caller forwards a
-    // `--crate-type` of its own: `bin` and `proc-macro` cannot be
-    // mixed with other crate types, and under compiletest a test's
-    // own crate type is the only one in the invocation.
+    // Crate type. Run mode pins `lib` unless the caller forwards a
+    // `--crate-type` of its own: execution looks `main` up among the
+    // converted functions, and the pin keeps the crate shape the
+    // interpreter was built against the only one in the invocation.
+    //
+    // Convert mode instead mirrors compiletest, which passes no
+    // `--crate-type` for a test file at all (its one exception,
+    // mir-opt's `rlib`, is forwarded by the caller): a forwarded
+    // `--crate-type` or a source-level `#![crate_type]` declaration
+    // governs when present, and rustc's own default (bin) applies
+    // otherwise -- including the entry-point checks (no `main`
+    // function, `main`'s signature) and the dead-code reachability
+    // roots, under which `main` is a root rather than an ordinary
+    // private function. Pinning `lib` in convert mode made the front
+    // end disagree with compiletest on exactly those points: a
+    // `#![deny(dead_code)]` test whose `main` nothing calls was
+    // rejected here ("function `main` is never used") and accepted
+    // there, and entry-point errors never fired here.
     let caller_sets_crate_type = rustc_args
         .iter()
         .any(|a| a == "--crate-type" || a.starts_with("--crate-type="));
-    if !caller_sets_crate_type {
+    if run_mode && !caller_sets_crate_type {
         args.push("--crate-type=lib".to_string());
     }
     // Caller-supplied rustc arguments (a test's `//@ compile-flags`,
