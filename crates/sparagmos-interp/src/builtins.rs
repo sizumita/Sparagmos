@@ -327,6 +327,23 @@ pub enum Builtin {
     CellReplace,
     /// `Cell::into_inner(cell) -> value`.
     CellIntoInner,
+    /// `RefCell::new(value)`: the natural `RefCell` aggregate
+    /// (borrow-flag `Cell` + `UnsafeCell` value).
+    RefCellNew,
+    /// `RefCell::borrow(&cell) -> Ref<T>`.
+    RefCellBorrow,
+    /// `RefCell::borrow_mut(&cell) -> RefMut<T>`.
+    RefCellBorrowMut,
+    /// `RefCell::try_borrow(&cell) -> Result<Ref<T>, BorrowError>`.
+    RefCellTryBorrow,
+    /// `RefCell::try_borrow_mut(&cell) -> Result<RefMut<T>, BorrowMutError>`.
+    RefCellTryBorrowMut,
+    /// `RefCell::get_mut(&mut cell) -> &mut T`.
+    RefCellGetMut,
+    /// `RefCell::replace(&cell, value) -> old value`.
+    RefCellReplace,
+    /// `RefCell::as_ptr(&cell) -> *mut T`.
+    RefCellAsPtr,
     /// `Option::unwrap(option)`.
     OptionUnwrap,
     /// `Result::unwrap(result)`.
@@ -591,6 +608,36 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         }
         _ if canonical.starts_with("std::cell::Cell") && canonical.ends_with(">::into_inner") => {
             Builtin::CellIntoInner
+        }
+        _ if canonical.starts_with("std::cell::RefCell") && canonical.ends_with(">::new") => {
+            Builtin::RefCellNew
+        }
+        _ if canonical.starts_with("std::cell::RefCell") && canonical.ends_with(">::borrow") => {
+            Builtin::RefCellBorrow
+        }
+        _ if canonical.starts_with("std::cell::RefCell")
+            && canonical.ends_with(">::borrow_mut") =>
+        {
+            Builtin::RefCellBorrowMut
+        }
+        _ if canonical.starts_with("std::cell::RefCell")
+            && canonical.ends_with(">::try_borrow") =>
+        {
+            Builtin::RefCellTryBorrow
+        }
+        _ if canonical.starts_with("std::cell::RefCell")
+            && canonical.ends_with(">::try_borrow_mut") =>
+        {
+            Builtin::RefCellTryBorrowMut
+        }
+        _ if canonical.starts_with("std::cell::RefCell") && canonical.ends_with(">::get_mut") => {
+            Builtin::RefCellGetMut
+        }
+        _ if canonical.starts_with("std::cell::RefCell") && canonical.ends_with(">::replace") => {
+            Builtin::RefCellReplace
+        }
+        _ if canonical.starts_with("std::cell::RefCell") && canonical.ends_with(">::as_ptr") => {
+            Builtin::RefCellAsPtr
         }
         _ if canonical.contains("option::Option") && canonical.ends_with(">::unwrap") => {
             Builtin::OptionUnwrap
@@ -1094,6 +1141,22 @@ impl<'a> Interpreter<'a> {
                             other.kind_name(),
                         )),
                     }
+                } else if self_ty_is(self_ty, "std::cell::Ref")
+                    || self_ty_is(self_ty, "std::cell::RefMut")
+                {
+                    // A borrow guard: field 0 is the reference to the
+                    // cell's value stored by the borrow builtins.
+                    let guard = self.resolve_value(frames, &vals[0])?;
+                    match guard {
+                        Value::Enum { fields, .. } if fields.len() == 2 => {
+                            Ok(fields.into_iter().next().expect("len checked"))
+                        }
+                        ref other => Err(InterpError::type_mismatch(
+                            "RefCell borrow guard",
+                            "Ref/RefMut guard aggregate",
+                            other.kind_name(),
+                        )),
+                    }
                 } else {
                     Err(unsupported(format!(
                         "Deref::deref for {self_ty} is not runtime-supported"
@@ -1567,6 +1630,21 @@ impl<'a> Interpreter<'a> {
                             other.kind_name(),
                         )),
                     }
+                } else if self_ty_is(self_ty, "std::cell::RefMut") {
+                    // A mutable borrow guard: field 0 is the
+                    // reference to the cell's value stored by the
+                    // borrow builtins.
+                    let guard = self.resolve_value(frames, &vals[0])?;
+                    match guard {
+                        Value::Enum { fields, .. } if fields.len() == 2 => {
+                            Ok(fields.into_iter().next().expect("len checked"))
+                        }
+                        ref other => Err(InterpError::type_mismatch(
+                            "RefCell borrow guard",
+                            "RefMut guard aggregate",
+                            other.kind_name(),
+                        )),
+                    }
                 } else {
                     Err(unsupported(format!(
                         "DerefMut::deref_mut for {self_ty} is not runtime-supported"
@@ -1622,6 +1700,91 @@ impl<'a> Interpreter<'a> {
                         other.kind_name(),
                     )),
                 }
+            }
+            Builtin::RefCellNew => {
+                arity(1)?;
+                let value = vals.into_iter().next().expect("arity checked");
+                Ok(refcell_value(value))
+            }
+            Builtin::RefCellBorrow | Builtin::RefCellBorrowMut => {
+                arity(1)?;
+                let mutable = kind == Builtin::RefCellBorrowMut;
+                let cell = self.refcell_place(&vals[0], name)?;
+                let flag_target =
+                    crate::interp::refcell_sub_target(&cell, &[RefProj::Field(0)]);
+                let flag = self.refcell_flag(frames, &flag_target)?;
+                if mutable {
+                    if flag != 0 {
+                        return Err(InterpError::panic("RefCell already borrowed"));
+                    }
+                    self.refcell_set_flag(frames, &flag_target, -1)?;
+                } else {
+                    if flag < 0 {
+                        return Err(InterpError::panic(
+                            "RefCell already mutably borrowed",
+                        ));
+                    }
+                    self.refcell_set_flag(frames, &flag_target, flag + 1)?;
+                }
+                Ok(refcell_guard(&cell))
+            }
+            Builtin::RefCellTryBorrow | Builtin::RefCellTryBorrowMut => {
+                arity(1)?;
+                let mutable = kind == Builtin::RefCellTryBorrowMut;
+                let cell = self.refcell_place(&vals[0], name)?;
+                let flag_target =
+                    crate::interp::refcell_sub_target(&cell, &[RefProj::Field(0)]);
+                let flag = self.refcell_flag(frames, &flag_target)?;
+                let conflict = if mutable { flag != 0 } else { flag < 0 };
+                if conflict {
+                    // Err(BorrowError / BorrowMutError): unit-struct
+                    // aggregates in this value model.
+                    return Ok(Value::Enum {
+                        variant: 1,
+                        fields: vec![Value::Enum {
+                            variant: 0,
+                            fields: Vec::new(),
+                        }],
+                    });
+                }
+                self.refcell_set_flag(
+                    frames,
+                    &flag_target,
+                    if mutable { -1 } else { flag + 1 },
+                )?;
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields: vec![refcell_guard(&cell)],
+                })
+            }
+            Builtin::RefCellGetMut | Builtin::RefCellAsPtr => {
+                arity(1)?;
+                let cell = self.refcell_place(&vals[0], name)?;
+                Ok(Value::Ref(crate::interp::refcell_sub_target(
+                    &cell,
+                    &[RefProj::Field(1), RefProj::Field(0)],
+                )))
+            }
+            Builtin::RefCellReplace => {
+                arity(2)?;
+                let mut vals = vals.into_iter();
+                let cell_arg = vals.next().expect("arity checked");
+                let new_value = vals.next().expect("arity checked");
+                let cell = self.refcell_place(&cell_arg, name)?;
+                let flag_target =
+                    crate::interp::refcell_sub_target(&cell, &[RefProj::Field(0)]);
+                let flag = self.refcell_flag(frames, &flag_target)?;
+                if flag != 0 {
+                    return Err(InterpError::panic("RefCell already borrowed"));
+                }
+                let value_target = crate::interp::refcell_sub_target(
+                    &cell,
+                    &[RefProj::Field(1), RefProj::Field(0)],
+                );
+                let resolved = self.deref_value(frames, &Value::Ref(value_target))?;
+                let old = self.read_resolved(frames, &resolved)?;
+                self.write_resolved(frames, &resolved, new_value)?;
+                Ok(old)
             }
             Builtin::OptionUnwrap => {
                 arity(1)?;
@@ -2291,6 +2454,52 @@ fn expect_arguments<'v>(value: &'v Value, name: &str) -> InterpResult<&'v FmtArg
 /// the bare name (a type whose generic arguments are all lifetimes
 /// renders without them, e.g. `std::str::Chars`) or `name<...>`
 /// with type arguments.
+/// The abstract `RefCell` value, in the real struct's shape: field 0
+/// is the borrow flag as a `Cell` aggregate (`Cell { UnsafeCell {
+/// isize } }`, starting at 0 = unused), field 1 is the `UnsafeCell`
+/// aggregate holding the value. Building the natural shape keeps
+/// collected bodies that project `RefCell` fields (e.g. `into_inner`)
+/// working on builtin-constructed cells.
+fn refcell_value(value: Value) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![
+            Value::Enum {
+                variant: 0,
+                fields: vec![Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Int(0)],
+                }],
+            },
+            Value::Enum {
+                variant: 0,
+                fields: vec![value],
+            },
+        ],
+    }
+}
+
+/// A `Ref` / `RefMut` guard value in this model: field 0 is a
+/// reference to the cell's value (through the `UnsafeCell` wrapper),
+/// field 1 is a reference to the cell's borrow-flag `Cell`, which is
+/// what the guard's drop glue (`DropPlan::RefCellRelease`) releases
+/// through.
+fn refcell_guard(cell: &RefTarget) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![
+            Value::Ref(crate::interp::refcell_sub_target(
+                cell,
+                &[RefProj::Field(1), RefProj::Field(0)],
+            )),
+            Value::Ref(crate::interp::refcell_sub_target(
+                cell,
+                &[RefProj::Field(0)],
+            )),
+        ],
+    }
+}
+
 fn self_ty_is(self_ty: &str, name: &str) -> bool {
     self_ty == name
         || self_ty
