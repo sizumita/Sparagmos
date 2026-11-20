@@ -193,6 +193,29 @@ impl From<InterpError> for MirRunError {
 /// explicit unsupported error instead of aborting on allocation.
 const MAX_REPEAT_ELEMENTS: u64 = 1_000_000;
 
+/// Reduce a raw `SwitchInt` target value to the canonical form the
+/// interpreter compares against. MIR stores target values as the
+/// discriminant type's bit pattern, zero-extended to 128 bits
+/// (a `-2i32` branch key is stored as 4294967294), while the
+/// interpreter holds signed values sign-extended (`switch_bits`),
+/// so a signed type's keys are sign-extended here from the type's
+/// width. Unsigned and non-integer discriminants already agree.
+/// The JIT applies the same normalisation in its lowering.
+fn normalize_switch_value(v: u128, ty: Option<&mir::Ty>) -> u128 {
+    match ty {
+        Some(mir::Ty::Int(it)) => {
+            let bits = it.bits();
+            if bits >= 128 {
+                v
+            } else {
+                let shift = 128 - bits;
+                (((v << shift) as i128) >> shift) as u128
+            }
+        }
+        _ => v,
+    }
+}
+
 /// Convert a whole MIR program into an interpreter [`ir::Program`].
 pub fn convert_program(program: &MirProgram) -> Result<ir::Program, ConvertError> {
     let conv = Converter::new(program);
@@ -948,7 +971,7 @@ impl<'a> Converter<'a> {
                 let pairs = targets
                     .values
                     .iter()
-                    .copied()
+                    .map(|v| normalize_switch_value(*v, ctx.as_ref()))
                     .zip(targets.targets.iter().map(|b| ir::BasicBlock(b.index())))
                     .collect();
                 ir::TerminatorKind::SwitchInt {

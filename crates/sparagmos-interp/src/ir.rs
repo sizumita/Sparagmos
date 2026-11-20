@@ -426,7 +426,11 @@ pub enum TerminatorKind {
     },
     SwitchInt {
         discr: Operand,
-        /// `(bit pattern of the discriminant, target block)` pairs.
+        /// `(discriminant value, target block)` pairs. Values are
+        /// in the canonical comparison form produced by
+        /// `Value::switch_bits` (sign-extended for signed
+        /// discriminant types); conversion normalises the raw MIR
+        /// bit patterns into this form.
         targets: Vec<(u128, BasicBlock)>,
         otherwise: BasicBlock,
     },

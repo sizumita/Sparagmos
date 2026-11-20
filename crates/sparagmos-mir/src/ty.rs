@@ -19,11 +19,12 @@ impl fmt::Display for DefId {
 pub type AdtDefId = DefId;
 
 /// Discriminant values of one ADT, indexed by variant index:
-/// `values[i]` is the discriminant of variant `i`. Signed
-/// discriminant types are sign-extended and unsigned ones
-/// zero-extended into 128 bits, matching how `SwitchInt` target
-/// values are stored, so a `Discriminant` rvalue result compares
-/// equal to the branch keys it is matched against.
+/// `values[i]` is the discriminant of variant `i`, as reported by
+/// the compiler for that variant, stored as an `i128`. A
+/// `Discriminant` rvalue yields these values; the interpreter
+/// stores them through the discriminant type of the destination
+/// place, which canonicalises them for comparison against
+/// `SwitchInt` branch keys.
 ///
 /// An enum without explicit discriminants has the sequential values
 /// `0, 1, 2, ...`; a struct has a single entry, `0`. Consumers that
