@@ -445,12 +445,12 @@ needs-threads 80 など) 229 件、プラットフォーム限定
 
 | カテゴリ | pass / 母数 | パス率 |
 |---|---|---|
-| 実行系 (exec) | 1,463 / 4,149 | 35.262% |
+| 実行系 (exec) | 1,547 / 4,149 | 37.286% |
 | 実行系 (procedure) | 0 / 551 | 0% (combined では未実行。専用実測では 1 / 551) |
 | 実行系 (exec-debugger) | 0 / 170 | 0% (分類・実測済み: 合否はデバッガ出力の照合で決まるため主経路ではパスしない) |
-| コンパイル時検証系 | 13,451 / 18,332 | 73.374% (成否レベルの一致。照合系の扱いは stage 2 の節に記載) |
+| コンパイル時検証系 | 13,592 / 18,332 | 74.144% (成否レベルの一致。照合系の扱いは stage 2 の節に記載) |
 | rustdoc 検証系 | 0 / 1,735 | 0% (分類・実測済み: 合否は rustdoc の出力照合で決まるため主経路ではパスしない) |
-| **全体** | **14,914 / 24,937** | **59.807%** |
+| **全体** | **15,139 / 24,937** | **60.709%** |
 
 統合後 combined 再実測 (both8、2026-11-21、main 455db46):
 AO/AP/AS/AV/AU/AC/AW/AR の全統合後に `rustc-subset-run.py`
@@ -488,6 +488,42 @@ InlineAsm 3、割当済み定数 1)、fail 16 (成功期待だがコンパイル
 ブロック 2、プラットフォーム限定 1、minicore ビルド失敗 1:
 `-Zpacked-stack` が s390x 専用で host の rustc が拒否)。
 ヘッダ機能による未実行は全体で 699 → 274 件になった。
+
+needs-* 条件の評価を入れた combined 再実測 (both10-bm、
+2026-11-21、lane/needs-eval): `//@ needs-*` を一律に
+「評価できない条件」として未実行にしていたのをやめ、
+compiletest (src/tools/compiletest の directives/needs.rs)
+と同じ出典で評価するようにした。ターゲット同一性に対する
+compiletest 自身の規則 (needs-threads / needs-subprocess /
+needs-asm-support / needs-dlltool)、公式リリースビルドの
+構成 (needs-enzyme / needs-offload / rustc・std の
+debug-assertions は無効、レイアウトのランダム化は無効で
+needs-deterministic-layouts は成立)、ピン留めした rustc
+への問い合わせ (all-target-specs-json による sanitizer
+一覧・xray・動的リンク・再配置モデル、supported-crate-types、
+--print cfg の target_has_atomic、backend-has-mnemonic /
+backend-has-zstd、sysroot 内の profiler ランタイム・
+sanitizer ランタイム・rust-lld)、そして LLVM コンポーネント
+については代表ターゲットへの `#![no_core]` プローブの
+コード生成可否で判定する。条件が不成立なら compiletest が
+ignore するのと同じくプラットフォーム限定 (out of
+environment) に数え、判定できない条件だけが未実行に残る。
+結果: 「条件を評価できない未実行」は 902 → 0 件。
+その 902 件の行き先は、pass 217 (実行系 76、コンパイル時
+検証系 141。条件別では needs-subprocess 71、
+needs-llvm-components 45、needs-asm-support 42、
+needs-sanitizer-cfi 15、needs-sanitizer-address 12、
+needs-xray 8 など)、プラットフォーム限定 69 (enzyme、
+offload、rustc debug-assertions、未対応 sanitizer 等の
+不成立)、compile-flags による未実行 313 (needs-llvm-
+components が成立した外国ターゲット向けテストで、
+`--target` が未導入という実理由に付け替わったもの)、
+残りは実試行のうえで変換済み本体なし (150) や InlineAsm
+など本来の未対応に落ちた。全体は 14,898 → 15,139
+(+241) で 60.709%、実行系は 1,447 → 1,547 で 37.286%、
+コンパイル時検証系は 13,451 → 13,592 で 74.144%。
+both9 両実測 (minicore / revisions) に対して pass からの
+回帰は 0 件。
 
 候補 3,699 件のうち両側を実行できたのは 2,823 件で、その内訳は
 pass 539、fail 18、unsupported 2,266 である。unsupported の
@@ -1078,7 +1114,7 @@ dump が得られても変換済み関数が 0 件だったものが 157 件あ�
 | 指標1 MIR バリアント網羅率 | 40 (確定) | 65.0% (26/40, 2026-11-21 実測) |
 | 副指標1b サブ enum | 上表の通り (確定) | 未測定 (BinOp の出現実測 15/26 のみ) |
 | 指標2(a) 自前コーパス | 46 (tests/corpus) | 100.0% (46/46, 2026-11-21 実測) |
-| 指標2(b) rustc テストサブセット | 24,937 (2026-11-20 機械抽出) | 59.807% (14,914/24,937, 2026-11-21 統合時点の合成値: exec 1,463 は revisions 実測、コンパイル時検証系 13,451 は add-minicore 実測。単一ランでの再実測で更新する。コンパイル時検証系は成否レベルの一致で、照合系の扱いは stage 2 の節に記載) |
+| 指標2(b) rustc テストサブセット | 24,937 (2026-11-20 機械抽出) | 60.709% (15,139/24,937, 2026-11-21 needs-* 条件評価後の combined 実測。コンパイル時検証系は成否レベルの一致で、照合系の扱いは stage 2 の節に記載) |
 | 指標3 std 機能網羅率 | 1,405 (2026-11-21 再抽出) | 61.9% (869/1,405, 2026-11-21 統合後実測。母数は変換できる本体が増えた分だけ広がった。再抽出前の 1,262 集合では 719 が実行可能だった) |
 
 指標2(a) の母数変更履歴: 2026-11-21 に 15 件から 36 件へ拡大した
