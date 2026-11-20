@@ -543,6 +543,40 @@ interp の変換層 (mir_convert) を関数単位に分離し、1つの関数が
 `tests/ui/traits/object/nested-trait-method-call.rs` (到達しない
 入れ子関数内の Dynamic ローカルが全体を落としていた) は
 pass になった。
+#### クロージャ本体の変換 (2026-11-21)
+
+ドライバはクロージャ item を `Instance::resolve_closure` で
+instance 化し、本体を変換対象に含めるようになった。クロージャの
+generic 引数に記録された kind (Fn / FnMut / FnOnce) をそのまま
+要求するため、instance の本体はクロージャ本体そのものになる。
+generic 引数にパラメータが残るクロージャ (ジェネリックな関数・
+メソッドの中で定義されたもの) は、単一の単相化済み本体が存在
+しないため、理由を明示して SKIPPED のままにする。非同期
+クロージャ (coroutine closure) も、coroutine 本体が未対応で
+あることを理由に明示して対象外である。なお、非同期クロージャを
+含むクレートでは、その item の型を引く時点で Stable MIR の
+型変換が panic する (FIXME(async_closures)) ため、収集全体が
+変換失敗として報告される。以前は interp 変換の段で失敗して
+いたケースで、状態 (unsupported) は変わらず理由だけが
+この panic に変わったものが 1 件ある。
+
+stage 1 の再実測 (本変更を加えたベースで候補 3,699 件を全件
+再実行): 実行系の pass は 1,037 件。直近の全件実測で
+「unknown function …::{closure#0}」が未対応の理由だった
+45 件のうち 33 件が pass になり、同じ理由で残ったものは
+0 件になった。残りの 12 件は本体の変換後に次の壁で
+unsupported である: FnOnce の by-value な環境渡し (interp 側)
+5 件、変換済み本体の無い関数への呼び出し (String::new など)、
+Drop ターミネータ、Transmute キャスト、Subslice 射影、
+クロージャを返すクロージャの呼び出しの型不一致、値の等価
+比較の型不一致。
+
+副作用として 1 件が pass から unsupported になった
+(tests/ui/higher-ranked/trait-bounds/hrtb-debruijn-object-types-in-closures.rs)。
+呼ばれないクロージャの本体が変換対象に増えたことで、その本体に
+含まれる interp 未対応の型 (Dynamic) がプログラム全体の interp
+変換を失敗させる。本体単位で変換の成否を分離するのは interp
+側の課題として残る。
 
 #### stage 2: コンパイル時検証系の実測 (2026-11-21)
 
