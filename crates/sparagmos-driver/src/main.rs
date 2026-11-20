@@ -484,8 +484,6 @@ fn ty_mentions_param(ty: &Ty) -> bool {
         _ => false,
     }
 }
-    }
-}
 
 fn collect() -> ControlFlow<()> {
     let mut conv = Converter::new();
