@@ -1608,6 +1608,114 @@ impl<'a> Converter<'a> {
         }
     }
 
+    /// Resolve a trait-method call whose func operand names the
+    /// trait item itself (which has no body) to the concrete impl
+    /// body the driver collected for the call's `Self` type, if the
+    /// program has one.
+    ///
+    /// MIR names such a call by the trait item (`std::ops::Index::
+    /// index` with generic arguments `[Self, Idx]`), while the
+    /// collected body is keyed by its instance name
+    /// (`<S as std::ops::Index<usize>>::index`). Without this step
+    /// the call falls through to the name-based builtin model of
+    /// the trait method, which is only faithful for receivers whose
+    /// impl bodies are not in the program (core's slice/array impls,
+    /// `Vec`): for a user-defined impl it silently computes the
+    /// builtin's semantics on the receiver instead — e.g. an
+    /// `Index` impl returning `&str` was executed as a slice index
+    /// into the receiver struct and panicked with a bogus
+    /// out-of-bounds message. A collected body, when one matches,
+    /// is the faithful semantics and wins over the builtin, exactly
+    /// as a `DefId`-resolved body does in `resolve_callee`.
+    fn resolve_impl_callee(&self, func: &mir::Operand) -> Option<String> {
+        let (name, _, raw_generic_args) = self.resolve_external_callee(func)?;
+        let (trait_path, method) = name.rsplit_once("::")?;
+        if trait_path.is_empty() || method.is_empty() {
+            return None;
+        }
+        let self_ty = raw_generic_args.first()?;
+        let self_name = self.concrete_ty_name(self_ty);
+        // The impl's instance name spells the trait path as the
+        // impl wrote it: the call may name the trait through `std::`
+        // while the impl was recorded through `core::`, or the
+        // other way round, so try both spellings.
+        let mut paths = vec![trait_path.to_string()];
+        if let Some(rest) = trait_path.strip_prefix("std::") {
+            paths.push(format!("core::{rest}"));
+        } else if let Some(rest) = trait_path.strip_prefix("core::") {
+            paths.push(format!("std::{rest}"));
+        }
+        // The trait's own generic arguments (the func operand's
+        // arguments after `Self`), rendered as they appear in the
+        // impl name: `<S as std::ops::Index<usize>>::index`.
+        let trait_args: Vec<String> = raw_generic_args[1..]
+            .iter()
+            .map(|t| crate::builtins::ty_tag(t, self.names))
+            .collect();
+        for path in &paths {
+            if !trait_args.is_empty() {
+                let candidate = format!(
+                    "<{self_name} as {path}<{}>>::{method}",
+                    trait_args.join(", ")
+                );
+                if let Some(key) = self.find_body_key(&candidate) {
+                    return Some(key);
+                }
+            }
+            let candidate = format!("<{self_name} as {path}>::{method}");
+            if let Some(key) = self.find_body_key(&candidate) {
+                return Some(key);
+            }
+        }
+        // Fall back to a scan: exactly one impl body for this
+        // `Self` type and trait, under any generic-argument
+        // spelling (a defaulted trait argument, for one, is
+        // elided from the instance name but present in the call's
+        // generic arguments). An ambiguous scan resolves nothing.
+        for path in &paths {
+            if let Some(key) = self.scan_impl_key(&self_name, path, method) {
+                return Some(key);
+            }
+        }
+        None
+    }
+
+    /// The program key of a body stored under exactly `candidate`,
+    /// or under its `DefId`-disambiguated form (`candidate#DefId`,
+    /// see `program_keys`) when that form is unique.
+    fn find_body_key(&self, candidate: &str) -> Option<String> {
+        if self.bodies.contains_key(candidate) {
+            return Some(candidate.to_string());
+        }
+        let mut matches = self.bodies.keys().filter(|k| {
+            k.strip_prefix(candidate)
+                .is_some_and(|rest| rest.starts_with('#'))
+        });
+        match (matches.next(), matches.next()) {
+            (Some(key), None) => Some(key.clone()),
+            _ => None,
+        }
+    }
+
+    /// The unique body keyed as an impl of `trait_path` for
+    /// `self_name` with method `method`, under any generic-argument
+    /// spelling of the trait; `None` when there is not exactly one.
+    fn scan_impl_key(&self, self_name: &str, trait_path: &str, method: &str) -> Option<String> {
+        let prefix = format!("<{self_name} as {trait_path}");
+        let suffix = format!(">::{method}");
+        let mut found: Option<&String> = None;
+        for key in self.bodies.keys() {
+            let base = key.split('#').next().unwrap_or(key.as_str());
+            if base.starts_with(&prefix) && base.ends_with(&suffix) {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(key);
+            }
+        }
+        found.cloned()
+    }
+
     /// Resolve a callee that has no converted body through the
     /// driver's full name table (std/core functions): its display
     /// name, its rendered generic arguments, and the raw generic
@@ -1782,7 +1890,10 @@ impl<'a> Converter<'a> {
                         destination: self.convert_place(destination)?,
                         target: target.map(|b| ir::BasicBlock(b.index())),
                     }
-                } else if let Some(name) = self.resolve_callee(func) {
+                } else if let Some(name) = self
+                    .resolve_callee(func)
+                    .or_else(|| self.resolve_impl_callee(func))
+                {
                     let callee = self.bodies.get(&name);
                     let mut ir_args = Vec::with_capacity(args.len());
                     for (i, arg) in args.iter().enumerate() {
