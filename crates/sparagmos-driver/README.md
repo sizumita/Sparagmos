@@ -58,6 +58,35 @@ measurement.
 `--dump <path>` writes the converted bodies in the crate's text dump
 format v0 (see `src/dump.rs`).
 
+### Auxiliary crates
+
+Both modes accept `--aux <name>=<file.rs>` (repeatable), the
+counterpart of compiletest's `//@ aux-build:` / `//@ aux-crate:`
+directives:
+
+```sh
+./target/debug/sparagmos-driver run main.rs --aux helper=helper.rs
+```
+
+Each auxiliary source is compiled with the pinned rustc as a
+library crate named `<name>` (with `-Zalways-encode-mir`, so every
+function body is present in the crate metadata) and linked into
+the main compilation with `--extern`. Pass auxiliary crates in
+dependency order — a crate before the crates that use it; each
+auxiliary compilation sees the previously built ones. The
+auxiliary crates' functions are converted into the same program as
+the main crate's functions, so calls across the crate boundary
+execute in the interpreter like any other call. Generic auxiliary
+functions are reported as skipped (no monomorphic instance), the
+same treatment local generic functions get. An auxiliary crate
+whose source declares `#![crate_type = "proc-macro"]` or
+`"cdylib"` is compiled and linked the same way, but its functions
+are not converted: proc macros run inside the compiler at compile
+time, and a cdylib exposes no Rust API to call. If an auxiliary
+crate fails to compile, the driver reports it as a conversion
+failure (run mode: exit 2) naming the crate and the first compiler
+error.
+
 ### Run mode: execute a program end to end
 
 ```sh
