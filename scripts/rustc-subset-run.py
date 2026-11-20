@@ -18,7 +18,12 @@ single-file or use auxiliary crates: `//@ aux-build:` /
 `//@ aux-crate:` directives are resolved transitively (an auxiliary
 file's own directives included), and the resulting crates are built
 by the native rustc for the oracle side and passed to the driver
-with `--aux` for the Sparagmos side, in dependency order. Stage 2 covers the nature="compile-check" population:
+with `--aux` for the Sparagmos side, in dependency order. A
+`//@ proc-macro:` directive (in a test or an auxiliary file) names
+a crate built as a proc-macro crate, and each auxiliary crate is
+built with the edition its own `//@ edition:` declares when it
+declares one, as compiletest builds them; both facts travel to the
+driver as `--aux` attributes (`;crate-type=`, `;edition=`). Stage 2 covers the nature="compile-check" population:
 each test is run through the driver's convert-only mode and the
 outcome is compared with the expectation compiletest derives from
 the test's directives (see the stage-2 section below). Tests with
@@ -81,6 +86,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import NamedTuple, Optional
 
 TOOLCHAIN = "1.100.0"
 DENOMINATOR = 24937  # metric 2(b) denominator at tag 1.100.0 (COVERAGE.md)
@@ -589,30 +595,82 @@ def declared_crate_name(text):
     return m.group(1) if m else None
 
 
-def aux_directives(header):
-    """(crate_name, file_name) pairs from a header's aux directives.
+class AuxSpec(NamedTuple):
+    """One resolved auxiliary crate, in dependency order.
+
+    `crate_type` is "proc-macro" for the crates a `//@ proc-macro:`
+    directive names (compiletest builds those as proc-macro crates)
+    and None otherwise. `edition` is the auxiliary file's own
+    `//@ edition:` directive when it declares one (compiletest
+    builds each auxiliary crate with its own edition) and None
+    otherwise, meaning the main test's edition.
+    """
+
+    name: str
+    path: Path
+    crate_type: Optional[str] = None
+    edition: Optional[str] = None
+
+
+def as_aux_spec(spec):
+    """Normalize an aux spec: an AuxSpec passes through; a plain
+    (name, path) pair gains empty attributes."""
+    if isinstance(spec, AuxSpec):
+        return spec
+    name, path = spec
+    return AuxSpec(name, Path(path))
+
+
+def aux_spec_arg(spec):
+    """The driver's `--aux` value for a spec: `name=path` plus the
+    `;crate-type=` / `;edition=` attributes the spec carries."""
+    spec = as_aux_spec(spec)
+    arg = f"{spec.name}={spec.path}"
+    if spec.crate_type:
+        arg += f";crate-type={spec.crate_type}"
+    if spec.edition:
+        arg += f";edition={spec.edition}"
+    return arg
+
+
+def aux_entries(header):
+    """(crate_name, file_name, crate_type) triples from a header's
+    aux directives.
 
     `aux-build: foo-bar.rs` builds crate `foo_bar` (the file stem
     with dashes as underscores, as compiletest derives it);
-    `aux-crate: name=file.rs` names the crate explicitly.
+    `aux-crate: name=file.rs` names the crate explicitly;
+    `proc-macro: foo-bar.rs` builds crate `foo_bar` as a proc-macro
+    crate (its crate_type is "proc-macro"; the others' is None).
     """
     out = []
     for value in header.values("aux-build"):
         fname = value.strip()
         if fname:
-            out.append((Path(fname).stem.replace("-", "_"), fname))
+            out.append((Path(fname).stem.replace("-", "_"), fname, None))
     for value in header.values("aux-crate"):
         value = value.strip()
         if "=" in value:
             name, fname = value.split("=", 1)
-            out.append((name.strip(), fname.strip()))
+            out.append((name.strip(), fname.strip(), None))
+    for value in header.values("proc-macro"):
+        fname = value.strip()
+        if fname:
+            out.append((Path(fname).stem.replace("-", "_"), fname,
+                        "proc-macro"))
     return out
+
+
+def aux_directives(header):
+    """(crate_name, file_name) pairs from a header's aux directives
+    (see `aux_entries`)."""
+    return [(name, fname) for name, fname, _ in aux_entries(header)]
 
 
 def resolve_aux_specs(test_path, revision=None, top=None):
     """Resolve a test's auxiliary crates, transitively, deps first.
 
-    Returns (specs, error): specs is a list of (crate_name, Path) in
+    Returns (specs, error): specs is a list of AuxSpec in
     dependency order (a crate before the crates that use it), the
     order both process sides expect. Auxiliary files are looked up
     next to the file whose directive names them, in that directory's
@@ -632,11 +690,14 @@ def resolve_aux_specs(test_path, revision=None, top=None):
     by_name = {}
     visiting = set()
 
-    def directives(p):
+    def file_header(p):
         h = Header(p.read_text(errors="ignore"))
         if revision is not None:
             h = h.view(revision)
-        return aux_directives(h)
+        return h
+
+    def directives(p):
+        return aux_entries(file_header(p))
 
     def find_file(fname, from_dir):
         # The `auxiliary/` subdirectory wins over the directory
@@ -651,7 +712,7 @@ def resolve_aux_specs(test_path, revision=None, top=None):
                 return cand
         return None
 
-    def visit(name, fname, from_dir):
+    def visit(name, fname, from_dir, crate_type=None):
         path = find_file(fname, from_dir)
         if path is None:
             return (f"auxiliary file {fname} for crate `{name}` "
@@ -666,20 +727,23 @@ def resolve_aux_specs(test_path, revision=None, top=None):
             return f"auxiliary crate dependency cycle at `{name}`"
         visiting.add(name)
         by_name[name] = path
-        for dep_name, dep_file in directives(path):
-            err = visit(dep_name, dep_file, path.parent)
+        header = file_header(path)
+        for dep_name, dep_file, dep_type in aux_entries(header):
+            err = visit(dep_name, dep_file, path.parent, dep_type)
             if err:
                 return err
         visiting.discard(name)
-        specs.append((name, path))
+        editions = header.values("edition")
+        edition = editions[-1].strip() if editions else None
+        specs.append(AuxSpec(name, path, crate_type, edition))
         return None
 
     if top is not None:
-        top_directives = aux_directives(top)
+        top_entries = aux_entries(top)
     else:
-        top_directives = directives(test_path)
-    for name, fname in top_directives:
-        err = visit(name, fname, test_dir)
+        top_entries = directives(test_path)
+    for name, fname, crate_type in top_entries:
+        err = visit(name, fname, test_dir, crate_type)
         if err:
             return [], err
     return specs, None
@@ -715,17 +779,19 @@ def native_side(path, edition, workdir, extra_flags=(), aux_specs=()):
         auxdir = Path(workdir) / "auxlibs"
         auxdir.mkdir()
         built = []
-        for name, src in aux_specs:
+        for spec in aux_specs:
+            spec = as_aux_spec(spec)
+            name, src = spec.name, spec.path
             text = src.read_text(errors="ignore")
             declared = declared_crate_type(text)
             eff_name = declared_crate_name(text) or name
-            cmd = rustc_cmd() + ["--edition", edition,
+            cmd = rustc_cmd() + ["--edition", spec.edition or edition,
                                  "--out-dir", str(auxdir)]
             if lib:
                 cmd += ["-L", lib]
             cmd += ["-L", f"dependency={auxdir}"]
             if declared is None:
-                cmd += ["--crate-type", "rlib"]
+                cmd += ["--crate-type", spec.crate_type or "rlib"]
             if declared_crate_name(text) is None:
                 cmd += ["--crate-name", name]
             for prev_name, prev_artifact in built:
@@ -739,7 +805,7 @@ def native_side(path, edition, workdir, extra_flags=(), aux_specs=()):
             if build["exit_code"] != 0:
                 first = first_error_line(build["stderr"])
                 return None, f"native compile failed: {first}"
-            effective = declared or "rlib"
+            effective = declared or spec.crate_type or "rlib"
             artifact = (find_artifact(auxdir, eff_name)
                         if effective in ("rlib", "lib", "dylib",
                                          "proc-macro")
@@ -786,8 +852,8 @@ def sparagmos_side(path, edition, driver_bin, cwd=None, rustc_args=(), aux_specs
     argv = [str(driver_bin), "run", str(path), "--edition", edition]
     for a in rustc_args:
         argv += ["--rustc-arg", a]
-    for name, src in aux_specs:
-        argv += ["--aux", f"{name}={src}"]
+    for spec in aux_specs:
+        argv += ["--aux", aux_spec_arg(spec)]
     res = run_cmd(argv,
                   timeout=DRIVER_TIMEOUT, cwd=cwd,
                   env_extra=BOOTSTRAP_ENV)
@@ -1315,8 +1381,8 @@ def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=()):
     argv = [str(driver_bin), str(path), "--edition", edition]
     for a in rustc_args:
         argv += ["--rustc-arg", a]
-    for name, src in aux_specs:
-        argv += ["--aux", f"{name}={src}"]
+    for spec in aux_specs:
+        argv += ["--aux", aux_spec_arg(spec)]
     res = run_cmd(argv,
                   timeout=CONVERT_TIMEOUT, env_extra=BOOTSTRAP_ENV)
     out = {

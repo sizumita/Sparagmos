@@ -646,6 +646,15 @@ class ConvertSideTests(unittest.TestCase):
         argv, _ = self.run_argv()
         self.assertNotIn("--aux", argv)
 
+    def test_aux_attributes_become_aux_arg_attributes(self):
+        argv, _ = self.run_argv(aux_specs=[
+            run.AuxSpec("pm", Path("/x/pm.rs"), "proc-macro", None),
+            run.AuxSpec("old", Path("/x/old.rs"), None, "2015"),
+        ])
+        args = [argv[i + 1] for i, a in enumerate(argv) if a == "--aux"]
+        self.assertEqual(args, ["pm=/x/pm.rs;crate-type=proc-macro",
+                                "old=/x/old.rs;edition=2015"])
+
 
 class ProcessStage2AuxTests(unittest.TestCase):
     """process_test(stage2=True) on tests with auxiliary crates."""
@@ -671,7 +680,8 @@ class ProcessStage2AuxTests(unittest.TestCase):
         orig = run.convert_side
 
         def stub(path, edition, driver_bin, rustc_args=(), aux_specs=()):
-            self.seen.append([(n, Path(s).name) for n, s in aux_specs])
+            self.seen.append([(spec.name, spec.path.name)
+                               for spec in aux_specs])
             return conv_result
 
         run.convert_side = stub
@@ -1017,6 +1027,14 @@ class AuxDirectivesTests(unittest.TestCase):
         self.assertEqual(run.aux_directives(header),
                          [("parser", "parser.rs")])
 
+    def test_proc_macro_entry_carries_crate_type(self):
+        header = run.Header("//@ proc-macro: my-macro.rs\n")
+        self.assertEqual(run.aux_entries(header),
+                         [("my_macro", "my-macro.rs", "proc-macro")])
+        # The pair view keeps the crate (it is an aux dependency).
+        self.assertEqual(run.aux_directives(header),
+                         [("my_macro", "my-macro.rs")])
+
 
 class ResolveAuxSpecsTests(unittest.TestCase):
     def setUp(self):
@@ -1035,7 +1053,7 @@ class ResolveAuxSpecsTests(unittest.TestCase):
         self.write("auxiliary/helper.rs", "pub fn f() {}\n")
         specs, err = run.resolve_aux_specs(main)
         self.assertIsNone(err)
-        self.assertEqual([name for name, _ in specs], ["helper"])
+        self.assertEqual([spec.name for spec in specs], ["helper"])
 
     def test_transitive_aux_comes_first(self):
         main = self.write(
@@ -1045,7 +1063,7 @@ class ResolveAuxSpecsTests(unittest.TestCase):
         self.write("auxiliary/base.rs", "pub fn f() {}\n")
         specs, err = run.resolve_aux_specs(main)
         self.assertIsNone(err)
-        self.assertEqual([name for name, _ in specs], ["base", "mid"])
+        self.assertEqual([spec.name for spec in specs], ["base", "mid"])
 
     def test_missing_aux_file_is_an_error(self):
         main = self.write("t.rs", "//@ run-pass\n//@ aux-build: nope.rs\n")
@@ -1058,6 +1076,44 @@ class ResolveAuxSpecsTests(unittest.TestCase):
         specs, err = run.resolve_aux_specs(main)
         self.assertIsNone(err)
         self.assertEqual(specs, [])
+
+    def test_proc_macro_directive_marks_the_spec(self):
+        main = self.write(
+            "t.rs", "//@ run-pass\n//@ proc-macro: my-macro.rs\n")
+        self.write("auxiliary/my-macro.rs", "pub fn f() {}\n")
+        specs, err = run.resolve_aux_specs(main)
+        self.assertIsNone(err)
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0].name, "my_macro")
+        self.assertEqual(specs[0].crate_type, "proc-macro")
+
+    def test_aux_proc_macro_dependency_comes_first(self):
+        # An auxiliary file's own `//@ proc-macro:` names a crate
+        # the auxiliary build needs first (dependency order).
+        main = self.write(
+            "t.rs", "//@ run-pass\n//@ aux-build: wrapper.rs\n")
+        self.write("auxiliary/wrapper.rs",
+                   "//@ proc-macro: inner-macro.rs\npub fn g() {}\n")
+        self.write("auxiliary/inner-macro.rs", "pub fn f() {}\n")
+        specs, err = run.resolve_aux_specs(main)
+        self.assertIsNone(err)
+        self.assertEqual([spec.name for spec in specs],
+                         ["inner_macro", "wrapper"])
+        self.assertEqual(specs[0].crate_type, "proc-macro")
+        self.assertIsNone(specs[1].crate_type)
+
+    def test_aux_edition_comes_from_the_aux_file(self):
+        main = self.write(
+            "t.rs", "//@ run-pass\n//@ edition: 2024\n"
+                    "//@ aux-build: old.rs\n//@ aux-build: plain.rs\n")
+        self.write("auxiliary/old.rs",
+                   "//@ edition: 2015\npub fn f() {}\n")
+        self.write("auxiliary/plain.rs", "pub fn g() {}\n")
+        specs, err = run.resolve_aux_specs(main)
+        self.assertIsNone(err)
+        by_name = {spec.name: spec for spec in specs}
+        self.assertEqual(by_name["old"].edition, "2015")
+        self.assertIsNone(by_name["plain"].edition)
 
 
 class ViewBlockerTests(unittest.TestCase):
@@ -1122,7 +1178,7 @@ class ProcessStage1RevisionTests(unittest.TestCase):
                         aux_specs=()):
             seen = {"rev": self.revision_of(list(extra_flags)),
                     "edition": edition, "flags": list(extra_flags),
-                    "aux": [name for name, _ in aux_specs]}
+                    "aux": [spec.name for spec in aux_specs]}
             self.native_seen.append(seen)
             if native_fake:
                 return native_fake(seen)
@@ -1132,7 +1188,7 @@ class ProcessStage1RevisionTests(unittest.TestCase):
                       rustc_args=(), aux_specs=()):
             seen = {"rev": self.revision_of(list(rustc_args)),
                     "args": list(rustc_args),
-                    "aux": [name for name, _ in aux_specs]}
+                    "aux": [spec.name for spec in aux_specs]}
             self.driver_seen.append(seen)
             if spar_fake:
                 return spar_fake(seen)
@@ -1304,7 +1360,7 @@ class ResolveAuxSpecsRevisionTests(unittest.TestCase):
         self.write("auxiliary/helper.rs", "pub fn f() {}\n")
         specs, err = run.resolve_aux_specs(main, "a")
         self.assertIsNone(err)
-        self.assertEqual([name for name, _ in specs], ["helper"])
+        self.assertEqual([spec.name for spec in specs], ["helper"])
         specs, err = run.resolve_aux_specs(main, "b")
         self.assertIsNone(err)
         self.assertEqual(specs, [])
@@ -1322,4 +1378,4 @@ class ResolveAuxSpecsRevisionTests(unittest.TestCase):
         self.assertEqual(specs, [])
         specs, err = run.resolve_aux_specs(main, top=header.view("a"))
         self.assertIsNone(err)
-        self.assertEqual([name for name, _ in specs], ["helper"])
+        self.assertEqual([spec.name for spec in specs], ["helper"])
