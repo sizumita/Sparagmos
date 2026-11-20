@@ -828,3 +828,42 @@ fn run_mode_two_instantiations_of_one_generic_drop_impl() {
         "both destructors must run"
     );
 }
+
+const LIFETIME_DROP_SRC: &str = r#"
+struct S<'a> { p: &'a str }
+impl<'a> Drop for S<'a> {
+    fn drop(&mut self) { println!("dropped {}", self.p); }
+}
+fn main() {
+    let _s = S { p: "x" };
+    println!("body");
+}
+"#;
+
+#[test]
+fn run_mode_lifetime_parameterized_drop_impl_runs() {
+    // A lifetime-only `Drop` impl is converted by the item loop
+    // under its declared spelling (`<S<'a> as ...>::drop`); the
+    // drop-demand pass resolves the same instance with the erased
+    // spelling (`<S<'_> as ...>::drop`). Registering both left the
+    // interpreter's destructor lookup with two candidates, which it
+    // treats as ambiguous, and the drop came out as
+    // "unsupported terminator: Drop" (the Lane BS demand-pass
+    // regression: drop-scope-exit, issue-2735-2 and seven more).
+    // The demand pass now skips instances that are already
+    // converted, by DefId.
+    let dir = temp_dir("lifetime-drop");
+    let src = fixture(&dir, "lifetime_drop.rs", LIFETIME_DROP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "lifetime-parameterized Drop impl must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "body\ndropped x\n",
+        "the destructor's output must follow the body's"
+    );
+}
