@@ -19,7 +19,7 @@
 //!   pointer (`&*_p`).
 
 use sparagmos_interp::mir_convert::{interpret_mir, MirProgram, MirRunError};
-use sparagmos_interp::{InterpError, Value};
+use sparagmos_interp::{InterpError, RefTarget, Value};
 use sparagmos_mir as mir;
 
 // ----- items ---------------------------------------------------------------
@@ -438,4 +438,215 @@ fn upcast_keeps_concrete_and_supertrait_dispatches() {
         interpret_mir(&prog, "main", Vec::new()).expect("main runs"),
         Value::Int(42)
     );
+}
+
+// ----- trait-method calls resolved to collected impl bodies ------------------
+//
+// Issue #65 (tests/ui/dst/dst-index-success.rs): a call naming the
+// trait item (`std::ops::Index::index`, generic arguments
+// `[Self, usize]`) whose program also contains the concrete impl
+// body must execute the impl body. Before the fix, conversion fell
+// through to the name-based builtin model of the trait method,
+// which treated the receiver as a slice: for the unit-struct
+// receivers below it panicked with a bogus "index out of bounds:
+// the len is 0 but the index is 0" — a silent wrong result for a
+// shape the runtime fully supports.
+
+const S_TY: mir::DefId = mir::DefId::new(0, 21);
+const T_TY: mir::DefId = mir::DefId::new(0, 22);
+const INDEX: mir::DefId = mir::DefId::new(0, 23);
+const DEBUG: &str = "std::fmt::Debug";
+
+fn s_ty() -> mir::Ty {
+    mir::Ty::Adt(S_TY, Vec::new())
+}
+
+fn t_ty() -> mir::Ty {
+    mir::Ty::Adt(T_TY, Vec::new())
+}
+
+fn usize_ty() -> mir::Ty {
+    mir::Ty::Uint(mir::UintTy::Usize)
+}
+
+fn const_usize(v: u64) -> mir::Operand {
+    mir::Operand::constant(mir::Constant::from_value(mir::ConstValue::Scalar(
+        mir::Scalar::Int {
+            data: v as u128,
+            size: 8,
+        },
+    )))
+}
+
+fn const_str(v: &str) -> mir::Operand {
+    mir::Operand::constant(mir::Constant::from_value(mir::ConstValue::Str(
+        v.to_string(),
+    )))
+}
+
+fn index_program() -> MirProgram {
+    let mut prog = MirProgram::new();
+    prog.fn_names.insert(S_TY, "probe::S".to_string());
+    prog.fn_names.insert(T_TY, "probe::T".to_string());
+    prog.fn_names
+        .insert(INDEX, "std::ops::Index::index".to_string());
+    prog
+}
+
+/// The string a `&str` value denotes, unwrapping the fat-pointer
+/// and reference layers the model wraps it in.
+fn str_content(v: &Value) -> Option<String> {
+    match v {
+        Value::Str(s) => Some(s.clone()),
+        Value::FatRef { base, .. } => str_content(base),
+        Value::Ref(RefTarget::Value(inner)) => str_content(inner),
+        _ => None,
+    }
+}
+
+/// `<probe::S as std::ops::Index<usize>>::index`: `_0 = "hello"`.
+fn s_index_impl_body() -> mir::Body {
+    mir::Body::new(
+        decls(&[ref_ty(mir::Ty::Str), ref_ty(s_ty()), usize_ty()]),
+        2,
+        vec![block(
+            vec![assign(place(0), mir::Rvalue::Use(const_str("hello")))],
+            ret(),
+        )],
+    )
+}
+
+/// `<probe::T as std::ops::Index<usize>>::index`:
+/// `_3 = 42; _4 = &_3; _0 = _4 as &dyn Debug` (the suite file's
+/// referent is a static; a local models the same Unsize shape).
+fn t_index_impl_body() -> mir::Body {
+    mir::Body::new(
+        decls(&[
+            ref_ty(dyn_ty(DEBUG)),
+            ref_ty(t_ty()),
+            usize_ty(),
+            usize_ty(),
+            ref_ty(usize_ty()),
+        ]),
+        2,
+        vec![block(
+            vec![
+                assign(place(3), mir::Rvalue::Use(const_usize(42))),
+                assign(place(4), ref_of(3)),
+                assign(place(0), unsize(copy(4), ref_ty(dyn_ty(DEBUG)))),
+            ],
+            ret(),
+        )],
+    )
+}
+
+/// `fn main() -> &str { _1 = S; _2 = &_1; _3 = Index::index(move _2, 0); _0 = _3 }`
+fn s_index_main() -> mir::Body {
+    mir::Body::new(
+        decls(&[
+            ref_ty(mir::Ty::Str),
+            s_ty(),
+            ref_ty(s_ty()),
+            ref_ty(mir::Ty::Str),
+        ]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(place(1), adt_aggregate(S_TY, Vec::new())),
+                    assign(place(2), ref_of(1)),
+                ],
+                call(
+                    fndef_operand(INDEX, vec![s_ty(), usize_ty()]),
+                    vec![move_(2), const_usize(0)],
+                    3,
+                    1,
+                ),
+            ),
+            block(vec![assign(place(0), mir::Rvalue::Use(move_(3)))], ret()),
+        ],
+    )
+}
+
+#[test]
+fn index_impl_with_str_output_runs_the_impl_body() {
+    let mut prog = index_program();
+    prog.add("main", s_index_main());
+    prog.add(
+        "<probe::S as std::ops::Index<usize>>::index",
+        s_index_impl_body(),
+    );
+
+    let value = interpret_mir(&prog, "main", Vec::new()).expect("main runs");
+    assert_eq!(str_content(&value).as_deref(), Some("hello"));
+}
+
+#[test]
+fn index_impl_with_dyn_output_runs_the_impl_body() {
+    // fn main() -> &dyn Debug {
+    //   _1 = T; _2 = &_1; _3 = Index::index(move _2, 0); _0 = _3
+    // }
+    let main = mir::Body::new(
+        decls(&[
+            ref_ty(dyn_ty(DEBUG)),
+            t_ty(),
+            ref_ty(t_ty()),
+            ref_ty(dyn_ty(DEBUG)),
+        ]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(place(1), adt_aggregate(T_TY, Vec::new())),
+                    assign(place(2), ref_of(1)),
+                ],
+                call(
+                    fndef_operand(INDEX, vec![t_ty(), usize_ty()]),
+                    vec![move_(2), const_usize(0)],
+                    3,
+                    1,
+                ),
+            ),
+            block(vec![assign(place(0), mir::Rvalue::Use(move_(3)))], ret()),
+        ],
+    );
+    let mut prog = index_program();
+    prog.add("main", main);
+    prog.add(
+        "<probe::T as std::ops::Index<usize>>::index",
+        t_index_impl_body(),
+    );
+
+    match interpret_mir(&prog, "main", Vec::new()).expect("main runs") {
+        Value::DynRef {
+            concrete, traits, ..
+        } => {
+            assert_eq!(concrete, "usize");
+            assert_eq!(traits, vec![DEBUG.to_string()]);
+        }
+        other => panic!("expected a dyn fat pointer, got {other:?}"),
+    }
+}
+
+#[test]
+fn index_call_without_a_collected_impl_body_keeps_the_builtin_model() {
+    // The same call as `index_impl_with_str_output_runs_the_impl_body`
+    // but with no impl body in the program: the name-based builtin
+    // model of `Index::index` applies, as it does for core's
+    // slice/array/Vec impls whose bodies are not collected. On
+    // this unit-struct receiver the builtin reports the receiver
+    // as a length-0 indexable — the pinned boundary is that the
+    // builtin, not an impl body, ran.
+    let mut prog = index_program();
+    prog.add("main", s_index_main());
+
+    match interpret_mir(&prog, "main", Vec::new()) {
+        Err(MirRunError::Interp(InterpError::Panic { message })) => {
+            assert_eq!(
+                message,
+                "index out of bounds: the len is 0 but the index is 0"
+            );
+        }
+        other => panic!("expected the builtin's bounds panic, got {other:?}"),
+    }
 }
