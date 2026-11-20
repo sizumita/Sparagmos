@@ -830,6 +830,10 @@ const MESSAGE_DEF: mir::DefId = mir::DefId::new(0, 22);
 const OPTION_DEF: mir::DefId = mir::DefId::new(0, 23);
 const PAIR_DEF: mir::DefId = mir::DefId::new(0, 24);
 const MAKE_DEF: mir::DefId = mir::DefId::new(0, 25);
+const NONNULL_DEF: mir::DefId = mir::DefId::new(0, 101);
+const UNIQUE_DEF: mir::DefId = mir::DefId::new(0, 102);
+const BOX_DEF: mir::DefId = mir::DefId::new(0, 103);
+
 
 fn adt_aggregate(
     def: mir::DefId,
@@ -1266,4 +1270,159 @@ fn unreachable_terminator_is_a_guest_panic() {
         Err(e) => panic!("expected guest panic from Unreachable, got error {e}"),
         Ok(v) => panic!("expected guest panic from Unreachable, got value {v:?}"),
     }
+}
+
+fn adt_i32_ty(def: mir::DefId) -> mir::Ty {
+    mir::Ty::Adt(def, vec![i32_ty()])
+}
+
+fn aggregate_adt(def: mir::DefId, operand: mir::Operand) -> mir::Rvalue {
+    mir::Rvalue::Aggregate(
+        Box::new(mir::AggregateKind::Adt {
+            def,
+            variant_index: 0,
+            generic_args: vec![i32_ty()],
+            user_ty: None,
+            field_index: None,
+        }),
+        vec![operand],
+    )
+}
+
+/// The shape rustc 1.100.0 emits around a `Box` deref: the box value
+/// is the chain Box(Unique(NonNull(*const i32))); extracting the
+/// pointer goes through a field read of the box followed by a
+/// `BoxDerefTransmute` cast, and the pointee is read or written
+/// through the resulting raw pointer.
+///
+/// Locals: _0 ret i32, _1 pointee i32, _2 *const i32, _3 NonNull,
+/// _4 Unique, _5 Box, _6 Unique (field copy), _7 *const i32 (cast).
+/// `tail` runs after the cast with the pointer in _7.
+fn box_deref_body(tail: Vec<mir::Statement>) -> mir::Body {
+    let mut stmts = vec![
+        assign(place(1), mir::Rvalue::Use(const_i32(41))),
+        assign(
+            place(2),
+            mir::Rvalue::RawPtr(mir::Mutability::Mut, place(1)),
+        ),
+        assign(place(3), aggregate_adt(NONNULL_DEF, move_(2))),
+        assign(place(4), aggregate_adt(UNIQUE_DEF, move_(3))),
+        assign(place(5), aggregate_adt(BOX_DEF, move_(4))),
+        assign(
+            place(6),
+            mir::Rvalue::Use(mir::Operand::Copy(field(5, 0, adt_i32_ty(UNIQUE_DEF)))),
+        ),
+        assign(
+            place(7),
+            mir::Rvalue::Cast(mir::CastKind::BoxDerefTransmute, copy(6), raw_ptr_i32_ty()),
+        ),
+    ];
+    stmts.extend(tail);
+    mir::Body::new(
+        decls(&[
+            i32_ty(),
+            i32_ty(),
+            raw_ptr_i32_ty(),
+            adt_i32_ty(NONNULL_DEF),
+            adt_i32_ty(UNIQUE_DEF),
+            adt_i32_ty(BOX_DEF),
+            adt_i32_ty(UNIQUE_DEF),
+            raw_ptr_i32_ty(),
+        ]),
+        0,
+        vec![block(stmts, ret())],
+    )
+}
+
+#[test]
+fn box_deref_transmute_reads_pointee() {
+    let body = box_deref_body(vec![assign(
+        place(0),
+        mir::Rvalue::Use(mir::Operand::Copy(place(7).deref())),
+    )]);
+    let mut prog = MirProgram::new();
+    prog.add("unbox_read", body);
+    let v = interpret_mir(&prog, "unbox_read", vec![]).expect("unbox_read must run");
+    assert_eq!(v, Value::Int(41));
+}
+
+#[test]
+fn box_deref_transmute_rejects_non_wrapper() {
+    // Casting a plain integer with BoxDerefTransmute is a type error,
+    // not a silent pass-through.
+    let body = mir::Body::new(
+        decls(&[i32_ty(), i32_ty(), raw_ptr_i32_ty()]),
+        0,
+        vec![block(
+            vec![
+                assign(place(1), mir::Rvalue::Use(const_i32(5))),
+                assign(
+                    place(2),
+                    mir::Rvalue::Cast(mir::CastKind::BoxDerefTransmute, copy(1), raw_ptr_i32_ty()),
+                ),
+                assign(place(0), mir::Rvalue::Use(const_i32(0))),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("bad_cast", body);
+    let err = interpret_mir(&prog, "bad_cast", vec![])
+        .expect_err("BoxDerefTransmute of an integer must fail");
+    assert!(
+        matches!(err, MirRunError::Interp(InterpError::TypeMismatch { .. })),
+        "expected a type mismatch, got {err}"
+    );
+}
+
+#[test]
+fn box_deref_transmute_writes_pointee() {
+    let body = box_deref_body(vec![
+        assign(place(7).deref(), mir::Rvalue::Use(const_i32(42))),
+        assign(place(0), mir::Rvalue::Use(copy(1))),
+    ]);
+    let mut prog = MirProgram::new();
+    prog.add("unbox_write", body);
+    let v = interpret_mir(&prog, "unbox_write", vec![]).expect("unbox_write must run");
+    assert_eq!(v, Value::Int(42));
+}
+
+#[test]
+fn closure_aggregate_fails_at_execution_not_silently() {
+    // Destination is a tuple type so conversion itself succeeds; the
+    // Closure aggregate kind is what is unsupported.
+    let body = mir::Body::new(
+        decls(&[mir::Ty::Tuple(vec![u32_ty()])]),
+        0,
+        vec![block(
+            vec![assign(
+                place(0),
+                mir::Rvalue::Aggregate(
+                    Box::new(mir::AggregateKind::Closure {
+                        def: mir::DefId::new(0, 1),
+                        generic_args: vec![],
+                    }),
+                    vec![const_u32(1)],
+                ),
+            )],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("mk", body);
+    let err = interpret_mir(&prog, "mk", vec![]).expect_err("Closure aggregate must fail");
+    // Since Lane AJ, closure aggregates convert into callable values;
+    // assigning one into a tuple-typed place fails loudly with a type
+    // mismatch instead of an unsupported-rvalue error.
+    assert!(
+        matches!(
+            err,
+            MirRunError::Interp(InterpError::TypeMismatch { .. })
+        ),
+        "expected TypeMismatch, got {err}"
+    );
+}
+
+fn raw_ptr_i32_ty() -> mir::Ty {
+    mir::Ty::RawPtr(Box::new(i32_ty()), mir::Mutability::Mut)
 }

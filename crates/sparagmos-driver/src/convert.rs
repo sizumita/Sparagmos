@@ -1263,10 +1263,7 @@ impl Converter {
             C::FnPtrToPtr => sm::CastKind::FnPtrToPtr,
             C::Transmute => sm::CastKind::Transmute,
             C::Subtype => sm::CastKind::Subtype,
-            C::BoxDerefTransmute => {
-                self.err("CastKind::BoxDerefTransmute");
-                sm::CastKind::Transmute
-            }
+            C::BoxDerefTransmute => sm::CastKind::BoxDerefTransmute,
         }
     }
 }

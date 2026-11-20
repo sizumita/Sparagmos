@@ -1076,6 +1076,7 @@ impl Conv {
             ("FloatToFloat", Payload::Unit) => mir::CastKind::FloatToFloat,
             ("IntToFloat", Payload::Unit) => mir::CastKind::IntToFloat,
             ("PtrToPtr", Payload::Unit) => mir::CastKind::PtrToPtr,
+            ("BoxDerefTransmute", Payload::Unit) => mir::CastKind::BoxDerefTransmute,
             ("FnPtrToPtr", Payload::Unit) => mir::CastKind::FnPtrToPtr,
             ("Transmute", Payload::Unit) => mir::CastKind::Transmute,
             ("Subtype", Payload::Unit) => mir::CastKind::Subtype,

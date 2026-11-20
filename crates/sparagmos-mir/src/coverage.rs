@@ -193,6 +193,7 @@ pub const CAST_KINDS: &[&str] = &[
     "FnPtrToPtr",
     "Transmute",
     "Subtype",
+    "BoxDerefTransmute",
 ];
 pub const AGGREGATE_KINDS: &[&str] = &[
     "Array",

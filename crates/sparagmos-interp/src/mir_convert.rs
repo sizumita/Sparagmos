@@ -1008,6 +1008,7 @@ impl<'a> Converter<'a> {
                                 .to_string(),
                         ),
                     },
+                    mir::CastKind::BoxDerefTransmute => ir::Rvalue::BoxDerefTransmute(v),
                     other => ir::Rvalue::Unsupported(format!("Cast {}", other.name())),
                 }
             }
