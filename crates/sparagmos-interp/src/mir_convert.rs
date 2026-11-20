@@ -44,12 +44,17 @@
 //!   driver's full name table: runtime-supported callees
 //!   ([`crate::builtins`]) become `CallBuiltin`; anything else stays an
 //!   unsupported call that names the function.
+//! * Conversion is isolated per body: a function whose body cannot
+//!   be converted does not fail the whole program. It is recorded
+//!   as unconverted with its reason; calling it fails at execution
+//!   time with that reason, while the entry function's own failure
+//!   stays a whole-run conversion failure.
 //! * `Drop` converts only for types whose drop glue provably has no
 //!   guest-observable effect in this value model (plain data, `String`,
 //!   modelled std containers/iterators, and compositions of those);
 //!   other drops stay explicit errors.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use sparagmos_mir as mir;
@@ -223,28 +228,62 @@ fn normalize_switch_value(v: u128, ty: Option<&mir::Ty>) -> u128 {
 }
 
 /// Convert a whole MIR program into an interpreter [`ir::Program`].
+///
+/// Conversion is isolated per body: a function whose body cannot be
+/// converted is recorded in the program's unconverted table with
+/// its failure reason instead of failing the whole conversion (see
+/// the module docs). Only a structurally malformed program — two
+/// functions with the same name — fails conversion as a whole.
 pub fn convert_program(program: &MirProgram) -> Result<ir::Program, ConvertError> {
+    Ok(convert_all(program)?.0)
+}
+
+/// [`convert_program`] plus the per-function conversion failures,
+/// for the run entry points: the entry function's own failure is a
+/// whole-run conversion failure, exactly as before per-body
+/// isolation, so callers need the failures beside the program.
+fn convert_all(
+    program: &MirProgram,
+) -> Result<(ir::Program, HashMap<String, ConvertError>), ConvertError> {
     let conv = Converter::new(program);
     let mut out = ir::Program::new();
+    let mut failures: HashMap<String, ConvertError> = HashMap::new();
+    let mut seen: HashSet<String> = HashSet::new();
     for func in &program.functions {
-        if out.get(&func.name).is_some() {
+        if !seen.insert(func.name.clone()) {
             return Err(ConvertError::DuplicateFunction {
                 name: func.name.clone(),
             });
         }
-        let body = conv.convert_body(func)?;
-        out.add_function(body);
+        match conv.convert_body(func) {
+            Ok(body) => {
+                out.add_function(body);
+            }
+            Err(e) => {
+                out.add_unconverted(func.name.clone(), e.to_string());
+                failures.insert(func.name.clone(), e);
+            }
+        }
     }
-    Ok(out)
+    Ok((out, failures))
 }
 
 /// Convert `program` and run `entry` with `args` in the interpreter.
+///
+/// Bodies are converted in isolation (see [`convert_program`]):
+/// an unconvertible helper that is never called does not affect
+/// the run, and calling one fails with its conversion reason. If
+/// the entry function itself cannot be converted, the run fails
+/// with that conversion error before anything executes.
 pub fn interpret_mir(
     program: &MirProgram,
     entry: &str,
     args: Vec<Value>,
 ) -> Result<Value, MirRunError> {
-    let ir_program = convert_program(program)?;
+    let (ir_program, failures) = convert_all(program)?;
+    if let Some(e) = failures.get(entry) {
+        return Err(MirRunError::Convert(e.clone()));
+    }
     let mut interp = Interpreter::new(&ir_program);
     Ok(interp.run(entry, args)?)
 }
@@ -265,8 +304,16 @@ pub fn interpret_mir_captured(
     entry: &str,
     args: Vec<Value>,
 ) -> CapturedRun {
-    match convert_program(program) {
-        Ok(ir_program) => {
+    match convert_all(program) {
+        Ok((ir_program, failures)) => {
+            // The entry function's own conversion failure is a
+            // whole-run failure with no guest output, as before.
+            if let Some(e) = failures.get(entry) {
+                return CapturedRun {
+                    result: Err(MirRunError::from(e.clone())),
+                    stdout: String::new(),
+                };
+            }
             let mut interp = Interpreter::new(&ir_program);
             let result = interp.run(entry, args).map_err(MirRunError::from);
             CapturedRun {
