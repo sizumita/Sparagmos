@@ -137,6 +137,7 @@ pub fn parse_dump(text: &str) -> Result<ParsedDump, DumpError> {
         program: MirProgramInput {
             functions,
             names: def_names,
+            adt_discriminants: Default::default(),
         },
         skipped,
     })

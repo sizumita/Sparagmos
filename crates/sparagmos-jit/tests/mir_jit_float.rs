@@ -114,6 +114,7 @@ fn build(specs: Vec<(u32, &str, usize, Vec<mir::Ty>, Vec<mir::BasicBlockData>)>)
             })
             .collect(),
         names,
+        adt_discriminants: Default::default(),
     };
     JitProgram::compile(&input).expect("JIT compile failed")
 }

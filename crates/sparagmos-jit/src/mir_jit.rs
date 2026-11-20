@@ -31,6 +31,13 @@
 //! semantics — which are exactly Rust's — with no normalisation
 //! step in the lowering.
 //!
+//! An ADT value is a single leaf holding its discriminant value,
+//! taken from the program's discriminant table exactly as the
+//! interpreter computes `Discriminant` results. Only the tag is
+//! represented; payloads are outside the model, and every construct
+//! that would create or touch one fails with an explicit
+//! unsupported error at its own lowering.
+//!
 //! # Panics
 //!
 //! A guest panic (failed `Assert`, checked-arithmetic overflow via
@@ -59,18 +66,21 @@
 //! Supported: integer / `bool` / `char` / `f32` / `f64` /
 //! tuple-of-supported and array-of-supported locals (arrays are
 //! their elements' leaves in order, read and written through
-//! constant index projections); `Use`, plain and checked `BinaryOp`,
+//! constant index projections), ADT locals holding only a
+//! discriminant tag; `Use`, plain and checked `BinaryOp`,
 //! `UnaryOp`, `IntToInt` / `FloatToInt` / `IntToFloat` /
-//! `FloatToFloat` casts, tuple aggregates, `Repeat`; `Goto`,
+//! `FloatToFloat` casts, tuple aggregates, fieldless ADT
+//! aggregates, `Repeat`, `Discriminant`, `SetDiscriminant`; `Goto`,
 //! `SwitchInt`, `Call` (within the program, up to six arguments),
 //! `Assert`, `Drop` of scalar values, `Return`.
 //! Anything else — `f16` / `f128`, 128-bit integers, references and
-//! places through them, ADTs, slices, aggregates other than tuples,
-//! dynamic index projections, calls to functions outside the
-//! program, and so on — fails the whole function's compilation with
-//! [`JitError::Unsupported`] naming the construct. There is
-//! deliberately no partial or fallback execution: a program either
-//! compiles completely on the JIT path or not at all.
+//! places through them, ADT payloads, slices, aggregates other
+//! than tuples and fieldless ADTs, dynamic index projections,
+//! calls to functions outside the program, and so on — fails the
+//! whole function's compilation with [`JitError::Unsupported`]
+//! naming the construct. There is deliberately no partial or
+//! fallback execution: a program either compiles completely on the
+//! JIT path or not at all.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -102,12 +112,15 @@ pub struct MirFunctionInput {
     pub body: mir::Body,
 }
 
-/// A whole program: the functions plus the driver's definition-name
-/// table (`DefId` -> path), used to name callees in diagnostics.
+/// A whole program: the functions, the driver's definition-name
+/// table (`DefId` -> path), used to name callees in diagnostics, and
+/// the ADT discriminant table, which gives `Discriminant` reads and
+/// `SetDiscriminant` writes the compiler's discriminant values.
 #[derive(Debug, Clone, Default)]
 pub struct MirProgramInput {
     pub functions: Vec<MirFunctionInput>,
     pub names: HashMap<mir::DefId, String>,
+    pub adt_discriminants: mir::AdtDiscriminants,
 }
 
 /// Why a program did not compile on the JIT path.
@@ -205,7 +218,14 @@ impl JitProgram {
         let mut messages = MsgTable::default();
         let mut ir_funcs: Vec<IrFunction> = Vec::with_capacity(input.functions.len());
         for f in &input.functions {
-            let lower = FnLower::new(f, &def_index, &input.names, &param_tys, &mut messages);
+            let lower = FnLower::new(
+                f,
+                &def_index,
+                &input.names,
+                &param_tys,
+                &input.adt_discriminants,
+                &mut messages,
+            );
             ir_funcs.push(lower.run()?);
         }
         let inner = compile_program(&ir_funcs, messages.into_vec())?;
@@ -387,6 +407,17 @@ fn flatten(ty: &mir::Ty, fname: &str) -> Result<usize, JitError> {
             }
             Ok(total)
         }
+        mir::Ty::Adt(..) => {
+            // An ADT value is a single leaf holding its discriminant
+            // value. Payloads have no representation: every construct
+            // that would create or touch one (an aggregate or a
+            // constant with fields, a field or downcast projection)
+            // fails with an explicit unsupported error at its own
+            // lowering, so a program that only ever moves the tag —
+            // `Discriminant` reads, `SetDiscriminant`, `SwitchInt`
+            // on the discriminant — is exact.
+            Ok(1)
+        }
         other => Err(unsup(fname, &format!("type {}", other.kind_name()))),
     }
 }
@@ -546,6 +577,7 @@ struct FnLower<'a> {
     def_index: &'a HashMap<mir::DefId, usize>,
     def_names: &'a HashMap<mir::DefId, String>,
     param_tys: &'a [Vec<mir::Ty>],
+    discriminants: &'a mir::AdtDiscriminants,
     messages: &'a mut MsgTable,
     /// Per local: (first leaf slot, leaf count).
     local_slots: Vec<(u32, usize)>,
@@ -564,6 +596,7 @@ impl<'a> FnLower<'a> {
         def_index: &'a HashMap<mir::DefId, usize>,
         def_names: &'a HashMap<mir::DefId, String>,
         param_tys: &'a [Vec<mir::Ty>],
+        discriminants: &'a mir::AdtDiscriminants,
         messages: &'a mut MsgTable,
     ) -> Self {
         Self {
@@ -572,6 +605,7 @@ impl<'a> FnLower<'a> {
             def_index,
             def_names,
             param_tys,
+            discriminants,
             messages,
             local_slots: Vec::new(),
             next_value: 0,
@@ -583,6 +617,27 @@ impl<'a> FnLower<'a> {
 
     fn err(&self, what: &str) -> JitError {
         unsup(&self.func.name, what)
+    }
+
+    /// The discriminant value of `variant_index` of the ADT `def`,
+    /// from the program's discriminant table. An ADT with no table
+    /// entry has the sequential values, so the index itself is the
+    /// value — the rule `sparagmos-mir` documents for the table's
+    /// consumers and the one the interpreter applies. An entry that
+    /// does not cover the variant is an error, as it is in the
+    /// interpreter.
+    fn discriminant_value(&self, def: mir::DefId, variant_index: u32) -> Result<i64, JitError> {
+        match self.discriminants.get(&def) {
+            None => Ok(variant_index as i64),
+            Some(values) => values
+                .get(variant_index as usize)
+                .map(|v| *v as i64)
+                .ok_or_else(|| {
+                    self.err(&format!(
+                        "discriminant table does not cover variant {variant_index}"
+                    ))
+                }),
+        }
     }
 
     fn fresh(&mut self) -> u32 {
@@ -886,7 +941,16 @@ impl<'a> FnLower<'a> {
             mir::ConstValue::Tuple(_) => {
                 return Err(self.err("tuple constant"));
             }
-            mir::ConstValue::Adt { .. } => return Err(self.err("ADT constant")),
+            mir::ConstValue::Adt { variant, fields } => {
+                if !fields.is_empty() {
+                    return Err(self.err("ADT constant with fields"));
+                }
+                let mir::Ty::Adt(def, _) = ctx else {
+                    return Err(self.err("ADT constant without an ADT type context"));
+                };
+                // A fieldless variant constant is its tag alone.
+                self.discriminant_value(*def, *variant)?
+            }
             mir::ConstValue::Ref(_) => {
                 return Err(self.err("reference constant"));
             }
@@ -948,7 +1012,23 @@ impl<'a> FnLower<'a> {
             | S::AscribeUserType(..)
             | S::Coverage
             | S::ConstEvalCounter => Ok(()),
-            S::SetDiscriminant { .. } => Err(self.err("SetDiscriminant statement")),
+            S::SetDiscriminant {
+                place,
+                variant_index,
+            } => {
+                let (dst, count, ty) = self.place_leaves(place)?;
+                let mir::Ty::Adt(def, _) = &ty else {
+                    return Err(self.err("SetDiscriminant on a non-ADT place"));
+                };
+                if count != 1 {
+                    return Err(self.err("SetDiscriminant on an ADT with a payload shape"));
+                }
+                // The place's single leaf is its tag: write the
+                // variant's discriminant value from the table.
+                let tag = self.discriminant_value(*def, *variant_index)?;
+                self.emit(Instr::Const { dst, imm: tag });
+                Ok(())
+            }
             S::Intrinsic(_) => Err(self.err("Intrinsic statement")),
         }
     }
@@ -1001,7 +1081,30 @@ impl<'a> FnLower<'a> {
             R::ThreadLocalRef(_) => Err(self.err("ThreadLocalRef rvalue")),
             R::RawPtr(..) => Err(self.err("RawPtr rvalue")),
             R::Len(_) => Err(self.err("Len rvalue")),
-            R::Discriminant(_) => Err(self.err("Discriminant rvalue")),
+            R::Discriminant(src_place) => {
+                let (dst, dst_count, dst_ty) = self.place_leaves(place)?;
+                if dst_count != 1 {
+                    return Err(self.err("Discriminant result is not a scalar"));
+                }
+                let (src, src_count, src_ty) = self.place_leaves(src_place)?;
+                if !matches!(src_ty, mir::Ty::Adt(..)) {
+                    return Err(self.err("Discriminant of a non-ADT place"));
+                }
+                if src_count != 1 {
+                    return Err(self.err("Discriminant of an ADT with a payload shape"));
+                }
+                // The ADT's single leaf holds the discriminant value
+                // itself; the read canonicalises it through the
+                // destination's (discriminant) type, so `SwitchInt`
+                // on the result compares against the same values the
+                // interpreter produces.
+                self.emit(Instr::Copy {
+                    dst,
+                    src: IrOperand::Value(src),
+                });
+                self.normalize(dst, &dst_ty);
+                Ok(())
+            }
             R::NullaryOp(..) => Err(self.err("NullaryOp rvalue")),
             R::ShallowInitBox(..) => Err(self.err("ShallowInitBox rvalue")),
             R::CopyForDeref(_) => Err(self.err("CopyForDeref rvalue")),
@@ -1794,8 +1897,26 @@ impl<'a> FnLower<'a> {
         kind: &mir::AggregateKind,
         ops: &[mir::Operand],
     ) -> Result<(), JitError> {
-        if !matches!(kind, mir::AggregateKind::Tuple) {
-            return Err(self.err(&format!("aggregate {}", kind.kind_name())));
+        match kind {
+            mir::AggregateKind::Tuple => {}
+            mir::AggregateKind::Adt {
+                def, variant_index, ..
+            } => {
+                if !ops.is_empty() {
+                    return Err(self.err("ADT aggregate with fields"));
+                }
+                let (dst, count, _) = self.place_leaves(place)?;
+                if count != 1 {
+                    return Err(self.err("ADT aggregate destination shape mismatch"));
+                }
+                // A fieldless variant's value is its tag alone.
+                let tag = self.discriminant_value(*def, *variant_index)?;
+                self.emit(Instr::Const { dst, imm: tag });
+                return Ok(());
+            }
+            other => {
+                return Err(self.err(&format!("aggregate {}", other.kind_name())));
+            }
         }
         let (dst, count, _) = self.place_leaves(place)?;
         if count != ops.len() {
