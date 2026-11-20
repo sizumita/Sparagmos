@@ -183,10 +183,13 @@ fn coroutine_typed_local_fails_conversion_with_reason() {
 }
 
 #[test]
-fn closure_typed_local_fails_conversion_with_reason() {
-    assert_unsupported_type(
-        body_with_local(mir::Ty::Closure(mir::DefId::new(0, 2), Vec::new())),
-        "Closure",
+fn closure_typed_local_converts() {
+    // Closure-typed locals are part of the callable value model:
+    // they convert (execution coverage lives in `callable_tests.rs`).
+    let body = body_with_local(mir::Ty::Closure(mir::DefId::new(0, 2), Vec::new()));
+    assert!(
+        convert_program(&program_with("typed", body)).is_ok(),
+        "closure-typed local must convert"
     );
 }
 
@@ -203,13 +206,16 @@ fn dynamic_typed_local_fails_conversion_with_reason() {
 }
 
 #[test]
-fn fnptr_typed_local_fails_conversion_with_reason() {
-    assert_unsupported_type(
-        body_with_local(mir::Ty::FnPtr(Box::new(mir::FnSig::new(
-            Vec::new(),
-            unit_ty(),
-        )))),
-        "FnPtr",
+fn fnptr_typed_local_converts() {
+    // Function-pointer locals are part of the callable value model:
+    // they convert (execution coverage lives in `callable_tests.rs`).
+    let body = body_with_local(mir::Ty::FnPtr(Box::new(mir::FnSig::new(
+        Vec::new(),
+        unit_ty(),
+    ))));
+    assert!(
+        convert_program(&program_with("typed", body)).is_ok(),
+        "fnptr-typed local must convert"
     );
 }
 
