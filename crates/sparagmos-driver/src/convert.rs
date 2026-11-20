@@ -71,7 +71,7 @@ impl Converter {
         sm::DefId::new(0, idx)
     }
 
-    fn crate_def_id<D: CrateDef>(&mut self, def: &D) -> sm::DefId {
+    pub fn crate_def_id<D: CrateDef>(&mut self, def: &D) -> sm::DefId {
         self.def_id(def.def_id())
     }
 

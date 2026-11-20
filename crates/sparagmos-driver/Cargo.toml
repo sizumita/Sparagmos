@@ -12,6 +12,7 @@ description = "Sparagmos rustc driver: obtains MIR via Stable MIR (rustc_public)
 
 [dependencies]
 sparagmos-mir = { path = "../sparagmos-mir" }
+sparagmos-interp = { path = "../sparagmos-interp" }
 
 [[bin]]
 name = "sparagmos-driver"

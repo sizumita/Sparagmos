@@ -56,7 +56,30 @@ aggregating the unhandled variants — this feeds the project's coverage
 measurement.
 
 `--dump <path>` writes the converted bodies in the crate's text dump
-format v0 (see `src/dump.rs`); the harness will read it in a later lane.
+format v0 (see `src/dump.rs`).
+
+### Run mode: execute a program end to end
+
+```sh
+./target/debug/sparagmos-driver run <file.rs> [--edition 2021]
+```
+
+Converts the file as above and then executes its `main` in the
+Sparagmos interpreter (`sparagmos-interp`), in the same process.
+Exit codes:
+
+- `0` — the guest program terminated normally;
+- `101` — the guest program panicked (the panic message is printed
+  to stderr);
+- `2` — the program could not be converted or executed; stderr
+  carries the concrete reason (the unsupported construct, and the
+  names of any calls that have no converted body).
+
+Run mode prints nothing to stdout — stdout is the guest program's
+channel. Guest output is not modelled yet: a program whose `main`
+calls into std's print machinery fails conversion/execution and
+exits 2 with the reason above. The corpus harness
+(`sparagmos-harness`) drives this mode through these exit codes.
 
 ## Notes / limitations (v0)
 
