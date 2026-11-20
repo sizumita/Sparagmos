@@ -204,10 +204,24 @@ pub fn collect_reachable(
     for rec in &records {
         match &rec.kind {
             RecordKind::WithBody { body, .. } => match conv.convert_body(body) {
-                Ok(b) => {
-                    converted.push(Some(b));
-                    failed.push(None);
-                }
+                Ok(b) => match unrepresentable_local(&b) {
+                    Some(what) => {
+                        let mut reasons: std::collections::BTreeMap<String, usize> =
+                            Default::default();
+                        reasons.insert(
+                            format!(
+                                "body uses a type the runtime cannot represent ({what})"
+                            ),
+                            1,
+                        );
+                        converted.push(None);
+                        failed.push(Some(reasons));
+                    }
+                    None => {
+                        converted.push(Some(b));
+                        failed.push(None);
+                    }
+                },
                 Err(errs) => {
                     let mut reasons: std::collections::BTreeMap<String, usize> =
                         Default::default();
@@ -336,4 +350,49 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// A converted body is only collected when every local's type has a
+/// runtime representation. The interpreter (and the JIT) reject the
+/// remaining types — trait objects, closures, coroutines, function
+/// items and pointers, `f16` / `f128`, arrays of unknown length —
+/// when converting a program, so a body using one could never
+/// execute; including it would also fail the conversion of the
+/// whole program, even for callers that never reach it. Such
+/// functions stay body-less, with the offending type recorded as
+/// the reason. ADT types are accepted without inspecting their
+/// arguments, matching how the runtime converts them (by name).
+fn unrepresentable_local(body: &sm::Body) -> Option<String> {
+    /// The kind name of the first type inside `ty` that has no
+    /// runtime representation, if any.
+    fn offending(ty: &sm::Ty) -> Option<String> {
+        match ty {
+            sm::Ty::Bool
+            | sm::Ty::Int(_)
+            | sm::Ty::Uint(_)
+            | sm::Ty::Char
+            | sm::Ty::Never
+            | sm::Ty::Str
+            | sm::Ty::Adt(..) => None,
+            sm::Ty::Float(ft) => match ft {
+                sm::FloatTy::F32 | sm::FloatTy::F64 => None,
+                _ => Some(ty.kind_name().to_string()),
+            },
+            sm::Ty::Tuple(ts) => ts.iter().find_map(offending),
+            sm::Ty::Ref(_, inner, _) | sm::Ty::RawPtr(inner, _) => offending(inner),
+            sm::Ty::Array(elem, len) => {
+                if matches!(len, sm::ArrayLen::Known(_)) {
+                    offending(elem)
+                } else {
+                    Some(ty.kind_name().to_string())
+                }
+            }
+            sm::Ty::Slice(elem) => offending(elem),
+            _ => Some(ty.kind_name().to_string()),
+        }
+    }
+    body.local_decls
+        .iter()
+        .enumerate()
+        .find_map(|(i, decl)| offending(&decl.ty).map(|kind| format!("{kind} in local _{i}")))
 }
