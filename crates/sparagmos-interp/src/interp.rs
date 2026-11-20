@@ -1105,6 +1105,15 @@ impl<'a> Interpreter<'a> {
                         .unwrap_or(P::Unknown);
                     work.push((path, plan));
                 }
+                P::RefCellRelease { mutable } => {
+                    // A moved-out / never-written guard has no
+                    // borrow to release, exactly like drop flags in
+                    // real MIR.
+                    let Some(guard) = self.read_at(frames, &root, &path)? else {
+                        continue;
+                    };
+                    self.release_refcell_borrow(frames, &guard, mutable)?;
+                }
                 P::CallDtor { func } => {
                     if self.read_at(frames, &root, &path)?.is_none() {
                         // Moved out of / never written: no glue, as
@@ -1634,6 +1643,117 @@ impl<'a> Interpreter<'a> {
                 Ok(())
             }
         }
+    }
+
+    /// The live place a `&RefCell` / `&mut RefCell` argument points
+    /// at. Borrowing needs a place: the flag lives inside the cell's
+    /// storage and must be written back, which a constant aggregate
+    /// (`RefTarget::Value`) cannot do — that case is an explicit
+    /// unsupported error, never a silent no-op.
+    pub(crate) fn refcell_place(&self, value: &Value, name: &str) -> InterpResult<RefTarget> {
+        match value {
+            Value::Ref(target @ RefTarget::Place { .. }) => Ok(target.clone()),
+            Value::Ref(_) => Err(InterpError::UnsupportedTerminator {
+                kind: format!(
+                    "runtime support: {name} on a RefCell with no live place \
+                     (constant aggregate) cannot track borrows"
+                ),
+            }),
+            other => Err(InterpError::type_mismatch(
+                name,
+                "reference to RefCell",
+                other.kind_name(),
+            )),
+        }
+    }
+
+    /// Read the borrow flag of the `Cell` aggregate `flag_cell`
+    /// points at: 0 = unused, -1 = mutably borrowed, n > 0 = n
+    /// shared borrows.
+    pub(crate) fn refcell_flag(
+        &self,
+        frames: &[Frame],
+        flag_cell: &RefTarget,
+    ) -> InterpResult<i128> {
+        let resolved = self.deref_value(frames, &Value::Ref(flag_cell.clone()))?;
+        let cell = self.read_resolved(frames, &resolved)?;
+        match cell {
+            Value::Enum { fields, .. } if fields.len() == 1 => match &fields[0] {
+                Value::Enum { fields: inner, .. } if inner.len() == 1 => match inner[0] {
+                    Value::Int(flag) => Ok(flag),
+                    ref other => Err(InterpError::type_mismatch(
+                        "RefCell borrow flag",
+                        "isize flag",
+                        other.kind_name(),
+                    )),
+                },
+                other => Err(InterpError::type_mismatch(
+                    "RefCell borrow flag",
+                    "UnsafeCell aggregate",
+                    other.kind_name(),
+                )),
+            },
+            ref other => Err(InterpError::type_mismatch(
+                "RefCell borrow flag",
+                "Cell aggregate",
+                other.kind_name(),
+            )),
+        }
+    }
+
+    /// Write the borrow flag of the `Cell` aggregate `flag_cell`
+    /// points at, rebuilding the `Cell { UnsafeCell { flag } }`
+    /// aggregate in place.
+    pub(crate) fn refcell_set_flag(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        flag_cell: &RefTarget,
+        flag: i128,
+    ) -> InterpResult<()> {
+        let resolved = self.deref_value(frames, &Value::Ref(flag_cell.clone()))?;
+        let cell = Value::Enum {
+            variant: 0,
+            fields: vec![Value::Enum {
+                variant: 0,
+                fields: vec![Value::Int(flag)],
+            }],
+        };
+        self.write_resolved(frames, &resolved, cell)
+    }
+
+    /// Release the borrow held by a `Ref` / `RefMut` guard value:
+    /// field 1 is the reference to the cell's borrow-flag `Cell`.
+    /// A shared release decrements the count; a mutable release
+    /// resets the flag to unused (0).
+    pub(crate) fn release_refcell_borrow(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        guard: &Value,
+        mutable: bool,
+    ) -> InterpResult<()> {
+        let flag_ref = match guard {
+            Value::Enum { fields, .. } if fields.len() == 2 => &fields[1],
+            other => {
+                return Err(InterpError::type_mismatch(
+                    "RefCell guard drop",
+                    "Ref/RefMut guard aggregate",
+                    other.kind_name(),
+                ))
+            }
+        };
+        let flag_target = match flag_ref {
+            Value::Ref(target) => target.clone(),
+            other => {
+                return Err(InterpError::type_mismatch(
+                    "RefCell guard drop",
+                    "reference to the borrow-flag Cell",
+                    other.kind_name(),
+                ))
+            }
+        };
+        let flag = self.refcell_flag(frames, &flag_target)?;
+        let next = if mutable { 0 } else { flag - 1 };
+        self.refcell_set_flag(frames, &flag_target, next)
     }
 
     pub(crate) fn read_place(
@@ -2873,4 +2993,29 @@ fn eval_cast(v: &Value, ty: &Ty) -> InterpResult<Value> {
 /// Convenience one-shot entry point with the default configuration.
 pub fn interpret(program: &Program, entry: &str, args: Vec<Value>) -> InterpResult<Value> {
     Interpreter::new(program).run(entry, args)
+}
+
+/// Extend a `RefCell` place target with a field path inside the
+/// cell. Only place targets can be extended; guard construction
+/// starts from `Interpreter::refcell_place`, which has already
+/// rejected the rest.
+pub(crate) fn refcell_sub_target(cell: &RefTarget, path: &[RefProj]) -> RefTarget {
+    match cell {
+        RefTarget::Place {
+            frame,
+            local,
+            projection,
+        } => {
+            let mut projection = projection.clone();
+            projection.extend_from_slice(path);
+            RefTarget::Place {
+                frame: *frame,
+                local: *local,
+                projection,
+            }
+        }
+        // Unreachable through `refcell_place`; keep the target as-is
+        // rather than panicking in the model.
+        other => other.clone(),
+    }
 }
