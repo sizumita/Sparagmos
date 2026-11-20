@@ -204,9 +204,10 @@ fn layout_constant_converts() {
 }
 
 const WITH_CAPACITY_RS: &str = "\
+use std::collections::VecDeque;
 fn main() {
-    let v: Vec<i32> = Vec::with_capacity(4);
-    println!(\"{}\", v.capacity());
+    let d: VecDeque<i32> = VecDeque::with_capacity(4);
+    println!(\"{}\", d.len());
 }
 ";
 
@@ -216,6 +217,10 @@ fn collected_rawvec_bodies_convert() {
     // lane is about: a fieldless `AllocInit` (1-byte tag), the
     // pattern-typed capacity wrapper, and niche-encoded
     // `Result<Layout, LayoutError>` / `TryReserveError` values.
+    // The route in is `VecDeque::with_capacity`, which builds its
+    // buffer through `RawVecInner`; `Vec::with_capacity` itself is
+    // an interpreter builtin (the abstract Vec model), so its body
+    // is not collected.
     let fixture = write_fixture("with_capacity", WITH_CAPACITY_RS);
     let (stdout, _, status) = run_driver(&[], &fixture);
     assert!(status.success(), "driver failed: {stdout}");

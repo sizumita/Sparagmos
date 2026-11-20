@@ -1428,30 +1428,21 @@ impl<'a> Converter<'a> {
                         mir::PointerCoercion::ClosureFnPointer,
                     ) => ir::Rvalue::Use(v),
                     mir::CastKind::BoxDerefTransmute => ir::Rvalue::BoxDerefTransmute(v),
-                    // A transmute from a pointer / reference to an
-                    // integer is the one transmute shape this value
-                    // model can evaluate: it yields the pointer's
-                    // synthetic address (see `eval_cast`). It is what
-                    // the raw-pointer precondition checks rustc
-                    // emits around dereferences reduce to. Every
-                    // other transmute shape stays an explicit
-                    // unsupported rvalue.
-                    mir::CastKind::Transmute
-                        if matches!(
-                            ctx.as_ref(),
-                            Some(mir::Ty::Ref(..) | mir::Ty::RawPtr(..))
-                        ) =>
-                    {
-                        match self.convert_ty(target, "cast target") {
-                            Ok(t @ (ir::Ty::Int(_) | ir::Ty::Uint(_))) => {
-                                ir::Rvalue::Cast(v, t)
-                            }
-                            _ => ir::Rvalue::Unsupported(format!(
-                                "Cast {}",
-                                kind.name()
-                            )),
-                        }
-                    }
+                    // A pointer-to-integer `transmute` (what the
+                    // compiler's UB precondition checks use to test a
+                    // pointer for null / alignment) becomes the
+                    // model's synthetic address. Every other
+                    // transmute shape stays unsupported: the model
+                    // cannot reinterpret a value's bytes, and
+                    // inventing an integer-to-pointer target would
+                    // fabricate a reference.
+                    mir::CastKind::Transmute => match (&ctx, target) {
+                        (
+                            Some(mir::Ty::RawPtr(..) | mir::Ty::Ref(..)),
+                            mir::Ty::Int(_) | mir::Ty::Uint(_),
+                        ) => ir::Rvalue::PtrToInt(v),
+                        _ => ir::Rvalue::Unsupported("Cast Transmute".to_string()),
+                    },
                     other => ir::Rvalue::Unsupported(format!("Cast {}", other.name())),
                 }
             }

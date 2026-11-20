@@ -397,6 +397,17 @@ pub enum Rvalue {
     /// (`Unique` around `NonNull` around the pointer); yields the
     /// raw pointer itself.
     BoxDerefTransmute(Operand),
+    /// A `Transmute` cast from a pointer/reference value to an
+    /// integer: the pointer's address. The model has no flat memory,
+    /// so the address is synthetic: a deterministic, non-zero,
+    /// 4096-aligned value derived from the reference target (the
+    /// same target always yields the same address). That is all the
+    /// observable behavior the model's pointers can honestly offer:
+    /// equality, null and alignment checks (the compiler's UB
+    /// precondition checks transmute pointers to `usize` for exactly
+    /// those) behave correctly; the numeric value itself is not a
+    /// real address and must not be turned back into a pointer.
+    PtrToInt(Operand),
     /// `&place` (also raw-pointer creation): a resolved reference value.
     Ref(Place),
     /// The length of the value at a place (array / slice / `str`).

@@ -1203,3 +1203,114 @@ fn run_mode_const_closure_fn_ptr_with_args() {
 fn run_mode_const_fn_item() {
     run_expect_42("const-fn-item", "const_fn_item.rs", CONST_FN_ITEM_SRC);
 }
+
+// ----- Vec allocation paths (Lane BO) -----
+
+const VEC_DROPPABLE_SRC: &str = r#"
+struct D(i32);
+impl Drop for D {
+    fn drop(&mut self) {
+        println!("drop {}", self.0);
+    }
+}
+fn main() {
+    let v = vec![D(3), D(4)];
+    println!("len {}", v.len());
+    drop(v);
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_vec_macro_of_droppables() {
+    // The `vec![...]` list form builds the vector through
+    // `Box::new_uninit` + `box_assume_init_into_vec_unsafe`, whose
+    // real bodies bottom out in the runtime allocator
+    // (`Global::alloc_impl_runtime` has no body). The interpreter
+    // models those entry points, so a Vec of droppable elements
+    // runs end to end and the element destructors run in order,
+    // byte for byte as natively.
+    let dir = temp_dir("vecdroppable");
+    let src = fixture(&dir, "vecdroppable.rs", VEC_DROPPABLE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "vec! of droppables must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "len 2\ndrop 3\ndrop 4\ndone\n",
+        "vec! elements drop in order, exactly as natively"
+    );
+}
+
+const VEC_GROWTH_SRC: &str = r#"
+struct D(i32);
+impl Drop for D {
+    fn drop(&mut self) {
+        println!("drop {}", self.0);
+    }
+}
+fn main() {
+    let mut v: Vec<D> = Vec::with_capacity(4);
+    v.reserve(8);
+    v.push(D(1));
+    v.push(D(2));
+    println!("len {}", v.len());
+}
+"#;
+
+#[test]
+fn run_mode_vec_with_capacity_push_and_reserve() {
+    // `with_capacity` and `reserve` are allocation entry points:
+    // the abstract Vec model does not represent capacity, so both
+    // are modelled (an empty vector / a no-op) and pushes onto the
+    // reserved vector behave as natively, including the scope-end
+    // drop of the elements.
+    let dir = temp_dir("vecgrowth");
+    let src = fixture(&dir, "vecgrowth.rs", VEC_GROWTH_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "with_capacity/reserve/push must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "len 2\ndrop 1\ndrop 2\n",
+        "reserved Vec pushes and drops exactly as natively"
+    );
+}
+
+const VEC_REPEAT_SRC: &str = r#"
+fn main() {
+    let v = vec![7; 4];
+    println!("len {} sum {}", v.len(), v[0] + v[3]);
+    let w = vec![String::from("ab"); 2];
+    println!("{} {}", w.len(), w[1]);
+}
+"#;
+
+#[test]
+fn run_mode_vec_repeat_form() {
+    // The `vec![x; n]` repeat form goes through
+    // `std::vec::from_elem`, another allocation entry point the
+    // interpreter models.
+    let dir = temp_dir("vecrepeat");
+    let src = fixture(&dir, "vecrepeat.rs", VEC_REPEAT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "vec![x; n] must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "len 4 sum 14\n2 ab\n",
+        "repeat-form Vec behaves exactly as natively"
+    );
+}

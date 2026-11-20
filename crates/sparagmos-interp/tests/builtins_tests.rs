@@ -179,6 +179,12 @@ const PARTIAL_LE: mir::DefId = mir::DefId::new(0, 209);
 const VEC_TY: mir::DefId = mir::DefId::new(0, 210);
 const VEC_NEW: mir::DefId = mir::DefId::new(0, 211);
 const VEC_PUSH: mir::DefId = mir::DefId::new(0, 212);
+const VEC_WITH_CAPACITY: mir::DefId = mir::DefId::new(0, 239);
+const VEC_RESERVE: mir::DefId = mir::DefId::new(0, 240);
+const VEC_CAPACITY: mir::DefId = mir::DefId::new(0, 241);
+const VEC_FROM_ELEM: mir::DefId = mir::DefId::new(0, 242);
+const BOX_NEW_UNINIT: mir::DefId = mir::DefId::new(0, 243);
+const BOX_ASSUME_INIT_INTO_VEC: mir::DefId = mir::DefId::new(0, 244);
 const VEC_LEN: mir::DefId = mir::DefId::new(0, 213);
 const INDEX: mir::DefId = mir::DefId::new(0, 214);
 const INDEX_MUT: mir::DefId = mir::DefId::new(0, 215);
@@ -221,6 +227,15 @@ fn std_names() -> HashMap<mir::DefId, String> {
         (VEC_TY, "std::vec::Vec".to_string()),
         (VEC_NEW, "std::vec::Vec::<T>::new".to_string()),
         (VEC_PUSH, "std::vec::Vec::<T, A>::push".to_string()),
+        (VEC_WITH_CAPACITY, "std::vec::Vec::<T>::with_capacity".to_string()),
+        (VEC_RESERVE, "std::vec::Vec::<T, A>::reserve".to_string()),
+        (VEC_CAPACITY, "std::vec::Vec::<T, A>::capacity".to_string()),
+        (VEC_FROM_ELEM, "std::vec::from_elem".to_string()),
+        (BOX_NEW_UNINIT, "std::boxed::Box::<T>::new_uninit".to_string()),
+        (
+            BOX_ASSUME_INIT_INTO_VEC,
+            "std::boxed::box_assume_init_into_vec_unsafe".to_string(),
+        ),
         (VEC_LEN, "std::vec::Vec::<T, A>::len".to_string()),
         (INDEX, "std::ops::Index::index".to_string()),
         (INDEX_MUT, "std::ops::IndexMut::index_mut".to_string()),
@@ -1829,4 +1844,327 @@ fn ptr_null_compares_unequal_to_a_real_reference_and_equal_to_null() {
     );
     let value = interpret_mir(&program_bi(body), "main", vec![]).expect("run");
     assert_eq!(value, Value::Bool(true));
+}
+
+// ----- the Vec allocation entry points (Lane BO) ----------------------------
+
+#[test]
+fn vec_with_capacity_reserve_then_push_and_len() {
+    // fn main() -> i32 {
+    //   _1 = Vec::with_capacity(4);
+    //   Vec::reserve(&mut _1, 8);
+    //   Vec::push(&mut _1, 10); Vec::push(&mut _1, 20);
+    //   return Vec::len(&_1) as i32;   // 2
+    // }
+    // Capacity is not represented in the value model: with_capacity
+    // yields the empty vector and reserve is a no-op, so the
+    // observable behavior (length, elements) is the native one.
+    let body = mir::Body::new(
+        decls(&[
+            i32_ty(),                    // _0
+            vec_i32_ty(),                // _1 vec
+            ref_ty(vec_i32_ty(), true),  // _2 &mut vec (reserve)
+            mir::Ty::unit(),             // _3 reserve result
+            ref_ty(vec_i32_ty(), true),  // _4 &mut vec (push)
+            mir::Ty::unit(),             // _5 push result
+            ref_ty(vec_i32_ty(), true),  // _6 &mut vec (push)
+            mir::Ty::unit(),             // _7 push result
+            ref_ty(vec_i32_ty(), false), // _8 &vec
+            usize_ty(),                  // _9 len
+        ]),
+        0,
+        vec![
+            block(
+                vec![],
+                call(fndef(VEC_WITH_CAPACITY, vec![i32_ty()]), vec![const_usize(4)], 1, 1),
+            ),
+            block(
+                vec![assign(place(2), ref_rvalue(1, true))],
+                call(
+                    fndef(VEC_RESERVE, vec![i32_ty()]),
+                    vec![move_(2), const_usize(8)],
+                    3,
+                    2,
+                ),
+            ),
+            block(
+                vec![assign(place(4), ref_rvalue(1, true))],
+                call(
+                    fndef(VEC_PUSH, vec![i32_ty()]),
+                    vec![move_(4), const_i32(10)],
+                    5,
+                    3,
+                ),
+            ),
+            block(
+                vec![assign(place(6), ref_rvalue(1, true))],
+                call(
+                    fndef(VEC_PUSH, vec![i32_ty()]),
+                    vec![move_(6), const_i32(20)],
+                    7,
+                    4,
+                ),
+            ),
+            block(
+                vec![assign(place(8), ref_rvalue(1, false))],
+                call(fndef(VEC_LEN, vec![i32_ty()]), vec![move_(8)], 9, 5),
+            ),
+            block(
+                vec![assign(
+                    place(0),
+                    mir::Rvalue::Cast(mir::CastKind::IntToInt, copy(9), i32_ty()),
+                )],
+                ret(),
+            ),
+        ],
+    );
+    let value = interpret_mir(&program(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Int(2));
+}
+
+#[test]
+fn vec_from_elem_repeats_the_element() {
+    // fn main() -> i32 {
+    //   _1 = std::vec::from_elem(7, 3);
+    //   return *Index::index(&_1, 2) + (Vec::len(&_1) as i32);  // 7 + 3
+    // }
+    let body = mir::Body::new(
+        decls(&[
+            i32_ty(),                    // _0
+            vec_i32_ty(),                // _1 vec
+            ref_ty(vec_i32_ty(), false), // _2 &vec
+            ref_ty(i32_ty(), false),     // _3 &elem
+            i32_ty(),                    // _4 elem
+            ref_ty(vec_i32_ty(), false), // _5 &vec
+            usize_ty(),                  // _6 len
+            i32_ty(),                    // _7 len as i32
+        ]),
+        0,
+        vec![
+            block(
+                vec![],
+                call(
+                    fndef(VEC_FROM_ELEM, vec![i32_ty()]),
+                    vec![const_i32(7), const_usize(3)],
+                    1,
+                    1,
+                ),
+            ),
+            block(
+                vec![assign(place(2), ref_rvalue(1, false))],
+                call(
+                    fndef(INDEX, vec![vec_i32_ty(), usize_ty()]),
+                    vec![move_(2), const_usize(2)],
+                    3,
+                    2,
+                ),
+            ),
+            block(
+                vec![
+                    assign(place(4), mir::Rvalue::Use(mir::Operand::Copy(deref_place(3)))),
+                    assign(place(5), ref_rvalue(1, false)),
+                ],
+                call(fndef(VEC_LEN, vec![i32_ty()]), vec![move_(5)], 6, 3),
+            ),
+            block(
+                vec![
+                    assign(
+                        place(7),
+                        mir::Rvalue::Cast(mir::CastKind::IntToInt, copy(6), i32_ty()),
+                    ),
+                    assign(
+                        place(0),
+                        mir::Rvalue::BinaryOp(
+                            mir::BinOp::Add,
+                            Box::new((copy(4), copy(7))),
+                        ),
+                    ),
+                ],
+                ret(),
+            ),
+        ],
+    );
+    let value = interpret_mir(&program(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Int(10));
+}
+
+#[test]
+fn vec_capacity_is_an_explicit_error() {
+    // fn main() { _1 = Vec::new(); _3 = Vec::capacity(&_1); }
+    // Capacity has no representation in the value model, so the
+    // call fails with an explicit error naming the function instead
+    // of projecting the abstract value as if it had the std layout.
+    let body = mir::Body::new(
+        decls(&[
+            mir::Ty::unit(),             // _0
+            vec_i32_ty(),                // _1 vec
+            ref_ty(vec_i32_ty(), false), // _2 &vec
+            usize_ty(),                  // _3 capacity
+        ]),
+        0,
+        vec![
+            block(vec![], call(fndef(VEC_NEW, vec![i32_ty()]), vec![], 1, 1)),
+            block(
+                vec![assign(place(2), ref_rvalue(1, false))],
+                call(fndef(VEC_CAPACITY, vec![i32_ty()]), vec![move_(2)], 3, 2),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let err = interpret_mir(&program(body), "main", vec![])
+        .expect_err("Vec::capacity must fail explicitly");
+    match err {
+        MirRunError::Interp(InterpError::UnsupportedTerminator { kind }) => {
+            assert!(
+                kind.contains("Vec::capacity is not runtime-supported"),
+                "error names the function: {kind}"
+            );
+        }
+        other => panic!("expected an explicit unsupported error, got {other:?}"),
+    }
+}
+
+fn field_place(idx: u32, fields: &[(u32, mir::Ty)]) -> mir::Place {
+    mir::Place {
+        local: mir::Local(idx),
+        projection: fields
+            .iter()
+            .map(|(i, ty)| mir::PlaceElem::Field(*i, ty.clone()))
+            .collect(),
+    }
+}
+
+fn deref_field_place(idx: u32, fields: &[(u32, mir::Ty)]) -> mir::Place {
+    let mut projection = vec![mir::PlaceElem::Deref];
+    projection.extend(
+        fields
+            .iter()
+            .map(|(i, ty)| mir::PlaceElem::Field(*i, ty.clone())),
+    );
+    mir::Place {
+        local: mir::Local(idx),
+        projection,
+    }
+}
+
+#[test]
+fn box_new_uninit_write_then_assume_init_into_vec() {
+    // The `vec![1, 2, 3]` expansion, shaped as rustc 1.100 emits it:
+    // fn main() -> i32 {
+    //   _1 = Box::<[i32; 3]>::new_uninit();
+    //   _3 = BoxDerefTransmute(copy _1.0);
+    //   ((*_3).1: ManuallyDrop<[i32; 3]>).0 = [1, 2, 3];
+    //   _4 = box_assume_init_into_vec_unsafe(copy _1);
+    //   return *Index::index(&_4, 0) + *Index::index(&_4, 1)
+    //        + *Index::index(&_4, 2);   // 6
+    // }
+    let array_ty = mir::Ty::Array(Box::new(i32_ty()), mir::ArrayLen::Known(3));
+    let box_ty = mir::Ty::Adt(BOX_TY, vec![array_ty.clone()]);
+    let raw_ptr_ty = mir::Ty::RawPtr(Box::new(array_ty.clone()), mir::Mutability::Mut);
+    let body = mir::Body::new(
+        decls(&[
+            i32_ty(),                    // _0
+            box_ty.clone(),              // _1 box
+            box_ty.clone(),              // _2 box field copy source type (unused shape)
+            raw_ptr_ty,                  // _3 raw ptr
+            vec_i32_ty(),                // _4 vec
+            ref_ty(vec_i32_ty(), false), // _5 &vec
+            ref_ty(i32_ty(), false),     // _6 &elem
+            i32_ty(),                    // _7 elem 0
+            ref_ty(vec_i32_ty(), false), // _8 &vec
+            ref_ty(i32_ty(), false),     // _9 &elem
+            i32_ty(),                    // _10 elem 1
+            ref_ty(vec_i32_ty(), false), // _11 &vec
+            ref_ty(i32_ty(), false),     // _12 &elem
+            i32_ty(),                    // _13 elem 2
+            i32_ty(),                    // _14 partial sum
+        ]),
+        0,
+        vec![
+            block(
+                vec![],
+                call(fndef(BOX_NEW_UNINIT, vec![array_ty.clone()]), vec![], 1, 1),
+            ),
+            block(
+                vec![
+                    assign(
+                        place(3),
+                        mir::Rvalue::Cast(
+                            mir::CastKind::BoxDerefTransmute,
+                            mir::Operand::Copy(field_place(1, &[(0, box_ty.clone())])),
+                            mir::Ty::RawPtr(Box::new(array_ty.clone()), mir::Mutability::Mut),
+                        ),
+                    ),
+                    assign(
+                        deref_field_place(3, &[(1, array_ty.clone()), (0, array_ty.clone())]),
+                        mir::Rvalue::Aggregate(
+                            Box::new(mir::AggregateKind::Array(i32_ty())),
+                            vec![const_i32(1), const_i32(2), const_i32(3)],
+                        ),
+                    ),
+                ],
+                call(
+                    fndef(BOX_ASSUME_INIT_INTO_VEC, vec![i32_ty(), array_ty.clone()]),
+                    vec![copy(1)],
+                    4,
+                    2,
+                ),
+            ),
+            block(
+                vec![assign(place(5), ref_rvalue(4, false))],
+                call(
+                    fndef(INDEX, vec![vec_i32_ty(), usize_ty()]),
+                    vec![move_(5), const_usize(0)],
+                    6,
+                    3,
+                ),
+            ),
+            block(
+                vec![
+                    assign(place(7), mir::Rvalue::Use(mir::Operand::Copy(deref_place(6)))),
+                    assign(place(8), ref_rvalue(4, false)),
+                ],
+                call(
+                    fndef(INDEX, vec![vec_i32_ty(), usize_ty()]),
+                    vec![move_(8), const_usize(1)],
+                    9,
+                    4,
+                ),
+            ),
+            block(
+                vec![
+                    assign(place(10), mir::Rvalue::Use(mir::Operand::Copy(deref_place(9)))),
+                    assign(place(11), ref_rvalue(4, false)),
+                ],
+                call(
+                    fndef(INDEX, vec![vec_i32_ty(), usize_ty()]),
+                    vec![move_(11), const_usize(2)],
+                    12,
+                    5,
+                ),
+            ),
+            block(
+                vec![
+                    assign(place(13), mir::Rvalue::Use(mir::Operand::Copy(deref_place(12)))),
+                    assign(
+                        place(14),
+                        mir::Rvalue::BinaryOp(
+                            mir::BinOp::Add,
+                            Box::new((copy(7), copy(10))),
+                        ),
+                    ),
+                    assign(
+                        place(0),
+                        mir::Rvalue::BinaryOp(
+                            mir::BinOp::Add,
+                            Box::new((copy(14), copy(13))),
+                        ),
+                    ),
+                ],
+                ret(),
+            ),
+        ],
+    );
+    let value = interpret_mir(&program(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Int(6));
 }
