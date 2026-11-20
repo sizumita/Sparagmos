@@ -796,6 +796,12 @@ Drop ターミネータ、Transmute キャスト、Subslice 射影、
 変換を失敗させる。本体単位で変換の成否を分離するのは interp
 側の課題として残る。
 
+#### トレイト宣言メソッドのキー統一 (2026-11-21、lane/trait-method-key、Issue #64)
+
+トレイト宣言メソッドへの呼び出しは `FnDef` 対象がトレイト宣言を名指すため `(トレイト定義, 解決済み instance)` でキーされるが、アイテム走査は impl メソッドを `(impl 定義, instance)` で登録しており、両キーが一致せず impl 本体が変換済みでも実行時に「no converted body」で失敗していた。ドライバにエイリアス登録パスを追加した: 変換済み本体 (ローカルアイテム・要求 instance・到達可能性収集した外部本体) の Stable MIR 呼び出し対象を走査し、解決先 instance の本体が impl キーに存在してトレイトキーに無い場合、その本体のコピーをトレイトキーで登録する (汎用 impl メソッドは Lane BA の要求 instance 収集が既に参照キーで登録しており、本パスはアイテム走査で変換された非汎用 impl メソッドの穴を埋める)。あわせて interp の `CastKind::PointerExposeProvenance` (`ptr as usize`) を合成アドレスへのキャストとして評価可能にした (ポインタ→整数 Transmute と同じ扱い)。
+
+レーン単独の実測 (base main 864a7e8 との単一ラン比較、subset-bvbase.json / subset-bv2.json、--jobs 48): 指標2(b) 全体 **65.501% → 66.066%** (16,334 → 16,475)、実行系 **1,813 → 1,954 (+141)**、コンパイル時検証系は 14,521 で不変 (stage 2 は無関係)。テスト単位の反転は改善 142 / 悪化 1。悪化 1 件 `tests/ui/derives/deriving-with-repr-packed-3.rs` は偽 pass の是正: 従来はトレイトキーに本体が無いため PartialEq の builtin (構造比較) が派生 eq 本体を迂回してパスしていたが、本来の派生 eq が実行されるようになり、`Aligned::eq` 内の `std::mem::align_of::<Aligned>()` (ユーザー ADT のレイアウトは interp に ADT レイアウト表が無く未対応) で正直に unsupported になった。なお同テストが使う `ptr as usize` は本レーンのキャスト対応で実行可能になっている。
+
 #### combined 再実測 both11 (2026-11-21、main 379e0ac)
 
 Lane BA/BG/BK/BH/BP/BJ 統合後の単一ラン再実測 (subset-both11.json、--jobs 48): 指標2(b) 全体 **62.195% → 65.204%** (16,260/24,937)。実行系 1,751/4,149 = 42.203%、コンパイル時検証系 14,509/18,332 = 79.146%。残りバケット上位: 単相化 instance 無し 1,346、評価不能条件 935 (Lane BM 対応中)、本体なし呼び出し 872、型不一致 235、interp 型モデル 256、Drop 未対応 54。 この実測の後に Lane BI (builtins round 2)、Lane BF (dyn 型モデル)、Lane BN (aux spec) が統合されており、増分は次回 combined 実測で確定する。
