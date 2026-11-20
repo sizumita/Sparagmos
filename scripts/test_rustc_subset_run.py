@@ -44,6 +44,18 @@ class HeaderTests(unittest.TestCase):
         h = header("// run-pass\n/* //@ run-fail */\n")
         self.assertIsNone(run.run_mode(h))
 
+    def test_scoped_directive_with_space_after_prefix(self):
+        # compiletest trims whitespace after `//@` before the
+        # optional [revision] scope, so `//@ [lib] compile-flags:`
+        # is the same directive as `//@[lib] compile-flags:`.
+        h = header("//@ revisions: lib bin\n"
+                   "//@ [lib] compile-flags: --crate-type lib\n"
+                   "//@[bin] compile-flags: --crate-type bin\n")
+        self.assertEqual(run.compile_flags(h.view("lib")),
+                         ["--crate-type", "lib"])
+        self.assertEqual(run.compile_flags(h.view("bin")),
+                         ["--crate-type", "bin"])
+
 
 class BlockerTests(unittest.TestCase):
     def rec(self):
@@ -929,6 +941,55 @@ class ProcessStage2Tests(unittest.TestCase):
         res = run.process_test(rec, self.rust_dir, Path("/fake/driver"))
         self.assertEqual(res["status"], "not-attempted")
         self.assertIn("nature", res["bucket"])
+
+    def test_mir_opt_forwards_rlib_crate_type(self):
+        # compiletest compiles mir-opt tests as rlib crates; the
+        # runner forwards the crate type it prescribes.
+        rec = self.write_test("pub fn f() {}\n", suite="mir-opt")
+        res, captured = self.run_with_conv_capture(rec, conv())
+        self.assertEqual(res["status"], "pass")
+        args = captured["rustc_args"]
+        i = args.index("--crate-type")
+        self.assertEqual(args[i + 1], "rlib")
+
+    def test_ui_forwards_no_crate_type(self):
+        # compiletest names no crate type for a UI test file: the
+        # driver's convert mode must be left to the source-level
+        # declaration or the rustc default (bin).
+        rec = self.write_test("//@ check-pass\nfn main() {}\n")
+        res, captured = self.run_with_conv_capture(rec, conv())
+        self.assertEqual(res["status"], "pass")
+        self.assertNotIn("--crate-type", captured["rustc_args"])
+        self.assertFalse(any(a.startswith("--crate-type=")
+                             for a in captured["rustc_args"]))
+
+    def test_pretty_forwards_lib_crate_type(self):
+        # A pretty test is never compiled as a binary by compiletest
+        # (it stops at -Zunpretty output); the conversion proxy keeps
+        # the lib shape.
+        rec = self.write_test("pub fn f() {}\n", suite="pretty")
+        res, captured = self.run_with_conv_capture(rec, conv())
+        self.assertEqual(res["status"], "pass")
+        args = captured["rustc_args"]
+        i = args.index("--crate-type")
+        self.assertEqual(args[i + 1], "lib")
+
+    def test_pretty_declared_crate_type_is_left_alone(self):
+        rec = self.write_test("#![crate_type = \"rlib\"]\n"
+                              "pub fn f() {}\n", suite="pretty")
+        res, captured = self.run_with_conv_capture(rec, conv())
+        self.assertEqual(res["status"], "pass")
+        self.assertNotIn("--crate-type", captured["rustc_args"])
+
+    def test_own_crate_type_flag_wins_over_suite_default(self):
+        rec = self.write_test(
+            "//@ compile-flags: --crate-type=cdylib\n"
+            "pub fn f() {}\n", suite="mir-opt")
+        res, captured = self.run_with_conv_capture(rec, conv())
+        self.assertEqual(res["status"], "pass")
+        args = captured["rustc_args"]
+        self.assertNotIn("--crate-type", args)
+        self.assertIn("--crate-type=cdylib", args)
 
 
 

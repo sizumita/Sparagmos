@@ -700,6 +700,51 @@ components が成立した外国ターゲット向けテストで、
 both9 両実測 (minicore / revisions) に対して pass からの
 回帰は 0 件。
 
+crate-type の compiletest 準拠化と scoped 指令パースの
+combined 再実測 (bq2、2026-11-21、lane/crate-type-fidelity):
+both9 の census で残った dead_code の不一致 45 件の原因は、
+ドライバが変換対象を `--crate-type=lib` で固定して
+コンパイルしていたことだった。compiletest のソース
+(src/tools/compiletest/src/runtest.rs) を確認すると、
+compiletest はテスト本体に crate-type を一切指定しない
+(例外は mir-opt の `--crate-type=rlib` と minicore
+ビルドのみ)。指定が無ければ rustc の既定は bin であり、
+`fn main` は到達可能性の根になり、エントリポイント検査
+(E0601 など) が走る。lib では main は通常の非公開関数と
+して dead_code の対象になる。そこで convert モードの
+ドライバは crate-type を固定せず、転送された
+`--crate-type` かソースの `#![crate_type]` が無ければ
+rustc の既定 (bin) に従うようにした (run モードの lib
+固定は実行系の都合で不変)。ランナーの stage 2 は
+mir-opt に compiletest 自身の指定である rlib を転送し、
+pretty (compiletest は bin としてコンパイルしない) には
+従来の lib 変換を転送する。crate-type 変更のみの実測
+(bq1) ではコンパイル時検証系 14,041 → 14,224
+(76.593% → 77.591%)、全体 15,510 → 15,696
+(62.197% → 62.943%)。「コンパイル失敗だが成功期待」は
+326 → 177、「変換成功したが失敗期待」は 297 → 228 で、
+dead_code のエラーが先頭に来る成功期待の失敗は
+38 件 → 0 件になった。
+測定中に第二の不整合も見つけた: ランナーの指令パースが
+`//@ [lib] compile-flags:` のような空白入りの scoped
+指令を丸ごと落としていた (compiletest のパーサは
+`//@` の後の空白を許す)。lib 固定がこの欠落を隠して
+いた。修正後の最終実測 (bq2、--jobs 48) はコンパイル時
+検証系 14,183 / 18,332 = 77.367%、実行系
+1,472 / 4,149 = 35.478%、全体 15,655 / 24,937 =
+62.778%。「変換成功したが失敗期待」はさらに 168 件
+まで減った (scoped な check-fail / compile-flags が
+効くようになったため)。一方で、指令を無視したまま得て
+いた pass 69 件を失った: 内訳は needs-llvm-components
+など評価できない条件を持つ revision が正直に未実行に
+なった 59 件 (条件評価の実装が入れば再び対象化される)、
+polonius 等の scoped compile-flags や宣言済みの
+crate_type が効いて変換未完になった 7 件、偽の pass が露出した 2 件
+(compiletest 自身の自己テストと ignore-auxiliary の
+補助ファイルで、いずれも単体クレートとして
+コンパイルされることはない)、scoped な失敗期待の
+解釈が変わった 1 件である。
+
 候補 3,699 件のうち両側を実行できたのは 2,823 件で、その内訳は
 pass 539、fail 18、unsupported 2,266 である。unsupported の
 理由の上位は、by-reference 定数 860 件、ローカルの型が未対応
