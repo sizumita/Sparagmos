@@ -1627,25 +1627,31 @@ fn shift_amount_boundaries() {
         run_shift(Shl, u32_ty(), u8_ty(), Value::Uint(1), Value::Uint(30)).expect("<< 30"),
         Value::Uint(1 << 30)
     );
-    // Shifting the sign bit into place with Shl loses bits on the
-    // way back, which this interpreter's plain operators report as
-    // an arithmetic overflow (as for same-type amounts).
-    expect_shift_panic(
-        Shl,
-        i32_ty(),
-        u8_ty(),
-        Value::Int(1),
-        Value::Uint(31),
-        "arithmetic overflow in Shl",
+    // Bits shifted out of the width are simply lost, as natively:
+    // only the amount can overflow a shift. Shifting into the sign
+    // bit, and shifting significant bits out, both yield the
+    // wrapped value (42u8 << 4 == 160, 10i8 << 4 == -96 natively).
+    assert_eq!(
+        run_shift(Shl, i32_ty(), u8_ty(), Value::Int(1), Value::Uint(31)).expect("1i32 << 31"),
+        Value::Int(i32::MIN as i128)
     );
-    // Amount == bits is an overflowing shift.
+    assert_eq!(
+        run_shift(Shl, u8_ty(), u8_ty(), Value::Uint(42), Value::Uint(4)).expect("42u8 << 4"),
+        Value::Uint(160)
+    );
+    assert_eq!(
+        run_shift(Shl, i8_ty(), u8_ty(), Value::Int(10), Value::Uint(4)).expect("10i8 << 4"),
+        Value::Int(-96)
+    );
+    // Amount == bits is an overflowing shift, with Rust 1.100.0's
+    // native message (direction only; the amount is not in it).
     expect_shift_panic(
         Shl,
         i32_ty(),
         u8_ty(),
         Value::Int(1),
         Value::Uint(32),
-        "attempt to shift by 32 bits, which overflows the type width 32",
+        "attempt to shift left with overflow",
     );
     expect_shift_panic(
         Shr,
@@ -1653,7 +1659,7 @@ fn shift_amount_boundaries() {
         i16_ty(),
         Value::Uint(1),
         Value::Int(8),
-        "attempt to shift by 8 bits, which overflows the type width 8",
+        "attempt to shift right with overflow",
     );
     expect_shift_panic(
         Shl,
@@ -1661,7 +1667,7 @@ fn shift_amount_boundaries() {
         u32_ty(),
         Value::Uint(1),
         Value::Uint(32),
-        "attempt to shift by 32 bits, which overflows the type width 32",
+        "attempt to shift left with overflow",
     );
 }
 
@@ -1669,14 +1675,15 @@ fn shift_amount_boundaries() {
 fn negative_and_huge_shift_amounts_panic() {
     use mir::BinOp::{Shl, Shr};
     // A negative amount does not fit the u32 reading; u32::MAX
-    // stands in for it in the message, as in the same-type path.
+    // stands in for it, so it reports an overflowing amount, as in
+    // the same-type path. The message names only the direction.
     expect_shift_panic(
         Shl,
         i32_ty(),
         i8_ty(),
         Value::Int(1),
         Value::Int(-1),
-        "attempt to shift by 4294967295 bits, which overflows the type width 32",
+        "attempt to shift left with overflow",
     );
     expect_shift_panic(
         Shr,
@@ -1684,7 +1691,7 @@ fn negative_and_huge_shift_amounts_panic() {
         i64_ty(),
         Value::Uint(16),
         Value::Int(-1),
-        "attempt to shift by 4294967295 bits, which overflows the type width 32",
+        "attempt to shift right with overflow",
     );
     expect_shift_panic(
         Shl,
@@ -1692,7 +1699,7 @@ fn negative_and_huge_shift_amounts_panic() {
         i32_ty(),
         Value::Int(1),
         Value::Int(-1),
-        "attempt to shift by 4294967295 bits, which overflows the type width 32",
+        "attempt to shift left with overflow",
     );
     // An amount above u32::MAX overflows the same way.
     expect_shift_panic(
@@ -1701,7 +1708,7 @@ fn negative_and_huge_shift_amounts_panic() {
         u64_ty(),
         Value::Int(1),
         Value::Uint(5_000_000_000),
-        "attempt to shift by 4294967295 bits, which overflows the type width 32",
+        "attempt to shift left with overflow",
     );
 }
 
@@ -1735,10 +1742,13 @@ fn checked_mixed_type_shifts() {
         run(Shr, u32_ty(), i16_ty(), Value::Uint(0x8000_0000), Value::Int(33)),
         Value::Tuple(vec![Value::Uint(0x4000_0000), Value::Bool(true)])
     );
-    // Bits shifted out of a Shl set the flag in the checked form.
+    // Bits shifted out of a Shl do NOT set the flag in the checked
+    // form either: only the amount overflows a shift (natively,
+    // 3u8.checked_shl(7) is Some(128) and overflowing_shl reports
+    // (128, false)).
     assert_eq!(
         run(Shl, u8_ty(), i64_ty(), Value::Uint(3), Value::Int(7)),
-        Value::Tuple(vec![Value::Uint(128), Value::Bool(true)])
+        Value::Tuple(vec![Value::Uint(128), Value::Bool(false)])
     );
 }
 
@@ -1768,7 +1778,7 @@ fn constant_shift_amounts_keep_their_own_type() {
     match interpret_mir(&prog, "neg", vec![Value::Int(1)]) {
         Err(MirRunError::Interp(InterpError::Panic { message })) => assert_eq!(
             message,
-            "attempt to shift by 4294967295 bits, which overflows the type width 32"
+            "attempt to shift left with overflow"
         ),
         other => panic!("expected overflowing-shift panic, got {other:?}"),
     }
@@ -1780,7 +1790,7 @@ fn constant_shift_amounts_keep_their_own_type() {
     match interpret_mir(&prog, "huge", vec![Value::Int(1)]) {
         Err(MirRunError::Interp(InterpError::Panic { message })) => assert_eq!(
             message,
-            "attempt to shift by 4294967295 bits, which overflows the type width 32"
+            "attempt to shift left with overflow"
         ),
         other => panic!("expected overflowing-shift panic, got {other:?}"),
     }
