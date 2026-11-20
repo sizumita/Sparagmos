@@ -250,6 +250,15 @@ pub enum Builtin {
     /// `Box::new(value)`: the box is an ADT aggregate holding its
     /// pointee in this value model.
     BoxNew,
+    /// `Box::new_uninit()`: a box whose pointee is uninitialized,
+    /// with the shape its type fixes (an array pointee is a tuple of
+    /// uninitialized elements). The allocation the real body would
+    /// perform is not observable in this value model.
+    BoxNewUninit,
+    /// `box_assume_init_into_vec_unsafe(box)`: the `vec!` expansion's
+    /// final step — the box's array pointee becomes a `Vec` value
+    /// (an ADT aggregate of its elements).
+    BoxAssumeInitIntoVec,
     /// `Vec::new()`: an empty vector (ADT aggregate of its elements).
     VecNew,
     /// `Vec::push(&mut vec, value)`.
@@ -258,6 +267,32 @@ pub enum Builtin {
     VecLen,
     /// `Vec::is_empty(&vec)`.
     VecIsEmpty,
+    /// `Vec::with_capacity(cap)` / `Vec::with_capacity_in(cap, alloc)`:
+    /// an empty vector. The allocation is not observable in this
+    /// value model, which does not represent capacity (the same
+    /// reason `Vec::capacity` is not modelled).
+    VecWithCapacity,
+    /// `std::vec::from_elem(elem, n)`: a vector of `n` copies of
+    /// `elem` (the `vec![x; n]` form). Values are immutable in this
+    /// model, so the copies repeat the one value and each drops
+    /// independently. That is exact for `Copy` elements (the
+    /// specialization the real body selects for them performs no
+    /// `clone` calls) and for elements whose `Clone` is the plain
+    /// field-wise one; a `Clone` impl with side effects or one that
+    /// produces a different value is not run per copy.
+    VecFromElem,
+    /// `Vec::reserve(&mut vec, additional)` /
+    /// `Vec::reserve_exact(&mut vec, additional)`: no-ops. Growing
+    /// the allocation is not observable in this value model, which
+    /// does not represent capacity (the same convention as
+    /// `Vec::with_capacity`).
+    VecReserve,
+    /// `Vec::capacity(&vec)`: not modelled. Capacity has no
+    /// representation in the value model, and returning the length
+    /// would be observably wrong, so the call fails with an
+    /// explicit error naming the function (rather than projecting
+    /// the abstract value as if it had the std layout).
+    VecCapacity,
     /// `core::slice::<impl [T]>::iter(&slice)`: a slice iterator state
     /// (element snapshot + next index), the shape `Iterator::next`
     /// consumes for `std::slice::Iter`.
@@ -419,6 +454,12 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         _ if canonical.starts_with("std::boxed::Box") && canonical.ends_with(">::new") => {
             Builtin::BoxNew
         }
+        _ if canonical.starts_with("std::boxed::Box")
+            && canonical.ends_with(">::new_uninit") =>
+        {
+            Builtin::BoxNewUninit
+        }
+        "std::boxed::box_assume_init_into_vec_unsafe" => Builtin::BoxAssumeInitIntoVec,
         _ if canonical.starts_with("std::vec::Vec") && canonical.ends_with(">::new") => {
             Builtin::VecNew
         }
@@ -430,6 +471,22 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         }
         _ if canonical.starts_with("std::vec::Vec") && canonical.ends_with(">::is_empty") => {
             Builtin::VecIsEmpty
+        }
+        _ if canonical.starts_with("std::vec::Vec")
+            && (canonical.ends_with(">::with_capacity")
+                || canonical.ends_with(">::with_capacity_in")) =>
+        {
+            Builtin::VecWithCapacity
+        }
+        "std::vec::from_elem" => Builtin::VecFromElem,
+        _ if canonical.starts_with("std::vec::Vec")
+            && (canonical.ends_with(">::reserve")
+                || canonical.ends_with(">::reserve_exact")) =>
+        {
+            Builtin::VecReserve
+        }
+        _ if canonical.starts_with("std::vec::Vec") && canonical.ends_with(">::capacity") => {
+            Builtin::VecCapacity
         }
         _ if canonical.starts_with("core::slice::<impl") && canonical.ends_with(">::iter") => {
             Builtin::SliceIter
@@ -1071,6 +1128,51 @@ impl<'a> Interpreter<'a> {
                     fields: vec![vals.into_iter().next().expect("arity checked")],
                 })
             }
+            Builtin::BoxNewUninit => {
+                arity(0)?;
+                let tag = generic_args.first().map(String::as_str).unwrap_or("");
+                match uninit_value_for_tag(tag) {
+                    Some(pointee) => Ok(Value::Enum {
+                        variant: 0,
+                        fields: vec![pointee],
+                    }),
+                    None => Err(unsupported(format!(
+                        "Box::new_uninit for {tag} is not runtime-supported"
+                    ))),
+                }
+            }
+            Builtin::BoxAssumeInitIntoVec => {
+                arity(1)?;
+                let arg = vals.into_iter().next().expect("arity checked");
+                let boxed = match &arg {
+                    Value::Ref(_) | Value::FatRef { .. } => {
+                        let target = self.deref_value(frames, &arg)?;
+                        self.read_resolved(frames, &target)?
+                    }
+                    _ => arg,
+                };
+                match boxed {
+                    Value::Enum { fields, .. } if fields.len() == 1 => {
+                        let pointee = fields.into_iter().next().expect("one field");
+                        match assume_init_elements(pointee) {
+                            Some(elems) => Ok(Value::Enum {
+                                variant: 0,
+                                fields: elems,
+                            }),
+                            None => Err(InterpError::type_mismatch(
+                                "box_assume_init_into_vec_unsafe",
+                                "box of an array value",
+                                "box of a non-array value",
+                            )),
+                        }
+                    }
+                    ref other => Err(InterpError::type_mismatch(
+                        "box_assume_init_into_vec_unsafe",
+                        "box value",
+                        other.kind_name(),
+                    )),
+                }
+            }
             Builtin::VecNew => {
                 arity(0)?;
                 Ok(Value::Enum {
@@ -1118,6 +1220,61 @@ impl<'a> Interpreter<'a> {
                     Ok(Value::Bool(len == 0))
                 }
             }
+            Builtin::VecWithCapacity => {
+                // One argument (`with_capacity`) or two
+                // (`with_capacity_in`: capacity and the allocator,
+                // a zero-sized handle here). The requested capacity
+                // has no representation in the value model, so the
+                // result is the empty vector, as for `Vec::new`.
+                if vals.len() != 1 && vals.len() != 2 {
+                    return Err(InterpError::type_mismatch(
+                        format!("builtin {name}"),
+                        "1 or 2 argument(s)",
+                        format!("{} argument(s)", vals.len()),
+                    ));
+                }
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields: Vec::new(),
+                })
+            }
+            Builtin::VecFromElem => {
+                arity(2)?;
+                let mut vals = vals.into_iter();
+                let elem = vals.next().expect("arity checked");
+                let count = match vals.next().expect("arity checked") {
+                    Value::Uint(n) => n,
+                    ref other => {
+                        return Err(InterpError::type_mismatch(
+                            "std::vec::from_elem",
+                            "element count (usize)",
+                            other.kind_name(),
+                        ));
+                    }
+                };
+                // Mirrors the repeat-aggregate resource bound in
+                // mir_convert: past it the vector is not
+                // materialised, so a huge count fails explicitly
+                // instead of exhausting the host.
+                const MAX_FROM_ELEM: u128 = 1_000_000;
+                if count > MAX_FROM_ELEM {
+                    return Err(unsupported(format!(
+                        "std::vec::from_elem with {count} elements exceeds the model's {MAX_FROM_ELEM}-element bound"
+                    )));
+                }
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields: vec![elem; count as usize],
+                })
+            }
+            Builtin::VecReserve => {
+                arity(2)?;
+                Ok(Value::Unit)
+            }
+            Builtin::VecCapacity => Err(unsupported(
+                "Vec::capacity is not runtime-supported (capacity is not represented in the value model)"
+                    .to_string(),
+            )),
             Builtin::SliceIter => {
                 arity(1)?;
                 let (elems, _) = self.slice_elements(frames, &vals[0])?;
@@ -1963,6 +2120,69 @@ fn split_top_level(s: &str) -> Vec<&str> {
         parts.push(tail);
     }
     parts.into_iter().filter(|p| !p.is_empty()).collect()
+}
+
+/// The uninitialized value of the shape a rendered type tag fixes,
+/// for `Box::new_uninit`: an array type is a tuple of uninitialized
+/// elements (the count is part of the type), a `MaybeUninit<T>`
+/// wrapper is transparent, and any other type is a single
+/// uninitialized value. `None` for an array too large to materialize.
+fn uninit_value_for_tag(tag: &str) -> Option<Value> {
+    let tag = tag.trim();
+    if let Some(inner) = tag
+        .strip_prefix("std::mem::MaybeUninit<")
+        .and_then(|t| t.strip_suffix('>'))
+    {
+        return uninit_value_for_tag(inner);
+    }
+    if tag.starts_with('[') && tag.ends_with(']') {
+        let inner = &tag[1..tag.len() - 1];
+        if let Some((_, n)) = inner.rsplit_once(';') {
+            if let Ok(n) = n.trim().parse::<usize>() {
+                if n > 4096 {
+                    return None;
+                }
+                // The pointee is a `MaybeUninit<[T; N]>`, and the
+                // `vec!` expansion writes the elements through the
+                // place `(*ptr).1.0`: the union's value field (index
+                // 1), then `ManuallyDrop`'s only field. The value is
+                // shaped to that layout -- field 0 is the unit
+                // `uninit` field, field 1 wraps the uninitialized
+                // element array -- so the projected write lands on
+                // the array.
+                return Some(Value::Enum {
+                    variant: 0,
+                    fields: vec![
+                        Value::Unit,
+                        Value::Enum {
+                            variant: 0,
+                            fields: vec![Value::Tuple(vec![Value::Uninit; n])],
+                        },
+                    ],
+                });
+            }
+        }
+    }
+    Some(Value::Uninit)
+}
+
+/// The element values inside a `box_assume_init_into_vec_unsafe`
+/// argument's pointee: an array value is its element tuple; a
+/// `MaybeUninit` wrapper value wraps the array in one of its
+/// fields. Anything else is not an array pointee.
+fn assume_init_elements(pointee: Value) -> Option<Vec<Value>> {
+    match pointee {
+        Value::Tuple(elems) => Some(elems),
+        // The pointee is a `MaybeUninit<[T; N]>`: either a
+        // single-field wrapper (the array is the only field) or the
+        // layout-shaped value `Box::new_uninit` produces (the array
+        // sits in the union's value field, inside `ManuallyDrop`).
+        // Search the wrapper fields for the element array.
+        Value::Enum { fields, .. } if fields.len() <= 2 => {
+            fields.into_iter().find_map(assume_init_elements)
+        }
+        _ => None,
+    }
 }
 
 /// The `Default` value for a rendered type tag, for the types whose
