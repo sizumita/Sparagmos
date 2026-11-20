@@ -1681,6 +1681,11 @@ impl<'a> Interpreter<'a> {
             Value::Enum { fields, .. } if fields.len() == 1 => match &fields[0] {
                 Value::Enum { fields: inner, .. } if inner.len() == 1 => match inner[0] {
                     Value::Int(flag) => Ok(flag),
+                    // A flag materialised from a constant whose
+                    // signed context was lost arrives as an
+                    // unsigned word; the flag values (0, -1,
+                    // small counts) reinterpret exactly.
+                    Value::Uint(flag) => Ok(flag as i128),
                     ref other => Err(InterpError::type_mismatch(
                         "RefCell borrow flag",
                         "isize flag",
