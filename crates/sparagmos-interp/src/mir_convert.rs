@@ -2393,6 +2393,28 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                     },
                 });
             }
+            "std::result::Result" => {
+                // Mirrors `Option`: the payloads' glue runs through
+                // field 0 of the live variant. (Needed so a
+                // `try_borrow` result holding a guard can be dropped:
+                // the guard's release is the Ok payload's glue.)
+                let ok = self.plan(args.first()?)?;
+                let err = self.plan(args.get(1)?)?;
+                return Some(match (ok, err) {
+                    (P::Trivial, P::Trivial) => P::Trivial,
+                    (ok, err) => P::Variants {
+                        variants: vec![at_field0(ok), at_field0(err)],
+                    },
+                });
+            }
+            // The `try_borrow` error types: unit structs with no
+            // fields and no `Drop` impl.
+            "std::cell::BorrowError" | "core::cell::BorrowError" => {
+                return Some(P::Trivial)
+            }
+            "std::cell::BorrowMutError" | "core::cell::BorrowMutError" => {
+                return Some(P::Trivial)
+            }
             "std::ops::Range" | "std::ops::RangeInclusive" => {
                 let bound = self.plan(args.first()?)?;
                 return Some(collapse_fields(vec![bound.clone(), bound], true));
