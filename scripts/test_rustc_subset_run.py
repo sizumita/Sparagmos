@@ -528,7 +528,7 @@ class ProcessStage2Tests(unittest.TestCase):
     def run_with_conv_capture(self, rec, conv_result):
         captured = {}
 
-        def stub(path, edition, driver_bin, rustc_args=()):
+        def stub(path, edition, driver_bin, rustc_args=(), aux_specs=()):
             captured["rustc_args"] = list(rustc_args)
             return conv_result
 
@@ -612,6 +612,122 @@ class ProcessStage2Tests(unittest.TestCase):
         self.assertIn("nature", res["bucket"])
 
 
+
+
+class ConvertSideTests(unittest.TestCase):
+    """convert_side's driver argv (run_cmd stubbed)."""
+
+    def run_argv(self, **kw):
+        orig = run.run_cmd
+        seen = []
+
+        def stub(argv, *, timeout, cwd=None, env_extra=None):
+            seen.append(argv)
+            return {"exit_code": 0, "timeout": False,
+                    "stdout": "converted: 1, skipped: 0\n",
+                    "stderr": ""}
+
+        run.run_cmd = stub
+        try:
+            out = run.convert_side(Path("t.rs"), "2021",
+                                   Path("/fake/driver"), **kw)
+        finally:
+            run.run_cmd = orig
+        return seen[0], out
+
+    def test_aux_specs_become_aux_args(self):
+        argv, out = self.run_argv(
+            aux_specs=[("helper", Path("/x/helper.rs"))])
+        i = argv.index("--aux")
+        self.assertEqual(argv[i + 1], "helper=/x/helper.rs")
+        self.assertEqual(out["converted"], 1)
+
+    def test_no_aux_args_by_default(self):
+        argv, _ = self.run_argv()
+        self.assertNotIn("--aux", argv)
+
+
+class ProcessStage2AuxTests(unittest.TestCase):
+    """process_test(stage2=True) on tests with auxiliary crates."""
+
+    def setUp(self):
+        self.tmp = Path(self.enterContext(__import__("tempfile")
+                                         .TemporaryDirectory()))
+        (self.tmp / "tests" / "ui" / "auxiliary").mkdir(parents=True)
+        self.rust_dir = self.tmp
+        self.seen = []
+
+    def write_test(self, body, aux_files=()):
+        p = self.rust_dir / "tests" / "ui" / "t.rs"
+        p.write_text(body)
+        for name, text in aux_files:
+            (self.rust_dir / "tests" / "ui" / "auxiliary"
+             / name).write_text(text)
+        return {"suite": "ui", "path": "tests/ui/t.rs",
+                "nature": "compile-check", "single_file": False,
+                "ffi": False, "env_excluded": False}
+
+    def run_with_conv(self, rec, conv_result):
+        orig = run.convert_side
+
+        def stub(path, edition, driver_bin, rustc_args=(), aux_specs=()):
+            self.seen.append([(n, Path(s).name) for n, s in aux_specs])
+            return conv_result
+
+        run.convert_side = stub
+        try:
+            return run.process_test(rec, self.rust_dir,
+                                    Path("/fake/driver"), stage2=True)
+        finally:
+            run.convert_side = orig
+
+    def test_aux_test_is_attempted_and_forwards_specs(self):
+        rec = self.write_test(
+            "//@ check-pass\n//@ aux-build: helper.rs\nfn main() {}\n",
+            [("helper.rs", "pub fn f() {}\n")])
+        res = self.run_with_conv(rec, conv())
+        self.assertEqual(res["status"], "pass")
+        self.assertEqual(self.seen, [[("helper", "helper.rs")]])
+
+    def test_transitive_aux_forwarded_deps_first(self):
+        rec = self.write_test(
+            "//@ check-pass\n//@ aux-build: mid.rs\nfn main() {}\n",
+            [("mid.rs", "//@ aux-build: base.rs\npub fn g() {}\n"),
+             ("base.rs", "pub fn f() {}\n")])
+        res = self.run_with_conv(rec, conv())
+        self.assertEqual(res["status"], "pass")
+        self.assertEqual(self.seen,
+                         [[("base", "base.rs"), ("mid", "mid.rs")]])
+
+    def test_missing_aux_file_is_not_attempted(self):
+        rec = self.write_test(
+            "//@ check-pass\n//@ aux-build: nope.rs\nfn main() {}\n")
+        res = run.process_test(rec, self.rust_dir, Path("/fake/driver"),
+                               stage2=True)
+        self.assertEqual(res["status"], "not-attempted")
+        self.assertIn("multi-file", res["bucket"])
+        self.assertIn("not found", res["reason"])
+
+    def test_check_fail_aux_test_passes_on_clean_rejection(self):
+        rec = self.write_test(
+            "//@ check-fail\n//@ aux-build: helper.rs\nfn main() {}\n",
+            [("helper.rs", "pub fn f() {}\n")])
+        res = self.run_with_conv(
+            rec, conv(exit_code=1, compilation_failed=True,
+                      converted=None, skipped=None))
+        self.assertEqual(res["status"], "pass")
+        self.assertEqual(self.seen, [[("helper", "helper.rs")]])
+
+    def test_scoped_aux_resolved_per_revision(self):
+        rec = self.write_test(
+            "//@ revisions: a b\n//@[a] check-pass\n"
+            "//@[b] check-pass\n//@[a] aux-build: helper.rs\n"
+            "fn main() {}\n",
+            [("helper.rs", "pub fn f() {}\n")])
+        res = self.run_with_conv(rec, conv())
+        self.assertEqual(res["status"], "pass")
+        # Revision a builds the aux crate; revision b converts bare.
+        self.assertEqual(self.seen, [[("helper", "helper.rs")], []])
 
 
 class HeaderViewTests(unittest.TestCase):
@@ -733,7 +849,7 @@ class ProcessStage2RevisionTests(unittest.TestCase):
 
     def run_with_fake(self, rec, fake):
         orig = run.convert_side
-        def stub(path, edition, driver_bin, rustc_args=()):
+        def stub(path, edition, driver_bin, rustc_args=(), aux_specs=()):
             self.calls.append(list(rustc_args))
             return fake(list(rustc_args))
         run.convert_side = stub
@@ -1196,3 +1312,14 @@ class ResolveAuxSpecsRevisionTests(unittest.TestCase):
         specs, err = run.resolve_aux_specs(main)
         self.assertIsNone(err)
         self.assertEqual(specs, [])
+    def test_top_view_supplies_scoped_directives(self):
+        main = self.write(
+            "t.rs", "//@ revisions: a\n//@[a] aux-build: helper.rs\n")
+        self.write("auxiliary/helper.rs", "pub fn f() {}\n")
+        header = run.Header(main.read_text())
+        specs, err = run.resolve_aux_specs(main)
+        self.assertIsNone(err)
+        self.assertEqual(specs, [])
+        specs, err = run.resolve_aux_specs(main, top=header.view("a"))
+        self.assertIsNone(err)
+        self.assertEqual([name for name, _ in specs], ["helper"])

@@ -21,7 +21,11 @@ by the native rustc for the oracle side and passed to the driver
 with `--aux` for the Sparagmos side, in dependency order. Stage 2 covers the nature="compile-check" population:
 each test is run through the driver's convert-only mode and the
 outcome is compared with the expectation compiletest derives from
-the test's directives (see the stage-2 section below). Everything
+the test's directives (see the stage-2 section below). Tests with
+auxiliary crates are attempted in stage 2 the same way: the aux
+crates are resolved and forwarded with `--aux`, and conversion
+completeness is judged on the target crate's own functions, so
+auxiliary bodies do not count against it. Everything
 else in the denominator is reported as not attempted, with a reason;
 unattempted and failed tests alike count against the overall
 metric-2(b) rate, whose denominator is always the full subset
@@ -605,7 +609,7 @@ def aux_directives(header):
     return out
 
 
-def resolve_aux_specs(test_path, revision=None):
+def resolve_aux_specs(test_path, revision=None, top=None):
     """Resolve a test's auxiliary crates, transitively, deps first.
 
     Returns (specs, error): specs is a list of (crate_name, Path) in
@@ -618,6 +622,10 @@ def resolve_aux_specs(test_path, revision=None):
     through that revision's view (an auxiliary file's own
     directives are scoped by the same revision, as compiletest
     scopes them).
+    The test's own directives are read from `top` when given (a
+    Header, or a HeaderView when a revision's scoped aux directives
+    apply); the transitive directives of auxiliary files always come
+    from the files themselves, scoped by `revision` when one is set.
     """
     test_dir = test_path.parent
     specs = []
@@ -666,7 +674,11 @@ def resolve_aux_specs(test_path, revision=None):
         specs.append((name, path))
         return None
 
-    for name, fname in directives(test_path):
+    if top is not None:
+        top_directives = aux_directives(top)
+    else:
+        top_directives = directives(test_path)
+    for name, fname in top_directives:
         err = visit(name, fname, test_dir)
         if err:
             return [], err
@@ -1172,6 +1184,15 @@ def fill_result_revisions(rec, header, revs, path, driver_bin, out):
 # adds for no_core tests. Builds are cached per flag variant; a
 # variant that fails to build leaves its tests not attempted with
 # that reason, never judged against a missing extern.
+# Tests with auxiliary crates are attempted as in stage 1: the aux
+# directives are resolved transitively and the crates are handed to
+# the driver with `--aux` in dependency order (per revision, when
+# the directives are revision-scoped). The driver's target-crate
+# report counts only the test crate's own functions, so an
+# auxiliary crate's unconverted bodies do not make the conversion
+# incomplete; an auxiliary crate that fails to compile fails the
+# conversion the way its build failure fails the test under
+# compiletest.
 #
 # What stage 2 deliberately does not do: compare compiler output with
 # the test's `.stderr` snapshot, check `//~` error annotations, apply
@@ -1277,7 +1298,7 @@ _CONVERTED_RE = re.compile(r"^converted: (\d+), skipped: (\d+)$", re.M)
 _TARGET_RE = re.compile(r"^target-crate converted: (\d+), skipped: (\d+)$", re.M)
 
 
-def convert_side(path, edition, driver_bin, rustc_args=()):
+def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=()):
     """Run the driver in convert-only mode and parse its report.
 
     Returns a dict with exit_code (None on timeout), converted and
@@ -1287,11 +1308,15 @@ def convert_side(path, edition, driver_bin, rustc_args=()):
     compilation failure), ice (stderr shows an internal compiler
     error), and stderr. `rustc_args` are forwarded to the driver's
     embedded rustc through its `--rustc-arg` option (a test's
-    compile-flags and the per-revision arguments).
+    compile-flags and the per-revision arguments). Auxiliary crates
+    are handed to the driver with `--aux`, in dependency order, as
+    in run mode.
     """
     argv = [str(driver_bin), str(path), "--edition", edition]
     for a in rustc_args:
         argv += ["--rustc-arg", a]
+    for name, src in aux_specs:
+        argv += ["--aux", f"{name}={src}"]
     res = run_cmd(argv,
                   timeout=CONVERT_TIMEOUT, env_extra=BOOTSTRAP_ENV)
     out = {
@@ -1550,12 +1575,15 @@ def minicore_test_args(view, rust_dir, edition, flags):
 
 
 def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
-                   rust_dir):
+                   rust_dir, aux_specs=(), aux_per_revision=False):
     """Judge one directive view of a compile-check record.
 
     `revision` is the revision name this view belongs to (None for a
     test without revisions) and `all_revisions` the test's declared
-    revisions. Returns a dict with status/reason/bucket, plus the
+    revisions. `aux_specs` are the test's auxiliary crates, resolved
+    by the caller; when `aux_per_revision` is set the test's aux
+    directives are revision-scoped and each view resolves its own
+    set instead. Returns a dict with status/reason/bucket, plus the
     expectation and driver details when the conversion ran. A
     "not-attempted" result carries the bucket that says why; the
     "out of environment" bucket is kept distinct because the
@@ -1604,7 +1632,21 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
             return res
         args += mc_args
     args += flags
-    conv = convert_side(path, edition, driver_bin, rustc_args=args)
+    specs = aux_specs
+    if aux_per_revision:
+        # The test's aux directives are scoped to revisions: this
+        # view builds the auxiliary crates its own directives name
+        # (a view naming none converts without auxiliaries).
+        if aux_directives(view):
+            specs, aux_err = resolve_aux_specs(path, top=view)
+            if aux_err:
+                res["reason"] = aux_err
+                res["bucket"] = "out of stage-2 scope (multi-file)"
+                return res
+        else:
+            specs = []
+    conv = convert_side(path, edition, driver_bin, rustc_args=args,
+                        aux_specs=specs)
     verdict, reason, bucket = judge_compile(expectation, conv)
     res["status"] = verdict
     res["reason"] = reason
@@ -1639,10 +1681,6 @@ def fill_result_stage2(rec, rust_dir, driver_bin, out):
     path = rust_dir / rec["path"]
     text = path.read_text(errors="ignore")
     out["snapshot"] = snapshot_flags(path, text)
-    if not rec["single_file"]:
-        out["reason"] = "multi-file / auxiliary crates (not in stage-2 scope)"
-        out["bucket"] = "out of stage-2 scope (multi-file)"
-        return
     if rec["suite"] == "incremental":
         out["reason"] = ("incremental suite: the verdict depends on "
                          "recompilation across sessions, which a single "
@@ -1650,10 +1688,34 @@ def fill_result_stage2(rec, rust_dir, driver_bin, out):
         out["bucket"] = "out of stage-2 scope (suite: incremental)"
         return
     header = Header(text)
+    # Auxiliary crates, as in stage 1: the test's aux directives are
+    # resolved transitively and the crates handed to the driver with
+    # --aux, in dependency order. When every aux directive is scoped
+    # to a revision, resolution happens per revision in
+    # stage2_attempt instead. A non-single-file test whose files no
+    # directive accounts for stays out of scope.
+    aux_specs = []
+    aux_per_revision = False
+    if not rec["single_file"]:
+        aux_specs, aux_err = resolve_aux_specs(path)
+        if aux_err:
+            out["reason"] = aux_err
+            out["bucket"] = "out of stage-2 scope (multi-file)"
+            return
+        if not aux_specs:
+            if any(name in ("aux-build", "aux-crate")
+                   for (_rev, name) in header.scoped):
+                aux_per_revision = True
+            else:
+                out["reason"] = ("multi-file / auxiliary crates "
+                                 "(not in stage-2 scope)")
+                out["bucket"] = "out of stage-2 scope (multi-file)"
+                return
     revs = header.revisions()
     if not revs:
         res = stage2_attempt(rec, header.view(None), path, driver_bin,
-                             None, [], rust_dir)
+                             None, [], rust_dir, aux_specs,
+                             aux_per_revision)
         for key in ("status", "reason", "bucket", "expectation",
                     "driver"):
             if key in res:
@@ -1662,7 +1724,8 @@ def fill_result_stage2(rec, rust_dir, driver_bin, out):
     per_rev = {}
     for rev in revs:
         per_rev[rev] = stage2_attempt(rec, header.view(rev), path,
-                                      driver_bin, rev, revs, rust_dir)
+                                      driver_bin, rev, revs, rust_dir,
+                                      aux_specs, aux_per_revision)
     out["revisions"] = {
         rev: {k: r[k] for k in ("status", "reason", "bucket",
                                 "expectation") if r.get(k)}
