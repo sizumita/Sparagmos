@@ -315,6 +315,11 @@ pub enum Builtin {
     /// `std::convert::Into::into(value)`: shares the `From::from`
     /// modelling (the blanket `Into` impl is `From` by definition).
     IntoInto,
+    /// A primitive `f32` / `f64` inherent method (`is_nan`, `sqrt`,
+    /// `powi`, ...). The float width is part of the callee name
+    /// (`core::f64::<impl f64>::sqrt`), so it is carried here and the
+    /// operation runs at that width.
+    FloatMethod { f32: bool, op: FloatOp },
 }
 
 /// A relational operator selected by a `PartialOrd` method.
@@ -324,6 +329,34 @@ pub enum RelOp {
     Le,
     Gt,
     Ge,
+}
+
+/// One primitive float method operation, selected by the method name
+/// of an `f32` / `f64` inherent impl call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatOp {
+    IsNan,
+    IsInfinite,
+    IsFinite,
+    IsSignPositive,
+    IsSignNegative,
+    Abs,
+    Sqrt,
+    Floor,
+    Ceil,
+    Round,
+    Trunc,
+    Fract,
+    Recip,
+    Signum,
+    ToDegrees,
+    ToRadians,
+    Powi,
+    Powf,
+    Min,
+    Max,
+    ToBits,
+    FromBits,
 }
 
 /// Look a canonical callee name up in the registry.
@@ -446,7 +479,204 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         _ if canonical.starts_with("std::mem::ManuallyDrop") && canonical.ends_with(">::new") => {
             Builtin::ManuallyDropNew
         }
+        _ => return float_method(canonical),
+    })
+}
+
+/// Resolve a primitive float method callee
+/// (`core::f64::<impl f64>::sqrt`, `std::f32::<impl f32>::floor`,
+/// ...) to its builtin. The methods live partly in `core` and partly
+/// in `std`; both prefixes name the same inherent impls, so either is
+/// accepted for every modelled method. A float method this registry
+/// does not model (e.g. `sin_cos`, which returns a tuple) stays an
+/// explicit unsupported call.
+fn float_method(canonical: &str) -> Option<Builtin> {
+    let (method, f32) = if let Some(rest) = canonical
+        .strip_prefix("core::f32::<impl f32>::")
+        .or_else(|| canonical.strip_prefix("std::f32::<impl f32>::"))
+    {
+        (rest, true)
+    } else if let Some(rest) = canonical
+        .strip_prefix("core::f64::<impl f64>::")
+        .or_else(|| canonical.strip_prefix("std::f64::<impl f64>::"))
+    {
+        (rest, false)
+    } else {
+        return None;
+    };
+    use FloatOp as O;
+    let op = match method {
+        "is_nan" => O::IsNan,
+        "is_infinite" => O::IsInfinite,
+        "is_finite" => O::IsFinite,
+        "is_sign_positive" => O::IsSignPositive,
+        "is_sign_negative" => O::IsSignNegative,
+        "abs" => O::Abs,
+        "sqrt" => O::Sqrt,
+        "floor" => O::Floor,
+        "ceil" => O::Ceil,
+        "round" => O::Round,
+        "trunc" => O::Trunc,
+        "fract" => O::Fract,
+        "recip" => O::Recip,
+        "signum" => O::Signum,
+        "to_degrees" => O::ToDegrees,
+        "to_radians" => O::ToRadians,
+        "powi" => O::Powi,
+        "powf" => O::Powf,
+        "min" => O::Min,
+        "max" => O::Max,
+        "to_bits" => O::ToBits,
+        "from_bits" => O::FromBits,
         _ => return None,
+    };
+    Some(Builtin::FloatMethod { f32, op })
+}
+
+/// Execute one primitive float method. The operation runs at the
+/// method's own width — an `f32` method computes on the `f32` value
+/// and the result widens back (widening is exact) — so rounding, NaN
+/// propagation and signed-zero behaviour are the native ones by
+/// construction: the host `f32` / `f64` methods are the definitions
+/// core and std themselves use.
+fn exec_float_method(
+    name: &str,
+    f32_width: bool,
+    op: FloatOp,
+    vals: &[Value],
+) -> InterpResult<Value> {
+    let arity = |n: usize| -> InterpResult<()> {
+        if vals.len() == n {
+            Ok(())
+        } else {
+            Err(InterpError::type_mismatch(
+                format!("builtin {name}"),
+                format!("{n} argument(s)"),
+                format!("{} argument(s)", vals.len()),
+            ))
+        }
+    };
+    let as_float = |v: &Value| -> InterpResult<f64> {
+        match v {
+            Value::Float(x) => Ok(*x),
+            other => Err(InterpError::type_mismatch(
+                format!("builtin {name}"),
+                "float",
+                other.kind_name(),
+            )),
+        }
+    };
+    use FloatOp as O;
+    // `from_bits` is an associated function: no receiver, the single
+    // argument is the bit pattern.
+    if op == O::FromBits {
+        arity(1)?;
+        let bits = match vals[0] {
+            Value::Uint(v) => v,
+            Value::Int(v) => v as u128,
+            ref other => {
+                return Err(InterpError::type_mismatch(
+                    format!("builtin {name}"),
+                    "integer",
+                    other.kind_name(),
+                ));
+            }
+        };
+        return Ok(Value::Float(if f32_width {
+            f32::from_bits(bits as u32) as f64
+        } else {
+            f64::from_bits(bits as u64)
+        }));
+    }
+    arity(if matches!(op, O::Powi | O::Powf | O::Min | O::Max) {
+        2
+    } else {
+        1
+    })?;
+    let x = as_float(&vals[0])?;
+    macro_rules! unary {
+        ($method:ident) => {
+            if f32_width {
+                (x as f32).$method() as f64
+            } else {
+                x.$method()
+            }
+        };
+    }
+    macro_rules! predicate {
+        ($method:ident) => {
+            if f32_width {
+                (x as f32).$method()
+            } else {
+                x.$method()
+            }
+        };
+    }
+    Ok(match op {
+        O::IsNan => Value::Bool(predicate!(is_nan)),
+        O::IsInfinite => Value::Bool(predicate!(is_infinite)),
+        O::IsFinite => Value::Bool(predicate!(is_finite)),
+        O::IsSignPositive => Value::Bool(predicate!(is_sign_positive)),
+        O::IsSignNegative => Value::Bool(predicate!(is_sign_negative)),
+        O::Abs => Value::Float(unary!(abs)),
+        O::Sqrt => Value::Float(unary!(sqrt)),
+        O::Floor => Value::Float(unary!(floor)),
+        O::Ceil => Value::Float(unary!(ceil)),
+        O::Round => Value::Float(unary!(round)),
+        O::Trunc => Value::Float(unary!(trunc)),
+        O::Fract => Value::Float(unary!(fract)),
+        O::Recip => Value::Float(unary!(recip)),
+        O::Signum => Value::Float(unary!(signum)),
+        O::ToDegrees => Value::Float(unary!(to_degrees)),
+        O::ToRadians => Value::Float(unary!(to_radians)),
+        O::ToBits => Value::Uint(if f32_width {
+            (x as f32).to_bits() as u128
+        } else {
+            x.to_bits() as u128
+        }),
+        O::Powi => {
+            let n = match vals[1] {
+                Value::Int(v) => v as i32,
+                Value::Uint(v) => v as i32,
+                ref other => {
+                    return Err(InterpError::type_mismatch(
+                        format!("builtin {name}"),
+                        "i32",
+                        other.kind_name(),
+                    ));
+                }
+            };
+            Value::Float(if f32_width {
+                (x as f32).powi(n) as f64
+            } else {
+                x.powi(n)
+            })
+        }
+        O::Powf => {
+            let y = as_float(&vals[1])?;
+            Value::Float(if f32_width {
+                (x as f32).powf(y as f32) as f64
+            } else {
+                x.powf(y)
+            })
+        }
+        O::Min => {
+            let y = as_float(&vals[1])?;
+            Value::Float(if f32_width {
+                (x as f32).min(y as f32) as f64
+            } else {
+                x.min(y)
+            })
+        }
+        O::Max => {
+            let y = as_float(&vals[1])?;
+            Value::Float(if f32_width {
+                (x as f32).max(y as f32) as f64
+            } else {
+                x.max(y)
+            })
+        }
+        O::FromBits => unreachable!("handled above"),
     })
 }
 
@@ -1241,6 +1471,7 @@ impl<'a> Interpreter<'a> {
                     other => Ok(other.clone()),
                 }
             }
+            Builtin::FloatMethod { f32, op } => exec_float_method(name, f32, op, &vals),
         }
     }
 
