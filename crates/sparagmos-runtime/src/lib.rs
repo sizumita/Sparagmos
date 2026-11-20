@@ -7,6 +7,8 @@
 //! - [`error`]: [`error::RuntimeError`] panic/error propagation shared by JIT + interpreter
 //! - [`intrinsic`]: name -> implementation registry (unknown = explicit error)
 //! - [`ffi`]: `extern "C"` entry points (`sparagmos_alloc`, ...) for JIT-generated code
+//! Design notes (target premise: Rust 1.100.0; future scope incl. the
+//! stabilised Allocator API) live in `crates/sparagmos-runtime/DESIGN_NOTES.md`.
 pub mod alloc;
 pub mod error;
 pub mod ffi;
