@@ -305,10 +305,41 @@ fn convert_all(
     program: &MirProgram,
 ) -> Result<(ir::Program, HashMap<String, ConvertError>), ConvertError> {
     let keys = program_keys(program)?;
+    // First phase: convert every body with trait-impl call
+    // resolution off (the historical behaviour), learning which
+    // bodies convert at all.
     let conv = Converter::new(program, &keys);
+    let (mut out, mut failures) = convert_each(&conv, program, &keys);
+    // Second phase: convert again with trait-impl call resolution
+    // on, restricted to the bodies that converted in the first
+    // phase (see `resolve_impl_callee`). Resolution only retargets
+    // calls, so the converted set is unchanged in principle; a
+    // body whose second-phase conversion unexpectedly fails keeps
+    // its first-phase form, and the failure records are reconciled
+    // with the merged program at the end.
+    let converted: HashSet<String> = out.functions.keys().cloned().collect();
+    if !converted.is_empty() {
+        let conv = Converter::with_impl_targets(program, &keys, converted);
+        let (resolved, _) = convert_each(&conv, program, &keys);
+        for (key, body) in resolved.functions {
+            out.unconverted.remove(&key);
+            out.functions.insert(key, body);
+        }
+    }
+    failures.retain(|key, _| !out.functions.contains_key(key));
+    Ok((out, failures))
+}
+
+/// Convert every body of `program` with `conv`, isolating failures
+/// per body (see [`convert_program`]).
+fn convert_each(
+    conv: &Converter,
+    program: &MirProgram,
+    keys: &[String],
+) -> (ir::Program, HashMap<String, ConvertError>) {
     let mut out = ir::Program::new();
     let mut failures: HashMap<String, ConvertError> = HashMap::new();
-    for (func, key) in program.functions.iter().zip(&keys) {
+    for (func, key) in program.functions.iter().zip(keys) {
         match conv.convert_body(func, key) {
             Ok(body) => {
                 out.add_function(body);
@@ -319,7 +350,7 @@ fn convert_all(
             }
         }
     }
-    Ok((out, failures))
+    (out, failures)
 }
 
 /// Convert `program` and run `entry` with `args` in the interpreter.
@@ -735,6 +766,11 @@ struct Converter<'a> {
     /// completely, `Drop` impls included. `None` when the program
     /// has no `main` function.
     local_crate: Option<String>,
+    /// The bodies trait-impl call resolution may target (see
+    /// `resolve_impl_callee`): `None` disables resolution (the
+    /// first conversion phase in `convert_all`), `Some` restricts
+    /// it to the named bodies (the second phase).
+    impl_targets: Option<HashSet<String>>,
 }
 
 impl<'a> Converter<'a> {
@@ -764,7 +800,20 @@ impl<'a> Converter<'a> {
             discriminants: &program.adt_discriminants,
             adt_aggregates,
             local_crate,
+            impl_targets: None,
         }
+    }
+
+    /// A converter with trait-impl call resolution enabled,
+    /// restricted to `targets` (see `resolve_impl_callee`).
+    fn with_impl_targets(
+        program: &'a MirProgram,
+        keys: &[String],
+        targets: HashSet<String>,
+    ) -> Self {
+        let mut conv = Self::new(program, keys);
+        conv.impl_targets = Some(targets);
+        conv
     }
 
     fn convert_body(&self, func: &MirFunction, key: &str) -> Result<ir::Body, ConvertError> {
@@ -1628,6 +1677,23 @@ impl<'a> Converter<'a> {
     /// is the faithful semantics and wins over the builtin, exactly
     /// as a `DefId`-resolved body does in `resolve_callee`.
     fn resolve_impl_callee(&self, func: &mir::Operand) -> Option<String> {
+        // Resolution runs only in the second conversion phase,
+        // against the bodies that converted in the first (see
+        // `convert_all`): resolving to an impl body that cannot
+        // itself convert would trade a working builtin model of
+        // the trait method for an unconverted-body error — a
+        // derived `PartialEq` on a packed struct, whose body the
+        // conversion rejects for its pointer casts while the
+        // structural-comparison builtin is exact, is the shape
+        // that pins this restriction.
+        let targets = self.impl_targets.as_ref()?;
+        let key = self.find_impl_callee(func)?;
+        targets.contains(&key).then_some(key)
+    }
+
+    /// Find the collected impl body for a trait-method call (see
+    /// `resolve_impl_callee` for when a found body may be used).
+    fn find_impl_callee(&self, func: &mir::Operand) -> Option<String> {
         let (name, _, raw_generic_args) = self.resolve_external_callee(func)?;
         let (trait_path, method) = name.rsplit_once("::")?;
         if trait_path.is_empty() || method.is_empty() {

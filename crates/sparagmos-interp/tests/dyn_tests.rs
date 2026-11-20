@@ -650,3 +650,102 @@ fn index_call_without_a_collected_impl_body_keeps_the_builtin_model() {
         other => panic!("expected the builtin's bounds panic, got {other:?}"),
     }
 }
+
+const PARTIAL_EQ: mir::DefId = mir::DefId::new(0, 24);
+
+fn const_bool(v: bool) -> mir::Operand {
+    mir::Operand::constant(mir::Constant::from_value(mir::ConstValue::Bool(v)))
+}
+
+fn partial_eq_program() -> MirProgram {
+    let mut prog = MirProgram::new();
+    prog.fn_names.insert(S_TY, "probe::S".to_string());
+    prog.fn_names
+        .insert(PARTIAL_EQ, "std::cmp::PartialEq::eq".to_string());
+    prog
+}
+
+/// `fn main() -> bool { _1 = S; _2 = S; _3 = &_1; _4 = &_2;
+/// _5 = PartialEq::eq(move _3, move _4); _0 = _5 }`
+fn partial_eq_main() -> mir::Body {
+    mir::Body::new(
+        decls(&[
+            mir::Ty::Bool,
+            s_ty(),
+            s_ty(),
+            ref_ty(s_ty()),
+            ref_ty(s_ty()),
+            mir::Ty::Bool,
+        ]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(place(1), adt_aggregate(S_TY, Vec::new())),
+                    assign(place(2), adt_aggregate(S_TY, Vec::new())),
+                    assign(place(3), ref_of(1)),
+                    assign(place(4), ref_of(2)),
+                ],
+                call(
+                    fndef_operand(PARTIAL_EQ, vec![s_ty(), s_ty()]),
+                    vec![move_(3), move_(4)],
+                    5,
+                    1,
+                ),
+            ),
+            block(vec![assign(place(0), mir::Rvalue::Use(copy(5)))], ret()),
+        ],
+    )
+}
+
+#[test]
+fn partial_eq_call_runs_a_converted_custom_impl_body() {
+    // Resolution is not Index-specific: a converted custom
+    // PartialEq impl body wins over the builtin's structural
+    // comparison. The impl returns false unconditionally, so two
+    // equal unit values compare unequal — proof the body ran.
+    let eq_impl = mir::Body::new(
+        decls(&[mir::Ty::Bool, ref_ty(s_ty()), ref_ty(s_ty())]),
+        2,
+        vec![block(
+            vec![assign(place(0), mir::Rvalue::Use(const_bool(false)))],
+            ret(),
+        )],
+    );
+    let mut prog = partial_eq_program();
+    prog.add("main", partial_eq_main());
+    prog.add("<probe::S as std::cmp::PartialEq>::eq", eq_impl);
+
+    let value = interpret_mir(&prog, "main", Vec::new()).expect("main runs");
+    assert_eq!(value, Value::Bool(false));
+}
+
+#[test]
+fn impl_resolution_skips_impl_bodies_that_do_not_convert() {
+    // A derived-PartialEq shape: the impl body is in the program
+    // but cannot convert (here it holds a coroutine local; the
+    // real case is a packed struct's derived eq, whose body the
+    // conversion rejects for its pointer casts). The call must
+    // keep the builtin's structural comparison — resolving to the
+    // unconvertible body would trade a correct answer for an
+    // unconverted-body error.
+    let eq_impl = mir::Body::new(
+        decls(&[
+            mir::Ty::Bool,
+            ref_ty(s_ty()),
+            ref_ty(s_ty()),
+            mir::Ty::Coroutine(mir::DefId::new(0, 7), Vec::new()),
+        ]),
+        2,
+        vec![block(
+            vec![assign(place(0), mir::Rvalue::Use(const_bool(true)))],
+            ret(),
+        )],
+    );
+    let mut prog = partial_eq_program();
+    prog.add("main", partial_eq_main());
+    prog.add("<probe::S as std::cmp::PartialEq>::eq", eq_impl);
+
+    let value = interpret_mir(&prog, "main", Vec::new()).expect("main runs");
+    assert_eq!(value, Value::Bool(true));
+}
