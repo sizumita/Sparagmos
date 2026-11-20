@@ -462,6 +462,28 @@ impl<'a> Converter<'a> {
                     });
                 }
             }
+            mir::ConstValue::Tuple(fields) => ir::Constant::Tuple(
+                fields
+                    .iter()
+                    .map(|f| self.convert_const_value(f, None))
+                    .collect::<Result<_, _>>()?,
+            ),
+            mir::ConstValue::Adt { variant, fields } => ir::Constant::Adt {
+                variant: *variant,
+                fields: fields
+                    .iter()
+                    .map(|f| self.convert_const_value(f, None))
+                    .collect::<Result<_, _>>()?,
+            },
+            mir::ConstValue::Ref(inner) => {
+                ir::Constant::Ref(Box::new(self.convert_const_value(inner, None)?))
+            }
+            mir::ConstValue::SliceVal(elems) => ir::Constant::SliceVal(
+                elems
+                    .iter()
+                    .map(|e| self.convert_const_value(e, None))
+                    .collect::<Result<_, _>>()?,
+            ),
             mir::ConstValue::ByRef { .. } => {
                 return Err(ConvertError::UnsupportedConstant {
                     kind: "by-reference constant".to_string(),
