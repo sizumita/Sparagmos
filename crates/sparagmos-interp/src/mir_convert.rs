@@ -179,6 +179,12 @@ impl From<InterpError> for MirRunError {
     }
 }
 
+/// Resource bound on `Rvalue::Repeat` element counts, mirroring the
+/// interpreter's step / call-depth limits: past this many elements the
+/// aggregate is not materialised and the rvalue converts to an
+/// explicit unsupported error instead of aborting on allocation.
+const MAX_REPEAT_ELEMENTS: u64 = 1_000_000;
+
 /// Convert a whole MIR program into an interpreter [`ir::Program`].
 pub fn convert_program(program: &MirProgram) -> Result<ir::Program, ConvertError> {
     let conv = Converter::new(program);
@@ -705,14 +711,24 @@ impl<'a> Converter<'a> {
                 other => ir::Rvalue::Unsupported(format!("Aggregate {}", other.kind_name())),
             },
             R::Repeat(op, count) => {
-                let elem_ty = match dest_ty {
-                    Some(mir::Ty::Tuple(ts)) => ts.first().cloned(),
-                    Some(mir::Ty::Array(elem, _)) => Some((**elem).clone()),
-                    _ => None,
-                };
-                let v = self.convert_operand(body, op, elem_ty.as_ref())?;
-                let n = usize::try_from(*count).unwrap_or(usize::MAX);
-                ir::Rvalue::AggregateTuple(vec![v; n])
+                // A repeat count is guest-controlled input: a huge
+                // count (e.g. `[0u8; 1 << 40]`) would make the
+                // aggregate allocation abort the host process instead
+                // of failing the run. Like the interpreter's step and
+                // call-depth limits, the element count is a resource
+                // bound; past it the rvalue stays an explicit
+                // unsupported error.
+                if *count > MAX_REPEAT_ELEMENTS {
+                    ir::Rvalue::Unsupported(format!("Repeat of {count} elements"))
+                } else {
+                    let elem_ty = match dest_ty {
+                        Some(mir::Ty::Tuple(ts)) => ts.first().cloned(),
+                        Some(mir::Ty::Array(elem, _)) => Some((**elem).clone()),
+                        _ => None,
+                    };
+                    let v = self.convert_operand(body, op, elem_ty.as_ref())?;
+                    ir::Rvalue::AggregateTuple(vec![v; *count as usize])
+                }
             }
             R::Ref(_, _, place) => ir::Rvalue::Ref(self.convert_place(place)?),
             R::CopyForDeref(place) => ir::Rvalue::CopyForDeref(self.convert_place(place)?),

@@ -15,6 +15,16 @@
 //!   frame is live.
 //! * Execution is bounded by a step limit and a call-depth limit so a
 //!   looping program can never hang the oracle (or a test run).
+//! * Host-panic freedom: every failure a guest program can cause is
+//!   an [`InterpError`], never a host `panic!`. The `expect` /
+//!   `unreachable!` sites in this crate are internal invariants only:
+//!   the frame stack is non-empty by construction while the run loop
+//!   executes, builtin arities are checked before argument slots are
+//!   read, and the arithmetic helpers split the closed `BinOp`
+//!   enumeration exhaustively. Input-shaped failures (unsupported
+//!   kinds, type mismatches, uninitialized reads, resource limits)
+//!   all return errors. Regression coverage lives in
+//!   `tests/robustness_tests.rs`.
 
 use crate::error::{InterpError, InterpResult};
 use crate::ir::*;
@@ -1283,6 +1293,8 @@ fn eval_binary(
                 })
             }
         };
+        // Invariant: comparisons returned early above and every other
+        // arm of the match yields `Some`, so `wide` is always present.
         let raw = wide.expect("all signed ops produce a value");
         // Determine overflow by recomputing in the declared width: a result
         // is overflowing if the mathematical result leaves [min, max].
@@ -1352,6 +1364,10 @@ fn eval_binary(
             }
             return Ok((result, overflowed));
         }
+        // Comparisons and shifts returned above; the operators that
+        // can reach this match are exactly the eight covered below,
+        // which is what makes the closing `unreachable!` an internal
+        // invariant rather than an input-dependent failure.
         let (raw, overflowed) = match op {
             Add => {
                 let r = a.wrapping_add(b);
