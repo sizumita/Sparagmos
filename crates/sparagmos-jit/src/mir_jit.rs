@@ -38,19 +38,35 @@
 //! that would create or touch one fails with an explicit
 //! unsupported error at its own lowering.
 //!
-//! A thin reference or raw pointer is one word: the stack address
-//! of the pointee's slot. Taking a reference emits the backend's
-//! slot-address instruction, and reading or writing through
-//! exactly one dereference loads or stores through that address,
-//! so the access lands on the original place — the interpreter's
-//! model of a reference, where reads and writes reach the place
-//! the reference was taken of. This holds across a call, too: a
-//! caller's frame outlives the call, so a callee writing through
-//! a pointer argument writes the caller's place. Fat references
-//! (to slices, `str` or trait objects), a projection *through* a
-//! dereference (a field of a pointed-to value) and a second
-//! dereference stay unsupported, as do pointees that are not a
-//! single scalar leaf.
+//! A thin reference or raw pointer is one word: the address of
+//! the pointee's first leaf. Taking a reference to a frame place
+//! emits the backend's slot-address instruction; leaf `k` of the
+//! pointee lies `8 * k` bytes below that address, matching the
+//! backend's descending slot layout, so a place reached through
+//! dereferences and field/index projections resolves to an
+//! address expression — a base pointer (a slot's value, a slot's
+//! address, or a pointer loaded from memory), a constant leaf
+//! offset, and at most one dynamic index term — and reads and
+//! writes through it land on the original place, the interpreter's
+//! model of a reference. This holds across a call, too: a caller's
+//! frame outlives the call, so a callee writing through a pointer
+//! argument writes the caller's place. A second dereference loads
+//! the inner pointer from memory and continues the same way.
+//!
+//! A fat reference — to a slice or to `str` — is two words: the
+//! address above plus the length, carried in the next slot
+//! wherever the reference lives (a local, an argument, a call
+//! argument). Taking a reference to a slice/str place yields the
+//! place's address and its length (a constant for arrays, the
+//! fat pair's own length word for a reborrowed slice); the
+//! `Unsize` coercion from `&[T; N]` builds the pair from the
+//! array's address and the constant `N`. `Len` and `PtrMetadata`
+//! read the length word. Indexing a slice (dynamically or with a
+//! literal) checks the index against the length word and panics
+//! with the interpreter's index message, exactly like indexing an
+//! array local. References to trait objects stay unsupported:
+//! their metadata word is a vtable pointer, which the slot model
+//! has no representation for.
 //!
 //! # Panics
 //!
@@ -62,7 +78,10 @@
 //! and [`JitProgram::call`] returns it as a [`PanicRecord`]. Division
 //! and remainder get explicit divisor guards at lowering time because
 //! the hardware instructions trap on a zero divisor (and on
-//! `MIN / -1` in the 64-bit signed case). Reaching a MIR `Unreachable`
+//! `MIN / -1` in the 64-bit signed case). An out-of-bounds index
+//! is a guest panic with the interpreter's message — `index out of
+//! bounds: the len is {len} but the index is {index}`, formatted
+//! at runtime from the actual length and index values. Reaching a MIR `Unreachable`
 //! block is a guest panic too, with the message `entered unreachable
 //! code` — the interpreter's model — lowered to a jump into a panic
 //! block like a failed `Assert`, never to a hardware trap.
@@ -83,24 +102,33 @@
 //! Supported: integer / `bool` / `char` / `f32` / `f64` /
 //! tuple-of-supported and array-of-supported locals (arrays are
 //! their elements' leaves in order, read and written through
-//! constant index projections), ADT locals holding only a
-//! discriminant tag, thin references and raw pointers to scalar
-//! places; `Use`, plain and checked `BinaryOp`, `UnaryOp`,
-//! `IntToInt` / `FloatToInt` / `IntToFloat` / `FloatToFloat`
-//! casts and the address-preserving pointer casts, tuple
-//! aggregates, fieldless ADT aggregates, `Repeat`,
+//! constant and dynamic index projections, the dynamic form with
+//! the interpreter's bounds-check panic), ADT locals holding only
+//! a discriminant tag, thin references and raw pointers, fat
+//! references to slices and `str` (as address+length pairs), and
+//! projections through dereferences — fields, indices, further
+//! dereferences, `Discriminant` / `SetDiscriminant` of a tag-only
+//! ADT in memory, and references taken of memory places;
+//! `Use`, `CopyForDeref`, plain and checked `BinaryOp`, `UnaryOp`
+//! (including `PtrMetadata`), `IntToInt` / `FloatToInt` /
+//! `IntToFloat` / `FloatToFloat` casts, the address-preserving
+//! pointer casts and the array-to-slice `Unsize` coercion, `Len`,
+//! tuple aggregates, fieldless ADT aggregates, `Repeat`,
 //! `Discriminant`, `SetDiscriminant`; `Goto`, `SwitchInt`, `Call`
-//! (within the program, up to six arguments), `Assert`, `Drop` of
-//! scalar values, `Return`, `Unreachable` (as a guest panic).
-//! Anything else — `f16` / `f128`, 128-bit integers, fat
-//! references, projections through a dereference, ADT payloads,
-//! slices, aggregates other than tuples and fieldless ADTs,
-//! dynamic index projections,
-//! calls to functions outside the program, and so on — fails the
-//! whole function's compilation with [`JitError::Unsupported`]
-//! naming the construct. There is deliberately no partial or
-//! fallback execution: a program either compiles completely on the
-//! JIT path or not at all.
+//! (within the program, up to six register words of arguments),
+//! `Assert`, `Drop`, `Return`, `Unreachable` (as a guest panic).
+//! Anything else — `f16` / `f128`, 128-bit integers, references
+//! to trait objects, ADT payloads, `Subslice`, a second dynamic
+//! index within one place, an index of a signed integer type,
+//! a literal index from the end of a slice, multi-word return
+//! values (a function's result travels in one register word, so
+//! a fat or pair result cannot be returned yet), arguments of
+//! more than two words, aggregates other than tuples and
+//! fieldless ADTs, calls to functions outside the program, and
+//! so on — fails the whole function's compilation with
+//! [`JitError::Unsupported`] naming the construct. There is
+//! deliberately no partial or fallback execution: a program
+//! either compiles completely on the JIT path or not at all.
 
 use std::collections::HashMap;
 use std::fmt;
