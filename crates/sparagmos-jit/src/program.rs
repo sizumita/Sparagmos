@@ -38,6 +38,30 @@ struct PanicCtx {
     message_index: Cell<u64>,
 }
 
+/// Message index the generated code stores for a panic whose text
+/// was formatted at run time (an index-out-of-bounds message): the text
+/// lives in the program's scratch buffer, not the message table.
+const DYNAMIC_MESSAGE: u64 = u64::MAX;
+
+/// The index-out-of-bounds message formatter the generated code
+/// calls: same buffer contract as [`format_index_message`]. The
+/// wording matches the interpreter's message for an index outside
+/// an array or slice: both numbers are the runtime length and
+/// index, read as `usize` values.
+///
+/// # Safety
+/// `buf` must point to at least 128 writable bytes (the program's
+/// scratch buffer); the message is well under that.
+extern "C" fn format_index_message(len: u64, index: u64, buf: *mut u8) -> usize {
+    let text = format!("index out of bounds: the len is {len} but the index is {index}");
+    let bytes = text.as_bytes();
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.len().to_le_bytes().as_ptr(), buf, 8);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.add(8), bytes.len());
+    }
+    bytes.len()
+}
+
 /// A whole compiled program: executable image plus the state its
 /// generated code refers to by absolute address.
 pub struct CompiledProgram {
@@ -51,6 +75,9 @@ pub struct CompiledProgram {
     /// these bytes to `sparagmos_panic`, so they must not move.
     #[allow(dead_code)]
     messages: Vec<Box<str>>,
+    /// Scratch buffer for run-time-formatted panic messages
+    /// (address-stable; see [`format_index_message`]).
+    scratch_buf: Box<[u8; 128]>,
 }
 
 impl CompiledProgram {
@@ -89,11 +116,15 @@ impl CompiledProgram {
         let result = unsafe { f(padded[0], padded[1], padded[2], padded[3], padded[4], padded[5]) };
         if self.panic_ctx.panicked.get() != 0 {
             let msg_idx = self.panic_ctx.message_index.get();
-            let message = self
-                .messages
-                .get(msg_idx as usize)
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "<unknown panic message>".to_string());
+            let message = if msg_idx == DYNAMIC_MESSAGE {
+                let len = u64::from_le_bytes(self.scratch_buf[0..8].try_into().unwrap()) as usize;
+                String::from_utf8_lossy(&self.scratch_buf[8..8 + len]).into_owned()
+            } else {
+                self.messages
+                    .get(msg_idx as usize)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "<unknown panic message>".to_string())
+            };
             return Err(PanicRecord {
                 message,
                 location: None,
@@ -117,6 +148,7 @@ pub fn compile_program(
         message_index: Cell::new(0),
     });
     let messages: Vec<Box<str>> = messages.into_iter().map(|s| s.into_boxed_str()).collect();
+    let scratch_buf: Box<[u8; 128]> = Box::new([0; 128]);
     let ctx = ProgramCtx {
         flag_addr: panic_ctx.as_ref() as *const PanicCtx as usize,
         panic_fn: sparagmos_runtime::ffi::sparagmos_panic as usize,
@@ -124,6 +156,8 @@ pub fn compile_program(
             .iter()
             .map(|s| (s.as_ptr() as usize, s.len()))
             .collect(),
+        index_fmt_fn: format_index_message as usize,
+        scratch_buf: scratch_buf.as_ptr() as usize,
     };
 
     // Compile each function separately, then lay the bodies out in
@@ -166,6 +200,7 @@ pub fn compile_program(
         param_counts: funcs.iter().map(|f| f.param_count).collect(),
         panic_ctx,
         messages,
+        scratch_buf,
     })
 }
 

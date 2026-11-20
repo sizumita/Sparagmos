@@ -159,7 +159,7 @@ never 型 `!`、inline asm) を書き、fleur 上で
    仮数えせず、JIT 完了まで未実装として扱う。厳しい側に倒す)。
 
 指標1の率 = 実装済みバリアント数 / 40 × 100 (小数第1位まで)。
-現在の値: **65.0% (実装済み 26/40)** (2026-11-21 実測。バリアント別の内訳は次のマトリクス)。
+現在の値: **67.5% (実装済み 27/40)** (2026-11-21 実測。バリアント別の内訳は次のマトリクス)。
 
 
 ### バリアント別マトリクス (2026-11-21 実測)
@@ -186,7 +186,7 @@ never 型 `!`、inline asm) を書き、fleur 上で
 - interp 内部 IR だけを対象とするテストと、ハーネスのコーパス実行は、
   sparagmos-mir のバリアントを直接構築しないため数えていない。
 
-結果: **実装済み 26/40 = 65.0%**、部分的 1 (すべて interp のみ)、
+結果: **実装済み 27/40 = 67.5%**、部分的 0、
 未対応 13。
 
 **StatementKind (12)**
@@ -226,7 +226,7 @@ never 型 `!`、inline asm) を書き、fleur 上で
 | FalseUnwind | × (分岐なし) | × | × | 未対応 |
 | InlineAsm | × (変換エラー) | × | × | 未対応 |
 
-注: Unreachable は、到達しないブロックが存在しても実行が正しく進むことを両経路で検証している。到達した場合の挙動は経路で異なる: interp は guest panic ("entered unreachable code") を返し、JIT はトラップ命令 (int3) を出すためホストプロセスが SIGTRAP で終了する (2026-11-21 実測)。
+注: Unreachable は、到達しないブロックが存在しても実行が正しく進むことを両経路で検証している。到達した場合は両経路とも guest panic ("entered unreachable code") を返す (JIT は Lane AY で panic 機構に統一され、ホストプロセスを落とさない)。
 
 **Rvalue (13)**
 
@@ -242,7 +242,7 @@ never 型 `!`、inline asm) を書き、fleur 上で
 | UnaryOp | ○ | ○ mir_jit::negation | ○ mir_jit::negation | 実装済み |
 | Discriminant | ○ | ○ print_support_tests::range_inclusive_next_loop_sums 他 | ○ mir_jit::discriminant_of_aggregate_and_constant 他 | 実装済み |
 | Aggregate | ○ | ○ 6件 (mir_convert_tests::tuple_and_array_aggregates_and_repeat 他) | ○ mir_jit::tuple_aggregate_fields_read_back | 実装済み |
-| CopyForDeref | ○ | ○ mir_convert_tests::copy_for_deref_reads_through_reference_and_plain_place | × | 部分的 |
+| CopyForDeref | ○ | ○ mir_convert_tests::copy_for_deref_reads_through_reference_and_plain_place | ○ mir_jit::copy_for_deref_reads_the_pointee | 実装済み |
 | WrapUnsafeBinder | × (型なし) | × | × | 未対応 |
 | Reborrow | × (型なし) | × | × | 未対応 |
 
@@ -1193,7 +1193,7 @@ dump が得られても変換済み関数が 0 件だったものが 157 件あ�
 
 | 指標 | 母数 | 現在値 |
 |---|---|---|
-| 指標1 MIR バリアント網羅率 | 40 (確定) | 65.0% (26/40, 2026-11-21 実測) |
+| 指標1 MIR バリアント網羅率 | 40 (確定) | 67.5% (27/40, 2026-11-21 実測) |
 | 副指標1b サブ enum | 上表の通り (確定) | 未測定 (BinOp の出現実測 15/26 のみ) |
 | 指標2(a) 自前コーパス | 46 (tests/corpus) | 100.0% (46/46, 2026-11-21 実測) |
 | 指標2(b) rustc テストサブセット | 24,937 (2026-11-20 機械抽出) | 62.195% (15,510/24,937, 2026-11-21 統合後 combined 単一ラン実測 both10: exec 1,469、コンパイル時検証系 14,041。この実測の後に proc-macro 補助クレート対応 (+84、レーン実測) が統合済みで、次の combined 実測で確定する。コンパイル時検証系は成否レベルの一致で、照合系の扱いは stage 2 の節に記載) |

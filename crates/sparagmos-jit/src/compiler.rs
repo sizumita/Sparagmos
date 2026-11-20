@@ -101,6 +101,14 @@ pub struct ProgramCtx {
     pub panic_fn: usize,
     /// Panic message table: `(ptr, len)` of each message's UTF-8 bytes.
     pub messages: Vec<(usize, usize)>,
+    /// Address of the program layer's index-message formatter:
+    /// `extern "C" fn(len: u64, index: u64, buf: *mut u8) -> usize`,
+    /// writing a length-prefixed message into `scratch_buf` and
+    /// returning the message length.
+    pub index_fmt_fn: usize,
+    /// Address of the scratch buffer the formatter writes into:
+    /// 8 length bytes (little-endian u64) followed by message bytes.
+    pub scratch_buf: usize,
 }
 
 /// Call fixups produced when compiling one function of a program:
@@ -725,6 +733,31 @@ impl<'a> Compiler<'a> {
                 self.e.ret();
                 let target = self.e.position();
                 self.e.buf.patch_rel32(at, target);
+            }
+            Instr::PanicIndexOob { len, index } => {
+                let ctx = self
+                    .ctx
+                    .ok_or(CompileError::ProgramOnly("PanicIndexOob"))?;
+                // Format the message into the program's scratch
+                // buffer, then record it through the runtime's panic
+                // path like a static message (the u64::MAX sentinel
+                // index, as for the shift message).
+                self.load_operand(Reg::Rdi, *len)?;
+                self.load_operand(Reg::Rsi, *index)?;
+                self.e.mov_ri64(Reg::Rdx, ctx.scratch_buf as i64);
+                self.e.mov_ri64(Reg::Rax, ctx.index_fmt_fn as i64);
+                self.e.call_r(Reg::Rax);
+                self.e.mov_rr(Reg::Rsi, Reg::Rax);
+                self.e.mov_ri64(Reg::Rdi, (ctx.scratch_buf + 8) as i64);
+                self.e.mov_ri64(Reg::Rax, ctx.panic_fn as i64);
+                self.e.call_r(Reg::Rax);
+                self.e.mov_ri64(Reg::Rax, ctx.flag_addr as i64);
+                self.e.mov_ri64(Reg::Rcx, 1);
+                self.e.mov_store(Reg::Rax, 0, Reg::Rcx);
+                self.e.mov_ri64(Reg::Rcx, -1);
+                self.e.mov_store(Reg::Rax, 8, Reg::Rcx);
+                self.e.leave();
+                self.e.ret();
             }
         }
         Ok(())

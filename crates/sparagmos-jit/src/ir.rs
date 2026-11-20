@@ -211,6 +211,12 @@ pub enum Instr {
     /// function immediately (propagating a guest panic raised by a
     /// callee). Otherwise a no-op. Program compiles only.
     CheckPanic,
+    /// Guest panic with the index-out-of-bounds message, whose text
+    /// depends on the runtime length and index: "index out of
+    /// bounds: the len is {len} but the index is {index}". The message is formatted
+    /// by a helper in the program layer into a scratch buffer and
+    /// then recorded through the usual panic path. Program compiles only.
+    PanicIndexOob { len: Operand, index: Operand },
     /// `dst = lhs op rhs` on floating-point values of format `kind`.
     /// Operands and the result are bit patterns in their slots (see
     /// the module docs); for the comparison forms the result is the
