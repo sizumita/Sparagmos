@@ -6,6 +6,14 @@ version = 4
 name = "sparagmos-driver"
 version = "0.1.0"
 dependencies = [
+ "sparagmos-interp",
+ "sparagmos-mir",
+]
+
+[[package]]
+name = "sparagmos-interp"
+version = "0.1.0"
+dependencies = [
  "sparagmos-mir",
 ]
 

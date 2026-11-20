@@ -1,11 +1,23 @@
 //! `sparagmos-driver` — the Sparagmos rustc driver.
 //!
-//! Usage: `sparagmos-driver <file.rs> [--dump <path>] [--edition <ed>]`
+//! Usage:
+//! - `sparagmos-driver <file.rs> [--dump <path>] [--edition <ed>]` —
+//!   convert and print a per-function summary.
+//! - `sparagmos-driver run <file.rs> [--edition <ed>]` — convert and
+//!   execute the program's `main` in the Sparagmos interpreter
+//!   (`sparagmos-interp`), in this process.
 //!
-//! Compiles `<file.rs>` as a single crate with the pinned Rust 1.100.0
-//! toolchain, obtains every local function's MIR through Stable MIR
-//! (`rustc_public`), converts it to `sparagmos_mir::Body`, and prints a
-//! per-function summary. Build/run instructions: see the crate README.
+//! Both modes compile `<file.rs>` as a single crate with the pinned
+//! Rust 1.100.0 toolchain, obtain every local function's MIR through
+//! Stable MIR (`rustc_public`), and convert it to `sparagmos_mir::Body`.
+//! Build/run instructions: see the crate README.
+//!
+//! Run-mode exit codes: 0 = the guest program terminated normally,
+//! 101 = the guest program panicked (message on stderr), 2 = the
+//! program could not be converted or executed (concrete reason on
+//! stderr). Run mode prints nothing to stdout: stdout is the guest
+//! program's channel, and guest output is not modelled yet (calls that
+//! would produce it are unresolved and surface as exit 2).
 
 #![feature(rustc_private)]
 
@@ -15,7 +27,7 @@ extern crate rustc_middle;
 extern crate rustc_public;
 extern crate rustc_span;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 use std::sync::{Mutex, OnceLock};
 
@@ -29,6 +41,10 @@ use sparagmos_mir::Body;
 struct Collected {
     report: ConversionReport,
     bodies: Vec<(String, Body)>,
+    /// `DefId` of each entry of `bodies` (same order), as assigned by
+    /// the converter; lets the interpreter resolve `FnDef` call targets
+    /// to the converted functions.
+    body_def_ids: Vec<sparagmos_mir::DefId>,
     def_names: Vec<String>,
 }
 
@@ -47,10 +63,15 @@ fn collect() -> ControlFlow<()> {
     let mut conv = Converter::new();
     let mut report = ConversionReport::default();
     let mut bodies: Vec<(String, Body)> = Vec::new();
+    let mut body_def_ids: Vec<sparagmos_mir::DefId> = Vec::new();
 
     let items = rustc_public::all_local_items();
     for item in items.iter() {
         let name = item.name();
+        // Assign (or fetch) this item's Sparagmos DefId up front, so a
+        // converted body can be handed to the interpreter together with
+        // the id that other bodies use to call it.
+        let def_id = conv.crate_def_id(item);
         let instance = match Instance::try_from(item.clone()) {
             Ok(i) => i,
             Err(_) => {
@@ -87,6 +108,7 @@ fn collect() -> ControlFlow<()> {
         match conv.convert_body(&body) {
             Ok(converted) => {
                 bodies.push((name.clone(), converted));
+                body_def_ids.push(def_id);
                 report.functions.push(FnReport {
                     name,
                     blocks,
@@ -114,18 +136,115 @@ fn collect() -> ControlFlow<()> {
     stash(Collected {
         report,
         bodies,
+        body_def_ids,
         def_names: conv.def_names.clone(),
     });
     ControlFlow::Continue(())
 }
 
+fn is_main(name: &str) -> bool {
+    name == "main" || name.ends_with("::main")
+}
+
+/// Names of `FnDef` call targets that have no converted body in this
+/// program (library / core functions, `println!` machinery, ...), in
+/// the driver's `def_names` spelling. Used to make run-mode failure
+/// reasons concrete about *which* call could not be resolved.
+fn external_callees(c: &Collected) -> Vec<String> {
+    let defined: BTreeSet<&str> = c.bodies.iter().map(|(n, _)| n.as_str()).collect();
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    for (_, body) in &c.bodies {
+        for bb in &body.basic_blocks {
+            let Some(term) = &bb.terminator else { continue };
+            let sparagmos_mir::TerminatorKind::Call { func, .. } = &term.kind else {
+                continue;
+            };
+            let sparagmos_mir::Operand::Constant(konst) = func else {
+                continue;
+            };
+            let sparagmos_mir::ConstKind::Ty(sparagmos_mir::Ty::FnDef(def, _)) = &konst.literal
+            else {
+                continue;
+            };
+            if def.krate != 0 {
+                continue;
+            }
+            if let Some(name) = c.def_names.get(def.index as usize) {
+                if !defined.contains(name.as_str()) {
+                    out.insert(name.clone());
+                }
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// Execute the collected program's `main` in the interpreter and
+/// return the run-mode process exit code (see the crate docs).
+fn execute(c: &Collected) -> i32 {
+    let mut program = sparagmos_interp::MirProgram::new();
+    for ((name, body), def_id) in c.bodies.iter().zip(c.body_def_ids.iter()) {
+        program.functions.push(sparagmos_interp::MirFunction {
+            name: name.clone(),
+            def_id: Some(*def_id),
+            body: body.clone(),
+        });
+    }
+    let Some(entry) = c.bodies.iter().map(|(n, _)| n).find(|n| is_main(n)) else {
+        for f in &c.report.functions {
+            if is_main(&f.name) {
+                if let FnOutcome::Skipped { reasons } = &f.outcome {
+                    let rs: Vec<String> =
+                        reasons.iter().map(|(k, v)| format!("{k} x{v}")).collect();
+                    eprintln!(
+                        "sparagmos-driver run: unsupported: `main` was not converted ({})",
+                        rs.join(", ")
+                    );
+                    return 2;
+                }
+            }
+        }
+        eprintln!(
+            "sparagmos-driver run: unsupported: no `main` function among the converted functions"
+        );
+        return 2;
+    };
+    match sparagmos_interp::interpret_mir(&program, entry, Vec::new()) {
+        Ok(sparagmos_interp::Value::Unit) => 0,
+        Ok(other) => {
+            eprintln!(
+                "sparagmos-driver run: unsupported: entry `{entry}` returned {other}, expected ()"
+            );
+            2
+        }
+        Err(sparagmos_interp::MirRunError::Interp(sparagmos_interp::InterpError::Panic {
+            message,
+        })) => {
+            eprintln!("thread 'main' panicked: {message}");
+            101
+        }
+        Err(e) => {
+            eprintln!("sparagmos-driver run: unsupported: {e}");
+            let ext = external_callees(c);
+            if !ext.is_empty() {
+                eprintln!(
+                    "sparagmos-driver run: calls to functions with no converted body: {}",
+                    ext.join(", ")
+                );
+            }
+            2
+        }
+    }
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
+    let run_mode = argv.get(1).map(|a| a == "run").unwrap_or(false);
     let mut input: Option<String> = None;
     let mut dump_path: Option<String> = None;
     let mut edition = "2021".to_string();
     let mut sysroot: Option<String> = None;
-    let mut i = 1;
+    let mut i = if run_mode { 2 } else { 1 };
     while i < argv.len() {
         match argv[i].as_str() {
             "--dump" => {
@@ -150,7 +269,7 @@ fn main() {
                 }));
             }
             "-h" | "--help" => {
-                println!("usage: sparagmos-driver <file.rs> [--dump <path>] [--edition <ed>] [--sysroot <path>]");
+                println!("usage: sparagmos-driver [run] <file.rs> [--dump <path>] [--edition <ed>] [--sysroot <path>]");
                 return;
             }
             other if input.is_none() && !other.starts_with('-') => {
@@ -164,7 +283,7 @@ fn main() {
         i += 1;
     }
     let Some(input) = input else {
-        eprintln!("usage: sparagmos-driver <file.rs> [--dump <path>]");
+        eprintln!("usage: sparagmos-driver [run] <file.rs> [--dump <path>]");
         std::process::exit(2);
     };
     let sysroot = sysroot
@@ -174,10 +293,7 @@ fn main() {
     // Only the MIR is needed: emit metadata into a scratch directory so
     // running the driver never leaves build artifacts in the caller's
     // working directory.
-    let out_dir = std::env::temp_dir().join(format!(
-        "sparagmos-driver-out-{}",
-        std::process::id()
-    ));
+    let out_dir = std::env::temp_dir().join(format!("sparagmos-driver-out-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&out_dir);
     let args: Vec<String> = vec![
         "sparagmos-driver".to_string(),
@@ -192,6 +308,17 @@ fn main() {
     let collected = take();
     match (result, collected) {
         (Ok(()), Some(c)) => {
+            if run_mode {
+                if let Some(path) = &dump_path {
+                    let text =
+                        sparagmos_driver::dump::render(&input, &c.report, &c.bodies, &c.def_names);
+                    if let Err(e) = std::fs::write(path, text) {
+                        eprintln!("failed to write dump {path}: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                std::process::exit(execute(&c));
+            }
             println!(
                 "sparagmos-driver: {input} (Stable MIR, {})",
                 env!("SPARAGMOS_BUILD_RUSTC_VERSION")
@@ -222,7 +349,8 @@ fn main() {
                 }
             }
             if let Some(path) = &dump_path {
-                let text = sparagmos_driver::dump::render(&input, &c.report, &c.bodies, &c.def_names);
+                let text =
+                    sparagmos_driver::dump::render(&input, &c.report, &c.bodies, &c.def_names);
                 if let Err(e) = std::fs::write(path, text) {
                     eprintln!("failed to write dump {path}: {e}");
                     std::process::exit(1);
@@ -236,7 +364,9 @@ fn main() {
         }
         (Err(e), _) => {
             eprintln!("sparagmos-driver: compilation failed: {e:?}");
-            std::process::exit(1);
+            // In run mode a failed compilation is a conversion failure,
+            // which the run contract reports as exit 2.
+            std::process::exit(if run_mode { 2 } else { 1 });
         }
     }
 }
