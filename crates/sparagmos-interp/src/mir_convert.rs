@@ -782,7 +782,18 @@ impl<'a> Converter<'a> {
                 elems
                     .iter()
                     .map(|e| {
-                        let elem_ctx = match ctx {
+                        // The slice value may sit directly under a
+                        // reference context (a `&[u8]` constant), so
+                        // unwrap references before matching the
+                        // array/slice element type.
+                        let mut inner_ctx = ctx;
+                        while let Some(
+                            mir::Ty::Ref(_, pointee, _) | mir::Ty::RawPtr(pointee, _),
+                        ) = inner_ctx
+                        {
+                            inner_ctx = Some(pointee);
+                        }
+                        let elem_ctx = match inner_ctx {
                             Some(mir::Ty::Array(elem, _) | mir::Ty::Slice(elem)) => {
                                 Some(&**elem)
                             }
