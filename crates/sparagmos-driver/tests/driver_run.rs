@@ -173,3 +173,72 @@ fn run_mode_materialised_constant_shapes() {
         "decoded constant values must match the source program"
     );
 }
+
+const EXPLICIT_DISCRIMINANT_SRC: &str = r#"
+#[repr(i32)]
+enum E { A = 3, B = 7, C = -2 }
+#[repr(i32)]
+enum P { X(i32) = -5, Y(u32) = 42, Z = 0 }
+#[repr(u8)]
+enum U { Lo = 3, Hi = 200 }
+fn name(e: E) -> i32 { match e { E::A => 100, E::B => 200, E::C => 300 } }
+fn p_val(p: P) -> i32 { match p { P::X(v) => v, P::Y(v) => v as i32 + 1, P::Z => -1 } }
+fn u_val(u: U) -> u32 { match u { U::Lo => 1, U::Hi => 2 } }
+const PC: P = P::Y(9);
+fn main() {
+    println!("{}", name(E::A));
+    println!("{}", name(E::B));
+    println!("{}", name(E::C));
+    println!("{}", p_val(P::X(-7)));
+    println!("{}", p_val(PC));
+    println!("{}", u_val(U::Hi));
+    println!("{}", E::C as i32);
+}
+"#;
+
+#[test]
+fn run_mode_explicit_discriminant_match() {
+    // Enums with explicit discriminants: `Discriminant` must yield
+    // the discriminant values (3, 7, -2, ...), not the variant
+    // indices, or every match falls through. The expected output
+    // is what the native build of the same program prints.
+    let dir = temp_dir("explicit-discriminant");
+    let src = fixture(&dir, "explicit_discriminant.rs", EXPLICIT_DISCRIMINANT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "explicit-discriminant enums must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "100\n200\n300\n-7\n10\n2\n-2\n",
+        "matches on explicit discriminants must pick the native branches"
+    );
+}
+
+const NEGATIVE_INT_MATCH_SRC: &str = r#"
+fn f(x: i32) -> i32 { match x { -2 => 300, 3 => 100, _ => 0 } }
+fn main() { println!("{}", f(-2)); println!("{}", f(3)); println!("{}", f(9)); }
+"#;
+
+#[test]
+fn run_mode_negative_int_match() {
+    // SwitchInt branch keys are stored as zero-extended bit
+    // patterns; a signed match must still hit its negative arms.
+    let dir = temp_dir("negative-int-match");
+    let src = fixture(&dir, "negative_int_match.rs", NEGATIVE_INT_MATCH_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "signed int match must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "300\n100\n0\n",
+        "the -2 arm must be taken for -2"
+    );
+}
