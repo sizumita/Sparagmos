@@ -886,6 +886,93 @@ stage 1 も compile-flags を両側 (ネイティブ rustc とドライバ) へ
 
 ---
 
+#### Drop ターミネータ残件の census と修正 (Lane BS、2026-11-21)
+
+both10 時点で理由・バケットが「unsupported terminator: Drop」を
+引く 26 件を全件再現し、原因で分類した。
+
+| クラス | 件数 | 原因 |
+|---|---|---|
+| A. ジェネリックな Drop impl の本体が未収集 | 8 | 名前表には impl があるが単相化された本体が無い。アイテム走査はジェネリック項目を飛ばし、到達可能性収集は Call 辺しか辿らない (drop glue は呼び出し辺ではない) |
+| B. モデル化 glue の無い非ローカル ADT | 6 | Result ×3、RefCell ×1、Cow ×1、Rc/Arc ×1 |
+| C. glue 計画に Ty::Dynamic の腕が無い | 4 | dyn の drop (Lane BF の値モデルの領域) |
+| D. glue 計画に Ty::Closure の腕が無い | 3 | クロージャのキャプチャが計画されない |
+| E. 実行時サポート builtin の型タグ表 | 5 | needs_drop / size_of_val / Default::default (builtins.rs 側の別系統) |
+
+修正 (ブランチ lane/drop-remaining、コミット 88b9020 / 8199fad /
+a0b938e):
+
+- クラス A: ドライバに drop 要求パスを追加した。変換済み本体の
+  Drop ターミネータを走査し、落とされる place の型を計算して
+  (Field / Deref / Index / Downcast を辿る) 型ツリーを歩き、
+  ローカルクレートの ADT 候補ごとに Drop impl メソッドを ADT の
+  ジェネリック引数で Instance::resolve し、ローカル項目と同じ
+  変換で本体化して到達可能性の種に渡す。不動点まで反復
+  (上限 256)、候補ごとに catch_unwind で分離する。
+- クラス A の後続: mir_convert の dtor_body が、ジェネリック
+  引数を builtins::ty_tag で描いた完全な instance キーを最初に
+  試すようになった。同一ジェネリック impl の単相化が2つ共存する
+  形 (issue-24805) で従来の「唯一候補」フォールバックが諦めて
+  いた。
+- クラス B の一部: std::result::Result に Option と同じ形の
+  モデル化 glue (Ok / Err とも field 0 のペイロード)。
+- クラス D: クロージャをキャプチャタプル (最後のジェネリック
+  引数) として計画し、run_drop_glue の Fields の腕が
+  Value::Closure を受けるようにした。部分的にムーブされた
+  キャプチャは既存の Uninit 読み経路で飛ばす。
+
+検証: ワークスペース 336 件全パス (このクローンのベース時点の
+件数)、ドライバ 41 件全パス、コーパス 46/46 (このベースには
+Lane BL が main へ足した int128_ops がまだ無い)。新規テストは
+interp の drop_glue_tests が 10 → 14 件、ドライバの driver_run
+が 24 → 26 件。
+
+combined 実測 (subset-bs.json、ベースは Lane BH 統合時点の
+6619de9 で both11 のベース 379e0ac より古いため、見出しの
+合計は直接比較できない。参考値: 全体 62.738%):
+
+- Drop バケットは both11 の 54 件から 19 件へ。both11 の 54 件の
+  行き先は、pass 6 件、Drop の拒否が消えて後段の「変換された
+  本体が無い関数への呼び出し」へ移行 39 件、Drop のまま 8 件、
+  実行されるが fail 1 件。
+- 新規 pass 6 件: drop-trait-generic、dropck_traits、
+  issue-24805-dropck-itemless、yeet-for-result、
+  partial-move-drop-order、moved-upvar-mut-rebind-11958。
+- fail 化した 1 件 generic-drop-trait-bound-15858 は、デストラクタ
+  が static mut へ書く形で、残るブロッカーは Drop ではなく
+  statics の意味論 (別系統)。
+- Drop のまま残る 8 件は、クラス C の dyn ×4、RefCell
+  (generic-recursive-list-struct と drop-order-comparisons-
+  let-chains)、Cow ×1、Rc/Arc ×1。
+- bs 側で新たに Drop バケットへ入った 11 件のうち 3 件
+  (issue-30018-nopanic、issue-90752、issue-90752-raw-ptr-
+  shenanigans) は both11 では別の理由で unsupported であり、
+  ベース差である。残り 8 件は下記の回帰に含まれる。
+
+**回帰 (統合前に要修正)**: ドライバの drop 要求パスは、この
+レーンのベース (6619de9) で pass する 9 件を「unsupported
+terminator: Drop」(dropflag-reinit-in-loop は mem::drop の
+glue を会計できない形) に落とす。ベースのドライババイナリと
+レーンのバイナリで同一テストを直接実行して切り分けた実測で、
+main.rs の要求パスだけを戻すと全件 pass に戻る。対象は
+drop-scope-exit、issue-2735-2、issue-2735-3、issue-979、
+dropflag-reinit-in-loop、issue-45696-long-live-borrows-in-boxes、
+init-res-into-things、resource-in-struct、
+newtype-struct-drop-run で、いずれも通常の (ジェネリックでない、
+またはライフタイムのみの) ローカル ADT を落とすテストである。
+interp 側の変更 (dtor キー、Result / クロージャ glue) は
+単独では再現しない。要求パスが追加で変換したデストラクタ本体の
+登録キーが、mir_convert 側の「impl は知っているが本体が無い」
+判定と噛み合っていない可能性が高い。**このブランチは現状の
+まま統合しないこと。**
+
+残件: クラス C (dyn の drop)、RefCell / Cow / Rc・Arc の
+glue、クラス E (builtin の型タグ表)、aux クレートのジェネリック
+なデストラクタ、static mut へのデストラクタからの書き込み、
+union 代入の drop 意味論。
+
+---
+
 ### rustdoc 検証系の内訳と成否一致の実測 (2026-11-21)
 
 `scripts/rustc-subset-rustdoc.py` による分類と実測。入力は母数実測と
