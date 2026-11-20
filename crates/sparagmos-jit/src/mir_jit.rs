@@ -73,8 +73,9 @@
 //! operators exactly those panics: plain `Add` / `Sub` / `Mul` are
 //! compiled through the checked backend operation plus a branch on
 //! its flag, plain division checks the `MIN / -1` case explicitly,
-//! plain shifts check the amount and (for `Shl`) the bits shifted
-//! out, and plain `Neg` checks for the type's minimum. The checked
+//! plain shifts check the amount only (bits shifted out are
+//! lost, as natively), and plain `Neg` checks for the type's
+//! minimum. The checked
 //! forms (`CheckedBinaryOp`, `*WithOverflow`) yield the flag as a
 //! value instead, as in the interpreter.
 //!
@@ -1727,9 +1728,10 @@ impl<'a> FnLower<'a> {
     }
 
     /// Plain shift: an amount meeting or exceeding the type width
-    /// panics with the shift message (formatted at run time, since
-    /// the amount is in the message); `Shl` additionally panics when
-    /// bits are shifted out, as the interpreter's plain form does.
+    /// panics with Rust 1.100.0's message for the direction
+    /// (`attempt to shift left with overflow` / `attempt to shift
+    /// right with overflow`), as the interpreter's plain form does.
+    /// Bits shifted out of the width are simply lost, as natively.
     fn lower_shift(
         &mut self,
         dst: u32,
@@ -1748,15 +1750,12 @@ impl<'a> FnLower<'a> {
             lhs: IrOperand::Value(rv),
             rhs: IrOperand::Const(bits as i64),
         });
-        let pblk = self.new_block();
-        self.seal_block(
-            pblk,
-            vec![Instr::PanicShiftOverflow {
-                amount: IrOperand::Value(rv),
-                bits,
-            }],
-            IrTerminator::Unreachable,
-        );
+        let msg = self.messages.intern(if is_shl {
+            "attempt to shift left with overflow"
+        } else {
+            "attempt to shift right with overflow"
+        });
+        let pblk = self.panic_block(msg);
         let cont = self.new_block();
         self.seal_and_continue(
             IrTerminator::Branch {
@@ -1780,41 +1779,13 @@ impl<'a> FnLower<'a> {
             rhs: IrOperand::Value(rv),
         });
         self.normalize(dst, dst_ty);
-        if is_shl {
-            // Bits-shifted-out check: shifting the result back must
-            // reproduce the operand.
-            let back = self.fresh();
-            self.emit(Instr::BinOp {
-                dst: back,
-                op: if kind.signed { IrBinOp::Sar } else { IrBinOp::Shr },
-                lhs: IrOperand::Value(dst),
-                rhs: IrOperand::Value(rv),
-            });
-            let loss = self.fresh();
-            self.emit(Instr::BinOp {
-                dst: loss,
-                op: IrBinOp::Ne,
-                lhs: IrOperand::Value(back),
-                rhs: IrOperand::Value(lv),
-            });
-            let msg = self.messages.intern("arithmetic overflow in Shl");
-            let pblk = self.panic_block(msg);
-            let cont = self.new_block();
-            self.seal_and_continue(
-                IrTerminator::Branch {
-                    cond: IrOperand::Value(loss),
-                    then_blk: pblk,
-                    else_blk: cont,
-                },
-                cont,
-            );
-        }
         Ok(())
     }
 
     /// Checked shift (`CheckedBinaryOp` with `Shl` / `Shr`): the
     /// value wraps (the amount is taken modulo the width) and the
-    /// flag reports an overshift or, for `Shl`, bits shifted out.
+    /// flag reports an overshift only; bits shifted out are lost
+    /// and do not set the flag, as natively.
     fn lower_checked_shift_to(
         &mut self,
         dst: u32,
@@ -1864,35 +1835,9 @@ impl<'a> FnLower<'a> {
             rhs: IrOperand::Value(masked),
         });
         self.normalize(dst, &val_ty);
-        let flag = if is_shl {
-            let back = self.fresh();
-            self.emit(Instr::BinOp {
-                dst: back,
-                op: if kind.signed { IrBinOp::Sar } else { IrBinOp::Shr },
-                lhs: IrOperand::Value(dst),
-                rhs: IrOperand::Value(masked),
-            });
-            let loss = self.fresh();
-            self.emit(Instr::BinOp {
-                dst: loss,
-                op: IrBinOp::Ne,
-                lhs: IrOperand::Value(back),
-                rhs: IrOperand::Value(lv),
-            });
-            let either = self.fresh();
-            self.emit(Instr::BinOp {
-                dst: either,
-                op: IrBinOp::Or,
-                lhs: IrOperand::Value(over),
-                rhs: IrOperand::Value(loss),
-            });
-            either
-        } else {
-            over
-        };
         self.emit(Instr::Copy {
             dst: dst + 1,
-            src: IrOperand::Value(flag),
+            src: IrOperand::Value(over),
         });
         Ok(())
     }
