@@ -424,6 +424,61 @@ impl<'a> Converter<'a> {
         })
     }
 
+    /// Convert the two operands of a binary operation under one shared
+    /// typing context.
+    ///
+    /// In MIR both operands of a binary operation have the same type
+    /// (shift amounts aside; a shift amount's numeric value does not
+    /// depend on which integer type it is read as), and a literal
+    /// operand carries no type of its own in `sparagmos-mir` — how its
+    /// bits are interpreted must come from the operation's context:
+    ///
+    /// 1. A place operand pins the shared type: its declared type is
+    ///    the operation's operand type.
+    /// 2. Otherwise the result type gives it away. A checked operation
+    ///    (a `CheckedBinaryOp`, or a `BinaryOp` with a `*WithOverflow`
+    ///    operator) yields the `(T, bool)` pair, so the operand type is
+    ///    the tuple's first element. A plain operation yields the
+    ///    operand type directly — except comparisons, which yield
+    ///    `bool` and say nothing about their operands. (Typing a
+    ///    literal by the `bool` destination used to collapse every
+    ///    nonzero literal to `true`.)
+    /// 3. Otherwise — a comparison of two literals — no declared type
+    ///    exists anywhere. The pair still needs ONE interpretation:
+    ///    guessing per literal can yield an `Int`/`Uint` pair that
+    ///    cannot even be compared. Both literals are read in the single
+    ///    interpretation of [`literal_pair_ty`]. This is the shape of
+    ///    rustc's expanded Div/Rem checks: `Eq(rhs, 0)`, `Eq(rhs, -1)`,
+    ///    `Eq(lhs, MIN)` over two literals.
+    fn convert_binop_operands(
+        &self,
+        body: &mir::Body,
+        pair: &(mir::Operand, mir::Operand),
+        dest_ty: Option<&mir::Ty>,
+        checked_result: bool,
+        comparison: bool,
+    ) -> Result<(ir::Operand, ir::Operand), ConvertError> {
+        let ctx = self
+            .operand_place_ty(body, &pair.0)
+            .or_else(|| self.operand_place_ty(body, &pair.1))
+            .or_else(|| {
+                if checked_result {
+                    match dest_ty {
+                        Some(mir::Ty::Tuple(ts)) => ts.first().cloned(),
+                        _ => None,
+                    }
+                } else if comparison {
+                    None
+                } else {
+                    dest_ty.cloned()
+                }
+            })
+            .or_else(|| literal_pair_ty(&pair.0, &pair.1));
+        let lhs = self.convert_operand(body, &pair.0, ctx.as_ref())?;
+        let rhs = self.convert_operand(body, &pair.1, ctx.as_ref())?;
+        Ok((lhs, rhs))
+    }
+
     // ----- rvalues -----------------------------------------------------------
 
     fn convert_rvalue(
@@ -436,14 +491,13 @@ impl<'a> Converter<'a> {
         Ok(match rv {
             R::Use(op) => ir::Rvalue::Use(self.convert_operand(body, op, dest_ty)?),
             R::BinaryOp(op, pair) => {
-                let lhs_ctx = self
-                    .operand_place_ty(body, &pair.1)
-                    .or_else(|| dest_ty.cloned());
-                let rhs_ctx = self
-                    .operand_place_ty(body, &pair.0)
-                    .or_else(|| dest_ty.cloned());
-                let lhs = self.convert_operand(body, &pair.0, lhs_ctx.as_ref())?;
-                let rhs = self.convert_operand(body, &pair.1, rhs_ctx.as_ref())?;
+                let (lhs, rhs) = self.convert_binop_operands(
+                    body,
+                    pair,
+                    dest_ty,
+                    overflow_base(*op).is_some(),
+                    is_comparison(*op),
+                )?;
                 match overflow_base(*op) {
                     // `BinaryOp` with a *WithOverflow operator yields the
                     // `(value, overflowed)` tuple in rustc MIR, exactly
@@ -457,14 +511,13 @@ impl<'a> Converter<'a> {
                 }
             }
             R::CheckedBinaryOp(op, pair) => {
-                let lhs_ctx = self
-                    .operand_place_ty(body, &pair.1)
-                    .or_else(|| dest_ty.cloned());
-                let rhs_ctx = self
-                    .operand_place_ty(body, &pair.0)
-                    .or_else(|| dest_ty.cloned());
-                let lhs = self.convert_operand(body, &pair.0, lhs_ctx.as_ref())?;
-                let rhs = self.convert_operand(body, &pair.1, rhs_ctx.as_ref())?;
+                let (lhs, rhs) = self.convert_binop_operands(
+                    body,
+                    pair,
+                    dest_ty,
+                    true,
+                    is_comparison(*op),
+                )?;
                 match overflow_base(*op).or_else(|| plain_binop(*op)) {
                     Some(base) => ir::Rvalue::CheckedBinaryOp(base, Box::new((lhs, rhs))),
                     None => ir::Rvalue::Unsupported(format!("CheckedBinaryOp {}", op.name())),
@@ -693,6 +746,68 @@ fn convert_uint_ty(ty: mir::UintTy) -> ir::UintTy {
         mir::UintTy::U128 => ir::UintTy::U128,
         mir::UintTy::Usize => ir::UintTy::Usize,
     }
+}
+
+/// Whether a `mir` binary operator is a comparison: its result is
+/// `bool`, so its destination type is not its operand type.
+fn is_comparison(op: mir::BinOp) -> bool {
+    use mir::BinOp as M;
+    matches!(op, M::Eq | M::Ne | M::Lt | M::Le | M::Gt | M::Ge)
+}
+
+/// The shared interpretation for two integer literals whose operation
+/// has no declared operand type anywhere (a comparison of two
+/// literals): the integer type of their common storage width — signed
+/// when either bit pattern has the width's sign bit set (the patterns
+/// rustc's expanded checks compare against, `-1` and the type
+/// minimum, both do), unsigned otherwise. `None` when the two operands
+/// are not integer literals of one standard width.
+fn literal_pair_ty(lhs: &mir::Operand, rhs: &mir::Operand) -> Option<mir::Ty> {
+    fn scalar_int(op: &mir::Operand) -> Option<(u128, u8)> {
+        let mir::Operand::Constant(c) = op else {
+            return None;
+        };
+        let mir::ConstKind::Value(mir::ConstValue::Scalar(mir::Scalar::Int { data, size })) =
+            &c.literal
+        else {
+            return None;
+        };
+        Some((*data, *size))
+    }
+    let (ldata, lsize) = scalar_int(lhs)?;
+    let (rdata, rsize) = scalar_int(rhs)?;
+    if lsize != rsize {
+        return None;
+    }
+    let bits = u32::from(lsize) * 8;
+    let sign_bit = |data: u128| bits > 0 && (data >> (bits - 1)) & 1 == 1;
+    if sign_bit(ldata) || sign_bit(rdata) {
+        int_ty_of_bits(bits).map(mir::Ty::Int)
+    } else {
+        uint_ty_of_bits(bits).map(mir::Ty::Uint)
+    }
+}
+
+fn int_ty_of_bits(bits: u32) -> Option<mir::IntTy> {
+    Some(match bits {
+        8 => mir::IntTy::I8,
+        16 => mir::IntTy::I16,
+        32 => mir::IntTy::I32,
+        64 => mir::IntTy::I64,
+        128 => mir::IntTy::I128,
+        _ => return None,
+    })
+}
+
+fn uint_ty_of_bits(bits: u32) -> Option<mir::UintTy> {
+    Some(match bits {
+        8 => mir::UintTy::U8,
+        16 => mir::UintTy::U16,
+        32 => mir::UintTy::U32,
+        64 => mir::UintTy::U64,
+        128 => mir::UintTy::U128,
+        _ => return None,
+    })
 }
 
 /// Sign-extend the low `bits` of `data` into an `i128`.
