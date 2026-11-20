@@ -667,10 +667,10 @@ class ProcessStage1FlagsTests(unittest.TestCase):
 
     def run_with_capture(self, rec):
         orig_n, orig_s = run.native_side, run.sparagmos_side
-        def fake_native(path, edition, workdir, extra_flags=()):
+        def fake_native(path, edition, workdir, extra_flags=(), aux_specs=()):
             self.seen["native_flags"] = list(extra_flags)
             return ({"exit_code": 0, "stdout": "", "stderr": ""}, None)
-        def fake_spar(path, edition, driver_bin, cwd=None, rustc_args=()):
+        def fake_spar(path, edition, driver_bin, cwd=None, rustc_args=(), aux_specs=()):
             self.seen["driver_args"] = list(rustc_args)
             return ({"exit_code": 0, "stdout": "", "stderr": ""},
                     "result", "")
@@ -720,3 +720,57 @@ class SkipBucketTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AuxDirectivesTests(unittest.TestCase):
+    def test_aux_build_name_derivation(self):
+        header = run.Header("//@ aux-build: my-helper.rs\n")
+        self.assertEqual(run.aux_directives(header),
+                         [("my_helper", "my-helper.rs")])
+
+    def test_aux_crate_explicit_name(self):
+        header = run.Header("//@ aux-crate: parser=parser.rs\n")
+        self.assertEqual(run.aux_directives(header),
+                         [("parser", "parser.rs")])
+
+
+class ResolveAuxSpecsTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(self.enterContext(__import__("tempfile")
+                                         .TemporaryDirectory()))
+        self.dir = self.tmp / "tests" / "ui"
+        (self.dir / "auxiliary").mkdir(parents=True)
+
+    def write(self, rel, body):
+        p = self.dir / rel
+        p.write_text(body)
+        return p
+
+    def test_single_aux_in_auxiliary_dir(self):
+        main = self.write("t.rs", "//@ run-pass\n//@ aux-build: helper.rs\n")
+        self.write("auxiliary/helper.rs", "pub fn f() {}\n")
+        specs, err = run.resolve_aux_specs(main)
+        self.assertIsNone(err)
+        self.assertEqual([name for name, _ in specs], ["helper"])
+
+    def test_transitive_aux_comes_first(self):
+        main = self.write(
+            "t.rs", "//@ run-pass\n//@ aux-build: mid.rs\n")
+        self.write("auxiliary/mid.rs",
+                   "//@ aux-build: base.rs\npub fn g() {}\n")
+        self.write("auxiliary/base.rs", "pub fn f() {}\n")
+        specs, err = run.resolve_aux_specs(main)
+        self.assertIsNone(err)
+        self.assertEqual([name for name, _ in specs], ["base", "mid"])
+
+    def test_missing_aux_file_is_an_error(self):
+        main = self.write("t.rs", "//@ run-pass\n//@ aux-build: nope.rs\n")
+        specs, err = run.resolve_aux_specs(main)
+        self.assertEqual(specs, [])
+        self.assertIn("not found", err)
+
+    def test_no_directives_resolves_to_nothing(self):
+        main = self.write("t.rs", "//@ run-pass\nfn main() {}\n")
+        specs, err = run.resolve_aux_specs(main)
+        self.assertIsNone(err)
+        self.assertEqual(specs, [])

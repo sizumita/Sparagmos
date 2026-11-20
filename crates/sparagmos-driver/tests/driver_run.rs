@@ -362,3 +362,106 @@ fn run_mode_negative_int_match() {
         "the -2 arm must be taken for -2"
     );
 }
+
+// ----- auxiliary crates (--aux) ----------------------------------------------
+
+const AUX_BASE_SRC: &str = r#"
+pub fn base_val() -> i32 { 40 }
+"#;
+
+const AUX_BROKEN_SRC: &str = r#"
+pub fn broken( -> i32 { 1 }
+"#;
+
+const AUX_LIB_SRC: &str = r#"
+fn secret(x: i32) -> i32 { x * 3 }
+pub fn add(a: i32, b: i32) -> i32 { a + b }
+pub fn triple(x: i32) -> i32 { secret(x) }
+pub fn generic_id<T>(x: T) -> T { x }
+"#;
+
+const AUX_MAIN_SRC: &str = r#"
+extern crate auxlib;
+fn main() {
+    println!("add={}", auxlib::add(2, 3));
+    println!("triple={}", auxlib::triple(7));
+}
+"#;
+
+const AUX_MID_SRC: &str = r#"
+extern crate base;
+pub fn with_base() -> i32 { base::base_val() + 2 }
+"#;
+
+const AUX_NESTED_MAIN_SRC: &str = r#"
+extern crate mid;
+fn main() { println!("val={}", mid::with_base()); }
+"#;
+
+fn run_driver_with_aux(src: &Path, aux: &[(&str, &Path)]) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"));
+    cmd.arg("run").arg(src);
+    for (name, path) in aux {
+        cmd.arg("--aux").arg(format!("{}={}", name, path.display()));
+    }
+    cmd.output().expect("failed to run sparagmos-driver")
+}
+
+#[test]
+fn run_mode_aux_compile_failure_exits_two() {
+    let dir = temp_dir("aux-broken");
+    let aux = fixture(&dir, "auxlib.rs", AUX_BROKEN_SRC);
+    let src = fixture(&dir, "auxmain.rs", AUX_MAIN_SRC);
+    let out = run_driver_with_aux(&src, &[("auxlib", &aux)]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an uncompilable auxiliary crate is a conversion failure; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("auxiliary crate `auxlib` failed to compile"),
+        "the reason names the auxiliary crate: {stderr}"
+    );
+}
+
+#[test]
+fn run_mode_aux_crate_functions_execute() {
+    // Functions of an auxiliary crate -- including its private
+    // helpers -- are converted into the same program and execute in
+    // the interpreter; the crate's generic functions are skipped
+    // without affecting the run.
+    let dir = temp_dir("aux-basic");
+    let aux = fixture(&dir, "auxlib.rs", AUX_LIB_SRC);
+    let src = fixture(&dir, "auxmain.rs", AUX_MAIN_SRC);
+    let out = run_driver_with_aux(&src, &[("auxlib", &aux)]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "aux calls must execute; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "add=5\ntriple=21\n",
+        "aux function results reach the guest's stdout"
+    );
+}
+
+#[test]
+fn run_mode_nested_aux_crates_execute() {
+    // Auxiliary crates are passed in dependency order: `mid` uses
+    // `base`, and the main crate uses `mid`.
+    let dir = temp_dir("aux-nested");
+    let base = fixture(&dir, "base.rs", AUX_BASE_SRC);
+    let mid = fixture(&dir, "mid.rs", AUX_MID_SRC);
+    let src = fixture(&dir, "nestedmain.rs", AUX_NESTED_MAIN_SRC);
+    let out = run_driver_with_aux(&src, &[("base", &base), ("mid", &mid)]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "nested aux calls must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "val=42\n");
+}
