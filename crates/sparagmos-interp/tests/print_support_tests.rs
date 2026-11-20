@@ -1035,6 +1035,30 @@ fn fmt_debug_array_uses_brackets() {
 }
 
 #[test]
+fn fmt_debug_array_behind_reference_tag_uses_brackets() {
+    // `println!("{:#?}", mref)` with `mref: &mut [i32; 4]`: the fmt
+    // argument's type tag names the reference type, and the value
+    // still formats as an array.
+    let flags: u32 = 0x20 | (3 << 29) | (1 << 23);
+    let mut template = vec![0xC1u8];
+    template.extend_from_slice(&flags.to_le_bytes());
+    template.push(0);
+    let out = print_one(
+        Ty::Array(Box::new(Ty::i32()), 4),
+        Rvalue::AggregateTuple(vec![
+            Operand::const_int(1),
+            Operand::const_int(3),
+            Operand::const_int(4),
+            Operand::const_int(5),
+        ]),
+        "core::fmt::rt::Argument::new_debug",
+        "&mut [i32; 4]",
+        template,
+    );
+    assert_eq!(out, "[\n    1,\n    3,\n    4,\n    5,\n]");
+}
+
+#[test]
 fn fmt_debug_array_pretty_uses_brackets() {
     // "{:#?}" of the array: ALTERNATE flag in the flags field.
     let flags: u32 = 0x20 | (3 << 29) | (1 << 23);

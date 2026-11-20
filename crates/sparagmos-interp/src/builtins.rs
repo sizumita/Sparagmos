@@ -1019,7 +1019,10 @@ impl<'a> Interpreter<'a> {
             // Arrays ride as tuple values; the type tag is what
             // distinguishes `[T; N]` / `[T]` from a tuple, and core's
             // Debug for an array uses brackets, not parentheses.
-            Value::Tuple(_) if ty.starts_with('[') => {
+            // The tag names the type the fmt argument was built
+            // over, which may sit behind references (`&mut [i32; 4]`
+            // for `println!("{:#?}", mref)`), so strip those first.
+            Value::Tuple(_) if pointee_tag(ty).starts_with('[') => {
                 self.format_debug_seq(frames, value, options, indent, '[', ']')
             }
             Value::Tuple(_) => self.format_debug_seq(frames, value, options, indent, '(', ')'),
@@ -1372,6 +1375,26 @@ fn finish_int(negative: bool, mut digits: String, prefix: &str, options: &FmtOpt
         options.flags &= !SIGN_AWARE_ZERO_PAD;
     }
     pad_integral(negative, prefix, &digits, &options)
+}
+
+/// A type tag with any reference / raw-pointer layers stripped:
+/// the tag of the value a fmt argument ultimately formats.
+fn pointee_tag(ty: &str) -> &str {
+    let mut ty = ty;
+    loop {
+        ty = ty.trim_start();
+        if let Some(rest) = ty.strip_prefix("&mut ") {
+            ty = rest;
+        } else if let Some(rest) = ty.strip_prefix('&') {
+            ty = rest;
+        } else if let Some(rest) = ty.strip_prefix("*const ") {
+            ty = rest;
+        } else if let Some(rest) = ty.strip_prefix("*mut ") {
+            ty = rest;
+        } else {
+            return ty;
+        }
+    }
 }
 
 /// Display/Debug formatting of a float value. The host formatter is
