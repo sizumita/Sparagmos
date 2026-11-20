@@ -614,3 +614,207 @@ fn duplicate_function_names_are_rejected() {
     let err = convert_program(&prog).expect_err("duplicate names must fail");
     assert!(matches!(err, ConvertError::DuplicateFunction { .. }));
 }
+
+// ----- unit return place: real MIR never writes `_0` of a `()` fn -----------
+
+/// `fn unit_main()` shaped like real rustc MIR for a unit-returning
+/// function (a counting loop, then a bare `return`): `_0: ()` is never
+/// assigned anywhere — rustc emits no write for the unit return place.
+fn unit_main_body() -> mir::Body {
+    mir::Body::new(
+        decls(&[mir::Ty::unit(), i32_ty(), i32_ty(), bool_ty()]),
+        0,
+        vec![
+            // bb0: _1 = 0 (sum); _2 = 0 (i); goto bb1
+            block(
+                vec![
+                    assign(place(1), mir::Rvalue::Use(const_i32(0))),
+                    assign(place(2), mir::Rvalue::Use(const_i32(0))),
+                ],
+                goto(1),
+            ),
+            // bb1: _3 = Lt(copy _2, 100); switchInt(move _3) -> [0: bb3, otherwise: bb2]
+            block(
+                vec![assign(place(3), binop(mir::BinOp::Lt, copy(2), const_i32(100)))],
+                switch_bool(move_(3), 3, 2),
+            ),
+            // bb2: _1 = Add(copy _1, copy _2); _2 = Add(copy _2, 1); goto bb1
+            block(
+                vec![
+                    assign(place(1), binop(mir::BinOp::Add, copy(1), copy(2))),
+                    assign(place(2), binop(mir::BinOp::Add, copy(2), const_i32(1))),
+                ],
+                goto(1),
+            ),
+            // bb3: return — `_0` was never written, exactly as in real MIR.
+            block(vec![], ret()),
+        ],
+    )
+}
+
+#[test]
+fn unit_returning_function_never_writes_return_place() {
+    let mut prog = MirProgram::new();
+    prog.add("unit_main", unit_main_body());
+    let v = interpret_mir(&prog, "unit_main", vec![])
+        .expect("a unit-returning function must run to its bare `return`");
+    assert_eq!(v, Value::Unit);
+}
+
+#[test]
+fn uninitialized_non_unit_return_place_is_still_an_error() {
+    // `fn missing() -> i32 { return }` with `_0` never written: only the
+    // unit return place may be read unwritten; any other type is a
+    // genuine uninitialized read and must stay an error.
+    let body = mir::Body::new(decls(&[i32_ty()]), 0, vec![block(vec![], ret())]);
+    let mut prog = MirProgram::new();
+    prog.add("missing", body);
+    let err = interpret_mir(&prog, "missing", vec![])
+        .expect_err("unwritten i32 return place must not read as a value");
+    assert!(
+        matches!(
+            err,
+            MirRunError::Interp(InterpError::UninitializedRead { .. })
+        ),
+        "expected UninitializedRead, got {err}"
+    );
+}
+// ----- literal operands of binary operations --------------------------------
+
+/// `fn lit_add() -> i32 { 40 + 2 }`: both operands are literals, so the
+/// only typing context is the checked pair's destination type
+/// `(i32, bool)` — the operand type is its first element.
+/// Locals: _0: i32, _1: (i32, bool).
+fn lit_add_body() -> mir::Body {
+    let pair_ty = mir::Ty::Tuple(vec![i32_ty(), bool_ty()]);
+    mir::Body::new(
+        decls(&[i32_ty(), pair_ty]),
+        0,
+        vec![
+            block(
+                vec![assign(
+                    place(1),
+                    mir::Rvalue::CheckedBinaryOp(
+                        mir::BinOp::Add,
+                        Box::new((const_i32(40), const_i32(2))),
+                    ),
+                )],
+                mir::TerminatorKind::Assert {
+                    cond: mir::Operand::Move(field(1, 1, bool_ty())),
+                    expected: false,
+                    msg: Box::new(mir::AssertMessage::Overflow(
+                        mir::BinOp::Add,
+                        Box::new(const_i32(40)),
+                        Box::new(const_i32(2)),
+                    )),
+                    target: mir::BasicBlock(1),
+                    unwind: mir::UnwindAction::Continue,
+                },
+            ),
+            block(
+                vec![assign(place(0), mir::Rvalue::Use(move_field(1, 0)))],
+                ret(),
+            ),
+        ],
+    )
+}
+
+#[test]
+fn literal_checked_add_uses_the_pair_element_type() {
+    let mut prog = MirProgram::new();
+    prog.add("lit_add", lit_add_body());
+    let v = interpret_mir(&prog, "lit_add", vec![])
+        .expect("literal 40 + 2 must convert with i32 operand typing and run");
+    assert_eq!(v, Value::Int(42));
+}
+
+/// The block shape rustc 1.100.0 emits for `lhs % rhs` on literals: the
+/// division-by-zero and overflow conditions are expanded into explicit
+/// `Eq` comparisons against `0`, `-1` and the type minimum, guarded by
+/// `Assert`s, before the plain `Rem` in the final block.
+/// Locals: _0: i32 (return), _1: i32 (result), _2..=_5: bool checks.
+fn lit_rem_body(lhs: i32, rhs: i32) -> mir::Body {
+    fn assert_not(
+        cond: mir::Operand,
+        msg: mir::AssertMessage,
+        target: u32,
+    ) -> mir::TerminatorKind {
+        mir::TerminatorKind::Assert {
+            cond,
+            expected: false,
+            msg: Box::new(msg),
+            target: mir::BasicBlock(target),
+            unwind: mir::UnwindAction::Continue,
+        }
+    }
+    mir::Body::new(
+        decls(&[i32_ty(), i32_ty(), bool_ty(), bool_ty(), bool_ty(), bool_ty()]),
+        0,
+        vec![
+            // bb0: _2 = Eq(rhs, 0); assert(!move _2, RemainderByZero) -> bb1
+            block(
+                vec![assign(place(2), binop(mir::BinOp::Eq, const_i32(rhs), const_i32(0)))],
+                assert_not(
+                    move_(2),
+                    mir::AssertMessage::RemainderByZero(Box::new(const_i32(lhs))),
+                    1,
+                ),
+            ),
+            // bb1: _3 = Eq(rhs, -1); _4 = Eq(lhs, i32::MIN);
+            //      _5 = BitAnd(move _3, move _4);
+            //      assert(!move _5, Overflow(Rem)) -> bb2
+            block(
+                vec![
+                    assign(place(3), binop(mir::BinOp::Eq, const_i32(rhs), const_i32(-1))),
+                    assign(
+                        place(4),
+                        binop(mir::BinOp::Eq, const_i32(lhs), const_i32(i32::MIN)),
+                    ),
+                    assign(place(5), binop(mir::BinOp::BitAnd, move_(3), move_(4))),
+                ],
+                assert_not(
+                    move_(5),
+                    mir::AssertMessage::Overflow(
+                        mir::BinOp::Rem,
+                        Box::new(const_i32(lhs)),
+                        Box::new(const_i32(rhs)),
+                    ),
+                    2,
+                ),
+            ),
+            // bb2: _1 = Rem(lhs, rhs); _0 = move _1; return
+            block(
+                vec![
+                    assign(place(1), binop(mir::BinOp::Rem, const_i32(lhs), const_i32(rhs))),
+                    assign(place(0), mir::Rvalue::Use(move_(1))),
+                ],
+                ret(),
+            ),
+        ],
+    )
+}
+
+#[test]
+fn literal_rem_checks_do_not_misfire() {
+    // `17 % 5`: neither the by-zero check (5 == 0) nor the overflow
+    // check (5 == -1 && 17 == i32::MIN) holds, so execution must reach
+    // the `Rem` and produce 2 — not a spurious overflow panic.
+    let mut prog = MirProgram::new();
+    prog.add("lit_rem", lit_rem_body(17, 5));
+    let v = interpret_mir(&prog, "lit_rem", vec![]).expect("17 % 5 must run");
+    assert_eq!(v, Value::Int(2));
+}
+
+#[test]
+fn literal_rem_min_by_neg_one_still_panics() {
+    // `i32::MIN % -1` is the one genuinely overflowing remainder: the
+    // expanded checks must still catch it and panic in the guest.
+    let mut prog = MirProgram::new();
+    prog.add("lit_rem_ovf", lit_rem_body(i32::MIN, -1));
+    let err = interpret_mir(&prog, "lit_rem_ovf", vec![])
+        .expect_err("i32::MIN % -1 must panic via the overflow Assert");
+    assert!(
+        matches!(err, MirRunError::Interp(InterpError::Panic { .. })),
+        "expected guest panic, got {err}"
+    );
+}

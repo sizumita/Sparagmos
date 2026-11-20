@@ -221,12 +221,24 @@ impl<'a> Interpreter<'a> {
                 }
                 TerminatorKind::Return => {
                     let frame = frames.pop().expect("frame");
-                    let value = frame.locals.first().cloned().unwrap_or(Value::Uninit);
+                    let mut value = frame.locals.first().cloned().unwrap_or(Value::Uninit);
                     if value == Value::Uninit {
-                        return Err(InterpError::UninitializedRead {
-                            func: frame.func.clone(),
-                            place: "_0".to_string(),
-                        });
+                        // rustc MIR never writes the return place of a
+                        // unit-returning function: its final block is a
+                        // bare `return;`, and the single value of the
+                        // unit type is implied. An unwritten `_0` therefore
+                        // reads as `()` exactly when the declared return
+                        // type is unit. For every other type an unwritten
+                        // `_0` is a genuine uninitialized read and stays
+                        // an error.
+                        if body.local_ty(Local::RETURN) == Some(&Ty::Unit) {
+                            value = Value::Unit;
+                        } else {
+                            return Err(InterpError::UninitializedRead {
+                                func: frame.func.clone(),
+                                place: "_0".to_string(),
+                            });
+                        }
                     }
                     if frames.is_empty() {
                         return Ok(value);
