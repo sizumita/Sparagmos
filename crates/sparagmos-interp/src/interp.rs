@@ -329,7 +329,13 @@ impl<'a> Interpreter<'a> {
                     // because that place is dead after the call).
                     let (callable, env_ref) = match kind {
                         FnCallKind::CallOnce => {
-                            self.eval_callable(&frames, body, &receiver)?
+                            let (value, env) =
+                                self.eval_callable(&frames, body, &receiver)?;
+                            if matches!(value, Value::DynRef { .. }) {
+                                self.dyn_callable(&frames, &value)?
+                            } else {
+                                (value, env)
+                            }
                         }
                         FnCallKind::Call | FnCallKind::CallMut => {
                             let recv = self.eval_operand(&mut frames, body, &receiver)?;
@@ -337,7 +343,14 @@ impl<'a> Interpreter<'a> {
                                 Value::Ref(_) | Value::FatRef { .. } => {
                                     let resolved = self.deref_value(&frames, &recv)?;
                                     let value = self.read_resolved(&frames, &resolved)?;
-                                    (value, recv)
+                                    if matches!(value, Value::DynRef { .. }) {
+                                        self.dyn_callable(&frames, &value)?
+                                    } else {
+                                        (value, recv)
+                                    }
+                                }
+                                Value::DynRef { .. } => {
+                                    self.dyn_callable(&frames, &recv)?
                                 }
                                 value => {
                                     let env = self.callable_env_ref(
@@ -662,6 +675,31 @@ impl<'a> Interpreter<'a> {
     /// operand's place is deliberately not cleared: the environment
     /// reference aliases it for the duration of the call, and the
     /// place is dead afterwards by MIR's move semantics.
+    /// The callable value and environment reference behind a
+    /// `dyn Fn`-family fat pointer: the concrete value it denotes
+    /// (a closure value, for the payloads a program can contain),
+    /// referenced through the fat pointer's own base when that
+    /// base is a reference (a `&dyn Fn`), and as a value otherwise
+    /// (an owned `Box<dyn Fn>` — the closure value inside the box
+    /// aggregate; its captures are place references, so calls
+    /// through the copy still reach them).
+    fn dyn_callable(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+    ) -> InterpResult<(Value, Value)> {
+        let Value::DynRef { base, .. } = value else {
+            unreachable!("dyn_callable on a non-dyn value")
+        };
+        let resolved = self.deref_value(frames, value)?;
+        let callable = self.read_resolved(frames, &resolved)?;
+        let env = match &**base {
+            Value::Ref(_) | Value::FatRef { .. } => (**base).clone(),
+            _ => Value::Ref(RefTarget::Value(Box::new(callable.clone()))),
+        };
+        Ok((callable, env))
+    }
+
     fn eval_callable(
         &self,
         frames: &[Frame],
