@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sparagmos-mir",
+    "crates/sparagmos-parse",
+    "crates/sparagmos-interp",
+    "crates/sparagmos-jit",
+    "crates/sparagmos-runtime",
+    "crates/sparagmos-cli",
+    "crates/sparagmos-harness",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[profile.dev]
+debug = true
