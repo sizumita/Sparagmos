@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use sparagmos_interp::builtins::{canonical_name, lookup, BitOp, Builtin, RelOp, SatOp};
+use sparagmos_interp::builtins::{canonical_name, lookup, BitOp, Builtin, RelOp, SatOp, TrimSide};
 use sparagmos_interp::mir_convert::{interpret_mir, MirProgram};
 use sparagmos_interp::{InterpError, MirRunError, Value};
 use sparagmos_mir as mir;
@@ -307,6 +307,29 @@ fn registry_covers_the_modelled_callees() {
         ("std::mem::swap", Builtin::MemSwap),
         ("std::mem::size_of", Builtin::MemSizeOf),
         ("std::mem::ManuallyDrop::<T>::new", Builtin::ManuallyDropNew),
+        ("std::string::String::new", Builtin::StringNew),
+        ("std::string::String::len", Builtin::StringLen),
+        ("std::string::String::is_empty", Builtin::StringIsEmpty),
+        ("std::string::String::capacity", Builtin::StringCapacity),
+        ("std::string::String::as_str", Builtin::StringAsStr),
+        ("std::string::String::as_bytes", Builtin::StringAsBytes),
+        ("std::string::String::into_bytes", Builtin::StringIntoBytes),
+        ("std::string::String::push_str", Builtin::StringPushStr),
+        ("std::string::String::push", Builtin::StringPush),
+        ("core::str::<impl str>::len", Builtin::StrLen),
+        ("core::str::<impl str>::is_empty", Builtin::StrIsEmpty),
+        ("core::str::<impl str>::as_bytes", Builtin::StrAsBytes),
+        ("core::str::<impl str>::chars", Builtin::StrChars),
+        ("core::str::<impl str>::bytes", Builtin::StrBytes),
+        ("core::str::<impl str>::trim", Builtin::StrTrim(TrimSide::Both)),
+        (
+            "core::str::<impl str>::trim_start",
+            Builtin::StrTrim(TrimSide::Start),
+        ),
+        (
+            "core::str::<impl str>::trim_end",
+            Builtin::StrTrim(TrimSide::End),
+        ),
         ("std::borrow::ToOwned::to_owned", Builtin::ToOwned),
         ("std::convert::Into::into", Builtin::IntoInto),
     ];

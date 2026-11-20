@@ -977,3 +977,159 @@ fn summary_mode_demanded_generic_instances_are_converted() {
         "the undemanded generic definition stays explicitly skipped: {unused}"
     );
 }
+
+// ----- the String / str surface on the abstract string value ------------
+//
+// `String` and `str` are the string data itself in the interpreter's
+// value model, so the std bodies (which project the real struct's
+// buffer/length/capacity fields) cannot run on them; the methods
+// are runtime support instead. These fixtures pin the observable
+// behaviour against native semantics.
+
+const STRING_LEN_SRC: &str = r#"
+fn main() {
+    let s = String::from("héllo");
+    println!("{}", s.len());
+    println!("{}", s.is_empty());
+    let e = String::new();
+    println!("{}", e.is_empty());
+    let r: &str = "héllo";
+    println!("{}", r.len());
+    println!("{}", r.is_empty());
+}
+"#;
+
+#[test]
+fn run_mode_string_len_is_byte_length() {
+    let dir = temp_dir("string-len");
+    let src = fixture(&dir, "string_len.rs", STRING_LEN_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    // `len` is a byte count on both String and str: "héllo" is
+    // 6 bytes (é is two), not 5 chars.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "6\nfalse\ntrue\n6\nfalse\n");
+}
+
+const STRING_INTO_BYTES_SRC: &str = r#"
+fn main() {
+    let s = String::from("abc");
+    let mut b = s.into_bytes();
+    println!("{}", b.len());
+    println!("{}", b[1]);
+    b.push(100);
+    println!("{}", b.len());
+    println!("{}", b[3]);
+}
+"#;
+
+#[test]
+fn run_mode_string_into_bytes_yields_a_real_vec() {
+    let dir = temp_dir("string-into-bytes");
+    let src = fixture(&dir, "string_into_bytes.rs", STRING_INTO_BYTES_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    // The result is a genuine Vec<u8> value: it has a length, its
+    // elements index, and it grows through Vec::push.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n98\n4\n100\n");
+}
+
+const STRING_PUSH_SRC: &str = r#"
+fn main() {
+    let mut s = String::new();
+    s.push_str("ab");
+    s.push('é');
+    s.push_str("cd");
+    println!("{}", s);
+    println!("{}", s.len());
+}
+"#;
+
+#[test]
+fn run_mode_string_push_str_and_push_mutate_in_place() {
+    let dir = temp_dir("string-push");
+    let src = fixture(&dir, "string_push.rs", STRING_PUSH_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "abécd\n6\n");
+}
+
+const STRING_VIEWS_SRC: &str = r#"
+fn main() {
+    let s = String::from("abc");
+    let b = s.as_bytes();
+    println!("{}", b.len());
+    println!("{}", b[0]);
+    let r: &str = s.as_str();
+    println!("{}", r);
+    let t: &str = "abc";
+    println!("{}", t.as_bytes()[2]);
+}
+"#;
+
+#[test]
+fn run_mode_string_as_bytes_and_as_str() {
+    let dir = temp_dir("string-views");
+    let src = fixture(&dir, "string_views.rs", STRING_VIEWS_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n97\nabc\n99\n");
+}
+
+const STR_TRIM_CHARS_SRC: &str = r#"
+fn main() {
+    let s = String::from("  hi  ");
+    println!("[{}]", s.trim());
+    println!("[{}]", s.trim_start());
+    println!("[{}]", s.trim_end());
+    let mut n = 0;
+    for _c in "aébc".chars() { n += 1; }
+    println!("{}", n);
+    let mut m = 0;
+    for _b in "aé".bytes() { m += 1; }
+    println!("{}", m);
+    let mut it = "éx".chars();
+    println!("{}", it.next().unwrap());
+}
+"#;
+
+#[test]
+fn run_mode_str_trim_and_char_byte_iterators() {
+    let dir = temp_dir("str-trim-chars");
+    let src = fixture(&dir, "str_trim_chars.rs", STR_TRIM_CHARS_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    // chars() counts/iterates chars (aébc = 4), bytes() iterates
+    // the UTF-8 bytes (aé = 3).
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[hi]\n[hi  ]\n[  hi]\n4\n3\né\n"
+    );
+}
+
+const STRING_CAPACITY_SRC: &str = r#"
+fn main() {
+    let s = String::from("abc");
+    println!("{}", s.capacity());
+}
+"#;
+
+#[test]
+fn run_mode_string_capacity_is_an_explicit_unsupported() {
+    // Allocation capacity is not tracked by the abstract string
+    // model; the call must fail as unsupported naming the method,
+    // not as a projection failure inside the collected std body.
+    let dir = temp_dir("string-capacity");
+    let src = fixture(&dir, "string_capacity.rs", STRING_CAPACITY_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr={stderr}");
+    assert!(
+        stderr.contains("std::string::String::capacity"),
+        "the error names the method: {stderr}"
+    );
+}
