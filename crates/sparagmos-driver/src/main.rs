@@ -615,15 +615,12 @@ fn collect_local_instances(
             };
             match conv.convert_body(&ibody) {
                 Ok(converted) => {
-                    if let Some(what) = sparagmos_driver::reach::unrepresentable_local(&converted)
-                    {
-                        fail_all(
-                            &mut demands,
-                            &owners,
-                            format!("body uses a type the runtime cannot represent ({what})"),
-                        );
-                        continue;
-                    }
+                    // No representability screen: these are local
+                    // functions, and the item loop converts local
+                    // bodies without one. A body the interpreter
+                    // cannot represent stays in the program and is
+                    // recorded unconverted by the interpreter's own
+                    // per-body isolation if it is ever called.
                     taken += 1;
                     queue.push_back(ibody.clone());
                     extra_seeds.push(ibody.clone());
