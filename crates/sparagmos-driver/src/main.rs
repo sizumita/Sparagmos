@@ -687,11 +687,23 @@ fn demand_drop_instances(
             let Ok(Some((inst, sm_body))) = resolved else {
                 continue;
             };
+            // Identity, not spelling: the item loop may already
+            // have converted this very instance under a differently
+            // spelled name (the item records the declared lifetime
+            // parameters, e.g. `<'a>`, where the resolved instance
+            // renders erased lifetimes as `'_`). Registering the
+            // same destructor twice leaves the interpreter's
+            // destructor lookup with two candidates, which it
+            // treats as ambiguous and refuses the drop, so an
+            // already-converted instance is skipped by its DefId.
+            let def_id = conv.instance_def_id(inst.def.def_id(), &inst);
+            if body_def_ids.contains(&def_id) {
+                continue;
+            }
             let name = inst.name().to_string();
             if bodies.iter().any(|(n, _)| n == &name) {
                 continue;
             }
-            let def_id = conv.instance_def_id(inst.def.def_id(), &inst);
             let before = bodies.len();
             convert_item(
                 conv,
