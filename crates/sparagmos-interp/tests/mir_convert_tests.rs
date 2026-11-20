@@ -614,3 +614,68 @@ fn duplicate_function_names_are_rejected() {
     let err = convert_program(&prog).expect_err("duplicate names must fail");
     assert!(matches!(err, ConvertError::DuplicateFunction { .. }));
 }
+
+// ----- unit return place: real MIR never writes `_0` of a `()` fn -----------
+
+/// `fn unit_main()` shaped like real rustc MIR for a unit-returning
+/// function (a counting loop, then a bare `return`): `_0: ()` is never
+/// assigned anywhere — rustc emits no write for the unit return place.
+fn unit_main_body() -> mir::Body {
+    mir::Body::new(
+        decls(&[mir::Ty::unit(), i32_ty(), i32_ty(), bool_ty()]),
+        0,
+        vec![
+            // bb0: _1 = 0 (sum); _2 = 0 (i); goto bb1
+            block(
+                vec![
+                    assign(place(1), mir::Rvalue::Use(const_i32(0))),
+                    assign(place(2), mir::Rvalue::Use(const_i32(0))),
+                ],
+                goto(1),
+            ),
+            // bb1: _3 = Lt(copy _2, 100); switchInt(move _3) -> [0: bb3, otherwise: bb2]
+            block(
+                vec![assign(place(3), binop(mir::BinOp::Lt, copy(2), const_i32(100)))],
+                switch_bool(move_(3), 3, 2),
+            ),
+            // bb2: _1 = Add(copy _1, copy _2); _2 = Add(copy _2, 1); goto bb1
+            block(
+                vec![
+                    assign(place(1), binop(mir::BinOp::Add, copy(1), copy(2))),
+                    assign(place(2), binop(mir::BinOp::Add, copy(2), const_i32(1))),
+                ],
+                goto(1),
+            ),
+            // bb3: return — `_0` was never written, exactly as in real MIR.
+            block(vec![], ret()),
+        ],
+    )
+}
+
+#[test]
+fn unit_returning_function_never_writes_return_place() {
+    let mut prog = MirProgram::new();
+    prog.add("unit_main", unit_main_body());
+    let v = interpret_mir(&prog, "unit_main", vec![])
+        .expect("a unit-returning function must run to its bare `return`");
+    assert_eq!(v, Value::Unit);
+}
+
+#[test]
+fn uninitialized_non_unit_return_place_is_still_an_error() {
+    // `fn missing() -> i32 { return }` with `_0` never written: only the
+    // unit return place may be read unwritten; any other type is a
+    // genuine uninitialized read and must stay an error.
+    let body = mir::Body::new(decls(&[i32_ty()]), 0, vec![block(vec![], ret())]);
+    let mut prog = MirProgram::new();
+    prog.add("missing", body);
+    let err = interpret_mir(&prog, "missing", vec![])
+        .expect_err("unwritten i32 return place must not read as a value");
+    assert!(
+        matches!(
+            err,
+            MirRunError::Interp(InterpError::UninitializedRead { .. })
+        ),
+        "expected UninitializedRead, got {err}"
+    );
+}
