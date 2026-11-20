@@ -904,6 +904,59 @@ BoxDerefTransmute のオペランド形状 2 件、終了コード不一致
 明示エラー)、`PtrMetadata` の dyn ポインタへの適用、
 vtable 同一性の等価比較、dyn 値の Display/Debug 整形。
 
+#### コルーチンの状態オブジェクト実行 (2026-11-21、lane/coroutine-yield)
+
+前提の発見: Stable MIR (rustc_public 1.100.0) は `Yield` /
+`CoroutineDrop` ターミネータを公開しない (`TerminatorKind` は
+10 種のみ)。ドライバが受け取るのはコルーチン変換後の本体で、
+判別子ディスパッチ・状態フィールドの保存/復元・
+`SetDiscriminant`・`Poll` / `CoroutineState` の返却までが通常の
+文と終端子で表れている。そこで Yield そのものではなく状態
+オブジェクトをモデル化した: `Value::Coroutine { variant, fields }`
+を `Value::Enum` とは別にし (Downcast は透過、フィールド書き込みは
+`Uninit` で伸長、`SetDiscriminant` はタグのみ変更)、生成は
+`AggregateKind::Coroutine` → `Rvalue::CoroutineAggregate`、drop
+glue は状態フィールド表に対する Variants プランで組む。ドライバの
+到達可能性スクリーニングが `Ty::Coroutine` ローカルを拒んでいた点も
+直した。意味テストは `crates/sparagmos-interp/tests/coroutine_tests.rs`
+に 6 件 (生成器の yield 列と完了、完了後の再開 panic、yield しない
+async fn の即 Ready、Ready な future の await、Pending を返す内側
+コルーチンの await、suspend 中コルーチンの drop glue) を手組みの
+変換後形状ボディで検証し、全件パス。
+
+combined 実測 (subset-bz、--jobs 48、both11 と同一 survey、
+ベースは main a1de97a + 本レーン): 全体は 16,588/24,937 =
+66.52% で both11 の 65.204% から +328 件、pass から他状態への
+後退は 0 件。ただしこのベースには both11 未収録の BI/BF/BN/BM が
+含まれるため +328 の全てが本レーンの寄与ではない。本レーンに
+帰属する動き: both11 で失敗理由に coroutine / Yield を含んだ
+記録は 91 件 → 25 件に減り、うち 27 件が pass に転じた
+(tests/ui/coroutine/* の gen テスト群、async-await の
+issue-65419-coroutine-resume-after-completion など)。残る 64 件は
+コルーチン以外の境界へ前進した: 変換済み本体の無い関数への
+呼び出し 38 件 (大半は `Waker::noop` と waker vtable)、
+by-reference 定数 15 件、型不一致 6 件、Drop 4 件、未初期化
+読み 1 件。カテゴリ別は exec 1,921/4,149 = 46.3%、
+コンパイル時検証系 14,667/18,332 = 80.008%。
+
+指標1 への影響はない: variant-matrix の Yield / CoroutineDrop
+行は `none` のまま 27/40 で不変 (JIT に Yield の lowering は
+無く、interp もドライバ経由では Yield ターミネータを受け
+取らない)。
+
+副次的な修正: anon_const / body_isolation / robustness の
+各テストが「変換できない型」のフィクスチャにコルーチン型
+ローカルを使っていたため、dyn フィクスチャの時と同じ手順で
+`Ty::CoroutineWitness` (依然として未モデル) へ差し替えた。
+
+明示的な境界として残るもの: Yield / CoroutineDrop ターミネータ
+自体 (ドライバからは到達不能)、async クロージャ
+(`AggregateKind::CoroutineClosure`)、`Ty::CoroutineWitness`、
+実 Waker 構築を要する async の end-to-end 実行 (`Waker::noop` /
+RawWakerVTable の by-reference 定数、`Arc<T>` から Waker への
+`From`)、コルーチンへの `size_of_val`、async-drop が使う
+DerefMut の runtime support。
+
 #### stage 2: コンパイル時検証系の実測 (2026-11-21)
 
 同じランナーの stage 2 で、コンパイル時検証系 18,332 件を実測した。
