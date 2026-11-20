@@ -352,7 +352,13 @@ impl<'a> Converter<'a> {
             // Function items and closures are named by the body they
             // call, so a value of this type can be invoked.
             mir::Ty::FnDef(def, _) => ir::Ty::FnDef(self.def_display_name(def)),
-            mir::Ty::Closure(def, _) => ir::Ty::Closure(self.def_display_name(def)),
+            mir::Ty::Closure(def, args) => {
+                let upvars = match args.get(2) {
+                    Some(mir::Ty::Tuple(ts)) => ts.len(),
+                    _ => 0,
+                };
+                ir::Ty::Closure(self.def_display_name(def), upvars)
+            }
             mir::Ty::Ref(_, inner, _) => {
                 ir::Ty::Ref(Box::new(self.convert_ty(inner, context)?))
             }
@@ -729,7 +735,7 @@ impl<'a> Converter<'a> {
                     ) => match operand {
                         mir::Operand::Copy(_) | mir::Operand::Move(_) => ir::Rvalue::Use(v),
                         mir::Operand::Constant(_) => ir::Rvalue::Unsupported(
-                            "Cast ClosureFnPointer of a zero-sized closure constant                              (the closure type is not preserved in the constant)"
+                            "Cast ClosureFnPointer of a zero-sized closure constant (the closure type is not preserved in the constant)"
                                 .to_string(),
                         ),
                     },

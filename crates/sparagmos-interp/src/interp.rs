@@ -850,6 +850,15 @@ impl<'a> Interpreter<'a> {
                         local: *local,
                     }
                 })?;
+                // A zero-capture closure is zero-sized and rustc
+                // MIR never writes its place: an unwritten read of
+                // such a local denotes the unique empty-environment
+                // closure value.
+                let base = if base == Value::Uninit {
+                    self.zst_closure_value(frame, *local).unwrap_or(base)
+                } else {
+                    base
+                };
                 let place_desc = describe_resolved(*local, projection);
                 let value = project_value(base, projection, &frame.func, &place_desc)?;
                 if value == Value::Uninit {
@@ -860,6 +869,20 @@ impl<'a> Interpreter<'a> {
                 }
                 Ok(value)
             }
+        }
+    }
+
+    /// The value of a never-written zero-capture closure local in
+    /// `frame` (see the note in `read_resolved`); `None` for any
+    /// other local.
+    fn zst_closure_value(&self, frame: &Frame, local: usize) -> Option<Value> {
+        let body = self.program.get(&frame.func)?;
+        match body.local_ty(Local(local)) {
+            Some(Ty::Closure(def, 0)) => Some(Value::Closure {
+                def: def.clone(),
+                env: Vec::new(),
+            }),
+            _ => None,
         }
     }
 
@@ -967,7 +990,7 @@ impl<'a> Interpreter<'a> {
             (Some(Ty::FnPtr), Value::FnPtr(_))
             | (Some(Ty::FnPtr), Value::Closure { .. })
             | (Some(Ty::FnDef(_)), Value::FnPtr(_))
-            | (Some(Ty::Closure(_)), Value::Closure { .. }) => Ok(value),
+            | (Some(Ty::Closure(..)), Value::Closure { .. }) => Ok(value),
             // ADT locals hold the ADT value forms: aggregates, string
             // data (`String`), and the fmt value family.
             (Some(Ty::Adt(_)), Value::Enum { .. })

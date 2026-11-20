@@ -168,9 +168,13 @@ pub enum Ty {
     /// A function item type: the zero-sized type of one specific
     /// function, identified by the function's name.
     FnDef(String),
-    /// A closure type, identified by the closure body's name in the
-    /// program.
-    Closure(String),
+    /// A closure type: the closure body's name in the program, and
+    /// the number of captured variables (the length of the upvars
+    /// tuple). The count matters because a zero-capture closure is
+    /// zero-sized: rustc MIR never writes its place, so the
+    /// interpreter synthesises the (unique) empty-environment value
+    /// when such a place is read.
+    Closure(String, usize),
 }
 
 impl Ty {

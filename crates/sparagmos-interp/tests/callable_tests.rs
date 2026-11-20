@@ -709,3 +709,64 @@ fn closure_without_body_in_program_fails_with_its_name() {
         "expected UnknownFunction naming the closure, got {err}"
     );
 }
+
+#[test]
+fn zero_capture_closure_place_is_never_written() {
+    // Real rustc MIR for a zero-capture closure: the closure local
+    // is never assigned (the value is zero-sized); the caller only
+    // ever takes a reference to the place and calls through it.
+    // main: _2 = &_1 (no write to _1 anywhere); _3 = (41,);
+    //       _4 = Fn::call(move _2, move _3); _0 = copy _4
+    let clo_ty = closure_ty(CLOSURE, vec![i32_ty()], vec![]);
+    let main = mir::Body::new(
+        decls(&[
+            i32_ty(),
+            clo_ty.clone(),
+            ref_ty(clo_ty.clone(), false),
+            mir::Ty::Tuple(vec![i32_ty()]),
+            i32_ty(),
+        ]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(
+                        place(2),
+                        mir::Rvalue::Ref(mir::Region::Erased, mir::BorrowKind::Shared, place(1)),
+                    ),
+                    assign(
+                        place(3),
+                        mir::Rvalue::Aggregate(
+                            Box::new(mir::AggregateKind::Tuple),
+                            vec![const_i32(41)],
+                        ),
+                    ),
+                ],
+                call(
+                    fndef_operand(FN_CALL, vec![clo_ty.clone(), mir::Ty::Tuple(vec![i32_ty()])]),
+                    vec![move_(2), move_(3)],
+                    4,
+                    1,
+                ),
+            ),
+            block(vec![assign(place(0), mir::Rvalue::Use(copy(4)))], ret()),
+        ],
+    );
+    // {closure#0}(_1: &{closure}, _2: i32) -> i32 { _0 = _2 + 1 }
+    let env_ty = ref_ty(clo_ty.clone(), false);
+    let closure_body = mir::Body::new(
+        decls(&[i32_ty(), env_ty, i32_ty()]),
+        2,
+        vec![block(
+            vec![assign(place(0), add(copy(2), const_i32(1)))],
+            ret(),
+        )],
+    );
+    let mut prog = program_with_std_call_names();
+    prog.fn_names
+        .insert(CLOSURE, "main::{closure#0}".to_string());
+    prog.add_with_def_id("main::{closure#0}", CLOSURE, closure_body);
+    prog.add("main", main);
+    let result = interpret_mir(&prog, "main", vec![]).expect("run must succeed");
+    assert_eq!(result, Value::Int(42));
+}
