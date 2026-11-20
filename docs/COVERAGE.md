@@ -251,6 +251,33 @@ Rvalue::Len / CheckedBinaryOp / NullaryOp / ShallowInitBox) は
 このマトリクスに含めない。CheckedBinaryOp を使うテストは、
 同時に構築される Assign / Assert 等の根拠として現れる。
 
+### coverage テーブルとの対応
+
+`crates/sparagmos-mir/src/coverage.rs` には2種類の表がある。
+
+- **指標1の母数表** (`METRIC1_STATEMENT_KINDS` / `METRIC1_TERMINATOR_KINDS` /
+  `METRIC1_RVALUE_KINDS`): 上の母数表と同一の40種。網羅率の分母はこの表だけが
+  担う (`metric1_variant_count() == 40`)。
+- **モデル表** (`model_tables()` が返す15表): `sparagmos-mir` の型モデル自身が
+  定義するバリアントの目録で、副指標1b の集計と、各モジュールのサンプル
+  テスト (全バリアントを構築して `kind_name()` を照合する) のためにある。
+  分母ではない (`model_variant_total()` はモデルの総数であって網羅率の
+  分母ではない)。
+
+モデルは rustc MIR の方言なので、モデル表と母数表は一致しない。主な相違は
+次のとおり。モデルには `StatementKind::Retag` があり、母数の
+`BackwardIncompatibleDropHint` が無い。unwind 系ターミネータはモデルでは
+`Resume` / `Terminate`、母数では `UnwindResume` / `UnwindTerminate`。
+`Rvalue` はモデルでは `Len` / `CheckedBinaryOp` / `NullaryOp` /
+`ShallowInitBox` を独立バリアントとして持つ (15種) が、母数では他の
+バリアントに統合され、代わりに `WrapUnsafeBinder` と `Reborrow` がある
+(13種)。
+
+モデル表の件数は副指標1b の分母と一致するとは限らない (例: CastKind は
+1b の分母が12種に対しモデルは11種で `BoxDerefTransmute` を欠く)。モデルが
+持たない enum (BorrowKind、FakeReadCause 等) については、モデル表自体が
+無い。
+
 ---
 
 ## 指標2: テストパス率
