@@ -18,6 +18,10 @@ dependencies = [
 [[package]]
 name = "sparagmos-harness"
 version = "0.1.0"
+dependencies = [
+ "sparagmos-jit",
+ "sparagmos-mir",
+]
 
 [[package]]
 name = "sparagmos-interp"
