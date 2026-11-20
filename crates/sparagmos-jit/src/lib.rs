@@ -24,9 +24,10 @@ pub mod mir_jit;
 pub mod program;
 
 pub use compiler::{compile, compile_to_bytes, CompileError, CompiledFunction};
-pub use emitter::{CodeBuffer, Cond, Emitter, Reg};
+pub use emitter::{CodeBuffer, Cond, Emitter, Reg, Xmm};
 pub use ir::{
-    BasicBlock, BinOp, BlockId, Function, FunctionBuilder, Instr, Operand, Terminator, UnOp, Value,
+    BasicBlock, BinOp, BlockId, FloatBinOp, FloatKind, Function, FunctionBuilder, Instr, IntKind,
+    Operand, Terminator, UnOp, Value,
 };
 pub use memory::JitMemory;
 pub use mir_jit::{JitCallError, JitError, JitProgram, MirFunctionInput, MirProgramInput};

@@ -21,9 +21,29 @@
 //!   (panic flag address, panic runtime entry, message table) so calls
 //!   between the functions and guest panics work.
 
-use crate::emitter::{Cond, Emitter, Reg};
-use crate::ir::{BinOp, CheckedOp, Function, Instr, Operand, Terminator, UnOp, Value};
+use crate::emitter::{Cond, Emitter, Reg, Xmm};
+use crate::ir::{
+    BinOp, CheckedOp, FloatBinOp, FloatKind, Function, Instr, Operand, Terminator, UnOp, Value,
+};
 use crate::memory::JitMemory;
+
+/// Rust's `%` on `f64` (the exact `fmod` remainder). SSE has no
+/// remainder instruction, and the exact result cannot be computed
+/// from a truncated quotient without extended precision, so — like
+/// the libcall a native compiler emits — the generated code calls
+/// this helper, which lives in the JIT crate itself and is therefore
+/// at a stable address in any process that runs generated code.
+/// Arguments and result follow the System V float convention
+/// (xmm0, xmm1 -> xmm0), which is exactly where the compiler's
+/// float sequences keep them.
+extern "C" fn float_rem_f64(a: f64, b: f64) -> f64 {
+    a % b
+}
+
+/// The `f32` form of [`float_rem_f64`].
+extern "C" fn float_rem_f32(a: f32, b: f32) -> f32 {
+    a % b
+}
 
 #[derive(Debug)]
 pub enum CompileError {
@@ -179,6 +199,129 @@ impl<'a> Compiler<'a> {
         self.store_reg(dst, Reg::Rax)
     }
 
+    /// Load a floating-point operand (a slot's bit pattern, or an
+    /// inline pattern for `Operand::Const`) into SSE register `x`.
+    fn load_float_operand(
+        &mut self,
+        x: Xmm,
+        kind: FloatKind,
+        op: Operand,
+    ) -> Result<(), CompileError> {
+        match op {
+            Operand::Value(v) => {
+                let d = self.slot_disp(v)?;
+                match kind {
+                    FloatKind::F64 => self.e.movsd_load(x, Reg::Rbp, d),
+                    FloatKind::F32 => self.e.movss_load(x, Reg::Rbp, d),
+                }
+            }
+            Operand::Const(bits) => {
+                self.e.mov_ri64(Reg::Rcx, bits);
+                match kind {
+                    FloatKind::F64 => self.e.movq_xmm(x, Reg::Rcx),
+                    FloatKind::F32 => self.e.movd_xmm(x, Reg::Rcx),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Store the float result in xmm0 into `dst`'s slot. An `f32`
+    /// result goes through a general register so the slot's upper
+    /// half becomes zero — the canonical form for `f32` (a `movss`
+    /// store would leave stale bits in the upper half).
+    fn store_float_result(&mut self, dst: Value, kind: FloatKind) -> Result<(), CompileError> {
+        let d = self.slot_disp(dst)?;
+        match kind {
+            FloatKind::F64 => self.e.movsd_store(Reg::Rbp, d, Xmm::Xmm0),
+            FloatKind::F32 => {
+                self.e.movd_gpr(Reg::Rax, Xmm::Xmm0);
+                self.e.mov_store(Reg::Rbp, d, Reg::Rax);
+            }
+        }
+        Ok(())
+    }
+
+    /// Patch every collected rel32 field to the current position.
+    fn patch_all_here(&mut self, fields: &[usize]) {
+        let target = self.e.position();
+        for at in fields {
+            self.e.buf.patch_rel32(*at, target);
+        }
+    }
+
+    /// Emit the saturating `f64` -> `i64` conversion of Rust's `as`
+    /// cast: the value in xmm0 becomes the result in rax.
+    /// `cvttsd2si` alone truncates but yields the indefinite value
+    /// (i64::MIN) for NaN and out-of-range inputs; the fixup path
+    /// distinguishes those cases: NaN maps to 0, an input of at
+    /// least 2^63 saturates to i64::MAX, and anything else that
+    /// produced the indefinite value is a genuine i64::MIN (an input
+    /// of at most -2^63, which saturates to or equals the minimum).
+    fn emit_f64_to_i64(&mut self) {
+        self.e.cvttsd2si(Reg::Rax, Xmm::Xmm0);
+        self.e.mov_ri64(Reg::Rcx, i64::MIN);
+        self.e.cmp_rr(Reg::Rax, Reg::Rcx);
+        let done1 = self.e.jcc_rel32(Cond::NotEqual);
+        // rax == i64::MIN: the sentinel, or a genuine minimum.
+        self.e.ucomisd(Xmm::Xmm0, Xmm::Xmm0);
+        let not_nan = self.e.jcc_rel32(Cond::NotParity);
+        self.e.xor_rr(Reg::Rax, Reg::Rax); // NaN -> 0
+        let done2 = self.e.jmp_rel32();
+        let not_nan_at = self.e.position();
+        self.e.buf.patch_rel32(not_nan, not_nan_at);
+        self.e.mov_ri64(Reg::Rcx, 0x43E0_0000_0000_0000); // 2^63
+        self.e.movq_xmm(Xmm::Xmm1, Reg::Rcx);
+        self.e.ucomisd(Xmm::Xmm0, Xmm::Xmm1);
+        let done3 = self.e.jcc_rel32(Cond::Below);
+        self.e.mov_ri64(Reg::Rax, i64::MAX);
+        self.patch_all_here(&[done1, done2, done3]);
+    }
+
+    /// Emit the saturating `f64` -> `u64` conversion of Rust's `as`
+    /// cast: the value in xmm0 becomes the result in rax. Inputs of
+    /// at least 2^63 take the subtract-and-set-the-top-bit path (the
+    /// hardware conversion is signed); negative inputs clamp to 0
+    /// and NaN maps to 0.
+    fn emit_f64_to_u64(&mut self) {
+        self.e.ucomisd(Xmm::Xmm0, Xmm::Xmm0);
+        let not_nan = self.e.jcc_rel32(Cond::NotParity);
+        self.e.xor_rr(Reg::Rax, Reg::Rax); // NaN -> 0
+        let done1 = self.e.jmp_rel32();
+        let not_nan_at = self.e.position();
+        self.e.buf.patch_rel32(not_nan, not_nan_at);
+        // At least 2^64 saturates to u64::MAX.
+        self.e.mov_ri64(Reg::Rcx, 0x43F0_0000_0000_0000); // 2^64
+        self.e.movq_xmm(Xmm::Xmm1, Reg::Rcx);
+        self.e.ucomisd(Xmm::Xmm0, Xmm::Xmm1);
+        let not_huge = self.e.jcc_rel32(Cond::Below);
+        self.e.mov_ri64(Reg::Rax, -1);
+        let done2 = self.e.jmp_rel32();
+        let not_huge_at = self.e.position();
+        self.e.buf.patch_rel32(not_huge, not_huge_at);
+        // Compare against 2^63 to pick the path.
+        self.e.mov_ri64(Reg::Rcx, 0x43E0_0000_0000_0000); // 2^63
+        self.e.movq_xmm(Xmm::Xmm1, Reg::Rcx);
+        self.e.ucomisd(Xmm::Xmm0, Xmm::Xmm1);
+        let small = self.e.jcc_rel32(Cond::Below);
+        // Big path: (x - 2^63) fits the signed conversion; setting
+        // the top bit adds 2^63 back exactly.
+        self.e.subsd(Xmm::Xmm0, Xmm::Xmm1);
+        self.e.cvttsd2si(Reg::Rax, Xmm::Xmm0);
+        self.e.mov_ri64(Reg::Rcx, i64::MIN);
+        self.e.or_rr(Reg::Rax, Reg::Rcx);
+        let done3 = self.e.jmp_rel32();
+        let small_at = self.e.position();
+        self.e.buf.patch_rel32(small, small_at);
+        // Small path: the signed conversion is exact; a negative
+        // result is a negative input, which clamps to 0.
+        self.e.cvttsd2si(Reg::Rax, Xmm::Xmm0);
+        self.e.test_rr(Reg::Rax, Reg::Rax);
+        let done4 = self.e.jcc_rel32(Cond::NotSign);
+        self.e.xor_rr(Reg::Rax, Reg::Rax);
+        self.patch_all_here(&[done1, done2, done3, done4]);
+    }
+
     fn compile_instr(&mut self, instr: &Instr) -> Result<(), CompileError> {
         match instr {
             Instr::Const { dst, imm } => {
@@ -327,6 +470,202 @@ impl<'a> Compiler<'a> {
                     self.store_reg(*dst_val, Reg::Rcx)?;
                     self.store_result(*dst_flag)?;
                 }
+            }
+            Instr::FloatBinOp {
+                dst,
+                op,
+                kind,
+                lhs,
+                rhs,
+            } => {
+                use FloatBinOp as F;
+                self.load_float_operand(Xmm::Xmm0, *kind, *lhs)?;
+                self.load_float_operand(Xmm::Xmm1, *kind, *rhs)?;
+                match op {
+                    F::Add | F::Sub | F::Mul | F::Div => {
+                        match (kind, op) {
+                            (FloatKind::F64, F::Add) => self.e.addsd(Xmm::Xmm0, Xmm::Xmm1),
+                            (FloatKind::F64, F::Sub) => self.e.subsd(Xmm::Xmm0, Xmm::Xmm1),
+                            (FloatKind::F64, F::Mul) => self.e.mulsd(Xmm::Xmm0, Xmm::Xmm1),
+                            (FloatKind::F64, F::Div) => self.e.divsd(Xmm::Xmm0, Xmm::Xmm1),
+                            (FloatKind::F32, F::Add) => self.e.addss(Xmm::Xmm0, Xmm::Xmm1),
+                            (FloatKind::F32, F::Sub) => self.e.subss(Xmm::Xmm0, Xmm::Xmm1),
+                            (FloatKind::F32, F::Mul) => self.e.mulss(Xmm::Xmm0, Xmm::Xmm1),
+                            (FloatKind::F32, F::Div) => self.e.divss(Xmm::Xmm0, Xmm::Xmm1),
+                            _ => unreachable!(),
+                        }
+                        self.store_float_result(*dst, *kind)?;
+                    }
+                    F::Rem => {
+                        // The operands are already in the System V
+                        // float argument registers (xmm0, xmm1) and
+                        // the helper returns into xmm0. The frame
+                        // keeps rsp 16-byte aligned at every point
+                        // (see the prologue), so the call is ABI-correct.
+                        let helper = match kind {
+                            FloatKind::F64 => float_rem_f64 as usize,
+                            FloatKind::F32 => float_rem_f32 as usize,
+                        };
+                        self.e.mov_ri64(Reg::Rax, helper as i64);
+                        self.e.call_r(Reg::Rax);
+                        self.store_float_result(*dst, *kind)?;
+                    }
+                    F::Eq | F::Ne | F::Lt | F::Le | F::Gt | F::Ge => {
+                        match kind {
+                            FloatKind::F64 => self.e.ucomisd(Xmm::Xmm0, Xmm::Xmm1),
+                            FloatKind::F32 => self.e.ucomiss(Xmm::Xmm0, Xmm::Xmm1),
+                        }
+                        // ucomi sets flags like an unsigned compare,
+                        // with PF set exactly when an operand is NaN.
+                        // Each Rust comparison is a setcc on those
+                        // flags combined with a parity test, so NaN
+                        // behaves as Rust requires (false everywhere
+                        // except Ne).
+                        let (cc, parity, or) = match op {
+                            F::Eq => (Cond::Equal, Cond::NotParity, false),
+                            F::Ne => (Cond::NotEqual, Cond::Parity, true),
+                            F::Lt => (Cond::Below, Cond::NotParity, false),
+                            F::Le => (Cond::BelowOrEqual, Cond::NotParity, false),
+                            F::Gt => (Cond::Above, Cond::NotParity, false),
+                            F::Ge => (Cond::AboveOrEqual, Cond::NotParity, false),
+                            _ => unreachable!(),
+                        };
+                        self.e.setcc_reg(Reg::Rax, cc);
+                        self.e.movzx_rr(Reg::Rax, Reg::Rax);
+                        self.e.setcc_reg(Reg::Rcx, parity);
+                        self.e.movzx_rr(Reg::Rcx, Reg::Rcx);
+                        if or {
+                            self.e.or_rr(Reg::Rax, Reg::Rcx);
+                        } else {
+                            self.e.and_rr(Reg::Rax, Reg::Rcx);
+                        }
+                        self.store_result(*dst)?;
+                    }
+                }
+            }
+            Instr::FloatToInt {
+                dst,
+                kind,
+                src,
+                int,
+            } => {
+                self.load_float_operand(Xmm::Xmm0, *kind, *src)?;
+                // Widening f32 to f64 is exact and preserves every
+                // boundary case, so one f64 path serves both formats.
+                if *kind == FloatKind::F32 {
+                    self.e.cvtss2sd(Xmm::Xmm0, Xmm::Xmm0);
+                }
+                if int.signed {
+                    self.emit_f64_to_i64();
+                } else {
+                    self.emit_f64_to_u64();
+                }
+                // A narrower target saturates at its own bounds,
+                // which is a clamp of the 64-bit saturated result.
+                if int.bits < 64 {
+                    if int.signed {
+                        let max = (1i64 << (int.bits - 1)) - 1;
+                        let min = -(1i64 << (int.bits - 1));
+                        self.e.mov_ri64(Reg::Rcx, max);
+                        self.e.cmp_rr(Reg::Rax, Reg::Rcx);
+                        let ok1 = self.e.jcc_rel32(Cond::LessOrEqual);
+                        self.e.mov_ri64(Reg::Rax, max);
+                        let at1 = self.e.position();
+                        self.e.buf.patch_rel32(ok1, at1);
+                        self.e.mov_ri64(Reg::Rcx, min);
+                        self.e.cmp_rr(Reg::Rax, Reg::Rcx);
+                        let ok2 = self.e.jcc_rel32(Cond::GreaterOrEqual);
+                        self.e.mov_ri64(Reg::Rax, min);
+                        let at2 = self.e.position();
+                        self.e.buf.patch_rel32(ok2, at2);
+                    } else {
+                        let max = ((1u64 << int.bits) - 1) as i64;
+                        self.e.mov_ri64(Reg::Rcx, max);
+                        self.e.cmp_rr(Reg::Rax, Reg::Rcx);
+                        let ok = self.e.jcc_rel32(Cond::BelowOrEqual);
+                        self.e.mov_ri64(Reg::Rax, max);
+                        let at = self.e.position();
+                        self.e.buf.patch_rel32(ok, at);
+                    }
+                }
+                self.store_result(*dst)?;
+            }
+            Instr::IntToFloat {
+                dst,
+                kind,
+                src,
+                int,
+            } => {
+                self.load_operand(Reg::Rax, *src)?;
+                if !int.signed && int.bits == 64 {
+                    // The one case where rax's bits are not the
+                    // value read as a signed integer.
+                    match kind {
+                        FloatKind::F64 => {
+                            // Convert as signed (giving x - 2^64 for
+                            // large x), then add 2^64 back when the
+                            // top bit was set. Both steps are exact,
+                            // so the result is the correctly rounded
+                            // conversion of x.
+                            self.e.cvtsi2sd(Xmm::Xmm0, Reg::Rax);
+                            self.e.test_rr(Reg::Rax, Reg::Rax);
+                            let done = self.e.jcc_rel32(Cond::NotSign);
+                            self.e.mov_ri64(Reg::Rcx, 0x43F0_0000_0000_0000); // 2^64
+                            self.e.movq_xmm(Xmm::Xmm1, Reg::Rcx);
+                            self.e.addsd(Xmm::Xmm0, Xmm::Xmm1);
+                            let at = self.e.position();
+                            self.e.buf.patch_rel32(done, at);
+                        }
+                        FloatKind::F32 => {
+                            // The compiler-rt algorithm: for x with
+                            // the top bit set, convert (x >> 1) |
+                            // (x & 1) (exact as a signed value) and
+                            // double the result — a single rounding,
+                            // unlike going through f64.
+                            self.e.test_rr(Reg::Rax, Reg::Rax);
+                            let small = self.e.jcc_rel32(Cond::NotSign);
+                            self.e.mov_rr(Reg::Rcx, Reg::Rax);
+                            self.e.shr_imm(Reg::Rcx, 1);
+                            self.e.and_ri(Reg::Rax, 1);
+                            self.e.or_rr(Reg::Rcx, Reg::Rax);
+                            self.e.cvtsi2ss(Xmm::Xmm0, Reg::Rcx);
+                            self.e.addss(Xmm::Xmm0, Xmm::Xmm0);
+                            let done = self.e.jmp_rel32();
+                            let small_at = self.e.position();
+                            self.e.buf.patch_rel32(small, small_at);
+                            self.e.cvtsi2ss(Xmm::Xmm0, Reg::Rax);
+                            let at = self.e.position();
+                            self.e.buf.patch_rel32(done, at);
+                        }
+                    }
+                } else {
+                    // Canonical form means rax already holds the
+                    // exact value as an i64 (sign-extended signed
+                    // types, zero-extended narrow unsigned types).
+                    match kind {
+                        FloatKind::F64 => self.e.cvtsi2sd(Xmm::Xmm0, Reg::Rax),
+                        FloatKind::F32 => self.e.cvtsi2ss(Xmm::Xmm0, Reg::Rax),
+                    }
+                }
+                self.store_float_result(*dst, *kind)?;
+            }
+            Instr::FloatToFloat {
+                dst,
+                kind,
+                src,
+                src_kind,
+            } => {
+                self.load_float_operand(Xmm::Xmm0, *src_kind, *src)?;
+                match (src_kind, kind) {
+                    (FloatKind::F32, FloatKind::F64) => {
+                        self.e.cvtss2sd(Xmm::Xmm0, Xmm::Xmm0)
+                    }
+                    (FloatKind::F64, FloatKind::F32) => {
+                        self.e.cvtsd2ss(Xmm::Xmm0, Xmm::Xmm0)
+                    }
+                    _ => {}
+                }
+                self.store_float_result(*dst, *kind)?;
             }
             Instr::Call { dst, func, args } => {
                 if self.ctx.is_none() {
