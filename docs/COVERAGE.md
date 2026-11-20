@@ -466,6 +466,34 @@ MIR 本体無し 495 件、ヘッダ機能による未実行 699 件、
 ローカルの型が未対応 228 件、interp 変換時の型不一致
 159 件である。
 
+Lane BI 再実測 (both9-bi、2026-11-21、lane/builtins-round2):
+builtins 第 2 ラウンドとして、both8 で最大の exec 失敗
+バケットだった「変換済み本体の無い関数への呼び出し」
+(1,177 件) の被呼出関数を集計し、値モデルで忠実に表せる
+ものを builtin に追加した: `black_box`、`String::new`、
+ビット操作 intrinsics (`ctpop` / `ctlz` / `cttz` /
+`bitreverse` / `bswap`)、`saturating_add` / `saturating_sub`、
+`atomic_load` / `atomic_store`、`Rc::new` / `Arc::new`
+(既存の `Deref` builtin の対象に追加)、`mem::zeroed`、
+`ptr::null` / `ptr::null_mut` (専用の参照ターゲット
+`RefTarget::Null` で表現し、等価性は null 同士でのみ真、
+参照解決は明示エラー)。combined 再実測 (--jobs 48) で
+同バケットは 1,177 件から 1,132 件へ (−45)、exec は
+1,447/4,149 (34.876%) から 1,466/4,149 (35.334%) へ
+(+19)、全体は 59.474% から 59.550% (14,850/24,937) へ。
+both8 で pass だったテストの回帰は 0 件。unsupported から
+fail に移った 2 件 (構造体フィールドの破棄順、
+`next_power_of_two` のオーバーフロー) は、実行が進んだ
+先の次のギャップとして残る。`std::ops` の算術トレイト
+(`Add` / `Mul` / `Neg` / `Not` など) は登録しない: core の
+デフォルト本体が収集・実行でき (参照や `Wrapping` の
+Self も本体経由で動く)、名前だけの builtin はカスタム
+実装を影にして壊すため (ドライバの enum 定数テストで
+実証し、登録を撤回した)。イテレータアダプタや
+`catch_unwind` などゲストクロージャを呼ぶもの、割り当て
+機械 (RawVec 系)、チャネル、スレッドローカル、io、env は
+値モデルの境界として未対応のままである。
+
 候補 3,699 件のうち両側を実行できたのは 2,823 件で、その内訳は
 pass 539、fail 18、unsupported 2,266 である。unsupported の
 理由の上位は、by-reference 定数 860 件、ローカルの型が未対応
