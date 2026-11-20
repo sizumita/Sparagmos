@@ -270,8 +270,15 @@ impl<'a> Interpreter<'a> {
                 } => {
                     // The callee value comes from a place: resolve it
                     // together with the environment reference a
-                    // closure body expects (see `eval_callable`).
+                    // closure body expects (see `eval_callable`). A
+                    // body that takes its environment by value (an
+                    // `FnOnce` closure's own body) gets the value
+                    // itself instead (see `consumed_env_arg`).
                     let (callee, env_ref) = self.eval_callable(&frames, body, &func)?;
+                    let env_ref = match self.consumed_env_arg(&mut frames, body, &func, &callee)? {
+                        Some(by_value) => by_value,
+                        None => env_ref,
+                    };
                     let mut arg_values = Vec::with_capacity(args.len());
                     for arg in &args {
                         arg_values.push(self.eval_operand(&mut frames, body, arg)?);
@@ -320,16 +327,32 @@ impl<'a> Interpreter<'a> {
                         }
                     };
                     // The callable value, and the environment
-                    // reference a closure body expects as its first
+                    // argument a closure body expects as its first
                     // argument. For `call` / `call_mut` the receiver
-                    // already is that reference; for `call_once` the
-                    // receiver is the value itself, referenced in
-                    // place (the real shim materialises a local for
-                    // it; aliasing the moved-from place is equivalent
-                    // because that place is dead after the call).
+                    // already is the reference the body takes. For
+                    // `call_once` the receiver is the value itself:
+                    // a body that takes its environment by value (an
+                    // `FnOnce` closure's own body — no shim exists in
+                    // the program) receives the value, consuming the
+                    // receiver place; any other body receives a
+                    // reference to the value in place, which is what
+                    // the real `call_once` shim passes when it
+                    // consumes an `Fn` / `FnMut` closure (aliasing
+                    // the moved-from place is equivalent because that
+                    // place is dead after the call).
                     let (callable, env_ref) = match kind {
                         FnCallKind::CallOnce => {
-                            self.eval_callable(&frames, body, &receiver)?
+                            let (value, env_ref) = self.eval_callable(&frames, body, &receiver)?;
+                            let env_ref = match self.consumed_env_arg(
+                                &mut frames,
+                                body,
+                                &receiver,
+                                &value,
+                            )? {
+                                Some(by_value) => by_value,
+                                None => env_ref,
+                            };
+                            (value, env_ref)
                         }
                         FnCallKind::Call | FnCallKind::CallMut => {
                             let recv = self.eval_operand(&mut frames, body, &receiver)?;
@@ -631,9 +654,12 @@ impl<'a> Interpreter<'a> {
     /// when the operand is a place, the reference points at that
     /// place, so `FnMut` mutations of by-value captures persist
     /// across calls, exactly as through the real shim. A `Move`
-    /// operand's place is deliberately not cleared: the environment
-    /// reference aliases it for the duration of the call, and the
-    /// place is dead afterwards by MIR's move semantics.
+    /// operand's place is deliberately not cleared here: the
+    /// environment reference aliases it for the duration of the
+    /// call, and the place is dead afterwards by MIR's move
+    /// semantics. (A body that takes its environment by value is
+    /// the exception: `consumed_env_arg` passes the value itself
+    /// and does clear the place.)
     fn eval_callable(
         &self,
         frames: &[Frame],
@@ -680,6 +706,60 @@ impl<'a> Interpreter<'a> {
             }
             Operand::Constant(_) => Ok(Value::Ref(RefTarget::Value(Box::new(value.clone())))),
         }
+    }
+
+    /// Whether the converted body of the closure `def` takes its
+    /// environment by value: its first parameter is the closure
+    /// value itself, not a reference to it. That is the body shape
+    /// produced for a closure whose own kind is `FnOnce` — the
+    /// closure body is resolved with the closure's own kind, so no
+    /// `FnOnce` adapter shim exists in the program, and the body
+    /// reads its captures with plain field projections on the value
+    /// (and may move them out of it).
+    fn closure_body_takes_env_by_value(&self, def: &str) -> bool {
+        match self.program.get(def) {
+            Some(body) => matches!(body.local_ty(Local(1)), Some(Ty::Closure(..))),
+            None => false,
+        }
+    }
+
+    /// The environment argument for a call that consumes its
+    /// callable (`FnOnce::call_once`, or an indirect call through a
+    /// callable place) when the callee is the closure `value`:
+    /// `Some` holding the closure value itself when the closure's
+    /// body takes its environment by value. A `Move` operand's
+    /// place is then left uninitialized — the value has moved into
+    /// the callee — so the closure is really consumed: a later read
+    /// of the place is an uninitialized read and a later drop of it
+    /// runs no glue a second time, exactly as with any other move.
+    /// `None` when the body takes a reference to the environment
+    /// instead; the caller passes the environment reference it
+    /// already built, which is also what the `call_once` shim does
+    /// when it consumes an `Fn` / `FnMut` closure.
+    fn consumed_env_arg(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        body: &Body,
+        operand: &Operand,
+        value: &Value,
+    ) -> InterpResult<Option<Value>> {
+        match value {
+            Value::Closure { def, .. } if self.closure_body_takes_env_by_value(def) => {}
+            _ => return Ok(None),
+        }
+        if let Operand::Move(place) = operand {
+            if place.is_direct_local() {
+                let frame = frames.last_mut().expect("frame");
+                if let Some(slot) = frame.locals.get_mut(place.local.0) {
+                    *slot = Value::Uninit;
+                }
+            } else if let Ok(target) = self.resolve_place(frames, body, place) {
+                if matches!(target, Resolved::Place { .. }) {
+                    self.write_resolved(frames, &target, Value::Uninit)?;
+                }
+            }
+        }
+        Ok(Some(value.clone()))
     }
 
     /// Read the value at `root` + `path` for drop glue: `Ok(None)`

@@ -508,6 +508,25 @@ fn main() {
 }
 "#;
 
+const CLOSURE_FNONCE_MOVE_OUT_SRC: &str = r#"
+fn main() {
+    let s = String::from("abc");
+    let f = move || -> String { s };
+    let out = f();
+    println!("{}", out);
+}
+"#;
+
+const CLOSURE_FNONCE_IN_STRUCT_SRC: &str = r#"
+struct Once<F: FnOnce() -> String> { f: F }
+fn main() {
+    let s = String::from("xyz");
+    let o = Once { f: move || s };
+    let out = (o.f)();
+    println!("{}", out);
+}
+"#;
+
 const CLOSURE_RETURNED_SRC: &str = r#"
 fn make_adder(n: i32) -> impl Fn(i32) -> i32 {
     move |x| x + n
@@ -586,6 +605,38 @@ fn run_mode_closure_stored_in_struct() {
         "a closure stored in a struct field must be callable; stderr={stderr}"
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "12\n");
+}
+
+#[test]
+fn run_mode_fnonce_closure_moves_capture_out() {
+    let dir = temp_dir("closure-fnonce-move-out");
+    let src = fixture(&dir, "closure_fnonce_move_out.rs", CLOSURE_FNONCE_MOVE_OUT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an FnOnce closure moving its capture out must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "abc\n");
+}
+
+#[test]
+fn run_mode_fnonce_closure_in_struct_field() {
+    let dir = temp_dir("closure-fnonce-in-struct");
+    let src = fixture(
+        &dir,
+        "closure_fnonce_in_struct.rs",
+        CLOSURE_FNONCE_IN_STRUCT_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an FnOnce closure stored in a struct field must be callable; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "xyz\n");
 }
 
 #[test]
