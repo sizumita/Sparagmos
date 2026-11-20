@@ -34,6 +34,12 @@
 //!   [`InterpError::Panic`], which is the oracle's model of a panic.
 //! * `AggregateKind::Array` becomes a tuple value (the IR has no distinct
 //!   array value); `AggregateKind::Adt` becomes a variant + fields value.
+//!   ADT aggregate operands are typed by the fields' declared types,
+//!   recovered program-wide from `Field` projections (an aggregate
+//!   rvalue itself carries no field types in this MIR form); without
+//!   that, a non-negative literal in a signed field would be read as
+//!   unsigned by the no-context scalar rule and the stored field would
+//!   mismatch its declared type on first use.
 //! * Calls to functions without converted bodies resolve through the
 //!   driver's full name table: runtime-supported callees
 //!   ([`crate::builtins`]) become `CallBuiltin`; anything else stays an
@@ -248,6 +254,231 @@ pub fn interpret_mir_captured(
 
 // ---------------------------------------------------------------------------
 
+/// One ADT field slot whose declared type was recovered from a
+/// `Field` projection somewhere in the program.
+#[derive(PartialEq)]
+struct AdtFieldKey {
+    def: mir::DefId,
+    /// The ADT instantiation's generic arguments (the projection's
+    /// field type is already substituted for them).
+    generic_args: Vec<mir::Ty>,
+    variant: u32,
+    field: u32,
+}
+
+/// Declared field types of ADTs, recovered from `Field` projections.
+///
+/// An `Aggregate` rvalue in this MIR form does not carry the types of
+/// the fields it fills — the operands are bare values — but every
+/// access to a field through a place does: `PlaceElem::Field` holds
+/// the field's (substituted) declared type. Scanning every place in
+/// the program before conversion therefore yields, for each
+/// (ADT instantiation, variant, field) slot that is ever projected,
+/// the type its stored value must carry. Aggregate conversion types
+/// its operands by this table, so a field's value is stored with its
+/// declared tag from the start instead of being re-derived — wrongly,
+/// for signed types — from the literal's bit pattern.
+#[derive(Default)]
+struct AdtFieldTys {
+    entries: Vec<(AdtFieldKey, mir::Ty)>,
+}
+
+impl AdtFieldTys {
+    fn record(&mut self, key: AdtFieldKey, ty: mir::Ty) {
+        // Repeated projections of one slot must agree (they are the
+        // same declared field); the first sighting wins so a
+        // malformed program cannot flip a field's type mid-conversion.
+        if self.entries.iter().any(|(k, _)| *k == key) {
+            return;
+        }
+        self.entries.push((key, ty));
+    }
+
+    fn get(
+        &self,
+        def: mir::DefId,
+        generic_args: &[mir::Ty],
+        variant: u32,
+        field: u32,
+    ) -> Option<&mir::Ty> {
+        self.entries
+            .iter()
+            .find(|(k, _)| {
+                k.def == def
+                    && k.generic_args.as_slice() == generic_args
+                    && k.variant == variant
+                    && k.field == field
+            })
+            .map(|(_, ty)| ty)
+    }
+}
+
+/// Walk one place's projection chain the way [`Converter::place_ty`]
+/// does, recording the declared type of every ADT field stepped into.
+fn scan_place_fields(table: &mut AdtFieldTys, body: &mir::Body, place: &mir::Place) {
+    let Some(decl) = body.local_decls.get(place.local.index()) else {
+        return;
+    };
+    let mut ty = decl.ty.clone();
+    let mut variant = 0u32;
+    for elem in &place.projection {
+        match elem {
+            mir::PlaceElem::Field(idx, field_ty) => {
+                if let mir::Ty::Adt(def, args) = &ty {
+                    table.record(
+                        AdtFieldKey {
+                            def: *def,
+                            generic_args: args.clone(),
+                            variant,
+                            field: *idx,
+                        },
+                        field_ty.clone(),
+                    );
+                }
+                ty = field_ty.clone();
+                variant = 0;
+            }
+            mir::PlaceElem::Downcast(_, v) => variant = *v,
+            mir::PlaceElem::Deref => match ty {
+                mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _) => {
+                    ty = *inner;
+                    variant = 0;
+                }
+                _ => return,
+            },
+            mir::PlaceElem::Index(_) | mir::PlaceElem::ConstantIndex { .. } => match ty {
+                mir::Ty::Array(elem, _) | mir::Ty::Slice(elem) => {
+                    ty = *elem;
+                    variant = 0;
+                }
+                _ => return,
+            },
+            mir::PlaceElem::Subslice { .. } => {}
+            mir::PlaceElem::OpaqueCast(t) | mir::PlaceElem::Subtype(t) => {
+                ty = t.clone();
+                variant = 0;
+            }
+        }
+    }
+}
+
+fn scan_operand_fields(table: &mut AdtFieldTys, body: &mir::Body, op: &mir::Operand) {
+    if let Some(place) = op.place() {
+        scan_place_fields(table, body, place);
+    }
+}
+
+fn scan_rvalue_fields(table: &mut AdtFieldTys, body: &mir::Body, rv: &mir::Rvalue) {
+    use mir::Rvalue as R;
+    match rv {
+        R::Use(op)
+        | R::Repeat(op, _)
+        | R::Cast(_, op, _)
+        | R::UnaryOp(_, op)
+        | R::ShallowInitBox(op, _) => scan_operand_fields(table, body, op),
+        R::BinaryOp(_, pair) | R::CheckedBinaryOp(_, pair) => {
+            scan_operand_fields(table, body, &pair.0);
+            scan_operand_fields(table, body, &pair.1);
+        }
+        R::Ref(_, _, place)
+        | R::RawPtr(_, place)
+        | R::Len(place)
+        | R::Discriminant(place)
+        | R::CopyForDeref(place) => scan_place_fields(table, body, place),
+        R::Aggregate(_, ops) => {
+            for op in ops {
+                scan_operand_fields(table, body, op);
+            }
+        }
+        R::ThreadLocalRef(_) | R::NullaryOp(..) => {}
+    }
+}
+
+fn scan_statement_fields(table: &mut AdtFieldTys, body: &mir::Body, stmt: &mir::Statement) {
+    use mir::StatementKind as S;
+    match &stmt.kind {
+        S::Assign(pair) => {
+            let (place, rv) = &**pair;
+            scan_place_fields(table, body, place);
+            scan_rvalue_fields(table, body, rv);
+        }
+        S::FakeRead(pair) => scan_place_fields(table, body, &pair.1),
+        S::SetDiscriminant { place, .. } => scan_place_fields(table, body, place),
+        S::Retag(_, place) | S::PlaceMention(place) => scan_place_fields(table, body, place),
+        S::AscribeUserType(pair, _) => scan_place_fields(table, body, &pair.0),
+        S::Intrinsic(intr) => match &**intr {
+            mir::NonDivergingIntrinsic::CopyNonOverlapping { src, dst, count } => {
+                scan_operand_fields(table, body, src);
+                scan_operand_fields(table, body, dst);
+                scan_operand_fields(table, body, count);
+            }
+            mir::NonDivergingIntrinsic::Assume(op) => scan_operand_fields(table, body, op),
+        },
+        S::StorageLive(_)
+        | S::StorageDead(_)
+        | S::Coverage
+        | S::ConstEvalCounter
+        | S::Nop => {}
+    }
+}
+
+fn scan_terminator_fields(table: &mut AdtFieldTys, body: &mir::Body, kind: &mir::TerminatorKind) {
+    use mir::TerminatorKind as T;
+    match kind {
+        T::SwitchInt { discr, .. } => scan_operand_fields(table, body, discr),
+        T::Call {
+            func,
+            args,
+            destination,
+            ..
+        } => {
+            scan_operand_fields(table, body, func);
+            for arg in args {
+                scan_operand_fields(table, body, arg);
+            }
+            scan_place_fields(table, body, destination);
+        }
+        T::Assert { cond, .. } => scan_operand_fields(table, body, cond),
+        T::Drop { place, .. } => scan_place_fields(table, body, place),
+        T::Yield {
+            value, resume_arg, ..
+        } => {
+            scan_operand_fields(table, body, value);
+            scan_place_fields(table, body, resume_arg);
+        }
+        T::InlineAsm { operands, .. } => {
+            for op in operands {
+                scan_operand_fields(table, body, op);
+            }
+        }
+        T::TailCall { func, args } => {
+            scan_operand_fields(table, body, func);
+            for arg in args {
+                scan_operand_fields(table, body, arg);
+            }
+        }
+        T::Goto { .. }
+        | T::Resume
+        | T::Terminate(_)
+        | T::Return
+        | T::Unreachable
+        | T::CoroutineDrop
+        | T::FalseEdge { .. }
+        | T::FalseUnwind { .. } => {}
+    }
+}
+
+fn scan_body_fields(table: &mut AdtFieldTys, body: &mir::Body) {
+    for bb in &body.basic_blocks {
+        for stmt in &bb.statements {
+            scan_statement_fields(table, body, stmt);
+        }
+        if let Some(term) = &bb.terminator {
+            scan_terminator_fields(table, body, &term.kind);
+        }
+    }
+}
+
 struct Converter<'a> {
     /// Function name -> body, for callee argument typing.
     bodies: HashMap<String, &'a mir::Body>,
@@ -256,22 +487,28 @@ struct Converter<'a> {
     /// `DefId` -> name for every named item (the driver's table,
     /// including body-less callees and ADT types).
     names: &'a HashMap<mir::DefId, String>,
+    /// Declared ADT field types recovered from `Field` projections
+    /// across the whole program (see [`AdtFieldTys`]).
+    adt_fields: AdtFieldTys,
 }
 
 impl<'a> Converter<'a> {
     fn new(program: &'a MirProgram) -> Self {
         let mut bodies = HashMap::new();
         let mut def_names = HashMap::new();
+        let mut adt_fields = AdtFieldTys::default();
         for f in &program.functions {
             bodies.insert(f.name.clone(), &f.body);
             if let Some(def) = f.def_id {
                 def_names.insert(def, f.name.clone());
             }
+            scan_body_fields(&mut adt_fields, &f.body);
         }
         Converter {
             bodies,
             def_names,
             names: &program.fn_names,
+            adt_fields,
         }
     }
 
@@ -737,7 +974,20 @@ impl<'a> Converter<'a> {
                     };
                     let mut fields = Vec::with_capacity(ops.len());
                     for (i, op) in ops.iter().enumerate() {
-                        let ctx = if i < 2 { bound_ty } else { None };
+                        // The field's declared type, recovered from
+                        // `Field` projections program-wide, is the
+                        // primary context: it is what the stored
+                        // value will be read as. The Range bound rule
+                        // stays as the fallback for fields no place
+                        // ever projects (their values are consumed by
+                        // runtime support, not by MIR places).
+                        let declared = self.adt_fields.get(
+                            *def,
+                            generic_args,
+                            *variant_index,
+                            i as u32,
+                        );
+                        let ctx = declared.or_else(|| if i < 2 { bound_ty } else { None });
                         fields.push(self.convert_operand(body, op, ctx)?);
                     }
                     ir::Rvalue::AggregateAdt {
