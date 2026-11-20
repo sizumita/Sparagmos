@@ -1414,6 +1414,275 @@ fn box_deref_transmute_writes_pointee() {
     assert_eq!(v, Value::Int(42));
 }
 
+const BOX_NEW_DEF: mir::DefId = mir::DefId::new(0, 104);
+
+/// A program with the names the driver registers for the Box
+/// family. The builtin-box cast classification below keys off
+/// these names, exactly as it does on driver-produced programs.
+fn box_prog(body: mir::Body, name: &str) -> MirProgram {
+    let mut prog = MirProgram::new();
+    prog.add(name, body);
+    prog.fn_names.insert(BOX_DEF, "std::boxed::Box".to_string());
+    prog.fn_names.insert(UNIQUE_DEF, "std::ptr::Unique".to_string());
+    prog.fn_names
+        .insert(NONNULL_DEF, "std::ptr::NonNull".to_string());
+    prog.fn_names
+        .insert(BOX_NEW_DEF, "std::boxed::Box::<T>::new".to_string());
+    prog
+}
+
+fn box_cast(operand: mir::Operand, dest: u32, target: mir::Ty) -> mir::Statement {
+    assign(
+        place(dest),
+        mir::Rvalue::Cast(mir::CastKind::BoxDerefTransmute, operand, target),
+    )
+}
+
+/// The shape the interpreter actually receives for
+/// `let b = Box::new(41); *b` when the box comes from the
+/// `Box::new` builtin: the builtin stores the pointee directly in
+/// the box value, so there is no Unique/NonNull wrapper chain in
+/// the value, while rustc's deref elaboration still reads the
+/// box's field 0 (the `Unique`) and casts it with
+/// `BoxDerefTransmute`. Regression test: this used to fail with
+/// "type mismatch in BoxDerefTransmute cast: expected pointer
+/// wrapper ..., found signed integer" on every real program,
+/// because the aggregate-built chain above was the only shape
+/// exercised.
+///
+/// Locals: _0 ret i32, _1 Box<i32>, _2 *const i32; `tail` runs
+/// after the cast with the extracted pointer in _2.
+fn builtin_box_body(tail: Vec<mir::Statement>) -> mir::Body {
+    let mut stmts = vec![box_cast(
+        mir::Operand::Copy(field(1, 0, adt_i32_ty(UNIQUE_DEF))),
+        2,
+        raw_ptr_i32_ty(),
+    )];
+    stmts.extend(tail);
+    mir::Body::new(
+        decls(&[i32_ty(), adt_i32_ty(BOX_DEF), raw_ptr_i32_ty()]),
+        0,
+        vec![
+            block(
+                vec![],
+                call(fndef_operand(BOX_NEW_DEF), const_i32(41), 1, 1),
+            ),
+            block(stmts, ret()),
+        ],
+    )
+}
+
+#[test]
+fn box_deref_transmute_builtin_box_field_reads_pointee() {
+    let body = builtin_box_body(vec![assign(
+        place(0),
+        mir::Rvalue::Use(mir::Operand::Copy(place(2).deref())),
+    )]);
+    let prog = box_prog(body, "unbox_builtin_read");
+    let v = interpret_mir(&prog, "unbox_builtin_read", vec![])
+        .expect("builtin box deref must run");
+    assert_eq!(v, Value::Int(41));
+}
+
+#[test]
+fn box_deref_transmute_builtin_box_field_writes_pointee() {
+    // Write through the extracted pointer, then read the pointee
+    // back out of the box's field 0: the pointer must name the
+    // box's own storage.
+    let body = builtin_box_body(vec![
+        assign(place(2).deref(), mir::Rvalue::Use(const_i32(42))),
+        assign(
+            place(0),
+            mir::Rvalue::Use(mir::Operand::Copy(field(1, 0, adt_i32_ty(UNIQUE_DEF)))),
+        ),
+    ]);
+    let prog = box_prog(body, "unbox_builtin_write");
+    let v = interpret_mir(&prog, "unbox_builtin_write", vec![])
+        .expect("builtin box write must run");
+    assert_eq!(v, Value::Int(42));
+}
+
+#[test]
+fn box_deref_transmute_whole_builtin_box() {
+    // The cast operand is the box place itself (no field read).
+    let body = mir::Body::new(
+        decls(&[i32_ty(), adt_i32_ty(BOX_DEF), raw_ptr_i32_ty()]),
+        0,
+        vec![
+            block(
+                vec![],
+                call(fndef_operand(BOX_NEW_DEF), const_i32(41), 1, 1),
+            ),
+            block(
+                vec![
+                    box_cast(copy(1), 2, raw_ptr_i32_ty()),
+                    assign(
+                        place(0),
+                        mir::Rvalue::Use(mir::Operand::Copy(place(2).deref())),
+                    ),
+                ],
+                ret(),
+            ),
+        ],
+    );
+    let prog = box_prog(body, "unbox_builtin_whole");
+    let v = interpret_mir(&prog, "unbox_builtin_whole", vec![])
+        .expect("whole-box cast must run");
+    assert_eq!(v, Value::Int(41));
+}
+
+#[test]
+fn box_deref_transmute_builtin_box_move_operand() {
+    // A Move operand clears the field's storage while it is
+    // evaluated; the extracted pointer names that same storage,
+    // so the value must be restored for the read to see it.
+    let body = mir::Body::new(
+        decls(&[i32_ty(), adt_i32_ty(BOX_DEF), raw_ptr_i32_ty()]),
+        0,
+        vec![
+            block(
+                vec![],
+                call(fndef_operand(BOX_NEW_DEF), const_i32(41), 1, 1),
+            ),
+            block(
+                vec![
+                    box_cast(
+                        mir::Operand::Move(field(1, 0, adt_i32_ty(UNIQUE_DEF))),
+                        2,
+                        raw_ptr_i32_ty(),
+                    ),
+                    assign(
+                        place(0),
+                        mir::Rvalue::Use(mir::Operand::Copy(place(2).deref())),
+                    ),
+                ],
+                ret(),
+            ),
+        ],
+    );
+    let prog = box_prog(body, "unbox_builtin_move");
+    let v = interpret_mir(&prog, "unbox_builtin_move", vec![])
+        .expect("move-operand cast must run");
+    assert_eq!(v, Value::Int(41));
+}
+
+#[test]
+fn box_deref_transmute_builtin_box_of_reference() {
+    // Box<&i32>: the builtin box's single layer holds the pointee
+    // — a reference — itself. The cast must yield a pointer TO
+    // that reference, not the reference: reading through the
+    // result twice reaches the i32.
+    let ref_i32 = mir::Ty::Ref(mir::Region::Erased, Box::new(i32_ty()), mir::Mutability::Not);
+    let body = mir::Body::new(
+        decls(&[
+            i32_ty(),
+            i32_ty(),
+            ref_i32.clone(),
+            mir::Ty::Adt(BOX_DEF, vec![ref_i32.clone()]),
+            mir::Ty::RawPtr(Box::new(ref_i32.clone()), mir::Mutability::Mut),
+        ]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(place(1), mir::Rvalue::Use(const_i32(33))),
+                    assign(
+                        place(2),
+                        mir::Rvalue::Ref(mir::Region::Erased, mir::BorrowKind::Shared, place(1)),
+                    ),
+                ],
+                call(fndef_operand(BOX_NEW_DEF), copy(2), 3, 1),
+            ),
+            block(
+                vec![
+                    box_cast(
+                        mir::Operand::Copy(field(
+                            3,
+                            0,
+                            mir::Ty::Adt(UNIQUE_DEF, vec![ref_i32.clone()]),
+                        )),
+                        4,
+                        mir::Ty::RawPtr(Box::new(ref_i32.clone()), mir::Mutability::Mut),
+                    ),
+                    assign(
+                        place(0),
+                        mir::Rvalue::Use(mir::Operand::Copy(place(4).deref().deref())),
+                    ),
+                ],
+                ret(),
+            ),
+        ],
+    );
+    let prog = box_prog(body, "unbox_builtin_ref");
+    let v = interpret_mir(&prog, "unbox_builtin_ref", vec![])
+        .expect("box-of-reference cast must run");
+    assert_eq!(v, Value::Int(33));
+}
+
+#[test]
+fn box_deref_transmute_builtin_box_of_struct() {
+    // Box<Point>: the value found under the cast is an ADT value
+    // (the "found ADT value" failure shape). Fields of the
+    // pointee are read through the extracted pointer.
+    let point_ty = mir::Ty::Adt(POINT_DEF, vec![]);
+    let body = mir::Body::new(
+        decls(&[
+            i32_ty(),
+            point_ty.clone(),
+            mir::Ty::Adt(BOX_DEF, vec![point_ty.clone()]),
+            mir::Ty::RawPtr(Box::new(point_ty.clone()), mir::Mutability::Mut),
+            i32_ty(),
+        ]),
+        0,
+        vec![
+            block(
+                vec![assign(
+                    place(1),
+                    mir::Rvalue::Aggregate(
+                        Box::new(mir::AggregateKind::Adt {
+                            def: POINT_DEF,
+                            variant_index: 0,
+                            generic_args: vec![],
+                            user_ty: None,
+                            field_index: None,
+                        }),
+                        vec![const_i32(3), const_i32(4)],
+                    ),
+                )],
+                call(fndef_operand(BOX_NEW_DEF), copy(1), 2, 1),
+            ),
+            block(
+                vec![
+                    box_cast(
+                        mir::Operand::Copy(field(
+                            2,
+                            0,
+                            mir::Ty::Adt(UNIQUE_DEF, vec![point_ty.clone()]),
+                        )),
+                        3,
+                        mir::Ty::RawPtr(Box::new(point_ty.clone()), mir::Mutability::Mut),
+                    ),
+                    assign(
+                        place(4),
+                        mir::Rvalue::Use(mir::Operand::Copy(place(3).deref().field(0, i32_ty()))),
+                    ),
+                    assign(
+                        place(0),
+                        mir::Rvalue::Use(mir::Operand::Copy(place(3).deref().field(1, i32_ty()))),
+                    ),
+                    assign(place(0), binop(mir::BinOp::Add, copy(0), copy(4))),
+                ],
+                ret(),
+            ),
+        ],
+    );
+    let prog = box_prog(body, "unbox_builtin_struct");
+    let v = interpret_mir(&prog, "unbox_builtin_struct", vec![])
+        .expect("box-of-struct cast must run");
+    assert_eq!(v, Value::Int(7));
+}
+
+
 #[test]
 fn closure_aggregate_fails_at_execution_not_silently() {
     // Destination is a tuple type so conversion itself succeeds; the
