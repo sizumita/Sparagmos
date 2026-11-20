@@ -80,7 +80,7 @@ class RegistryTests(unittest.TestCase):
     def test_unknown_guard_is_an_error(self):
         bad = FIXTURE_BUILTINS.replace(
             'canonical.ends_with("::to_uppercase")',
-            'canonical.starts_with("std::")')
+            'canonical.matches("::to_uppercase")')
         with self.assertRaises(ValueError):
             cov.BuiltinRegistry(bad)
 

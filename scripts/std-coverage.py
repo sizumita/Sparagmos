@@ -120,11 +120,16 @@ def is_std_path(canonical):
 class BuiltinRegistry:
     """The interpreter's builtin support, read from builtins.rs.
 
-    Exact names come from the match arms of `lookup`; the two guard
-    rules (RangeInclusive::new, *::to_uppercase) are recognized by
-    their condition text. Any other guard shape is a hard error so a
-    future change to builtins.rs cannot silently drift this tool.
+    Exact names come from the match arms of `lookup`; every guard arm
+    (`_ if <cond> =>`) is interpreted generically: the condition must
+    be a conjunction of `canonical.contains("..")`,
+    `canonical.ends_with("..")` and `canonical.starts_with("..")`
+    terms. Any other guard shape is a hard error so a future change
+    to builtins.rs cannot silently drift this tool.
     """
+
+    _TERM = re.compile(
+        r'canonical\.(contains|ends_with|starts_with)\("([^"]*)"\)')
 
     def __init__(self, source):
         start = source.find("pub fn lookup")
@@ -137,29 +142,43 @@ class BuiltinRegistry:
         self.exact = set(re.findall(r'"([^"\n]+)"\s*(?:\||=>)', body))
         if not self.exact:
             raise ValueError("builtins.rs: no exact builtin names found")
-        guards = re.findall(r"^\s*_ if (.+?) =>", body, re.M)
-        self.range_inclusive_new = False
-        self.to_uppercase = False
-        for g in guards:
-            if 'canonical.contains("RangeInclusive")' in g \
-                    and 'canonical.ends_with("::new")' in g:
-                self.range_inclusive_new = True
-            elif 'canonical.ends_with("::to_uppercase")' in g:
-                self.to_uppercase = True
-            else:
-                raise ValueError(f"builtins.rs: unknown lookup guard: {g}")
-        if len(guards) != 2:
-            raise ValueError(
-                f"builtins.rs: expected 2 lookup guards, found {len(guards)}")
+        self.guards = []
+        for g in re.findall(r"^\s*_ if (.+?) =>", body, re.M):
+            terms = []
+            for term in g.split("&&"):
+                m = self._TERM.fullmatch(term.strip())
+                if m is None:
+                    raise ValueError(
+                        f"builtins.rs: unknown lookup guard: {g}")
+                terms.append((m.group(1), m.group(2)))
+            self.guards.append(terms)
+        if not self.guards:
+            raise ValueError("builtins.rs: no lookup guards found")
+        # Derived flags for the two historical special cases, kept for
+        # the report line and the unit tests.
+        self.range_inclusive_new = any(
+            set(t) == {("contains", "RangeInclusive"),
+                       ("ends_with", "::new")} for t in self.guards)
+        self.to_uppercase = any(
+            t == [("ends_with", "::to_uppercase")] for t in self.guards)
 
     def lookup(self, canonical):
         if canonical in self.exact:
             return True
-        if self.range_inclusive_new and "RangeInclusive" in canonical \
-                and canonical.endswith("::new"):
-            return True
-        if self.to_uppercase and canonical.endswith("::to_uppercase"):
-            return True
+        for terms in self.guards:
+            ok = True
+            for op, arg in terms:
+                if op == "contains" and arg not in canonical:
+                    ok = False
+                    break
+                if op == "ends_with" and not canonical.endswith(arg):
+                    ok = False
+                    break
+                if op == "starts_with" and not canonical.startswith(arg):
+                    ok = False
+                    break
+            if ok:
+                return True
         return False
 
 
