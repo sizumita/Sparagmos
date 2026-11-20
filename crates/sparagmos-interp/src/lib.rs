@@ -37,14 +37,17 @@
 //! | `Rvalue::{Use, BinaryOp, CheckedBinaryOp, UnaryOp, Aggregate, Cast}` | [`ir::Rvalue`] | `Aggregate` is narrowed to `AggregateTuple`; other aggregate kinds are `Rvalue::Unsupported`. |
 //! | `Ty` (full rustc type model) | [`ir::Ty`] | Reduced to scalars + tuples; no ADTs/references/generics yet. |
 //!
-//! When Lane A lands, the reconciliation path is a conversion layer
-//! `sparagmos_mir::Body -> sparagmos_interp::ir::Body` (or making this
-//! crate generic over Lane A's types); the interpreter core (frames,
-//! arithmetic, limits) is written to survive that swap unchanged.
+//! Lane A has since landed, and the reconciliation path is implemented
+//! in [`mir_convert`]: `sparagmos_mir::Body -> sparagmos_interp::ir::Body`,
+//! kept inside this crate as the interpreter's internal adapter (MIR
+//! itself arrives only via the Stable MIR driver, which produces
+//! `sparagmos-mir` bodies). The interpreter core (frames, arithmetic,
+//! limits) is unchanged by that layer.
 
 pub mod error;
 pub mod interp;
 pub mod ir;
+pub mod mir_convert;
 pub mod value;
 
 pub use error::{InterpError, InterpResult};
@@ -52,5 +55,8 @@ pub use interp::{interpret, InterpConfig, Interpreter};
 pub use ir::{
     BasicBlock, BasicBlockData, BinOp, Body, Constant, Local, Operand, Place, Program,
     ProjectionElem, Rvalue, Statement, StatementKind, TerminatorKind, Ty, UnOp,
+};
+pub use mir_convert::{
+    convert_program, interpret_mir, ConvertError, MirFunction, MirProgram, MirRunError,
 };
 pub use value::Value;
