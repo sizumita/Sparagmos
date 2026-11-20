@@ -2081,14 +2081,14 @@ fn builtin_arg_ctx(
         // Lane V: the value arguments of these builtins are the
         // callee's first generic parameter (the element / pointee /
         // cell type), so a literal argument takes that type.
-        Builtin::BoxNew | Builtin::ManuallyDropNew | Builtin::CellNew => {
+        Builtin::BoxNew | Builtin::ManuallyDropNew | Builtin::CellNew | Builtin::RefCellNew => {
             if arg_index == 0 {
                 raw_generic_args.first().cloned()
             } else {
                 None
             }
         }
-        Builtin::CellSet | Builtin::CellReplace | Builtin::VecPush => {
+        Builtin::CellSet | Builtin::CellReplace | Builtin::VecPush | Builtin::RefCellReplace => {
             if arg_index == 1 {
                 raw_generic_args.first().cloned()
             } else {
@@ -2371,6 +2371,25 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                     P::Trivial => P::Trivial,
                     e => P::Variants {
                         variants: vec![P::Trivial, at_field0(e)],
+                    },
+                });
+            }
+            "std::cell::Ref" | "core::cell::Ref" => {
+                return Some(P::RefCellRelease { mutable: false })
+            }
+            "std::cell::RefMut" | "core::cell::RefMut" => {
+                return Some(P::RefCellRelease { mutable: true })
+            }
+            "std::cell::RefCell" | "core::cell::RefCell" => {
+                // `RefCell` has no `Drop` impl of its own: the
+                // flag `Cell` is plain data, and the value's glue
+                // runs through the `UnsafeCell` field wrapper.
+                let inner = self.plan(args.first()?)?;
+                return Some(match inner {
+                    P::Trivial => P::Trivial,
+                    plan => P::At {
+                        path: vec![RefProj::Field(1), RefProj::Field(0)],
+                        plan: Box::new(plan),
                     },
                 });
             }
