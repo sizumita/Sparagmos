@@ -907,7 +907,6 @@ fn collect() -> ControlFlow<()> {
         &seed_bodies,
         &mut demand_state,
     );
-    apply_instance_demands(&mut report, &deferred, &demand_state.demands);
     let mut reach_seeds = seed_bodies;
     reach_seeds.extend(instance_seeds);
 
@@ -920,10 +919,78 @@ fn collect() -> ControlFlow<()> {
         &local_defs,
         sparagmos_driver::reach::MAX_COLLECTED_BODIES,
     );
+    let mut foreign_taken = reached.bodies.len();
+    let mut frontier = reached.walked_bodies;
     bodies.extend(reached.bodies);
     body_def_ids.extend(reached.body_def_ids);
     body_def_names.extend(reached.body_def_names);
     report.functions.extend(reached.reports);
+
+    // A generic local definition can also be demanded from inside
+    // a collected foreign body (a std adapter calling a trait
+    // method of a local generic type): the reachability collection
+    // skips targets that resolve to local items, and the demand
+    // pass above only walked local bodies, so such instances were
+    // never converted. Alternate the two passes to a fixpoint:
+    // scan the newly collected foreign bodies for demanded local
+    // instances, then collect the foreign functions those instance
+    // bodies call, whose bodies may in turn demand more local
+    // instances. Later reachability passes re-walk (and
+    // re-convert) targets earlier passes already collected; the
+    // duplicates are dropped by DefId for bodies and by display
+    // name for report entries, and both collections keep their
+    // per-program caps across passes (shared demand state, and a
+    // remaining-budget argument for reachability).
+    let mut collected_ids: HashSet<sparagmos_mir::DefId> =
+        body_def_ids.iter().copied().collect();
+    let mut report_names: HashSet<String> =
+        report.functions.iter().map(|f| f.name.clone()).collect();
+    loop {
+        let ids_before = body_def_ids.len();
+        let new_instances = collect_local_instances(
+            &mut conv,
+            &mut bodies,
+            &mut body_def_ids,
+            &mut body_def_names,
+            &deferred,
+            &frontier,
+            &mut demand_state,
+        );
+        if new_instances.is_empty() {
+            break;
+        }
+        for id in &body_def_ids[ids_before..] {
+            collected_ids.insert(*id);
+        }
+        if foreign_taken >= sparagmos_driver::reach::MAX_COLLECTED_BODIES {
+            break;
+        }
+        let reached = sparagmos_driver::reach::collect_reachable(
+            &mut conv,
+            &new_instances,
+            &local_defs,
+            sparagmos_driver::reach::MAX_COLLECTED_BODIES - foreign_taken,
+        );
+        frontier = reached.walked_bodies;
+        for ((name, body), (def_id, def_name)) in reached
+            .bodies
+            .into_iter()
+            .zip(reached.body_def_ids.into_iter().zip(reached.body_def_names))
+        {
+            if collected_ids.insert(def_id) {
+                foreign_taken += 1;
+                bodies.push((name, body));
+                body_def_ids.push(def_id);
+                body_def_names.push(def_name);
+            }
+        }
+        for entry in reached.reports {
+            if report_names.insert(entry.name.clone()) {
+                report.functions.push(entry);
+            }
+        }
+    }
+    apply_instance_demands(&mut report, &deferred, &demand_state.demands);
 
     // Auxiliary crates (--aux): the main compilation links them as
     // dependencies, so their functions live in this same Stable MIR
