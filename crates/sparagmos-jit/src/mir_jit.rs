@@ -372,6 +372,61 @@ fn normalize_u128(v: u128, ty: &mir::Ty) -> i64 {
     }
 }
 
+/// The shared type of a pair of integer literals, for a comparison
+/// neither of whose operands has a place type. Mirrors the
+/// interpreter's rule: both literals must have the same byte size;
+/// if either has the width's sign bit set the pair is read as the
+/// signed integer of that width, otherwise as the unsigned one.
+fn literal_pair_ty(lhs: &mir::Operand, rhs: &mir::Operand) -> Option<mir::Ty> {
+    fn scalar_int(op: &mir::Operand) -> Option<(u128, u8)> {
+        let mir::Operand::Constant(c) = op else {
+            return None;
+        };
+        let mir::ConstKind::Value(mir::ConstValue::Scalar(mir::Scalar::Int { data, size })) =
+            &c.literal
+        else {
+            return None;
+        };
+        Some((*data, *size))
+    }
+    let (ldata, lsize) = scalar_int(lhs)?;
+    let (rdata, rsize) = scalar_int(rhs)?;
+    if lsize != rsize {
+        return None;
+    }
+    let bits = u32::from(lsize) * 8;
+    let sign_bit = |data: u128| bits > 0 && (data >> (bits - 1)) & 1 == 1;
+    if sign_bit(ldata) || sign_bit(rdata) {
+        int_ty_of_bits(bits).map(mir::Ty::Int)
+    } else {
+        uint_ty_of_bits(bits).map(mir::Ty::Uint)
+    }
+}
+
+fn int_ty_of_bits(bits: u32) -> Option<mir::IntTy> {
+    use mir::IntTy::*;
+    Some(match bits {
+        8 => I8,
+        16 => I16,
+        32 => I32,
+        64 => I64,
+        128 => I128,
+        _ => return None,
+    })
+}
+
+fn uint_ty_of_bits(bits: u32) -> Option<mir::UintTy> {
+    use mir::UintTy::*;
+    Some(match bits {
+        8 => U8,
+        16 => U16,
+        32 => U32,
+        64 => U64,
+        128 => U128,
+        _ => return None,
+    })
+}
+
 /// The panic message text for an `Assert`, mirroring the
 /// interpreter's rule: a custom message verbatim, anything else as
 /// `assertion failed: <kind>`.
@@ -846,10 +901,16 @@ impl<'a> FnLower<'a> {
         }
         let is_compare = matches!(op, M::Eq | M::Ne | M::Lt | M::Le | M::Gt | M::Ge);
         // Arithmetic operands share the destination's type; comparison
-        // operands share each other's type (the destination is bool).
+        // operands share each other's type (the destination is bool,
+        // which says nothing about them). A comparison of two literals
+        // — the shape of rustc's expanded division checks, `Eq(4, 0)`
+        // — has no place type anywhere, so the pair is typed from the
+        // literals themselves (see literal_pair_ty); typing it by the
+        // bool destination would collapse every nonzero literal to 1.
         let op_ty = if is_compare {
             self.operand_place_ty(lhs)
                 .or_else(|| self.operand_place_ty(rhs))
+                .or_else(|| literal_pair_ty(lhs, rhs))
                 .unwrap_or_else(|| dst_ty.clone())
         } else {
             dst_ty.clone()

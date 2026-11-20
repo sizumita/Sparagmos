@@ -537,6 +537,71 @@ fn casts_and_guarded_division() {
     );
 }
 
+// ----- literal-operand guards (the real silent_arith shape) ------------------
+//
+// rustc expands the division check over the *literal* divisor:
+// `_t = Eq(const 4, const 0)` — neither operand has a place, so the
+// comparison's type comes from the literals. (Typing it by the bool
+// destination collapses 4 to 1 and the guard misfires.)
+
+#[test]
+fn literal_division_guard() {
+    let i32t = i(mir::IntTy::I32);
+    let f = spec(
+        "lit_guard",
+        0,
+        0,
+        &[
+            i32t.clone(),
+            mir::Ty::Tuple(vec![i32t.clone(), mir::Ty::Bool]),
+            i32t.clone(),
+            mir::Ty::Bool,
+        ],
+        vec![
+            bb(
+                vec![
+                    assign(
+                        pl(1),
+                        mir::Rvalue::CheckedBinaryOp(
+                            mir::BinOp::Sub,
+                            Box::new((i32c(40), i32c(10))),
+                        ),
+                    ),
+                ],
+                assert_overflow(fld(1, 1, mir::Ty::Bool), mir::BinOp::Sub, 1),
+            ),
+            bb(
+                vec![
+                    assign(pl(2), mir::Rvalue::Use(mvf(1, 0, i32t.clone()))),
+                    assign(
+                        pl(3),
+                        mir::Rvalue::BinaryOp(
+                            mir::BinOp::Eq,
+                            Box::new((i32c(4), i32c(0))),
+                        ),
+                    ),
+                ],
+                mir::TerminatorKind::Assert {
+                    cond: mir::Operand::Move(pl(3)),
+                    expected: false,
+                    msg: Box::new(mir::AssertMessage::DivisionByZero(Box::new(i32c(4)))),
+                    target: mir::BasicBlock(2),
+                    unwind: mir::UnwindAction::Continue,
+                },
+            ),
+            bb(
+                vec![assign(
+                    pl(0),
+                    mir::Rvalue::BinaryOp(mir::BinOp::Div, Box::new((cp(2), i32c(4)))),
+                )],
+                mir::TerminatorKind::Return,
+            ),
+        ],
+    );
+    let (jit, prog) = build(&[f]);
+    check(&jit, &prog, "lit_guard", &[], vec![], Ok(7));
+}
+
 // ----- unguarded division: the lowering's own guards -------------------------
 
 fn div_program() -> (JitProgram, sparagmos_interp::MirProgram) {
