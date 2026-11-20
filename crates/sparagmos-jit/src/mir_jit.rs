@@ -116,16 +116,17 @@
 //! pointer casts and the array-to-slice `Unsize` coercion, `Len`,
 //! tuple aggregates, fieldless ADT aggregates, `Repeat`,
 //! `Discriminant`, `SetDiscriminant`; `Goto`, `SwitchInt`, `Call`
-//! (within the program, up to six register words of arguments),
+//! (within the program, up to six register words of arguments,
+//! and results of up to two words — a fat pointer or a pair —
+//! returned in RAX/RDX, the System V pair-return convention),
 //! `Assert`, `Drop`, `Return`, `Unreachable` (as a guest panic).
 //! Anything else — `f16` / `f128`, 128-bit integers, references
 //! to trait objects, ADT payloads, `Subslice`, a second dynamic
 //! index within one place, an index of a signed integer type,
-//! a literal index from the end of a slice, multi-word return
-//! values (a function's result travels in one register word, so
-//! a fat or pair result cannot be returned yet), arguments of
-//! more than two words, aggregates other than tuples and
-//! fieldless ADTs, calls to functions outside the program, and
+//! a literal index from the end of a slice, return values of
+//! more than two words, arguments of more than two words,
+//! aggregates other than tuples and fieldless ADTs, calls to
+//! functions outside the program, and
 //! so on — fails the whole function's compilation with
 //! [`JitError::Unsupported`] naming the construct. There is
 //! deliberately no partial or fallback execution: a program
@@ -326,6 +327,39 @@ impl JitProgram {
             });
         }
         self.inner.call(idx, args).map_err(JitCallError::Panic)
+    }
+
+    /// Call the function called `name`; see [`JitProgram::call`]
+    /// for the argument contract. Returns both words of a two-word
+    /// result (a fat pointer: the address, then the length; a pair:
+    /// its two fields, in order). The second word is meaningful
+    /// only when the function returns two words; a guest panic
+    /// yields no words at all.
+    pub fn call_pair(&self, name: &str, args: &[i64]) -> Result<(i64, i64), JitCallError> {
+        let idx = self
+            .index_by_name
+            .get(name)
+            .copied()
+            .ok_or_else(|| JitCallError::UnknownFunction(name.to_string()))?;
+        self.call_index_pair(idx, args)
+    }
+
+    /// Call the function at index `idx` (input order); see
+    /// [`JitProgram::call_pair`] for the contract.
+    pub fn call_index_pair(
+        &self,
+        idx: usize,
+        args: &[i64],
+    ) -> Result<(i64, i64), JitCallError> {
+        let expected = self.param_counts[idx];
+        if args.len() != expected {
+            return Err(JitCallError::WrongArgCount {
+                name: self.names[idx].clone(),
+                expected,
+                got: args.len(),
+            });
+        }
+        self.inner.call_pair(idx, args).map_err(JitCallError::Panic)
     }
 }
 
@@ -3020,9 +3054,22 @@ impl<'a> FnLower<'a> {
             T::Return => {
                 let (slot, count) = self.local_slots[0];
                 let term = match count {
-                    0 => IrTerminator::Return(IrOperand::Const(0)),
-                    1 => IrTerminator::Return(IrOperand::Value(slot)),
-                    _ => return Err(self.err("multi-word return value")),
+                    0 => IrTerminator::Return {
+                        value: IrOperand::Const(0),
+                        second: None,
+                    },
+                    1 => IrTerminator::Return {
+                        value: IrOperand::Value(slot),
+                        second: None,
+                    },
+                    // A two-word result (a fat pointer, a pair):
+                    // the leaves are consecutive slots, returned
+                    // in RAX/RDX (see the IR docs).
+                    2 => IrTerminator::Return {
+                        value: IrOperand::Value(slot),
+                        second: Some(IrOperand::Value(slot + 1)),
+                    },
+                    _ => return Err(self.err("return value of more than two words")),
                 };
                 self.seal_terminator(term);
                 Ok(())
@@ -3214,22 +3261,41 @@ impl<'a> FnLower<'a> {
         let dst_loc = self.classify_place(destination)?;
         let (dst, count) = match &dst_loc {
             PlaceLoc::Mem { count, .. } => {
-                if *count != Some(1) {
-                    return Err(self.err("call returning a multi-word value"));
+                let count = match count {
+                    Some(c @ (0 | 1 | 2)) => *c,
+                    Some(_) => {
+                        return Err(
+                            self.err("call returning a value of more than two words")
+                        )
+                    }
+                    None => return Err(self.err("call destination is an unsized place")),
+                };
+                // The result lands in a consecutive scratch pair;
+                // `store_mem_from` stores it through the address
+                // after the panic check.
+                let first = self.fresh();
+                if count == 2 {
+                    let second = self.fresh();
+                    debug_assert_eq!(second, first + 1);
                 }
-                (self.fresh(), 1)
+                (first, count)
             }
             PlaceLoc::Slots { .. } => {
                 let (dst, count, _) = self.place_leaves(destination)?;
                 (dst, count)
             }
         };
-        if count > 1 {
-            return Err(self.err("call returning a multi-word value"));
+        if count > 2 {
+            return Err(self.err("call returning a value of more than two words"));
         }
-        let dst = if count == 1 { dst } else { self.fresh() };
+        let (dst, dst2) = match count {
+            0 => (self.fresh(), None),
+            1 => (dst, None),
+            _ => (dst, Some(dst + 1)),
+        };
         self.emit(Instr::Call {
             dst,
+            dst2,
             func: callee as u32,
             args: ir_args,
         });
