@@ -37,6 +37,16 @@
 //!   what the formatter dispatch in core keys on.
 //! - [`Value::FmtCount`] is an `rt::Argument` built by
 //!   `Argument::from_usize`: a width/precision count, not a value.
+//! - [`Value::FnPtr`] is a function item or function pointer value:
+//!   the name of the target function in the program. Function items
+//!   are zero-sized in rustc MIR and reifying one into a function
+//!   pointer does not change the value, so both share this form.
+//! - [`Value::Closure`] is a closure value: the closure body's name
+//!   plus the captured environment in field order. A closure body
+//!   receives a reference to this value as its first argument and
+//!   reads its captures through field projections on it, exactly as
+//!   it reads `(*env).<field>` in rustc MIR.
+//!
 //! - [`Value::FmtArguments`] is a built `std::fmt::Arguments` value:
 //!   either a plain string (`from_str`) or a pieces template plus the
 //!   snapshot of its argument array (`Arguments::new`).
@@ -151,6 +161,12 @@ pub enum Value {
     FmtCount(u16),
     /// A built `std::fmt::Arguments`.
     FmtArguments(FmtArguments),
+    /// A function item or function pointer value: the name of the
+    /// target function in the program.
+    FnPtr(String),
+    /// A closure value: the closure body's name plus the captured
+    /// environment, in the field order of the closure aggregate.
+    Closure { def: String, env: Vec<Value> },
 }
 
 impl Value {
@@ -171,6 +187,8 @@ impl Value {
             Value::FmtArg { .. } => "fmt argument",
             Value::FmtCount(_) => "fmt count",
             Value::FmtArguments(_) => "fmt arguments",
+            Value::FnPtr(_) => "function pointer",
+            Value::Closure { .. } => "closure",
         }
     }
 
@@ -272,6 +290,10 @@ impl fmt::Display for Value {
             }
             Value::FmtCount(n) => write!(f, "<fmt count {n}>"),
             Value::FmtArguments(_) => write!(f, "<fmt::Arguments>"),
+            Value::FnPtr(name) => write!(f, "<fn {name}>"),
+            Value::Closure { def, env } => {
+                write!(f, "<closure {def} ({} captures)>", env.len())
+            }
         }
     }
 }

@@ -161,6 +161,16 @@ pub enum Ty {
     /// The `str` type; only appears behind a reference or as the type
     /// of a string-data place.
     Str,
+    /// A function pointer type (`fn(A) -> B`). The signature is not
+    /// modelled: call arguments are values, and their count is
+    /// checked against the callee body's arity at the call site.
+    FnPtr,
+    /// A function item type: the zero-sized type of one specific
+    /// function, identified by the function's name.
+    FnDef(String),
+    /// A closure type, identified by the closure body's name in the
+    /// program.
+    Closure(String),
 }
 
 impl Ty {
@@ -273,6 +283,9 @@ pub enum Constant {
     Ref(Box<Constant>),
     /// A slice constant with decoded (non-byte) elements.
     SliceVal(Vec<Constant>),
+    /// A function item constant: evaluates to the callable value
+    /// naming the function.
+    FnDef(String),
 }
 
 /// An operand: the right-hand side leaf of most rvalues.
@@ -350,6 +363,10 @@ pub enum Rvalue {
     AggregateTuple(Vec<Operand>),
     /// Build an ADT value: a variant index plus field values.
     AggregateAdt { variant: u32, operands: Vec<Operand> },
+    /// Build a closure value: the closure body's name plus the
+    /// captured environment values (the aggregate's operands, in
+    /// field order).
+    ClosureAggregate { def: String, operands: Vec<Operand> },
     /// An `as` cast to the given scalar type (wrapping, as in Rust).
     Cast(Operand, Ty),
     /// The array-to-slice unsizing coercion: wraps the operand (a
@@ -413,6 +430,20 @@ impl Statement {
     }
 }
 
+/// Which `Fn`-family trait method a [`TerminatorKind::CallTrait`]
+/// dispatches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FnCallKind {
+    /// `Fn::call`: the receiver is a shared reference to the callable.
+    Call,
+    /// `FnMut::call_mut`: the receiver is a unique reference to the
+    /// callable.
+    CallMut,
+    /// `FnOnce::call_once`: the receiver is the callable value
+    /// itself, consumed by the call.
+    CallOnce,
+}
+
 /// Terminator kinds (subset of rustc MIR `TerminatorKind`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum TerminatorKind {
@@ -431,6 +462,28 @@ pub enum TerminatorKind {
         args: Vec<Operand>,
         destination: Place,
         /// Continuation block in the caller; `None` models a diverging call.
+        target: Option<BasicBlock>,
+    },
+    /// A call through a callable value (function pointer, function
+    /// item, or closure) held in a place: the `func` operand
+    /// evaluates to the callable value. A closure callee is invoked
+    /// with call-once semantics (its environment is consumed).
+    CallIndirect {
+        func: Operand,
+        args: Vec<Operand>,
+        destination: Place,
+        target: Option<BasicBlock>,
+    },
+    /// A call through the `Fn` / `FnMut` / `FnOnce` trait methods
+    /// (`std::ops::Fn::call` and siblings), in the shape rustc MIR
+    /// emits for calling a closure: the receiver is the callable
+    /// (a reference to it for `call` / `call_mut`, the value itself
+    /// for `call_once`) and `args` evaluates to the argument tuple.
+    CallTrait {
+        kind: FnCallKind,
+        receiver: Operand,
+        args: Operand,
+        destination: Place,
         target: Option<BasicBlock>,
     },
     /// A call into runtime support (std/core functions whose bodies
