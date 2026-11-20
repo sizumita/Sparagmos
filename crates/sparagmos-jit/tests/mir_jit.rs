@@ -1306,6 +1306,53 @@ fn unreachable_block_reached_is_a_guest_panic() {
     );
 }
 
+fn unreachable_callee_program() -> (JitProgram, sparagmos_interp::MirProgram) {
+    // fn dive() -> i32 { unreachable }
+    // fn main() -> i32 { dive() }
+    // The panic raised in the callee must propagate out of the
+    // caller through the panic flag, as an `Assert` panic does.
+    let i32t = i(mir::IntTy::I32);
+    let dive = spec(
+        "dive",
+        0,
+        0,
+        &[i32t.clone()],
+        vec![bb(vec![], mir::TerminatorKind::Unreachable)],
+    );
+    let main = spec(
+        "main",
+        1,
+        0,
+        &[mir::Ty::Tuple(vec![]), i32t],
+        vec![
+            bb(vec![], call_term(fndef(def(0)), vec![], 1, 1)),
+            bb(vec![], mir::TerminatorKind::Return),
+        ],
+    );
+    build(&[dive, main])
+}
+
+#[test]
+fn unreachable_in_callee_propagates_as_guest_panic() {
+    let (jit, prog) = unreachable_callee_program();
+    check(
+        &jit,
+        &prog,
+        "dive",
+        &[],
+        vec![],
+        Err("entered unreachable code"),
+    );
+    check(
+        &jit,
+        &prog,
+        "main",
+        &[],
+        vec![],
+        Err("entered unreachable code"),
+    );
+}
+
 // ----- Repeat: arrays built by repeating one element -------------------------
 
 fn arr_i32(n: u64) -> mir::Ty {
