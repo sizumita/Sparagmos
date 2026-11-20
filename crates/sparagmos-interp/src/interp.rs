@@ -2168,8 +2168,7 @@ fn eval_shift(
             };
             // Overflow if significant bits are shifted out of the
             // declared width, i.e. shifting back does not restore `a`.
-            let overflowed =
-                op == BinOp::Shl && (wrap_signed(a << shift, bits) >> shift) != a;
+            let overflowed = op == BinOp::Shl && (wrap_signed(a << shift, bits) >> shift) != a;
             let result = Value::Int(wrap_signed(raw, bits));
             if overflowed && !checked_form {
                 return Err(InterpError::panic(format!("arithmetic overflow in {op:?}")));
@@ -2192,7 +2191,11 @@ fn eval_shift(
                     "attempt to shift by {shift} bits, which overflows the type width {bits}"
                 )));
             }
-            let raw = if op == BinOp::Shl { a << shift } else { a >> shift };
+            let raw = if op == BinOp::Shl {
+                a << shift
+            } else {
+                a >> shift
+            };
             let overflowed = op == BinOp::Shl && (wrap_unsigned(raw, bits) >> shift) != a;
             let result = Value::Uint(wrap_unsigned(raw, bits));
             if overflowed && !checked_form {
