@@ -19,6 +19,15 @@ fn i32_ty() -> mir::Ty {
 fn u32_ty() -> mir::Ty {
     mir::Ty::Uint(mir::UintTy::U32)
 }
+fn u8_ty() -> mir::Ty {
+    mir::Ty::Uint(mir::UintTy::U8)
+}
+fn u16_ty() -> mir::Ty {
+    mir::Ty::Uint(mir::UintTy::U16)
+}
+fn i8_ty() -> mir::Ty {
+    mir::Ty::Int(mir::IntTy::I8)
+}
 fn usize_ty() -> mir::Ty {
     mir::Ty::Uint(mir::UintTy::Usize)
 }
@@ -340,4 +349,85 @@ fn nested_ref_constant_derefs_twice() {
         )],
     );
     assert_eq!(run(body), Value::Int(5));
+}
+
+// ----- promoted float-to-uint cast results (the `println!` shape) -----------
+//
+// A `200.0f64 as u8` in argument position is promoted by rustc to a
+// by-reference constant holding the raw byte 200. The leaf carries no
+// signedness, so conversion must type it from the pointee type. These
+// tests pin the converted constant itself: a place deref would re-tag
+// the value on read and hide a mistagging, but consumers that receive
+// the reference value directly (the fmt machinery) see the tag as
+// converted — read as signed, 200 came back as -56.
+
+use sparagmos_interp::mir_convert::convert_program;
+use sparagmos_interp::{Constant, Operand, Rvalue, StatementKind};
+
+/// Convert a one-statement body (`_0 = const <value>; return`) and
+/// return the constant the assignment carries.
+fn converted_const(decl_ty: mir::Ty, value: mir::ConstValue) -> Constant {
+    let body = mir::Body::new(
+        decls(&[decl_ty]),
+        0,
+        vec![block(vec![assign(place(0), use_op(const_op(value)))], ret())],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("main", body);
+    let ir_prog = convert_program(&prog).expect("conversion should succeed");
+    let body = ir_prog.get("main").expect("main body");
+    match &body.blocks[0].statements[0].kind {
+        StatementKind::Assign(_, Rvalue::Use(Operand::Constant(c))) => c.clone(),
+        other => panic!("unexpected first statement: {other:?}"),
+    }
+}
+
+fn ref_const(inner: mir::ConstValue) -> mir::ConstValue {
+    mir::ConstValue::Ref(Box::new(inner))
+}
+
+#[test]
+fn promoted_ref_to_u8_converts_as_unsigned() {
+    let c = converted_const(ref_ty(u8_ty()), ref_const(scalar(200, 1)));
+    assert_eq!(c, Constant::Ref(Box::new(Constant::Uint(200))));
+}
+
+#[test]
+fn promoted_ref_to_u16_saturated_converts_as_unsigned() {
+    // The promoted result of `70000.0f64 as u16` is the saturated
+    // value 65535 (0xFFFF), whose sign bit is set at 16 bits.
+    let c = converted_const(ref_ty(u16_ty()), ref_const(scalar(65535, 2)));
+    assert_eq!(c, Constant::Ref(Box::new(Constant::Uint(65535))));
+}
+
+#[test]
+fn promoted_ref_to_i8_converts_as_signed() {
+    // The same bit pattern under a signed pointee type is -56: the
+    // declared type, not the bits, decides.
+    let c = converted_const(ref_ty(i8_ty()), ref_const(scalar(200, 1)));
+    assert_eq!(c, Constant::Ref(Box::new(Constant::Int(-56))));
+}
+
+#[test]
+fn nested_ref_to_u8_converts_as_unsigned() {
+    let c = converted_const(
+        ref_ty(ref_ty(u8_ty())),
+        ref_const(ref_const(scalar(200, 1))),
+    );
+    assert_eq!(
+        c,
+        Constant::Ref(Box::new(Constant::Ref(Box::new(Constant::Uint(200)))))
+    );
+}
+
+#[test]
+fn slice_of_u8_constants_convert_elements_as_unsigned() {
+    let c = converted_const(
+        ref_ty(mir::Ty::Slice(Box::new(u8_ty()))),
+        mir::ConstValue::SliceVal(vec![scalar(200, 1), scalar(255, 1)]),
+    );
+    assert_eq!(
+        c,
+        Constant::SliceVal(vec![Constant::Uint(200), Constant::Uint(255)])
+    );
 }
