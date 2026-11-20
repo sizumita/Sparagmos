@@ -37,9 +37,19 @@
 //! - One function's conversion failure never stops the others: each
 //!   collected body is converted on its own and failures are
 //!   recorded per function in the report.
-//! - Collection is capped at [`MAX_COLLECTED_BODIES`] bodies; targets
-//!   past the cap are recorded with that reason instead of being
-//!   collected, so the cutoff is visible in the report.
+//! - Collection is capped at [`MAX_COLLECTED_BODIES`] bodies per
+//!   program; the caller passes the remaining budget to each pass
+//!   (the driver runs further passes over bodies the first pass
+//!   unlocked), and targets past the cap are recorded with that
+//!   reason instead of being collected, so the cutoff is visible
+//!   in the report.
+//! - The Stable MIR bodies obtained during the walk are returned
+//!   alongside the converted bodies ([`CollectedFns::walked_bodies`]):
+//!   targets resolving to local items are skipped here, but a
+//!   collected foreign body can be the only place that demands a
+//!   monomorphic instance of a generic local definition, and the
+//!   caller's local-instance collection scans these bodies for
+//!   exactly those demands.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -81,6 +91,11 @@ pub struct CollectedFns {
     pub stable_bodies: Vec<mir::Body>,
     /// Whether the collection cap stopped further collection.
     pub limit_reached: bool,
+    /// The Stable MIR bodies obtained from foreign instances
+    /// during the walk, in discovery order (the seeds are not
+    /// included). A body is listed whether or not its conversion
+    /// succeeded: its call targets were walked either way.
+    pub walked_bodies: Vec<mir::Body>,
 }
 
 enum RecordKind {
@@ -106,10 +121,14 @@ struct Record {
 /// converted local bodies (`seeds`, Stable MIR form). `local_defs`
 /// holds the `DefId`s of the local crate's items; targets resolving
 /// to one of them are skipped (they are collected as local items).
+/// At most `cap` bodies are collected in this pass; the caller
+/// passes the program's remaining budget ([`MAX_COLLECTED_BODIES`]
+/// minus what earlier passes collected).
 pub fn collect_reachable(
     conv: &mut Converter,
     seeds: &[mir::Body],
     local_defs: &HashSet<rustc_public::DefId>,
+    cap: usize,
 ) -> CollectedFns {
     let mut records: Vec<Record> = Vec::new();
     let mut by_instance: HashMap<(rustc_public::DefId, Instance), ()> = HashMap::new();
@@ -118,6 +137,7 @@ pub fn collect_reachable(
     let mut queue: VecDeque<mir::Body> = seeds.iter().cloned().collect();
     let mut bodies_taken = 0usize;
     let mut limit_reached = false;
+    let mut walked_bodies: Vec<mir::Body> = Vec::new();
 
     while let Some(body) = queue.pop_front() {
         for (def, args) in call_targets(&body) {
@@ -181,7 +201,7 @@ pub fn collect_reachable(
                     }
                     _ => no_body("no MIR body available"),
                 },
-                _ if bodies_taken >= MAX_COLLECTED_BODIES => {
+                _ if bodies_taken >= cap => {
                     limit_reached = true;
                     no_body("collection limit reached")
                 }
@@ -189,6 +209,7 @@ pub fn collect_reachable(
                     Some(body) => {
                         bodies_taken += 1;
                         queue.push_back(body.clone());
+                        walked_bodies.push(body.clone());
                         RecordKind::WithBody { inst, body }
                     }
                     None => no_body("no MIR body available"),
@@ -293,6 +314,7 @@ pub fn collect_reachable(
         reports: Vec::new(),
         stable_bodies: Vec::new(),
         limit_reached,
+        walked_bodies,
     };
     for (i, rec) in records.iter().enumerate() {
         let name = display_name(i, rec);

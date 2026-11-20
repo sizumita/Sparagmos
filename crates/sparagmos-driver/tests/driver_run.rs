@@ -1512,3 +1512,88 @@ fn summary_mode_trivial_consts_are_converted_without_bodies() {
         "no target-crate function is skipped: {stdout}"
     );
 }
+
+// ----- external-demand instances (Lane BX) -----
+
+const EXTERNAL_DEMAND_SRC: &str = r#"
+struct RepeatN<T> { v: T, n: usize }
+impl<T: Copy> Iterator for RepeatN<T> {
+    type Item = T;
+    fn next(&mut self) -> Option<T> {
+        if self.n == 0 { None } else { self.n -= 1; Some(self.v) }
+    }
+}
+
+struct Total(i32);
+impl std::iter::Sum<i32> for Total {
+    fn sum<I: Iterator<Item = i32>>(mut iter: I) -> Self {
+        let mut acc = 0i32;
+        while let Some(x) = iter.next() {
+            acc += x;
+        }
+        Total(acc)
+    }
+}
+
+fn unused<T>(x: T) -> T { x }
+
+fn main() {
+    let t: Total = RepeatN { v: 7i32, n: 3 }.sum();
+    println!("{}", t.0);
+}
+"#;
+
+#[test]
+fn run_mode_generic_instance_demanded_through_foreign_body_executes() {
+    // Neither generic definition is named by a local body:
+    // `Total::sum` (generic over the iterator type) is demanded
+    // only from the collected body of `Iterator::sum`, and
+    // `RepeatN::next` (a method of a generic impl) only from
+    // `Total::sum`'s instance body. Both instances are resolved
+    // and converted, so the program runs end to end.
+    let dir = temp_dir("external-demand");
+    let src = fixture(&dir, "external_demand.rs", EXTERNAL_DEMAND_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "externally demanded generic instances must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "21\n");
+}
+
+#[test]
+fn summary_mode_externally_demanded_instances_are_converted() {
+    // The definitions demanded through foreign bodies are
+    // reported converted; a definition nothing demands keeps its
+    // no-instance record.
+    let dir = temp_dir("external-demand-summary");
+    let src = fixture(&dir, "external_demand.rs", EXTERNAL_DEMAND_SRC);
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let sum = stdout
+        .lines()
+        .find(|l| l.contains("::sum:") && l.contains("Sum<i32>"))
+        .expect("summary lists the Sum impl method");
+    assert!(
+        sum.contains("[converted]"),
+        "the externally demanded generic method is converted: {sum}"
+    );
+    let next = stdout
+        .lines()
+        .find(|l| l.contains("RepeatN") && l.contains(">::next:"))
+        .expect("summary lists the Iterator impl method");
+    assert!(
+        next.contains("[converted]"),
+        "the transitively demanded generic method is converted: {next}"
+    );
+    let unused = stdout
+        .lines()
+        .find(|l| l.starts_with("fn external_demand::unused:"))
+        .expect("summary lists the unused generic definition");
+    assert!(
+        unused.contains("SKIPPED (no monomorphic instance available (kind=Fn)"),
+        "the undemanded generic definition stays explicitly skipped: {unused}"
+    );
+}

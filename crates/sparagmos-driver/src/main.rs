@@ -80,7 +80,7 @@ extern crate rustc_middle;
 extern crate rustc_public;
 extern crate rustc_span;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::sync::{Mutex, OnceLock};
 
@@ -521,70 +521,96 @@ struct DeferredFn {
 /// collection's cap for foreign bodies.
 const MAX_LOCAL_INSTANCES: usize = 1024;
 
+/// Outcome accumulated for one deferred definition across every
+/// demand pass of a program.
+#[derive(Default)]
+struct Demand {
+    converted: usize,
+    failures: BTreeMap<String, usize>,
+    first_counts: Option<(usize, usize, usize)>,
+}
+
+fn fail_all(
+    demands: &mut HashMap<rustc_public::DefId, Demand>,
+    owners: &[rustc_public::DefId],
+    reason: String,
+) {
+    for owner in owners {
+        *demands
+            .entry(*owner)
+            .or_default()
+            .failures
+            .entry(reason.clone())
+            .or_default() += 1;
+    }
+}
+
+/// State shared by the demand passes of one program
+/// ([`collect_local_instances`] runs first over the converted
+/// local bodies, then over the foreign bodies the reachability
+/// collection obtained): which instances were already considered,
+/// how many instance bodies were taken against
+/// [`MAX_LOCAL_INSTANCES`], which definitions already own their
+/// plain display name, and the per-definition outcomes the passes
+/// accumulated.
+#[derive(Default)]
+struct InstanceDemandState {
+    seen: HashSet<(rustc_public::DefId, Instance)>,
+    unresolved_seen: HashSet<(rustc_public::DefId, String)>,
+    plain_taken: HashSet<rustc_public::DefId>,
+    taken: usize,
+    demands: HashMap<rustc_public::DefId, Demand>,
+}
+
 /// Convert the monomorphic instances of generic local function
-/// definitions that the program's bodies actually call.
+/// definitions that a set of bodies actually calls.
 ///
 /// A generic definition has no instance as an item, so the item
 /// loop cannot convert it; but every call site names the
 /// definition through an `FnDef` target with concrete generic
 /// arguments, and resolving those targets yields the instances
-/// the crate demands — the same mechanism the reachability
-/// collection uses for foreign functions. This pass walks the
-/// converted local bodies (and, transitively, the instance bodies
-/// themselves) for `FnDef` targets, resolves the ones belonging
-/// to deferred definitions, and converts each distinct instance,
-/// registering it under the same `(referenced definition,
-/// instance)` key call sites resolve through.
+/// the program demands — the same mechanism the reachability
+/// collection uses for foreign functions. This pass walks `seeds`
+/// (and, transitively, the instance bodies themselves) for
+/// `FnDef` targets, resolves the ones belonging to deferred
+/// definitions, and converts each distinct instance, registering
+/// it under the same `(referenced definition, instance)` key call
+/// sites resolve through.
 ///
-/// A deferred definition is then reported as converted when every
-/// instance demanded of it converted; when some instance could
-/// not be converted it stays skipped with that instance's
-/// reasons, and a definition nothing demands keeps the item
-/// loop's "no monomorphic instance available" record. The Stable
-/// MIR bodies of the converted instances are returned so the
-/// reachability collection can walk them for foreign targets too.
+/// The pass runs several times per program with shared `state`:
+/// first over the converted local bodies, then — interleaved with
+/// the reachability collection — over the foreign bodies that
+/// collection obtained, which can demand further local instances
+/// (a std adapter calling a trait method of a local generic type
+/// is the common shape). Sharing the state keeps the per-program
+/// cap and the instance deduplication in force across passes.
+/// Outcomes accumulate in the state; the caller records them in
+/// the report with [`apply_instance_demands`] once the last pass
+/// has run. The Stable MIR bodies of the instances this pass
+/// converted are returned so the reachability collection can walk
+/// them for foreign targets too.
 fn collect_local_instances(
     conv: &mut Converter,
-    report: &mut ConversionReport,
     bodies: &mut Vec<(String, Body)>,
     body_def_ids: &mut Vec<sparagmos_mir::DefId>,
     body_def_names: &mut Vec<String>,
     deferred: &[DeferredFn],
     seeds: &[rustc_public::mir::Body],
+    state: &mut InstanceDemandState,
 ) -> Vec<rustc_public::mir::Body> {
-    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::collections::VecDeque;
 
-    /// Outcome accumulated for one deferred definition.
-    #[derive(Default)]
-    struct Demand {
-        converted: usize,
-        failures: BTreeMap<String, usize>,
-        first_counts: Option<(usize, usize, usize)>,
-    }
-
-    fn fail_all(
-        demands: &mut HashMap<rustc_public::DefId, Demand>,
-        owners: &[rustc_public::DefId],
-        reason: String,
-    ) {
-        for owner in owners {
-            *demands
-                .entry(*owner)
-                .or_default()
-                .failures
-                .entry(reason.clone())
-                .or_default() += 1;
-        }
-    }
+    let InstanceDemandState {
+        seen,
+        unresolved_seen,
+        plain_taken,
+        taken,
+        demands,
+    } = state;
 
     let deferred_defs: HashSet<rustc_public::DefId> = deferred.iter().map(|d| d.def).collect();
-    let mut demands: HashMap<rustc_public::DefId, Demand> = HashMap::new();
-    let mut seen: HashSet<(rustc_public::DefId, Instance)> = HashSet::new();
-    let mut unresolved_seen: HashSet<(rustc_public::DefId, String)> = HashSet::new();
-    let mut plain_taken: HashSet<rustc_public::DefId> = HashSet::new();
     let mut queue: VecDeque<rustc_public::mir::Body> = seeds.iter().cloned().collect();
     let mut extra_seeds: Vec<rustc_public::mir::Body> = Vec::new();
-    let mut taken = 0usize;
 
     while let Some(body) = queue.pop_front() {
         // Instance resolution and body access go through the
@@ -632,8 +658,8 @@ fn collect_local_instances(
             if resolved != referenced && deferred_defs.contains(&resolved) {
                 owners.push(resolved);
             }
-            if taken >= MAX_LOCAL_INSTANCES {
-                fail_all(&mut demands, &owners, "collection limit reached".to_string());
+            if *taken >= MAX_LOCAL_INSTANCES {
+                fail_all(&mut *demands, &owners, "collection limit reached".to_string());
                 continue;
             }
             // Mirror the reachability collection's guards before
@@ -643,7 +669,7 @@ fn collect_local_instances(
             // compilation even when the unwind is caught).
             if matches!(inst.kind, rustc_public::mir::mono::InstanceKind::Virtual { .. }) {
                 fail_all(
-                    &mut demands,
+                    &mut *demands,
                     &owners,
                     "dynamic dispatch target (virtual instance)".to_string(),
                 );
@@ -656,11 +682,11 @@ fn collect_local_instances(
                     }
                     _ => "no MIR body available",
                 };
-                fail_all(&mut demands, &owners, reason.to_string());
+                fail_all(&mut *demands, &owners, reason.to_string());
                 continue;
             }
             let Some(ibody) = inst.body() else {
-                fail_all(&mut demands, &owners, "no MIR body available".to_string());
+                fail_all(&mut *demands, &owners, "no MIR body available".to_string());
                 continue;
             };
             match conv.convert_body(&ibody) {
@@ -671,7 +697,7 @@ fn collect_local_instances(
                     // cannot represent stays in the program and is
                     // recorded unconverted by the interpreter's own
                     // per-body isolation if it is ever called.
-                    taken += 1;
+                    *taken += 1;
                     queue.push_back(ibody.clone());
                     extra_seeds.push(ibody.clone());
                     let counts = (ibody.blocks.len(), ibody.locals().len(), ibody.arg_locals().len());
@@ -699,7 +725,7 @@ fn collect_local_instances(
                 }
                 Err(errs) => {
                     for e in errs {
-                        fail_all(&mut demands, &owners, e);
+                        fail_all(&mut *demands, &owners, e);
                     }
                 }
             }
@@ -714,6 +740,21 @@ fn collect_local_instances(
         }
     }
 
+    extra_seeds
+}
+
+/// Record the demand outcomes accumulated by
+/// [`collect_local_instances`] in the report: a deferred
+/// definition is converted when every instance demanded of it
+/// converted; when some instance could not be converted it stays
+/// skipped with that instance's reasons, and a definition nothing
+/// demands keeps the item loop's "no monomorphic instance
+/// available" record.
+fn apply_instance_demands(
+    report: &mut ConversionReport,
+    deferred: &[DeferredFn],
+    demands: &HashMap<rustc_public::DefId, Demand>,
+) {
     for dfn in deferred {
         let Some(demand) = demands.get(&dfn.def) else {
             continue;
@@ -731,7 +772,6 @@ fn collect_local_instances(
             };
         }
     }
-    extra_seeds
 }
 
 /// Register converted impl method bodies under the trait keys
@@ -1057,14 +1097,15 @@ fn collect() -> ControlFlow<()> {
     // function definitions that the converted bodies call; the
     // instance bodies join the reachability seeds below, so the
     // foreign functions they call are collected too.
+    let mut demand_state = InstanceDemandState::default();
     let instance_seeds = collect_local_instances(
         &mut conv,
-        &mut report,
         &mut bodies,
         &mut body_def_ids,
         &mut body_def_names,
         &deferred,
         &seed_bodies,
+        &mut demand_state,
     );
     let mut reach_seeds = seed_bodies;
     reach_seeds.extend(instance_seeds);
@@ -1072,18 +1113,95 @@ fn collect() -> ControlFlow<()> {
     // Collect the bodies of non-local functions reachable from the
     // converted local bodies (std / core / alloc and other library
     // functions), so calls into them have bodies in the program too.
-    let reached = sparagmos_driver::reach::collect_reachable(&mut conv, &reach_seeds, &local_defs);
+    let reached = sparagmos_driver::reach::collect_reachable(
+        &mut conv,
+        &reach_seeds,
+        &local_defs,
+        sparagmos_driver::reach::MAX_COLLECTED_BODIES,
+    );
+    let mut foreign_taken = reached.bodies.len();
+    let mut frontier = reached.walked_bodies;
     bodies.extend(reached.bodies);
     body_def_ids.extend(reached.body_def_ids);
     body_def_names.extend(reached.body_def_names);
     report.functions.extend(reached.reports);
 
+    // A generic local definition can also be demanded from inside
+    // a collected foreign body (a std adapter calling a trait
+    // method of a local generic type): the reachability collection
+    // skips targets that resolve to local items, and the demand
+    // pass above only walked local bodies, so such instances were
+    // never converted. Alternate the two passes to a fixpoint:
+    // scan the newly collected foreign bodies for demanded local
+    // instances, then collect the foreign functions those instance
+    // bodies call, whose bodies may in turn demand more local
+    // instances. Later reachability passes re-walk (and
+    // re-convert) targets earlier passes already collected; the
+    // duplicates are dropped by DefId for bodies and by display
+    // name for report entries, and both collections keep their
+    // per-program caps across passes (shared demand state, and a
+    // remaining-budget argument for reachability).
+    let mut collected_ids: HashSet<sparagmos_mir::DefId> =
+        body_def_ids.iter().copied().collect();
+    // Stable MIR sources for the trait-key alias pass below: the
+    // local seeds plus every foreign body the reachability passes
+    // walk, across all fixpoint rounds.
+    let mut alias_sources = reach_seeds.clone();
+    alias_sources.extend(frontier.iter().cloned());
+    let mut report_names: HashSet<String> =
+        report.functions.iter().map(|f| f.name.clone()).collect();
+    loop {
+        let ids_before = body_def_ids.len();
+        let new_instances = collect_local_instances(
+            &mut conv,
+            &mut bodies,
+            &mut body_def_ids,
+            &mut body_def_names,
+            &deferred,
+            &frontier,
+            &mut demand_state,
+        );
+        if new_instances.is_empty() {
+            break;
+        }
+        for id in &body_def_ids[ids_before..] {
+            collected_ids.insert(*id);
+        }
+        if foreign_taken >= sparagmos_driver::reach::MAX_COLLECTED_BODIES {
+            break;
+        }
+        let reached = sparagmos_driver::reach::collect_reachable(
+            &mut conv,
+            &new_instances,
+            &local_defs,
+            sparagmos_driver::reach::MAX_COLLECTED_BODIES - foreign_taken,
+        );
+        frontier = reached.walked_bodies;
+        alias_sources.extend(frontier.iter().cloned());
+        for ((name, body), (def_id, def_name)) in reached
+            .bodies
+            .into_iter()
+            .zip(reached.body_def_ids.into_iter().zip(reached.body_def_names))
+        {
+            if collected_ids.insert(def_id) {
+                foreign_taken += 1;
+                bodies.push((name, body));
+                body_def_ids.push(def_id);
+                body_def_names.push(def_name);
+            }
+        }
+        for entry in reached.reports {
+            if report_names.insert(entry.name.clone()) {
+                report.functions.push(entry);
+            }
+        }
+    }
+    apply_instance_demands(&mut report, &deferred, &demand_state.demands);
+
     // Register converted impl method bodies under the trait keys
     // their call sites resolve through (Issue #64). Demands can
     // come from any converted body: local items, demanded local
     // instances, and collected foreign bodies alike.
-    let mut alias_sources = reach_seeds;
-    alias_sources.extend(reached.stable_bodies.iter().cloned());
     register_trait_key_aliases(
         &mut conv,
         &mut bodies,
