@@ -565,7 +565,7 @@ class ProcessStage2RevisionTests(unittest.TestCase):
 
     def run_with_fake(self, rec, fake):
         orig = run.convert_side
-        def stub(path, edition, driver_bin, rustc_args=()):
+        def stub(path, edition, driver_bin, rustc_args=(), aux_specs=()):
             self.calls.append(list(rustc_args))
             return fake(list(rustc_args))
         run.convert_side = stub
