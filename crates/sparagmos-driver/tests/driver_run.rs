@@ -448,6 +448,150 @@ fn run_mode_aux_crate_functions_execute() {
     );
 }
 
+
+const AUX_PM_SRC: &str = r#"
+extern crate proc_macro;
+use proc_macro::TokenStream;
+
+#[proc_macro]
+pub fn answer(_input: TokenStream) -> TokenStream {
+    "42".parse().unwrap()
+}
+"#;
+
+const AUX_PM_MAIN_SRC: &str = r#"
+extern crate pmaux;
+fn main() { println!("answer={}", pmaux::answer!()); }
+"#;
+
+// `async` is an identifier only in edition 2015.
+const AUX_ED2015_SRC: &str = r#"
+pub fn async() -> i32 { 11 }
+"#;
+
+// `gen` is a reserved keyword only in edition 2024.
+const AUX_ED2021_SRC: &str = r#"
+pub fn gen() -> i32 { 7 }
+"#;
+
+const AUX_EDITIONS_MAIN_SRC: &str = r#"
+extern crate auxa;
+extern crate auxb;
+fn main() {
+    println!("a={}", auxa::r#async());
+    println!("b={}", auxb::r#gen());
+}
+"#;
+
+fn run_driver_with_aux_specs(
+    src: &Path,
+    edition: Option<&str>,
+    specs: &[String],
+) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"));
+    cmd.arg("run").arg(src);
+    if let Some(ed) = edition {
+        cmd.arg("--edition").arg(ed);
+    }
+    for spec in specs {
+        cmd.arg("--aux").arg(spec);
+    }
+    cmd.output().expect("failed to run sparagmos-driver")
+}
+
+fn aux_spec(name: &str, path: &Path, attrs: &str) -> String {
+    format!("{}={}{}", name, path.display(), attrs)
+}
+
+#[test]
+fn run_mode_aux_proc_macro_crate_type_attribute() {
+    // A proc-macro auxiliary crate whose source declares no crate
+    // type (the shape compiletest's `//@ proc-macro:` produces):
+    // the `;crate-type=proc-macro` attribute builds it as a proc
+    // macro, and the main crate's macro invocation runs inside the
+    // compiler before the guest executes.
+    let dir = temp_dir("aux-proc-macro");
+    let pm = fixture(&dir, "pmaux.rs", AUX_PM_SRC);
+    let src = fixture(&dir, "pmmain.rs", AUX_PM_MAIN_SRC);
+    let out = run_driver_with_aux_specs(
+        &src,
+        None,
+        &[aux_spec("pmaux", &pm, ";crate-type=proc-macro")],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "proc-macro aux must build and expand; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "answer=42\n");
+}
+
+#[test]
+fn run_mode_aux_proc_macro_without_attribute_fails() {
+    // The same source without the attribute is built as an rlib,
+    // which rustc rejects for `#[proc_macro]` items: a conversion
+    // failure (exit 2), not a silent mis-build.
+    let dir = temp_dir("aux-proc-macro-plain");
+    let pm = fixture(&dir, "pmaux.rs", AUX_PM_SRC);
+    let src = fixture(&dir, "pmmain.rs", AUX_PM_MAIN_SRC);
+    let out = run_driver_with_aux_specs(&src, None, &[aux_spec("pmaux", &pm, "")]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr={stderr}");
+    assert!(
+        stderr.contains("auxiliary crate `pmaux` failed to compile"),
+        "the reason names the auxiliary crate: {stderr}"
+    );
+}
+
+#[test]
+fn run_mode_aux_per_crate_editions() {
+    // Two auxiliary crates with different editions, both different
+    // from the main crate's edition 2024: each `;edition=` wins for
+    // its own crate (compiletest builds each auxiliary with the
+    // edition the auxiliary file itself declares).
+    let dir = temp_dir("aux-editions");
+    let auxa = fixture(&dir, "auxa.rs", AUX_ED2015_SRC);
+    let auxb = fixture(&dir, "auxb.rs", AUX_ED2021_SRC);
+    let src = fixture(&dir, "edmain.rs", AUX_EDITIONS_MAIN_SRC);
+    let out = run_driver_with_aux_specs(
+        &src,
+        Some("2024"),
+        &[
+            aux_spec("auxa", &auxa, ";edition=2015"),
+            aux_spec("auxb", &auxb, ";edition=2021"),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "per-aux editions must apply; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a=11\nb=7\n");
+}
+
+#[test]
+fn run_mode_aux_without_edition_attribute_uses_main_edition() {
+    // Without `;edition=`, the auxiliary crate is built with the
+    // main edition (2024), under which `gen` is reserved: the
+    // build fails as a conversion failure.
+    let dir = temp_dir("aux-edition-default");
+    let auxb = fixture(&dir, "auxb.rs", AUX_ED2021_SRC);
+    let src = fixture(&dir, "edmain.rs", AUX_EDITIONS_MAIN_SRC);
+    let out = run_driver_with_aux_specs(
+        &src,
+        Some("2024"),
+        &[aux_spec("auxb", &auxb, "")],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr={stderr}");
+    assert!(
+        stderr.contains("auxiliary crate `auxb` failed to compile"),
+        "the reason names the auxiliary crate: {stderr}"
+    );
+}
+
 #[test]
 fn run_mode_nested_aux_crates_execute() {
     // Auxiliary crates are passed in dependency order: `mid` uses
