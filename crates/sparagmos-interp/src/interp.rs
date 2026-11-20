@@ -656,6 +656,9 @@ impl<'a> Interpreter<'a> {
                 (base, projection)
             }
             RefTarget::Value(v) => ((**v).clone(), &[]),
+            // A null pointer denotes nothing; there is no drop
+            // glue to read through it.
+            RefTarget::Null => return Ok(None),
         };
         let mut value = base;
         for step in prefix.iter().chain(path.iter()) {
@@ -691,6 +694,11 @@ impl<'a> Interpreter<'a> {
                 let projected = project_value((**v).clone(), path, "<drop>", "drop glue")?;
                 Ok(RefTarget::Value(Box::new(projected)))
             }
+            RefTarget::Null => Err(InterpError::type_mismatch(
+                "drop glue reference",
+                "a valid reference",
+                "null pointer",
+            )),
         }
     }
 
@@ -1158,6 +1166,11 @@ impl<'a> Interpreter<'a> {
                 projection: projection.clone(),
             }),
             Value::Ref(RefTarget::Value(v)) => Ok(Resolved::Value((**v).clone())),
+            Value::Ref(RefTarget::Null) => Err(InterpError::type_mismatch(
+                "dereference",
+                "reference",
+                "null pointer",
+            )),
             // Dereferencing a fat pointer whose base is a reference
             // reaches through to the base place. A self-contained
             // fat pointer (a slice constant: the base is the element

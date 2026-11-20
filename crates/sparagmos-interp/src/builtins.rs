@@ -33,6 +33,8 @@ use sparagmos_mir as mir;
 use crate::error::{InterpError, InterpResult};
 use crate::interp::{eval_binary, Frame, Interpreter, Resolved};
 use crate::ir::{BinOp, Body, FloatTy, IntTy, Operand, Ty, UintTy};
+use std::borrow::Cow;
+
 use crate::value::{FmtArguments, FmtTrait, RefProj, RefTarget, Value};
 
 // ---------------------------------------------------------------------------
@@ -1702,7 +1704,12 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::PtrNull => {
                 arity(0)?;
-                Ok(Value::Uint(0))
+                // The null pointer: a dedicated reference target
+                // denoting no place and no value. It is equal only
+                // to itself (see `values_equal`); dereferencing it
+                // is an explicit error, as a null dereference has
+                // no meaning in the value model.
+                Ok(Value::Ref(RefTarget::Null))
             }
             Builtin::MemZeroed => {
                 arity(0)?;
@@ -1823,46 +1830,83 @@ impl<'a> Interpreter<'a> {
                         "arithmetic trait method for {self_ty} is not runtime-supported"
                     ))
                 })?;
+                // The operation is defined on the Self type's bit
+                // patterns. Constants in this value model carry
+                // their own signedness flavour, so re-flavour the
+                // operands to the Self type first; for
+                // `Wrapping<T>` the operand is the aggregate's one
+                // field and the result is re-wrapped.
+                let finish = |result: Value| -> Value {
+                    if wrapping {
+                        Value::Enum {
+                            variant: 0,
+                            fields: vec![result],
+                        }
+                    } else {
+                        result
+                    }
+                };
                 if assign {
                     let current = self.resolve_value(frames, &vals[0])?;
+                    let current = trait_operand(&current, tag, wrapping);
+                    let rhs = trait_operand(&vals[1], tag, wrapping);
                     let (result, _) =
-                        eval_binary(op.binop(), &current, &vals[1], Some(&ty), wrapping)?;
+                        eval_binary(op.binop(), &current, &rhs, Some(&ty), wrapping)?;
                     let target = self.deref_value(frames, &vals[0])?;
-                    self.write_resolved(frames, &target, result)?;
+                    self.write_resolved(frames, &target, finish(result))?;
                     Ok(Value::Unit)
                 } else {
+                    let lhs = trait_operand(&vals[0], tag, wrapping);
+                    let rhs = trait_operand(&vals[1], tag, wrapping);
                     let (result, _) =
-                        eval_binary(op.binop(), &vals[0], &vals[1], Some(&ty), wrapping)?;
-                    Ok(result)
+                        eval_binary(op.binop(), &lhs, &rhs, Some(&ty), wrapping)?;
+                    Ok(finish(result))
                 }
             }
             Builtin::NegNeg => {
                 arity(1)?;
                 let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
-                let wrapping = self_ty.starts_with("std::num::Wrapping<");
-                match vals.into_iter().next().expect("arity checked") {
-                    Value::Float(x) => Ok(Value::Float(-x)),
-                    Value::Int(v) => {
-                        let tag = self_ty
-                            .strip_prefix("std::num::Wrapping<")
-                            .and_then(|rest| rest.strip_suffix('>'))
-                            .unwrap_or(self_ty);
-                        let (bits, _) = int_tag(tag).ok_or_else(|| {
-                            unsupported(format!("Neg for {self_ty} is not runtime-supported"))
-                        })?;
-                        if wrapping {
-                            let pattern = (0u128.wrapping_sub(v as u128)) & bit_mask(bits);
-                            Ok(Value::Int(sign_extend(pattern, bits)))
-                        } else {
-                            let min = -(sign_extend(bit_mask(bits) >> 1, bits)) - 1;
-                            if v == min {
-                                Err(InterpError::panic("attempt to negate with overflow"))
-                            } else {
-                                Ok(Value::Int(-v))
-                            }
-                        }
+                let (tag, wrapping) = match self_ty
+                    .strip_prefix("std::num::Wrapping<")
+                    .and_then(|rest| rest.strip_suffix('>'))
+                {
+                    Some(inner) => (inner, true),
+                    None => (self_ty, false),
+                };
+                let raw = vals.into_iter().next().expect("arity checked");
+                let raw = if wrapping {
+                    unwrap_one_field(&raw).into_owned()
+                } else {
+                    raw
+                };
+                if matches!(raw, Value::Int(_) | Value::Uint(_)) {
+                    let (bits, signed) = int_tag(tag).ok_or_else(|| {
+                        unsupported(format!("Neg for {self_ty} is not runtime-supported"))
+                    })?;
+                    let pattern = as_u128(&raw, name)? & bit_mask(bits);
+                    // Negating the type's minimum overflows, exactly
+                    // like the plain unary `-`.
+                    if !wrapping && signed && pattern == (1u128 << (bits - 1)) {
+                        return Err(InterpError::panic("attempt to negate with overflow"));
                     }
-                    ref other => Err(InterpError::type_mismatch(
+                    let negated = 0u128.wrapping_sub(pattern) & bit_mask(bits);
+                    let value = if signed {
+                        Value::Int(sign_extend(negated, bits))
+                    } else {
+                        Value::Uint(negated)
+                    };
+                    return Ok(if wrapping {
+                        Value::Enum {
+                            variant: 0,
+                            fields: vec![value],
+                        }
+                    } else {
+                        value
+                    });
+                }
+                match raw {
+                    Value::Float(x) => Ok(Value::Float(-x)),
+                    other => Err(InterpError::type_mismatch(
                         format!("builtin {name}"),
                         "number",
                         other.kind_name(),
@@ -1872,26 +1916,48 @@ impl<'a> Interpreter<'a> {
             Builtin::NotNot => {
                 arity(1)?;
                 let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
-                match vals.into_iter().next().expect("arity checked") {
-                    Value::Bool(b) => Ok(Value::Bool(!b)),
-                    Value::Int(v) => {
-                        let (bits, _) = int_tag(self_ty).ok_or_else(|| {
+                let (tag, wrapping) = match self_ty
+                    .strip_prefix("std::num::Wrapping<")
+                    .and_then(|rest| rest.strip_suffix('>'))
+                {
+                    Some(inner) => (inner, true),
+                    None => (self_ty, false),
+                };
+                let raw = vals.into_iter().next().expect("arity checked");
+                let raw = if wrapping {
+                    unwrap_one_field(&raw).into_owned()
+                } else {
+                    raw
+                };
+                let result = match raw {
+                    Value::Bool(b) => Value::Bool(!b),
+                    Value::Int(_) | Value::Uint(_) => {
+                        let (bits, signed) = int_tag(tag).ok_or_else(|| {
                             unsupported(format!("Not for {self_ty} is not runtime-supported"))
                         })?;
-                        Ok(Value::Int(sign_extend(!(v as u128) & bit_mask(bits), bits)))
+                        let flipped = !as_u128(&raw, name)? & bit_mask(bits);
+                        if signed {
+                            Value::Int(sign_extend(flipped, bits))
+                        } else {
+                            Value::Uint(flipped)
+                        }
                     }
-                    Value::Uint(v) => {
-                        let (bits, _) = int_tag(self_ty).ok_or_else(|| {
-                            unsupported(format!("Not for {self_ty} is not runtime-supported"))
-                        })?;
-                        Ok(Value::Uint(!v & bit_mask(bits)))
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            format!("builtin {name}"),
+                            "integer or bool",
+                            other.kind_name(),
+                        ))
                     }
-                    ref other => Err(InterpError::type_mismatch(
-                        format!("builtin {name}"),
-                        "integer or bool",
-                        other.kind_name(),
-                    )),
-                }
+                };
+                Ok(if wrapping {
+                    Value::Enum {
+                        variant: 0,
+                        fields: vec![result],
+                    }
+                } else {
+                    result
+                })
             }
             Builtin::FloatMethod { f32, op } => exec_float_method(name, f32, op, &vals),
         }
@@ -2034,6 +2100,8 @@ impl<'a> Interpreter<'a> {
         let a = self.resolve_value(frames, a)?;
         let b = self.resolve_value(frames, b)?;
         Ok(match (&a, &b) {
+            (Value::Ref(RefTarget::Null), Value::Ref(RefTarget::Null)) => true,
+            (Value::Ref(RefTarget::Null), _) | (_, Value::Ref(RefTarget::Null)) => false,
             (Value::Unit, Value::Unit) => true,
             (Value::Bool(x), Value::Bool(y)) => x == y,
             (Value::Int(x), Value::Int(y)) => x == y,
@@ -2173,6 +2241,9 @@ impl<'a> Interpreter<'a> {
         let mut value = value.clone();
         loop {
             match &value {
+                // The null pointer denotes no data; resolving it
+                // yields itself so equality can see it.
+                Value::Ref(RefTarget::Null) => return Ok(value),
                 Value::Ref(_) | Value::FatRef { .. } => {
                     let target = self.deref_value(frames, &value)?;
                     value = self.read_resolved(frames, &target)?;
@@ -2507,6 +2578,52 @@ fn zeroed_value_for_tag(tag: &str) -> Option<Value> {
             Value::Tuple(vec![elem; n])
         }
         _ => return None,
+    })
+}
+
+/// The one field of a one-field aggregate (a newtype wrapper
+/// such as `Wrapping<T>`), or the value itself when it is not
+/// such an aggregate.
+fn unwrap_one_field(v: &Value) -> Cow<'_, Value> {
+    match v {
+        Value::Enum { fields, .. } if fields.len() == 1 => Cow::Borrowed(&fields[0]),
+        Value::Tuple(fields) if fields.len() == 1 => Cow::Borrowed(&fields[0]),
+        _ => Cow::Borrowed(v),
+    }
+}
+
+/// One operand of an arithmetic trait method: for
+/// `Wrapping<T>` the aggregate's one field, re-flavoured to the
+/// Self type (see `normalise_int_for_tag`).
+fn trait_operand<'a>(v: &'a Value, tag: &str, wrapping: bool) -> Cow<'a, Value> {
+    let inner = if wrapping {
+        unwrap_one_field(v)
+    } else {
+        Cow::Borrowed(v)
+    };
+    match normalise_int_for_tag(&inner, tag) {
+        Some(n) => Cow::Owned(n),
+        None => inner,
+    }
+}
+
+/// Re-flavour an integer value to the signedness and width of
+/// the type named by `tag`, preserving its bit pattern. Returns
+/// `None` for non-integer values and unknown tags. The value
+/// model's constants carry their own signedness, so a callee
+/// whose semantics are defined by its Self type uses this to
+/// see the operand exactly as that type denotes it.
+fn normalise_int_for_tag(v: &Value, tag: &str) -> Option<Value> {
+    let (bits, signed) = int_tag(tag)?;
+    let pattern = match v {
+        Value::Int(i) => (*i as u128) & bit_mask(bits),
+        Value::Uint(u) => *u & bit_mask(bits),
+        _ => return None,
+    };
+    Some(if signed {
+        Value::Int(sign_extend(pattern, bits))
+    } else {
+        Value::Uint(pattern)
     })
 }
 
