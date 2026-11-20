@@ -747,6 +747,12 @@ impl<'a> Interpreter<'a> {
             | (None, _) => Ok(value),
             (Some(Ty::Int(it)), Value::Int(v)) => Ok(Value::Int(wrap_signed(*v, it.bits()))),
             (Some(Ty::Uint(ut)), Value::Uint(v)) => Ok(Value::Uint(*v & ut.max())),
+            // An `f32` place holds the `f32` rounding of the stored
+            // (exactly widened) value; an `f64` place holds it as-is.
+            (Some(Ty::Float(FloatTy::F32)), Value::Float(v)) => {
+                Ok(Value::Float((*v as f32) as f64))
+            }
+            (Some(Ty::Float(FloatTy::F64)), Value::Float(_)) => Ok(value),
             // ADT locals hold the ADT value forms: aggregates, string
             // data (`String`), and the fmt value family.
             (Some(Ty::Adt(_)), Value::Enum { .. })
@@ -801,6 +807,7 @@ impl<'a> Interpreter<'a> {
                 Constant::Bool(b) => Value::Bool(*b),
                 Constant::Int(v) => Value::Int(*v),
                 Constant::Uint(v) => Value::Uint(*v),
+                Constant::Float(v) => Value::Float(*v),
                 Constant::Str(s) => Value::Str(s.clone()),
                 Constant::Bytes(b) => Value::Bytes(b.clone()),
             }),
@@ -1391,11 +1398,54 @@ fn eval_binary(
         }
         return Ok((result, overflowed));
     }
+    // Floating-point arithmetic, computed in `f64` (see `Value::Float`
+    // for why that is exact at `f32` destinations too). Division by
+    // zero and NaN follow IEEE 754, as in Rust: they are values, not
+    // panics. Float operations never set the overflow flag.
+    if let (Value::Float(a), Value::Float(b)) = (lhs, rhs) {
+        let (a, b) = (*a, *b);
+        let round = |r: f64| match float_ty_of(dest_ty) {
+            Some(FloatTy::F32) => (r as f32) as f64,
+            _ => r,
+        };
+        let v = match op {
+            Eq => Value::Bool(a == b),
+            Ne => Value::Bool(a != b),
+            Lt => Value::Bool(a < b),
+            Le => Value::Bool(a <= b),
+            Gt => Value::Bool(a > b),
+            Ge => Value::Bool(a >= b),
+            Add => Value::Float(round(a + b)),
+            Sub => Value::Float(round(a - b)),
+            Mul => Value::Float(round(a * b)),
+            Div => Value::Float(round(a / b)),
+            Rem => Value::Float(round(a % b)),
+            _ => {
+                return Err(InterpError::type_mismatch(
+                    format!("binary operation {op:?}"),
+                    "integer operands",
+                    "float",
+                ))
+            }
+        };
+        return Ok((v, false));
+    }
     Err(InterpError::type_mismatch(
         format!("binary operation {op:?}"),
         "matching integer/bool operands",
         format!("{} and {}", lhs.kind_name(), rhs.kind_name()),
     ))
+}
+
+/// The float width a binary operation's destination declares, if any.
+/// A checked operation's destination is the `(T, bool)` tuple; the
+/// operand width lives in its first element.
+fn float_ty_of(dest_ty: Option<&Ty>) -> Option<FloatTy> {
+    match dest_ty {
+        Some(Ty::Float(ft)) => Some(*ft),
+        Some(Ty::Tuple(ts)) => float_ty_of(ts.first()),
+        _ => None,
+    }
 }
 
 fn eval_unary(op: UnOp, v: &Value, dest_ty: Option<&Ty>) -> InterpResult<Value> {
@@ -1412,6 +1462,7 @@ fn eval_unary(op: UnOp, v: &Value, dest_ty: Option<&Ty>) -> InterpResult<Value> 
                 _ => Err(InterpError::panic("arithmetic overflow in Neg")),
             }
         }
+        (UnOp::Neg, Value::Float(a)) => Ok(Value::Float(-a)),
         (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
         (UnOp::Not, Value::Int(a)) => Ok(Value::Int(wrap_signed(!a, signed_bits(dest_ty)))),
         (UnOp::Not, Value::Uint(a)) => Ok(Value::Uint(wrap_unsigned(!a, unsigned_bits(dest_ty)))),
@@ -1428,9 +1479,39 @@ fn eval_unary(op: UnOp, v: &Value, dest_ty: Option<&Ty>) -> InterpResult<Value> 
     }
 }
 
+/// Rust float-to-int cast semantics: saturate at the target type's
+/// range, NaN becomes 0. The host `as` cast saturates at `i128`;
+/// clamping to the declared width finishes the job.
+fn float_to_int(v: f64, bits: u32) -> i128 {
+    let wide = v as i128;
+    if bits >= 128 {
+        wide
+    } else {
+        let min = -(1i128 << (bits - 1));
+        let max = (1i128 << (bits - 1)) - 1;
+        wide.clamp(min, max)
+    }
+}
+
+/// Rust float-to-uint cast semantics: saturate at the target type's
+/// range (negative values become 0), NaN becomes 0.
+fn float_to_uint(v: f64, bits: u32) -> u128 {
+    let wide = v as u128;
+    if bits >= 128 {
+        wide
+    } else {
+        wide.min((1u128 << bits) - 1)
+    }
+}
+
 fn eval_cast(v: &Value, ty: &Ty) -> InterpResult<Value> {
     match ty {
         Ty::Int(it) => {
+            // A float source saturates; it does not wrap like an
+            // integer source.
+            if let Value::Float(a) = v {
+                return Ok(Value::Int(float_to_int(*a, it.bits())));
+            }
             let raw = match v {
                 Value::Int(a) => *a,
                 Value::Uint(a) => *a as i128,
@@ -1446,6 +1527,9 @@ fn eval_cast(v: &Value, ty: &Ty) -> InterpResult<Value> {
             Ok(Value::Int(wrap_signed(raw, it.bits())))
         }
         Ty::Uint(ut) => {
+            if let Value::Float(a) = v {
+                return Ok(Value::Uint(float_to_uint(*a, ut.bits())));
+            }
             let raw = match v {
                 Value::Int(a) => *a as u128,
                 Value::Uint(a) => *a,
@@ -1459,6 +1543,26 @@ fn eval_cast(v: &Value, ty: &Ty) -> InterpResult<Value> {
                 }
             };
             Ok(Value::Uint(wrap_unsigned(raw, ut.bits())))
+        }
+        Ty::Float(ft) => {
+            // Convert at the target width directly: going through
+            // `f64` first would double-round wide integer sources.
+            let out = match (v, ft) {
+                (Value::Int(a), FloatTy::F32) => (*a as f32) as f64,
+                (Value::Int(a), FloatTy::F64) => *a as f64,
+                (Value::Uint(a), FloatTy::F32) => (*a as f32) as f64,
+                (Value::Uint(a), FloatTy::F64) => *a as f64,
+                (Value::Float(a), FloatTy::F32) => (*a as f32) as f64,
+                (Value::Float(a), FloatTy::F64) => *a,
+                (other, _) => {
+                    return Err(InterpError::type_mismatch(
+                        "cast",
+                        "numeric source",
+                        other.kind_name(),
+                    ))
+                }
+            };
+            Ok(Value::Float(out))
         }
         Ty::Bool => match v {
             Value::Bool(b) => Ok(Value::Bool(*b)),

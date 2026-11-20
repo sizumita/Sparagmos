@@ -117,10 +117,12 @@ impl MirProgram {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConvertError {
     /// A local (or cast target / tuple element) has a type the IR's
-    /// type model cannot represent (floats, trait objects, closures, ...).
+    /// type model cannot represent (trait objects, closures,
+    /// coroutines, `f16` / `f128`, ...).
     UnsupportedType { context: String, ty: String },
-    /// A constant form the IR cannot represent (strings, pointers,
-    /// floats, unevaluated / type constants outside call position, ...).
+    /// A constant form the IR cannot represent (pointers, `f16` /
+    /// `f128` float constants, unevaluated / type constants outside
+    /// call position, ...).
     UnsupportedConstant { kind: String },
     /// A place projection the IR cannot represent.
     UnsupportedProjection { kind: String },
@@ -318,6 +320,9 @@ impl<'a> Converter<'a> {
             mir::Ty::Bool => ir::Ty::Bool,
             mir::Ty::Int(it) => ir::Ty::Int(convert_int_ty(*it)),
             mir::Ty::Uint(ut) => ir::Ty::Uint(convert_uint_ty(*ut)),
+            // `f16` / `f128` fall through to the unsupported arm.
+            mir::Ty::Float(mir::FloatTy::F32) => ir::Ty::Float(ir::FloatTy::F32),
+            mir::Ty::Float(mir::FloatTy::F64) => ir::Ty::Float(ir::FloatTy::F64),
             // `char` is a 32-bit scalar; the IR models it as `u32`.
             mir::Ty::Char => ir::Ty::Uint(ir::UintTy::U32),
             mir::Ty::Never => ir::Ty::Never,
@@ -482,9 +487,15 @@ impl<'a> Converter<'a> {
         ctx: Option<&mir::Ty>,
     ) -> Result<ir::Constant, ConvertError> {
         match scalar {
-            mir::Scalar::Float { .. } => Err(ConvertError::UnsupportedConstant {
-                kind: "float constant".to_string(),
-            }),
+            mir::Scalar::Float { bits, ty } => match ty {
+                mir::FloatTy::F32 => {
+                    Ok(ir::Constant::Float(f32::from_bits(*bits as u32) as f64))
+                }
+                mir::FloatTy::F64 => Ok(ir::Constant::Float(f64::from_bits(*bits as u64))),
+                other => Err(ConvertError::UnsupportedConstant {
+                    kind: format!("{other:?} float constant"),
+                }),
+            },
             mir::Scalar::Ptr { .. } => Err(ConvertError::UnsupportedConstant {
                 kind: "pointer constant".to_string(),
             }),
@@ -640,10 +651,14 @@ impl<'a> Converter<'a> {
                     .or_else(|| dest_ty.cloned());
                 let v = self.convert_operand(body, operand, ctx.as_ref())?;
                 match kind {
-                    mir::CastKind::IntToInt => match self.convert_ty(target, "cast target") {
+                    mir::CastKind::IntToInt
+                    | mir::CastKind::FloatToInt
+                    | mir::CastKind::FloatToFloat
+                    | mir::CastKind::IntToFloat => match self.convert_ty(target, "cast target") {
                         Ok(t) => ir::Rvalue::Cast(v, t),
                         Err(_) => ir::Rvalue::Unsupported(format!(
-                            "Cast IntToInt to {}",
+                            "Cast {} to {}",
+                            kind.name(),
                             target.kind_name()
                         )),
                     },
