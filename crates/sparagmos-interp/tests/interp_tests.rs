@@ -692,3 +692,72 @@ fn cross_function_call() {
         Value::Int(41)
     );
 }
+
+// ---------------------------------------------------------------------------
+// Shifts: the amount may have a different integer type than the value.
+
+#[test]
+fn mixed_type_shift_amounts() {
+    // fn shl(a: i32, b: u32) -> i32 { _0 = Shl(_1, _2); return }
+    let shl = Body::new(
+        "shl",
+        2,
+        vec![Ty::i32(), Ty::i32(), Ty::u32()],
+        vec![bb(
+            vec![assign(
+                0,
+                bin(BinOp::Shl, Operand::copy_local(1), Operand::copy_local(2)),
+            )],
+            ret(),
+        )],
+    );
+    let p = program_of(shl);
+    assert_eq!(
+        interpret(&p, "shl", vec![Value::Int(3), Value::Uint(2)]).unwrap(),
+        Value::Int(12)
+    );
+    // fn shr(a: i32, b: u32) -> i32: arithmetic shift of a negative value.
+    let shr = Body::new(
+        "shr",
+        2,
+        vec![Ty::i32(), Ty::i32(), Ty::u32()],
+        vec![bb(
+            vec![assign(
+                0,
+                bin(BinOp::Shr, Operand::copy_local(1), Operand::copy_local(2)),
+            )],
+            ret(),
+        )],
+    );
+    let p = program_of(shr);
+    assert_eq!(
+        interpret(&p, "shr", vec![Value::Int(-16), Value::Uint(2)]).unwrap(),
+        Value::Int(-4)
+    );
+}
+
+#[test]
+fn mixed_type_shift_amount_overflow_panics() {
+    // fn shl(a: i32, b: u32) -> i32 with an amount at the type width.
+    let shl = Body::new(
+        "shl",
+        2,
+        vec![Ty::i32(), Ty::i32(), Ty::u32()],
+        vec![bb(
+            vec![assign(
+                0,
+                bin(BinOp::Shl, Operand::copy_local(1), Operand::copy_local(2)),
+            )],
+            ret(),
+        )],
+    );
+    let p = program_of(shl);
+    let err = interpret(&p, "shl", vec![Value::Int(1), Value::Uint(32)]).unwrap_err();
+    match err {
+        InterpError::Panic { message } => assert_eq!(
+            message,
+            "attempt to shift by 32 bits, which overflows the type width 32"
+        ),
+        other => panic!("expected shift-overflow panic, got {other}"),
+    }
+}
