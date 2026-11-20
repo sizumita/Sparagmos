@@ -1380,6 +1380,32 @@ fn builtin_arg_ctx(
             }
         }
         Builtin::ArgumentFromUsize => Some(mir::Ty::Uint(mir::UintTy::Usize)),
+        // Lane V: the value arguments of these builtins are the
+        // callee's first generic parameter (the element / pointee /
+        // cell type), so a literal argument takes that type.
+        Builtin::BoxNew | Builtin::ManuallyDropNew | Builtin::CellNew => {
+            if arg_index == 0 {
+                raw_generic_args.first().cloned()
+            } else {
+                None
+            }
+        }
+        Builtin::CellSet | Builtin::CellReplace | Builtin::VecPush => {
+            if arg_index == 1 {
+                raw_generic_args.first().cloned()
+            } else {
+                None
+            }
+        }
+        // The index argument of `Index` / `IndexMut` is the trait's
+        // `Idx` parameter, the callee's second generic argument.
+        Builtin::IndexIndex | Builtin::IndexMut => {
+            if arg_index == 1 {
+                raw_generic_args.get(1).cloned()
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
