@@ -1081,3 +1081,191 @@ fn call_api_errors() {
     }
     assert_eq!(jit.function_names(), vec!["boom", "main"]);
 }
+
+// ----- storage / annotation statements: present, no effect on values --------
+
+fn annotated_program() -> (JitProgram, sparagmos_interp::MirProgram) {
+    // fn annotated(a: i32) -> i32 { _2 = a + 1; return _2 }, with the
+    // block carrying the execution-no-op statements rustc emits around
+    // real code: storage markers, a fake read, a place mention, a
+    // user-type ascription, a coverage counter, a const-eval counter
+    // and a plain nop. None of them may disturb the computed value.
+    let i32t = i(mir::IntTy::I32);
+    let annotated = spec(
+        "annotated",
+        0,
+        1,
+        &[i32t.clone(), i32t.clone(), i32t.clone()],
+        vec![bb(
+            vec![
+                mir::StatementKind::StorageLive(mir::Local(2)),
+                assign(
+                    pl(2),
+                    mir::Rvalue::BinaryOp(mir::BinOp::Add, Box::new((cp(1), i32c(1)))),
+                ),
+                mir::StatementKind::FakeRead(Box::new((mir::FakeReadCause::ForLet, pl(2)))),
+                mir::StatementKind::PlaceMention(Box::new(pl(2))),
+                mir::StatementKind::AscribeUserType(
+                    Box::new((
+                        pl(2),
+                        mir::UserTypeProjection {
+                            user_ty_index: 0,
+                            projections: vec![],
+                        },
+                    )),
+                    mir::Variance::Covariant,
+                ),
+                mir::StatementKind::Coverage,
+                mir::StatementKind::ConstEvalCounter,
+                mir::StatementKind::Nop,
+                assign(pl(0), mir::Rvalue::Use(cp(2))),
+                mir::StatementKind::StorageDead(mir::Local(2)),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    build(&[annotated])
+}
+
+#[test]
+fn storage_and_annotation_statements_do_not_affect_execution() {
+    let (jit, prog) = annotated_program();
+    check(&jit, &prog, "annotated", &[41], vec![int(41)], Ok(42));
+    check(&jit, &prog, "annotated", &[-1], vec![int(-1)], Ok(0));
+}
+
+// ----- Aggregate (tuple): fields read back -----------------------------------
+
+fn tuple_aggregate_program() -> (JitProgram, sparagmos_interp::MirProgram) {
+    // fn combine(a: i32, b: i32) -> i32 {
+    //   _3 = (a, b); _4 = _3.0 * 10; return _4 + _3.1
+    // }
+    let i32t = i(mir::IntTy::I32);
+    let pair = mir::Ty::Tuple(vec![i32t.clone(), i32t.clone()]);
+    let combine = spec(
+        "combine",
+        0,
+        2,
+        &[i32t.clone(), i32t.clone(), i32t.clone(), pair, i32t.clone()],
+        vec![bb(
+            vec![
+                assign(
+                    pl(3),
+                    mir::Rvalue::Aggregate(
+                        Box::new(mir::AggregateKind::Tuple),
+                        vec![cp(1), cp(2)],
+                    ),
+                ),
+                assign(
+                    pl(4),
+                    mir::Rvalue::BinaryOp(
+                        mir::BinOp::Mul,
+                        Box::new((cpf(3, 0, i32t.clone()), i32c(10))),
+                    ),
+                ),
+                assign(
+                    pl(0),
+                    mir::Rvalue::BinaryOp(
+                        mir::BinOp::Add,
+                        Box::new((cp(4), cpf(3, 1, i32t.clone()))),
+                    ),
+                ),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    build(&[combine])
+}
+
+#[test]
+fn tuple_aggregate_fields_read_back() {
+    let (jit, prog) = tuple_aggregate_program();
+    check(&jit, &prog, "combine", &[3, 4], vec![int(3), int(4)], Ok(34));
+    check(&jit, &prog, "combine", &[5, 7], vec![int(5), int(7)], Ok(57));
+}
+
+// ----- Drop of a scalar: no code runs, execution continues at target --------
+
+fn drop_scalar_program() -> (JitProgram, sparagmos_interp::MirProgram) {
+    // fn drop_scalar(a: i32) -> i32 { _2 = a; drop(_2) -> bb1; bb1: return a + 1 }
+    let i32t = i(mir::IntTy::I32);
+    let f = spec(
+        "drop_scalar",
+        0,
+        1,
+        &[i32t.clone(), i32t.clone(), i32t.clone()],
+        vec![
+            bb(
+                vec![assign(pl(2), mir::Rvalue::Use(cp(1)))],
+                mir::TerminatorKind::Drop {
+                    place: pl(2),
+                    target: mir::BasicBlock(1),
+                    unwind: mir::UnwindAction::Continue,
+                    replace: false,
+                },
+            ),
+            bb(
+                vec![assign(
+                    pl(0),
+                    mir::Rvalue::BinaryOp(mir::BinOp::Add, Box::new((cp(1), i32c(1)))),
+                )],
+                mir::TerminatorKind::Return,
+            ),
+        ],
+    );
+    build(&[f])
+}
+
+#[test]
+fn drop_of_scalar_jumps_to_target() {
+    let (jit, prog) = drop_scalar_program();
+    check(&jit, &prog, "drop_scalar", &[41], vec![int(41)], Ok(42));
+}
+
+// ----- Unreachable: a block that is present but never taken ------------------
+
+fn unreachable_program() -> (JitProgram, sparagmos_interp::MirProgram) {
+    // fn keep(a: i32) -> i32 { if a < 0 { unreachable } else { a } }:
+    // the Unreachable block is the taken-when-negative arm of the
+    // switch; the checks below only exercise the non-negative arm, so
+    // execution must return `a` untouched on both engines. The
+    // behaviour when execution *does* reach the block is asserted for
+    // the interpreter in mir_convert_tests (guest panic); on the JIT
+    // the block compiles to a trap (see Issue #39).
+    let i32t = i(mir::IntTy::I32);
+    let keep = spec(
+        "keep",
+        0,
+        1,
+        &[i32t.clone(), i32t.clone(), mir::Ty::Bool],
+        vec![
+            bb(
+                vec![assign(
+                    pl(2),
+                    mir::Rvalue::BinaryOp(mir::BinOp::Lt, Box::new((cp(1), i32c(0)))),
+                )],
+                mir::TerminatorKind::SwitchInt {
+                    discr: cp(2),
+                    targets: mir::SwitchTargets::new(
+                        vec![0],
+                        vec![mir::BasicBlock(1)],
+                        mir::BasicBlock(2),
+                    ),
+                },
+            ),
+            bb(
+                vec![assign(pl(0), mir::Rvalue::Use(cp(1)))],
+                mir::TerminatorKind::Return,
+            ),
+            bb(vec![], mir::TerminatorKind::Unreachable),
+        ],
+    );
+    build(&[keep])
+}
+
+#[test]
+fn unreachable_block_not_taken_leaves_execution_intact() {
+    let (jit, prog) = unreachable_program();
+    check(&jit, &prog, "keep", &[5], vec![int(5)], Ok(5));
+    check(&jit, &prog, "keep", &[0], vec![int(0)], Ok(0));
+}

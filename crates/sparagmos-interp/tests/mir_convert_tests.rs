@@ -1146,3 +1146,126 @@ fn discriminant_rvalue_yields_the_recorded_value() {
     let v = interpret_mir(&prog, "discr_a", vec![]).expect("discr_a runs");
     assert_eq!(v, Value::Int(3));
 }
+
+// ----- raw pointers: creation shares the reference representation ------------
+
+#[test]
+fn raw_ptr_creation_reads_and_writes_through() {
+    // fn read_raw() -> i32 { _1 = 41; _2 = &raw const _1; return *_2 }
+    let raw_ty = mir::Ty::RawPtr(Box::new(i32_ty()), mir::Mutability::Not);
+    let read_raw = mir::Body::new(
+        decls(&[i32_ty(), i32_ty(), raw_ty]),
+        0,
+        vec![block(
+            vec![
+                assign(place(1), mir::Rvalue::Use(const_i32(41))),
+                assign(
+                    place(2),
+                    mir::Rvalue::RawPtr(mir::Mutability::Not, place(1)),
+                ),
+                assign(
+                    place(0),
+                    mir::Rvalue::Use(mir::Operand::Copy(place(2).deref())),
+                ),
+            ],
+            ret(),
+        )],
+    );
+    // fn write_raw() -> i32 { _1 = 1; _2 = &raw mut _1; *_2 = 99; return _1 }
+    let raw_mut_ty = mir::Ty::RawPtr(Box::new(i32_ty()), mir::Mutability::Mut);
+    let write_raw = mir::Body::new(
+        decls(&[i32_ty(), i32_ty(), raw_mut_ty]),
+        0,
+        vec![block(
+            vec![
+                assign(place(1), mir::Rvalue::Use(const_i32(1))),
+                assign(
+                    place(2),
+                    mir::Rvalue::RawPtr(mir::Mutability::Mut, place(1)),
+                ),
+                assign(place(2).deref(), mir::Rvalue::Use(const_i32(99))),
+                assign(place(0), mir::Rvalue::Use(copy(1))),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("read_raw", read_raw);
+    prog.add("write_raw", write_raw);
+    assert_eq!(
+        interpret_mir(&prog, "read_raw", vec![]).expect("read_raw runs"),
+        Value::Int(41)
+    );
+    assert_eq!(
+        interpret_mir(&prog, "write_raw", vec![]).expect("write_raw runs"),
+        Value::Int(99)
+    );
+}
+
+// ----- CopyForDeref: read through a reference place, plain copy otherwise ----
+
+#[test]
+fn copy_for_deref_reads_through_reference_and_plain_place() {
+    // fn cfd_ref() -> i32 { _1 = 7; _2 = &_1; return CopyForDeref(_2) }
+    let ref_ty = mir::Ty::Ref(mir::Region::Erased, Box::new(i32_ty()), mir::Mutability::Not);
+    let cfd_ref = mir::Body::new(
+        decls(&[i32_ty(), i32_ty(), ref_ty]),
+        0,
+        vec![block(
+            vec![
+                assign(place(1), mir::Rvalue::Use(const_i32(7))),
+                assign(
+                    place(2),
+                    mir::Rvalue::Ref(mir::Region::Erased, mir::BorrowKind::Shared, place(1)),
+                ),
+                assign(place(0), mir::Rvalue::CopyForDeref(place(2))),
+            ],
+            ret(),
+        )],
+    );
+    // fn cfd_plain() -> i32 { _1 = 9; return CopyForDeref(_1) }
+    // (a non-reference place: CopyForDeref is a plain copy there)
+    let cfd_plain = mir::Body::new(
+        decls(&[i32_ty(), i32_ty()]),
+        0,
+        vec![block(
+            vec![
+                assign(place(1), mir::Rvalue::Use(const_i32(9))),
+                assign(place(0), mir::Rvalue::CopyForDeref(place(1))),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("cfd_ref", cfd_ref);
+    prog.add("cfd_plain", cfd_plain);
+    assert_eq!(
+        interpret_mir(&prog, "cfd_ref", vec![]).expect("cfd_ref runs"),
+        Value::Int(7)
+    );
+    assert_eq!(
+        interpret_mir(&prog, "cfd_plain", vec![]).expect("cfd_plain runs"),
+        Value::Int(9)
+    );
+}
+
+// ----- Unreachable: reaching it is a guest panic in the interpreter ----------
+
+#[test]
+fn unreachable_terminator_is_a_guest_panic() {
+    // fn f() -> i32 { unreachable }
+    let body = mir::Body::new(
+        decls(&[i32_ty()]),
+        0,
+        vec![block(vec![], mir::TerminatorKind::Unreachable)],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("f", body);
+    match interpret_mir(&prog, "f", vec![]) {
+        Err(MirRunError::Interp(InterpError::Panic { message })) => {
+            assert_eq!(message, "entered unreachable code");
+        }
+        Err(e) => panic!("expected guest panic from Unreachable, got error {e}"),
+        Ok(v) => panic!("expected guest panic from Unreachable, got value {v:?}"),
+    }
+}
