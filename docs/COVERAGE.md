@@ -440,7 +440,6 @@ panic したケースである。
 残る。再実行は
 `python3 scripts/rustc-subset-run.py --survey-json <survey JSON> --rust-dir <チェックアウト> --driver-bin <ドライバ> --out <結果 JSON>`。
 
-<<<<<<< HEAD
 #### stage 2: コンパイル時検証系の実測 (2026-11-21)
 
 同じランナーの stage 2 で、コンパイル時検証系 18,332 件を実測した。
@@ -614,7 +613,6 @@ rustdoc-ui の合否の近似にならない。加えて、一致した 152 件�
 (1件あたり)。テストごとの結果は `subset-rustdoc-results.json`
 (測定クローンに保存) に機械可読な形で残る。再実行は
 `python3 scripts/rustc-subset-rustdoc.py --survey-json <survey JSON> --rust-dir <チェックアウト> --driver-bin <ドライバ> --out <結果 JSON>`。
-=======
 
 ### 指標2(b) procedure カテゴリの実測 (2026-11-21)
 
@@ -672,7 +670,6 @@ C ABI の main と pthread FFI をドライバが未対応と返した)。
 ドライバ実行 60 秒 (1 件あたり)。テストごとの結果は結果 JSON
 に機械可読な形で残る。再実行は
 `python3 scripts/rustc-subset-runmake.py --survey-json <survey JSON> --rust-dir <チェックアウト> --driver-bin <ドライバ> --out <結果 JSON>`。
->>>>>>> 31412fa6adfe58cfac7cb8e3a87cc124be38242f
 
 ---
 
