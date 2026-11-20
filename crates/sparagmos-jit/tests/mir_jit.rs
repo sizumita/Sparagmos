@@ -2167,6 +2167,7 @@ fn jit_compile(specs: &[FnSpec]) -> Result<JitProgram, JitError> {
             })
             .collect(),
         names,
+        adt_discriminants: Default::default(),
     })
 }
 
