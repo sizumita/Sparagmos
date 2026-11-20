@@ -716,6 +716,16 @@ impl<'a> FnLower<'a> {
             mir::ConstValue::ByRef { .. } => {
                 return Err(self.err("by-reference constant"));
             }
+            mir::ConstValue::Tuple(_) => {
+                return Err(self.err("tuple constant"));
+            }
+            mir::ConstValue::Adt { .. } => return Err(self.err("ADT constant")),
+            mir::ConstValue::Ref(_) => {
+                return Err(self.err("reference constant"));
+            }
+            mir::ConstValue::SliceVal(_) => {
+                return Err(self.err("slice-value constant"));
+            }
         })
     }
 
