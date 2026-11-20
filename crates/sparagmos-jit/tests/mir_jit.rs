@@ -2902,3 +2902,539 @@ fn double_dereference_reads_and_writes() {
     check(&jit, &prog, "write2", &[], vec![], Ok(4));
     check(&jit, &prog, "main2", &[], vec![], Ok(9));
 }
+
+// ----- two-word return values ------------------------------------------------
+//
+// A function's result of two words (a fat pointer, a two-scalar
+// pair) travels in RAX/RDX. The pair helpers below are `check`
+// for word pairs: the interpreter's result is the corresponding
+// two-field tuple value.
+
+fn jit_call_pair(jit: &JitProgram, name: &str, args: &[i64]) -> Result<(i64, i64), String> {
+    jit.call_pair(name, args).map_err(|e| match e {
+        JitCallError::Panic(rec) => rec.message,
+        other => other.to_string(),
+    })
+}
+
+fn value_word(v: &Value) -> i64 {
+    match v {
+        Value::Int(x) => *x as i64,
+        Value::Uint(x) => *x as i64,
+        Value::Bool(b) => *b as i64,
+        Value::Unit => 0,
+        other => panic!("unexpected interp word {other:?}"),
+    }
+}
+
+fn interp_call_pair(
+    prog: &sparagmos_interp::MirProgram,
+    name: &str,
+    args: Vec<Value>,
+) -> Result<(i64, i64), String> {
+    match sparagmos_interp::interpret_mir(prog, name, args) {
+        Ok(Value::Tuple(fields)) if fields.len() == 2 => {
+            Ok((value_word(&fields[0]), value_word(&fields[1])))
+        }
+        Ok(other) => panic!("unexpected interp result {other:?}"),
+        Err(MirRunError::Interp(InterpError::Panic { message })) => Err(message),
+        Err(other) => panic!("unexpected interp error: {other}"),
+    }
+}
+
+/// Both engines must produce `expected` (a word pair, or a guest
+/// panic with exactly this message — in which case neither engine
+/// produces any words).
+fn check_pair(
+    jit: &JitProgram,
+    prog: &sparagmos_interp::MirProgram,
+    name: &str,
+    jit_args: &[i64],
+    interp_args: Vec<Value>,
+    expected: Result<(i64, i64), &str>,
+) {
+    let expected = expected.map_err(|s| s.to_string());
+    assert_eq!(
+        jit_call_pair(jit, name, jit_args),
+        expected,
+        "JIT result for {name}"
+    );
+    assert_eq!(
+        interp_call_pair(prog, name, interp_args),
+        expected,
+        "interp result for {name}"
+    );
+}
+
+/// fn make_pair(x: i32) -> (i32, i32) { (x, x + 1) }
+fn make_pair_spec() -> FnSpec {
+    let i32t = i(mir::IntTy::I32);
+    let pair = mir::Ty::Tuple(vec![i32t.clone(), i32t.clone()]);
+    spec(
+        "make_pair",
+        0,
+        1,
+        &[pair, i32t.clone(), i32t.clone()],
+        vec![bb(
+            vec![
+                assign(
+                    pl(2),
+                    mir::Rvalue::BinaryOp(
+                        mir::BinOp::Add,
+                        Box::new((cp(1), i32c(1))),
+                    ),
+                ),
+                assign(
+                    pl(0),
+                    mir::Rvalue::Aggregate(
+                        Box::new(mir::AggregateKind::Tuple),
+                        vec![cp(1), cp(2)],
+                    ),
+                ),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    )
+}
+
+#[test]
+fn pair_return_words_and_consumer() {
+    let i32t = i(mir::IntTy::I32);
+    let pair = mir::Ty::Tuple(vec![i32t.clone(), i32t.clone()]);
+    // fn main() -> i32 { let p = make_pair(10); p.0 * 100 + p.1 }
+    let main = spec(
+        "main_pair",
+        1,
+        0,
+        &[i32t.clone(), pair.clone(), i32t.clone()],
+        vec![
+            bb(vec![], call_term(fndef(def(0)), vec![i32c(10)], 1, 1)),
+            bb(
+                vec![
+                    assign(
+                        pl(2),
+                        mir::Rvalue::BinaryOp(
+                            mir::BinOp::Mul,
+                            Box::new((cpf(1, 0, i32t.clone()), i32c(100))),
+                        ),
+                    ),
+                    assign(
+                        pl(0),
+                        mir::Rvalue::BinaryOp(
+                            mir::BinOp::Add,
+                            Box::new((cp(2), cpf(1, 1, i32t.clone()))),
+                        ),
+                    ),
+                ],
+                mir::TerminatorKind::Return,
+            ),
+        ],
+    );
+    let (jit, prog) = build(&[make_pair_spec(), main]);
+    check_pair(&jit, &prog, "make_pair", &[41], vec![int(41)], Ok((41, 42)));
+    check_pair(&jit, &prog, "make_pair", &[-1], vec![int(-1)], Ok((-1, 0)));
+    check(&jit, &prog, "main_pair", &[], vec![], Ok(1011));
+}
+
+#[test]
+fn fat_return_built_by_unsize_in_callee() {
+    let i32t = i(mir::IntTy::I32);
+    let usizet = u(mir::UintTy::Usize);
+    // fn wrap(a: &[i32; 3]) -> &[i32] { a as &[i32] }
+    let wrap = spec(
+        "wrap",
+        0,
+        1,
+        &[fatrefty(i32t.clone()), refty(arr_i32(3))],
+        vec![bb(
+            vec![assign(
+                pl(0),
+                mir::Rvalue::Cast(
+                    mir::CastKind::PointerCoercion(mir::PointerCoercion::Unsize),
+                    cp(1),
+                    fatrefty(i32t.clone()),
+                ),
+            )],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    // fn main() -> i32 {
+    //   _1 = [5, 6, 7]; _2 = wrap(&_1); (*_2)[0] + (*_2)[2]
+    // }
+    let main = spec(
+        "main_wrap",
+        1,
+        0,
+        &[
+            i32t.clone(),
+            arr_i32(3),
+            fatrefty(i32t.clone()),
+            refty(arr_i32(3)),
+        ],
+        vec![
+            bb(
+                vec![
+                    assign(pl(1), mir::Rvalue::Repeat(i32c(5), 3)),
+                    assign(cidx(1, 1, 3), mir::Rvalue::Use(i32c(6))),
+                    assign(cidx(1, 2, 3), mir::Rvalue::Use(i32c(7))),
+                    assign(pl(3), shared(pl(1))),
+                ],
+                call_term(fndef(def(0)), vec![cp(3)], 2, 1),
+            ),
+            bb(
+                vec![assign(
+                    pl(0),
+                    mir::Rvalue::BinaryOp(
+                        mir::BinOp::Add,
+                        Box::new((
+                            mir::Operand::Copy(dcidx(2, 0, 3)),
+                            mir::Operand::Copy(dcidx(2, 2, 3)),
+                        )),
+                    ),
+                )],
+                mir::TerminatorKind::Return,
+            ),
+        ],
+    );
+    // fn main_len() -> usize { _1 = [5, 6, 7]; Len(*wrap(&_1)) }
+    let main_len = spec(
+        "main_wrap_len",
+        2,
+        0,
+        &[
+            usizet.clone(),
+            arr_i32(3),
+            fatrefty(i32t.clone()),
+            refty(arr_i32(3)),
+        ],
+        vec![
+            bb(
+                vec![
+                    assign(pl(1), mir::Rvalue::Repeat(i32c(5), 3)),
+                    assign(pl(3), shared(pl(1))),
+                ],
+                call_term(fndef(def(0)), vec![cp(3)], 2, 1),
+            ),
+            bb(
+                vec![assign(pl(0), mir::Rvalue::Len(dpl(2)))],
+                mir::TerminatorKind::Return,
+            ),
+        ],
+    );
+    let (jit, prog) = build(&[wrap, main, main_len]);
+    check(&jit, &prog, "main_wrap", &[], vec![], Ok(5 + 7));
+    check(&jit, &prog, "main_wrap_len", &[], vec![], Ok(3));
+}
+
+#[test]
+fn fat_return_identity_pair_words() {
+    let i32t = i(mir::IntTy::I32);
+    // fn id(s: &[i32]) -> &[i32] { s }
+    let id = spec(
+        "id_slice",
+        0,
+        1,
+        &[fatrefty(i32t.clone()), fatrefty(i32t.clone())],
+        vec![bb(
+            vec![assign(pl(0), mir::Rvalue::Use(cp(1)))],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    let (jit, prog) = build(&[id]);
+    // The JIT address word is exactly the address passed in (the
+    // pair travels through unchanged), and the length word is the
+    // length; the interpreter's result is the same fat value, whose
+    // comparable word is its length.
+    let store: [i64; 3] = [30, 20, 10];
+    let addr = store.as_ptr().wrapping_add(2) as i64;
+    assert_eq!(jit_call_pair(&jit, "id_slice", &[addr, 3]), Ok((addr, 3)));
+    match sparagmos_interp::interpret_mir(&prog, "id_slice", vec![fatval(&[10, 20, 30], 3)]) {
+        Ok(Value::FatRef { len, .. }) => assert_eq!(len, 3),
+        other => panic!("unexpected interp result {other:?}"),
+    }
+}
+
+#[test]
+fn str_return_through_nested_calls() {
+    let usizet = u(mir::UintTy::Usize);
+    let strref = mir::Ty::Ref(
+        mir::Region::Erased,
+        Box::new(mir::Ty::Str),
+        mir::Mutability::Not,
+    );
+    // fn id_str(s: &str) -> &str { s }
+    let id_str = spec(
+        "id_str",
+        0,
+        1,
+        &[strref.clone(), strref.clone()],
+        vec![bb(
+            vec![assign(pl(0), mir::Rvalue::Use(cp(1)))],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    // fn use_str(s: &str) -> usize { PtrMetadata(s) }
+    let use_str = spec(
+        "use_str",
+        1,
+        1,
+        &[usizet.clone(), strref.clone()],
+        vec![bb(
+            vec![assign(
+                pl(0),
+                mir::Rvalue::UnaryOp(mir::UnOp::PtrMetadata, cp(1)),
+            )],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    // fn main(s: &str) -> usize { use_str(id_str(s)) }
+    let main = spec(
+        "main_str",
+        2,
+        1,
+        &[usizet.clone(), strref.clone(), strref.clone()],
+        vec![
+            bb(vec![], call_term(fndef(def(0)), vec![cp(1)], 2, 1)),
+            bb(vec![], call_term(fndef(def(1)), vec![cp(2)], 0, 2)),
+            bb(vec![], mir::TerminatorKind::Return),
+        ],
+    );
+    let (jit, prog) = build(&[id_str, use_str, main]);
+    let fat = Value::FatRef {
+        base: Box::new(Value::Str("hello".to_string())),
+        len: 5,
+    };
+    check(&jit, &prog, "main_str", &[0, 5], vec![fat], Ok(5));
+}
+
+#[test]
+fn nested_calls_returning_fat_refs() {
+    let i32t = i(mir::IntTy::I32);
+    // fn inner(a: &[i32; 3]) -> &[i32] { a as &[i32] }
+    let inner = spec(
+        "inner",
+        0,
+        1,
+        &[fatrefty(i32t.clone()), refty(arr_i32(3))],
+        vec![bb(
+            vec![assign(
+                pl(0),
+                mir::Rvalue::Cast(
+                    mir::CastKind::PointerCoercion(mir::PointerCoercion::Unsize),
+                    cp(1),
+                    fatrefty(i32t.clone()),
+                ),
+            )],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    // fn middle(a: &[i32; 3]) -> &[i32] { inner(a) }
+    let middle = spec(
+        "middle",
+        1,
+        1,
+        &[
+            fatrefty(i32t.clone()),
+            refty(arr_i32(3)),
+            fatrefty(i32t.clone()),
+        ],
+        vec![
+            bb(vec![], call_term(fndef(def(0)), vec![cp(1)], 2, 1)),
+            bb(
+                vec![assign(pl(0), mir::Rvalue::Use(mir::Operand::Move(pl(2))))],
+                mir::TerminatorKind::Return,
+            ),
+        ],
+    );
+    // fn main() -> i32 { _1 = [5, 6, 7]; (*middle(&_1))[1] }
+    let main = spec(
+        "main_nested",
+        2,
+        0,
+        &[
+            i32t.clone(),
+            arr_i32(3),
+            fatrefty(i32t.clone()),
+            refty(arr_i32(3)),
+        ],
+        vec![
+            bb(
+                vec![
+                    assign(pl(1), mir::Rvalue::Repeat(i32c(5), 3)),
+                    assign(cidx(1, 1, 3), mir::Rvalue::Use(i32c(6))),
+                    assign(cidx(1, 2, 3), mir::Rvalue::Use(i32c(7))),
+                    assign(pl(3), shared(pl(1))),
+                ],
+                call_term(fndef(def(1)), vec![cp(3)], 2, 1),
+            ),
+            bb(
+                vec![assign(
+                    pl(0),
+                    mir::Rvalue::Use(mir::Operand::Copy(dcidx(2, 1, 3))),
+                )],
+                mir::TerminatorKind::Return,
+            ),
+        ],
+    );
+    let (jit, prog) = build(&[inner, middle, main]);
+    check(&jit, &prog, "main_nested", &[], vec![], Ok(6));
+}
+
+#[test]
+fn pair_return_panics_propagate_without_a_result() {
+    let i32t = i(mir::IntTy::I32);
+    let pair = mir::Ty::Tuple(vec![i32t.clone(), i32t.clone()]);
+    let checked = mir::Ty::Tuple(vec![i32t.clone(), mir::Ty::Bool]);
+    // fn boom_pair(x: i32) -> (i32, i32) { (x + x, 7) }  (checked add)
+    let boom_pair = spec(
+        "boom_pair",
+        0,
+        1,
+        &[pair.clone(), i32t.clone(), checked, i32t.clone()],
+        vec![
+            bb(
+                vec![assign(
+                    pl(2),
+                    mir::Rvalue::CheckedBinaryOp(
+                        mir::BinOp::Add,
+                        Box::new((cp(1), cp(1))),
+                    ),
+                )],
+                assert_overflow(fld(2, 1, mir::Ty::Bool), mir::BinOp::Add, 1),
+            ),
+            bb(
+                vec![
+                    assign(pl(3), mir::Rvalue::Use(mvf(2, 0, i32t.clone()))),
+                    assign(
+                        pl(0),
+                        mir::Rvalue::Aggregate(
+                            Box::new(mir::AggregateKind::Tuple),
+                            vec![cp(3), i32c(7)],
+                        ),
+                    ),
+                ],
+                mir::TerminatorKind::Return,
+            ),
+        ],
+    );
+    // fn main() -> i32 { boom_pair(2_000_000_000).0 }
+    let main = spec(
+        "main_boom_pair",
+        1,
+        0,
+        &[i32t.clone(), pair.clone()],
+        vec![
+            bb(
+                vec![],
+                call_term(fndef(def(0)), vec![i32c(2_000_000_000)], 1, 1),
+            ),
+            bb(
+                vec![assign(pl(0), mir::Rvalue::Use(cpf(1, 0, i32t.clone())))],
+                mir::TerminatorKind::Return,
+            ),
+        ],
+    );
+    let (jit, prog) = build(&[boom_pair, main]);
+    check_pair(&jit, &prog, "boom_pair", &[21], vec![int(21)], Ok((42, 7)));
+    // On the panicking path neither engine produces result words:
+    // the pair call itself fails with the panic, and the caller
+    // propagates it instead of reading its destination.
+    check_pair(
+        &jit,
+        &prog,
+        "boom_pair",
+        &[2_000_000_000],
+        vec![int(2_000_000_000)],
+        Err("assertion failed: Overflow"),
+    );
+    check(
+        &jit,
+        &prog,
+        "main_boom_pair",
+        &[],
+        vec![],
+        Err("assertion failed: Overflow"),
+    );
+}
+
+#[test]
+fn pair_return_into_a_memory_destination() {
+    let i32t = i(mir::IntTy::I32);
+    let pair = mir::Ty::Tuple(vec![i32t.clone(), i32t.clone()]);
+    // fn main() -> i32 {
+    //   _1 = (0, 0); _2 = &mut _1; *_2 = make_pair(5); _1.0 + _1.1
+    // }
+    let main = spec(
+        "main_mem_dest",
+        1,
+        0,
+        &[i32t.clone(), pair.clone(), refmty(pair.clone()), i32t.clone()],
+        vec![
+            bb(
+                vec![
+                    assign(
+                        pl(1),
+                        mir::Rvalue::Aggregate(
+                            Box::new(mir::AggregateKind::Tuple),
+                            vec![i32c(0), i32c(0)],
+                        ),
+                    ),
+                    assign(pl(2), mutref(pl(1))),
+                ],
+                mir::TerminatorKind::Call {
+                    func: fndef(def(0)),
+                    args: vec![i32c(5)],
+                    destination: dpl(2),
+                    target: Some(mir::BasicBlock(1)),
+                    unwind: mir::UnwindAction::Continue,
+                    call_source: mir::CallSource::Normal,
+                },
+            ),
+            bb(
+                vec![
+                    assign(
+                        pl(3),
+                        mir::Rvalue::BinaryOp(
+                            mir::BinOp::Add,
+                            Box::new((cpf(1, 0, i32t.clone()), cpf(1, 1, i32t.clone()))),
+                        ),
+                    ),
+                    assign(pl(0), mir::Rvalue::Use(cp(3))),
+                ],
+                mir::TerminatorKind::Return,
+            ),
+        ],
+    );
+    let (jit, prog) = build(&[make_pair_spec(), main]);
+    check(&jit, &prog, "main_mem_dest", &[], vec![], Ok(11));
+}
+
+#[test]
+fn three_word_return_is_unsupported() {
+    let i32t = i(mir::IntTy::I32);
+    let triple = mir::Ty::Tuple(vec![i32t.clone(), i32t.clone(), i32t.clone()]);
+    // fn f() -> (i32, i32, i32) { (1, 2, 3) }
+    let f = spec(
+        "triple",
+        0,
+        0,
+        &[triple],
+        vec![bb(
+            vec![assign(
+                pl(0),
+                mir::Rvalue::Aggregate(
+                    Box::new(mir::AggregateKind::Tuple),
+                    vec![i32c(1), i32c(2), i32c(3)],
+                ),
+            )],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    match jit_compile(&[f]) {
+        Err(JitError::Unsupported(msg)) => {
+            assert!(msg.contains("more than two words"), "{msg}")
+        }
+        Err(other) => panic!("expected Unsupported, got {other}"),
+        Ok(_) => panic!("expected Unsupported, but the program compiled"),
+    }
+}

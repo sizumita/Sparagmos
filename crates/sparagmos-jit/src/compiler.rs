@@ -682,7 +682,7 @@ impl<'a> Compiler<'a> {
                 self.load_operand(Reg::Rcx, *src)?;
                 self.e.mov_store(Reg::Rax, 0, Reg::Rcx);
             }
-            Instr::Call { dst, func, args } => {
+            Instr::Call { dst, dst2, func, args } => {
                 if self.ctx.is_none() {
                     return Err(CompileError::ProgramOnly("Call"));
                 }
@@ -695,6 +695,11 @@ impl<'a> Compiler<'a> {
                 let at = self.e.call_rel32();
                 self.call_fixups.push((at, *func));
                 self.store_result(*dst)?;
+                if let Some(dst2) = dst2 {
+                    // The result's second word comes back in RDX
+                    // (the pair-return convention; see the IR docs).
+                    self.store_reg(*dst2, Reg::Rdx)?;
+                }
             }
             Instr::Panic { msg } => {
                 let ctx = self
@@ -765,8 +770,11 @@ impl<'a> Compiler<'a> {
 
     fn compile_terminator(&mut self, term: &Terminator) -> Result<(), CompileError> {
         match *term {
-            Terminator::Return(op) => {
-                self.load_operand(Reg::Rax, op)?;
+            Terminator::Return { value, second } => {
+                if let Some(second) = second {
+                    self.load_operand(Reg::Rdx, second)?;
+                }
+                self.load_operand(Reg::Rax, value)?;
                 self.e.leave();
                 self.e.ret();
             }
@@ -897,7 +905,7 @@ mod tests {
         let mut b = FunctionBuilder::new("add", 2);
         let (a, c) = (b.param(0), b.param(1));
         let r = b.binop(B::Add, a, c);
-        let f = b.finish(Terminator::Return(r.into()));
+        let f = b.finish(Terminator::Return { value: r.into(), second: None });
         let cf = compile(&f).unwrap();
         assert_eq!(unsafe { cf.call2(2, 3) }, 5);
         assert_eq!(unsafe { cf.call2(-10, 4) }, -6);
@@ -914,7 +922,7 @@ mod tests {
         let r = b.binop(B::Rem, a, c);
         let t = b.binop(B::Sub, m, d);
         let out = b.binop(B::Add, t, r);
-        let f = b.finish(Terminator::Return(out.into()));
+        let f = b.finish(Terminator::Return { value: out.into(), second: None });
         let cf = compile(&f).unwrap();
         // (17*5) - (17/5) + (17%5) = 85 - 3 + 2 = 84
         assert_eq!(unsafe { cf.call2(17, 5) }, 84);
@@ -928,7 +936,7 @@ mod tests {
         let mut b = FunctionBuilder::new("lt", 2);
         let (a, c) = (b.param(0), b.param(1));
         let r = b.binop(B::Lt, a, c);
-        let f = b.finish(Terminator::Return(r.into()));
+        let f = b.finish(Terminator::Return { value: r.into(), second: None });
         let cf = compile(&f).unwrap();
         assert_eq!(unsafe { cf.call2(3, 4) }, 1);
         assert_eq!(unsafe { cf.call2(4, 3) }, 0);
@@ -978,7 +986,7 @@ mod tests {
         });
         b.end_block(Terminator::Jump(loop_blk));
         // block3 (exit): return s
-        let f = b.finish(Terminator::Return(s.into()));
+        let f = b.finish(Terminator::Return { value: s.into(), second: None });
         let cf = compile(&f).unwrap();
         assert_eq!(unsafe { cf.call1(10) }, 55);
         assert_eq!(unsafe { cf.call1(100) }, 5050);
@@ -1023,7 +1031,7 @@ mod tests {
             rhs: Operand::Const(1),
         });
         b.end_block(Terminator::Jump(loop_blk));
-        let f = b.finish(Terminator::Return(a.into()));
+        let f = b.finish(Terminator::Return { value: a.into(), second: None });
         let cf = compile(&f).unwrap();
         assert_eq!(unsafe { cf.call1(0) }, 0);
         assert_eq!(unsafe { cf.call1(1) }, 1);

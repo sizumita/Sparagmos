@@ -10,7 +10,7 @@ fn jit_add_2_3_is_5() {
     let mut b = FunctionBuilder::new("add", 2);
     let (a, c) = (b.param(0), b.param(1));
     let r = b.binop(B::Add, a, c);
-    let f = b.finish(Terminator::Return(r.into()));
+    let f = b.finish(Terminator::Return { value: r.into(), second: None });
     let cf = compile(&f).unwrap();
     // SAFETY: cf was compiled from the IR above: fn(i64, i64) -> i64.
     assert_eq!(unsafe { cf.call2(2, 3) }, 5);
@@ -43,7 +43,7 @@ fn jit_factorial_loop() {
         rhs: Operand::Const(1),
     });
     b.end_block(Terminator::Jump(1));
-    let f = b.finish(Terminator::Return(acc.into()));
+    let f = b.finish(Terminator::Return { value: acc.into(), second: None });
     let cf = compile(&f).unwrap();
     assert_eq!(unsafe { cf.call1(0) }, 1);
     assert_eq!(unsafe { cf.call1(5) }, 120);
@@ -102,7 +102,7 @@ fn jit_gcd_loop() {
         src: t.into(),
     });
     b.end_block(Terminator::Jump(1));
-    let f = b.finish(Terminator::Return(a.into()));
+    let f = b.finish(Terminator::Return { value: a.into(), second: None });
     let cf = compile(&f).unwrap();
     assert_eq!(unsafe { cf.call2(48, 36) }, 12);
     assert_eq!(unsafe { cf.call2(17, 5) }, 1);
@@ -120,7 +120,7 @@ fn jit_f64_arithmetic() {
     let d = b.float_binop(F::Sub, FloatKind::F64, a, c);
     let m = b.float_binop(F::Mul, FloatKind::F64, s, d);
     let q = b.float_binop(F::Div, FloatKind::F64, m, c);
-    let f = b.finish(Terminator::Return(q.into()));
+    let f = b.finish(Terminator::Return { value: q.into(), second: None });
     let cf = compile(&f).unwrap();
     let run = |x: f64, y: f64| f64::from_bits(unsafe { cf.call2(x.to_bits() as i64, y.to_bits() as i64) } as u64);
     for (x, y) in [(3.5f64, 1.5f64), (0.1, 0.2), (-7.25, 0.5), (1e308, 1e308)] {
@@ -136,7 +136,7 @@ fn jit_f32_arithmetic_and_rem() {
     let r = b.float_binop(F::Rem, FloatKind::F32, a, c);
     let m = b.float_binop(F::Mul, FloatKind::F32, a, c);
     let s = b.float_binop(F::Add, FloatKind::F32, r, m);
-    let f = b.finish(Terminator::Return(s.into()));
+    let f = b.finish(Terminator::Return { value: s.into(), second: None });
     let cf = compile(&f).unwrap();
     let run = |x: f32, y: f32| {
         let bits = unsafe { cf.call2(x.to_bits() as i64, y.to_bits() as i64) } as u64;
@@ -154,7 +154,7 @@ fn jit_f64_rem() {
     let mut b = FunctionBuilder::new("f", 2);
     let (a, c) = (b.param(0), b.param(1));
     let r = b.float_binop(F::Rem, FloatKind::F64, a, c);
-    let f = b.finish(Terminator::Return(r.into()));
+    let f = b.finish(Terminator::Return { value: r.into(), second: None });
     let cf = compile(&f).unwrap();
     let run = |x: f64, y: f64| f64::from_bits(unsafe { cf.call2(x.to_bits() as i64, y.to_bits() as i64) } as u64);
     for (x, y) in [
@@ -182,7 +182,7 @@ fn jit_f64_comparisons() {
         let mut b = FunctionBuilder::new("cmp", 2);
         let (a, c) = (b.param(0), b.param(1));
         let r = b.float_binop(op, FloatKind::F64, a, c);
-        let f = b.finish(Terminator::Return(r.into()));
+        let f = b.finish(Terminator::Return { value: r.into(), second: None });
         let cf = compile(&f).unwrap();
         for (x, y) in [
             (1.0f64, 2.0f64),
@@ -213,7 +213,7 @@ fn jit_float_casts() {
         src: a.into(),
         int: IntKind::new(32, true),
     });
-    let f = b.finish(Terminator::Return(dst.into()));
+    let f = b.finish(Terminator::Return { value: dst.into(), second: None });
     let cf = compile(&f).unwrap();
     let run = |x: f64| unsafe { cf.call1(x.to_bits() as i64) };
     assert_eq!(run(3.99), 3);
@@ -234,7 +234,7 @@ fn jit_float_casts() {
         src: a.into(),
         int: IntKind::new(64, false),
     });
-    let f = b.finish(Terminator::Return(dst.into()));
+    let f = b.finish(Terminator::Return { value: dst.into(), second: None });
     let cf = compile(&f).unwrap();
     for x in [0u64, 1, 42, u64::MAX, u64::MAX - 1, 1 << 63, (1 << 53) + 1] {
         let got = unsafe { cf.call1(x as i64) } as u64;
@@ -251,7 +251,7 @@ fn jit_float_casts() {
         src: a.into(),
         src_kind: FloatKind::F64,
     });
-    let f = b.finish(Terminator::Return(dst.into()));
+    let f = b.finish(Terminator::Return { value: dst.into(), second: None });
     let cf = compile(&f).unwrap();
     for x in [0.1f64, 1.5, -2.75, 1e300, 1e-300] {
         let got = unsafe { cf.call1(x.to_bits() as i64) } as u64;

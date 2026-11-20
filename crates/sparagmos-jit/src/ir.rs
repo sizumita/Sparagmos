@@ -191,11 +191,15 @@ pub enum Instr {
     },
     /// Call function `func` (an index into the program's function
     /// table) with the given arguments (at most six, passed in the
-    /// System V argument registers); the result lands in `dst`.
+    /// System V argument registers); the result lands in `dst`,
+    /// and its second word — when the callee returns two words —
+    /// in `dst2`. Results travel the way System V returns a pair:
+    /// the first word in RAX, the second in RDX.
     /// Only meaningful in a program compile ([`crate::program`]);
     /// the single-function entry points reject it.
     Call {
         dst: Value,
+        dst2: Option<Value>,
         func: u32,
         args: Vec<Operand>,
     },
@@ -276,8 +280,16 @@ pub enum Instr {
 /// How a basic block ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Terminator {
-    /// Return a value from the function.
-    Return(Operand),
+    /// Return a value from the function. A two-word result (a fat
+    /// pointer, a two-scalar pair) travels in two registers:
+    /// `value` in RAX and `second` in RDX — the System V
+    /// pair-return convention, the mirror of how two-word
+    /// arguments are passed. A result of at most one word has
+    /// `second: None`.
+    Return {
+        value: Operand,
+        second: Option<Operand>,
+    },
     /// Unconditional jump.
     Jump(BlockId),
     /// Jump to `then_blk` if `cond != 0`, else to `else_blk`.

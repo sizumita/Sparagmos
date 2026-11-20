@@ -38,6 +38,16 @@ struct PanicCtx {
     message_index: Cell<u64>,
 }
 
+/// A two-word result as the generated code returns it: the first
+/// word in RAX, the second in RDX. `#[repr(C)]` with two `i64`
+/// fields classifies as two INTEGER eightbytes under System V, so
+/// a Rust caller of this shape reads exactly those two registers.
+#[repr(C)]
+struct RetPair {
+    first: i64,
+    second: i64,
+}
+
 /// Message index the generated code stores for a panic whose text
 /// was formatted at run time (an index-out-of-bounds message): the text
 /// lives in the program's scratch buffer, not the message table.
@@ -100,6 +110,18 @@ impl CompiledProgram {
     /// the function's parameter count — both are caller bugs, not
     /// guest behaviour.
     pub fn call(&self, idx: usize, args: &[i64]) -> Result<i64, PanicRecord> {
+        self.call_pair(idx, args).map(|(first, _)| first)
+    }
+
+    /// Call function `idx` like [`CompiledProgram::call`], returning
+    /// both result words: the first (RAX) and the second (RDX) of
+    /// the pair-return convention. The second word is meaningful
+    /// only when the function returns two words (a fat pointer or a
+    /// pair); for a result of at most one word it is whatever the
+    /// register happened to hold. On a guest panic no result words
+    /// are produced at all — the [`PanicRecord`] is returned before
+    /// either register is read.
+    pub fn call_pair(&self, idx: usize, args: &[i64]) -> Result<(i64, i64), PanicRecord> {
         assert!(idx < self.offsets.len(), "function index {idx} out of range");
         assert_eq!(
             args.len(),
@@ -111,7 +133,7 @@ impl CompiledProgram {
         clear_last_panic();
         let mut padded = [0i64; 6];
         padded[..args.len()].copy_from_slice(args);
-        let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64 =
+        let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> RetPair =
             unsafe { std::mem::transmute(self.function_ptr(idx)) };
         let result = unsafe { f(padded[0], padded[1], padded[2], padded[3], padded[4], padded[5]) };
         if self.panic_ctx.panicked.get() != 0 {
@@ -130,7 +152,7 @@ impl CompiledProgram {
                 location: None,
             });
         }
-        Ok(result)
+        Ok((result.first, result.second))
     }
 }
 
@@ -214,7 +236,7 @@ mod tests {
         let mut b = FunctionBuilder::new("callee", 1);
         let x = b.param(0);
         let r = b.binop(B::Mul, x, Operand::Const(3));
-        let callee = b.finish(Terminator::Return(r.into()));
+        let callee = b.finish(Terminator::Return { value: r.into(), second: None });
         // fn caller(x) = callee(x + 1) + callee(10)
         let mut b = FunctionBuilder::new("caller", 1);
         let x = b.param(0);
@@ -222,6 +244,7 @@ mod tests {
         let c1 = b.fresh();
         b.push_raw(Instr::Call {
             dst: c1,
+            dst2: None,
             func: 0,
             args: vec![xp1.into()],
         });
@@ -229,12 +252,13 @@ mod tests {
         let c2 = b.fresh();
         b.push_raw(Instr::Call {
             dst: c2,
+            dst2: None,
             func: 0,
             args: vec![Operand::Const(10)],
         });
         b.push_raw(Instr::CheckPanic);
         let sum = b.binop(B::Add, c1, c2);
-        let caller = b.finish(Terminator::Return(sum.into()));
+        let caller = b.finish(Terminator::Return { value: sum.into(), second: None });
         (vec![callee, caller], vec![])
     }
 
@@ -248,6 +272,41 @@ mod tests {
     }
 
     #[test]
+    fn pair_return_and_call_pair() {
+        // fn callee(x) = (x + 1, x * 2): a two-word result.
+        let mut b = FunctionBuilder::new("callee", 1);
+        let x = b.param(0);
+        let a = b.binop(B::Add, x, Operand::Const(1));
+        let c = b.binop(B::Mul, x, Operand::Const(2));
+        let callee = b.finish(Terminator::Return {
+            value: a.into(),
+            second: Some(c.into()),
+        });
+        // fn caller(x) = callee(x).0 + callee(x).1 (one call).
+        let mut b = FunctionBuilder::new("caller", 1);
+        let x = b.param(0);
+        let d0 = b.fresh();
+        let d1 = b.fresh();
+        b.push_raw(Instr::Call {
+            dst: d0,
+            dst2: Some(d1),
+            func: 0,
+            args: vec![x.into()],
+        });
+        b.push_raw(Instr::CheckPanic);
+        let sum = b.binop(B::Add, d0, d1);
+        let caller = b.finish(Terminator::Return {
+            value: sum.into(),
+            second: None,
+        });
+        let prog = compile_program(&[callee, caller], vec![]).unwrap();
+        // The pair travels in RAX/RDX; `call` reads the first word.
+        assert_eq!(prog.call_pair(0, &[10]), Ok((11, 20)));
+        assert_eq!(prog.call(0, &[10]), Ok(11));
+        assert_eq!(prog.call(1, &[10]), Ok(31));
+    }
+
+    #[test]
     fn panic_propagates_through_calls() {
         // fn boom() = panic("kaboom"); fn mid() = boom(); fn top() = mid()
         let mut b = FunctionBuilder::new("boom", 0);
@@ -258,11 +317,12 @@ mod tests {
             let d = b.fresh();
             b.push_raw(Instr::Call {
                 dst: d,
+                dst2: None,
                 func: callee,
                 args: vec![],
             });
             b.push_raw(Instr::CheckPanic);
-            b.finish(Terminator::Return(d.into()))
+            b.finish(Terminator::Return { value: d.into(), second: None })
         };
         let mid = mk_caller("mid", 0);
         let top = mk_caller("top", 1);
