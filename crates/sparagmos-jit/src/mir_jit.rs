@@ -24,6 +24,13 @@
 //! operations are exact for every integer type of up to 64 bits, and
 //! comparisons only need the operand type's signedness.
 //!
+//! A float leaf holds its IEEE 754 bit pattern instead: all 64 bits
+//! for `f64`, the low 32 bits (upper half zero) for `f32`. The
+//! backend computes on the patterns in SSE registers, so float
+//! arithmetic, comparisons and casts follow the hardware's IEEE
+//! semantics — which are exactly Rust's — with no normalisation
+//! step in the lowering.
+//!
 //! # Panics
 //!
 //! A guest panic (failed `Assert`, checked-arithmetic overflow via
@@ -49,17 +56,19 @@
 //!
 //! # Scope
 //!
-//! Supported: integer / `bool` / `char` / tuple-of-supported locals;
-//! `Use`, plain and checked `BinaryOp`, `UnaryOp`, `IntToInt` casts,
-//! tuple aggregates; `Goto`, `SwitchInt`, `Call` (within the program,
-//! up to six arguments), `Assert`, `Drop` of scalar values, `Return`.
-//! Anything else — floats, 128-bit integers, references and places
-//! through them, ADTs, slices, aggregates other than tuples, calls
-//! to functions outside the program, and so on — fails the whole
-//! function's compilation with [`JitError::Unsupported`] naming the
-//! construct. There is deliberately no partial or fallback execution:
-//! a program either compiles completely on the JIT path or not at
-//! all.
+//! Supported: integer / `bool` / `char` / `f32` / `f64` /
+//! tuple-of-supported locals; `Use`, plain and checked `BinaryOp`,
+//! `UnaryOp`, `IntToInt` / `FloatToInt` / `IntToFloat` /
+//! `FloatToFloat` casts, tuple aggregates; `Goto`, `SwitchInt`,
+//! `Call` (within the program, up to six arguments), `Assert`,
+//! `Drop` of scalar values, `Return`.
+//! Anything else — `f16` / `f128`, 128-bit integers, references and
+//! places through them, ADTs, slices, aggregates other than tuples,
+//! calls to functions outside the program, and so on — fails the
+//! whole function's compilation with [`JitError::Unsupported`]
+//! naming the construct. There is deliberately no partial or
+//! fallback execution: a program either compiles completely on the
+//! JIT path or not at all.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -69,8 +78,9 @@ use sparagmos_runtime::error::PanicRecord;
 
 use crate::compiler::CompileError;
 use crate::ir::{
-    BasicBlock as IrBlock, BinOp as IrBinOp, CheckedOp, Function as IrFunction, Instr,
-    IntKind as IrIntKind, Operand as IrOperand, Terminator as IrTerminator, UnOp as IrUnOp,
+    BasicBlock as IrBlock, BinOp as IrBinOp, CheckedOp, FloatBinOp as IrFloatBinOp,
+    FloatKind as IrFloatKind, Function as IrFunction, Instr, IntKind as IrIntKind,
+    Operand as IrOperand, Terminator as IrTerminator, UnOp as IrUnOp,
 };
 use crate::program::{compile_program, CompiledProgram};
 
@@ -343,8 +353,24 @@ fn flatten(ty: &mir::Ty, fname: &str) -> Result<usize, JitError> {
         }
         // A never-typed value is never produced; it occupies no leaf.
         mir::Ty::Never => Ok(0),
-        mir::Ty::Float(_) => Err(unsup(fname, "floating-point type")),
+        mir::Ty::Float(mir::FloatTy::F32) | mir::Ty::Float(mir::FloatTy::F64) => Ok(1),
+        mir::Ty::Float(mir::FloatTy::F16) => {
+            Err(unsup(fname, "16-bit floating-point type"))
+        }
+        mir::Ty::Float(mir::FloatTy::F128) => {
+            Err(unsup(fname, "128-bit floating-point type"))
+        }
         other => Err(unsup(fname, &format!("type {}", other.kind_name()))),
+    }
+}
+
+/// The backend float format of a scalar type, if it is one the JIT
+/// supports.
+fn float_kind(ty: &mir::Ty) -> Option<IrFloatKind> {
+    match ty {
+        mir::Ty::Float(mir::FloatTy::F32) => Some(IrFloatKind::F32),
+        mir::Ty::Float(mir::FloatTy::F64) => Some(IrFloatKind::F64),
+        _ => None,
     }
 }
 
@@ -425,6 +451,52 @@ fn uint_ty_of_bits(bits: u32) -> Option<mir::UintTy> {
         128 => U128,
         _ => return None,
     })
+}
+
+/// The shared type of a pair of float literals, for a comparison
+/// neither of whose operands has a place type (the float form of
+/// [`literal_pair_ty`]).
+fn literal_float_pair_ty(lhs: &mir::Operand, rhs: &mir::Operand) -> Option<mir::Ty> {
+    fn scalar_float(op: &mir::Operand) -> Option<mir::FloatTy> {
+        let mir::Operand::Constant(c) = op else {
+            return None;
+        };
+        let mir::ConstKind::Value(mir::ConstValue::Scalar(mir::Scalar::Float { ty, .. })) =
+            &c.literal
+        else {
+            return None;
+        };
+        Some(*ty)
+    }
+    let l = scalar_float(lhs)?;
+    let r = scalar_float(rhs)?;
+    if l == r && matches!(l, mir::FloatTy::F32 | mir::FloatTy::F64) {
+        Some(mir::Ty::Float(l))
+    } else {
+        None
+    }
+}
+
+/// The integer type of a lone integer literal, typed by the same
+/// heuristic as [`literal_pair_ty`]: a set sign bit at the literal's
+/// own width reads as the signed type of that width, otherwise the
+/// unsigned one. Used for the source of an `IntToFloat` cast whose
+/// operand is a constant.
+fn literal_int_ty(op: &mir::Operand) -> Option<mir::Ty> {
+    let mir::Operand::Constant(c) = op else {
+        return None;
+    };
+    let mir::ConstKind::Value(mir::ConstValue::Scalar(mir::Scalar::Int { data, size })) =
+        &c.literal
+    else {
+        return None;
+    };
+    let bits = u32::from(*size) * 8;
+    if bits > 0 && bits < 128 && (data >> (bits - 1)) & 1 == 1 {
+        int_ty_of_bits(bits).map(mir::Ty::Int)
+    } else {
+        uint_ty_of_bits(bits).map(mir::Ty::Uint)
+    }
 }
 
 /// The panic message text for an `Assert`, mirroring the
@@ -634,6 +706,29 @@ impl<'a> FnLower<'a> {
         op.place().and_then(|p| self.place_ty(p).ok())
     }
 
+    /// The float type of an operand, from its place or — for a float
+    /// constant — from the constant itself. Casts need the source
+    /// type even when the operand has no place.
+    fn operand_float_ty(&self, op: &mir::Operand) -> Option<mir::Ty> {
+        if let Some(t) = self.operand_place_ty(op) {
+            if float_kind(&t).is_some() {
+                return Some(t);
+            }
+        }
+        if let mir::Operand::Constant(c) = op {
+            if let mir::ConstKind::Value(mir::ConstValue::Scalar(mir::Scalar::Float {
+                ty,
+                ..
+            })) = &c.literal
+            {
+                if matches!(ty, mir::FloatTy::F32 | mir::FloatTy::F64) {
+                    return Some(mir::Ty::Float(*ty));
+                }
+            }
+        }
+        None
+    }
+
     /// Materialise an operand as a single IR value in canonical form
     /// for `ctx`. Multi-leaf operands are rejected here; whole-value
     /// copies are handled by the `Use` path.
@@ -704,8 +799,17 @@ impl<'a> FnLower<'a> {
                     }
                 }
             }
-            mir::ConstValue::Scalar(mir::Scalar::Float { .. }) => {
-                return Err(self.err("floating-point constant"));
+            mir::ConstValue::Scalar(mir::Scalar::Float { bits, ty }) => {
+                // A float value's slot word is its bit pattern: the
+                // full 64 bits for f64, the low 32 (zero-extended)
+                // for f32.
+                match ty {
+                    mir::FloatTy::F64 => *bits as u64 as i64,
+                    mir::FloatTy::F32 => *bits as u32 as i64,
+                    other => {
+                        return Err(self.err(&format!("{} constant", other.name())));
+                    }
+                }
             }
             mir::ConstValue::Scalar(mir::Scalar::Ptr { .. }) => {
                 return Err(self.err("pointer constant"));
@@ -911,10 +1015,14 @@ impl<'a> FnLower<'a> {
             self.operand_place_ty(lhs)
                 .or_else(|| self.operand_place_ty(rhs))
                 .or_else(|| literal_pair_ty(lhs, rhs))
+                .or_else(|| literal_float_pair_ty(lhs, rhs))
                 .unwrap_or_else(|| dst_ty.clone())
         } else {
             dst_ty.clone()
         };
+        if let Some(fk) = float_kind(&op_ty) {
+            return self.lower_float_binop(dst, op, lhs, rhs, fk, &op_ty);
+        }
         let Some(kind) = int_kind(&op_ty) else {
             return Err(self.err(&format!(
                 "binary operation {op:?} on type {}",
@@ -988,6 +1096,50 @@ impl<'a> FnLower<'a> {
             M::Cmp => return Err(self.err("Cmp binary operation")),
             M::AddWithOverflow | M::SubWithOverflow | M::MulWithOverflow => unreachable!(),
         }
+        Ok(())
+    }
+
+    /// A plain `BinaryOp` on floats: arithmetic and comparisons map
+    /// directly onto the backend's float operations (the hardware's
+    /// IEEE semantics are Rust's, including the NaN comparison
+    /// rules). Bitwise and shift operators have no float form.
+    fn lower_float_binop(
+        &mut self,
+        dst: u32,
+        op: mir::BinOp,
+        lhs: &mir::Operand,
+        rhs: &mir::Operand,
+        kind: IrFloatKind,
+        op_ty: &mir::Ty,
+    ) -> Result<(), JitError> {
+        use mir::BinOp as M;
+        let fop = match op {
+            M::Add | M::AddUnchecked => IrFloatBinOp::Add,
+            M::Sub | M::SubUnchecked => IrFloatBinOp::Sub,
+            M::Mul | M::MulUnchecked => IrFloatBinOp::Mul,
+            M::Div => IrFloatBinOp::Div,
+            M::Rem => IrFloatBinOp::Rem,
+            M::Eq => IrFloatBinOp::Eq,
+            M::Ne => IrFloatBinOp::Ne,
+            M::Lt => IrFloatBinOp::Lt,
+            M::Le => IrFloatBinOp::Le,
+            M::Gt => IrFloatBinOp::Gt,
+            M::Ge => IrFloatBinOp::Ge,
+            other => {
+                return Err(self.err(&format!(
+                    "binary operation {other:?} on a floating-point type"
+                )));
+            }
+        };
+        let lv = self.operand_value(lhs, op_ty)?;
+        let rv = self.operand_value(rhs, op_ty)?;
+        self.emit(Instr::FloatBinOp {
+            dst,
+            op: fop,
+            kind,
+            lhs: IrOperand::Value(lv),
+            rhs: IrOperand::Value(rv),
+        });
         Ok(())
     }
 
@@ -1306,6 +1458,25 @@ impl<'a> FnLower<'a> {
         }
         match op {
             mir::UnOp::Neg => {
+                if let Some(fk) = float_kind(&dst_ty) {
+                    // Float negation is an exact sign-bit flip (it
+                    // applies to NaNs and zeroes alike), so it lowers
+                    // to an integer xor on the value's bit pattern:
+                    // the sign bit for f64, bit 31 for f32 (whose
+                    // canonical form keeps the upper half zero).
+                    let v = self.operand_value(operand, &dst_ty)?;
+                    let mask = match fk {
+                        IrFloatKind::F64 => i64::MIN,
+                        IrFloatKind::F32 => 0x8000_0000,
+                    };
+                    self.emit(Instr::BinOp {
+                        dst,
+                        op: IrBinOp::Xor,
+                        lhs: IrOperand::Value(v),
+                        rhs: IrOperand::Const(mask),
+                    });
+                    return Ok(());
+                }
                 let mir::Ty::Int(it) = dst_ty else {
                     return Err(self.err("Neg on a non-signed-integer type"));
                 };
@@ -1375,31 +1546,108 @@ impl<'a> FnLower<'a> {
         operand: &mir::Operand,
         target: &mir::Ty,
     ) -> Result<(), JitError> {
-        if !matches!(kind, mir::CastKind::IntToInt) {
-            return Err(self.err(&format!("cast {kind:?}")));
-        }
         let (dst, count, _) = self.place_leaves(place)?;
         if count != 1 {
             return Err(self.err("cast of an aggregate value"));
         }
-        if int_kind(target).is_none() {
-            return Err(self.err(&format!(
-                "cast to type {}",
-                target.kind_name()
-            )));
+        match kind {
+            mir::CastKind::IntToInt => {
+                if int_kind(target).is_none() {
+                    return Err(self.err(&format!(
+                        "cast to type {}",
+                        target.kind_name()
+                    )));
+                }
+                // The source value is canonical for its own type, so
+                // casting is exactly normalising that 64-bit value to
+                // the target type.
+                let src_ty = self
+                    .operand_place_ty(operand)
+                    .unwrap_or_else(|| target.clone());
+                let v = self.operand_value(operand, &src_ty)?;
+                self.emit(Instr::Copy {
+                    dst,
+                    src: IrOperand::Value(v),
+                });
+                self.normalize(dst, target);
+                Ok(())
+            }
+            mir::CastKind::FloatToInt => {
+                let Some(src_ty) = self.operand_float_ty(operand) else {
+                    return Err(self.err("FloatToInt cast with an unknown source type"));
+                };
+                let fk = float_kind(&src_ty).expect("operand_float_ty yields a float kind");
+                let Some(int) = int_kind(target) else {
+                    return Err(self.err(&format!(
+                        "FloatToInt cast to type {}",
+                        target.kind_name()
+                    )));
+                };
+                let v = self.operand_value(operand, &src_ty)?;
+                self.emit(Instr::FloatToInt {
+                    dst,
+                    kind: fk,
+                    src: IrOperand::Value(v),
+                    int,
+                });
+                Ok(())
+            }
+            mir::CastKind::IntToFloat => {
+                let Some(fk) = float_kind(target) else {
+                    return Err(self.err(&format!(
+                        "IntToFloat cast to type {}",
+                        target.kind_name()
+                    )));
+                };
+                // The source type comes from the operand's place, or
+                // from the literal itself for a constant operand.
+                let Some(src_ty) = self
+                    .operand_place_ty(operand)
+                    .or_else(|| literal_int_ty(operand))
+                else {
+                    return Err(self.err("IntToFloat cast with an unknown source type"));
+                };
+                let Some(int) = int_kind(&src_ty) else {
+                    return Err(self.err("IntToFloat cast from a non-integer type"));
+                };
+                let v = self.operand_value(operand, &src_ty)?;
+                self.emit(Instr::IntToFloat {
+                    dst,
+                    kind: fk,
+                    src: IrOperand::Value(v),
+                    int,
+                });
+                Ok(())
+            }
+            mir::CastKind::FloatToFloat => {
+                let Some(src_ty) = self.operand_float_ty(operand) else {
+                    return Err(self.err("FloatToFloat cast with an unknown source type"));
+                };
+                let src_kind = float_kind(&src_ty).expect("operand_float_ty yields a float kind");
+                let Some(fk) = float_kind(target) else {
+                    return Err(self.err(&format!(
+                        "FloatToFloat cast to type {}",
+                        target.kind_name()
+                    )));
+                };
+                let v = self.operand_value(operand, &src_ty)?;
+                if src_kind == fk {
+                    self.emit(Instr::Copy {
+                        dst,
+                        src: IrOperand::Value(v),
+                    });
+                } else {
+                    self.emit(Instr::FloatToFloat {
+                        dst,
+                        kind: fk,
+                        src: IrOperand::Value(v),
+                        src_kind,
+                    });
+                }
+                Ok(())
+            }
+            other => Err(self.err(&format!("cast {other:?}"))),
         }
-        // The source value is canonical for its own type, so casting
-        // is exactly normalising that 64-bit value to the target type.
-        let src_ty = self
-            .operand_place_ty(operand)
-            .unwrap_or_else(|| target.clone());
-        let v = self.operand_value(operand, &src_ty)?;
-        self.emit(Instr::Copy {
-            dst,
-            src: IrOperand::Value(v),
-        });
-        self.normalize(dst, target);
-        Ok(())
     }
 
     fn lower_aggregate(

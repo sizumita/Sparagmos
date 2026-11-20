@@ -973,12 +973,13 @@ fn switch_on_char() {
 
 #[test]
 fn unsupported_constructs_report_reasons() {
-    // A floating-point local.
+    // A 16-bit floating-point local (f32 / f64 are supported; the
+    // SSE-less formats are not).
     let float_fn = MirFunctionInput {
         name: "floaty".to_string(),
         def_id: Some(def(0)),
         body: mir::Body::new(
-            locals(&[mir::Ty::Float(mir::FloatTy::F64), mir::Ty::Float(mir::FloatTy::F64)]),
+            locals(&[mir::Ty::Float(mir::FloatTy::F16), mir::Ty::Float(mir::FloatTy::F16)]),
             1,
             vec![bb(vec![], mir::TerminatorKind::Return)],
         ),
@@ -987,7 +988,7 @@ fn unsupported_constructs_report_reasons() {
         functions: vec![float_fn],
         names: HashMap::new(),
     })
-    .expect_err("float must be unsupported");
+    .expect_err("f16 must be unsupported");
     match err {
         JitError::Unsupported(what) => assert!(what.contains("floating-point"), "{what}"),
         other => panic!("expected Unsupported, got {other}"),
