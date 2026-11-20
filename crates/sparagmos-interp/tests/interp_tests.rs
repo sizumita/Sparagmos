@@ -756,7 +756,7 @@ fn mixed_type_shift_amount_overflow_panics() {
     match err {
         InterpError::Panic { message } => assert_eq!(
             message,
-            "attempt to shift by 32 bits, which overflows the type width 32"
+            "attempt to shift left with overflow"
         ),
         other => panic!("expected shift-overflow panic, got {other}"),
     }

@@ -38,32 +38,6 @@ struct PanicCtx {
     message_index: Cell<u64>,
 }
 
-/// Message index the generated code stores for a panic whose text
-/// was formatted at run time (the shift-overflow message): the text
-/// lives in the program's scratch buffer, not the message table.
-const DYNAMIC_MESSAGE: u64 = u64::MAX;
-
-/// The shift-overflow message formatter the generated code calls:
-/// writes the message length (little-endian u64) at `buf`, the
-/// message bytes at `buf + 8`, and returns the length. The wording
-/// matches the interpreter's message for a plain shift whose amount
-/// meets or exceeds the type width; an amount that does not fit in
-/// a `u32` is reported as `u32::MAX`, as the interpreter does.
-///
-/// # Safety
-/// `buf` must point to at least 128 writable bytes (the program's
-/// scratch buffer); the message is well under that.
-extern "C" fn format_shift_message(amount: u64, bits: u64, buf: *mut u8) -> usize {
-    let shift = u32::try_from(amount).unwrap_or(u32::MAX);
-    let text = format!("attempt to shift by {shift} bits, which overflows the type width {bits}");
-    let bytes = text.as_bytes();
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.len().to_le_bytes().as_ptr(), buf, 8);
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.add(8), bytes.len());
-    }
-    bytes.len()
-}
-
 /// A whole compiled program: executable image plus the state its
 /// generated code refers to by absolute address.
 pub struct CompiledProgram {
@@ -77,9 +51,6 @@ pub struct CompiledProgram {
     /// these bytes to `sparagmos_panic`, so they must not move.
     #[allow(dead_code)]
     messages: Vec<Box<str>>,
-    /// Scratch buffer for run-time-formatted panic messages
-    /// (address-stable; see [`format_shift_message`]).
-    shift_buf: Box<[u8; 128]>,
 }
 
 impl CompiledProgram {
@@ -118,15 +89,11 @@ impl CompiledProgram {
         let result = unsafe { f(padded[0], padded[1], padded[2], padded[3], padded[4], padded[5]) };
         if self.panic_ctx.panicked.get() != 0 {
             let msg_idx = self.panic_ctx.message_index.get();
-            let message = if msg_idx == DYNAMIC_MESSAGE {
-                let len = u64::from_le_bytes(self.shift_buf[0..8].try_into().unwrap()) as usize;
-                String::from_utf8_lossy(&self.shift_buf[8..8 + len]).into_owned()
-            } else {
-                self.messages
-                    .get(msg_idx as usize)
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "<unknown panic message>".to_string())
-            };
+            let message = self
+                .messages
+                .get(msg_idx as usize)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "<unknown panic message>".to_string());
             return Err(PanicRecord {
                 message,
                 location: None,
@@ -150,7 +117,6 @@ pub fn compile_program(
         message_index: Cell::new(0),
     });
     let messages: Vec<Box<str>> = messages.into_iter().map(|s| s.into_boxed_str()).collect();
-    let shift_buf: Box<[u8; 128]> = Box::new([0; 128]);
     let ctx = ProgramCtx {
         flag_addr: panic_ctx.as_ref() as *const PanicCtx as usize,
         panic_fn: sparagmos_runtime::ffi::sparagmos_panic as usize,
@@ -158,8 +124,6 @@ pub fn compile_program(
             .iter()
             .map(|s| (s.as_ptr() as usize, s.len()))
             .collect(),
-        shift_fmt_fn: format_shift_message as usize,
-        shift_buf: shift_buf.as_ptr() as usize,
     };
 
     // Compile each function separately, then lay the bodies out in
@@ -202,7 +166,6 @@ pub fn compile_program(
         param_counts: funcs.iter().map(|f| f.param_count).collect(),
         panic_ctx,
         messages,
-        shift_buf,
     })
 }
 

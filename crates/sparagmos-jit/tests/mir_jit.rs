@@ -880,15 +880,25 @@ fn shifts_plain_and_checked() {
         "shl_u32",
         &[1, 32],
         vec![uint(1), uint(32)],
-        Err("attempt to shift by 32 bits, which overflows the type width 32"),
+        Err("attempt to shift left with overflow"),
     );
+    // Bits shifted out are simply lost, as natively: only the
+    // amount can overflow a shift.
     check(
         &jit,
         &prog,
         "shl_u32",
         &[0x1_0000, 16],
         vec![uint(0x1_0000), uint(16)],
-        Err("arithmetic overflow in Shl"),
+        Ok(0),
+    );
+    check(
+        &jit,
+        &prog,
+        "shl_u32",
+        &[42, 28],
+        vec![uint(42), uint(28)],
+        Ok(0xA000_0000),
     );
     check(&jit, &prog, "shr_i32", &[-16, 2], vec![int(-16), int(2)], Ok(-4));
     check(
@@ -897,11 +907,21 @@ fn shifts_plain_and_checked() {
         "shr_i32",
         &[16, 33],
         vec![int(16), int(33)],
-        Err("attempt to shift by 33 bits, which overflows the type width 32"),
+        Err("attempt to shift right with overflow"),
     );
     // Checked form: no panic, the flag and the wrapped value instead.
+    // The flag reports the overshift only: bits shifted out leave
+    // it clear.
     check(&jit, &prog, "cshl_flag", &[1, 32], vec![uint(1), uint(32)], Ok(1));
     check(&jit, &prog, "cshl_flag", &[1, 4], vec![uint(1), uint(4)], Ok(0));
+    check(
+        &jit,
+        &prog,
+        "cshl_flag",
+        &[0x1_0000, 16],
+        vec![uint(0x1_0000), uint(16)],
+        Ok(0),
+    );
     check(&jit, &prog, "cshl_val", &[1, 32], vec![uint(1), uint(32)], Ok(1));
     check(
         &jit,
