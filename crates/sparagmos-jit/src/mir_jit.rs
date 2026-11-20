@@ -62,7 +62,10 @@
 //! and [`JitProgram::call`] returns it as a [`PanicRecord`]. Division
 //! and remainder get explicit divisor guards at lowering time because
 //! the hardware instructions trap on a zero divisor (and on
-//! `MIN / -1` in the 64-bit signed case).
+//! `MIN / -1` in the 64-bit signed case). Reaching a MIR `Unreachable`
+//! block is a guest panic too, with the message `entered unreachable
+//! code` — the interpreter's model — lowered to a jump into a panic
+//! block like a failed `Assert`, never to a hardware trap.
 //!
 //! The interpreter's model of the *plain* (unchecked) operators is
 //! that they panic on overflow — `arithmetic overflow in Add`, the
@@ -88,7 +91,7 @@
 //! aggregates, fieldless ADT aggregates, `Repeat`,
 //! `Discriminant`, `SetDiscriminant`; `Goto`, `SwitchInt`, `Call`
 //! (within the program, up to six arguments), `Assert`, `Drop` of
-//! scalar values, `Return`.
+//! scalar values, `Return`, `Unreachable` (as a guest panic).
 //! Anything else — `f16` / `f128`, 128-bit integers, fat
 //! references, projections through a dereference, ADT payloads,
 //! slices, aggregates other than tuples and fieldless ADTs,
@@ -2179,7 +2182,17 @@ impl<'a> FnLower<'a> {
                 Ok(())
             }
             T::Unreachable => {
-                self.seal_terminator(IrTerminator::Unreachable);
+                // Reaching an `Unreachable` block is a guest panic,
+                // exactly the interpreter's model: lower it to a jump
+                // into a panic block, the same mechanism `Assert`
+                // uses, so the panic is recorded through the runtime
+                // path and propagates via the program's panic flag.
+                // (Lowering it to the backend's trap terminator made
+                // the generated code execute int3 and kill the host
+                // process with SIGTRAP.)
+                let msg_idx = self.messages.intern("entered unreachable code");
+                let pblk = self.panic_block(msg_idx);
+                self.seal_terminator(IrTerminator::Jump(pblk));
                 Ok(())
             }
             T::SwitchInt { discr, targets } => self.lower_switch(discr, targets),

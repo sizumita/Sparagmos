@@ -1240,11 +1240,9 @@ fn drop_of_scalar_jumps_to_target() {
 fn unreachable_program() -> (JitProgram, sparagmos_interp::MirProgram) {
     // fn keep(a: i32) -> i32 { if a < 0 { unreachable } else { a } }:
     // the Unreachable block is the taken-when-negative arm of the
-    // switch; the checks below only exercise the non-negative arm, so
-    // execution must return `a` untouched on both engines. The
-    // behaviour when execution *does* reach the block is asserted for
-    // the interpreter in mir_convert_tests (guest panic); on the JIT
-    // the block compiles to a trap (see Issue #39).
+    // switch. The non-negative checks exercise the return arm; the
+    // negative checks reach the block, which both engines surface as
+    // the guest panic `entered unreachable code`.
     let i32t = i(mir::IntTy::I32);
     let keep = spec(
         "keep",
@@ -1281,6 +1279,78 @@ fn unreachable_block_not_taken_leaves_execution_intact() {
     let (jit, prog) = unreachable_program();
     check(&jit, &prog, "keep", &[5], vec![int(5)], Ok(5));
     check(&jit, &prog, "keep", &[0], vec![int(0)], Ok(0));
+}
+
+#[test]
+fn unreachable_block_reached_is_a_guest_panic() {
+    // Reaching the Unreachable block must return the interpreter's
+    // guest panic from `JitProgram::call`, not trap: this used to
+    // lower to int3 and kill the host process with SIGTRAP
+    // (Issue #56), so this test could not even run to completion.
+    let (jit, prog) = unreachable_program();
+    check(
+        &jit,
+        &prog,
+        "keep",
+        &[-1],
+        vec![int(-1)],
+        Err("entered unreachable code"),
+    );
+    check(
+        &jit,
+        &prog,
+        "keep",
+        &[-42],
+        vec![int(-42)],
+        Err("entered unreachable code"),
+    );
+}
+
+fn unreachable_callee_program() -> (JitProgram, sparagmos_interp::MirProgram) {
+    // fn dive() -> i32 { unreachable }
+    // fn main() -> i32 { dive() }
+    // The panic raised in the callee must propagate out of the
+    // caller through the panic flag, as an `Assert` panic does.
+    let i32t = i(mir::IntTy::I32);
+    let dive = spec(
+        "dive",
+        0,
+        0,
+        &[i32t.clone()],
+        vec![bb(vec![], mir::TerminatorKind::Unreachable)],
+    );
+    let main = spec(
+        "main",
+        1,
+        0,
+        &[mir::Ty::Tuple(vec![]), i32t],
+        vec![
+            bb(vec![], call_term(fndef(def(0)), vec![], 1, 1)),
+            bb(vec![], mir::TerminatorKind::Return),
+        ],
+    );
+    build(&[dive, main])
+}
+
+#[test]
+fn unreachable_in_callee_propagates_as_guest_panic() {
+    let (jit, prog) = unreachable_callee_program();
+    check(
+        &jit,
+        &prog,
+        "dive",
+        &[],
+        vec![],
+        Err("entered unreachable code"),
+    );
+    check(
+        &jit,
+        &prog,
+        "main",
+        &[],
+        vec![],
+        Err("entered unreachable code"),
+    );
 }
 
 // ----- Repeat: arrays built by repeating one element -------------------------
