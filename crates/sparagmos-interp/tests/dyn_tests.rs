@@ -756,9 +756,13 @@ const HELPER: mir::DefId = mir::DefId::new(0, 25);
 fn impl_resolution_skips_impl_bodies_calling_unconvertible_helpers() {
     // The transitive shape of the packed-struct regression: the
     // impl body itself converts, but it calls a helper whose body
-    // holds an unsupported rvalue — a `PointerExposeProvenance`
-    // cast, the `check_align` helper of
-    // `tests/ui/derives/deriving-with-repr-packed-3.rs`. Resolving
+    // holds an unsupported rvalue — an int-to-pointer
+    // `PointerWithExposedProvenance` cast, standing in for the
+    // `check_align` helper of
+    // `tests/ui/derives/deriving-with-repr-packed-3.rs` (whose
+    // `PointerExposeProvenance` cast became executable in Lane
+    // BV, so the still-unsupported reverse cast plays its role
+    // here). Resolving
     // the trait call to the impl body would run the helper and
     // fail on the unsupported cast; the builtin's structural
     // comparison is exact, so it must run instead. The impl
@@ -766,17 +770,17 @@ fn impl_resolution_skips_impl_bodies_calling_unconvertible_helpers() {
     // comparing equal proves the builtin ran.
     let helper = mir::Body::new(
         decls(&[
-            mir::Ty::Uint(mir::UintTy::Usize),
             mir::Ty::RawPtr(Box::new(i32_ty()), mir::Mutability::Not),
+            mir::Ty::Uint(mir::UintTy::Usize),
         ]),
         0,
         vec![block(
             vec![assign(
                 place(0),
                 mir::Rvalue::Cast(
-                    mir::CastKind::PointerExposeProvenance,
+                    mir::CastKind::PointerWithExposedProvenance,
                     copy(1),
-                    mir::Ty::Uint(mir::UintTy::Usize),
+                    mir::Ty::RawPtr(Box::new(i32_ty()), mir::Mutability::Not),
                 ),
             )],
             ret(),
