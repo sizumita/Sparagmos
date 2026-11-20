@@ -872,7 +872,12 @@ fn collect() -> ControlFlow<()> {
     // Collect the bodies of non-local functions reachable from the
     // converted local bodies (std / core / alloc and other library
     // functions), so calls into them have bodies in the program too.
-    let reached = sparagmos_driver::reach::collect_reachable(&mut conv, &reach_seeds, &local_defs);
+    let reached = sparagmos_driver::reach::collect_reachable(
+        &mut conv,
+        &reach_seeds,
+        &local_defs,
+        sparagmos_driver::reach::MAX_COLLECTED_BODIES,
+    );
     bodies.extend(reached.bodies);
     body_def_ids.extend(reached.body_def_ids);
     body_def_names.extend(reached.body_def_names);
