@@ -724,6 +724,74 @@ fn collect_local_instances(
     extra_seeds
 }
 
+/// Convert one local body (an item-loop body, or a constant body
+/// obtained from the item itself) and record the outcome; a
+/// successfully converted body also becomes a reachability seed.
+#[allow(clippy::too_many_arguments)]
+fn convert_local_body(
+    conv: &mut Converter,
+    report: &mut ConversionReport,
+    bodies: &mut Vec<(String, Body)>,
+    body_def_ids: &mut Vec<sparagmos_mir::DefId>,
+    body_def_names: &mut Vec<String>,
+    seed_bodies: &mut Vec<rustc_public::mir::Body>,
+    name: String,
+    def_id: sparagmos_mir::DefId,
+    body: rustc_public::mir::Body,
+) {
+    let blocks = body.blocks.len();
+    let locals = body.locals().len();
+    let arg_count = body.arg_locals().len();
+    match conv.convert_body(&body) {
+        Ok(converted) => {
+            seed_bodies.push(body);
+            bodies.push((name.clone(), converted));
+            body_def_ids.push(def_id);
+            body_def_names.push(name.clone());
+            report.functions.push(FnReport {
+                name,
+                blocks,
+                locals,
+                arg_count,
+                outcome: FnOutcome::Converted,
+            });
+        }
+        Err(errs) => {
+            let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
+            for e in errs {
+                *reasons.entry(e).or_default() += 1;
+            }
+            report.functions.push(FnReport {
+                name,
+                blocks,
+                locals,
+                arg_count,
+                outcome: FnOutcome::Skipped { reasons },
+            });
+        }
+    }
+}
+
+/// Account for a constant that has no MIR body anywhere: a
+/// *trivial* constant (a literal, a path to another constant, a
+/// const parameter). rustc represents such constants without a
+/// body by design — its `is_trivial_const` check is what makes
+/// body retrieval return `None` for an otherwise available local
+/// constant — because the value is folded into every use site:
+/// the bodies that use the constant carry the evaluated value,
+/// so nothing is missing from the program and there is no body
+/// to convert. The constant is therefore accounted as converted,
+/// with no body, instead of being reported as a missing body.
+fn account_trivial_const(report: &mut ConversionReport, name: String) {
+    report.functions.push(FnReport {
+        name,
+        blocks: 0,
+        locals: 0,
+        arg_count: 0,
+        outcome: FnOutcome::Converted,
+    });
+}
+
 fn collect() -> ControlFlow<()> {
     let mut conv = Converter::new();
     let mut report = ConversionReport::default();
@@ -792,6 +860,38 @@ fn collect() -> ControlFlow<()> {
                         });
                         continue;
                     }
+                    if matches!(item.kind(), ItemKind::Const) {
+                        // A constant that requires monomorphization
+                        // as an item (an anonymous constant inside a
+                        // generic function, an associated constant
+                        // of a generic impl, ...): it has no
+                        // instance, but the constant's own MIR body
+                        // can still be converted, the way the
+                        // demanded instances of a generic function
+                        // are. Monomorphized bodies that use the
+                        // constant carry its evaluated value, so the
+                        // converted body is registered under the
+                        // constant's own definition id — the key
+                        // unevaluated constant references resolve
+                        // through. A constant whose own body is
+                        // unavailable too is a trivial constant
+                        // (see `account_trivial_const`).
+                        match item.body() {
+                            Some(body) => convert_local_body(
+                                &mut conv,
+                                &mut report,
+                                &mut bodies,
+                                &mut body_def_ids,
+                                &mut body_def_names,
+                                &mut seed_bodies,
+                                name,
+                                def_id,
+                                body,
+                            ),
+                            None => account_trivial_const(&mut report, name),
+                        }
+                        continue;
+                    }
                     skip_fn(
                         &mut report,
                         &name,
@@ -806,6 +906,12 @@ fn collect() -> ControlFlow<()> {
             },
         };
         let Some(body) = instance.body() else {
+            if matches!(item.kind(), ItemKind::Const) {
+                // The constant has an instance but no body: a
+                // trivial constant (see `account_trivial_const`).
+                account_trivial_const(&mut report, name);
+                continue;
+            }
             let mut reasons = BTreeMap::new();
             reasons.insert("no MIR body available".to_string(), 1);
             report.functions.push(FnReport {
@@ -817,37 +923,17 @@ fn collect() -> ControlFlow<()> {
             });
             continue;
         };
-        let blocks = body.blocks.len();
-        let locals = body.locals().len();
-        let arg_count = body.arg_locals().len();
-        match conv.convert_body(&body) {
-            Ok(converted) => {
-                seed_bodies.push(body);
-                bodies.push((name.clone(), converted));
-                body_def_ids.push(def_id);
-                body_def_names.push(item.def_id().name());
-                report.functions.push(FnReport {
-                    name,
-                    blocks,
-                    locals,
-                    arg_count,
-                    outcome: FnOutcome::Converted,
-                });
-            }
-            Err(errs) => {
-                let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
-                for e in errs {
-                    *reasons.entry(e).or_default() += 1;
-                }
-                report.functions.push(FnReport {
-                    name,
-                    blocks,
-                    locals,
-                    arg_count,
-                    outcome: FnOutcome::Skipped { reasons },
-                });
-            }
-        }
+        convert_local_body(
+            &mut conv,
+            &mut report,
+            &mut bodies,
+            &mut body_def_ids,
+            &mut body_def_names,
+            &mut seed_bodies,
+            name,
+            def_id,
+            body,
+        );
     }
 
     let local_body_count = bodies.len();
