@@ -977,3 +977,100 @@ fn summary_mode_demanded_generic_instances_are_converted() {
         "the undemanded generic definition stays explicitly skipped: {unused}"
     );
 }
+
+// ----- trait method keys (Issue #64) ------------------------------------------
+
+const TRAIT_CALL_SRC: &str = r#"
+trait Greeter { fn greet(&self) -> u32; }
+struct S;
+impl Greeter for S { fn greet(&self) -> u32 { 42 } }
+fn main() {
+    let s = S;
+    println!("{} {}", s.greet(), <S as Greeter>::greet(&s));
+}
+"#;
+
+#[test]
+fn run_mode_trait_method_call_executes() {
+    // A call to a trait-declared method names the trait
+    // declaration in its FnDef target, while the item loop
+    // converts the impl method under the impl's own key; the
+    // driver registers the impl body under the trait key too, so
+    // the call executes (Issue #64).
+    let dir = temp_dir("trait-call");
+    let src = fixture(&dir, "trait_call.rs", TRAIT_CALL_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "trait method calls must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42 42\n");
+}
+
+const TRAIT_TWO_TYPES_SRC: &str = r#"
+trait Get { fn get(&self) -> u32; }
+struct Wrap<T>(T);
+impl Get for Wrap<u32> { fn get(&self) -> u32 { self.0 + 1 } }
+impl Get for Wrap<u16> { fn get(&self) -> u32 { self.0 as u32 + 100 } }
+trait Tag { fn tag(&self) -> u32; }
+struct Pair<T>(T, T);
+impl<T> Tag for Pair<T> { fn tag(&self) -> u32 { 7 } }
+fn main() {
+    let a = Wrap(3u32).get();
+    let b = Wrap(4u16).get();
+    let c = Pair(1u32, 2u32).tag();
+    let d = Pair(true, false).tag();
+    println!("{} {} {} {}", a, b, c, d);
+}
+"#;
+
+#[test]
+fn run_mode_trait_method_two_type_arguments() {
+    // The same trait method demanded at two different type
+    // arguments resolves to the right impl body for each: two
+    // concrete impls of one generic struct, and one generic impl
+    // instantiated at two types.
+    let dir = temp_dir("trait-two-types");
+    let src = fixture(&dir, "trait_two_types.rs", TRAIT_TWO_TYPES_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "trait calls at two type arguments must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "4 104 7 7\n");
+}
+
+const TRAIT_DEFAULT_SRC: &str = r#"
+trait D {
+    fn val(&self) -> u32 { 10 }
+    fn extra(&self) -> u32 { self.val() + 1 }
+}
+struct X;
+impl D for X {}
+struct Y;
+impl D for Y { fn val(&self) -> u32 { 20 } }
+fn main() {
+    println!("{} {} {} {}", X.val(), X.extra(), Y.val(), Y.extra());
+}
+"#;
+
+#[test]
+fn run_mode_trait_default_method_body() {
+    // A trait default method keeps its own body: X uses both
+    // defaults, Y overrides `val`, and the default `extra` body
+    // dispatches its inner `self.val()` call to Y's override.
+    let dir = temp_dir("trait-default");
+    let src = fixture(&dir, "trait_default.rs", TRAIT_DEFAULT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "trait default methods must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "10 11 20 21\n");
+}
