@@ -1,11 +1,19 @@
 //! `sparagmos-driver` — the Sparagmos rustc driver.
 //!
 //! Usage:
-//! - `sparagmos-driver <file.rs> [--dump <path>] [--edition <ed>]` —
-//!   convert and print a per-function summary.
-//! - `sparagmos-driver run <file.rs> [--edition <ed>]` — convert and
-//!   execute the program's `main` in the Sparagmos interpreter
-//!   (`sparagmos-interp`), in this process.
+//! - `sparagmos-driver <file.rs> [--dump <path>] [--edition <ed>]`
+//!   `[--rustc-arg <arg>]...` — convert and print a per-function
+//!   summary.
+//! - `sparagmos-driver run <file.rs> [--edition <ed>]`
+//!   `[--rustc-arg <arg>]...` — convert and execute the program's
+//!   `main` in the Sparagmos interpreter (`sparagmos-interp`), in
+//!   this process.
+//!
+//! Each `--rustc-arg` forwards one argument verbatim to the embedded
+//! rustc invocation, appended after this driver's own flags — the
+//! position compiletest gives a test's `//@ compile-flags`, so a
+//! caller measuring the rustc test suite can honour per-test flags
+//! (and per-revision `--cfg`s) without a second invocation path.
 //!
 //! Both modes compile `<file.rs>` as a single crate with the pinned
 //! Rust 1.100.0 toolchain, obtain every local function's MIR through
@@ -419,6 +427,7 @@ fn main() {
     let mut dump_path: Option<String> = None;
     let mut edition = "2021".to_string();
     let mut sysroot: Option<String> = None;
+    let mut rustc_args: Vec<String> = Vec::new();
     let mut i = if run_mode { 2 } else { 1 };
     while i < argv.len() {
         match argv[i].as_str() {
@@ -436,6 +445,13 @@ fn main() {
                     std::process::exit(2);
                 });
             }
+            "--rustc-arg" => {
+                i += 1;
+                rustc_args.push(argv.get(i).cloned().unwrap_or_else(|| {
+                    eprintln!("--rustc-arg needs a value");
+                    std::process::exit(2);
+                }));
+            }
             "--sysroot" => {
                 i += 1;
                 sysroot = Some(argv.get(i).cloned().unwrap_or_else(|| {
@@ -444,7 +460,7 @@ fn main() {
                 }));
             }
             "-h" | "--help" => {
-                println!("usage: sparagmos-driver [run] <file.rs> [--dump <path>] [--edition <ed>] [--sysroot <path>]");
+                println!("usage: sparagmos-driver [run] <file.rs> [--dump <path>] [--edition <ed>] [--sysroot <path>] [--rustc-arg <arg>]...");
                 return;
             }
             other if input.is_none() && !other.starts_with('-') => {
@@ -470,15 +486,27 @@ fn main() {
     // working directory.
     let out_dir = std::env::temp_dir().join(format!("sparagmos-driver-out-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&out_dir);
-    let args: Vec<String> = vec![
+    let mut args: Vec<String> = vec![
         "sparagmos-driver".to_string(),
         input.clone(),
         format!("--edition={edition}"),
-        "--crate-type=lib".to_string(),
         "--emit=metadata".to_string(),
         format!("--out-dir={}", out_dir.display()),
         format!("--sysroot={sysroot}"),
     ];
+    // The crate type is pinned to `lib` unless the caller forwards a
+    // `--crate-type` of its own: `bin` and `proc-macro` cannot be
+    // mixed with other crate types, and under compiletest a test's
+    // own crate type is the only one in the invocation.
+    let caller_sets_crate_type = rustc_args
+        .iter()
+        .any(|a| a == "--crate-type" || a.starts_with("--crate-type="));
+    if !caller_sets_crate_type {
+        args.push("--crate-type=lib".to_string());
+    }
+    // Caller-supplied rustc arguments (a test's `//@ compile-flags`,
+    // per-revision `--cfg`s) go last, as they do under compiletest.
+    args.extend(rustc_args);
     // The compiler runs in-process, under two disciplines:
     // - A panic raised inside Stable MIR conversion (the
     //   `unimplemented!()`s hit by explicit tail calls, async
