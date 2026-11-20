@@ -31,10 +31,8 @@ use std::collections::HashMap;
 use sparagmos_mir as mir;
 
 use crate::error::{InterpError, InterpResult};
-use crate::interp::{eval_binary, Frame, Interpreter, Resolved};
-use crate::ir::{BinOp, Body, FloatTy, IntTy, Operand, Ty, UintTy};
-use std::borrow::Cow;
-
+use crate::interp::{Frame, Interpreter, Resolved};
+use crate::ir::{Body, Operand};
 use crate::value::{FmtArguments, FmtTrait, RefProj, RefTarget, Value};
 
 // ---------------------------------------------------------------------------
@@ -351,26 +349,12 @@ pub enum Builtin {
     /// `std::intrinsics::atomic_store(ptr, value)`: a plain
     /// write through the pointer, as for `atomic_load`.
     AtomicStore,
-    /// A scalar `std::ops` arithmetic trait method (`Add::add`,
-    /// `AddAssign::add_assign`, ...): the operation the
-    /// corresponding `BinaryOp` performs, reached through the
-    /// trait because the caller is generic. `assign` selects the
-    /// `&mut self` form, which writes the result back through the
-    /// receiver reference.
-    ArithTrait { op: ArithOp, assign: bool },
-    /// `Neg::neg(value)` for scalars (and `Wrapping` integers,
-    /// which wrap at the type's minimum instead of panicking).
-    NegNeg,
-    /// `Not::not(value)` for integers and `bool`.
-    NotNot,
     /// `std::mem::zeroed()`: the all-zero-bits value of a scalar
     /// type, or of a tuple/array of scalar types.
     MemZeroed,
     /// `std::ptr::null()` / `std::ptr::null_mut()`: the null
-    /// pointer. As in the JIT model a pointer is a word, so null
-    /// is the word 0; it compares unequal to every real reference
-    /// (a `Value::Ref`), and reading or writing through it fails
-    /// where the access is attempted, as any non-reference does.
+    /// pointer, a dedicated `RefTarget::Null` denoting no place
+    /// and no value.
     PtrNull,
 }
 
@@ -428,39 +412,6 @@ pub enum BitOp {
 pub enum SatOp {
     Add,
     Sub,
-}
-
-/// A scalar arithmetic trait operation (`std::ops`), selected
-/// by the trait method's name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ArithOp {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Rem,
-    BitAnd,
-    BitOr,
-    BitXor,
-    Shl,
-    Shr,
-}
-
-impl ArithOp {
-    fn binop(self) -> BinOp {
-        match self {
-            ArithOp::Add => BinOp::Add,
-            ArithOp::Sub => BinOp::Sub,
-            ArithOp::Mul => BinOp::Mul,
-            ArithOp::Div => BinOp::Div,
-            ArithOp::Rem => BinOp::Rem,
-            ArithOp::BitAnd => BinOp::BitAnd,
-            ArithOp::BitOr => BinOp::BitOr,
-            ArithOp::BitXor => BinOp::BitXor,
-            ArithOp::Shl => BinOp::Shl,
-            ArithOp::Shr => BinOp::Shr,
-        }
-    }
 }
 
 /// Look a canonical callee name up in the registry.
@@ -602,88 +553,6 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         _ if canonical.starts_with("std::sync::Arc") && canonical.ends_with(">::new") => {
             Builtin::ArcNew
         }
-        _ if canonical.ends_with("::Add::add") => Builtin::ArithTrait {
-            op: ArithOp::Add,
-            assign: false,
-        },
-        _ if canonical.ends_with("::Sub::sub") => Builtin::ArithTrait {
-            op: ArithOp::Sub,
-            assign: false,
-        },
-        _ if canonical.ends_with("::Mul::mul") => Builtin::ArithTrait {
-            op: ArithOp::Mul,
-            assign: false,
-        },
-        _ if canonical.ends_with("::Div::div") => Builtin::ArithTrait {
-            op: ArithOp::Div,
-            assign: false,
-        },
-        _ if canonical.ends_with("::Rem::rem") => Builtin::ArithTrait {
-            op: ArithOp::Rem,
-            assign: false,
-        },
-        _ if canonical.ends_with("::BitAnd::bitand") => Builtin::ArithTrait {
-            op: ArithOp::BitAnd,
-            assign: false,
-        },
-        _ if canonical.ends_with("::BitOr::bitor") => Builtin::ArithTrait {
-            op: ArithOp::BitOr,
-            assign: false,
-        },
-        _ if canonical.ends_with("::BitXor::bitxor") => Builtin::ArithTrait {
-            op: ArithOp::BitXor,
-            assign: false,
-        },
-        _ if canonical.ends_with("::Shl::shl") => Builtin::ArithTrait {
-            op: ArithOp::Shl,
-            assign: false,
-        },
-        _ if canonical.ends_with("::Shr::shr") => Builtin::ArithTrait {
-            op: ArithOp::Shr,
-            assign: false,
-        },
-        _ if canonical.ends_with("::AddAssign::add_assign") => Builtin::ArithTrait {
-            op: ArithOp::Add,
-            assign: true,
-        },
-        _ if canonical.ends_with("::SubAssign::sub_assign") => Builtin::ArithTrait {
-            op: ArithOp::Sub,
-            assign: true,
-        },
-        _ if canonical.ends_with("::MulAssign::mul_assign") => Builtin::ArithTrait {
-            op: ArithOp::Mul,
-            assign: true,
-        },
-        _ if canonical.ends_with("::DivAssign::div_assign") => Builtin::ArithTrait {
-            op: ArithOp::Div,
-            assign: true,
-        },
-        _ if canonical.ends_with("::RemAssign::rem_assign") => Builtin::ArithTrait {
-            op: ArithOp::Rem,
-            assign: true,
-        },
-        _ if canonical.ends_with("::BitAndAssign::bitand_assign") => Builtin::ArithTrait {
-            op: ArithOp::BitAnd,
-            assign: true,
-        },
-        _ if canonical.ends_with("::BitOrAssign::bitor_assign") => Builtin::ArithTrait {
-            op: ArithOp::BitOr,
-            assign: true,
-        },
-        _ if canonical.ends_with("::BitXorAssign::bitxor_assign") => Builtin::ArithTrait {
-            op: ArithOp::BitXor,
-            assign: true,
-        },
-        _ if canonical.ends_with("::ShlAssign::shl_assign") => Builtin::ArithTrait {
-            op: ArithOp::Shl,
-            assign: true,
-        },
-        _ if canonical.ends_with("::ShrAssign::shr_assign") => Builtin::ArithTrait {
-            op: ArithOp::Shr,
-            assign: true,
-        },
-        _ if canonical.ends_with("::Neg::neg") => Builtin::NegNeg,
-        _ if canonical.ends_with("::Not::not") => Builtin::NotNot,
         _ => return float_method(canonical),
     })
 }
@@ -1812,153 +1681,6 @@ impl<'a> Interpreter<'a> {
                 self.write_resolved(frames, &target, value)?;
                 Ok(Value::Unit)
             }
-            Builtin::ArithTrait { op, assign } => {
-                arity(2)?;
-                let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
-                // `Wrapping<T>` arithmetic wraps at the type's
-                // width instead of panicking on overflow; every
-                // other scalar impl is the plain operation.
-                let (tag, wrapping) = match self_ty
-                    .strip_prefix("std::num::Wrapping<")
-                    .and_then(|rest| rest.strip_suffix('>'))
-                {
-                    Some(inner) => (inner, true),
-                    None => (self_ty, false),
-                };
-                let ty = ir_ty_for_tag(tag).ok_or_else(|| {
-                    unsupported(format!(
-                        "arithmetic trait method for {self_ty} is not runtime-supported"
-                    ))
-                })?;
-                // The operation is defined on the Self type's bit
-                // patterns. Constants in this value model carry
-                // their own signedness flavour, so re-flavour the
-                // operands to the Self type first; for
-                // `Wrapping<T>` the operand is the aggregate's one
-                // field and the result is re-wrapped.
-                let finish = |result: Value| -> Value {
-                    if wrapping {
-                        Value::Enum {
-                            variant: 0,
-                            fields: vec![result],
-                        }
-                    } else {
-                        result
-                    }
-                };
-                if assign {
-                    let current = self.resolve_value(frames, &vals[0])?;
-                    let current = trait_operand(&current, tag, wrapping);
-                    let rhs = trait_operand(&vals[1], tag, wrapping);
-                    let (result, _) =
-                        eval_binary(op.binop(), &current, &rhs, Some(&ty), wrapping)?;
-                    let target = self.deref_value(frames, &vals[0])?;
-                    self.write_resolved(frames, &target, finish(result))?;
-                    Ok(Value::Unit)
-                } else {
-                    let lhs = trait_operand(&vals[0], tag, wrapping);
-                    let rhs = trait_operand(&vals[1], tag, wrapping);
-                    let (result, _) =
-                        eval_binary(op.binop(), &lhs, &rhs, Some(&ty), wrapping)?;
-                    Ok(finish(result))
-                }
-            }
-            Builtin::NegNeg => {
-                arity(1)?;
-                let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
-                let (tag, wrapping) = match self_ty
-                    .strip_prefix("std::num::Wrapping<")
-                    .and_then(|rest| rest.strip_suffix('>'))
-                {
-                    Some(inner) => (inner, true),
-                    None => (self_ty, false),
-                };
-                let raw = vals.into_iter().next().expect("arity checked");
-                let raw = if wrapping {
-                    unwrap_one_field(&raw).into_owned()
-                } else {
-                    raw
-                };
-                if matches!(raw, Value::Int(_) | Value::Uint(_)) {
-                    let (bits, signed) = int_tag(tag).ok_or_else(|| {
-                        unsupported(format!("Neg for {self_ty} is not runtime-supported"))
-                    })?;
-                    let pattern = as_u128(&raw, name)? & bit_mask(bits);
-                    // Negating the type's minimum overflows, exactly
-                    // like the plain unary `-`.
-                    if !wrapping && signed && pattern == (1u128 << (bits - 1)) {
-                        return Err(InterpError::panic("attempt to negate with overflow"));
-                    }
-                    let negated = 0u128.wrapping_sub(pattern) & bit_mask(bits);
-                    let value = if signed {
-                        Value::Int(sign_extend(negated, bits))
-                    } else {
-                        Value::Uint(negated)
-                    };
-                    return Ok(if wrapping {
-                        Value::Enum {
-                            variant: 0,
-                            fields: vec![value],
-                        }
-                    } else {
-                        value
-                    });
-                }
-                match raw {
-                    Value::Float(x) => Ok(Value::Float(-x)),
-                    other => Err(InterpError::type_mismatch(
-                        format!("builtin {name}"),
-                        "number",
-                        other.kind_name(),
-                    )),
-                }
-            }
-            Builtin::NotNot => {
-                arity(1)?;
-                let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
-                let (tag, wrapping) = match self_ty
-                    .strip_prefix("std::num::Wrapping<")
-                    .and_then(|rest| rest.strip_suffix('>'))
-                {
-                    Some(inner) => (inner, true),
-                    None => (self_ty, false),
-                };
-                let raw = vals.into_iter().next().expect("arity checked");
-                let raw = if wrapping {
-                    unwrap_one_field(&raw).into_owned()
-                } else {
-                    raw
-                };
-                let result = match raw {
-                    Value::Bool(b) => Value::Bool(!b),
-                    Value::Int(_) | Value::Uint(_) => {
-                        let (bits, signed) = int_tag(tag).ok_or_else(|| {
-                            unsupported(format!("Not for {self_ty} is not runtime-supported"))
-                        })?;
-                        let flipped = !as_u128(&raw, name)? & bit_mask(bits);
-                        if signed {
-                            Value::Int(sign_extend(flipped, bits))
-                        } else {
-                            Value::Uint(flipped)
-                        }
-                    }
-                    other => {
-                        return Err(InterpError::type_mismatch(
-                            format!("builtin {name}"),
-                            "integer or bool",
-                            other.kind_name(),
-                        ))
-                    }
-                };
-                Ok(if wrapping {
-                    Value::Enum {
-                        variant: 0,
-                        fields: vec![result],
-                    }
-                } else {
-                    result
-                })
-            }
             Builtin::FloatMethod { f32, op } => exec_float_method(name, f32, op, &vals),
         }
     }
@@ -2477,31 +2199,6 @@ fn int_tag(tag: &str) -> Option<(u32, bool)> {
     })
 }
 
-/// The interpreter IR type of a primitive type tag, for the
-/// width-sensitive operations (`eval_binary` reads the operand
-/// width from the destination type).
-fn ir_ty_for_tag(tag: &str) -> Option<Ty> {
-    Some(match tag {
-        "bool" => Ty::Bool,
-        "char" => Ty::Uint(UintTy::U32), // char rides as its code point
-        "i8" => Ty::Int(IntTy::I8),
-        "i16" => Ty::Int(IntTy::I16),
-        "i32" => Ty::Int(IntTy::I32),
-        "i64" => Ty::Int(IntTy::I64),
-        "i128" => Ty::Int(IntTy::I128),
-        "isize" => Ty::Int(IntTy::Isize),
-        "u8" => Ty::Uint(UintTy::U8),
-        "u16" => Ty::Uint(UintTy::U16),
-        "u32" => Ty::Uint(UintTy::U32),
-        "u64" => Ty::Uint(UintTy::U64),
-        "u128" => Ty::Uint(UintTy::U128),
-        "usize" => Ty::Uint(UintTy::Usize),
-        "f32" => Ty::Float(FloatTy::F32),
-        "f64" => Ty::Float(FloatTy::F64),
-        _ => return None,
-    })
-}
-
 /// A mask of the low `bits` bits.
 fn bit_mask(bits: u32) -> u128 {
     if bits >= 128 {
@@ -2581,51 +2278,6 @@ fn zeroed_value_for_tag(tag: &str) -> Option<Value> {
     })
 }
 
-/// The one field of a one-field aggregate (a newtype wrapper
-/// such as `Wrapping<T>`), or the value itself when it is not
-/// such an aggregate.
-fn unwrap_one_field(v: &Value) -> Cow<'_, Value> {
-    match v {
-        Value::Enum { fields, .. } if fields.len() == 1 => Cow::Borrowed(&fields[0]),
-        Value::Tuple(fields) if fields.len() == 1 => Cow::Borrowed(&fields[0]),
-        _ => Cow::Borrowed(v),
-    }
-}
-
-/// One operand of an arithmetic trait method: for
-/// `Wrapping<T>` the aggregate's one field, re-flavoured to the
-/// Self type (see `normalise_int_for_tag`).
-fn trait_operand<'a>(v: &'a Value, tag: &str, wrapping: bool) -> Cow<'a, Value> {
-    let inner = if wrapping {
-        unwrap_one_field(v)
-    } else {
-        Cow::Borrowed(v)
-    };
-    match normalise_int_for_tag(&inner, tag) {
-        Some(n) => Cow::Owned(n),
-        None => inner,
-    }
-}
-
-/// Re-flavour an integer value to the signedness and width of
-/// the type named by `tag`, preserving its bit pattern. Returns
-/// `None` for non-integer values and unknown tags. The value
-/// model's constants carry their own signedness, so a callee
-/// whose semantics are defined by its Self type uses this to
-/// see the operand exactly as that type denotes it.
-fn normalise_int_for_tag(v: &Value, tag: &str) -> Option<Value> {
-    let (bits, signed) = int_tag(tag)?;
-    let pattern = match v {
-        Value::Int(i) => (*i as u128) & bit_mask(bits),
-        Value::Uint(u) => *u & bit_mask(bits),
-        _ => return None,
-    };
-    Some(if signed {
-        Value::Int(sign_extend(pattern, bits))
-    } else {
-        Value::Uint(pattern)
-    })
-}
 
 fn default_value_for_tag(tag: &str) -> Option<Value> {
     let tag = tag.trim();

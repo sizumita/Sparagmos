@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use sparagmos_interp::builtins::{canonical_name, lookup, ArithOp, BitOp, Builtin, RelOp, SatOp};
+use sparagmos_interp::builtins::{canonical_name, lookup, BitOp, Builtin, RelOp, SatOp};
 use sparagmos_interp::mir_convert::{interpret_mir, MirProgram};
 use sparagmos_interp::{InterpError, MirRunError, Value};
 use sparagmos_mir as mir;
@@ -1329,19 +1329,12 @@ const SAT_ADD: mir::DefId = mir::DefId::new(0, 308);
 const SAT_SUB: mir::DefId = mir::DefId::new(0, 309);
 const ATOMIC_LOAD: mir::DefId = mir::DefId::new(0, 310);
 const ATOMIC_STORE: mir::DefId = mir::DefId::new(0, 311);
-const ADD_TRAIT: mir::DefId = mir::DefId::new(0, 312);
-const MUL_TRAIT: mir::DefId = mir::DefId::new(0, 313);
-const ADD_ASSIGN: mir::DefId = mir::DefId::new(0, 314);
-const BITOR_TRAIT: mir::DefId = mir::DefId::new(0, 315);
-const NEG_TRAIT: mir::DefId = mir::DefId::new(0, 316);
-const NOT_TRAIT: mir::DefId = mir::DefId::new(0, 317);
 const RC_TY: mir::DefId = mir::DefId::new(0, 318);
 const RC_NEW: mir::DefId = mir::DefId::new(0, 319);
 const ARC_TY: mir::DefId = mir::DefId::new(0, 320);
 const ARC_NEW: mir::DefId = mir::DefId::new(0, 321);
 const MEM_ZEROED: mir::DefId = mir::DefId::new(0, 322);
 const PTR_NULL: mir::DefId = mir::DefId::new(0, 323);
-const WRAPPING_TY: mir::DefId = mir::DefId::new(0, 324);
 
 fn names_bi() -> HashMap<mir::DefId, String> {
     let mut names = std_names();
@@ -1357,19 +1350,12 @@ fn names_bi() -> HashMap<mir::DefId, String> {
         (SAT_SUB, "std::intrinsics::saturating_sub".to_string()),
         (ATOMIC_LOAD, "std::intrinsics::atomic_load".to_string()),
         (ATOMIC_STORE, "std::intrinsics::atomic_store".to_string()),
-        (ADD_TRAIT, "std::ops::Add::add".to_string()),
-        (MUL_TRAIT, "std::ops::Mul::mul".to_string()),
-        (ADD_ASSIGN, "std::ops::AddAssign::add_assign".to_string()),
-        (BITOR_TRAIT, "std::ops::BitOr::bitor".to_string()),
-        (NEG_TRAIT, "std::ops::Neg::neg".to_string()),
-        (NOT_TRAIT, "std::ops::Not::not".to_string()),
         (RC_TY, "std::rc::Rc".to_string()),
         (RC_NEW, "std::rc::Rc::<T>::new".to_string()),
         (ARC_TY, "std::sync::Arc".to_string()),
         (ARC_NEW, "std::sync::Arc::<T>::new".to_string()),
         (MEM_ZEROED, "std::mem::zeroed".to_string()),
         (PTR_NULL, "std::ptr::null".to_string()),
-        (WRAPPING_TY, "std::num::Wrapping".to_string()),
     ]);
     names
 }
@@ -1450,28 +1436,6 @@ fn registry_round2_covers_the_new_callees() {
         ("std::ptr::null_mut", Builtin::PtrNull),
         ("std::rc::Rc::<T>::new", Builtin::RcNew),
         ("std::sync::Arc::<T>::new", Builtin::ArcNew),
-        ("std::ops::Add::add", Builtin::ArithTrait { op: ArithOp::Add, assign: false }),
-        ("std::ops::Sub::sub", Builtin::ArithTrait { op: ArithOp::Sub, assign: false }),
-        ("std::ops::Mul::mul", Builtin::ArithTrait { op: ArithOp::Mul, assign: false }),
-        ("std::ops::Div::div", Builtin::ArithTrait { op: ArithOp::Div, assign: false }),
-        ("std::ops::Rem::rem", Builtin::ArithTrait { op: ArithOp::Rem, assign: false }),
-        ("std::ops::BitAnd::bitand", Builtin::ArithTrait { op: ArithOp::BitAnd, assign: false }),
-        ("std::ops::BitOr::bitor", Builtin::ArithTrait { op: ArithOp::BitOr, assign: false }),
-        ("std::ops::BitXor::bitxor", Builtin::ArithTrait { op: ArithOp::BitXor, assign: false }),
-        ("std::ops::Shl::shl", Builtin::ArithTrait { op: ArithOp::Shl, assign: false }),
-        ("std::ops::Shr::shr", Builtin::ArithTrait { op: ArithOp::Shr, assign: false }),
-        ("std::ops::AddAssign::add_assign", Builtin::ArithTrait { op: ArithOp::Add, assign: true }),
-        ("std::ops::SubAssign::sub_assign", Builtin::ArithTrait { op: ArithOp::Sub, assign: true }),
-        ("std::ops::MulAssign::mul_assign", Builtin::ArithTrait { op: ArithOp::Mul, assign: true }),
-        ("std::ops::DivAssign::div_assign", Builtin::ArithTrait { op: ArithOp::Div, assign: true }),
-        ("std::ops::RemAssign::rem_assign", Builtin::ArithTrait { op: ArithOp::Rem, assign: true }),
-        ("std::ops::BitAndAssign::bitand_assign", Builtin::ArithTrait { op: ArithOp::BitAnd, assign: true }),
-        ("std::ops::BitOrAssign::bitor_assign", Builtin::ArithTrait { op: ArithOp::BitOr, assign: true }),
-        ("std::ops::BitXorAssign::bitxor_assign", Builtin::ArithTrait { op: ArithOp::BitXor, assign: true }),
-        ("std::ops::ShlAssign::shl_assign", Builtin::ArithTrait { op: ArithOp::Shl, assign: true }),
-        ("std::ops::ShrAssign::shr_assign", Builtin::ArithTrait { op: ArithOp::Shr, assign: true }),
-        ("std::ops::Neg::neg", Builtin::NegNeg),
-        ("std::ops::Not::not", Builtin::NotNot),
     ];
     for (name, expected) in cases {
         assert_eq!(
@@ -1484,8 +1448,17 @@ fn registry_round2_covers_the_new_callees() {
     // write through the returned raw pointer, which the value
     // model cannot serve), closure-taking callees (a builtin
     // cannot invoke a guest closure), contract thunks, channels
-    // and thread-locals.
+    // and thread-locals. The `std::ops` arithmetic traits are
+    // likewise not registered: their core default bodies are
+    // collected and executed as ordinary functions (which also
+    // covers reference and `Wrapping` Self types), and a
+    // name-only builtin would shadow custom impls.
     for name in [
+        "std::ops::Add::add",
+        "std::ops::Mul::mul",
+        "std::ops::AddAssign::add_assign",
+        "std::ops::Neg::neg",
+        "std::ops::Not::not",
         "std::alloc::Global::alloc_impl_runtime",
         "std::intrinsics::contract_check_requires",
         "std::iter::Iterator::map",
@@ -1635,111 +1608,6 @@ fn atomic_store_writes_through_and_load_reads_back() {
     );
     let value = interpret_mir(&program_bi(body), "main", vec![]).expect("run");
     assert_eq!(value, Value::Int(41));
-}
-
-#[test]
-fn ops_trait_methods_compute_like_the_binary_ops() {
-    // Add::add::<i32>(40, 2) == 42
-    let prog = binary_call(ADD_TRAIT, i32_ty(), const_i32(40), const_i32(2), i32_ty());
-    assert_eq!(interpret_mir(&prog, "main", vec![]).expect("run"), Value::Int(42));
-    // Mul::mul::<u32>(6, 7) == 42
-    let prog = binary_call(MUL_TRAIT, u32_ty(), const_int(6, 4), const_int(7, 4), u32_ty());
-    assert_eq!(interpret_mir(&prog, "main", vec![]).expect("run"), Value::Uint(42));
-    // BitOr::bitor::<u32>(0b1010, 0b0101) == 0b1111
-    let prog = binary_call(BITOR_TRAIT, u32_ty(), const_int(0b1010, 4), const_int(0b0101, 4), u32_ty());
-    assert_eq!(interpret_mir(&prog, "main", vec![]).expect("run"), Value::Uint(0b1111));
-}
-
-#[test]
-fn ops_trait_add_overflow_panics_like_the_binary_op() {
-    // Add::add::<i32>(i32::MAX, 1) panics, with the same message
-    // the plain `+` operator produces in this interpreter.
-    let prog = binary_call(ADD_TRAIT, i32_ty(), const_i32(i32::MAX), const_i32(1), i32_ty());
-    let message = expect_panic(interpret_mir(&prog, "main", vec![]));
-    assert_eq!(message, "arithmetic overflow in Add");
-}
-
-#[test]
-fn ops_trait_add_assign_writes_back_through_the_reference() {
-    // fn main() -> i32 { let mut x = 10; AddAssign::add_assign(&mut x, 5); return x; }
-    let body = mir::Body::new(
-        decls(&[i32_ty(), i32_ty(), ref_ty(i32_ty(), true), mir::Ty::unit()]),
-        0,
-        vec![
-            block(
-                vec![
-                    assign(place(1), mir::Rvalue::Use(const_i32(10))),
-                    assign(place(2), ref_rvalue(1, true)),
-                ],
-                call(
-                    fndef(ADD_ASSIGN, vec![i32_ty()]),
-                    vec![move_(2), const_i32(5)],
-                    3,
-                    1,
-                ),
-            ),
-            block(
-                vec![assign(place(0), mir::Rvalue::Use(copy(1)))],
-                ret(),
-            ),
-        ],
-    );
-    let value = interpret_mir(&program_bi(body), "main", vec![]).expect("run");
-    assert_eq!(value, Value::Int(15));
-}
-
-#[test]
-fn ops_trait_wrapping_add_wraps_instead_of_panicking() {
-    // <Wrapping<i32> as Add>::add(Wrapping(i32::MAX), Wrapping(1))
-    // == Wrapping(i32::MIN): the wrapper value is the aggregate,
-    // and the operation wraps at the inner type's width.
-    let wrapping_i32 = mir::Ty::Adt(WRAPPING_TY, vec![i32_ty()]);
-    let prog = binary_call(
-        ADD_TRAIT,
-        wrapping_i32.clone(),
-        mir::Operand::constant(mir::Constant::from_value(mir::ConstValue::Adt {
-            variant: 0,
-            fields: vec![mir::ConstValue::Scalar(mir::Scalar::Int {
-                data: i32::MAX as u32 as u128,
-                size: 4,
-            })],
-        })),
-        mir::Operand::constant(mir::Constant::from_value(mir::ConstValue::Adt {
-            variant: 0,
-            fields: vec![mir::ConstValue::Scalar(mir::Scalar::Int { data: 1, size: 4 })],
-        })),
-        wrapping_i32.clone(),
-    );
-    let value = interpret_mir(&prog, "main", vec![]).expect("run");
-    assert_eq!(
-        value,
-        Value::Enum {
-            variant: 0,
-            fields: vec![Value::Int(i32::MIN as i128)],
-        }
-    );
-}
-
-#[test]
-fn ops_trait_neg_and_not() {
-    // Neg::neg::<i32>(5) == -5
-    let prog = unary_call(NEG_TRAIT, i32_ty(), const_i32(5), i32_ty());
-    assert_eq!(interpret_mir(&prog, "main", vec![]).expect("run"), Value::Int(-5));
-    // Neg::neg::<i32>(i32::MIN) panics like the native unary `-`.
-    let prog = unary_call(NEG_TRAIT, i32_ty(), const_i32(i32::MIN), i32_ty());
-    let message = expect_panic(interpret_mir(&prog, "main", vec![]));
-    assert_eq!(message, "attempt to negate with overflow");
-    // Not::not::<u8>(0x0F) == 0xF0
-    let prog = unary_call(NOT_TRAIT, u8_ty(), const_int(0x0F, 1), u8_ty());
-    assert_eq!(interpret_mir(&prog, "main", vec![]).expect("run"), Value::Uint(0xF0));
-    // Not::not::<bool>(true) == false
-    let prog = unary_call(
-        NOT_TRAIT,
-        bool_ty(),
-        mir::Operand::constant(mir::Constant::from_value(mir::ConstValue::Bool(true))),
-        bool_ty(),
-    );
-    assert_eq!(interpret_mir(&prog, "main", vec![]).expect("run"), Value::Bool(false));
 }
 
 #[test]

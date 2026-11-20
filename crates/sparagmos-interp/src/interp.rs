@@ -1909,7 +1909,7 @@ fn unsigned_bits(dest_ty: Option<&Ty>) -> u32 {
 /// Returns `(result, overflowed)`. In non-checked mode an overflow (or a
 /// division by zero / invalid shift) is a guest panic instead of a flag.
 /// Comparison and bitwise-on-bool operations never overflow.
-pub(crate) fn eval_binary(
+fn eval_binary(
     op: BinOp,
     lhs: &Value,
     rhs: &Value,
