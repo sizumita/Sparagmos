@@ -1682,6 +1682,85 @@ fn box_deref_transmute_builtin_box_of_struct() {
     assert_eq!(v, Value::Int(7));
 }
 
+fn usize_ty() -> mir::Ty {
+    mir::Ty::Uint(mir::UintTy::Usize)
+}
+
+/// `addr_of` helper body: locals _0 usize ret, _1 i32, _2 i32,
+/// _3 &i32, _4 usize; returns the transmute of a reference to
+/// local `which` (1 or 2).
+fn addr_of_body(which: u32) -> mir::Body {
+    let ref_i32 = mir::Ty::Ref(mir::Region::Erased, Box::new(i32_ty()), mir::Mutability::Not);
+    mir::Body::new(
+        decls(&[usize_ty(), i32_ty(), i32_ty(), ref_i32, usize_ty()]),
+        0,
+        vec![block(
+            vec![
+                assign(place(1), mir::Rvalue::Use(const_i32(5))),
+                assign(place(2), mir::Rvalue::Use(const_i32(7))),
+                assign(
+                    place(3),
+                    mir::Rvalue::Ref(mir::Region::Erased, mir::BorrowKind::Shared, place(which)),
+                ),
+                assign(
+                    place(4),
+                    mir::Rvalue::Cast(mir::CastKind::Transmute, copy(3), usize_ty()),
+                ),
+                assign(place(0), mir::Rvalue::Use(copy(4))),
+            ],
+            ret(),
+        )],
+    )
+}
+
+#[test]
+fn transmute_pointer_to_usize_is_aligned_stable_and_distinct() {
+    // The alignment precondition checks rustc emits around raw
+    // pointer dereferences transmute the pointer to usize and
+    // test `addr & (align - 1) == 0`; the synthetic address must
+    // be aligned, stable per target, and distinct per place.
+    let mut prog = MirProgram::new();
+    prog.add("addr1", addr_of_body(1));
+    let a1 = interpret_mir(&prog, "addr1", vec![]).expect("addr1 must run");
+    let mut prog = MirProgram::new();
+    prog.add("addr2", addr_of_body(2));
+    let a2 = interpret_mir(&prog, "addr2", vec![]).expect("addr2 must run");
+    let (Value::Uint(a1), Value::Uint(a2)) = (a1, a2) else {
+        panic!("expected usize results");
+    };
+    assert_ne!(a1, 0, "a place address is never null");
+    assert_eq!(a1 % 4096, 0, "address must satisfy alignment checks");
+    assert_eq!(a2 % 4096, 0, "address must satisfy alignment checks");
+    assert_ne!(a1, a2, "distinct places get distinct addresses");
+}
+
+#[test]
+fn transmute_non_pointer_stays_unsupported() {
+    // Only the pointer-to-integer transmute is modelled; an
+    // integer-to-integer transmute keeps failing explicitly.
+    let body = mir::Body::new(
+        decls(&[i32_ty()]),
+        0,
+        vec![block(
+            vec![assign(
+                place(0),
+                mir::Rvalue::Cast(mir::CastKind::Transmute, const_i32(7), i32_ty()),
+            )],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("bad_transmute", body);
+    let err = interpret_mir(&prog, "bad_transmute", vec![])
+        .expect_err("non-pointer transmute must stay unsupported");
+    assert!(
+        matches!(
+            err,
+            MirRunError::Interp(InterpError::UnsupportedRvalue { .. })
+        ),
+        "expected UnsupportedRvalue, got {err}"
+    );
+}
 
 #[test]
 fn closure_aggregate_fails_at_execution_not_silently() {
