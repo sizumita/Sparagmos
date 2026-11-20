@@ -1389,6 +1389,69 @@ dump が得られても変換済み関数が 0 件だったものが 157 件あ�
 
 ---
 
+### RefCell モデル (Lane CC, 2026-11-21)
+
+`std::cell::RefCell` の借用フラグ規律をインタプリタにモデル化した。
+これまで `RefCell::new` は変換できたが `borrow` / `borrow_mut` は
+本体の MIR に `Operand::RuntimeChecks(UbChecks)` を含むため
+「no converted body」で落ちていた (both8 時点のセンサスで
+borrow 8 件・borrow_mut 5 件が主ブロッカー)。
+
+設計:
+
+- 自然な値形状をそのまま使う: `RefCell{ field0 = Cell{UnsafeCell{isize フラグ}}, field1 = UnsafeCell{T} }`。
+  フラグ経路は [F0,F0,F0]、値経路は [F1,F0]。フラグは 0 = 未使用、
+  -1 = 書き込み中、正数 n = 共有借用 n 件。`RefCell::new` の
+  ビルトインがこの形状を構築するので、RefCell のフィールドを
+  射影する収集済み本体とも共存する。
+- ビルトイン: `new` / `borrow` / `borrow_mut` / `try_borrow` /
+  `try_borrow_mut` / `get_mut` / `replace` / `as_ptr`。
+  ガード値 (`Ref` / `RefMut`) は [値への参照, フラグセルへの参照]
+  の2フィールド集約で、`Deref` / `DerefMut` ビルトインに
+  `std::cell::Ref` / `RefMut` のアームを追加し第0フィールドを返す。
+- 競合時のパニック文言は Rust 1.100.0 で実測したものを使う:
+  借用中の `borrow_mut` → `RefCell already borrowed`、
+  書き込み中の `borrow` → `RefCell already mutably borrowed`、
+  書き込み中の `borrow_mut` → `RefCell already borrowed`。
+- Drop 連携: 新しい `DropPlan::RefCellRelease { mutable }` を
+  `std::cell::Ref` / `RefMut` の glue として生成し、ガードの
+  Drop でフラグを解放する (共有は減算、可変は 0 にリセット)。
+  `RefCell` 自体の glue は値経路 [F1,F0] へ包んだ値の glue を
+  適用する。`try_borrow` の結果を落とせるよう、`Result` の
+  Variants プラン (Ok 側は包んだ値のプラン、Err 側は Trivial) と
+  `BorrowError` / `BorrowMutError` のフィールドプランも追加した。
+
+Drop 連携の検証結果 (意味テスト16件 + ドライバ e2e 4件で確認):
+
+- スコープ終端の Drop で解放され、後続の `borrow_mut` が成功する。
+- `std::mem::drop(guard)` でも解放される。
+- ガードを消費した呼び出し先関数のフレーム終端 Drop が、
+  呼び出し元のセルの借用を解放する (フレームまたぎ)。
+- `RefCell<D>` の Drop で D のデストラクタが値経路を通して走る。
+- `Result<Ref>` の Drop (try_borrow の Err/Ok 両方) が含まれ
+  るガードを解放する。
+
+実測効果: both11 の結果 JSON で RefCell に言及する12件
+(うち11件は borrow / borrow_mut が記録上の主ブロッカー) を
+本レーンのドライバで再測定したところ、2件が pass に転じ
+(issue-23338-params-outlive-temps-of-body、
+refcell-borrow-comparison-12033)、9件は RefCell のブロッカーを
+越えて無関係な後段のブロッカー (Iterator::for_each、別クレート
+需要、Drop ターミネータの形状、Index ビルトイン、値等価性、
+Vec::drain 等) へ前進した。issue-63787 は符号文脈を失った
+定数由来のフラグ (Uint) を許容する修正でフラグ読み取りを
+越えたが、-O 形状の別の代入不一致で依然 unsupported。
+検証数 (本レーンのベース bcce754 上): ワークスペース
+398 passed / 0 failed、ドライバ 55 passed / 0 failed、
+コーパス 47/47。
+
+明示的に未対応のまま (名前付きエラーで落とす):
+`Ref::map` / `RefMut::map` / `Ref::clone`、および定数集約として
+のみ存在する RefCell の借用 (ライブな場所が無くフラグの
+置き場が無いため)。
+
+---
+
 ## 測定の規律
 
 - 測定は fleur 上で、ツールチェーンとコマンドを併記して記録する。
