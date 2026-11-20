@@ -159,7 +159,7 @@ never 型 `!`、inline asm) を書き、fleur 上で
    仮数えせず、JIT 完了まで未実装として扱う。厳しい側に倒す)。
 
 指標1の率 = 実装済みバリアント数 / 40 × 100 (小数第1位まで)。
-現在の値: **52.5% (実装済み 21/40)** (2026-11-21 実測。バリアント別の内訳は次のマトリクス)。
+現在の値: **57.5% (実装済み 23/40)** (2026-11-21 実測。バリアント別の内訳は次のマトリクス)。
 
 
 ### バリアント別マトリクス (2026-11-21 実測)
@@ -186,7 +186,7 @@ never 型 `!`、inline asm) を書き、fleur 上で
 - interp 内部 IR だけを対象とするテストと、ハーネスのコーパス実行は、
   sparagmos-mir のバリアントを直接構築しないため数えていない。
 
-結果: **実装済み 21/40 = 52.5%**、部分的 5 (すべて interp のみ)、
+結果: **実装済み 23/40 = 57.5%**、部分的 3 (すべて interp のみ)、
 未対応 14。
 
 **StatementKind (12)**
@@ -234,9 +234,9 @@ never 型 `!`、inline asm) を書き、fleur 上で
 |---|---|---|---|---|
 | Use | ○ | ○ 29件 (mir_convert_tests::checked_add_matches_rustc_shape 他) | ○ 10件 (mir_jit::checked_add_ok_and_overflow_panic 他) | 実装済み |
 | Repeat | △ 条件付き | ○ mir_convert_tests::tuple_and_array_aggregates_and_repeat | × | 部分的 |
-| Ref | ○ | ○ 4件 (mir_convert_tests::copy_for_deref_reads_through_reference_and_plain_place 他) | × | 部分的 |
+| Ref | ○ | ○ 4件 (mir_convert_tests::copy_for_deref_reads_through_reference_and_plain_place 他) | ○ 6件 (mir_jit::mut_ref_read_modify_write_reaches_the_place 他) | 実装済み |
 | ThreadLocalRef | ○ | × | × | 未対応 |
-| RawPtr | ○ | ○ mir_convert_tests::raw_ptr_creation_reads_and_writes_through | × | 部分的 |
+| RawPtr | ○ | ○ mir_convert_tests::raw_ptr_creation_reads_and_writes_through | ○ mir_jit::raw_ptr_creation_reads_and_writes_through 他 | 実装済み |
 | Cast | △ 条件付き | ○ 3件 (mir_convert_tests::int_to_int_cast_widens_and_truncates 他) | ○ 2件 (mir_jit::casts_and_guarded_division 他) | 実装済み |
 | BinaryOp | ○ | ○ 23件 (mir_convert_tests::if_else_max 他) | ○ 11件 (mir_jit::casts_and_guarded_division 他) | 実装済み |
 | UnaryOp | ○ | ○ mir_jit::negation | ○ mir_jit::negation | 実装済み |
