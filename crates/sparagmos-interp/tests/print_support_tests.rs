@@ -924,3 +924,134 @@ fn fmt_long_literal_piece() {
     let steps = print_chain(1, 2, 3, 4, 5, &[], template);
     assert_eq!(run_steps(tys, steps), literal);
 }
+
+// ----- floats and array Debug (Lane S) ---------------------------------------
+
+fn f64_ir_ty() -> Ty {
+    Ty::Float(sparagmos_interp::ir::FloatTy::F64)
+}
+
+fn f32_ir_ty() -> Ty {
+    Ty::Float(sparagmos_interp::ir::FloatTy::F32)
+}
+
+#[test]
+fn fmt_display_f64() {
+    let out = print_one(
+        f64_ir_ty(),
+        Rvalue::Use(Operand::Constant(Constant::Float(3.5))),
+        "core::fmt::rt::Argument::new_display",
+        "f64",
+        vec![192, 0],
+    );
+    assert_eq!(out, "3.5");
+}
+
+#[test]
+fn fmt_display_f32_narrows_before_formatting() {
+    // The stored value is the exact f64 widening of 0.1f32; Display
+    // must render the f32 value ("0.1"), not the widened digits.
+    let out = print_one(
+        f32_ir_ty(),
+        Rvalue::Use(Operand::Constant(Constant::Float(0.1f32 as f64))),
+        "core::fmt::rt::Argument::new_display",
+        "f32",
+        vec![192, 0],
+    );
+    assert_eq!(out, "0.1");
+}
+
+#[test]
+fn fmt_debug_f64_keeps_point_zero() {
+    let out = print_one(
+        f64_ir_ty(),
+        Rvalue::Use(Operand::Constant(Constant::Float(2.0))),
+        "core::fmt::rt::Argument::new_debug",
+        "f64",
+        vec![192, 0],
+    );
+    assert_eq!(out, "2.0");
+}
+
+#[test]
+fn fmt_float_precision() {
+    // "{:.2}" of 3.14159: precision field only.
+    let out = print_one(
+        f64_ir_ty(),
+        Rvalue::Use(Operand::Constant(Constant::Float(3.14159))),
+        "core::fmt::rt::Argument::new_display",
+        "f64",
+        vec![0xC4, 2, 0, 0],
+    );
+    assert_eq!(out, "3.14");
+}
+
+#[test]
+fn fmt_float_zero_pad_and_width() {
+    // "{:08.2}" of 3.14159: flags + width + precision fields.
+    let flags: u32 = 0x20 | (3 << 29) | (1 << 24);
+    let mut template = vec![0xC7u8];
+    template.extend_from_slice(&flags.to_le_bytes());
+    template.extend_from_slice(&8u16.to_le_bytes());
+    template.extend_from_slice(&2u16.to_le_bytes());
+    template.push(0);
+    let out = print_one(
+        f64_ir_ty(),
+        Rvalue::Use(Operand::Constant(Constant::Float(3.14159))),
+        "core::fmt::rt::Argument::new_display",
+        "f64",
+        template,
+    );
+    assert_eq!(out, "00003.14");
+}
+
+#[test]
+fn fmt_float_lower_exp() {
+    let out = print_one(
+        f64_ir_ty(),
+        Rvalue::Use(Operand::Constant(Constant::Float(314.159))),
+        "core::fmt::rt::Argument::new_lower_exp",
+        "f64",
+        vec![192, 0],
+    );
+    assert_eq!(out, "3.14159e2");
+}
+
+#[test]
+fn fmt_debug_array_uses_brackets() {
+    let out = print_one(
+        Ty::Array(Box::new(Ty::i32()), 4),
+        Rvalue::AggregateTuple(vec![
+            Operand::const_int(1),
+            Operand::const_int(3),
+            Operand::const_int(4),
+            Operand::const_int(5),
+        ]),
+        "core::fmt::rt::Argument::new_debug",
+        "[i32; 4]",
+        vec![192, 0],
+    );
+    assert_eq!(out, "[1, 3, 4, 5]");
+}
+
+#[test]
+fn fmt_debug_array_pretty_uses_brackets() {
+    // "{:#?}" of the array: ALTERNATE flag in the flags field.
+    let flags: u32 = 0x20 | (3 << 29) | (1 << 23);
+    let mut template = vec![0xC1u8];
+    template.extend_from_slice(&flags.to_le_bytes());
+    template.push(0);
+    let out = print_one(
+        Ty::Array(Box::new(Ty::i32()), 4),
+        Rvalue::AggregateTuple(vec![
+            Operand::const_int(1),
+            Operand::const_int(3),
+            Operand::const_int(4),
+            Operand::const_int(5),
+        ]),
+        "core::fmt::rt::Argument::new_debug",
+        "[i32; 4]",
+        template,
+    );
+    assert_eq!(out, "[\n    1,\n    3,\n    4,\n    5,\n]");
+}
