@@ -1938,6 +1938,18 @@ fn eval_binary(
         };
         return Ok((v, false));
     }
+    // Shifts: in MIR the amount of a `Shl` / `Shr` may have ANY
+    // integer type, independent of the value's type, so the
+    // same-kind pair dispatch below cannot see mixed pairs. Integer
+    // shift pairs are evaluated by `eval_shift`, which reads the
+    // amount as a `u32` and keeps the value's own type and
+    // signedness.
+    if matches!(op, Shl | Shr)
+        && matches!(lhs, Value::Int(_) | Value::Uint(_))
+        && matches!(rhs, Value::Int(_) | Value::Uint(_))
+    {
+        return eval_shift(op, lhs, rhs, dest_ty, checked_form);
+    }
     // Signed arithmetic.
     if let (Value::Int(a), Value::Int(b)) = (lhs, rhs) {
         let (a, b) = (*a, *b);
@@ -1985,23 +1997,7 @@ fn eval_binary(
             BitAnd => Some(a & b),
             BitOr => Some(a | b),
             BitXor => Some(a ^ b),
-            Shl | Shr => {
-                let shift = u32::try_from(b).unwrap_or(u32::MAX);
-                if shift >= bits {
-                    if checked_form {
-                        let wrapped = wrap_signed(a.wrapping_shl(shift % bits), bits);
-                        return Ok((Value::Int(wrapped), true));
-                    }
-                    return Err(InterpError::panic(format!(
-                        "attempt to shift by {shift} bits, which overflows the type width {bits}"
-                    )));
-                }
-                Some(if op == Shl {
-                    wrap_signed(a << shift, bits)
-                } else {
-                    a >> shift
-                })
-            }
+            Shl | Shr => unreachable!("shifts are evaluated by `eval_shift`"),
         };
         // Invariant: comparisons returned early above and every other
         // arm of the match yields `Some`, so `wide` is always present.
@@ -2015,12 +2011,7 @@ fn eval_binary(
             Sub => a.checked_sub(b).map_or(true, |r| r < min || r > max),
             Mul => a.checked_mul(b).map_or(true, |r| r < min || r > max),
             Div | Rem => a == min && b == -1,
-            Shl => {
-                // Overflow if significant bits are shifted out of the
-                // declared width, i.e. shifting back does not restore `a`.
-                let shift = u32::try_from(b).unwrap_or(u32::MAX);
-                shift >= bits || (shift < 128 && (wrap_signed(a << shift, bits) >> shift) != a)
-            }
+            Shl => unreachable!("shifts are evaluated by `eval_shift`"),
             _ => false,
         };
         let result = Value::Int(wrap_signed(raw, bits));
@@ -2055,26 +2046,8 @@ fn eval_binary(
                 "attempt to calculate the remainder with a divisor of zero"
             }));
         }
-        if op == Shl || op == Shr {
-            let shift = u32::try_from(b).unwrap_or(u32::MAX);
-            if shift >= bits {
-                if checked_form {
-                    let wrapped = wrap_unsigned(a.wrapping_shl(shift % bits), bits);
-                    return Ok((Value::Uint(wrapped), true));
-                }
-                return Err(InterpError::panic(format!(
-                    "attempt to shift by {shift} bits, which overflows the type width {bits}"
-                )));
-            }
-            let raw = if op == Shl { a << shift } else { a >> shift };
-            let overflowed = op == Shl && (wrap_unsigned(raw, bits) >> shift) != a;
-            let result = Value::Uint(wrap_unsigned(raw, bits));
-            if overflowed && !checked_form {
-                return Err(InterpError::panic(format!("arithmetic overflow in {op:?}")));
-            }
-            return Ok((result, overflowed));
-        }
-        // Comparisons and shifts returned above; the operators that
+        // Comparisons returned above and shifts are evaluated by
+        // `eval_shift` before this dispatch; the operators that
         // can reach this match are exactly the eight covered below,
         // which is what makes the closing `unreachable!` an internal
         // invariant rather than an input-dependent failure.
@@ -2138,6 +2111,97 @@ fn eval_binary(
         "matching integer/bool operands",
         format!("{} and {}", lhs.kind_name(), rhs.kind_name()),
     ))
+}
+
+/// Evaluate a `Shl` / `Shr` operation.
+///
+/// The value (left operand) keeps its own type and signedness: the
+/// declared width comes from the destination type exactly as in the
+/// same-kind paths of `eval_binary`, a signed value shifts
+/// arithmetically and an unsigned value logically. The amount
+/// (right operand) may have any integer type; only its numeric
+/// value matters. It is read as a `u32`, as rustc interprets shift
+/// amounts: a negative amount or one above `u32::MAX` does not fit,
+/// and `u32::MAX` stands in for it, which is at or above every
+/// type width and so reports an overflowing amount either way.
+///
+/// An amount at or above the value's width is an overflow: the
+/// checked form yields the wrapped result (the amount taken modulo
+/// the width, the `wrapping_shl` / `wrapping_shr` reading) with the
+/// overflow flag set, and the plain form is a guest panic. For
+/// `Shl`, bits shifted out of the declared width are an arithmetic
+/// overflow as well, under the same checked/plain split as the
+/// other operators.
+fn eval_shift(
+    op: BinOp,
+    lhs: &Value,
+    rhs: &Value,
+    dest_ty: Option<&Ty>,
+    checked_form: bool,
+) -> InterpResult<(Value, bool)> {
+    let shift = match rhs {
+        Value::Int(b) => u32::try_from(*b).unwrap_or(u32::MAX),
+        Value::Uint(b) => u32::try_from(*b).unwrap_or(u32::MAX),
+        _ => unreachable!("shift amounts are integer values"),
+    };
+    match lhs {
+        Value::Int(a) => {
+            let a = *a;
+            let bits = signed_bits(dest_ty);
+            if shift >= bits {
+                if checked_form {
+                    let wrapped = if op == BinOp::Shl {
+                        wrap_signed(a.wrapping_shl(shift % bits), bits)
+                    } else {
+                        wrap_signed(a.wrapping_shr(shift % bits), bits)
+                    };
+                    return Ok((Value::Int(wrapped), true));
+                }
+                return Err(InterpError::panic(format!(
+                    "attempt to shift by {shift} bits, which overflows the type width {bits}"
+                )));
+            }
+            let raw = if op == BinOp::Shl {
+                wrap_signed(a << shift, bits)
+            } else {
+                a >> shift
+            };
+            // Overflow if significant bits are shifted out of the
+            // declared width, i.e. shifting back does not restore `a`.
+            let overflowed =
+                op == BinOp::Shl && (wrap_signed(a << shift, bits) >> shift) != a;
+            let result = Value::Int(wrap_signed(raw, bits));
+            if overflowed && !checked_form {
+                return Err(InterpError::panic(format!("arithmetic overflow in {op:?}")));
+            }
+            Ok((result, overflowed))
+        }
+        Value::Uint(a) => {
+            let a = *a;
+            let bits = unsigned_bits(dest_ty);
+            if shift >= bits {
+                if checked_form {
+                    let wrapped = if op == BinOp::Shl {
+                        wrap_unsigned(a.wrapping_shl(shift % bits), bits)
+                    } else {
+                        wrap_unsigned(a.wrapping_shr(shift % bits), bits)
+                    };
+                    return Ok((Value::Uint(wrapped), true));
+                }
+                return Err(InterpError::panic(format!(
+                    "attempt to shift by {shift} bits, which overflows the type width {bits}"
+                )));
+            }
+            let raw = if op == BinOp::Shl { a << shift } else { a >> shift };
+            let overflowed = op == BinOp::Shl && (wrap_unsigned(raw, bits) >> shift) != a;
+            let result = Value::Uint(wrap_unsigned(raw, bits));
+            if overflowed && !checked_form {
+                return Err(InterpError::panic(format!("arithmetic overflow in {op:?}")));
+            }
+            Ok((result, overflowed))
+        }
+        _ => unreachable!("shift values are integer values"),
+    }
 }
 
 /// The float width a binary operation's destination declares, if any.
