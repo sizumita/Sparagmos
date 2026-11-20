@@ -22,14 +22,12 @@ fn unit_ty() -> mir::Ty {
     mir::Ty::Tuple(Vec::new())
 }
 
-/// A `dyn Trait` type: outside the interpreter's type model, so
-/// any body holding one as a local fails conversion.
+/// A coroutine type: outside the interpreter's type model, so
+/// any body holding one as a local fails conversion. (This fixture
+/// used a `dyn Trait` local until the Dynamic type model landed;
+/// a coroutine local keeps the same unconvertible-body role.)
 fn dyn_ty() -> mir::Ty {
-    mir::Ty::Dynamic(
-        vec!["std::fmt::Debug".to_string()],
-        Box::new(unit_ty()),
-        mir::Region::Erased,
-    )
+    mir::Ty::Coroutine(mir::DefId::new(0, 7), Vec::new())
 }
 
 fn decls(tys: &[mir::Ty]) -> Vec<mir::LocalDecl> {
@@ -203,7 +201,7 @@ fn unconvertible_anonymous_const_is_isolated_under_its_own_key() {
         .unconverted_reason("test_crate::_#DefId(0:11)")
         .expect("const B's failure is recorded under its own key");
     assert!(
-        reason.contains("Dynamic"),
+        reason.contains("Coroutine"),
         "the recorded reason names the unconvertible type: {reason}"
     );
 
