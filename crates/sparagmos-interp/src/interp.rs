@@ -235,41 +235,124 @@ impl<'a> Interpreter<'a> {
                     destination,
                     target,
                 } => {
-                    let callee = self
-                        .program
-                        .get(&func)
-                        .cloned()
-                        .ok_or_else(|| InterpError::UnknownFunction { name: func.clone() })?;
-                    if frames.len() >= self.config.max_call_depth {
-                        return Err(InterpError::CallDepthExceeded {
-                            limit: self.config.max_call_depth,
-                        });
-                    }
                     let mut arg_values = Vec::with_capacity(args.len());
                     for arg in &args {
                         arg_values.push(self.eval_operand(&mut frames, body, arg)?);
                     }
-                    if arg_values.len() != callee.arg_count {
-                        return Err(InterpError::type_mismatch(
-                            format!("call to `{func}`"),
-                            format!("{} argument(s)", callee.arg_count),
-                            format!("{} argument(s)", arg_values.len()),
-                        ));
+                    self.start_call(&mut frames, &func, arg_values, &destination, target)?;
+                }
+                TerminatorKind::CallIndirect {
+                    func,
+                    args,
+                    destination,
+                    target,
+                } => {
+                    // The callee value comes from a place: resolve it
+                    // together with the environment reference a
+                    // closure body expects (see `eval_callable`).
+                    let (callee, env_ref) = self.eval_callable(&frames, body, &func)?;
+                    let mut arg_values = Vec::with_capacity(args.len());
+                    for arg in &args {
+                        arg_values.push(self.eval_operand(&mut frames, body, arg)?);
                     }
-                    let mut locals = vec![Value::Uninit; callee.local_count()];
-                    for (i, v) in arg_values.into_iter().enumerate() {
-                        locals[i + 1] = v;
+                    match callee {
+                        Value::FnPtr(name) => {
+                            self.start_call(
+                                &mut frames,
+                                &name,
+                                arg_values,
+                                &destination,
+                                target,
+                            )?;
+                        }
+                        Value::Closure { def, .. } => {
+                            let mut full = vec![env_ref];
+                            full.extend(arg_values);
+                            self.start_call(&mut frames, &def, full, &destination, target)?;
+                        }
+                        other => {
+                            return Err(InterpError::type_mismatch(
+                                "indirect call",
+                                "callable value",
+                                other.kind_name(),
+                            ));
+                        }
                     }
-                    let frame_id = self.fresh_frame_id();
-                    frames.push(Frame {
-                        id: frame_id,
-                        func: func.clone(),
-                        locals,
-                        block: 0,
-                        stmt: 0,
-                        return_dest: Some(destination),
-                        return_block: target,
-                    });
+                }
+                TerminatorKind::CallTrait {
+                    kind,
+                    receiver,
+                    args,
+                    destination,
+                    target,
+                } => {
+                    let args_value = self.eval_operand(&mut frames, body, &args)?;
+                    let arg_values = match args_value {
+                        Value::Tuple(items) => items,
+                        Value::Unit => Vec::new(),
+                        other => {
+                            return Err(InterpError::type_mismatch(
+                                "Fn trait call arguments",
+                                "argument tuple",
+                                other.kind_name(),
+                            ));
+                        }
+                    };
+                    // The callable value, and the environment
+                    // reference a closure body expects as its first
+                    // argument. For `call` / `call_mut` the receiver
+                    // already is that reference; for `call_once` the
+                    // receiver is the value itself, referenced in
+                    // place (the real shim materialises a local for
+                    // it; aliasing the moved-from place is equivalent
+                    // because that place is dead after the call).
+                    let (callable, env_ref) = match kind {
+                        FnCallKind::CallOnce => {
+                            self.eval_callable(&frames, body, &receiver)?
+                        }
+                        FnCallKind::Call | FnCallKind::CallMut => {
+                            let recv = self.eval_operand(&mut frames, body, &receiver)?;
+                            match recv {
+                                Value::Ref(_) | Value::FatRef { .. } => {
+                                    let resolved = self.deref_value(&frames, &recv)?;
+                                    let value = self.read_resolved(&frames, &resolved)?;
+                                    (value, recv)
+                                }
+                                value => {
+                                    let env = self.callable_env_ref(
+                                        &frames,
+                                        body,
+                                        &receiver,
+                                        &value,
+                                    )?;
+                                    (value, env)
+                                }
+                            }
+                        }
+                    };
+                    match callable {
+                        Value::Closure { def, .. } => {
+                            let mut full = vec![env_ref];
+                            full.extend(arg_values);
+                            self.start_call(&mut frames, &def, full, &destination, target)?;
+                        }
+                        Value::FnPtr(name) => {
+                            self.start_call(
+                                &mut frames,
+                                &name,
+                                arg_values,
+                                &destination,
+                                target,
+                            )?;
+                        }
+                        other => {
+                            return Err(InterpError::type_mismatch(
+                                "Fn trait call",
+                                "callable value",
+                                other.kind_name(),
+                            ));
+                        }
+                    }
                 }
                 TerminatorKind::CallBuiltin {
                     name,
@@ -371,6 +454,112 @@ impl<'a> Interpreter<'a> {
                     return Err(InterpError::UnsupportedTerminator { kind });
                 }
             }
+        }
+    }
+
+    /// Push a call frame for `func` with already-evaluated argument
+    /// values (placed at locals 1..), returning into `destination` /
+    /// `target` of the current top frame when the callee returns.
+    /// Shared by direct calls, indirect calls and `Fn`-trait calls.
+    fn start_call(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        func: &str,
+        arg_values: Vec<Value>,
+        destination: &Place,
+        target: Option<BasicBlock>,
+    ) -> InterpResult<()> {
+        let callee = self
+            .program
+            .get(func)
+            .cloned()
+            .ok_or_else(|| InterpError::UnknownFunction {
+                name: func.to_string(),
+            })?;
+        if frames.len() >= self.config.max_call_depth {
+            return Err(InterpError::CallDepthExceeded {
+                limit: self.config.max_call_depth,
+            });
+        }
+        if arg_values.len() != callee.arg_count {
+            return Err(InterpError::type_mismatch(
+                format!("call to `{func}`"),
+                format!("{} argument(s)", callee.arg_count),
+                format!("{} argument(s)", arg_values.len()),
+            ));
+        }
+        let mut locals = vec![Value::Uninit; callee.local_count()];
+        for (i, v) in arg_values.into_iter().enumerate() {
+            locals[i + 1] = v;
+        }
+        let frame_id = self.fresh_frame_id();
+        frames.push(Frame {
+            id: frame_id,
+            func: func.to_string(),
+            locals,
+            block: 0,
+            stmt: 0,
+            return_dest: Some(destination.clone()),
+            return_block: target,
+        });
+        Ok(())
+    }
+
+    /// Evaluate a callable operand (a closure or function value being
+    /// called by value) together with the environment reference a
+    /// closure body expects as its first argument. The body's first
+    /// parameter is a reference to the closure value in rustc MIR;
+    /// when the operand is a place, the reference points at that
+    /// place, so `FnMut` mutations of by-value captures persist
+    /// across calls, exactly as through the real shim. A `Move`
+    /// operand's place is deliberately not cleared: the environment
+    /// reference aliases it for the duration of the call, and the
+    /// place is dead afterwards by MIR's move semantics.
+    fn eval_callable(
+        &self,
+        frames: &[Frame],
+        body: &Body,
+        operand: &Operand,
+    ) -> InterpResult<(Value, Value)> {
+        let value = match operand {
+            Operand::Copy(place) | Operand::Move(place) => {
+                let resolved = self.resolve_place(frames, body, place)?;
+                self.read_resolved(frames, &resolved)?
+            }
+            Operand::Constant(c) => self.eval_constant(c)?,
+        };
+        let env_ref = self.callable_env_ref(frames, body, operand, &value)?;
+        Ok((value, env_ref))
+    }
+
+    /// The environment reference for a callable value obtained from
+    /// `operand`: a reference to the operand's place when it has one,
+    /// otherwise a reference to the value itself (constant form).
+    fn callable_env_ref(
+        &self,
+        frames: &[Frame],
+        body: &Body,
+        operand: &Operand,
+        value: &Value,
+    ) -> InterpResult<Value> {
+        match operand {
+            Operand::Copy(place) | Operand::Move(place) => {
+                match self.resolve_place(frames, body, place)? {
+                    Resolved::Place {
+                        frame_pos,
+                        local,
+                        projection,
+                    } => Ok(Value::Ref(RefTarget::place(
+                        frames[frame_pos].id,
+                        local,
+                        projection,
+                    ))),
+                    Resolved::Value(_) => {
+                        Ok(Value::Ref(RefTarget::Value(Box::new(value.clone()))))
+                    }
+                }
+            }
+            Operand::Constant(_) => Ok(Value::Ref(RefTarget::Value(Box::new(value.clone())))),
         }
     }
 
@@ -661,6 +850,15 @@ impl<'a> Interpreter<'a> {
                         local: *local,
                     }
                 })?;
+                // A zero-capture closure is zero-sized and rustc
+                // MIR never writes its place: an unwritten read of
+                // such a local denotes the unique empty-environment
+                // closure value.
+                let base = if base == Value::Uninit {
+                    self.zst_closure_value(frame, *local).unwrap_or(base)
+                } else {
+                    base
+                };
                 let place_desc = describe_resolved(*local, projection);
                 let value = project_value(base, projection, &frame.func, &place_desc)?;
                 if value == Value::Uninit {
@@ -671,6 +869,20 @@ impl<'a> Interpreter<'a> {
                 }
                 Ok(value)
             }
+        }
+    }
+
+    /// The value of a never-written zero-capture closure local in
+    /// `frame` (see the note in `read_resolved`); `None` for any
+    /// other local.
+    fn zst_closure_value(&self, frame: &Frame, local: usize) -> Option<Value> {
+        let body = self.program.get(&frame.func)?;
+        match body.local_ty(Local(local)) {
+            Some(Ty::Closure(def, 0)) => Some(Value::Closure {
+                def: def.clone(),
+                env: Vec::new(),
+            }),
+            _ => None,
         }
     }
 
@@ -771,6 +983,14 @@ impl<'a> Interpreter<'a> {
                 Ok(Value::Int(wrap_signed(*v as i128, it.bits())))
             }
             (Some(Ty::Uint(ut)), Value::Int(v)) => Ok(Value::Uint((*v as u128) & ut.max())),
+            // Callable locals: a function-pointer place holds a
+            // function item value or a (non-capturing) closure value;
+            // a function-item place holds the item value; a closure
+            // place holds the closure value.
+            (Some(Ty::FnPtr), Value::FnPtr(_))
+            | (Some(Ty::FnPtr), Value::Closure { .. })
+            | (Some(Ty::FnDef(_)), Value::FnPtr(_))
+            | (Some(Ty::Closure(..)), Value::Closure { .. }) => Ok(value),
             // ADT locals hold the ADT value forms: aggregates, string
             // data (`String`), and the fmt value family.
             (Some(Ty::Adt(_)), Value::Enum { .. })
@@ -835,6 +1055,7 @@ impl<'a> Interpreter<'a> {
             Constant::Int(v) => Value::Int(*v),
             Constant::Uint(v) => Value::Uint(*v),
             Constant::Float(v) => Value::Float(*v),
+            Constant::FnDef(name) => Value::FnPtr(name.clone()),
             Constant::Str(s) => Value::Str(s.clone()),
             Constant::Bytes(b) => Value::Bytes(b.clone()),
             Constant::Tuple(fields) => Value::Tuple(
@@ -920,6 +1141,16 @@ impl<'a> Interpreter<'a> {
                 Ok(Value::Enum {
                     variant: *variant,
                     fields,
+                })
+            }
+            Rvalue::ClosureAggregate { def, operands } => {
+                let mut env = Vec::with_capacity(operands.len());
+                for op in operands {
+                    env.push(self.eval_operand(frames, body, op)?);
+                }
+                Ok(Value::Closure {
+                    def: def.clone(),
+                    env,
                 })
             }
             Rvalue::Cast(operand, ty) => {
@@ -1081,6 +1312,14 @@ pub(crate) fn project_value(
                         }
                     })?
                 }
+                Value::Closure { ref env, .. } => {
+                    env.get(*idx).cloned().ok_or_else(|| {
+                        InterpError::UninitializedRead {
+                            func: func.to_string(),
+                            place: place.to_string(),
+                        }
+                    })?
+                }
                 ref other => {
                     return Err(InterpError::type_mismatch(
                         format!("field projection on {place}"),
@@ -1170,6 +1409,7 @@ pub(crate) fn navigate_mut<'x>(
             let items = match slot {
                 Value::Tuple(items) => items,
                 Value::Enum { fields, .. } => fields,
+                Value::Closure { env, .. } => env,
                 other => {
                     return Err(InterpError::type_mismatch(
                         format!("field write on {place}"),

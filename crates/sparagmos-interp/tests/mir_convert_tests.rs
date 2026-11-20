@@ -580,9 +580,10 @@ fn unresolved_callee_fails_at_execution_not_silently() {
 }
 
 #[test]
-fn closure_aggregate_fails_at_execution_not_silently() {
-    // Destination is a tuple type so conversion itself succeeds; the
-    // Closure aggregate kind is what is unsupported.
+fn closure_aggregate_into_wrong_place_type_fails_loudly() {
+    // A Closure aggregate builds a closure value; storing it into a
+    // tuple-typed place is a type mismatch, reported at execution.
+    // (Positive closure coverage lives in `callable_tests.rs`.)
     let body = mir::Body::new(
         decls(&[mir::Ty::Tuple(vec![u32_ty()])]),
         0,
@@ -604,11 +605,8 @@ fn closure_aggregate_fails_at_execution_not_silently() {
     prog.add("mk", body);
     let err = interpret_mir(&prog, "mk", vec![]).expect_err("Closure aggregate must fail");
     assert!(
-        matches!(
-            err,
-            MirRunError::Interp(InterpError::UnsupportedRvalue { .. })
-        ),
-        "expected UnsupportedRvalue, got {err}"
+        matches!(err, MirRunError::Interp(InterpError::TypeMismatch { .. })),
+        "expected TypeMismatch, got {err}"
     );
 }
 
