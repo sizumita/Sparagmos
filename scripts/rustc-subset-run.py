@@ -555,44 +555,42 @@ def fill_result(rec, rust_dir, driver_bin, out):
     editions = header.values("edition")
     edition = editions[0].strip() if editions else "2021"
 
-    sparagmos_cwd = None
     with tempfile.TemporaryDirectory(prefix="subset-run-") as td:
         native, err = native_side(path, edition, td)
-        sparagmos_cwd = td
-    if err:
-        out["reason"] = err
-        out["bucket"] = bucket_reason(err)
-        return
-    exp = expected_exit(mode, header)
-    if native["exit_code"] != exp:
-        out["reason"] = (f"native run exit {native['exit_code']} does not "
-                          f"match the mode expectation {exp}")
-        out["bucket"] = "native run does not match mode expectation"
-        out["native"] = {"exit_code": native["exit_code"]}
-        return
+        if err:
+            out["reason"] = err
+            out["bucket"] = bucket_reason(err)
+            return
+        exp = expected_exit(mode, header)
+        if native["exit_code"] != exp:
+            out["reason"] = (f"native run exit {native['exit_code']} does "
+                              f"not match the mode expectation {exp}")
+            out["bucket"] = "native run does not match mode expectation"
+            out["native"] = {"exit_code": native["exit_code"]}
+            return
+        got, kind, reason = sparagmos_side(path, edition, driver_bin, td)
+        if kind == "unsupported":
+            out["status"] = "unsupported"
+            out["reason"] = reason
+            out["bucket"] = bucket_reason(reason)
+            return
+        if kind in ("timeout", "driver-error"):
+            out["status"] = "fail"
+            out["reason"] = reason
+            out["bucket"] = bucket_reason(reason)
+            return
+        verdict, detail = judge(mode, header, native, got)
+        out["status"] = "pass" if verdict == "pass" else "fail"
+        if verdict != "pass":
+            out["reason"] = detail
+            out["bucket"] = ("stdout mismatch"
+                             if detail == "stdout mismatch"
+                             else "exit-code mismatch")
+            out["native"] = {"exit_code": native["exit_code"],
+                             "stdout": native["stdout"][:500]}
+            out["sparagmos"] = {"exit_code": got["exit_code"],
+                                "stdout": got["stdout"][:500]}
 
-    got, kind, reason = sparagmos_side(path, edition, driver_bin,
-                                       sparagmos_cwd)
-    if kind == "unsupported":
-        out["status"] = "unsupported"
-        out["reason"] = reason
-        out["bucket"] = bucket_reason(reason)
-        return
-    if kind in ("timeout", "driver-error"):
-        out["status"] = "fail"
-        out["reason"] = reason
-        out["bucket"] = bucket_reason(reason)
-        return
-    verdict, detail = judge(mode, header, native, got)
-    out["status"] = "pass" if verdict == "pass" else "fail"
-    if verdict != "pass":
-        out["reason"] = detail
-        out["bucket"] = ("stdout mismatch" if detail == "stdout mismatch"
-                         else "exit-code mismatch")
-        out["native"] = {"exit_code": native["exit_code"],
-                         "stdout": native["stdout"][:500]}
-        out["sparagmos"] = {"exit_code": got["exit_code"],
-                            "stdout": got["stdout"][:500]}
 
 
 # ---------------------------------------------------------------------------
