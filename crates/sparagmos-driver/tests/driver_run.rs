@@ -70,25 +70,20 @@ fn run_mode_guest_panic_exits_101() {
 }
 
 #[test]
-fn run_mode_println_is_unsupported_with_concrete_reason() {
+fn run_mode_println_prints_to_stdout() {
     let dir = temp_dir("println");
     let src = fixture(&dir, "println.rs", PRINTLN_SRC);
     let out = run_driver(&src);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         out.status.code(),
-        Some(2),
-        "println! is not modelled yet and must exit 2; stderr={stderr}"
+        Some(0),
+        "println! runs through the interpreter's runtime print support; stderr={stderr}"
     );
-    assert!(
-        stderr.contains("unsupported"),
-        "reason goes to stderr: {stderr}"
-    );
-    // The wall, concretely: the call into std's print machinery has
-    // no converted body, and the reason must name it.
-    assert!(
-        stderr.contains("_print"),
-        "reason names the unresolved callee: {stderr}"
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "hi\n",
+        "the guest's stdout is the driver's stdout"
     );
 }
 

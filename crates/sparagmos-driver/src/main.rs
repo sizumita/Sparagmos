@@ -15,9 +15,9 @@
 //! Run-mode exit codes: 0 = the guest program terminated normally,
 //! 101 = the guest program panicked (message on stderr), 2 = the
 //! program could not be converted or executed (concrete reason on
-//! stderr). Run mode prints nothing to stdout: stdout is the guest
-//! program's channel, and guest output is not modelled yet (calls that
-//! would produce it are unresolved and surface as exit 2).
+//! stderr). Run mode writes the guest program's captured stdout to
+//! its own stdout (in every outcome — a native program's output is
+//! likewise observable when it panics).
 
 #![feature(rustc_private)]
 
@@ -190,6 +190,16 @@ fn execute(c: &Collected) -> i32 {
             body: body.clone(),
         });
     }
+    // The interpreter names ADT locals and resolves runtime-support
+    // calls through the full name table (every named item, including
+    // body-less std functions and types). `def_names` is indexed by
+    // the DefId index within crate 0.
+    for (index, name) in c.def_names.iter().enumerate() {
+        program.fn_names.insert(
+            sparagmos_mir::DefId::new(0, index as u32),
+            name.clone(),
+        );
+    }
     let Some(entry) = c.bodies.iter().map(|(n, _)| n).find(|n| is_main(n)) else {
         for f in &c.report.functions {
             if is_main(&f.name) {
@@ -209,7 +219,16 @@ fn execute(c: &Collected) -> i32 {
         );
         return 2;
     };
-    match sparagmos_interp::interpret_mir(&program, entry, Vec::new()) {
+    let run = sparagmos_interp::interpret_mir_captured(&program, entry, Vec::new());
+    // The guest's stdout is this process's stdout, whatever the
+    // outcome was.
+    {
+        use std::io::Write;
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(run.stdout.as_bytes());
+        let _ = out.flush();
+    }
+    match run.result {
         Ok(sparagmos_interp::Value::Unit) => 0,
         Ok(other) => {
             eprintln!(
