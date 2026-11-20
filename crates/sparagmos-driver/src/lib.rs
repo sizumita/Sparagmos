@@ -33,4 +33,5 @@ extern crate rustc_span;
 
 pub mod convert;
 pub mod dump;
+pub mod reach;
 pub mod report;
