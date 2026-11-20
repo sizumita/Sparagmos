@@ -1324,6 +1324,21 @@ impl<'a> Converter<'a> {
                         ),
                     },
                     mir::CastKind::BoxDerefTransmute => ir::Rvalue::BoxDerefTransmute(v),
+                    // A pointer-to-integer `transmute` (what the
+                    // compiler's UB precondition checks use to test a
+                    // pointer for null / alignment) becomes the
+                    // model's synthetic address. Every other
+                    // transmute shape stays unsupported: the model
+                    // cannot reinterpret a value's bytes, and
+                    // inventing an integer-to-pointer target would
+                    // fabricate a reference.
+                    mir::CastKind::Transmute => match (&ctx, target) {
+                        (
+                            Some(mir::Ty::RawPtr(..) | mir::Ty::Ref(..)),
+                            mir::Ty::Int(_) | mir::Ty::Uint(_),
+                        ) => ir::Rvalue::PtrToInt(v),
+                        _ => ir::Rvalue::Unsupported("Cast Transmute".to_string()),
+                    },
                     other => ir::Rvalue::Unsupported(format!("Cast {}", other.name())),
                 }
             }

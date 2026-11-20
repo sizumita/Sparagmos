@@ -110,6 +110,31 @@ pub struct Interpreter<'a> {
     drop_continuations: Vec<DropContinuation>,
 }
 
+/// The synthetic address of a pointer value (see
+/// [`crate::ir::Rvalue::PtrToInt`]): an FNV-1a hash of the reference
+/// target, mapped into a non-zero, 4096-aligned range. The same
+/// target always yields the same address within a run, so equality,
+/// null and alignment checks on transmuted pointers behave as they
+/// do natively; distinct targets collide only on a hash collision.
+fn synthetic_address(value: &Value) -> Option<u128> {
+    fn fnv1a(bytes: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+    let key = match value {
+        Value::Ref(target) => format!("ref:{target:?}"),
+        Value::FatRef { base, len } => format!("fat:{base:?}:{len}"),
+        Value::FnPtr(name) => format!("fn:{name}"),
+        _ => return None,
+    };
+    let h = fnv1a(key.as_bytes());
+    Some(0x1_0000_0000u128 + u128::from(h % 0x10_0000) * 0x1000)
+}
+
 impl<'a> Interpreter<'a> {
     pub fn new(program: &'a Program) -> Self {
         Interpreter::with_config(program, InterpConfig::default())
@@ -1603,6 +1628,17 @@ impl<'a> Interpreter<'a> {
                     )),
                 }
             }
+            Rvalue::PtrToInt(operand) => {
+                let value = self.eval_operand(frames, body, operand)?;
+                match synthetic_address(&value) {
+                    Some(addr) => Ok(Value::Uint(addr)),
+                    None => Err(InterpError::TypeMismatch {
+                        context: "pointer-to-integer transmute".to_string(),
+                        expected: "a pointer value".to_string(),
+                        found: value.kind_name().to_string(),
+                    }),
+                }
+            }
             Rvalue::BoxDerefTransmute(operand) => {
                 // The operand is the wrapper chain a `Box` keeps
                 // around its raw pointer (`Unique` around `NonNull`
@@ -1616,6 +1652,42 @@ impl<'a> Interpreter<'a> {
                             v = fields.pop().expect("one field");
                         }
                         other => {
+                            // A box built by the `Box::new` /
+                            // `Box::new_uninit` builtins stores its
+                            // pointee as the field value itself, not
+                            // as a pointer chain, so the unwrapping
+                            // bottoms out at the pointee value. The
+                            // pointer the cast stands for is then a
+                            // reference to the operand place — the
+                            // pointee's home in this model — and
+                            // reads and writes through it reach the
+                            // pointee there. The operand place must
+                            // actually project into the box (the cast
+                            // in real MIR always reads the box's
+                            // pointer field); a bare local holding a
+                            // non-pointer value is the type error it
+                            // was before.
+                            if let Operand::Copy(place) | Operand::Move(place) = operand {
+                                match self.resolve_place(frames, body, place)? {
+                                    Resolved::Place {
+                                        frame_pos,
+                                        local,
+                                        projection,
+                                    } if !projection.is_empty() => {
+                                        break Ok(Value::Ref(RefTarget::place(
+                                            frames[frame_pos].id,
+                                            local,
+                                            projection,
+                                        )));
+                                    }
+                                    Resolved::Value(value) => {
+                                        break Ok(Value::Ref(RefTarget::Value(Box::new(
+                                            value,
+                                        ))));
+                                    }
+                                    Resolved::Place { .. } => {}
+                                }
+                            }
                             break Err(InterpError::type_mismatch(
                                 "BoxDerefTransmute cast",
                                 "pointer wrapper (Unique/NonNull around a raw pointer)",
