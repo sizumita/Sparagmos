@@ -1078,10 +1078,14 @@ impl<'a> Converter<'a> {
                     Some(mir::Ty::Uint(_)) | Some(mir::Ty::Char) => ir::Constant::Uint(data),
                     Some(mir::Ty::Bool) => ir::Constant::Bool(data != 0),
                     // No context: use the scalar's own storage width. A
-                    // set sign bit means a negative signed value.
+                    // set sign bit means a negative signed value, at
+                    // every width: a 16-byte pattern with its top bit
+                    // set is a negative `i128`, not `2^127` unsigned
+                    // (the rule `literal_pair_ty` already applies to
+                    // 128-bit literal pairs).
                     _ => {
                         let bits = (*size as u32) * 8;
-                        if bits > 0 && bits < 128 && (data >> (bits - 1)) & 1 == 1 {
+                        if bits > 0 && (data >> (bits - 1)) & 1 == 1 {
                             ir::Constant::Int(sign_extend(data, bits))
                         } else {
                             ir::Constant::Uint(data)
