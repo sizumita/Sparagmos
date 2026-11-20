@@ -8,8 +8,9 @@
 //!   expected result (stdout / stderr / exit code). This is the oracle the
 //!   harness compares Sparagmos against; it does NOT run Sparagmos itself.
 //! - `sparagmos corpus [--dir <path>] [--json]` — evaluate every program in
-//!   `tests/corpus` and print the aggregate. Until the interpreter/JIT
-//!   lanes are wired in, every case is honestly reported UNSUPPORTED.
+//!   `tests/corpus` and print the aggregate. The interpreter runner is
+//!   wired in; until the Stable MIR driver (Lane I) supplies MIR, every
+//!   case is honestly reported UNSUPPORTED (awaiting the driver).
 //!
 //! Exit codes: 0 = success, 1 = a check/corpus failure or native error,
 //! 2 = usage error.
@@ -18,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use sparagmos_harness::{
-    compile_and_run_native, default_corpus_dir, emit_mir, evaluate_corpus, UnsupportedRunner,
+    compile_and_run_native, default_corpus_dir, emit_mir, evaluate_corpus, InterpRunner,
 };
 
 fn usage() -> &'static str {
@@ -111,9 +112,11 @@ fn cmd_corpus(args: &[String]) -> Result<ExitCode, String> {
         .map(PathBuf::from)
         .unwrap_or_else(default_corpus_dir);
     let json = args.iter().any(|a| a == "--json");
-    // NOTE (connection point): replace `UnsupportedRunner` with the real
-    // interpreter/JIT runner once Lane C/D expose one via `SparagmosRunner`.
-    let report = evaluate_corpus(&dir, &UnsupportedRunner)
+    // Main path: InterpRunner executes MIR produced by the Stable MIR
+    // driver (sparagmos-driver, Lane I) in the interpreter. Until the
+    // driver is integrated it reports each case UNSUPPORTED with the
+    // reason, so the aggregate below stays honest (pass rate 0).
+    let report = evaluate_corpus(&dir, &InterpRunner)
         .map_err(|e| format!("failed to read corpus dir {}: {e}", dir.display()))?;
     if json {
         print!("{}", report.to_json());

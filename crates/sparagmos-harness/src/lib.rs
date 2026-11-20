@@ -9,6 +9,10 @@
 //!   under parallel development), the case is `Unsupported` — never counted
 //!   as passed. See [`SparagmosRunner`] for the plug-in point.
 
+pub mod interp_runner;
+
+pub use interp_runner::{run_mir_program, InterpRunner};
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
@@ -79,13 +83,15 @@ impl fmt::Display for UnsupportedReason {
     }
 }
 
-/// Plug-in point for the other lanes.
+/// Plug-in point for the execution lanes.
 ///
-/// Lane B (parser) + Lane C (interpreter) / Lane D (JIT) will provide an
-/// implementation that: emits MIR for `case.path`, parses it, executes it,
-/// and returns its stdout / exit code — or an [`UnsupportedReason`] when a
-/// construct is not implemented yet. Returning `Err` must stay cheap and
-/// honest: when in doubt, report unsupported instead of guessing output.
+/// On the project's main path, MIR for `case.path` is produced by the
+/// Stable MIR driver (Lane I, `sparagmos-driver`) as `sparagmos-mir`
+/// bodies and executed by the interpreter / JIT. [`InterpRunner`] is
+/// that runner; until the driver is integrated it reports every case
+/// as unsupported (awaiting the driver). Returning `Err` must stay
+/// cheap and honest: when in doubt, report unsupported instead of
+/// guessing output.
 pub trait SparagmosRunner {
     fn run(&self, case: &CorpusCase) -> Result<RunResult, UnsupportedReason>;
 }
