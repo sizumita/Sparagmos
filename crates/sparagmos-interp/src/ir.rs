@@ -20,6 +20,8 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use crate::value::RefProj;
+
 /// Index of a local variable. Local 0 is always the return place,
 /// locals `1..=arg_count` are the arguments (as in rustc MIR).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -420,6 +422,66 @@ impl Statement {
 
 /// Terminator kinds (subset of rustc MIR `TerminatorKind`).
 #[derive(Debug, Clone, PartialEq)]
+/// Drop glue for one dropped value, built by `mir_convert` from the
+/// dropped type. The interpreter executes a plan against the value
+/// actually stored at the dropped place; a part that is uninitialized
+/// (moved out of, never written) is skipped, which is this value
+/// model's form of rustc's drop flags. A plan is only built when
+/// conversion can account for every part of the type: anything it
+/// cannot account for keeps the whole `Drop` terminator unsupported.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DropPlan {
+    /// No guest-observable effect: nothing to run.
+    Trivial,
+    /// The glue of this part of the value is not modelled (a field or
+    /// variant whose type conversion could not establish). Executing
+    /// it is an explicit error, never a silent skip.
+    Unknown,
+    /// Run each plan in order.
+    Seq(Vec<DropPlan>),
+    /// Run `plan` against the sub-place at `path`, a projection from
+    /// the value this plan applies to.
+    At {
+        path: Vec<RefProj>,
+        plan: Box<DropPlan>,
+    },
+    /// Call the converted destructor body `func` (a program key) with
+    /// a `&mut` reference to the value this plan applies to.
+    CallDtor { func: String },
+    /// Run `elem` against every element of the array / tuple / `Vec`
+    /// value this plan applies to, in index order.
+    Each { elem: Box<DropPlan> },
+    /// Run `fields[i]` against field `i` of the tuple / ADT value
+    /// this plan applies to, in field order. `complete` records that
+    /// conversion proved the plan covers every field the value can
+    /// hold; when it is false, a value holding more fields than the
+    /// plan covers is an explicit error at run time.
+    Fields {
+        fields: Vec<DropPlan>,
+        complete: bool,
+    },
+    /// Run `variants[v]` when the ADT value this plan applies to has
+    /// variant index `v`. A live variant with no entry is an explicit
+    /// error at run time (as if it were [`DropPlan::Unknown`]).
+    Variants { variants: Vec<DropPlan> },
+    /// The glue of one ADT instantiation, held in the terminator's
+    /// glue table ([`DropGlue::adts`]) so recursive types stay
+    /// finite: an ADT's entry is registered before its fields are
+    /// planned, and a recursive occurrence refers back to it.
+    Adt { index: usize },
+}
+
+/// The drop glue of one `Drop` terminator: the plan for the dropped
+/// type plus the table of ADT plans it references.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropGlue {
+    /// Glue of the dropped type itself.
+    pub root: DropPlan,
+    /// Glue of each ADT instantiation reachable from the dropped
+    /// type, referenced by [`DropPlan::Adt`] indices.
+    pub adts: Vec<DropPlan>,
+}
+
 pub enum TerminatorKind {
     Goto {
         target: BasicBlock,
@@ -457,13 +519,14 @@ pub enum TerminatorKind {
         destination: Place,
         target: Option<BasicBlock>,
     },
-    /// Drop the value at a place and continue at `target`. Only
-    /// converted when the dropped type's glue provably has no
-    /// guest-observable effect in this value model (see
-    /// `mir_convert`); other drops stay explicit errors.
+    /// Drop the value at a place, running its `glue` (converted
+    /// destructor calls and field glue; see `mir_convert`), and
+    /// continue at `target`. Drops whose glue conversion cannot
+    /// account for stay `Unsupported` instead.
     Drop {
         place: Place,
         target: BasicBlock,
+        glue: DropGlue,
     },
     Return,
     Unreachable,
