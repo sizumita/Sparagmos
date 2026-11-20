@@ -2595,7 +2595,7 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
 #   construction, so it does not block.)
 
 _DEP_GRAPH_ASSERTION_RE = re.compile(
-    r"#\[!?\s*rustc_(clean|dirty|partition_reused|partition_codegened)\b")
+    r"#!?\[\s*rustc_(clean|dirty|partition_reused|partition_codegened)\b")
 _ASSERT_INCR_STATE_LOADED_RE = re.compile(
     r"assert-incr-state\s*=\s*loaded\b")
 
@@ -2655,17 +2655,6 @@ def incremental_cross_session_blocker(test_path, text):
     loaded at startup, makes the verdict cross-session by
     definition.
     """
-    for line in text.splitlines():
-        if line.lstrip().startswith("//@") and \
-                _ASSERT_INCR_STATE_LOADED_RE.search(line):
-            return ("compile-flags assert the incremental cache "
-                    "state at startup "
-                    "(-Zassert-incr-state=loaded): the revision "
-                    "must start from the previous session's cache, "
-                    "which independent per-revision conversions do "
-                    "not have",
-                    "out of stage-2 scope (incremental cache-state "
-                    "assertion)")
     sources = [(test_path, text)] + _aux_source_texts(test_path)
     for src_path, src_text in sources:
         m = _DEP_GRAPH_ASSERTION_RE.search(src_text)
@@ -2680,6 +2669,17 @@ def incremental_cross_session_blocker(test_path, text):
                     "per-revision conversions cannot reproduce",
                     "out of stage-2 scope (incremental dep-graph "
                     "assertions)")
+    for line in text.splitlines():
+        if line.lstrip().startswith("//@") and \
+                _ASSERT_INCR_STATE_LOADED_RE.search(line):
+            return ("compile-flags assert the incremental cache "
+                    "state at startup "
+                    "(-Zassert-incr-state=loaded): the revision "
+                    "must start from the previous session's cache, "
+                    "which independent per-revision conversions do "
+                    "not have",
+                    "out of stage-2 scope (incremental cache-state "
+                    "assertion)")
     return None
 
 
