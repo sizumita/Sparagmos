@@ -544,6 +544,16 @@ pub enum DropPlan {
     /// finite: an ADT's entry is registered before its fields are
     /// planned, and a recursive occurrence refers back to it.
     Adt { index: usize },
+    /// Release a `std::cell::RefCell` borrow held by the guard value
+    /// this plan applies to (a `std::cell::Ref` / `RefMut` aggregate
+    /// built by the `RefCell` borrow builtins in `builtins`): the
+    /// guard's second field is a reference to the cell's borrow-flag
+    /// `Cell`. A shared guard decrements the flag's count; a mutable
+    /// guard resets it to unused (0). A guard whose flag reference
+    /// can no longer be resolved (the cell's frame is gone) is an
+    /// explicit error, as for any other dangling reference in this
+    /// model — it is never silently skipped.
+    RefCellRelease { mutable: bool },
 }
 
 /// The drop glue of one `Drop` terminator: the plan for the dropped
