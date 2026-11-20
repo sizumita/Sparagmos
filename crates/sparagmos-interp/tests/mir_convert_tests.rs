@@ -824,3 +824,243 @@ fn literal_rem_min_by_neg_one_still_panics() {
         "expected guest panic, got {err}"
     );
 }
+
+// ----- ADT aggregate operands: declared field types --------------------------
+
+const POINT_DEF: mir::DefId = mir::DefId::new(0, 21);
+const MESSAGE_DEF: mir::DefId = mir::DefId::new(0, 22);
+const OPTION_DEF: mir::DefId = mir::DefId::new(0, 23);
+const PAIR_DEF: mir::DefId = mir::DefId::new(0, 24);
+const MAKE_DEF: mir::DefId = mir::DefId::new(0, 25);
+
+fn adt_aggregate(
+    def: mir::DefId,
+    variant: u32,
+    generic_args: Vec<mir::Ty>,
+    ops: Vec<mir::Operand>,
+) -> mir::Rvalue {
+    mir::Rvalue::Aggregate(
+        Box::new(mir::AggregateKind::Adt {
+            def,
+            variant_index: variant,
+            generic_args,
+            user_ty: None,
+            field_index: None,
+        }),
+        ops,
+    )
+}
+
+fn variant_field(idx: u32, variant: u32, f: u32, ty: mir::Ty) -> mir::Place {
+    place(idx).downcast(None, variant).field(f, ty)
+}
+
+/// `struct Point { x: i32, y: i32 }`
+/// `fn main() -> i32 { _1 = Point { x: 3, y: -4 };
+///   _2 = Add(copy _1.0, 10); _3 = Mul(copy _1.1, 2);
+///   _0 = Add(copy _2, copy _3); return }` = 13 + -8 = 5.
+///
+/// The aggregate operands are bare scalars with no type of their own:
+/// typed by the no-context rule, the non-negative `3` would be stored
+/// unsigned and the first read of `_1.0` would mismatch its declared
+/// `i32`. The declared field types (carried by the `Field`
+/// projections below) are what the operands must be typed by.
+#[test]
+fn struct_i32_fields_keep_their_signed_tag() {
+    let point_ty = mir::Ty::Adt(POINT_DEF, vec![]);
+    let body = mir::Body::new(
+        decls(&[i32_ty(), point_ty, i32_ty(), i32_ty()]),
+        0,
+        vec![block(
+            vec![
+                assign(
+                    place(1),
+                    adt_aggregate(POINT_DEF, 0, vec![], vec![const_i32(3), const_i32(-4)]),
+                ),
+                assign(
+                    place(2),
+                    binop(
+                        mir::BinOp::Add,
+                        mir::Operand::Copy(field(1, 0, i32_ty())),
+                        const_i32(10),
+                    ),
+                ),
+                assign(
+                    place(3),
+                    binop(
+                        mir::BinOp::Mul,
+                        mir::Operand::Copy(field(1, 1, i32_ty())),
+                        const_i32(2),
+                    ),
+                ),
+                assign(place(0), binop(mir::BinOp::Add, copy(2), copy(3))),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("main", body);
+    let v = interpret_mir(&prog, "main", vec![]).expect("struct i32 fields must run");
+    assert_eq!(v, Value::Int(5));
+}
+
+/// `enum Message { Code(i32) }` (variant 2 here), built in one
+/// function and projected in another:
+/// `fn make() -> Message { _0 = Message::Code(5); return }`
+/// `fn main() -> i32 { _1 = call make();
+///   _0 = Mul(copy (_1 as Code).0, 10); return }` = 50.
+///
+/// The aggregate lives only in `make`, the `Downcast`/`Field`
+/// projections only in `main`: the field's declared type has to be
+/// recovered program-wide, not per body. (The payload is positive on
+/// purpose: a negative literal would be tagged signed even by the
+/// no-context fallback rule and could not catch the bug.)
+#[test]
+fn enum_i32_payload_keeps_its_signed_tag_across_bodies() {
+    let message_ty = mir::Ty::Adt(MESSAGE_DEF, vec![]);
+    let make_body = mir::Body::new(
+        decls(&[message_ty.clone()]),
+        0,
+        vec![block(
+            vec![assign(
+                place(0),
+                adt_aggregate(MESSAGE_DEF, 2, vec![], vec![const_i32(5)]),
+            )],
+            ret(),
+        )],
+    );
+    let main_body = mir::Body::new(
+        decls(&[i32_ty(), message_ty]),
+        0,
+        vec![
+            block(
+                vec![],
+                mir::TerminatorKind::Call {
+                    func: fndef_operand(MAKE_DEF),
+                    args: vec![],
+                    destination: place(1),
+                    target: Some(mir::BasicBlock(1)),
+                    unwind: mir::UnwindAction::Continue,
+                    call_source: mir::CallSource::Normal,
+                },
+            ),
+            block(
+                vec![assign(
+                    place(0),
+                    binop(
+                        mir::BinOp::Mul,
+                        mir::Operand::Copy(variant_field(1, 2, 0, i32_ty())),
+                        const_i32(10),
+                    ),
+                )],
+                ret(),
+            ),
+        ],
+    );
+    let mut prog = MirProgram::new();
+    prog.add_with_def_id("make", MAKE_DEF, make_body);
+    prog.add("main", main_body);
+    let v = interpret_mir(&prog, "main", vec![]).expect("enum i32 payload must run");
+    assert_eq!(v, Value::Int(50));
+}
+
+/// `fn main() -> i32 { _1 = Some(40);
+///   _0 = Add(copy (_1 as Some).0, 2); return }` = 42.
+///
+/// The payload's declared type is the ADT instantiation's generic
+/// argument (`Option<i32>`): a constant payload must be stored signed.
+#[test]
+fn option_i32_constant_payload_keeps_its_signed_tag() {
+    let option_ty = mir::Ty::Adt(OPTION_DEF, vec![i32_ty()]);
+    let body = mir::Body::new(
+        decls(&[i32_ty(), option_ty]),
+        0,
+        vec![block(
+            vec![
+                assign(
+                    place(1),
+                    adt_aggregate(OPTION_DEF, 1, vec![i32_ty()], vec![const_i32(40)]),
+                ),
+                assign(
+                    place(0),
+                    binop(
+                        mir::BinOp::Add,
+                        mir::Operand::Copy(variant_field(1, 1, 0, i32_ty())),
+                        const_i32(2),
+                    ),
+                ),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("main", body);
+    let v = interpret_mir(&prog, "main", vec![]).expect("Option<i32> payload must run");
+    assert_eq!(v, Value::Int(42));
+}
+
+/// `struct Pair<T> { a: T, b: T }` instantiated with both `i32` and
+/// `u32` in one program: each instantiation's fields keep their own
+/// declared tag (the recovery key includes the generic arguments).
+#[test]
+fn generic_struct_instantiations_keep_separate_field_types() {
+    // `fn sum_i() -> i32 { _1 = Pair { a: 5, b: -2 };
+    //   _0 = Add(copy _1.0, copy _1.1); return }` = 3
+    let pair_i_ty = mir::Ty::Adt(PAIR_DEF, vec![i32_ty()]);
+    let sum_i_body = mir::Body::new(
+        decls(&[i32_ty(), pair_i_ty]),
+        0,
+        vec![block(
+            vec![
+                assign(
+                    place(1),
+                    adt_aggregate(PAIR_DEF, 0, vec![i32_ty()], vec![const_i32(5), const_i32(-2)]),
+                ),
+                assign(
+                    place(0),
+                    binop(
+                        mir::BinOp::Add,
+                        mir::Operand::Copy(field(1, 0, i32_ty())),
+                        mir::Operand::Copy(field(1, 1, i32_ty())),
+                    ),
+                ),
+            ],
+            ret(),
+        )],
+    );
+    // `fn sum_u() -> u32 { _1 = Pair { a: 5, b: 2 };
+    //   _0 = Add(copy _1.0, copy _1.1); return }` = 7
+    let pair_u_ty = mir::Ty::Adt(PAIR_DEF, vec![u32_ty()]);
+    let sum_u_body = mir::Body::new(
+        decls(&[u32_ty(), pair_u_ty]),
+        0,
+        vec![block(
+            vec![
+                assign(
+                    place(1),
+                    adt_aggregate(PAIR_DEF, 0, vec![u32_ty()], vec![const_u32(5), const_u32(2)]),
+                ),
+                assign(
+                    place(0),
+                    binop(
+                        mir::BinOp::Add,
+                        mir::Operand::Copy(field(1, 0, u32_ty())),
+                        mir::Operand::Copy(field(1, 1, u32_ty())),
+                    ),
+                ),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("sum_i", sum_i_body);
+    prog.add("sum_u", sum_u_body);
+    assert_eq!(
+        interpret_mir(&prog, "sum_i", vec![]).expect("Pair<i32> must run"),
+        Value::Int(3)
+    );
+    assert_eq!(
+        interpret_mir(&prog, "sum_u", vec![]).expect("Pair<u32> must run"),
+        Value::Uint(7)
+    );
+}
