@@ -1,0 +1,17 @@
+[package]
+name = "sparagmos-bench-helper"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Measurement helper for scripts/bench.py: loads a driver dump once
+# and times the post-conversion stages (MIR conversion, interpreter
+# execution, JIT compilation, JIT execution) in-process. It is a
+# standalone crate on purpose: it must not become part of the
+# workspace or of any shipped artifact.
+[workspace]
+
+[dependencies]
+sparagmos-harness = { path = "../../crates/sparagmos-harness" }
+sparagmos-interp = { path = "../../crates/sparagmos-interp" }
+sparagmos-jit = { path = "../../crates/sparagmos-jit" }
