@@ -161,7 +161,7 @@ class BlockerTests(unittest.TestCase):
         self.assertIn("ignore-test", self.blocker("//@ ignore-test\n"))
 
     def test_only_windows_is_out_of_environment(self):
-        self.assertIn("only-windows", self.blocker("//@ only-windows\n"))
+        self.assertIn("only-*", self.blocker("//@ only-windows\n"))
 
 
 class AgreementTests(unittest.TestCase):
