@@ -148,9 +148,12 @@ fn resume_and_coroutine_drop_are_explicit_errors() {
 // ----- unsupported local types: conversion errors with reasons -------------
 
 fn conversion_err(body: mir::Body) -> ConvertError {
-    match convert_program(&program_with("typed", body)) {
-        Ok(_) => panic!("program with an unsupported local type must not convert"),
-        Err(e) => e,
+    // Conversion is isolated per body, so a lone unconvertible
+    // function no longer fails `convert_program`; running it as
+    // the entry surfaces its conversion error as the run failure.
+    match interpret_mir(&program_with("typed", body), "typed", Vec::new()) {
+        Err(MirRunError::Convert(e)) => e,
+        other => panic!("unsupported local type must fail as a conversion error, got {other:?}"),
     }
 }
 
