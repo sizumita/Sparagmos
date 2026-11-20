@@ -57,18 +57,20 @@
 //! # Scope
 //!
 //! Supported: integer / `bool` / `char` / `f32` / `f64` /
-//! tuple-of-supported locals; `Use`, plain and checked `BinaryOp`,
+//! tuple-of-supported and array-of-supported locals (arrays are
+//! their elements' leaves in order, read and written through
+//! constant index projections); `Use`, plain and checked `BinaryOp`,
 //! `UnaryOp`, `IntToInt` / `FloatToInt` / `IntToFloat` /
-//! `FloatToFloat` casts, tuple aggregates; `Goto`, `SwitchInt`,
-//! `Call` (within the program, up to six arguments), `Assert`,
-//! `Drop` of scalar values, `Return`.
+//! `FloatToFloat` casts, tuple aggregates, `Repeat`; `Goto`,
+//! `SwitchInt`, `Call` (within the program, up to six arguments),
+//! `Assert`, `Drop` of scalar values, `Return`.
 //! Anything else — `f16` / `f128`, 128-bit integers, references and
 //! places through them, ADTs, slices, aggregates other than tuples,
-//! calls to functions outside the program, and so on — fails the
-//! whole function's compilation with [`JitError::Unsupported`]
-//! naming the construct. There is deliberately no partial or
-//! fallback execution: a program either compiles completely on the
-//! JIT path or not at all.
+//! dynamic index projections, calls to functions outside the
+//! program, and so on — fails the whole function's compilation with
+//! [`JitError::Unsupported`] naming the construct. There is
+//! deliberately no partial or fallback execution: a program either
+//! compiles completely on the JIT path or not at all.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -325,6 +327,14 @@ fn int_kind(ty: &mir::Ty) -> Option<IrIntKind> {
     }
 }
 
+/// Leaf bound for one array type. Every leaf is an 8-byte stack
+/// slot in the compiled frame, so an unbounded array type would let
+/// a guest program demand an unbounded frame; past this many scalar
+/// elements the type is outside the JIT's range. (The interpreter
+/// bounds `Repeat` element counts the same way, at 1,000,000; the
+/// JIT's bound is in leaves because its frames are physical.)
+const MAX_ARRAY_LEAVES: usize = 4096;
+
 /// Number of scalar leaves a value of `ty` occupies, or the reason
 /// the type is outside the JIT's range.
 fn flatten(ty: &mir::Ty, fname: &str) -> Result<usize, JitError> {
@@ -359,6 +369,23 @@ fn flatten(ty: &mir::Ty, fname: &str) -> Result<usize, JitError> {
         }
         mir::Ty::Float(mir::FloatTy::F128) => {
             Err(unsup(fname, "128-bit floating-point type"))
+        }
+        mir::Ty::Array(elem, len) => {
+            // An array value is its elements' leaves in order, the
+            // same shape the interpreter gives it (arrays ride as
+            // tuples of their elements there).
+            let mir::ArrayLen::Known(n) = len else {
+                return Err(unsup(fname, "array type with unknown length"));
+            };
+            let per = flatten(elem, fname)?;
+            let total = (*n as usize).checked_mul(per).unwrap_or(usize::MAX);
+            if total > MAX_ARRAY_LEAVES {
+                return Err(unsup(
+                    fname,
+                    "array type with more scalar elements than the JIT frame holds",
+                ));
+            }
+            Ok(total)
         }
         other => Err(unsup(fname, &format!("type {}", other.kind_name()))),
     }
@@ -685,6 +712,42 @@ impl<'a> FnLower<'a> {
                     }
                     ty = field_ty.clone();
                 }
+                mir::PlaceElem::ConstantIndex {
+                    offset: idx,
+                    min_length: _,
+                    from_end,
+                } => {
+                    let mir::Ty::Array(elem, len) = &ty else {
+                        return Err(self.err(&format!(
+                            "ConstantIndex projection on non-array type {}",
+                            ty.kind_name()
+                        )));
+                    };
+                    let mir::ArrayLen::Known(len) = len else {
+                        return Err(self.err(
+                            "ConstantIndex projection on an array of unknown length",
+                        ));
+                    };
+                    // `from_end` offsets count back from one past
+                    // the last element (offset 1 is the last
+                    // element), as in rustc and the interpreter.
+                    let idx = if *from_end {
+                        match len.checked_sub(*idx).filter(|i| *i < *len) {
+                            Some(i) => i,
+                            None => {
+                                return Err(
+                                    self.err("ConstantIndex projection out of range")
+                                );
+                            }
+                        }
+                    } else if idx < len {
+                        *idx
+                    } else {
+                        return Err(self.err("ConstantIndex projection out of range"));
+                    };
+                    offset += idx as usize * flatten(elem, &self.func.name)?;
+                    ty = (**elem).clone();
+                }
                 mir::PlaceElem::OpaqueCast(t) | mir::PlaceElem::Subtype(t) => {
                     ty = t.clone();
                 }
@@ -933,7 +996,7 @@ impl<'a> FnLower<'a> {
             R::UnaryOp(op, operand) => self.lower_unop(place, *op, operand),
             R::Cast(kind, operand, target) => self.lower_cast(place, kind, operand, target),
             R::Aggregate(kind, ops) => self.lower_aggregate(place, kind, ops),
-            R::Repeat(..) => Err(self.err("Repeat rvalue")),
+            R::Repeat(op, count) => self.lower_repeat(place, op, *count),
             R::Ref(..) => Err(self.err("Ref rvalue")),
             R::ThreadLocalRef(_) => Err(self.err("ThreadLocalRef rvalue")),
             R::RawPtr(..) => Err(self.err("RawPtr rvalue")),
@@ -942,6 +1005,71 @@ impl<'a> FnLower<'a> {
             R::NullaryOp(..) => Err(self.err("NullaryOp rvalue")),
             R::ShallowInitBox(..) => Err(self.err("ShallowInitBox rvalue")),
             R::CopyForDeref(_) => Err(self.err("CopyForDeref rvalue")),
+        }
+    }
+
+    /// `Rvalue::Repeat`: build the destination array by copying one
+    /// element value into every element slot. The element is
+    /// evaluated once, as in the interpreter (which materialises the
+    /// same value `count` times). Element shapes the slot model
+    /// cannot hold never reach here — `flatten` has already rejected
+    /// the destination's type — and a constant element of aggregate
+    /// type stays unsupported, as aggregate constants are elsewhere.
+    fn lower_repeat(
+        &mut self,
+        place: &mir::Place,
+        op: &mir::Operand,
+        count: u64,
+    ) -> Result<(), JitError> {
+        // The interpreter's conversion bound on repeat counts,
+        // mirrored so both engines accept the same programs.
+        if count > 1_000_000 {
+            return Err(self.err(&format!("Repeat of {count} elements")));
+        }
+        let (dst, dst_count, dst_ty) = self.place_leaves(place)?;
+        let mir::Ty::Array(elem_ty, _) = &dst_ty else {
+            return Err(self.err("Repeat rvalue with a non-array destination"));
+        };
+        let elem_ty = (**elem_ty).clone();
+        let per = flatten(&elem_ty, &self.func.name)?;
+        if per == 0 {
+            // A zero-leaf element (unit / never) stores nothing; the
+            // destination necessarily has zero leaves too.
+            return Ok(());
+        }
+        let total = (count as usize).checked_mul(per).unwrap_or(usize::MAX);
+        if total != dst_count {
+            return Err(self.err("Repeat count does not match the array length"));
+        }
+        match op {
+            mir::Operand::Copy(p) | mir::Operand::Move(p) => {
+                let (src, src_count, _) = self.place_leaves(p)?;
+                if src_count != per {
+                    return Err(self.err("Repeat element shape mismatch"));
+                }
+                for i in 0..count as usize {
+                    for k in 0..per as u32 {
+                        self.emit(Instr::Copy {
+                            dst: dst + (i * per) as u32 + k,
+                            src: IrOperand::Value(src + k),
+                        });
+                    }
+                }
+                Ok(())
+            }
+            mir::Operand::Constant(_) => {
+                if per != 1 {
+                    return Err(self.err("Repeat of a constant aggregate element"));
+                }
+                let v = self.operand_value(op, &elem_ty)?;
+                for i in 0..count as u32 {
+                    self.emit(Instr::Copy {
+                        dst: dst + i,
+                        src: IrOperand::Value(v),
+                    });
+                }
+                Ok(())
+            }
         }
     }
 

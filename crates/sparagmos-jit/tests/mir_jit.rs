@@ -1269,3 +1269,272 @@ fn unreachable_block_not_taken_leaves_execution_intact() {
     check(&jit, &prog, "keep", &[5], vec![int(5)], Ok(5));
     check(&jit, &prog, "keep", &[0], vec![int(0)], Ok(0));
 }
+
+// ----- Repeat: arrays built by repeating one element -------------------------
+
+fn arr_i32(n: u64) -> mir::Ty {
+    mir::Ty::Array(Box::new(i(mir::IntTy::I32)), mir::ArrayLen::Known(n))
+}
+
+/// `_n[offset]`, a constant index projection in the shape rustc
+/// emits for a literal subscript.
+fn cidx(n: u32, offset: u64, len: u64) -> mir::Place {
+    mir::Place {
+        local: mir::Local(n),
+        projection: vec![mir::PlaceElem::ConstantIndex {
+            offset,
+            min_length: len,
+            from_end: false,
+        }],
+    }
+}
+
+/// `_n[offset from the end]`, the `from_end` form of the same
+/// projection.
+fn cidx_end(n: u32, offset: u64, len: u64) -> mir::Place {
+    mir::Place {
+        local: mir::Local(n),
+        projection: vec![mir::PlaceElem::ConstantIndex {
+            offset,
+            min_length: len,
+            from_end: true,
+        }],
+    }
+}
+
+fn repeat_sum_program() -> (JitProgram, sparagmos_interp::MirProgram) {
+    // fn repeat_sum() -> i32 {
+    //   _1 = Repeat(const 7, 4);
+    //   _0 = _1[0] + _1[1] + _1[2] + _1[1 from the end];
+    //   return
+    // }
+    let i32t = i(mir::IntTy::I32);
+    let sum_from = |place: mir::Place| {
+        assign(
+            pl(0),
+            mir::Rvalue::BinaryOp(
+                mir::BinOp::Add,
+                Box::new((cp(0), mir::Operand::Copy(place))),
+            ),
+        )
+    };
+    let f = spec(
+        "repeat_sum",
+        0,
+        0,
+        &[i32t, arr_i32(4)],
+        vec![bb(
+            vec![
+                assign(pl(1), mir::Rvalue::Repeat(i32c(7), 4)),
+                assign(pl(0), mir::Rvalue::Use(mir::Operand::Copy(cidx(1, 0, 4)))),
+                sum_from(cidx(1, 1, 4)),
+                sum_from(cidx(1, 2, 4)),
+                sum_from(cidx_end(1, 1, 4)),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    build(&[f])
+}
+
+#[test]
+fn repeat_const_elements_sum() {
+    let (jit, prog) = repeat_sum_program();
+    check(&jit, &prog, "repeat_sum", &[], vec![], Ok(28));
+}
+
+fn repeat_mix_program() -> (JitProgram, sparagmos_interp::MirProgram) {
+    // fn repeat_mix(a: i32) -> i32 {
+    //   _3 = a + a;
+    //   _2 = Repeat(copy _3, 3);
+    //   _2[1] = 100;
+    //   _0 = _2[0] + _2[1] + _2[2];
+    //   return
+    // }
+    let i32t = i(mir::IntTy::I32);
+    let f = spec(
+        "repeat_mix",
+        0,
+        1,
+        &[i32t.clone(), i32t.clone(), arr_i32(3), i32t],
+        vec![bb(
+            vec![
+                assign(
+                    pl(3),
+                    mir::Rvalue::BinaryOp(mir::BinOp::Add, Box::new((cp(1), cp(1)))),
+                ),
+                assign(pl(2), mir::Rvalue::Repeat(cp(3), 3)),
+                assign(cidx(2, 1, 3), mir::Rvalue::Use(i32c(100))),
+                assign(pl(0), mir::Rvalue::Use(mir::Operand::Copy(cidx(2, 0, 3)))),
+                assign(
+                    pl(0),
+                    mir::Rvalue::BinaryOp(
+                        mir::BinOp::Add,
+                        Box::new((cp(0), mir::Operand::Copy(cidx(2, 1, 3)))),
+                    ),
+                ),
+                assign(
+                    pl(0),
+                    mir::Rvalue::BinaryOp(
+                        mir::BinOp::Add,
+                        Box::new((cp(0), mir::Operand::Copy(cidx(2, 2, 3)))),
+                    ),
+                ),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    build(&[f])
+}
+
+#[test]
+fn repeat_place_element_and_element_write() {
+    let (jit, prog) = repeat_mix_program();
+    check(&jit, &prog, "repeat_mix", &[5], vec![int(5)], Ok(120));
+    check(&jit, &prog, "repeat_mix", &[0], vec![int(0)], Ok(100));
+}
+
+fn repeat_pairs_program() -> (JitProgram, sparagmos_interp::MirProgram) {
+    // fn repeat_pairs() -> i32 {
+    //   _2 = (3, 4);
+    //   _1 = Repeat(copy _2, 2);
+    //   _0 = _1[1].0 + _1[0].1;
+    //   return
+    // }
+    let i32t = i(mir::IntTy::I32);
+    let pair_ty = mir::Ty::Tuple(vec![i32t.clone(), i32t.clone()]);
+    let arr_ty = mir::Ty::Array(Box::new(pair_ty.clone()), mir::ArrayLen::Known(2));
+    let at = |offset: u64, field: u32| mir::Place {
+        local: mir::Local(1),
+        projection: vec![
+            mir::PlaceElem::ConstantIndex {
+                offset,
+                min_length: 2,
+                from_end: false,
+            },
+            mir::PlaceElem::Field(field, i32t.clone()),
+        ],
+    };
+    let f = spec(
+        "repeat_pairs",
+        0,
+        0,
+        &[i32t.clone(), arr_ty, pair_ty],
+        vec![bb(
+            vec![
+                assign(
+                    pl(2),
+                    mir::Rvalue::Aggregate(
+                        Box::new(mir::AggregateKind::Tuple),
+                        vec![i32c(3), i32c(4)],
+                    ),
+                ),
+                assign(pl(1), mir::Rvalue::Repeat(cp(2), 2)),
+                assign(pl(0), mir::Rvalue::Use(mir::Operand::Copy(at(1, 0)))),
+                assign(
+                    pl(0),
+                    mir::Rvalue::BinaryOp(
+                        mir::BinOp::Add,
+                        Box::new((cp(0), mir::Operand::Copy(at(0, 1)))),
+                    ),
+                ),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    build(&[f])
+}
+
+#[test]
+fn repeat_tuple_elements() {
+    let (jit, prog) = repeat_pairs_program();
+    check(&jit, &prog, "repeat_pairs", &[], vec![], Ok(7));
+}
+
+#[test]
+fn repeat_zero_elements() {
+    // fn repeat_zero() -> i32 { _1 = Repeat(const 9, 0); _0 = 5; return }
+    let i32t = i(mir::IntTy::I32);
+    let f = spec(
+        "repeat_zero",
+        0,
+        0,
+        &[i32t, arr_i32(0)],
+        vec![bb(
+            vec![
+                assign(pl(1), mir::Rvalue::Repeat(i32c(9), 0)),
+                assign(pl(0), mir::Rvalue::Use(i32c(5))),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    let (jit, prog) = build(&[f]);
+    check(&jit, &prog, "repeat_zero", &[], vec![], Ok(5));
+}
+
+#[test]
+fn repeat_beyond_frame_bound_is_unsupported() {
+    let i32t = i(mir::IntTy::I32);
+    let f = MirFunctionInput {
+        name: "big_repeat".to_string(),
+        def_id: Some(def(0)),
+        body: mir::Body::new(
+            locals(&[i32t, arr_i32(5000)]),
+            0,
+            vec![bb(
+                vec![assign(pl(1), mir::Rvalue::Repeat(i32c(1), 5000))],
+                mir::TerminatorKind::Return,
+            )],
+        ),
+    };
+    let err = JitProgram::compile(&MirProgramInput {
+        functions: vec![f],
+        names: HashMap::new(),
+    })
+    .expect_err("an array past the frame bound must be unsupported");
+    match err {
+        JitError::Unsupported(what) => {
+            assert!(what.contains("scalar elements"), "{what}")
+        }
+        other => panic!("expected Unsupported, got {other}"),
+    }
+}
+
+#[test]
+fn dynamic_index_projection_is_unsupported() {
+    // fn idx(i: usize) -> i32 { _2 = Repeat(const 3, 2); _0 = _2[_1]; return }
+    // A runtime index cannot address the JIT's static slots, so the
+    // projection stays an explicit unsupported error.
+    let i32t = i(mir::IntTy::I32);
+    let f = MirFunctionInput {
+        name: "idx".to_string(),
+        def_id: Some(def(0)),
+        body: mir::Body::new(
+            locals(&[i32t, u(mir::UintTy::Usize), arr_i32(2)]),
+            1,
+            vec![bb(
+                vec![
+                    assign(pl(2), mir::Rvalue::Repeat(i32c(3), 2)),
+                    assign(
+                        pl(0),
+                        mir::Rvalue::Use(mir::Operand::Copy(
+                            pl(2).index(mir::Local(1)),
+                        )),
+                    ),
+                ],
+                mir::TerminatorKind::Return,
+            )],
+        ),
+    };
+    let err = JitProgram::compile(&MirProgramInput {
+        functions: vec![f],
+        names: HashMap::new(),
+    })
+    .expect_err("a dynamic index projection must be unsupported");
+    match err {
+        JitError::Unsupported(what) => {
+            assert!(what.contains("Index projection"), "{what}")
+        }
+        other => panic!("expected Unsupported, got {other}"),
+    }
+}
