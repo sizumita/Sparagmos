@@ -265,12 +265,13 @@ mod tests {
             CaseStatus::Passed,
             "silent_panic should pass end-to-end: {panic_case:?}"
         );
-        // println! is not modelled yet: the case must come back
-        // Unsupported with a concrete reason, never a pass.
+        // println! output is modelled: hello passes end-to-end with
+        // stdout and exit code matching the native run.
         let hello = evaluate_case(&case("hello.rs"), &runner);
-        assert!(
-            matches!(hello.status, CaseStatus::Unsupported { .. }),
-            "hello must be unsupported until output is modelled: {hello:?}"
+        assert_eq!(
+            hello.status,
+            CaseStatus::Passed,
+            "hello should pass end-to-end: {hello:?}"
         );
     }
 }
