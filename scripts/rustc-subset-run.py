@@ -29,14 +29,17 @@ metric-2(b) rate, whose denominator is always the full subset
 
 A test is *attempted* only when both sides can be run faithfully:
 
-- its header carries an unscoped run-pass / run-fail directive
-  (revisions, run-crash, run-flags, exec-env, stdin and
+- its header carries a run-pass / run-fail directive
+  (run-crash, run-flags, exec-env, stdin and
   add-core-stubs are recorded as not-attempted reasons in stage 1;
   a test's `compile-flags` are honoured in both stages by forwarding
   them to the native rustc and, via the driver's `--rustc-arg`, to
   the driver's embedded rustc — the position compiletest gives them;
-  stage 2 additionally judges revision tests per revision, with the
-  `--cfg <revision>` and `--check-cfg` arguments compiletest adds);
+  revision tests are judged once per revision in both stages --
+  with the revision's directive view, its compile-flags, and the
+  `--cfg <revision>` and `--check-cfg` arguments compiletest
+  adds -- and the record passes only when every revision that
+  runs passes);
 - no `ignore-*` condition matches this host and every `only-*`
   condition is satisfied (otherwise the test is out of environment
   for x86_64-unknown-linux-gnu and is recorded as such);
@@ -472,6 +475,34 @@ def stage1_blocker(header, survey_rec):
     return None
 
 
+def stage1_view_blocker(view):
+    """Why one directive view of an exec record is not attempted
+    in stage 1, or None.
+
+    The per-revision counterpart of stage1_blocker, checked per
+    revision view the way stage2_blocker is: a directive scoped to
+    one revision only blocks that revision. Revisions themselves
+    are not a blocker here; fill_result judges a revision test once
+    per revision (see fill_result_revisions).
+    """
+    mode = run_mode(view)
+    if mode is None:
+        return "no run-pass/run-fail directive for this revision"
+    if mode == "run-crash":
+        return "run-crash mode (crash reproduction is out of stage-1 scope)"
+    if view.has("run-flags"):
+        return "run-flags present (guest program arguments are not supported)"
+    if view.has("exec-env"):
+        return "exec-env present (guest environment is not modelled)"
+    if view.has("stdin"):
+        return "stdin directive present (guest stdin is not modelled)"
+    if view.has("add-core-stubs"):
+        return "add-core-stubs (test links the minicore stub crate)"
+    if view.has("ignore-test"):
+        return "ignore-test (compiletest itself never runs this test)"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Process execution
 # ---------------------------------------------------------------------------
@@ -572,7 +603,7 @@ def aux_directives(header):
     return out
 
 
-def resolve_aux_specs(test_path):
+def resolve_aux_specs(test_path, revision=None):
     """Resolve a test's auxiliary crates, transitively, deps first.
 
     Returns (specs, error): specs is a list of (crate_name, Path) in
@@ -581,12 +612,21 @@ def resolve_aux_specs(test_path):
     next to the file whose directive names them, in that directory's
     `auxiliary/` subdirectory, and next to the main test file (the
     places compiletest looks). error is a not-attempted reason when
-    resolution fails.
+    resolution fails. With `revision` set, directives are read
+    through that revision's view (an auxiliary file's own
+    directives are scoped by the same revision, as compiletest
+    scopes them).
     """
     test_dir = test_path.parent
     specs = []
     by_name = {}
     visiting = set()
+
+    def directives(p):
+        h = Header(p.read_text(errors="ignore"))
+        if revision is not None:
+            h = h.view(revision)
+        return aux_directives(h)
 
     def find_file(fname, from_dir):
         # The `auxiliary/` subdirectory wins over the directory
@@ -616,8 +656,7 @@ def resolve_aux_specs(test_path):
             return f"auxiliary crate dependency cycle at `{name}`"
         visiting.add(name)
         by_name[name] = path
-        header = Header(path.read_text(errors="ignore"))
-        for dep_name, dep_file in aux_directives(header):
+        for dep_name, dep_file in directives(path):
             err = visit(dep_name, dep_file, path.parent)
             if err:
                 return err
@@ -625,8 +664,7 @@ def resolve_aux_specs(test_path):
         specs.append((name, path))
         return None
 
-    header = Header(test_path.read_text(errors="ignore"))
-    for name, fname in aux_directives(header):
+    for name, fname in directives(test_path):
         err = visit(name, fname, test_dir)
         if err:
             return [], err
@@ -870,6 +908,11 @@ def fill_result(rec, rust_dir, driver_bin, out):
     mode = run_mode(header)
     out["mode"] = mode
 
+    revs = header.revisions()
+    if revs:
+        fill_result_revisions(rec, header, revs, path, driver_bin, out)
+        return
+
     aux_specs = []
     if not rec["single_file"]:
         aux_specs, aux_err = resolve_aux_specs(path)
@@ -947,6 +990,146 @@ def fill_result(rec, rust_dir, driver_bin, out):
 
 
 
+
+
+def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions):
+    """Judge one revision view of an exec record.
+
+    The stage-1 counterpart of stage2_attempt: the revision is
+    compiled and run on both sides under the revision's directive
+    view -- its run mode, its compile-flags, and the `--cfg
+    <revision>` / `--check-cfg` arguments compiletest adds -- and
+    the execution is judged against the native run of the same
+    revision. Auxiliary crates are resolved through the same
+    revision view. Returns a dict with status/reason/bucket/mode,
+    plus the native and Sparagmos run details on a judged failure.
+    A "not-attempted" result carries the bucket that says why; the
+    "out of environment" bucket is kept distinct because the
+    revision-combining caller treats skipped revisions specially.
+    """
+    res = {"status": "not-attempted", "reason": "", "bucket": "",
+           "mode": None}
+    blocker = stage1_view_blocker(view)
+    if blocker:
+        res["reason"] = blocker
+        res["bucket"] = "not attempted (header feature)"
+        return res
+    mode = run_mode(view)
+    res["mode"] = mode
+    status, why = applicability(view)
+    if status == "out-of-environment":
+        res["reason"] = why
+        res["bucket"] = "out of environment"
+        return res
+    if status == "unevaluatable":
+        res["reason"] = why
+        res["bucket"] = "not attempted (unevaluatable condition)"
+        return res
+    aux_specs = []
+    if not rec["single_file"]:
+        aux_specs, aux_err = resolve_aux_specs(path, revision)
+        if aux_err:
+            res["reason"] = aux_err
+            res["bucket"] = "out of stage-1 scope (multi-file)"
+            return res
+    editions = view.values("edition")
+    edition = editions[-1].strip() if editions else "2021"
+    flags = compile_flags(view)
+    screened = screen_flags(flags)
+    if screened:
+        res["reason"] = screened
+        res["bucket"] = "not attempted (compile-flags)"
+        return res
+    args = revision_args(view, revision, all_revisions) + flags
+    with tempfile.TemporaryDirectory(prefix="subset-run-") as td:
+        native, err = native_side(path, edition, td, args, aux_specs)
+        if err:
+            res["reason"] = err
+            res["bucket"] = bucket_reason(err)
+            return res
+        exp = expected_exit(mode, view)
+        if native["exit_code"] != exp:
+            res["reason"] = (f"native run exit {native['exit_code']} does "
+                             f"not match the mode expectation {exp}")
+            res["bucket"] = "native run does not match mode expectation"
+            res["native"] = {"exit_code": native["exit_code"]}
+            return res
+        got, kind, reason = sparagmos_side(path, edition, driver_bin,
+                                           td, rustc_args=args,
+                                           aux_specs=aux_specs)
+        if kind == "unsupported":
+            res["status"] = "unsupported"
+            res["reason"] = reason
+            res["bucket"] = bucket_reason(reason)
+            return res
+        if kind in ("timeout", "driver-error"):
+            res["status"] = "fail"
+            res["reason"] = reason
+            res["bucket"] = bucket_reason(reason)
+            return res
+        verdict, detail = judge(mode, view, native, got)
+        res["status"] = "pass" if verdict == "pass" else "fail"
+        if verdict != "pass":
+            res["reason"] = detail
+            res["bucket"] = ("stdout mismatch"
+                             if detail == "stdout mismatch"
+                             else "exit-code mismatch")
+            res["native"] = {"exit_code": native["exit_code"],
+                             "stdout": native["stdout"][:500]}
+            res["sparagmos"] = {"exit_code": got["exit_code"],
+                                "stdout": got["stdout"][:500]}
+        return res
+
+
+def fill_result_revisions(rec, header, revs, path, driver_bin, out):
+    """Stage-1 judging for a test with `//@ revisions:`.
+
+    The test is judged once per revision -- with that revision's
+    directive view, its compile-flags, and the `--cfg` compiletest
+    adds -- and the record passes only when every revision that
+    runs passes (compiletest runs each revision as a separate test
+    instance; the subset counts the file once, so the record
+    aggregates its instances). A revision an ignore-/only-
+    condition removes from this host does not run, as in
+    compiletest; if any other revision cannot be attempted, the
+    record is not attempted, with that revision's reason.
+    """
+    per_rev = {}
+    for rev in revs:
+        per_rev[rev] = stage1_attempt(rec, header.view(rev), path,
+                                      driver_bin, rev, revs)
+    out["revisions"] = {
+        rev: {k: r[k] for k in ("status", "reason", "bucket", "mode")
+              if r.get(k)}
+        for rev, r in per_rev.items()
+    }
+    modes = {r["mode"] for r in per_rev.values() if r["mode"]}
+    if len(modes) == 1:
+        out["mode"] = modes.pop()
+    ran = {rev: r for rev, r in per_rev.items()
+           if r["bucket"] != "out of environment"}
+    if not ran:
+        first = next(iter(per_rev.values()))
+        out["reason"] = first["reason"]
+        out["bucket"] = "out of environment"
+        return
+    for rev, r in ran.items():
+        if r["status"] == "not-attempted":
+            out["reason"] = f"revision {rev}: {r['reason']}"
+            out["bucket"] = r["bucket"]
+            return
+    for wanted in ("fail", "unsupported"):
+        for rev, r in ran.items():
+            if r["status"] == wanted:
+                out["status"] = wanted
+                out["reason"] = (f"revision {rev}: {r['reason']}"
+                                 if r["reason"] else "")
+                out["bucket"] = r["bucket"]
+                for key in ("native", "sparagmos"):
+                    if key in r:
+                        out[key] = r[key]
+                return
+    out["status"] = "pass"
 
 
 # ---------------------------------------------------------------------------
@@ -1418,8 +1601,9 @@ def main():
     # the denominator is carried through as not-attempted so the
     # aggregate arithmetic covers the whole subset. A non-single-file
     # record is a candidate when its header carries auxiliary-crate
-    # directives (scoped ones included: process_test records those
-    # under the revisions blocker).
+    # directives (scoped ones included: revision tests resolve them
+    # per revision; scoped directives on a test that declares no
+    # revisions stay blocked in stage 1).
     def has_aux_directives(r):
         try:
             text = (args.rust_dir / r["path"]).read_text(errors="ignore")
