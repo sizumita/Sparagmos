@@ -1629,7 +1629,24 @@ impl<'a> Converter<'a> {
     /// of the trait path is accepted as well); a generic impl made
     /// concrete for one type (`impl Drop for G<i32>`) is found by
     /// the same pattern when it is the only candidate.
-    fn dtor_body(&self, adt_name: &str) -> Option<String> {
+    fn dtor_body(&self, adt_name: &str, args: &[mir::Ty]) -> Option<String> {
+        // The exact instance key, with the generic arguments
+        // rendered as the driver records instance names: several
+        // monomorphizations of one generic impl can coexist in the
+        // program, and only the full key tells them apart.
+        if !args.is_empty() {
+            let parts: Vec<String> = args
+                .iter()
+                .map(|t| crate::builtins::ty_tag(t, self.names))
+                .collect();
+            let instantiated = format!("{adt_name}<{}>", parts.join(", "));
+            for trait_path in ["std::ops::Drop", "core::ops::Drop"] {
+                let key = format!("<{instantiated} as {trait_path}>::drop");
+                if self.bodies.contains_key(&key) {
+                    return Some(key);
+                }
+            }
+        }
         for trait_path in ["std::ops::Drop", "core::ops::Drop"] {
             let key = format!("<{adt_name} as {trait_path}>::drop");
             if self.bodies.contains_key(&key) {
@@ -2223,6 +2240,20 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                     elem: Box::new(elem_plan),
                 }),
             },
+            mir::Ty::Closure(_, args) => {
+                // A closure's glue is its captures' glue: the last
+                // generic argument is the capture tuple. Anything
+                // else in that position is a shape this builder does
+                // not model, and the drop stays refused.
+                let mir::Ty::Tuple(captures) = args.last()? else {
+                    return None;
+                };
+                let mut fields = Vec::with_capacity(captures.len());
+                for t in captures {
+                    fields.push(self.plan(t)?);
+                }
+                Some(collapse_fields(fields, true))
+            }
             mir::Ty::Adt(def, args) => {
                 let key = format!("{ty:?}");
                 if let Some(&index) = self.adt_index.get(&key) {
@@ -2276,6 +2307,18 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                     },
                 });
             }
+            "std::result::Result" => {
+                // Same value shape as `Option`: variant 0 is `Ok`,
+                // variant 1 is `Err`, the payload sits at field 0.
+                let ok = self.plan(args.first()?)?;
+                let err = self.plan(args.get(1)?)?;
+                return Some(match (ok, err) {
+                    (P::Trivial, P::Trivial) => P::Trivial,
+                    (ok, err) => P::Variants {
+                        variants: vec![at_field0(ok), at_field0(err)],
+                    },
+                });
+            }
             "std::ops::Range" | "std::ops::RangeInclusive" => {
                 let bound = self.plan(args.first()?)?;
                 return Some(collapse_fields(vec![bound.clone(), bound], true));
@@ -2295,7 +2338,7 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
         // Any other ADT: its glue is its `Drop` impl (called first,
         // as in rustc's drop glue) followed by its fields' glue.
         let mut steps = Vec::new();
-        if let Some(func) = conv.dtor_body(&name) {
+        if let Some(func) = conv.dtor_body(&name, args) {
             steps.push(P::CallDtor { func });
         } else if conv.dtor_impl_known(&name) {
             // The impl exists but has no converted body (a generic
