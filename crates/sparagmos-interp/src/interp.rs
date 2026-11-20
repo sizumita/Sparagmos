@@ -141,9 +141,7 @@ impl<'a> Interpreter<'a> {
         let body = self
             .program
             .get(entry)
-            .ok_or_else(|| InterpError::UnknownFunction {
-                name: entry.to_string(),
-            })?;
+            .ok_or_else(|| self.missing_body_error(entry))?;
         if args.len() != body.arg_count {
             return Err(InterpError::type_mismatch(
                 format!("call to `{entry}`"),
@@ -457,6 +455,22 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// The error for naming a function that has no body in the
+    /// program: the recorded conversion failure when the function
+    /// exists but could not be converted, a plain unknown-function
+    /// error otherwise.
+    fn missing_body_error(&self, name: &str) -> InterpError {
+        match self.program.unconverted_reason(name) {
+            Some(reason) => InterpError::UnconvertedFunction {
+                name: name.to_string(),
+                reason: reason.to_string(),
+            },
+            None => InterpError::UnknownFunction {
+                name: name.to_string(),
+            },
+        }
+    }
+
     /// Push a call frame for `func` with already-evaluated argument
     /// values (placed at locals 1..), returning into `destination` /
     /// `target` of the current top frame when the callee returns.
@@ -473,9 +487,7 @@ impl<'a> Interpreter<'a> {
             .program
             .get(func)
             .cloned()
-            .ok_or_else(|| InterpError::UnknownFunction {
-                name: func.to_string(),
-            })?;
+            .ok_or_else(|| self.missing_body_error(func))?;
         if frames.len() >= self.config.max_call_depth {
             return Err(InterpError::CallDepthExceeded {
                 limit: self.config.max_call_depth,

@@ -469,7 +469,9 @@ fn tuple_and_array_aggregates_and_repeat() {
 fn f16_local_is_a_conversion_error() {
     // f32 / f64 locals convert and execute (see float_tests.rs);
     // f16 stays outside the type model and must fail conversion
-    // with an explicit reason.
+    // with an explicit reason. Conversion is isolated per body:
+    // the failure is recorded for `f`, and running `f` as the
+    // entry fails with that conversion error.
     let body = mir::Body::new(
         decls(&[mir::Ty::Float(mir::FloatTy::F16)]),
         0,
@@ -477,10 +479,22 @@ fn f16_local_is_a_conversion_error() {
     );
     let mut prog = MirProgram::new();
     prog.add("f", body);
-    let err = convert_program(&prog).expect_err("f16 local must not convert");
+    let converted = convert_program(&prog).expect("conversion is per-body");
+    assert!(converted.get("f").is_none(), "f16 body must not convert");
+    let reason = converted
+        .unconverted_reason("f")
+        .expect("the failure must be recorded");
     assert!(
-        matches!(err, ConvertError::UnsupportedType { .. }),
-        "expected UnsupportedType, got {err}"
+        reason.contains("unsupported type"),
+        "the recorded reason names the failure: {reason}"
+    );
+    let err = interpret_mir(&prog, "f", vec![]).expect_err("entry conversion must fail");
+    assert!(
+        matches!(
+            err,
+            MirRunError::Convert(ConvertError::UnsupportedType { .. })
+        ),
+        "expected Convert(UnsupportedType), got {err}"
     );
 }
 
@@ -511,12 +525,25 @@ fn subslice_projection_is_a_conversion_error() {
     );
     let mut prog = MirProgram::new();
     prog.add("idx", body);
-    // The conversion must fail explicitly, never guess.
-    let err = convert_program(&prog).expect_err("must not convert");
+    // The conversion must fail explicitly, never guess: the body
+    // is recorded as unconverted, and running it as the entry
+    // fails with the conversion error.
+    let converted = convert_program(&prog).expect("conversion is per-body");
+    assert!(
+        converted.get("idx").is_none(),
+        "subslice body must not convert"
+    );
+    assert!(
+        converted.unconverted_reason("idx").is_some(),
+        "the failure must be recorded"
+    );
+    let err = interpret_mir(&prog, "idx", vec![]).expect_err("entry conversion must fail");
     assert!(
         matches!(
             err,
-            ConvertError::UnsupportedProjection { .. } | ConvertError::UnsupportedType { .. }
+            MirRunError::Convert(
+                ConvertError::UnsupportedProjection { .. } | ConvertError::UnsupportedType { .. }
+            )
         ),
         "expected a projection/type conversion error, got {err}"
     );
