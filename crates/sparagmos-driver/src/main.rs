@@ -834,6 +834,10 @@ fn register_trait_key_aliases(
                 // fatal panic must report its own message.
                 let _ = take_captured_panic();
             }
+        }
+    }
+}
+
 /// Convert one local body (an item-loop body, or a constant body
 /// obtained from the item itself) and record the outcome; a
 /// successfully converted body also becomes a reachability seed.

@@ -1414,14 +1414,6 @@ fn run_mode_trait_default_method_body() {
 
 // ----- anonymous constants (Lane BW) -----
 
-const NAMES: [&str; 2] = ["x", "yy"];
-const OPT: Option<&i32> = Some(&5);
-fn main() {
-    println!("{} {} {} {} {} {}", S1.a, S1.b, *R, B, NAMES[1],
-             match OPT { Some(r) => *r, None => 0 });
-}
-"#;
-
 const ANON_CONST_GENERIC_SRC: &str = r#"
 fn f<T>(x: T) -> usize {
     let a = [0u32; 1 + 2];
