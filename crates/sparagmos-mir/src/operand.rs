@@ -46,6 +46,17 @@ pub enum ConstValue {
     /// A fat reference to decoded elements: a slice constant whose
     /// elements are not plain bytes.
     SliceVal(Vec<ConstValue>),
+    /// A function pointer value, decoded from an allocation whose
+    /// provenance names this function item: the callable value of
+    /// the item itself (the same target a  function
+    /// item constant names in operand position).
+    FnDef(DefId),
+    /// A function pointer value, decoded from an allocation whose
+    /// provenance names this closure (through its  adapter
+    /// shim): the closure coerced to a function pointer. Only
+    /// non-capturing closures coerce to function pointers, so the
+    /// environment is empty by construction.
+    Closure(DefId),
 }
 
 #[derive(Clone, Debug, PartialEq)]

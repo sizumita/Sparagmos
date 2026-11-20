@@ -941,6 +941,12 @@ impl Conv {
                     meta: atom_parse(field(f, "meta")?, "meta")?,
                 }
             }
+            ("FnDef", Payload::Args(a)) if a.len() == 1 => {
+                mir::ConstValue::FnDef(Self::def_id(&a[0])?)
+            }
+            ("Closure", Payload::Args(a)) if a.len() == 1 => {
+                mir::ConstValue::Closure(Self::def_id(&a[0])?)
+            }
             ("ByRef", Payload::Fields(f)) => mir::ConstValue::ByRef {
                 alloc_id: atom_parse(field(f, "alloc_id")?, "alloc_id")?,
                 offset: atom_parse(field(f, "offset")?, "offset")?,

@@ -962,6 +962,30 @@ impl<'a> Converter<'a> {
             mir::ConstKind::Ty(mir::Ty::FnDef(def, _)) => {
                 Ok(ir::Constant::FnDef(self.def_display_name(def)))
             }
+            // A closure in constant position is a value too (the
+            // zero-sized closure constant a `ClosureFnPointer` cast
+            // coerces, or a stored closure value): with an empty
+            // captured environment it becomes the closure value
+            // naming the body. A constant whose environment is not
+            // empty cannot be materialised here — the captured
+            // values are not part of the type constant — and stays
+            // an explicit unsupported naming the closure.
+            mir::ConstKind::Ty(mir::Ty::Closure(def, args)) => {
+                let upvars = match args.get(2) {
+                    Some(mir::Ty::Tuple(ts)) => ts.len(),
+                    _ => usize::MAX,
+                };
+                if upvars == 0 {
+                    Ok(ir::Constant::Closure(self.def_display_name(def)))
+                } else {
+                    Err(ConvertError::UnsupportedConstant {
+                        kind: format!(
+                            "closure constant {} with a captured environment",
+                            self.def_display_name(def)
+                        ),
+                    })
+                }
+            }
             mir::ConstKind::Ty(t) => Err(ConvertError::UnsupportedConstant {
                 kind: format!("type constant {} outside call position", t.kind_name()),
             }),
@@ -1075,6 +1099,12 @@ impl<'a> Converter<'a> {
                     })
                     .collect::<Result<_, _>>()?,
             ),
+            mir::ConstValue::FnDef(def) => {
+                ir::Constant::FnDef(self.def_display_name(def))
+            }
+            mir::ConstValue::Closure(def) => {
+                ir::Constant::Closure(self.def_display_name(def))
+            }
             mir::ConstValue::ByRef { .. } => {
                 return Err(ConvertError::UnsupportedConstant {
                     kind: "by-reference constant".to_string(),
@@ -1387,20 +1417,16 @@ impl<'a> Converter<'a> {
                         mir::PointerCoercion::ReifyFnPointer,
                     ) => ir::Rvalue::Use(v),
                     // A non-capturing closure coerced to a function
-                    // pointer: with a place operand, the closure
-                    // value itself is the callable. The constant
-                    // form names no closure (the zero-sized constant
-                    // does not preserve the closure type), so it
-                    // stays an explicit unsupported.
+                    // pointer: the closure value itself is the
+                    // callable, for place operands and for constant
+                    // operands alike — the driver preserves the
+                    // closure type of zero-sized closure constants,
+                    // and constant conversion resolves it to the
+                    // closure value (a captured environment stays an
+                    // explicit unsupported there).
                     mir::CastKind::PointerCoercion(
                         mir::PointerCoercion::ClosureFnPointer,
-                    ) => match operand {
-                        mir::Operand::Copy(_) | mir::Operand::Move(_) => ir::Rvalue::Use(v),
-                        mir::Operand::Constant(_) => ir::Rvalue::Unsupported(
-                            "Cast ClosureFnPointer of a zero-sized closure constant (the closure type is not preserved in the constant)"
-                                .to_string(),
-                        ),
-                    },
+                    ) => ir::Rvalue::Use(v),
                     mir::CastKind::BoxDerefTransmute => ir::Rvalue::BoxDerefTransmute(v),
                     // A transmute from a pointer / reference to an
                     // integer is the one transmute shape this value
@@ -1608,6 +1634,31 @@ impl<'a> Converter<'a> {
         })
     }
 
+    /// The argument types of the body a constant callable operand
+    /// names (a decoded function-item or closure constant): the
+    /// callee's own declared argument locals, skipping a closure
+    /// body's environment local. Empty when the operand is not
+    /// such a constant or the body is not converted.
+    fn constant_callee_param_tys(&self, func: &mir::Operand) -> Vec<mir::Ty> {
+        let mir::Operand::Constant(c) = func else {
+            return Vec::new();
+        };
+        let (def, env_locals) = match &c.literal {
+            mir::ConstKind::Value(mir::ConstValue::Closure(def)) => (def, 1),
+            mir::ConstKind::Value(mir::ConstValue::FnDef(def)) => (def, 0),
+            _ => return Vec::new(),
+        };
+        let Some(key) = self.def_names.get(def) else {
+            return Vec::new();
+        };
+        let Some(callee) = self.bodies.get(key) else {
+            return Vec::new();
+        };
+        (1 + env_locals..=callee.arg_count)
+            .filter_map(|i| callee.local_decls.get(i).map(|d| d.ty.clone()))
+            .collect()
+    }
+
     fn resolve_callee(&self, func: &mir::Operand) -> Option<String> {
         let mir::Operand::Constant(c) = func else {
             return None;
@@ -1779,9 +1830,33 @@ impl<'a> Converter<'a> {
                 // Indirect call through a callable value in a place
                 // (a function pointer, function item, or closure
                 // variable): the func operand is the callable itself.
-                if matches!(func, mir::Operand::Copy(_) | mir::Operand::Move(_)) {
+                // A constant operand holding a decoded callable value
+                // (a function pointer constant naming a function item
+                // or a coerced closure) is the same shape: the call
+                // goes through the value, so a closure target gets
+                // its environment argument like any other indirect
+                // call.
+                let indirect = matches!(
+                    func,
+                    mir::Operand::Copy(_) | mir::Operand::Move(_)
+                ) || matches!(
+                    func,
+                    mir::Operand::Constant(c) if matches!(
+                        c.literal,
+                        mir::ConstKind::Value(
+                            mir::ConstValue::FnDef(_) | mir::ConstValue::Closure(_)
+                        )
+                    )
+                );
+                if indirect {
                     let func_ty = self.operand_place_ty(body, func);
-                    let param_tys = callable_param_tys(func_ty.as_ref());
+                    // A constant callable carries no type of its own;
+                    // type the arguments from the target body's
+                    // signature instead, as the direct-call path does.
+                    let param_tys = match func_ty.as_ref() {
+                        Some(_) => callable_param_tys(func_ty.as_ref()),
+                        None => self.constant_callee_param_tys(func),
+                    };
                     let ir_func = self.convert_operand(body, func, func_ty.as_ref())?;
                     let mut ir_args = Vec::with_capacity(args.len());
                     for (i, arg) in args.iter().enumerate() {

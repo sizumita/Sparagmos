@@ -1133,3 +1133,113 @@ fn run_mode_string_capacity_is_an_explicit_unsupported() {
         "the error names the method: {stderr}"
     );
 }
+
+// ----- explicit mem::drop (Issue #61) ------------------------------------------
+
+const MEM_DROP_SRC: &str = r#"
+struct D(i32);
+impl Drop for D {
+    fn drop(&mut self) { println!("drop {}", self.0); }
+}
+fn main() {
+    let a = D(1);
+    let b = D(2);
+    std::mem::drop(a);
+    println!("middle");
+}
+"#;
+
+#[test]
+fn run_mode_mem_drop_runs_destructors() {
+    // An explicit std::mem::drop runs the same destructor as a
+    // scope-end drop: the explicitly dropped value's destructor
+    // runs at the call, and the remaining local drops afterwards,
+    // at scope end — the native interleaving, byte for byte. (The
+    // container cases are covered at the interpreter level in
+    // memdrop_glue_tests; a Vec of droppable elements additionally
+    // needs the runtime allocation path.)
+    let dir = temp_dir("memdrop");
+    let src = fixture(&dir, "memdrop.rs", MEM_DROP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "mem::drop program must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "drop 1\nmiddle\ndrop 2\n",
+        "explicit and scope-end drops interleave exactly as natively"
+    );
+}
+
+const CONST_CLOSURE_FN_PTR_SRC: &str = r#"
+const F: fn() -> i32 = || 42;
+fn main() { println!("{}", F()); }
+"#;
+
+const STATIC_CLOSURE_FN_PTR_SRC: &str = r#"
+static F: fn() -> i32 = || 42;
+fn main() { println!("{}", F()); }
+"#;
+
+const DIRECT_CLOSURE_FN_PTR_SRC: &str = r#"
+fn main() {
+    let f: fn() -> i32 = || 42;
+    println!("{}", f());
+}
+"#;
+
+const CONST_CLOSURE_FN_PTR_ARGS_SRC: &str = r#"
+const F: fn(i32) -> i32 = |x| x + 1;
+fn main() { println!("{}", F(41)); }
+"#;
+
+const CONST_FN_ITEM_SRC: &str = r#"
+fn foo() -> i32 { 42 }
+const F: fn() -> i32 = foo;
+fn main() { println!("{}", F()); }
+"#;
+
+fn run_expect_42(tag: &str, name: &str, src: &str) {
+    let dir = temp_dir(tag);
+    let path = fixture(&dir, name, src);
+    let out = run_driver(&path);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "callable constant must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "42\n",
+        "output must match the native program"
+    );
+}
+
+#[test]
+fn run_mode_const_coerced_closure_fn_ptr() {
+    run_expect_42("const-closure", "const_closure.rs", CONST_CLOSURE_FN_PTR_SRC);
+}
+
+#[test]
+fn run_mode_static_coerced_closure_fn_ptr() {
+    run_expect_42("static-closure", "static_closure.rs", STATIC_CLOSURE_FN_PTR_SRC);
+}
+
+#[test]
+fn run_mode_direct_closure_fn_ptr_cast() {
+    run_expect_42("direct-closure", "direct_closure.rs", DIRECT_CLOSURE_FN_PTR_SRC);
+}
+
+#[test]
+fn run_mode_const_closure_fn_ptr_with_args() {
+    run_expect_42("const-closure-args", "const_closure_args.rs", CONST_CLOSURE_FN_PTR_ARGS_SRC);
+}
+
+#[test]
+fn run_mode_const_fn_item() {
+    run_expect_42("const-fn-item", "const_fn_item.rs", CONST_FN_ITEM_SRC);
+}

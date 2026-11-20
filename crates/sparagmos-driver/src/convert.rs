@@ -22,7 +22,7 @@ use std::collections::HashMap;
 
 use rustc_public::abi::{FieldsShape, TagEncoding, VariantsShape};
 use rustc_public::mir;
-use rustc_public::mir::mono::Instance;
+use rustc_public::mir::mono::{Instance, InstanceKind};
 use rustc_public::ty::{
     AdtDef, AdtKind, AliasKind as SmirAliasKind, Allocation, ConstantKind, FloatTy as SmirFloatTy,
     FnDef, GenericArgKind, GenericArgs, IntTy as SmirIntTy, RigidTy, TyConstKind, TyKind,
@@ -501,10 +501,15 @@ impl Converter {
         let mc = &c.const_;
         match mc.kind() {
             CK::ZeroSized => {
-                // Function items are ZST constants whose type is the FnDef;
-                // keep the type so call targets stay identifiable.
+                // Function items and closures are ZST constants whose
+                // type names the callable (the FnDef, resp. the closure
+                // definition); keep the type so call targets stay
+                // identifiable.
                 let ty = mc.ty();
-                if matches!(ty.kind(), TyKind::RigidTy(RigidTy::FnDef(..))) {
+                if matches!(
+                    ty.kind(),
+                    TyKind::RigidTy(RigidTy::FnDef(..) | RigidTy::Closure(..))
+                ) {
                     let t = self.ty(&ty);
                     return sm::Constant {
                         literal: sm::ConstKind::Ty(t),
@@ -524,7 +529,20 @@ impl Converter {
                     let v = self.const_from_alloc(&t, alloc);
                     sm::Constant::from_value(v)
                 }
-                TyConstKind::ZSTValue(_) => {
+                TyConstKind::ZSTValue(ty) => {
+                    // A zero-sized type constant of function-item or
+                    // closure type names a callable; keep the type,
+                    // as for `CK::ZeroSized` above.
+                    if matches!(
+                        ty.kind(),
+                        TyKind::RigidTy(RigidTy::FnDef(..) | RigidTy::Closure(..))
+                    ) {
+                        let t = self.ty(ty);
+                        return sm::Constant {
+                            literal: sm::ConstKind::Ty(t),
+                            user_ty: None,
+                        };
+                    }
                     sm::Constant::from_value(sm::ConstValue::ZeroSized)
                 }
                 TyConstKind::Unevaluated(def, args) => {
@@ -790,6 +808,21 @@ impl Converter {
     }
 
 
+    /// Whether a closure type's captured environment is empty: the
+    /// environment tuple is the last of the closure's generic
+    /// arguments (after the parent arguments, the kind and the
+    /// signature). Anything not recognisably an empty tuple counts
+    /// as non-empty.
+    fn closure_env_is_empty(args: &GenericArgs) -> bool {
+        match args.0.last() {
+            Some(GenericArgKind::Type(t)) => match t.kind() {
+                TyKind::RigidTy(RigidTy::Tuple(elems)) => elems.is_empty(),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     /// Decode the value of type `ty` stored in `alloc` at `offset`
     /// into a structured constant. Aggregates are laid out with the
     /// type's own layout (`Ty::layout`), pointers are followed
@@ -882,6 +915,26 @@ impl Converter {
                     fields.push(self.decode_const(elem, alloc, offset + off, depth + 1)?);
                 }
                 Some(sm::ConstValue::Tuple(fields))
+            }
+            TyKind::RigidTy(RigidTy::FnDef(def, args)) => {
+                // A function item value is zero-sized: the type
+                // itself names the callable, no bytes are stored.
+                let d = self.fn_def_id(&def, &args);
+                Some(sm::ConstValue::FnDef(d))
+            }
+            TyKind::RigidTy(RigidTy::FnPtr(_)) => {
+                self.decode_fn_pointer(alloc, offset)
+            }
+            TyKind::RigidTy(RigidTy::Closure(def, args)) => {
+                // A stored closure value with no captures is the
+                // callable itself; a captured environment has no
+                // constant form here and stays undecoded.
+                if Self::closure_env_is_empty(&args) {
+                    let d = self.crate_def_id(&def);
+                    Some(sm::ConstValue::Closure(d))
+                } else {
+                    None
+                }
             }
             TyKind::RigidTy(RigidTy::Pat(inner, _)) => {
                 // Pattern types (e.g. the `usize is 0..=N` field of
@@ -1055,6 +1108,50 @@ impl Converter {
     /// the reference's value in the interpreter's model: string and
     /// byte data directly, a fat slice value for decoded slices, and
     /// `ConstValue::Ref` over the decoded pointee otherwise.
+    /// Decode a function pointer stored in `alloc` at `offset`:
+    /// its provenance names the target instance. A plain function
+    /// item becomes the callable of that item. A closure coerced to
+    /// a function pointer points at the closure's `Fn` trait adapter
+    /// shim (const evaluation picks the `FnOnce` one), whose `Self`
+    /// argument is the closure type; a direct closure instance's
+    /// own type is the closure type. Both identify the closure
+    /// body, which is the callable, with an empty environment (only
+    /// non-capturing closures coerce to function pointers).
+    /// Anything else (a vtable, a null pointer with no provenance)
+    /// has no callable constant form and stays undecoded.
+    fn decode_fn_pointer(
+        &mut self,
+        alloc: &Allocation,
+        offset: usize,
+    ) -> Option<sm::ConstValue> {
+        let (_, prov) = alloc
+            .provenance
+            .ptrs
+            .iter()
+            .find(|(o, _)| *o as usize == offset)?;
+        let mir::alloc::GlobalAlloc::Function(inst) =
+            mir::alloc::GlobalAlloc::from(prov.0)
+        else {
+            return None;
+        };
+        if matches!(inst.kind, InstanceKind::Shim) {
+            for arg in &inst.args().0 {
+                if let GenericArgKind::Type(t) = arg {
+                    if let TyKind::RigidTy(RigidTy::Closure(def, _)) = t.kind() {
+                        let d = self.crate_def_id(&def);
+                        return Some(sm::ConstValue::Closure(d));
+                    }
+                }
+            }
+        }
+        if let TyKind::RigidTy(RigidTy::Closure(def, _)) = inst.ty().kind() {
+            let d = self.crate_def_id(&def);
+            return Some(sm::ConstValue::Closure(d));
+        }
+        let d = self.instance_def_id(inst.def.def_id(), &inst);
+        Some(sm::ConstValue::FnDef(d))
+    }
+
     fn decode_ref(
         &mut self,
         inner: &rustc_public::ty::Ty,

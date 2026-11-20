@@ -300,6 +300,11 @@ pub enum Constant {
     /// A function item constant: evaluates to the callable value
     /// naming the function.
     FnDef(String),
+    /// A non-capturing closure constant (a closure value in
+    /// constant position, or a closure coerced to a function
+    /// pointer by a constant): evaluates to the closure value
+    /// naming the closure body, with an empty environment.
+    Closure(String),
 }
 
 /// An operand: the right-hand side leaf of most rvalues.
