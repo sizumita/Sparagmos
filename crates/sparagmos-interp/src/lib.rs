@@ -60,7 +60,8 @@ pub mod value;
 pub use error::{InterpError, InterpResult};
 pub use interp::{interpret, InterpConfig, Interpreter};
 pub use ir::{
-    BasicBlock, BasicBlockData, BinOp, Body, Constant, Local, Operand, Place, Program,
+    BasicBlock, BasicBlockData, BinOp, Body, Constant, DropGlue, DropPlan, Local, Operand,
+    Place, Program,
     ProjectionElem, Rvalue, Statement, StatementKind, TerminatorKind, Ty, UnOp,
 };
 pub use mir_convert::{
