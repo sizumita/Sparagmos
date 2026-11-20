@@ -9,6 +9,8 @@
 # and print a Markdown table. This is a *marker* report, not the Sparagmos
 # coverage definition itself — see docs/COVERAGE.md for the three real
 # metrics (MIR variant coverage / corpus pass rate / std feature coverage).
+# The reference for all of those metrics is Rust 1.100.0 (released
+# 2026-11-12; installed and verified on the dev host).
 #
 # Usage: scripts/coverage-report.sh [workspace-root]
 # Output: Markdown on stdout (suitable for $GITHUB_STEP_SUMMARY / Issues).
@@ -43,7 +45,8 @@ fi
 echo "# Sparagmos coverage marker report"
 echo
 echo "Generated: $(date -u '+%Y-%m-%dT%H:%M:%SZ')  "
-echo "Workspace: \`$ROOT\`"
+echo "Workspace: \`$ROOT\`  "
+echo "Reference toolchain (MIR denominator): Rust 1.100.0"
 echo
 echo "| Crate | Source files | LOC | TODO/FIXME | unimplemented!/todo! | Tests (\`#[test]\`) |"
 echo "|---|---:|---:|---:|---:|---:|"
