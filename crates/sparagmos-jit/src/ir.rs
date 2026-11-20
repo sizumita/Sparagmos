@@ -256,6 +256,22 @@ pub enum Instr {
         src: Operand,
         src_kind: FloatKind,
     },
+    /// `dst = &slot`: the machine address of value `slot`'s stack
+    /// slot. This is how the MIR front end represents a reference or
+    /// raw pointer to a local place: the pointer *is* the slot's
+    /// address, so loads and stores through it (below) read and
+    /// write the place itself. The address is only meaningful while
+    /// the current frame (or an ancestor frame, for a pointer passed
+    /// down as a call argument) is live.
+    SlotAddr { dst: Value, slot: Value },
+    /// `dst = *ptr`: load the full 64-bit word at the address held
+    /// in `ptr`. A scalar leaf's slot always holds the value's
+    /// canonical 64-bit form, so a whole-word load through a pointer
+    /// to a slot yields exactly the leaf's value.
+    LoadPtr { dst: Value, ptr: Operand },
+    /// `*ptr = src`: store the full 64-bit word `src` at the address
+    /// held in `ptr` (the counterpart of [`Instr::LoadPtr`]).
+    StorePtr { ptr: Operand, src: Operand },
 }
 
 /// How a basic block ends.
