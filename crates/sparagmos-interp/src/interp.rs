@@ -590,6 +590,31 @@ impl<'a> Interpreter<'a> {
                 // the receiver (the box aggregate itself for a
                 // by-value `Box<dyn>` receiver).
                 Some(Ok((impl_func, receiver))) => {
+                    // Shape the receiver the way the impl body's
+                    // `self` type expects: a reference receiver gets
+                    // a reference to the concrete value (through the
+                    // box aggregate for a `Box<dyn>`), a by-value
+                    // receiver gets the data pointer as it is.
+                    let receiver = match self
+                        .program
+                        .get(&impl_func)
+                        .and_then(|b| b.local_tys.get(1))
+                    {
+                        Some(Ty::Ref(..)) => match receiver {
+                            Value::Enum { fields, .. } if fields.len() == 1 => {
+                                Value::Ref(RefTarget::Value(Box::new(
+                                    fields.into_iter().next().expect("one field"),
+                                )))
+                            }
+                            other @ (Value::Ref(_)
+                            | Value::FatRef { .. }
+                            | Value::DynRef { .. }) => other,
+                            other => {
+                                Value::Ref(RefTarget::Value(Box::new(other)))
+                            }
+                        },
+                        _ => receiver,
+                    };
                     let mut args = arg_values;
                     args[0] = receiver;
                     return self.start_call(frames, &impl_func, args, destination, target);
@@ -1414,6 +1439,9 @@ impl<'a> Interpreter<'a> {
             // data (`String`), and the fmt value family.
             (Some(Ty::Adt(_)), Value::Enum { .. })
             | (Some(Ty::Adt(_)), Value::Str(_))
+            // A smart-pointer ADT over a `dyn` pointee (`Box<dyn
+            // Trait>`, `Rc<dyn Trait>`) holds the fat pointer.
+            | (Some(Ty::Adt(_)), Value::DynRef { .. })
             | (Some(Ty::Adt(_)), Value::FmtArg { .. })
             | (Some(Ty::Adt(_)), Value::FmtCount(_))
             | (Some(Ty::Adt(_)), Value::FmtArguments(_)) => Ok(value),
@@ -1660,7 +1688,9 @@ impl<'a> Interpreter<'a> {
                 let mut v = self.eval_operand(frames, body, operand)?;
                 loop {
                     match v {
-                        Value::Ref(_) | Value::FatRef { .. } => break Ok(v),
+                        Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. } => {
+                            break Ok(v)
+                        }
                         Value::Enum { mut fields, .. } if fields.len() == 1 => {
                             v = fields.pop().expect("one field");
                         }
@@ -1822,6 +1852,11 @@ pub(crate) fn project_value(
                         }
                     })?
                 }
+                // Field 0 of a fat pointer value is the pointer
+                // field of its smart-pointer wrapper (a `Box`'s
+                // `Unique`): in this model the `DynRef` *is* that
+                // pointer, metadata included.
+                Value::DynRef { .. } if *idx == 0 => value,
                 ref other => {
                     return Err(InterpError::type_mismatch(
                         format!("field projection on {place}"),
