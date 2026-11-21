@@ -1898,7 +1898,7 @@ fn external_callees(c: &Collected) -> Vec<String> {
 
 /// Execute the collected program's `main` in the interpreter and
 /// return the run-mode process exit code (see the crate docs).
-fn execute(c: &Collected) -> i32 {
+fn execute(c: &Collected, guest_args: &[String]) -> i32 {
     let mut program = sparagmos_interp::MirProgram::new();
     for ((name, body), def_id) in c.bodies.iter().zip(c.body_def_ids.iter()) {
         program.functions.push(sparagmos_interp::MirFunction {
@@ -1943,7 +1943,16 @@ fn execute(c: &Collected) -> i32 {
         );
         return 2;
     };
-    let run = sparagmos_interp::interpret_mir_captured(&program, entry, Vec::new());
+    let config = sparagmos_interp::InterpConfig {
+        guest_args: guest_args.to_vec(),
+        ..sparagmos_interp::InterpConfig::default()
+    };
+    let run = sparagmos_interp::interpret_mir_captured_with_config(
+        &program,
+        entry,
+        Vec::new(),
+        config,
+    );
     // The guest's stdout is this process's stdout, whatever the
     // outcome was.
     {
@@ -2518,6 +2527,7 @@ fn main() {
     let mut edition = "2021".to_string();
     let mut sysroot: Option<String> = None;
     let mut rustc_args: Vec<String> = Vec::new();
+    let mut guest_args: Vec<String> = Vec::new();
     let mut i = if run_mode { 2 } else { 1 };
     while i < argv.len() {
         match argv[i].as_str() {
@@ -2539,6 +2549,13 @@ fn main() {
                 i += 1;
                 rustc_args.push(argv.get(i).cloned().unwrap_or_else(|| {
                     eprintln!("--rustc-arg needs a value");
+                    std::process::exit(2);
+                }));
+            }
+            "--guest-arg" => {
+                i += 1;
+                guest_args.push(argv.get(i).cloned().unwrap_or_else(|| {
+                    eprintln!("--guest-arg needs a value");
                     std::process::exit(2);
                 }));
             }
@@ -2564,7 +2581,7 @@ fn main() {
                 }));
             }
             "-h" | "--help" => {
-    println!("usage: sparagmos-driver [run] <file.rs> [--aux <name>=<file.rs>[;crate-type=<type>][;edition=<ed>]] [--rustc-arg <arg>] [--dump <path>] [--edition <ed>] [--sysroot <path>]");
+    println!("usage: sparagmos-driver [run] <file.rs> [--aux <name>=<file.rs>[;crate-type=<type>][;edition=<ed>]] [--rustc-arg <arg>] [--guest-arg <arg>] [--dump <path>] [--edition <ed>] [--sysroot <path>]");
                 return;
             }
             other if input.is_none() && !other.starts_with('-') => {
@@ -2749,7 +2766,7 @@ fn main() {
                         std::process::exit(1);
                     }
                 }
-                std::process::exit(execute(&c));
+                std::process::exit(execute(&c, &guest_args));
             }
             println!(
                 "sparagmos-driver: {input} (Stable MIR, {})",

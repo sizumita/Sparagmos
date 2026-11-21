@@ -39,8 +39,16 @@ metric-2(b) rate, whose denominator is always the full subset
 A test is *attempted* only when both sides can be run faithfully:
 
 - its header carries a run-pass / run-fail directive
-  (run-crash, run-flags, exec-env, stdin and
-  add-core-stubs are recorded as not-attempted reasons in stage 1;
+  (run-crash, stdin and add-core-stubs are recorded as
+  not-attempted reasons in stage 1; `//@ run-flags:` are
+  forwarded to both runs -- as the native run's argv and as the
+  driver's `--guest-arg` options -- and `//@ exec-env:` pairs
+  are applied to both runs' environments, the way compiletest
+  applies them, with `//@ unset-exec-env:` names removed; a
+  revision whose directive view carries no run mode is judged
+  as a compile check under compiletest's per-revision default
+  (ui tests default to check-fail), exactly as stage 2 judges
+  compile-check views;
   a test's `compile-flags` are honoured in both stages by forwarding
   them to the native rustc and, via the driver's `--rustc-arg`, to
   the driver's embedded rustc — the position compiletest gives them;
@@ -200,6 +208,97 @@ def run_mode(header):
         if header.has(mode):
             return mode
     return None
+
+
+_SYSROOT_BASE = None
+
+
+def sysroot_base():
+    """The reference toolchain's sysroot directory."""
+    global _SYSROOT_BASE
+    if _SYSROOT_BASE is None:
+        try:
+            out = subprocess.run(
+                rustc_cmd() + ["--print", "sysroot"],
+                capture_output=True, text=True, timeout=30)
+            _SYSROOT_BASE = out.stdout.strip()
+        except Exception:
+            _SYSROOT_BASE = ""
+    return _SYSROOT_BASE
+
+
+def suite_root(path):
+    """The suite root directory of a test file (compiletest's
+    src-base for the test): the nearest ancestor directory whose
+    parent is `tests`."""
+    for parent in Path(path).parents:
+        if parent.parent.name == "tests":
+            return str(parent)
+    return str(Path(path).parent)
+
+
+def expand_variables(value, src_base, build_base):
+    """compiletest's `{{...}}` substitutions in directive values.
+
+    Mirrors expand_variables in compiletest's directives.rs (it
+    expands every name-value directive value): {{cwd}} is the
+    directory compiletest runs from -- here the runner's working
+    directory; {{src-base}} the test's suite root; {{build-base}}
+    the attempt's scratch directory; {{sysroot-base}} the
+    reference toolchain's sysroot; {{target}} the host target;
+    {{target-linker}} empty (no custom linker is configured on
+    this host); {{rust-src-base}} the sysroot's rust source tree.
+    """
+    if "{{" not in value:
+        return value
+    value = value.replace("{{cwd}}", os.getcwd())
+    value = value.replace("{{src-base}}", src_base)
+    value = value.replace("{{build-base}}", build_base)
+    value = value.replace("{{sysroot-base}}", sysroot_base())
+    value = value.replace("{{target-linker}}", "")
+    value = value.replace("{{target}}", HOST_TARGET)
+    value = value.replace(
+        "{{rust-src-base}}",
+        str(Path(sysroot_base()) / "lib" / "rustlib" / "src" / "rust"))
+    return value
+
+
+def parse_env_pairs(values):
+    """(name, value) pairs from env directive values, read the
+    way compiletest's parse_env reads them: split at the first
+    `=`, the name trimmed, a missing `=` means an empty value."""
+    pairs = []
+    for v in values:
+        name, sep, val = v.partition("=")
+        pairs.append((name.strip(), val if sep else ""))
+    return pairs
+
+
+def view_env(view, set_name, unset_name, src_base, build_base):
+    """The environment a directive view prescribes: (pairs, unset).
+
+    `pairs` is a dict of the view's `set_name` directives
+    (`rustc-env` / `exec-env`) with compiletest's variable
+    expansion applied to the values; `unset` is the list of
+    variable names the view's `unset_name` directives remove
+    (each value is one variable name, trimmed).
+    """
+    pairs = {}
+    for name, val in parse_env_pairs(view.values(set_name)):
+        pairs[name] = expand_variables(val, src_base, build_base)
+    unset = [v.strip() for v in view.values(unset_name) if v.strip()]
+    return pairs, unset
+
+
+def view_run_flags(view, src_base, build_base):
+    """The guest program arguments a directive view prescribes:
+    its `run-flags` values, variable-expanded and split the way
+    compiletest splits them."""
+    flags = []
+    for v in view.values("run-flags"):
+        flags.extend(split_flags(expand_variables(v, src_base,
+                                                  build_base)))
+    return flags
 
 
 # ---------------------------------------------------------------------------
@@ -1044,10 +1143,6 @@ def stage1_blocker(header, survey_rec):
         return "no unscoped run-pass/run-fail directive"
     if mode == "run-crash":
         return "run-crash mode (crash reproduction is out of stage-1 scope)"
-    if header.has("run-flags"):
-        return "run-flags present (guest program arguments are not supported)"
-    if header.has("exec-env"):
-        return "exec-env present (guest environment is not modelled)"
     if header.has("stdin"):
         return "stdin directive present (guest stdin is not modelled)"
     if header.has("add-core-stubs"):
@@ -1068,14 +1163,8 @@ def stage1_view_blocker(view):
     per revision (see fill_result_revisions).
     """
     mode = run_mode(view)
-    if mode is None:
-        return "no run-pass/run-fail directive for this revision"
     if mode == "run-crash":
         return "run-crash mode (crash reproduction is out of stage-1 scope)"
-    if view.has("run-flags"):
-        return "run-flags present (guest program arguments are not supported)"
-    if view.has("exec-env"):
-        return "exec-env present (guest environment is not modelled)"
     if view.has("stdin"):
         return "stdin directive present (guest stdin is not modelled)"
     if view.has("add-core-stubs"):
@@ -1089,10 +1178,12 @@ def stage1_view_blocker(view):
 # Process execution
 # ---------------------------------------------------------------------------
 
-def run_cmd(argv, *, timeout, cwd=None, env_extra=None):
+def run_cmd(argv, *, timeout, cwd=None, env_extra=None, env_remove=()):
     env = dict(os.environ)
     if env_extra:
         env.update(env_extra)
+    for key in env_remove:
+        env.pop(key, None)
     try:
         p = subprocess.run(argv, capture_output=True, timeout=timeout,
                            cwd=cwd, env=env, stdin=subprocess.DEVNULL)
@@ -1180,6 +1271,7 @@ class AuxSpec(NamedTuple):
     path: Path
     crate_type: Optional[str] = None
     edition: Optional[str] = None
+    modifiers: Optional[str] = None
 
 
 def as_aux_spec(spec):
@@ -1193,9 +1285,14 @@ def as_aux_spec(spec):
 
 def aux_spec_arg(spec):
     """The driver's `--aux` value for a spec: `name=path` plus the
-    `;crate-type=` / `;edition=` attributes the spec carries."""
+    `;crate-type=` / `;edition=` attributes the spec carries. A
+    spec with `--extern` modifiers binds under
+    `modifiers:name`, the verbatim binding name the driver keeps
+    for such specs."""
     spec = as_aux_spec(spec)
-    arg = f"{spec.name}={spec.path}"
+    binding = (f"{spec.modifiers}:{spec.name}" if spec.modifiers
+               else spec.name)
+    arg = f"{binding}={spec.path}"
     if spec.crate_type:
         arg += f";crate-type={spec.crate_type}"
     if spec.edition:
@@ -1203,38 +1300,63 @@ def aux_spec_arg(spec):
     return arg
 
 
+def parse_aux_crate_value(value):
+    """(modifiers, crate_name, file_name) from an `aux-crate:`
+    value, parsed the way compiletest's parse_aux_crate parses
+    it: `name=path` or `modifiers:name=path`, where the modifiers
+    are `--extern` modifiers (`priv`, `noprelude`, ...) the crate
+    is bound with. Returns None for a value without `=`."""
+    m = re.match(r"^(?:([^=]*?):)?([^=]*)=(.*)$", value.strip())
+    if not m:
+        return None
+    modifiers, name, fname = m.groups()
+    return (modifiers, name.strip(), fname.strip())
+
+
+def parse_proc_macro_value(value):
+    """(modifiers, file_name) from a `proc-macro:` value, parsed
+    the way compiletest's parse_proc_macro parses it: `path` or
+    `modifiers:path`."""
+    m = re.match(r"^(?:([^=]*?):)?(.*)$", value.strip())
+    modifiers, fname = m.groups()
+    return (modifiers, fname.strip())
+
+
 def aux_entries(header):
-    """(crate_name, file_name, crate_type) triples from a header's
-    aux directives.
+    """(crate_name, file_name, crate_type, modifiers) tuples from
+    a header's aux directives.
 
     `aux-build: foo-bar.rs` builds crate `foo_bar` (the file stem
     with dashes as underscores, as compiletest derives it);
-    `aux-crate: name=file.rs` names the crate explicitly;
+    `aux-crate: name=file.rs` names the crate explicitly and may
+    carry `--extern` modifiers (`aux-crate: priv:name=file.rs`);
     `proc-macro: foo-bar.rs` builds crate `foo_bar` as a proc-macro
-    crate (its crate_type is "proc-macro"; the others' is None).
+    crate (its crate_type is "proc-macro"; the others' is None)
+    and may likewise carry modifiers (`proc-macro: priv:foo.rs`).
     """
     out = []
     for value in header.values("aux-build"):
         fname = value.strip()
         if fname:
-            out.append((Path(fname).stem.replace("-", "_"), fname, None))
+            out.append((Path(fname).stem.replace("-", "_"), fname,
+                        None, None))
     for value in header.values("aux-crate"):
-        value = value.strip()
-        if "=" in value:
-            name, fname = value.split("=", 1)
-            out.append((name.strip(), fname.strip(), None))
+        parsed = parse_aux_crate_value(value)
+        if parsed:
+            modifiers, name, fname = parsed
+            out.append((name, fname, None, modifiers))
     for value in header.values("proc-macro"):
-        fname = value.strip()
+        modifiers, fname = parse_proc_macro_value(value)
         if fname:
             out.append((Path(fname).stem.replace("-", "_"), fname,
-                        "proc-macro"))
+                        "proc-macro", modifiers))
     return out
 
 
 def aux_directives(header):
     """(crate_name, file_name) pairs from a header's aux directives
     (see `aux_entries`)."""
-    return [(name, fname) for name, fname, _ in aux_entries(header)]
+    return [(name, fname) for name, fname, _, _ in aux_entries(header)]
 
 
 def resolve_aux_specs(test_path, revision=None, top=None,
@@ -1286,7 +1408,7 @@ def resolve_aux_specs(test_path, revision=None, top=None,
                 return cand
         return None
 
-    def visit(name, fname, from_dir, crate_type=None):
+    def visit(name, fname, from_dir, crate_type=None, modifiers=None):
         path = find_file(fname, from_dir)
         if path is None:
             return (f"auxiliary file {fname} for crate `{name}` "
@@ -1302,15 +1424,17 @@ def resolve_aux_specs(test_path, revision=None, top=None,
         visiting.add(name)
         by_name[name] = path
         header = file_header(path)
-        for dep_name, dep_file, dep_type in aux_entries(header):
-            err = visit(dep_name, dep_file, path.parent, dep_type)
+        for dep_name, dep_file, dep_type, dep_mod in aux_entries(header):
+            err = visit(dep_name, dep_file, path.parent, dep_type,
+                        dep_mod)
             if err:
                 return err
         visiting.discard(name)
         editions = header.values("edition")
         edition = _concrete_edition(editions[-1].strip()) \
             if editions else None
-        specs.append(AuxSpec(name, path, crate_type, edition))
+        specs.append(AuxSpec(name, path, crate_type, edition,
+                             modifiers))
         return None
 
     if top is not None:
@@ -1324,8 +1448,8 @@ def resolve_aux_specs(test_path, revision=None, top=None,
         # them twice. Proc-macro crates an auxiliary file names are
         # transitive entries, not top entries, and stay.
         top_entries = [e for e in top_entries if e[2] is None]
-    for name, fname, crate_type in top_entries:
-        err = visit(name, fname, test_dir, crate_type)
+    for name, fname, crate_type, modifiers in top_entries:
+        err = visit(name, fname, test_dir, crate_type, modifiers)
         if err:
             return [], err
     return specs, None
@@ -1370,16 +1494,18 @@ def _find_proc_macro_file(test_path, fname):
     return None
 
 
-def _proc_macro_chain(test_path, fname, edition):
+def _proc_macro_chain(test_path, fname, edition, modifiers=None):
     """Resolve one `//@ proc-macro:` directive to a build chain.
 
     Returns (chain, error): chain is a list of (crate_name,
-    source_path, forced_crate_type) in dependency order -- the
-    auxiliary crates the proc-macro crate itself depends on first
-    (its own aux directives, resolved transitively), the proc-macro
-    crate last with its type forced to proc-macro, the treatment
-    compiletest's directive names. Which edition each crate is
-    built with is decided at build time from its own header.
+    source_path, forced_crate_type, extern_modifiers) in
+    dependency order -- the auxiliary crates the proc-macro crate
+    itself depends on first (its own aux directives, resolved
+    transitively), the proc-macro crate last with its type forced
+    to proc-macro and the `//@ proc-macro:` directive's own
+    modifiers attached, the treatment compiletest's directive
+    names. Which edition each crate is built with is decided at
+    build time from its own header.
     """
     src = _find_proc_macro_file(test_path, fname)
     if src is None:
@@ -1389,8 +1515,9 @@ def _proc_macro_chain(test_path, fname, edition):
         return None, err
     text = src.read_text(errors="ignore")
     name = declared_crate_name(text) or Path(fname).stem.replace("-", "_")
-    chain = [(spec.name, spec.path, spec.crate_type) for spec in deps]
-    chain.append((name, src, "proc-macro"))
+    chain = [(spec.name, spec.path, spec.crate_type, spec.modifiers)
+             for spec in deps]
+    chain.append((name, src, "proc-macro", modifiers))
     return chain, None
 
 
@@ -1421,7 +1548,8 @@ def _build_proc_macro_chain(chain, edition, outdir, extra_externs=()):
     crate itself.
     """
     built = list(extra_externs)
-    for cname, csrc, forced in chain:
+    last_name, last_artifact = None, None
+    for cname, csrc, forced, cmod in chain:
         text = csrc.read_text(errors="ignore")
         eff_name = declared_crate_name(text) or cname
         aux_view = Header(text).view(None)
@@ -1444,9 +1572,10 @@ def _build_proc_macro_chain(chain, edition, outdir, extra_externs=()):
         # distinction for same-named auxiliary crates.
         meta = hashlib.sha256(str(csrc).encode()).hexdigest()[:12]
         cmd += ["-C", f"metadata=sparagmos-aux-{meta}"]
-        for prev_name, prev_artifact in built:
+        for prev_binding, prev_artifact in built:
             if prev_artifact is not None:
-                cmd += ["--extern", f"{prev_name}={prev_artifact}"]
+                cmd += ["--extern",
+                        f"{prev_binding}={prev_artifact}"]
         if forced is not None:
             # compiletest links the proc_macro library crate into
             # proc-macro auxiliary builds with a bare --extern, so
@@ -1455,28 +1584,51 @@ def _build_proc_macro_chain(chain, edition, outdir, extra_externs=()):
             cmd += ["--extern", "proc_macro"]
         cmd += compile_flags(aux_view)
         cmd += [str(csrc)]
+        # The crate's own `//@ rustc-env:` pairs apply to its
+        # build, as compiletest applies an auxiliary file's
+        # rustc-env to the auxiliary build.
+        cenv, cunset = view_env(aux_view, "rustc-env",
+                                "unset-rustc-env",
+                                suite_root(csrc),
+                                str(outdir))
+        env = dict(BOOTSTRAP_ENV)
+        env.update(cenv)
         build = run_cmd(cmd, timeout=NATIVE_COMPILE_TIMEOUT,
-                        env_extra=BOOTSTRAP_ENV)
+                        env_extra=env, env_remove=cunset)
         if build["timeout"]:
             return None, None, (f"build of auxiliary crate "
                                 f"`{eff_name}` timed out")
         if build["exit_code"] != 0:
+            first = first_error_line(build["stderr"])
+            if first.startswith("error: linking with `cc`"):
+                # The generic cc line hides the cause; the
+                # linker note names it (e.g. a bootstrap-built
+                # test helper library the official sysroot does
+                # not ship).
+                for line in build["stderr"].splitlines():
+                    if "unable to find library" in line:
+                        first += ": " + line.strip().split(
+                            "= note: ", 1)[-1]
+                        break
             return None, None, (
                 f"build of auxiliary crate `{eff_name}` failed: "
-                f"{first_error_line(build['stderr'])}")
+                f"{first}")
         effective = forced or declared or "rlib"
         artifact = (find_artifact(outdir, eff_name)
                     if effective in ("rlib", "lib", "dylib", "proc-macro")
                     else None)
-        built.append((eff_name, artifact))
-    name, artifact = built[-1]
-    if artifact is None:
-        return None, None, (f"build of proc-macro crate `{name}` "
-                            f"produced no linkable artifact")
-    return name, artifact, None
+        binding = f"{cmod}:{eff_name}" if cmod else eff_name
+        built.append((binding, artifact))
+        last_name, last_artifact = eff_name, artifact
+    if last_artifact is None:
+        return None, None, (f"build of proc-macro crate "
+                            f"`{last_name}` produced no linkable "
+                            f"artifact")
+    return last_name, last_artifact, None
 
 
-def build_proc_macro(test_path, fname, edition, extra_externs=()):
+def build_proc_macro(test_path, fname, edition, extra_externs=(),
+                     modifiers=None):
     """Build the proc-macro crate a `//@ proc-macro:` directive names.
 
     Returns (crate_name, artifact, error). Builds are cached: the
@@ -1488,22 +1640,24 @@ def build_proc_macro(test_path, fname, edition, extra_externs=()):
     and repeated runs.
     """
     edition = _concrete_edition(edition)
-    chain, err = _proc_macro_chain(test_path, fname, edition)
+    chain, err = _proc_macro_chain(test_path, fname, edition,
+                                   modifiers)
     if err:
         return None, None, err
     h = hashlib.sha256()
     # Recipe version: bump when the build recipe changes (crate
     # metadata disambiguation, the bare proc_macro extern, ...),
     # so artifacts built by an older recipe are never reused.
-    h.update(b"sparagmos-pm-recipe-2")
+    h.update(b"sparagmos-pm-recipe-3")
     h.update(edition.encode())
     for prev_name, prev_artifact in extra_externs:
         h.update(prev_name.encode())
         h.update(str(prev_artifact).encode())
-    for cname, csrc, forced in chain:
+    for cname, csrc, forced, cmod in chain:
         h.update(cname.encode())
         h.update(csrc.read_bytes())
         h.update((forced or "").encode())
+        h.update((cmod or "").encode())
     key = h.hexdigest()[:24]
     if key in _PROC_MACRO_CACHE:
         return _PROC_MACRO_CACHE[key]
@@ -1544,25 +1698,28 @@ def proc_macro_extern_args(test_path, view, edition):
     conversion is attempted with the same --extern set compiletest
     arranges. Returns (args, error).
     """
-    fnames = [v.strip() for v in view.values("proc-macro")]
-    fnames = [f for f in fnames if f]
-    if not fnames:
+    directives = [parse_proc_macro_value(v)
+                  for v in view.values("proc-macro")]
+    directives = [(mod, f) for mod, f in directives if f]
+    if not directives:
         return [], None
     args = []
     seen_dirs = set()
     built = []
-    for fname in fnames:
+    for modifiers, fname in directives:
         # Directive order matters: a later proc-macro crate may
         # use an earlier one (compiletest links each auxiliary
         # build against the ones before it), so each build sees
         # the crates already built for this view as externs.
         name, artifact, err = build_proc_macro(
-            test_path, fname, edition, extra_externs=built)
+            test_path, fname, edition, extra_externs=built,
+            modifiers=modifiers)
         if err:
             return [], (f"proc-macro auxiliary crate from {fname} "
                         f"could not be built: {err}")
-        built.append((name, artifact))
-        args += ["--extern", f"{name}={artifact}"]
+        binding = f"{modifiers}:{name}" if modifiers else name
+        built.append((binding, artifact))
+        args += ["--extern", f"{binding}={artifact}"]
         dep_dir = str(artifact.parent)
         if dep_dir not in seen_dirs:
             seen_dirs.add(dep_dir)
@@ -1570,7 +1727,8 @@ def proc_macro_extern_args(test_path, view, edition):
     return args, None
 
 
-def native_side(path, edition, workdir, extra_flags=(), aux_specs=()):
+def native_side(path, edition, workdir, extra_flags=(), aux_specs=(),
+                run_args=(), run_env_extra=None, run_env_remove=()):
     """Compile and run natively. Returns (result_dict, error_reason).
 
     error_reason is None when the native run completed (whatever its
@@ -1578,7 +1736,10 @@ def native_side(path, edition, workdir, extra_flags=(), aux_specs=()):
     `extra_flags` are the test's compile-flags, appended last as
     compiletest appends them. Auxiliary crates are compiled first,
     in dependency order, the way compiletest builds them for the
-    test's own compilation.
+    test's own compilation. `run_args` are the test's run-flags,
+    appended to the run's argv, and `run_env_extra` /
+    `run_env_remove` its exec-env pairs and unsets, applied to
+    the run only -- the positions compiletest gives them.
     """
     binpath = Path(workdir) / "prog"
     lib = sysroot_lib()
@@ -1602,9 +1763,10 @@ def native_side(path, edition, workdir, extra_flags=(), aux_specs=()):
                 cmd += ["--crate-type", spec.crate_type or "rlib"]
             if declared_crate_name(text) is None:
                 cmd += ["--crate-name", name]
-            for prev_name, prev_artifact in built:
+            for prev_binding, prev_artifact in built:
                 if prev_artifact is not None:
-                    cmd += ["--extern", f"{prev_name}={prev_artifact}"]
+                    cmd += ["--extern",
+                            f"{prev_binding}={prev_artifact}"]
             cmd += [str(src)]
             build = run_cmd(cmd, timeout=NATIVE_COMPILE_TIMEOUT,
                             env_extra=BOOTSTRAP_ENV)
@@ -1618,9 +1780,11 @@ def native_side(path, edition, workdir, extra_flags=(), aux_specs=()):
                         if effective in ("rlib", "lib", "dylib",
                                          "proc-macro")
                         else None)
-            built.append((eff_name, artifact))
+            binding = (f"{spec.modifiers}:{eff_name}"
+                       if spec.modifiers else eff_name)
+            built.append((binding, artifact))
             if artifact is not None:
-                externs += ["--extern", f"{eff_name}={artifact}"]
+                externs += ["--extern", f"{binding}={artifact}"]
     build = run_cmd(
         rustc_cmd() + ["--edition", edition, "-C", "opt-level=0"]
         + (["-L", lib] if lib else [])
@@ -1641,30 +1805,47 @@ def native_side(path, edition, workdir, extra_flags=(), aux_specs=()):
     if lib:
         prev = os.environ.get("LD_LIBRARY_PATH", "")
         run_env["LD_LIBRARY_PATH"] = lib + (":" + prev if prev else "")
-    run = run_cmd([str(binpath)], timeout=NATIVE_RUN_TIMEOUT,
-                  cwd=str(workdir), env_extra=run_env)
+    if run_env_extra:
+        run_env.update(run_env_extra)
+    run = run_cmd([str(binpath)] + list(run_args),
+                  timeout=NATIVE_RUN_TIMEOUT,
+                  cwd=str(workdir), env_extra=run_env,
+                  env_remove=run_env_remove)
     if run["timeout"]:
         return None, "native run timed out"
     return run, None
 
 
-def sparagmos_side(path, edition, driver_bin, cwd=None, rustc_args=(), aux_specs=()):
+def sparagmos_side(path, edition, driver_bin, cwd=None, rustc_args=(),
+                   aux_specs=(), guest_args=(), env_extra=None,
+                   env_remove=()):
     """Run through the driver. Returns (result_dict, kind, reason).
 
     kind is "result" (exit 0/101), "unsupported" (driver exit 2),
     "timeout", or "driver-error". `rustc_args` are the test's
     compile-flags, forwarded through the driver's `--rustc-arg`.
     Auxiliary crates are handed to the driver with `--aux`, in
-    dependency order.
+    dependency order. `guest_args` are the test's run-flags,
+    forwarded through the driver's `--guest-arg` (the guest
+    program's argv after argv[0], whose policy is the
+    interpreter's). `env_extra` / `env_remove` are the test's
+    exec-env pairs and unsets, applied to the driver process --
+    the guest runs in-process, so this is the environment
+    compiletest's exec-env describes for it.
     """
     argv = [str(driver_bin), "run", str(path), "--edition", edition]
     for a in rustc_args:
         argv += ["--rustc-arg", a]
     for spec in aux_specs:
         argv += ["--aux", aux_spec_arg(spec)]
+    for a in guest_args:
+        argv += ["--guest-arg", a]
+    env = dict(BOOTSTRAP_ENV)
+    if env_extra:
+        env.update(env_extra)
     res = run_cmd(argv,
                   timeout=DRIVER_TIMEOUT, cwd=cwd,
-                  env_extra=BOOTSTRAP_ENV)
+                  env_extra=env, env_remove=env_remove)
     if res["timeout"]:
         return None, "timeout", f"driver timed out after {DRIVER_TIMEOUT}s"
     if res["exit_code"] in (0, 101):
@@ -1798,7 +1979,8 @@ def fill_result(rec, rust_dir, driver_bin, out):
 
     revs = header.revisions()
     if revs:
-        fill_result_revisions(rec, header, revs, path, driver_bin, out)
+        fill_result_revisions(rec, header, revs, path, driver_bin, out,
+                              rust_dir)
         return
 
     aux_specs = []
@@ -1839,8 +2021,16 @@ def fill_result(rec, rust_dir, driver_bin, out):
         out["bucket"] = "not attempted (compile-flags)"
         return
 
+    src_base = suite_root(path)
     with tempfile.TemporaryDirectory(prefix="subset-run-") as td:
-        native, err = native_side(path, edition, td, flags, aux_specs)
+        env_pairs, env_unset = view_env(header.view(None),
+                                        "exec-env", "unset-exec-env",
+                                        src_base, td)
+        run_flags = view_run_flags(header.view(None), src_base, td)
+        native, err = native_side(path, edition, td, flags, aux_specs,
+                                  run_args=run_flags,
+                                  run_env_extra=env_pairs,
+                                  run_env_remove=env_unset)
         if err:
             out["reason"] = err
             out["bucket"] = bucket_reason(err)
@@ -1853,7 +2043,11 @@ def fill_result(rec, rust_dir, driver_bin, out):
             out["native"] = {"exit_code": native["exit_code"]}
             return
         got, kind, reason = sparagmos_side(path, edition, driver_bin, td,
-                                           rustc_args=flags, aux_specs=aux_specs)
+                                           rustc_args=flags,
+                                           aux_specs=aux_specs,
+                                           guest_args=run_flags,
+                                           env_extra=env_pairs,
+                                           env_remove=env_unset)
         if kind == "unsupported":
             out["status"] = "unsupported"
             out["reason"] = reason
@@ -1880,7 +2074,69 @@ def fill_result(rec, rust_dir, driver_bin, out):
 
 
 
-def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions):
+def stage1_compile_check(rec, view, path, driver_bin, revision, res,
+                         edition, rev_args, flags, aux_specs,
+                         rust_dir):
+    """Judge a stage-1 revision view that carries no run mode.
+
+    compiletest gives such a revision a compile-only verdict:
+    the ui pass/fail directives visible in the view decide the
+    expectation (check-pass / build-pass expect success,
+    check-fail / build-fail expect failure), and a ui revision
+    with no mode directive at all defaults to check-fail
+    (TestProps::from_file in compiletest). The revision is
+    judged exactly the way stage2_attempt judges a compile-check
+    view -- the driver's convert-only mode under the revision's
+    arguments, the view's rustc-env applied to the driver
+    process, and judge_compile's outcome comparison -- so the
+    same revision receives the same verdict shape in both
+    stages.
+    """
+    expectation = compile_expectation(rec["suite"], view)
+    res["expectation"] = expectation
+    if expectation is None:
+        res["reason"] = ("verdict involves executing the program "
+                         "(run-fail-or-crash / run mode), which a "
+                         "compile outcome alone cannot judge")
+        res["bucket"] = "not attempted (verdict needs execution)"
+        return res
+    args = list(rev_args)
+    if view.has("add-minicore"):
+        mc_args, mc_err = minicore_test_args(view, rust_dir, edition,
+                                             flags)
+        if mc_err is not None:
+            res["reason"] = mc_err
+            res["bucket"] = "not attempted (minicore build)"
+            return res
+        args += mc_args
+    args += flags
+    pm_args, pm_err = proc_macro_extern_args(path, view, edition)
+    if pm_err:
+        res["reason"] = pm_err
+        res["bucket"] = "not attempted (header feature)"
+        return res
+    args += pm_args
+    cenv, cunset = view_env(view, "rustc-env", "unset-rustc-env",
+                            suite_root(path), os.getcwd())
+    conv = convert_side(path, edition, driver_bin, rustc_args=args,
+                        aux_specs=aux_specs, env_extra=cenv,
+                        env_remove=cunset)
+    verdict, reason, bucket = judge_compile(expectation, conv)
+    res["status"] = verdict
+    res["reason"] = reason
+    res["bucket"] = bucket
+    res["driver"] = {
+        "exit_code": conv["exit_code"],
+        "converted": conv["converted"],
+        "skipped": conv["skipped"],
+        "skip_totals": conv["skip_totals"],
+        "ice": conv["ice"],
+    }
+    return res
+
+
+def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions,
+                   rust_dir):
     """Judge one revision view of an exec record.
 
     The stage-1 counterpart of stage2_attempt: the revision is
@@ -1888,12 +2144,18 @@ def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions):
     view -- its run mode, its compile-flags, and the `--cfg
     <revision>` / `--check-cfg` arguments compiletest adds -- and
     the execution is judged against the native run of the same
-    revision. Auxiliary crates are resolved through the same
-    revision view. Returns a dict with status/reason/bucket/mode,
-    plus the native and Sparagmos run details on a judged failure.
-    A "not-attempted" result carries the bucket that says why; the
-    "out of environment" bucket is kept distinct because the
-    revision-combining caller treats skipped revisions specially.
+    revision. The view's run-flags and exec-env are forwarded to
+    both runs the way compiletest applies them. A view with no
+    run mode is not an execution at all under compiletest (its
+    verdict is a compile outcome, defaulting to check-fail for
+    ui tests); stage1_compile_check judges it the way stage 2
+    judges compile-check views. Auxiliary crates are resolved
+    through the same revision view. Returns a dict with
+    status/reason/bucket/mode, plus the native and Sparagmos run
+    details on a judged failure. A "not-attempted" result
+    carries the bucket that says why; the "out of environment"
+    bucket is kept distinct because the revision-combining
+    caller treats skipped revisions specially.
     """
     res = {"status": "not-attempted", "reason": "", "bucket": "",
            "mode": None}
@@ -1929,9 +2191,23 @@ def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions):
         res["reason"] = screened
         res["bucket"] = "not attempted (compile-flags)"
         return res
-    args = revision_args(view, revision, all_revisions) + flags
+    rev_args = revision_args(view, revision, all_revisions)
+    args = rev_args + flags
+    if mode is None:
+        return stage1_compile_check(rec, view, path, driver_bin,
+                                    revision, res, edition,
+                                    rev_args, flags, aux_specs,
+                                    rust_dir)
+    src_base = suite_root(path)
     with tempfile.TemporaryDirectory(prefix="subset-run-") as td:
-        native, err = native_side(path, edition, td, args, aux_specs)
+        env_pairs, env_unset = view_env(view, "exec-env",
+                                        "unset-exec-env",
+                                        src_base, td)
+        run_flags = view_run_flags(view, src_base, td)
+        native, err = native_side(path, edition, td, args, aux_specs,
+                                  run_args=run_flags,
+                                  run_env_extra=env_pairs,
+                                  run_env_remove=env_unset)
         if err:
             res["reason"] = err
             res["bucket"] = bucket_reason(err)
@@ -1945,7 +2221,10 @@ def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions):
             return res
         got, kind, reason = sparagmos_side(path, edition, driver_bin,
                                            td, rustc_args=args,
-                                           aux_specs=aux_specs)
+                                           aux_specs=aux_specs,
+                                           guest_args=run_flags,
+                                           env_extra=env_pairs,
+                                           env_remove=env_unset)
         if kind == "unsupported":
             res["status"] = "unsupported"
             res["reason"] = reason
@@ -1970,7 +2249,8 @@ def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions):
         return res
 
 
-def fill_result_revisions(rec, header, revs, path, driver_bin, out):
+def fill_result_revisions(rec, header, revs, path, driver_bin, out,
+                          rust_dir):
     """Stage-1 judging for a test with `//@ revisions:`.
 
     The test is judged once per revision -- with that revision's
@@ -1986,7 +2266,8 @@ def fill_result_revisions(rec, header, revs, path, driver_bin, out):
     per_rev = {}
     for rev in revs:
         per_rev[rev] = stage1_attempt(rec, header.view(rev), path,
-                                      driver_bin, rev, revs)
+                                      driver_bin, rev, revs,
+                                      rust_dir)
     out["revisions"] = {
         rev: {k: r[k] for k in ("status", "reason", "bucket", "mode")
               if r.get(k)}
@@ -2048,6 +2329,11 @@ def fill_result_revisions(rec, header, revs, path, driver_bin, out):
 # adds. The record passes only when every revision that runs
 # passes; a revision removed by an ignore-/only- condition does not
 # run, as in compiletest.
+# A view's `//@ rustc-env:` pairs are applied to the driver process
+# environment (and `//@ unset-rustc-env:` names removed from it):
+# the driver's embedded rustc is the compiler compiletest would
+# set them for, and values a test reads at compile time with
+# env! / option_env! take effect in it unchanged.
 #
 # Tests carrying `//@ add-minicore` are attempted the way compiletest
 # runs them: the suite's minicore stub crate
@@ -2169,8 +2455,6 @@ def stage2_blocker(view, rec):
         return "add-core-stubs (test links the core stub crate)"
     if view.has("ignore-test"):
         return "ignore-test (compiletest itself never runs this test)"
-    if view.has("rustc-env"):
-        return "rustc-env present (compiler environment is not modelled)"
     return None
 
 
@@ -2210,7 +2494,8 @@ _CONVERTED_RE = re.compile(r"^converted: (\d+), skipped: (\d+)$", re.M)
 _TARGET_RE = re.compile(r"^target-crate converted: (\d+), skipped: (\d+)$", re.M)
 
 
-def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=()):
+def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=(),
+                 env_extra=None, env_remove=()):
     """Run the driver in convert-only mode and parse its report.
 
     Returns a dict with exit_code (None on timeout), converted and
@@ -2234,8 +2519,12 @@ def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=()):
         argv += ["--rustc-arg", a]
     for spec in aux_specs:
         argv += ["--aux", aux_spec_arg(spec)]
+    env = dict(BOOTSTRAP_ENV)
+    if env_extra:
+        env.update(env_extra)
     res = run_cmd(argv,
-                  timeout=CONVERT_TIMEOUT, env_extra=BOOTSTRAP_ENV)
+                  timeout=CONVERT_TIMEOUT, env_extra=env,
+                  env_remove=env_remove)
     out = {
         "exit_code": res["exit_code"],
         "timeout": res["timeout"],
@@ -2631,8 +2920,16 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
         res["bucket"] = "not attempted (header feature)"
         return res
     args += pm_args
+    # The view's `//@ rustc-env:` pairs are applied to the driver
+    # process: the driver's embedded rustc reads them exactly as
+    # compiletest's rustc invocation does (including values a
+    # test reads back with env! / option_env!), and
+    # `//@ unset-rustc-env:` names are removed from it.
+    cenv, cunset = view_env(view, "rustc-env", "unset-rustc-env",
+                            suite_root(path), os.getcwd())
     conv = convert_side(path, edition, driver_bin, rustc_args=args,
-                        aux_specs=specs)
+                        aux_specs=specs, env_extra=cenv,
+                        env_remove=cunset)
     verdict, reason, bucket = judge_compile(expectation, conv)
     res["status"] = verdict
     res["reason"] = reason
@@ -2717,7 +3014,13 @@ def _aux_source_texts(test_path):
                             if n in ("aux-build", "aux-crate",
                                      "proc-macro")]):
         for value in values:
-            fname = value.strip().split("=")[-1].strip()
+            if name == "aux-crate":
+                parsed = parse_aux_crate_value(value)
+                fname = parsed[2] if parsed else ""
+            elif name == "proc-macro":
+                fname = parse_proc_macro_value(value)[1]
+            else:
+                fname = value.strip()
             if fname:
                 fnames.append(fname)
     test_dir = test_path.parent
