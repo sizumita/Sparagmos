@@ -4095,6 +4095,64 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// Mutate the value a resolved target denotes in place,
+    /// running `f` on the stored slot. Callers must preserve the
+    /// value's top-level form (an `Enum` stays the same `Enum`, a
+    /// `Str` stays a `Str`): write normalization
+    /// ([`Self::normalize_for_ty`]) is the identity for those
+    /// forms, so skipping the read-modify-write round trip through
+    /// [`Self::write_resolved`] — which clones every element of an
+    /// aggregate on the way out and back in — is unobservable.
+    pub(crate) fn modify_resolved<R>(
+        &self,
+        frames: &mut Vec<Frame>,
+        target: &Resolved,
+        f: impl FnOnce(&mut Value) -> InterpResult<R>,
+    ) -> InterpResult<R> {
+        match target {
+            Resolved::Value(_) => Err(InterpError::type_mismatch(
+                "assignment",
+                "mutable place",
+                "constant aggregate",
+            )),
+            Resolved::Static { name, projection } => {
+                let mut store = self.statics.borrow_mut();
+                let slot = store
+                    .get_mut(name)
+                    .ok_or_else(|| self.missing_static(name))?;
+                let place_desc = format!("static {name}");
+                let slot = navigate_mut(slot, projection, "<static>", &place_desc)?;
+                f(slot)
+            }
+            Resolved::Alloc { id, projection } => {
+                let mut store = self.allocs.borrow_mut();
+                let slot = store
+                    .get_mut(id)
+                    .ok_or_else(|| self.missing_alloc(*id))?;
+                let place_desc = format!("allocation #{id}");
+                let slot = navigate_mut(slot, projection, "<allocation>", &place_desc)?;
+                f(slot)
+            }
+            Resolved::Place {
+                frame_pos,
+                local,
+                projection,
+            } => {
+                let frame = &mut frames[*frame_pos];
+                let func = frame.func.clone();
+                let place_desc = describe_resolved(*local, projection);
+                let slot = frame.locals.get_mut(*local).ok_or_else(|| {
+                    InterpError::UnknownLocal {
+                        func: func.clone(),
+                        local: *local,
+                    }
+                })?;
+                let slot = navigate_mut(slot, projection, &func, &place_desc)?;
+                f(slot)
+            }
+        }
+    }
+
     /// Read element `index` of the aggregate a resolved target
     /// denotes (the element access `copy_nonoverlapping` performs).
     pub(crate) fn read_resolved_at(

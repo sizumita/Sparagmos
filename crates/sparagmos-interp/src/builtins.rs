@@ -2677,18 +2677,17 @@ impl<'a> Interpreter<'a> {
                 arity(2)?;
                 let suffix = self.resolve_string(frames, &vals[1])?;
                 let target = self.deref_value(frames, &vals[0])?;
-                match self.read_resolved(frames, &target)? {
-                    Value::Str(mut s) => {
+                self.modify_resolved(frames, &target, |slot| match slot {
+                    Value::Str(s) => {
                         s.push_str(&suffix);
-                        self.write_resolved(frames, &target, Value::Str(s))?;
                         Ok(Value::Unit)
                     }
-                    ref other => Err(InterpError::type_mismatch(
+                    other => Err(InterpError::type_mismatch(
                         "String::push_str",
                         "string value",
                         other.kind_name(),
                     )),
-                }
+                })
             }
             Builtin::StringPush => {
                 arity(2)?;
@@ -2712,18 +2711,17 @@ impl<'a> Interpreter<'a> {
                     }
                 };
                 let target = self.deref_value(frames, &vals[0])?;
-                match self.read_resolved(frames, &target)? {
-                    Value::Str(mut s) => {
+                self.modify_resolved(frames, &target, |slot| match slot {
+                    Value::Str(s) => {
                         s.push(c);
-                        self.write_resolved(frames, &target, Value::Str(s))?;
                         Ok(Value::Unit)
                     }
-                    ref other => Err(InterpError::type_mismatch(
+                    other => Err(InterpError::type_mismatch(
                         "String::push",
                         "string value",
                         other.kind_name(),
                     )),
-                }
+                })
             }
             Builtin::StrChars => {
                 arity(1)?;
@@ -3285,26 +3283,20 @@ impl<'a> Interpreter<'a> {
             Builtin::VecPush => {
                 arity(2)?;
                 let target = self.deref_value(frames, &vals[0])?;
-                let state = self.read_resolved(frames, &target)?;
-                match state {
-                    Value::Enum {
-                        variant,
-                        mut fields,
-                    } => {
-                        fields.push(vals.into_iter().nth(1).expect("arity checked"));
-                        self.write_resolved(
-                            frames,
-                            &target,
-                            Value::Enum { variant, fields },
-                        )?;
+                let mut vals = vals.into_iter();
+                let _ = vals.next();
+                let elem = vals.next().expect("arity checked");
+                self.modify_resolved(frames, &target, |slot| match slot {
+                    Value::Enum { fields, .. } => {
+                        fields.push(elem);
                         Ok(Value::Unit)
                     }
-                    ref other => Err(InterpError::type_mismatch(
+                    other => Err(InterpError::type_mismatch(
                         "Vec::push",
                         "vector value",
                         other.kind_name(),
                     )),
-                }
+                })
             }
             Builtin::VecLen | Builtin::VecIsEmpty => {
                 arity(1)?;
