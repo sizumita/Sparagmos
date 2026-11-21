@@ -2288,12 +2288,17 @@ impl<'a> Converter<'a> {
     ///   coroutine machinery's `ResumeTy` chain transmute through
     ///   these;
     /// * zero-sized type -> zero-sized type whose value is
-    ///   uniquely determined by its type.
+    ///   uniquely determined by its type;
+    /// * scalar-shaped -> scalar-shaped of the same total width
+    ///   ([`ir::Rvalue::Reinterpret`]): integers, floats, `bool`
+    ///   and `char` in any combination, arrays of scalars, and
+    ///   one-payload-field ADTs over those — the bit-level
+    ///   reinterpretation `transmute` means there.
     ///
     /// Every other shape — aggregate <-> aggregate byte
-    /// reinterpretation, fat pointers, enums with payloads —
-    /// stays [`ir::Rvalue::Unsupported`]: the model has no flat
-    /// byte memory to reinterpret through.
+    /// reinterpretation beyond one payload field, fat pointers,
+    /// enums with payloads — stays [`ir::Rvalue::Unsupported`]:
+    /// the model has no flat byte memory to reinterpret through.
     fn convert_transmute(
         &self,
         body: &mir::Body,
@@ -2328,6 +2333,33 @@ impl<'a> Converter<'a> {
                 }
             }
         }
+        // The scalar-shape reinterpretation, decided from the
+        // two types alone: when both sides flatten to the same
+        // nonzero bit width, the cast is a `Reinterpret`. The
+        // specialised arms below still take the shapes whose
+        // result this does not reproduce (pointers and fieldless
+        // enums carry no scalar shape, so those pairs never
+        // produce a `generic`).
+        let generic = {
+            let to = self.scalar_shape(target, 0);
+            let from = match &src {
+                Some(s) => self.scalar_shape(s, 0),
+                // A constant operand carries no place type; its
+                // shape comes from the constant itself (see
+                // `constant_scalar_shape`).
+                None => to
+                    .as_ref()
+                    .and_then(|t| self.constant_scalar_shape(v, t.bits())),
+            };
+            match (from, to) {
+                (Some(from), Some(to))
+                    if from.bits() == to.bits() && from.bits() > 0 =>
+                {
+                    Some(ir::Rvalue::Reinterpret(v.clone(), from, to))
+                }
+                _ => None,
+            }
+        };
         match (&src, target) {
             // Pointer -> integer: the synthetic address (what the
             // compiler's UB precondition checks use to test a
@@ -2370,6 +2402,14 @@ impl<'a> Converter<'a> {
             (_, t) if src_is_int && is_thin_ptr_ty(t) => {
                 ir::Rvalue::IntToPtr(v.clone())
             }
+            // Scalar-shaped -> scalar-shaped of the same width:
+            // the bit-level reinterpretation (float <-> integer
+            // bits, `bool` / `char` <-> integer, scalar arrays,
+            // one-payload wrappers over scalars). For the one
+            // overlap with the arms below (a one-field struct ->
+            // the integer of exactly its field's type) the result
+            // is the same value: the field itself.
+            (_, _) if generic.is_some() => generic.clone().unwrap(),
             // Fieldless enum -> integer: the discriminant value.
             // Single-field struct -> integer of exactly the
             // field's type: the field itself (the struct is a
@@ -2666,6 +2706,172 @@ impl<'a> Converter<'a> {
         }
     }
 
+    /// The [`ir::ScalarShape`] of a type whose every bit is
+    /// accounted for by scalar leaves (integers, floats, `bool`,
+    /// `char`, arrays of those, and one-payload-field ADTs over
+    /// those), or `None` for any other type. `depth` bounds the
+    /// ADT nesting: a sized type cannot actually recurse without
+    /// indirection (which has no scalar shape and ends the chain
+    /// first), so the bound is only belt and braces.
+    fn scalar_shape(
+        &self,
+        ty: &mir::Ty,
+        depth: u32,
+    ) -> Option<ir::ScalarShape> {
+        use ir::ScalarShape as S;
+        if depth > 8 {
+            return None;
+        }
+        match ty {
+            mir::Ty::Bool => Some(S::Bool),
+            mir::Ty::Char => Some(S::Char),
+            mir::Ty::Int(it) => Some(S::Int {
+                bits: it.bits(),
+                signed: true,
+            }),
+            mir::Ty::Uint(ut) => Some(S::Int {
+                bits: ut.bits(),
+                signed: false,
+            }),
+            mir::Ty::Float(ft) => match ft.bits() {
+                16 | 32 | 64 => Some(S::Float { bits: ft.bits() }),
+                _ => None,
+            },
+            mir::Ty::Array(elem, mir::ArrayLen::Known(n)) => {
+                let elem = self.scalar_shape(elem, depth + 1)?;
+                let total = elem.bits().checked_mul(*n as u32)?;
+                if total == 0 || total > 128 {
+                    return None;
+                }
+                Some(S::Array(Box::new(elem), *n))
+            }
+            mir::Ty::Adt(def, args) => {
+                let shape = self.adt_shapes.get(def)?;
+                if shape.variants.len() != 1 {
+                    return None;
+                }
+                let fields = self.instantiated_field_tys(def, args, 0)?;
+                let mut payload: Option<(u32, ir::ScalarShape)> = None;
+                let mut fill = Vec::new();
+                for (i, fty) in fields.iter().enumerate() {
+                    match self.scalar_shape(fty, depth + 1) {
+                        Some(fs) if fs.bits() > 0 => {
+                            if payload.is_some() {
+                                return None;
+                            }
+                            payload = Some((i as u32, fs));
+                        }
+                        _ => {
+                            let zv = self.zst_value(fty, 0)?;
+                            fill.push((i as u32, value_to_constant(&zv)?));
+                        }
+                    }
+                }
+                let (index, inner) = payload?;
+                Some(S::AdtField {
+                    index,
+                    count: fields.len(),
+                    fill,
+                    inner: Box::new(inner),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// The scalar shape of a constant operand, whose MIR form
+    /// carries no type: the constant's own kind gives the leaf
+    /// kind, and the width is the transmute target's width (a
+    /// transmute's two sides agree on size, so the source's
+    /// width is the target's). A tuple constant is read as an
+    /// array of its first element's kind; a bytes constant as an
+    /// array of `u8`. Anything else has no derivable shape.
+    fn constant_scalar_shape(
+        &self,
+        v: &ir::Operand,
+        width: u32,
+    ) -> Option<ir::ScalarShape> {
+        use ir::ScalarShape as S;
+        let ir::Operand::Constant(c) = v else {
+            return None;
+        };
+        match c {
+            ir::Constant::Int(_) => Some(S::Int {
+                bits: width,
+                signed: true,
+            }),
+            ir::Constant::Uint(_) => Some(S::Int {
+                bits: width,
+                signed: false,
+            }),
+            ir::Constant::Float(_) => match width {
+                16 | 32 | 64 => Some(S::Float { bits: width }),
+                _ => None,
+            },
+            ir::Constant::Bool(_) => (width == 8).then_some(S::Bool),
+            ir::Constant::Bytes(b) => {
+                (width == 8 * b.len() as u32).then(|| {
+                    S::Array(
+                        Box::new(S::Int {
+                            bits: 8,
+                            signed: false,
+                        }),
+                        b.len() as u64,
+                    )
+                })
+            }
+            ir::Constant::Tuple(fields) if !fields.is_empty() => {
+                let n = fields.len() as u32;
+                if width == 0 || width % n != 0 {
+                    return None;
+                }
+                let ew = width / n;
+                let elem = match &fields[0] {
+                    ir::Constant::Int(_) => S::Int {
+                        bits: ew,
+                        signed: true,
+                    },
+                    ir::Constant::Uint(_) => S::Int {
+                        bits: ew,
+                        signed: false,
+                    },
+                    ir::Constant::Float(_) => match ew {
+                        16 | 32 | 64 => S::Float { bits: ew },
+                        _ => return None,
+                    },
+                    ir::Constant::Bool(_) => {
+                        if ew != 8 {
+                            return None;
+                        }
+                        S::Bool
+                    }
+                    _ => return None,
+                };
+                let same = fields.iter().all(|f| {
+                    matches!(
+                        (f, &fields[0]),
+                        (ir::Constant::Int(_), ir::Constant::Int(_))
+                            | (
+                                ir::Constant::Uint(_),
+                                ir::Constant::Uint(_)
+                            )
+                            | (
+                                ir::Constant::Float(_),
+                                ir::Constant::Float(_)
+                            )
+                            | (ir::Constant::Bool(_), ir::Constant::Bool(_))
+                    )
+                });
+                if same {
+                    Some(S::Array(Box::new(elem), u64::from(n)))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// The [`WrapperShape`] of the struct `def` instantiated
     /// with `args`, or `None` when it is not a transparent
     /// wrapper (not a struct, more than one payload field, or a
@@ -2924,13 +3130,51 @@ impl<'a> Converter<'a> {
                     // place in this model. (Lane BV)
                     mir::CastKind::PointerExposeProvenance => match (&ctx, target) {
                         (
-                            Some(mir::Ty::RawPtr(..) | mir::Ty::Ref(..)),
+                            Some(
+                                mir::Ty::RawPtr(..)
+                                | mir::Ty::Ref(..)
+                                | mir::Ty::FnPtr(..)
+                                | mir::Ty::FnDef(..),
+                            ),
                             mir::Ty::Int(_) | mir::Ty::Uint(_),
                         ) => ir::Rvalue::PtrToInt(v.clone()),
                         _ => ir::Rvalue::Unsupported(
                             "Cast PointerExposeProvenance".to_string(),
                         ),
                     },
+                    // The reverse provenance cast (an integer
+                    // address back to a pointer,
+                    // `with_exposed_provenance` / `addr as *mut T`):
+                    // the same address-only reference the
+                    // integer -> pointer transmute produces. It
+                    // compares, tests for null and casts back to
+                    // an integer; reading or writing through it is
+                    // an explicit error, as for any address-only
+                    // pointer in this model.
+                    mir::CastKind::PointerWithExposedProvenance => {
+                        let src_is_int = matches!(
+                            ctx,
+                            Some(mir::Ty::Int(_) | mir::Ty::Uint(_))
+                        ) || matches!(
+                            v,
+                            ir::Operand::Constant(
+                                ir::Constant::Int(_) | ir::Constant::Uint(_)
+                            )
+                        );
+                        if src_is_int && is_thin_ptr_ty(target) {
+                            ir::Rvalue::IntToPtr(v.clone())
+                        } else {
+                            ir::Rvalue::Unsupported(
+                                "Cast PointerWithExposedProvenance"
+                                    .to_string(),
+                            )
+                        }
+                    }
+                    // A subtyping cast changes only lifetimes,
+                    // which this model does not track (a reference
+                    // value carries no lifetime): the value itself
+                    // is unchanged.
+                    mir::CastKind::Subtype => ir::Rvalue::Use(v),
                     // `transmute`: the shapes the value model
                     // can reinterpret exactly (pointers, integers,
                     // fieldless enums, transparent wrappers,
