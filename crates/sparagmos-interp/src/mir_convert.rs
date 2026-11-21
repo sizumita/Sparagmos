@@ -1209,7 +1209,9 @@ fn scan_terminator_fields(table: &mut AdtFieldTys, body: &mir::Body, kind: &mir:
         }
         T::InlineAsm { operands, .. } => {
             for op in operands {
-                scan_operand_fields(table, body, op);
+                if let Some(value) = &op.in_value {
+                    scan_operand_fields(table, body, value);
+                }
             }
         }
         T::TailCall { func, args } => {
@@ -4498,6 +4500,76 @@ impl<'a> Converter<'a> {
         }
     }
 
+    /// Convert the operands of an evaluable inline-asm block into
+    /// register slots: inputs are evaluated at block entry, outputs
+    /// written back at block exit. Only called for blocks the
+    /// classifier accepted, so every operand is in the register
+    /// class with a plain integer type.
+    fn convert_asm_regs(
+        &self,
+        body: &mir::Body,
+        operands: &[mir::InlineAsmOperand],
+    ) -> Result<Vec<ir::AsmReg>, ConvertError> {
+        let mut regs = Vec::with_capacity(operands.len());
+        for op in operands {
+            let init = match op.kind {
+                mir::AsmOperandKind::Const => Some(ir::Operand::Constant(ir::Constant::Uint(
+                    u128::from(op.const_bits.unwrap_or(0)),
+                ))),
+                mir::AsmOperandKind::In | mir::AsmOperandKind::InOut => {
+                    let value = op
+                        .in_value
+                        .as_ref()
+                        .expect("the driver sets in_value for in operands");
+                    let ctx = self.operand_place_ty(body, value);
+                    Some(self.convert_operand(body, value, ctx.as_ref())?)
+                }
+                mir::AsmOperandKind::Out | mir::AsmOperandKind::Sym => None,
+            };
+            let dest = match op.kind {
+                mir::AsmOperandKind::Out | mir::AsmOperandKind::InOut => {
+                    let place = op
+                        .out_place
+                        .as_ref()
+                        .expect("the driver sets out_place for out operands");
+                    Some(self.convert_place(place)?)
+                }
+                _ => None,
+            };
+            // The operand type: an inout operand's place type
+            // (its in_value is the same place), else the in
+            // operand's place type, else the out place's.
+            let reg_ty = match op.kind {
+                mir::AsmOperandKind::InOut | mir::AsmOperandKind::Out => op
+                    .out_place
+                    .as_ref()
+                    .and_then(|p| self.place_ty(body, p))
+                    .or_else(|| {
+                        op.in_value
+                            .as_ref()
+                            .and_then(|v| self.operand_place_ty(body, v))
+                    }),
+                mir::AsmOperandKind::In => op
+                    .in_value
+                    .as_ref()
+                    .and_then(|v| self.operand_place_ty(body, v)),
+                _ => None,
+            };
+            let kind = match reg_ty {
+                Some(mir::Ty::Int(_)) => ir::AsmRegKind::Signed,
+                Some(mir::Ty::Bool) => ir::AsmRegKind::Bool,
+                _ => ir::AsmRegKind::Unsigned,
+            };
+            regs.push(ir::AsmReg {
+                init,
+                dest,
+                width: op.width,
+                kind,
+            });
+        }
+        Ok(regs)
+    }
+
     fn convert_terminator(
         &self,
         body: &mir::Body,
@@ -4823,6 +4895,7 @@ impl<'a> Converter<'a> {
             T::CoroutineDrop => ir::TerminatorKind::Unsupported("CoroutineDrop".to_string()),
             T::InlineAsm {
                 template,
+                operands,
                 options,
                 destination,
                 ..
@@ -4835,6 +4908,38 @@ impl<'a> Converter<'a> {
                         None => ir::TerminatorKind::Unsupported(
                             "InlineAsm (no-op template without a destination)".to_string(),
                         ),
+                    }
+                } else if let Some(program) = mir::inline_asm_program(
+                    template,
+                    options,
+                    operands,
+                    destination.is_some(),
+                ) {
+                    if program.steps.is_empty() {
+                        // The step-over class: templates with no
+                        // real instruction, whose operands the
+                        // classifier leaves inert (e.g. the
+                        // explicit-register operands of a
+                        // clobber-only block).
+                        match destination {
+                            Some(target) => ir::TerminatorKind::Goto {
+                                target: ir::BasicBlock(target.index()),
+                            },
+                            None => ir::TerminatorKind::Unsupported(
+                                "InlineAsm (no-op template without a destination)"
+                                    .to_string(),
+                            ),
+                        }
+                    } else {
+                        ir::TerminatorKind::InlineAsm {
+                            regs: self.convert_asm_regs(body, operands)?,
+                            steps: program.steps,
+                            target: if program.returns {
+                                None
+                            } else {
+                                destination.map(|b| ir::BasicBlock(b.index()))
+                            },
+                        }
                     }
                 } else {
                     ir::TerminatorKind::Unsupported(format!(

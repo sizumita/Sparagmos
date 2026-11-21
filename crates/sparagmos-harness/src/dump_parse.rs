@@ -1318,7 +1318,7 @@ impl Conv {
                 operands: {
                     let mut v = Vec::new();
                     for a in as_list(field(f, "operands")?)? {
-                        v.push(Self::operand(a)?);
+                        v.push(Self::asm_operand(a)?);
                     }
                     v
                 },
@@ -1360,6 +1360,35 @@ impl Conv {
             values,
             targets,
             otherwise: Self::basic_block_id(field(f, "otherwise")?)?,
+        })
+    }
+
+    fn asm_operand(n: &Node) -> Result<mir::InlineAsmOperand, DumpError> {
+        let f = fields(n, "InlineAsmOperand")?;
+        let kind = match atom(field(f, "kind")?)? {
+            "In" => mir::AsmOperandKind::In,
+            "Out" => mir::AsmOperandKind::Out,
+            "InOut" => mir::AsmOperandKind::InOut,
+            "Const" => mir::AsmOperandKind::Const,
+            "Sym" => mir::AsmOperandKind::Sym,
+            other => return unsupported("AsmOperandKind", other),
+        };
+        Ok(mir::InlineAsmOperand {
+            kind,
+            reg_class: as_bool(field(f, "reg_class")?)?,
+            width: atom_parse(field(f, "width")?, "width")?,
+            const_bits: match as_opt(field(f, "const_bits")?)? {
+                Some(v) => Some(atom_parse(v, "const_bits")?),
+                None => None,
+            },
+            in_value: match as_opt(field(f, "in_value")?)? {
+                Some(v) => Some(Self::operand(v)?),
+                None => None,
+            },
+            out_place: match as_opt(field(f, "out_place")?)? {
+                Some(v) => Some(Self::place(v)?),
+                None => None,
+            },
         })
     }
 

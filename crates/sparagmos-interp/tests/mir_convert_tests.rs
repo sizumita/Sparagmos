@@ -2693,6 +2693,323 @@ fn inline_asm_with_real_instructions_is_a_named_error() {
     }
 }
 
+// ----- InlineAsm: the evaluable register class executes (Lane GI) -----
+
+fn asm_op(
+    kind: mir::AsmOperandKind,
+    width: u32,
+    in_value: Option<mir::Operand>,
+    out_place: Option<mir::Place>,
+) -> mir::InlineAsmOperand {
+    mir::InlineAsmOperand {
+        kind,
+        reg_class: true,
+        width,
+        const_bits: None,
+        in_value,
+        out_place,
+    }
+}
+
+fn asm_prog_term(
+    template: &str,
+    operands: Vec<mir::InlineAsmOperand>,
+    destination: Option<u32>,
+) -> mir::TerminatorKind {
+    mir::TerminatorKind::InlineAsm {
+        template: template.to_string(),
+        operands,
+        options: String::new(),
+        destination: destination.map(mir::BasicBlock),
+        unwind: mir::UnwindAction::Continue,
+    }
+}
+
+fn run_asm_body(name: &str, body: mir::Body) -> Value {
+    let mut prog = MirProgram::new();
+    prog.add(name, body);
+    interpret_mir(&prog, name, vec![]).expect("asm body runs")
+}
+
+#[test]
+fn inline_asm_mov_and_add_execute() {
+    // _1: u32 = 40 (in), _2: u32 (out): mov {0:e}, {1:e}; add {0:e}, 2
+    let body = mir::Body::new(
+        decls(&[u32_ty(), u32_ty(), u32_ty()]),
+        0,
+        vec![
+            block(
+                vec![assign(place(1), mir::Rvalue::Use(const_u32(40)))],
+                asm_prog_term(
+                    "mov {0:e}, {1:e}\nadd {0:e}, 2",
+                    vec![
+                        asm_op(mir::AsmOperandKind::Out, 32, None, Some(place(2))),
+                        asm_op(mir::AsmOperandKind::In, 32, Some(copy(1)), None),
+                    ],
+                    Some(1),
+                ),
+            ),
+            block(vec![assign(place(0), mir::Rvalue::Use(copy(2)))], ret()),
+        ],
+    );
+    assert_eq!(run_asm_body("f", body), Value::Uint(42));
+}
+
+#[test]
+fn inline_asm_inout_sub_sign_extends() {
+    // _1: i32 = 10 (inout), _2: i32 = 25 (in): sub {0}, {1} -> -15
+    let body = mir::Body::new(
+        decls(&[i32_ty(), i32_ty(), i32_ty()]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(place(1), mir::Rvalue::Use(const_i32(10))),
+                    assign(place(2), mir::Rvalue::Use(const_i32(25))),
+                ],
+                asm_prog_term(
+                    "sub {}, {}",
+                    vec![
+                        asm_op(
+                            mir::AsmOperandKind::InOut,
+                            32,
+                            Some(copy(1)),
+                            Some(place(1)),
+                        ),
+                        asm_op(mir::AsmOperandKind::In, 32, Some(copy(2)), None),
+                    ],
+                    Some(1),
+                ),
+            ),
+            block(vec![assign(place(0), mir::Rvalue::Use(copy(1)))], ret()),
+        ],
+    );
+    assert_eq!(run_asm_body("f", body), Value::Int(-15));
+}
+
+#[test]
+fn inline_asm_shift_ops() {
+    // i32: sar {0:e} -16 by 2 -> -4 (32-bit arithmetic shift).
+    // The modifier-less form names the whole 64-bit register, so
+    // sar {} on the zero-extended -16 gives 0x3FFFFFFC — the
+    // native result for the same source.
+    let sar_body = mir::Body::new(
+        decls(&[i32_ty(), i32_ty()]),
+        0,
+        vec![
+            block(
+                vec![assign(place(1), mir::Rvalue::Use(const_i32(-16)))],
+                asm_prog_term(
+                    "sar {0:e}, 2",
+                    vec![asm_op(
+                        mir::AsmOperandKind::InOut,
+                        32,
+                        Some(copy(1)),
+                        Some(place(1)),
+                    )],
+                    Some(1),
+                ),
+            ),
+            block(vec![assign(place(0), mir::Rvalue::Use(copy(1)))], ret()),
+        ],
+    );
+    assert_eq!(run_asm_body("sar", sar_body), Value::Int(-4));
+    let sar_plain_body = mir::Body::new(
+        decls(&[i32_ty(), i32_ty()]),
+        0,
+        vec![
+            block(
+                vec![assign(place(1), mir::Rvalue::Use(const_i32(-16)))],
+                asm_prog_term(
+                    "sar {}, 2",
+                    vec![asm_op(
+                        mir::AsmOperandKind::InOut,
+                        32,
+                        Some(copy(1)),
+                        Some(place(1)),
+                    )],
+                    Some(1),
+                ),
+            ),
+            block(vec![assign(place(0), mir::Rvalue::Use(copy(1)))], ret()),
+        ],
+    );
+    assert_eq!(
+        run_asm_body("sar_plain", sar_plain_body),
+        Value::Int(1073741820)
+    );
+    let shl_body = mir::Body::new(
+        decls(&[u32_ty(), u32_ty()]),
+        0,
+        vec![
+            block(
+                vec![assign(place(1), mir::Rvalue::Use(const_u32(3)))],
+                asm_prog_term(
+                    "shl {}, 4",
+                    vec![asm_op(
+                        mir::AsmOperandKind::InOut,
+                        32,
+                        Some(copy(1)),
+                        Some(place(1)),
+                    )],
+                    Some(1),
+                ),
+            ),
+            block(vec![assign(place(0), mir::Rvalue::Use(copy(1)))], ret()),
+        ],
+    );
+    assert_eq!(run_asm_body("shl", shl_body), Value::Uint(48));
+}
+
+#[test]
+fn inline_asm_subregister_modifiers() {
+    // u16 0x1234: mov {0:l}, 0xAB -> 0x12AB; mov {0:h}, 0xCD -> 0xCDAB
+    let inout16 = || {
+        asm_op(
+            mir::AsmOperandKind::InOut,
+            16,
+            Some(copy(1)),
+            Some(place(1)),
+        )
+    };
+    let body = mir::Body::new(
+        decls(&[u16_ty(), u16_ty()]),
+        0,
+        vec![
+            block(
+                vec![assign(place(1), mir::Rvalue::Use(const_int(0x1234, 2)))],
+                asm_prog_term("mov {0:l}, 0xAB", vec![inout16()], Some(1)),
+            ),
+            block(
+                vec![],
+                asm_prog_term("mov {0:h}, 0xCD", vec![inout16()], Some(2)),
+            ),
+            block(vec![assign(place(0), mir::Rvalue::Use(copy(1)))], ret()),
+        ],
+    );
+    assert_eq!(run_asm_body("f", body), Value::Uint(0xCDAB));
+}
+
+#[test]
+fn inline_asm_32bit_write_zero_extends() {
+    // u64 u64::MAX: mov {0:e}, 1 -> 1 (the 32-bit write clears the
+    // high half, as on x86-64).
+    let body = mir::Body::new(
+        decls(&[u64_ty(), u64_ty()]),
+        0,
+        vec![
+            block(
+                vec![assign(place(1), mir::Rvalue::Use(const_u64(u64::MAX)))],
+                asm_prog_term(
+                    "mov {0:e}, 1",
+                    vec![asm_op(
+                        mir::AsmOperandKind::InOut,
+                        64,
+                        Some(copy(1)),
+                        Some(place(1)),
+                    )],
+                    Some(1),
+                ),
+            ),
+            block(vec![assign(place(0), mir::Rvalue::Use(copy(1)))], ret()),
+        ],
+    );
+    assert_eq!(run_asm_body("f", body), Value::Uint(1));
+}
+
+#[test]
+fn inline_asm_const_operand_and_unary_ops() {
+    // out u32 := const 7 via mov; u8 0x0F not -> 0xF0.
+    let mut konst = asm_op(mir::AsmOperandKind::Const, 32, None, None);
+    konst.const_bits = Some(7);
+    let body = mir::Body::new(
+        decls(&[u32_ty(), u32_ty()]),
+        0,
+        vec![
+            block(
+                vec![],
+                asm_prog_term(
+                    "mov {}, {1}",
+                    vec![
+                        asm_op(mir::AsmOperandKind::Out, 32, None, Some(place(1))),
+                        konst,
+                    ],
+                    Some(1),
+                ),
+            ),
+            block(vec![assign(place(0), mir::Rvalue::Use(copy(1)))], ret()),
+        ],
+    );
+    assert_eq!(run_asm_body("konst", body), Value::Uint(7));
+    let not_body = mir::Body::new(
+        decls(&[u8_ty(), u8_ty()]),
+        0,
+        vec![
+            block(
+                vec![assign(place(1), mir::Rvalue::Use(const_int(0x0F, 1)))],
+                asm_prog_term(
+                    "not {}",
+                    vec![asm_op(
+                        mir::AsmOperandKind::InOut,
+                        8,
+                        Some(copy(1)),
+                        Some(place(1)),
+                    )],
+                    Some(1),
+                ),
+            ),
+            block(vec![assign(place(0), mir::Rvalue::Use(copy(1)))], ret()),
+        ],
+    );
+    assert_eq!(run_asm_body("not", not_body), Value::Uint(0xF0));
+}
+
+#[test]
+fn inline_asm_naked_ret_returns() {
+    // _0 = 9; then a destination-less `ret` block ends the function.
+    let body = mir::Body::new(
+        decls(&[i32_ty()]),
+        0,
+        vec![block(
+            vec![assign(place(0), mir::Rvalue::Use(const_i32(9)))],
+            asm_prog_term("ret", vec![], None),
+        )],
+    );
+    assert_eq!(run_asm_body("naked", body), Value::Int(9));
+}
+
+#[test]
+fn inline_asm_memory_operand_is_a_named_error() {
+    // mov {0}, [{1}] touches memory: outside the class, named error.
+    let body = mir::Body::new(
+        decls(&[u32_ty(), u32_ty(), u32_ty()]),
+        0,
+        vec![
+            block(
+                vec![assign(place(1), mir::Rvalue::Use(const_u32(1)))],
+                asm_prog_term(
+                    "mov {}, [{}]",
+                    vec![
+                        asm_op(mir::AsmOperandKind::Out, 32, None, Some(place(2))),
+                        asm_op(mir::AsmOperandKind::In, 32, Some(copy(1)), None),
+                    ],
+                    Some(1),
+                ),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("f", body);
+    match interpret_mir(&prog, "f", vec![]) {
+        Err(MirRunError::Interp(InterpError::UnsupportedTerminator { kind })) => {
+            assert!(kind.contains("InlineAsm"), "error names InlineAsm: {kind}");
+        }
+        Err(e) => panic!("expected UnsupportedTerminator for InlineAsm, got {e}"),
+        Ok(v) => panic!("expected UnsupportedTerminator for InlineAsm, got {v:?}"),
+    }
+}
+
 // ----- transmute: the honestly representable shapes (Lane DN) ----------------
 
 fn ref_i32_ty() -> mir::Ty {

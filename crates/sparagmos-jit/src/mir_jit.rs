@@ -699,7 +699,9 @@ fn scan_terminator_fields(scan: &mut AdtScan, body: &mir::Body, kind: &mir::Term
         }
         T::InlineAsm { operands, .. } => {
             for op in operands {
-                scan_operand_fields(scan, body, op);
+                if let Some(value) = &op.in_value {
+                    scan_operand_fields(scan, body, value);
+                }
             }
         }
         T::TailCall { func, args } => {

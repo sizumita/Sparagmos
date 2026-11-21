@@ -1266,43 +1266,7 @@ impl<'a> Interpreter<'a> {
                     });
                 }
                 TerminatorKind::Return => {
-                    // A returning destructor frame resumes its
-                    // suspended drop glue instead of delivering a
-                    // value to a caller place.
-                    let returning = frames.last().expect("frame").id;
-                    if let Some(pos) = self
-                        .drop_continuations
-                        .iter()
-                        .rposition(|c| c.callee_frame == returning)
-                    {
-                        let cont = self.drop_continuations.remove(pos);
-                        frames.pop();
-                        self.run_glue_session(frames, cont.session, cont.sessions)?;
-                        continue;
-                    }
-                    let frame = frames.pop().expect("frame");
-                    let mut value = frame.locals.first().cloned().unwrap_or(Value::Uninit);
-                    if value == Value::Uninit {
-                        // rustc MIR never writes the return place of
-                        // a zero-sized return type: the final block
-                        // is a bare `return;`, and the type's single
-                        // value is implied. An unwritten `_0`
-                        // therefore reads as that value exactly when
-                        // the declared return type is provably
-                        // zero-sized. For every other type an
-                        // unwritten `_0` is a genuine uninitialized
-                        // read and stays an error.
-                        match self.zst_local_value(&frame, 0) {
-                            Some(v) => value = v,
-                            None => {
-                                return Err(InterpError::UninitializedRead {
-                                    func: frame.func.clone(),
-                                    place: "_0".to_string(),
-                                });
-                            }
-                        }
-                    }
-                    if frames.len() == stop_depth {
+                    if let Some(value) = self.exec_return(frames, stop_depth)? {
                         return Ok(value);
                     }
                     let dest = frame
@@ -1352,11 +1316,133 @@ impl<'a> Interpreter<'a> {
                         Self::jump(frames, body, *target)?;
                     }
                 }
+                TerminatorKind::InlineAsm { regs, steps, target } => {
+                    self.exec_inline_asm(frames, body, &regs, &steps)?;
+                    match target {
+                        Some(target) => Self::jump(frames, body, target)?,
+                        None => {
+                            if let Some(value) = self.exec_return(frames, stop_depth)? {
+                                return Ok(value);
+                            }
+                        }
+                    }
+                }
                 TerminatorKind::Unsupported(kind) => {
                     return Err(InterpError::UnsupportedTerminator { kind: kind.clone() });
                 }
             }
         }
+    }
+
+    /// Execute one evaluable inline-asm block: seed a 64-bit slot
+    /// per operand from its input value, run the register program
+    /// with x86-64 partial-register semantics, and write back the
+    /// operands the program wrote. Inout operands always write
+    /// back; a pure output the program never wrote keeps its
+    /// destination untouched — its value is unspecified, and
+    /// leaving the place alone keeps a later read an explicit
+    /// uninitialized error rather than a fabricated zero.
+    fn exec_inline_asm(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        body: &Body,
+        regs: &[AsmReg],
+        steps: &[AsmStep],
+    ) -> InterpResult<()> {
+        let mut slots: Vec<u64> = Vec::with_capacity(regs.len());
+        for reg in regs {
+            let bits = match &reg.init {
+                Some(op) => {
+                    let value = self.eval_operand(frames, body, op)?;
+                    asm_input_bits(&value, reg)?
+                }
+                None => 0,
+            };
+            slots.push(bits);
+        }
+        let mut written = vec![false; regs.len()];
+        for step in steps {
+            exec_asm_step(&mut slots, &mut written, regs, step);
+        }
+        for (i, reg) in regs.iter().enumerate() {
+            let Some(dest) = &reg.dest else { continue };
+            if !written[i] && reg.init.is_none() {
+                continue;
+            }
+            let value = asm_output_value(slots[i], reg);
+            self.write_place(frames, body, dest, value)?;
+        }
+        Ok(())
+    }
+
+    /// Execute a return from the top frame: deliver the return
+    /// place's value to the caller, or finish the run when the
+    /// frame stack reaches the stop depth. `Ok(Some(value))` ends
+    /// the run; `Ok(None)` means execution continues in the caller
+    /// (or in a resumed drop-glue session).
+    fn exec_return(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        stop_depth: usize,
+    ) -> InterpResult<Option<Value>> {
+        // A returning destructor frame resumes its
+        // suspended drop glue instead of delivering a
+        // value to a caller place.
+        let returning = frames.last().expect("frame").id;
+        if let Some(pos) = self
+            .drop_continuations
+            .iter()
+            .rposition(|c| c.callee_frame == returning)
+        {
+            let cont = self.drop_continuations.remove(pos);
+            frames.pop();
+            self.run_glue_session(frames, cont.session, cont.sessions)?;
+            return Ok(None);
+        }
+        let frame = frames.pop().expect("frame");
+        let mut value = frame.locals.first().cloned().unwrap_or(Value::Uninit);
+        if value == Value::Uninit {
+            // rustc MIR never writes the return place of
+            // a zero-sized return type: the final block
+            // is a bare `return;`, and the type's single
+            // value is implied. An unwritten `_0`
+            // therefore reads as that value exactly when
+            // the declared return type is provably
+            // zero-sized. For every other type an
+            // unwritten `_0` is a genuine uninitialized
+            // read and stays an error.
+            match self.zst_local_value(&frame, 0) {
+                Some(v) => value = v,
+                None => {
+                    return Err(InterpError::UninitializedRead {
+                        func: frame.func.clone(),
+                        place: "_0".to_string(),
+                    });
+                }
+            }
+        }
+        if frames.len() == stop_depth {
+            return Ok(Some(value));
+        }
+        let dest = frame
+            .return_dest
+            .clone()
+            .expect("non-entry frame has a destination");
+        let resume = frame.return_block;
+        let caller_name = frames.last().expect("caller").func.clone();
+        let caller_body = self.program.get(&caller_name).cloned().ok_or_else(|| {
+            InterpError::UnknownFunction {
+                name: caller_name.clone(),
+            }
+        })?;
+        self.write_place(frames, &caller_body, &dest, value)?;
+        match resume {
+            Some(bb) => Self::jump(frames, &caller_body, bb)?,
+            None => {
+                return Err(InterpError::MissingContinuation { func: caller_name });
+            }
+        }
+        Ok(None)
     }
 
     /// The error for naming a function that has no body in the
@@ -7529,5 +7615,179 @@ pub(crate) fn refcell_sub_target(cell: &RefTarget, path: &[RefProj]) -> RefTarge
         // Unreachable through `refcell_place`; keep the target as-is
         // rather than panicking in the model.
         other => other.clone(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inline-asm register program execution (the evaluable class of
+// sparagmos-mir's `inline_asm_program`): slots are 64-bit, reads
+// and writes follow the x86-64 partial-register rules.
+// ---------------------------------------------------------------------------
+
+/// The bit mask of a `width`-bit operand.
+fn asm_width_mask(width: u32) -> u64 {
+    if width >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << width) - 1
+    }
+}
+
+/// Sign-extend the low `width` bits of `bits` to 64 bits.
+fn asm_sign_extend(bits: u64, width: u32) -> u64 {
+    if width >= 64 {
+        bits
+    } else {
+        let shift = 64 - width;
+        ((bits << shift) as i64 >> shift) as u64
+    }
+}
+
+/// The bits an asm input value enters its slot with: the value
+/// zero-extended from the operand width. (The bits above the
+/// width are unspecified on hardware — a wider register form
+/// read there observes whatever the caller left; the model
+/// fixes them to zero.)
+fn asm_input_bits(value: &Value, reg: &AsmReg) -> InterpResult<u64> {
+    let bits = match value {
+        Value::Int(v) => *v as u64,
+        Value::Uint(v) => *v as u64,
+        Value::Bool(b) => u64::from(*b),
+        other => {
+            return Err(InterpError::type_mismatch(
+                "inline asm operand",
+                "integer or bool",
+                other.kind_name(),
+            ));
+        }
+    };
+    Ok(bits & asm_width_mask(reg.width))
+}
+
+/// The value written back to an asm output place: the slot bits
+/// interpreted at the operand type.
+fn asm_output_value(bits: u64, reg: &AsmReg) -> Value {
+    let masked = bits & asm_width_mask(reg.width);
+    match reg.kind {
+        AsmRegKind::Signed => Value::Int(asm_sign_extend(masked, reg.width) as i128),
+        AsmRegKind::Unsigned => Value::Uint(u128::from(masked)),
+        AsmRegKind::Bool => Value::Bool(masked != 0),
+    }
+}
+
+/// Read a register slot at an instruction operand: the modifier
+/// picks the sub-register (`h` is bits 8..16); no modifier reads
+/// the whole register — the full 64-bit register for the `reg`
+/// class (a placeholder without a modifier names it, whatever
+/// the operand width), the byte for the `reg_byte` class.
+fn asm_read(slots: &[u64], regs: &[AsmReg], idx: usize, modifier: Option<char>) -> u64 {
+    let slot = slots[idx];
+    match modifier {
+        Some('h') => (slot >> 8) & 0xff,
+        Some('l') => slot & 0xff,
+        Some('x') => slot & 0xffff,
+        Some('e') => slot & 0xffff_ffff,
+        _ if regs[idx].width == 8 => slot & 0xff,
+        _ => slot,
+    }
+}
+
+/// Write a register slot at an instruction operand, with x86-64
+/// partial-register semantics: a 32-bit write zero-extends,
+/// 8/16-bit writes preserve the rest of the slot, an `h` write
+/// lands in bits 8..16, and a modifier-less write replaces the
+/// whole register (the byte for the `reg_byte` class).
+fn asm_write(
+    slots: &mut [u64],
+    written: &mut [bool],
+    regs: &[AsmReg],
+    idx: usize,
+    modifier: Option<char>,
+    value: u64,
+) {
+    written[idx] = true;
+    let slot = &mut slots[idx];
+    match modifier {
+        Some('h') => *slot = (*slot & !0xff00) | ((value & 0xff) << 8),
+        Some('l') => *slot = (*slot & !0xff) | (value & 0xff),
+        Some('x') => *slot = (*slot & !0xffff) | (value & 0xffff),
+        Some('e') => *slot = value & 0xffff_ffff,
+        _ if regs[idx].width == 8 => *slot = (*slot & !0xff) | (value & 0xff),
+        _ => *slot = value,
+    }
+}
+
+/// The width an instruction operates at: the destination
+/// modifier's width, else the full register (64 bits, or 8 for
+/// the `reg_byte` class) — a modifier-less placeholder names the
+/// whole register, so e.g. a shift count is masked at 64 bits,
+/// not at the operand width.
+fn asm_instr_width(regs: &[AsmReg], idx: usize, modifier: Option<char>) -> u32 {
+    match modifier {
+        Some('e') => 32,
+        Some('x') => 16,
+        Some('l') | Some('h') => 8,
+        _ if regs[idx].width == 8 => 8,
+        _ => 64,
+    }
+}
+
+/// The value of an instruction source operand.
+fn asm_src_value(slots: &[u64], regs: &[AsmReg], src: &sparagmos_mir::AsmSrc) -> u64 {
+    match src {
+        sparagmos_mir::AsmSrc::Reg(idx, modifier) => asm_read(slots, regs, *idx, *modifier),
+        sparagmos_mir::AsmSrc::Imm(bits) => *bits,
+    }
+}
+
+/// Run one classified asm instruction against the slots.
+fn exec_asm_step(
+    slots: &mut [u64],
+    written: &mut [bool],
+    regs: &[AsmReg],
+    step: &AsmStep,
+) {
+    use sparagmos_mir::{AsmBinOp, AsmUnOp};
+    match step {
+        AsmStep::Nop | AsmStep::Ret => {}
+        AsmStep::Mov { dst, dst_mod, src } => {
+            let value = asm_src_value(slots, regs, src);
+            asm_write(slots, written, regs, *dst, *dst_mod, value);
+        }
+        AsmStep::Bin {
+            op,
+            dst,
+            dst_mod,
+            src,
+        } => {
+            let width = asm_instr_width(regs, *dst, *dst_mod);
+            let mask = asm_width_mask(width);
+            let a = asm_read(slots, regs, *dst, *dst_mod) & mask;
+            let b = asm_src_value(slots, regs, src) & mask;
+            let count = (b & if width >= 64 { 63 } else { 31 }) as u32;
+            let result = match op {
+                AsmBinOp::Add => a.wrapping_add(b),
+                AsmBinOp::Sub => a.wrapping_sub(b),
+                AsmBinOp::And => a & b,
+                AsmBinOp::Or => a | b,
+                AsmBinOp::Xor => a ^ b,
+                AsmBinOp::Shl => a << count,
+                AsmBinOp::Shr => a >> count,
+                AsmBinOp::Sar => (asm_sign_extend(a, width) as i64 >> count) as u64,
+            };
+            asm_write(slots, written, regs, *dst, *dst_mod, result & mask);
+        }
+        AsmStep::Un { op, dst, dst_mod } => {
+            let width = asm_instr_width(regs, *dst, *dst_mod);
+            let mask = asm_width_mask(width);
+            let a = asm_read(slots, regs, *dst, *dst_mod) & mask;
+            let result = match op {
+                AsmUnOp::Neg => 0u64.wrapping_sub(a),
+                AsmUnOp::Not => !a,
+                AsmUnOp::Inc => a.wrapping_add(1),
+                AsmUnOp::Dec => a.wrapping_sub(1),
+            };
+            asm_write(slots, written, regs, *dst, *dst_mod, result & mask);
+        }
     }
 }

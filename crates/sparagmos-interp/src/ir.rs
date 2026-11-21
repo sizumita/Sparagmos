@@ -20,6 +20,8 @@
 use std::collections::HashMap;
 use std::fmt;
 
+pub use sparagmos_mir::AsmStep;
+
 use crate::value::{RefProj, Value};
 
 /// Index of a local variable. Local 0 is always the return place,
@@ -998,8 +1000,47 @@ pub enum TerminatorKind {
         /// `InterpConfig::overflow_checks`).
         overflow: bool,
     },
+    /// An inline-assembly block of the evaluable class
+    /// (sparagmos-mir's `inline_asm_program`): a straight-line
+    /// register program over the asm operands, each a 64-bit slot
+    /// seeded from its input value and written back when the
+    /// program writes it. `target` is the continuation block;
+    /// `None` ends the function after the steps (the
+    /// naked-function `ret` shape).
+    InlineAsm {
+        regs: Vec<AsmReg>,
+        steps: Vec<AsmStep>,
+        target: Option<BasicBlock>,
+    },
     /// Any terminator kind not modelled yet; executing it is an explicit error.
     Unsupported(String),
+}
+
+/// One register slot of a [`TerminatorKind::InlineAsm`]: how its
+/// value enters the block and where the result goes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AsmReg {
+    /// Input value (in / inout / const operands); `None` for a
+    /// pure output, whose slot starts at zero.
+    pub init: Option<Operand>,
+    /// Write-back place (out / inout operands); `None` otherwise.
+    pub dest: Option<Place>,
+    /// Operand type width in bits (8, 16, 32 or 64).
+    pub width: u32,
+    /// The operand type's value kind: write-back sign-extends from
+    /// `width` for `Signed`, zero-extends for `Unsigned`, and
+    /// rebuilds a `bool` for `Bool`. (`char` operands are
+    /// `Unsigned` at width 32: the value model carries chars as
+    /// code-point integers.)
+    pub kind: AsmRegKind,
+}
+
+/// The value kind of an [`AsmReg`]'s operand type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsmRegKind {
+    Signed,
+    Unsigned,
+    Bool,
 }
 
 /// A basic block: statements followed by exactly one terminator.
