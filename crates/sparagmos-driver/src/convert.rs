@@ -252,6 +252,79 @@ fn adt_may_be_unsized(
     })
 }
 
+/// The sizedness of an ADT instance as far as the driver's
+/// own walk can tell, refining `adt_may_be_unsized`'s bool:
+/// `Unsized` only when a genuinely unsized type (a slice,
+/// `str`, or a trait object) is reachable through the fields;
+/// `Unknown` when the walk cannot prove either way — the
+/// case of field types that mention a type alias, whose
+/// sizedness only the compiler's layout computation knows.
+#[derive(Clone, Copy, PartialEq)]
+enum Sizedness {
+    Sized,
+    Unsized,
+    Unknown,
+}
+
+fn adt_sizedness(
+    def: &AdtDef,
+    args: &rustc_public::ty::GenericArgs,
+    depth: usize,
+) -> Sizedness {
+    if depth >= 8 {
+        return Sizedness::Unknown;
+    }
+    let mut result = Sizedness::Sized;
+    for variant in def.variants() {
+        for field in variant.fields() {
+            match ty_sizedness(&field.ty(), Some(args), depth + 1) {
+                Sizedness::Unsized => return Sizedness::Unsized,
+                Sizedness::Unknown => result = Sizedness::Unknown,
+                Sizedness::Sized => {}
+            }
+        }
+    }
+    result
+}
+
+fn ty_sizedness(
+    ty: &rustc_public::ty::Ty,
+    args: Option<&rustc_public::ty::GenericArgs>,
+    depth: usize,
+) -> Sizedness {
+    if depth >= 8 {
+        return Sizedness::Unknown;
+    }
+    match ty.kind() {
+        TyKind::RigidTy(r) => match r {
+            RigidTy::Slice(_) | RigidTy::Str | RigidTy::Dynamic(..) => {
+                Sizedness::Unsized
+            }
+            RigidTy::Adt(def, a2) => adt_sizedness(&def, &a2, depth),
+            RigidTy::Array(elem, _) => ty_sizedness(&elem, args, depth),
+            RigidTy::Tuple(ts) => {
+                let mut result = Sizedness::Sized;
+                for t in ts.iter() {
+                    match ty_sizedness(t, args, depth) {
+                        Sizedness::Unsized => return Sizedness::Unsized,
+                        Sizedness::Unknown => result = Sizedness::Unknown,
+                        Sizedness::Sized => {}
+                    }
+                }
+                result
+            }
+            _ => Sizedness::Sized,
+        },
+        TyKind::Param(p) => match args.and_then(|a| a.0.get(p.index as usize)) {
+            Some(rustc_public::ty::GenericArgKind::Type(t)) => {
+                ty_sizedness(t, None, depth + 1)
+            }
+            _ => Sizedness::Unknown,
+        },
+        _ => Sizedness::Unknown,
+    }
+}
+
 fn ty_may_be_unsized(
     ty: &rustc_public::ty::Ty,
     args: Option<&rustc_public::ty::GenericArgs>,
@@ -2563,7 +2636,7 @@ impl Converter {
         if !self.layout_attempted.insert(key.clone()) {
             return;
         }
-        self.record_niche(ty, def, &key);
+        self.record_niche(ty, def, args, &key);
         if adt_may_be_unsized(def, args, 0) {
             return;
         }
@@ -2595,23 +2668,38 @@ impl Converter {
     /// once per distinct instance.
     ///
     /// The recording runs its own contained layout query
-    /// instead of sharing `record_layout`'s result: the
-    /// maybe-unsized screen that guards the layout table
-    /// answers conservatively for ADTs whose fields mention
-    /// a type alias, which is exactly the
+    /// instead of sharing `record_layout`'s result, because
+    /// the instances that matter most never reach that
+    /// result: the maybe-unsized screen that guards the
+    /// layout table answers conservatively for ADTs whose
+    /// fields mention a type alias, which is exactly the
     /// `Option<NonZero<T>>` family this table exists for.
     /// The compiler's layout query has no such doubt and
-    /// answers for the instance directly (and is memoized,
-    /// so asking again for enums that pass the screen costs
-    /// nothing measurable). Only multi-variant enums can
-    /// carry a niche encoding at all.
+    /// answers for those instances directly (and is
+    /// memoized, so asking again for enums that pass the
+    /// screen costs nothing measurable). Only multi-variant
+    /// enums can carry a niche encoding at all.
     fn record_niche(
         &mut self,
         ty: &rustc_public::ty::Ty,
         def: &AdtDef,
+        args: &GenericArgs,
         key: &str,
     ) {
         if def.kind() != AdtKind::Enum || def.num_variants() < 2 {
+            return;
+        }
+        // Genuinely unsized instances are skipped without
+        // querying: forcing a layout for one (the
+        // trivial-bounds test cases, whose fields are slices
+        // under assumed `Sized` bounds) trips the compiler's
+        // own delayed bugs. Instances whose sizedness the
+        // walk cannot prove — the alias-carrying
+        // `Option<NonZero<T>>` family — go through the
+        // contained query below, which is the only way to
+        // learn their encoding; an uncomputable layout
+        // simply records nothing.
+        if adt_sizedness(def, args, 0) == Sizedness::Unsized {
             return;
         }
         let layout = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ty.layout()));
