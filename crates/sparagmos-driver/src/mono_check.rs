@@ -50,7 +50,7 @@
 use rustc_public::mir::mono::{Instance, InstanceKind};
 use rustc_public::mir::{Body, Operand, TerminatorKind};
 use rustc_public::ty::{RigidTy, Ty, TyKind};
-use rustc_public::CrateDef;
+use rustc_public::{CrateDef, CrateDefType};
 
 /// Scan the Stable MIR bodies that were converted for this program
 /// and return the first monomorphization failure rustc would have
@@ -117,6 +117,9 @@ fn layout_too_big(
 }
 
 fn raw_layout_too_big(ty: Ty) -> Option<String> {
+    if !layout_query_safe(ty) {
+        return None;
+    }
     let layout = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ty.layout()));
     let Err(err) = (match layout {
         Ok(r) => r,
@@ -136,6 +139,106 @@ fn raw_layout_too_big(ty: Ty) -> Option<String> {
     match text.find("values of the type") {
         Some(at) => Some(text[at..].to_string()),
         None => Some(text),
+    }
+}
+
+/// Whether asking the compiler for `ty`'s layout is safe for
+/// this scan. The layout query is not total: for a type with an
+/// unsized field in a non-final position (accepted under
+/// trivial bounds but never materializable) or a projection
+/// alias in field position (whose normalization can be
+/// ambiguous), the query does not return an error at all — it
+/// creates a delayed internal compiler error that poisons the
+/// rest of the compilation. The scan therefore walks the type
+/// structurally first, asking the compiler nothing: a type is
+/// safe when every component in field position is a concrete
+/// sized shape, with unsized components only in tail position
+/// (the last field of a variant, the last element of a tuple,
+/// or nested under either). Pointer and reference types are
+/// walked through as well: their layout needs the pointee's
+/// metadata, which is computed from the pointee's tail. Type
+/// parameters are resolved one frame at a time through the
+/// enclosing ADT's arguments —
+/// never through the compiler's instantiating-and-normalizing
+/// accessors — and anything unresolvable is unsafe. Recursive
+/// types are cut off by a visited set: a type already being
+/// walked is assumed safe, as its own walk is in progress in
+/// a context at least as strict (non-tail occurrences are
+/// always walked before the tail occurrence).
+fn layout_query_safe(ty: Ty) -> bool {
+    let mut visited = std::collections::HashSet::new();
+    walk_layout_type(ty, &[], true, &mut visited, 0)
+}
+
+/// Walk `ty` structurally. `frames` is the stack of generic
+/// argument lists of the ADTs whose fields are being walked,
+/// innermost last: a type parameter in `ty` refers to the
+/// innermost frame, and the type it resolves to was written
+/// one frame further out, so it is walked with the innermost
+/// frame popped. `tail` marks tail position (see above).
+fn walk_layout_type(
+    ty: Ty,
+    frames: &[rustc_public::ty::GenericArgs],
+    tail: bool,
+    visited: &mut std::collections::HashSet<Ty>,
+    depth: usize,
+) -> bool {
+    if depth > 256 {
+        return false;
+    }
+    match ty.kind() {
+        TyKind::RigidTy(RigidTy::Adt(def, args)) => {
+            if !visited.insert(ty) {
+                return true;
+            }
+            let mut frames = frames.to_vec();
+            frames.push(args);
+            def.variants().iter().all(|variant| {
+                let fields = variant.fields();
+                let last = fields.len().saturating_sub(1);
+                fields.iter().enumerate().all(|(i, field)| {
+                    walk_layout_type(
+                        field.ty(),
+                        &frames,
+                        tail && i == last,
+                        visited,
+                        depth + 1,
+                    )
+                })
+            })
+        }
+        TyKind::RigidTy(RigidTy::Tuple(elems)) => {
+            let last = elems.len().saturating_sub(1);
+            elems.iter().enumerate().all(|(i, elem)| {
+                walk_layout_type(*elem, frames, tail && i == last, visited, depth + 1)
+            })
+        }
+        TyKind::RigidTy(RigidTy::Array(elem, _)) => {
+            walk_layout_type(elem, frames, false, visited, depth + 1)
+        }
+        TyKind::RigidTy(RigidTy::Pat(inner, _)) => {
+            walk_layout_type(inner, frames, tail, visited, depth + 1)
+        }
+        TyKind::RigidTy(RigidTy::Ref(_, pointee, _))
+        | TyKind::RigidTy(RigidTy::RawPtr(pointee, _)) => {
+            walk_layout_type(pointee, frames, true, visited, depth + 1)
+        }
+        TyKind::RigidTy(RigidTy::Slice(_))
+        | TyKind::RigidTy(RigidTy::Str)
+        | TyKind::RigidTy(RigidTy::Dynamic(..)) => tail,
+        TyKind::Param(param) => {
+            let Some((innermost, outer)) = frames.split_last() else {
+                return false;
+            };
+            match innermost.0.get(param.index as usize) {
+                Some(rustc_public::ty::GenericArgKind::Type(arg)) => {
+                    walk_layout_type(*arg, outer, tail, visited, depth + 1)
+                }
+                _ => false,
+            }
+        }
+        TyKind::Alias(..) | TyKind::Bound(..) => false,
+        TyKind::RigidTy(_) => true,
     }
 }
 

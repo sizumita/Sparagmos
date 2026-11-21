@@ -2364,6 +2364,56 @@ fn run_mode_unbounded_self_instantiation_is_unsupported() {
     );
 }
 
+const UNSIZED_NONFINAL_SRC: &str = r#"
+#![feature(trivial_bounds)]
+#![expect(trivial_bounds)]
+struct TwoStrs(str, str)
+where
+    str: Sized;
+fn main() {}
+"#;
+
+#[test]
+fn convert_mode_unsized_field_in_non_final_position_converts() {
+    // A struct with an unsized field in a non-final position is
+    // accepted under trivial bounds but can never be
+    // materialized; asking the compiler for its layout creates
+    // a delayed internal compiler error instead of returning
+    // one. The too-big scan must screen the type out and leave
+    // the compilation alone.
+    let dir = temp_dir("mono-unsized-nonfinal");
+    let src = fixture(&dir, "unsized_nonfinal.rs", UNSIZED_NONFINAL_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a never-materializable unsized-field struct must not fail compilation; stderr={stderr}"
+    );
+}
+
+const POINTER_TO_HUGE_SRC: &str = r#"
+fn main() {
+    let _p: *const [u8; usize::MAX] = core::ptr::null();
+}
+"#;
+
+#[test]
+fn convert_mode_pointer_to_huge_type_converts() {
+    // A pointer to a too-big type is itself an ordinary pointer;
+    // merely pointing at the type does not materialize it, so
+    // the program converts.
+    let dir = temp_dir("mono-pointer-to-huge");
+    let src = fixture(&dir, "pointer_to_huge.rs", POINTER_TO_HUGE_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a pointer to a huge type must convert; stderr={stderr}"
+    );
+}
+
 #[test]
 fn convert_mode_bounded_generic_recursion_converts() {
     let dir = temp_dir("mono-bounded-recursion");
