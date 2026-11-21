@@ -755,6 +755,30 @@ fn collect_local_instances(
             if resolved != referenced && deferred_defs.contains(&resolved) {
                 owners.push(resolved);
             }
+            // The expanded-size cap (see
+            // `sparagmos_driver::reach::MAX_INSTANTIATION_EXPANDED_SIZE`):
+            // a size-increasing recursion nests its definition
+            // only linearly deep, so the depth check below cannot
+            // bind before the type expansion exhausts memory.
+            // The size of the demanded arguments is the quantity
+            // that explodes, so it is the one capped here;
+            // tripping it is reported exactly like the depth
+            // limit, since it is the same rustc failure, reached
+            // through the expansion rustc's interning keeps
+            // implicit.
+            if !sparagmos_driver::reach::generic_args_within_expanded_size(
+                &args,
+                sparagmos_driver::reach::MAX_INSTANTIATION_EXPANDED_SIZE,
+            ) {
+                if recursion_limit.is_none() {
+                    *recursion_limit = Some(format!(
+                        "reached the recursion limit while instantiating `{}` (instantiation size limit)",
+                        def.name()
+                    ));
+                }
+                fail_all(&mut *demands, &owners, "recursion limit reached".to_string());
+                continue;
+            }
             // The recursion-limit check mirrors rustc's mono
             // collector: if this instance nests its definition
             // deeper along the current demand path than the
@@ -903,7 +927,7 @@ fn collect_closure_instances(
         plain_taken,
         taken,
         demands,
-        recursion_limit: _,
+        recursion_limit,
     } = state;
 
     let deferred_names: HashMap<rustc_public::DefId, &str> =
@@ -927,6 +951,23 @@ fn collect_closure_instances(
                     continue;
                 }
                 let owners = [referenced];
+                // The expanded-size cap, as in the function
+                // demand pass: a closure demanded with
+                // size-increasing arguments is the same
+                // recursion-limit situation.
+                if !sparagmos_driver::reach::generic_args_within_expanded_size(
+                    &args,
+                    sparagmos_driver::reach::MAX_INSTANTIATION_EXPANDED_SIZE,
+                ) {
+                    if recursion_limit.is_none() {
+                        *recursion_limit = Some(format!(
+                            "reached the recursion limit while instantiating `{}` (instantiation size limit)",
+                            base_name
+                        ));
+                    }
+                    fail_all(&mut *demands, &owners, "recursion limit reached".to_string());
+                    continue;
+                }
                 let Some(kind) = closure_kind(&args) else {
                     if unresolved_seen.insert((referenced, format!("{args:?}"))) {
                         *demands
@@ -1054,7 +1095,7 @@ fn collect_coroutine_instances(
         plain_taken,
         taken,
         demands,
-        recursion_limit: _,
+        recursion_limit,
     } = state;
 
     let deferred_names: HashMap<rustc_public::DefId, &str> =
@@ -1077,6 +1118,23 @@ fn collect_coroutine_instances(
                     continue;
                 }
                 let owners = [referenced];
+                // The expanded-size cap, as in the function
+                // demand pass: a coroutine demanded with
+                // size-increasing arguments is the same
+                // recursion-limit situation.
+                if !sparagmos_driver::reach::generic_args_within_expanded_size(
+                    &args,
+                    sparagmos_driver::reach::MAX_INSTANTIATION_EXPANDED_SIZE,
+                ) {
+                    if recursion_limit.is_none() {
+                        *recursion_limit = Some(format!(
+                            "reached the recursion limit while instantiating `{}` (instantiation size limit)",
+                            base_name
+                        ));
+                    }
+                    fail_all(&mut *demands, &owners, "recursion limit reached".to_string());
+                    continue;
+                }
                 // Obtain the instance body: resolution first,
                 // the definition's own body as the fallback.
                 let ibody = match Instance::resolve(

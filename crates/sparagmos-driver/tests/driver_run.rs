@@ -3976,6 +3976,87 @@ fn g<T>() { g::<Option<T>>(); }
 fn main() { g::<i32>(); }
 "#;
 
+/// The shape of tests/ui/recursion/infinite-instantiation-via-
+/// size-increasing-tuple.rs: each instantiation demands the
+/// next with the type doubled, so the nesting depth grows only
+/// linearly while the type expansion grows exponentially.
+const SIZE_INCREASING_TUPLE_SRC: &str = r#"
+trait Foo {
+    fn recurse(&self);
+}
+
+impl<T> Foo for T {
+    fn recurse(&self) {
+        (self, self).recurse();
+    }
+}
+
+fn main() {
+    ().recurse();
+}
+"#;
+
+/// The shape of tests/ui/recursion/infinite-instantiation-via-
+/// nested-closures.rs, reduced: four methods pass the generic
+/// parameter along a cycle, and two of the hops substitute a
+/// fresh closure type that mentions the previous parameter
+/// twice (as the enclosing substitution and as a capture), so
+/// the demanded arguments' expansion doubles per cycle while
+/// the nesting depth grows only linearly.
+const SIZE_INCREASING_CLOSURES_SRC: &str = r#"
+#![crate_type = "rlib"]
+#[derive(Clone)]
+struct A(B);
+
+impl A {
+    pub fn matches<F: Fn()>(&self, f: &F) {
+        let A(term) = self;
+        term.matches(f);
+    }
+}
+
+#[derive(Clone)]
+enum B {
+    Variant1,
+    Variant2(C),
+}
+
+impl B {
+    pub fn matches<F: Fn()>(&self, f: &F) {
+        match self {
+            B::Variant2(factor) => factor.matches(&|| ()),
+            _ => unreachable!(""),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct C(D);
+
+impl C {
+    pub fn matches<F: Fn()>(&self, f: &F) {
+        let C(base) = self;
+        base.matches(&|| {
+            C(base.clone()).matches(f);
+        });
+    }
+}
+
+#[derive(Clone)]
+struct D(Box<A>);
+
+impl D {
+    pub fn matches<F: Fn()>(&self, f: &F) {
+        let D(a) = self;
+        a.matches(f);
+    }
+}
+
+pub fn matches() {
+    A(B::Variant1).matches(&|| ());
+}
+"#;
+
 const UNSIZED_NONFINAL_SRC: &str = r#"
 #![feature(trivial_bounds)]
 #![expect(trivial_bounds)]
@@ -4130,6 +4211,54 @@ fn run_mode_unbounded_self_instantiation_is_unsupported() {
         stderr.contains("sparagmos-driver: compilation failed")
             && stderr.contains("reached the recursion limit while instantiating"),
         "the failure must name the recursion limit; stderr={stderr}"
+    );
+}
+
+#[test]
+fn convert_mode_size_increasing_tuple_is_a_size_limit_failure() {
+    // The depth and instance-count caps cannot bind here: the
+    // demand path nests the definition once per instantiation
+    // while the type doubles, so conversion exhausts memory
+    // long before either cap is reached. The expanded-size cap
+    // must stop it, as the same recursion-limit failure rustc
+    // reports.
+    let dir = temp_dir("mono-size-increasing-tuple");
+    let src = fixture(&dir, "size_increasing.rs", SIZE_INCREASING_TUPLE_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "size-increasing instantiation must fail compilation; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("sparagmos-driver: compilation failed")
+            && stderr.contains("reached the recursion limit while instantiating")
+            && stderr.contains("(instantiation size limit)"),
+        "the failure must name the instantiation size limit; stderr={stderr}"
+    );
+}
+
+#[test]
+fn convert_mode_size_increasing_closures_is_a_size_limit_failure() {
+    // The closure-mediated shape of the same disease: the
+    // demanded arguments' expansion doubles per cycle through
+    // the closure arguments, so the size cap, not the depth
+    // cap, is what stops the collection.
+    let dir = temp_dir("mono-size-increasing-closures");
+    let src = fixture(&dir, "size_increasing_closures.rs", SIZE_INCREASING_CLOSURES_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "closure-mediated size-increasing instantiation must fail compilation; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("sparagmos-driver: compilation failed")
+            && stderr.contains("reached the recursion limit while instantiating")
+            && stderr.contains("(instantiation size limit)"),
+        "the failure must name the instantiation size limit; stderr={stderr}"
     );
 }
 

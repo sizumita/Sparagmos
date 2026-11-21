@@ -71,6 +71,127 @@ use crate::report::{FnOutcome, FnReport};
 /// Cap on collected bodies per program; see the module docs.
 pub const MAX_COLLECTED_BODIES: usize = 1024;
 
+/// Cap on the expanded size (node count) of one demanded
+/// instance's generic arguments, where the size of a type is the
+/// number of nodes in its full expansion: a tuple `(T, T)` counts
+/// one plus twice the size of `T`, an ADT counts one plus the
+/// sizes of its generic arguments, a reference counts one plus
+/// the size of its pointee, and a leaf type counts one.
+///
+/// rustc interns types, so its recursion limit — a bound on how
+/// deep one definition's instantiations nest along a demand
+/// path — is all it needs: each nesting level costs it O(1) new
+/// type nodes. This driver instead materializes types as trees
+/// when it converts a body, so a size-increasing recursion (each
+/// instantiation of a definition demanding the next with a
+/// doubled type, as in `fn recurse(&self) { (self,
+/// self).recurse() }`) costs memory exponential in the nesting
+/// depth: the depth and instance-count caps are reached only
+/// after the process has allocated more than any machine has.
+/// The expanded-size cap is the bound that actually binds for
+/// such programs, and tripping it is reported through the same
+/// recursion-limit channel as the depth cap, since the
+/// situation is exactly rustc's "reached the recursion limit
+/// while instantiating". The cap value is set by conversion
+/// cost, not by what a type can theoretically reach: converting
+/// a type re-resolves the closure and function instances among
+/// its nodes, so conversion time grows superlinearly in the
+/// expanded size. At 32768 nodes a worst-case size-increasing
+/// chain still finishes in seconds with its memory bounded,
+/// while legitimate local programs stay far below it (no test
+/// in the rustc suite demands a local instance past a few
+/// thousand nodes).
+///
+/// The cap guards the LOCAL collection passes in the driver
+/// only. Foreign demands are deliberately not capped: their
+/// argument spellings grow by substitution composition even
+/// for a finite instance set — collecting
+/// tests/ui/iterators/iter-map-fold-type-length.rs demands
+/// `Iterator::fold` at expansions up to 540,651 nodes for a
+/// twelve-deep `Map` tower, and the base driver completes it —
+/// so a per-instance cap there refuses legitimate collection.
+/// The unbounded growth this cap exists to stop is driven by
+/// local instantiation, and a local size failure aborts the
+/// conversion before foreign bodies are converted.
+pub const MAX_INSTANTIATION_EXPANDED_SIZE: usize = 1 << 15;
+
+/// Whether the expanded size of `args` (see
+/// [`MAX_INSTANTIATION_EXPANDED_SIZE`]) stays within `limit`.
+/// The walk counts nodes against a budget and stops as soon as
+/// the budget is spent, so deciding the question costs
+/// O(min(expanded size, limit)): the walk itself can never be
+/// the runaway allocation it guards against.
+pub fn generic_args_within_expanded_size(args: &GenericArgs, limit: usize) -> bool {
+    struct Walk {
+        budget: usize,
+    }
+    impl Walk {
+        fn node(&mut self) -> bool {
+            if self.budget == 0 {
+                return false;
+            }
+            self.budget -= 1;
+            true
+        }
+        fn args(&mut self, args: &GenericArgs) -> bool {
+            args.0.iter().all(|arg| self.arg(arg))
+        }
+        fn arg(&mut self, arg: &GenericArgKind) -> bool {
+            match arg {
+                GenericArgKind::Type(ty) => self.ty(ty),
+                GenericArgKind::Const(konst) => match konst.kind() {
+                    rustc_public::ty::TyConstKind::Unevaluated(_, inner) => {
+                        self.node() && self.args(&inner)
+                    }
+                    rustc_public::ty::TyConstKind::Value(ty, _)
+                    | rustc_public::ty::TyConstKind::ZSTValue(ty) => self.ty(&ty),
+                    _ => self.node(),
+                },
+                GenericArgKind::Lifetime(_) => true,
+            }
+        }
+        fn ty(&mut self, ty: &Ty) -> bool {
+            if !self.node() {
+                return false;
+            }
+            match ty.kind() {
+                TyKind::RigidTy(RigidTy::Tuple(elems)) => {
+                    elems.iter().all(|elem| self.ty(elem))
+                }
+                TyKind::RigidTy(RigidTy::Ref(_, inner, _))
+                | TyKind::RigidTy(RigidTy::RawPtr(inner, _))
+                | TyKind::RigidTy(RigidTy::Slice(inner))
+                | TyKind::RigidTy(RigidTy::Pat(inner, _)) => self.ty(&inner),
+                TyKind::RigidTy(RigidTy::Array(inner, _)) => self.ty(&inner),
+                TyKind::RigidTy(RigidTy::FnPtr(sig)) => {
+                    sig.value.inputs_and_output.iter().all(|t| self.ty(t))
+                }
+                TyKind::RigidTy(RigidTy::Adt(_, args))
+                | TyKind::RigidTy(RigidTy::FnDef(_, args))
+                | TyKind::RigidTy(RigidTy::Closure(_, args))
+                | TyKind::RigidTy(RigidTy::Coroutine(_, args))
+                | TyKind::RigidTy(RigidTy::CoroutineClosure(_, args))
+                | TyKind::RigidTy(RigidTy::CoroutineWitness(_, args)) => self.args(&args),
+                TyKind::RigidTy(RigidTy::Dynamic(bounds, _)) => bounds.iter().all(|bound| {
+                    match &bound.value {
+                        rustc_public::ty::ExistentialPredicate::Trait(t) => {
+                            self.args(&t.generic_args)
+                        }
+                        rustc_public::ty::ExistentialPredicate::Projection(p) => {
+                            self.args(&p.generic_args)
+                        }
+                        rustc_public::ty::ExistentialPredicate::AutoTrait(_) => true,
+                    }
+                }),
+                TyKind::Alias(_, alias) => self.args(&alias.args),
+                _ => true,
+            }
+        }
+    }
+    Walk { budget: limit }.args(args)
+}
+
+
 /// The outcome of one reachability pass: the converted foreign
 /// bodies (in discovery order) and a report entry for every
 /// distinct foreign target that was considered.
