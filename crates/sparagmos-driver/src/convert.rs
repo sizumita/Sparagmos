@@ -53,6 +53,9 @@ pub struct Converter {
     /// `Discriminant` rvalues must yield these values, because the
     /// `SwitchInt` branch keys carry values, not variant indices.
     pub adt_discriminants: sm::AdtDiscriminants,
+    /// Declared types of the target crate's statics, recorded by
+    /// the item scan before conversion (`note_static_ty`).
+    static_tys: HashMap<sm::DefId, rustc_public::ty::Ty>,
     /// Unsupported hits of the function currently being converted.
     errors: Vec<String>,
 }
@@ -70,6 +73,7 @@ impl Converter {
             instance_ids: HashMap::new(),
             def_names: Vec::new(),
             adt_discriminants: sm::AdtDiscriminants::new(),
+            static_tys: HashMap::new(),
             errors: Vec::new(),
         }
     }
@@ -94,6 +98,18 @@ impl Converter {
 
     pub fn crate_def_id<D: CrateDef>(&mut self, def: &D) -> sm::DefId {
         self.def_id(def.def_id())
+    }
+
+    /// Record the declared type of a static item. Called by the
+    /// item scan before any conversion: a reference into a static's
+    /// interior is decoded against the static's own type (its seed
+    /// is the full initializer and the reference carries a
+    /// projection into it), and the type query is only safe for
+    /// real items, so it is asked there, never from the constant
+    /// decoder.
+    pub fn note_static_ty<D: CrateDef>(&mut self, def: &D, ty: rustc_public::ty::Ty) {
+        let id = self.crate_def_id(def);
+        self.static_tys.insert(id, ty);
     }
 
     /// Map a resolved function instance, reached through the
@@ -829,7 +845,7 @@ impl Converter {
     /// through provenance, and enums are resolved through their tag
     /// (direct or niche encoding). Returns `None` for anything that
     /// has no faithful value form: unions, function pointers and
-    /// vtables, references to statics or functions, null pointers,
+    /// vtables, references to functions, null pointers,
     /// unsized values behind no pointer, and nesting deeper than
     /// the depth budget (cyclic statics exhaust it).
     fn decode_const(
@@ -1168,12 +1184,19 @@ impl Converter {
             .iter()
             .find(|(o, _)| *o as usize == offset)?;
         let target_off = read_uint_at(alloc, offset, PTR_SIZE)? as usize;
-        let target = match mir::alloc::GlobalAlloc::from(prov.0) {
-            mir::alloc::GlobalAlloc::Memory(target) => target,
+        let (target, static_def) = match mir::alloc::GlobalAlloc::from(prov.0) {
+            mir::alloc::GlobalAlloc::Memory(target) => (target, None),
             // A reference to a static: the pointee is the static's
-            // initializer allocation (the value a constant read of
-            // the static observes).
-            mir::alloc::GlobalAlloc::Static(def) => def.eval_initializer().ok()?,
+            // own storage. The decoded value is the static's
+            // initializer allocation (the value the storage holds
+            // before the program runs); the reference keeps the
+            // static's identity so the interpreter can route reads
+            // and writes through the program-level statics store
+            // instead of a per-constant snapshot.
+            mir::alloc::GlobalAlloc::Static(def) => {
+                let init = def.eval_initializer().ok()?;
+                (init, Some(def))
+            }
             // Functions and vtables are not materialised.
             _ => return None,
         };
@@ -1213,10 +1236,171 @@ impl Converter {
                 Some(sm::ConstValue::Bytes(bytes.to_vec()))
             }
             _ => {
+                if let Some(def) = &static_def {
+                    if let Some(c) =
+                        self.decode_static_ref(def, inner, &target, target_off, depth)
+                    {
+                        return Some(c);
+                    }
+                }
                 let pointee = self.decode_const(inner, &target, target_off, depth + 1)?;
                 Some(sm::ConstValue::Ref(Box::new(pointee)))
             }
         }
+    }
+
+    /// Decode a reference whose provenance names the static
+    /// `def`: a [`sm::ConstValue::StaticRef`] carrying the static's
+    /// full initializer as the store seed and the projection from
+    /// the static's base to the pointee. `None` when the projection
+    /// cannot be determined (the caller then falls back to a
+    /// snapshot of the pointee: reads stay correct, writes are
+    /// rejected like any other constant-aggregate write).
+    fn decode_static_ref(
+        &mut self,
+        def: &mir::mono::StaticDef,
+        inner: &rustc_public::ty::Ty,
+        alloc: &Allocation,
+        target_off: usize,
+        depth: usize,
+    ) -> Option<sm::ConstValue> {
+        let def_id = self.crate_def_id(def);
+        // The static's declared type, recorded by the item scan
+        // (see `note_static_ty`). A static with no recorded type —
+        // a foreign static, or an anonymous promoted one — is in
+        // practice reached through references that denote it
+        // whole, whose pointee type is the static's own type, so a
+        // pointee-typed seed stays consistent for it.
+        let Some(static_ty) = self.static_tys.get(&def_id).cloned() else {
+            let seed = self.decode_const(inner, alloc, target_off, depth + 1)?;
+            return Some(sm::ConstValue::StaticRef {
+                def: def_id,
+                value: Box::new(seed),
+                projection: Vec::new(),
+            });
+        };
+        let projection = self.static_offset_path(&static_ty, target_off, inner, depth)?;
+        let seed = self.decode_const(&static_ty, alloc, 0, depth + 1)?;
+        Some(sm::ConstValue::StaticRef {
+            def: def_id,
+            value: Box::new(seed),
+            projection,
+        })
+    }
+
+    /// The projection path from the base of a value of type `ty`
+    /// to the sub-value at byte offset `off`, when that sub-value
+    /// has type `inner`: layout-guided descent through struct and
+    /// union fields, tuple elements and array elements. Enum
+    /// payloads are not descended (the active variant is a fact of
+    /// the stored tag this layer does not read for projections);
+    /// a whole-value reference is the empty path.
+    fn static_offset_path(
+        &mut self,
+        ty: &rustc_public::ty::Ty,
+        off: usize,
+        inner: &rustc_public::ty::Ty,
+        depth: usize,
+    ) -> Option<Vec<sm::PlaceElem>> {
+        if depth > MAX_CONST_DEPTH {
+            return None;
+        }
+        if off == 0 && ty == inner {
+            return Some(Vec::new());
+        }
+        match ty.kind() {
+            TyKind::RigidTy(RigidTy::Adt(def, args)) => match def.kind() {
+                AdtKind::Struct => {
+                    let variant = def.variant(VariantIdx::to_val(0))?;
+                    let offsets = arbitrary_offsets(ty)?;
+                    let fields: Vec<(rustc_public::ty::Ty, usize)> = variant
+                        .fields()
+                        .iter()
+                        .map(|f| f.ty_with_args(&args))
+                        .zip(offsets)
+                        .collect();
+                    let (i, fty, mut rest) =
+                        self.record_offset_path(&fields, off, inner, depth)?;
+                    let mut path = vec![sm::PlaceElem::Field(i as u32, self.ty(&fty))];
+                    path.append(&mut rest);
+                    Some(path)
+                }
+                AdtKind::Union => {
+                    let variant = def.variant(VariantIdx::to_val(0))?;
+                    let fields: Vec<(rustc_public::ty::Ty, usize)> = variant
+                        .fields()
+                        .iter()
+                        .map(|f| (f.ty_with_args(&args), 0))
+                        .collect();
+                    let (i, fty, mut rest) =
+                        self.record_offset_path(&fields, off, inner, depth)?;
+                    let mut path = vec![sm::PlaceElem::Field(i as u32, self.ty(&fty))];
+                    path.append(&mut rest);
+                    Some(path)
+                }
+                AdtKind::Enum => None,
+            },
+            TyKind::RigidTy(RigidTy::Tuple(elems)) => {
+                let offsets = arbitrary_offsets(ty)?;
+                let fields: Vec<(rustc_public::ty::Ty, usize)> =
+                    elems.iter().cloned().zip(offsets).collect();
+                let (i, fty, mut rest) = self.record_offset_path(&fields, off, inner, depth)?;
+                let mut path = vec![sm::PlaceElem::Field(i as u32, self.ty(&fty))];
+                path.append(&mut rest);
+                Some(path)
+            }
+            TyKind::RigidTy(RigidTy::Array(elem, _)) => {
+                let stride = elem.layout().ok()?.shape().size.bytes() as usize;
+                if stride == 0 || off % stride != 0 {
+                    return None;
+                }
+                let idx = off / stride;
+                let count =
+                    ty.layout().ok()?.shape().size.bytes() as usize / stride;
+                if idx >= count {
+                    return None;
+                }
+                let mut rest = self.static_offset_path(&elem, 0, inner, depth + 1)?;
+                let mut path = vec![sm::PlaceElem::ConstantIndex {
+                    offset: idx as u64,
+                    min_length: count as u64,
+                    from_end: false,
+                }];
+                path.append(&mut rest);
+                Some(path)
+            }
+            _ => None,
+        }
+    }
+
+    /// Find the record field (type and byte offset within the
+    /// record) that contains `off` and from which a pointee of
+    /// type `inner` is reachable, returning the field index, the
+    /// field's type, and the remaining path from that field.
+    fn record_offset_path(
+        &mut self,
+        fields: &[(rustc_public::ty::Ty, usize)],
+        off: usize,
+        inner: &rustc_public::ty::Ty,
+        depth: usize,
+    ) -> Option<(usize, rustc_public::ty::Ty, Vec<sm::PlaceElem>)> {
+        for (i, (fty, foff)) in fields.iter().enumerate() {
+            if *foff > off {
+                continue;
+            }
+            let size = fty.layout().ok()?.shape().size.bytes() as usize;
+            // A field contains `off` when it starts at or before it
+            // and ends after it; a zero-sized field contains only
+            // its own offset.
+            let contains = if size == 0 { *foff == off } else { off < foff + size };
+            if !contains {
+                continue;
+            }
+            if let Some(rest) = self.static_offset_path(fty, off - foff, inner, depth + 1) {
+                return Some((i, fty.clone(), rest));
+            }
+        }
+        None
     }
 
     fn place(&mut self, p: &mir::Place) -> sm::Place {

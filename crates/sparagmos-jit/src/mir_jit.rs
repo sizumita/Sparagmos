@@ -1771,6 +1771,9 @@ impl<'a> FnLower<'a> {
             mir::ConstValue::SliceVal(_) => {
                 return Err(self.err("slice-value constant"));
             }
+            mir::ConstValue::StaticRef { .. } => {
+                return Err(self.err("static reference constant"));
+            }
         })
     }
 

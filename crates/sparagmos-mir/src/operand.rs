@@ -1,5 +1,5 @@
 //! `Operand`, `Constant`, `ConstValue`, `Scalar`.
-use crate::place::Place;
+use crate::place::{Place, PlaceElem};
 use crate::ty::{DefId, FloatTy, Ty};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -43,6 +43,27 @@ pub enum ConstValue {
     /// materialised form of a reference constant whose pointee is
     /// itself a constant value.
     Ref(Box<ConstValue>),
+    /// A thin reference (or raw pointer) to a `static` item. The
+    /// pointee is the static's own storage, identified by the
+    /// static's `DefId`; `value` is the decoded initializer — the
+    /// value the storage holds before the program runs. Unlike
+    /// [`ConstValue::Ref`], whose pointee is an immutable snapshot,
+    /// a static reference observes (and, through a mutable
+    /// reference, updates) the one program-level storage of that
+    /// static: reads and writes through it are read-after-write
+    /// consistent across the whole run.
+    StaticRef {
+        def: DefId,
+        value: Box<ConstValue>,
+        /// The path from the static's base to the pointee this
+        /// reference denotes: empty for a reference to the static
+        /// itself, a field/index path for a reference into its
+        /// interior (`static B: &usize = &A.a;`). `value` is always
+        /// the static's full initializer, never the interior value:
+        /// seeding the store with an interior value would corrupt
+        /// every other access to the same static.
+        projection: Vec<PlaceElem>,
+    },
     /// A fat reference to decoded elements: a slice constant whose
     /// elements are not plain bytes.
     SliceVal(Vec<ConstValue>),
