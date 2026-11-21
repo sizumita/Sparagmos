@@ -2262,12 +2262,13 @@ impl<'a> Interpreter<'a> {
                                 else {
                                     continue;
                                 };
+                                // A handle naming no allocation is
+                                // a dangling `Weak::new()`: its count
+                                // lives in a static fake allocation
+                                // that is never freed, so releasing
+                                // it is unobservable - a no-op.
                                 let Some(id) = rc_handle_id(&handle) else {
-                                    return Err(InterpError::type_mismatch(
-                                        "weak handle drop glue",
-                                        "a Weak handle",
-                                        handle.kind_name(),
-                                    ));
+                                    continue;
                                 };
                                 id
                             }
