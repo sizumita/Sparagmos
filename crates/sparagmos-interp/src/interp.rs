@@ -7980,6 +7980,7 @@ fn drop_dyn_value(value: &Value) -> InterpResult<()> {
         | Value::Int(_)
         | Value::Uint(_)
         | Value::Float(_)
+        | Value::Float128(_)
         | Value::Str(_)
         | Value::Bytes(_)
         | Value::Ref(_)
