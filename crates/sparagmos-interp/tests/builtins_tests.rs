@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use sparagmos_interp::builtins::{canonical_name, lookup, BitOp, Builtin, RelOp, SatOp, TrimSide};
 use sparagmos_interp::mir_convert::{interpret_mir, MirProgram};
-use sparagmos_interp::{InterpError, MirRunError, Value};
+use sparagmos_interp::{InterpError, MirRunError, RefTarget, Value};
 use sparagmos_mir as mir;
 
 // ----- shared builders over sparagmos_mir -----------------------------------
@@ -3563,7 +3563,23 @@ fn waker_from_arc_carries_the_arc_value() {
             variant: 0,
             fields: vec![Value::Enum {
                 variant: 0,
-                fields: vec![Value::Uint(7)],
+                fields: vec![
+                    Value::Enum {
+                        variant: 0,
+                        fields: vec![Value::Ref(RefTarget::Alloc {
+                            id: 1,
+                            projection: vec![],
+                        })],
+                    },
+                    Value::Enum {
+                        variant: 0,
+                        fields: vec![],
+                    },
+                    Value::Enum {
+                        variant: 0,
+                        fields: vec![],
+                    },
+                ],
             }],
         }
     );
@@ -3603,7 +3619,23 @@ fn local_waker_from_rc_carries_the_rc_value() {
             variant: 0,
             fields: vec![Value::Enum {
                 variant: 0,
-                fields: vec![Value::Uint(9)],
+                fields: vec![
+                    Value::Enum {
+                        variant: 0,
+                        fields: vec![Value::Ref(RefTarget::Alloc {
+                            id: 1,
+                            projection: vec![],
+                        })],
+                    },
+                    Value::Enum {
+                        variant: 0,
+                        fields: vec![],
+                    },
+                    Value::Enum {
+                        variant: 0,
+                        fields: vec![],
+                    },
+                ],
             }],
         }
     );
