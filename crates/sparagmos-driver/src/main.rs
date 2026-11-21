@@ -1610,6 +1610,259 @@ fn demand_drop_instances(
     }
 }
 
+/// The `dyn` trait references one Stable MIR body forms: every
+/// unsizing cast whose target mentions a `dyn` type and whose
+/// source pointee is a concrete sized type, as a `TraitRef` with
+/// that type as `Self` — the vtable the cast materializes, in
+/// Stable MIR terms. Casts from another `dyn` type (a supertrait
+/// upcast) name no concrete type and are skipped: the sized
+/// formation of the same value elsewhere in the program demands
+/// the full vtable, supertraits included. Casts whose pointee
+/// still mentions a type parameter are skipped the same way: a
+/// monomorphic instance body carries the concrete cast.
+fn dyn_trait_refs(body: &rustc_public::mir::Body) -> Vec<rustc_public::ty::TraitRef> {
+    fn find_dyn(
+        ty: &Ty,
+    ) -> Option<Vec<rustc_public::ty::Binder<rustc_public::ty::ExistentialPredicate>>> {
+        match ty.kind() {
+            TyKind::RigidTy(RigidTy::Dynamic(bounds, _)) => Some(bounds),
+            TyKind::RigidTy(RigidTy::Ref(_, inner, _)) => find_dyn(&inner),
+            TyKind::RigidTy(RigidTy::RawPtr(inner, _)) => find_dyn(&inner),
+            TyKind::RigidTy(RigidTy::Adt(_, args)) => args.0.iter().find_map(|a| match a {
+                GenericArgKind::Type(t) => find_dyn(t),
+                _ => None,
+            }),
+            _ => None,
+        }
+    }
+    fn pointee(ty: &Ty) -> Ty {
+        match ty.kind() {
+            TyKind::RigidTy(RigidTy::Ref(_, inner, _)) => inner,
+            TyKind::RigidTy(RigidTy::RawPtr(inner, _)) => inner,
+            TyKind::RigidTy(RigidTy::Adt(_, args)) => args
+                .0
+                .iter()
+                .find_map(|a| match a {
+                    GenericArgKind::Type(t) => Some(*t),
+                    _ => None,
+                })
+                .unwrap_or(*ty),
+            _ => *ty,
+        }
+    }
+    let locals = body.locals();
+    let mut out = Vec::new();
+    for bb in &body.blocks {
+        for stmt in &bb.statements {
+            let rustc_public::mir::StatementKind::Assign(_, rv) = &stmt.kind else {
+                continue;
+            };
+            let rustc_public::mir::Rvalue::Cast(kind, op, target) = rv else {
+                continue;
+            };
+            if !matches!(
+                kind,
+                rustc_public::mir::CastKind::PointerCoercion(
+                    rustc_public::mir::PointerCoercion::Unsize
+                )
+            ) {
+                continue;
+            }
+            let Some(bounds) = find_dyn(target) else {
+                continue;
+            };
+            let Ok(src) = op.ty(&locals) else {
+                continue;
+            };
+            let concrete = pointee(&src);
+            if matches!(concrete.kind(), TyKind::RigidTy(RigidTy::Dynamic(..))) {
+                continue;
+            }
+            if args_mention_params(&GenericArgs(vec![GenericArgKind::Type(concrete)])) {
+                continue;
+            }
+            for bound in &bounds {
+                if let rustc_public::ty::ExistentialPredicate::Trait(et) = &bound.value {
+                    out.push(et.with_self_ty(concrete));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Cap on vtable method bodies demanded per program across all
+/// [`demand_dyn_instances`] calls, mirroring the drop demand's cap.
+const MAX_DEMANDED_DYN_BODIES: usize = 256;
+
+/// Demand a converted body for every method of every vtable the
+/// scanned bodies form (see [`dyn_trait_refs`]).
+///
+/// A method called through a `dyn` receiver has no demand edge the
+/// other passes can follow: resolving the trait method with the
+/// `dyn` type itself yields a virtual instance, which has no body,
+/// so a trait *default* method — whose only body is the trait's
+/// own, instantiated with the concrete `Self` — is never demanded
+/// at all, and the interpreter's vtable lookup finds neither an
+/// impl body nor a default body at the call. The body a vtable
+/// dispatch actually reaches is the instance the compiler puts in
+/// the concrete type's vtable: an impl method when the impl
+/// provides one, the trait's default body instantiated with the
+/// concrete `Self` when it does not. Demanding exactly those
+/// instances (the compiler's own vtable entries, supertrait
+/// vtables included through their `TraitVPtr` entries) puts the
+/// dispatch target in the program under the instance name the
+/// interpreter's lookup constructs
+/// (`<{concrete} as {trait}>::{method}`). An instance an earlier
+/// pass already converted is skipped by identity and by name, so
+/// a collected impl body is never shadowed by the default body —
+/// the vtable itself already encodes that priority.
+///
+/// Instances with no MIR body available (a non-generic,
+/// non-inline library method is the common case) are left alone:
+/// the dispatch stays the interpreter's explicit unsupported
+/// error, as before. `Fn`-family traits are skipped: their vtable
+/// entries are call shims, and `dyn Fn` calls are executed through
+/// the callable value, never through this lookup. Every converted
+/// instance whose definition is a deferred definition is recorded
+/// in `credited` (instance count and first instance's shape); the
+/// caller credits it in the demand accounting once the demand
+/// passes have run (see the call sites in `collect`).
+#[allow(clippy::too_many_arguments)]
+fn demand_dyn_instances(
+    conv: &mut Converter,
+    report: &mut ConversionReport,
+    bodies: &mut Vec<(String, Body)>,
+    body_def_ids: &mut Vec<sparagmos_mir::DefId>,
+    body_def_names: &mut Vec<String>,
+    sources: &[rustc_public::mir::Body],
+    deferred_defs: &HashSet<rustc_public::DefId>,
+    credited: &mut HashMap<rustc_public::DefId, (usize, (usize, usize, usize))>,
+    demanded: &mut usize,
+) -> Vec<rustc_public::mir::Body> {
+    use std::collections::VecDeque;
+    let mut queue: VecDeque<rustc_public::mir::Body> = sources.iter().cloned().collect();
+    let mut seen_refs: HashSet<String> = HashSet::new();
+    let mut new_bodies: Vec<rustc_public::mir::Body> = Vec::new();
+    while let Some(body) = queue.pop_front() {
+        // Vtable queries go through the compiler's internals and
+        // can panic on exotic traits; isolate each scanned body
+        // exactly as the other demand passes do, so this pass can
+        // never make a crate convert worse.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut converted_now: Vec<rustc_public::mir::Body> = Vec::new();
+            for tref in dyn_trait_refs(&body) {
+                if !seen_refs.insert(format!("{tref:?}")) {
+                    continue;
+                }
+                let mut vtables: VecDeque<rustc_public::ty::TraitRef> =
+                    VecDeque::from([tref]);
+                while let Some(tr) = vtables.pop_front() {
+                    if matches!(
+                        tr.def_id.name().as_str(),
+                        "std::ops::Fn"
+                            | "core::ops::Fn"
+                            | "std::ops::FnMut"
+                            | "core::ops::FnMut"
+                            | "std::ops::FnOnce"
+                            | "core::ops::FnOnce"
+                    ) {
+                        continue;
+                    }
+                    let Ok(entries) = std::panic::catch_unwind(
+                        std::panic::AssertUnwindSafe(|| tr.vtable_entries()),
+                    ) else {
+                        continue;
+                    };
+                    for entry in entries {
+                        match entry {
+                            rustc_public::ty::VtblEntry::TraitVPtr(super_ref) => {
+                                if seen_refs.insert(format!("{super_ref:?}")) {
+                                    vtables.push_back(super_ref);
+                                }
+                            }
+                            rustc_public::ty::VtblEntry::Method(inst) => {
+                                if *demanded >= MAX_DEMANDED_DYN_BODIES {
+                                    continue;
+                                }
+                                if !matches!(
+                                    inst.kind,
+                                    rustc_public::mir::mono::InstanceKind::Item
+                                ) {
+                                    continue;
+                                }
+                                let Ok(true) = std::panic::catch_unwind(
+                                    std::panic::AssertUnwindSafe(|| inst.has_body()),
+                                ) else {
+                                    continue;
+                                };
+                                let Ok(Some(sbody)) = std::panic::catch_unwind(
+                                    std::panic::AssertUnwindSafe(|| inst.body()),
+                                ) else {
+                                    continue;
+                                };
+                                let def_id =
+                                    conv.instance_def_id(inst.def.def_id(), &inst);
+                                if body_def_ids.contains(&def_id) {
+                                    continue;
+                                }
+                                let name = inst.name().to_string();
+                                if bodies.iter().any(|(n, _)| n == &name) {
+                                    continue;
+                                }
+                                let before = bodies.len();
+                                convert_item(
+                                    conv,
+                                    report,
+                                    bodies,
+                                    body_def_ids,
+                                    body_def_names,
+                                    name,
+                                    def_id,
+                                    Ok(Some(sbody.clone())),
+                                );
+                                if bodies.len() > before {
+                                    *demanded += 1;
+                                    converted_now.push(sbody.clone());
+                                    if deferred_defs.contains(&inst.def.def_id()) {
+                                        let entry = credited
+                                            .entry(inst.def.def_id())
+                                            .or_insert_with(|| {
+                                                (
+                                                    0,
+                                                    (
+                                                        sbody.blocks.len(),
+                                                        sbody.locals().len(),
+                                                        sbody.arg_locals().len(),
+                                                    ),
+                                                )
+                                            });
+                                        entry.0 += 1;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            converted_now
+        }));
+        match outcome {
+            Ok(converted_now) => {
+                for sbody in converted_now {
+                    queue.push_back(sbody.clone());
+                    new_bodies.push(sbody);
+                }
+            }
+            Err(_) => {
+                let _ = take_captured_panic();
+            }
+        }
+    }
+    new_bodies
+}
+
 /// Account for a constant that has no MIR body anywhere: a
 /// *trivial* constant (a literal, a path to another constant, a
 /// const parameter). rustc represents such constants without a
@@ -1925,6 +2178,33 @@ fn collect() -> ControlFlow<()> {
     reach_seeds.extend(closure_seeds);
     reach_seeds.extend(coroutine_seeds);
 
+    // Demand the vtable method bodies of the `dyn` values the
+    // bodies scanned so far form (trait default methods reached
+    // only through a vtable are the case this serves; see
+    // `demand_dyn_instances`). The demanded bodies join the
+    // reachability seeds, so the functions they call are
+    // collected too. The state is shared with the fixpoint rounds
+    // below, which rescan the bodies those rounds convert.
+    let deferred_def_set: HashSet<rustc_public::DefId> =
+        deferred.iter().map(|d| d.def).collect();
+    let mut dyn_credited: HashMap<
+        rustc_public::DefId,
+        (usize, (usize, usize, usize)),
+    > = HashMap::new();
+    let mut dyn_demanded = 0usize;
+    let dyn_seeds = demand_dyn_instances(
+        &mut conv,
+        &mut report,
+        &mut bodies,
+        &mut body_def_ids,
+        &mut body_def_names,
+        &reach_seeds.clone(),
+        &deferred_def_set,
+        &mut dyn_credited,
+        &mut dyn_demanded,
+    );
+    reach_seeds.extend(dyn_seeds);
+
     // Collect the bodies of non-local functions reachable from the
     // converted local bodies (std / core / alloc and other library
     // functions), so calls into them have bodies in the program too.
@@ -2004,14 +2284,35 @@ fn collect() -> ControlFlow<()> {
             &coroutine_scan,
             &mut demand_state,
         );
+        // Bodies converted or collected this round can form
+        // `dyn` values whose vtables no earlier pass demanded
+        // (a demanded generic instance unsizing its parameter's
+        // concrete type is the common shape).
+        let mut dyn_scan = fn_scan.clone();
+        dyn_scan.extend(new_instances.iter().cloned());
+        dyn_scan.extend(new_closure_bodies.iter().cloned());
+        dyn_scan.extend(new_coroutine_bodies.iter().cloned());
+        let new_dyn_bodies = demand_dyn_instances(
+            &mut conv,
+            &mut report,
+            &mut bodies,
+            &mut body_def_ids,
+            &mut body_def_names,
+            &dyn_scan,
+            &deferred_def_set,
+            &mut dyn_credited,
+            &mut dyn_demanded,
+        );
         if new_instances.is_empty()
             && new_closure_bodies.is_empty()
             && new_coroutine_bodies.is_empty()
+            && new_dyn_bodies.is_empty()
         {
             break;
         }
         local_scan = new_closure_bodies.clone();
         local_scan.extend(new_coroutine_bodies.iter().cloned());
+        local_scan.extend(new_dyn_bodies.iter().cloned());
         for id in &body_def_ids[ids_before..] {
             collected_ids.insert(*id);
         }
@@ -2021,6 +2322,7 @@ fn collect() -> ControlFlow<()> {
         let mut reach_input = new_instances;
         reach_input.extend(new_closure_bodies.iter().cloned());
         reach_input.extend(new_coroutine_bodies.iter().cloned());
+        reach_input.extend(new_dyn_bodies.iter().cloned());
         let reached = sparagmos_driver::reach::collect_reachable(
             &mut conv,
             &reach_input,
@@ -2031,6 +2333,7 @@ fn collect() -> ControlFlow<()> {
         alias_sources.extend(frontier.iter().cloned());
         alias_sources.extend(new_closure_bodies.iter().cloned());
         alias_sources.extend(new_coroutine_bodies.iter().cloned());
+        alias_sources.extend(new_dyn_bodies.iter().cloned());
         for ((name, body), (def_id, def_name)) in reached
             .bodies
             .into_iter()
@@ -2048,6 +2351,24 @@ fn collect() -> ControlFlow<()> {
                 report.functions.push(entry);
             }
         }
+    }
+    // Credit the vtable instances the dyn demand converted for
+    // deferred definitions (a trait default method is the common
+    // case): the "dynamic dispatch target (virtual instance)"
+    // failure the demand passes recorded for such a definition is
+    // served by those bodies, so it no longer stands against it.
+    // Any other failure of the same definition is untouched, and
+    // a definition no vtable instance was converted for keeps the
+    // failure — its dyn calls stay unsupported at run time.
+    for (def, (count, counts)) in &dyn_credited {
+        let demand = demand_state.demands.entry(*def).or_default();
+        demand.converted += count;
+        if demand.first_counts.is_none() {
+            demand.first_counts = Some(*counts);
+        }
+        demand
+            .failures
+            .remove("dynamic dispatch target (virtual instance)");
     }
     apply_instance_demands(&mut report, &deferred, &demand_state.demands);
     apply_instance_demands(&mut report, &deferred_closures, &demand_state.demands);
