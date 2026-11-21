@@ -124,6 +124,12 @@ pub struct MirProgram {
     /// driver (see `mir::ThreadLocalDef`): each entry's initializer
     /// seeds one thread's storage for that static.
     pub thread_locals: mir::ThreadLocals,
+    /// Field types of monomorphic ADT instances whose generic
+    /// shape mentions a type alias, as recorded by the driver
+    /// (see `mir::AdtInstanceShapes`). Consulted for an ADT
+    /// instance's field types before the generic shape, whose
+    /// alias field types cannot be resolved here.
+    pub adt_instance_shapes: mir::AdtInstanceShapes,
 }
 
 /// Widen an `f16` bit pattern to `f64`. The conversion is exact:
@@ -1403,6 +1409,8 @@ struct Converter<'a> {
     discriminants: &'a mir::AdtDiscriminants,
     /// ADT shape tables of the program (see `MirProgram`).
     adt_shapes: &'a mir::AdtShapes,
+    /// Instance ADT shape tables of the program (see `MirProgram`).
+    adt_instance_shapes: &'a mir::AdtInstanceShapes,
     /// Operand counts of ADT aggregate constructions (see
     /// [`AdtAggregateCounts`]).
     adt_aggregates: AdtAggregateCounts,
@@ -1469,6 +1477,7 @@ impl<'a> Converter<'a> {
             adt_fields,
             discriminants: &program.adt_discriminants,
             adt_shapes: &program.adt_shapes,
+            adt_instance_shapes: &program.adt_instance_shapes,
             adt_aggregates,
             local_crate,
             impl_targets: None,
@@ -3565,6 +3574,7 @@ impl<'a> Converter<'a> {
     ) -> Option<Vec<mir::Ty>> {
         let shape = self.adt_shapes.get(def)?;
         let declared = shape.variants.get(variant as usize)?;
+        let instance = self.instance_field_tys(def, args, variant);
         Some(
             declared
                 .iter()
@@ -3573,10 +3583,31 @@ impl<'a> Converter<'a> {
                     self.adt_fields
                         .get(*def, args, variant, fi as u32)
                         .cloned()
+                        .or_else(|| instance.and_then(|fs| fs.get(fi)).cloned())
                         .unwrap_or_else(|| subst_ty(fty, args))
                 })
                 .collect(),
         )
+    }
+
+    /// The driver-recorded field types of one variant of the ADT
+    /// instance `def` instantiated with `args` (see
+    /// `mir::AdtInstanceShapes`), or `None` when the driver
+    /// recorded no entry for the instance — the common case, in
+    /// which the generic shape's field types need no resolution
+    /// beyond substitution.
+    fn instance_field_tys(
+        &self,
+        def: &mir::AdtDefId,
+        args: &[mir::Ty],
+        variant: u32,
+    ) -> Option<&[mir::Ty]> {
+        let tag = crate::builtins::ty_tag(&mir::Ty::Adt(*def, args.to_vec()), self.names);
+        self.adt_instance_shapes
+            .get(&tag)?
+            .variants
+            .get(variant as usize)
+            .map(Vec::as_slice)
     }
 
     // ----- rvalues -----------------------------------------------------------
