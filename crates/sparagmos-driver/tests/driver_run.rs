@@ -70,6 +70,36 @@ fn run_mode_guest_panic_exits_101() {
 }
 
 #[test]
+fn summary_mode_tail_call_body_is_skipped_with_named_reason() {
+    // In summary (convert) mode the same containment reports the
+    // tail-call body as skipped with its named reason, and the
+    // rest of the crate still converts: no conversion panic is
+    // reported anywhere.
+    let dir = temp_dir("tailcall-summary");
+    let src = fixture(&dir, "tailcall.rs", TAIL_CALL_SRC);
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "summary mode succeeds with a named skip; stderr={stderr}"
+    );
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("countdown"))
+        .unwrap_or_else(|| panic!("summary lists countdown: {stdout}"));
+    assert!(
+        line.contains("body contains a tail call"),
+        "the skip reason names the tail call: {line}"
+    );
+    assert!(
+        !stdout.contains("panicked") && !stderr.contains("panicked"),
+        "no conversion panic is reported: stdout={stdout} stderr={stderr}"
+    );
+}
+
+#[test]
 fn run_mode_println_prints_to_stdout() {
     let dir = temp_dir("println");
     let src = fixture(&dir, "println.rs", PRINTLN_SRC);
@@ -200,13 +230,15 @@ fn main() {
 
 
 #[test]
-fn run_mode_tail_call_conversion_panic_exits_two() {
+fn run_mode_tail_call_body_is_skipped_and_call_exits_two() {
     // Converting a `become` (explicit tail call) makes rustc_public
     // panic (`unimplemented!()` in Stable MIR's terminator
-    // conversion). The driver must catch that panic at the compiler
-    // boundary and report it under the run-mode contract — exit 2
-    // with the panic message as the reason — instead of dying with
-    // the panic (exit 101 and a default panic dump on stderr).
+    // conversion). The driver contains that panic at the compiler
+    // boundary and skips the body with the named tail-call reason,
+    // so conversion completes; the call in `main` then reports the
+    // unconverted body under the usual run-mode contract — exit 2 —
+    // instead of the whole run dying with the panic (exit 101 and
+    // a default panic dump on stderr).
     let dir = temp_dir("tailcall");
     let src = fixture(&dir, "tailcall.rs", TAIL_CALL_SRC);
     let out = run_driver(&src);
@@ -214,15 +246,19 @@ fn run_mode_tail_call_conversion_panic_exits_two() {
     assert_eq!(
         out.status.code(),
         Some(2),
-        "a conversion panic is a conversion failure (exit 2), not a process panic; stderr={stderr}"
+        "calling an unconverted body is unsupported (exit 2), not a process panic; stderr={stderr}"
     );
     assert!(
-        stderr.contains("Stable MIR conversion panicked"),
-        "the reason names the conversion panic: {stderr}"
+        stderr.contains("no converted body"),
+        "the reason names the unconverted body: {stderr}"
     );
     assert!(
-        stderr.contains("not implemented"),
-        "the reason carries the panic message: {stderr}"
+        stderr.contains("tailcall::countdown"),
+        "the reason names the skipped function: {stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "the conversion panic is contained, not reported: {stderr}"
     );
     assert!(
         !stderr.contains("RUST_BACKTRACE"),

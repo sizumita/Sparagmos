@@ -99,8 +99,9 @@ use rustc_public::{CrateDef, CrateDefType};
 use rustc_public::ItemKind;
 
 use sparagmos_driver::convert::{
-    args_mention_params, closure_kind, is_coroutine_closure_panic, Converter,
-    COROUTINE_CLOSURE_TYPE_REASON,
+    args_mention_params, closure_kind, stable_mir_panic_reason, Converter,
+    CONST_EXPR_REASON, COROUTINE_CLOSURE_TYPE_REASON, INSTANCE_CONST_REASON,
+    TAIL_CALL_REASON, UNSAFE_BINDER_REASON,
 };
 use sparagmos_driver::report::{ConversionReport, FnOutcome, FnReport};
 use sparagmos_mir::Body;
@@ -231,6 +232,31 @@ fn panic_reason(info: &std::panic::PanicHookInfo<'_>) -> String {
     }
 }
 
+/// When a panic that escaped the compiler run is the compiler
+/// aborting the compilation itself, the compilation-failure
+/// reason to report for it; `None` for anything else (a
+/// conversion panic, which the caller reports as such). Two
+/// shapes: an error emitted under `-Z treat-err-as-bug` panics
+/// with "aborting due to `-Z treat-err-as-bug=…`" (rustc_errors'
+/// `panic_if_treat_err_as_bug`), and a delayed bug created
+/// during compilation is flushed at the end of the run by
+/// panicking with the non-string `DelayedBugPanic` marker
+/// (rustc_errors/src/lib.rs:1499) — that bug's own text is an
+/// internal compiler error the compiler has already printed.
+fn compiler_abort_reason(reason: &str) -> Option<String> {
+    if reason.contains("treat-err-as-bug") {
+        Some(reason.to_string())
+    } else if reason.contains("rustc_errors/src/lib.rs:1499:") {
+        Some(
+            "the compiler aborted on a delayed bug it created during \
+             compilation (see the internal compiler error above)"
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
 /// Reason text from a caught panic payload, when it is a string.
 fn payload_reason(payload: &(dyn std::any::Any + Send)) -> Option<String> {
     if let Some(s) = payload.downcast_ref::<&str>() {
@@ -242,25 +268,72 @@ fn payload_reason(payload: &(dyn std::any::Any + Send)) -> Option<String> {
     }
 }
 
-/// Run a Stable MIR query that may hit rustc_public 1.100.0's
-/// unimplemented coroutine-closure type conversion (inspecting
-/// the type kind of an async closure item materializes it,
-/// unlike a body fetch, whose types stay opaque until
-/// conversion). A panic from that specific unimplemented
-/// conversion is contained and reported as
-/// `COROUTINE_CLOSURE_TYPE_REASON`; any other panic is resumed —
-/// this guard must never paper over an unrelated compiler
-/// failure.
-fn guard_coroutine_closure_query<T>(query: impl FnOnce() -> T) -> Result<T, String> {
+/// Peek at the panic-capture slot without clearing it (see
+/// `take_captured_panic`).
+fn peek_captured_panic() -> Option<String> {
+    PANIC_CAPTURE.lock().ok().and_then(|slot| slot.clone())
+}
+
+/// The skip reason for a caught panic whose payload is the
+/// bare text "not implemented": several of rustc_public
+/// 1.100.0's unimplemented conversions panic with exactly that
+/// payload (`unimplemented!()` with no message), so the
+/// payload alone cannot tell them apart — but the panic
+/// hook's record of the same panic carries its location,
+/// which names the site. The record must be this very panic:
+/// its message part is the same bare text. (The toolchain is
+/// pinned, so the locations are stable.)
+fn unimplemented_site_reason(
+    payload: &(dyn std::any::Any + Send),
+) -> Option<&'static str> {
+    if payload_reason(payload).as_deref() != Some("not implemented") {
+        return None;
+    }
+    let captured = peek_captured_panic()?;
+    let (message, location) = captured.split_once(" (panicked at ")?;
+    if message != "not implemented" {
+        return None;
+    }
+    if location.contains("rustc_public/src/unstable/convert/stable/mir.rs:775:") {
+        Some(TAIL_CALL_REASON)
+    } else if location
+        .contains("rustc_public/src/unstable/convert/stable/ty.rs:471:")
+    {
+        Some(UNSAFE_BINDER_REASON)
+    } else if location
+        .contains("rustc_public/src/unstable/convert/stable/ty.rs:577:")
+    {
+        Some(CONST_EXPR_REASON)
+    } else {
+        None
+    }
+}
+
+/// Run a Stable MIR query that may hit one of rustc_public
+/// 1.100.0's known unimplemented conversions (inspecting the
+/// type kind of an async closure item materializes it, unlike
+/// a body fetch, whose types stay opaque until conversion —
+/// but a body fetch materializes the whole body, terminators
+/// and projections included). A panic from one of those
+/// specific unimplemented conversions is contained and
+/// reported as its named reason (`stable_mir_panic_reason`
+/// for the payloads that identify themselves,
+/// `unimplemented_site_reason` for the bare "not implemented"
+/// ones); any other panic is resumed — this guard must never
+/// paper over an unrelated compiler failure.
+fn guard_stable_mir_query<T>(query: impl FnOnce() -> T) -> Result<T, String> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(query)) {
         Ok(value) => Ok(value),
         Err(payload) => {
-            if is_coroutine_closure_panic(&*payload) {
+            let reason = stable_mir_panic_reason(&*payload)
+                .map(str::to_string)
+                .or_else(|| unimplemented_site_reason(&*payload).map(str::to_string));
+            if let Some(reason) = reason {
                 // Contained panic: clear the capture slot, as the
                 // instance collection does — a later, genuinely
                 // fatal panic must report its own message.
                 let _ = take_captured_panic();
-                Err(COROUTINE_CLOSURE_TYPE_REASON.to_string())
+                Err(reason)
             } else {
                 std::panic::resume_unwind(payload);
             }
@@ -268,20 +341,43 @@ fn guard_coroutine_closure_query<T>(query: impl FnOnce() -> T) -> Result<T, Stri
     }
 }
 
-/// Convert one body through the coroutine-closure containment
-/// (see `Converter::convert_body_contained`), clearing the panic
-/// capture slot when the containment fired: the hook recorded
+/// Convert one body through the Stable MIR containment (see
+/// `Converter::convert_body_contained`), clearing the panic
+/// capture slot when a containment fired: the hook recorded
 /// the contained panic's message, and a later, genuinely fatal
-/// panic must report its own.
+/// panic must report its own. A panic the inner containment
+/// resumes because its payload is the bare "not implemented"
+/// is caught once more here and identified by its recorded
+/// location (`unimplemented_site_reason`).
 fn convert_body_isolated(
     conv: &mut Converter,
     body: &rustc_public::mir::Body,
 ) -> Result<Body, Vec<String>> {
-    let result = conv.convert_body_contained(body);
-    if matches!(&result, Err(errs) if errs.iter().any(|e| e == COROUTINE_CLOSURE_TYPE_REASON)) {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        conv.convert_body_contained(body)
+    }));
+    let result = match outcome {
+        Ok(result) => result,
+        Err(payload) => {
+            if let Some(reason) = unimplemented_site_reason(&*payload) {
+                let _ = take_captured_panic();
+                return Err(vec![reason.to_string()]);
+            }
+            std::panic::resume_unwind(payload);
+        }
+    };
+    if matches!(&result, Err(errs) if errs.iter().any(|e| is_contained_reason(e))) {
         let _ = take_captured_panic();
     }
     result
+}
+
+/// Whether a conversion error is one of the contained Stable
+/// MIR panics' named reasons (see `stable_mir_panic_reason`).
+fn is_contained_reason(reason: &str) -> bool {
+    reason == COROUTINE_CLOSURE_TYPE_REASON
+        || reason == UNSAFE_BINDER_REASON
+        || reason == INSTANCE_CONST_REASON
 }
 
 /// Install a panic hook that records the first panic's message into
@@ -514,7 +610,7 @@ enum ClosureAttempt {
 /// below only fires if a future Stable MIR implements the
 /// conversion).
 fn closure_instance(item: &rustc_public::CrateItem) -> ClosureAttempt {
-    match guard_coroutine_closure_query(|| closure_instance_kind(item)) {
+    match guard_stable_mir_query(|| closure_instance_kind(item)) {
         Ok(attempt) => attempt,
         Err(reason) => ClosureAttempt::Unsupported(reason),
     }
@@ -1187,7 +1283,7 @@ fn collect_coroutine_instances(
                     );
                     continue;
                 }
-                match conv.convert_body(&ibody) {
+                match convert_body_isolated(conv, &ibody) {
                     Ok(converted) => {
                         *taken += 1;
                         queue.push_back(ibody.clone());
@@ -2169,7 +2265,7 @@ fn collect() -> ControlFlow<()> {
                         // through. A constant whose own body is
                         // unavailable too is a trivial constant
                         // (see `account_trivial_const`).
-                        match guard_coroutine_closure_query(|| item.body()) {
+                        match guard_stable_mir_query(|| item.body()) {
                             Ok(Some(body)) => convert_local_body(
                                 &mut conv,
                                 &mut report,
@@ -2199,7 +2295,7 @@ fn collect() -> ControlFlow<()> {
                 }
             },
         };
-        let body = match guard_coroutine_closure_query(|| instance.body()) {
+        let body = match guard_stable_mir_query(|| instance.body()) {
             Ok(Some(body)) => body,
             Ok(None) => {
                 if matches!(item.kind(), ItemKind::Const) {
@@ -2565,7 +2661,7 @@ fn collect() -> ControlFlow<()> {
                          (auxiliary crate function)"
                         .to_string())
                 } else {
-                    guard_coroutine_closure_query(|| fn_def.body())
+                    guard_stable_mir_query(|| fn_def.body())
                 };
                 convert_item(
                     &mut conv,
@@ -3719,6 +3815,15 @@ fn main() {
             let reason = take_captured_panic()
                 .or_else(|| payload_reason(&*payload))
                 .unwrap_or_else(|| "panic with a non-string payload".to_string());
+            if let Some(abort) = compiler_abort_reason(&reason) {
+                // The compiler itself aborted the compilation:
+                // that is a compilation failure, not a conversion
+                // gap, so it takes the compilation-failure report
+                // (and its exit codes), exactly like a front-end
+                // rejection recorded by the callbacks.
+                eprintln!("sparagmos-driver: compilation failed: {abort}");
+                std::process::exit(if run_mode { 2 } else { 1 });
+            }
             if run_mode {
                 eprintln!(
                     "sparagmos-driver run: unsupported: Stable MIR conversion panicked: {reason}"

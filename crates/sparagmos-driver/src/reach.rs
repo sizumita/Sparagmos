@@ -65,7 +65,7 @@ use rustc_public::CrateDef;
 
 use sparagmos_mir as sm;
 
-use crate::convert::Converter;
+use crate::convert::{stable_mir_panic_reason, Converter};
 use crate::report::{FnOutcome, FnReport};
 
 /// Cap on collected bodies per program; see the module docs.
@@ -249,6 +249,30 @@ struct Record {
     kind: RecordKind,
 }
 
+/// Fetch one instance's body, containing the panics of
+/// rustc_public 1.100.0's known unimplemented conversions
+/// whose payloads identify them (`stable_mir_panic_reason`):
+/// materializing a foreign body can hit the bridge's
+/// unreachable instance-constant evaluation, among others.
+/// A contained panic is reported as the named reason (the
+/// caller records the instance as body-less with it); any
+/// other panic is resumed — this containment must never paper
+/// over an unrelated compiler failure.
+fn fetch_body_contained(
+    inst: &Instance,
+) -> Result<Option<mir::Body>, &'static str> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inst.body())) {
+        Ok(body) => Ok(body),
+        Err(payload) => {
+            if let Some(reason) = stable_mir_panic_reason(&*payload) {
+                Err(reason)
+            } else {
+                std::panic::resume_unwind(payload);
+            }
+        }
+    }
+}
+
 /// Collect the bodies of non-local functions reachable from the
 /// converted local bodies (`seeds`, Stable MIR form). `local_defs`
 /// holds the `DefId`s of the local crate's items; targets resolving
@@ -363,14 +387,15 @@ pub fn collect_reachable(
                     limit_reached = true;
                     no_body("collection limit reached")
                 }
-                _ => match inst.body() {
-                    Some(body) => {
+                _ => match fetch_body_contained(&inst) {
+                    Ok(Some(body)) => {
                         bodies_taken += 1;
                         queue.push_back(body.clone());
                         walked_bodies.push(body.clone());
                         RecordKind::WithBody { inst, body }
                     }
-                    None => no_body("no MIR body available"),
+                    Ok(None) => no_body("no MIR body available"),
+                    Err(reason) => no_body(reason),
                 },
             };
             records.push(Record {

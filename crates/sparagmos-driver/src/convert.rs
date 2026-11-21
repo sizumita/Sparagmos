@@ -411,6 +411,103 @@ pub fn is_coroutine_closure_panic(payload: &(dyn std::any::Any + Send)) -> bool 
     message.is_some_and(|m| m.contains("FIXME(async_closures)"))
 }
 
+/// Why a body containing a tail call cannot be converted:
+/// rustc_public 1.100.0's internal-to-stable terminator
+/// conversion is `unimplemented!()` for
+/// `mir::TerminatorKind::TailCall` (convert/stable/mir.rs:775),
+/// so a body using `become` cannot even be materialized as a
+/// Stable MIR body. The affected body is skipped with this
+/// reason instead of the panic aborting the whole crate's
+/// conversion. (The panic's payload is the bare text
+/// "not implemented"; the site is identified by its recorded
+/// location — see `unimplemented_site_reason` in the driver.)
+pub const TAIL_CALL_REASON: &str = "body contains a tail call \
+    (mir::TerminatorKind::TailCall), which Stable MIR 1.100.0 does not \
+    expose (rustc_public leaves TailCall conversion unimplemented)";
+
+/// Why a body mentioning an unsafe binder cannot be converted:
+/// rustc_public 1.100.0's type conversion is `unimplemented!()`
+/// for `ty::UnsafeBinder` (convert/stable/ty.rs:471), and its
+/// projection conversion for the wrap/unwrap projections is
+/// `unimplemented!("FIXME(unsafe_binders):")`
+/// (convert/stable/mir.rs). The affected body is skipped with
+/// this reason instead of the panic aborting the conversion.
+pub const UNSAFE_BINDER_REASON: &str = "body mentions an unsafe binder \
+    (ty::UnsafeBinder / WrapUnsafeBinder), which Stable MIR 1.100.0 \
+    cannot convert (rustc_public leaves unsafe binders unimplemented)";
+
+/// Why a body whose instance constants cannot be evaluated
+/// cannot be converted: while materializing an instance body,
+/// rustc_public_bridge evaluates the body's constants; when a
+/// constant's evaluation is too generic
+/// (`ErrorHandled::TooGeneric` — an unevaluated constant whose
+/// arguments still mention parameters, e.g. `type_name::<T>`
+/// inside a body the demand collection materialized), the
+/// bridge hits `unreachable!("Failed to evaluate instance
+/// constant")`. The affected body is skipped with this reason
+/// instead of the panic aborting the conversion.
+pub const INSTANCE_CONST_REASON: &str = "body mentions an instance constant \
+    that Stable MIR 1.100.0 cannot evaluate (rustc_public_bridge \
+    evaluates an instance's constants while materializing its body \
+    and hits unreachable! when the evaluation is too generic)";
+
+/// Why a body mentioning a generic const expression in a type
+/// cannot be converted: rustc_public 1.100.0's constant
+/// conversion is `unimplemented!()` for `ty::ConstKind::Expr`
+/// (convert/stable/ty.rs:577) — the const-tree expressions of
+/// `generic_const_exprs` in type position. The affected body
+/// is skipped with this reason instead of the panic aborting
+/// the conversion. (Identified by panic location, like
+/// `TAIL_CALL_REASON`.)
+pub const CONST_EXPR_REASON: &str = "body mentions a generic const \
+    expression in a type (ty::ConstKind::Expr), which Stable MIR \
+    1.100.0 cannot convert (rustc_public leaves it unimplemented)";
+
+/// The string text of a caught panic payload, when it is one.
+fn payload_text(payload: &(dyn std::any::Any + Send)) -> Option<String> {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        Some((*s).to_string())
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        Some(s.clone())
+    } else {
+        None
+    }
+}
+
+/// Whether a caught panic payload is rustc_public 1.100.0's
+/// unimplemented unsafe-binder projection conversion.
+pub fn is_unsafe_binder_panic(payload: &(dyn std::any::Any + Send)) -> bool {
+    payload_text(payload).is_some_and(|m| m.contains("FIXME(unsafe_binders)"))
+}
+
+/// Whether a caught panic payload is rustc_public_bridge's
+/// unreachable instance-constant evaluation.
+pub fn is_instance_const_panic(payload: &(dyn std::any::Any + Send)) -> bool {
+    payload_text(payload)
+        .is_some_and(|m| m.contains("Failed to evaluate instance constant"))
+}
+
+/// The skip reason for a caught panic whose payload alone
+/// identifies it as one of rustc_public 1.100.0's known
+/// unimplemented conversions (see the `*_REASON` constants).
+/// Panics whose payload is the bare text "not implemented"
+/// carry no identifying text; those are identified by their
+/// recorded location instead (`unimplemented_site_reason` in
+/// the driver) and are resumed here.
+pub fn stable_mir_panic_reason(
+    payload: &(dyn std::any::Any + Send),
+) -> Option<&'static str> {
+    if is_coroutine_closure_panic(payload) {
+        Some(COROUTINE_CLOSURE_TYPE_REASON)
+    } else if is_unsafe_binder_panic(payload) {
+        Some(UNSAFE_BINDER_REASON)
+    } else if is_instance_const_panic(payload) {
+        Some(INSTANCE_CONST_REASON)
+    } else {
+        None
+    }
+}
+
 impl Converter {
     pub fn new() -> Self {
         Self {
@@ -666,13 +763,16 @@ impl Converter {
     }
 
 
-    /// Convert one Stable MIR body, containing rustc_public
-    /// 1.100.0's unimplemented coroutine-closure type conversion:
-    /// a body that mentions a coroutine-closure (async closure)
-    /// type fails with `COROUTINE_CLOSURE_TYPE_REASON` instead of
-    /// the panic escaping. Any other panic is resumed — this
-    /// containment must never paper over an unrelated compiler
-    /// failure.
+    /// Convert one Stable MIR body, containing the panics of
+    /// rustc_public 1.100.0's known unimplemented conversions
+    /// whose payloads identify them (coroutine-closure types,
+    /// unsafe-binder projections, instance-constant evaluation):
+    /// a body hitting one fails with the corresponding
+    /// `*_REASON` instead of the panic escaping. Any other panic
+    /// is resumed — this containment must never paper over an
+    /// unrelated compiler failure. (The bare "not implemented"
+    /// payloads are identified by location one layer up, in the
+    /// driver's `convert_body_isolated`.)
     pub fn convert_body_contained(
         &mut self,
         body: &mir::Body,
@@ -682,8 +782,8 @@ impl Converter {
         })) {
             Ok(result) => result,
             Err(payload) => {
-                if is_coroutine_closure_panic(&*payload) {
-                    Err(vec![COROUTINE_CLOSURE_TYPE_REASON.to_string()])
+                if let Some(reason) = stable_mir_panic_reason(&*payload) {
+                    Err(vec![reason.to_string()])
                 } else {
                     std::panic::resume_unwind(payload);
                 }
