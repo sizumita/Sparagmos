@@ -677,6 +677,68 @@ enum UniqueValue {
     Many,
 }
 
+/// Whether `ty` is a thin pointer type: a raw pointer or
+/// reference whose pointee carries no metadata half (not a slice,
+/// `str`, `dyn` or opaque alias pointee). A thin pointer's value
+/// in this model is exactly its target, so transmutes between
+/// thin pointer types — and between a thin pointer and a
+/// transparent wrapper around one — reinterpret nothing.
+fn is_thin_ptr_ty(ty: &mir::Ty) -> bool {
+    match ty {
+        mir::Ty::RawPtr(pointee, _) | mir::Ty::Ref(_, pointee, _) => !matches!(
+            **pointee,
+            mir::Ty::Slice(_)
+                | mir::Ty::Str
+                | mir::Ty::Dynamic(..)
+                | mir::Ty::Alias(..)
+        ),
+        _ => false,
+    }
+}
+
+/// The constant form of a uniquely determined zero-sized value
+/// (the only values [`Converter::zst_value`] synthesizes), or
+/// `None` for a value kind with no constant form.
+fn value_to_constant(v: &Value) -> Option<ir::Constant> {
+    match v {
+        Value::Unit => Some(ir::Constant::Unit),
+        Value::Tuple(items) => items
+            .iter()
+            .map(value_to_constant)
+            .collect::<Option<Vec<_>>>()
+            .map(ir::Constant::Tuple),
+        Value::Enum { variant, fields } => fields
+            .iter()
+            .map(value_to_constant)
+            .collect::<Option<Vec<_>>>()
+            .map(|fields| ir::Constant::Adt {
+                variant: *variant,
+                fields,
+            }),
+        Value::Closure { def, env } if env.is_empty() => {
+            Some(ir::Constant::Closure(def.clone()))
+        }
+        Value::FnPtr(name) => Some(ir::Constant::FnDef(name.clone())),
+        _ => None,
+    }
+}
+
+/// The shape of a transparent wrapper struct for `transmute`
+/// purposes: a struct whose fields are exactly one thin-pointer
+/// payload field plus any number of zero-sized fields whose
+/// values are uniquely determined by their types (`NonNull`,
+/// `Pin`, `PtrAndZst` are the shapes std transmutes through).
+struct WrapperShape {
+    /// Total number of fields of the struct.
+    field_count: usize,
+    /// Index of the payload (thin pointer) field.
+    payload_index: usize,
+    /// Instantiated type of the payload field.
+    payload_ty: mir::Ty,
+    /// Unique values of the zero-sized fields, by field index.
+    fill: Vec<(usize, ir::Constant)>,
+}
+
 /// Substitute a definition's generic arguments for its parameters
 /// in a declared field type (see `mir::AdtShape`): `Param(i)` is
 /// replaced by the instantiation's `i`-th argument, recursively.
@@ -1852,6 +1914,270 @@ impl<'a> Converter<'a> {
         Ok((lhs, rhs))
     }
 
+    // ----- transmute casts ---------------------------------------------------
+
+    /// Convert a `CastKind::Transmute` rvalue: `operand` is the
+    /// MIR operand, `v` its converted IR form, `target` the cast's
+    /// target type. Only the shapes this value model can
+    /// reinterpret exactly are converted:
+    ///
+    /// * pointer -> integer (the synthetic address) and the
+    ///   reverse (an address-only reference);
+    /// * thin pointer -> thin pointer, including reference ->
+    ///   reference across pointee types (`&Waker` ->
+    ///   `&LocalWaker`): the value is the pointer itself, the
+    ///   pointee type lives in the destination's declared type;
+    /// * fieldless enum <-> integer, through the baked
+    ///   discriminant table;
+    /// * thin pointer <-> transparent wrapper struct (one
+    ///   thin-pointer payload field, the remaining fields
+    ///   zero-sized with unique values): `NonNull`, `Pin` and the
+    ///   coroutine machinery's `ResumeTy` chain transmute through
+    ///   these;
+    /// * zero-sized type -> zero-sized type whose value is
+    ///   uniquely determined by its type.
+    ///
+    /// Every other shape — aggregate <-> aggregate byte
+    /// reinterpretation, fat pointers, enums with payloads —
+    /// stays [`ir::Rvalue::Unsupported`]: the model has no flat
+    /// byte memory to reinterpret through.
+    fn convert_transmute(
+        &self,
+        body: &mir::Body,
+        operand: &mir::Operand,
+        v: &ir::Operand,
+        target: &mir::Ty,
+    ) -> ir::Rvalue {
+        fn unsupported() -> ir::Rvalue {
+            ir::Rvalue::Unsupported("Cast Transmute".to_string())
+        }
+        let src = self.operand_place_ty(body, operand);
+        // A constant integer operand carries no place type; the
+        // converted operand itself is the evidence for its kind.
+        let src_is_int = matches!(src, Some(mir::Ty::Int(_) | mir::Ty::Uint(_)))
+            || matches!(
+                v,
+                ir::Operand::Constant(ir::Constant::Int(_) | ir::Constant::Uint(_))
+            );
+        match (&src, target) {
+            // Pointer -> integer: the synthetic address (what the
+            // compiler's UB precondition checks use to test a
+            // pointer for null / alignment).
+            (
+                Some(mir::Ty::RawPtr(..) | mir::Ty::Ref(..)),
+                mir::Ty::Int(_) | mir::Ty::Uint(_),
+            ) => ir::Rvalue::PtrToInt(v.clone()),
+            // Thin pointer -> thin pointer: the value itself.
+            (Some(s), t) if is_thin_ptr_ty(s) && is_thin_ptr_ty(t) => {
+                ir::Rvalue::Use(v.clone())
+            }
+            // Integer -> thin pointer: an address-only reference.
+            (_, t) if src_is_int && is_thin_ptr_ty(t) => {
+                ir::Rvalue::IntToPtr(v.clone())
+            }
+            // Fieldless enum -> integer: the discriminant value.
+            (Some(mir::Ty::Adt(def, _)), mir::Ty::Int(_) | mir::Ty::Uint(_)) => {
+                match self.fieldless_enum_discriminants(def) {
+                    Some(table) => match self.convert_ty(target, "cast target") {
+                        Ok(t) => ir::Rvalue::EnumToInt(v.clone(), table, t),
+                        Err(_) => unsupported(),
+                    },
+                    None => unsupported(),
+                }
+            }
+            // Integer -> fieldless enum: the variant whose
+            // discriminant the integer's bit pattern equals.
+            (_, mir::Ty::Adt(def, _)) if src_is_int => {
+                match self.fieldless_enum_discriminants(def) {
+                    Some(table) => ir::Rvalue::IntToEnum(v.clone(), table),
+                    None => unsupported(),
+                }
+            }
+            // Thin pointer -> transparent wrapper struct: wrap
+            // the pointer, filling the zero-sized fields with
+            // their unique values.
+            (Some(s), mir::Ty::Adt(def, args)) if is_thin_ptr_ty(s) => {
+                match self.wrapper_shape(def, args) {
+                    Some(shape) => {
+                        let mut operands = Vec::with_capacity(shape.field_count);
+                        for i in 0..shape.field_count {
+                            if i == shape.payload_index {
+                                operands.push(v.clone());
+                            } else {
+                                let c = shape
+                                    .fill
+                                    .iter()
+                                    .find(|(j, _)| *j == i)
+                                    .map(|(_, c)| c.clone());
+                                match c {
+                                    Some(c) => {
+                                        operands.push(ir::Operand::Constant(c))
+                                    }
+                                    None => return unsupported(),
+                                }
+                            }
+                        }
+                        ir::Rvalue::AggregateAdt {
+                            variant: 0,
+                            operands,
+                            field_index: None,
+                        }
+                    }
+                    None => unsupported(),
+                }
+            }
+            // Transparent wrapper struct -> thin pointer: read
+            // the payload field back out.
+            (Some(mir::Ty::Adt(def, args)), t) if is_thin_ptr_ty(t) => {
+                match self.wrapper_shape(def, args) {
+                    Some(shape) => self.unwrap_wrapper(operand, v, &shape),
+                    None => unsupported(),
+                }
+            }
+            // Zero-sized -> zero-sized with a uniquely determined
+            // value: the value is the target type's unique value,
+            // whatever the source value was (a zero-sized source
+            // with a unique value carries no other information).
+            (Some(s), t) => {
+                match (self.zst_value(s, 0), self.zst_value(t, 0)) {
+                    (Some(_), Some(tv)) => match value_to_constant(&tv) {
+                        Some(c) => ir::Rvalue::Use(ir::Operand::Constant(c)),
+                        None => unsupported(),
+                    },
+                    _ => unsupported(),
+                }
+            }
+            _ => unsupported(),
+        }
+    }
+
+    /// Read the payload field out of a transparent wrapper value
+    /// (the reverse of the wrap in [`Self::convert_transmute`]).
+    fn unwrap_wrapper(
+        &self,
+        operand: &mir::Operand,
+        v: &ir::Operand,
+        shape: &WrapperShape,
+    ) -> ir::Rvalue {
+        fn unsupported() -> ir::Rvalue {
+            ir::Rvalue::Unsupported("Cast Transmute".to_string())
+        }
+        match operand.place() {
+            Some(place) => {
+                let place = place
+                    .clone()
+                    .field(shape.payload_index as u32, shape.payload_ty.clone());
+                match self.convert_place(&place) {
+                    Ok(p) => match operand {
+                        mir::Operand::Move(_) => {
+                            ir::Rvalue::Use(ir::Operand::Move(p))
+                        }
+                        _ => ir::Rvalue::Use(ir::Operand::Copy(p)),
+                    },
+                    Err(_) => unsupported(),
+                }
+            }
+            None => match v {
+                ir::Operand::Constant(ir::Constant::Adt { fields, .. }) => {
+                    match fields.get(shape.payload_index) {
+                        Some(c) => {
+                            ir::Rvalue::Use(ir::Operand::Constant(c.clone()))
+                        }
+                        None => unsupported(),
+                    }
+                }
+                _ => unsupported(),
+            },
+        }
+    }
+
+    /// The effective discriminant table of an enum whose
+    /// variants are all fieldless (variant index -> discriminant
+    /// value), or `None` when `def` is not such an enum. A missing
+    /// recorded table means the discriminants are the sequential
+    /// defaults, so the table is synthesized from the variant
+    /// count — the same convention as the `Discriminant` rvalue.
+    fn fieldless_enum_discriminants(
+        &self,
+        def: &mir::AdtDefId,
+    ) -> Option<Vec<i128>> {
+        let shape = self.adt_shapes.get(def)?;
+        if shape.kind != mir::AdtShapeKind::Enum
+            || shape.variants.iter().any(|fields| !fields.is_empty())
+        {
+            return None;
+        }
+        match self.discriminants.get(def) {
+            Some(table) if !table.is_empty() => Some(table.clone()),
+            _ => Some((0..shape.variants.len() as i128).collect()),
+        }
+    }
+
+    /// The [`WrapperShape`] of the struct `def` instantiated
+    /// with `args`, or `None` when it is not a transparent
+    /// wrapper (not a struct, more than one payload field, or a
+    /// field that is neither the payload nor a uniquely valued
+    /// zero-sized type).
+    fn wrapper_shape(
+        &self,
+        def: &mir::AdtDefId,
+        args: &[mir::Ty],
+    ) -> Option<WrapperShape> {
+        let shape = self.adt_shapes.get(def)?;
+        if shape.kind != mir::AdtShapeKind::Struct || shape.variants.len() != 1 {
+            return None;
+        }
+        let fields = self.instantiated_field_tys(def, args, 0)?;
+        let mut payload: Option<(usize, mir::Ty)> = None;
+        let mut fill = Vec::new();
+        for (i, fty) in fields.iter().enumerate() {
+            if is_thin_ptr_ty(fty) {
+                if payload.is_some() {
+                    return None;
+                }
+                payload = Some((i, fty.clone()));
+            } else if let Some(zv) = self.zst_value(fty, 0) {
+                fill.push((i, value_to_constant(&zv)?));
+            } else {
+                return None;
+            }
+        }
+        let (payload_index, payload_ty) = payload?;
+        Some(WrapperShape {
+            field_count: fields.len(),
+            payload_index,
+            payload_ty,
+            fill,
+        })
+    }
+
+    /// The field types of one variant of `def` instantiated with
+    /// `args`: recovered field types (already instantiated for
+    /// this `args`) win over the shape's declared types, whose
+    /// parameter indices can misalign — the same resolution as
+    /// `unique_value`.
+    fn instantiated_field_tys(
+        &self,
+        def: &mir::AdtDefId,
+        args: &[mir::Ty],
+        variant: u32,
+    ) -> Option<Vec<mir::Ty>> {
+        let shape = self.adt_shapes.get(def)?;
+        let declared = shape.variants.get(variant as usize)?;
+        Some(
+            declared
+                .iter()
+                .enumerate()
+                .map(|(fi, fty)| {
+                    self.adt_fields
+                        .get(*def, args, variant, fi as u32)
+                        .cloned()
+                        .unwrap_or_else(|| subst_ty(fty, args))
+                })
+                .collect(),
+        )
+    }
+
     // ----- rvalues -----------------------------------------------------------
 
     fn convert_rvalue(
@@ -2030,21 +2356,15 @@ impl<'a> Converter<'a> {
                             "Cast PointerExposeProvenance".to_string(),
                         ),
                     },
-                    // A pointer-to-integer `transmute` (what the
-                    // compiler's UB precondition checks use to test a
-                    // pointer for null / alignment) becomes the
-                    // model's synthetic address. Every other
-                    // transmute shape stays unsupported: the model
-                    // cannot reinterpret a value's bytes, and
-                    // inventing an integer-to-pointer target would
-                    // fabricate a reference.
-                    mir::CastKind::Transmute => match (&ctx, target) {
-                        (
-                            Some(mir::Ty::RawPtr(..) | mir::Ty::Ref(..)),
-                            mir::Ty::Int(_) | mir::Ty::Uint(_),
-                        ) => ir::Rvalue::PtrToInt(v),
-                        _ => ir::Rvalue::Unsupported("Cast Transmute".to_string()),
-                    },
+                    // `transmute`: the shapes the value model
+                    // can reinterpret exactly (pointers, integers,
+                    // fieldless enums, transparent wrappers,
+                    // zero-sized types) are decided in
+                    // `convert_transmute`; every other shape
+                    // stays an explicit unsupported.
+                    mir::CastKind::Transmute => {
+                        self.convert_transmute(body, operand, &v, target)
+                    }
                     other => ir::Rvalue::Unsupported(format!("Cast {}", other.name())),
                 }
             }
