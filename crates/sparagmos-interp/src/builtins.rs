@@ -5468,20 +5468,15 @@ impl<'a> Interpreter<'a> {
         b: &Value,
     ) -> InterpResult<bool> {
         if matches!(a, Value::FatRef { .. }) || matches!(b, Value::FatRef { .. }) {
-            let (ea, la) = self.slice_elements(frames, a)?;
-            let (eb, lb) = self.slice_elements(frames, b)?;
+            let (ea, la) = self.slice_elements_ref(frames, a)?;
+            let (eb, lb) = self.slice_elements_ref(frames, b)?;
             if la != lb {
                 return Ok(false);
             }
-            for (x, y) in ea.iter().zip(eb.iter()) {
-                if !self.values_equal(frames, x, y)? {
-                    return Ok(false);
-                }
-            }
-            return Ok(true);
+            return self.elems_equal(frames, &ea, &eb);
         }
-        let a = self.resolve_value(frames, a)?;
-        let b = self.resolve_value(frames, b)?;
+        let a = self.resolve_ref(frames, a)?;
+        let b = self.resolve_ref(frames, b)?;
         // A `dyn Trait` value denotes its concrete pointee: two
         // trait objects compare equal when their concrete types
         // agree and the pointees compare equal, and unequal when
@@ -5494,11 +5489,11 @@ impl<'a> Interpreter<'a> {
         // structural evaluation is the same policy the model applies
         // to direct calls. A dyn side against a sized side compares
         // the pointee against that side.
-        if matches!(a, Value::DynRef { .. }) || matches!(b, Value::DynRef { .. }) {
+        if matches!(&*a, Value::DynRef { .. }) || matches!(&*b, Value::DynRef { .. }) {
             if let (
                 Value::DynRef { concrete: ca, .. },
                 Value::DynRef { concrete: cb, .. },
-            ) = (&a, &b)
+            ) = (&*a, &*b)
             {
                 if ca != cb {
                     return Ok(false);
@@ -5513,15 +5508,20 @@ impl<'a> Interpreter<'a> {
         // compares as a slice against the other side's elements:
         // the other side may resolve to the bare array value, whose
         // elements are exactly its own.
-        if matches!(a, Value::FatRef { .. }) || matches!(b, Value::FatRef { .. }) {
-            let (ea, la) = self.slice_elements(frames, &a)?;
-            let (eb, lb) = self.slice_elements(frames, &b)?;
+        if matches!(&*a, Value::FatRef { .. }) || matches!(&*b, Value::FatRef { .. }) {
+            let (ea, la) = self.slice_elements_ref(frames, &a)?;
+            let (eb, lb) = self.slice_elements_ref(frames, &b)?;
             if la != lb {
                 return Ok(false);
             }
-            return self.seq_equal(frames, &ea, &eb);
+            return match (&ea, &eb) {
+                (SliceElems::Values(x), SliceElems::Values(y)) => {
+                    self.seq_equal(frames, x, y)
+                }
+                _ => self.elems_equal(frames, &ea, &eb),
+            };
         }
-        Ok(match (&a, &b) {
+        Ok(match (&*a, &*b) {
             (Value::Ref(RefTarget::Null), Value::Ref(RefTarget::Null)) => true,
             // Address-only pointers compare by address; address 0
             // is the null address.
@@ -5618,6 +5618,25 @@ impl<'a> Interpreter<'a> {
         Ok(true)
     }
 
+    /// Element-wise equality of two borrowed element lists: the
+    /// slice arm of `values_equal` without materialising either
+    /// side's elements, so a comparison that decides early does not
+    /// pay for a snapshot of the rest.
+    fn elems_equal(
+        &self,
+        frames: &[Frame],
+        a: &SliceElems<'_>,
+        b: &SliceElems<'_>,
+    ) -> InterpResult<bool> {
+        for i in 0..a.len().min(b.len()) {
+            let (x, y) = (a.get(i), b.get(i));
+            if !self.values_equal(frames, &x, &y)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Semantic (derived `Ord`) comparison of two values: integers
     /// and booleans by value, strings byte-wise (as `str`'s `Ord`
     /// is), aggregates lexicographically with enum variants ordered
@@ -5647,19 +5666,17 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         discriminants: Option<&[i128]>,
     ) -> InterpResult<Option<Ordering>> {
         if matches!(a, Value::FatRef { .. }) || matches!(b, Value::FatRef { .. }) {
-            let (ea, la) = self.slice_elements(frames, a)?;
-            let (eb, lb) = self.slice_elements(frames, b)?;
-            for (x, y) in ea.iter().zip(eb.iter()) {
-                match self.values_cmp(frames, x, y, None)? {
-                    Some(Ordering::Equal) => {}
-                    other => return Ok(other),
-                }
+            let (ea, la) = self.slice_elements_ref(frames, a)?;
+            let (eb, lb) = self.slice_elements_ref(frames, b)?;
+            match self.elems_cmp(frames, &ea, &eb)? {
+                Some(Ordering::Equal) => {}
+                other => return Ok(other),
             }
             return Ok(Some(la.cmp(&lb)));
         }
-        let a = self.resolve_value(frames, a)?;
-        let b = self.resolve_value(frames, b)?;
-        Ok(match (&a, &b) {
+        let a = self.resolve_ref(frames, a)?;
+        let b = self.resolve_ref(frames, b)?;
+        Ok(match (&*a, &*b) {
             (Value::Unit, Value::Unit) => Some(Ordering::Equal),
             (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)),
             (Value::Int(x), Value::Int(y)) => Some(x.cmp(y)),
@@ -5708,6 +5725,27 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
             }
         }
         Ok(Some(a.len().cmp(&b.len())))
+    }
+
+    /// Element-wise comparison of two borrowed element lists: the
+    /// slice arm of `values_cmp` without materialising either
+    /// side's elements. The result is the first non-`Equal` element
+    /// result, or `Equal` when the common prefix compares equal
+    /// (the caller applies the length tiebreak).
+    fn elems_cmp(
+        &self,
+        frames: &[Frame],
+        a: &SliceElems<'_>,
+        b: &SliceElems<'_>,
+    ) -> InterpResult<Option<Ordering>> {
+        for i in 0..a.len().min(b.len()) {
+            let (x, y) = (a.get(i), b.get(i));
+            match self.values_cmp(frames, &x, &y, None)? {
+                Some(Ordering::Equal) => {}
+                other => return Ok(other),
+            }
+        }
+        Ok(Some(Ordering::Equal))
     }
 
     /// The elements a slice-like value denotes, with its length: a
