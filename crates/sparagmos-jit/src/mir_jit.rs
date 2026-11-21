@@ -785,6 +785,10 @@ fn scan_body_aggregates(scan: &mut AdtScan, body: &mir::Body) {
                                 if let Some(ty) = place_decl_ty(body, place) {
                                     scan.record_field(&key, *variant_index, i as u32, ty);
                                 }
+                            } else if let mir::Operand::Constant(c) = op {
+                                if let Some(ty) = const_literal_ty(&c.literal) {
+                                    scan.record_field(&key, *variant_index, i as u32, ty);
+                                }
                             }
                         }
                     }
@@ -798,6 +802,44 @@ fn scan_body_aggregates(scan: &mut AdtScan, body: &mir::Body) {
 /// computed once before lowering.
 struct AdtLayouts {
     entries: Vec<(AdtKey, Result<AdtLayout, String>)>,
+}
+
+/// A width-exact type for a constant literal, when the literal
+/// alone determines one: integer scalars by size, floats by
+/// their type, tuples elementwise. Used to type aggregate
+/// fields that are built directly from constants (no place
+/// projection ever names their type). An integer literal's
+/// signedness is not observable from the literal; the chosen
+/// type only fixes the leaf width, which is all the layout
+/// needs — reads go through projections, which carry their own
+/// declared types.
+fn const_literal_ty(kind: &mir::ConstKind) -> Option<mir::Ty> {
+    let mir::ConstKind::Value(v) = kind else {
+        return None;
+    };
+    const_value_ty(v)
+}
+
+fn const_value_ty(v: &mir::ConstValue) -> Option<mir::Ty> {
+    use mir::IntTy;
+    match v {
+        mir::ConstValue::Scalar(mir::Scalar::Int { size, .. }) => Some(mir::Ty::Int(match size {
+            1 => IntTy::I8,
+            2 => IntTy::I16,
+            4 => IntTy::I32,
+            8 => IntTy::I64,
+            16 => IntTy::I128,
+            _ => return None,
+        })),
+        mir::ConstValue::Scalar(mir::Scalar::Float { ty, .. }) => Some(mir::Ty::Float(*ty)),
+        mir::ConstValue::Bool(_) => Some(mir::Ty::Bool),
+        mir::ConstValue::Char(_) => Some(mir::Ty::Char),
+        mir::ConstValue::Tuple(fields) => {
+            let tys: Option<Vec<mir::Ty>> = fields.iter().map(const_value_ty).collect();
+            Some(mir::Ty::Tuple(tys?))
+        }
+        _ => None,
+    }
 }
 
 impl AdtLayouts {
@@ -2336,6 +2378,148 @@ impl<'a> FnLower<'a> {
     }
 
 
+    /// Write an operand's leaves — `flatten(ctx)` of them — into
+    /// the consecutive slots starting at `dst`. The operand may
+    /// live in the frame, in memory, or be a constant (materialised
+    /// leaf by leaf). Used for aggregate fields and whole-value
+    /// copies of multi-leaf values.
+    fn store_operand_leaves(
+        &mut self,
+        op: &mir::Operand,
+        ctx: &mir::Ty,
+        dst: u32,
+    ) -> Result<(), JitError> {
+        let count = flatten(ctx, &self.func.name, self.layouts)?;
+        match op {
+            mir::Operand::Copy(p) | mir::Operand::Move(p) => {
+                let loc = self.classify_place(p)?;
+                match &loc {
+                    PlaceLoc::Slots { first, count: c, .. } => {
+                        if *c != count {
+                            return Err(self.err("operand shape mismatch"));
+                        }
+                        for k in 0..count as u32 {
+                            self.emit(Instr::Copy {
+                                dst: dst + k,
+                                src: IrOperand::Value(first + k),
+                            });
+                        }
+                        Ok(())
+                    }
+                    PlaceLoc::Mem { count: c, .. } => {
+                        if *c != Some(count) {
+                            return Err(self.err("operand shape mismatch"));
+                        }
+                        self.load_mem_to(&loc, dst);
+                        Ok(())
+                    }
+                }
+            }
+            mir::Operand::Constant(c) => match &c.literal {
+                mir::ConstKind::Value(v) => self.const_value_leaves(v, ctx, dst),
+                _ => Err(self.err("non-value constant in aggregate position")),
+            },
+        }
+    }
+
+    /// The leaves of an operand as value slots (a fresh scratch
+    /// run for a constant or a memory value; the place's own slots
+    /// for a frame value). `count` must equal the operand type's
+    /// leaf count.
+    fn operand_leaves(
+        &mut self,
+        op: &mir::Operand,
+        ctx: &mir::Ty,
+        count: usize,
+    ) -> Result<Vec<u32>, JitError> {
+        match op {
+            mir::Operand::Copy(p) | mir::Operand::Move(p) => {
+                let loc = self.classify_place(p)?;
+                match &loc {
+                    PlaceLoc::Slots { first, count: c, .. } => {
+                        if *c != count {
+                            return Err(self.err("operand shape mismatch"));
+                        }
+                        Ok((0..count as u32).map(|k| first + k).collect())
+                    }
+                    PlaceLoc::Mem { count: c, .. } => {
+                        if *c != Some(count) {
+                            return Err(self.err("operand shape mismatch"));
+                        }
+                        let base = self.fresh();
+                        for _ in 1..count {
+                            self.fresh();
+                        }
+                        self.load_mem_to(&loc, base);
+                        Ok((0..count as u32).map(|k| base + k).collect())
+                    }
+                }
+            }
+            mir::Operand::Constant(_) => {
+                let base = self.fresh();
+                for _ in 1..count {
+                    self.fresh();
+                }
+                self.store_operand_leaves(op, ctx, base)?;
+                Ok((0..count as u32).map(|k| base + k).collect())
+            }
+        }
+    }
+
+    /// Materialise a constant value's leaves into the consecutive
+    /// slots starting at `dst`, under the type context `ctx`:
+    /// scalars are one leaf (their canonical word), tuples are
+    /// their fields in order, an ADT constant is its tag (when the
+    /// layout has one) plus each field in its layout slot.
+    fn const_value_leaves(
+        &mut self,
+        v: &mir::ConstValue,
+        ctx: &mir::Ty,
+        dst: u32,
+    ) -> Result<(), JitError> {
+        match (v, ctx) {
+            (mir::ConstValue::Adt { variant, fields }, mir::Ty::Adt(def, _)) => {
+                let layout = self.adt_layout(ctx)?;
+                let slots = layout
+                    .variants
+                    .get(*variant as usize)
+                    .ok_or_else(|| self.err("ADT constant variant outside the layout"))?;
+                if slots.len() != fields.len() {
+                    return Err(self.err("ADT constant field count mismatch"));
+                }
+                if layout.tag {
+                    let tag = self.discriminant_value(*def, *variant)?;
+                    self.emit(Instr::Const { dst, imm: tag });
+                }
+                for (field, slot) in fields.iter().zip(slots.iter()) {
+                    let fctx = slot.ty.clone();
+                    self.const_value_leaves(field, &fctx, dst + slot.offset as u32)?;
+                }
+                Ok(())
+            }
+            (mir::ConstValue::Tuple(fields), mir::Ty::Tuple(tys)) => {
+                if fields.len() != tys.len() {
+                    return Err(self.err("tuple constant field count mismatch"));
+                }
+                let mut off = 0usize;
+                for (field, ty) in fields.iter().zip(tys.iter()) {
+                    self.const_value_leaves(field, ty, dst + off as u32)?;
+                    off += flatten(ty, &self.func.name, self.layouts)?;
+                }
+                Ok(())
+            }
+            _ => {
+                if flatten(ctx, &self.func.name, self.layouts)? == 0 {
+                    // A zero-leaf value (unit / never) stores nothing.
+                    return Ok(());
+                }
+                let w = self.const_value_i64(v, ctx)?;
+                self.emit(Instr::Const { dst, imm: w });
+                Ok(())
+            }
+        }
+    }
+
     /// Interpret a constant under the type context it is used in.
     fn const_i64(&self, c: &mir::Constant, ctx: &mir::Ty) -> Result<i64, JitError> {
         match &c.literal {
@@ -2491,32 +2675,41 @@ impl<'a> FnLower<'a> {
                 variant_index,
             } => {
                 let loc = self.classify_place(place)?;
-                if let PlaceLoc::Mem { count, ty, .. } = &loc {
+                if let PlaceLoc::Mem { ty, .. } = &loc {
                     let mir::Ty::Adt(def, _) = ty else {
                         return Err(self.err("SetDiscriminant on a non-ADT place"));
                     };
-                    if *count != Some(1) {
-                        return Err(
-                            self.err("SetDiscriminant on an ADT with a payload shape")
-                        );
-                    }
+                    let layout = self.adt_layout(ty)?;
+                    // Validates the variant against the table.
                     let tag = self.discriminant_value(*def, *variant_index)?;
-                    let tmp = self.fresh();
-                    self.emit(Instr::Const { dst: tmp, imm: tag });
-                    self.store_mem_from(&loc, tmp);
+                    if layout.tag {
+                        // The value's first leaf in memory is its
+                        // tag: store just that leaf.
+                        let mut tag_loc = loc.clone();
+                        if let PlaceLoc::Mem { count, .. } = &mut tag_loc {
+                            *count = Some(1);
+                        }
+                        let tmp = self.fresh();
+                        self.emit(Instr::Const { dst: tmp, imm: tag });
+                        self.store_mem_from(&tag_loc, tmp);
+                    }
                     return Ok(());
                 }
-                let (dst, count, ty) = self.place_leaves(place)?;
+                let (dst, _, ty) = self.place_leaves(place)?;
                 let mir::Ty::Adt(def, _) = &ty else {
                     return Err(self.err("SetDiscriminant on a non-ADT place"));
                 };
-                if count != 1 {
-                    return Err(self.err("SetDiscriminant on an ADT with a payload shape"));
-                }
-                // The place's single leaf is its tag: write the
-                // variant's discriminant value from the table.
+                let layout = self.adt_layout(&ty)?;
+                // Validates the variant against the table.
                 let tag = self.discriminant_value(*def, *variant_index)?;
-                self.emit(Instr::Const { dst, imm: tag });
+                if layout.tag {
+                    // The place's first leaf is its tag: write the
+                    // variant's discriminant value from the table.
+                    self.emit(Instr::Const { dst, imm: tag });
+                }
+                // A single-variant ADT has no tag leaf: its
+                // discriminant is implicit, and setting it (to the
+                // only variant) writes nothing.
                 Ok(())
             }
             S::Intrinsic(_) => Err(self.err("Intrinsic statement")),
@@ -2641,7 +2834,7 @@ impl<'a> FnLower<'a> {
                     let (a, b) = self.operand_pair(op)?;
                     Ok(vec![a, b])
                 }
-                _ => Err(self.err("assignment of an aggregate value through a dereference")),
+                _ => self.operand_leaves(op, dst_ty, count),
             },
             R::BinaryOp(op, pair) => {
                 if count != 1 {
@@ -2827,7 +3020,20 @@ impl<'a> FnLower<'a> {
                             let v = self.const_i64(c, &dst_ty)?;
                             self.emit(Instr::Const { dst, imm: v });
                         } else if dst_count > 1 {
-                            return Err(self.err("constant of aggregate type"));
+                            // A multi-leaf constant (a tuple or an
+                            // ADT with payload fields) materialises
+                            // leaf by leaf under the destination's
+                            // type.
+                            match &c.literal {
+                                mir::ConstKind::Value(v) => {
+                                    self.const_value_leaves(v, &dst_ty, dst)?;
+                                }
+                                _ => {
+                                    return Err(
+                                        self.err("constant of aggregate type")
+                                    )
+                                }
+                            }
                         }
                         // A zero-leaf (unit / never) destination has
                         // nothing to store.
@@ -2894,37 +3100,47 @@ impl<'a> FnLower<'a> {
                     return Err(self.err("Discriminant result is not a scalar"));
                 }
                 let src_loc = self.classify_place(src_place)?;
-                if let PlaceLoc::Mem { count, ty, .. } = &src_loc {
-                    if !matches!(ty, mir::Ty::Adt(..)) {
+                if let PlaceLoc::Mem { ty, .. } = &src_loc {
+                    let mir::Ty::Adt(def, _) = ty else {
                         return Err(self.err("Discriminant of a non-ADT place"));
+                    };
+                    let layout = self.adt_layout(ty)?;
+                    if layout.tag {
+                        // The value's first leaf in memory holds
+                        // the discriminant value itself.
+                        let mut tag_loc = src_loc.clone();
+                        if let PlaceLoc::Mem { count, .. } = &mut tag_loc {
+                            *count = Some(1);
+                        }
+                        self.load_mem_to(&tag_loc, dst);
+                    } else {
+                        // A single-variant ADT's discriminant is
+                        // the constant of its only variant.
+                        let v = self.discriminant_value(*def, 0)?;
+                        self.emit(Instr::Const { dst, imm: v });
                     }
-                    if *count != Some(1) {
-                        return Err(
-                            self.err("Discriminant of an ADT with a payload shape")
-                        );
-                    }
-                    // The ADT's single leaf in memory holds the
-                    // discriminant value itself.
-                    self.load_mem_to(&src_loc, dst);
                     self.normalize(dst, &dst_ty);
                     return Ok(());
                 }
-                let (src, src_count, src_ty) = self.place_leaves(src_place)?;
-                if !matches!(src_ty, mir::Ty::Adt(..)) {
+                let (src, _, src_ty) = self.place_leaves(src_place)?;
+                let mir::Ty::Adt(def, _) = &src_ty else {
                     return Err(self.err("Discriminant of a non-ADT place"));
+                };
+                let layout = self.adt_layout(&src_ty)?;
+                if layout.tag {
+                    // The value's first leaf holds the discriminant
+                    // value itself; the read canonicalises it
+                    // through the destination's (discriminant) type,
+                    // so `SwitchInt` on the result compares against
+                    // the same values the interpreter produces.
+                    self.emit(Instr::Copy {
+                        dst,
+                        src: IrOperand::Value(src),
+                    });
+                } else {
+                    let v = self.discriminant_value(*def, 0)?;
+                    self.emit(Instr::Const { dst, imm: v });
                 }
-                if src_count != 1 {
-                    return Err(self.err("Discriminant of an ADT with a payload shape"));
-                }
-                // The ADT's single leaf holds the discriminant value
-                // itself; the read canonicalises it through the
-                // destination's (discriminant) type, so `SwitchInt`
-                // on the result compares against the same values the
-                // interpreter produces.
-                self.emit(Instr::Copy {
-                    dst,
-                    src: IrOperand::Value(src),
-                });
                 self.normalize(dst, &dst_ty);
                 Ok(())
             }
@@ -2942,21 +3158,20 @@ impl<'a> FnLower<'a> {
                     );
                 }
                 // The value is the pointee: read through one
-                // dereference of the source place.
-                if count != 1 {
-                    return Err(self.err("CopyForDeref of an aggregate value"));
-                }
+                // dereference of the source place, leaf by leaf
+                // (a payload ADT pointee copies its whole layout).
+                let _ = count;
                 let mut projection = src_place.projection.clone();
                 projection.push(mir::PlaceElem::Deref);
                 let deref_place = mir::Place {
                     local: src_place.local,
                     projection,
                 };
-                let v = self.operand_value(&mir::Operand::Copy(deref_place), &dst_ty)?;
-                self.emit(Instr::Copy {
+                self.store_operand_leaves(
+                    &mir::Operand::Copy(deref_place),
+                    &dst_ty,
                     dst,
-                    src: IrOperand::Value(v),
-                });
+                )?;
                 Ok(())
             }
         }
@@ -3720,18 +3935,38 @@ impl<'a> FnLower<'a> {
         match kind {
             mir::AggregateKind::Tuple => {}
             mir::AggregateKind::Adt {
-                def, variant_index, ..
+                def,
+                variant_index,
+                field_index,
+                ..
             } => {
-                if !ops.is_empty() {
-                    return Err(self.err("ADT aggregate with fields"));
+                if field_index.is_some() {
+                    // A union aggregate writes one active field;
+                    // unions are outside the layout model.
+                    return Err(self.err("ADT aggregate with an active-field index (union)"));
                 }
-                let (dst, count, _) = self.place_leaves(place)?;
-                if count != 1 {
+                let (dst, count, dst_ty) = self.place_leaves(place)?;
+                let layout = self.adt_layout(&dst_ty)?;
+                if count != layout.total {
                     return Err(self.err("ADT aggregate destination shape mismatch"));
                 }
-                // A fieldless variant's value is its tag alone.
-                let tag = self.discriminant_value(*def, *variant_index)?;
-                self.emit(Instr::Const { dst, imm: tag });
+                let slots = layout
+                    .variants
+                    .get(*variant_index as usize)
+                    .ok_or_else(|| self.err("ADT aggregate variant outside the layout"))?
+                    .clone();
+                if slots.len() != ops.len() {
+                    return Err(self.err("ADT aggregate field count mismatch"));
+                }
+                if layout.tag {
+                    // The value's first leaf is the variant's
+                    // discriminant value from the table.
+                    let tag = self.discriminant_value(*def, *variant_index)?;
+                    self.emit(Instr::Const { dst, imm: tag });
+                }
+                for (op, slot) in ops.iter().zip(slots.iter()) {
+                    self.store_operand_leaves(op, &slot.ty, dst + slot.offset as u32)?;
+                }
                 return Ok(());
             }
             other => {
