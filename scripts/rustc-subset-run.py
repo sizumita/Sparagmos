@@ -1522,17 +1522,22 @@ def _proc_macro_chain(test_path, fname, edition, modifiers=None):
 
 
 def _concrete_edition(edition):
-    """The single edition a range directive (`2015..2021`) ends
-    at. compiletest runs one instance per edition in the range;
-    the subset collapses a test to one attempt, and its aux
-    builds use the range's last edition, the same value the
-    attempt's own edition selection takes from the directive.
-    An open-ended range (`2018..`) has no last edition; the
-    collapse takes its first, the earliest edition the test
-    claims to support."""
+    """The single edition a range directive (`2015..2021`)
+    collapses to for the subset's one attempt.
+
+    compiletest's range is half-open, [lower, upper), and its
+    edition_to_test picks the run's requested edition when it
+    falls in the range and the lower bound otherwise. Bootstrap
+    passes compiletest no requested edition, so the request
+    defaults to the minimum (2015) and every range -- closed or
+    open-ended (`2018..`) -- resolves to its lower bound: the
+    edition the test's sources are written against (a
+    `2015..2021` test may use syntax later editions reject).
+    The subset's collapse takes the same lower bound.
+    """
     if ".." in edition:
-        start, _, end = edition.partition("..")
-        return (end.strip() or start.strip())
+        start, _, _end = edition.partition("..")
+        return start.strip()
     return edition
 
 

@@ -890,8 +890,11 @@ class JudgeCompileTests(unittest.TestCase):
 
 
 class ConcreteEditionTests(unittest.TestCase):
-    def test_closed_range_takes_last(self):
-        self.assertEqual(run._concrete_edition("2015..2021"), "2021")
+    def test_closed_range_takes_lower_bound(self):
+        # compiletest's range is half-open and, with no requested
+        # edition configured, edition_to_test falls to the lower
+        # bound -- never the excluded upper end.
+        self.assertEqual(run._concrete_edition("2015..2021"), "2015")
 
     def test_open_range_takes_first(self):
         self.assertEqual(run._concrete_edition("2018.."), "2018")
@@ -2176,7 +2179,7 @@ class ProcMacroExternTests(unittest.TestCase):
              "--extern", "second_pm=/c/libsecond_pm.so"])
 
     def test_concrete_edition_of_range_and_plain(self):
-        self.assertEqual(run._concrete_edition("2015..2021"), "2021")
+        self.assertEqual(run._concrete_edition("2015..2021"), "2015")
         self.assertEqual(run._concrete_edition("2021"), "2021")
         self.assertEqual(run._concrete_edition("2018"), "2018")
 
@@ -2342,9 +2345,9 @@ class AttemptEditionTests(unittest.TestCase):
     """attempt_edition: the one edition selection every attempt
     path uses, ranges collapsed before they can reach rustc."""
 
-    def test_range_collapses_to_its_last_edition(self):
+    def test_range_collapses_to_its_lower_bound(self):
         h = header("//@ edition:2015..2021\n")
-        self.assertEqual(run.attempt_edition(h.view(None)), "2021")
+        self.assertEqual(run.attempt_edition(h.view(None)), "2015")
 
     def test_open_range_collapses_to_its_first_edition(self):
         h = header("//@ edition:2018..\n")
@@ -2360,7 +2363,7 @@ class AttemptEditionTests(unittest.TestCase):
 
     def test_last_directive_wins(self):
         h = header("//@ edition:2015\n//@ edition:2018..2024\n")
-        self.assertEqual(run.attempt_edition(h.view(None)), "2024")
+        self.assertEqual(run.attempt_edition(h.view(None)), "2018")
 
     def test_stage1_flat_path_uses_the_collapsed_edition(self):
         # Regression: the flat stage-1 path used to hand the
@@ -2392,7 +2395,7 @@ class AttemptEditionTests(unittest.TestCase):
         finally:
             run.native_side, run.sparagmos_side = orig_n, orig_s
         self.assertEqual(res["status"], "pass")
-        self.assertEqual(seen, {"native": "2021", "sparagmos": "2021"})
+        self.assertEqual(seen, {"native": "2015", "sparagmos": "2015"})
 
 
 class CompiletestModeArgsTests(unittest.TestCase):
