@@ -119,6 +119,7 @@ fn mode_interp(input: &MirProgramInput, entry: &str, reps: usize) -> Result<(), 
         max_steps: 10_000_000_000,
         max_call_depth: 1_000_000,
         guest_args: Vec::new(),
+        program_path: String::new(),
     };
     for i in 0..reps {
         let mut interp = Interpreter::with_config(&ir, config.clone());
