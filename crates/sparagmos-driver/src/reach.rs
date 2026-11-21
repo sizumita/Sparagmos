@@ -288,7 +288,7 @@ pub fn collect_reachable(
                     }
                 }
             }
-            RecordKind::WithBody { body, .. } => match conv.convert_body(body) {
+            RecordKind::WithBody { body, .. } => match conv.convert_body_contained(body) {
                 Ok(b) => match unrepresentable_local(&b) {
                     Some(what) => {
                         let mut reasons: std::collections::BTreeMap<String, usize> =
