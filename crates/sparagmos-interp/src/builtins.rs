@@ -25,6 +25,7 @@
 //!   Rust 1.100.0 `core::fmt` (see `format_template`), and the
 //!   padding rules mirror `Formatter::pad` / `pad_integral`.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -3702,7 +3703,7 @@ impl<'a> Interpreter<'a> {
                     return self.index_range(frames, name, &vals[0], &vals[1], idx_tag);
                 }
                 let idx = expect_index(&vals[1], name)?;
-                let (elems, len) = self.slice_elements(frames, &vals[0])?;
+                let (elems, len) = self.slice_elements_ref(frames, &vals[0])?;
                 if idx as u128 >= len {
                     return Err(InterpError::panic(format!(
                         "index out of bounds: the len is {len} but the index is {idx}"
@@ -3711,7 +3712,9 @@ impl<'a> Interpreter<'a> {
                 // A shared element reference: reads resolve against
                 // the element value itself (the model has no separate
                 // heap place for it), as for constant aggregates.
-                let elem = elems.into_iter().nth(idx).expect("bounds checked");
+                // Only the one element is cloned out of the borrowed
+                // element storage.
+                let elem = elems.at(idx);
                 Ok(Value::Ref(RefTarget::Value(Box::new(elem))))
             }
             Builtin::IndexMut => {
@@ -5715,16 +5718,29 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         frames: &[Frame],
         value: &Value,
     ) -> InterpResult<(Vec<Value>, u128)> {
+        let (elems, len) = self.slice_elements_ref(frames, value)?;
+        Ok((elems.into_vec(), len))
+    }
+
+    /// The borrowing form of [`slice_elements`]: the same elements
+    /// and length, but the element storage is lent out of the
+    /// resolved value wherever it is already materialised, so a
+    /// consumer that needs one element (or a comparison that stops
+    /// early) does not pay for a snapshot of all of them.
+    fn slice_elements_ref<'x>(
+        &self,
+        frames: &'x [Frame],
+        value: &'x Value,
+    ) -> InterpResult<(SliceElems<'x>, u128)> {
         match value {
             Value::FatRef { base, len } => {
-                let base = self.resolve_value(frames, base)?;
-                let mut elems = value_elements(&base)?;
-                elems.truncate(*len as usize);
+                let base = self.resolve_ref(frames, base)?;
+                let elems = elements_of(base)?.truncated(*len as usize);
                 Ok((elems, *len))
             }
             _ => {
-                let resolved = self.resolve_value(frames, value)?;
-                let elems = value_elements(&resolved)?;
+                let resolved = self.resolve_ref(frames, value)?;
+                let elems = elements_of(resolved)?;
                 let len = elems.len() as u128;
                 Ok((elems, len))
             }
@@ -5991,30 +6007,35 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         frames: &[Frame],
         value: &Value,
     ) -> InterpResult<Value> {
-        let mut value = value.clone();
+        Ok(self.resolve_ref(frames, value)?.into_owned())
+    }
+
+    /// Follow references in `value` until a non-reference value,
+    /// borrowing the denoted data wherever it is already
+    /// materialised: the borrowing form of [`resolve_value`], with
+    /// the same results and errors. The shapes that denote no data
+    /// (null and address-only pointers) and a fat pointer over a
+    /// self-contained element tuple (a slice constant, a
+    /// materialised sub-slice — dereferencing it would yield
+    /// itself, so following it would spin) resolve to themselves.
+    pub(crate) fn resolve_ref<'x>(
+        &self,
+        frames: &'x [Frame],
+        value: &'x Value,
+    ) -> InterpResult<Cow<'x, Value>> {
+        let mut cur: Cow<'x, Value> = Cow::Borrowed(value);
         loop {
-            match &value {
-                // The null pointer denotes no data; resolving it
-                // yields itself so equality can see it. An
-                // address-only pointer likewise denotes no readable
-                // data; it resolves to itself.
-                Value::Ref(RefTarget::Null) | Value::Ref(RefTarget::Address(_)) => {
-                    return Ok(value)
-                }
-                // A fat pointer over a self-contained element tuple
-                // (a slice constant, a materialised sub-slice) is
-                // already data: dereferencing it yields itself, so
-                // following it would spin. Its elements are read
-                // through the fat value itself.
-                Value::FatRef { base, .. } if matches!(&**base, Value::Tuple(_)) => {
-                    return Ok(value)
-                }
-                Value::Ref(_) | Value::FatRef { .. } => {
-                    let target = self.deref_value(frames, &value)?;
-                    value = self.read_resolved(frames, &target)?;
-                }
-                _ => return Ok(value),
+            let follows = match &*cur {
+                Value::Ref(RefTarget::Null) | Value::Ref(RefTarget::Address(_)) => false,
+                Value::FatRef { base, .. } if matches!(&**base, Value::Tuple(_)) => false,
+                Value::Ref(_) | Value::FatRef { .. } => true,
+                _ => false,
+            };
+            if !follows {
+                return Ok(cur);
             }
+            let target = self.deref_value(frames, &cur)?;
+            cur = self.read_resolved_ref(frames, &target)?;
         }
     }
 
@@ -6838,6 +6859,111 @@ fn ordering_value(ord: Ordering) -> Value {
             Ordering::Greater => 2,
         },
         fields: Vec::new(),
+    }
+}
+
+/// The elements a slice-like value denotes, borrowed where the
+/// element storage is already materialised: aggregate elements
+/// lend their storage, while byte/string elements are the bytes
+/// themselves (each byte is one element, exactly what
+/// [`value_elements`] materialises as an integer).
+pub(crate) enum SliceElems<'a> {
+    Values(Cow<'a, [Value]>),
+    Bytes(Cow<'a, [u8]>),
+}
+
+impl<'a> SliceElems<'a> {
+    /// The number of elements.
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            SliceElems::Values(v) => v.len(),
+            SliceElems::Bytes(b) => b.len(),
+        }
+    }
+
+    /// The element at `idx`, cloned out of the element storage (a
+    /// byte element is constructed as an integer).
+    pub(crate) fn at(&self, idx: usize) -> Value {
+        match self {
+            SliceElems::Values(v) => v[idx].clone(),
+            SliceElems::Bytes(b) => Value::Uint(b[idx] as u128),
+        }
+    }
+
+    /// The element at `idx`, borrowed when it is stored element
+    /// storage (a byte element is a constructed temporary).
+    pub(crate) fn get(&self, idx: usize) -> Cow<'_, Value> {
+        match self {
+            SliceElems::Values(v) => Cow::Borrowed(&v[idx]),
+            SliceElems::Bytes(b) => Cow::Owned(Value::Uint(b[idx] as u128)),
+        }
+    }
+
+    /// Truncate to at most `len` elements (a fat reference's
+    /// carried length applied to its base's full element list, as
+    /// `Vec::truncate` applies it in `slice_elements`).
+    fn truncated(self, len: usize) -> Self {
+        match self {
+            SliceElems::Values(Cow::Borrowed(s)) => {
+                SliceElems::Values(Cow::Borrowed(&s[..len.min(s.len())]))
+            }
+            SliceElems::Values(Cow::Owned(mut v)) => {
+                v.truncate(len);
+                SliceElems::Values(Cow::Owned(v))
+            }
+            SliceElems::Bytes(Cow::Borrowed(b)) => {
+                SliceElems::Bytes(Cow::Borrowed(&b[..len.min(b.len())]))
+            }
+            SliceElems::Bytes(Cow::Owned(mut v)) => {
+                v.truncate(len);
+                SliceElems::Bytes(Cow::Owned(v))
+            }
+        }
+    }
+
+    /// The elements as an owned vector (what `slice_elements`
+    /// returns): byte elements materialise as integers.
+    pub(crate) fn into_vec(self) -> Vec<Value> {
+        match self {
+            SliceElems::Values(v) => v.into_owned(),
+            SliceElems::Bytes(b) => {
+                b.iter().map(|byte| Value::Uint(*byte as u128)).collect()
+            }
+        }
+    }
+}
+
+/// The elements of an already-resolved value, borrowed where
+/// possible: the borrowing form of [`value_elements`], with the
+/// same results and errors.
+fn elements_of<'a>(value: Cow<'a, Value>) -> InterpResult<SliceElems<'a>> {
+    match value {
+        Cow::Borrowed(v) => Ok(match v {
+            Value::Tuple(items) => SliceElems::Values(Cow::Borrowed(items)),
+            Value::Enum { fields, .. } => SliceElems::Values(Cow::Borrowed(fields)),
+            Value::Bytes(b) => SliceElems::Bytes(Cow::Borrowed(b)),
+            Value::Str(text) => SliceElems::Bytes(Cow::Borrowed(text.as_bytes())),
+            other => {
+                return Err(InterpError::type_mismatch(
+                    "slice elements",
+                    "aggregate, byte or string value",
+                    other.kind_name(),
+                ))
+            }
+        }),
+        Cow::Owned(v) => Ok(match v {
+            Value::Tuple(items) => SliceElems::Values(Cow::Owned(items)),
+            Value::Enum { fields, .. } => SliceElems::Values(Cow::Owned(fields)),
+            Value::Bytes(b) => SliceElems::Bytes(Cow::Owned(b)),
+            Value::Str(text) => SliceElems::Bytes(Cow::Owned(text.into_bytes())),
+            other => {
+                return Err(InterpError::type_mismatch(
+                    "slice elements",
+                    "aggregate, byte or string value",
+                    other.kind_name(),
+                ))
+            }
+        }),
     }
 }
 
