@@ -1890,3 +1890,76 @@ fn run_mode_refcell_drop_runs_inner_destructor() {
         "dropping the cell runs the wrapped value's destructor"
     );
 }
+
+// ----- monomorphization validity checks (Lane CA) ---------------------------
+
+const SIMD_SCALAR_SRC: &str = r#"
+#![feature(core_intrinsics)]
+use std::intrinsics::simd::simd_add;
+fn main() { unsafe { let _ = simd_add(0, 1); } }
+"#;
+
+const SIMD_VECTOR_SRC: &str = r#"
+#![feature(core_intrinsics, repr_simd)]
+use std::intrinsics::simd::simd_add;
+#[repr(simd)]
+#[derive(Copy, Clone)]
+struct I32x4([i32; 4]);
+fn main() { unsafe { let _ = simd_add(I32x4([1, 2, 3, 4]), I32x4([5, 6, 7, 8])); } }
+"#;
+
+const SIMD_TOO_MANY_LANES_SRC: &str = r#"
+#![feature(portable_simd)]
+use std::simd::Simd;
+fn main() { let _x = Simd::<u16, 54321>::splat(0); }
+"#;
+
+#[test]
+fn convert_mode_simd_intrinsic_with_scalar_args_is_a_compile_failure() {
+    let dir = temp_dir("mono-simd-scalar");
+    let src = fixture(&dir, "simd_scalar.rs", SIMD_SCALAR_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an invalid SIMD monomorphization must fail compilation; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("sparagmos-driver: compilation failed")
+            && stderr.contains("simd_add")
+            && stderr.contains("expected SIMD input type"),
+        "the failure must name the intrinsic and the reason; stderr={stderr}"
+    );
+}
+
+#[test]
+fn convert_mode_simd_intrinsic_with_vector_args_converts() {
+    let dir = temp_dir("mono-simd-vector");
+    let src = fixture(&dir, "simd_vector.rs", SIMD_VECTOR_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a valid SIMD monomorphization must convert; stderr={stderr}"
+    );
+}
+
+#[test]
+fn convert_mode_simd_type_with_too_many_lanes_is_a_compile_failure() {
+    let dir = temp_dir("mono-simd-lanes");
+    let src = fixture(&dir, "simd_lanes.rs", SIMD_TOO_MANY_LANES_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a SIMD type over the lane limit must fail compilation; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("sparagmos-driver: compilation failed")
+            && stderr.contains("invalid number of lanes"),
+        "the failure must name the reason; stderr={stderr}"
+    );
+}
