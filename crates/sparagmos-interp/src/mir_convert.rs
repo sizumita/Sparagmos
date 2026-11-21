@@ -3491,6 +3491,13 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                 let bound = self.plan(args.first()?)?;
                 return Some(collapse_fields(vec![bound.clone(), bound], true));
             }
+            "std::ops::RangeFrom" | "std::ops::RangeTo" | "std::ops::RangeToInclusive" => {
+                // The one-bound ranges: a single field holding the
+                // bound, whose glue is the field's.
+                let bound = self.plan(args.first()?)?;
+                return Some(collapse_fields(vec![bound], true));
+            }
+            "std::ops::RangeFull" => return Some(P::Trivial),
             "std::array::IntoIter" => {
                 // The modelled value does not expose the buffer's
                 // elements as fields, so only a trivial element
