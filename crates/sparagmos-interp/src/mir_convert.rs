@@ -3125,9 +3125,8 @@ impl<'a> Converter<'a> {
                     // user code (e.g. alignment checks on raw
                     // pointers). The reverse direction (an integer
                     // cast back to a pointer,
-                    // PointerWithExposedProvenance) stays an
-                    // explicit unsupported: an address names no
-                    // place in this model. (Lane BV)
+                    // PointerWithExposedProvenance) is the next
+                    // arm below. (Lane BV)
                     mir::CastKind::PointerExposeProvenance => match (&ctx, target) {
                         (
                             Some(
