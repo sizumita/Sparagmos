@@ -2326,7 +2326,6 @@ fn fatval(elems: &[i128], len: u128) -> Value {
 }
 
 #[test]
-#[test]
 fn fat_reference_argument_index_len_and_metadata() {
     let i32t = i(mir::IntTy::I32);
     let usizet = u(mir::UintTy::Usize);
@@ -4062,17 +4061,20 @@ fn subslice_of_a_local_array() {
         &[i32t.clone(), arr_i32(5)],
         vec![bb(stmts, mir::TerminatorKind::Return)],
     );
-    // fn subdyn(i: usize) -> i32 { return _1[1..4][_2] }
-    let mut stmts = arr5_fill();
+    // fn subdyn(i: usize) -> i32 { _2 = [10, 20, 30, 40, 50]; return _2[1..4][_1] }
+    let mut stmts = vec![assign(pl(2), mir::Rvalue::Repeat(i32c(0), 5))];
+    for (k, v) in [10, 20, 30, 40, 50].iter().enumerate() {
+        stmts.push(assign(cidx(2, k as u64, 5), mir::Rvalue::Use(i32c(*v))));
+    }
     stmts.push(assign(
         pl(0),
-        mir::Rvalue::Use(mir::Operand::Copy(then_idx(sub(1, 1, 4, false), 2))),
+        mir::Rvalue::Use(mir::Operand::Copy(then_idx(sub(2, 1, 4, false), 1))),
     ));
     let subdyn = spec(
         "subdyn",
         2,
         1,
-        &[i32t.clone(), arr_i32(5), usizet.clone()],
+        &[i32t.clone(), usizet.clone(), arr_i32(5)],
         vec![bb(stmts, mir::TerminatorKind::Return)],
     );
     // fn subend() -> usize { return Len(_1[1..len - 1]) }
@@ -4309,6 +4311,34 @@ fn subslice_of_a_slice_argument() {
             mir::TerminatorKind::Return,
         )],
     );
+    // fn main_sset() -> i32 { _1 = [10, 20, 30, 40]; _2 = &mut _1; return sset(_2, 99) }
+    let main_sset = spec(
+        "main_sset",
+        8,
+        0,
+        &[i32t.clone(), arr_i32(4), fatrefmty(i32t.clone())],
+        vec![
+            bb(
+                vec![
+                    assign(pl(1), mir::Rvalue::Repeat(i32c(0), 4)),
+                    assign(cidx(1, 0, 4), mir::Rvalue::Use(i32c(10))),
+                    assign(cidx(1, 1, 4), mir::Rvalue::Use(i32c(20))),
+                    assign(cidx(1, 2, 4), mir::Rvalue::Use(i32c(30))),
+                    assign(cidx(1, 3, 4), mir::Rvalue::Use(i32c(40))),
+                    assign(pl(2), mutref(pl(1))),
+                ],
+                mir::TerminatorKind::Call {
+                    func: fndef(def(3)),
+                    args: vec![mir::Operand::Move(pl(2)), i32c(99)],
+                    destination: pl(0),
+                    target: Some(mir::BasicBlock(1)),
+                    unwind: mir::UnwindAction::Continue,
+                    call_source: mir::CallSource::Normal,
+                },
+            ),
+            bb(vec![], mir::TerminatorKind::Return),
+        ],
+    );
     let (jit, prog) = build(&[
         slen2,
         stail,
@@ -4318,6 +4348,7 @@ fn subslice_of_a_slice_argument() {
         sbad_from_end,
         sbad_inverted,
         sbad_inverted_end,
+        main_sset,
     ]);
     let store: [i64; 4] = [40, 30, 20, 10];
     let addr = store.as_ptr().wrapping_add(3) as i64;
@@ -4327,14 +4358,7 @@ fn subslice_of_a_slice_argument() {
     arg(&jit, &prog, "slen2", Ok(2));
     arg(&jit, &prog, "stail", Ok(3));
     arg(&jit, &prog, "send", Ok(30));
-    check(
-        &jit,
-        &prog,
-        "sset",
-        &[addr, 4, 99],
-        vec![fatval(&[10, 20, 30, 40], 4), int(99)],
-        Ok(99),
-    );
+    check(&jit, &prog, "main_sset", &[], vec![], Ok(99));
     arg(
         &jit,
         &prog,
