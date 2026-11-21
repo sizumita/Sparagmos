@@ -568,8 +568,6 @@ fn collect_local_instances(
     } = state;
 
     let deferred_defs: HashSet<rustc_public::DefId> = deferred.iter().map(|d| d.def).collect();
-    let deferred_ctors: HashSet<rustc_public::DefId> =
-        deferred.iter().filter(|d| d.ctor).map(|d| d.def).collect();
     let mut queue: VecDeque<rustc_public::mir::Body> = seeds.iter().cloned().collect();
     let mut extra_seeds: Vec<rustc_public::mir::Body> = Vec::new();
 
@@ -583,17 +581,20 @@ fn collect_local_instances(
         // than the item loop alone did.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // The demand targets of this body: its `FnDef` call
-        // targets, plus — for deferred constructors — every
-        // `FnDef` constant it materializes. A constructor used
+        // targets, plus every `FnDef` constant it materializes
+        // that names a deferred definition. A constructor used
         // as a value (assigned, passed on, returned) never
         // appears as a call target of the body that demands it,
-        // so call targets alone would miss the demand; a plain
-        // function's value uses stay call-target-only, exactly
-        // as before.
+        // so call targets alone would miss the demand (Lane CF,
+        // constructors); the same holds for a plain generic
+        // function used as a value, so the scan follows `FnDef`
+        // constants for every deferred definition (Lane CP).
+        // Targets are filtered by deferred membership below, so
+        // constants naming anything else cost one hash lookup.
         let mut targets = sparagmos_driver::reach::call_targets(&body);
-        if !deferred_ctors.is_empty() {
+        if !deferred.is_empty() {
             for (def, args) in sparagmos_driver::reach::fndef_constants(&body) {
-                if deferred_ctors.contains(&def.def_id()) {
+                if deferred_defs.contains(&def.def_id()) {
                     targets.push((def, args));
                 }
             }

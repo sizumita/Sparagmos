@@ -2300,6 +2300,86 @@ ctor instance 化が未反映だったことによる見かけの差で、
 本レーンの寄与ではない。本修正の正しさは上記の意味テストと、
 24,937 件での回帰ゼロで担保する。
 
+### 需要パス第2弾: FnDef 定数の需要追従・外部コンストラクタ合成・変換ブロッカー3件の解消 (Lane CP, 2026-11-21)
+
+Unit 1 (d552ff0):
+
+- 到達収集とローカル需要が、Call ターゲットだけでなく FnDef 定数も
+  辿るようにした (Lane CF は保留コンストラクタについてのみ辿って
+  いた)。builtin の除外と共有キャップ 1,024 は不変。
+- 外部クレートのコンストラクタはクレートメタデータに MIR 本体を
+  持たない (`has_body()` が偽で、rustc が shim を合成するのは
+  ローカル定義のみ) ため、到達収集が等価な1ブロック集約本体を
+  sparagmos-mir 形式で合成する (`synthetic_ctor_body`)。同定は
+  保守的で、単相化シグネチャの出力が非 union の ADT、定義の末尾
+  セグメントがバリアント名、入力数がバリアントのフィールド数と
+  一致する場合のみ。それ以外は従来どおり「MIR 本体なし」の記録を
+  残す。
+- これで Lane CF の残件 (外部コンストラクタを値として使う
+  `let f = Some;`) が解消した。e2e 検証済み: `let f = Some; f(3)`
+  が正しく出力する、外部タプルバリアントコンストラクタを高階関数
+  へ渡す (`apply(Some, 40)` → 42)、外部タプル構造体コンストラクタ
+  `std::num::Wrapping` を値として使う、素の関数 `String::new` を
+  値として使う。ドライバ e2e テスト3件 (`run_mode_foreign_*`)。
+
+Unit 2 (95dc167 / 6fb13ba / d596a63):
+
+- 表現可能性スクリーンの緩和 (reach.rs `unrepresentable_local`):
+  FnDef/FnPtr/Closure 型のローカルを持つ本体を到達収集で skip
+  しなくなった。これがトレイトデフォルトメソッド本体の収集を
+  塞いでいた (例: `Iterator::fold` が「Closure in local _3」で
+  SKIPPED、`Iterator::map` が「FnDef in local _2」で SKIPPED)。
+- クロージャ generic 引数の誤読修正 (mir_convert.rs、3箇所):
+  upvars タプルは generic 引数の**最後**であり、3番目ではない
+  (rustc_middle の `split_closure_args` で確認)。3番目を読む従来
+  コードは、親 generic を持つクロージャ定数を軒並み「環境を
+  捕捉している」と誤読していた (例: `Sum::sum` 内のクロージャ)。
+- `Operand::RuntimeChecks` を定数 `true` に解決 (convert.rs):
+  ub/overflow/contract チェックの codegen 時 cfg フラグであり、
+  ドライバはプログラム全体をデバッグプロファイル既定
+  (デバッグアサーション・オーバーフローチェック・コントラクト
+  チェック有効、最適化フラグなし) でコンパイルし、ネイティブ
+  オラクルも同じ条件で作られるため、この解決が一致する。
+  ガードされる事前条件アサーションはネイティブのデバッグ
+  ビルドと同様に実行される。
+
+実測 (subset-cp、`/mnt/raid/measure/subset-cp.json`、both12 と
+同一 survey):
+
+- 指標2(b) = **71.28%** (17,775/24,937)。実行系 54.061%
+  (2,243/4,149)、コンパイル時検証系 84.726% (15,532/18,332)。
+- both12 比 +335 pass / **回帰 0**。subset-cf 比 +42 pass /
+  **回帰 0** (CP 自身の寄与)。RuntimeChecks の `true` 化による
+  事前条件 panic の誤発火、クロージャ引数修正による挙動変化の
+  回帰はいずれも観測されなかった。
+- 「本体なし呼び出し」バケットは 914 → 839 件。うち25件が
+  pass へ進み、残りは後段のブロッカーへ前進した。
+- ワークスペース+ドライバテスト 518 passed / 0 failed、
+  コーパス 47/47。
+
+914 バケットの census (both12 時点、一次 callee 単位。全件が
+実行系。一次 callee を名指しできるのは 439 件・170 種で、残り
+475 件は別の失敗 (実行時サポートターミネータ約217件、
+Cast Transmute 約118件、動的ディスパッチ等) が先に立ち、
+callee は二次的にしか現れない。生データ:
+`/mnt/raid/measure/cp-census-both12.json`):
+
+| グループ | 件数 | 備考 |
+|---|---|---|
+| スレッド/同期 (thread::spawn 46、mpmc::channel 41、LocalKey::with 14、spawn_unchecked 2) | 103 | スレッドは値モデルの外 |
+| env::args 系 (args 38、args_os 4、test_main_env_args 8) | 50 | プロセス引数は未モデル |
+| Iterator/Option デフォルトメソッド (Iterator::map 14、fold 7、Option::map 7、size_hint 3、all 2、filter 2、for_each 1) | 36 | Unit 2 で変換レベルは解消。実行は Vec 割当など後段のブロッカーへ前進 |
+| catch_unwind | 25 | 名前 builtin では解けず、interp 本体の panic 捕捉が必要 |
+| io 出力経路 (_eprint 10、stdout 8) | 18 | モデル化済みの名前が未モデルの経路から到達しており、根本原因は未特定 |
+| caller_location | 15 | 呼び出し位置は未モデル |
+| simd intrinsic 群 | 11 | ベクトル値モデルなし |
+| contracts intrinsic 群 | 8 | |
+| RawVec 入口 (RawVecInner::with_capacity_in) | 6 | Lane CN の領域 |
+| atomic RMW intrinsic (atomic_xadd 3、atomic_xchg 1) | 4 | atomic_load/store と同型にモデル化可能だが未実装 |
+| Drop::drop の直接呼び出し | 4 | |
+| va_arg / TypeId::of | 各4 | |
+| ロングテール (上記以外の一次 callee) | 155 | 1–2件の callee が多数 |
+
 ---
 ---
 

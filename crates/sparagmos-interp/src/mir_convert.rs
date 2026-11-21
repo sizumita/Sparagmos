@@ -1107,7 +1107,14 @@ impl<'a> Converter<'a> {
             // call, so a value of this type can be invoked.
             mir::Ty::FnDef(def, _) => ir::Ty::FnDef(self.def_display_name(def)),
             mir::Ty::Closure(def, args) => {
-                let upvars = match args.get(2) {
+                // The closure type's generic arguments are
+                // `[parent args.., kind, signature, upvars tuple]`:
+                // the upvars tuple is the LAST argument, not the
+                // third — the third is the upvars tuple only for a
+                // closure with no parent generics, and reading it
+                // there misreads every closure defined inside a
+                // generic function or trait method.
+                let upvars = match args.last() {
                     Some(mir::Ty::Tuple(ts)) => ts.len(),
                     _ => 0,
                 };
@@ -1226,7 +1233,14 @@ impl<'a> Converter<'a> {
             // values are not part of the type constant — and stays
             // an explicit unsupported naming the closure.
             mir::ConstKind::Ty(mir::Ty::Closure(def, args)) => {
-                let upvars = match args.get(2) {
+                // The upvars tuple is the closure type's LAST
+                // generic argument (see `convert_ty`); the third
+                // argument is the upvars tuple only when the
+                // closure has no parent generics, so a closure
+                // constant inside a generic context (e.g. the
+                // closure inside `Sum::sum`) was misread as
+                // capturing an environment it does not have.
+                let upvars = match args.last() {
                     Some(mir::Ty::Tuple(ts)) => ts.len(),
                     _ => usize::MAX,
                 };
@@ -1790,10 +1804,10 @@ impl<'a> Converter<'a> {
                     }
                 }
                 mir::AggregateKind::Closure { def, generic_args } => {
-                    // The closure type's third generic argument is
+                    // The closure type's LAST generic argument is
                     // the upvars tuple; its element types type the
                     // capture operands.
-                    let upvar_tys: Vec<mir::Ty> = match generic_args.get(2) {
+                    let upvar_tys: Vec<mir::Ty> = match generic_args.last() {
                         Some(mir::Ty::Tuple(ts)) => ts.clone(),
                         _ => Vec::new(),
                     };
