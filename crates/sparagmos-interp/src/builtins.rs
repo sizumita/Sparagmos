@@ -3293,6 +3293,40 @@ impl<'a> Interpreter<'a> {
                                 return Ok(self.new_box(cloned));
                             }
                         }
+                        // A cloned container owns its elements: a
+                        // `Vec` value's fields are its elements in
+                        // this model, and a tuple's / array's fields
+                        // likewise, so the elements go through the
+                        // same owned clone (a `Vec<Box<T>>` clone
+                        // must not alias the source's boxes).
+                        let value = if self_ty.starts_with("std::vec::Vec<")
+                            || self_ty.starts_with("alloc::vec::Vec<")
+                        {
+                            match value {
+                                Value::Enum { variant, fields } => Value::Enum {
+                                    variant,
+                                    fields: fields
+                                        .iter()
+                                        .map(|f| self.clone_owned_value(frames, f))
+                                        .collect::<InterpResult<Vec<_>>>()?,
+                                },
+                                other => other,
+                            }
+                        } else if (self_ty.starts_with('(') || self_ty.starts_with('['))
+                            && matches!(value, Value::Tuple(_))
+                        {
+                            match value {
+                                Value::Tuple(items) => Value::Tuple(
+                                    items
+                                        .iter()
+                                        .map(|f| self.clone_owned_value(frames, f))
+                                        .collect::<InterpResult<Vec<_>>>()?,
+                                ),
+                                other => other,
+                            }
+                        } else {
+                            value
+                        };
                         if let (Some(kind), Some(id)) =
                             (chan_kind, channel_handle_id(&value))
                         {
