@@ -2371,13 +2371,35 @@ impl<'a> Converter<'a> {
                     })
                     .collect::<Result<_, _>>()?,
             ),
-            mir::ConstValue::Adt { variant, fields } => ir::Constant::Adt {
-                variant: *variant,
-                fields: fields
-                    .iter()
-                    .map(|f| self.convert_const_value(f, None))
-                    .collect::<Result<_, _>>()?,
-            },
+            mir::ConstValue::Adt { variant, fields } => {
+                // The fields take the ADT's instantiated field
+                // types as their context, exactly as the tuple arm
+                // takes its element types: a scalar field's bits
+                // carry no signedness of their own, so a `u128`
+                // field holding 2^127 decoded context-free reads
+                // back as a negative `i128` (the `Some(1 << 127)`
+                // constant in checked_shl's test, among others).
+                let field_ctxs = match ctx {
+                    Some(mir::Ty::Adt(def, args)) => {
+                        self.instantiated_field_tys(def, args, *variant)
+                    }
+                    _ => None,
+                };
+                ir::Constant::Adt {
+                    variant: *variant,
+                    fields: fields
+                        .iter()
+                        .enumerate()
+                        .map(|(i, f)| {
+                            let fctx = field_ctxs
+                                .as_ref()
+                                .and_then(|ts| ts.get(i))
+                                .map(|t| t as &mir::Ty);
+                            self.convert_const_value(f, fctx)
+                        })
+                        .collect::<Result<_, _>>()?,
+                }
+            }
             mir::ConstValue::Ref(inner) => {
                 // The pointee's declared type types the inner value:
                 // a scalar leaf carries raw bits with no signedness of
