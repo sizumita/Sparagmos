@@ -92,7 +92,10 @@ use rustc_public::ty::{
 use rustc_public::{CrateDef, CrateDefType};
 use rustc_public::ItemKind;
 
-use sparagmos_driver::convert::{args_mention_params, closure_kind, Converter};
+use sparagmos_driver::convert::{
+    args_mention_params, closure_kind, is_coroutine_closure_panic, Converter,
+    COROUTINE_CLOSURE_TYPE_REASON,
+};
 use sparagmos_driver::report::{ConversionReport, FnOutcome, FnReport};
 use sparagmos_mir::Body;
 
@@ -203,6 +206,48 @@ fn payload_reason(payload: &(dyn std::any::Any + Send)) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Run a Stable MIR query that may hit rustc_public 1.100.0's
+/// unimplemented coroutine-closure type conversion (inspecting
+/// the type kind of an async closure item materializes it,
+/// unlike a body fetch, whose types stay opaque until
+/// conversion). A panic from that specific unimplemented
+/// conversion is contained and reported as
+/// `COROUTINE_CLOSURE_TYPE_REASON`; any other panic is resumed —
+/// this guard must never paper over an unrelated compiler
+/// failure.
+fn guard_coroutine_closure_query<T>(query: impl FnOnce() -> T) -> Result<T, String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(query)) {
+        Ok(value) => Ok(value),
+        Err(payload) => {
+            if is_coroutine_closure_panic(&*payload) {
+                // Contained panic: clear the capture slot, as the
+                // instance collection does — a later, genuinely
+                // fatal panic must report its own message.
+                let _ = take_captured_panic();
+                Err(COROUTINE_CLOSURE_TYPE_REASON.to_string())
+            } else {
+                std::panic::resume_unwind(payload);
+            }
+        }
+    }
+}
+
+/// Convert one body through the coroutine-closure containment
+/// (see `Converter::convert_body_contained`), clearing the panic
+/// capture slot when the containment fired: the hook recorded
+/// the contained panic's message, and a later, genuinely fatal
+/// panic must report its own.
+fn convert_body_isolated(
+    conv: &mut Converter,
+    body: &rustc_public::mir::Body,
+) -> Result<Body, Vec<String>> {
+    let result = conv.convert_body_contained(body);
+    if matches!(&result, Err(errs) if errs.iter().any(|e| e == COROUTINE_CLOSURE_TYPE_REASON)) {
+        let _ = take_captured_panic();
+    }
+    result
 }
 
 /// Install a panic hook that records the first panic's message into
@@ -350,7 +395,7 @@ fn convert_item(
     let blocks = body.blocks.len();
     let locals = body.locals().len();
     let arg_count = body.arg_locals().len();
-    match conv.convert_body(&body) {
+    match convert_body_isolated(&mut *conv, &body) {
         Ok(converted) => {
             bodies.push((name.clone(), converted));
             body_def_ids.push(def_id);
@@ -428,8 +473,24 @@ enum ClosureAttempt {
 /// collection after the loop converts the instances that
 /// monomorphic bodies actually demand. Async closures are
 /// coroutine closures; their bodies are coroutines, which are
-/// not converted.
+/// not converted — and merely asking for an async closure
+/// item's type hits the unimplemented coroutine-closure type
+/// conversion, so the guard accounts the item unsupported
+/// before its kind is ever seen (the `CoroutineClosure` arm
+/// below only fires if a future Stable MIR implements the
+/// conversion).
 fn closure_instance(item: &rustc_public::CrateItem) -> ClosureAttempt {
+    match guard_coroutine_closure_query(|| closure_instance_kind(item)) {
+        Ok(attempt) => attempt,
+        Err(reason) => ClosureAttempt::Unsupported(reason),
+    }
+}
+
+/// The kind inspection behind [`closure_instance`]: asking for
+/// an async closure item's type kind is what materializes the
+/// unimplemented coroutine-closure type conversion, so the
+/// whole inspection runs under the guard.
+fn closure_instance_kind(item: &rustc_public::CrateItem) -> ClosureAttempt {
     match item.ty().kind() {
         TyKind::RigidTy(RigidTy::CoroutineClosure(..)) => ClosureAttempt::Unsupported(
             "async closure body is not converted (coroutine closures are unsupported)".to_string(),
@@ -722,7 +783,7 @@ fn collect_local_instances(
                 fail_all(&mut *demands, &owners, "no MIR body available".to_string());
                 continue;
             };
-            match conv.convert_body(&ibody) {
+            match convert_body_isolated(&mut *conv, &ibody) {
                 Ok(converted) => {
                     // No representability screen: these are local
                     // functions, and the item loop converts local
@@ -884,7 +945,7 @@ fn collect_closure_instances(
                     fail_all(&mut *demands, &owners, "no MIR body available".to_string());
                     continue;
                 };
-                match conv.convert_body(&ibody) {
+                match convert_body_isolated(&mut *conv, &ibody) {
                     Ok(converted) => {
                         *taken += 1;
                         queue.push_back(ibody.clone());
@@ -1254,7 +1315,7 @@ fn convert_local_body(
     let blocks = body.blocks.len();
     let locals = body.locals().len();
     let arg_count = body.arg_locals().len();
-    match conv.convert_body(&body) {
+    match convert_body_isolated(&mut *conv, &body) {
         Ok(converted) => {
             seed_bodies.push(body);
             bodies.push((name.clone(), converted));
@@ -1694,8 +1755,8 @@ fn collect() -> ControlFlow<()> {
                         // through. A constant whose own body is
                         // unavailable too is a trivial constant
                         // (see `account_trivial_const`).
-                        match item.body() {
-                            Some(body) => convert_local_body(
+                        match guard_coroutine_closure_query(|| item.body()) {
+                            Ok(Some(body)) => convert_local_body(
                                 &mut conv,
                                 &mut report,
                                 &mut bodies,
@@ -1706,7 +1767,8 @@ fn collect() -> ControlFlow<()> {
                                 def_id,
                                 body,
                             ),
-                            None => account_trivial_const(&mut report, name),
+                            Ok(None) => account_trivial_const(&mut report, name),
+                            Err(reason) => skip_fn(&mut report, &name, reason),
                         }
                         continue;
                     }
@@ -1723,23 +1785,30 @@ fn collect() -> ControlFlow<()> {
                 }
             },
         };
-        let Some(body) = instance.body() else {
-            if matches!(item.kind(), ItemKind::Const) {
-                // The constant has an instance but no body: a
-                // trivial constant (see `account_trivial_const`).
-                account_trivial_const(&mut report, name);
+        let body = match guard_coroutine_closure_query(|| instance.body()) {
+            Ok(Some(body)) => body,
+            Ok(None) => {
+                if matches!(item.kind(), ItemKind::Const) {
+                    // The constant has an instance but no body: a
+                    // trivial constant (see `account_trivial_const`).
+                    account_trivial_const(&mut report, name);
+                    continue;
+                }
+                let mut reasons = BTreeMap::new();
+                reasons.insert("no MIR body available".to_string(), 1);
+                report.functions.push(FnReport {
+                    name,
+                    blocks: 0,
+                    locals: 0,
+                    arg_count: 0,
+                    outcome: FnOutcome::Skipped { reasons },
+                });
                 continue;
             }
-            let mut reasons = BTreeMap::new();
-            reasons.insert("no MIR body available".to_string(), 1);
-            report.functions.push(FnReport {
-                name,
-                blocks: 0,
-                locals: 0,
-                arg_count: 0,
-                outcome: FnOutcome::Skipped { reasons },
-            });
-            continue;
+            Err(reason) => {
+                skip_fn(&mut report, &name, reason);
+                continue;
+            }
         };
         convert_local_body(
             &mut conv,
@@ -2014,7 +2083,7 @@ fn collect() -> ControlFlow<()> {
                          (auxiliary crate function)"
                         .to_string())
                 } else {
-                    Ok(fn_def.body())
+                    guard_coroutine_closure_query(|| fn_def.body())
                 };
                 convert_item(
                     &mut conv,

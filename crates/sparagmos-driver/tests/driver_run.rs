@@ -237,11 +237,14 @@ fn run_mode_tail_call_conversion_panic_exits_two() {
 
 
 #[test]
-fn run_mode_async_closure_conversion_panic_exits_two() {
-    // Async closures hit a different `unimplemented!()` inside
-    // Stable MIR (type conversion: "FIXME(async_closures)"). Same
-    // contract as the tail-call case: exit 2, panic message as the
-    // reason, no process panic.
+fn run_mode_async_closure_exits_two_with_named_reason() {
+    // Async closures hit an `unimplemented!()` inside Stable MIR
+    // (type conversion: "FIXME(async_closures)"): a body that
+    // mentions a coroutine-closure type cannot be converted at
+    // all. The conversion contains that panic per body and skips
+    // the body with a named reason, so run mode reports the
+    // unconverted `main` — exit 2, the skip reason as the
+    // message, no conversion panic and no process panic.
     let dir = temp_dir("asyncclosure");
     let src = fixture(&dir, "asyncclosure.rs", ASYNC_CLOSURE_SRC);
     let out = run_driver(&src);
@@ -249,15 +252,15 @@ fn run_mode_async_closure_conversion_panic_exits_two() {
     assert_eq!(
         out.status.code(),
         Some(2),
-        "a conversion panic is a conversion failure (exit 2), not a process panic; stderr={stderr}"
+        "an unconvertible main is a conversion failure (exit 2), not a process panic; stderr={stderr}"
     );
     assert!(
-        stderr.contains("Stable MIR conversion panicked"),
-        "the reason names the conversion panic: {stderr}"
+        stderr.contains("`main` was not converted (body mentions a coroutine-closure"),
+        "the reason names the coroutine-closure skip: {stderr}"
     );
     assert!(
-        stderr.contains("async_closures"),
-        "the reason carries the panic message: {stderr}"
+        !stderr.contains("conversion panicked"),
+        "the failure is a named skip, not a conversion panic: {stderr}"
     );
     assert!(
         !stderr.contains("RUST_BACKTRACE"),

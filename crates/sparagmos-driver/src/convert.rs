@@ -160,6 +160,35 @@ enum UniqueConst {
     Many,
 }
 
+/// Why a body that mentions a coroutine-closure (async closure)
+/// type cannot be converted: rustc_public 1.100.0's
+/// internal-to-stable type conversion is unimplemented for
+/// `ty::CoroutineClosure` ("FIXME(async_closures): Lower these
+/// to SMIR"), and Stable MIR types are opaque, so the panic
+/// fires lazily, the first time a conversion asks for the kind
+/// of such a type — inside `convert_body`, or when the type of
+/// an async closure item is asked for directly. The affected
+/// body is skipped with this reason instead of the panic
+/// aborting the conversion of the whole crate; every other body
+/// still converts. Async closure bodies themselves stay
+/// unconverted: Stable MIR 1.100.0 cannot hand them over at all.
+pub const COROUTINE_CLOSURE_TYPE_REASON: &str = "body mentions a coroutine-closure \
+    (async closure) type, which Stable MIR 1.100.0 cannot convert \
+    (rustc_public leaves ty::CoroutineClosure unimplemented)";
+
+/// Whether a caught panic payload is rustc_public 1.100.0's
+/// unimplemented coroutine-closure type conversion.
+pub fn is_coroutine_closure_panic(payload: &(dyn std::any::Any + Send)) -> bool {
+    let message = if let Some(s) = payload.downcast_ref::<&str>() {
+        Some((*s).to_string())
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        Some(s.clone())
+    } else {
+        None
+    };
+    message.is_some_and(|m| m.contains("FIXME(async_closures)"))
+}
+
 impl Converter {
     pub fn new() -> Self {
         Self {
@@ -272,6 +301,31 @@ impl Converter {
         self.def_id(raw)
     }
 
+
+    /// Convert one Stable MIR body, containing rustc_public
+    /// 1.100.0's unimplemented coroutine-closure type conversion:
+    /// a body that mentions a coroutine-closure (async closure)
+    /// type fails with `COROUTINE_CLOSURE_TYPE_REASON` instead of
+    /// the panic escaping. Any other panic is resumed — this
+    /// containment must never paper over an unrelated compiler
+    /// failure.
+    pub fn convert_body_contained(
+        &mut self,
+        body: &mir::Body,
+    ) -> Result<sm::Body, Vec<String>> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.convert_body(body)
+        })) {
+            Ok(result) => result,
+            Err(payload) => {
+                if is_coroutine_closure_panic(&*payload) {
+                    Err(vec![COROUTINE_CLOSURE_TYPE_REASON.to_string()])
+                } else {
+                    std::panic::resume_unwind(payload);
+                }
+            }
+        }
+    }
 
     /// Convert one Stable MIR body. On any unsupported construct, returns
     /// the list of reasons (variant names) instead of a body.

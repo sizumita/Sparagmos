@@ -101,3 +101,22 @@ fn report_records_bodyless_targets_with_reasons() {
         "collected Iterator::count body missing:\n{stdout}"
     );
 }
+
+const ASYNC_CLOSURE_MAIN_RS: &str = "\
+fn main() {
+    let f = async || 42;
+    let _fut = f();
+    println!(\"defined\");
+}
+";
+
+const ASYNC_CLOSURE_HELPER_RS: &str = "\
+fn make() {
+    let f = async || 42;
+    let _fut = f();
+}
+fn main() {
+    println!(\"main only\");
+}
+";
+
