@@ -60,8 +60,9 @@ class EnumParseTest(unittest.TestCase):
 
     def test_rvalue(self):
         names = self.parse("crates/sparagmos-mir/src/rvalue.rs", "Rvalue")
-        self.assertEqual(len(names), 15)
+        self.assertEqual(len(names), 16)
         self.assertIn("CheckedBinaryOp", names)  # sparagmos-mir-only
+        self.assertIn("Reborrow", names)
 
 
 class MappingTest(unittest.TestCase):
@@ -91,6 +92,37 @@ class StripRustTest(unittest.TestCase):
     def test_lifetimes_survive(self):
         out = vm.strip_rust("fn f<'a>(x: &'a u8) -> &'a u8 { x }")
         self.assertIn("&'a u8", out)
+
+
+class UnreachableTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(REPO, "docs", "COVERAGE.md")) as f:
+            cls.denom = vm.parse_denominator(f.read())
+
+    def test_nine_unreachable(self):
+        self.assertEqual(len(vm.UNREACHABLE), 9)
+
+    def test_unreachable_are_denominator_members(self):
+        for enum, name in vm.UNREACHABLE:
+            self.assertIn(name, self.denom[enum])
+
+    def test_reachable_remainder_is_31(self):
+        total = sum(len(v) for v in self.denom.values())
+        self.assertEqual(total - len(vm.UNREACHABLE), 31)
+
+    def test_spot_members(self):
+        self.assertIn(("StatementKind", "BackwardIncompatibleDropHint"), vm.UNREACHABLE)
+        self.assertIn(("TerminatorKind", "Yield"), vm.UNREACHABLE)
+        self.assertIn(("TerminatorKind", "CoroutineDrop"), vm.UNREACHABLE)
+        self.assertIn(("TerminatorKind", "TailCall"), vm.UNREACHABLE)
+        self.assertIn(("TerminatorKind", "FalseEdge"), vm.UNREACHABLE)
+        self.assertIn(("TerminatorKind", "FalseUnwind"), vm.UNREACHABLE)
+        self.assertIn(("TerminatorKind", "UnwindResume"), vm.UNREACHABLE)
+        self.assertIn(("TerminatorKind", "UnwindTerminate"), vm.UNREACHABLE)
+        self.assertIn(("Rvalue", "WrapUnsafeBinder"), vm.UNREACHABLE)
+        # InlineAsm IS reachable through Stable MIR (no-op class).
+        self.assertNotIn(("TerminatorKind", "InlineAsm"), vm.UNREACHABLE)
 
 
 if __name__ == "__main__":
