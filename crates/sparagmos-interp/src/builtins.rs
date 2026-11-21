@@ -779,6 +779,14 @@ pub enum Builtin {
     /// `std::intrinsics::atomic_fence()`: orders other threads'
     /// accesses; there are none, so it is a no-op.
     AtomicFence,
+    /// `std::intrinsics::arith_offset(ptr, count)`: wrapping
+    /// pointer arithmetic — what `wrapping_offset` / `wrapping_add`
+    /// / `wrapping_sub` lower to — and `std::intrinsics::offset`,
+    /// the checked form `BinaryOp::Offset` computes. Both evaluate
+    /// through the interpreter's pointer-offset machinery and
+    /// differ only in the null-base case (see
+    /// `Interpreter::ptr_offset_value`).
+    ArithOffset { wrapping: bool },
     /// `std::mem::zeroed()`: the all-zero-bits value of a scalar
     /// type, or of a tuple/array of scalar types.
     MemZeroed,
@@ -1296,6 +1304,12 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::intrinsics::atomic_xsub" | "core::intrinsics::atomic_xsub" => Builtin::AtomicXsub,
         "std::intrinsics::atomic_fence" | "core::intrinsics::atomic_fence" => {
             Builtin::AtomicFence
+        }
+        "std::intrinsics::arith_offset" | "core::intrinsics::arith_offset" => {
+            Builtin::ArithOffset { wrapping: true }
+        }
+        "std::intrinsics::offset" | "core::intrinsics::offset" => {
+            Builtin::ArithOffset { wrapping: false }
         }
         "std::mem::zeroed" => Builtin::MemZeroed,
         "std::ptr::null" | "std::ptr::null_mut" => Builtin::PtrNull,
@@ -5025,6 +5039,29 @@ impl<'a> Interpreter<'a> {
                     };
                     Ok(Value::Uint(r))
                 }
+            }
+            Builtin::ArithOffset { wrapping } => {
+                arity(2)?;
+                let tag = generic_args.first().map(String::as_str).unwrap_or("");
+                let (size, _) = self.layout_of(tag).ok_or_else(|| {
+                    unsupported(format!(
+                        "pointer offset for {tag} is not runtime-supported"
+                    ))
+                })?;
+                let count = match &vals[1] {
+                    Value::Int(v) => *v,
+                    Value::Uint(v) => i128::try_from(*v).map_err(|_| {
+                        unsupported("pointer offset count does not fit in an isize")
+                    })?,
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            "pointer offset count",
+                            "integer count",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                self.ptr_offset_value(frames, vals[0].clone(), count, Some(size as u64), wrapping)
             }
             Builtin::AtomicLoad => {
                 arity(1)?;
