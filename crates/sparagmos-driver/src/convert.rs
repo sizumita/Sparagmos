@@ -490,8 +490,20 @@ impl Converter {
             O::Move(p) => sm::Operand::Move(self.place(p)),
             O::Constant(c) => sm::Operand::Constant(Box::new(self.constant(c))),
             O::RuntimeChecks(checks) => {
-                self.err(format!("Operand::RuntimeChecks({checks:?})"));
-                sm::Operand::constant(sm::Constant::bool(false))
+                // A codegen-time cfg flag (`cfg!(ub_checks)` and
+                // its siblings), left symbolic in MIR and resolved
+                // when the instance is code-generated. Sparagmos
+                // compiles the whole program in one session with
+                // the debug-profile defaults — debug assertions,
+                // overflow checks and contract checks enabled, and
+                // no optimisation flag is ever passed — which is
+                // also how the native oracle for these programs is
+                // built, so the flags resolve to `true` here. The
+                // checks they guard (unsafe-precondition assertions
+                // in core, contract ensures) then run like they do
+                // in a native debug build.
+                let _ = checks;
+                sm::Operand::constant(sm::Constant::bool(true))
             }
         }
     }
