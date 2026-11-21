@@ -102,6 +102,11 @@ pub struct MirProgram {
     /// values so they agree with the `SwitchInt` branch keys, which
     /// carry discriminant values rather than variant indices.
     pub adt_discriminants: mir::AdtDiscriminants,
+    /// Layouts of the monomorphic ADT instances in the program, as
+    /// recorded by the driver from the compiler's layout query
+    /// (see [`mir::AdtLayouts`]). Consulted by the `size_of` /
+    /// `align_of` / `size_of_val` builtins for ADT type tags.
+    pub adt_layouts: mir::AdtLayouts,
 }
 
 impl MirProgram {
@@ -329,6 +334,7 @@ fn convert_all(
         }
     }
     failures.retain(|key, _| !out.functions.contains_key(key));
+    out.adt_layouts = program.adt_layouts.clone();
     Ok((out, failures))
 }
 

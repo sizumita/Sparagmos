@@ -38,6 +38,20 @@ pub type DiscriminantValues = Vec<i128>;
 /// `Discriminant` rvalues.
 pub type AdtDiscriminants = std::collections::HashMap<AdtDefId, DiscriminantValues>;
 
+/// Layout of one monomorphic ADT instance: `(size, align)` in bytes,
+/// as computed by the compiler's own layout query (so `repr(C)`,
+/// `repr(packed)`, `repr(align)` and enum tag placement are already
+/// reflected). Keyed by the rendered instance name — the same string
+/// the interpreter's type-tag rendering produces for the ADT type
+/// (e.g. `Aligned`, `Pair<i32, u8>`) — because layouts differ per
+/// monomorphization and the `size_of`/`align_of` builtins only ever
+/// see the rendered tag. The driver fills one entry per ADT instance
+/// it converts whose layout the compiler can give; unsized types and
+/// types whose layout is not computable (generic parameters, trait
+/// objects) get no entry and stay explicitly unsupported in the
+/// interpreter.
+pub type AdtLayouts = std::collections::HashMap<String, (u64, u64)>;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum IntTy {
     I8,

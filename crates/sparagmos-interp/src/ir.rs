@@ -748,6 +748,13 @@ impl Body {
 /// A whole program: a set of named function bodies in one module.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Program {
+    /// Layouts of the program's monomorphic ADT instances
+    /// (`(size, align)` in bytes), keyed by the rendered instance
+    /// name (the type tag the builtins see). Filled from
+    /// [`crate::mir_convert::MirProgram::adt_layouts`] at conversion;
+    /// consulted by the `size_of` / `align_of` / `size_of_val`
+    /// builtins for ADT tags the static layout table cannot answer.
+    pub adt_layouts: std::collections::HashMap<String, (u64, u64)>,
     pub functions: HashMap<String, Body>,
     /// Functions that exist in the source program but whose bodies
     /// could not be converted, keyed by name, with the reason

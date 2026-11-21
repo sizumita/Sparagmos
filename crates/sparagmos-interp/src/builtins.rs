@@ -2168,7 +2168,7 @@ impl<'a> Interpreter<'a> {
             Builtin::MemSizeOf | Builtin::MemAlignOf => {
                 arity(0)?;
                 let tag = generic_args.first().map(String::as_str).unwrap_or("");
-                match type_layout(tag) {
+                match self.layout_of(tag) {
                     Some((size, align)) => Ok(Value::Uint(if kind == Builtin::MemSizeOf {
                         size
                     } else {
@@ -2188,7 +2188,7 @@ impl<'a> Interpreter<'a> {
                 } else if tag.starts_with('[') && tag.ends_with(']') && !tag.contains(';') {
                     // A slice: element count × element size.
                     let elem = &tag[1..tag.len() - 1];
-                    let (elem_size, _) = type_layout(elem).ok_or_else(|| {
+                    let (elem_size, _) = self.layout_of(elem).ok_or_else(|| {
                         unsupported(format!(
                             "size_of_val for {tag} is not runtime-supported"
                         ))
@@ -2208,7 +2208,7 @@ impl<'a> Interpreter<'a> {
                     };
                     Ok(Value::Uint(len * elem_size))
                 } else {
-                    match type_layout(tag) {
+                    match self.layout_of(tag) {
                         Some((size, _)) => Ok(Value::Uint(size)),
                         None => Err(unsupported(format!(
                             "size_of_val for {tag} is not runtime-supported"
@@ -3177,6 +3177,23 @@ fn default_value_for_tag(tag: &str) -> Option<Value> {
 
 /// The `(size, align)` of a rendered type tag on this platform
 /// (x86_64), for the types whose layout is fixed and known.
+impl<'a> Interpreter<'a> {
+    /// The `(size, align)` of a rendered type tag: the static table
+    /// for the primitive and abstract-model types, then the
+    /// program's ADT layout table (compiler-computed layouts of the
+    /// monomorphic ADT instances, recorded by the driver) for ADT
+    /// tags. `None` stays an explicit unsupported error at the call
+    /// site.
+    fn layout_of(&self, tag: &str) -> Option<(u128, u128)> {
+        type_layout(tag).or_else(|| {
+            self.program()
+                .adt_layouts
+                .get(tag)
+                .map(|&(size, align)| (u128::from(size), u128::from(align)))
+        })
+    }
+}
+
 fn type_layout(tag: &str) -> Option<(u128, u128)> {
     let tag = tag.trim();
     Some(match tag {
