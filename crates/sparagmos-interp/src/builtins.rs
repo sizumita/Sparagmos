@@ -1873,6 +1873,26 @@ impl<'a> Interpreter<'a> {
                             other.kind_name(),
                         )),
                     }
+                } else if self_ty.starts_with('&') {
+                    // A reference's own `Deref` is the identity on
+                    // the pointer value: `<&T as Deref>::deref` and
+                    // `<&mut T as Deref>::deref` both return the
+                    // inner reference itself. Generic code over
+                    // `P: Deref` instantiated with a reference (the
+                    // `Pin<&mut T>` machinery, `ManuallyDrop`
+                    // access, ...) reaches this arm.
+                    Ok(self.resolve_value(frames, &vals[0])?)
+                } else if self_ty.starts_with("std::pin::Pin<") {
+                    // `Pin<P>` derefs exactly as the pointer it
+                    // wraps: the wrapper is a one-field aggregate
+                    // holding the pointer value.
+                    let wrapper = self.resolve_value(frames, &vals[0])?;
+                    let pointer = one_field_value(wrapper, "Deref::deref for Pin")?;
+                    deref_pointer_value(pointer)
+                } else if self_ty.starts_with("std::panic::AssertUnwindSafe<") {
+                    // A one-field newtype wrapper: the result is a
+                    // reference to the held value.
+                    self.field_zero_ref(frames, &vals[0], "Deref::deref for AssertUnwindSafe")
                 } else {
                     Err(unsupported(format!(
                         "Deref::deref for {self_ty} is not runtime-supported"
@@ -2989,6 +3009,31 @@ impl<'a> Interpreter<'a> {
                             other.kind_name(),
                         )),
                     }
+                } else if self_ty.starts_with("&mut ") {
+                    // A mutable reference's own `DerefMut` returns
+                    // the inner `&mut T` itself. The coroutine
+                    // runtime paths reach this arm constantly:
+                    // `Pin<&mut C>` is built by dereferencing the
+                    // `&mut C` it wraps, and async drop glue
+                    // dereferences `&mut ManuallyDrop<C>` /
+                    // `&mut Pin<..>` the same way.
+                    Ok(self.resolve_value(frames, &vals[0])?)
+                } else if self_ty.starts_with("std::pin::Pin<") {
+                    // `Pin<P>` derefs exactly as the pointer it
+                    // wraps: the wrapper is a one-field aggregate
+                    // holding the pointer value.
+                    let wrapper = self.resolve_value(frames, &vals[0])?;
+                    let pointer =
+                        one_field_value(wrapper, "DerefMut::deref_mut for Pin")?;
+                    deref_pointer_value(pointer)
+                } else if self_ty.starts_with("std::panic::AssertUnwindSafe<") {
+                    // A one-field newtype wrapper: the result is a
+                    // mutable reference to the held value.
+                    self.field_zero_ref(
+                        frames,
+                        &vals[0],
+                        "DerefMut::deref_mut for AssertUnwindSafe",
+                    )
                 } else {
                     Err(unsupported(format!(
                         "DerefMut::deref_mut for {self_ty} is not runtime-supported"
@@ -4343,6 +4388,48 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         }
     }
 
+    /// A reference to field 0 of the aggregate `arg` points at:
+    /// the dereference result of a one-field newtype wrapper
+    /// (`AssertUnwindSafe`). A place-backed argument yields a live
+    /// place reference, so writes through the result land in the
+    /// wrapper; a detached aggregate value yields a reference to a
+    /// copy of the field.
+    pub(crate) fn field_zero_ref(
+        &self,
+        frames: &[Frame],
+        arg: &Value,
+        what: &str,
+    ) -> InterpResult<Value> {
+        Ok(match self.deref_value(frames, arg)? {
+            Resolved::Place {
+                frame_pos,
+                local,
+                mut projection,
+            } => {
+                projection.push(RefProj::Field(0));
+                Value::Ref(RefTarget::Place {
+                    frame: frames[frame_pos].id,
+                    local,
+                    projection,
+                })
+            }
+            Resolved::Static {
+                name,
+                mut projection,
+            } => {
+                projection.push(RefProj::Field(0));
+                Value::Ref(RefTarget::Static { name, projection })
+            }
+            Resolved::Alloc { id, mut projection } => {
+                projection.push(RefProj::Field(0));
+                Value::Ref(RefTarget::Alloc { id, projection })
+            }
+            Resolved::Value(value) => {
+                Value::Ref(RefTarget::Value(Box::new(one_field_value(value, what)?)))
+            }
+        })
+    }
+
     /// Follow references in `value` until a non-reference value.
     pub(crate) fn resolve_value(
         &self,
@@ -4569,6 +4656,54 @@ fn cell_value(value: Value) -> Value {
 
 /// The value a `Cell` aggregate of the natural shape holds;
 /// `None` for any other value.
+/// The single field of a one-field aggregate value: the shape of
+/// the std newtype wrappers (`Pin`, `ManuallyDrop`,
+/// `AssertUnwindSafe`).
+fn one_field_value(value: Value, what: &str) -> InterpResult<Value> {
+    match value {
+        Value::Enum { fields, .. } if fields.len() == 1 => {
+            Ok(fields.into_iter().next().expect("one field"))
+        }
+        other => Err(InterpError::type_mismatch(
+            what,
+            "one-field aggregate",
+            other.kind_name(),
+        )),
+    }
+}
+
+/// The value produced by dereferencing a pointer-shaped value: a
+/// reference, fat reference or dyn reference is its own
+/// dereference; a built `Box` yields the pointer to its allocation
+/// (an aggregate-built box a reference to the held pointee value);
+/// an `Rc` / `Arc` handle yields a reference to the stored value
+/// field. This is the shared tail of the `Box` and `Rc` arms of
+/// the `Deref` / `DerefMut` builtins, factored out for `Pin<P>`,
+/// which derefs as the pointer it wraps.
+fn deref_pointer_value(pointer: Value) -> InterpResult<Value> {
+    if let Some(id) = rc_handle_id(&pointer) {
+        return Ok(Value::Ref(RefTarget::Alloc {
+            id,
+            projection: vec![RefProj::Field(2)],
+        }));
+    }
+    match pointer {
+        Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. } => Ok(pointer),
+        Value::Enum { fields, .. } if fields.len() == 1 => {
+            let inner = fields.into_iter().next().expect("one field");
+            match inner {
+                Value::Ref(RefTarget::Alloc { .. }) => Ok(inner),
+                other => Ok(Value::Ref(RefTarget::Value(Box::new(other)))),
+            }
+        }
+        other => Err(InterpError::type_mismatch(
+            "dereference of a wrapped pointer",
+            "reference, box or handle value",
+            other.kind_name(),
+        )),
+    }
+}
+
 fn cell_held(state: &Value) -> Option<&Value> {
     match state {
         Value::Enum { fields, .. } if fields.len() == 1 => match &fields[0] {
