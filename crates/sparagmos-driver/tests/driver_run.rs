@@ -7440,6 +7440,115 @@ fn run_mode_caller_location_reports_the_call_site() {
     assert_eq!(stdout, "tracked 7\ndirect 8\n", "stdout={stdout}");
 }
 
+const CALLER_LOCATION_FNPTR_SRC: &str = r#"
+fn ptr_call(f: fn() -> u32) -> u32 { f() }
+#[track_caller]
+fn tracked() -> u32 { std::panic::Location::caller().line() }
+trait Tr { fn m() -> u32; }
+impl Tr for () {
+    #[track_caller]
+    fn m() -> u32 { std::panic::Location::caller().line() }
+}
+fn main() {
+    println!("fn {}", ptr_call(tracked));
+    println!("impl {}", ptr_call(<() as Tr>::m));
+}
+"#;
+
+#[test]
+fn run_mode_caller_location_through_fn_pointer_is_the_definition() {
+    // A `#[track_caller]` function entered through a function
+    // pointer observes its own definition location (the call
+    // shim's location), for a free function (line 4) and for a
+    // trait method item (the impl method, line 8) alike.
+    run_ok(
+        "caller-location-fnptr",
+        CALLER_LOCATION_FNPTR_SRC,
+        "fn 4\nimpl 8\n",
+    );
+}
+
+const CALLER_LOCATION_DYN_SRC: &str = r#"
+trait Tr {
+    #[track_caller]
+    fn def_tracked(&self) -> (u32, u32) {
+        let l = std::panic::Location::caller();
+        (l.line(), l.column())
+    }
+    fn impl_only(&self) -> (u32, u32);
+}
+impl Tr for () {
+    #[track_caller]
+    fn impl_only(&self) -> (u32, u32) {
+        let l = std::panic::Location::caller();
+        (l.line(), l.column())
+    }
+}
+fn main() {
+    let t: &dyn Tr = &();
+    let (l1, c1) = t.def_tracked();
+    println!("def {l1} {c1}");
+    let (l2, c2) = t.impl_only();
+    println!("impl {l2} {c2}");
+}
+"#;
+
+#[test]
+fn run_mode_caller_location_through_dyn_trait_object() {
+    // A trait definition's `#[track_caller]` method called on
+    // a trait object observes the call site (line 19, the
+    // method name at column 22); an impl-only `#[track_caller]`
+    // method observes its definition (the impl method at
+    // 12:5).
+    run_ok(
+        "caller-location-dyn",
+        CALLER_LOCATION_DYN_SRC,
+        "def 19 22\nimpl 12 5\n",
+    );
+}
+
+const CALLER_LOCATION_CLOSURE_SRC: &str = r#"
+#![feature(stmt_expr_attributes)]
+#![feature(closure_track_caller)]
+use std::panic::Location;
+type Loc = &'static Location<'static>;
+#[track_caller]
+fn mono_fn<F: Fn() -> Loc>(v: &F) -> Loc { v() }
+#[track_caller]
+fn mono_once<F: FnOnce() -> Loc>(v: F) -> Loc { v() }
+#[track_caller]
+fn dyn_mut(v: &mut dyn FnMut() -> Loc) -> Loc { v() }
+#[track_caller]
+fn dyn_once(v: Box<dyn FnOnce() -> Loc>) -> Loc { v() }
+fn main() {
+    let mut c = #[track_caller] || Location::caller();
+    let d = c();
+    println!("direct {} {}", d.line(), d.column());
+    let m = mono_fn(&c);
+    println!("mono {} {}", m.line(), m.column());
+    let dm = dyn_mut(&mut c);
+    println!("dynmut-other {}", dm.file() != file!());
+    let dn = dyn_once(Box::new(c));
+    println!("dynonce-other {}", dn.file() != file!());
+    let mo = mono_once(#[track_caller] || Location::caller());
+    println!("monoonce {} {}", mo.line(), mo.column());
+}
+"#;
+
+#[test]
+fn run_mode_caller_location_through_closures() {
+    // A track-caller closure called directly observes the call
+    // site (16:13); through a `#[track_caller]` generic `Fn` /
+    // `FnOnce` wrapper the location forwards to the wrapper's
+    // call site (18:13 and 24:14); through a `dyn` receiver it
+    // observes the `Fn` shim's location in core, not this file.
+    run_ok(
+        "caller-location-closure",
+        CALLER_LOCATION_CLOSURE_SRC,
+        "direct 16 13\nmono 18 13\ndynmut-other true\ndynonce-other true\nmonoonce 24 14\n",
+    );
+}
+
 const PROCESS_EXIT_SRC: &str = r#"
 fn main() {
     println!("before");
