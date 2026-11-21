@@ -2336,3 +2336,242 @@ class GuestArgForwardingTests(unittest.TestCase):
                          "1")
         self.assertEqual(captured["env_remove"],
                          ("RUST_BACKTRACE",))
+
+
+class AttemptEditionTests(unittest.TestCase):
+    """attempt_edition: the one edition selection every attempt
+    path uses, ranges collapsed before they can reach rustc."""
+
+    def test_range_collapses_to_its_last_edition(self):
+        h = header("//@ edition:2015..2021\n")
+        self.assertEqual(run.attempt_edition(h.view(None)), "2021")
+
+    def test_open_range_collapses_to_its_first_edition(self):
+        h = header("//@ edition:2018..\n")
+        self.assertEqual(run.attempt_edition(h.view(None)), "2018")
+
+    def test_plain_edition_unchanged(self):
+        h = header("//@ edition:2015\n")
+        self.assertEqual(run.attempt_edition(h.view(None)), "2015")
+
+    def test_no_directive_defaults_to_2021(self):
+        h = header("fn main() {}\n")
+        self.assertEqual(run.attempt_edition(h.view(None)), "2021")
+
+    def test_last_directive_wins(self):
+        h = header("//@ edition:2015\n//@ edition:2018..2024\n")
+        self.assertEqual(run.attempt_edition(h.view(None)), "2024")
+
+    def test_stage1_flat_path_uses_the_collapsed_edition(self):
+        # Regression: the flat stage-1 path used to hand the
+        # verbatim range string (`2015..2021`) to both sides,
+        # which rustc rejects as an edition value.
+        tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (tmp / "tests" / "ui").mkdir(parents=True)
+        p = tmp / "tests" / "ui" / "t.rs"
+        p.write_text("//@ run-pass\n//@ edition:2015..2021\n"
+                     "fn main() {}\n")
+        rec = {"suite": "ui", "path": "tests/ui/t.rs",
+               "nature": "exec", "single_file": True, "ffi": False,
+               "env_excluded": False}
+        seen = {}
+        orig_n, orig_s = run.native_side, run.sparagmos_side
+
+        def native(path, edition, *a, **kw):
+            seen["native"] = edition
+            return ({"exit_code": 0, "stdout": "", "stderr": ""}, None)
+
+        def sparagmos(path, edition, *a, **kw):
+            seen["sparagmos"] = edition
+            return ({"exit_code": 0, "stdout": "", "stderr": ""},
+                    "result", "")
+
+        run.native_side, run.sparagmos_side = native, sparagmos
+        try:
+            res = run.process_test(rec, tmp, Path("/fake/driver"))
+        finally:
+            run.native_side, run.sparagmos_side = orig_n, orig_s
+        self.assertEqual(res["status"], "pass")
+        self.assertEqual(seen, {"native": "2021", "sparagmos": "2021"})
+
+
+class CompiletestModeArgsTests(unittest.TestCase):
+    """compiletest_mode_args: the arguments compiletest's mode
+    layer adds, which the subset must supply itself."""
+
+    def test_ui_tests_get_one_codegen_unit(self):
+        self.assertEqual(run.compiletest_mode_args("ui", []),
+                         ["-Ccodegen-units=1"])
+        self.assertEqual(run.compiletest_mode_args("ui-fulldeps", []),
+                         ["-Ccodegen-units=1"])
+
+    def test_own_codegen_units_setting_wins(self):
+        for flags in (["-Ccodegen-units=16"], ["-C", "codegen-units=16"],
+                      ["-Ccodegen-units", "16"]):
+            self.assertEqual(run.compiletest_mode_args("ui", flags), [])
+
+    def test_cfi_with_lto_gets_one_codegen_unit(self):
+        flags = ["-Clto", "-Zsanitizer=cfi", "-Copt-level=0"]
+        self.assertEqual(
+            run.compiletest_mode_args("codegen-llvm", flags),
+            ["-Ccodegen-units=1"])
+
+    def test_cfi_split_token_spelling(self):
+        flags = ["-C", "lto=fat", "-Z", "sanitizer=cfi"]
+        self.assertEqual(
+            run.compiletest_mode_args("codegen-llvm", flags),
+            ["-Ccodegen-units=1"])
+
+    def test_cfi_without_lto_needs_nothing(self):
+        self.assertEqual(run.compiletest_mode_args(
+            "codegen-llvm", ["-Zsanitizer=cfi"]), [])
+
+    def test_other_sanitizer_with_lto_needs_nothing(self):
+        self.assertEqual(run.compiletest_mode_args(
+            "codegen-llvm", ["-Clto", "-Zsanitizer=address"]), [])
+
+    def test_unrelated_suite_and_flags(self):
+        self.assertEqual(run.compiletest_mode_args("mir-opt", []), [])
+        self.assertEqual(run.compiletest_mode_args("codegen-llvm", []),
+                         [])
+
+
+class SysrootExternArgsTests(unittest.TestCase):
+    """sysroot_extern_args over a stubbed ambiguity map."""
+
+    def setUp(self):
+        self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        orig = run.ambiguous_sysroot_crates
+        run.ambiguous_sysroot_crates = lambda: {
+            "libc": "/sysroot/lib/liblibc-7d5a06a231119d28.rmeta"}
+        self.addCleanup(setattr, run, "ambiguous_sysroot_crates", orig)
+
+    def write(self, text):
+        p = self.tmp / "t.rs"
+        p.write_text(text)
+        return p
+
+    def test_declared_ambiguous_crate_is_pinned(self):
+        p = self.write("extern crate libc;\nfn main() {}\n")
+        self.assertEqual(
+            run.sysroot_extern_args(p, []),
+            ["--extern",
+             "libc=/sysroot/lib/liblibc-7d5a06a231119d28.rmeta"])
+
+    def test_undeclared_crate_is_not_pinned(self):
+        p = self.write("fn main() {}\n")
+        self.assertEqual(run.sysroot_extern_args(p, []), [])
+
+    def test_foreign_target_is_not_pinned(self):
+        p = self.write("extern crate libc;\nfn main() {}\n")
+        for flags in (["--target", "aarch64-unknown-linux-gnu"],
+                      ["--target=aarch64-unknown-linux-gnu"]):
+            self.assertEqual(run.sysroot_extern_args(p, flags), [])
+
+    def test_host_target_still_pinned(self):
+        p = self.write("extern crate libc;\nfn main() {}\n")
+        args = run.sysroot_extern_args(
+            p, ["--target", "x86_64-unknown-linux-gnu"])
+        self.assertEqual(len(args), 2)
+
+    def test_flag_bound_name_is_left_to_the_flags(self):
+        p = self.write("extern crate libc;\nfn main() {}\n")
+        for flags in (["--extern", "libc=/elsewhere.rmeta"],
+                      ["--extern=libc=/elsewhere.rmeta"]):
+            self.assertEqual(run.sysroot_extern_args(p, flags), [])
+
+    def test_missing_source_reads_as_no_declarations(self):
+        self.assertEqual(
+            run.sysroot_extern_args(self.tmp / "absent.rs", []), [])
+
+
+class ProcessStage2RunModeTests(unittest.TestCase):
+    """process_test(stage2=True) on views whose mode is a run
+    mode: judged by execution, with the process sides stubbed."""
+
+    def setUp(self):
+        self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (self.tmp / "tests" / "ui").mkdir(parents=True)
+        self.rust_dir = self.tmp
+
+    def write_test(self, body):
+        p = self.rust_dir / "tests" / "ui" / "t.rs"
+        p.write_text(body)
+        return {"suite": "ui", "path": "tests/ui/t.rs",
+                "nature": "compile-check", "single_file": True,
+                "ffi": False, "env_excluded": False}
+
+    def run_with_sides(self, rec, native, sparagmos, conv_result):
+        orig_n = run.native_side
+        orig_s = run.sparagmos_side
+        orig_c = run.convert_side
+        run.native_side = lambda *a, **kw: native
+        run.sparagmos_side = lambda *a, **kw: sparagmos
+        run.convert_side = lambda *a, **kw: conv_result
+        try:
+            return run.process_test(rec, self.rust_dir,
+                                    Path("/fake/driver"), stage2=True)
+        finally:
+            run.native_side = orig_n
+            run.sparagmos_side = orig_s
+            run.convert_side = orig_c
+
+    def test_run_pass_revision_is_judged_by_execution(self):
+        rec = self.write_test(
+            "//@ revisions: runtime borrowck\n"
+            "//@ [runtime] run-pass\n"
+            "//@ [borrowck] check-fail\n"
+            "fn main() { println!(\"x\"); }\n")
+        res = self.run_with_sides(
+            rec,
+            ({"exit_code": 0, "stdout": "x\n", "stderr": ""}, None),
+            ({"exit_code": 0, "stdout": "x\n", "stderr": ""},
+             "result", ""),
+            conv(exit_code=1, compilation_failed=True,
+                 converted=None, skipped=None))
+        self.assertEqual(res["status"], "pass")
+        self.assertEqual(res["revisions"]["runtime"]["status"], "pass")
+        self.assertEqual(res["revisions"]["runtime"]["expectation"],
+                         "run-pass")
+        self.assertEqual(res["revisions"]["borrowck"]["status"], "pass")
+
+    def test_run_fail_revision_mismatch_fails(self):
+        rec = self.write_test(
+            "//@ revisions: runtime\n"
+            "//@ [runtime] run-fail\n"
+            "fn main() { panic!(\"boom\"); }\n")
+        res = self.run_with_sides(
+            rec,
+            ({"exit_code": 101, "stdout": "", "stderr": ""}, None),
+            ({"exit_code": 0, "stdout": "", "stderr": ""},
+             "result", ""),
+            conv())
+        self.assertEqual(res["status"], "fail")
+        self.assertEqual(res["bucket"], "exit-code mismatch")
+
+    def test_run_crash_revision_stays_not_attempted(self):
+        rec = self.write_test(
+            "//@ revisions: chk rt\n"
+            "//@ [chk] check-pass\n"
+            "//@ [rt] run-crash\n"
+            "fn main() {}\n")
+        res = self.run_with_sides(
+            rec,
+            ({"exit_code": 0, "stdout": "", "stderr": ""}, None),
+            ({"exit_code": 0, "stdout": "", "stderr": ""},
+             "result", ""),
+            conv())
+        self.assertEqual(res["status"], "not-attempted")
+        self.assertEqual(res["bucket"],
+                         "not attempted (verdict needs execution)")
+
+    def test_unscoped_run_mode_is_judged_by_execution(self):
+        rec = self.write_test("//@ run-pass\nfn main() {}\n")
+        res = self.run_with_sides(
+            rec,
+            ({"exit_code": 0, "stdout": "", "stderr": ""}, None),
+            ({"exit_code": 0, "stdout": "", "stderr": ""},
+             "result", ""),
+            conv())
+        self.assertEqual(res["status"], "pass")
+        self.assertEqual(res["expectation"], "run-pass")
