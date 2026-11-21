@@ -196,7 +196,7 @@ fn interp_call(
             Value::Unit => 0,
             other => panic!("unexpected interp result {other:?}"),
         }),
-        Err(MirRunError::Interp(InterpError::Panic { message })) => Err(message),
+        Err(MirRunError::Interp(InterpError::Panic { message, .. })) => Err(message),
         Err(other) => panic!("unexpected interp error: {other}"),
     }
 }
@@ -2856,7 +2856,7 @@ fn interp_call_pair(
             Ok((value_word(&fields[0]), value_word(&fields[1])))
         }
         Ok(other) => panic!("unexpected interp result {other:?}"),
-        Err(MirRunError::Interp(InterpError::Panic { message })) => Err(message),
+        Err(MirRunError::Interp(InterpError::Panic { message, .. })) => Err(message),
         Err(other) => panic!("unexpected interp error: {other}"),
     }
 }

@@ -1962,6 +1962,7 @@ fn execute(c: &Collected) -> i32 {
         }
         Err(sparagmos_interp::MirRunError::Interp(sparagmos_interp::InterpError::Panic {
             message,
+            ..
         })) => {
             eprintln!("thread 'main' panicked: {message}");
             101

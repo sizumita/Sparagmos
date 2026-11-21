@@ -64,6 +64,14 @@
 //!   field slots being addressed per (state, field) through explicit
 //!   copies whenever the layout moves a value between slots.
 //!
+//! - [`Value::PanicPayload`] is a raw panic payload in flight: the
+//!   value the panic runtime hands to `catch_unwind`'s catch
+//!   function as a `*mut u8`. It exists only between the
+//!   `catch_unwind` intrinsic (which produces it when the tried
+//!   function panics) and `std::panicking::catch_unwind::cleanup`
+//!   (which boxes it into a [`Value::DynRef`], the model's
+//!   `Box<dyn Any + Send>`).
+//!
 //! - [`Value::FmtArguments`] is a built `std::fmt::Arguments` value:
 //!   either a plain string (`from_str`) or a pieces template plus the
 //!   snapshot of its argument array (`Arguments::new`).
@@ -158,6 +166,22 @@ pub enum FmtArguments {
     Template { template: Vec<u8>, args: Vec<Value> },
 }
 
+/// A guest panic's payload: the concrete value the panic carries
+/// (the argument of `panic_any`, the message of a `panic!`), with
+/// the rendered name of its concrete type — the same rendering
+/// `builtins::ty_tag` produces for a generic argument, which is
+/// what `dyn Any` downcasts compare against. The interpreter's
+/// panic error carries one of these from the panic site to the
+/// `catch_unwind` that observes it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PanicPayload {
+    /// Rendered concrete type name, e.g. `&str`,
+    /// `std::string::String`, `i32`.
+    pub ty: String,
+    /// The payload value itself.
+    pub value: Box<Value>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     /// The slot was never written (or was moved out of).
@@ -228,6 +252,11 @@ pub enum Value {
     /// the state storage fields. See the module docs for how this
     /// differs from [`Value::Enum`].
     Coroutine { variant: u32, fields: Vec<Value> },
+    /// A raw panic payload in flight between the `catch_unwind`
+    /// intrinsic and `std::panicking::catch_unwind::cleanup` (see
+    /// the module docs). Anywhere else the value is meaningless;
+    /// operations on it are explicit errors.
+    PanicPayload(PanicPayload),
 }
 
 impl Value {
@@ -252,6 +281,7 @@ impl Value {
             Value::FnPtr(_) => "function pointer",
             Value::Closure { .. } => "closure",
             Value::Coroutine { .. } => "coroutine",
+            Value::PanicPayload(_) => "panic payload",
         }
     }
 
@@ -375,6 +405,9 @@ impl fmt::Display for Value {
             }
             Value::Coroutine { variant, fields } => {
                 write!(f, "<coroutine state {variant} ({} fields)>", fields.len())
+            }
+            Value::PanicPayload(payload) => {
+                write!(f, "<panic payload of type {}>", payload.ty)
             }
         }
     }

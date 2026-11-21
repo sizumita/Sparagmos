@@ -650,6 +650,18 @@ pub enum DropPlan {
     /// explicit error, as for any other dangling reference in this
     /// model — it is never silently skipped.
     RefCellRelease { mutable: bool },
+    /// The glue of a value of dynamic type (`dyn Trait`): the
+    /// concrete type is known only from the value itself, which in
+    /// this model is a `DynRef` carrying the payload value.
+    /// Execution judges the payload by its shape, as
+    /// [`DropPlan::Untyped`] does: scalars, strings and references
+    /// own nothing, tuples and closure environments recurse, and an
+    /// ADT value — whose concrete type might hide a destructor
+    /// this plan cannot name — is an explicit error. This is the
+    /// plan that lets a caught panic's `Box<dyn Any>` payload be
+    /// dropped at scope end for the payload shapes the model can
+    /// account for.
+    Dynamic,
 }
 
 /// The drop glue of one `Drop` terminator: the plan for the dropped

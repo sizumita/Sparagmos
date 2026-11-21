@@ -457,7 +457,7 @@ fn array_index_out_of_bounds_is_a_guest_panic() {
     assert!(
         matches!(
             err,
-            MirRunError::Interp(InterpError::Panic { ref message })
+            MirRunError::Interp(InterpError::Panic { ref message, .. })
             if message == "index out of bounds: the len is 3 but the index is 5"
         ),
         "expected the rustc bounds-check panic, got {err}"

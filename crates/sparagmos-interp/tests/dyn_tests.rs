@@ -641,7 +641,7 @@ fn index_call_without_a_collected_impl_body_keeps_the_builtin_model() {
     prog.add("main", s_index_main());
 
     match interpret_mir(&prog, "main", Vec::new()) {
-        Err(MirRunError::Interp(InterpError::Panic { message })) => {
+        Err(MirRunError::Interp(InterpError::Panic { message, .. })) => {
             assert_eq!(
                 message,
                 "index out of bounds: the len is 0 but the index is 0"

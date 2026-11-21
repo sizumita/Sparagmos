@@ -1291,7 +1291,7 @@ fn unreachable_terminator_is_a_guest_panic() {
     let mut prog = MirProgram::new();
     prog.add("f", body);
     match interpret_mir(&prog, "f", vec![]) {
-        Err(MirRunError::Interp(InterpError::Panic { message })) => {
+        Err(MirRunError::Interp(InterpError::Panic { message, .. })) => {
             assert_eq!(message, "entered unreachable code");
         }
         Err(e) => panic!("expected guest panic from Unreachable, got error {e}"),
@@ -1880,7 +1880,7 @@ fn expect_shift_panic(
     message: &str,
 ) {
     match run_shift(op, value_ty, amount_ty, value, amount) {
-        Err(MirRunError::Interp(InterpError::Panic { message: got })) => {
+        Err(MirRunError::Interp(InterpError::Panic { message: got, .. })) => {
             assert_eq!(got, message)
         }
         Err(e) => panic!("expected guest panic `{message}`, got error {e}"),
@@ -2124,7 +2124,7 @@ fn constant_shift_amounts_keep_their_own_type() {
     let mut prog = MirProgram::new();
     prog.add("neg", body_with_amount(const_i8(-1)));
     match interpret_mir(&prog, "neg", vec![Value::Int(1)]) {
-        Err(MirRunError::Interp(InterpError::Panic { message })) => assert_eq!(
+        Err(MirRunError::Interp(InterpError::Panic { message, .. })) => assert_eq!(
             message,
             "attempt to shift left with overflow"
         ),
@@ -2136,7 +2136,7 @@ fn constant_shift_amounts_keep_their_own_type() {
     let mut prog = MirProgram::new();
     prog.add("huge", body_with_amount(const_u64(1 << 32)));
     match interpret_mir(&prog, "huge", vec![Value::Int(1)]) {
-        Err(MirRunError::Interp(InterpError::Panic { message })) => assert_eq!(
+        Err(MirRunError::Interp(InterpError::Panic { message, .. })) => assert_eq!(
             message,
             "attempt to shift left with overflow"
         ),
@@ -2491,7 +2491,7 @@ fn intrinsic_assume_true_is_a_noop_and_false_is_a_guest_panic() {
         Value::Int(5)
     );
     match interpret_mir(&prog, "assume_false", vec![]) {
-        Err(MirRunError::Interp(InterpError::Panic { message })) => {
+        Err(MirRunError::Interp(InterpError::Panic { message, .. })) => {
             assert!(message.contains("assume"), "panic names assume: {message}");
         }
         Err(e) => panic!("expected guest panic from assume(false), got {e}"),

@@ -212,7 +212,7 @@ impl fmt::Display for ConvertError {
 impl std::error::Error for ConvertError {}
 
 /// Failure of a whole MIR run: either conversion or interpretation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum MirRunError {
     Convert(ConvertError),
     Interp(InterpError),
@@ -480,6 +480,9 @@ fn drop_glue_edges<'a>(glue: &'a ir::DropGlue, targets: &mut Vec<&'a str>) -> bo
             ir::DropPlan::Trivial => true,
             // Releasing a RefCell borrow calls no destructor body.
             ir::DropPlan::RefCellRelease { .. } => true,
+            // Judged from the value at run time; calls no
+            // destructor body.
+            ir::DropPlan::Dynamic => true,
             ir::DropPlan::Unknown | ir::DropPlan::Untyped => false,
             ir::DropPlan::Seq(plans) => plans.iter().all(|p| walk(p, adts, targets, seen)),
             ir::DropPlan::At { plan, .. } => walk(plan, adts, targets, seen),
@@ -3257,6 +3260,9 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                 self.adts[index] = plan;
                 Some(P::Adt { index })
             }
+            // A `dyn` value's glue is judged from the value at
+            // run time (see `DropPlan::Dynamic`).
+            mir::Ty::Dynamic(..) => Some(P::Dynamic),
             mir::Ty::Coroutine(def, args) => {
                 let key = format!("{ty:?}");
                 if let Some(&index) = self.adt_index.get(&key) {
