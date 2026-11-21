@@ -1020,6 +1020,12 @@ pub struct Body {
     /// Empty for hand-built bodies, and a block past the end of the
     /// table defaults to [`UnwindAction::Continue`].
     pub unwind: Vec<UnwindAction>,
+    /// For a `#[track_caller]` function: the index of the
+    /// synthetic final local holding the caller location the
+    /// driver stamped onto each call (conversion-assigned; see
+    /// `mark_caller_location_bodies` in mir_convert). `None` for
+    /// ordinary functions.
+    pub caller_location_local: Option<usize>,
 }
 
 impl Body {
@@ -1036,6 +1042,7 @@ impl Body {
             blocks,
             zst_locals: Vec::new(),
             unwind: Vec::new(),
+            caller_location_local: None,
         }
     }
     pub fn local_count(&self) -> usize {

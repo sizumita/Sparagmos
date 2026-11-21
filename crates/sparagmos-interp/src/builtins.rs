@@ -422,6 +422,11 @@ pub enum Builtin {
     DurationFromMicros,
     /// `std::time::Duration::from_nanos(n)`.
     DurationFromNanos,
+    /// `std::intrinsics::caller_location()`: the caller location
+    /// of the current function (the received stamp for a
+    /// `#[track_caller]` function, the stamped call site
+    /// otherwise).
+    CallerLocation,
     /// `std::time::Instant::now()`: the host monotonic clock.
     InstantNow,
     /// `std::time::SystemTime::now()`: the host wall clock.
@@ -777,6 +782,22 @@ pub enum SatOp {
 }
 
 /// Look a canonical callee name up in the registry.
+/// Whether a builtin consumes the caller-location stamp the
+/// driver appends to `#[track_caller]` calls: the location
+/// intrinsic (the stamp is its result) and the panic entry
+/// points (the location belongs to the panic). Other
+/// builtin-served track-caller functions (e.g. `Option::unwrap`)
+/// are not stamped, so their argument lists stay as declared.
+pub fn consumes_caller_location(kind: Builtin) -> bool {
+    matches!(
+        kind,
+        Builtin::CallerLocation
+            | Builtin::PanicStr
+            | Builtin::PanicFmt
+            | Builtin::PanicAny
+    )
+}
+
 pub fn lookup(canonical: &str) -> Option<Builtin> {
     use FmtTrait as F;
     Some(match canonical {
@@ -839,6 +860,7 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::time::Duration::from_millis" => Builtin::DurationFromMillis,
         "std::time::Duration::from_micros" => Builtin::DurationFromMicros,
         "std::time::Duration::from_nanos" => Builtin::DurationFromNanos,
+        "std::intrinsics::caller_location" => Builtin::CallerLocation,
         "std::time::Instant::now" => Builtin::InstantNow,
         "std::time::SystemTime::now" => Builtin::SystemTimeNow,
         "std::time::Instant::checked_add" => Builtin::TimeCheckedAdd(false),
@@ -1551,6 +1573,16 @@ impl<'a> Interpreter<'a> {
         for arg in args {
             vals.push(self.eval_operand(frames, body, arg)?);
         }
+        // The panic entry points are `#[track_caller]`: the
+        // driver appends the caller-location stamp as a trailing
+        // argument, which the arms below do not consume.
+        if matches!(
+            kind,
+            Builtin::PanicStr | Builtin::PanicFmt | Builtin::PanicAny
+        ) && vals.len() == 2
+        {
+            vals.truncate(1);
+        }
         let arity = |n: usize| -> InterpResult<()> {
             if vals.len() == n {
                 Ok(())
@@ -1857,6 +1889,21 @@ impl<'a> Interpreter<'a> {
                 arity(1)?;
                 let ns = uint_arg_bits(&vals[0], name)?;
                 self.duration_value(ns / 1_000_000_000, ns % 1_000_000_000)
+            }
+            Builtin::CallerLocation => {
+                // A `#[track_caller]` function's location is the
+                // one it received (bound to its synthetic local);
+                // any other function's is the stamp appended to
+                // this call.
+                if let Some(idx) = body.caller_location_local {
+                    let frame = frames.last().expect("frame");
+                    let received = frame.locals.get(idx).cloned().unwrap_or(Value::Uninit);
+                    if !matches!(received, Value::Uninit) {
+                        return Ok(received);
+                    }
+                }
+                arity(1)?;
+                Ok(vals.into_iter().next().expect("one argument"))
             }
             Builtin::InstantNow => {
                 arity(0)?;

@@ -339,8 +339,11 @@ impl Converter {
                 mutability: mutability(d.mutability),
             })
             .collect();
-        let blocks: Vec<sm::BasicBlockData> =
-            body.blocks.iter().map(|b| self.basic_block(b)).collect();
+        let blocks: Vec<sm::BasicBlockData> = body
+            .blocks
+            .iter()
+            .map(|b| self.basic_block(body, b))
+            .collect();
         let debug_info: Vec<sm::VarDebugInfo> = body
             .var_debug_info
             .iter()
@@ -371,13 +374,13 @@ impl Converter {
         }
     }
 
-    fn basic_block(&mut self, bb: &mir::BasicBlock) -> sm::BasicBlockData {
+    fn basic_block(&mut self, body: &mir::Body, bb: &mir::BasicBlock) -> sm::BasicBlockData {
         let statements = bb
             .statements
             .iter()
             .map(|s| sm::Statement::new(self.statement_kind(&s.kind)))
             .collect();
-        let terminator = self.terminator_kind(&bb.terminator.kind);
+        let terminator = self.terminator_kind(body, &bb.terminator);
         let mut data = sm::BasicBlockData::new(sm::Terminator::new(terminator));
         data.statements = statements;
         // Stable MIR (1.100.0) does not expose `is_cleanup`; see module docs.
@@ -446,9 +449,53 @@ impl Converter {
         }
     }
 
-    fn terminator_kind(&mut self, kind: &mir::TerminatorKind) -> sm::TerminatorKind {
+    /// The implicit caller-location argument for a call to a
+    /// `#[track_caller]` callee, if this call is one: the
+    /// constant `&'static Location` of this call site, computed
+    /// by the compiler's own resolution (which accounts for MIR
+    /// inlining). The interpreter binds it to the callee's
+    /// synthetic location local; when the calling function is
+    /// itself `#[track_caller]`, the interpreter forwards the
+    /// caller's received location instead (see
+    /// `Interpreter::start_call`).
+    fn caller_location_stamp(
+        &mut self,
+        body: &mir::Body,
+        term: &mir::Terminator,
+        func: &mir::Operand,
+    ) -> Option<sm::Operand> {
+        let mir::Operand::Constant(c) = func else {
+            return None;
+        };
+        let TyKind::RigidTy(RigidTy::FnDef(def, args)) = c.const_.ty().kind() else {
+            return None;
+        };
+        let inst = Instance::resolve(def, &args).ok()?;
+        if !inst.requires_caller_location() {
+            return None;
+        }
+        // A builtin-served callee has no body to bind the stamp
+        // to; only the builtins that consume the location (the
+        // intrinsic, the panic entry points) are stamped, so the
+        // other builtins keep their declared argument lists.
+        let canonical = sparagmos_interp::builtins::canonical_name(&def.def_id().name());
+        if let Some(kind) = sparagmos_interp::builtins::lookup(&canonical) {
+            if !sparagmos_interp::builtins::consumes_caller_location(kind) {
+                return None;
+            }
+        }
+        let mc = body.caller_location(term, None);
+        let constant = self.constant(&mir::ConstOperand {
+            span: term.source_info.span,
+            user_ty: None,
+            const_: mc,
+        });
+        Some(sm::Operand::Constant(Box::new(constant)))
+    }
+
+    fn terminator_kind(&mut self, body: &mir::Body, term: &mir::Terminator) -> sm::TerminatorKind {
         use mir::TerminatorKind as TK;
-        match kind {
+        match &term.kind {
             TK::Goto { target } => sm::TerminatorKind::Goto { target: bb(*target) },
             TK::SwitchInt { discr, targets } => {
                 let d = self.operand(discr);
@@ -484,7 +531,15 @@ impl Converter {
                 unwind,
             } => {
                 let f = self.operand(func);
-                let a = args.iter().map(|a| self.operand(a)).collect();
+                let mut a: Vec<sm::Operand> =
+                    args.iter().map(|a| self.operand(a)).collect();
+                // A call to a `#[track_caller]` callee carries the
+                // implicit caller-location argument, appended here
+                // (the callee body models it as a synthetic final
+                // local).
+                if let Some(stamp) = self.caller_location_stamp(body, term, func) {
+                    a.push(stamp);
+                }
                 let d = self.place(destination);
                 sm::TerminatorKind::Call {
                     func: f,

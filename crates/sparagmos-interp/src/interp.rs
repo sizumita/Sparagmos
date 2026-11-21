@@ -1344,6 +1344,24 @@ impl<'a> Interpreter<'a> {
         destination: &Place,
         target: Option<BasicBlock>,
     ) -> InterpResult<()> {
+        // A `#[track_caller]` callee (marked at conversion) may
+        // arrive with one extra argument: the caller-location
+        // stamp the driver appended to the call. Pop it before
+        // anything else inspects the arguments; it is bound to
+        // the callee's synthetic location local below (and simply
+        // dropped when the call turns out to be a vtable
+        // dispatch to an unmarked impl body, whose location the
+        // model does not track).
+        let mut arg_values = arg_values;
+        let stamp = match self.program.get(func) {
+            Some(callee)
+                if callee.caller_location_local.is_some()
+                    && arg_values.len() == callee.arg_count + 1 =>
+            {
+                arg_values.pop()
+            }
+            _ => None,
+        };
         // A call whose receiver is a `dyn` fat pointer is a vtable
         // dispatch even when a body exists under the callee's own
         // name: that body is one monomorphic instance of the trait
@@ -1391,6 +1409,14 @@ impl<'a> Interpreter<'a> {
                 limit: self.config.max_call_depth,
             });
         }
+        // When the calling frame is itself a track-caller frame,
+        // the location forwards — the stamp is replaced by the
+        // caller's own received location — matching the
+        // compiler's propagation (a call written in a plain
+        // function inlined into a track-caller body is the one
+        // case this runtime forwarding cannot tell apart; the
+        // stamp then still names a location in the call chain,
+        // one frame further out).
         if arg_values.len() != callee.arg_count {
             return Err(InterpError::type_mismatch(
                 format!("call to `{func}`"),
@@ -1401,6 +1427,18 @@ impl<'a> Interpreter<'a> {
         let mut locals = vec![Value::Uninit; callee.local_count()];
         for (i, v) in arg_values.into_iter().enumerate() {
             locals[i + 1] = v;
+        }
+        if let (Some(idx), Some(mut stamp)) = (callee.caller_location_local, stamp) {
+            if let Some(caller) = frames.last() {
+                if let Some(caller_idx) = self
+                    .program
+                    .get(&caller.func)
+                    .and_then(|b| b.caller_location_local)
+                {
+                    stamp = caller.locals[caller_idx].clone();
+                }
+            }
+            locals[idx] = stamp;
         }
         let frame_id = self.fresh_frame_id();
         frames.push(Frame {

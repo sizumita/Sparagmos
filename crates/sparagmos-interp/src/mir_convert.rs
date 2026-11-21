@@ -510,7 +510,46 @@ fn convert_all(
     }
     failures.retain(|key, _| !out.functions.contains_key(key));
     out.adt_layouts = program.adt_layouts.clone();
+    mark_caller_location_bodies(&mut out);
     Ok((out, failures))
+}
+
+/// Mark the `#[track_caller]` bodies of a converted program: the
+/// driver appends the caller-location stamp as one extra
+/// argument to every direct call of such a function, so a body
+/// whose converted callers all pass `arg_count + 1` arguments is
+/// a track-caller body. Each marked body gains a synthetic final
+/// local (typed as the location reference) that the interpreter
+/// binds the stamp to (see `Body::caller_location_local`).
+fn mark_caller_location_bodies(program: &mut ir::Program) {
+    let mut marked: Vec<String> = Vec::new();
+    for body in program.functions.values() {
+        for block in &body.blocks {
+            if let ir::TerminatorKind::Call { func, args, .. } = &block.terminator {
+                if let Some(callee) = program.functions.get(func) {
+                    if args.len() == callee.arg_count + 1
+                        && callee.caller_location_local.is_none()
+                        && !marked.contains(func)
+                    {
+                        marked.push(func.clone());
+                    }
+                }
+            }
+        }
+    }
+    for name in marked {
+        let Some(body) = program.functions.get_mut(&name) else {
+            continue;
+        };
+        let idx = body.local_tys.len();
+        body.local_tys.push(ir::Ty::Ref(Box::new(ir::Ty::Adt(
+            "std::panic::Location".to_string(),
+        ))));
+        if !body.zst_locals.is_empty() {
+            body.zst_locals.push(None);
+        }
+        body.caller_location_local = Some(idx);
+    }
 }
 
 /// The defensive bound on the joint-fixpoint rounds in

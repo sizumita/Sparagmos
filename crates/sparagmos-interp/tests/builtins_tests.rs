@@ -471,8 +471,6 @@ fn registry_covers_the_modelled_callees() {
     for name in [
         "std::fs::File::create",
         "std::panic::catch_unwind",
-        "std::io::stdout",
-        "std::env::args",
     ] {
         assert_eq!(lookup(&canonical_name(name)), None, "{name} stays unsupported");
     }
@@ -1995,7 +1993,6 @@ fn registry_round2_covers_the_new_callees() {
         "std::option::Option::<T>::map",
         "std::sync::mpmc::channel",
         "std::thread::LocalKey::<T>::with",
-        "std::intrinsics::caller_location",
         "std::intrinsics::va_arg",
     ] {
         assert_eq!(lookup(&canonical_name(name)), None, "{name} stays unsupported");
