@@ -7417,3 +7417,208 @@ fn run_mode_dst_struct_trailing_slice_metadata() {
         "stdout={stdout}"
     );
 }
+const DEBUG_ADT_SRC: &str = r#"
+#[derive(Debug)]
+struct Named { x: i32, name: String }
+#[derive(Debug)]
+struct Empty {}
+#[derive(Debug)]
+struct Tup(i32, bool);
+#[derive(Debug)]
+struct Tup1(i32);
+#[derive(Debug)]
+struct Unit;
+#[derive(Debug)]
+enum E { A, B(i32), C(i32, u8), D { f: i32 }, G {} }
+fn main() {
+    println!("{:?}", Named { x: 3, name: "hi".to_string() });
+    println!("{:?}", Empty {});
+    println!("{:?}", Tup(1, true));
+    println!("{:?}", Tup1(9));
+    println!("{:?}", Unit);
+    println!("{:?}", E::A);
+    println!("{:?}", E::B(5));
+    println!("{:?}", E::C(5, 6));
+    println!("{:?}", E::D { f: 7 });
+    println!("{:?}", E::G {});
+}
+"#;
+
+#[test]
+fn run_mode_debug_format_derived_adts() {
+    let dir = temp_dir("debug-adt");
+    let src = fixture(&dir, "debug_adt.rs", DEBUG_ADT_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "Named { x: 3, name: \"hi\" }\n\
+         Empty\n\
+         Tup(1, true)\n\
+         Tup1(9)\n\
+         Unit\n\
+         A\n\
+         B(5)\n\
+         C(5, 6)\n\
+         D { f: 7 }\n\
+         G\n",
+        "stdout={stdout}"
+    );
+}
+
+const DEBUG_ADT_PRETTY_SRC: &str = r#"
+#[derive(Debug)]
+struct Named { x: i32, name: String }
+#[derive(Debug)]
+struct Tup(i32, bool);
+#[derive(Debug)]
+enum E { D { f: i32 } }
+#[derive(Debug)]
+struct Outer { inner: Named, list: Vec<Tup> }
+fn main() {
+    println!("{:#?}", Named { x: 3, name: "hi".to_string() });
+    println!("{:#?}", Tup(1, true));
+    println!("{:#?}", E::D { f: 7 });
+    println!("{:#?}", Outer { inner: Named { x: 1, name: "z".into() }, list: vec![Tup(3, true)] });
+    println!("{:#?}", Vec::<i32>::new());
+}
+"#;
+
+#[test]
+fn run_mode_debug_format_pretty_adts() {
+    let dir = temp_dir("debug-adt-pretty");
+    let src = fixture(&dir, "debug_adt_pretty.rs", DEBUG_ADT_PRETTY_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "Named {\n    x: 3,\n    name: \"hi\",\n}\n\
+         Tup(\n    1,\n    true,\n)\n\
+         D {\n    f: 7,\n}\n\
+         Outer {\n    inner: Named {\n        x: 1,\n        name: \"z\",\n    },\n    list: [\n        Tup(\n            3,\n            true,\n        ),\n    ],\n}\n\
+         []\n",
+        "stdout={stdout}"
+    );
+}
+
+const DEBUG_ADT_CONTAINERS_SRC: &str = r#"
+#[derive(Debug)]
+struct Named { x: i32, name: String }
+#[derive(Debug)]
+struct Tup(i32, bool);
+#[derive(Debug)]
+struct Outer { inner: Named, list: Vec<Tup>, opt: Option<i32> }
+#[derive(Debug)]
+struct Pair<T> { a: T, b: T }
+fn main() {
+    println!("{:?}", Some(Named { x: 1, name: "a".into() }));
+    println!("{:?}", Ok::<i32, String>(3));
+    println!("{:?}", Err::<i32, String>("bad".into()));
+    println!("{:?}", vec![Tup(1, false), Tup(2, true)]);
+    println!("{:?}", [Named { x: 2, name: "b".into() }]);
+    println!("{:?}", (Tup(4, true), 8));
+    println!("{:?}", Outer { inner: Named { x: 1, name: "z".into() }, list: vec![Tup(3, true)], opt: None });
+    let v = vec![Named { x: 1, name: "p".into() }, Named { x: 2, name: "q".into() }];
+    println!("{:?}", &v[..]);
+    println!("{:?}", Pair { a: 1, b: 2 });
+    println!("{:?}", Pair { a: "s", b: "t" });
+    println!("{:?}", format!("{:?}", Named { x: 8, name: "f".into() }));
+}
+"#;
+
+#[test]
+fn run_mode_debug_format_adt_in_containers() {
+    let dir = temp_dir("debug-adt-containers");
+    let src = fixture(&dir, "debug_adt_containers.rs", DEBUG_ADT_CONTAINERS_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "Some(Named { x: 1, name: \"a\" })\n\
+         Ok(3)\n\
+         Err(\"bad\")\n\
+         [Tup(1, false), Tup(2, true)]\n\
+         [Named { x: 2, name: \"b\" }]\n\
+         (Tup(4, true), 8)\n\
+         Outer { inner: Named { x: 1, name: \"z\" }, list: [Tup(3, true)], opt: None }\n\
+         [Named { x: 1, name: \"p\" }, Named { x: 2, name: \"q\" }]\n\
+         Pair { a: 1, b: 2 }\n\
+         Pair { a: \"s\", b: \"t\" }\n\
+         \"Named { x: 8, name: \\\"f\\\" }\"\n",
+        "stdout={stdout}"
+    );
+}
+
+const DEBUG_ADT_REFS_SRC: &str = r#"
+use std::fmt::Debug;
+#[derive(Debug)]
+struct Named { x: i32 }
+#[derive(Debug)]
+struct Tup(i32, bool);
+#[derive(Debug)]
+enum E { V(i32), W }
+fn main() {
+    let n = Named { x: 3 };
+    println!("{:?}", &n);
+    println!("{:?}", Box::new(Tup(7, false)));
+    let d: &dyn Debug = &Named { x: 5 };
+    println!("{:?}", d);
+    let d2: Box<dyn Debug> = Box::new(E::V(3));
+    println!("{:?}", d2);
+    let d3: &dyn Debug = &E::W;
+    println!("{:?}", d3);
+}
+"#;
+
+#[test]
+fn run_mode_debug_format_refs_box_and_dyn() {
+    let dir = temp_dir("debug-adt-refs");
+    let src = fixture(&dir, "debug_adt_refs.rs", DEBUG_ADT_REFS_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "Named { x: 3 }\n\
+         Tup(7, false)\n\
+         Named { x: 5 }\n\
+         V(3)\n\
+         W\n",
+        "stdout={stdout}"
+    );
+}
+
+const DEBUG_RANGES_SRC: &str = r#"
+fn main() {
+    println!("{:?}", std::ops::Range { start: 1, end: 4 });
+    println!("{:?}", 1..=4);
+    println!("{:?}", 1..);
+    println!("{:?}", ..4);
+    println!("{:?}", ..=4);
+    println!("{:?}", ..);
+    println!("{:?}", 'a'..='z');
+    println!("{:#?}", 1..4);
+}
+"#;
+
+#[test]
+fn run_mode_debug_format_ranges() {
+    let dir = temp_dir("debug-ranges");
+    let src = fixture(&dir, "debug_ranges.rs", DEBUG_RANGES_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "1..4\n1..=4\n1..\n..4\n..=4\n..\n'a'..='z'\n1..4\n",
+        "stdout={stdout}"
+    );
+}
