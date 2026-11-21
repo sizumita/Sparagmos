@@ -228,3 +228,180 @@ fn unwritten_scalar_body_converts() {
     prog.add("main", f);
     convert_program(&prog).expect("body converts");
 }
+
+// ----- group B: zero-sized values are synthesized ----------------------------
+
+const ZST_STRUCT: mir::DefId = mir::DefId::new(0, 50);
+const SINGLE_ENUM: mir::DefId = mir::DefId::new(0, 51);
+const EMPTY_ENUM: mir::DefId = mir::DefId::new(0, 52);
+const OPT_EMPTY: mir::DefId = mir::DefId::new(0, 53);
+const BLACK_BOX: mir::DefId = mir::DefId::new(0, 54);
+
+fn adt_ty(def: mir::DefId) -> mir::Ty {
+    mir::Ty::Adt(def, Vec::new())
+}
+
+fn shape(kind: mir::AdtShapeKind, variants: Vec<Vec<mir::Ty>>) -> mir::AdtShape {
+    mir::AdtShape { kind, variants }
+}
+
+fn zst_program(main: mir::Body, shapes: &[(mir::DefId, mir::AdtShape)]) -> MirProgram {
+    let mut prog = MirProgram::new();
+    for (def, s) in shapes {
+        prog.adt_shapes.insert(*def, s.clone());
+    }
+    prog.add("main", main);
+    prog
+}
+
+/// `struct Z; fn main() -> Z { return }` — a unit struct
+/// constructor's body is a bare `return`: the return place is
+/// never written, and its single value is synthesized from the
+/// shape table.
+#[test]
+fn zst_struct_return_synthesizes_value() {
+    let shapes = [(
+        ZST_STRUCT,
+        shape(mir::AdtShapeKind::Struct, vec![vec![]]),
+    )];
+    let main = mir::Body::new(
+        decls(&[adt_ty(ZST_STRUCT)]),
+        0,
+        vec![block(vec![], ret())],
+    );
+    let value = interpret_mir(&zst_program(main, &shapes), "main", Vec::new()).expect("main runs");
+    assert_eq!(value, Value::Enum { variant: 0, fields: vec![] });
+}
+
+/// `enum E { A(()) } fn main() -> E { let e: E; e }` — an enum
+/// with a single inhabited variant whose fields are all
+/// zero-sized has exactly one value; a never-written local of
+/// that type reads as it.
+#[test]
+fn single_variant_enum_unwritten_read_synthesizes() {
+    let shapes = [(
+        SINGLE_ENUM,
+        shape(
+            mir::AdtShapeKind::Enum,
+            vec![vec![mir::Ty::Tuple(Vec::new())]],
+        ),
+    )];
+    let main = mir::Body::new(
+        decls(&[adt_ty(SINGLE_ENUM), adt_ty(SINGLE_ENUM)]),
+        0,
+        vec![block(
+            vec![assign(place(0), mir::Rvalue::Use(copy(1)))],
+            ret(),
+        )],
+    );
+    let value = interpret_mir(&zst_program(main, &shapes), "main", Vec::new()).expect("main runs");
+    assert_eq!(
+        value,
+        Value::Enum { variant: 0, fields: vec![Value::Unit] }
+    );
+}
+
+/// `enum Empty {} fn main() -> Option<Empty> { let o; o }` —
+/// the `Some` variant's field type is uninhabited, so it can
+/// never be constructed and the enum's single value is `None`
+/// (variant 1), even though two variants are declared.
+#[test]
+fn option_of_uninhabited_synthesizes_none() {
+    let shapes = [
+        (EMPTY_ENUM, shape(mir::AdtShapeKind::Enum, vec![])),
+        (
+            OPT_EMPTY,
+            shape(
+                mir::AdtShapeKind::Enum,
+                vec![vec![adt_ty(EMPTY_ENUM)], vec![]],
+            ),
+        ),
+    ];
+    let main = mir::Body::new(
+        decls(&[adt_ty(OPT_EMPTY), adt_ty(OPT_EMPTY)]),
+        0,
+        vec![block(
+            vec![assign(place(0), mir::Rvalue::Use(copy(1)))],
+            ret(),
+        )],
+    );
+    let value = interpret_mir(&zst_program(main, &shapes), "main", Vec::new()).expect("main runs");
+    assert_eq!(value, Value::Enum { variant: 1, fields: vec![] });
+}
+
+/// A zero-sized constant of an ADT type — the typed
+/// `ConstValue::Adt` the driver now emits for a unit struct
+/// constant instead of an untyped unit — keeps its ADT value
+/// through `black_box` (the identity builtin), instead of
+/// collapsing to `Value::Unit`.
+#[test]
+fn zst_const_through_black_box_keeps_adt_value() {
+    let shapes = [(
+        ZST_STRUCT,
+        shape(mir::AdtShapeKind::Struct, vec![vec![]]),
+    )];
+    let mut prog = zst_program(
+        mir::Body::new(
+            decls(&[adt_ty(ZST_STRUCT)]),
+            0,
+            vec![
+                block(
+                    vec![],
+                    mir::TerminatorKind::Call {
+                        func: mir::Operand::constant(mir::Constant {
+                            literal: mir::ConstKind::Ty(mir::Ty::FnDef(BLACK_BOX, Vec::new())),
+                            user_ty: None,
+                        }),
+                        args: vec![mir::Operand::constant(mir::Constant::from_value(
+                            mir::ConstValue::Adt { variant: 0, fields: Vec::new() },
+                        ))],
+                        destination: place(0),
+                        target: Some(mir::BasicBlock(1)),
+                        unwind: mir::UnwindAction::Continue,
+                        call_source: mir::CallSource::Normal,
+                    },
+                ),
+                block(vec![], ret()),
+            ],
+        ),
+        &shapes,
+    );
+    prog.fn_names
+        .insert(BLACK_BOX, "std::intrinsics::black_box".to_string());
+    let value = interpret_mir(&prog, "main", Vec::new()).expect("main runs");
+    assert_eq!(value, Value::Enum { variant: 0, fields: vec![] });
+}
+
+// ----- group C: Repeat evaluates its operand once ----------------------------
+
+/// `fn main() -> [[u32; 2]; 3] { let a = [7u32; 2]; [a; 3] }` —
+/// MIR writes the outer repeat's operand as a move of `_1`;
+/// a repeat evaluates its operand once and replicates the
+/// value, so the conversion reads it as a copy. Evaluating the
+/// move per element would fail on the second read (the source
+/// having been moved out of).
+#[test]
+fn repeat_of_moved_array_replicates() {
+    let inner = mir::Ty::Array(Box::new(u32_ty()), mir::ArrayLen::Known(2));
+    let outer = mir::Ty::Array(Box::new(inner.clone()), mir::ArrayLen::Known(3));
+    let main = mir::Body::new(
+        decls(&[outer.clone(), inner.clone(), outer]),
+        0,
+        vec![block(
+            vec![
+                assign(place(1), mir::Rvalue::Repeat(const_u32(7), 2)),
+                assign(
+                    place(2),
+                    mir::Rvalue::Repeat(mir::Operand::Move(place(1)), 3),
+                ),
+                assign(place(0), mir::Rvalue::Use(copy(2))),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("main", main);
+    let value = interpret_mir(&prog, "main", Vec::new()).expect("main runs");
+    let row = Value::Tuple(vec![Value::Uint(7), Value::Uint(7)]);
+    assert_eq!(value, Value::Tuple(vec![row.clone(), row.clone(), row]));
+}
