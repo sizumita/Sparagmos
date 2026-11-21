@@ -85,6 +85,14 @@ pub struct Converter {
     /// Depth of nested `record_debug_shape` calls currently
     /// unfolding field types (see there).
     debug_shape_depth: usize,
+    /// Thread-local statics converted so far, keyed by the
+    /// converted `DefId` (see `sm::ThreadLocalDef`). Handed to the
+    /// interpreter with the converted program, which seeds each
+    /// thread's storage from these initializers. Filled when a
+    /// `ThreadLocalRef` rvalue is converted; a static whose
+    /// initializer cannot be decoded gets no entry, and its
+    /// `ThreadLocalRef` stays an explicit error at run time.
+    pub thread_locals: sm::ThreadLocals,
     /// Declared types of the target crate's statics, recorded by
     /// the item scan before conversion (`note_static_ty`).
     static_tys: HashMap<sm::DefId, rustc_public::ty::Ty>,
@@ -211,6 +219,7 @@ impl Converter {
             adt_shapes: sm::AdtShapes::new(),
             adt_debug_shapes: sm::AdtDebugShapes::new(),
             debug_shape_depth: 0,
+            thread_locals: sm::ThreadLocals::new(),
             static_tys: HashMap::new(),
             errors: Vec::new(),
         }
@@ -248,6 +257,40 @@ impl Converter {
     pub fn note_static_ty<D: CrateDef>(&mut self, def: &D, ty: rustc_public::ty::Ty) {
         let id = self.crate_def_id(def);
         self.static_tys.insert(id, ty);
+    }
+
+    /// Record the definition of the thread-local static `item`
+    /// (already assigned the Sparagmos id `id`) in the program's
+    /// thread-locals table: its declared type and its initializer,
+    /// decoded from the static's initializer allocation the way a
+    /// plain static's seed is decoded in `decode_static_ref`. The
+    /// declared type comes from the item scan's table when the
+    /// static was recorded there; otherwise it is asked of the
+    /// item itself, guarded the way the item scan guards it (this
+    /// is rvalue conversion, not the constant decoder). A static
+    /// whose type or initializer cannot be obtained gets no entry:
+    /// the interpreter then reports its `ThreadLocalRef` as an
+    /// explicit error instead of inventing storage.
+    fn note_thread_local(&mut self, id: sm::DefId, item: &rustc_public::CrateItem) {
+        if self.thread_locals.contains_key(&id) {
+            return;
+        }
+        let Some(ty) = self.static_tys.get(&id).cloned().or_else(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| item.ty())).ok()
+        }) else {
+            return;
+        };
+        let Ok(def) = mir::mono::StaticDef::try_from(item.clone()) else {
+            return;
+        };
+        let Ok(alloc) = def.eval_initializer() else {
+            return;
+        };
+        let Some(init) = self.decode_const(&ty, &alloc, 0, 0) else {
+            return;
+        };
+        let ty = self.ty(&ty);
+        self.thread_locals.insert(id, sm::ThreadLocalDef { ty, init });
     }
 
     /// Map a resolved function instance, reached through the
@@ -763,6 +806,7 @@ impl Converter {
             }
             R::ThreadLocalRef(item) => {
                 let id = self.crate_def_id(item);
+                self.note_thread_local(id, item);
                 sm::Rvalue::ThreadLocalRef(id)
             }
             R::AddressOf(kind, place) => {
