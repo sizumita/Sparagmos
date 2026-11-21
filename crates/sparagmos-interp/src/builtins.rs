@@ -1744,6 +1744,35 @@ impl<'a> Interpreter<'a> {
                             ))),
                         }
                     }
+                    Resolved::Static { name, projection } => {
+                        let base = self.read_resolved(frames, &Resolved::Static {
+                            name: name.clone(),
+                            projection: projection.clone(),
+                        })?;
+                        let len = base.len().ok_or_else(|| {
+                            InterpError::type_mismatch(
+                                "IndexMut::index_mut",
+                                "indexable value",
+                                base.kind_name(),
+                            )
+                        })?;
+                        if idx as u128 >= len {
+                            return Err(InterpError::panic(format!(
+                                "index out of bounds: the len is {len} but the index is {idx}"
+                            )));
+                        }
+                        match base {
+                            Value::Tuple(_) => {
+                                let mut projection = projection;
+                                projection.push(RefProj::Index(idx));
+                                Ok(Value::Ref(RefTarget::Static { name, projection }))
+                            }
+                            ref other => Err(unsupported(format!(
+                                "IndexMut::index_mut on a {} is not runtime-supported",
+                                other.kind_name()
+                            ))),
+                        }
+                    }
                     Resolved::Value(_) => Err(unsupported(
                         "IndexMut::index_mut on a constant aggregate is not runtime-supported",
                     )),

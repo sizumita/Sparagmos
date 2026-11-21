@@ -29,6 +29,7 @@
 use crate::error::{InterpError, InterpResult};
 use crate::ir::*;
 use crate::value::{RefProj, RefTarget, Value};
+use std::collections::{HashMap, HashSet};
 
 /// Interpreter limits / configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +95,12 @@ pub(crate) enum Resolved {
         projection: Vec<RefProj>,
     },
     Value(Value),
+    /// A place inside a `static` item's storage in the
+    /// interpreter's statics store.
+    Static {
+        name: String,
+        projection: Vec<RefProj>,
+    },
 }
 
 /// The interpreter state for one program.
@@ -108,6 +115,19 @@ pub struct Interpreter<'a> {
     /// Drop glue suspended on destructor calls (see
     /// [`DropContinuation`]); a stack, innermost last.
     drop_continuations: Vec<DropContinuation>,
+    /// The program-level statics store: one storage per `static`
+    /// item, keyed by the static's program key (see
+    /// [`crate::ir::Constant::StaticRef`]). A static's storage is
+    /// seeded lazily from the initializer constant its first
+    /// reference carries. Interior-mutable because most execution
+    /// paths hold only `&self`.
+    statics: std::cell::RefCell<HashMap<String, Value>>,
+    /// Statics whose seeding is already in flight further up the
+    /// stack (an initializer that mentions its own static through
+    /// a reference): a nested seeding request for one of these
+    /// must not start over — the outer seeding fills the storage,
+    /// and the nested reference simply names it.
+    statics_seeding: std::cell::RefCell<HashSet<String>>,
 }
 
 /// The synthetic address of a pointer value (see
@@ -148,6 +168,8 @@ impl<'a> Interpreter<'a> {
             next_frame_id: 0,
             output: String::new(),
             drop_continuations: Vec::new(),
+            statics: std::cell::RefCell::new(HashMap::new()),
+            statics_seeding: std::cell::RefCell::new(HashSet::new()),
         }
     }
 
@@ -483,6 +505,10 @@ impl<'a> Interpreter<'a> {
                                 local,
                                 projection,
                             } => RefTarget::place(frames[frame_pos].id, local, projection),
+                            Resolved::Static { name, projection } => RefTarget::Static {
+                                name,
+                                projection,
+                            },
                             Resolved::Value(_) => {
                                 return Err(InterpError::type_mismatch(
                                     "std::mem::drop",
@@ -524,6 +550,10 @@ impl<'a> Interpreter<'a> {
                             local,
                             projection,
                         } => RefTarget::place(frames[frame_pos].id, local, projection),
+                        Resolved::Static { name, projection } => RefTarget::Static {
+                            name,
+                            projection,
+                        },
                         Resolved::Value(_) => {
                             return Err(InterpError::type_mismatch(
                                 "Drop",
@@ -847,6 +877,9 @@ impl<'a> Interpreter<'a> {
                     Resolved::Value(_) => {
                         Ok(Value::Ref(RefTarget::Value(Box::new(value.clone()))))
                     }
+                    Resolved::Static { name, projection } => {
+                        Ok(Value::Ref(RefTarget::Static { name, projection }))
+                    }
                 }
             }
             Operand::Constant(_) => Ok(Value::Ref(RefTarget::Value(Box::new(value.clone())))),
@@ -934,6 +967,7 @@ impl<'a> Interpreter<'a> {
                 (base, projection)
             }
             RefTarget::Value(v) => ((**v).clone(), &[]),
+            RefTarget::Static { name, projection } => (self.static_base(name)?, projection),
             // A null pointer denotes nothing; there is no drop
             // glue to read through it.
             RefTarget::Null => return Ok(None),
@@ -971,6 +1005,14 @@ impl<'a> Interpreter<'a> {
             RefTarget::Value(v) => {
                 let projected = project_value((**v).clone(), path, "<drop>", "drop glue")?;
                 Ok(RefTarget::Value(Box::new(projected)))
+            }
+            RefTarget::Static { name, projection } => {
+                let mut projection = projection.clone();
+                projection.extend(path.iter().cloned());
+                Ok(RefTarget::Static {
+                    name: name.clone(),
+                    projection,
+                })
             }
             RefTarget::Null => Err(InterpError::type_mismatch(
                 "drop glue reference",
@@ -1237,6 +1279,81 @@ impl<'a> Interpreter<'a> {
         Ok(())
     }
 
+    /// The error for touching a static that has no storage: its
+    /// initializer constant was never evaluated, so there is no
+    /// seeded value to read or write. (Every reference to a static
+    /// carries its initializer and seeds the store when evaluated,
+    /// so this is unreachable for driver-produced programs.)
+    fn missing_static(&self, name: &str) -> InterpError {
+        InterpError::UnsupportedTerminator {
+            kind: format!(
+                "static `{name}` has no storage: its initializer constant was never evaluated"
+            ),
+        }
+    }
+
+    /// Seed the storage of the static `name` from its initializer
+    /// constant `seed`, unless it is already seeded. A static
+    /// whose initializer mentions itself (or a cycle of statics)
+    /// through a reference does not recurse: the nested reference
+    /// evaluates to a pointer at the storage the outer seeding is
+    /// about to fill, exactly as the nested reference in a native
+    /// static initializer names the static's address.
+    fn ensure_static(&self, name: &str, seed: &Constant) -> InterpResult<()> {
+        if self.statics.borrow().contains_key(name) {
+            return Ok(());
+        }
+        if !self.statics_seeding.borrow_mut().insert(name.to_string()) {
+            return Ok(());
+        }
+        let value = self.eval_constant(seed);
+        self.statics_seeding.borrow_mut().remove(name);
+        let value = value?;
+        self.statics.borrow_mut().insert(name.to_string(), value);
+        Ok(())
+    }
+
+    /// The current value of the static `name`'s storage.
+    fn static_base(&self, name: &str) -> InterpResult<Value> {
+        self.statics
+            .borrow()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| self.missing_static(name))
+    }
+
+    /// Set the discriminant of the ADT value `value` to `variant`,
+    /// as a `SetDiscriminant` statement does: a coroutine keeps its
+    /// state fields (they are the shared storage the transform
+    /// writes before the tag moves), an enum's old payload is
+    /// invalidated.
+    fn set_discriminant_value(
+        value: &mut Value,
+        variant: u32,
+        place: &Place,
+    ) -> InterpResult<()> {
+        match value {
+            Value::Coroutine { variant: current, .. } => {
+                *current = variant;
+                Ok(())
+            }
+            Value::Enum {
+                variant: current,
+                fields,
+            } => {
+                *current = variant;
+                // The old payload is invalidated, as in MIR.
+                fields.clear();
+                Ok(())
+            }
+            other => Err(InterpError::type_mismatch(
+                format!("SetDiscriminant on {place}"),
+                "ADT value",
+                other.kind_name(),
+            )),
+        }
+    }
+
     fn exec_statement(
         &self,
         frames: &mut Vec<Frame>,
@@ -1251,55 +1368,37 @@ impl<'a> Interpreter<'a> {
             }
             StatementKind::SetDiscriminant { place, variant } => {
                 let target = self.resolve_place(frames, body, place)?;
-                let Resolved::Place {
-                    frame_pos,
-                    local,
-                    projection,
-                } = target
-                else {
-                    return Err(InterpError::type_mismatch(
+                match target {
+                    Resolved::Place {
+                        frame_pos,
+                        local,
+                        projection,
+                    } => {
+                        let frame = &mut frames[frame_pos];
+                        let func = frame.func.clone();
+                        let slot = frame.locals.get_mut(local).ok_or_else(|| {
+                            InterpError::UnknownLocal {
+                                func: func.clone(),
+                                local,
+                            }
+                        })?;
+                        let place_desc = describe_resolved(local, &projection);
+                        let value = navigate_mut(slot, &projection, &func, &place_desc)?;
+                        Self::set_discriminant_value(value, *variant, place)
+                    }
+                    Resolved::Static { name, projection } => {
+                        let mut store = self.statics.borrow_mut();
+                        let slot = store
+                            .get_mut(&name)
+                            .ok_or_else(|| self.missing_static(&name))?;
+                        let place_desc = format!("static {name}");
+                        let value = navigate_mut(slot, &projection, "<static>", &place_desc)?;
+                        Self::set_discriminant_value(value, *variant, place)
+                    }
+                    Resolved::Value(_) => Err(InterpError::type_mismatch(
                         format!("SetDiscriminant on {place}"),
                         "mutable place",
                         "constant aggregate",
-                    ));
-                };
-                let frame = &mut frames[frame_pos];
-                let func = frame.func.clone();
-                let slot = frame.locals.get_mut(local).ok_or_else(|| {
-                    InterpError::UnknownLocal {
-                        func: func.clone(),
-                        local,
-                    }
-                })?;
-                let place_desc = describe_resolved(local, &projection);
-                let value = navigate_mut(slot, &projection, &func, &place_desc)?;
-                match value {
-                    Value::Coroutine {
-                        variant: current, ..
-                    } => {
-                        *current = *variant;
-                        // The state storage is shared between
-                        // states: the fields stay in place. The
-                        // transform sets the tag of the state it is
-                        // entering only after (or before) storing
-                        // that state's fields through downcast
-                        // projections, and values saved for later
-                        // states must survive this tag change.
-                        Ok(())
-                    }
-                    Value::Enum {
-                        variant: current,
-                        fields,
-                    } => {
-                        *current = *variant;
-                        // The old payload is invalidated, as in MIR.
-                        fields.clear();
-                        Ok(())
-                    }
-                    other => Err(InterpError::type_mismatch(
-                        format!("SetDiscriminant on {place}"),
-                        "ADT value",
-                        other.kind_name(),
                     )),
                 }
             }
@@ -1403,6 +1502,10 @@ impl<'a> Interpreter<'a> {
             Resolved::Value(value) => {
                 Value::Ref(RefTarget::Value(Box::new(value.clone())))
             }
+            Resolved::Static { name, projection } => Value::Ref(RefTarget::Static {
+                name: name.clone(),
+                projection: projection.clone(),
+            }),
         }
     }
 
@@ -1492,6 +1595,13 @@ impl<'a> Interpreter<'a> {
                 let projected = project_value(value, &[step], &func, &place.to_string())?;
                 Ok(Resolved::Value(projected))
             }
+            Resolved::Static {
+                name,
+                mut projection,
+            } => {
+                projection.push(step);
+                Ok(Resolved::Static { name, projection })
+            }
         }
     }
 
@@ -1551,6 +1661,10 @@ impl<'a> Interpreter<'a> {
                 projection: projection.clone(),
             }),
             Value::Ref(RefTarget::Value(v)) => Ok(Resolved::Value((**v).clone())),
+            Value::Ref(RefTarget::Static { name, projection }) => Ok(Resolved::Static {
+                name: name.clone(),
+                projection: projection.clone(),
+            }),
             Value::Ref(RefTarget::Null) => Err(InterpError::type_mismatch(
                 "dereference",
                 "reference",
@@ -1598,6 +1712,22 @@ impl<'a> Interpreter<'a> {
                     });
                 }
                 Ok(value.clone())
+            }
+            Resolved::Static { name, projection } => {
+                let base = self.static_base(name)?;
+                let func = frames
+                    .last()
+                    .map(|f| f.func.clone())
+                    .unwrap_or_else(|| "<static>".to_string());
+                let place_desc = format!("static {name}");
+                let value = project_value(base, projection, &func, &place_desc)?;
+                if value == Value::Uninit {
+                    return Err(InterpError::UninitializedRead {
+                        func,
+                        place: place_desc,
+                    });
+                }
+                Ok(value)
             }
             Resolved::Place {
                 frame_pos,
@@ -1659,6 +1789,20 @@ impl<'a> Interpreter<'a> {
                 "mutable place",
                 "constant aggregate",
             )),
+            Resolved::Static { name, projection } => {
+                let mut store = self.statics.borrow_mut();
+                let slot = store
+                    .get_mut(name)
+                    .ok_or_else(|| self.missing_static(name))?;
+                if projection.is_empty() {
+                    *slot = value;
+                    return Ok(());
+                }
+                let place_desc = format!("static {name}");
+                let slot = navigate_mut(slot, projection, "<static>", &place_desc)?;
+                *slot = value;
+                Ok(())
+            }
             Resolved::Place {
                 frame_pos,
                 local,
@@ -1704,7 +1848,9 @@ impl<'a> Interpreter<'a> {
     /// unsupported error, never a silent no-op.
     pub(crate) fn refcell_place(&self, value: &Value, name: &str) -> InterpResult<RefTarget> {
         match value {
-            Value::Ref(target @ RefTarget::Place { .. }) => Ok(target.clone()),
+            Value::Ref(target @ (RefTarget::Place { .. } | RefTarget::Static { .. })) => {
+                Ok(target.clone())
+            }
             Value::Ref(_) => Err(InterpError::UnsupportedTerminator {
                 kind: format!(
                     "runtime support: {name} on a RefCell with no live place \
@@ -1930,7 +2076,7 @@ impl<'a> Interpreter<'a> {
                     // the whole value does not run the moved-out
                     // part's glue a second time (rustc's drop flags
                     // track exactly this).
-                    if matches!(target, Resolved::Place { .. }) {
+                    if matches!(target, Resolved::Place { .. } | Resolved::Static { .. }) {
                         self.write_resolved(frames, &target, Value::Uninit)?;
                     }
                 }
@@ -1973,6 +2119,17 @@ impl<'a> Interpreter<'a> {
             },
             Constant::Ref(inner) => {
                 Value::Ref(RefTarget::Value(Box::new(self.eval_constant(inner)?)))
+            }
+            Constant::StaticRef {
+                name,
+                value,
+                projection,
+            } => {
+                self.ensure_static(name, value)?;
+                Value::Ref(RefTarget::Static {
+                    name: name.clone(),
+                    projection: projection.clone(),
+                })
             }
             Constant::SliceVal(elems) => {
                 let elems = elems
@@ -2226,7 +2383,15 @@ impl<'a> Interpreter<'a> {
                                             value,
                                         ))));
                                     }
-                                    Resolved::Place { .. } => {}
+                                    Resolved::Static { name, projection }
+                                        if !projection.is_empty() =>
+                                    {
+                                        break Ok(Value::Ref(RefTarget::Static {
+                                            name,
+                                            projection,
+                                        }));
+                                    }
+                                    Resolved::Place { .. } | Resolved::Static { .. } => {}
                                 }
                             }
                             break Err(InterpError::type_mismatch(
@@ -2268,6 +2433,9 @@ impl<'a> Interpreter<'a> {
                         projection,
                     ))),
                     Resolved::Value(value) => Ok(Value::Ref(RefTarget::Value(Box::new(value)))),
+                    Resolved::Static { name, projection } => {
+                        Ok(Value::Ref(RefTarget::Static { name, projection }))
+                    }
                 }
             }
             Rvalue::Len(place) => {
@@ -3029,6 +3197,21 @@ fn synthetic_addr(v: &Value) -> u128 {
         Value::Ref(RefTarget::Value(_)) => {
             mix(&mut h, 0x5eed_5eed_5eed_5eed);
         }
+        Value::Ref(RefTarget::Static { name, projection }) => {
+            mix(&mut h, 0x57a7_1c5_7a7_1c5);
+            for b in name.bytes() {
+                mix(&mut h, b as u128);
+            }
+            for step in projection {
+                let (tag, n) = match step {
+                    RefProj::Field(i) => (1u128, *i as u128),
+                    RefProj::Index(i) => (2u128, *i as u128),
+                    RefProj::Downcast(i) => (3u128, *i as u128),
+                };
+                mix(&mut h, tag);
+                mix(&mut h, n);
+            }
+        }
         Value::FatRef { base, .. } => {
             return synthetic_addr(base);
         }
@@ -3153,6 +3336,14 @@ pub(crate) fn refcell_sub_target(cell: &RefTarget, path: &[RefProj]) -> RefTarge
             RefTarget::Place {
                 frame: *frame,
                 local: *local,
+                projection,
+            }
+        }
+        RefTarget::Static { name, projection } => {
+            let mut projection = projection.clone();
+            projection.extend_from_slice(path);
+            RefTarget::Static {
+                name: name.clone(),
                 projection,
             }
         }

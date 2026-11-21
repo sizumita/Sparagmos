@@ -1034,6 +1034,20 @@ impl<'a> Converter<'a> {
     /// Display name for a `DefId` (function items, closure bodies,
     /// ADT types): the driver's full name table first, then the
     /// table of converted bodies, then the raw id.
+    /// The program key of the `static` item `def`: its display
+    /// name, disambiguated with the `DefId` when several named
+    /// items share that name (the [`program_keys`] rule applied to
+    /// statics). Computed from the name table alone, so every
+    /// conversion phase assigns the same key to the same static.
+    fn static_key(&self, def: &mir::DefId) -> String {
+        let name = self.def_display_name(def);
+        if self.names.values().filter(|n| **n == name).count() > 1 {
+            format!("{name}#{def}")
+        } else {
+            name
+        }
+    }
+
     fn def_display_name(&self, def: &mir::DefId) -> String {
         self.names
             .get(def)
@@ -1230,6 +1244,25 @@ impl<'a> Converter<'a> {
         }
     }
 
+    /// A projection step of a static reference, in the
+    /// interpreter's reference-projection form.
+    fn convert_ref_proj(&self, elem: &mir::PlaceElem) -> Result<RefProj, ConvertError> {
+        Ok(match elem {
+            mir::PlaceElem::Field(idx, _) => RefProj::Field(*idx as usize),
+            mir::PlaceElem::ConstantIndex {
+                offset,
+                from_end: false,
+                ..
+            } => RefProj::Index(*offset as usize),
+            mir::PlaceElem::Downcast(_, variant) => RefProj::Downcast(*variant),
+            other => {
+                return Err(ConvertError::UnsupportedConstant {
+                    kind: format!("projection {other:?} in a static reference"),
+                })
+            }
+        })
+    }
+
     fn convert_const_value(
         &self,
         value: &mir::ConstValue,
@@ -1308,6 +1341,27 @@ impl<'a> Converter<'a> {
                     _ => None,
                 };
                 ir::Constant::Ref(Box::new(self.convert_const_value(inner, inner_ctx)?))
+            }
+            mir::ConstValue::StaticRef { def, value, projection } => {
+                // The seed is the static's full initializer, typed
+                // by the pointee context exactly as for a plain
+                // reference constant; the reference itself names the
+                // static's program-level storage, projected from the
+                // static's base to the pointee.
+                let inner_ctx = match ctx {
+                    Some(mir::Ty::Ref(_, pointee, _) | mir::Ty::RawPtr(pointee, _)) => {
+                        Some(&**pointee)
+                    }
+                    _ => None,
+                };
+                ir::Constant::StaticRef {
+                    name: self.static_key(def),
+                    value: Box::new(self.convert_const_value(value, inner_ctx)?),
+                    projection: projection
+                        .iter()
+                        .map(|e| self.convert_ref_proj(e))
+                        .collect::<Result<_, _>>()?,
+                }
             }
             mir::ConstValue::SliceVal(elems) => ir::Constant::SliceVal(
                 elems
