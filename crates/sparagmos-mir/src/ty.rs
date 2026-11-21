@@ -52,6 +52,52 @@ pub type AdtDiscriminants = std::collections::HashMap<AdtDefId, DiscriminantValu
 /// interpreter.
 pub type AdtLayouts = std::collections::HashMap<String, (u64, u64)>;
 
+/// The derived-`Debug` shape of one monomorphic ADT instance: the
+/// names and field structure a `#[derive(Debug)]` expansion prints,
+/// recorded without any function body. Keyed like [`AdtLayouts`]
+/// by the rendered instance name - the type tag the interpreter's
+/// formatter sees - because the field *types* (which the formatter
+/// needs to format nested values with their own types known)
+/// differ per monomorphization even though the names do not.
+///
+/// The driver fills one entry per monomorphic struct/enum instance
+/// it converts (see `Converter::record_debug_shape` in the driver);
+/// the interpreter's `Debug` formatter consults the table when it
+/// meets an ADT value. An instance with no entry stays explicitly
+/// unsupported in the formatter. Unions get no entry: `Debug` is
+/// never derived for them, so formatting a union value is always a
+/// handwritten impl, which this table does not model.
+pub type AdtDebugShapes = std::collections::HashMap<String, AdtDebugShape>;
+
+/// Derived-`Debug` shape of one ADT instance (see
+/// [`AdtDebugShapes`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AdtDebugShape {
+    pub kind: AdtShapeKind,
+    pub variants: Vec<AdtDebugVariant>,
+}
+
+/// One variant of an [`AdtDebugShape`]: its printed name (for a
+/// struct, the type name) and its fields in declaration order.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AdtDebugVariant {
+    pub name: String,
+    pub fields: Vec<AdtDebugField>,
+}
+
+/// One field of an [`AdtDebugVariant`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct AdtDebugField {
+    /// The field name of a named-field variant; `None` for a
+    /// tuple field.
+    pub name: Option<String>,
+    /// The rendered type tag of the field's type in this
+    /// monomorphization (the same rendering [`AdtLayouts`] keys
+    /// use), so the formatter can format the field's value with
+    /// its type known.
+    pub ty: String,
+}
+
 /// The kind of an ADT, for shape purposes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AdtShapeKind {
