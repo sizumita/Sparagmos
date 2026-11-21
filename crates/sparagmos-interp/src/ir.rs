@@ -531,6 +531,15 @@ pub enum UnsizeMeta {
     Dyn {
         concrete: Option<String>,
         traits: Vec<String>,
+        /// The concrete type's drop glue, built by conversion from
+        /// the cast's pointee type (the full generic instantiation,
+        /// so no two instantiations can be confused). The value
+        /// carries it from the cast on, like a vtable's drop shim.
+        /// `None` when conversion could not account for the
+        /// pointee's glue (dropping the value then fails
+        /// explicitly) and for supertrait upcasts, where the value
+        /// already carries its own glue.
+        glue: Option<DropGlue>,
     },
 }
 
@@ -681,6 +690,16 @@ pub enum DropPlan {
     /// dropped at scope end for the payload shapes the model can
     /// account for.
     Dynamic,
+    /// The glue of a `dyn Trait` value: the dropped type is a trait
+    /// object, so the glue is the *concrete* type's, which only the
+    /// value knows. Executing it reads the value: a
+    /// [`crate::value::Value::DynRef`] carries the concrete type's
+    /// drop glue (built by conversion at the unsizing cast, the way
+    /// a real vtable carries the drop shim), and the interpreter
+    /// runs it against the pointee. A dyn value whose glue
+    /// conversion could not account for is an explicit error, never
+    /// a silent skip.
+    Dyn,
 }
 
 /// The drop glue of one `Drop` terminator: the plan for the dropped

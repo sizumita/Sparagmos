@@ -2190,6 +2190,11 @@ impl<'a> Interpreter<'a> {
                             "std::any::Any".to_string(),
                             "std::marker::Send".to_string(),
                         ],
+                        // Fabricated by the interpreter, not formed
+                        // by an unsizing cast: no accounted glue
+                        // travels with it, and its drop is judged
+                        // by shape (see `DropPlan::Dyn`).
+                        drop_glue: None,
                     }),
                     other => Err(InterpError::type_mismatch(
                         format!("builtin {name}"),
@@ -2786,6 +2791,23 @@ impl<'a> Interpreter<'a> {
                         ref other => Err(InterpError::type_mismatch(
                             "DerefMut::deref_mut for Box",
                             "boxed value",
+                            other.kind_name(),
+                        )),
+                    }
+                } else if self_ty.starts_with("std::mem::ManuallyDrop<") {
+                    // The same one-field aggregate as
+                    // `ManuallyDrop::new`: `deref_mut` yields a
+                    // reference to the held value, in the same
+                    // value-reference form as `Box` above.
+                    let pointee = self.resolve_value(frames, &vals[0])?;
+                    match pointee {
+                        Value::Enum { fields, .. } if fields.len() == 1 => {
+                            let inner = fields.into_iter().next().expect("len checked");
+                            Ok(Value::Ref(RefTarget::Value(Box::new(inner))))
+                        }
+                        ref other => Err(InterpError::type_mismatch(
+                            "DerefMut::deref_mut for ManuallyDrop",
+                            "one-field aggregate",
                             other.kind_name(),
                         )),
                     }

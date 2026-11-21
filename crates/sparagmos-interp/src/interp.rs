@@ -81,15 +81,37 @@ pub(crate) struct Frame {
 struct DropContinuation {
     /// Frame id of the destructor call this work waits on.
     callee_frame: u64,
-    /// The dropped place the remaining work applies to.
+    /// The glue session the remaining work belongs to.
+    session: GlueSession,
+    /// Glue sessions suspended below `session` (dyn glue runs the
+    /// concrete type's glue as a nested session; see
+    /// [`GlueCompletion::Resume`]), innermost last.
+    sessions: Vec<GlueSession>,
+}
+
+/// One run of drop glue: a work stack of (path from `root`, plan)
+/// items against one dropped place, with the ADT glue table the
+/// plans index into.
+struct GlueSession {
+    /// The dropped place the work applies to.
     root: RefTarget,
-    /// Remaining (path from `root`, plan) items, a stack: the last
-    /// item runs next.
+    /// Remaining work items, a stack: the last item runs next.
     work: Vec<(Vec<RefProj>, crate::ir::DropPlan)>,
     /// ADT glue table of the originating `Drop` terminator.
     adts: Vec<crate::ir::DropPlan>,
-    /// Block the owner frame jumps to when the work is done.
-    target: BasicBlock,
+    /// What happens when the work runs out.
+    completion: GlueCompletion,
+}
+
+/// How a glue session ends when its work runs out.
+enum GlueCompletion {
+    /// The session is a whole `Drop` terminator (or `mem::drop`
+    /// call): the dropped place's own slot is cleared and the owner
+    /// frame jumps to this block.
+    Jump(BasicBlock),
+    /// The session is the nested glue of a `dyn` value's concrete
+    /// type: the session below it on the stack resumes.
+    Resume,
 }
 
 /// A place fully resolved against the frame stack: either a concrete
@@ -648,7 +670,8 @@ impl<'a> Interpreter<'a> {
                     if let Some(glue) = drop_glue {
                         // `std::mem::drop` with the dropped type's glue
                         // attached by conversion: run it against the
-                        // argument place, exactly like a `Drop`
+                        // argument (a place, or a constant's value),
+                        // exactly like a `Drop`
                         // terminator — a destructor call suspends the
                         // remaining glue on a `DropContinuation` and
                         // resumes it when the destructor returns. The
@@ -667,33 +690,39 @@ impl<'a> Interpreter<'a> {
                                 "no arguments",
                             ));
                         };
-                        let place = match operand {
-                            Operand::Copy(place) | Operand::Move(place) => place,
-                            _ => {
-                                return Err(InterpError::type_mismatch(
-                                    "std::mem::drop",
-                                    "a place argument",
-                                    "a constant argument",
-                                ));
+                        // The glue runs against the argument place,
+                        // or — for a constant argument, whose value
+                        // conversion accounted for when it attached
+                        // the glue — against the constant's own value.
+                        let root = match operand {
+                            Operand::Copy(place) | Operand::Move(place) => {
+                                let place = place.clone();
+                                match self.resolve_place(&frames, body, &place)? {
+                                    Resolved::Place {
+                                        frame_pos,
+                                        local,
+                                        projection,
+                                    } => RefTarget::place(
+                                        frames[frame_pos].id,
+                                        local,
+                                        projection,
+                                    ),
+                                    Resolved::Static { name, projection } => {
+                                        RefTarget::Static { name, projection }
+                                    }
+                                    Resolved::Value(_) => {
+                                        return Err(InterpError::type_mismatch(
+                                            "std::mem::drop",
+                                            "a storage place",
+                                            "a constant aggregate",
+                                        ));
+                                    }
+                                }
                             }
-                        };
-                        let resolved = self.resolve_place(&frames, body, place)?;
-                        let root = match resolved {
-                            Resolved::Place {
-                                frame_pos,
-                                local,
-                                projection,
-                            } => RefTarget::place(frames[frame_pos].id, local, projection),
-                            Resolved::Static { name, projection } => RefTarget::Static {
-                                name,
-                                projection,
-                            },
-                            Resolved::Value(_) => {
-                                return Err(InterpError::type_mismatch(
-                                    "std::mem::drop",
-                                    "a storage place",
-                                    "a constant aggregate",
-                                ));
+                            Operand::Constant(_) => {
+                                let value =
+                                    self.eval_operand(&mut frames, body, operand)?;
+                                RefTarget::Value(Box::new(value))
                             }
                         };
                         self.write_place(frames, body, &destination, Value::Unit)?;
@@ -739,12 +768,13 @@ impl<'a> Interpreter<'a> {
                             name,
                             projection,
                         },
-                        Resolved::Value(_) => {
-                            return Err(InterpError::type_mismatch(
-                                "Drop",
-                                "a storage place",
-                                "a constant aggregate",
-                            ));
+                        Resolved::Value(value) => {
+                            // The place is the deref of a value
+                            // reference (a `Box` / `ManuallyDrop`
+                            // deref in this model): the glue runs
+                            // against that value itself, as it does
+                            // for a `mem::drop` constant argument.
+                            RefTarget::Value(Box::new(value))
                         }
                     };
                     let work = vec![(Vec::new(), glue.root.clone())];
@@ -762,13 +792,7 @@ impl<'a> Interpreter<'a> {
                     {
                         let cont = self.drop_continuations.remove(pos);
                         frames.pop();
-                        self.run_drop_glue(
-                            frames,
-                            cont.root,
-                            cont.work,
-                            &cont.adts,
-                            cont.target,
-                        )?;
+                        self.run_glue_session(frames, cont.session, cont.sessions)?;
                         continue;
                     }
                     let frame = frames.pop().expect("frame");
@@ -878,6 +902,7 @@ impl<'a> Interpreter<'a> {
             base,
             concrete,
             traits,
+            ..
         } = args.first()?
         else {
             return None;
@@ -1378,269 +1403,370 @@ impl<'a> Interpreter<'a> {
         &mut self,
         frames: &mut Vec<Frame>,
         root: RefTarget,
-        mut work: Vec<(Vec<RefProj>, crate::ir::DropPlan)>,
+        work: Vec<(Vec<RefProj>, crate::ir::DropPlan)>,
         adts: &[crate::ir::DropPlan],
         target: BasicBlock,
     ) -> InterpResult<()> {
+        let session = GlueSession {
+            root,
+            work,
+            adts: adts.to_vec(),
+            completion: GlueCompletion::Jump(target),
+        };
+        self.run_glue_session(frames, session, Vec::new())
+    }
+
+    /// Run one glue session (and, below it, any sessions suspended
+    /// under it) until the outermost session completes or a
+    /// destructor call suspends the run.
+    fn run_glue_session(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        mut active: GlueSession,
+        mut suspended: Vec<GlueSession>,
+    ) -> InterpResult<()> {
         use crate::ir::DropPlan as P;
-        while let Some((path, plan)) = work.pop() {
-            self.tick()?;
-            match plan {
-                P::Trivial => {}
-                P::Untyped => {
-                    // The type of this part is unrecorded, so judge
-                    // by the value's own shape: kinds that never
-                    // carry glue pass, tuples recurse (a tuple has
-                    // no destructor of its own), and an ADT value
-                    // might hide a destructor — an explicit error.
-                    match self.read_at(frames, &root, &path)? {
-                        None => {}
-                        Some(Value::Tuple(items)) => {
-                            for i in (0..items.len()).rev() {
-                                let mut sub = path.clone();
-                                sub.push(RefProj::Index(i));
-                                work.push((sub, P::Untyped));
+        'sessions: loop {
+            while let Some((path, plan)) = active.work.pop() {
+                self.tick()?;
+                match plan {
+                    P::Trivial => {}
+                    P::Untyped => {
+                        // The type of this part is unrecorded, so judge
+                        // by the value's own shape: kinds that never
+                        // carry glue pass, tuples recurse (a tuple has
+                        // no destructor of its own), and an ADT value
+                        // might hide a destructor — an explicit error.
+                        match self.read_at(frames, &active.root, &path)? {
+                            None => {}
+                            Some(Value::Tuple(items)) => {
+                                for i in (0..items.len()).rev() {
+                                    let mut sub = path.clone();
+                                    sub.push(RefProj::Index(i));
+                                    active.work.push((sub, P::Untyped));
+                                }
                             }
+                            // An enum with no fields has no contents
+                            // whose glue could hide here (its own
+                            // destructor, if any, is a separate plan
+                            // node): nothing to judge, like an empty
+                            // tuple. Typed zero-sized constants make
+                            // this shape common — a fieldless variant
+                            // written by an aggregate and never
+                            // projected lands here with an untyped plan.
+                            Some(Value::Enum { fields, .. }) if fields.is_empty() => {}
+                            Some(Value::Enum { .. }) | Some(Value::Coroutine { .. }) => {
+                                return Err(InterpError::UnsupportedTerminator {
+                                    kind: "Drop".to_string(),
+                                });
+                            }
+                            Some(_) => {}
                         }
-                        // An enum with no fields has no contents
-                        // whose glue could hide here (its own
-                        // destructor, if any, is a separate plan
-                        // node): nothing to judge, like an empty
-                        // tuple. Typed zero-sized constants make
-                        // this shape common — a fieldless variant
-                        // written by an aggregate and never
-                        // projected lands here with an untyped plan.
-                        Some(Value::Enum { fields, .. }) if fields.is_empty() => {}
-                        Some(Value::Enum { .. }) | Some(Value::Coroutine { .. }) => {
-                            return Err(InterpError::UnsupportedTerminator {
-                                kind: "Drop".to_string(),
-                            });
-                        }
-                        Some(_) => {}
                     }
-                }
-                P::Unknown => {
-                    return Err(InterpError::UnsupportedTerminator {
-                        kind: "Drop".to_string(),
-                    });
-                }
-                P::Seq(plans) => {
-                    for plan in plans.into_iter().rev() {
-                        work.push((path.clone(), plan));
-                    }
-                }
-                P::At { path: extra, plan } => {
-                    let mut full = path;
-                    full.extend(extra);
-                    work.push((full, *plan));
-                }
-                P::Adt { index } => {
-                    let plan = adts.get(index).cloned().ok_or_else(|| {
-                        InterpError::type_mismatch(
-                            "drop glue",
-                            "an ADT plan in the glue table",
-                            "a glue index out of range",
-                        )
-                    })?;
-                    work.push((path, plan));
-                }
-                P::Fields { fields, complete } => {
-                    let Some(value) = self.read_at(frames, &root, &path)? else {
-                        continue;
-                    };
-                    let is_coroutine = matches!(value, Value::Coroutine { .. });
-                    let items = match value {
-                        Value::Tuple(items) => items,
-                        Value::Enum { fields, .. } => fields,
-                        // A closure's fields are its captures.
-                        Value::Closure { env, .. } => env,
-                        Value::Coroutine { fields, .. } => fields,
-                        other => {
-                            return Err(InterpError::type_mismatch(
-                                "drop glue",
-                                "a tuple or ADT value",
-                                other.kind_name(),
-                            ));
-                        }
-                    };
-                    if items.len() != fields.len()
-                        && !(is_coroutine && items.len() < fields.len())
-                    {
-                        // With `complete`, conversion proved the
-                        // field count, so a mismatch means the value
-                        // is malformed; without it, the value holds
-                        // fields whose glue conversion could not
-                        // account for. Either way the drop cannot be
-                        // carried out faithfully: explicit, never
-                        // silent.
-                        let _ = complete;
+                    P::Unknown => {
                         return Err(InterpError::UnsupportedTerminator {
                             kind: "Drop".to_string(),
                         });
                     }
-                    for (i, field_plan) in fields.into_iter().enumerate().rev() {
-                        if i >= items.len() {
-                            // Only reachable for a coroutine value
-                            // whose storage is shorter than the plan:
-                            // the field was never written, so it
-                            // holds nothing to drop.
+                    P::Seq(plans) => {
+                        for plan in plans.into_iter().rev() {
+                            active.work.push((path.clone(), plan));
+                        }
+                    }
+                    P::At { path: extra, plan } => {
+                        let mut full = path;
+                        full.extend(extra);
+                        active.work.push((full, *plan));
+                    }
+                    P::Adt { index } => {
+                        let plan = active.adts.get(index).cloned().ok_or_else(|| {
+                            InterpError::type_mismatch(
+                                "drop glue",
+                                "an ADT plan in the glue table",
+                                "a glue index out of range",
+                            )
+                        })?;
+                        active.work.push((path, plan));
+                    }
+                    P::Fields { fields, complete } => {
+                        let Some(value) = self.read_at(frames, &active.root, &path)? else {
+                            continue;
+                        };
+                        let is_coroutine = matches!(value, Value::Coroutine { .. });
+                        let items = match value {
+                            Value::Tuple(items) => items,
+                            Value::Enum { fields, .. } => fields,
+                            // A closure's fields are its captures.
+                            Value::Closure { env, .. } => env,
+                            Value::Coroutine { fields, .. } => fields,
+                            other => {
+                                return Err(InterpError::type_mismatch(
+                                    "drop glue",
+                                    "a tuple or ADT value",
+                                    other.kind_name(),
+                                ));
+                            }
+                        };
+                        if items.len() != fields.len()
+                            && !(is_coroutine && items.len() < fields.len())
+                        {
+                            // With `complete`, conversion proved the
+                            // field count, so a mismatch means the value
+                            // is malformed; without it, the value holds
+                            // fields whose glue conversion could not
+                            // account for. Either way the drop cannot be
+                            // carried out faithfully: explicit, never
+                            // silent.
+                            let _ = complete;
+                            return Err(InterpError::UnsupportedTerminator {
+                                kind: "Drop".to_string(),
+                            });
+                        }
+                        for (i, field_plan) in fields.into_iter().enumerate().rev() {
+                            if i >= items.len() {
+                                // Only reachable for a coroutine value
+                                // whose storage is shorter than the plan:
+                                // the field was never written, so it
+                                // holds nothing to drop.
+                                continue;
+                            }
+                            if field_plan != P::Trivial {
+                                let mut sub = path.clone();
+                                sub.push(RefProj::Field(i));
+                                active.work.push((sub, field_plan));
+                            }
+                        }
+                    }
+                    P::Each { elem } => {
+                        let Some(value) = self.read_at(frames, &active.root, &path)? else {
+                            continue;
+                        };
+                        let (count, is_enum) = match &value {
+                            Value::Tuple(items) => (items.len(), false),
+                            Value::Enum { fields, .. } => (fields.len(), true),
+                            other => {
+                                return Err(InterpError::type_mismatch(
+                                    "drop glue",
+                                    "an array, tuple or Vec value",
+                                    other.kind_name(),
+                                ));
+                            }
+                        };
+                        for i in (0..count).rev() {
+                            let mut sub = path.clone();
+                            sub.push(if is_enum {
+                                RefProj::Field(i)
+                            } else {
+                                RefProj::Index(i)
+                            });
+                            active.work.push((sub, (*elem).clone()));
+                        }
+                    }
+                    P::Variants { variants } => {
+                        let Some(value) = self.read_at(frames, &active.root, &path)? else {
+                            continue;
+                        };
+                        let variant = match value {
+                            Value::Enum { variant, .. } => variant,
+                            Value::Coroutine { variant, .. } => variant,
+                            Value::Tuple(_) => 0,
+                            other => {
+                                return Err(InterpError::type_mismatch(
+                                    "drop glue",
+                                    "an ADT value",
+                                    other.kind_name(),
+                                ));
+                            }
+                        };
+                        let plan = variants
+                            .get(variant as usize)
+                            .cloned()
+                            .unwrap_or(P::Unknown);
+                        active.work.push((path, plan));
+                    }
+                    P::RefCellRelease { mutable } => {
+                        // A moved-out / never-written guard has no
+                        // borrow to release, exactly like drop flags in
+                        // real MIR.
+                        let Some(guard) = self.read_at(frames, &active.root, &path)? else {
+                            continue;
+                        };
+                        self.release_refcell_borrow(frames, &guard, mutable)?;
+                    }
+                    P::ChannelHandleDrop { sender } => {
+                        // A moved-out / never-written handle has no
+                        // count to decrement, exactly like drop flags
+                        // in real MIR.
+                        let Some(value) = self.read_at(frames, &active.root, &path)? else {
+                            continue;
+                        };
+                        let Some(id) = channel_handle_id(&value) else {
+                            return Err(InterpError::type_mismatch(
+                                "channel handle drop glue",
+                                "an mpsc channel handle",
+                                value.kind_name(),
+                            ));
+                        };
+                        self.channel_handle_dropped(
+                            id,
+                            if sender { "sender" } else { "receiver" },
+                        );
+                    }
+                    P::Dynamic => {
+                        // A moved-out / never-written place holds
+                        // nothing to drop, as with rustc's drop flags.
+                        if let Some(value) = self.read_at(frames, &active.root, &path)? {
+                            drop_dyn_value(&value)?;
+                        }
+                    }
+                    P::Dyn => {
+                        // The dropped value is a trait object: run the
+                        // concrete type's glue, which the value
+                        // carries from its unsizing cast, against the
+                        // pointee as a nested session.
+                        let Some(value) = self.read_at(frames, &active.root, &path)? else {
+                            continue;
+                        };
+                        let Value::DynRef {
+                            base,
+                            drop_glue,
+                            ..
+                        } = value
+                        else {
+                            // Not a trait-object value at all: judge
+                            // it by its shape, as the `Dynamic` plan
+                            // does.
+                            drop_unaccounted_dyn(&value)?;
+                            continue;
+                        };
+                        let Some(glue) = drop_glue.map(|g| *g) else {
+                            // The value carries no accounted glue:
+                            // it was fabricated by the interpreter
+                            // itself (a caught panic's payload box, a
+                            // joined thread's message box) rather than
+                            // formed by an unsizing cast. Judge its
+                            // contents by shape; shapes that can hide
+                            // a destructor are explicit errors, never
+                            // a silent skip.
+                            drop_unaccounted_dyn(&base)?;
+                            continue;
+                        };
+                        if glue.root == P::Trivial {
                             continue;
                         }
-                        if field_plan != P::Trivial {
-                            let mut sub = path.clone();
-                            sub.push(RefProj::Field(i));
-                            work.push((sub, field_plan));
-                        }
+                        // The pointee the glue applies to: inside the
+                        // one-field aggregate for a smart pointer
+                        // built by the `new` builtins, or behind the
+                        // data pointer itself for a pointer-shaped
+                        // base.
+                        let pointee_root = match &*base {
+                            Value::Enum { fields, .. } if fields.len() == 1 => {
+                                RefTarget::Value(Box::new(fields[0].clone()))
+                            }
+                            Value::Ref(target) => target.clone(),
+                            other => {
+                                return Err(InterpError::type_mismatch(
+                                    "drop glue",
+                                    "a box aggregate or reference dyn data pointer",
+                                    other.kind_name(),
+                                ));
+                            }
+                        };
+                        let nested = GlueSession {
+                            root: pointee_root,
+                            work: vec![(Vec::new(), glue.root)],
+                            adts: glue.adts,
+                            completion: GlueCompletion::Resume,
+                        };
+                        suspended.push(std::mem::replace(&mut active, nested));
+                        continue 'sessions;
                     }
-                }
-                P::Each { elem } => {
-                    let Some(value) = self.read_at(frames, &root, &path)? else {
-                        continue;
-                    };
-                    let (count, is_enum) = match &value {
-                        Value::Tuple(items) => (items.len(), false),
-                        Value::Enum { fields, .. } => (fields.len(), true),
-                        other => {
+                    P::CallDtor { func } => {
+                        if self.read_at(frames, &active.root, &path)?.is_none() {
+                            // Moved out of / never written: no glue, as
+                            // with rustc's drop flags.
+                            continue;
+                        }
+                        let callee = self.program.get(&func).cloned().ok_or_else(|| {
+                            InterpError::UnknownFunction { name: func.clone() }
+                        })?;
+                        if frames.len() >= self.config.max_call_depth {
+                            return Err(InterpError::CallDepthExceeded {
+                                limit: self.config.max_call_depth,
+                            });
+                        }
+                        if callee.arg_count != 1 || callee.local_count() < 2 {
                             return Err(InterpError::type_mismatch(
-                                "drop glue",
-                                "an array, tuple or Vec value",
-                                other.kind_name(),
+                                format!("destructor `{func}`"),
+                                "one argument",
+                                format!("{} argument(s)", callee.arg_count),
                             ));
                         }
-                    };
-                    for i in (0..count).rev() {
-                        let mut sub = path.clone();
-                        sub.push(if is_enum {
-                            RefProj::Field(i)
-                        } else {
-                            RefProj::Index(i)
+                        let target_ref = self.extend_ref(&active.root, &path)?;
+                        let mut locals = vec![Value::Uninit; callee.local_count()];
+                        locals[1] = Value::Ref(target_ref);
+                        let frame_id = self.fresh_frame_id();
+                        self.drop_continuations.push(DropContinuation {
+                            callee_frame: frame_id,
+                            session: active,
+                            sessions: suspended,
                         });
-                        work.push((sub, (*elem).clone()));
+                        frames.push(Frame {
+                            id: frame_id,
+                            func,
+                            locals,
+                            block: 0,
+                            stmt: 0,
+                            return_dest: None,
+                            return_block: None,
+                        });
+                        return Ok(());
                     }
                 }
-                P::Variants { variants } => {
-                    let Some(value) = self.read_at(frames, &root, &path)? else {
-                        continue;
-                    };
-                    let variant = match value {
-                        Value::Enum { variant, .. } => variant,
-                        Value::Coroutine { variant, .. } => variant,
-                        Value::Tuple(_) => 0,
-                        other => {
-                            return Err(InterpError::type_mismatch(
-                                "drop glue",
-                                "an ADT value",
-                                other.kind_name(),
-                            ));
+            }
+            // The active session's work is done.
+            match active.completion {
+                GlueCompletion::Jump(target) => {
+                    // Glue finished: the dropped place is dead, as in
+                    // MIR. A direct local of the owner frame is
+                    // cleared.
+                    if let RefTarget::Place {
+                        frame,
+                        local,
+                        projection,
+                    } = &active.root
+                    {
+                        if projection.is_empty() {
+                            let frame_pos = self.frame_pos(frames, *frame)?;
+                            if let Some(slot) = frames[frame_pos].locals.get_mut(*local) {
+                                *slot = Value::Uninit;
+                            }
                         }
-                    };
-                    let plan = variants
-                        .get(variant as usize)
+                    }
+                    let owner = frames.last().expect("owner frame");
+                    let owner_body = self
+                        .program
+                        .get(&owner.func)
                         .cloned()
-                        .unwrap_or(P::Unknown);
-                    work.push((path, plan));
+                        .ok_or_else(|| InterpError::UnknownFunction {
+                            name: owner.func.clone(),
+                        })?;
+                    return Self::jump(frames, &owner_body, target);
                 }
-                P::ChannelHandleDrop { sender } => {
-                    // A moved-out / never-written handle has no
-                    // count to decrement, exactly like drop flags
-                    // in real MIR.
-                    let Some(value) = self.read_at(frames, &root, &path)? else {
-                        continue;
-                    };
-                    let Some(id) = channel_handle_id(&value) else {
+                GlueCompletion::Resume => match suspended.pop() {
+                    Some(session) => {
+                        active = session;
+                    }
+                    None => {
                         return Err(InterpError::type_mismatch(
-                            "channel handle drop glue",
-                            "an mpsc channel handle",
-                            value.kind_name(),
-                        ));
-                    };
-                    self.channel_handle_dropped(id, if sender { "sender" } else { "receiver" });
-                }
-                P::RefCellRelease { mutable } => {
-                    // A moved-out / never-written guard has no
-                    // borrow to release, exactly like drop flags in
-                    // real MIR.
-                    let Some(guard) = self.read_at(frames, &root, &path)? else {
-                        continue;
-                    };
-                    self.release_refcell_borrow(frames, &guard, mutable)?;
-                }
-                P::Dynamic => {
-                    // A moved-out / never-written place holds
-                    // nothing to drop, as with rustc's drop flags.
-                    if let Some(value) = self.read_at(frames, &root, &path)? {
-                        drop_dyn_value(&value)?;
-                    }
-                }
-                P::CallDtor { func } => {
-                    if self.read_at(frames, &root, &path)?.is_none() {
-                        // Moved out of / never written: no glue, as
-                        // with rustc's drop flags.
-                        continue;
-                    }
-                    let callee = self.program.get(&func).cloned().ok_or_else(|| {
-                        InterpError::UnknownFunction { name: func.clone() }
-                    })?;
-                    if frames.len() >= self.config.max_call_depth {
-                        return Err(InterpError::CallDepthExceeded {
-                            limit: self.config.max_call_depth,
-                        });
-                    }
-                    if callee.arg_count != 1 || callee.local_count() < 2 {
-                        return Err(InterpError::type_mismatch(
-                            format!("destructor `{func}`"),
-                            "one argument",
-                            format!("{} argument(s)", callee.arg_count),
+                            "drop glue",
+                            "an enclosing glue session to resume",
+                            "none",
                         ));
                     }
-                    let target_ref = self.extend_ref(&root, &path)?;
-                    let mut locals = vec![Value::Uninit; callee.local_count()];
-                    locals[1] = Value::Ref(target_ref);
-                    let frame_id = self.fresh_frame_id();
-                    self.drop_continuations.push(DropContinuation {
-                        callee_frame: frame_id,
-                        root,
-                        work,
-                        adts: adts.to_vec(),
-                        target,
-                    });
-                    frames.push(Frame {
-                        id: frame_id,
-                        func,
-                        locals,
-                        block: 0,
-                        stmt: 0,
-                        return_dest: None,
-                        return_block: None,
-                    });
-                    return Ok(());
-                }
+                },
             }
         }
-        // Glue finished: the dropped place is dead, as in MIR. A
-        // direct local of the owner frame is cleared.
-        if let RefTarget::Place {
-            frame,
-            local,
-            projection,
-        } = &root
-        {
-            if projection.is_empty() {
-                let frame_pos = self.frame_pos(frames, *frame)?;
-                if let Some(slot) = frames[frame_pos].locals.get_mut(*local) {
-                    *slot = Value::Uninit;
-                }
-            }
-        }
-        let owner = frames.last().expect("owner frame");
-        let owner_body = self
-            .program
-            .get(&owner.func)
-            .cloned()
-            .ok_or_else(|| InterpError::UnknownFunction {
-                name: owner.func.clone(),
-            })?;
-        Self::jump(frames, &owner_body, target)
     }
 
     fn jump(frames: &mut Vec<Frame>, body: &Body, target: BasicBlock) -> InterpResult<()> {
@@ -3297,18 +3423,25 @@ impl<'a> Interpreter<'a> {
                 let v = self.eval_operand(frames, body, operand)?;
                 match meta {
                     UnsizeMeta::Slice => self.unsize_to_slice(frames, v),
-                    UnsizeMeta::Dyn { concrete, traits } => match v {
-                        // A supertrait upcast: the data pointer and
-                        // the concrete type carry over; only the
-                        // bounds the pointer answers to change.
+                    UnsizeMeta::Dyn {
+                        concrete,
+                        traits,
+                        glue,
+                    } => match v {
+                        // A supertrait upcast: the data pointer, the
+                        // concrete type and its drop glue carry over;
+                        // only the bounds the pointer answers to
+                        // change.
                         Value::DynRef {
                             base,
                             concrete: existing,
+                            drop_glue,
                             ..
                         } => Ok(Value::DynRef {
                             base,
                             concrete: existing,
                             traits: traits.clone(),
+                            drop_glue,
                         }),
                         Value::Ref(_) | Value::FatRef { .. } | Value::Enum { .. } => {
                             let concrete = concrete.clone().ok_or_else(|| {
@@ -3321,6 +3454,7 @@ impl<'a> Interpreter<'a> {
                                 base: Box::new(v),
                                 concrete,
                                 traits: traits.clone(),
+                                drop_glue: glue.clone().map(Box::new),
                             })
                         }
                         other => Err(InterpError::type_mismatch(
@@ -4598,6 +4732,23 @@ fn eval_cast(v: &Value, ty: &Ty) -> InterpResult<Value> {
 /// coroutine value might hide a destructor in its concrete type,
 /// which this judgment cannot name: an explicit error, never a
 /// silent skip — the same rule `DropPlan::Untyped` applies.
+/// Judge the drop of a `dyn` value that carries no
+/// conversion-accounted glue (see the `DropPlan::Dyn` arm): strip
+/// the box shapes the interpreter's own builtins build (a one-field
+/// aggregate holding the payload, possibly behind a glue-less
+/// `DynRef`) and judge the payload itself with
+/// [`drop_dyn_value`], whose shapes that can hide a destructor are
+/// explicit errors.
+fn drop_unaccounted_dyn(value: &Value) -> InterpResult<()> {
+    match value {
+        Value::DynRef { base, .. } => drop_unaccounted_dyn(base),
+        Value::Enum { fields, .. } if fields.len() == 1 => {
+            drop_unaccounted_dyn(&fields[0])
+        }
+        other => drop_dyn_value(other),
+    }
+}
+
 fn drop_dyn_value(value: &Value) -> InterpResult<()> {
     match value {
         Value::Uninit

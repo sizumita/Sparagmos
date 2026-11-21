@@ -4153,3 +4153,189 @@ fn run_mode_waker_from_arc_constructs_and_clones() {
         "the guest's stdout is the driver's stdout"
     );
 }
+
+const RC_ARC_DROP_SRC: &str = r#"
+use std::rc::Rc;
+use std::sync::Arc;
+static mut CHECK: u32 = 0;
+struct Cat;
+impl Drop for Cat {
+    fn drop(&mut self) {
+        unsafe { CHECK += 1; }
+    }
+}
+fn main() {
+    {
+        let _r = Rc::new(Cat);
+        let _a = Arc::new(Cat);
+    }
+    unsafe { assert_eq!(CHECK, 2); }
+    println!("rc-arc ok");
+}
+"#;
+
+#[test]
+fn run_mode_rc_arc_drop_runs_pointee_destructor() {
+    let dir = temp_dir("rc-arc-drop");
+    let src = fixture(&dir, "rc_arc_drop.rs", RC_ARC_DROP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "dropping an Rc / Arc must run the pointee destructor; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "rc-arc ok\n");
+}
+
+const BOX_DYN_DROP_SRC: &str = r#"
+static mut CHECK: u32 = 0;
+trait Dummy {
+    fn probe(&self) -> u32;
+}
+struct Cat;
+impl Dummy for Cat {
+    fn probe(&self) -> u32 {
+        7
+    }
+}
+impl Drop for Cat {
+    fn drop(&mut self) {
+        unsafe { CHECK += 1; }
+    }
+}
+struct Holder {
+    d: Box<dyn Dummy>,
+}
+fn main() {
+    {
+        let b: Box<dyn Dummy> = Box::new(Cat);
+        assert_eq!(b.probe(), 7);
+        let _h = Holder { d: Box::new(Cat) };
+    }
+    unsafe { assert_eq!(CHECK, 2); }
+    println!("box-dyn ok");
+}
+"#;
+
+#[test]
+fn run_mode_box_dyn_drop_runs_concrete_destructor() {
+    let dir = temp_dir("box-dyn-drop");
+    let src = fixture(&dir, "box_dyn_drop.rs", BOX_DYN_DROP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "dropping a Box<dyn Trait> (directly or as a field) must run the concrete destructor; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "box-dyn ok\n");
+}
+
+const UNION_DROP_SRC: &str = r#"
+use std::mem::ManuallyDrop;
+struct S;
+static mut CHECK: u8 = 0;
+impl Drop for S {
+    fn drop(&mut self) {
+        unsafe { CHECK += 10; }
+    }
+}
+union U {
+    a: ManuallyDrop<S>,
+}
+impl Drop for U {
+    fn drop(&mut self) {
+        unsafe { CHECK += 1; }
+    }
+}
+fn main() {
+    unsafe {
+        let mut u = U { a: ManuallyDrop::new(S) };
+        u = U { a: ManuallyDrop::new(S) };
+        assert_eq!(CHECK, 1);
+        *u.a = S;
+        assert_eq!(CHECK, 11);
+    }
+    println!("union ok");
+}
+"#;
+
+#[test]
+fn run_mode_union_drop_and_field_assignment() {
+    let dir = temp_dir("union-drop");
+    let src = fixture(&dir, "union_drop.rs", UNION_DROP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a union with a Drop impl must drop on overwrite, and assigning through its field must drop the old field value; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "union ok\n");
+}
+
+const MEM_DROP_ZST_UNION_SRC: &str = r#"
+use std::mem::ManuallyDrop;
+struct S;
+static mut CHECK: u8 = 0;
+impl Drop for S {
+    fn drop(&mut self) {
+        unsafe { CHECK += 10; }
+    }
+}
+union U {
+    a: ManuallyDrop<S>,
+}
+impl Drop for U {
+    fn drop(&mut self) {
+        unsafe { CHECK += 1; }
+    }
+}
+fn main() {
+    let u = U { a: ManuallyDrop::new(S) };
+    drop(u);
+    unsafe { assert_eq!(CHECK, 1); }
+    println!("mem-drop ok");
+}
+"#;
+
+#[test]
+fn run_mode_mem_drop_of_zst_union_runs_destructor() {
+    let dir = temp_dir("mem-drop-zst-union");
+    let src = fixture(&dir, "mem_drop_zst_union.rs", MEM_DROP_ZST_UNION_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an explicit mem::drop of a zero-sized union value must run its destructor; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "mem-drop ok\n");
+}
+
+const WEAK_COW_DROP_SRC: &str = r#"
+enum Void {}
+fn main() {
+    let _w1 = std::rc::Weak::<Void>::new();
+    let _w2 = std::sync::Weak::<Void>::new();
+    let c: std::borrow::Cow<str> = std::borrow::Cow::Borrowed("x");
+    let _o: std::borrow::Cow<str> = std::borrow::Cow::Owned(String::from("y"));
+    drop(c);
+    println!("weak-cow ok");
+}
+"#;
+
+#[test]
+fn run_mode_weak_and_cow_str_drop() {
+    let dir = temp_dir("weak-cow-drop");
+    let src = fixture(&dir, "weak_cow_drop.rs", WEAK_COW_DROP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "dropping Weak pointers and Cow<str> values must be accounted; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "weak-cow ok\n");
+}
