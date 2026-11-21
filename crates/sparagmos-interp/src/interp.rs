@@ -1308,10 +1308,113 @@ impl<'a> Interpreter<'a> {
             StatementKind::StorageLive(_) | StatementKind::StorageDead(_) | StatementKind::Nop => {
                 Ok(())
             }
+            StatementKind::Assume(op) => {
+                let value = self.eval_operand(frames, body, op)?;
+                match value {
+                    Value::Bool(true) => Ok(()),
+                    Value::Bool(false) => Err(InterpError::Panic {
+                        message: "intrinsic `assume` called with a false condition                                   (undefined behaviour in the guest)"
+                            .to_string(),
+                    }),
+                    other => Err(InterpError::type_mismatch(
+                        "assume operand",
+                        "bool",
+                        other.kind_name(),
+                    )),
+                }
+            }
+            StatementKind::CopyNonOverlapping { src, dst, count } => {
+                let src_value = self.eval_operand(frames, body, src)?;
+                let dst_value = self.eval_operand(frames, body, dst)?;
+                let count_value = self.eval_operand(frames, body, count)?;
+                self.exec_copy_nonoverlapping(frames, src_value, dst_value, count_value)
+            }
             StatementKind::Unsupported(kind) => Err(InterpError::UnsupportedStatement {
                 kind: kind.clone(),
             }),
         }
+    }
+
+    /// The element copy behind `copy_nonoverlapping`, shared by the
+    /// `StatementKind::Intrinsic` form (a direct
+    /// `core::intrinsics::copy_nonoverlapping` call in MIR) and the
+    /// `std::ptr::copy_nonoverlapping` / `std::ptr::copy` builtin
+    /// (the same operation arriving as an ordinary call). The source
+    /// elements are snapshotted before any write, so the copy is
+    /// exact even if the ranges overlapped (which the
+    /// non-overlapping contract forbids, and which makes the shared
+    /// implementation a correct `memmove` for `ptr::copy`).
+    pub(crate) fn exec_copy_nonoverlapping(
+        &self,
+        frames: &mut Vec<Frame>,
+        src_value: Value,
+        dst_value: Value,
+        count_value: Value,
+    ) -> InterpResult<()> {
+                let n = match count_value {
+                    Value::Uint(n) => usize::try_from(n).map_err(|_| {
+                        InterpError::type_mismatch(
+                            "copy_nonoverlapping count",
+                            "count that fits in usize",
+                            format!("{n}"),
+                        )
+                    })?,
+                    Value::Int(n) if n >= 0 => n as usize,
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            "copy_nonoverlapping count",
+                            "unsigned integer",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                if n == 0 {
+                    // A zero-count copy touches no memory: the
+                    // pointers are never dereferenced, so even a
+                    // null or dangling pointer is a legal operand.
+                    return Ok(());
+                }
+                let src_target = self.deref_value(frames, &src_value)?;
+                let dst_target = self.deref_value(frames, &dst_value)?;
+                // Snapshot the source elements before writing: the
+                // intrinsic's contract is that the ranges do not
+                // overlap, and the snapshot keeps the copy exact
+                // element-for-element either way. A pointer in this
+                // model denotes either an aggregate (an array place,
+                // a fat pointer's base) whose elements are indexed, or
+                // a single element, which only a count of 1 can copy.
+                let aggregate = |v: &Value| {
+                    matches!(
+                        v,
+                        Value::Tuple(_) | Value::FatRef { .. } | Value::Bytes(_) | Value::Str(_)
+                    )
+                };
+                let src_base = self.read_resolved(frames, &src_target)?;
+                let elems: Vec<Value> = if n == 1 && !aggregate(&src_base) {
+                    vec![src_base]
+                } else {
+                    let mut elems = Vec::with_capacity(n);
+                    for i in 0..n {
+                        elems.push(self.read_resolved_at(frames, &src_target, i)?);
+                    }
+                    elems
+                };
+                // An unreadable (not yet written) destination is a
+                // buffer being filled: the indexed path is the one
+                // that can create its elements.
+                let dst_aggregate = self
+                    .read_resolved(frames, &dst_target)
+                    .map(|v| aggregate(&v))
+                    .unwrap_or(true);
+                if n == 1 && !dst_aggregate {
+                    let value = elems.into_iter().next().expect("one element");
+                    self.write_resolved(frames, &dst_target, value)?;
+                } else {
+                    for (i, value) in elems.into_iter().enumerate() {
+                        self.write_resolved_at(frames, &dst_target, i, value)?;
+                    }
+                }
+                Ok(())
     }
 
     // ----- place resolution --------------------------------------------------
@@ -1694,6 +1797,72 @@ impl<'a> Interpreter<'a> {
                 *slot = value;
                 Ok(())
             }
+        }
+    }
+
+    /// Read element `index` of the aggregate a resolved target
+    /// denotes (the element access `copy_nonoverlapping` performs).
+    pub(crate) fn read_resolved_at(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        index: usize,
+    ) -> InterpResult<Value> {
+        match target {
+            Resolved::Place {
+                frame_pos,
+                local,
+                projection,
+            } => {
+                let mut projection = projection.clone();
+                projection.push(RefProj::Index(index));
+                self.read_resolved(
+                    frames,
+                    &Resolved::Place {
+                        frame_pos: *frame_pos,
+                        local: *local,
+                        projection,
+                    },
+                )
+            }
+            Resolved::Value(value) => project_value(
+                value.clone(),
+                &[RefProj::Index(index)],
+                "<constant>",
+                "copy_nonoverlapping source",
+            ),
+        }
+    }
+
+    /// Write element `index` of the aggregate a resolved target
+    /// denotes. Writing through a constant aggregate is the error
+    /// `write_resolved` already produces for it.
+    pub(crate) fn write_resolved_at(
+        &self,
+        frames: &mut Vec<Frame>,
+        target: &Resolved,
+        index: usize,
+        value: Value,
+    ) -> InterpResult<()> {
+        match target {
+            Resolved::Place {
+                frame_pos,
+                local,
+                projection,
+            } => {
+                let mut projection = projection.clone();
+                projection.push(RefProj::Index(index));
+                self.write_resolved(
+                    frames,
+                    &Resolved::Place {
+                        frame_pos: *frame_pos,
+                        local: *local,
+                        projection,
+                    },
+                    value,
+                )
+            }
+            Resolved::Value(_) => self.write_resolved(frames, target, value),
         }
     }
 
@@ -2320,6 +2489,23 @@ impl<'a> Interpreter<'a> {
                     _ => Ok(value),
                 }
             }
+            Rvalue::Reborrow(place) => {
+                // A bitwise copy of the pointer value held at the
+                // place, reinterpreted as the target pointer type.
+                // The value model tracks neither pointer mutability
+                // nor provenance, and a CoerceShared pair has equal
+                // layout by contract, so the copy is the value itself
+                // (for a wrapper ADT around a pointer, the aggregate
+                // itself, exactly as a bitwise copy prescribes).
+                self.read_place(frames, body, place)
+            }
+            Rvalue::ThreadLocalRef(name) => Err(InterpError::UnsupportedRvalue {
+                kind: format!(
+                    "ThreadLocalRef {name}: thread-local statics are not modelled \
+                     (the driver collects no static items, so there is no storage \
+                     or initializer to bind)"
+                ),
+            }),
             Rvalue::Unsupported(kind) => Err(InterpError::UnsupportedRvalue {
                 kind: kind.clone(),
             }),

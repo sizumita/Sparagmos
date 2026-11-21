@@ -715,6 +715,7 @@ fn scan_rvalue_fields(table: &mut AdtFieldTys, body: &mir::Body, rv: &mir::Rvalu
         | R::RawPtr(_, place)
         | R::Len(place)
         | R::Discriminant(place)
+        | R::Reborrow(_, _, place)
         | R::CopyForDeref(place) => scan_place_fields(table, body, place),
         R::Aggregate(_, ops) => {
             for op in ops {
@@ -1831,7 +1832,8 @@ impl<'a> Converter<'a> {
             R::CopyForDeref(place) => ir::Rvalue::CopyForDeref(self.convert_place(place)?),
             // Raw pointer creation shares the reference representation.
             R::RawPtr(_, place) => ir::Rvalue::Ref(self.convert_place(place)?),
-            R::ThreadLocalRef(def) => ir::Rvalue::Unsupported(format!("ThreadLocalRef {def}")),
+            R::Reborrow(_, _, place) => ir::Rvalue::Reborrow(self.convert_place(place)?),
+            R::ThreadLocalRef(def) => ir::Rvalue::ThreadLocalRef(format!("{def}")),
             R::Len(place) => ir::Rvalue::Len(self.convert_place(place)?),
             R::NullaryOp(op, _) => ir::Rvalue::Unsupported(format!("NullaryOp {}", op.kind_name())),
             R::Discriminant(place) => {
@@ -1896,7 +1898,18 @@ impl<'a> Converter<'a> {
                 },
             },
             S::Intrinsic(intr) => ir::Statement {
-                kind: ir::StatementKind::Unsupported(format!("Intrinsic {}", intr.kind_name())),
+                kind: match &**intr {
+                    mir::NonDivergingIntrinsic::Assume(op) => {
+                        ir::StatementKind::Assume(self.convert_operand(body, op, None)?)
+                    }
+                    mir::NonDivergingIntrinsic::CopyNonOverlapping { src, dst, count } => {
+                        ir::StatementKind::CopyNonOverlapping {
+                            src: self.convert_operand(body, src, None)?,
+                            dst: self.convert_operand(body, dst, None)?,
+                            count: self.convert_operand(body, count, None)?,
+                        }
+                    }
+                },
             },
         })
     }

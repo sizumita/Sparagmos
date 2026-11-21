@@ -1809,7 +1809,17 @@ impl<'a> FnLower<'a> {
                 self.emit(Instr::Const { dst, imm: tag });
                 Ok(())
             }
-            S::Intrinsic(_) => Err(self.err("Intrinsic statement")),
+            S::Intrinsic(intr) => match &**intr {
+                // `assume` is an optimisation hint: the JIT emits
+                // nothing for it. (On a false operand the guest has
+                // undefined behaviour; the interpreter reports it as
+                // a guest panic, the JIT simply proceeds — both are
+                // legitimate readings of UB.)
+                mir::NonDivergingIntrinsic::Assume(_) => Ok(()),
+                mir::NonDivergingIntrinsic::CopyNonOverlapping { .. } => {
+                    Err(self.err("Intrinsic statement CopyNonOverlapping"))
+                }
+            },
         }
     }
 
@@ -1962,6 +1972,17 @@ impl<'a> FnLower<'a> {
                 self.lower_cast_to(tmp, kind, operand, target)?;
                 Ok(vec![tmp])
             }
+            R::Reborrow(_, _, src_place) => match count {
+                1 => Ok(vec![
+                    self.operand_value(&mir::Operand::Copy(src_place.clone()), dst_ty)?,
+                ]),
+                2 => {
+                    let (a, b) =
+                        self.operand_pair(&mir::Operand::Copy(src_place.clone()))?;
+                    Ok(vec![a, b])
+                }
+                _ => Err(self.err("reborrow of an aggregate value")),
+            },
             R::Ref(_, _, target) | R::RawPtr(_, target) => {
                 let words = self.ref_words(target, dst_ty)?;
                 if words.len() != count {
@@ -2217,6 +2238,13 @@ impl<'a> FnLower<'a> {
                 });
                 self.normalize(dst, &dst_ty);
                 Ok(())
+            }
+            R::Reborrow(_, _, src_place) => {
+                // A bitwise copy of the pointer value held at the
+                // place, reinterpreted as the target pointer type:
+                // exactly a `Use` copy of the place's value.
+                let use_rv = mir::Rvalue::Use(mir::Operand::Copy(src_place.clone()));
+                self.lower_assign(place, &use_rv)
             }
             R::NullaryOp(..) => Err(self.err("NullaryOp rvalue")),
             R::ShallowInitBox(..) => Err(self.err("ShallowInitBox rvalue")),

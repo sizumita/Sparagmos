@@ -442,10 +442,10 @@ impl Converter {
                 let p = self.place(place);
                 sm::Rvalue::CopyForDeref(p)
             }
-            R::Reborrow(ty, mutability, place) => {
+            R::Reborrow(ty, m, place) => {
                 let t = self.ty(ty);
                 let p = self.place(place);
-                sm::Rvalue::Reborrow(t, mutability(*mutability), p)
+                sm::Rvalue::Reborrow(t, mutability(*m), p)
             }
         }
     }
