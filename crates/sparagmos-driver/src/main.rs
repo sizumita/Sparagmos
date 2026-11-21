@@ -923,6 +923,163 @@ fn collect_closure_instances(
     extra_seeds
 }
 
+/// Convert the demanded instances of the local coroutines
+/// (async blocks, `gen` blocks, and the futures of `async fn`s
+/// defined as separate items) that converted bodies create or
+/// hold. A coroutine item has no monomorphic instance as an item
+/// — `Instance::try_from` rejects it like a closure — so the item
+/// loop defers it with the generic functions, but neither the
+/// instance demand (which follows call targets and `FnDef`
+/// constants) nor the closure demand (which follows closure
+/// types) ever mentions it: a coroutine is demanded by the
+/// `AggregateKind::Coroutine` rvalue that creates it and by the
+/// coroutine-typed locals that hold it. This pass scans for
+/// exactly those mentions ([`sparagmos_driver::reach::coroutine_targets`])
+/// and converts each distinct demanded instance, recording the
+/// outcome in the shared demand state so
+/// [`apply_instance_demands`] accounts the deferred item.
+///
+/// The body comes from resolving the coroutine definition as an
+/// instance (the monomorphization the compiler itself performs
+/// for the creation site); when resolution refuses the
+/// definition, the definition's own body is used — the arguments
+/// are concrete here, so that body is already the monomorphic
+/// one. Converted bodies reference a coroutine by its plain
+/// definition key (the key the creation aggregate converts
+/// through), so the first demanded instance's body is registered
+/// under that key; a further instance of the same definition
+/// counts as a converted demand without registering a second
+/// body, the same one-body-per-definition shape the aggregate
+/// conversion itself assumes.
+fn collect_coroutine_instances(
+    conv: &mut Converter,
+    bodies: &mut Vec<(String, Body)>,
+    body_def_ids: &mut Vec<sparagmos_mir::DefId>,
+    body_def_names: &mut Vec<String>,
+    deferred: &[DeferredFn],
+    seeds: &[rustc_public::mir::Body],
+    state: &mut InstanceDemandState,
+) -> Vec<rustc_public::mir::Body> {
+    use std::collections::VecDeque;
+
+    let InstanceDemandState {
+        seen,
+        unresolved_seen,
+        plain_taken,
+        taken,
+        demands,
+        recursion_limit: _,
+    } = state;
+
+    let deferred_names: HashMap<rustc_public::DefId, &str> =
+        deferred.iter().map(|d| (d.def, d.name.as_str())).collect();
+    let mut queue: VecDeque<rustc_public::mir::Body> = seeds.iter().cloned().collect();
+    let mut extra_seeds: Vec<rustc_public::mir::Body> = Vec::new();
+
+    while let Some(body) = queue.pop_front() {
+        // Instance resolution and body access go through the
+        // compiler's internals and can panic on exotic targets;
+        // isolate each scanned body exactly as the other demand
+        // passes do.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for (def, args) in sparagmos_driver::reach::coroutine_targets(&body) {
+                let referenced = def.def_id();
+                let Some(&base_name) = deferred_names.get(&referenced) else {
+                    continue;
+                };
+                if args_mention_params(&args) {
+                    continue;
+                }
+                let owners = [referenced];
+                // Obtain the instance body: resolution first,
+                // the definition's own body as the fallback.
+                let ibody = match Instance::resolve(
+                    rustc_public::ty::FnDef(referenced),
+                    &args,
+                ) {
+                    Ok(inst) => {
+                        if !seen.insert((referenced, inst)) {
+                            continue;
+                        }
+                        if !inst.has_body() {
+                            fail_all(
+                                &mut *demands,
+                                &owners,
+                                "no MIR body available".to_string(),
+                            );
+                            continue;
+                        }
+                        inst.body()
+                    }
+                    Err(_) => {
+                        if !unresolved_seen.insert((referenced, format!("{args:?}"))) {
+                            continue;
+                        }
+                        def.body()
+                    }
+                };
+                let Some(ibody) = ibody else {
+                    fail_all(
+                        &mut *demands,
+                        &owners,
+                        "no MIR body available".to_string(),
+                    );
+                    continue;
+                };
+                if *taken >= MAX_LOCAL_INSTANCES {
+                    fail_all(
+                        &mut *demands,
+                        &owners,
+                        "collection limit reached".to_string(),
+                    );
+                    continue;
+                }
+                match conv.convert_body(&ibody) {
+                    Ok(converted) => {
+                        *taken += 1;
+                        queue.push_back(ibody.clone());
+                        extra_seeds.push(ibody.clone());
+                        let counts =
+                            (ibody.blocks.len(), ibody.locals().len(), ibody.arg_locals().len());
+                        let demand = demands.entry(referenced).or_default();
+                        demand.converted += 1;
+                        if demand.first_counts.is_none() {
+                            demand.first_counts = Some(counts);
+                        }
+                        // Register the body under the plain
+                        // definition key the creation aggregates
+                        // reference, unless an earlier instance of
+                        // this definition already registered one.
+                        let plain = conv.crate_def_id(&def);
+                        if !body_def_ids.contains(&plain) {
+                            let display = if plain_taken.insert(referenced) {
+                                base_name.to_string()
+                            } else {
+                                format!("{} [coroutine]", base_name)
+                            };
+                            bodies.push((display, converted));
+                            body_def_ids.push(plain);
+                            body_def_names.push(base_name.to_string());
+                        }
+                    }
+                    Err(errs) => {
+                        for e in errs {
+                            fail_all(&mut *demands, &owners, e);
+                        }
+                    }
+                }
+            }
+        }));
+        if outcome.is_err() {
+            // Contained panic: clear the capture slot, as the
+            // other demand passes do.
+            let _ = take_captured_panic();
+        }
+    }
+
+    extra_seeds
+}
+
 /// Record the demand outcomes accumulated by
 /// [`collect_local_instances`] in the report: a deferred
 /// definition is converted when every instance demanded of it
@@ -1646,9 +1803,35 @@ fn collect() -> ControlFlow<()> {
         &closure_scan,
         &mut demand_state,
     );
+    // Convert the demanded instances of the local coroutines
+    // the converted bodies create or hold: a coroutine is
+    // demanded by its creation aggregate and its coroutine-typed
+    // locals, which neither the instance demand nor the closure
+    // demand follows.
+    let mut coroutine_scan = closure_scan;
+    coroutine_scan.extend(closure_seeds.iter().cloned());
+    let coroutine_seeds = collect_coroutine_instances(
+        &mut conv,
+        &mut bodies,
+        &mut body_def_ids,
+        &mut body_def_names,
+        &deferred,
+        &coroutine_scan,
+        &mut demand_state,
+    );
+    // Local bodies converted by the closure and coroutine passes
+    // have not been scanned for the *function* instances they
+    // demand (each demand pass scans only for its own kind of
+    // target). The fixpoint loop below scans them with the
+    // instance demand, and each round's newly converted closure
+    // and coroutine bodies become the next round's scan set, so
+    // every converted body is eventually scanned by every pass.
+    let mut local_scan: Vec<rustc_public::mir::Body> = closure_seeds.clone();
+    local_scan.extend(coroutine_seeds.iter().cloned());
     let mut reach_seeds = seed_bodies;
     reach_seeds.extend(instance_seeds);
     reach_seeds.extend(closure_seeds);
+    reach_seeds.extend(coroutine_seeds);
 
     // Collect the bodies of non-local functions reachable from the
     // converted local bodies (std / core / alloc and other library
@@ -1692,13 +1875,15 @@ fn collect() -> ControlFlow<()> {
         report.functions.iter().map(|f| f.name.clone()).collect();
     loop {
         let ids_before = body_def_ids.len();
+        let mut fn_scan = frontier.clone();
+        fn_scan.extend(local_scan.iter().cloned());
         let new_instances = collect_local_instances(
             &mut conv,
             &mut bodies,
             &mut body_def_ids,
             &mut body_def_names,
             &deferred,
-            &frontier,
+            &fn_scan,
             &mut demand_state,
         );
         // Newly collected foreign bodies and demanded instances
@@ -1714,9 +1899,27 @@ fn collect() -> ControlFlow<()> {
             &closure_scan,
             &mut demand_state,
         );
-        if new_instances.is_empty() && new_closure_bodies.is_empty() {
+        // Newly collected bodies can likewise create or hold
+        // local coroutines concretely.
+        let mut coroutine_scan = closure_scan;
+        coroutine_scan.extend(new_closure_bodies.iter().cloned());
+        let new_coroutine_bodies = collect_coroutine_instances(
+            &mut conv,
+            &mut bodies,
+            &mut body_def_ids,
+            &mut body_def_names,
+            &deferred,
+            &coroutine_scan,
+            &mut demand_state,
+        );
+        if new_instances.is_empty()
+            && new_closure_bodies.is_empty()
+            && new_coroutine_bodies.is_empty()
+        {
             break;
         }
+        local_scan = new_closure_bodies.clone();
+        local_scan.extend(new_coroutine_bodies.iter().cloned());
         for id in &body_def_ids[ids_before..] {
             collected_ids.insert(*id);
         }
@@ -1725,6 +1928,7 @@ fn collect() -> ControlFlow<()> {
         }
         let mut reach_input = new_instances;
         reach_input.extend(new_closure_bodies.iter().cloned());
+        reach_input.extend(new_coroutine_bodies.iter().cloned());
         let reached = sparagmos_driver::reach::collect_reachable(
             &mut conv,
             &reach_input,
@@ -1734,6 +1938,7 @@ fn collect() -> ControlFlow<()> {
         frontier = reached.walked_bodies;
         alias_sources.extend(frontier.iter().cloned());
         alias_sources.extend(new_closure_bodies.iter().cloned());
+        alias_sources.extend(new_coroutine_bodies.iter().cloned());
         for ((name, body), (def_id, def_name)) in reached
             .bodies
             .into_iter()

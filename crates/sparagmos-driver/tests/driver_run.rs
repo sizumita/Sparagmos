@@ -1139,6 +1139,89 @@ fn summary_mode_undemanded_generic_context_closure_stays_skipped() {
     );
 }
 
+const COROUTINE_DEMANDED_SRC: &str = r#"
+fn main() {
+    let _a = async { 1 };
+    let _b = async move { 2 };
+}
+"#;
+
+#[test]
+fn summary_mode_demanded_async_block_is_converted() {
+    // A coroutine item (an async block) has no monomorphic
+    // instance as an item, but the converted body that creates it
+    // mentions it with concrete arguments, and the coroutine
+    // collection converts the demanded instance.
+    let dir = temp_dir("coroutine-demanded");
+    let src = fixture(&dir, "coroutine_demanded.rs", COROUTINE_DEMANDED_SRC);
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for name in ["{closure#0}", "{closure#1}"] {
+        let line = stdout
+            .lines()
+            .find(|l| l.contains(name))
+            .expect("summary lists the coroutine item");
+        assert!(
+            line.contains("[converted]"),
+            "the demanded coroutine instance is converted: {line}"
+        );
+    }
+}
+
+const COROUTINE_UNDEMANDED_SRC: &str = r#"
+fn wrap<T: Copy>(v: T) -> T {
+    let _f = async move { v };
+    v
+}
+fn main() { println!("hi"); }
+"#;
+
+#[test]
+fn summary_mode_undemanded_coroutine_stays_skipped() {
+    // A coroutine inside a generic function that is never
+    // instantiated has no concrete demand anywhere and stays
+    // skipped: an undemanded generic is never counted converted.
+    let dir = temp_dir("coroutine-undemanded");
+    let src = fixture(&dir, "coroutine_undemanded.rs", COROUTINE_UNDEMANDED_SRC);
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("{closure#0}"))
+        .expect("summary lists the coroutine item");
+    assert!(
+        line.contains("SKIPPED") && line.contains("no monomorphic instance"),
+        "the undemanded coroutine stays skipped: {line}"
+    );
+}
+
+const COROUTINE_ONLY_CALLER_SRC: &str = r#"
+fn helper<T: Copy>(v: T) -> T { v }
+fn main() {
+    let _f = async { helper::<i32>(3) };
+}
+"#;
+
+#[test]
+fn summary_mode_generic_fn_called_only_from_coroutine_body_is_converted() {
+    // The only call to the generic function lives in the
+    // coroutine's body. Converting the coroutine must feed the
+    // instance demand too: every converted body is scanned by
+    // every demand pass.
+    let dir = temp_dir("coroutine-only-caller");
+    let src = fixture(&dir, "coroutine_only_caller.rs", COROUTINE_ONLY_CALLER_SRC);
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("helper"))
+        .expect("summary lists the generic function item");
+    assert!(
+        line.contains("[converted]"),
+        "the generic function demanded only by the coroutine body is converted: {line}"
+    );
+}
+
 #[test]
 fn run_mode_generic_context_closure_runs() {
     let dir = temp_dir("closure-generic-run");
