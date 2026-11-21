@@ -4883,23 +4883,45 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
     }
 
     /// The drop glue of one coroutine instantiation: the live
-    /// state's fields, state by state. Coroutine layouts are dense
-    /// (unresumed, one state per suspension point, then the returned
-    /// and panicked states), and a state's fields are all projected
-    /// by the body that saves or resumes it - so a state with no
-    /// evidence holds no fields to drop. The returned and panicked
-    /// states, which follow the last suspension state and never
-    /// hold fields (the unwinding path drops the live locals before
-    /// the tag is set to panicked), are covered by extending the
-    /// plan two past the last evidenced state.
+    /// state's fields, state by state. The compiler numbers the
+    /// states 0 (unresumed), 1 (returned), 2 (panicked) and one per
+    /// suspension point from 3 on, and a state's fields are all
+    /// projected by the body that saves or resumes it - so a state
+    /// with no evidence holds no fields to drop. The plan must
+    /// still *cover* every state the value can be dropped in: the
+    /// three fixed states, plus every state the coroutine's own
+    /// body names in a `SetDiscriminant` (the only way a state tag
+    /// is ever written), even when that state holds no evidenced
+    /// fields - a suspended coroutine with nothing live across the
+    /// suspension point is dropped in exactly such a state.
     fn coroutine_plan(
         &mut self,
         def: mir::DefId,
         args: &[mir::Ty],
     ) -> Option<ir::DropPlan> {
         use ir::DropPlan as P;
+        let conv = self.conv;
         let variants = self.evidenced_variants(def, args);
-        let max_v = *variants.iter().max().expect("variant 0 present") + 2;
+        let mut max_v = 2u32;
+        if let Some(&top) = variants.iter().max() {
+            max_v = max_v.max(top);
+        }
+        if let Some(body) = conv
+            .def_names
+            .get(&def)
+            .and_then(|key| conv.bodies.get(key))
+        {
+            for bb in &body.basic_blocks {
+                for stmt in &bb.statements {
+                    if let mir::StatementKind::SetDiscriminant {
+                        variant_index, ..
+                    } = &stmt.kind
+                    {
+                        max_v = max_v.max(*variant_index);
+                    }
+                }
+            }
+        }
         let mut plans = Vec::new();
         for v in 0..=max_v {
             if !variants.contains(&v) {
