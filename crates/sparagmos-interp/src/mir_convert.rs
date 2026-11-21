@@ -2413,6 +2413,30 @@ impl<'a> Converter<'a> {
         }
     }
 
+    /// The element size of a `BinaryOp::Offset`, from the pointer
+    /// operand's type (its place type, else the result type — the
+    /// operation's result is the pointer type itself), when the
+    /// pointee's size is exactly computable from the type alone
+    /// (see [`mir_ty_size`]). `None` leaves the size to execution,
+    /// which derives it from the executing body's declared type of
+    /// the pointer operand.
+    fn offset_elem_size(
+        &self,
+        body: &mir::Body,
+        pair: &(mir::Operand, mir::Operand),
+        dest_ty: Option<&mir::Ty>,
+    ) -> Option<u64> {
+        let ty = self
+            .operand_place_ty(body, &pair.0)
+            .or_else(|| dest_ty.cloned())?;
+        let pointee = match ty {
+            mir::Ty::RawPtr(inner, _) => *inner,
+            mir::Ty::Ref(_, inner, _) => *inner,
+            _ => return None,
+        };
+        mir_ty_size(&pointee)
+    }
+
     // ----- constants & operands ---------------------------------------------
 
     fn convert_constant(
@@ -3854,6 +3878,22 @@ impl<'a> Converter<'a> {
         use mir::Rvalue as R;
         Ok(match rv {
             R::Use(op) => ir::Rvalue::Use(self.convert_operand(body, op, dest_ty)?),
+            R::BinaryOp(op, pair) if *op == mir::BinOp::Offset => {
+                // `BinaryOp::Offset` is, like a shift, a binary
+                // operation whose operands do not share a type: a
+                // pointer and an element count. The operands are
+                // typed separately the same way (the pointer takes
+                // the operation's context — its place type, else the
+                // result type, which is the pointer type itself; the
+                // count keeps its own type).
+                let (lhs, rhs) = self.convert_shift_operands(body, pair, dest_ty, false)?;
+                let elem_size = self.offset_elem_size(body, pair, dest_ty);
+                let count_width = match self.operand_place_ty(body, &pair.1) {
+                    Some(mir::Ty::Uint(uty)) => uty.bits(),
+                    _ => 0,
+                };
+                ir::Rvalue::PtrOffset(lhs, rhs, elem_size, count_width)
+            }
             R::BinaryOp(op, pair) => {
                 let (lhs, rhs) = if is_shift(*op) {
                     self.convert_shift_operands(body, pair, dest_ty, false)?
@@ -5830,8 +5870,10 @@ fn is_shift(op: mir::BinOp) -> bool {
 }
 
 /// The IR operator for a plain (non-checked) `mir` binary operator.
-/// `Offset` (pointer arithmetic) and `Cmp` (three-way) have no IR
-/// equivalent and yield `None`.
+/// `Offset` (pointer arithmetic) is converted separately into
+/// `ir::Rvalue::PtrOffset` (a `CheckedBinaryOp` with `Offset`, the
+/// only way this function could still see it, is never emitted) and
+/// `Cmp` (three-way) has no IR equivalent; both yield `None`.
 fn plain_binop(op: mir::BinOp) -> Option<ir::BinOp> {
     use mir::BinOp as M;
     Some(match op {
@@ -5855,6 +5897,39 @@ fn plain_binop(op: mir::BinOp) -> Option<ir::BinOp> {
         // *WithOverflow in a plain position is handled by `overflow_base`
         // before this function is consulted.
         M::AddWithOverflow | M::SubWithOverflow | M::MulWithOverflow => return None,
+    })
+}
+
+/// The size in bytes of a `mir` type whose layout is fixed by the
+/// type alone: scalars, arrays of such types with a known length,
+/// and pointers (fat when the pointee is unsized). Anything whose
+/// layout needs the compiler's layout computation — ADTs, tuples
+/// with more than one element, slices, `str` — yields `None`.
+fn mir_ty_size(ty: &mir::Ty) -> Option<u64> {
+    use mir::Ty as T;
+    Some(match ty {
+        T::Bool => 1,
+        T::Char => 4,
+        T::Int(t) => u64::from(t.bits() / 8),
+        T::Uint(t) => u64::from(t.bits() / 8),
+        T::Float(t) => u64::from(t.bits() / 8),
+        T::Array(elem, mir::ArrayLen::Known(n)) => n.checked_mul(mir_ty_size(elem)?)?,
+        T::Array(_, _) => return None,
+        T::RawPtr(pointee, _) | T::Ref(_, pointee, _) => {
+            if matches!(&**pointee, T::Slice(_) | T::Str | T::Dynamic(..)) {
+                16
+            } else {
+                8
+            }
+        }
+        T::FnPtr(_) => 8,
+        T::Tuple(ts) if ts.len() <= 1 => match ts.first() {
+            Some(t) => mir_ty_size(t)?,
+            None => 0,
+        },
+        T::Pat(inner, _) => mir_ty_size(inner)?,
+        T::Never => 0,
+        _ => return None,
     })
 }
 

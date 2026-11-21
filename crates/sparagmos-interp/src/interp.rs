@@ -4461,8 +4461,363 @@ impl<'a> Interpreter<'a> {
                     Err(e) => return Err(e),
                 };
                 Ok(value)
+    /// The size in bytes of an IR type whose layout is fixed by
+    /// the type alone or by the program's ADT layout table:
+    /// scalars, arrays of such types, pointers (fat when the
+    /// pointee is unsized), and the ADT instances the driver
+    /// recorded a layout for. Anything else — multi-element
+    /// tuples (their field layout is the compiler's choice),
+    /// slices, `str`, closures — yields `None`.
+    fn ty_size(&self, ty: &Ty) -> Option<u64> {
+        Some(match ty {
+            Ty::Unit => 0,
+            Ty::Bool => 1,
+            Ty::Int(t) => u64::from(t.bits() / 8),
+            Ty::Uint(t) => u64::from(t.bits() / 8),
+            Ty::Float(t) => u64::from(t.bits() / 8),
+            Ty::Adt(name) => self.program().adt_layouts.get(name).map(|&(size, _)| size)?,
+            Ty::Ref(pointee) => {
+                if matches!(&**pointee, Ty::Slice(_) | Ty::Str | Ty::Dynamic(..)) {
+                    16
+                } else {
+                    8
+                }
+            }
+            Ty::Array(elem, n) => n.checked_mul(self.ty_size(elem)?)?,
+            Ty::Tuple(ts) if ts.len() <= 1 => match ts.first() {
+                Some(t) => self.ty_size(t)?,
+                None => 0,
+            },
+            Ty::FnPtr => 8,
+            Ty::FnDef(_) => 0,
+            _ => return None,
+        })
+    }
+
+    /// The element size of a pointer offset whose size conversion
+    /// could not bake: derived from the executing body's declared
+    /// type of the pointer operand, when the operand is a plain
+    /// local of pointer type.
+    fn offset_elem_size_of(&self, body: &Body, op: &Operand) -> Option<u64> {
+        let place = match op {
+            Operand::Copy(place) | Operand::Move(place) => place,
+            Operand::Constant(_) => return None,
+        };
+        if !place.projection.is_empty() {
+            return None;
+        }
+        match body.local_tys.get(place.local.0)? {
+            Ty::Ref(pointee) => self.ty_size(pointee),
+            _ => None,
+        }
+    }
+
+    /// The value of a pointer offset (see [`Rvalue::PtrOffset`]):
+    /// `base` advanced by `count` elements of `elem_size` bytes
+    /// each (the size may be unknown, in which case only the
+    /// shapes that need no size — a zero count — evaluate).
+    /// `wrapping` selects the `arith_offset` intrinsic's semantics
+    /// over `BinaryOp::Offset`'s: the two compute the same denoted
+    /// position wherever both are defined, and differ only for a
+    /// null base, which wrapping turns into the bare address and
+    /// the checked form rejects as the undefined behaviour it is.
+    pub(crate) fn ptr_offset_value(
+        &self,
+        frames: &[Frame],
+        base: Value,
+        count: i128,
+        elem_size: Option<u64>,
+        wrapping: bool,
+    ) -> InterpResult<Value> {
+        if count == 0 {
+            return Ok(base);
+        }
+        // The byte displacement, when the element size is known.
+        // A displacement that overflows an i128 is not a position
+        // in any allocation and has no honest rendering.
+        let disp: Option<i128> = match elem_size {
+            Some(size) => Some(count.checked_mul(i128::from(size)).ok_or_else(|| {
+                InterpError::UnsupportedRvalue {
+                    kind: "pointer offset: element displacement overflows".to_string(),
+                }
+            })?),
+            None => None,
+        };
+        match base {
+            Value::Ref(target) => Ok(Value::Ref(
+                self.offset_target(target, frames, count, elem_size, disp, wrapping)?,
+            )),
+            Value::FatRef { base, len } => match *base {
+                Value::Ref(_) => {
+                    let base = self.ptr_offset_value(frames, *base, count, elem_size, wrapping)?;
+                    Ok(Value::FatRef {
+                        base: Box::new(base),
+                        len,
+                    })
+                }
+                Value::Tuple(elems) => {
+                    // A self-contained slice constant: the offset
+                    // data pointer denotes the suffix starting at
+                    // the count, with the length metadata unchanged
+                    // (exactly what offsetting a fat pointer does).
+                    let n = usize::try_from(count).map_err(|_| {
+                        InterpError::UnsupportedRvalue {
+                            kind: "pointer offset: negative offset of a slice constant"
+                                .to_string(),
+                        }
+                    })?;
+                    if n > elems.len() {
+                        return Err(InterpError::UnsupportedRvalue {
+                            kind: "pointer offset: offset past the end of a slice constant"
+                                .to_string(),
+                        });
+                    }
+                    Ok(Value::FatRef {
+                        base: Box::new(Value::Tuple(elems[n..].to_vec())),
+                        len,
+                    })
+                }
+                ref other => Err(InterpError::type_mismatch(
+                    "pointer offset",
+                    "fat pointer over a reference or a slice constant",
+                    other.kind_name(),
+                )),
+            },
+            Value::DynRef {
+                base,
+                concrete,
+                traits,
+            } => match *base {
+                Value::Ref(_) => {
+                    let base = self.ptr_offset_value(frames, *base, count, elem_size, wrapping)?;
+                    Ok(Value::DynRef {
+                        base: Box::new(base),
+                        concrete,
+                        traits,
+                    })
+                }
+                ref other => Err(InterpError::type_mismatch(
+                    "pointer offset",
+                    "dyn pointer over a reference",
+                    other.kind_name(),
+                )),
+            },
+            other => Err(InterpError::type_mismatch(
+                "pointer offset",
+                "pointer value",
+                other.kind_name(),
+            )),
+        }
+    }
+
+    /// A reference target advanced by a pointer offset (see
+    /// [`Self::ptr_offset_value`]).
+    fn offset_target(
+        &self,
+        target: RefTarget,
+        frames: &[Frame],
+        count: i128,
+        elem_size: Option<u64>,
+        disp: Option<i128>,
+        wrapping: bool,
+    ) -> InterpResult<RefTarget> {
+        match target {
+            RefTarget::Place {
+                frame,
+                local,
+                projection,
+            } => {
+                let projection =
+                    self.offset_projection(frames, Some((frame, local)), projection, disp)?;
+                Ok(RefTarget::Place {
+                    frame,
+                    local,
+                    projection,
+                })
+            }
+            RefTarget::Static { name, projection } => {
+                // A static's declared type is not part of the IR
+                // program, so no array absorption is attempted for
+                // statics: the displacement is carried.
+                let projection = self.offset_projection(frames, None, projection, disp)?;
+                Ok(RefTarget::Static { name, projection })
+            }
+            RefTarget::Value(v) => Ok(RefTarget::Value(Box::new(
+                self.offset_value_target(*v, count, elem_size)?,
+            ))),
+            RefTarget::Null => {
+                if wrapping {
+                    let d = disp.ok_or_else(|| InterpError::UnsupportedRvalue {
+                        kind: "pointer offset: element size is not known".to_string(),
+                    })?;
+                    Ok(RefTarget::Address(d as u64))
+                } else {
+                    Err(InterpError::UnsupportedRvalue {
+                        kind: "pointer offset: offset of a null pointer".to_string(),
+                    })
+                }
+            }
+            RefTarget::Address(addr) => {
+                // An address-only pointer has no allocation bounds
+                // in this model for the checked form to check; the
+                // address arithmetic is the observable behaviour.
+                let d = disp.ok_or_else(|| InterpError::UnsupportedRvalue {
+                    kind: "pointer offset: element size is not known".to_string(),
+                })?;
+                Ok(RefTarget::Address(addr.wrapping_add(d as u64)))
             }
         }
+    }
+
+    /// A constant aggregate advanced by a pointer offset. Such a
+    /// target under an offset denotes its first element (the shape
+    /// a cast of a constant array reference to an element pointer
+    /// produces), so the offset denotes the count-th element,
+    /// projected eagerly — constant aggregates are read-only in
+    /// this model, so nothing observable is lost (the same
+    /// reasoning as [`Self::ptr_field_value`]'s eager projection).
+    /// A one-past-the-end position has no value to denote and
+    /// stays an explicit error.
+    fn offset_value_target(
+        &self,
+        value: Value,
+        count: i128,
+        elem_size: Option<u64>,
+    ) -> InterpResult<Value> {
+        match value {
+            Value::Tuple(elems) => {
+                let idx = usize::try_from(count).map_err(|_| InterpError::UnsupportedRvalue {
+                    kind: "pointer offset: negative offset of a constant array".to_string(),
+                })?;
+                elems.get(idx).cloned().ok_or_else(|| InterpError::UnsupportedRvalue {
+                    kind: "pointer offset: offset at or past the end of a constant array"
+                        .to_string(),
+                })
+            }
+            Value::Bytes(bytes) => {
+                // A pointer into constant byte storage: only a
+                // byte-sized element type denotes a single byte
+                // of it.
+                if elem_size != Some(1) {
+                    return Err(InterpError::UnsupportedRvalue {
+                        kind: "pointer offset: offset of a byte-string pointer with a                                non-byte element type"
+                            .to_string(),
+                    });
+                }
+                let idx = usize::try_from(count).map_err(|_| InterpError::UnsupportedRvalue {
+                    kind: "pointer offset: negative offset of a byte string".to_string(),
+                })?;
+                bytes
+                    .get(idx)
+                    .map(|b| Value::Uint(u128::from(*b)))
+                    .ok_or_else(|| InterpError::UnsupportedRvalue {
+                        kind: "pointer offset: offset past the end of a byte string"
+                            .to_string(),
+                    })
+            }
+            other => Err(InterpError::UnsupportedRvalue {
+                kind: format!(
+                    "pointer offset: offset of a pointer to a constant {} value is not modelled",
+                    other.kind_name()
+                ),
+            }),
+        }
+    }
+
+    /// Advance a place/static target's projection by a byte
+    /// displacement (`disp`, in bytes; `None` when the offset's
+    /// element size is unknown). When the target denotes an element
+    /// of an array place (or the array place itself) and the total
+    /// displacement lands exactly on an element boundary, it is
+    /// absorbed into the index projection, so reads and writes
+    /// through the result resolve structurally. Otherwise the
+    /// displacement is carried as a trailing
+    /// [`RefProj::ByteOffset`] step: the position is faithfully
+    /// denoted (and further offsets accumulate into it), but
+    /// reading or writing through it is an explicit error at the
+    /// use site. A total displacement of zero never appears in the
+    /// result: an offset that cancels a carried one restores the
+    /// structural position.
+    fn offset_projection(
+        &self,
+        frames: &[Frame],
+        place: Option<(u64, usize)>,
+        mut projection: Vec<RefProj>,
+        disp: Option<i128>,
+    ) -> InterpResult<Vec<RefProj>> {
+        // A displacement already carried on the target accumulates
+        // into this one: the combination is what decides
+        // absorption.
+        let mut carried: i128 = 0;
+        if let Some(RefProj::ByteOffset(prev)) = projection.last() {
+            carried = *prev;
+            projection.pop();
+        }
+        let total = match disp {
+            Some(d) => carried.checked_add(d).ok_or_else(|| InterpError::UnsupportedRvalue {
+                kind: "pointer offset: displacement overflows".to_string(),
+            })?,
+            None => {
+                return Err(InterpError::UnsupportedRvalue {
+                    kind: "pointer offset: element size is not known".to_string(),
+                })
+            }
+        };
+        if total == 0 {
+            return Ok(projection);
+        }
+        if let Some((cur, elem)) = self.array_position(frames, place, &projection) {
+            if elem > 0 {
+                if let Some(byte_pos) = cur.checked_mul(elem).and_then(|b| b.checked_add(total)) {
+                    if byte_pos >= 0 && byte_pos % elem == 0 {
+                        let idx = byte_pos / elem;
+                        // The result keeps the input's form: an
+                        // index projection denotes the element
+                        // itself, while an empty projection denotes
+                        // the array place as a whole — different
+                        // positions in this model, even at index 0.
+                        return Ok(if idx == 0 && projection.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![RefProj::Index(usize::try_from(idx).map_err(|_| {
+                                InterpError::UnsupportedRvalue {
+                                    kind: "pointer offset: element index out of range"
+                                        .to_string(),
+                                }
+                            })?)]
+                        });
+                    }
+                }
+            }
+        }
+        projection.push(RefProj::ByteOffset(total));
+        Ok(projection)
+    }
+
+    /// The array position a place target denotes, when it is
+    /// directly determinable from the target local's declared
+    /// type: the local is an array and the projection is empty
+    /// (the array base, element 0) or a single index into it.
+    /// Returns the current element index and the element size.
+    fn array_position(
+        &self,
+        frames: &[Frame],
+        place: Option<(u64, usize)>,
+        projection: &[RefProj],
+    ) -> Option<(i128, i128)> {
+        let (frame_id, local) = place?;
+        let frame = &frames[self.frame_pos(frames, frame_id).ok()?];
+        let body = self.program().functions.get(&frame.func)?;
+        let elem = match body.local_tys.get(local)? {
+            Ty::Array(elem, _) => self.ty_size(elem)?,
+            _ => return None,
+        };
+        let cur = match projection {
+            [] => 0,
+            [RefProj::Index(i)] => i128::try_from(*i).ok()?,
+            _ => return None,
+        };
+        Some((cur, i128::from(elem)))
     }
 
     pub(crate) fn read_resolved(
@@ -5746,7 +6101,25 @@ impl<'a> Interpreter<'a> {
             Value::FatRef { len, .. } => Ok(Value::Uint(*len)),
             Value::Str(s) => Ok(Value::Uint(s.len() as u128)),
             Value::DynRef { .. } => Ok(v.clone()),
-            Value::Ref(_) => {
+            Value::Ref(target) => {
+                // A byte-displaced thin pointer's metadata is the
+                // unit value: the pointer itself is thin whatever
+                // it points into, and the displaced position is not
+                // readable in this model, so the pointee read below
+                // does not apply to it.
+                let projection = match target {
+                    RefTarget::Place { projection, .. }
+                    | RefTarget::Static { projection, .. }
+                    | RefTarget::Alloc { projection, .. } => Some(projection),
+                    _ => None,
+                };
+                if let Some(projection) = projection {
+                    if let Some(RefProj::ByteOffset(d)) = projection.last() {
+                        if *d != 0 {
+                            return Ok(Value::Unit);
+                        }
+                    }
+                }
                 let target = self.deref_value(frames, v)?;
                 let pointee = self.read_resolved(frames, &target)?;
                 self.metadata_of_pointee(frames, &pointee, dest_ty)
@@ -5878,7 +6251,40 @@ impl<'a> Interpreter<'a> {
                 for op in operands {
                     items.push(self.eval_operand(frames, body, op)?);
                 }
-                Ok(Value::Tuple(items))
+                Ok(Value::Tuple(items))            }
+            Rvalue::AggregateRawPtr(data_op, meta_op) => {
+                let data = self.eval_operand(frames, body, data_op)?;
+                match meta_op {
+                    None => Ok(data),
+                    Some(meta_op) => {
+                        let len: Option<u128> =
+                            match self.eval_operand(frames, body, meta_op)? {
+                                Value::Unit => None,
+                                Value::Int(v) if v >= 0 => Some(v as u128),
+                                Value::Uint(v) => Some(v),
+                                other => {
+                                    return Err(InterpError::UnsupportedRvalue {
+                                        kind: format!(
+                                            "raw pointer aggregate with {} metadata",
+                                            other.kind_name()
+                                        ),
+                                    })
+                                }
+                            };
+                        Ok(match len {
+                            None => data,
+                            Some(len) => match data {
+                                Value::FatRef { base, .. } => {
+                                    Value::FatRef { base, len }
+                                }
+                                data => Value::FatRef {
+                                    base: Box::new(data),
+                                    len,
+                                },
+                            },
+                        })
+                    }
+                }
             }
             Rvalue::AggregateAdt {
                 variant,
@@ -6028,10 +6434,6 @@ impl<'a> Interpreter<'a> {
                         return Err(InterpError::type_mismatch(
                             "integer-to-enum transmute",
                             "an integer value",
-                            other.kind_name(),
-                        ))
-                    }
-                };
                 match discriminants.iter().position(|d| *d as u128 == bits) {
                     Some(variant) => Ok(Value::Enum {
                         variant: variant as u32,
@@ -6047,6 +6449,45 @@ impl<'a> Interpreter<'a> {
             Rvalue::Reinterpret(operand, src, dst) => {
                 let value = self.eval_operand(frames, body, operand)?;
                 self.reinterpret_value(&value, src, dst)
+            }
+            Rvalue::PtrOffset(ptr_op, count_op, baked_size, count_width) => {
+                let base = self.eval_operand(frames, body, ptr_op)?;
+                let count_value = self.eval_operand(frames, body, count_op)?;
+                let count = match count_value {
+                    Value::Int(v) => v,
+                    Value::Uint(v) => {
+                        let v = i128::try_from(v).map_err(|_| {
+                            InterpError::UnsupportedRvalue {
+                                kind: "pointer offset: count does not fit in an isize"
+                                    .to_string(),
+                            }
+                        })?;
+                        if *count_width > 0 && *count_width < 128 {
+                            // The count arrived in an unsigned-typed
+                            // operand (the `byte_*` family passes its
+                            // `usize` count straight through): its
+                            // bits are the `isize` count.
+                            let w = *count_width;
+                            let masked = v & ((1i128 << w) - 1);
+                            if (masked >> (w - 1)) & 1 == 1 {
+                                masked - (1i128 << w)
+                            } else {
+                                masked
+                            }
+                        } else {
+                            v
+                        }
+                    }
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            "pointer offset count",
+                            "integer count",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                let elem_size = baked_size.or_else(|| self.offset_elem_size_of(body, ptr_op));
+                self.ptr_offset_value(frames, base, count, elem_size, false)
             }
             Rvalue::BoxDerefTransmute(operand) => {
                 // The cast yields a pointer to the box's pointee.
@@ -6350,6 +6791,9 @@ pub(crate) fn describe_resolved(local: usize, projection: &[RefProj]) -> String 
             }
             RefProj::Subslice { offset, len } => {
                 let _ = write!(out, "[{offset}..{}]", offset + len);
+            }
+            RefProj::ByteOffset(d) => {
+                let _ = write!(out, " +byte {d}");
             }
         }
     }
@@ -6664,6 +7108,20 @@ pub(crate) fn project_value(
                     ));
                 }
             },
+            RefProj::ByteOffset(disp) => {
+                if *disp == 0 {
+                    value
+                } else {
+                    // The position does not coincide with a value
+                    // boundary, and the model has no byte-level
+                    // view of a value's storage to reinterpret.
+                    return Err(InterpError::UnsupportedProjection {
+                        kind: format!(
+                            "read through a pointer displaced {disp} bytes from a value boundary"
+                        ),
+                    });
+                }
+            }
         };
     }
     Ok(value)
@@ -6957,6 +7415,16 @@ pub(crate) fn navigate_mut<'x>(
                 }
             }
             navigate_mut(&mut fields[*idx], rest, func, place)
+        RefProj::ByteOffset(disp) => {
+            if *disp == 0 {
+                navigate_mut(slot, rest, func, place)
+            } else {
+                Err(InterpError::UnsupportedProjection {
+                    kind: format!(
+                        "write through a pointer displaced {disp} bytes from a value boundary"
+                    ),
+                })
+            }
         }
         RefProj::Field(idx) => {
             if let Value::Coroutine { fields, .. } = slot {
@@ -7748,6 +8216,7 @@ fn synthetic_addr(v: &Value) -> u128 {
                     RefProj::Subslice { offset, len } => {
                         (4u128, ((*offset as u128) << 64) | (*len as u128))
                     }
+                    RefProj::ByteOffset(d) => (6u128, *d as u128),
                 };
                 mix(&mut h, tag);
                 mix(&mut h, n);
@@ -7787,6 +8256,7 @@ fn synthetic_addr(v: &Value) -> u128 {
                     RefProj::Subslice { offset, len } => {
                         (4u128, ((*offset as u128) << 64) | (*len as u128))
                     }
+                    RefProj::ByteOffset(d) => (6u128, *d as u128),
                 };
                 mix(&mut h, tag);
                 mix(&mut h, n);
@@ -7810,6 +8280,7 @@ fn synthetic_addr(v: &Value) -> u128 {
                     RefProj::Subslice { offset, len } => {
                         (4u128, ((*offset as u128) << 64) | (*len as u128))
                     }
+                    RefProj::ByteOffset(d) => (6u128, *d as u128),
                 };
                 mix(&mut h, tag);
                 mix(&mut h, n);
