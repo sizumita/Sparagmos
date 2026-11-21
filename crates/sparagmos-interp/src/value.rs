@@ -97,6 +97,18 @@ pub enum RefProj {
     /// value's length at resolution time. Reads materialise the
     /// sub-sequence; writes navigate into it element-wise.
     Subslice { offset: usize, len: usize },
+    /// A byte displacement from the position the preceding steps
+    /// denote, produced by pointer arithmetic (`BinaryOp::Offset`,
+    /// the `arith_offset` intrinsic) whose result does not coincide
+    /// with a structural position in the value tree — a `byte_add`
+    /// into the middle of a scalar's or struct's storage is the
+    /// canonical case. The step faithfully denotes the position (it
+    /// participates in pointer identity and in further offsets,
+    /// which accumulate), but reading or writing through it is an
+    /// explicit error: the model has no byte-level view of a value's
+    /// storage to reinterpret. A zero displacement never appears;
+    /// offset evaluation absorbs or drops it.
+    ByteOffset(i128),
 }
 
 /// Where a [`Value::Ref`] points.
@@ -388,6 +400,7 @@ impl fmt::Display for RefTarget {
                         RefProj::Subslice { offset, len } => {
                             write!(f, "[{offset}..{}]", offset + len)?
                         }
+                        RefProj::ByteOffset(d) => write!(f, " +byte {d}")?,
                     }
                 }
                 Ok(())
@@ -419,6 +432,7 @@ impl fmt::Display for RefTarget {
                         RefProj::Subslice { offset, len } => {
                             write!(f, "[{offset}..{}]", offset + len)?
                         }
+                        RefProj::ByteOffset(d) => write!(f, " +byte {d}")?,
                     }
                 }
                 Ok(())

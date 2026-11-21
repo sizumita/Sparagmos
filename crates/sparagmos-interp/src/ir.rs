@@ -532,6 +532,14 @@ pub enum Rvalue {
     /// Build a tuple value from operands. Array aggregates ride as
     /// tuples too (the length lives in the declared type).
     AggregateTuple(Vec<Operand>),
+    /// A raw-pointer aggregate: a pointer rebuilt from its data
+    /// pointer operand and, for fat pointers, its metadata operand
+    /// (absent for thin pointers in some MIR shapes). A unit
+    /// metadata operand yields the data pointer itself; an integer
+    /// metadata operand yields the fat pointer of that length; a
+    /// vtable metadata operand has no standalone value in this
+    /// model and is an explicit unsupported.
+    AggregateRawPtr(Operand, Option<Operand>),
     /// Build an ADT value: a variant index plus field values.
     AggregateAdt {
         variant: u32,
@@ -636,6 +644,29 @@ pub enum Rvalue {
     /// field stays unsupported: there is no flat byte memory to
     /// reinterpret through.
     Reinterpret(Operand, ScalarShape, ScalarShape),
+    /// A pointer offset (`BinaryOp::Offset`: `ptr.offset` /
+    /// `ptr.add` / `ptr.sub` and the `byte_add` family after their
+    /// cast to an element pointer): the first operand's pointer
+    /// position advanced by the second operand's count, in elements
+    /// of the pointer's pointee type. The third element is the
+    /// pointee's size in bytes when conversion could compute it
+    /// exactly (scalars, arrays of those, pointers); `None` leaves
+    /// the size to execution, which derives it from the executing
+    /// body's declared type of the pointer operand. Execution
+    /// represents the result in the projection model: an offset that
+    /// lands on an element of an array place is absorbed into the
+    /// place's index projection, an address-only pointer's address
+    /// advances by the byte count, and any other displacement is
+    /// carried as a byte-offset projection step (see
+    /// [`crate::value::RefProj::ByteOffset`]). A displacement whose
+    /// size is unknown in all of these is an explicit error, never a
+    /// fabricated position. The fourth element is the bit width
+    /// of the count operand's MIR type when that type is unsigned
+    /// (0 when it is signed): the `byte_*` family passes its
+    /// `usize` count straight into the `Offset`, whose count is
+    /// an `isize`, so execution reinterprets the unsigned bits as
+    /// the signed value of that width.
+    PtrOffset(Operand, Operand, Option<u64>, u32),
     /// `&place` (also raw-pointer creation): a resolved reference value.
     Ref(Place),
     /// The length of the value at a place (array / slice / `str`).
