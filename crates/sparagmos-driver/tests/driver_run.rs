@@ -802,6 +802,58 @@ fn run_mode_aux_locator_extern_name() {
 }
 
 #[test]
+fn run_mode_aux_modified_binding_stays_out_of_prelude() {
+    // Lane CI round 2: an `aux-crate:` binding with modifiers
+    // (`priv,noprelude:somedep`) is the binding itself — the
+    // driver must not ALSO bind the crate under its unmodified
+    // build name, or the crate lands in the extern prelude the
+    // `noprelude` modifier exists to keep it out of, and
+    // tests/ui/extern-flag/multiple-opts.rs stops failing the
+    // way it must. The `extern crate somedep;` item inside the
+    // module still resolves through the modified binding; the
+    // prelude use in `main` cannot, so compilation fails
+    // (run-mode exit 2).
+    let dir = temp_dir("aux-modified-binding");
+    let aux = fixture(
+        &dir,
+        "somedep.rs",
+        "pub struct S;\npub fn somefun() {}\n",
+    );
+    let src = fixture(
+        &dir,
+        "momain.rs",
+        "//@ aux-crate:priv,noprelude:somedep=somedep.rs\n\
+         #![warn(exported_private_dependencies)]\n\
+         pub mod m {\n\
+             extern crate somedep;\n\
+             pub struct PublicType { pub field: somedep::S }\n\
+         }\n\
+         fn main() { somedep::somefun(); }\n",
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run")
+        .arg(&src)
+        .arg("--rustc-arg")
+        .arg("-Z")
+        .arg("--rustc-arg")
+        .arg("unstable-options")
+        .arg("--aux")
+        .arg(aux_spec("priv,noprelude:somedep", &aux, ""))
+        .output()
+        .expect("failed to run sparagmos-driver");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a noprelude binding must keep the crate out of the prelude; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("cannot find"),
+        "the failure is the unresolved prelude use: {stderr}"
+    );
+}
+
+#[test]
 fn run_mode_nested_aux_crates_execute() {
     // Auxiliary crates are passed in dependency order: `mid` uses
     // `base`, and the main crate uses `mid`.
