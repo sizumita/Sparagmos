@@ -1913,3 +1913,32 @@ fn run_mode_f16_constants_execute() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "1.75\n3\n");
 }
+
+const NULLPTR_SRC: &str = r#"fn target() {}
+const FN_AS_PTR: *const () = target as *const ();
+const NULLP: *const u8 = core::ptr::null();
+static WORD: u32 = 9;
+const STATIC_PTR: *const u32 = &raw const WORD;
+fn main() {
+    println!("{:?}", NULLP.is_null());
+    println!("{:?}", FN_AS_PTR.is_null());
+    println!("{:?}", unsafe { *STATIC_PTR });
+}
+"#;
+
+#[test]
+fn run_mode_null_and_fn_pointer_constants_execute() {
+    let dir = temp_dir("nullptr");
+    let src = fixture(&dir, "nullptr.rs", NULLPTR_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "null/fn pointer constant program must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "true\nfalse\n9\n"
+    );
+}

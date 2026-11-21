@@ -43,6 +43,11 @@ pub enum ConstValue {
     /// materialised form of a reference constant whose pointee is
     /// itself a constant value.
     Ref(Box<ConstValue>),
+    /// A null pointer constant: an allocation word of zero with no
+    /// provenance. Equality with another null pointer holds; any
+    /// dereference is an explicit error in the interpreter (the
+    /// `RefTarget::Null` value).
+    NullPtr,
     /// A fat reference to decoded elements: a slice constant whose
     /// elements are not plain bytes.
     SliceVal(Vec<ConstValue>),

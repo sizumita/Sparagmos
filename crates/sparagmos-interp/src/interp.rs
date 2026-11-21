@@ -125,6 +125,11 @@ fn synthetic_address(value: &Value) -> Option<u128> {
         }
         h
     }
+    if matches!(value, Value::Ref(RefTarget::Null)) {
+        // The null pointer's address is 0, as natively: `is_null`
+        // and address comparisons depend on it.
+        return Some(0);
+    }
     let key = match value {
         Value::Ref(target) => format!("ref:{target:?}"),
         Value::FatRef { base, len } => format!("fat:{base:?}:{len}"),
@@ -1977,6 +1982,7 @@ impl<'a> Interpreter<'a> {
             Constant::Ref(inner) => {
                 Value::Ref(RefTarget::Value(Box::new(self.eval_constant(inner)?)))
             }
+            Constant::NullPtr => Value::Ref(RefTarget::Null),
             Constant::SliceVal(elems) => {
                 let elems = elems
                     .iter()
@@ -3071,6 +3077,9 @@ fn synthetic_addr(v: &Value) -> u128 {
             *h ^= limb as u128;
             *h = h.wrapping_mul(0x100_0000_01b3);
         }
+    }
+    if matches!(v, Value::Ref(RefTarget::Null)) {
+        return 0;
     }
     let mut h: u128 = 0xcbf2_9ce4_8422_2325;
     match v {

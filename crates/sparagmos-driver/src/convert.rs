@@ -807,6 +807,12 @@ impl Converter {
                 offset: 0,
             };
         }
+        // No provenance at all: a stored zero word is a null
+        // pointer constant. Anything else is an integer-derived
+        // address, which has no faithful value form.
+        if alloc.read_partial_uint(0..PTR_SIZE).ok() == Some(0) {
+            return sm::ConstValue::NullPtr;
+        }
         self.err(format!(
             "ConstantKind::Allocated (reference without provenance: {})",
             short_ty(inner)
@@ -1170,11 +1176,20 @@ impl Converter {
         if depth > MAX_CONST_DEPTH {
             return None;
         }
-        let (_, prov) = alloc
+        let prov = alloc
             .provenance
             .ptrs
             .iter()
-            .find(|(o, _)| *o as usize == offset)?;
+            .find(|(o, _)| *o as usize == offset);
+        let Some((_, prov)) = prov else {
+            // No provenance: a stored zero word is a null pointer.
+            // A nonzero word is an integer-derived address, which
+            // has no faithful value form and stays undecoded.
+            return match read_uint_at(alloc, offset, PTR_SIZE) {
+                Some(0) => Some(sm::ConstValue::NullPtr),
+                _ => None,
+            };
+        };
         let target_off = read_uint_at(alloc, offset, PTR_SIZE)? as usize;
         let target = match mir::alloc::GlobalAlloc::from(prov.0) {
             mir::alloc::GlobalAlloc::Memory(target) => target,
@@ -1182,7 +1197,15 @@ impl Converter {
             // initializer allocation (the value a constant read of
             // the static observes).
             mir::alloc::GlobalAlloc::Static(def) => def.eval_initializer().ok()?,
-            // Functions and vtables are not materialised.
+            // A pointer whose target is a function: the value is
+            // a reference to the callable itself (a function item
+            // coerced to a raw pointer keeps its identity for
+            // comparisons and its pointer shape for assignments).
+            mir::alloc::GlobalAlloc::Function(_) => {
+                let f = self.decode_fn_pointer(alloc, offset)?;
+                return Some(sm::ConstValue::Ref(Box::new(f)));
+            }
+            // Vtables are not materialised.
             _ => return None,
         };
         match inner.kind() {
