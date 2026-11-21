@@ -6069,3 +6069,244 @@ fn run_mode_box_dyn_mut_method_writes_through_allocation() {
         "get 10\ndtor 10\nafter drop\n"
     );
 }
+
+const RC_GET_MUT_SRC: &str = r#"
+use std::rc::Rc;
+fn main() {
+    let mut r = Rc::new(41);
+    *Rc::get_mut(&mut r).unwrap() += 1;
+    println!("{}", *r);
+}
+"#;
+
+#[test]
+fn run_mode_rc_get_mut_write_is_observed_by_the_owner() {
+    // `Rc::get_mut` runs its converted std body against the
+    // allocation the handle names: the write through the returned
+    // `&mut` lands in the shared storage and the owner reads it
+    // back.
+    let dir = temp_dir("rc-get-mut");
+    let src = fixture(&dir, "rc_get_mut.rs", RC_GET_MUT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Rc::get_mut on a unique Rc must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const RC_GET_MUT_SHARED_SRC: &str = r#"
+use std::rc::Rc;
+fn main() {
+    let mut r = Rc::new(41);
+    println!("unique: {}", Rc::get_mut(&mut r).is_some());
+    let r2 = r.clone();
+    println!("shared: {}", Rc::get_mut(&mut r).is_some());
+    drop(r2);
+    println!("unique again: {}", Rc::get_mut(&mut r).is_some());
+}
+"#;
+
+#[test]
+fn run_mode_rc_get_mut_is_none_while_shared() {
+    // The strong/weak counts live in the allocation, so the
+    // converted `get_mut` body observes clones and drops exactly
+    // as natively: `None` while a second handle shares the value.
+    let dir = temp_dir("rc-get-mut-shared");
+    let src = fixture(&dir, "rc_get_mut_shared.rs", RC_GET_MUT_SHARED_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Rc::get_mut must track sharing through clone/drop; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "unique: true\nshared: false\nunique again: true\n"
+    );
+}
+
+const ARC_GET_MUT_SHARED_SRC: &str = r#"
+use std::sync::Arc;
+fn main() {
+    let mut a = Arc::new(41);
+    println!("unique: {}", Arc::get_mut(&mut a).is_some());
+    let a2 = a.clone();
+    println!("shared: {}", Arc::get_mut(&mut a).is_some());
+    drop(a2);
+    println!("unique again: {}", Arc::get_mut(&mut a).is_some());
+}
+"#;
+
+#[test]
+fn run_mode_arc_get_mut_is_none_while_shared() {
+    let dir = temp_dir("arc-get-mut-shared");
+    let src = fixture(&dir, "arc_get_mut_shared.rs", ARC_GET_MUT_SHARED_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Arc::get_mut must track sharing through clone/drop; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "unique: true\nshared: false\nunique again: true\n"
+    );
+}
+
+const ARC_MAKE_MUT_SRC: &str = r#"
+use std::sync::Arc;
+fn main() {
+    let mut a = Arc::new(41);
+    *Arc::make_mut(&mut a) += 1;
+    println!("{}", *a);
+}
+"#;
+
+#[test]
+fn run_mode_arc_make_mut_on_unique_arc_writes_in_place() {
+    // The unique path of the converted `make_mut` body: the
+    // layout intrinsics resolve, the uniqueness check reads the
+    // counts from the allocation, and the returned `&mut` writes
+    // into the same storage the owner reads.
+    let dir = temp_dir("arc-make-mut");
+    let src = fixture(&dir, "arc_make_mut.rs", ARC_MAKE_MUT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Arc::make_mut on a unique Arc must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const RC_MAKE_MUT_SRC: &str = r#"
+use std::rc::Rc;
+fn main() {
+    let mut r = Rc::new(41);
+    *Rc::make_mut(&mut r) += 1;
+    println!("{}", *r);
+}
+"#;
+
+#[test]
+fn run_mode_rc_make_mut_on_unique_rc_writes_in_place() {
+    let dir = temp_dir("rc-make-mut");
+    let src = fixture(&dir, "rc_make_mut.rs", RC_MAKE_MUT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Rc::make_mut on a unique Rc must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const RC_WEAK_SRC: &str = r#"
+use std::rc::Rc;
+fn main() {
+    let r = Rc::new(41);
+    let w = Rc::downgrade(&r);
+    println!("{}", *w.upgrade().unwrap());
+    println!("{}", Rc::strong_count(&r));
+    println!("{}", Rc::weak_count(&r));
+    drop(r);
+    println!("{}", w.upgrade().is_none());
+}
+"#;
+
+#[test]
+fn run_mode_rc_weak_upgrade_and_counts() {
+    // Downgrade bumps the weak count in the allocation; upgrade
+    // observes the strong count, so it succeeds while a strong
+    // handle lives and returns `None` once the last one drops -
+    // the storage outlives the pointee on the weak bundle.
+    let dir = temp_dir("rc-weak");
+    let src = fixture(&dir, "rc_weak.rs", RC_WEAK_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Rc::downgrade / Weak::upgrade must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "41\n1\n1\ntrue\n");
+}
+
+const RC_DROP_ONCE_SRC: &str = r#"
+use std::rc::Rc;
+static mut N: usize = 0;
+struct D;
+impl Drop for D {
+    fn drop(&mut self) {
+        unsafe { N += 1; }
+    }
+}
+fn main() {
+    let r = Rc::new(D);
+    let r2 = r.clone();
+    drop(r);
+    println!("after drop r: {}", unsafe { N });
+    drop(r2);
+    println!("after drop r2: {}", unsafe { N });
+}
+"#;
+
+#[test]
+fn run_mode_rc_pointee_glue_runs_once_at_the_last_handle() {
+    // Dropping one of two handles only decrements the count in
+    // the allocation; the pointee's destructor runs when the
+    // last strong handle drops, not once per handle copy.
+    let dir = temp_dir("rc-drop-once");
+    let src = fixture(&dir, "rc_drop_once.rs", RC_DROP_ONCE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Rc drop glue must be count-driven; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "after drop r: 0\nafter drop r2: 1\n"
+    );
+}
+
+const ARC_MAKE_MUT_COW_SRC: &str = r#"
+use std::sync::Arc;
+fn main() {
+    let mut a = Arc::new(41);
+    let a2 = a.clone();
+    *Arc::make_mut(&mut a) += 1;
+    println!("{} {}", *a, *a2);
+}
+"#;
+
+#[test]
+fn run_mode_arc_make_mut_shared_stops_at_the_allocator() {
+    // The copy-on-write path of `make_mut` allocates the
+    // replacement `ArcInner` through the allocator machinery
+    // (`UniqueArcUninit`, `__rust_alloc`), which needs a
+    // byte-addressable allocation model the interpreter does not
+    // have yet. Until it does, the run must stop with an explicit
+    // unsupported (exit 2) rather than answering wrongly.
+    let dir = temp_dir("arc-make-mut-cow");
+    let src = fixture(&dir, "arc_make_mut_cow.rs", ARC_MAKE_MUT_COW_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "make_mut's shared path is unsupported until the allocator is modelled; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("unsupported"),
+        "the stop names itself as unsupported: {stderr}"
+    );
+}
