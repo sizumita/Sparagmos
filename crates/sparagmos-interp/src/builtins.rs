@@ -219,6 +219,15 @@ fn float_ty_name(ty: mir::FloatTy) -> &'static str {
 pub enum Builtin {
     /// `std::io::_print(Arguments)`: format and append to guest stdout.
     Print,
+    /// `std::io::_eprint(Arguments)`: format and append to guest stderr.
+    Eprint,
+    /// `std::env::args() -> Args`: the run's argument iterator
+    /// (argv[0] plus the configured guest arguments).
+    EnvArgs,
+    /// `std::env::args_os() -> ArgsOs`: the run's argument iterator
+    /// over `OsString` values, which are the string values
+    /// themselves in this model (guest arguments are text).
+    EnvArgsOs,
     /// `std::fmt::format(Arguments) -> String`.
     Format,
     /// `std::fmt::Arguments::from_str(&str)`.
@@ -739,6 +748,9 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
     use FmtTrait as F;
     Some(match canonical {
         "std::io::_print" => Builtin::Print,
+        "std::io::_eprint" => Builtin::Eprint,
+        "std::env::args" => Builtin::EnvArgs,
+        "std::env::args_os" => Builtin::EnvArgsOs,
         "std::fmt::format" => Builtin::Format,
         "std::fmt::Arguments::from_str" | "std::fmt::Arguments::from_str_nonconst" => {
             Builtin::ArgumentsFromStr
@@ -1352,6 +1364,39 @@ impl<'a> Interpreter<'a> {
                 self.push_output(&text);
                 Ok(Value::Unit)
             }
+            Builtin::Eprint => {
+                arity(1)?;
+                let text = self.format_arguments(frames, expect_arguments(&vals[0], name)?)?;
+                self.push_error_output(&text);
+                Ok(Value::Unit)
+            }
+            Builtin::EnvArgs | Builtin::EnvArgsOs => {
+                arity(0)?;
+                // argv[0] is the program path the run was invoked
+                // with, then the configured guest arguments, in
+                // order. `Args` wraps `ArgsOs`, which wraps a
+                // `vec::IntoIter` in this model's iteration-state
+                // shape ([element snapshot, next index]).
+                let mut items: Vec<Value> = Vec::new();
+                if !self.program_path().is_empty() {
+                    items.push(Value::Str(self.program_path().to_string()));
+                }
+                for arg in self.guest_args() {
+                    items.push(Value::Str(arg.clone()));
+                }
+                let args_os = Value::Enum {
+                    variant: 0,
+                    fields: vec![owned_iter_state(items)],
+                };
+                if kind == Builtin::EnvArgsOs {
+                    Ok(args_os)
+                } else {
+                    Ok(Value::Enum {
+                        variant: 0,
+                        fields: vec![args_os],
+                    })
+                }
+            }
             Builtin::Format => {
                 arity(1)?;
                 let text = self.format_arguments(frames, expect_arguments(&vals[0], name)?)?;
@@ -1689,6 +1734,26 @@ impl<'a> Interpreter<'a> {
                         variant: 0,
                         fields: vec![Value::Tuple(elems), Value::Uint(0)],
                     })
+                } else if self_ty_is(self_ty, "std::env::Args")
+                    || self_ty_is(self_ty, "std::env::ArgsOs")
+                {
+                    // The env argument iterators are their own
+                    // `IntoIterator` (the state `env::args` built).
+                    Ok(value)
+                } else if self_ty.starts_with("std::vec::Vec<")
+                    || self_ty.starts_with("alloc::vec::Vec<")
+                {
+                    // A by-value `Vec` iterates as `vec::IntoIter`:
+                    // the element snapshot plus the next index (the
+                    // vector value's fields are its elements).
+                    match value {
+                        Value::Enum { fields, .. } => Ok(owned_iter_state(fields)),
+                        ref other => Err(InterpError::type_mismatch(
+                            "IntoIterator::into_iter for a Vec",
+                            "vector value",
+                            other.kind_name(),
+                        )),
+                    }
                 } else if self_ty.starts_with("std::sync::mpsc::Iter<") {
                     // `mpsc::Iter` is its own `IntoIterator`.
                     Ok(value)
@@ -3829,6 +3894,43 @@ impl<'a> Interpreter<'a> {
                 Err(()) => Ok(none_value()),
             };
         }
+        if self_ty_is(self_ty, "std::env::Args") || self_ty_is(self_ty, "std::env::ArgsOs") {
+            // `Args { inner: ArgsOs }` / `ArgsOs { inner:
+            // vec::IntoIter }`: step the innermost owned-iterator
+            // state and rebuild the wrappers. The yielded
+            // `OsString` is the string value itself in this model,
+            // so `Args::next`'s OsString-to-String conversion is
+            // the identity (the arguments are always valid text
+            // here, so the native panic on invalid Unicode cannot
+            // arise).
+            let depth = if self_ty_is(self_ty, "std::env::Args") { 2 } else { 1 };
+            let mut inner = &state;
+            for _ in 0..depth {
+                inner = match inner {
+                    Value::Enum { fields, .. } if fields.len() == 1 => &fields[0],
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            format!("{self_ty} state"),
+                            "nested one-field iterator wrappers",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+            }
+            let (new_inner, item) = step_owned_iter(inner, self_ty)?;
+            let mut rebuilt = new_inner;
+            for _ in 0..depth {
+                rebuilt = Value::Enum {
+                    variant: 0,
+                    fields: vec![rebuilt],
+                };
+            }
+            self.write_resolved(frames, &target, rebuilt)?;
+            return Ok(match item {
+                Some(value) => some_value(value),
+                None => none_value(),
+            });
+        }
         let fields = iterator_fields(&state, self_ty)?;
         let (new_fields, result) = if self_ty.starts_with("std::ops::RangeInclusive<") {
             if fields.len() != 3 {
@@ -3875,6 +3977,8 @@ impl<'a> Interpreter<'a> {
             // An empty iterator yields `None` forever.
             (fields, none_value())
         } else if self_ty.starts_with("std::array::IntoIter<")
+            || self_ty.starts_with("std::vec::IntoIter<")
+            || self_ty.starts_with("alloc::vec::IntoIter<")
             || self_ty.starts_with("std::slice::Iter<")
             || self_ty_is(self_ty, "std::str::Chars")
             || self_ty_is(self_ty, "core::str::Chars")
@@ -4782,6 +4886,64 @@ fn self_ty_is(self_ty: &str, name: &str) -> bool {
 }
 
 /// The fields of an iterator state value (ADT aggregate or tuple).
+/// One step of an owned-sequence iterator state (see
+/// [`owned_iter_state`]): returns the new state and the yielded
+/// item, or `None` when the sequence is exhausted (the state is
+/// then returned unchanged by the caller).
+fn step_owned_iter(state: &Value, self_ty: &str) -> InterpResult<(Value, Option<Value>)> {
+    let fields = iterator_fields(state, self_ty)?;
+    if fields.len() != 2 {
+        return Err(InterpError::type_mismatch(
+            format!("{self_ty} state"),
+            "[items, next index]",
+            format!("{} field(s)", fields.len()),
+        ));
+    }
+    let items = match &fields[0] {
+        Value::Tuple(items) => items.clone(),
+        ref other => {
+            return Err(InterpError::type_mismatch(
+                format!("{self_ty} items"),
+                "tuple of elements",
+                other.kind_name(),
+            ))
+        }
+    };
+    let idx = match fields[1] {
+        Value::Uint(v) => v as usize,
+        ref other => {
+            return Err(InterpError::type_mismatch(
+                format!("{self_ty} index"),
+                "unsigned integer",
+                other.kind_name(),
+            ))
+        }
+    };
+    if idx < items.len() {
+        let item = items[idx].clone();
+        let new_state = match state {
+            Value::Enum { variant, .. } => Value::Enum {
+                variant: *variant,
+                fields: vec![Value::Tuple(items), Value::Uint((idx + 1) as u128)],
+            },
+            _ => Value::Tuple(vec![Value::Tuple(items), Value::Uint((idx + 1) as u128)]),
+        };
+        Ok((new_state, Some(item)))
+    } else {
+        Ok((state.clone(), None))
+    }
+}
+
+/// The iteration state of an owned-sequence iterator in this
+/// model (`vec::IntoIter`, `array::IntoIter`, the env argument
+/// iterators): the element snapshot plus the next index.
+fn owned_iter_state(items: Vec<Value>) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![Value::Tuple(items), Value::Uint(0)],
+    }
+}
+
 fn iterator_fields(state: &Value, self_ty: &str) -> InterpResult<Vec<Value>> {
     match state {
         Value::Enum { fields, .. } => Ok(fields.clone()),
