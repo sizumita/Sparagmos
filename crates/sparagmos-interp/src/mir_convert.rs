@@ -1085,7 +1085,7 @@ impl<'a> Converter<'a> {
             mir::Ty::Bool => ir::Ty::Bool,
             mir::Ty::Int(it) => ir::Ty::Int(convert_int_ty(*it)),
             mir::Ty::Uint(ut) => ir::Ty::Uint(convert_uint_ty(*ut)),
-            // `f16` / `f128` fall through to the unsupported arm.
+            // `f128` falls through to the unsupported arm.
             mir::Ty::Float(mir::FloatTy::F16) => ir::Ty::Float(ir::FloatTy::F16),
             mir::Ty::Float(mir::FloatTy::F32) => ir::Ty::Float(ir::FloatTy::F32),
             mir::Ty::Float(mir::FloatTy::F64) => ir::Ty::Float(ir::FloatTy::F64),

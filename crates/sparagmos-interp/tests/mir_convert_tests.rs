@@ -466,21 +466,21 @@ fn tuple_and_array_aggregates_and_repeat() {
 // ----- explicit failures (nothing is silently skipped) ---------------------------
 
 #[test]
-fn f16_local_is_a_conversion_error() {
-    // f32 / f64 locals convert and execute (see float_tests.rs);
-    // f16 stays outside the type model and must fail conversion
+fn f128_local_is_a_conversion_error() {
+    // f16 / f32 / f64 locals convert and execute (see float_tests.rs);
+    // f128 stays outside the type model and must fail conversion
     // with an explicit reason. Conversion is isolated per body:
     // the failure is recorded for `f`, and running `f` as the
     // entry fails with that conversion error.
     let body = mir::Body::new(
-        decls(&[mir::Ty::Float(mir::FloatTy::F16)]),
+        decls(&[mir::Ty::Float(mir::FloatTy::F128)]),
         0,
         vec![block(vec![], ret())],
     );
     let mut prog = MirProgram::new();
     prog.add("f", body);
     let converted = convert_program(&prog).expect("conversion is per-body");
-    assert!(converted.get("f").is_none(), "f16 body must not convert");
+    assert!(converted.get("f").is_none(), "f128 body must not convert");
     let reason = converted
         .unconverted_reason("f")
         .expect("the failure must be recorded");
