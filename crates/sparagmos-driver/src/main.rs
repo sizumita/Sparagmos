@@ -2597,7 +2597,73 @@ fn exit_code_value(value: &sparagmos_interp::Value) -> Option<i32> {
     }
 }
 
-fn execute(c: &Collected, input: &str, guest_args: &[String]) -> i32 {
+/// The session's effective overflow-checks setting, resolved from
+/// the final rustc argument list the way rustc resolves it
+/// (`Session::overflow_checks`): the last `-C overflow-checks`
+/// wins; without one, the last `-C debug-assertions`; without
+/// either, checks are on exactly when the opt-level is 0 (`-O`
+/// selects opt-level 2). The interpreter needs the resolved value
+/// because an overflow `Assert` inside a
+/// `#[rustc_inherit_overflow_checks]` body is present in the MIR
+/// either way — dropping it when the session has checks off is a
+/// codegen-time decision the driver must reproduce (see
+/// `InterpConfig::overflow_checks`).
+fn session_overflow_checks(args: &[String]) -> bool {
+    // One pass over the arguments, tracking the last value of each
+    // relevant option. A codegen option appears as `-C opt[=v]`,
+    // `-Copt[=v]`, `--codegen opt[=v]` or `--codegen=opt[=v]`.
+    let mut overflow: Option<Option<String>> = None;
+    let mut debug_assertions: Option<Option<String>> = None;
+    let mut opt_is_zero = true;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "-O" {
+            opt_is_zero = false;
+            i += 1;
+            continue;
+        }
+        let text: Option<&str> = if a == "-C" || a == "--codegen" {
+            i += 1;
+            args.get(i).map(String::as_str)
+        } else if let Some(rest) = a.strip_prefix("--codegen=") {
+            Some(rest)
+        } else if let Some(rest) = a.strip_prefix("-C") {
+            Some(rest)
+        } else {
+            None
+        };
+        if let Some(t) = text {
+            let (name, value) = match t.split_once('=') {
+                Some((n, v)) => (n, Some(v.to_string())),
+                None => (t, None),
+            };
+            match name {
+                "overflow-checks" | "overflow_checks" => overflow = Some(value),
+                "debug-assertions" | "debug_assertions" => debug_assertions = Some(value),
+                "opt-level" => {
+                    if let Some(v) = &value {
+                        opt_is_zero = v == "0";
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    // A value-less boolean option counts as on; the spelled-out
+    // negative values are the only off readings.
+    let as_bool = |v: &Option<String>| !matches!(v.as_deref(), Some("off" | "no" | "false"));
+    if let Some(v) = &overflow {
+        return as_bool(v);
+    }
+    if let Some(v) = &debug_assertions {
+        return as_bool(v);
+    }
+    opt_is_zero
+}
+
+fn execute(c: &Collected, input: &str, guest_args: &[String], overflow_checks: bool) -> i32 {
     let mut program = sparagmos_interp::MirProgram::new();
     for ((name, body), def_id) in c.bodies.iter().zip(c.body_def_ids.iter()) {
         program.functions.push(sparagmos_interp::MirFunction {
@@ -2668,6 +2734,7 @@ fn execute(c: &Collected, input: &str, guest_args: &[String]) -> i32 {
     let config = sparagmos_interp::InterpConfig {
         guest_args: guest_args.to_vec(),
         program_path: input.to_string(),
+        overflow_checks,
         ..sparagmos_interp::InterpConfig::default()
     };
     let run = sparagmos_interp::interpret_mir_captured_with_config(
@@ -3500,6 +3567,7 @@ fn main() {
     //   (e.g. `log_syntax!` output) is redirected to stderr: this
     //   process's stdout is reserved for the driver's own report —
     //   in run mode, for the guest program's output alone.
+    let overflow_checks = session_overflow_checks(&args);
     let previous_hook = begin_panic_capture();
     let mut stdout_guard = StdoutToStderr::new();
     let run_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3541,7 +3609,7 @@ fn main() {
                         std::process::exit(1);
                     }
                 }
-                std::process::exit(execute(&c, &input, &guest_args));
+                std::process::exit(execute(&c, &input, &guest_args, overflow_checks));
             }
             println!(
                 "sparagmos-driver: {input} (Stable MIR, {})",
