@@ -33,7 +33,7 @@ use sparagmos_mir as mir;
 use crate::error::{InterpError, InterpResult};
 use crate::interp::{channel_handle_id, synthetic_address, Frame, Interpreter, Resolved};
 use crate::ir::{Body, Operand};
-use crate::value::{FmtArguments, FmtTrait, RefProj, RefTarget, Value};
+use crate::value::{FmtArguments, FmtTrait, PanicPayload, RefProj, RefTarget, Value};
 
 // ---------------------------------------------------------------------------
 // Callee names
@@ -380,6 +380,44 @@ pub enum Builtin {
     DurationFromMicros,
     /// `std::time::Duration::from_nanos(n)`.
     DurationFromNanos,
+    /// `std::intrinsics::catch_unwind(try_fn, data, catch_fn) -> bool`:
+    /// run the try function to completion; on a guest panic, roll
+    /// the frame stack back to the call and run the catch function
+    /// with the panic's raw payload, reporting `true`.
+    CatchUnwind,
+    /// `std::panicking::catch_unwind::cleanup(payload)`: box a raw
+    /// panic payload into a `Box<dyn Any + Send>` (a `DynRef` in
+    /// this value model). The native cleanup also decrements the
+    /// panic count; no guest program can observe that counter
+    /// through the modelled surface (`std::panicking()` is not
+    /// modelled), so there is nothing further to do.
+    PanicCleanup,
+    /// `std::panicking::begin_panic(payload)` /
+    /// `std::rt::begin_panic(payload)`: raise a guest panic
+    /// carrying the argument as its payload. This is the sink
+    /// `panic_any` lowers to; modelling it here (rather than
+    /// executing std's converted body) keeps the payload intact —
+    /// the body routes it through the panic-hook machinery, which
+    /// has no observable effect beyond the panic itself.
+    PanicAny,
+    /// `std::panic::resume_unwind(box)` /
+    /// `std::panicking::resume_unwind(box)`: re-raise a caught
+    /// payload as a guest panic carrying the same payload.
+    ResumeUnwind,
+    /// `<(dyn Any + ...)>::downcast_ref::<T>(&self) -> Option<&T>`:
+    /// `Some` exactly when the payload's concrete type is `T`.
+    DynAnyDowncastRef,
+    /// `<(dyn Any + ...)>::downcast::<T>(self) -> Result<T, Box>`
+    /// (and `Box<dyn Any + ...>::downcast`, the inherent method
+    /// guest code actually calls): the payload value on a type
+    /// match, the box back otherwise. The payload is the generic
+    /// argument at the given index: 0 for the dyn method itself,
+    /// 1 for the `Box` impl method, whose first generic argument
+    /// is the allocator.
+    DynAnyDowncast(usize),
+    /// `<(dyn Any + ...)>::is::<T>(&self) -> bool`: whether the
+    /// payload's concrete type is `T`.
+    DynAnyIs,
     /// `PartialEq::eq(&a, &b)`: semantic (derived) value equality.
     PartialEqEq,
     /// `PartialEq::ne(&a, &b)`.
@@ -788,6 +826,38 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "core::num::from_ascii_bytes_radix_panic" => Builtin::FromAsciiRadixPanic,
         "core::slice::index::slice_index_fail" => Builtin::SliceIndexFail,
         "core::slice::index::RangeError::report" => Builtin::RangeErrorReport,
+        // The panic-catching path: the `catch_unwind` intrinsic
+        // itself (its std wrapper's body is collected and runs;
+        // only the intrinsic is modelled here), the payload
+        // plumbing around it, and the `dyn Any` downcast methods,
+        // whose collected bodies dispatch through `Any::type_id`,
+        // a virtual call this model cannot resolve.
+        "std::intrinsics::catch_unwind" | "core::intrinsics::catch_unwind" => {
+            Builtin::CatchUnwind
+        }
+        "std::panicking::catch_unwind::cleanup" => Builtin::PanicCleanup,
+        "std::panicking::begin_panic" | "std::rt::begin_panic" => Builtin::PanicAny,
+        "std::panic::resume_unwind" | "std::panicking::resume_unwind" => {
+            Builtin::ResumeUnwind
+        }
+        "<(dyn std::any::Any + 'static)>::downcast_ref"
+        | "<(dyn std::any::Any + std::marker::Send + 'static)>::downcast_ref" => {
+            Builtin::DynAnyDowncastRef
+        }
+        "<(dyn std::any::Any + 'static)>::downcast"
+        | "<(dyn std::any::Any + std::marker::Send + 'static)>::downcast" => {
+            Builtin::DynAnyDowncast(0)
+        }
+        "<(dyn std::any::Any + 'static)>::is"
+        | "<(dyn std::any::Any + std::marker::Send + 'static)>::is" => Builtin::DynAnyIs,
+        // By-value downcast is an inherent method on the `Box`
+        // itself (in alloc's `convert` module), not on the dyn
+        // type: `Box<dyn Any>::downcast` is the call guest code
+        // actually makes.
+        "std::boxed::convert::<impl std::boxed::Box<(dyn std::any::Any + 'static), A>>::downcast"
+        | "std::boxed::convert::<impl std::boxed::Box<(dyn std::any::Any + std::marker::Send + 'static), A>>::downcast" => {
+            Builtin::DynAnyDowncast(1)
+        }
         // Comparison traits: the impls for the modelled data types
         // are the derived ones, i.e. semantic value comparison.
         _ if canonical.ends_with("::PartialEq::eq") => Builtin::PartialEqEq,
@@ -1895,20 +1965,42 @@ impl<'a> Interpreter<'a> {
                 arity(1)?;
                 // `core::panicking::panic` takes the message as a
                 // string; formatted-panic shapes hand over a built
-                // `fmt::Arguments` instead.
-                let message = match &vals[0] {
-                    Value::FmtArguments(_) => {
-                        self.format_arguments(frames, expect_arguments(&vals[0], name)?)?
+                // `fmt::Arguments` instead. The payload mirrors
+                // core: a literal message is a `&str` payload, a
+                // formatted one a `String`.
+                match &vals[0] {
+                    Value::FmtArguments(FmtArguments::Plain(text)) => {
+                        Err(InterpError::panic_str_payload(text.clone()))
                     }
-                    _ => self.resolve_string(frames, &vals[0])?,
-                };
-                Err(InterpError::panic(message))
+                    Value::FmtArguments(_) => {
+                        let message = self.format_arguments(
+                            frames,
+                            expect_arguments(&vals[0], name)?,
+                        )?;
+                        Err(InterpError::panic_string_payload(message))
+                    }
+                    _ => {
+                        let message = self.resolve_string(frames, &vals[0])?;
+                        Err(InterpError::panic_str_payload(message))
+                    }
+                }
             }
             Builtin::PanicFmt => {
                 arity(1)?;
-                let message =
-                    self.format_arguments(frames, expect_arguments(&vals[0], name)?)?;
-                Err(InterpError::panic(message))
+                // A verbatim `Arguments` (a literal message) is a
+                // `&str` payload; a formatted one is a `String`.
+                match expect_arguments(&vals[0], name)? {
+                    FmtArguments::Plain(text) => {
+                        Err(InterpError::panic_str_payload(text.clone()))
+                    }
+                    _ => {
+                        let message = self.format_arguments(
+                            frames,
+                            expect_arguments(&vals[0], name)?,
+                        )?;
+                        Err(InterpError::panic_string_payload(message))
+                    }
+                }
             }
             Builtin::AssertFailed => {
                 arity(4)?;
@@ -1941,7 +2033,7 @@ impl<'a> Interpreter<'a> {
                 let left = self.resolve_value(frames, &vals[1])?;
                 let right = self.resolve_value(frames, &vals[2])?;
                 message = format!("{message}\n  left: {left}\n right: {right}");
-                Err(InterpError::panic(message))
+                Err(InterpError::panic_string_payload(message))
             }
             Builtin::PanicNounwindFmt => {
                 // `panic_nounwind_fmt(args, force_no_backtrace)`:
@@ -1956,13 +2048,22 @@ impl<'a> Interpreter<'a> {
                         format!("{} argument(s)", vals.len()),
                     ));
                 }
-                let message =
-                    self.format_arguments(frames, expect_arguments(&vals[0], name)?)?;
-                Err(InterpError::panic(message))
+                match expect_arguments(&vals[0], name)? {
+                    FmtArguments::Plain(text) => {
+                        Err(InterpError::panic_str_payload(text.clone()))
+                    }
+                    _ => {
+                        let message = self.format_arguments(
+                            frames,
+                            expect_arguments(&vals[0], name)?,
+                        )?;
+                        Err(InterpError::panic_string_payload(message))
+                    }
+                }
             }
             Builtin::OptionUnwrapFailed => {
                 arity(0)?;
-                Err(InterpError::panic(
+                Err(InterpError::panic_str_payload(
                     "called `Option::unwrap()` on a `None` value",
                 ))
             }
@@ -1987,12 +2088,14 @@ impl<'a> Interpreter<'a> {
                     &FmtOptions::new(),
                     0,
                 )?;
-                Err(InterpError::panic(format!("{msg}: {rendered}")))
+                Err(InterpError::panic_string_payload(format!(
+                    "{msg}: {rendered}"
+                )))
             }
             Builtin::FromAsciiRadixPanic => {
                 arity(1)?;
                 let radix = as_u128(&vals[0], name)?;
-                Err(InterpError::panic(format!(
+                Err(InterpError::panic_string_payload(format!(
                     "from_ascii_bytes_radix: radix must lie in the range `[2, 36]` - found {radix}"
                 )))
             }
@@ -2001,9 +2104,9 @@ impl<'a> Interpreter<'a> {
                 let start = as_u128(&vals[0], name)? as usize;
                 let end = as_u128(&vals[1], name)? as usize;
                 let len = as_u128(&vals[2], name)? as usize;
-                Err(InterpError::panic(slice_index_fail_message(
-                    start, end, len,
-                )))
+                Err(InterpError::panic_string_payload(
+                    slice_index_fail_message(start, end, len),
+                ))
             }
             Builtin::RangeErrorReport => {
                 arity(2)?;
@@ -2028,17 +2131,126 @@ impl<'a> Interpreter<'a> {
                         ))
                     }
                 };
-                Err(InterpError::panic(slice_index_fail_message(
-                    start, end, len,
-                )))
+                Err(InterpError::panic_string_payload(
+                    slice_index_fail_message(start, end, len),
+                ))
             }
             Builtin::VecRemoveAssertFailed => {
                 arity(2)?;
                 let index = as_u128(&vals[0], name)?;
                 let len = as_u128(&vals[1], name)?;
-                Err(InterpError::panic(format!(
+                Err(InterpError::panic_string_payload(format!(
                     "removal index (is {index}) should be < len (is {len})"
                 )))
+            }
+            Builtin::CatchUnwind => {
+                arity(3)?;
+                let try_fn = expect_fn_ptr(&vals[0], name)?;
+                let catch_fn = expect_fn_ptr(&vals[2], name)?;
+                let panicked =
+                    self.exec_catch_unwind(frames, &try_fn, vals[1].clone(), &catch_fn)?;
+                Ok(Value::Bool(panicked))
+            }
+            Builtin::PanicCleanup => {
+                arity(1)?;
+                match &vals[0] {
+                    Value::PanicPayload(payload) => Ok(Value::DynRef {
+                        base: Box::new(payload.value.as_ref().clone()),
+                        concrete: payload.ty.clone(),
+                        traits: vec![
+                            "std::any::Any".to_string(),
+                            "std::marker::Send".to_string(),
+                        ],
+                    }),
+                    other => Err(InterpError::type_mismatch(
+                        format!("builtin {name}"),
+                        "a raw panic payload",
+                        other.kind_name(),
+                    )),
+                }
+            }
+            Builtin::PanicAny => {
+                arity(1)?;
+                let ty = generic_args.first().cloned().unwrap_or_default();
+                let value = vals.into_iter().next().expect("arity checked");
+                // The message the default hook reports for the
+                // payload: a string payload reports as itself,
+                // anything else as the opaque box (std's
+                // `payload_as_str`).
+                let message = match &value {
+                    Value::Str(text) => text.clone(),
+                    _ if ty == "&str" => self
+                        .resolve_string(frames, &value)
+                        .unwrap_or_else(|_| "Box<dyn Any>".to_string()),
+                    _ => "Box<dyn Any>".to_string(),
+                };
+                Err(InterpError::panic_with_payload(
+                    message,
+                    PanicPayload {
+                        ty,
+                        value: Box::new(value),
+                    },
+                ))
+            }
+            Builtin::ResumeUnwind => {
+                arity(1)?;
+                let (concrete, value, _) = resolve_dyn_box(self, frames, &vals[0], name)?;
+                let message = match &value {
+                    Value::Str(text) => text.clone(),
+                    _ => "Box<dyn Any>".to_string(),
+                };
+                Err(InterpError::panic_with_payload(
+                    message,
+                    PanicPayload {
+                        ty: concrete,
+                        value: Box::new(value),
+                    },
+                ))
+            }
+            Builtin::DynAnyDowncastRef => {
+                arity(1)?;
+                let want = expect_generic_ty(generic_args, name)?;
+                let (concrete, value, _) = resolve_dyn_box(self, frames, &vals[0], name)?;
+                if concrete == want {
+                    Ok(Value::Enum {
+                        variant: 1,
+                        fields: vec![Value::Ref(RefTarget::Value(Box::new(value)))],
+                    })
+                } else {
+                    Ok(Value::Enum {
+                        variant: 0,
+                        fields: vec![],
+                    })
+                }
+            }
+            Builtin::DynAnyDowncast(t_index) => {
+                arity(1)?;
+                let want = expect_generic_ty_at(generic_args, name, t_index)?;
+                let (concrete, value, original) =
+                    resolve_dyn_box(self, frames, &vals[0], name)?;
+                if concrete == want {
+                    // `Ok` holds a `Box<T>`: the box aggregate
+                    // around the payload value (the same shape
+                    // `Box::new` builds), not the bare payload.
+                    Ok(Value::Enum {
+                        variant: 0,
+                        fields: vec![Value::Enum {
+                            variant: 0,
+                            fields: vec![value],
+                        }],
+                    })
+                } else {
+                    Ok(Value::Enum {
+                        variant: 1,
+                        fields: vec![original],
+                    })
+                }
+            }
+            Builtin::DynAnyIs => {
+                arity(1)?;
+                let want = expect_generic_ty(generic_args, name)?;
+                let (concrete, _, _) = resolve_dyn_box(self, frames, &vals[0], name)?;
+                Ok(Value::Bool(concrete == want))
             }
             Builtin::PartialEqEq | Builtin::PartialEqNe => {
                 arity(2)?;
@@ -3840,6 +4052,85 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                 "array of fmt arguments",
                 other.kind_name(),
             )),
+        }
+    }
+}
+
+/// The function name a function-pointer argument denotes (the
+/// `catch_unwind` intrinsic's try/catch functions are fn items).
+fn expect_fn_ptr(value: &Value, name: &str) -> InterpResult<String> {
+    match value {
+        Value::FnPtr(func) => Ok(func.clone()),
+        other => Err(InterpError::type_mismatch(
+            format!("builtin {name}"),
+            "a function pointer",
+            other.kind_name(),
+        )),
+    }
+}
+
+/// The first generic argument of a builtin call (the `T` of a
+/// `dyn Any` downcast), rendered as a type tag.
+fn expect_generic_ty(generic_args: &[String], name: &str) -> InterpResult<String> {
+    expect_generic_ty_at(generic_args, name, 0)
+}
+
+/// The generic argument at `index` of a builtin call, rendered
+/// as a type tag.
+fn expect_generic_ty_at(
+    generic_args: &[String],
+    name: &str,
+    index: usize,
+) -> InterpResult<String> {
+    generic_args.get(index).cloned().ok_or_else(|| {
+        InterpError::type_mismatch(
+            format!("builtin {name}"),
+            "a generic type argument",
+            "no generic arguments",
+        )
+    })
+}
+
+/// Resolve a `Box<dyn Any ...>` value (or a reference to one) to
+/// the payload it carries: the concrete type tag, the payload
+/// value, and the box value itself (handed back to the caller on
+/// a failed by-value downcast).
+fn resolve_dyn_box(
+    interp: &mut Interpreter,
+    frames: &mut Vec<Frame>,
+    value: &Value,
+    name: &str,
+) -> InterpResult<(String, Value, Value)> {
+    // Resolve references down to the box value itself (that value
+    // is what a failed by-value downcast hands back).
+    let mut current = value.clone();
+    while matches!(current, Value::Ref(_) | Value::FatRef { .. }) {
+        let target = interp.deref_value(frames, &current)?;
+        current = interp.read_resolved(frames, &target)?;
+    }
+    let original = current.clone();
+    // Then unwrap the box-shaped wrappers (the one-field `Box` /
+    // `Unique` / `NonNull` aggregate chain) down to the `DynRef`,
+    // and read the payload out of it.
+    loop {
+        match current {
+            Value::DynRef {
+                base, concrete, ..
+            } => return Ok((concrete, (*base).clone(), original)),
+            Value::Enum { fields, .. } if fields.len() == 1 => {
+                current = fields.into_iter().next().expect("one field");
+            }
+            Value::Ref(_) | Value::FatRef { .. } => {
+                let target = interp.deref_value(frames, &current)?;
+                current = interp.read_resolved(frames, &target)?;
+            }
+            other => {
+                return Err(InterpError::type_mismatch(
+                    format!("builtin {name}"),
+                    "a `Box<dyn Any>` value",
+                    other.kind_name(),
+                ));
+            }
         }
     }
 }

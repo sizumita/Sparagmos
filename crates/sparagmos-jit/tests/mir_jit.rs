@@ -196,7 +196,7 @@ fn interp_call(
             Value::Unit => 0,
             other => panic!("unexpected interp result {other:?}"),
         }),
-        Err(MirRunError::Interp(InterpError::Panic { message })) => Err(message),
+        Err(MirRunError::Interp(InterpError::Panic { message, .. })) => Err(message),
         Err(other) => panic!("unexpected interp error: {other}"),
     }
 }
@@ -276,7 +276,7 @@ fn checked_add_ok_and_overflow_panic() {
         "boom",
         &[2_000_000_000],
         vec![int(2_000_000_000)],
-        Err("assertion failed: Overflow"),
+        Err("attempt to add with overflow"),
     );
     // The panic propagates out of the caller, as in the interpreter.
     check(
@@ -285,7 +285,7 @@ fn checked_add_ok_and_overflow_panic() {
         "main",
         &[],
         vec![],
-        Err("assertion failed: Overflow"),
+        Err("attempt to add with overflow"),
     );
 }
 
@@ -545,7 +545,7 @@ fn casts_and_guarded_division() {
         "calc",
         &[5, 0],
         vec![int(5), int(0)],
-        Err("assertion failed: DivisionByZero"),
+        Err("attempt to divide by zero"),
     );
 }
 
@@ -784,7 +784,7 @@ fn checked_sub_u64() {
         "sub_u64",
         &[0, 1],
         vec![uint(0), uint(1)],
-        Err("assertion failed: Overflow"),
+        Err("attempt to subtract with overflow"),
     );
     check(
         &jit,
@@ -2856,7 +2856,7 @@ fn interp_call_pair(
             Ok((value_word(&fields[0]), value_word(&fields[1])))
         }
         Ok(other) => panic!("unexpected interp result {other:?}"),
-        Err(MirRunError::Interp(InterpError::Panic { message })) => Err(message),
+        Err(MirRunError::Interp(InterpError::Panic { message, .. })) => Err(message),
         Err(other) => panic!("unexpected interp error: {other}"),
     }
 }
@@ -3264,7 +3264,7 @@ fn pair_return_panics_propagate_without_a_result() {
         "boom_pair",
         &[2_000_000_000],
         vec![int(2_000_000_000)],
-        Err("assertion failed: Overflow"),
+        Err("attempt to add with overflow"),
     );
     check(
         &jit,
@@ -3272,7 +3272,7 @@ fn pair_return_panics_propagate_without_a_result() {
         "main_boom_pair",
         &[],
         vec![],
-        Err("assertion failed: Overflow"),
+        Err("attempt to add with overflow"),
     );
 }
 

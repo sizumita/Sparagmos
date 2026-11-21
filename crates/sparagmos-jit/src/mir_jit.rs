@@ -1390,11 +1390,41 @@ fn literal_int_ty(op: &mir::Operand) -> Option<mir::Ty> {
 }
 
 /// The panic message text for an `Assert`, mirroring the
-/// interpreter's rule: a custom message verbatim, anything else as
-/// `assertion failed: <kind>`.
+/// interpreter's rule: a custom message verbatim; for the
+/// compiler-generated kinds, the exact message core panics with;
+/// kinds whose message embeds operand values keep the stable
+/// `assertion failed: <kind>` text.
 fn assert_message_text(msg: &mir::AssertMessage) -> String {
+    use mir::AssertMessage as A;
     match msg {
-        mir::AssertMessage::Custom(s) => s.clone(),
+        A::Custom(s) => s.clone(),
+        A::Overflow(op, _, _) => match op {
+            mir::BinOp::Add | mir::BinOp::AddWithOverflow => {
+                "attempt to add with overflow".to_string()
+            }
+            mir::BinOp::Sub | mir::BinOp::SubWithOverflow => {
+                "attempt to subtract with overflow".to_string()
+            }
+            mir::BinOp::Mul | mir::BinOp::MulWithOverflow => {
+                "attempt to multiply with overflow".to_string()
+            }
+            mir::BinOp::Div => "attempt to divide with overflow".to_string(),
+            mir::BinOp::Rem => {
+                "attempt to calculate the remainder with overflow".to_string()
+            }
+            mir::BinOp::Shl | mir::BinOp::ShlUnchecked => {
+                "attempt to shift left with overflow".to_string()
+            }
+            mir::BinOp::Shr | mir::BinOp::ShrUnchecked => {
+                "attempt to shift right with overflow".to_string()
+            }
+            other => format!("assertion failed: {other:?}"),
+        },
+        A::OverflowNeg(_) => "attempt to negate with overflow".to_string(),
+        A::DivisionByZero(_) => "attempt to divide by zero".to_string(),
+        A::RemainderByZero(_) => {
+            "attempt to calculate the remainder with a divisor of zero".to_string()
+        }
         other => format!("assertion failed: {}", other.kind_name()),
     }
 }

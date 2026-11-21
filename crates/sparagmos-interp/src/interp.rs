@@ -28,7 +28,7 @@
 
 use crate::error::{InterpError, InterpResult};
 use crate::ir::*;
-use crate::value::{RefProj, RefTarget, Value};
+use crate::value::{PanicPayload, RefProj, RefTarget, Value};
 use std::collections::{HashMap, HashSet};
 
 /// Interpreter limits / configuration.
@@ -328,7 +328,6 @@ impl<'a> Interpreter<'a> {
             return_dest: None,
             return_block: None,
         }];
-
         self.drive_frames(&mut frames, 0)
     }
 
@@ -342,13 +341,29 @@ impl<'a> Interpreter<'a> {
     /// discarded, as unwinding discards them.
     fn drive_frames(&mut self, frames_out: &mut Vec<Frame>, base: usize) -> InterpResult<Value> {
         let mut frames: Vec<Frame> = std::mem::take(frames_out);
-        let result = self.drive_frames_loop(&mut frames, base);
+        let result = self.drive(&mut frames, base);
         frames.truncate(base);
         *frames_out = frames;
         result
     }
 
-    fn drive_frames_loop(&mut self, frames: &mut Vec<Frame>, base: usize) -> InterpResult<Value> {
+    /// The run loop: execute until the frame stack shrinks to
+    /// `stop_depth`, then return the value the frame that was on
+    /// top returned. The top-level [`Interpreter::run`] drives with
+    /// `stop_depth == 0` (the entry frame's return ends the run);
+    /// runtime support that calls back into guest code (the
+    /// `catch_unwind` intrinsic) drives a nested region with the
+    /// current depth as its stop, so the nested call's return value
+    /// comes back here instead of being delivered to a caller
+    /// place. Frames pushed for a nested region carry no return
+    /// destination (see `start_detached_call`); stack discipline
+    /// guarantees such a frame returns exactly when the stack is
+    /// back at `stop_depth + 1`.
+    fn drive(
+        &mut self,
+        mut frames: &mut Vec<Frame>,
+        stop_depth: usize,
+    ) -> InterpResult<Value> {
         loop {
             // Fetch the current block's next unit of work, cloning the small
             // pieces we need so the frame stack can be mutated freely after.
@@ -778,7 +793,7 @@ impl<'a> Interpreter<'a> {
                             }
                         }
                     }
-                    if frames.len() == base {
+                    if frames.len() == stop_depth {
                         return Ok(value);
                     }
                     let dest = frame
@@ -966,6 +981,143 @@ impl<'a> Interpreter<'a> {
             return_block: target,
         });
         Ok(())
+    }
+
+    /// Push a frame for `func` with already-evaluated arguments and
+    /// no return destination: the frame belongs to a nested
+    /// [`Interpreter::drive`] region whose stop depth is the stack
+    /// depth before the push, and its return value is that drive's
+    /// result. Used by runtime support that calls back into guest
+    /// code (the `catch_unwind` intrinsic's try/catch functions).
+    fn start_detached_call(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        func: &str,
+        arg_values: Vec<Value>,
+    ) -> InterpResult<()> {
+        let body = match self.program.get(func) {
+            Some(b) => b.clone(),
+            None => match self.virtual_call_target(func, &arg_values) {
+                // A vtable call, shaped exactly as in `start_call`.
+                Some(Ok((impl_func, receiver))) => {
+                    let receiver = match self
+                        .program
+                        .get(&impl_func)
+                        .and_then(|b| b.local_tys.get(1))
+                    {
+                        Some(Ty::Ref(..)) => match receiver {
+                            Value::Enum { fields, .. } if fields.len() == 1 => {
+                                Value::Ref(RefTarget::Value(Box::new(
+                                    fields.into_iter().next().expect("one field"),
+                                )))
+                            }
+                            other @ (Value::Ref(_)
+                            | Value::FatRef { .. }
+                            | Value::DynRef { .. }) => other,
+                            other => Value::Ref(RefTarget::Value(Box::new(other))),
+                        },
+                        _ => receiver,
+                    };
+                    let mut args = arg_values;
+                    args[0] = receiver;
+                    return self.start_detached_call(frames, &impl_func, args);
+                }
+                Some(Err(e)) => return Err(e),
+                None => return Err(self.missing_body_error(func)),
+            },
+        };
+        if arg_values.len() != body.arg_count {
+            return Err(InterpError::type_mismatch(
+                format!("call to {func}"),
+                format!("{} argument(s)", body.arg_count),
+                format!("{} argument(s)", arg_values.len()),
+            ));
+        }
+        let mut locals = vec![Value::Uninit; body.local_count()];
+        for (i, arg) in arg_values.into_iter().enumerate() {
+            locals[i + 1] = arg;
+        }
+        let id = self.fresh_frame_id();
+        frames.push(Frame {
+            id,
+            func: func.to_string(),
+            locals,
+            block: 0,
+            stmt: 0,
+            return_dest: None,
+            return_block: None,
+        });
+        Ok(())
+    }
+
+    /// Call `func` with evaluated arguments and run the nested
+    /// drive region until it returns, yielding its return value.
+    pub(crate) fn call_to_completion(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        func: &str,
+        arg_values: Vec<Value>,
+    ) -> InterpResult<Value> {
+        let depth = frames.len();
+        self.start_detached_call(frames, func, arg_values)?;
+        self.drive(frames, depth)
+    }
+
+    /// Execute the `catch_unwind` intrinsic's protocol: run
+    /// `try_fn(data)`; when it returns, report `false` (no panic).
+    /// When it panics, roll the frame stack back to the depth at
+    /// entry — the panicking frames are discarded; MIR-level
+    /// unwinding does not exist in this IR (conversion drops unwind
+    /// edges), so no guest destructors run for the discarded
+    /// frames, exactly as for an uncaught panic, which likewise
+    /// runs none — then run `catch_fn(data, payload)` with the
+    /// panic's raw payload and report `true`. A panic raised by
+    /// the catch function itself, and any non-panic error,
+    /// propagate unchanged. State outside the frame stack (the
+    /// statics store, accumulated guest output) is not rolled
+    /// back: writes made before the panic persist, as they do
+    /// natively.
+    pub(crate) fn exec_catch_unwind(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        try_fn: &str,
+        data: Value,
+        catch_fn: &str,
+    ) -> InterpResult<bool> {
+        let depth = frames.len();
+        match self.call_to_completion(frames, try_fn, vec![data.clone()]) {
+            Ok(_) => Ok(false),
+            Err(InterpError::Panic { message, payload }) => {
+                self.truncate_frames(frames, depth);
+                // A panic site that did not record a payload
+                // carries a core literal-message panic: the payload
+                // is the message itself, as a `&str`.
+                let payload = payload.unwrap_or_else(|| PanicPayload {
+                    ty: "&str".to_string(),
+                    value: Box::new(Value::Str(message)),
+                });
+                self.call_to_completion(
+                    frames,
+                    catch_fn,
+                    vec![data, Value::PanicPayload(payload)],
+                )?;
+                Ok(true)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Discard every frame above `depth`, together with any
+    /// suspended drop-glue continuations belonging to the
+    /// discarded frames (their destructors never resume: the
+    /// frames they would have resumed into are gone).
+    fn truncate_frames(&mut self, frames: &mut Vec<Frame>, depth: usize) {
+        if frames.len() <= depth {
+            return;
+        }
+        let removed: Vec<u64> = frames.drain(depth..).map(|f| f.id).collect();
+        self.drop_continuations
+            .retain(|cont| !removed.contains(&cont.callee_frame));
     }
 
     /// Evaluate a callable operand (a closure or function value being
@@ -1413,6 +1565,13 @@ impl<'a> Interpreter<'a> {
                     };
                     self.release_refcell_borrow(frames, &guard, mutable)?;
                 }
+                P::Dynamic => {
+                    // A moved-out / never-written place holds
+                    // nothing to drop, as with rustc's drop flags.
+                    if let Some(value) = self.read_at(frames, &root, &path)? {
+                        drop_dyn_value(&value)?;
+                    }
+                }
                 P::CallDtor { func } => {
                     if self.read_at(frames, &root, &path)?.is_none() {
                         // Moved out of / never written: no glue, as
@@ -1562,7 +1721,7 @@ impl<'a> Interpreter<'a> {
         self.current_thread.set(previous);
         let outcome = match result {
             Ok(value) => Ok(value),
-            Err(InterpError::Panic { message }) => Err(message),
+            Err(InterpError::Panic { message, .. }) => Err(message),
             Err(e) => return Err(e),
         };
         if let Some(slot) = self.threads.borrow_mut().get_mut(&id) {
@@ -1843,6 +2002,7 @@ impl<'a> Interpreter<'a> {
                     Value::Bool(false) => Err(InterpError::Panic {
                         message: "intrinsic `assume` called with a false condition                                   (undefined behaviour in the guest)"
                             .to_string(),
+                        payload: None,
                     }),
                     other => Err(InterpError::type_mismatch(
                         "assume operand",
@@ -4429,6 +4589,43 @@ fn eval_cast(v: &Value, ty: &Ty) -> InterpResult<Value> {
 }
 
 /// Convenience one-shot entry point with the default configuration.
+/// Judge the drop of one value of dynamic type (the
+/// [`crate::ir::DropPlan::Dynamic`] plan): the value's concrete
+/// contents are all the glue can know. Scalars, strings and
+/// references own nothing; a `DynRef` recurses into the payload it
+/// carries; tuples and closure environments recurse into their
+/// elements (neither has a destructor of its own). An ADT or
+/// coroutine value might hide a destructor in its concrete type,
+/// which this judgment cannot name: an explicit error, never a
+/// silent skip — the same rule `DropPlan::Untyped` applies.
+fn drop_dyn_value(value: &Value) -> InterpResult<()> {
+    match value {
+        Value::Uninit
+        | Value::Unit
+        | Value::Bool(_)
+        | Value::Int(_)
+        | Value::Uint(_)
+        | Value::Float(_)
+        | Value::Str(_)
+        | Value::Bytes(_)
+        | Value::Ref(_)
+        | Value::FatRef { .. }
+        | Value::FnPtr(_)
+        | Value::FmtArg { .. }
+        | Value::FmtCount(_)
+        | Value::FmtArguments(_) => Ok(()),
+        Value::DynRef { base, .. } => drop_dyn_value(base),
+        Value::Tuple(items) => items.iter().try_for_each(drop_dyn_value),
+        Value::Closure { env, .. } => env.iter().try_for_each(drop_dyn_value),
+        Value::Enum { fields, .. } if fields.is_empty() => Ok(()),
+        Value::Enum { .. } | Value::Coroutine { .. } | Value::PanicPayload(_) => {
+            Err(InterpError::UnsupportedTerminator {
+                kind: "Drop".to_string(),
+            })
+        }
+    }
+}
+
 pub fn interpret(program: &Program, entry: &str, args: Vec<Value>) -> InterpResult<Value> {
     Interpreter::new(program).run(entry, args)
 }

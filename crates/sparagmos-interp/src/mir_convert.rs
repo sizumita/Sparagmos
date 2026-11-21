@@ -212,7 +212,7 @@ impl fmt::Display for ConvertError {
 impl std::error::Error for ConvertError {}
 
 /// Failure of a whole MIR run: either conversion or interpretation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum MirRunError {
     Convert(ConvertError),
     Interp(InterpError),
@@ -625,6 +625,9 @@ fn drop_glue_edges<'a>(glue: &'a ir::DropGlue, targets: &mut Vec<&'a str>) -> bo
             // Releasing a RefCell borrow calls no destructor body.
             ir::DropPlan::RefCellRelease { .. } => true,
             ir::DropPlan::ChannelHandleDrop { .. } => true,
+            // Judged from the value at run time; calls no
+            // destructor body.
+            ir::DropPlan::Dynamic => true,
             ir::DropPlan::Unknown | ir::DropPlan::Untyped => false,
             ir::DropPlan::Seq(plans) => plans.iter().all(|p| walk(p, adts, targets, seen)),
             ir::DropPlan::At { plan, .. } => walk(plan, adts, targets, seen),
@@ -1430,7 +1433,7 @@ impl<'a> Converter<'a> {
                 _ => UniqueValue::Many,
             },
             mir::Ty::FnDef(def, _) => {
-                UniqueValue::One(Value::FnPtr(self.def_display_name(def)))
+                UniqueValue::One(Value::FnPtr(self.body_key(def)))
             }
             _ => UniqueValue::Many,
         }
@@ -1481,11 +1484,14 @@ impl<'a> Converter<'a> {
 
     /// The program key of the body a `DefId` names, for references
     /// that must land on one specific converted body (closure
-    /// values and closure types): the converted-body table first —
-    /// it is keyed by the exact (definition, instance) id the
-    /// driver assigned, so two instances of one closure definition
-    /// resolve to their own bodies — and the display name only as
-    /// a fallback for definitions with no body in the program.
+    /// values and closure types, and `FnDef` constants — a function
+    /// item materialized as a value names the instance its
+    /// constant refers to, not the definition's first instance):
+    /// the converted-body table first — it is keyed by the exact
+    /// (definition, instance) id the driver assigned, so two
+    /// instances of one definition resolve to their own bodies —
+    /// and the display name only as a fallback for definitions
+    /// with no body in the program.
     fn body_key(&self, def: &mir::DefId) -> String {
         self.def_names
             .get(def)
@@ -1717,7 +1723,7 @@ impl<'a> Converter<'a> {
             // zero-sized fn item, reifiable to a function pointer):
             // it becomes a callable constant naming the function.
             mir::ConstKind::Ty(mir::Ty::FnDef(def, _)) => {
-                Ok(ir::Constant::FnDef(self.def_display_name(def)))
+                Ok(ir::Constant::FnDef(self.body_key(def)))
             }
             // A closure in constant position is a value too (the
             // zero-sized closure constant a `ClosureFnPointer` cast
@@ -1906,7 +1912,7 @@ impl<'a> Converter<'a> {
                     .collect::<Result<_, _>>()?,
             ),
             mir::ConstValue::FnDef(def) => {
-                ir::Constant::FnDef(self.def_display_name(def))
+                ir::Constant::FnDef(self.body_key(def))
             }
             mir::ConstValue::Closure(def) => {
                 ir::Constant::Closure(self.body_key(def))
@@ -3393,12 +3399,45 @@ fn sign_extend(data: u128, bits: u32) -> i128 {
     ((data << shift) as i128) >> shift
 }
 
-/// Human-readable text for a MIR `Assert` message: the custom string when
-/// there is one, otherwise the message kind (the operands rustc embeds
-/// are not rendered — the oracle only needs a stable panic message).
+/// Human-readable text for a MIR `Assert` message: the custom
+/// string when there is one; for the compiler-generated kinds,
+/// the exact message core panics with (these messages are what a
+/// `catch_unwind` caller observes as the panic's `&str` payload,
+/// so they must match core's text, not a paraphrase). Kinds whose
+/// message embeds operand values (bounds checks, misaligned
+/// dereferences) keep the stable kind text: the operands are not
+/// rendered.
 fn assert_message_text(msg: &mir::AssertMessage) -> String {
+    use mir::AssertMessage as A;
     match msg {
-        mir::AssertMessage::Custom(s) => s.clone(),
+        A::Custom(s) => s.clone(),
+        A::Overflow(op, _, _) => match op {
+            mir::BinOp::Add | mir::BinOp::AddWithOverflow => {
+                "attempt to add with overflow".to_string()
+            }
+            mir::BinOp::Sub | mir::BinOp::SubWithOverflow => {
+                "attempt to subtract with overflow".to_string()
+            }
+            mir::BinOp::Mul | mir::BinOp::MulWithOverflow => {
+                "attempt to multiply with overflow".to_string()
+            }
+            mir::BinOp::Div => "attempt to divide with overflow".to_string(),
+            mir::BinOp::Rem => {
+                "attempt to calculate the remainder with overflow".to_string()
+            }
+            mir::BinOp::Shl | mir::BinOp::ShlUnchecked => {
+                "attempt to shift left with overflow".to_string()
+            }
+            mir::BinOp::Shr | mir::BinOp::ShrUnchecked => {
+                "attempt to shift right with overflow".to_string()
+            }
+            other => format!("assertion failed: {other:?}"),
+        },
+        A::OverflowNeg(_) => "attempt to negate with overflow".to_string(),
+        A::DivisionByZero(_) => "attempt to divide by zero".to_string(),
+        A::RemainderByZero(_) => {
+            "attempt to calculate the remainder with a divisor of zero".to_string()
+        }
         other => format!("assertion failed: {}", other.kind_name()),
     }
 }
@@ -3606,6 +3645,9 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                 self.adts[index] = plan;
                 Some(P::Adt { index })
             }
+            // A `dyn` value's glue is judged from the value at
+            // run time (see `DropPlan::Dynamic`).
+            mir::Ty::Dynamic(..) => Some(P::Dynamic),
             mir::Ty::Coroutine(def, args) => {
                 let key = format!("{ty:?}");
                 if let Some(&index) = self.adt_index.get(&key) {

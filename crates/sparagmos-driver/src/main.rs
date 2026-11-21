@@ -2245,6 +2245,7 @@ fn execute(c: &Collected, guest_args: &[String]) -> i32 {
         }
         Err(sparagmos_interp::MirRunError::Interp(sparagmos_interp::InterpError::Panic {
             message,
+            ..
         })) => {
             eprintln!("thread 'main' panicked: {message}");
             101

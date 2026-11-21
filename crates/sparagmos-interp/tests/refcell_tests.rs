@@ -284,7 +284,7 @@ fn run(main: mir::Body) -> Result<Value, MirRunError> {
 
 fn expect_panic(result: Result<Value, MirRunError>) -> String {
     match result {
-        Err(MirRunError::Interp(InterpError::Panic { message })) => message,
+        Err(MirRunError::Interp(InterpError::Panic { message, .. })) => message,
         other => panic!("expected a guest panic, got {other:?}"),
     }
 }

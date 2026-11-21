@@ -163,7 +163,7 @@ fn interp_call(
             Value::Unit => 0,
             other => panic!("unexpected interp result {other:?}"),
         }),
-        Err(MirRunError::Interp(InterpError::Panic { message })) => Err(message),
+        Err(MirRunError::Interp(InterpError::Panic { message, .. })) => Err(message),
         Err(other) => panic!("unexpected interp error: {other}"),
     }
 }

@@ -114,7 +114,7 @@ fn run_binop(ty: mir::Ty, op: mir::BinOp, a: Value, b: Value) -> Result<Value, M
 
 fn expect_panic(res: Result<Value, MirRunError>) -> String {
     match res {
-        Err(MirRunError::Interp(InterpError::Panic { message })) => message,
+        Err(MirRunError::Interp(InterpError::Panic { message, .. })) => message,
         other => panic!("expected a guest panic, got {other:?}"),
     }
 }

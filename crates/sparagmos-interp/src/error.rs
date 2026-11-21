@@ -5,7 +5,12 @@
 //! * [`InterpError::Panic`] models a *guest* panic (arithmetic overflow in a
 //!   checked operation, division by zero, a failed `Assert`, reaching
 //!   `unreachable`). This mirrors how rustc MIR represents panicking code
-//!   and is what the JIT is expected to reproduce.
+//!   and is what the JIT is expected to reproduce. A panic carries its
+//!   payload (see [`crate::value::PanicPayload`]) from the panic site to
+//!   the `catch_unwind` that observes it; sites that cannot know the
+//!   payload's concrete type leave it unset, and the catch site then
+//!   presents the message itself as a `&str` payload, which is what
+//!   core's literal-message panics carry.
 //! * Every other variant is an interpreter/oracle failure: the input MIR is
 //!   malformed, unsupported, or exhausted a resource limit. Unsupported
 //!   constructs always fail loudly here — the oracle must never silently
@@ -13,14 +18,23 @@
 
 use std::fmt;
 
+use crate::value::PanicPayload;
+
 /// Result alias for interpreter operations.
 pub type InterpResult<T> = Result<T, InterpError>;
 
 /// An interpretation failure. See the module docs for the panic split.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum InterpError {
     /// A guest panic (overflow, divide by zero, failed assert, ...).
-    Panic { message: String },
+    /// `payload` is the panic's payload value when the panic site
+    /// knows it (a `panic!` message, a `panic_any` argument);
+    /// `None` for the interpreter's own modelled panics, whose
+    /// payload the catch site synthesizes from the message.
+    Panic {
+        message: String,
+        payload: Option<PanicPayload>,
+    },
     /// The configured step budget was exhausted (probable infinite loop).
     StepLimitExceeded { limit: usize },
     /// The configured call-depth budget was exhausted.
@@ -69,6 +83,44 @@ impl InterpError {
     pub fn panic(message: impl Into<String>) -> Self {
         InterpError::Panic {
             message: message.into(),
+            payload: None,
+        }
+    }
+
+    /// Build a guest-panic error whose payload is the message
+    /// itself, as a `&str` — the payload of `panic!("literal")`
+    /// and of core's literal-message panics.
+    pub fn panic_str_payload(message: impl Into<String>) -> Self {
+        let message = message.into();
+        InterpError::Panic {
+            payload: Some(PanicPayload {
+                ty: "&str".to_string(),
+                value: Box::new(crate::value::Value::Str(message.clone())),
+            }),
+            message,
+        }
+    }
+
+    /// Build a guest-panic error whose payload is the message as a
+    /// `String` — the payload of a formatted `panic!` (core
+    /// formats the message into a fresh `String` and boxes that).
+    pub fn panic_string_payload(message: impl Into<String>) -> Self {
+        let message = message.into();
+        InterpError::Panic {
+            payload: Some(PanicPayload {
+                ty: "std::string::String".to_string(),
+                value: Box::new(crate::value::Value::Str(message.clone())),
+            }),
+            message,
+        }
+    }
+
+    /// Build a guest-panic error with an explicit payload (the
+    /// `panic_any` argument, a resumed payload).
+    pub fn panic_with_payload(message: impl Into<String>, payload: PanicPayload) -> Self {
+        InterpError::Panic {
+            message: message.into(),
+            payload: Some(payload),
         }
     }
 
@@ -89,7 +141,7 @@ impl InterpError {
 impl fmt::Display for InterpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            InterpError::Panic { message } => write!(f, "guest panic: {message}"),
+            InterpError::Panic { message, .. } => write!(f, "guest panic: {message}"),
             InterpError::StepLimitExceeded { limit } => {
                 write!(f, "step limit exceeded ({limit} steps)")
             }

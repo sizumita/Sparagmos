@@ -300,7 +300,7 @@ fn program(body: mir::Body) -> MirProgram {
 
 fn expect_panic(result: Result<Value, MirRunError>) -> String {
     match result {
-        Err(MirRunError::Interp(InterpError::Panic { message })) => message,
+        Err(MirRunError::Interp(InterpError::Panic { message, .. })) => message,
         other => panic!("expected a guest panic, got {other:?}"),
     }
 }
@@ -442,8 +442,10 @@ fn registry_covers_the_modelled_callees() {
             "lookup for {name}"
         );
     }
-    // Callees that stay unsupported: filesystem, unwinding through
-    // closures — no name-only registrations.
+    // Callees that stay unsupported: filesystem — no name-only
+    // registrations. (`std::panic::catch_unwind` itself stays
+    // unregistered too: its collected body runs, and the
+    // intrinsic it lowers to is the registered builtin.)
     for name in [
         "std::fs::File::create",
         "std::panic::catch_unwind",
@@ -451,6 +453,44 @@ fn registry_covers_the_modelled_callees() {
         "std::env::args",
     ] {
         assert_eq!(lookup(&canonical_name(name)), None, "{name} stays unsupported");
+    }
+}
+
+#[test]
+fn catch_unwind_family_registers() {
+    let cases: [(&str, Builtin); 10] = [
+        ("std::intrinsics::catch_unwind", Builtin::CatchUnwind),
+        ("core::intrinsics::catch_unwind", Builtin::CatchUnwind),
+        (
+            "std::panicking::catch_unwind::cleanup",
+            Builtin::PanicCleanup,
+        ),
+        ("std::panicking::begin_panic", Builtin::PanicAny),
+        ("std::rt::begin_panic", Builtin::PanicAny),
+        ("std::panic::resume_unwind", Builtin::ResumeUnwind),
+        (
+            "<(dyn std::any::Any + std::marker::Send + 'static)>::downcast_ref",
+            Builtin::DynAnyDowncastRef,
+        ),
+        (
+            "<(dyn std::any::Any + 'static)>::downcast",
+            Builtin::DynAnyDowncast(0),
+        ),
+        (
+            "std::boxed::convert::<impl std::boxed::Box<(dyn std::any::Any + std::marker::Send + 'static), A>>::downcast",
+            Builtin::DynAnyDowncast(1),
+        ),
+        (
+            "<(dyn std::any::Any + std::marker::Send + 'static)>::is",
+            Builtin::DynAnyIs,
+        ),
+    ];
+    for (name, expected) in cases {
+        assert_eq!(
+            lookup(&canonical_name(name)),
+            Some(expected),
+            "lookup for {name}"
+        );
     }
 }
 

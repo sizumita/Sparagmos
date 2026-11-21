@@ -756,7 +756,7 @@ fn mixed_type_shift_amount_overflow_panics() {
     let p = program_of(shl);
     let err = interpret(&p, "shl", vec![Value::Int(1), Value::Uint(32)]).unwrap_err();
     match err {
-        InterpError::Panic { message } => assert_eq!(
+        InterpError::Panic { message, .. } => assert_eq!(
             message,
             "attempt to shift left with overflow"
         ),
