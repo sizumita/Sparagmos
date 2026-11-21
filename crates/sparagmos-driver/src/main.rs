@@ -2545,6 +2545,48 @@ fn external_callees(c: &Collected) -> Vec<String> {
 
 /// Execute the collected program's `main` in the interpreter and
 /// return the run-mode process exit code (see the crate docs).
+/// Whether the entry body at `entry_index` returns
+/// `std::process::ExitCode` (its local 0 is that ADT).
+fn entry_returns_exit_code(c: &Collected, entry_index: usize) -> bool {
+    let Some((_, body)) = c.bodies.get(entry_index) else {
+        return false;
+    };
+    let Some(decl) = body.local_decls.first() else {
+        return false;
+    };
+    let sparagmos_mir::Ty::Adt(def, _) = &decl.ty else {
+        return false;
+    };
+    c.def_names
+        .get(def.index as usize)
+        .map(|n| n == "std::process::ExitCode")
+        .unwrap_or(false)
+}
+
+/// The code byte of an `ExitCode` value: the wrapper aggregate
+/// around the platform aggregate around the byte, the shape the
+/// `ExitCode::from` builtin builds and the collected
+/// `Termination::report` body passes through.
+fn exit_code_value(value: &sparagmos_interp::Value) -> Option<i32> {
+    let sparagmos_interp::Value::Enum { fields, .. } = value else {
+        return None;
+    };
+    let [inner] = fields.as_slice() else {
+        return None;
+    };
+    let sparagmos_interp::Value::Enum { fields, .. } = inner else {
+        return None;
+    };
+    let [byte] = fields.as_slice() else {
+        return None;
+    };
+    match byte {
+        sparagmos_interp::Value::Uint(v) => Some(*v as u8 as i32),
+        sparagmos_interp::Value::Int(v) => Some(*v as u8 as i32),
+        _ => None,
+    }
+}
+
 fn execute(c: &Collected, input: &str, guest_args: &[String]) -> i32 {
     let mut program = sparagmos_interp::MirProgram::new();
     for ((name, body), def_id) in c.bodies.iter().zip(c.body_def_ids.iter()) {
@@ -2636,11 +2678,34 @@ fn execute(c: &Collected, input: &str, guest_args: &[String]) -> i32 {
     }
     match run.result {
         Ok(sparagmos_interp::Value::Unit) => 0,
+        Ok(ref value) if entry_returns_exit_code(c, entry_index) => {
+            // The entry reported through `Termination` (a
+            // `fn main() -> ExitCode`, which is also the shape of
+            // a `--test` harness main): the reported code is the
+            // process exit code, exactly as `lang_start` would
+            // apply it natively.
+            match exit_code_value(value) {
+                Some(code) => code,
+                None => {
+                    eprintln!(
+                        "sparagmos-driver run: unsupported: entry `{entry_name}` returned a malformed ExitCode value"
+                    );
+                    2
+                }
+            }
+        }
         Ok(other) => {
             eprintln!(
                 "sparagmos-driver run: unsupported: entry `{entry_name}` returned {other}, expected ()"
             );
             2
+        }
+        Err(sparagmos_interp::MirRunError::Interp(
+            sparagmos_interp::InterpError::ProcessExit { code },
+        )) => {
+            // `std::process::exit(code)`: the guest's normal
+            // termination; the code is the process exit code.
+            code
         }
         Err(sparagmos_interp::MirRunError::Interp(sparagmos_interp::InterpError::Panic {
             message,

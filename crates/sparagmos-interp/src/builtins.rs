@@ -228,6 +228,9 @@ pub enum Builtin {
     /// over `OsString` values, which are the string values
     /// themselves in this model (guest arguments are text).
     EnvArgsOs,
+    /// `std::process::exit(code)`: end the run with the given
+    /// exit code (see `InterpError::ProcessExit`).
+    ProcessExit,
     /// `std::fmt::format(Arguments) -> String`.
     Format,
     /// `std::fmt::Arguments::from_str(&str)`.
@@ -751,6 +754,7 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::io::_eprint" => Builtin::Eprint,
         "std::env::args" => Builtin::EnvArgs,
         "std::env::args_os" => Builtin::EnvArgsOs,
+        "std::process::exit" => Builtin::ProcessExit,
         "std::fmt::format" => Builtin::Format,
         "std::fmt::Arguments::from_str" | "std::fmt::Arguments::from_str_nonconst" => {
             Builtin::ArgumentsFromStr
@@ -1397,6 +1401,11 @@ impl<'a> Interpreter<'a> {
                     })
                 }
             }
+            Builtin::ProcessExit => {
+                arity(1)?;
+                let code = as_i128(&vals[0], name)? as i32;
+                Err(InterpError::ProcessExit { code })
+            }
             Builtin::Format => {
                 arity(1)?;
                 let text = self.format_arguments(frames, expect_arguments(&vals[0], name)?)?;
@@ -1809,6 +1818,25 @@ impl<'a> Interpreter<'a> {
                     // denotes the result (width/sign are applied when
                     // the destination place is written).
                     Ok(value)
+                } else if target == "std::process::ExitCode"
+                    && matches!(value, Value::Uint(_) | Value::Int(_))
+                {
+                    // `ExitCode::from(u8)`: the code byte inside
+                    // the platform exit-code wrapper, two one-field
+                    // aggregates in this model (the shape the
+                    // driver's entry-return handling reads back).
+                    let byte = match value {
+                        Value::Uint(v) => v,
+                        Value::Int(v) => v as u128,
+                        _ => unreachable!(),
+                    };
+                    Ok(Value::Enum {
+                        variant: 0,
+                        fields: vec![Value::Enum {
+                            variant: 0,
+                            fields: vec![Value::Uint(byte)],
+                        }],
+                    })
                 } else if target.starts_with("std::vec::Vec<") {
                     // `Vec::from([T; N])`: the array's elements become
                     // the vector's.

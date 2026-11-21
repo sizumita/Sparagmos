@@ -47,6 +47,13 @@ pub enum InterpError {
     /// and the driver maps it to the guest-panic exit (101) with
     /// the abort reason on stderr.
     Abort { message: String },
+    /// The guest called `std::process::exit(code)`: the run ends
+    /// successfully with that exit code. This is not a failure —
+    /// it is the guest's normal termination path — so it travels
+    /// as its own variant the driver maps to the process exit
+    /// code, distinct from both a completed `main` (code 0) and
+    /// every error outcome.
+    ProcessExit { code: i32 },
     /// The configured step budget was exhausted (probable infinite loop).
     StepLimitExceeded { limit: usize },
     /// The configured call-depth budget was exhausted.
@@ -154,6 +161,9 @@ impl fmt::Display for InterpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             InterpError::Panic { message, .. } => write!(f, "guest panic: {message}"),
+            InterpError::ProcessExit { code } => {
+                write!(f, "guest exited with code {code}")
+            }
             InterpError::Abort { message } => write!(f, "guest abort: {message}"),
             InterpError::StepLimitExceeded { limit } => {
                 write!(f, "step limit exceeded ({limit} steps)")
