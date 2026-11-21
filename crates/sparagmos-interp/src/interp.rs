@@ -690,7 +690,6 @@ impl<'a> Interpreter<'a> {
                     }
                 }
                 TerminatorKind::Drop { place, target, glue } => {
-                    self.note_channel_handle_drop(&frames, body, &place);
                     // Run the dropped type's glue (conversion built
                     // it; see `mir_convert`). The glue work starts
                     // here and either finishes in `run_drop_glue`
@@ -1373,6 +1372,22 @@ impl<'a> Interpreter<'a> {
                         .unwrap_or(P::Unknown);
                     work.push((path, plan));
                 }
+                P::ChannelHandleDrop { sender } => {
+                    // A moved-out / never-written handle has no
+                    // count to decrement, exactly like drop flags
+                    // in real MIR.
+                    let Some(value) = self.read_at(frames, &root, &path)? else {
+                        continue;
+                    };
+                    let Some(id) = channel_handle_id(&value) else {
+                        return Err(InterpError::type_mismatch(
+                            "channel handle drop glue",
+                            "an mpsc channel handle",
+                            value.kind_name(),
+                        ));
+                    };
+                    self.channel_handle_dropped(id, if sender { "sender" } else { "receiver" });
+                }
                 P::RefCellRelease { mutable } => {
                     // A moved-out / never-written guard has no
                     // borrow to release, exactly like drop flags in
@@ -1663,40 +1678,6 @@ impl<'a> Interpreter<'a> {
                 "sender" => state.senders += 1,
                 _ => state.receivers += 1,
             }
-        }
-    }
-
-    /// If the place a `Drop` terminator is about to drop holds an
-    /// mpsc channel handle directly, record the drop with the
-    /// channel state. A handle nested inside another aggregate
-    /// that is dropped whole is not tracked (the glue recursion
-    /// does not pass through here), and a moved-out place reads as
-    /// uninitialized and is skipped, so a handle is counted
-    /// exactly once per place that actually holds it.
-    fn note_channel_handle_drop(&self, frames: &[Frame], body: &Body, place: &Place) {
-        let Some(Ty::Adt(name)) = body.local_ty(place.local) else {
-            return;
-        };
-        let kind = if name.starts_with("std::sync::mpsc::Sender")
-            || name.starts_with("std::sync::mpsc::SyncSender")
-        {
-            "sender"
-        } else if name.starts_with("std::sync::mpsc::Receiver") {
-            "receiver"
-        } else {
-            return;
-        };
-        if !place.projection.is_empty() {
-            return;
-        }
-        let Ok(resolved) = self.resolve_place(frames, body, place) else {
-            return;
-        };
-        let Ok(value) = self.read_resolved(frames, &resolved) else {
-            return;
-        };
-        if let Some(id) = channel_handle_id(&value) {
-            self.channel_handle_dropped(id, kind);
         }
     }
 

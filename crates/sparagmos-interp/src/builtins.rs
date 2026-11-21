@@ -1498,9 +1498,12 @@ impl<'a> Interpreter<'a> {
                         fields: vec![Value::Tuple(elems), Value::Uint(0)],
                     })
                 } else if self_ty.starts_with("std::sync::mpsc::Receiver<") {
-                    // The channel iterator's state is the receiver
-                    // handle itself (see `iterator_next`).
-                    Ok(value)
+                    // The channel iterator holds the receiver
+                    // handle as its one field (see `iterator_next`).
+                    Ok(Value::Enum {
+                        variant: 0,
+                        fields: vec![value],
+                    })
                 } else {
                     Err(unsupported(format!(
                         "IntoIterator::into_iter for {self_ty} is not runtime-supported"
@@ -3118,12 +3121,22 @@ impl<'a> Interpreter<'a> {
             };
         }
         if self_ty.starts_with("std::sync::mpsc::IntoIter<") {
-            // The state is the receiver handle itself.
-            let Some(id) = channel_handle_id(&state) else {
+            // The state holds the receiver handle as its one field.
+            let handle = match &state {
+                Value::Enum { fields, .. } if fields.len() == 1 => fields[0].clone(),
+                other => {
+                    return Err(InterpError::type_mismatch(
+                        "mpsc IntoIter state",
+                        "an iterator holding a receiver handle",
+                        other.kind_name(),
+                    ))
+                }
+            };
+            let Some(id) = channel_handle_id(&handle) else {
                 return Err(InterpError::type_mismatch(
                     "mpsc IntoIter state",
                     "a receiver handle",
-                    state.kind_name(),
+                    handle.kind_name(),
                 ));
             };
             return match self.mpsc_recv(frames, id, "Iterator::next for mpsc::IntoIter")? {

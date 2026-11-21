@@ -650,6 +650,14 @@ pub enum DropPlan {
     /// explicit error, as for any other dangling reference in this
     /// model — it is never silently skipped.
     RefCellRelease { mutable: bool },
+    /// Decrement the live-handle count of the mpsc channel whose
+    /// handle value this plan applies to (the `Sender` /
+    /// `SyncSender` / `Receiver` drop glue in the interpreter's
+    /// channel model, see `ChannelState` in `interp.rs`): dropping
+    /// the last sender disconnects the channel for its receivers,
+    /// and dropping the receiver for its senders. A moved-out
+    /// handle has no count to decrement.
+    ChannelHandleDrop { sender: bool },
 }
 
 /// The drop glue of one `Drop` terminator: the plan for the dropped
