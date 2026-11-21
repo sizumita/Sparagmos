@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use sparagmos_mir as mir;
 
 use crate::error::{InterpError, InterpResult};
-use crate::interp::{Frame, Interpreter, Resolved};
+use crate::interp::{synthetic_address, Frame, Interpreter, Resolved};
 use crate::ir::{Body, Operand};
 use crate::value::{FmtArguments, FmtTrait, RefProj, RefTarget, Value};
 
@@ -507,6 +507,18 @@ pub enum Builtin {
     /// `std::intrinsics::atomic_store(ptr, value)`: a plain
     /// write through the pointer, as for `atomic_load`.
     AtomicStore,
+    /// `std::intrinsics::atomic_cxchg(ptr, old, new) ->
+    /// (previous, success)`: store `new` iff the pointee equals
+    /// `old`. `atomic_cxchgweak` is the same builtin: its only
+    /// difference is that the exchange may fail spuriously, which
+    /// a single-threaded interpreter has no reason to simulate.
+    AtomicCxchg,
+    /// `std::intrinsics::atomic_xchg(ptr, new) -> previous`: an
+    /// unconditional exchange through the pointer.
+    AtomicXchg,
+    /// `std::intrinsics::atomic_fence()`: orders other threads'
+    /// accesses; there are none, so it is a no-op.
+    AtomicFence,
     /// `std::mem::zeroed()`: the all-zero-bits value of a scalar
     /// type, or of a tuple/array of scalar types.
     MemZeroed,
@@ -818,8 +830,20 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::intrinsics::bswap" => Builtin::IntBitOp(BitOp::Bswap),
         "std::intrinsics::saturating_add" => Builtin::SaturatingArith(SatOp::Add),
         "std::intrinsics::saturating_sub" => Builtin::SaturatingArith(SatOp::Sub),
-        "std::intrinsics::atomic_load" => Builtin::AtomicLoad,
-        "std::intrinsics::atomic_store" => Builtin::AtomicStore,
+        "std::intrinsics::atomic_load" | "core::intrinsics::atomic_load" => Builtin::AtomicLoad,
+        "std::intrinsics::atomic_store" | "core::intrinsics::atomic_store" => {
+            Builtin::AtomicStore
+        }
+        "std::intrinsics::atomic_cxchg" | "core::intrinsics::atomic_cxchg" => {
+            Builtin::AtomicCxchg
+        }
+        "std::intrinsics::atomic_cxchgweak" | "core::intrinsics::atomic_cxchgweak" => {
+            Builtin::AtomicCxchg
+        }
+        "std::intrinsics::atomic_xchg" | "core::intrinsics::atomic_xchg" => Builtin::AtomicXchg,
+        "std::intrinsics::atomic_fence" | "core::intrinsics::atomic_fence" => {
+            Builtin::AtomicFence
+        }
         "std::mem::zeroed" => Builtin::MemZeroed,
         "std::ptr::null" | "std::ptr::null_mut" => Builtin::PtrNull,
         _ if canonical.starts_with("std::rc::Rc") && canonical.ends_with(">::new") => {
@@ -2497,7 +2521,51 @@ impl<'a> Interpreter<'a> {
                 self.write_resolved(frames, &target, value)?;
                 Ok(Value::Unit)
             }
+            Builtin::AtomicCxchg => {
+                arity(3)?;
+                // Single-threaded: nothing can intervene between
+                // the read and the conditional write, and a weak
+                // exchange's spurious failure is not simulated, so
+                // `atomic_cxchgweak` is the same operation.
+                let target = self.deref_value(frames, &vals[0])?;
+                let current = self.read_resolved(frames, &target)?;
+                let success = self.atomic_value_eq(frames, &current, &vals[1])?;
+                if success {
+                    self.write_resolved(frames, &target, vals[2].clone())?;
+                }
+                Ok(Value::Tuple(vec![current, Value::Bool(success)]))
+            }
+            Builtin::AtomicXchg => {
+                arity(2)?;
+                let target = self.deref_value(frames, &vals[0])?;
+                let previous = self.read_resolved(frames, &target)?;
+                self.write_resolved(frames, &target, vals[1].clone())?;
+                Ok(previous)
+            }
+            Builtin::AtomicFence => {
+                arity(0)?;
+                // A fence orders other threads' accesses; there
+                // are none.
+                Ok(Value::Unit)
+            }
             Builtin::FloatMethod { f32, op } => exec_float_method(name, f32, op, &vals),
+        }
+    }
+
+    /// The equality an atomic compare-exchange performs: the
+    /// pointee's current value against the expected one.
+    /// Pointer-shaped values compare by identity — the synthetic
+    /// address, the same identity `PtrToInt` exposes — and every
+    /// other value by the semantic (derived) equality.
+    fn atomic_value_eq(
+        &self,
+        frames: &[Frame],
+        current: &Value,
+        expected: &Value,
+    ) -> InterpResult<bool> {
+        match (synthetic_address(current), synthetic_address(expected)) {
+            (Some(a), Some(b)) => Ok(a == b),
+            _ => self.values_equal(frames, current, expected),
         }
     }
 

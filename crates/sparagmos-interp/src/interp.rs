@@ -116,7 +116,7 @@ pub struct Interpreter<'a> {
 /// target always yields the same address within a run, so equality,
 /// null and alignment checks on transmuted pointers behave as they
 /// do natively; distinct targets collide only on a hash collision.
-fn synthetic_address(value: &Value) -> Option<u128> {
+pub(crate) fn synthetic_address(value: &Value) -> Option<u128> {
     fn fnv1a(bytes: &[u8]) -> u64 {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for &b in bytes {
