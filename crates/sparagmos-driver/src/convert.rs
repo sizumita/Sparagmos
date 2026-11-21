@@ -1001,10 +1001,19 @@ impl Converter {
                             let tag_off = arbitrary_offsets(ty)?.get(*tag_field).copied()?;
                             let raw = read_uint_at(alloc, offset + tag_off, size)?;
                             let val = if signed { sign_extend(raw, size) } else { raw };
+                            // Compare in the value domain: the tag
+                            // read above is sign-extended from the
+                            // tag's width, while `Discr::val` is the
+                            // bit pattern at the discriminant type's
+                            // width (see `discr_value`); the raw
+                            // patterns agree only when both widths
+                            // are 128, so a negative discriminant
+                            // never matched before this normalisation.
+                            let tag_value = val as i128;
                             let mut found = None;
                             for i in 0..def.num_variants() {
                                 let d = def.discriminant_for_variant(VariantIdx::to_val(i));
-                                if d.val == val {
+                                if discr_value(&d) == Some(tag_value) {
                                     found = Some(i);
                                     break;
                                 }
@@ -1292,7 +1301,10 @@ impl Converter {
             return;
         }
         let values: Vec<i128> = (0..def.num_variants())
-            .map(|i| def.discriminant_for_variant(VariantIdx::to_val(i)).val as i128)
+            .map(|i| {
+                let d = def.discriminant_for_variant(VariantIdx::to_val(i));
+                discr_value(&d).unwrap_or(d.val as i128)
+            })
             .collect();
         self.adt_discriminants.insert(id, values);
     }
@@ -1489,6 +1501,24 @@ fn read_uint_at(alloc: &Allocation, offset: usize, size: usize) -> Option<u128> 
 
 /// Sign-extend a zero-extended value of `size` bytes to 128 bits
 /// (the storage convention of `Scalar::Int` for signed types).
+/// The true value of a variant discriminant. Stable MIR reports
+/// `Discr::val` as the discriminant's bit pattern at the width of
+/// the discriminant type, zero-extended to u128: an `i8` enum's
+/// `-1` arrives as 255 and an `isize` enum's `-1` as 2^64 - 1, so
+/// the bare pattern cast to `i128` is a large positive number.
+/// Sign-extending the pattern from the discriminant type's width
+/// recovers the value; unsigned discriminants are already exact.
+fn discr_value(d: &rustc_public::ty::Discr) -> Option<i128> {
+    match d.ty.kind() {
+        TyKind::RigidTy(RigidTy::Int(t)) => {
+            let size = int_ty_size(&t)?;
+            Some(sign_extend(d.val, size) as i128)
+        }
+        TyKind::RigidTy(RigidTy::Uint(_)) => Some(d.val as i128),
+        _ => None,
+    }
+}
+
 fn sign_extend(raw: u128, size: usize) -> u128 {
     let bits = size * 8;
     if bits >= 128 {
