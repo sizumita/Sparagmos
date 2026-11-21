@@ -1890,3 +1890,149 @@ fn run_mode_refcell_drop_runs_inner_destructor() {
         "dropping the cell runs the wrapped value's destructor"
     );
 }
+
+// ----- generic constructors (Lane CF) -----
+//
+// A generic tuple-struct / tuple-variant constructor has no
+// monomorphic instance as an item. Its direct uses are aggregate
+// rvalues in the callers, so nothing is left unconverted; used as
+// a value, the instance its FnDef constant demands is converted
+// (the synthetic one-block body that aggregates the fields) and
+// the call through the value runs it.
+
+const CTOR_VALUE_SRC: &str = r#"
+struct Pair<T>(T, i32);
+fn main() {
+    let f = Pair;
+    let p = f(3, 4);
+    println!("{}", p.0 + p.1);
+}
+"#;
+
+#[test]
+fn run_mode_generic_ctor_as_value_executes() {
+    let dir = temp_dir("ctor-value");
+    let src = fixture(&dir, "ctor_value.rs", CTOR_VALUE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a generic constructor used as a value must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
+}
+
+const CTOR_HOF_SRC: &str = r#"
+struct Wrap<T>(T);
+fn apply<F: Fn(i32) -> Wrap<i32>>(f: F) -> i32 { f(41).0 + 1 }
+fn main() {
+    println!("{}", apply(Wrap));
+}
+"#;
+
+#[test]
+fn run_mode_generic_ctor_passed_to_hof_executes() {
+    let dir = temp_dir("ctor-hof");
+    let src = fixture(&dir, "ctor_hof.rs", CTOR_HOF_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a generic constructor passed as a callback must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const CTOR_ENUM_VALUE_SRC: &str = r#"
+enum E<T> { V(T, i32), W }
+fn main() {
+    let f = E::V;
+    let e = f(5, 6);
+    match e { E::V(a, b) => println!("{}", a + b), E::W => println!("w") }
+}
+"#;
+
+#[test]
+fn run_mode_generic_enum_variant_ctor_as_value_executes() {
+    let dir = temp_dir("ctor-enum-value");
+    let src = fixture(&dir, "ctor_enum_value.rs", CTOR_ENUM_VALUE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a generic variant constructor used as a value must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "11\n");
+}
+
+const CTOR_TWO_INSTANCES_SRC: &str = r#"
+struct G<T>(T, i32);
+fn main() {
+    let fi = G::<i32>;
+    let fs = G::<&str>;
+    let a = fi(1, 2);
+    let b = fs("x", 3);
+    println!("{} {} {}", a.0 + a.1, b.0, b.1);
+}
+"#;
+
+#[test]
+fn run_mode_generic_ctor_two_instances_as_values_execute() {
+    let dir = temp_dir("ctor-two-instances");
+    let src = fixture(&dir, "ctor_two_instances.rs", CTOR_TWO_INSTANCES_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "two instances of one generic constructor must both execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3 x 3\n");
+}
+
+const CTOR_DIRECT_ONLY_SRC: &str = r#"
+struct G<T>(T, i32);
+fn main() {
+    let g = G(10, 2);
+    println!("{}", g.0 + g.1);
+}
+"#;
+
+#[test]
+fn summary_mode_generic_ctor_is_accounted_converted() {
+    // Used directly (aggregate rvalues in main) or as a value
+    // (demanded instance converted), a generic constructor is
+    // reported converted — not as a missing monomorphic instance.
+    let dir = temp_dir("ctor-direct-only");
+    let src = fixture(&dir, "ctor_direct_only.rs", CTOR_DIRECT_ONLY_SRC);
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let g = stdout
+        .lines()
+        .find(|l| l.starts_with("fn ctor_direct_only::G:"))
+        .expect("summary lists the generic constructor");
+    assert!(
+        g.contains("[converted]"),
+        "an undemanded generic constructor is converted without a body: {g}"
+    );
+
+    let dir = temp_dir("ctor-value-summary");
+    let src = fixture(&dir, "ctor_value.rs", CTOR_VALUE_SRC);
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let pair = stdout
+        .lines()
+        .find(|l| l.starts_with("fn ctor_value::Pair:"))
+        .expect("summary lists the generic constructor");
+    assert!(
+        pair.contains("[converted]"),
+        "a demanded generic constructor is converted: {pair}"
+    );
+    assert!(
+        !stdout.contains("kind=Ctor"),
+        "no constructor is left as a missing instance: {stdout}"
+    );
+}
