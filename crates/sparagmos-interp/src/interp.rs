@@ -4018,6 +4018,9 @@ impl<'a> Interpreter<'a> {
         for step in projection {
             match step {
                 RefProj::Field(idx) => path.push(*idx),
+                // Union fields sit in the same per-parent index
+                // space the conversion-side walk records.
+                RefProj::UnionField { idx, .. } => path.push(*idx),
                 _ => return None,
             }
         }
