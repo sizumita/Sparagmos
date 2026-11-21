@@ -120,3 +120,43 @@ fn main() {
 }
 ";
 
+
+#[test]
+fn async_closure_in_main_is_skipped_with_named_reason() {
+    // Stable MIR 1.100.0 cannot convert a body that mentions a
+    // coroutine-closure (async closure) type at all (rustc_public
+    // leaves ty::CoroutineClosure unimplemented), so the body is
+    // skipped with that named reason instead of the conversion
+    // panic aborting the whole crate conversion.
+    let fixture = write_fixture("async_closure_main", ASYNC_CLOSURE_MAIN_RS);
+    let (stdout, status) = run_driver(&[], &fixture);
+    assert!(status.success(), "driver failed: {stdout}");
+    assert!(
+        stdout.contains(
+            "fn async_closure_main::main: SKIPPED (body mentions a coroutine-closure"
+        ),
+        "main not skipped with the coroutine-closure reason:\n{stdout}"
+    );
+}
+
+#[test]
+fn async_closure_in_uncalled_helper_does_not_block_main() {
+    // Only the function whose body mentions the async closure is
+    // skipped; the rest of the crate converts and runs.
+    let fixture = write_fixture("async_closure_helper", ASYNC_CLOSURE_HELPER_RS);
+    let (stdout, status) = run_driver(&[], &fixture);
+    assert!(status.success(), "driver failed: {stdout}");
+    assert!(
+        stdout.contains(
+            "fn async_closure_helper::make: SKIPPED (body mentions a coroutine-closure"
+        ),
+        "helper not skipped with the coroutine-closure reason:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("fn async_closure_helper::main: blocks="),
+        "main not converted:\n{stdout}"
+    );
+    let (stdout, status) = run_driver(&["run"], &fixture);
+    assert!(status.success(), "run failed: {stdout}");
+    assert_eq!(stdout, "main only\n");
+}
