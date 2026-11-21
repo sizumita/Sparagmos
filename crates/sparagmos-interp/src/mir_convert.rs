@@ -454,6 +454,7 @@ fn convert_all(
     // bodies convert at all.
     let conv = Converter::new(program, &keys);
     let (mut out, mut failures) = convert_each(&conv, program, &keys);
+    out.union_tables = conv.union_tables.clone();
     // Joint fixpoint of conversion, cleanliness and the
     // builtin-served set. Each round recomputes, from the merged
     // program so far:
@@ -1375,6 +1376,14 @@ struct Converter<'a> {
     /// honestly can be (see `resolve_body_callee`). Empty in the
     /// first conversion phase.
     unconverted: HashMap<String, String>,
+    /// Scalar-shape tables of the program's union instances (see
+    /// [`ir::Program::union_tables`]), interned in
+    /// `Converter::new` by [`Self::compute_union_tables`]: every
+    /// conversion round recomputes the same tables, so the
+    /// indices baked into converted places agree across rounds.
+    union_tables: Vec<Vec<Option<ir::ScalarShape>>>,
+    /// Union instance -> index into `union_tables`.
+    union_table_ids: Vec<(mir::AdtDefId, Vec<mir::Ty>, usize)>,
 }
 
 impl<'a> Converter<'a> {
@@ -1407,7 +1416,7 @@ impl<'a> Converter<'a> {
             .iter()
             .find(|f| f.name == "main" || f.name.ends_with("::main"))
             .map(|f| f.name.split("::").next().unwrap_or("").to_string());
-        Converter {
+        let mut conv = Converter {
             bodies,
             def_names,
             names: &program.fn_names,
@@ -1418,7 +1427,11 @@ impl<'a> Converter<'a> {
             local_crate,
             impl_targets: None,
             unconverted: HashMap::new(),
-        }
+            union_tables: Vec::new(),
+            union_table_ids: Vec::new(),
+        };
+        conv.compute_union_tables(program);
+        conv
     }
 
     /// A converter for a joint-fixpoint round in `convert_all`:
@@ -1437,6 +1450,138 @@ impl<'a> Converter<'a> {
         conv.impl_targets = Some(targets);
         conv.unconverted = unconverted;
         conv
+    }
+
+    /// Whether the ADT is a union.
+    fn is_union(&self, def: &mir::AdtDefId) -> bool {
+        self.adt_shapes
+            .get(def)
+            .map(|shape| shape.kind == mir::AdtShapeKind::Union)
+            .unwrap_or(false)
+    }
+
+    /// Intern the scalar-shape tables of every union instance a
+    /// place in the program can project a field of. The instance
+    /// set is the closure of the bodies' local types and the
+    /// projection-recovered field types under field, pointee and
+    /// element types: a place walk starts at a local, and each
+    /// step's type is one of those (a `Field` step's type is the
+    /// previous type's field type, a `Deref` step's the pointee,
+    /// an index step's the element). The closure is a pure
+    /// function of the program, so every conversion round
+    /// interns the same tables in the same order.
+    fn compute_union_tables(&mut self, program: &MirProgram) {
+        let mut visited: Vec<mir::Ty> = Vec::new();
+        let mut worklist: Vec<mir::Ty> = Vec::new();
+        for f in &program.functions {
+            for decl in &f.body.local_decls {
+                worklist.push(decl.ty.clone());
+            }
+        }
+        for (_, ty) in &self.adt_fields.entries {
+            worklist.push(ty.clone());
+        }
+        while let Some(ty) = worklist.pop() {
+            let mut ty = ty;
+            while let mir::Ty::Pat(inner, _) = ty {
+                ty = *inner;
+            }
+            if visited.contains(&ty) {
+                continue;
+            }
+            visited.push(ty.clone());
+            match &ty {
+                mir::Ty::Adt(def, args) => {
+                    if self.is_union(def) {
+                        self.intern_union_table(def, args);
+                    }
+                    let variant_count = self
+                        .adt_shapes
+                        .get(def)
+                        .map(|shape| shape.variants.len())
+                        .unwrap_or(0);
+                    for variant in 0..variant_count {
+                        if let Some(ftys) =
+                            self.instantiated_field_tys(def, args, variant as u32)
+                        {
+                            worklist.extend(ftys);
+                        }
+                    }
+                }
+                mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _) => {
+                    worklist.push((**inner).clone());
+                }
+                mir::Ty::Array(elem, _) | mir::Ty::Slice(elem) => {
+                    worklist.push((**elem).clone());
+                }
+                mir::Ty::Tuple(ts) => worklist.extend(ts.iter().cloned()),
+                _ => {}
+            }
+        }
+    }
+
+    /// Intern one union instance's per-field scalar shapes.
+    fn intern_union_table(&mut self, def: &mir::AdtDefId, args: &[mir::Ty]) {
+        if self
+            .union_table_ids
+            .iter()
+            .any(|(d, a, _)| d == def && a.as_slice() == args)
+        {
+            return;
+        }
+        let fields = self
+            .instantiated_field_tys(def, args, 0)
+            .unwrap_or_default();
+        let shapes: Vec<Option<ir::ScalarShape>> = fields
+            .iter()
+            .map(|fty| self.union_field_shape(fty))
+            .collect();
+        let idx = self.union_tables.len();
+        self.union_tables.push(shapes);
+        self.union_table_ids.push((*def, args.to_vec(), idx));
+    }
+
+    /// The table index of a union instance interned by
+    /// [`Self::compute_union_tables`]; `None` for an instance
+    /// the closure did not reach (the place then converts as a
+    /// plain field projection, the pre-union-fields behaviour).
+    fn union_table_for(&self, def: &mir::AdtDefId, args: &[mir::Ty]) -> Option<usize> {
+        self.union_table_ids
+            .iter()
+            .find(|(d, a, _)| d == def && a.as_slice() == args)
+            .map(|(_, _, idx)| *idx)
+    }
+
+    /// The scalar shape of one union field's type: the transmute
+    /// shape when the type has one, plus a tuple of equal scalar
+    /// shapes — its elements occupy consecutive slots of one
+    /// width in every field order, so the tuple's bit pattern is
+    /// the array pattern over the shared element shape (and a
+    /// tuple value and an array value are the same tuple of
+    /// elements in this model).
+    fn union_field_shape(&self, ty: &mir::Ty) -> Option<ir::ScalarShape> {
+        if let Some(shape) = self.scalar_shape(ty, 0) {
+            return Some(shape);
+        }
+        if let mir::Ty::Tuple(ts) = ty {
+            if ts.is_empty() || ts.len() > 128 {
+                return None;
+            }
+            let first = self.scalar_shape(&ts[0], 0)?;
+            if first.bits() == 0 || first.bits().checked_mul(ts.len() as u32)? > 128 {
+                return None;
+            }
+            for t in &ts[1..] {
+                if self.scalar_shape(t, 0).as_ref() != Some(&first) {
+                    return None;
+                }
+            }
+            return Some(ir::ScalarShape::Array(
+                Box::new(first),
+                ts.len() as u64,
+            ));
+        }
+        None
     }
 
     fn convert_body(&self, func: &MirFunction, key: &str) -> Result<ir::Body, ConvertError> {
@@ -1815,25 +1960,89 @@ impl<'a> Converter<'a> {
 
     // ----- places ----------------------------------------------------------
 
-    fn convert_place(&self, place: &mir::Place) -> Result<ir::Place, ConvertError> {
+    fn convert_place(
+        &self,
+        body: &mir::Body,
+        place: &mir::Place,
+    ) -> Result<ir::Place, ConvertError> {
         let mut out = ir::Place::from_index(place.local.index());
+        // The type before each projection step, tracked the way
+        // `place_ty` tracks it: a `Field` step whose base type
+        // is a union converts to a union field step (its read
+        // reinterprets the held field's bits; see
+        // `ir::ProjectionElem::UnionField`), every other step to
+        // the plain step it always was. Once the walk loses the
+        // type, later steps convert plainly too.
+        let mut ty = body
+            .local_decls
+            .get(place.local.index())
+            .map(|decl| decl.ty.clone());
         for elem in &place.projection {
+            while let Some(mir::Ty::Pat(inner, _)) = &ty {
+                ty = Some(inner.as_ref().clone());
+            }
             out.projection.push(match elem {
-                mir::PlaceElem::Field(idx, _) => ir::ProjectionElem::Field(*idx as usize),
-                mir::PlaceElem::Deref => ir::ProjectionElem::Deref,
-                mir::PlaceElem::Index(local) => ir::ProjectionElem::Index(ir::Local(local.index())),
+                mir::PlaceElem::Field(idx, field_ty) => {
+                    let step = match &ty {
+                        Some(mir::Ty::Adt(def, args)) if self.is_union(def) => {
+                            match self.union_table_for(def, args) {
+                                Some(table) => ir::ProjectionElem::UnionField {
+                                    idx: *idx as usize,
+                                    table,
+                                },
+                                None => ir::ProjectionElem::Field(*idx as usize),
+                            }
+                        }
+                        _ => ir::ProjectionElem::Field(*idx as usize),
+                    };
+                    ty = Some(field_ty.clone());
+                    step
+                }
+                mir::PlaceElem::Deref => {
+                    ty = match ty {
+                        Some(
+                            mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _),
+                        ) => Some(*inner),
+                        _ => None,
+                    };
+                    ir::ProjectionElem::Deref
+                }
+                mir::PlaceElem::Index(local) => {
+                    ty = match ty {
+                        Some(mir::Ty::Array(elem, _) | mir::Ty::Slice(elem)) => {
+                            Some(*elem)
+                        }
+                        _ => None,
+                    };
+                    ir::ProjectionElem::Index(ir::Local(local.index()))
+                }
                 mir::PlaceElem::ConstantIndex {
                     offset, from_end, ..
-                } => ir::ProjectionElem::ConstantIndex {
-                    offset: *offset as u64,
-                    from_end: *from_end,
-                },
-                mir::PlaceElem::Downcast(_, variant) => ir::ProjectionElem::Downcast(*variant),
-                mir::PlaceElem::Subslice { from, to, from_end } => ir::ProjectionElem::Subslice {
-                    from: *from,
-                    to: *to,
-                    from_end: *from_end,
-                },
+                } => {
+                    ty = match ty {
+                        Some(mir::Ty::Array(elem, _) | mir::Ty::Slice(elem)) => {
+                            Some(*elem)
+                        }
+                        _ => None,
+                    };
+                    ir::ProjectionElem::ConstantIndex {
+                        offset: *offset as u64,
+                        from_end: *from_end,
+                    }
+                }
+                mir::PlaceElem::Downcast(_, variant) => {
+                    ir::ProjectionElem::Downcast(*variant)
+                }
+                mir::PlaceElem::Subslice { from, to, from_end } => {
+                    if let Some(mir::Ty::Array(elem, _)) = &ty {
+                        ty = Some(mir::Ty::Slice(elem.clone()));
+                    }
+                    ir::ProjectionElem::Subslice {
+                        from: *from,
+                        to: *to,
+                        from_end: *from_end,
+                    }
+                }
                 other => {
                     return Err(ConvertError::UnsupportedProjection {
                         kind: other.kind_name().to_string(),
@@ -2197,15 +2406,13 @@ impl<'a> Converter<'a> {
 
     fn convert_operand(
         &self,
-        // Part of the uniform converter signature; operand typing is
-        // done by callers through `ctx`, so the body is not needed here.
-        _body: &mir::Body,
+        body: &mir::Body,
         op: &mir::Operand,
         ctx: Option<&mir::Ty>,
     ) -> Result<ir::Operand, ConvertError> {
         Ok(match op {
-            mir::Operand::Copy(p) => ir::Operand::Copy(self.convert_place(p)?),
-            mir::Operand::Move(p) => ir::Operand::Move(self.convert_place(p)?),
+            mir::Operand::Copy(p) => ir::Operand::Copy(self.convert_place(body, p)?),
+            mir::Operand::Move(p) => ir::Operand::Move(self.convert_place(body, p)?),
             mir::Operand::Constant(c) => ir::Operand::Constant(self.convert_constant(c, ctx)?),
         })
     }
@@ -2466,7 +2673,7 @@ impl<'a> Converter<'a> {
                 } else if let Some(field_ty) = self.single_field_ty(def, args)
                 {
                     if field_ty == *target {
-                        match self.field_operand(operand, v, 0, &field_ty) {
+                        match self.field_operand(body, operand, v, 0, &field_ty) {
                             Some(op) => ir::Rvalue::Use(op),
                             None => unsupported(),
                         }
@@ -2538,7 +2745,7 @@ impl<'a> Converter<'a> {
             // the payload field back out.
             (Some(mir::Ty::Adt(def, args)), t) if is_thin_ptr_ty(t) => {
                 match self.wrapper_shape(def, args) {
-                    Some(shape) => self.unwrap_wrapper(operand, v, &shape),
+                    Some(shape) => self.unwrap_wrapper(body, operand, v, &shape),
                     None => unsupported(),
                 }
             }
@@ -2557,7 +2764,7 @@ impl<'a> Converter<'a> {
                             mir::Ty::Int(_) | mir::Ty::Uint(_)
                         ) =>
                     {
-                        match self.field_operand(operand, v, 0, &field_ty) {
+                        match self.field_operand(body, operand, v, 0, &field_ty) {
                             Some(op) => ir::Rvalue::IntToEnum(op, table),
                             None => unsupported(),
                         }
@@ -2594,11 +2801,13 @@ impl<'a> Converter<'a> {
     /// (the reverse of the wrap in [`Self::convert_transmute`]).
     fn unwrap_wrapper(
         &self,
+        body: &mir::Body,
         operand: &mir::Operand,
         v: &ir::Operand,
         shape: &WrapperShape,
     ) -> ir::Rvalue {
         match self.field_operand(
+            body,
             operand,
             v,
             shape.payload_index as u32,
@@ -2616,6 +2825,7 @@ impl<'a> Converter<'a> {
     /// that carry no addressable field.
     fn field_operand(
         &self,
+        body: &mir::Body,
         operand: &mir::Operand,
         v: &ir::Operand,
         index: u32,
@@ -2624,7 +2834,7 @@ impl<'a> Converter<'a> {
         match operand.place() {
             Some(place) => {
                 let place = place.clone().field(index, field_ty.clone());
-                let p = self.convert_place(&place).ok()?;
+                let p = self.convert_place(body, &place).ok()?;
                 Some(match operand {
                     mir::Operand::Move(_) => ir::Operand::Move(p),
                     _ => ir::Operand::Copy(p),
@@ -3378,16 +3588,16 @@ impl<'a> Converter<'a> {
                     ir::Rvalue::AggregateTuple(vec![v; *count as usize])
                 }
             }
-            R::Ref(_, _, place) => ir::Rvalue::Ref(self.convert_place(place)?),
-            R::CopyForDeref(place) => ir::Rvalue::CopyForDeref(self.convert_place(place)?),
+            R::Ref(_, _, place) => ir::Rvalue::Ref(self.convert_place(body, place)?),
+            R::CopyForDeref(place) => ir::Rvalue::CopyForDeref(self.convert_place(body, place)?),
             // Raw pointer creation shares the reference representation.
-            R::RawPtr(_, place) => ir::Rvalue::Ref(self.convert_place(place)?),
-            R::Reborrow(_, _, place) => ir::Rvalue::Reborrow(self.convert_place(place)?),
+            R::RawPtr(_, place) => ir::Rvalue::Ref(self.convert_place(body, place)?),
+            R::Reborrow(_, _, place) => ir::Rvalue::Reborrow(self.convert_place(body, place)?),
             R::ThreadLocalRef(def) => ir::Rvalue::ThreadLocalRef(format!("{def}")),
-            R::Len(place) => ir::Rvalue::Len(self.convert_place(place)?),
+            R::Len(place) => ir::Rvalue::Len(self.convert_place(body, place)?),
             R::NullaryOp(op, _) => ir::Rvalue::Unsupported(format!("NullaryOp {}", op.kind_name())),
             R::Discriminant(place) => {
-                let converted = self.convert_place(place)?;
+                let converted = self.convert_place(body, place)?;
                 // Bake the discriminant table of the enum into the
                 // rvalue: at execution time the place type is no
                 // longer available, and the table is what separates
@@ -3419,7 +3629,7 @@ impl<'a> Converter<'a> {
             S::Assign(pair) => {
                 let (place, rv) = &**pair;
                 let dest_ty = self.place_ty(body, place);
-                let ir_place = self.convert_place(place)?;
+                let ir_place = self.convert_place(body, place)?;
                 let ir_rv = self.convert_rvalue(body, rv, dest_ty.as_ref())?;
                 ir::Statement::assign(ir_place, ir_rv)
             }
@@ -3443,7 +3653,7 @@ impl<'a> Converter<'a> {
                 variant_index,
             } => ir::Statement {
                 kind: ir::StatementKind::SetDiscriminant {
-                    place: self.convert_place(place)?,
+                    place: self.convert_place(body, place)?,
                     variant: *variant_index,
                 },
             },
@@ -3759,7 +3969,7 @@ impl<'a> Converter<'a> {
             name: canonical,
             generic_args: vec![self_ty.clone()],
             args: ir_args,
-            destination: self.convert_place(destination)?,
+            destination: self.convert_place(body, destination)?,
             target: target.map(|b| ir::BasicBlock(b.index())),
             drop_glue: None,
             cmp_discriminants: None,
@@ -3852,7 +4062,7 @@ impl<'a> Converter<'a> {
         let mut pointee = arg_place;
         pointee.projection.push(mir::PlaceElem::Deref);
         Some(ir::TerminatorKind::Drop {
-            place: self.convert_place(&pointee).ok()?,
+            place: self.convert_place(body, &pointee).ok()?,
             target: ir::BasicBlock(target.index()),
             glue,
         })
@@ -4147,7 +4357,7 @@ impl<'a> Converter<'a> {
                     ir::TerminatorKind::CallIndirect {
                         func: ir_func,
                         args: ir_args,
-                        destination: self.convert_place(destination)?,
+                        destination: self.convert_place(body, destination)?,
                         target: target.map(|b| ir::BasicBlock(b.index())),
                     }
                 } else if let Some(term) = self.time_add_sub_terminator(
@@ -4172,7 +4382,7 @@ impl<'a> Converter<'a> {
                                 kind,
                                 receiver,
                                 args: tuple,
-                                destination: self.convert_place(destination)?,
+                                destination: self.convert_place(body, destination)?,
                                 target: target.map(|b| ir::BasicBlock(b.index())),
                             }
                         }
@@ -4212,7 +4422,7 @@ impl<'a> Converter<'a> {
                             ir::TerminatorKind::Call {
                                 func: name,
                                 args: ir_args,
-                                destination: self.convert_place(destination)?,
+                                destination: self.convert_place(body, destination)?,
                                 target: target.map(|b| ir::BasicBlock(b.index())),
                             }
                         }
@@ -4315,7 +4525,7 @@ impl<'a> Converter<'a> {
                                 name: canonical,
                                 generic_args,
                                 args: ir_args,
-                                destination: self.convert_place(destination)?,
+                                destination: self.convert_place(body, destination)?,
                                 target: target.map(|b| ir::BasicBlock(b.index())),
                                 drop_glue,
                                 cmp_discriminants,
@@ -4339,7 +4549,7 @@ impl<'a> Converter<'a> {
                         ir::TerminatorKind::Call {
                             func: name,
                             args: ir_args,
-                            destination: self.convert_place(destination)?,
+                            destination: self.convert_place(body, destination)?,
                             target: target.map(|b| ir::BasicBlock(b.index())),
                         }
                     } else {
@@ -4378,7 +4588,7 @@ impl<'a> Converter<'a> {
                     .and_then(|t| self.drop_glue(&t));
                 match glue {
                     Some(glue) => ir::TerminatorKind::Drop {
-                        place: self.convert_place(place)?,
+                        place: self.convert_place(body, place)?,
                         target: ir::BasicBlock(target.index()),
                         glue,
                     },
