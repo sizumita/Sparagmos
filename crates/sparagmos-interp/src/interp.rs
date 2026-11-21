@@ -116,7 +116,7 @@ pub struct Interpreter<'a> {
 /// target always yields the same address within a run, so equality,
 /// null and alignment checks on transmuted pointers behave as they
 /// do natively; distinct targets collide only on a hash collision.
-fn synthetic_address(value: &Value) -> Option<u128> {
+pub(crate) fn synthetic_address(value: &Value) -> Option<u128> {
     // An address-only pointer's address is the stored integer
     // itself (address 0 is the null address).
     if let Value::Ref(RefTarget::Address(addr)) = value {

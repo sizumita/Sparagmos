@@ -2600,3 +2600,514 @@ fn box_new_uninit_write_then_assume_init_into_vec() {
     let value = interpret_mir(&program(body), "main", vec![]).expect("run");
     assert_eq!(value, Value::Int(6));
 }
+
+// ----- Lane CU: panic machinery and atomic intrinsics -------------------------
+
+const PANIC_NOUNWIND_FMT: mir::DefId = mir::DefId::new(0, 400);
+const PANIC_NOUNWIND: mir::DefId = mir::DefId::new(0, 401);
+const OPTION_EXPECT_FAILED: mir::DefId = mir::DefId::new(0, 402);
+const OPTION_UNWRAP_FAILED: mir::DefId = mir::DefId::new(0, 403);
+const RESULT_UNWRAP_FAILED: mir::DefId = mir::DefId::new(0, 404);
+const FROM_ASCII_RADIX_PANIC: mir::DefId = mir::DefId::new(0, 405);
+const SLICE_INDEX_FAIL: mir::DefId = mir::DefId::new(0, 406);
+const RANGE_ERROR_TY: mir::DefId = mir::DefId::new(0, 407);
+const RANGE_ERROR_REPORT: mir::DefId = mir::DefId::new(0, 408);
+const VEC_REMOVE_ASSERT_FAILED: mir::DefId = mir::DefId::new(0, 409);
+const ATOMIC_CXCHG: mir::DefId = mir::DefId::new(0, 410);
+const ATOMIC_CXCHGWEAK: mir::DefId = mir::DefId::new(0, 411);
+const ATOMIC_XCHG: mir::DefId = mir::DefId::new(0, 412);
+const ATOMIC_FENCE: mir::DefId = mir::DefId::new(0, 413);
+
+fn names_cu() -> HashMap<mir::DefId, String> {
+    let mut names = names_bi();
+    names.extend([
+        (PANIC_NOUNWIND_FMT, "core::panicking::panic_nounwind_fmt".to_string()),
+        (PANIC_NOUNWIND, "core::panicking::panic_nounwind".to_string()),
+        (OPTION_EXPECT_FAILED, "std::option::expect_failed".to_string()),
+        (OPTION_UNWRAP_FAILED, "std::option::unwrap_failed".to_string()),
+        (RESULT_UNWRAP_FAILED, "std::result::unwrap_failed".to_string()),
+        (
+            FROM_ASCII_RADIX_PANIC,
+            "core::num::from_ascii_bytes_radix_panic".to_string(),
+        ),
+        (SLICE_INDEX_FAIL, "core::slice::index::slice_index_fail".to_string()),
+        (RANGE_ERROR_TY, "core::slice::index::RangeError".to_string()),
+        (
+            RANGE_ERROR_REPORT,
+            "core::slice::index::RangeError::report".to_string(),
+        ),
+        (
+            VEC_REMOVE_ASSERT_FAILED,
+            "std::vec::Vec::<T, A>::remove::assert_failed".to_string(),
+        ),
+        (ATOMIC_CXCHG, "std::intrinsics::atomic_cxchg".to_string()),
+        (ATOMIC_CXCHGWEAK, "std::intrinsics::atomic_cxchgweak".to_string()),
+        (ATOMIC_XCHG, "std::intrinsics::atomic_xchg".to_string()),
+        (ATOMIC_FENCE, "std::intrinsics::atomic_fence".to_string()),
+    ]);
+    names
+}
+
+fn program_cu(body: mir::Body) -> MirProgram {
+    let mut prog = MirProgram::new();
+    prog.add("main", body);
+    prog.fn_names = names_cu();
+    prog
+}
+
+fn const_bool(v: bool) -> mir::Operand {
+    mir::Operand::constant(mir::Constant::from_value(mir::ConstValue::Bool(v)))
+}
+
+/// A `main` whose only block calls the diverging callee `def` with
+/// `args`; returns the guest panic message it raises.
+fn diverging_panic(def: mir::DefId, args: Vec<mir::Operand>) -> String {
+    let body = mir::Body::new(
+        decls(&[mir::Ty::unit(), mir::Ty::unit()]),
+        0,
+        vec![block(vec![], call_diverging(fndef(def, vec![]), args, 1))],
+    );
+    expect_panic(interpret_mir(&program_cu(body), "main", vec![]))
+}
+
+#[test]
+fn registry_covers_lane_cu_callees() {
+    let cases: &[(&str, Builtin)] = &[
+        ("core::panicking::panic_nounwind_fmt", Builtin::PanicNounwindFmt),
+        ("core::panicking::panic_nounwind", Builtin::PanicStr),
+        ("std::option::expect_failed", Builtin::PanicStr),
+        ("core::option::expect_failed", Builtin::PanicStr),
+        ("std::option::unwrap_failed", Builtin::OptionUnwrapFailed),
+        ("core::option::unwrap_failed", Builtin::OptionUnwrapFailed),
+        ("std::result::unwrap_failed", Builtin::ResultUnwrapFailed),
+        ("core::result::unwrap_failed", Builtin::ResultUnwrapFailed),
+        (
+            "core::num::from_ascii_bytes_radix_panic",
+            Builtin::FromAsciiRadixPanic,
+        ),
+        ("core::slice::index::slice_index_fail", Builtin::SliceIndexFail),
+        (
+            "core::slice::index::RangeError::report",
+            Builtin::RangeErrorReport,
+        ),
+        (
+            "std::vec::Vec::<T, A>::remove::assert_failed",
+            Builtin::VecRemoveAssertFailed,
+        ),
+        ("std::intrinsics::atomic_cxchg", Builtin::AtomicCxchg),
+        ("core::intrinsics::atomic_cxchg", Builtin::AtomicCxchg),
+        ("std::intrinsics::atomic_cxchgweak", Builtin::AtomicCxchg),
+        ("core::intrinsics::atomic_cxchgweak", Builtin::AtomicCxchg),
+        ("std::intrinsics::atomic_xchg", Builtin::AtomicXchg),
+        ("std::intrinsics::atomic_fence", Builtin::AtomicFence),
+        ("core::intrinsics::atomic_load", Builtin::AtomicLoad),
+        ("core::intrinsics::atomic_store", Builtin::AtomicStore),
+    ];
+    for (name, want) in cases {
+        assert_eq!(lookup(&canonical_name(name)), Some(*want), "{name}");
+    }
+}
+
+#[test]
+fn panic_nounwind_fmt_raises_a_guest_panic_with_the_message() {
+    // fn main() {
+    //   _2 = Arguments::from_str(const "nounwind boom");
+    //   _1 = panic_nounwind_fmt(move _2, const false) -> !;
+    // }
+    let body = mir::Body::new(
+        decls(&[mir::Ty::unit(), mir::Ty::unit(), arguments_ty()]),
+        0,
+        vec![
+            block(
+                vec![],
+                call(fndef(FROM_STR, vec![]), vec![const_str("nounwind boom")], 2, 1),
+            ),
+            block(
+                vec![],
+                call_diverging(
+                    fndef(PANIC_NOUNWIND_FMT, vec![]),
+                    vec![move_(2), const_bool(false)],
+                    1,
+                ),
+            ),
+        ],
+    );
+    let message = expect_panic(interpret_mir(&program_cu(body), "main", vec![]));
+    assert_eq!(message, "nounwind boom");
+}
+
+#[test]
+fn panic_nounwind_raises_a_guest_panic_with_the_str() {
+    let message = diverging_panic(PANIC_NOUNWIND, vec![const_str("nounwind message")]);
+    assert_eq!(message, "nounwind message");
+}
+
+#[test]
+fn option_expect_failed_panics_with_the_given_message() {
+    let message = diverging_panic(
+        OPTION_EXPECT_FAILED,
+        vec![const_str("the value must exist")],
+    );
+    assert_eq!(message, "the value must exist");
+}
+
+#[test]
+fn option_unwrap_failed_panics_with_core_message() {
+    let message = diverging_panic(OPTION_UNWRAP_FAILED, vec![]);
+    assert_eq!(message, "called `Option::unwrap()` on a `None` value");
+}
+
+#[test]
+fn result_unwrap_failed_panics_with_msg_and_debug_error() {
+    // fn main() {
+    //   _2 = 42;
+    //   _3 = &_2;
+    //   _1 = unwrap_failed(const "called `Result::unwrap()` on an `Err` value", move _3) -> !;
+    // }
+    let body = mir::Body::new(
+        decls(&[
+            mir::Ty::unit(),
+            mir::Ty::unit(),
+            i32_ty(),
+            ref_ty(i32_ty(), false),
+        ]),
+        0,
+        vec![block(
+            vec![
+                assign(place(2), mir::Rvalue::Use(const_i32(42))),
+                assign(place(3), ref_rvalue(2, false)),
+            ],
+            call_diverging(
+                fndef(RESULT_UNWRAP_FAILED, vec![]),
+                vec![
+                    const_str("called `Result::unwrap()` on an `Err` value"),
+                    move_(3),
+                ],
+                1,
+            ),
+        )],
+    );
+    let message = expect_panic(interpret_mir(&program_cu(body), "main", vec![]));
+    assert_eq!(message, "called `Result::unwrap()` on an `Err` value: 42");
+}
+
+#[test]
+fn from_ascii_radix_panic_names_the_radix() {
+    let message = diverging_panic(FROM_ASCII_RADIX_PANIC, vec![const_int(37, 4)]);
+    assert_eq!(
+        message,
+        "from_ascii_bytes_radix: radix must lie in the range `[2, 36]` - found 37"
+    );
+}
+
+#[test]
+fn slice_index_fail_selects_core_message_by_branch() {
+    let run = |start: u64, end: u64, len: u64| {
+        diverging_panic(
+            SLICE_INDEX_FAIL,
+            vec![const_usize(start), const_usize(end), const_usize(len)],
+        )
+    };
+    assert_eq!(
+        run(5, 6, 3),
+        "range start index 5 out of range for slice of length 3"
+    );
+    assert_eq!(
+        run(0, 9, 3),
+        "range end index 9 out of range for slice of length 3"
+    );
+    assert_eq!(run(2, 1, 5), "slice index starts at 2 but ends at 1");
+    // end == len + 1 with a valid start reaches the final branch,
+    // whose text is the end-index one.
+    assert_eq!(
+        run(0, 4, 3),
+        "range end index 4 out of range for slice of length 3"
+    );
+}
+
+#[test]
+fn range_error_report_forwards_to_slice_index_fail() {
+    // RangeError::EndPastLen { end: 9 } reported against len 3.
+    let body = mir::Body::new(
+        decls(&[
+            mir::Ty::unit(),
+            mir::Ty::unit(),
+            mir::Ty::Adt(RANGE_ERROR_TY, vec![]),
+        ]),
+        0,
+        vec![block(
+            vec![assign(
+                place(2),
+                adt_aggregate(RANGE_ERROR_TY, 0, vec![], vec![const_usize(9)]),
+            )],
+            call_diverging(
+                fndef(RANGE_ERROR_REPORT, vec![]),
+                vec![move_(2), const_usize(3)],
+                1,
+            ),
+        )],
+    );
+    let message = expect_panic(interpret_mir(&program_cu(body), "main", vec![]));
+    assert_eq!(message, "range end index 9 out of range for slice of length 3");
+
+    // RangeError::StartPastEnd { start: 2, end: 1 } against len 5.
+    let body = mir::Body::new(
+        decls(&[
+            mir::Ty::unit(),
+            mir::Ty::unit(),
+            mir::Ty::Adt(RANGE_ERROR_TY, vec![]),
+        ]),
+        0,
+        vec![block(
+            vec![assign(
+                place(2),
+                adt_aggregate(
+                    RANGE_ERROR_TY,
+                    1,
+                    vec![],
+                    vec![const_usize(2), const_usize(1)],
+                ),
+            )],
+            call_diverging(
+                fndef(RANGE_ERROR_REPORT, vec![]),
+                vec![move_(2), const_usize(5)],
+                1,
+            ),
+        )],
+    );
+    let message = expect_panic(interpret_mir(&program_cu(body), "main", vec![]));
+    assert_eq!(message, "slice index starts at 2 but ends at 1");
+}
+
+#[test]
+fn vec_remove_assert_failed_message() {
+    let message = diverging_panic(
+        VEC_REMOVE_ASSERT_FAILED,
+        vec![const_usize(5), const_usize(3)],
+    );
+    assert_eq!(message, "removal index (is 5) should be < len (is 3)");
+}
+
+#[test]
+fn atomic_cxchg_stores_on_match_and_reports_previous() {
+    // fn main() -> (i32, bool) {
+    //   let mut x = 7;
+    //   return atomic_cxchg(&mut x, 7, 41);
+    // }
+    let pair_ty = mir::Ty::Tuple(vec![i32_ty(), bool_ty()]);
+    let body = mir::Body::new(
+        decls(&[pair_ty, i32_ty(), ref_ty(i32_ty(), true)]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(place(1), mir::Rvalue::Use(const_i32(7))),
+                    assign(place(2), ref_rvalue(1, true)),
+                ],
+                call(
+                    fndef(ATOMIC_CXCHG, vec![i32_ty()]),
+                    vec![move_(2), const_i32(7), const_i32(41)],
+                    0,
+                    1,
+                ),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_cu(body), "main", vec![]).expect("run");
+    assert_eq!(
+        value,
+        Value::Tuple(vec![Value::Int(7), Value::Bool(true)])
+    );
+}
+
+#[test]
+fn atomic_cxchg_leaves_the_value_on_mismatch() {
+    // fn main() -> i32 {
+    //   let mut x = 7;
+    //   let _ = atomic_cxchg(&mut x, 8, 41);
+    //   return atomic_load(&x);
+    // }
+    let pair_ty = mir::Ty::Tuple(vec![i32_ty(), bool_ty()]);
+    let body = mir::Body::new(
+        decls(&[
+            i32_ty(),
+            i32_ty(),
+            ref_ty(i32_ty(), true),
+            pair_ty,
+            ref_ty(i32_ty(), true),
+        ]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(place(1), mir::Rvalue::Use(const_i32(7))),
+                    assign(place(2), ref_rvalue(1, true)),
+                ],
+                call(
+                    fndef(ATOMIC_CXCHG, vec![i32_ty()]),
+                    vec![move_(2), const_i32(8), const_i32(41)],
+                    3,
+                    1,
+                ),
+            ),
+            block(
+                vec![assign(place(4), ref_rvalue(1, true))],
+                call(fndef(ATOMIC_LOAD, vec![i32_ty()]), vec![move_(4)], 0, 2),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_cu(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Int(7));
+}
+
+#[test]
+fn atomic_cxchgweak_behaves_like_cxchg() {
+    // fn main() -> (bool, bool) {
+    //   let mut x = true;
+    //   return atomic_cxchgweak(&mut x, true, false);
+    // }
+    let pair_ty = mir::Ty::Tuple(vec![bool_ty(), bool_ty()]);
+    let body = mir::Body::new(
+        decls(&[pair_ty, bool_ty(), ref_ty(bool_ty(), true)]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(place(1), mir::Rvalue::Use(const_bool(true))),
+                    assign(place(2), ref_rvalue(1, true)),
+                ],
+                call(
+                    fndef(ATOMIC_CXCHGWEAK, vec![bool_ty()]),
+                    vec![move_(2), const_bool(true), const_bool(false)],
+                    0,
+                    1,
+                ),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_cu(body), "main", vec![]).expect("run");
+    assert_eq!(
+        value,
+        Value::Tuple(vec![Value::Bool(true), Value::Bool(true)])
+    );
+}
+
+#[test]
+fn atomic_cxchg_on_a_pointer_cell_compares_by_identity() {
+    // fn main() -> i32 {
+    //   let a = 7; let b = 9;
+    //   let mut cell = &a;
+    //   let _ = atomic_cxchg(&mut cell, &a, &b);
+    //   return *cell;
+    // }
+    let ptr_ty = ref_ty(i32_ty(), false);
+    let pair_ty = mir::Ty::Tuple(vec![ptr_ty.clone(), bool_ty()]);
+    let body = mir::Body::new(
+        decls(&[
+            i32_ty(),
+            i32_ty(),
+            i32_ty(),
+            ptr_ty.clone(),
+            ptr_ty.clone(),
+            ptr_ty.clone(),
+            ref_ty(ptr_ty.clone(), true),
+            pair_ty,
+        ]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(place(1), mir::Rvalue::Use(const_i32(7))),
+                    assign(place(2), mir::Rvalue::Use(const_i32(9))),
+                    assign(place(3), ref_rvalue(1, false)),
+                    assign(place(4), ref_rvalue(2, false)),
+                    assign(place(5), mir::Rvalue::Use(copy(3))),
+                    assign(place(6), ref_rvalue(5, true)),
+                ],
+                call(
+                    fndef(ATOMIC_CXCHG, vec![ptr_ty.clone()]),
+                    vec![move_(6), copy(3), copy(4)],
+                    7,
+                    1,
+                ),
+            ),
+            block(
+                vec![assign(place(0), mir::Rvalue::Use(mir::Operand::Copy(deref_place(5))))],
+                ret(),
+            ),
+        ],
+    );
+    let value = interpret_mir(&program_cu(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Int(9));
+}
+
+#[test]
+fn atomic_xchg_returns_the_previous_and_stores() {
+    // fn main() -> i32 {
+    //   let mut x = 7;
+    //   let old = atomic_xchg(&mut x, 41);
+    //   return old + atomic_load(&x);
+    // }
+    let body = mir::Body::new(
+        decls(&[
+            i32_ty(),
+            i32_ty(),
+            ref_ty(i32_ty(), true),
+            i32_ty(),
+            ref_ty(i32_ty(), true),
+            i32_ty(),
+        ]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(place(1), mir::Rvalue::Use(const_i32(7))),
+                    assign(place(2), ref_rvalue(1, true)),
+                ],
+                call(
+                    fndef(ATOMIC_XCHG, vec![i32_ty()]),
+                    vec![move_(2), const_i32(41)],
+                    3,
+                    1,
+                ),
+            ),
+            block(
+                vec![assign(place(4), ref_rvalue(1, true))],
+                call(fndef(ATOMIC_LOAD, vec![i32_ty()]), vec![move_(4)], 5, 2),
+            ),
+            block(
+                vec![assign(
+                    place(0),
+                    mir::Rvalue::BinaryOp(
+                        mir::BinOp::Add,
+                        Box::new((copy(3), copy(5))),
+                    ),
+                )],
+                ret(),
+            ),
+        ],
+    );
+    let value = interpret_mir(&program_cu(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Int(48));
+}
+
+#[test]
+fn atomic_fence_is_a_no_op() {
+    // fn main() -> i32 { atomic_fence(); return 5; }
+    let body = mir::Body::new(
+        decls(&[i32_ty(), mir::Ty::unit()]),
+        0,
+        vec![
+            block(vec![], call(fndef(ATOMIC_FENCE, vec![]), vec![], 1, 1)),
+            block(
+                vec![assign(place(0), mir::Rvalue::Use(const_i32(5)))],
+                ret(),
+            ),
+        ],
+    );
+    let value = interpret_mir(&program_cu(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Int(5));
+}

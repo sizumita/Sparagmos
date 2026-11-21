@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use sparagmos_mir as mir;
 
 use crate::error::{InterpError, InterpResult};
-use crate::interp::{Frame, Interpreter, Resolved};
+use crate::interp::{synthetic_address, Frame, Interpreter, Resolved};
 use crate::ir::{Body, Operand};
 use crate::value::{FmtArguments, FmtTrait, RefProj, RefTarget, Value};
 
@@ -287,6 +287,30 @@ pub enum Builtin {
     /// `core::panicking::assert_failed(kind, &left, &right, args)`:
     /// raise a guest panic reporting the failed comparison.
     AssertFailed,
+    /// `core::panicking::panic_nounwind_fmt(Arguments, bool)`:
+    /// raise a guest panic with the formatted message. The flag
+    /// only controls native backtrace capture, which no guest
+    /// program can observe.
+    PanicNounwindFmt,
+    /// `core::option::unwrap_failed()`: raise a guest panic with
+    /// core's fixed `Option::unwrap` message.
+    OptionUnwrapFailed,
+    /// `core::result::unwrap_failed(&str, &dyn Debug)`: raise a
+    /// guest panic `"{msg}: {error:?}"`, core's message.
+    ResultUnwrapFailed,
+    /// `core::num::from_ascii_bytes_radix_panic(radix)`: raise a
+    /// guest panic naming the out-of-range radix.
+    FromAsciiRadixPanic,
+    /// `core::slice::index::slice_index_fail(start, end, len)`:
+    /// raise a guest panic with the message core's branch order
+    /// selects for the failing range.
+    SliceIndexFail,
+    /// `core::slice::index::RangeError::report(self, len)`: core
+    /// forwards to `slice_index_fail`; the same builtin shape.
+    RangeErrorReport,
+    /// `Vec::remove`'s nested `assert_failed(index, len)`: raise
+    /// a guest panic with alloc's removal-index message.
+    VecRemoveAssertFailed,
     /// `PartialEq::eq(&a, &b)`: semantic (derived) value equality.
     PartialEqEq,
     /// `PartialEq::ne(&a, &b)`.
@@ -483,6 +507,18 @@ pub enum Builtin {
     /// `std::intrinsics::atomic_store(ptr, value)`: a plain
     /// write through the pointer, as for `atomic_load`.
     AtomicStore,
+    /// `std::intrinsics::atomic_cxchg(ptr, old, new) ->
+    /// (previous, success)`: store `new` iff the pointee equals
+    /// `old`. `atomic_cxchgweak` is the same builtin: its only
+    /// difference is that the exchange may fail spuriously, which
+    /// a single-threaded interpreter has no reason to simulate.
+    AtomicCxchg,
+    /// `std::intrinsics::atomic_xchg(ptr, new) -> previous`: an
+    /// unconditional exchange through the pointer.
+    AtomicXchg,
+    /// `std::intrinsics::atomic_fence()`: orders other threads'
+    /// accesses; there are none, so it is a no-op.
+    AtomicFence,
     /// `std::mem::zeroed()`: the all-zero-bits value of a scalar
     /// type, or of a tuple/array of scalar types.
     MemZeroed,
@@ -601,6 +637,16 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "core::panicking::panic" => Builtin::PanicStr,
         "std::rt::panic_fmt" | "core::panicking::panic_fmt" => Builtin::PanicFmt,
         "core::panicking::assert_failed" => Builtin::AssertFailed,
+        "core::panicking::panic_nounwind_fmt" => Builtin::PanicNounwindFmt,
+        // `panic_nounwind(&str)` and `Option::expect_failed(&str)`
+        // panic with exactly the given message, as `panic` does.
+        "core::panicking::panic_nounwind" => Builtin::PanicStr,
+        "std::option::expect_failed" | "core::option::expect_failed" => Builtin::PanicStr,
+        "std::option::unwrap_failed" | "core::option::unwrap_failed" => Builtin::OptionUnwrapFailed,
+        "std::result::unwrap_failed" | "core::result::unwrap_failed" => Builtin::ResultUnwrapFailed,
+        "core::num::from_ascii_bytes_radix_panic" => Builtin::FromAsciiRadixPanic,
+        "core::slice::index::slice_index_fail" => Builtin::SliceIndexFail,
+        "core::slice::index::RangeError::report" => Builtin::RangeErrorReport,
         // Comparison traits: the impls for the modelled data types
         // are the derived ones, i.e. semantic value comparison.
         _ if canonical.ends_with("::PartialEq::eq") => Builtin::PartialEqEq,
@@ -656,9 +702,7 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         _ if canonical.starts_with("std::boxed::Box") && canonical.ends_with(">::new") => {
             Builtin::BoxNew
         }
-        _ if canonical.starts_with("std::boxed::Box")
-            && canonical.ends_with(">::new_uninit") =>
-        {
+        _ if canonical.starts_with("std::boxed::Box") && canonical.ends_with(">::new_uninit") => {
             Builtin::BoxNewUninit
         }
         "std::boxed::box_assume_init_into_vec_unsafe" => Builtin::BoxAssumeInitIntoVec,
@@ -702,6 +746,7 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         _ if canonical.starts_with("std::vec::Vec") && canonical.ends_with(">::capacity") => {
             Builtin::VecCapacity
         }
+        _ if canonical.starts_with("std::vec::Vec") && canonical.ends_with(">::remove::assert_failed") => Builtin::VecRemoveAssertFailed,
         _ if canonical.starts_with("core::slice::<impl") && canonical.ends_with(">::iter") => {
             Builtin::SliceIter
         }
@@ -792,8 +837,20 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::intrinsics::bswap" => Builtin::IntBitOp(BitOp::Bswap),
         "std::intrinsics::saturating_add" => Builtin::SaturatingArith(SatOp::Add),
         "std::intrinsics::saturating_sub" => Builtin::SaturatingArith(SatOp::Sub),
-        "std::intrinsics::atomic_load" => Builtin::AtomicLoad,
-        "std::intrinsics::atomic_store" => Builtin::AtomicStore,
+        "std::intrinsics::atomic_load" | "core::intrinsics::atomic_load" => Builtin::AtomicLoad,
+        "std::intrinsics::atomic_store" | "core::intrinsics::atomic_store" => {
+            Builtin::AtomicStore
+        }
+        "std::intrinsics::atomic_cxchg" | "core::intrinsics::atomic_cxchg" => {
+            Builtin::AtomicCxchg
+        }
+        "std::intrinsics::atomic_cxchgweak" | "core::intrinsics::atomic_cxchgweak" => {
+            Builtin::AtomicCxchg
+        }
+        "std::intrinsics::atomic_xchg" | "core::intrinsics::atomic_xchg" => Builtin::AtomicXchg,
+        "std::intrinsics::atomic_fence" | "core::intrinsics::atomic_fence" => {
+            Builtin::AtomicFence
+        }
         "std::mem::zeroed" => Builtin::MemZeroed,
         "std::ptr::null" | "std::ptr::null_mut" => Builtin::PtrNull,
         "std::ptr::copy_nonoverlapping" | "std::ptr::copy" => Builtin::PtrCopy,
@@ -1499,6 +1556,103 @@ impl<'a> Interpreter<'a> {
                 let right = self.resolve_value(frames, &vals[2])?;
                 message = format!("{message}\n  left: {left}\n right: {right}");
                 Err(InterpError::panic(message))
+            }
+            Builtin::PanicNounwindFmt => {
+                // `panic_nounwind_fmt(args, force_no_backtrace)`:
+                // the flag only controls backtrace capture in the
+                // native runtime, which no guest program can
+                // observe; the panic carries the formatted message,
+                // exactly as `panic_fmt`'s does.
+                if vals.is_empty() || vals.len() > 2 {
+                    return Err(InterpError::type_mismatch(
+                        format!("builtin {name}"),
+                        "1 or 2 argument(s)",
+                        format!("{} argument(s)", vals.len()),
+                    ));
+                }
+                let message =
+                    self.format_arguments(frames, expect_arguments(&vals[0], name)?)?;
+                Err(InterpError::panic(message))
+            }
+            Builtin::OptionUnwrapFailed => {
+                arity(0)?;
+                Err(InterpError::panic(
+                    "called `Option::unwrap()` on a `None` value",
+                ))
+            }
+            Builtin::ResultUnwrapFailed => {
+                arity(2)?;
+                // `unwrap_failed(msg, error: &dyn Debug)` panics
+                // with "{msg}: {error:?}"; the Debug rendering is
+                // the fmt engine's, the same one `panic!` uses.
+                let msg = self.resolve_string(frames, &vals[0])?;
+                let error = match &vals[1] {
+                    Value::DynRef { .. } => {
+                        let target = self.deref_value(frames, &vals[1])?;
+                        self.read_resolved(frames, &target)?
+                    }
+                    other => self.resolve_value(frames, other)?,
+                };
+                let rendered = self.format_value(
+                    frames,
+                    &error,
+                    FmtTrait::Debug,
+                    "",
+                    &FmtOptions::new(),
+                    0,
+                )?;
+                Err(InterpError::panic(format!("{msg}: {rendered}")))
+            }
+            Builtin::FromAsciiRadixPanic => {
+                arity(1)?;
+                let radix = as_u128(&vals[0], name)?;
+                Err(InterpError::panic(format!(
+                    "from_ascii_bytes_radix: radix must lie in the range `[2, 36]` - found {radix}"
+                )))
+            }
+            Builtin::SliceIndexFail => {
+                arity(3)?;
+                let start = as_u128(&vals[0], name)? as usize;
+                let end = as_u128(&vals[1], name)? as usize;
+                let len = as_u128(&vals[2], name)? as usize;
+                Err(InterpError::panic(slice_index_fail_message(
+                    start, end, len,
+                )))
+            }
+            Builtin::RangeErrorReport => {
+                arity(2)?;
+                // `RangeError::report(self, len)` forwards to
+                // `slice_index_fail`: with a zero start for
+                // `EndPastLen`, with the stored pair for
+                // `StartPastEnd`.
+                let len = as_u128(&vals[1], name)? as usize;
+                let (start, end) = match self.resolve_value(frames, &vals[0])? {
+                    Value::Enum { variant: 0, fields } if fields.len() == 1 => {
+                        (0, as_u128(&fields[0], name)? as usize)
+                    }
+                    Value::Enum { variant: 1, fields } if fields.len() == 2 => (
+                        as_u128(&fields[0], name)? as usize,
+                        as_u128(&fields[1], name)? as usize,
+                    ),
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            format!("builtin {name}"),
+                            "a RangeError value",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                Err(InterpError::panic(slice_index_fail_message(
+                    start, end, len,
+                )))
+            }
+            Builtin::VecRemoveAssertFailed => {
+                arity(2)?;
+                let index = as_u128(&vals[0], name)?;
+                let len = as_u128(&vals[1], name)?;
+                Err(InterpError::panic(format!(
+                    "removal index (is {index}) should be < len (is {len})"
+                )))
             }
             Builtin::PartialEqEq | Builtin::PartialEqNe => {
                 arity(2)?;
@@ -2392,7 +2546,51 @@ impl<'a> Interpreter<'a> {
                 self.exec_copy_nonoverlapping(frames, src, dst, count)?;
                 Ok(Value::Unit)
             }
+            Builtin::AtomicCxchg => {
+                arity(3)?;
+                // Single-threaded: nothing can intervene between
+                // the read and the conditional write, and a weak
+                // exchange's spurious failure is not simulated, so
+                // `atomic_cxchgweak` is the same operation.
+                let target = self.deref_value(frames, &vals[0])?;
+                let current = self.read_resolved(frames, &target)?;
+                let success = self.atomic_value_eq(frames, &current, &vals[1])?;
+                if success {
+                    self.write_resolved(frames, &target, vals[2].clone())?;
+                }
+                Ok(Value::Tuple(vec![current, Value::Bool(success)]))
+            }
+            Builtin::AtomicXchg => {
+                arity(2)?;
+                let target = self.deref_value(frames, &vals[0])?;
+                let previous = self.read_resolved(frames, &target)?;
+                self.write_resolved(frames, &target, vals[1].clone())?;
+                Ok(previous)
+            }
+            Builtin::AtomicFence => {
+                arity(0)?;
+                // A fence orders other threads' accesses; there
+                // are none.
+                Ok(Value::Unit)
+            }
             Builtin::FloatMethod { f32, op } => exec_float_method(name, f32, op, &vals),
+        }
+    }
+
+    /// The equality an atomic compare-exchange performs: the
+    /// pointee's current value against the expected one.
+    /// Pointer-shaped values compare by identity — the synthetic
+    /// address, the same identity `PtrToInt` exposes — and every
+    /// other value by the semantic (derived) equality.
+    fn atomic_value_eq(
+        &self,
+        frames: &[Frame],
+        current: &Value,
+        expected: &Value,
+    ) -> InterpResult<bool> {
+        match (synthetic_address(current), synthetic_address(expected)) {
+            (Some(a), Some(b)) => Ok(a == b),
+            _ => self.values_equal(frames, current, expected),
         }
     }
 
@@ -2999,6 +3197,21 @@ fn iterator_fields(state: &Value, self_ty: &str) -> InterpResult<Vec<Value>> {
             "ADT value",
             other.kind_name(),
         )),
+    }
+}
+
+/// The panic message `core::slice::index::slice_index_fail`
+/// selects for `(start, end, len)`, in core's own branch order
+/// (the runtime form of its `const_panic!` messages).
+fn slice_index_fail_message(start: usize, end: usize, len: usize) -> String {
+    if start > len {
+        format!("range start index {start} out of range for slice of length {len}")
+    } else if end > len {
+        format!("range end index {end} out of range for slice of length {len}")
+    } else if start > end {
+        format!("slice index starts at {start} but ends at {end}")
+    } else {
+        format!("range end index {end} out of range for slice of length {len}")
     }
 }
 
