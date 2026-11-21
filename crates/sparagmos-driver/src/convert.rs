@@ -98,6 +98,7 @@ pub struct Converter {
     /// name (see `sm::AdtInstanceShapes`). Handed to the
     /// interpreter with the converted program.
     pub adt_instance_shapes: sm::AdtInstanceShapes,
+    pub adt_niches: sm::AdtNiches,
     /// Rendered instance keys whose instance-shape recording was
     /// already attempted (successfully or not), so an instance
     /// whose fields cannot be normalized is not retried at every
@@ -255,6 +256,7 @@ impl Converter {
             debug_shape_depth: 0,
             thread_locals: sm::ThreadLocals::new(),
             adt_instance_shapes: sm::AdtInstanceShapes::new(),
+            adt_niches: sm::AdtNiches::new(),
             instance_shape_attempted: std::collections::HashSet::new(),
             static_tys: HashMap::new(),
             errors: Vec::new(),
@@ -2484,6 +2486,7 @@ impl Converter {
         if !self.layout_attempted.insert(key.clone()) {
             return;
         }
+        self.record_niche(ty, def, &key);
         if adt_may_be_unsized(def, args, 0) {
             return;
         }
@@ -2506,6 +2509,81 @@ impl Converter {
         self.adt_layouts.insert(
             key,
             (shape.size.bytes() as u64, shape.abi_align),
+        );
+    }
+
+    /// Record the niche discriminant encoding of one
+    /// monomorphic enum instance (see `sm::AdtNiches`); the
+    /// caller dedups through `layout_attempted`, so this runs
+    /// once per distinct instance.
+    ///
+    /// The recording runs its own contained layout query
+    /// instead of sharing `record_layout`'s result: the
+    /// maybe-unsized screen that guards the layout table
+    /// answers conservatively for ADTs whose fields mention
+    /// a type alias, which is exactly the
+    /// `Option<NonZero<T>>` family this table exists for.
+    /// The compiler's layout query has no such doubt and
+    /// answers for the instance directly (and is memoized,
+    /// so asking again for enums that pass the screen costs
+    /// nothing measurable). Only multi-variant enums can
+    /// carry a niche encoding at all.
+    fn record_niche(
+        &mut self,
+        ty: &rustc_public::ty::Ty,
+        def: &AdtDef,
+        key: &str,
+    ) {
+        if def.kind() != AdtKind::Enum || def.num_variants() < 2 {
+            return;
+        }
+        let layout = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ty.layout()));
+        let Ok(Ok(layout)) = layout else {
+            return;
+        };
+        let shape = layout.shape();
+        if shape.is_unsized() {
+            return;
+        }
+        let VariantsShape::Multiple {
+            tag,
+            tag_encoding:
+                TagEncoding::Niche {
+                    untagged_variant,
+                    niche_variants,
+                    niche_start,
+                },
+            tag_field,
+            ..
+        } = &shape.variants
+        else {
+            return;
+        };
+        let offsets = match &shape.fields {
+            FieldsShape::Arbitrary { offsets } => {
+                offsets.iter().map(|o| o.bytes()).collect::<Vec<_>>()
+            }
+            _ => return,
+        };
+        let Some((tag_bytes, _)) = tag_scalar_size_signed(tag) else {
+            return;
+        };
+        let Some(offset) = offsets.get(*tag_field) else {
+            return;
+        };
+        self.adt_niches.insert(
+            key.to_string(),
+            sm::EnumNiche {
+                untagged_variant: untagged_variant.to_index() as u32,
+                niche_variants: (
+                    niche_variants.start().to_index() as u32,
+                    niche_variants.end().to_index() as u32,
+                ),
+                niche_start: *niche_start,
+                tag_field: *tag_field as u32,
+                tag_bits: (tag_bytes * 8) as u32,
+                niche_offset: *offset as u64,
+            },
         );
     }
 

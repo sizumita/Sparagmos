@@ -138,6 +138,7 @@ struct Collected {
     /// shape mentions a type alias, for the interpreter
     /// (see `Converter::adt_instance_shapes`).
     adt_instance_shapes: sparagmos_mir::AdtInstanceShapes,
+    adt_niches: sparagmos_mir::AdtNiches,
     /// Number of leading entries of `bodies` that come from the main
     /// crate itself (the rest are auxiliary-crate functions). The
     /// entry point is only ever searched among these: an auxiliary
@@ -2496,6 +2497,7 @@ fn collect() -> ControlFlow<()> {
         adt_debug_shapes: conv.adt_debug_shapes.clone(),
         thread_locals: conv.thread_locals.clone(),
         adt_instance_shapes: conv.adt_instance_shapes.clone(),
+        adt_niches: conv.adt_niches.clone(),
     });
     ControlFlow::Continue(())
 }
@@ -2697,6 +2699,7 @@ fn execute(c: &Collected, input: &str, guest_args: &[String], overflow_checks: b
     program.adt_debug_shapes = c.adt_debug_shapes.clone();
     program.thread_locals = c.thread_locals.clone();
     program.adt_instance_shapes = c.adt_instance_shapes.clone();
+    program.adt_niches = c.adt_niches.clone();
     // The entry body: the one rustc designated (see
     // `Collected::entry_def_id`) when collection recorded it, and
     // otherwise the first local body named `main`. A `--test`
