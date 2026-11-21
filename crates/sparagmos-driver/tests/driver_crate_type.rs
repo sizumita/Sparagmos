@@ -5,7 +5,9 @@
 //! `#![crate_type]` declaration governs when present, and rustc's
 //! default (bin) applies otherwise -- entry-point checks and
 //! dead-code reachability roots included. Run mode keeps its
-//! `--crate-type=lib` pin. Each test writes a tiny crate to a temp
+//! `--crate-type=lib` pin but caps lints: the pin removes the
+//! entry-point reachability roots, so lint levels under it are
+//! not the native compile's. Each test writes a tiny crate to a temp
 //! dir and spawns the driver binary (built with the pinned 1.100.0
 //! toolchain, see the crate README).
 
@@ -92,21 +94,37 @@ fn convert_mode_forwarded_crate_type_governs() {
 }
 
 #[test]
-fn run_mode_keeps_the_lib_pin() {
-    // Run mode is deliberately unchanged: it still pins
-    // `--crate-type=lib`, under which this program's `main` is dead
-    // code and the front end rejects it (run mode reports a failed
-    // compilation as exit 2). Execution semantics stay scoped to the
-    // crate shape the interpreter was built against; the
-    // compiletest-parity treatment applies to convert mode only.
-    let (code, _stdout, stderr) = run_driver(
+fn run_mode_caps_lints_under_the_lib_pin() {
+    // Run mode still pins `--crate-type=lib`, under which this
+    // program's `main` is dead code -- but run mode caps lints at
+    // allow, so the front end accepts it and the program runs,
+    // exactly as the native binary compile (the run's reference)
+    // accepts it: in a bin crate `main` is a reachability root
+    // and the denied lint never fires. Lint levels are not part
+    // of an execution verdict; a lint that fails the native
+    // compile keeps a program from ever reaching the driver.
+    let (code, stdout, stderr) = run_driver(
         Some("run"),
         "#![deny(dead_code)]\nfn main() { println!(\"hi\"); }\n",
         &[],
     );
-    assert_eq!(code, 2, "stderr={stderr}");
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(stdout.contains("hi"), "stdout={stdout}");
+}
+
+#[test]
+fn convert_mode_lint_errors_still_fail() {
+    // The cap is run-mode only: convert mode's front end mirrors
+    // compiletest's, so a denied lint on a function that is dead
+    // code in any crate shape still fails the compilation.
+    let (code, _stdout, stderr) = run_driver(
+        None,
+        "#![deny(dead_code)]\nfn unused() {}\nfn main() {}\n",
+        &[],
+    );
+    assert_eq!(code, 1, "stderr={stderr}");
     assert!(
-        stderr.contains("function `main` is never used"),
+        stderr.contains("function `unused` is never used"),
         "stderr={stderr}"
     );
 }
