@@ -4887,6 +4887,16 @@ impl<'a> Interpreter<'a> {
         func: &str,
         place: &str,
     ) -> InterpResult<Value> {
+        // A wholly uninitialized base holds no live field: that
+        // is the limiting case of the uninitialized read below,
+        // not a type mismatch (a partially initialized place can
+        // reach here with its union slot never materialized).
+        if value == Value::Uninit {
+            return Err(InterpError::UninitializedRead {
+                func: func.to_string(),
+                place: place.to_string(),
+            });
+        }
         let Value::Enum { ref fields, .. } = value else {
             return Err(InterpError::type_mismatch(
                 format!("union field read on {place}"),
