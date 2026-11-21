@@ -375,6 +375,73 @@ pub fn call_targets(body: &mir::Body) -> Vec<(rustc_public::ty::FnDef, GenericAr
     out
 }
 
+/// The `FnDef` constants materialized anywhere in one Stable MIR
+/// body: every constant operand of `FnDef` type, in statement
+/// rvalues and terminator operands alike. Unlike [`call_targets`],
+/// this also finds function items used *as values* — assigned to a
+/// local, passed as an argument, stored in an aggregate — whose
+/// instances a body can demand without ever naming them in a
+/// `Call` terminator of its own. (A tuple-struct constructor is
+/// the common case: direct construction is an aggregate rvalue,
+/// so the constructor item only ever appears as an `FnDef`
+/// constant when it is used as a value.)
+pub fn fndef_constants(body: &mir::Body) -> Vec<(rustc_public::ty::FnDef, GenericArgs)> {
+    fn visit(op: &Operand, out: &mut Vec<(rustc_public::ty::FnDef, GenericArgs)>) {
+        let Operand::Constant(c) = op else { return };
+        if let TyKind::RigidTy(RigidTy::FnDef(def, args)) = c.const_.ty().kind() {
+            out.push((def, args));
+        }
+    }
+    fn visit_rvalue(rv: &mir::Rvalue, out: &mut Vec<(rustc_public::ty::FnDef, GenericArgs)>) {
+        use mir::Rvalue as R;
+        match rv {
+            R::Use(op, _) | R::Cast(_, op, _) | R::Repeat(op, _) | R::UnaryOp(_, op) => {
+                visit(op, out)
+            }
+            R::BinaryOp(_, l, r) | R::CheckedBinaryOp(_, l, r) => {
+                visit(l, out);
+                visit(r, out);
+            }
+            R::Aggregate(_, ops) => {
+                for op in ops {
+                    visit(op, out);
+                }
+            }
+            // The remaining rvalues read places, not operands.
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for bb in &body.blocks {
+        for stmt in &bb.statements {
+            match &stmt.kind {
+                mir::StatementKind::Assign(_, rv) => visit_rvalue(rv, &mut out),
+                mir::StatementKind::Intrinsic(intr) => match intr {
+                    mir::NonDivergingIntrinsic::Assume(op) => visit(op, &mut out),
+                    mir::NonDivergingIntrinsic::CopyNonOverlapping(cno) => {
+                        visit(&cno.src, &mut out);
+                        visit(&cno.dst, &mut out);
+                        visit(&cno.count, &mut out);
+                    }
+                },
+                _ => {}
+            }
+        }
+        match &bb.terminator.kind {
+            TerminatorKind::Call { func, args, .. } => {
+                visit(func, &mut out);
+                for arg in args {
+                    visit(arg, &mut out);
+                }
+            }
+            TerminatorKind::Assert { cond, .. } => visit(cond, &mut out),
+            TerminatorKind::SwitchInt { discr, .. } => visit(discr, &mut out),
+            _ => {}
+        }
+    }
+    out
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.len() > max {
         format!("{}...", &s[..max])
