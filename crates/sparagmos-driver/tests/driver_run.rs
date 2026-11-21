@@ -1285,6 +1285,123 @@ fn run_mode_vec_with_capacity_push_and_reserve() {
     );
 }
 
+
+const STRING_WITH_CAPACITY_SRC: &str = r#"
+fn main() {
+    let mut s = String::with_capacity(16);
+    s.push_str("hi");
+    println!("{} {}", s, s.len());
+}
+"#;
+
+#[test]
+fn run_mode_string_with_capacity_push_str_and_len() {
+    // `String::with_capacity` is a direct `RawVecInner` caller:
+    // its collected body inlines down to
+    // `RawVecInner::with_capacity_in`, which has no converted
+    // body, so the constructor is modelled as the empty string
+    // (the requested capacity is not represented, as for
+    // `Vec::with_capacity`).
+    let dir = temp_dir("stringwithcapacity");
+    let src = fixture(&dir, "stringwithcapacity.rs", STRING_WITH_CAPACITY_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "String::with_capacity must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hi 2\n");
+}
+
+const VEC_TRY_RESERVE_SRC: &str = r#"
+fn main() {
+    let mut v = vec![1, 2, 3];
+    println!("small {}", v.try_reserve(10).is_ok());
+    println!("huge {}", v.try_reserve(usize::MAX).is_ok());
+    v.push(4);
+    println!("len {}", v.len());
+}
+"#;
+
+#[test]
+fn run_mode_vec_try_reserve_verdicts() {
+    // Allocation never fails in the abstract model, so the only
+    // error `try_reserve` can produce is capacity overflow:
+    // 3 + 10 elements fit easily (Ok), while `usize::MAX` more
+    // elements of 4 bytes exceed the `isize::MAX`-byte limit
+    // (Err), exactly as natively.
+    let dir = temp_dir("vectryreserve");
+    let src = fixture(&dir, "vectryreserve.rs", VEC_TRY_RESERVE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Vec::try_reserve must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "small true\nhuge false\nlen 4\n"
+    );
+}
+
+const VEC_SHRINK_SRC: &str = r#"
+fn main() {
+    let mut v = vec![1, 2, 3];
+    v.shrink_to_fit();
+    v.shrink_to(2);
+    println!("len {}", v.len());
+    v.push(4);
+    println!("len {}", v.len());
+}
+"#;
+
+#[test]
+fn run_mode_vec_shrink_to_fit_and_shrink_to() {
+    // Shrinking moves only the capacity, which the abstract Vec
+    // model does not represent: length, elements and later
+    // pushes are exactly as natively.
+    let dir = temp_dir("vecshrink");
+    let src = fixture(&dir, "vecshrink.rs", VEC_SHRINK_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Vec::shrink_to_fit/shrink_to must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "len 3\nlen 4\n");
+}
+
+const REF_VEC_ITER_SRC: &str = r#"
+fn main() {
+    let v = vec![10, 20, 30];
+    let mut sum = 0;
+    for x in &v {
+        sum += *x;
+    }
+    println!("{}", sum);
+}
+"#;
+
+#[test]
+fn run_mode_ref_vec_iteration() {
+    // `for x in &v` goes through `IntoIterator::into_iter` for
+    // `&Vec<T>`, which yields a `slice::Iter` over the elements;
+    // its items are `&T`, dereferenced by the loop body.
+    let dir = temp_dir("refveciter");
+    let src = fixture(&dir, "refveciter.rs", REF_VEC_ITER_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "iterating &Vec must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "60\n");
+}
+
 const VEC_REPEAT_SRC: &str = r#"
 fn main() {
     let v = vec![7; 4];
