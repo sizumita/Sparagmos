@@ -997,14 +997,26 @@ impl Converter {
                             // discriminant type (a fieldless enum
                             // with two variants gets a 1-byte tag
                             // while its discriminant type is isize).
-                            let (size, signed) = tag_scalar_size_signed(tag)?;
+                            let (size, _signed) = tag_scalar_size_signed(tag)?;
                             let tag_off = arbitrary_offsets(ty)?.get(*tag_field).copied()?;
                             let raw = read_uint_at(alloc, offset + tag_off, size)?;
-                            let val = if signed { sign_extend(raw, size) } else { raw };
+                            // Compare stored bit patterns, not values:
+                            // `Discriminant::val` carries the
+                            // discriminant in its declared type's own
+                            // width, zero-extended (a `-1` in an `i8`
+                            // enum reads back as 255), while a
+                            // sign-extended comparison would look for
+                            // the 128-bit pattern and never match a
+                            // negative discriminant stored narrowly.
+                            let mask = if size >= 16 {
+                                u128::MAX
+                            } else {
+                                (1u128 << (size * 8)) - 1
+                            };
                             let mut found = None;
                             for i in 0..def.num_variants() {
                                 let d = def.discriminant_for_variant(VariantIdx::to_val(i));
-                                if d.val == val {
+                                if d.val & mask == raw {
                                     found = Some(i);
                                     break;
                                 }
