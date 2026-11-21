@@ -1109,8 +1109,13 @@ impl Converter {
         let mir::alloc::GlobalAlloc::Memory(target) = target else {
             return None;
         };
-        let data = target.raw_bytes().ok()?;
         let meta = alloc.read_partial_uint(8..16).ok()? as u64;
+        let raw = target.raw_bytes().ok()?;
+        // The data is exactly the metadata's byte count: the
+        // backing allocation may extend past it (the file path
+        // allocation behind a `Location` constant carries a
+        // trailing NUL byte, for one).
+        let data = raw.get(..meta as usize)?.to_vec();
         Some((data, meta))
     }
 
@@ -1841,8 +1846,13 @@ impl Converter {
         };
         match inner.kind() {
             TyKind::RigidTy(RigidTy::Str) => {
+                // The string's bytes are exactly the fat pointer's
+                // length word (the second word at the pointer
+                // slot), as for the slice arm below: the backing
+                // allocation may extend past the string.
+                let len = read_uint_at(alloc, offset + PTR_SIZE, PTR_SIZE)? as usize;
                 let raw = target.raw_bytes().ok()?;
-                let bytes = raw.get(target_off..)?;
+                let bytes = raw.get(target_off..target_off + len)?;
                 String::from_utf8(bytes.to_vec()).ok().map(sm::ConstValue::Str)
             }
             TyKind::RigidTy(RigidTy::Slice(elem)) => {

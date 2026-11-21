@@ -7622,3 +7622,189 @@ fn run_mode_debug_format_ranges() {
         "stdout={stdout}"
     );
 }
+
+// ----- Location::file and the fat-pointer transmutes (Lane GE) --------------
+
+const LOCATION_FILE_SRC: &str = r#"
+fn main() {
+    let loc = std::panic::Location::caller();
+    println!("line {}", loc.line());
+    println!("file-ok {}", loc.file() == file!());
+}
+"#;
+
+#[test]
+fn run_mode_location_file_reports_the_source_path() {
+    // `Location::file` transmutes the stored `NonNull<str>` to a
+    // `*const str`: a fat pointer read out of its transparent
+    // wrapper. The conversion generalises wrapper transmutes to
+    // fat payloads, so the whole accessor now executes.
+    let dir = temp_dir("location-file");
+    let src = fixture(&dir, "locfile.rs", LOCATION_FILE_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    // `Location::caller()` is evaluated on line 3 of the fixture.
+    assert_eq!(stdout, "line 3\nfile-ok true\n", "stdout={stdout}");
+}
+
+const FAT_PTR_TRANSMUTE_SRC: &str = r#"
+fn main() {
+    let s = "hello";
+    let nn: std::ptr::NonNull<str> = unsafe { std::mem::transmute(s as *const str) };
+    let back: &str = unsafe { std::mem::transmute(nn) };
+    println!("back {back}");
+    let arr = [1u8, 2, 3];
+    let nn2: std::ptr::NonNull<[u8]> = unsafe { std::mem::transmute(&arr[..] as *const [u8]) };
+    let sl: &[u8] = unsafe { std::mem::transmute(nn2) };
+    println!("len {} sum {}", sl.len(), sl[0] + sl[1] + sl[2]);
+}
+"#;
+
+#[test]
+fn run_mode_fat_pointer_wrapper_transmutes_round_trip() {
+    let dir = temp_dir("fat-ptr-transmute");
+    let src = fixture(&dir, "fatptr.rs", FAT_PTR_TRANSMUTE_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "back hello\nlen 3 sum 6\n", "stdout={stdout}");
+}
+
+const ENUM_WRAP_TRANSMUTE_SRC: &str = r#"
+#[repr(isize)]
+#[derive(Clone, Copy)]
+enum Align { A1 = 1, A2 = 2, A4 = 4, A8 = 8 }
+#[repr(transparent)]
+struct Wrap(Align);
+fn main() {
+    let n: usize = unsafe { std::mem::transmute(Wrap(Align::A8)) };
+    println!("n {n}");
+    let m: usize = unsafe { std::mem::transmute(Wrap(Align::A2)) };
+    println!("m {m}");
+}
+"#;
+
+#[test]
+fn run_mode_transparent_wrapper_over_fieldless_enum_transmutes_to_int() {
+    // The `mem::Alignment` shape: a one-field transparent struct
+    // over a fieldless enum transmutes to the integer as the
+    // field's discriminant. (RawVec's allocation path performs
+    // exactly this transmute on the `Vec` collect path.)
+    let dir = temp_dir("enum-wrap-transmute");
+    let src = fixture(&dir, "alignwrap.rs", ENUM_WRAP_TRANSMUTE_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "n 8\nm 2\n", "stdout={stdout}");
+}
+
+// ----- Vec collect / size_hint / Rev (Lane GE) -------------------------------
+
+const COLLECT_SRC: &str = r#"
+fn main() {
+    let v: Vec<i32> = (0..3).collect();
+    println!("n {} s {}", v.len(), v[0] + v[1] + v[2]);
+    let w: Vec<i32> = (0..3).rev().collect();
+    println!("rev {} {}", w[0], w[2]);
+    let e: Vec<i32> = (5..5).collect();
+    println!("empty {}", e.len());
+    let mut x: Vec<i32> = Vec::new();
+    x.extend(10..12);
+    println!("ext {} {}", x.len(), x[0] + x[1]);
+}
+"#;
+
+#[test]
+fn run_mode_collect_builds_vec_from_iterators() {
+    // `Iterator::collect::<Vec<_>>` reaches
+    // `SpecFromIterNested::from_iter`, whose collected body has
+    // `Vec::with_capacity` inlined and drives `RawVecInner`
+    // directly; the entry point is modelled by stepping the
+    // iterator (see `Builtin::VecFromIterNested`), and
+    // `Vec::extend` reaches the modelled `extend_trusted`.
+    let dir = temp_dir("collect");
+    let src = fixture(&dir, "collect.rs", COLLECT_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout, "n 3 s 3\nrev 2 0\nempty 0\next 2 21\n",
+        "stdout={stdout}"
+    );
+}
+
+const ARGS_COLLECT_SRC: &str = r#"
+fn main() {
+    let fwd: Vec<String> = std::env::args().collect();
+    println!("fwd {}", fwd.len());
+    println!("fwd1 {}", fwd[1]);
+    let rev: Vec<String> = std::env::args().rev().collect();
+    println!("rev0 {}", rev[0]);
+    println!("rev-last {}", rev[rev.len() - 1] == fwd[0]);
+}
+"#;
+
+#[test]
+fn run_mode_env_args_collect_and_reverse() {
+    // `args().collect()` calls the iterator's `size_hint` first
+    // (the modelled `Iterator::size_hint` answers for the env
+    // iterators, whose real bodies read the real `vec::IntoIter`
+    // layout off the modelled state). `args().rev()` is the
+    // `Rev` adapter: its `next` is the inner iterator's back
+    // step.
+    let dir = temp_dir("args-collect");
+    let src = fixture(&dir, "argscollect.rs", ARGS_COLLECT_SRC);
+    let out = run_driver_extra(&src, &["--guest-arg", "one", "--guest-arg", "two"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout, "fwd 3\nfwd1 one\nrev0 two\nrev-last true\n",
+        "stdout={stdout}"
+    );
+}
+
+const SIZE_HINT_SRC: &str = r#"
+fn main() {
+    let (l, u) = (0..10).size_hint();
+    println!("range {l} {}", u.unwrap());
+    let (l, u) = (2..=5).size_hint();
+    println!("incl {l} {}", u.unwrap());
+    let (l, u) = "aé€".chars().size_hint();
+    println!("chars {l} {}", u.unwrap());
+    let (l, u) = "aé€".bytes().size_hint();
+    println!("bytes {l} {}", u.unwrap());
+    let (l, u) = ('a'..'z').size_hint();
+    println!("charrange {l} {}", u.unwrap());
+    let (l, u) = std::env::args().size_hint();
+    println!("args {l} {}", u.unwrap());
+    let (l, u) = (0..=u64::MAX).size_hint();
+    println!("big {l} {}", u.is_none());
+}
+"#;
+
+#[test]
+fn run_mode_size_hint_reports_std_values() {
+    // The exact pairs the standard library reports (measured
+    // against the pinned toolchain): exact counts for ranges and
+    // the owned iterators, the byte-count bounds for `Chars`
+    // (lower = remaining bytes / 4 rounded up, upper = remaining
+    // bytes), the surrogate gap removed for char ranges, and
+    // `(usize::MAX, None)` for a count that overflows `usize`.
+    let dir = temp_dir("size-hint");
+    let src = fixture(&dir, "sizehint.rs", SIZE_HINT_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "range 10 10\nincl 4 4\nchars 2 6\nbytes 6 6\ncharrange 25 25\nargs 1 1\nbig 18446744073709551615 true\n",
+        "stdout={stdout}"
+    );
+}
