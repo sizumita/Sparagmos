@@ -1251,6 +1251,29 @@ impl Converter {
             mir::alloc::GlobalAlloc::Function(inst) => {
                 return self.fn_pointer_value(&inst);
             }
+            mir::alloc::GlobalAlloc::TypeId { ty: tid_ty } => {
+                // A `TypeId` value is a 128-bit hash of the type,
+                // stored as two pointer-sized segments whose first
+                // segment's provenance is this symbolic allocation.
+                // The concrete hash function is unobservable - only
+                // equality between TypeIds matters - so synthesize
+                // the segments from a stable hash of the type. A
+                // reference to the allocation denotes the TypeId
+                // value itself; a pointer field pointing at it (the
+                // value's own first segment) denotes the segment's
+                // bits.
+                let (lo, hi) = type_id_segments(&tid_ty);
+                if matches!(inner.kind(), TyKind::RigidTy(RigidTy::Adt(..))) {
+                    return Some(sm::ConstValue::Ref(Box::new(sm::ConstValue::Adt {
+                        variant: 0,
+                        fields: vec![sm::ConstValue::Tuple(vec![
+                            sm::ConstValue::IntPtr(lo),
+                            sm::ConstValue::IntPtr(hi),
+                        ])],
+                    })));
+                }
+                return Some(sm::ConstValue::IntPtr(lo));
+            }
             // Vtables are not materialised.
             _ => return None,
         };
@@ -1554,6 +1577,27 @@ fn tag_scalar_size_signed(tag: &rustc_public::abi::Scalar) -> Option<(usize, boo
         Primitive::Pointer(_) => Some((PTR_SIZE, false)),
         _ => None,
     }
+}
+
+/// The two pointer-sized segments of a `TypeId` value for `ty`:
+/// a 128-bit FNV-1a hash (two lanes) of the type's debug form,
+/// which is stable within a run - all the equality semantics of
+/// `TypeId` need.
+fn type_id_segments(ty: &rustc_public::ty::Ty) -> (u64, u64) {
+    fn lane(bytes: &[u8], seed: u64) -> u64 {
+        let mut h = seed;
+        for b in bytes {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+        h
+    }
+    let text = format!("{ty:?}");
+    let bytes = text.as_bytes();
+    (
+        lane(bytes, 0xcbf2_9ce4_8422_2325),
+        lane(bytes, 0x8422_2325_cbf2_9ce4),
+    )
 }
 
 /// Read an unsigned integer of `size` bytes at `offset` in `alloc`.
