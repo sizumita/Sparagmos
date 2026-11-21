@@ -1815,6 +1815,40 @@ fn locator_extern_names(flags: &[String]) -> Vec<String> {
     names
 }
 
+/// The subset of a source's declarations that are true
+/// `--extern` binding declarations: the names of its
+/// `//@ aux-crate:` directives, verbatim (modifiers and
+/// namespaced paths included). Unlike an `aux-build:` stem or
+/// an `extern crate` item, an `aux-crate:` name is the binding
+/// itself: when it carries modifiers (`priv,noprelude:somedep`)
+/// those modifiers are the semantics (noprelude keeps the crate
+/// out of the extern prelude), so a consumer that declared one
+/// must not also receive the crate under its unmodified build
+/// name — that second binding silently undoes the modifiers
+/// (tests/ui/extern-flag/multiple-opts.rs relies on the prelude
+/// NOT containing the crate).
+fn declared_binding_names(src_text: &str) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    for line in src_text.lines() {
+        let Some(at) = line.find("//@") else { continue };
+        let rest = line[at + 3..].trim_start();
+        let rest = if rest.starts_with('[') {
+            match rest.find(']') {
+                Some(end) => rest[end + 1..].trim_start(),
+                None => continue,
+            }
+        } else {
+            rest
+        };
+        if let Some(value) = rest.strip_prefix("aux-crate:") {
+            if let Some((name, _)) = value.trim().split_once('=') {
+                names.insert(name.trim().to_string());
+            }
+        }
+    }
+    names
+}
+
 /// The `--extern` binding names a source file declares as its
 /// dependencies: for `//@ aux-crate:` the name before the `=`
 /// verbatim (modifiers and namespaced paths included), for
@@ -1976,10 +2010,24 @@ fn binding_names_for(built: &AuxBuilt) -> [&str; 2] {
 /// declared name (two svh `a` crates, the duplicate-rlib `foo`
 /// crates), each is bound in build order and rustc's own
 /// `--extern` precedence decides, as under compiletest.
+///
+/// One exception: when the consumer declared the binding name
+/// through a true binding declaration (`binding_declared`: an
+/// `aux-crate:` directive or a locator `--extern`), that
+/// binding alone is emitted. Its modifiers are load-bearing —
+/// with `priv,noprelude:somedep` bound, an additional
+/// unmodified `--extern somedep=` would put the crate in the
+/// extern prelude the modifier exists to keep it out of, and
+/// `extern crate somedep;` items still resolve through the
+/// modified binding (rustc matches them by crate name).
 fn bind_names_for<'a>(
     built: &'a AuxBuilt,
     declared: &std::collections::HashSet<String>,
+    binding_declared: &std::collections::HashSet<String>,
 ) -> Vec<&'a str> {
+    if binding_declared.contains(&built.extern_name) {
+        return vec![built.extern_name.as_str()];
+    }
     binding_names_for(built)
         .into_iter()
         .filter(|name| declared.contains(*name))
@@ -2060,10 +2108,13 @@ fn compile_aux(
     // dependency is not a private one. Undeclared transitive deps
     // still resolve through the `-L dependency` directory above.
     let mut deps = declared_aux_binding_names(&src_text);
-    deps.extend(locator_extern_names(&declared_compile_flags(&src_text)));
+    let own_flags = declared_compile_flags(&src_text);
+    deps.extend(locator_extern_names(&own_flags));
+    let mut binding_declared = declared_binding_names(&src_text);
+    binding_declared.extend(locator_extern_names(&own_flags));
     for prev in previous {
         if let Some(artifact) = &prev.artifact {
-            for bind in bind_names_for(prev, &deps) {
+            for bind in bind_names_for(prev, &deps, &binding_declared) {
                 cmd.arg("--extern")
                     .arg(format!("{}={}", bind, artifact.display()));
             }
@@ -2294,13 +2345,14 @@ fn main() {
         // directory, not as direct `--extern`s — a transitive crate
         // bound directly stops being a private dependency, which
         // changes lint outcomes like exported_private_dependencies).
-        let mut top_names = std::fs::read_to_string(&input)
-            .map(|text| declared_aux_binding_names(&text))
-            .unwrap_or_default();
+        let main_text = std::fs::read_to_string(&input).unwrap_or_default();
+        let mut top_names = declared_aux_binding_names(&main_text);
         top_names.extend(locator_names.iter().cloned());
+        let mut binding_declared = declared_binding_names(&main_text);
+        binding_declared.extend(locator_names.iter().cloned());
         for built in &aux_built {
             if let Some(artifact) = &built.artifact {
-                for bind in bind_names_for(built, &top_names) {
+                for bind in bind_names_for(built, &top_names, &binding_declared) {
                     args.push("--extern".to_string());
                     args.push(format!("{}={}", bind, artifact.display()));
                 }
