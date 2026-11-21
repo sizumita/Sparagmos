@@ -75,6 +75,7 @@ fn interp_program(input: &MirProgramInput) -> MirProgram {
             })
             .collect(),
         fn_names: input.names.clone(),
+        ..Default::default()
     }
 }
 
@@ -117,9 +118,10 @@ fn mode_interp(input: &MirProgramInput, entry: &str, reps: usize) -> Result<(), 
     let config = InterpConfig {
         max_steps: 10_000_000_000,
         max_call_depth: 1_000_000,
+        guest_args: Vec::new(),
     };
     for i in 0..reps {
-        let mut interp = Interpreter::with_config(&ir, config);
+        let mut interp = Interpreter::with_config(&ir, config.clone());
         let t = Instant::now();
         let result = interp.run(entry, Vec::new());
         let elapsed = t.elapsed();
