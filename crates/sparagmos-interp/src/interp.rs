@@ -2725,7 +2725,7 @@ impl<'a> Interpreter<'a> {
     }
 
     /// Validate / wrap a value being stored into a typed direct local.
-    fn normalize_for_ty(value: Value, ty: Option<&Ty>) -> InterpResult<Value> {
+    fn normalize_for_ty(mut value: Value, ty: Option<&Ty>) -> InterpResult<Value> {
         // A scalar place whose value arrives as a one-field wrapper
         // aggregate: reading through a raw pointer into a transparent
         // wrapper (`UnsafeCell<T>`, the `AtomicUsize`-family structs,
@@ -2735,18 +2735,42 @@ impl<'a> Interpreter<'a> {
         // only field IS the scalar at that address (the layout fact
         // the pointer arithmetic in the source relies on), so the
         // store unwraps it, recursively for nested wrappers.
+        //
+        // The unwrap is limited to unsigned-integer, boolean and
+        // float targets whose innermost leaf is a value of the same
+        // kind: those are the shapes the atomic/pointer-metadata
+        // assignments actually produce. A signed-integer target does
+        // not unwrap: a signed field's width lives only in its
+        // declared type, so reading a wrapper aggregate as a signed
+        // scalar of some other width is exactly the reinterpretation
+        // a cast to an unrelated pointee type asks for, and the
+        // model — which has no byte memory — keeps it an explicit
+        // type mismatch instead of fabricating a value (the negative
+        // case `wrapper_cast_to_an_unrelated_pointee_is_not_
+        // reinterpreted` pins this).
         if matches!(
             ty,
-            Some(Ty::Bool) | Some(Ty::Int(_)) | Some(Ty::Uint(_)) | Some(Ty::Float(_))
+            Some(Ty::Bool) | Some(Ty::Uint(_)) | Some(Ty::Float(_))
         ) {
-            if let Value::Enum {
+            let mut inner = &value;
+            while let Value::Enum {
                 variant: 0,
                 fields,
-            } = &value
+            } = inner
             {
-                if fields.len() == 1 {
-                    return Self::normalize_for_ty(fields[0].clone(), ty);
+                if fields.len() != 1 {
+                    break;
                 }
+                inner = &fields[0];
+            }
+            let same_kind = matches!(
+                (ty, inner),
+                (Some(Ty::Uint(_)), Value::Uint(_))
+                    | (Some(Ty::Bool), Value::Bool(_))
+                    | (Some(Ty::Float(_)), Value::Float(_))
+            );
+            if same_kind && !matches!(inner, Value::Enum { .. }) {
+                value = inner.clone();
             }
         }
         match (ty, &value) {
