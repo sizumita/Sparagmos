@@ -2736,7 +2736,7 @@ impl<'a> Converter<'a> {
                         // allocation path).
                         match self.fieldless_enum_discriminants(fdef) {
                             Some(table) => match self
-                                .field_operand(operand, v, 0, &field_ty)
+                                .field_operand(body, operand, v, 0, &field_ty)
                             {
                                 Some(op) => match self
                                     .convert_ty(target, "cast target")
