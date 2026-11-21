@@ -880,6 +880,42 @@ impl Converter {
                     ty: float_ty(f),
                 }))
             }
+            TyKind::RigidTy(RigidTy::Str) => {
+                // A `str` value in non-reference position is the
+                // trailing unsized field of an ADT (a newtype over
+                // `str`): its bytes run to the end of the allocation.
+                let raw = alloc.raw_bytes().ok()?;
+                let bytes = raw.get(offset..)?;
+                String::from_utf8(bytes.to_vec()).ok().map(sm::ConstValue::Str)
+            }
+            TyKind::RigidTy(RigidTy::Slice(elem)) => {
+                // Likewise a slice in non-reference position is a
+                // trailing unsized field (the `[u8]` inside `CStr`
+                // is the canonical case): its elements run to the
+                // end of the allocation.
+                let raw = alloc.raw_bytes().ok()?;
+                let bytes = raw.get(offset..)?;
+                if matches!(
+                    elem.kind(),
+                    TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8))
+                ) {
+                    return Some(sm::ConstValue::Bytes(bytes.to_vec()));
+                }
+                let stride = elem.layout().ok()?.shape().size.bytes();
+                if stride == 0 || bytes.len() % stride != 0 {
+                    return None;
+                }
+                let mut elems = Vec::new();
+                for i in 0..bytes.len() / stride {
+                    elems.push(self.decode_const(
+                        &elem,
+                        alloc,
+                        offset + i * stride,
+                        depth + 1,
+                    )?);
+                }
+                Some(sm::ConstValue::SliceVal(elems))
+            }
             TyKind::RigidTy(RigidTy::Ref(_, inner, _)) => {
                 self.decode_ref(&inner, alloc, offset, depth)
             }
@@ -997,14 +1033,26 @@ impl Converter {
                             // discriminant type (a fieldless enum
                             // with two variants gets a 1-byte tag
                             // while its discriminant type is isize).
-                            let (size, signed) = tag_scalar_size_signed(tag)?;
+                            let (size, _signed) = tag_scalar_size_signed(tag)?;
                             let tag_off = arbitrary_offsets(ty)?.get(*tag_field).copied()?;
                             let raw = read_uint_at(alloc, offset + tag_off, size)?;
-                            let val = if signed { sign_extend(raw, size) } else { raw };
+                            // Compare stored bit patterns, not values:
+                            // `Discriminant::val` carries the
+                            // discriminant in its declared type's own
+                            // width, zero-extended (a `-1` in an `i8`
+                            // enum reads back as 255), while a
+                            // sign-extended comparison would look for
+                            // the 128-bit pattern and never match a
+                            // negative discriminant stored narrowly.
+                            let mask = if size >= 16 {
+                                u128::MAX
+                            } else {
+                                (1u128 << (size * 8)) - 1
+                            };
                             let mut found = None;
                             for i in 0..def.num_variants() {
                                 let d = def.discriminant_for_variant(VariantIdx::to_val(i));
-                                if d.val == val {
+                                if d.val & mask == raw {
                                     found = Some(i);
                                     break;
                                 }
@@ -1134,6 +1182,18 @@ impl Converter {
         else {
             return None;
         };
+        self.fn_pointer_value(&inst)
+    }
+
+    /// The callable constant naming a function instance: a plain
+    /// function item becomes the callable of that item; a closure
+    /// (named directly, or through the `Fn` adapter shim const
+    /// evaluation picks for a coercion) becomes the closure value
+    /// with an empty environment.
+    fn fn_pointer_value(
+        &mut self,
+        inst: &rustc_public::mir::mono::Instance,
+    ) -> Option<sm::ConstValue> {
         if matches!(inst.kind, InstanceKind::Shim) {
             for arg in &inst.args().0 {
                 if let GenericArgKind::Type(t) = arg {
@@ -1148,7 +1208,7 @@ impl Converter {
             let d = self.crate_def_id(&def);
             return Some(sm::ConstValue::Closure(d));
         }
-        let d = self.instance_def_id(inst.def.def_id(), &inst);
+        let d = self.instance_def_id(inst.def.def_id(), inst);
         Some(sm::ConstValue::FnDef(d))
     }
 
@@ -1162,11 +1222,20 @@ impl Converter {
         if depth > MAX_CONST_DEPTH {
             return None;
         }
-        let (_, prov) = alloc
+        let Some((_, prov)) = alloc
             .provenance
             .ptrs
             .iter()
-            .find(|(o, _)| *o as usize == offset)?;
+            .find(|(o, _)| *o as usize == offset)
+        else {
+            // No provenance at the pointer slot: the stored integer
+            // is the address itself — a null pointer or a dangling
+            // pointer from `without_provenance` (an empty `Vec`'s
+            // buffer pointer, `NonNull::dangling`, a `Waker`'s null
+            // data pointer). Only the address is observable.
+            let addr = read_uint_at(alloc, offset, PTR_SIZE)?;
+            return Some(sm::ConstValue::IntPtr(addr as u64));
+        };
         let target_off = read_uint_at(alloc, offset, PTR_SIZE)? as usize;
         let target = match mir::alloc::GlobalAlloc::from(prov.0) {
             mir::alloc::GlobalAlloc::Memory(target) => target,
@@ -1174,7 +1243,38 @@ impl Converter {
             // initializer allocation (the value a constant read of
             // the static observes).
             mir::alloc::GlobalAlloc::Static(def) => def.eval_initializer().ok()?,
-            // Functions and vtables are not materialised.
+            // A pointer at a function item: the item is zero-sized,
+            // so the pointer's value is the callable itself. This
+            // covers both references to function items reached
+            // through pointer-typed fields and pointers to functions
+            // stored under a cast (`&(foo as *const u8)`).
+            mir::alloc::GlobalAlloc::Function(inst) => {
+                return self.fn_pointer_value(&inst);
+            }
+            mir::alloc::GlobalAlloc::TypeId { ty: tid_ty } => {
+                // A `TypeId` value is a 128-bit hash of the type,
+                // stored as two pointer-sized segments whose first
+                // segment's provenance is this symbolic allocation.
+                // The concrete hash function is unobservable - only
+                // equality between TypeIds matters - so synthesize
+                // the segments from a stable hash of the type. A
+                // reference to the allocation denotes the TypeId
+                // value itself; a pointer field pointing at it (the
+                // value's own first segment) denotes the segment's
+                // bits.
+                let (lo, hi) = type_id_segments(&tid_ty);
+                if matches!(inner.kind(), TyKind::RigidTy(RigidTy::Adt(..))) {
+                    return Some(sm::ConstValue::Ref(Box::new(sm::ConstValue::Adt {
+                        variant: 0,
+                        fields: vec![sm::ConstValue::Tuple(vec![
+                            sm::ConstValue::IntPtr(lo),
+                            sm::ConstValue::IntPtr(hi),
+                        ])],
+                    })));
+                }
+                return Some(sm::ConstValue::IntPtr(lo));
+            }
+            // Vtables are not materialised.
             _ => return None,
         };
         match inner.kind() {
@@ -1477,6 +1577,27 @@ fn tag_scalar_size_signed(tag: &rustc_public::abi::Scalar) -> Option<(usize, boo
         Primitive::Pointer(_) => Some((PTR_SIZE, false)),
         _ => None,
     }
+}
+
+/// The two pointer-sized segments of a `TypeId` value for `ty`:
+/// a 128-bit FNV-1a hash (two lanes) of the type's debug form,
+/// which is stable within a run - all the equality semantics of
+/// `TypeId` need.
+fn type_id_segments(ty: &rustc_public::ty::Ty) -> (u64, u64) {
+    fn lane(bytes: &[u8], seed: u64) -> u64 {
+        let mut h = seed;
+        for b in bytes {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+        h
+    }
+    let text = format!("{ty:?}");
+    let bytes = text.as_bytes();
+    (
+        lane(bytes, 0xcbf2_9ce4_8422_2325),
+        lane(bytes, 0x8422_2325_cbf2_9ce4),
+    )
 }
 
 /// Read an unsigned integer of `size` bytes at `offset` in `alloc`.

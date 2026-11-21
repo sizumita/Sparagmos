@@ -2523,6 +2523,13 @@ impl<'a> Interpreter<'a> {
         let b = self.resolve_value(frames, b)?;
         Ok(match (&a, &b) {
             (Value::Ref(RefTarget::Null), Value::Ref(RefTarget::Null)) => true,
+            // Address-only pointers compare by address; address 0
+            // is the null address.
+            (Value::Ref(RefTarget::Address(x)), Value::Ref(RefTarget::Address(y))) => {
+                x == y
+            }
+            (Value::Ref(RefTarget::Address(0)), Value::Ref(RefTarget::Null))
+            | (Value::Ref(RefTarget::Null), Value::Ref(RefTarget::Address(0))) => true,
             (Value::Ref(RefTarget::Null), _) | (_, Value::Ref(RefTarget::Null)) => false,
             (Value::Unit, Value::Unit) => true,
             (Value::Bool(x), Value::Bool(y)) => x == y,
@@ -2664,8 +2671,12 @@ impl<'a> Interpreter<'a> {
         loop {
             match &value {
                 // The null pointer denotes no data; resolving it
-                // yields itself so equality can see it.
-                Value::Ref(RefTarget::Null) => return Ok(value),
+                // yields itself so equality can see it. An
+                // address-only pointer likewise denotes no readable
+                // data; it resolves to itself.
+                Value::Ref(RefTarget::Null) | Value::Ref(RefTarget::Address(_)) => {
+                    return Ok(value)
+                }
                 Value::Ref(_) | Value::FatRef { .. } => {
                     let target = self.deref_value(frames, &value)?;
                     value = self.read_resolved(frames, &target)?;

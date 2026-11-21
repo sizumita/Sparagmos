@@ -2645,6 +2645,9 @@ impl<'a> FnLower<'a> {
             mir::ConstValue::ByRef { .. } => {
                 return Err(self.err("by-reference constant"));
             }
+            mir::ConstValue::IntPtr(_) => {
+                return Err(self.err("address pointer constant"));
+            }
             mir::ConstValue::Tuple(_) => {
                 return Err(self.err("tuple constant"));
             }

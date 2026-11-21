@@ -307,6 +307,9 @@ pub enum Constant {
     Adt { variant: u32, fields: Vec<Constant> },
     /// A reference to a constant value.
     Ref(Box<Constant>),
+    /// A pointer constant with no provenance (null or dangling):
+    /// evaluates to an address-only reference value.
+    IntPtr(u64),
     /// A slice constant with decoded (non-byte) elements.
     SliceVal(Vec<Constant>),
     /// A function item constant: evaluates to the callable value

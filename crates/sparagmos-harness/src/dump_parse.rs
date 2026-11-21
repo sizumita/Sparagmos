@@ -947,6 +947,9 @@ impl Conv {
             ("Closure", Payload::Args(a)) if a.len() == 1 => {
                 mir::ConstValue::Closure(Self::def_id(&a[0])?)
             }
+            ("IntPtr", Payload::Args(a)) if a.len() == 1 => {
+                mir::ConstValue::IntPtr(atom_parse(&a[0], "address")?)
+            }
             ("ByRef", Payload::Fields(f)) => mir::ConstValue::ByRef {
                 alloc_id: atom_parse(field(f, "alloc_id")?, "alloc_id")?,
                 offset: atom_parse(field(f, "offset")?, "offset")?,

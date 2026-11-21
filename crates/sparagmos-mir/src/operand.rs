@@ -28,6 +28,11 @@ pub enum ConstValue {
     Scalar(Scalar),
     Slice { data: Vec<u8>, meta: u64 },
     ByRef { alloc_id: u64, offset: u64 },
+    /// A pointer constant with no provenance: the stored integer
+    /// is the address itself — a null pointer, or a dangling
+    /// pointer minted by `without_provenance`. It denotes no
+    /// readable pointee; only its address identity is observable.
+    IntPtr(u64),
     ZeroSized,
     Bool(bool),
     Char(char),
