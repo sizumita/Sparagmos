@@ -421,6 +421,65 @@ pub enum UnOp {
     PtrMetadata,
 }
 
+/// One side of a scalar `Transmute` reinterpretation
+/// ([`Rvalue::Reinterpret`]): how a value of this shape flattens
+/// to a bit pattern (little-endian, the x86_64 target's order)
+/// and how a bit pattern constructs a value of this shape. Only
+/// shapes whose every bit is accounted for by scalar leaves are
+/// described; the two sides of a reinterpretation always agree
+/// on the total width, at most 128 bits.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScalarShape {
+    /// An integer of the given width. Flattening masks the
+    /// stored value to the width (a signed source is stored
+    /// sign-extended, so masking recovers its bit pattern);
+    /// construction wraps into the width with the given
+    /// signedness.
+    Int { bits: u32, signed: bool },
+    /// A float of the given width (16, 32 or 64). The stored
+    /// value is an `f64` (an `f32` / `f16` widened exactly), so
+    /// flattening narrows it back to its own width's bit pattern
+    /// and construction widens the pattern's value back.
+    Float { bits: u32 },
+    /// A `bool`: one byte, flattened as 0 or 1; construction
+    /// reads any nonzero pattern as `true`, the same convention
+    /// as a cast to `bool`.
+    Bool,
+    /// A `char`: flattened as its 32-bit code point (chars are
+    /// stored as unsigned integers); construction rejects a
+    /// pattern that is not a valid code point rather than
+    /// fabricating a `char`.
+    Char,
+    /// An array of a scalar element shape: element `i` occupies
+    /// bits `[i * elem_bits, (i + 1) * elem_bits)`.
+    Array(Box<ScalarShape>, u64),
+    /// A one-payload-field ADT (a struct, a union, or a
+    /// single-variant enum): the payload field at `index`
+    /// carries the whole bit pattern; the remaining fields are
+    /// zero-sized with uniquely determined values, baked in as
+    /// `fill` constants for construction and ignored when
+    /// flattening. `count` is the ADT's total field count.
+    AdtField {
+        index: u32,
+        count: usize,
+        fill: Vec<(u32, Constant)>,
+        inner: Box<ScalarShape>,
+    },
+}
+
+impl ScalarShape {
+    /// The total width in bits this shape accounts for.
+    pub fn bits(&self) -> u32 {
+        match self {
+            ScalarShape::Int { bits, .. } | ScalarShape::Float { bits } => *bits,
+            ScalarShape::Bool => 8,
+            ScalarShape::Char => 32,
+            ScalarShape::Array(elem, n) => elem.bits() * (*n as u32),
+            ScalarShape::AdtField { inner, .. } => inner.bits(),
+        }
+    }
+}
+
 /// A right-hand side expression.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Rvalue {
@@ -503,6 +562,17 @@ pub enum Rvalue {
     /// is an explicit error: the model does not fabricate an
     /// invalid enum value.
     IntToEnum(Operand, Vec<i128>),
+    /// A `Transmute` cast between scalar-shaped types of equal
+    /// total size: the operand's bit pattern, flattened through
+    /// the source [`ScalarShape`], reinterpreted through the
+    /// target one. This is the bit-level reinterpretation
+    /// `transmute` means for the shapes the value model can hold
+    /// exactly: integers, floats, `bool`, `char`, arrays of
+    /// scalars, and one-payload-field ADTs over those. Aggregate
+    /// <-> aggregate byte reinterpretation beyond one payload
+    /// field stays unsupported: there is no flat byte memory to
+    /// reinterpret through.
+    Reinterpret(Operand, ScalarShape, ScalarShape),
     /// `&place` (also raw-pointer creation): a resolved reference value.
     Ref(Place),
     /// The length of the value at a place (array / slice / `str`).
