@@ -52,6 +52,32 @@ pub type AdtDiscriminants = std::collections::HashMap<AdtDefId, DiscriminantValu
 /// interpreter.
 pub type AdtLayouts = std::collections::HashMap<String, (u64, u64)>;
 
+/// The kind of an ADT, for shape purposes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AdtShapeKind {
+    Struct,
+    Enum,
+    Union,
+}
+
+/// The declared shape of one ADT: per variant, the field types in
+/// terms of the definition's generic parameters (`Ty::Param`
+/// indices refer to the definition's parameter list). The driver
+/// records one entry per ADT it converts, alongside the
+/// discriminant table. Consumers use the shape to reason about an
+/// ADT's values without a layout engine — in particular whether an
+/// instantiated type is zero-sized, in which case rustc MIR may
+/// never write its places at all.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AdtShape {
+    pub kind: AdtShapeKind,
+    pub variants: Vec<Vec<Ty>>,
+}
+
+/// ADT shape tables for a program, keyed by the `DefId` of the ADT
+/// (see [`AdtShape`]).
+pub type AdtShapes = std::collections::HashMap<AdtDefId, AdtShape>;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum IntTy {
     I8,

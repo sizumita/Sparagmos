@@ -107,6 +107,10 @@ pub struct MirProgram {
     /// (see [`mir::AdtLayouts`]). Consulted by the `size_of` /
     /// `align_of` / `size_of_val` builtins for ADT type tags.
     pub adt_layouts: mir::AdtLayouts,
+    /// Declared shapes of the program's ADTs, as recorded by the
+    /// driver (see `mir::AdtShape`). Used to decide which locals
+    /// are provably zero-sized.
+    pub adt_shapes: mir::AdtShapes,
 }
 
 /// Widen an `f16` bit pattern to `f64`. The conversion is exact:
@@ -662,6 +666,58 @@ impl AdtFieldTys {
     }
 }
 
+/// The cardinality of a type's value set, for the zero-sized
+/// synthesis in `Converter::unique_value`.
+enum UniqueValue {
+    /// Exactly one value; here it is.
+    One(Value),
+    /// No values (an uninhabited type).
+    Uninhabited,
+    /// More than one value, or not provable here.
+    Many,
+}
+
+/// Substitute a definition's generic arguments for its parameters
+/// in a declared field type (see `mir::AdtShape`): `Param(i)` is
+/// replaced by the instantiation's `i`-th argument, recursively.
+/// A parameter with no corresponding argument is left as-is (it
+/// makes the type unprovable downstream, never unsound).
+fn subst_ty(ty: &mir::Ty, args: &[mir::Ty]) -> mir::Ty {
+    match ty {
+        mir::Ty::Param(i, _) => args.get(*i as usize).cloned().unwrap_or_else(|| ty.clone()),
+        mir::Ty::Tuple(ts) => {
+            mir::Ty::Tuple(ts.iter().map(|t| subst_ty(t, args)).collect())
+        }
+        mir::Ty::Array(e, l) => mir::Ty::Array(Box::new(subst_ty(e, args)), l.clone()),
+        mir::Ty::Adt(d, a) => {
+            mir::Ty::Adt(*d, a.iter().map(|t| subst_ty(t, args)).collect())
+        }
+        mir::Ty::Ref(r, t, m) => mir::Ty::Ref(r.clone(), Box::new(subst_ty(t, args)), *m),
+        mir::Ty::RawPtr(t, m) => mir::Ty::RawPtr(Box::new(subst_ty(t, args)), *m),
+        mir::Ty::Slice(t) => mir::Ty::Slice(Box::new(subst_ty(t, args))),
+        mir::Ty::Pat(t, pat) => mir::Ty::Pat(Box::new(subst_ty(t, args)), pat.clone()),
+        mir::Ty::Alias(k, d, a) => {
+            mir::Ty::Alias(*k, *d, a.iter().map(|t| subst_ty(t, args)).collect())
+        }
+        mir::Ty::Closure(d, a) => {
+            mir::Ty::Closure(*d, a.iter().map(|t| subst_ty(t, args)).collect())
+        }
+        mir::Ty::Coroutine(d, a) => {
+            mir::Ty::Coroutine(*d, a.iter().map(|t| subst_ty(t, args)).collect())
+        }
+        mir::Ty::CoroutineWitness(d, a) => {
+            mir::Ty::CoroutineWitness(*d, a.iter().map(|t| subst_ty(t, args)).collect())
+        }
+        mir::Ty::FnDef(d, a) => {
+            mir::Ty::FnDef(*d, a.iter().map(|t| subst_ty(t, args)).collect())
+        }
+        mir::Ty::Dynamic(bounds, t, r) => {
+            mir::Ty::Dynamic(bounds.clone(), Box::new(subst_ty(t, args)), r.clone())
+        }
+        _ => ty.clone(),
+    }
+}
+
 /// Walk one place's projection chain the way [`Converter::place_ty`]
 /// does, recording the declared type of every ADT field stepped into.
 fn scan_place_fields(table: &mut AdtFieldTys, body: &mir::Body, place: &mir::Place) {
@@ -964,6 +1020,8 @@ struct Converter<'a> {
     adt_fields: AdtFieldTys,
     /// Discriminant tables of the program (see `MirProgram`).
     discriminants: &'a mir::AdtDiscriminants,
+    /// ADT shape tables of the program (see `MirProgram`).
+    adt_shapes: &'a mir::AdtShapes,
     /// Operand counts of ADT aggregate constructions (see
     /// [`AdtAggregateCounts`]).
     adt_aggregates: AdtAggregateCounts,
@@ -1004,6 +1062,7 @@ impl<'a> Converter<'a> {
             names: &program.fn_names,
             adt_fields,
             discriminants: &program.adt_discriminants,
+            adt_shapes: &program.adt_shapes,
             adt_aggregates,
             local_crate,
             impl_targets: None,
@@ -1032,12 +1091,153 @@ impl<'a> Converter<'a> {
         for bb in &body.basic_blocks {
             blocks.push(self.convert_block(body, bb)?);
         }
-        Ok(ir::Body::new(
-            key.to_string(),
-            body.arg_count,
-            local_tys,
-            blocks,
-        ))
+        let mut out = ir::Body::new(key.to_string(), body.arg_count, local_tys, blocks);
+        out.zst_locals = body
+            .local_decls
+            .iter()
+            .map(|decl| self.zst_value(&decl.ty, 0))
+            .collect();
+        Ok(out)
+    }
+
+    /// The canonical value of a type that is provably zero-sized,
+    /// or `None` when the type is not provably zero-sized (or its
+    /// value is not uniquely determined by the type). rustc MIR
+    /// never writes the place of a zero-sized local in many bodies
+    /// — a unit struct constructor's body is a bare `return` — so
+    /// a never-written read of such a place denotes this value.
+    ///
+    /// The proof is structural: unit, and tuples of zero-sized
+    /// types; arrays of zero-sized elements and empty arrays;
+    /// structs and enums with a single inhabited variant whose
+    /// fields are all zero-sized (from the driver's shape table,
+    /// with the instantiation's arguments substituted for the
+    /// definition's parameters — a variant with an uninhabited
+    /// field type can never be constructed, so `Option<Empty>`
+    /// still has the single value `None`); zero-capture closures;
+    /// function items. Enums with two or more inhabited variants
+    /// are excluded (the type does not determine the variant), as
+    /// are unions (the type does not determine the active field)
+    /// and opaque aliases (the hidden type is not visible here).
+    fn zst_value(&self, ty: &mir::Ty, depth: u32) -> Option<Value> {
+        match self.unique_value(ty, depth) {
+            UniqueValue::One(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Whether a type has exactly one value (and what it is), no
+    /// value at all, or many. The one-value case is what
+    /// [`Self::zst_value`] synthesizes: a type with a single value
+    /// is zero-sized in every layout that matters here, and rustc
+    /// MIR may leave its places unwritten. An enum contributes its
+    /// unique inhabited variant: a variant with an uninhabited
+    /// field type (`Empty`, `!`, a struct containing one) can
+    /// never be constructed, so `Option<Empty>` has the single
+    /// value `None` even though the enum declares two variants.
+    fn unique_value(&self, ty: &mir::Ty, depth: u32) -> UniqueValue {
+        if depth > 32 {
+            return UniqueValue::Many;
+        }
+        match ty {
+            mir::Ty::Never => UniqueValue::Uninhabited,
+            mir::Ty::Tuple(ts) if ts.is_empty() => UniqueValue::One(Value::Unit),
+            mir::Ty::Tuple(ts) => {
+                let mut vals = Vec::with_capacity(ts.len());
+                for t in ts {
+                    match self.unique_value(t, depth + 1) {
+                        UniqueValue::One(v) => vals.push(v),
+                        UniqueValue::Uninhabited => return UniqueValue::Uninhabited,
+                        UniqueValue::Many => return UniqueValue::Many,
+                    }
+                }
+                UniqueValue::One(Value::Tuple(vals))
+            }
+            mir::Ty::Array(elem, len) => {
+                let n = match len {
+                    mir::ArrayLen::Known(n) => *n,
+                    _ => return UniqueValue::Many,
+                };
+                if n == 0 {
+                    return UniqueValue::One(Value::Tuple(Vec::new()));
+                }
+                if n > 4096 {
+                    return UniqueValue::Many;
+                }
+                match self.unique_value(elem, depth + 1) {
+                    UniqueValue::One(v) => {
+                        UniqueValue::One(Value::Tuple(vec![v; n as usize]))
+                    }
+                    UniqueValue::Uninhabited => UniqueValue::Uninhabited,
+                    UniqueValue::Many => UniqueValue::Many,
+                }
+            }
+            mir::Ty::Adt(def, args) => {
+                let Some(shape) = self.adt_shapes.get(def) else {
+                    return UniqueValue::Many;
+                };
+                if shape.kind == mir::AdtShapeKind::Union {
+                    return UniqueValue::Many;
+                }
+                let mut single: Option<(u32, Vec<Value>)> = None;
+                for (vi, variant_fields) in shape.variants.iter().enumerate() {
+                    let mut fields = Vec::with_capacity(variant_fields.len());
+                    let mut inhabited = true;
+                    for (fi, fty) in variant_fields.iter().enumerate() {
+                        // A field type recovered from a projection
+                        // in some body is already instantiated for
+                        // this `args`; the shape's declared type is
+                        // in terms of the definition's parameters,
+                        // whose indices also count lifetimes and
+                        // consts that the converted argument list
+                        // omits, so substitution can misalign.
+                        // Prefer the recovered type when one exists.
+                        let fty = self
+                            .adt_fields
+                            .get(*def, args, vi as u32, fi as u32)
+                            .cloned()
+                            .unwrap_or_else(|| subst_ty(fty, args));
+                        match self.unique_value(&fty, depth + 1) {
+                            UniqueValue::One(v) => fields.push(v),
+                            UniqueValue::Uninhabited => {
+                                inhabited = false;
+                                break;
+                            }
+                            // An inhabited variant whose field
+                            // has many values gives the type many
+                            // values.
+                            UniqueValue::Many => return UniqueValue::Many,
+                        }
+                    }
+                    if !inhabited {
+                        continue;
+                    }
+                    if single.is_some() {
+                        return UniqueValue::Many;
+                    }
+                    single = Some((vi as u32, fields));
+                }
+                match single {
+                    Some((variant, fields)) => {
+                        UniqueValue::One(Value::Enum { variant, fields })
+                    }
+                    None => UniqueValue::Uninhabited,
+                }
+            }
+            mir::Ty::Closure(def, args) => match args.get(2) {
+                Some(mir::Ty::Tuple(ts)) if ts.is_empty() => {
+                    UniqueValue::One(Value::Closure {
+                        def: self.def_display_name(def),
+                        env: Vec::new(),
+                    })
+                }
+                _ => UniqueValue::Many,
+            },
+            mir::Ty::FnDef(def, _) => {
+                UniqueValue::One(Value::FnPtr(self.def_display_name(def)))
+            }
+            _ => UniqueValue::Many,
+        }
     }
 
     fn convert_block(
@@ -1820,6 +2020,7 @@ impl<'a> Converter<'a> {
                     def,
                     variant_index,
                     generic_args,
+                    field_index,
                     ..
                 } => {
                     // For `Range` / `RangeInclusive` the two bound
@@ -1846,11 +2047,19 @@ impl<'a> Converter<'a> {
                         // stays as the fallback for fields no place
                         // ever projects (their values are consumed by
                         // runtime support, not by MIR places).
+                        // A union aggregate carries a single operand
+                        // for its active field (`field_index`), so
+                        // that field's declared type is the context,
+                        // not field 0's.
+                        let field = match field_index {
+                            Some(active) => *active,
+                            None => i as u32,
+                        };
                         let declared = self.adt_fields.get(
                             *def,
                             generic_args,
                             *variant_index,
-                            i as u32,
+                            field,
                         );
                         let ctx = declared.or_else(|| if i < 2 { bound_ty } else { None });
                         fields.push(self.convert_operand(body, op, ctx)?);
@@ -1858,6 +2067,7 @@ impl<'a> Converter<'a> {
                     ir::Rvalue::AggregateAdt {
                         variant: *variant_index,
                         operands: fields,
+                        field_index: *field_index,
                     }
                 }
                 mir::AggregateKind::Closure { def, generic_args } => {
@@ -1916,6 +2126,20 @@ impl<'a> Converter<'a> {
                         _ => None,
                     };
                     let v = self.convert_operand(body, op, elem_ty.as_ref())?;
+                    // A repeat evaluates its operand once and
+                    // replicates the value; the operand is written
+                    // as a move in MIR even for `Copy` element
+                    // types (an array of `Copy` elements is itself
+                    // `Copy`). Replicating a move operand would
+                    // read the source place once per element and
+                    // fail on the second read, the source having
+                    // been moved out of. Read it as a copy instead:
+                    // the value is replicated, not moved per
+                    // element.
+                    let v = match v {
+                        ir::Operand::Move(place) => ir::Operand::Copy(place),
+                        other => other,
+                    };
                     ir::Rvalue::AggregateTuple(vec![v; *count as usize])
                 }
             }

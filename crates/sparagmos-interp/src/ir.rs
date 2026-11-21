@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use crate::value::RefProj;
+use crate::value::{RefProj, Value};
 
 /// Index of a local variable. Local 0 is always the return place,
 /// locals `1..=arg_count` are the arguments (as in rustc MIR).
@@ -406,7 +406,15 @@ pub enum Rvalue {
     /// tuples too (the length lives in the declared type).
     AggregateTuple(Vec<Operand>),
     /// Build an ADT value: a variant index plus field values.
-    AggregateAdt { variant: u32, operands: Vec<Operand> },
+    AggregateAdt {
+        variant: u32,
+        operands: Vec<Operand>,
+        /// The active field of a union aggregate: a union value is
+        /// built from one operand, which initializes this field
+        /// rather than field 0. `None` for struct/enum aggregates,
+        /// whose operands fill the variant's fields from index 0.
+        field_index: Option<u32>,
+    },
     /// Build a closure value: the closure body's name plus the
     /// captured environment values (the aggregate's operands, in
     /// field order).
@@ -767,6 +775,14 @@ pub struct Body {
     pub arg_count: usize,
     pub local_tys: Vec<Ty>,
     pub blocks: Vec<BasicBlockData>,
+    /// Canonical values of the locals whose declared type is
+    /// provably zero-sized, indexed by local (conversion-computed;
+    /// see `mir_convert`'s `zst_value`). rustc MIR may never write
+    /// such a local's place; a never-written read of it denotes the
+    /// stored value. Empty for hand-built bodies: the interpreter
+    /// then falls back to the shapes derivable from the IR type
+    /// alone.
+    pub zst_locals: Vec<Option<Value>>,
 }
 
 impl Body {
@@ -781,6 +797,7 @@ impl Body {
             arg_count,
             local_tys,
             blocks,
+            zst_locals: Vec::new(),
         }
     }
     pub fn local_count(&self) -> usize {

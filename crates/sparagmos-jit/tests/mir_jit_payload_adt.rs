@@ -137,6 +137,7 @@ fn build_with_table(
         fn_names: names,
         adt_discriminants: table,
         adt_layouts: Default::default(),
+        adt_shapes: Default::default(),
     };
     let jit = JitProgram::compile(&jit_in).expect("JIT compile failed");
     (jit, interp_in)

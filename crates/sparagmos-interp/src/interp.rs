@@ -639,21 +639,23 @@ impl<'a> Interpreter<'a> {
                     let frame = frames.pop().expect("frame");
                     let mut value = frame.locals.first().cloned().unwrap_or(Value::Uninit);
                     if value == Value::Uninit {
-                        // rustc MIR never writes the return place of a
-                        // unit-returning function: its final block is a
-                        // bare `return;`, and the single value of the
-                        // unit type is implied. An unwritten `_0` therefore
-                        // reads as `()` exactly when the declared return
-                        // type is unit. For every other type an unwritten
-                        // `_0` is a genuine uninitialized read and stays
-                        // an error.
-                        if body.local_ty(Local::RETURN) == Some(&Ty::Unit) {
-                            value = Value::Unit;
-                        } else {
-                            return Err(InterpError::UninitializedRead {
-                                func: frame.func.clone(),
-                                place: "_0".to_string(),
-                            });
+                        // rustc MIR never writes the return place of
+                        // a zero-sized return type: the final block
+                        // is a bare `return;`, and the type's single
+                        // value is implied. An unwritten `_0`
+                        // therefore reads as that value exactly when
+                        // the declared return type is provably
+                        // zero-sized. For every other type an
+                        // unwritten `_0` is a genuine uninitialized
+                        // read and stays an error.
+                        match self.zst_local_value(&frame, 0) {
+                            Some(v) => value = v,
+                            None => {
+                                return Err(InterpError::UninitializedRead {
+                                    func: frame.func.clone(),
+                                    place: "_0".to_string(),
+                                });
+                            }
                         }
                     }
                     if frames.is_empty() {
@@ -1103,6 +1105,15 @@ impl<'a> Interpreter<'a> {
                                 work.push((sub, P::Untyped));
                             }
                         }
+                        // An enum with no fields has no contents
+                        // whose glue could hide here (its own
+                        // destructor, if any, is a separate plan
+                        // node): nothing to judge, like an empty
+                        // tuple. Typed zero-sized constants make
+                        // this shape common — a fieldless variant
+                        // written by an aggregate and never
+                        // projected lands here with an untyped plan.
+                        Some(Value::Enum { fields, .. }) if fields.is_empty() => {}
                         Some(Value::Enum { .. }) | Some(Value::Coroutine { .. }) => {
                             return Err(InterpError::UnsupportedTerminator {
                                 kind: "Drop".to_string(),
@@ -1822,12 +1833,12 @@ impl<'a> Interpreter<'a> {
                         local: *local,
                     }
                 })?;
-                // A zero-capture closure is zero-sized and rustc
-                // MIR never writes its place: an unwritten read of
-                // such a local denotes the unique empty-environment
-                // closure value.
+                // A zero-sized local's place may never be written
+                // by rustc MIR at all (a unit struct constructor's
+                // body is a bare `return`): an unwritten read of
+                // such a local denotes the type's single value.
                 let base = if base == Value::Uninit {
-                    self.zst_closure_value(frame, *local).unwrap_or(base)
+                    self.zst_local_value(frame, *local).unwrap_or(base)
                 } else {
                     base
                 };
@@ -1844,18 +1855,19 @@ impl<'a> Interpreter<'a> {
         }
     }
 
-    /// The value of a never-written zero-capture closure local in
-    /// `frame` (see the note in `read_resolved`); `None` for any
-    /// other local.
-    fn zst_closure_value(&self, frame: &Frame, local: usize) -> Option<Value> {
+    /// The value of a never-written zero-sized local in `frame`
+    /// (see the note in `read_resolved`); `None` for any other
+    /// local. Conversion records the canonical value of every
+    /// provably zero-sized local in the body (`Body::zst_locals`,
+    /// computed from the driver's ADT shape tables); for
+    /// hand-built bodies the shapes derivable from the IR type
+    /// alone are synthesized by [`zst_value_of_ty`].
+    fn zst_local_value(&self, frame: &Frame, local: usize) -> Option<Value> {
         let body = self.program.get(&frame.func)?;
-        match body.local_ty(Local(local)) {
-            Some(Ty::Closure(def, 0)) => Some(Value::Closure {
-                def: def.clone(),
-                env: Vec::new(),
-            }),
-            _ => None,
+        if let Some(Some(v)) = body.zst_locals.get(local) {
+            return Some(v.clone());
         }
+        zst_value_of_ty(body.local_ty(Local(local))?)
     }
 
     pub(crate) fn write_resolved(
@@ -2413,8 +2425,23 @@ impl<'a> Interpreter<'a> {
                 }
                 Ok(Value::Tuple(items))
             }
-            Rvalue::AggregateAdt { variant, operands } => {
-                let mut fields = Vec::with_capacity(operands.len());
+            Rvalue::AggregateAdt {
+                variant,
+                operands,
+                field_index,
+            } => {
+                // A union aggregate's single operand initializes the
+                // active field; the slots before it stay
+                // uninitialized, exactly as a field write through a
+                // projection leaves the slots it skipped over (see
+                // `navigate_mut`'s coroutine arm). Reading the active
+                // field then finds the stored value, and reading any
+                // other field is an uninitialized read, as it should
+                // be: the model does not reinterpret a union's bytes.
+                let mut fields = match field_index {
+                    Some(active) => vec![Value::Uninit; *active as usize],
+                    None => Vec::with_capacity(operands.len()),
+                };
                 for op in operands {
                     fields.push(self.eval_operand(frames, body, op)?);
                 }
@@ -2717,6 +2744,36 @@ fn index_oob(len: usize, index: usize) -> InterpError {
 }
 
 /// Apply constant projection steps to a value (read direction).
+/// The canonical value of a type that is zero-sized by its IR
+/// shape alone (see `Interpreter::zst_local_value`): unit, tuples
+/// of zero-sized types, arrays of zero-sized elements and empty
+/// arrays, zero-capture closures, function items. ADT values need
+/// the driver's shape tables and are only synthesized at
+/// conversion time.
+fn zst_value_of_ty(ty: &Ty) -> Option<Value> {
+    match ty {
+        Ty::Unit => Some(Value::Unit),
+        Ty::Tuple(ts) => {
+            let mut vals = Vec::with_capacity(ts.len());
+            for t in ts {
+                vals.push(zst_value_of_ty(t)?);
+            }
+            Some(Value::Tuple(vals))
+        }
+        Ty::Array(_, 0) => Some(Value::Tuple(Vec::new())),
+        Ty::Array(elem, n) if *n <= 4096 => {
+            let v = zst_value_of_ty(elem)?;
+            Some(Value::Tuple(vec![v; *n as usize]))
+        }
+        Ty::Closure(def, 0) => Some(Value::Closure {
+            def: def.clone(),
+            env: Vec::new(),
+        }),
+        Ty::FnDef(name) => Some(Value::FnPtr(name.clone())),
+        _ => None,
+    }
+}
+
 pub(crate) fn project_value(
     value: Value,
     projection: &[RefProj],
@@ -2870,17 +2927,18 @@ pub(crate) fn navigate_mut<'x>(
                 }
                 return navigate_mut(&mut fields[*idx], rest, func, place);
             }
+            // The field vector of the value in the slot may be
+            // sparse or invalidated: a union value covers only
+            // the fields written so far (see the union arm of
+            // aggregate evaluation), and an enum place being
+            // (re)initialized in place has no live payload slots
+            // for the variant being written (SetDiscriminant
+            // invalidated the old payload; a downcast write to a
+            // different variant rematerialized it empty). Grow
+            // the vector with Uninit padding up to the written
+            // index; slots never written keep reading as
+            // uninitialized.
             if let Value::Enum { fields, .. } = slot {
-                // An enum place being (re)initialized in place has
-                // no live payload slots for the variant being
-                // written: SetDiscriminant invalidated the old
-                // payload, and a downcast write to a different
-                // variant rematerialized it empty. The field slots
-                // of the variant being entered are materialized
-                // with Uninit padding up to the written index,
-                // exactly like the coroutine state storage above
-                // and the field-write padding elsewhere; slots
-                // never written keep reading as uninitialized.
                 if fields.len() <= *idx {
                     fields.resize(*idx + 1, Value::Uninit);
                 }
