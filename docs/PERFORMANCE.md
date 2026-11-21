@@ -190,3 +190,56 @@ exec samples for the large sizes were 6.3–11.0 ms (fib_rec),
   is quoted elsewhere, re-measure on an idle machine with
   `scripts/bench.py`; expect the ratios to hold up better
   than the absolute times.
+
+
+## Update 2026-11-21 (gpu-3070): interpreter clone elimination
+
+Measured on gpu-3070 (AMD Ryzen 9 5900X, 24 threads) with the
+same bench helper and median-of-runs method, before and after a
+semantics-preserving optimisation pass over the interpreter.
+A `perf record` profile of the pre-pass interpreter on
+`loop_sum` attributed roughly 55-60% of execution time to
+clone/drop/alloc work: the run loop cloned the whole current
+function body on every step, the plain-local write path cloned
+the destination body on every write, place descriptions were
+formatted on every read, and the Vec/String push builtins
+cloned the whole aggregate to append one element.
+
+The pass, in order:
+
+1. The run loop borrows the current body (resolved by id on
+   frame switches) instead of cloning it per step; statements
+   and terminators are borrowed too.
+2. The write path resolves the destination body's declared
+   types by borrow instead of cloning the body per write.
+3. Place descriptions are built lazily (only when an error
+   needs one) and in a single allocation; the error text is
+   byte-identical.
+4. `Vec::push`, `String::push_str` and `String::push` mutate
+   the stored aggregate in place.
+
+Interpreter execution medians (helper, identical conditions):
+
+| kernel | before | after | speedup |
+|---|---|---|---|
+| loop_sum_s (2M iterations) | 4,946 ms | 126.5 ms | 39x |
+| matmul_kernel_s (32^3) | 7,156 ms | 128.7 ms | 56x |
+| fib_rec_s (fib 25) | 1,412 ms | 179.2 ms | 7.9x |
+| fib_rec (fib 30) | 65,791 ms | 8,689 ms | 7.6x |
+| vec_push_sum_s (2k pushes) | 554 ms | 87.4 ms | 6.3x |
+| string_concat_s (1k push_str) | 405 ms | 15.0 ms | 27x |
+
+The interpreter is still far from native (post-pass ratios on
+the small kernels: roughly 19x-221x; float_loop 957x), and
+`float_loop` now executes in the interpreter, which the
+baseline above recorded as rejected. The JIT is unchanged by
+this pass and its numbers are unchanged within noise.
+
+Remaining measured hotspots, in order: read paths still clone
+whole aggregates (`resolve_value` clones non-reference inputs;
+`slice_elements` copies out Vec elements), which dominates the
+large vec kernel's ratio; `resolve_place` construction; and
+the JIT backend still has no register allocation. Semantics
+are unchanged: the full test suites pass and a subset
+flip-diff against the pre-pass tree shows no gains or losses
+attributable to the pass.
