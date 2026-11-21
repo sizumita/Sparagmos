@@ -2223,10 +2223,13 @@ fn transmute_pointer_to_int_yields_aligned_nonzero_address() {
 #[test]
 fn transmute_between_non_pointers_stays_unsupported() {
     // A transmute that is not pointer-to-integer (integer to
-    // integer of another width, integer to pointer) cannot be
-    // honoured by a value model with no byte representation; it
-    // stays an explicit conversion error naming the cast.
-    for target in [i64_ty(), raw_ptr_i32_ty()] {
+    // integer of another width) cannot be honoured by a value
+    // model with no byte representation; it stays an explicit
+    // conversion error naming the cast. (Integer to pointer is
+    // modelled separately since Lane DN, as an address-only
+    // reference value; see the transmute tests at the end of
+    // this file.)
+    for target in [i64_ty()] {
         let body = mir::Body::new(
             decls(&[i32_ty(), i32_ty(), target.clone()]),
             0,
@@ -2639,4 +2642,699 @@ fn inline_asm_with_real_instructions_is_a_named_error() {
         Err(e) => panic!("expected UnsupportedTerminator for InlineAsm, got {e}"),
         Ok(v) => panic!("expected UnsupportedTerminator for InlineAsm, got {v:?}"),
     }
+}
+
+// ----- transmute: the honestly representable shapes (Lane DN) ----------------
+
+fn ref_i32_ty() -> mir::Ty {
+    mir::Ty::Ref(mir::Region::Erased, Box::new(i32_ty()), mir::Mutability::Not)
+}
+
+fn raw_i32_ty() -> mir::Ty {
+    mir::Ty::RawPtr(Box::new(i32_ty()), mir::Mutability::Not)
+}
+
+fn transmute(op: mir::Operand, target: mir::Ty) -> mir::Rvalue {
+    mir::Rvalue::Cast(mir::CastKind::Transmute, op, target)
+}
+
+#[test]
+fn transmute_ref_to_raw_ptr_reads_through() {
+    // fn f() -> i32 { _1 = 41; _2 = &_1; _3 = transmute(_2) as *const i32; return *_3 }
+    let body = mir::Body::new(
+        decls(&[i32_ty(), i32_ty(), ref_i32_ty(), raw_i32_ty()]),
+        0,
+        vec![block(
+            vec![
+                assign(place(1), mir::Rvalue::Use(const_i32(41))),
+                assign(
+                    place(2),
+                    mir::Rvalue::Ref(mir::Region::Erased, mir::BorrowKind::Shared, place(1)),
+                ),
+                assign(place(3), transmute(copy(2), raw_i32_ty())),
+                assign(
+                    place(0),
+                    mir::Rvalue::Use(mir::Operand::Copy(place(3).deref())),
+                ),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("f", body);
+    assert_eq!(
+        interpret_mir(&prog, "f", vec![]).expect("ref-to-pointer transmute runs"),
+        Value::Int(41)
+    );
+}
+
+#[test]
+fn transmute_ptr_to_ptr_keeps_the_synthetic_address() {
+    // fn f() -> bool { _1 = 41; _2 = &raw const _1; _3 = transmute(_2) as *const u8;
+    //                  _4 = transmute(_3) as usize; _5 = transmute(_2) as usize;
+    //                  return _4 == _5 }
+    let raw_u8_ty = mir::Ty::RawPtr(Box::new(u8_ty()), mir::Mutability::Not);
+    let body = mir::Body::new(
+        decls(&[
+            bool_ty(),
+            i32_ty(),
+            raw_i32_ty(),
+            raw_u8_ty.clone(),
+            usize_ty(),
+            usize_ty(),
+        ]),
+        0,
+        vec![block(
+            vec![
+                assign(place(1), mir::Rvalue::Use(const_i32(41))),
+                assign(
+                    place(2),
+                    mir::Rvalue::RawPtr(mir::Mutability::Not, place(1)),
+                ),
+                assign(place(3), transmute(copy(2), raw_u8_ty)),
+                assign(place(4), transmute(copy(3), usize_ty())),
+                assign(place(5), transmute(copy(2), usize_ty())),
+                assign(place(0), binop(mir::BinOp::Eq, copy(4), copy(5))),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("f", body);
+    assert_eq!(
+        interpret_mir(&prog, "f", vec![]).expect("pointer-to-pointer transmute runs"),
+        Value::Bool(true)
+    );
+}
+
+#[test]
+fn transmute_int_to_pointer_round_trips_through_usize() {
+    // fn f(_1: usize) -> usize { _2 = transmute(_1) as *const i32;
+    //                            _0 = transmute(_2) as usize; return }
+    let body = mir::Body::new(
+        decls(&[usize_ty(), usize_ty(), raw_i32_ty()]),
+        1,
+        vec![block(
+            vec![
+                assign(place(2), transmute(copy(1), raw_i32_ty())),
+                assign(place(0), transmute(copy(2), usize_ty())),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("f", body);
+    for input in [0u128, 4096, 12288] {
+        let v = interpret_mir(&prog, "f", vec![Value::Uint(input)])
+            .expect("integer-to-pointer transmute runs");
+        assert_eq!(v, Value::Uint(input), "round trip of {input}");
+    }
+}
+
+#[test]
+fn transmute_int_to_pointer_deref_is_an_explicit_error() {
+    // fn f() -> i32 { _1 = transmute(4096usize) as *const i32; return *_1 }
+    // The fabricated address names no place: reading through it
+    // fails loudly instead of inventing a pointee.
+    let body = mir::Body::new(
+        decls(&[i32_ty(), raw_i32_ty()]),
+        0,
+        vec![block(
+            vec![
+                assign(place(1), transmute(const_int(4096, 8), raw_i32_ty())),
+                assign(
+                    place(0),
+                    mir::Rvalue::Use(mir::Operand::Copy(place(1).deref())),
+                ),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("f", body);
+    let err = interpret_mir(&prog, "f", vec![])
+        .expect_err("dereferencing an integer-made pointer must fail");
+    assert!(
+        matches!(
+            err,
+            MirRunError::Interp(InterpError::TypeMismatch { .. })
+        ),
+        "expected TypeMismatch, got {err}"
+    );
+}
+
+const SMALL_DEF: mir::DefId = mir::DefId::new(0, 77);
+
+fn small_prog() -> MirProgram {
+    let mut prog = MirProgram::new();
+    prog.adt_discriminants.insert(SMALL_DEF, vec![1, 5, 9]);
+    prog.adt_shapes.insert(
+        SMALL_DEF,
+        mir::AdtShape {
+            kind: mir::AdtShapeKind::Enum,
+            variants: vec![vec![], vec![], vec![]],
+        },
+    );
+    prog
+}
+
+fn small_ty() -> mir::Ty {
+    mir::Ty::Adt(SMALL_DEF, vec![])
+}
+
+fn const_small(variant: u32) -> mir::Operand {
+    mir::Operand::constant(mir::Constant::from_value(mir::ConstValue::Adt {
+        variant,
+        fields: vec![],
+    }))
+}
+
+#[test]
+fn transmute_enum_to_int_yields_the_discriminant() {
+    // fn f() -> u8 { _1 = Small::B; _0 = transmute(_1) as u8; return }
+    let body = mir::Body::new(
+        decls(&[u8_ty(), small_ty()]),
+        0,
+        vec![block(
+            vec![
+                assign(place(1), mir::Rvalue::Use(const_small(1))),
+                assign(place(0), transmute(copy(1), u8_ty())),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = small_prog();
+    prog.add("f", body);
+    assert_eq!(
+        interpret_mir(&prog, "f", vec![]).expect("enum-to-int transmute runs"),
+        Value::Uint(5)
+    );
+}
+
+#[test]
+fn transmute_int_to_enum_round_trips() {
+    // fn f() -> u8 { _1 = transmute(9u8) as Small; _0 = transmute(_1) as u8; return }
+    let body = mir::Body::new(
+        decls(&[u8_ty(), small_ty()]),
+        0,
+        vec![block(
+            vec![
+                assign(place(1), transmute(const_u8(9), small_ty())),
+                assign(place(0), transmute(copy(1), u8_ty())),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = small_prog();
+    prog.add("f", body);
+    assert_eq!(
+        interpret_mir(&prog, "f", vec![]).expect("int-to-enum transmute runs"),
+        Value::Uint(9)
+    );
+}
+
+#[test]
+fn transmute_int_to_enum_rejects_a_non_discriminant() {
+    // fn f() -> Small { _0 = transmute(7u8) as Small; return }
+    // 7 is not a discriminant of Small: an explicit error, never a
+    // fabricated variant.
+    let body = mir::Body::new(
+        decls(&[small_ty()]),
+        0,
+        vec![block(
+            vec![assign(place(0), transmute(const_u8(7), small_ty()))],
+            ret(),
+        )],
+    );
+    let mut prog = small_prog();
+    prog.add("f", body);
+    let err = interpret_mir(&prog, "f", vec![])
+        .expect_err("a non-discriminant integer must not become an enum value");
+    assert!(
+        matches!(
+            err,
+            MirRunError::Interp(InterpError::TypeMismatch { .. })
+        ),
+        "expected TypeMismatch, got {err}"
+    );
+}
+
+const DN_NONNULL_DEF: mir::DefId = mir::DefId::new(0, 78);
+
+fn nonnull_ty() -> mir::Ty {
+    mir::Ty::Adt(DN_NONNULL_DEF, vec![i32_ty()])
+}
+
+fn wrapper_prog() -> MirProgram {
+    let mut prog = MirProgram::new();
+    prog.adt_shapes.insert(
+        DN_NONNULL_DEF,
+        mir::AdtShape {
+            kind: mir::AdtShapeKind::Struct,
+            variants: vec![vec![mir::Ty::RawPtr(
+                Box::new(mir::Ty::Param(0, "T".to_string())),
+                mir::Mutability::Not,
+            )]],
+        },
+    );
+    prog
+}
+
+#[test]
+fn transmute_pointer_wrapper_round_trips() {
+    // fn f() -> i32 { _1 = 41; _2 = &raw const _1;
+    //                 _3 = transmute(_2) as NonNull<i32>;
+    //                 _4 = transmute(_3) as *const i32; return *_4 }
+    let body = mir::Body::new(
+        decls(&[i32_ty(), i32_ty(), raw_i32_ty(), nonnull_ty(), raw_i32_ty()]),
+        0,
+        vec![block(
+            vec![
+                assign(place(1), mir::Rvalue::Use(const_i32(41))),
+                assign(
+                    place(2),
+                    mir::Rvalue::RawPtr(mir::Mutability::Not, place(1)),
+                ),
+                assign(place(3), transmute(copy(2), nonnull_ty())),
+                assign(place(4), transmute(copy(3), raw_i32_ty())),
+                assign(
+                    place(0),
+                    mir::Rvalue::Use(mir::Operand::Copy(place(4).deref())),
+                ),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = wrapper_prog();
+    prog.add("f", body);
+    assert_eq!(
+        interpret_mir(&prog, "f", vec![]).expect("wrapper transmutes run"),
+        Value::Int(41)
+    );
+}
+
+const PTR_ZST_DEF: mir::DefId = mir::DefId::new(0, 79);
+
+#[test]
+fn transmute_wrapper_with_a_zst_field_round_trips() {
+    // The `PtrAndZst` shape: a payload pointer field plus a unit
+    // field. Wrapping fills the unit field with its unique value.
+    // fn f() -> i32 { _1 = 41; _2 = &raw const _1;
+    //                 _3 = transmute(_2) as PtrAndZst<i32>;
+    //                 _4 = transmute(_3) as *const i32; return *_4 }
+    let pz_ty = mir::Ty::Adt(PTR_ZST_DEF, vec![i32_ty()]);
+    let body = mir::Body::new(
+        decls(&[i32_ty(), i32_ty(), raw_i32_ty(), pz_ty.clone(), raw_i32_ty()]),
+        0,
+        vec![block(
+            vec![
+                assign(place(1), mir::Rvalue::Use(const_i32(41))),
+                assign(
+                    place(2),
+                    mir::Rvalue::RawPtr(mir::Mutability::Not, place(1)),
+                ),
+                assign(place(3), transmute(copy(2), pz_ty)),
+                assign(place(4), transmute(copy(3), raw_i32_ty())),
+                assign(
+                    place(0),
+                    mir::Rvalue::Use(mir::Operand::Copy(place(4).deref())),
+                ),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = wrapper_prog();
+    prog.adt_shapes.insert(
+        PTR_ZST_DEF,
+        mir::AdtShape {
+            kind: mir::AdtShapeKind::Struct,
+            variants: vec![vec![
+                mir::Ty::RawPtr(
+                    Box::new(mir::Ty::Param(0, "T".to_string())),
+                    mir::Mutability::Not,
+                ),
+                mir::Ty::Tuple(vec![]),
+            ]],
+        },
+    );
+    prog.add("f", body);
+    assert_eq!(
+        interpret_mir(&prog, "f", vec![]).expect("wrapper-with-ZST transmutes run"),
+        Value::Int(41)
+    );
+}
+
+#[test]
+fn transmute_zst_to_zst_yields_the_unique_value() {
+    // fn f() -> [i32; 0] { _1 = (); _0 = transmute(_1); return }
+    let arr_ty = mir::Ty::Array(Box::new(i32_ty()), mir::ArrayLen::Known(0));
+    let body = mir::Body::new(
+        decls(&[arr_ty.clone(), mir::Ty::Tuple(vec![])]),
+        0,
+        vec![block(
+            vec![
+                assign(
+                    place(1),
+                    mir::Rvalue::Aggregate(
+                        Box::new(mir::AggregateKind::Tuple),
+                        vec![],
+                    ),
+                ),
+                assign(place(0), transmute(copy(1), arr_ty.clone())),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("f", body);
+    assert_eq!(
+        interpret_mir(&prog, "f", vec![]).expect("ZST-to-ZST transmute runs"),
+        Value::Tuple(vec![])
+    );
+}
+
+#[test]
+fn transmute_fat_pointer_stays_unsupported() {
+    // fn f(_1: &str) -> *const u8 { _0 = transmute(_1); return }
+    // A fat pointer's metadata half has no thin target to land on.
+    let str_ref_ty = mir::Ty::Ref(
+        mir::Region::Erased,
+        Box::new(mir::Ty::Str),
+        mir::Mutability::Not,
+    );
+    let raw_u8_ty = mir::Ty::RawPtr(Box::new(u8_ty()), mir::Mutability::Not);
+    let body = mir::Body::new(
+        decls(&[raw_u8_ty.clone(), str_ref_ty]),
+        1,
+        vec![block(
+            vec![assign(place(0), transmute(copy(1), raw_u8_ty))],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("f", body);
+    let err = interpret_mir(&prog, "f", vec![Value::Str("hi".to_string())])
+        .expect_err("fat pointer transmute must stay unsupported");
+    assert!(
+        matches!(
+            err,
+            MirRunError::Interp(InterpError::UnsupportedRvalue { .. })
+        ),
+        "expected UnsupportedRvalue, got {err}"
+    );
+}
+
+#[test]
+fn transmute_enum_with_payload_stays_unsupported() {
+    // An enum with a payload variant has no discriminant-only
+    // reinterpretation: its bytes are not an integer.
+    const PAYLOAD_DEF: mir::DefId = mir::DefId::new(0, 80);
+    let payload_ty = mir::Ty::Adt(PAYLOAD_DEF, vec![]);
+    let konst = mir::Operand::constant(mir::Constant::from_value(
+        mir::ConstValue::Adt {
+            variant: 0,
+            fields: vec![],
+        },
+    ));
+    let body = mir::Body::new(
+        decls(&[i32_ty(), payload_ty]),
+        0,
+        vec![block(
+            vec![
+                assign(place(1), mir::Rvalue::Use(konst)),
+                assign(place(0), transmute(copy(1), i32_ty())),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.adt_shapes.insert(
+        PAYLOAD_DEF,
+        mir::AdtShape {
+            kind: mir::AdtShapeKind::Enum,
+            variants: vec![vec![], vec![i32_ty()]],
+        },
+    );
+    prog.add("f", body);
+    let err = interpret_mir(&prog, "f", vec![])
+        .expect_err("payload enum transmute must stay unsupported");
+    assert!(
+        matches!(
+            err,
+            MirRunError::Interp(InterpError::UnsupportedRvalue { .. })
+        ),
+        "expected UnsupportedRvalue, got {err}"
+    );
+}
+
+// A `ZeroSized` constant operand transmuted into a zero-sized
+// array type: the target type's unique value.
+#[test]
+fn transmute_zero_sized_constant_into_zst_array() {
+    let target = mir::Ty::Array(
+        Box::new(mir::Ty::Array(Box::new(u32_ty()), mir::ArrayLen::Known(0))),
+        mir::ArrayLen::Known(2),
+    );
+    let body = mir::Body::new(
+        decls(&[target.clone()]),
+        0,
+        vec![block(
+            vec![assign(
+                place(0),
+                transmute(
+                    mir::Operand::constant(mir::Constant::from_value(
+                        mir::ConstValue::ZeroSized,
+                    )),
+                    target,
+                ),
+            )],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("f", body);
+    assert_eq!(
+        interpret_mir(&prog, "f", vec![])
+            .expect("zero-sized constant transmute runs"),
+        Value::Tuple(vec![Value::Tuple(vec![]), Value::Tuple(vec![])])
+    );
+}
+
+const WRAP1_DEF: mir::DefId = mir::DefId::new(0, 81);
+
+fn wrap1_ty() -> mir::Ty {
+    mir::Ty::Adt(WRAP1_DEF, vec![])
+}
+
+// Integer -> enum with a single variant carrying a single
+// integer payload: that variant holding the integer.
+#[test]
+fn transmute_int_into_single_variant_payload_enum() {
+    let body = mir::Body::new(
+        decls(&[wrap1_ty()]),
+        0,
+        vec![block(
+            vec![assign(place(0), transmute(const_u32(2), wrap1_ty()))],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.adt_shapes.insert(
+        WRAP1_DEF,
+        mir::AdtShape {
+            kind: mir::AdtShapeKind::Enum,
+            variants: vec![vec![u32_ty()]],
+        },
+    );
+    prog.add("f", body);
+    assert_eq!(
+        interpret_mir(&prog, "f", vec![])
+            .expect("int-to-single-variant-enum transmute runs"),
+        Value::Enum {
+            variant: 0,
+            fields: vec![Value::Uint(2)],
+        }
+    );
+}
+
+const BAR_DEF: mir::DefId = mir::DefId::new(0, 82);
+
+fn bar_ty() -> mir::Ty {
+    mir::Ty::Adt(BAR_DEF, vec![])
+}
+
+// Single-field struct wrapping an integer -> fieldless enum:
+// the field is the discriminant (`Bar { a: 5 }` -> `Small`
+// variant with discriminant 5, read back as 5).
+#[test]
+fn transmute_single_field_struct_into_fieldless_enum() {
+    let body = mir::Body::new(
+        decls(&[u8_ty(), bar_ty(), small_ty()]),
+        0,
+        vec![block(
+            vec![
+                assign(
+                    place(1),
+                    adt_aggregate(BAR_DEF, 0, vec![], vec![const_u32(5)]),
+                ),
+                assign(place(2), transmute(copy(1), small_ty())),
+                assign(place(0), transmute(copy(2), u8_ty())),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = small_prog();
+    prog.adt_shapes.insert(
+        BAR_DEF,
+        mir::AdtShape {
+            kind: mir::AdtShapeKind::Struct,
+            variants: vec![vec![u32_ty()]],
+        },
+    );
+    prog.add("f", body);
+    assert_eq!(
+        interpret_mir(&prog, "f", vec![])
+            .expect("struct-to-enum transmute runs"),
+        Value::Uint(5)
+    );
+}
+
+// Single-field struct -> integer of the field's type: the
+// field itself (`Bar { a: 5 }` transmuted to u32 is 5).
+#[test]
+fn transmute_single_field_struct_into_int() {
+    let body = mir::Body::new(
+        decls(&[u32_ty(), bar_ty()]),
+        0,
+        vec![block(
+            vec![
+                assign(
+                    place(1),
+                    adt_aggregate(BAR_DEF, 0, vec![], vec![const_u32(5)]),
+                ),
+                assign(place(0), transmute(copy(1), u32_ty())),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.adt_shapes.insert(
+        BAR_DEF,
+        mir::AdtShape {
+            kind: mir::AdtShapeKind::Struct,
+            variants: vec![vec![u32_ty()]],
+        },
+    );
+    prog.add("f", body);
+    assert_eq!(
+        interpret_mir(&prog, "f", vec![])
+            .expect("struct-to-int transmute runs"),
+        Value::Uint(5)
+    );
+}
+
+const CELL_DEF: mir::DefId = mir::DefId::new(0, 83);
+
+fn cell_prog() -> MirProgram {
+    let mut prog = MirProgram::new();
+    prog.fn_names
+        .insert(CELL_DEF, "std::cell::UnsafeCell".to_string());
+    prog.adt_shapes.insert(
+        CELL_DEF,
+        mir::AdtShape {
+            kind: mir::AdtShapeKind::Struct,
+            variants: vec![vec![u32_ty()]],
+        },
+    );
+    prog
+}
+
+fn ref_cell_ty() -> mir::Ty {
+    mir::Ty::Ref(
+        mir::Region::Erased,
+        Box::new(mir::Ty::Adt(CELL_DEF, vec![u32_ty()])),
+        mir::Mutability::Not,
+    )
+}
+
+fn ref_u32_ty() -> mir::Ty {
+    mir::Ty::Ref(
+        mir::Region::Erased,
+        Box::new(u32_ty()),
+        mir::Mutability::Not,
+    )
+}
+
+// A transmute crossing an `UnsafeCell` wrapper boundary in the
+// entering direction (&UnsafeCell<u32> -> &u32) must NOT collapse
+// to the identity: the pointer would keep denoting the wrapper
+// aggregate. It composes the cast conversion's field-entering
+// treatment (Lane DP's `PtrField`), so the transmuted pointer
+// denotes the wrapper's inner field and reads through it.
+// fn f() -> u32 { _1 = UnsafeCell(41); _2 = &_1;
+//                 _3 = transmute(copy _2) as &u32; return *copy _3 }
+#[test]
+fn transmute_across_cell_wrapper_enters_the_field() {
+    let cell_ty = mir::Ty::Adt(CELL_DEF, vec![u32_ty()]);
+    let body = mir::Body::new(
+        decls(&[u32_ty(), cell_ty.clone(), ref_cell_ty(), ref_u32_ty()]),
+        0,
+        vec![block(
+            vec![
+                assign(
+                    place(1),
+                    adt_aggregate(CELL_DEF, 0, vec![u32_ty()], vec![const_u32(41)]),
+                ),
+                assign(
+                    place(2),
+                    mir::Rvalue::Ref(
+                        mir::Region::Erased,
+                        mir::BorrowKind::Shared,
+                        place(1),
+                    ),
+                ),
+                assign(place(3), transmute(copy(2), ref_u32_ty())),
+                assign(
+                    place(0),
+                    mir::Rvalue::Use(mir::Operand::Copy(place(3).deref())),
+                ),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = cell_prog();
+    prog.add("f", body);
+    assert_eq!(
+        interpret_mir(&prog, "f", vec![])
+            .expect("cell-entering transmute runs"),
+        Value::Uint(41)
+    );
+}
+
+// The exiting direction (&u32 -> &UnsafeCell<u32>) still has no
+// honest treatment: the pointer would have to come to denote a
+// wrapper aggregate around the field it points into, and there
+// is no field-exiting counterpart to `PtrField`. It stays an
+// explicit unsupported instead of silently pointing at the field.
+#[test]
+fn transmute_out_of_cell_wrapper_stays_unsupported() {
+    let body = mir::Body::new(
+        decls(&[ref_cell_ty(), ref_u32_ty()]),
+        0,
+        vec![block(
+            vec![assign(place(0), transmute(copy(1), ref_cell_ty()))],
+            ret(),
+        )],
+    );
+    let mut prog = cell_prog();
+    prog.add("f", body);
+    let err = interpret_mir(&prog, "f", vec![])
+        .expect_err("cell-exiting transmute must stay unsupported");
+    assert!(
+        matches!(
+            err,
+            MirRunError::Interp(InterpError::UnsupportedRvalue { .. })
+        ),
+        "expected UnsupportedRvalue, got {err}"
+    );
 }

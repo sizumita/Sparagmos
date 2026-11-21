@@ -3479,6 +3479,66 @@ impl<'a> Interpreter<'a> {
             Rvalue::PtrField(operand) => {
                 let value = self.eval_operand(frames, body, operand)?;
                 self.ptr_field_value(frames, body, value)
+            Rvalue::IntToPtr(operand) => {
+                let value = self.eval_operand(frames, body, operand)?;
+                match value {
+                    Value::Int(i) => Ok(Value::Ref(RefTarget::Address(i as u64))),
+                    Value::Uint(u) => Ok(Value::Ref(RefTarget::Address(u as u64))),
+                    other => Err(InterpError::type_mismatch(
+                        "integer-to-pointer transmute",
+                        "an integer value",
+                        other.kind_name(),
+                    )),
+                }
+            }
+            Rvalue::EnumToInt(operand, discriminants, ty) => {
+                let value = self.eval_operand(frames, body, operand)?;
+                match value {
+                    Value::Enum { variant, .. } => {
+                        let discr = if discriminants.is_empty() {
+                            variant as i128
+                        } else {
+                            *discriminants.get(variant as usize).ok_or_else(|| {
+                                InterpError::type_mismatch(
+                                    "enum-to-integer transmute",
+                                    "variant covered by the discriminant table",
+                                    format!("variant {variant}"),
+                                )
+                            })?
+                        };
+                        eval_cast(&Value::Int(discr), ty)
+                    }
+                    other => Err(InterpError::type_mismatch(
+                        "enum-to-integer transmute",
+                        "an enum value",
+                        other.kind_name(),
+                    )),
+                }
+            }
+            Rvalue::IntToEnum(operand, discriminants) => {
+                let value = self.eval_operand(frames, body, operand)?;
+                let bits = match value {
+                    Value::Int(i) => i as u128,
+                    Value::Uint(u) => u,
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            "integer-to-enum transmute",
+                            "an integer value",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                match discriminants.iter().position(|d| *d as u128 == bits) {
+                    Some(variant) => Ok(Value::Enum {
+                        variant: variant as u32,
+                        fields: Vec::new(),
+                    }),
+                    None => Err(InterpError::type_mismatch(
+                        "integer-to-enum transmute",
+                        "a discriminant value of the target enum",
+                        format!("integer {bits}"),
+                    )),
+                }
             }
             Rvalue::BoxDerefTransmute(operand) => {
                 // The cast yields a pointer to the box's pointee.

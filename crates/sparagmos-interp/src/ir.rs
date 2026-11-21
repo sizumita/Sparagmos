@@ -466,6 +466,30 @@ pub enum Rvalue {
     /// Any other pointer-to-pointer cast leaves the denoted place
     /// unchanged and stays a plain `Use`.
     PtrField(Operand),
+    /// An integer-to-pointer `Transmute` cast: the mirror image of
+    /// [`Rvalue::PtrToInt`]. The integer is an address in the
+    /// model's synthetic address space, so the result is an
+    /// address-only reference value: it compares for equality,
+    /// tests for null and transmutes back to an integer, but
+    /// reading or writing through it is an explicit error (the
+    /// address names no place), exactly like a pointer constant
+    /// with no provenance.
+    IntToPtr(Operand),
+    /// A `Transmute` cast from a fieldless enum value to an
+    /// integer: yields the discriminant value of the operand's
+    /// variant, taken from the table baked in at conversion time
+    /// (variant index -> discriminant value; an empty table means
+    /// the values are the variant indices), converted to the
+    /// target scalar type with the usual wrapping cast semantics.
+    EnumToInt(Operand, Vec<i128>, Ty),
+    /// A `Transmute` cast from an integer to a fieldless enum
+    /// value: yields the variant whose discriminant value equals
+    /// the operand's bit pattern, from the table baked in at
+    /// conversion time (same convention as
+    /// [`Rvalue::EnumToInt`]). An integer matching no discriminant
+    /// is an explicit error: the model does not fabricate an
+    /// invalid enum value.
+    IntToEnum(Operand, Vec<i128>),
     /// `&place` (also raw-pointer creation): a resolved reference value.
     Ref(Place),
     /// The length of the value at a place (array / slice / `str`).
