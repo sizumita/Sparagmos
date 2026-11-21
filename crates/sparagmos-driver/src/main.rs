@@ -2559,7 +2559,12 @@ fn entry_returns_exit_code(c: &Collected, entry_index: usize) -> bool {
     };
     c.def_names
         .get(def.index as usize)
-        .map(|n| n == "std::process::ExitCode")
+        // The compiler-generated test harness main names the
+        // type by the path visible in its generated module
+        // (`<crate>::test::ExitCode`), not the defining path;
+        // the value shape checked by `exit_code_value` keeps
+        // the match honest.
+        .map(|n| n == "std::process::ExitCode" || n.ends_with("::ExitCode"))
         .unwrap_or(false)
 }
 

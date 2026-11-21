@@ -432,6 +432,11 @@ pub enum Builtin {
     /// `std::panic::take_hook()`: take the panic hook, leaving
     /// the default in its place.
     PanicTakeHook,
+    /// `test::test_main_env_args(&[TestDescAndFn]) -> ExitCode`:
+    /// the libtest entry point. The compiler-generated harness
+    /// main calls a crate-local wrapper of this name, so the
+    /// registry matches the name's suffix.
+    TestMainEnvArgs,
     /// `std::time::Instant::now()`: the host monotonic clock.
     InstantNow,
     /// `std::time::SystemTime::now()`: the host wall clock.
@@ -874,6 +879,14 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::time::Duration::from_micros" => Builtin::DurationFromMicros,
         "std::time::Duration::from_nanos" => Builtin::DurationFromNanos,
         "std::intrinsics::caller_location" => Builtin::CallerLocation,
+        // The harness calls either a crate-local wrapper
+        // (`<crate>::test::test_main_env_args`) or, for an empty
+        // test list, the `test` crate's function directly.
+        _ if canonical == "test::test_main_env_args"
+            || canonical.ends_with("::test::test_main_env_args") =>
+        {
+            Builtin::TestMainEnvArgs
+        }
         "std::panic::set_hook" => Builtin::PanicSetHook,
         "std::panic::take_hook" => Builtin::PanicTakeHook,
         "std::time::Instant::now" => Builtin::InstantNow,
@@ -1419,6 +1432,15 @@ fn unsupported(what: impl Into<String>) -> InterpError {
 // Execution
 // ---------------------------------------------------------------------------
 
+/// One entry of the libtest harness's test list, read by
+/// `test_main_env_args` (see `Interpreter::read_test_descs`).
+struct TestDesc {
+    name: String,
+    ignore: bool,
+    should_panic: bool,
+    callable: Value,
+}
+
 /// A point in time as the model stores it: seconds and
 /// nanoseconds (0 <= nsec < 1e9) since the clock's epoch (the
 /// monotonic clock's unspecified epoch for `Instant`, the Unix
@@ -1580,6 +1602,14 @@ impl<'a> Interpreter<'a> {
             let mut vals = Vec::with_capacity(args.len());
             for arg in args {
                 vals.push(self.eval_operand(frames, body, arg)?);
+            }
+            // The time types' `Add` / `Sub` are `#[track_caller]`,
+            // so conversion appended the caller-location stamp;
+            // note it for the overflow panic's location, exactly
+            // as the panic builtins do with theirs.
+            if vals.len() == 3 {
+                let stamp = vals.pop().expect("three values checked");
+                self.note_panic_stamp(stamp);
             }
             let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
             return self.time_add_sub(name, self_ty, name.ends_with("Sub::sub"), &vals);
@@ -1913,6 +1943,83 @@ impl<'a> Interpreter<'a> {
                 arity(1)?;
                 let ns = uint_arg_bits(&vals[0], name)?;
                 self.duration_value(ns / 1_000_000_000, ns % 1_000_000_000)
+            }
+            Builtin::TestMainEnvArgs => {
+                arity(1)?;
+                let tests = self.read_test_descs(frames, &vals[0])?;
+                // libtest's filter: the first non-flag argument
+                // is a substring filter on test names.
+                let filter = self
+                    .guest_args()
+                    .iter()
+                    .find(|a| !a.starts_with('-'))
+                    .cloned();
+                let mut passed = 0usize;
+                let mut failed = 0usize;
+                let mut ignored = 0usize;
+                let mut filtered_out = 0usize;
+                let mut failures: Vec<String> = Vec::new();
+                let mut selected: Vec<&TestDesc> = Vec::new();
+                for test in &tests {
+                    if let Some(f) = &filter {
+                        if !test.name.contains(f.as_str()) {
+                            filtered_out += 1;
+                            continue;
+                        }
+                    }
+                    selected.push(test);
+                }
+                self.push_output(&format!("running {} tests\n", selected.len()));
+                for test in selected {
+                    if test.ignore {
+                        ignored += 1;
+                        self.push_output(&format!("test {} ... ignored\n", test.name));
+                        continue;
+                    }
+                    let result = self.call_callable_to_completion(
+                        frames,
+                        &test.callable,
+                        Vec::new(),
+                    );
+                    let panicked = match result {
+                        Ok(_) => false,
+                        Err(InterpError::Panic { .. }) => {
+                            self.note_panic_consumed();
+                            true
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    if panicked == test.should_panic {
+                        passed += 1;
+                        self.push_output(&format!("test {} ... ok\n", test.name));
+                    } else {
+                        failed += 1;
+                        failures.push(test.name.clone());
+                        self.push_output(&format!("test {} ... FAILED\n", test.name));
+                    }
+                }
+                if !failures.is_empty() {
+                    self.push_output("\nfailures:\n");
+                    for name in &failures {
+                        self.push_output(&format!("    {name}\n"));
+                    }
+                }
+                let verdict = if failed == 0 { "ok" } else { "FAILED" };
+                self.push_output(&format!(
+                    "\ntest result: {verdict}. {passed} passed; {failed} failed; \
+                     {ignored} ignored; 0 measured; {filtered_out} filtered out; \
+                     finished in 0.00s\n"
+                ));
+                // `ExitCode`: success is 0, any failure is 101,
+                // as in libtest.
+                let byte = if failed == 0 { 0 } else { 101 };
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Enum {
+                        variant: 0,
+                        fields: vec![Value::Uint(byte)],
+                    }],
+                })
             }
             Builtin::PanicSetHook => {
                 arity(1)?;
@@ -4217,6 +4324,89 @@ impl<'a> Interpreter<'a> {
     /// (a nanosecond count at or past one second carries into the
     /// seconds; the carry is checked, as in std).
 
+
+    /// The tests of a `&[TestDescAndFn]` slice, read out of the
+    /// value the harness main hands to `test_main_env_args`:
+    /// each element's descriptor gives the name (field 0 of the
+    /// `TestName`), the ignore flag (field 1) and the
+    /// should-panic mode (field 2, variant 0 is `No`); the
+    /// second field of the element is the `TestFn` enum whose
+    /// payload is the callable.
+    fn read_test_descs(
+        &self,
+        frames: &[Frame],
+        slice: &Value,
+    ) -> InterpResult<Vec<TestDesc>> {
+        let target = self.deref_value(frames, slice)?;
+        let array = self.read_resolved(frames, &target)?;
+        let elements = match &array {
+            Value::Tuple(items) | Value::Enum { fields: items, .. } => items.clone(),
+            other => {
+                return Err(InterpError::type_mismatch(
+                    "test::test_main_env_args",
+                    "a slice of test descriptors",
+                    other.kind_name(),
+                ))
+            }
+        };
+        let mut out = Vec::with_capacity(elements.len());
+        for element in &elements {
+            let element = self.resolve_value(frames, element)?;
+            let pair = match &element {
+                Value::Tuple(items) | Value::Enum { fields: items, .. } if items.len() == 2 => {
+                    items
+                }
+                other => {
+                    return Err(InterpError::type_mismatch(
+                        "test::test_main_env_args",
+                        "a TestDescAndFn value",
+                        other.kind_name(),
+                    ))
+                }
+            };
+            let desc_value = self.resolve_value(frames, &pair[0])?;
+            let desc = match &desc_value {
+                Value::Tuple(items) | Value::Enum { fields: items, .. } if items.len() >= 3 => {
+                    items
+                }
+                other => {
+                    return Err(InterpError::type_mismatch(
+                        "test::test_main_env_args",
+                        "a TestDesc value",
+                        other.kind_name(),
+                    ))
+                }
+            };
+            let name = match &desc[0] {
+                Value::Enum { fields, .. } if fields.len() == 1 => {
+                    self.resolve_string(frames, &fields[0])?
+                }
+                other => self.resolve_string(frames, other)?,
+            };
+            let ignore = matches!(desc[1], Value::Bool(true));
+            // The `ShouldPanic` field: in the layout the
+            // compiler emits for `TestDesc` in this toolchain it
+            // is the unit enum at field 8 (variant 0 is `No`);
+            // field 2 is checked as well, as it carries the mode
+            // in the declared field order.
+            let should_panic = [2usize, 8].iter().any(|&i| {
+                matches!(desc.get(i), Some(Value::Enum { variant, .. }) if *variant != 0)
+            });
+            let callable = match &pair[1] {
+                Value::Enum { fields, .. } if fields.len() == 1 => {
+                    self.resolve_value(frames, &fields[0])?
+                }
+                other => self.resolve_value(frames, other)?,
+            };
+            out.push(TestDesc {
+                name,
+                ignore,
+                should_panic,
+                callable,
+            });
+        }
+        Ok(out)
+    }
 
     /// `Add::add` / `Sub::sub` for the modelled time types,
     /// completed by the interpreter when the demanded instance

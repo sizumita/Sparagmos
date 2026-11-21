@@ -1664,6 +1664,13 @@ impl<'a> Interpreter<'a> {
         self.resume_signaled = true;
     }
 
+    /// Record that the in-flight panic was consumed by a
+    /// builtin (the libtest runner catching a test's panic), so
+    /// a later panic is not mistaken for its propagation.
+    pub(crate) fn note_panic_consumed(&mut self) {
+        self.hook_fired_depth = None;
+    }
+
     /// Execute the `catch_unwind` intrinsic's protocol: run
     /// `try_fn(data)`; when it returns, report `false` (no panic).
     /// When it panics, the nested drive has already unwound the

@@ -5492,10 +5492,9 @@ fn run_mode_test_crate_enters_harness_main_not_user_main() {
     // name alone would also have entered the user's `main`,
     // which natively is an ordinary function in a test crate.
     // The driver now enters the entry point rustc designated.
-    // The run then stops at the harness's call into the libtest
-    // runner, whose local wrapper has no converted body yet --
-    // the same stop a test crate without a user `main` hits --
-    // and the user's `main` must not have run.
+    // The harness's call into the libtest runner is served by
+    // the `test_main_env_args` builtin, so the crate's tests
+    // run; the user's `main` must not have run.
     let dir = temp_dir("test-crate-main");
     let src = fixture(&dir, "testcrate.rs", TEST_CRATE_WITH_MAIN_SRC);
     let out = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
@@ -5508,12 +5507,13 @@ fn run_mode_test_crate_enters_harness_main_not_user_main() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         out.status.code(),
-        Some(2),
-        "the harness entry must be reached and stop at the libtest runner call; stderr={stderr}"
+        Some(0),
+        "the harness entry must be reached and its tests run; stderr={stderr}"
     );
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stderr.contains("Call to testcrate::test::test_main_env_args (no converted body)"),
-        "the stop must name the harness runner call; stderr={stderr}"
+        stdout.contains("test sample_test ... ok"),
+        "the libtest runner must report the test; stdout={stdout}"
     );
     assert!(
         !stderr.contains("unknown function"),
@@ -5550,12 +5550,14 @@ fn run_mode_test_crate_without_tests_still_enters_harness() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         out.status.code(),
-        Some(2),
-        "the harness entry must be reached and stop at the libtest runner call; stderr={stderr}"
+        Some(0),
+        "the harness entry must be reached and run its empty test list; stderr={stderr}"
     );
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stderr.contains("Call to test::test_main_env_args (no converted body)"),
-        "the stop must name the libtest runner call; stderr={stderr}"
+        stdout.contains("running 0 tests")
+            && stdout.contains("test result: ok. 0 passed; 0 failed"),
+        "the libtest runner must report the empty run; stdout={stdout}"
     );
     assert!(
         !stderr.contains("unknown function"),
@@ -6900,4 +6902,200 @@ fn run_mode_size_of_val_on_async_future_uses_compiler_layout() {
         "size 1\nsize 0\n",
         "the future's size is the compiler layout size"
     );
+}
+
+fn run_driver_extra(src: &Path, extra: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run")
+        .arg(src)
+        .args(extra)
+        .output()
+        .expect("failed to run sparagmos-driver")
+}
+
+const ENV_ARGS_SRC: &str = r#"
+fn main() {
+    for a in std::env::args() {
+        println!("arg:{a}");
+    }
+    let mut os = std::env::args_os();
+    println!("os-first {}", os.next().is_some());
+    println!("count {}", std::env::args().count());
+}
+"#;
+
+#[test]
+fn run_mode_env_args_reach_the_guest() {
+    let dir = temp_dir("env-args");
+    let src = fixture(&dir, "args.rs", ENV_ARGS_SRC);
+    let out = run_driver_extra(&src, &["--guest-arg", "one", "--guest-arg", "two"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 5, "stdout={stdout}");
+    // argv[0] is the guest's program path: the input source.
+    assert!(lines[0].starts_with("arg:"), "stdout={stdout}");
+    assert!(lines[0].ends_with("args.rs"), "stdout={stdout}");
+    assert_eq!(lines[1], "arg:one");
+    assert_eq!(lines[2], "arg:two");
+    assert_eq!(lines[3], "os-first true");
+    assert_eq!(lines[4], "count 3");
+}
+
+const CALLER_LOCATION_SRC: &str = r#"
+#[track_caller]
+fn here() -> u32 {
+    std::panic::Location::caller().line()
+}
+fn main() {
+    println!("tracked {}", here());
+    println!("direct {}", std::panic::Location::caller().line());
+}
+"#;
+
+#[test]
+fn run_mode_caller_location_reports_the_call_site() {
+    let dir = temp_dir("caller-location");
+    let src = fixture(&dir, "loc.rs", CALLER_LOCATION_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    // `here()` is called on line 7 of the fixture; the direct
+    // `Location::caller()` is evaluated on line 8.
+    assert_eq!(stdout, "tracked 7\ndirect 8\n", "stdout={stdout}");
+}
+
+const PROCESS_EXIT_SRC: &str = r#"
+fn main() {
+    println!("before");
+    std::process::exit(7);
+}
+"#;
+
+const EXIT_CODE_SRC: &str = r#"
+fn main() -> std::process::ExitCode {
+    std::process::ExitCode::from(3)
+}
+"#;
+
+#[test]
+fn run_mode_process_exit_and_exit_code() {
+    let dir = temp_dir("exit-codes");
+    let src = fixture(&dir, "exit.rs", PROCESS_EXIT_SRC);
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(7), "process::exit(7)");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "before\n");
+    let src = fixture(&dir, "exitcode.rs", EXIT_CODE_SRC);
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(3), "ExitCode::from(3)");
+}
+
+const LIBTEST_SRC: &str = r#"
+#[test]
+fn alpha() { assert_eq!(1 + 1, 2); }
+#[test]
+#[ignore]
+fn gamma() {}
+#[test]
+#[should_panic]
+fn panics() { panic!("expected"); }
+"#;
+
+const LIBTEST_FAIL_SRC: &str = r#"
+#[test]
+fn good() { assert_eq!(2, 2); }
+#[test]
+fn bad() { assert_eq!(1, 2); }
+"#;
+
+#[test]
+fn run_mode_libtest_harness_runs_tests() {
+    let dir = temp_dir("libtest");
+    let src = fixture(&dir, "harness.rs", LIBTEST_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "--test"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr} stdout={stdout}");
+    assert!(stdout.contains("running 3 tests"), "stdout={stdout}");
+    assert!(stdout.contains("test alpha ... ok"), "stdout={stdout}");
+    assert!(stdout.contains("test panics ... ok"), "stdout={stdout}");
+    assert!(stdout.contains("test gamma ... ignored"), "stdout={stdout}");
+    assert!(
+        stdout.contains("test result: ok. 2 passed; 0 failed; 1 ignored"),
+        "stdout={stdout}"
+    );
+    let src = fixture(&dir, "harness_fail.rs", LIBTEST_FAIL_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "--test"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(101), "stdout={stdout}");
+    assert!(stdout.contains("test bad ... FAILED"), "stdout={stdout}");
+    assert!(
+        stdout.contains("test result: FAILED. 1 passed; 1 failed"),
+        "stdout={stdout}"
+    );
+}
+
+const TIME_SRC: &str = r#"
+fn main() {
+    let a = std::time::Instant::now();
+    let b = std::time::Instant::now();
+    assert!(b >= a);
+    let s = std::time::SystemTime::now();
+    let d = s.duration_since(std::time::UNIX_EPOCH).unwrap();
+    assert!(d.as_secs() > 1_600_000_000);
+    println!("time ok");
+}
+"#;
+
+const TIME_OVERFLOW_SRC: &str = r#"
+fn main() {
+    let t = std::time::Instant::now();
+    let _ = t + std::time::Duration::MAX;
+}
+"#;
+
+#[test]
+fn run_mode_time_now_and_overflow() {
+    let dir = temp_dir("time");
+    let src = fixture(&dir, "time.rs", TIME_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "time ok\n");
+    let src = fixture(&dir, "time_overflow.rs", TIME_OVERFLOW_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(101), "stderr={stderr}");
+    assert!(
+        stderr.contains("overflow when adding duration to instant"),
+        "stderr={stderr}"
+    );
+}
+
+const PANIC_HOOK_SRC: &str = r#"
+use std::sync::atomic::{AtomicUsize, Ordering};
+static FIRED: AtomicUsize = AtomicUsize::new(0);
+fn main() {
+    std::panic::set_hook(Box::new(|info| {
+        FIRED.fetch_add(1, Ordering::SeqCst);
+        println!("hook line {}", info.location().unwrap().line());
+    }));
+    let r = std::panic::catch_unwind(|| panic!("foobar"));
+    assert!(r.is_err());
+    println!("fired {}", FIRED.load(Ordering::SeqCst));
+}
+"#;
+
+#[test]
+fn run_mode_panic_hook_fires_with_location() {
+    let dir = temp_dir("panic-hook");
+    let src = fixture(&dir, "hook.rs", PANIC_HOOK_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    // The `panic!` is on line 9 of the fixture.
+    assert_eq!(stdout, "hook line 9\nfired 1\n", "stdout={stdout}");
 }
