@@ -2151,6 +2151,8 @@ fn summary_mode_generic_ctor_is_accounted_converted() {
     assert!(
         !stdout.contains("kind=Ctor"),
         "no constructor is left as a missing instance: {stdout}"
+    );
+}
 
 // ----- monomorphization validity checks (Lane CA) ---------------------------
 
@@ -2222,5 +2224,156 @@ fn convert_mode_simd_type_with_too_many_lanes_is_a_compile_failure() {
         stderr.contains("sparagmos-driver: compilation failed")
             && stderr.contains("invalid number of lanes"),
         "the failure must name the reason; stderr={stderr}"
+    );
+}
+
+// ----- monomorphization validity checks, round 2 (Lane CS) ------------------
+//
+// Types too big for the target architecture (the layout query's
+// own error, over locals and measured-call type arguments) and
+// the monomorphization recursion limit (per-definition nesting
+// depth along a demand path).
+
+const TOO_BIG_LOCAL_SRC: &str = r#"
+fn main() { let _a = [0u8; usize::MAX]; }
+"#;
+
+const TOO_BIG_SIZE_OF_SRC: &str = r#"
+struct S { x: [u8; usize::MAX] }
+fn f() -> usize { std::mem::size_of::<S>() }
+fn main() { let _ = f(); }
+"#;
+
+const LARGE_BUT_LEGAL_SRC: &str = r#"
+struct Big([u8; 1_000_000]);
+fn main() { let _b = Big([7u8; 1_000_000]); }
+"#;
+
+const HUGE_PHANTOM_ONLY_SRC: &str = r#"
+fn f<T>(_x: std::marker::PhantomData<T>) -> usize { std::mem::size_of::<usize>() }
+fn main() { let _ = f::<[u8; usize::MAX]>(std::marker::PhantomData); }
+"#;
+
+const UNBOUNDED_INSTANTIATION_SRC: &str = r#"
+fn g<T>() { g::<Option<T>>(); }
+fn main() { g::<i32>(); }
+"#;
+
+const BOUNDED_RECURSION_SRC: &str = r#"
+fn fact(n: u64) -> u64 { if n == 0 { 1 } else { n * fact(n - 1) } }
+fn down<T: Copy>(x: Option<T>) -> usize { match x { None => 0, Some(_) => down::<T>(x) } }
+fn main() { let _ = fact(3); let _ = down::<i32>(Some(1)); }
+"#;
+
+#[test]
+fn convert_mode_too_big_local_type_is_a_compile_failure() {
+    let dir = temp_dir("mono-too-big-local");
+    let src = fixture(&dir, "too_big_local.rs", TOO_BIG_LOCAL_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a local of a type too big for the target must fail compilation; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("sparagmos-driver: compilation failed")
+            && stderr.contains("too big for the target architecture"),
+        "the failure must carry rustc's too-big wording; stderr={stderr}"
+    );
+}
+
+#[test]
+fn convert_mode_too_big_size_of_argument_is_a_compile_failure() {
+    let dir = temp_dir("mono-too-big-size-of");
+    let src = fixture(&dir, "too_big_size_of.rs", TOO_BIG_SIZE_OF_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "measuring a too-big type with size_of must fail compilation; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("sparagmos-driver: compilation failed")
+            && stderr.contains("too big for the target architecture"),
+        "the failure must carry rustc's too-big wording; stderr={stderr}"
+    );
+}
+
+#[test]
+fn convert_mode_large_but_legal_type_converts() {
+    let dir = temp_dir("mono-large-legal");
+    let src = fixture(&dir, "large_legal.rs", LARGE_BUT_LEGAL_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a large type within the target's bound must convert; stderr={stderr}"
+    );
+}
+
+#[test]
+fn convert_mode_huge_type_named_only_through_phantom_data_converts() {
+    let dir = temp_dir("mono-huge-phantom");
+    let src = fixture(&dir, "huge_phantom.rs", HUGE_PHANTOM_ONLY_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a too-big type that is only named (PhantomData, an ordinary \
+         generic argument) is never materialized and must convert; stderr={stderr}"
+    );
+}
+
+#[test]
+fn convert_mode_unbounded_self_instantiation_is_a_recursion_limit_failure() {
+    let dir = temp_dir("mono-recursion-limit");
+    let src = fixture(&dir, "unbounded.rs", UNBOUNDED_INSTANTIATION_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "unbounded self-instantiation must fail compilation; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("sparagmos-driver: compilation failed")
+            && stderr.contains("reached the recursion limit while instantiating"),
+        "the failure must name the recursion limit; stderr={stderr}"
+    );
+}
+
+#[test]
+fn run_mode_unbounded_self_instantiation_is_unsupported() {
+    let dir = temp_dir("mono-recursion-limit-run");
+    let src = fixture(&dir, "unbounded_run.rs", UNBOUNDED_INSTANTIATION_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "run mode reports a monomorphization failure as unsupported; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("sparagmos-driver: compilation failed")
+            && stderr.contains("reached the recursion limit while instantiating"),
+        "the failure must name the recursion limit; stderr={stderr}"
+    );
+}
+
+#[test]
+fn convert_mode_bounded_generic_recursion_converts() {
+    let dir = temp_dir("mono-bounded-recursion");
+    let src = fixture(&dir, "bounded.rs", BOUNDED_RECURSION_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "plain recursion and same-instance generic recursion are \
+         finite demand and must convert; stderr={stderr}"
     );
 }
