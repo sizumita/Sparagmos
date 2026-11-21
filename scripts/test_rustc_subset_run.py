@@ -1174,6 +1174,65 @@ class ProcessStage2Tests(unittest.TestCase):
         self.assertNotIn("--crate-type", args)
         self.assertIn("--crate-type=cdylib", args)
 
+    def test_target_spec_file_is_forwarded_expanded(self):
+        rec = self.write_test(
+            "//@ check-pass\n"
+            "//@ compile-flags: --target={{src-base}}/custom.json\n"
+            "fn main() {}\n")
+        res, captured = self.run_with_conv_capture(rec, conv())
+        self.assertEqual(res["status"], "pass")
+        tgt = [a for a in captured["rustc_args"]
+               if a.startswith("--target")]
+        self.assertEqual(len(tgt), 1)
+        self.assertTrue(tgt[0].endswith("/custom.json"))
+        self.assertNotIn("{{", tgt[0])
+
+    def test_unknown_target_spec_rejection_is_attempted(self):
+        rec = self.write_test(
+            "//@ check-fail\n"
+            "//@ compile-flags: --target x86_64-linux-gnu\n"
+            "fn main() {}\n")
+        orig = run.known_targets
+        run.known_targets = lambda: {"x86_64-unknown-linux-gnu"}
+        try:
+            res, captured = self.run_with_conv_capture(
+                rec, conv(exit_code=1, compilation_failed=True,
+                          converted=None, skipped=None))
+        finally:
+            run.known_targets = orig
+        self.assertEqual(res["status"], "pass")
+        self.assertIn("--target", captured["rustc_args"])
+
+    def test_unpretty_dropped_when_dump_unchecked(self):
+        rec = self.write_test(
+            "//@ check-pass\n//@ dont-check-compiler-stdout\n"
+            "//@ compile-flags: -Zunpretty=mir\nfn main() {}\n")
+        res, captured = self.run_with_conv_capture(rec, conv())
+        self.assertEqual(res["status"], "pass")
+        self.assertNotIn("-Zunpretty=mir", captured["rustc_args"])
+
+    def test_unpretty_failure_without_snapshot_is_attempted(self):
+        rec = self.write_test(
+            "//@ check-fail\n//@ compile-flags: -Zunpretty=mir\n"
+            "fn main() {}\n")
+        res, captured = self.run_with_conv_capture(
+            rec, conv(exit_code=1, compilation_failed=True,
+                      converted=None, skipped=None))
+        self.assertEqual(res["status"], "pass")
+        self.assertNotIn("-Zunpretty=mir", captured["rustc_args"])
+
+    def test_unpretty_checked_dump_stays_refused(self):
+        rec = self.write_test(
+            "//@ check-fail\n//@ compile-flags: -Zunpretty=hir\n"
+            "fn main() {}\n")
+        (self.rust_dir / "tests" / "ui" / "t.stdout").write_text(
+            "dump\n")
+        res, captured = self.run_with_conv_capture(rec, conv())
+        self.assertEqual(res["status"], "not-attempted")
+        self.assertEqual(res["bucket"],
+                         "not attempted (compile-flags)")
+        self.assertNotIn("rustc_args", captured)
+
 
 
 
@@ -1434,6 +1493,131 @@ class ScreenFlagsTests(unittest.TestCase):
         self.assertIn("unpretty", run.screen_flags(["-Zunpretty=mir"]))
         self.assertIn("unpretty",
                       run.screen_flags(["-Z", "unpretty=mir"]))
+
+
+class CompileFlagsExpansionTests(unittest.TestCase):
+    def test_expands_variables_when_bases_supplied(self):
+        h = header("//@ compile-flags: --target={{src-base}}/x.json"
+                   " --remap-path-prefix={{src-base}}=/s\n")
+        self.assertEqual(
+            run.compile_flags(h.view(None), "/src/base", "/build/base"),
+            ["--target=/src/base/x.json",
+             "--remap-path-prefix=/src/base=/s"])
+
+    def test_raw_tokens_without_bases(self):
+        h = header("//@ compile-flags: --target={{src-base}}/x.json\n")
+        self.assertEqual(run.compile_flags(h.view(None)),
+                         ["--target={{src-base}}/x.json"])
+
+
+class ScreenFlagsTargetSpecTests(unittest.TestCase):
+    def setUp(self):
+        self.orig = run.installed_targets
+        run.installed_targets = lambda: {run.HOST_TARGET}
+
+    def tearDown(self):
+        run.installed_targets = self.orig
+
+    def test_target_spec_file_is_not_refused(self):
+        self.assertIsNone(run.screen_flags(
+            ["--target", "/src/codegen/custom.json"]))
+        self.assertIsNone(run.screen_flags(
+            ["--target=/src/codegen/custom.json"]))
+
+    def test_unknown_triple_forwarded_for_failure_expectation(self):
+        known = {run.HOST_TARGET, "aarch64-unknown-linux-gnu"}
+        self.assertIsNone(run.screen_flags(
+            ["--target", "x86_64-linux-gnu"], known=known,
+            expectation="failure"))
+
+    def test_unknown_triple_refused_for_success_expectation(self):
+        known = {run.HOST_TARGET, "aarch64-unknown-linux-gnu"}
+        reason = run.screen_flags(
+            ["--target", "x86_64-linux-gnu"], known=known,
+            expectation="success")
+        self.assertIn("not a target of this toolchain", reason)
+
+    def test_known_triple_without_std_stays_refused_for_failure(self):
+        # The only failure available there is the environment's
+        # (no std component), not the test's; forwarding it would
+        # manufacture a pass on a failure-expecting test.
+        known = {run.HOST_TARGET, "amdgcn-amd-amdhsa"}
+        reason = run.screen_flags(
+            ["--target", "amdgcn-amd-amdhsa"], known=known,
+            expectation="failure")
+        self.assertIn("not installed", reason)
+
+    def test_unknown_triple_without_known_set_stays_refused(self):
+        reason = run.screen_flags(
+            ["--target", "x86_64-linux-gnu"], expectation="failure")
+        self.assertIn("not installed", reason)
+
+
+class UnprettyTests(unittest.TestCase):
+    def test_has_and_strip_in_both_spellings(self):
+        flags = ["-Zunpretty=mir", "-C", "opt-level=0", "-Z",
+                 "unpretty=expanded", "--crate-type", "lib"]
+        self.assertTrue(run.has_unpretty(flags))
+        self.assertEqual(run.strip_unpretty(flags),
+                         ["-C", "opt-level=0", "--crate-type", "lib"])
+        self.assertFalse(run.has_unpretty(["-Z", "mir-opt-level=0"]))
+
+    def _path(self, td):
+        path = Path(td) / "t.rs"
+        path.write_text("fn main() {}\n")
+        return path
+
+    def test_unchecked_with_dont_check_compiler_stdout(self):
+        with tempfile.TemporaryDirectory() as td:
+            view = header("//@ dont-check-compiler-stdout\n").view(None)
+            self.assertTrue(run.unpretty_unchecked(
+                view, self._path(td), None, "success"))
+
+    def test_failure_without_stdout_snapshot_is_unchecked(self):
+        with tempfile.TemporaryDirectory() as td:
+            view = header("//@ check-fail\n").view(None)
+            self.assertTrue(run.unpretty_unchecked(
+                view, self._path(td), None, "failure"))
+
+    def test_failure_with_stdout_snapshot_stays_checked(self):
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "t.stdout").write_text("dump\n")
+            view = header("//@ check-fail\n").view(None)
+            self.assertFalse(run.unpretty_unchecked(
+                view, self._path(td), None, "failure"))
+
+    def test_revision_stdout_snapshot_stays_checked(self):
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "t.expanded.stdout").write_text("dump\n")
+            view = header("//@ check-fail\n").view(None)
+            self.assertFalse(run.unpretty_unchecked(
+                view, self._path(td), "expanded", "failure"))
+
+    def test_success_without_dont_check_stays_checked(self):
+        with tempfile.TemporaryDirectory() as td:
+            view = header("//@ check-pass\n").view(None)
+            self.assertFalse(run.unpretty_unchecked(
+                view, self._path(td), None, "success"))
+
+    def test_crash_expectation_never_unchecked(self):
+        with tempfile.TemporaryDirectory() as td:
+            view = header("//@ dont-check-compiler-stdout\n").view(None)
+            self.assertFalse(run.unpretty_unchecked(
+                view, self._path(td), None, "crash"))
+
+
+class HeaderBucketTests(unittest.TestCase):
+    def test_ignore_test_has_its_own_bucket(self):
+        self.assertEqual(
+            run.header_bucket("ignore-test (compiletest itself "
+                              "never runs this test)"),
+            "not attempted (ignore-test)")
+
+    def test_other_blockers_keep_the_header_feature_bucket(self):
+        self.assertEqual(
+            run.header_bucket("run-crash mode (crash reproduction "
+                              "is out of stage-1 scope)"),
+            "not attempted (header feature)")
 
 
 class RevisionArgsTests(unittest.TestCase):
@@ -2224,7 +2408,7 @@ class ProcMacroExternTests(unittest.TestCase):
         res = run.process_test(rec, self.tmp, Path("/fake/driver"),
                                stage2=True)
         self.assertEqual(res["status"], "not-attempted")
-        self.assertIn("header feature", res["bucket"])
+        self.assertIn("auxiliary crate build failure", res["bucket"])
         self.assertIn("kaboom", res["reason"])
 
 

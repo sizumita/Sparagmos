@@ -50,8 +50,10 @@ A test is *attempted* only when both sides can be run faithfully:
   (ui tests default to check-fail), exactly as stage 2 judges
   compile-check views;
   a test's `compile-flags` are honoured in both stages by forwarding
-  them to the native rustc and, via the driver's `--rustc-arg`, to
-  the driver's embedded rustc — the position compiletest gives them;
+  them (with compiletest's {{...}} variable expansion applied to
+  the values) to the native rustc and, via the driver's
+  `--rustc-arg`, to the driver's embedded rustc — the position
+  compiletest gives them;
   revision tests are judged once per revision in both stages --
   with the revision's directive view, its compile-flags, and the
   `--cfg <revision>` and `--check-cfg` arguments compiletest
@@ -309,6 +311,8 @@ HOST_TARGET = "x86_64-unknown-linux-gnu"
 
 _INSTALLED_TARGETS = None
 
+_KNOWN_TARGETS = None
+
 
 def _targets_in_sysroot(sysroot):
     """The triples with a std installed under a sysroot: the
@@ -354,15 +358,45 @@ def split_flags(flags):
     return out
 
 
-def compile_flags(view):
-    """All compile-flags tokens visible in a directive view."""
+def compile_flags(view, src_base=None, build_base=None):
+    """All compile-flags tokens visible in a directive view.
+
+    compiletest expands {{...}} variables in every directive value
+    before use (expand_variables in directives.rs), compile-flags
+    included, so when the caller supplies the attempt's src-base
+    and build-base the values are expanded the same way here.
+    Callers that only compare flag sets may omit them and get the
+    raw tokens.
+    """
     flags = []
     for v in view.values("compile-flags"):
+        if src_base is not None and build_base is not None:
+            v = expand_variables(v, src_base, build_base)
         flags.extend(split_flags(v))
     return flags
 
 
-def screen_flags(flags, targets=None):
+def known_targets():
+    """Every target triple the pinned toolchain knows (its
+    `--print target-list`): the built-in targets, whether or not
+    a std component is installed for them. Computed once per
+    process; an empty set when the query fails, which callers
+    treat as "unknown" so --target screening stays conservative.
+    """
+    global _KNOWN_TARGETS
+    if _KNOWN_TARGETS is None:
+        try:
+            out = subprocess.run(
+                rustc_cmd() + ["--print", "target-list"],
+                capture_output=True, text=True, timeout=30)
+            _KNOWN_TARGETS = {ln.strip() for ln in
+                              out.stdout.splitlines() if ln.strip()}
+        except Exception:
+            _KNOWN_TARGETS = set()
+    return _KNOWN_TARGETS
+
+
+def screen_flags(flags, targets=None, known=None, expectation=None):
     """Why this flag set cannot be honoured here, or None.
 
     The driver forwards flags verbatim to its embedded rustc (and
@@ -377,6 +411,25 @@ def screen_flags(flags, targets=None):
     host target's, and no foreign code is executed. Stage 1 passes
     just the host target instead, because it executes the program
     and a foreign binary cannot run on this host.
+
+    Two --target values are not refused even when they name no
+    installed target:
+
+    - a target-spec file (a value ending in `.json`): rustc loads
+      the spec itself, and no std component takes part in loading
+      it, so the compilation the test asks for can be attempted
+      as it stands;
+    - when `known` (the toolchain's target list) is supplied and
+      `expectation` is "failure", a triple that is not a target
+      of the toolchain at all: rustc rejects such a specification
+      while loading it, before any std is needed, and that
+      rejection is exactly the failure the test asserts, so the
+      driver's embedded rustc reproduces it in the attempt.
+
+    A known triple with no installed std stays refused for every
+    outcome: there the only failure available is the environment's
+    (E0463, can't find crate for `std`), not the test's, and
+    judging it would manufacture passes.
     """
     if targets is None:
         targets = installed_targets()
@@ -386,14 +439,24 @@ def screen_flags(flags, targets=None):
         nxt = flags[i + 1] if i + 1 < len(flags) else None
         if t == "--target" or t.startswith("--target="):
             tgt = t[len("--target="):] if t.startswith("--target=") else nxt
-            if tgt is not None and tgt not in targets:
-                if tgt in installed_targets():
+            if tgt is not None and tgt.endswith(".json"):
+                pass  # a target-spec file, not a triple
+            elif tgt is not None and tgt not in targets:
+                if known and tgt not in known:
+                    if expectation != "failure":
+                        return (f"compile-flags specify --target {tgt} "
+                                "(that is not a target of this "
+                                "toolchain)")
+                    # expectation == "failure": the specification
+                    # itself is rejected; fall through and attempt.
+                elif tgt in installed_targets():
                     return (f"compile-flags specify --target {tgt} "
                             "(that target is installed, but this "
                             "stage executes the program and only the "
                             "host target can run here)")
-                return (f"compile-flags specify --target {tgt} "
-                        "(that target is not installed on this host)")
+                else:
+                    return (f"compile-flags specify --target {tgt} "
+                            "(that target is not installed on this host)")
         elif t == "--print" or t.startswith("--print="):
             return ("compile-flags request --print output (rustc "
                     "prints target information instead of compiling)")
@@ -410,6 +473,90 @@ def screen_flags(flags, targets=None):
                     "possible)")
         i += 1
     return None
+
+
+def has_unpretty(flags):
+    """Whether the flag set carries a -Zunpretty request, in
+    either the joined (`-Zunpretty=...`) or split (`-Z`,
+    `unpretty=...`) spelling."""
+    i = 0
+    while i < len(flags):
+        t = flags[i]
+        if t.startswith("-Zunpretty"):
+            return True
+        if t == "-Z" and i + 1 < len(flags) \
+                and flags[i + 1].startswith("unpretty"):
+            return True
+        i += 1
+    return False
+
+
+def strip_unpretty(flags):
+    """The flag tokens with every -Zunpretty request removed, in
+    both spellings. Everything else is kept, in order."""
+    out = []
+    i = 0
+    while i < len(flags):
+        t = flags[i]
+        if t == "-Z" and i + 1 < len(flags) \
+                and flags[i + 1].startswith("unpretty"):
+            i += 2
+            continue
+        if t.startswith("-Zunpretty"):
+            i += 1
+            continue
+        out.append(t)
+        i += 1
+    return out
+
+
+def stdout_snapshot_checked(path, revision):
+    """Whether compiletest would compare the compiler's stdout
+    for one directive view against a `.stdout` snapshot: the
+    snapshot file for the view exists next to the test (the
+    unscoped file, or the revision's own)."""
+    stem = path.name[:-3] if path.name.endswith(".rs") else path.name
+    parent = str(path.parent)
+    if parent not in _DIR_LISTING_CACHE:
+        try:
+            _DIR_LISTING_CACHE[parent] = [p.name for p in
+                                          path.parent.iterdir()]
+        except OSError:
+            _DIR_LISTING_CACHE[parent] = []
+    names = _DIR_LISTING_CACHE[parent]
+    if f"{stem}.stdout" in names:
+        return True
+    return (revision is not None
+            and f"{stem}.{revision}.stdout" in names)
+
+
+def unpretty_unchecked(view, path, revision, expectation):
+    """Whether a view's -Zunpretty output cannot take part in its
+    verdict, so the attempt may drop the printing request and
+    convert the compilation itself.
+
+    -Zunpretty makes rustc print a dump and stop, so no conversion
+    is possible while the flag stands (screen_flags refuses it).
+    The dump is the test's assertion whenever compiletest compares
+    it, and those tests stay refused. It cannot take part in the
+    verdict when the view declares `//@ dont-check-compiler-stdout`
+    (the dump is compiler stdout, explicitly unchecked), or when
+    the expected outcome is a compilation failure and no `.stdout`
+    snapshot is checked for the view: the asserted failure is a
+    diagnostic the compilation produces before -- or instead of --
+    any dump, and an unchecked dump decides nothing. Crash
+    expectations are excluded: their verdict is the crash itself,
+    which a conversion does not reproduce.
+    """
+    if expectation not in ("success", "failure"):
+        return False
+    if view.has("dont-check-compiler-stdout"):
+        return True
+    if expectation != "failure":
+        return False
+    if view.has("check-stdout"):
+        return False
+    return not stdout_snapshot_checked(path, revision)
 
 
 def normalize_revision(revision):
@@ -1174,6 +1321,20 @@ def stage1_view_blocker(view):
     return None
 
 
+def header_bucket(reason):
+    """The not-attempted bucket for a header blocker's reason.
+
+    ignore-test is its own bucket: compiletest itself never runs
+    the test, on any host, so the record is not a gap in what the
+    subset reproduces at all. The other header features (run-crash,
+    stdin, core stubs) name behaviour of the test that the subset
+    declines to reproduce, and keep the shared bucket.
+    """
+    if reason.startswith("ignore-test"):
+        return "not attempted (ignore-test)"
+    return "not attempted (header feature)"
+
+
 # ---------------------------------------------------------------------------
 # Process execution
 # ---------------------------------------------------------------------------
@@ -1602,7 +1763,8 @@ def _build_proc_macro_chain(chain, edition, outdir, extra_externs=()):
             # sources may `use proc_macro::...` without declaring
             # it; without it such sources fail with E0432.
             cmd += ["--extern", "proc_macro"]
-        cmd += compile_flags(aux_view)
+        cmd += compile_flags(aux_view, suite_root(csrc),
+                             str(outdir))
         cmd += [str(csrc)]
         # The crate's own `//@ rustc-env:` pairs apply to its
         # build, as compiletest applies an auxiliary file's
@@ -2106,7 +2268,7 @@ def fill_result(rec, rust_dir, driver_bin, out):
     blocker = stage1_blocker(header, rec)
     if blocker:
         out["reason"] = blocker
-        out["bucket"] = "not attempted (header feature)"
+        out["bucket"] = header_bucket(blocker)
         return
     status, why = applicability(header)
     if status == "out-of-environment":
@@ -2125,15 +2287,14 @@ def fill_result(rec, rust_dir, driver_bin, out):
 
     edition = attempt_edition(header)
 
-    flags = compile_flags(header.view(None))
-    screened = screen_flags(flags, targets={HOST_TARGET})
-    if screened:
-        out["reason"] = screened
-        out["bucket"] = "not attempted (compile-flags)"
-        return
-
     src_base = suite_root(path)
     with tempfile.TemporaryDirectory(prefix="subset-run-") as td:
+        flags = compile_flags(header.view(None), src_base, td)
+        screened = screen_flags(flags, targets={HOST_TARGET})
+        if screened:
+            out["reason"] = screened
+            out["bucket"] = "not attempted (compile-flags)"
+            return
         env_pairs, env_unset = view_env(header.view(None),
                                         "exec-env", "unset-exec-env",
                                         src_base, td)
@@ -2285,7 +2446,7 @@ def stage1_compile_check(rec, view, path, driver_bin, revision, res,
     pm_args, pm_err = proc_macro_extern_args(path, view, edition)
     if pm_err:
         res["reason"] = pm_err
-        res["bucket"] = "not attempted (header feature)"
+        res["bucket"] = "auxiliary crate build failure"
         return res
     args += pm_args
     cenv, cunset = view_env(view, "rustc-env", "unset-rustc-env",
@@ -2334,7 +2495,7 @@ def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions,
     blocker = stage1_view_blocker(view)
     if blocker:
         res["reason"] = blocker
-        res["bucket"] = "not attempted (header feature)"
+        res["bucket"] = header_bucket(blocker)
         return res
     mode = run_mode(view)
     res["mode"] = mode
@@ -2355,21 +2516,21 @@ def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions,
             res["bucket"] = "out of stage-1 scope (multi-file)"
             return res
     edition = attempt_edition(view)
-    flags = compile_flags(view)
-    screened = screen_flags(flags, targets={HOST_TARGET})
-    if screened:
-        res["reason"] = screened
-        res["bucket"] = "not attempted (compile-flags)"
-        return res
-    rev_args = revision_args(view, revision, all_revisions)
-    args = rev_args + flags
-    if mode is None:
-        return stage1_compile_check(rec, view, path, driver_bin,
-                                    revision, res, edition,
-                                    rev_args, flags, aux_specs,
-                                    rust_dir)
     src_base = suite_root(path)
     with tempfile.TemporaryDirectory(prefix="subset-run-") as td:
+        flags = compile_flags(view, src_base, td)
+        screened = screen_flags(flags, targets={HOST_TARGET})
+        if screened:
+            res["reason"] = screened
+            res["bucket"] = "not attempted (compile-flags)"
+            return res
+        rev_args = revision_args(view, revision, all_revisions)
+        args = rev_args + flags
+        if mode is None:
+            return stage1_compile_check(rec, view, path, driver_bin,
+                                        revision, res, edition,
+                                        rev_args, flags, aux_specs,
+                                        rust_dir)
         env_pairs, env_unset = view_env(view, "exec-env",
                                         "unset-exec-env",
                                         src_base, td)
@@ -2491,12 +2652,18 @@ def fill_result_revisions(rec, header, revs, path, driver_bin, out,
 # crashes rustc under compiletest (exit code other than 0 or 1).
 #
 # Per-test compile-flags are forwarded to the driver's embedded
-# rustc (screened only for flags that would replace the compilation
-# itself: a --target that is not installed, --print, --sysroot, an output
-# location, -Zunpretty), and revision tests are judged once per
-# revision — with the revision's directive view, its compile-flags,
-# and the `--cfg <revision>` / `--check-cfg` arguments compiletest
-# adds. The record passes only when every revision that runs
+# rustc, screened for flags that would replace the compilation
+# itself or contradict its fixed invocation: a --target naming a
+# triple with no installed std (a target-spec `.json` file is
+# loaded by rustc itself and always forwarded, and a triple the
+# toolchain does not know is forwarded on failure-expecting tests,
+# whose asserted failure is rustc's rejection of the specification
+# itself), --print, --sysroot, an output location, and -Zunpretty
+# (dropped before screening only where the dump cannot take part
+# in the verdict — see unpretty_unchecked), and revision tests are
+# judged once per revision — with the revision's directive view,
+# its compile-flags, and the `--cfg <revision>` / `--check-cfg`
+# arguments compiletest adds. The record passes only when every revision that runs
 # passes; a revision removed by an ignore-/only- condition does not
 # run, as in compiletest.
 # A view's `//@ rustc-env:` pairs are applied to the driver process
@@ -2999,7 +3166,7 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
     blocker = stage2_blocker(view, rec)
     if blocker:
         res["reason"] = blocker
-        res["bucket"] = "not attempted (header feature)"
+        res["bucket"] = header_bucket(blocker)
         return res
     status, why = applicability(view)
     if status == "out-of-environment":
@@ -3033,8 +3200,12 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
         res["bucket"] = "not attempted (verdict needs execution)"
         return res
     edition = attempt_edition(view)
-    flags = compile_flags(view)
-    screened = screen_flags(flags)
+    flags = compile_flags(view, suite_root(path), os.getcwd())
+    if has_unpretty(flags) and unpretty_unchecked(
+            view, path, revision, expectation):
+        flags = strip_unpretty(flags)
+    screened = screen_flags(flags, known=known_targets() or None,
+                            expectation=expectation)
     if screened:
         res["reason"] = screened
         res["bucket"] = "not attempted (compile-flags)"
@@ -3088,7 +3259,7 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
     pm_args, pm_err = proc_macro_extern_args(path, view, edition)
     if pm_err:
         res["reason"] = pm_err
-        res["bucket"] = "not attempted (header feature)"
+        res["bucket"] = "auxiliary crate build failure"
         return res
     args += pm_args
     if expectation is None:
