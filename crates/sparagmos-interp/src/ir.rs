@@ -817,6 +817,16 @@ pub enum TerminatorKind {
         /// table (the sequential default, where index and value
         /// agree).
         cmp_discriminants: Option<Vec<i128>>,
+        /// Unsizing applied to the call's result before it is
+        /// written to the destination, baked by conversion for a
+        /// `From` / `Into` conversion whose target is a
+        /// `Box<dyn Trait>`: the modelled conversion returns the
+        /// plain box aggregate, and the result goes through the
+        /// same unsizing a coercion cast applies
+        /// ([`Rvalue::Unsize`]), so the destination holds a real
+        /// `DynRef` carrying the concrete type's drop glue.
+        /// `None` for every other builtin call.
+        result_unsize: Option<UnsizeMeta>,
     },
     /// Drop the value at a place, running its `glue` (converted
     /// destructor calls and field glue; see `mir_convert`), and

@@ -1678,8 +1678,24 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::FromFrom | Builtin::IntoInto => {
                 arity(1)?;
-                let target = generic_args.first().map(String::as_str).unwrap_or("");
-                let source = generic_args.get(1).map(String::as_str).unwrap_or("");
+                // `From::from` renders the callee's generic
+                // arguments as [target, source]; `Into::into`
+                // renders [source, target] (its `Self` is the
+                // source). The blanket `Into` is `From` by
+                // definition, so resolve both to the same
+                // (target, source) pair before dispatching on
+                // them.
+                let (target, source) = if matches!(kind, Builtin::IntoInto) {
+                    (
+                        generic_args.get(1).map(String::as_str).unwrap_or(""),
+                        generic_args.first().map(String::as_str).unwrap_or(""),
+                    )
+                } else {
+                    (
+                        generic_args.first().map(String::as_str).unwrap_or(""),
+                        generic_args.get(1).map(String::as_str).unwrap_or(""),
+                    )
+                };
                 let value = vals.into_iter().next().expect("arity checked");
                 // In this value model `String` and `str` data are the
                 // same value; the conversion is the identity on it.

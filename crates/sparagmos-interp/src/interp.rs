@@ -736,6 +736,7 @@ impl<'a> Interpreter<'a> {
                     target,
                     drop_glue,
                     cmp_discriminants,
+                    result_unsize,
                 } => {
                     if let Some(glue) = drop_glue {
                         // `std::mem::drop` with the dropped type's glue
@@ -799,7 +800,7 @@ impl<'a> Interpreter<'a> {
                         let work = vec![(Vec::new(), glue.root.clone())];
                         self.run_drop_glue(frames, root, work, &glue.adts, bb)?;
                     } else {
-                        let result = self.exec_builtin(
+                        let mut result = self.exec_builtin(
                             frames,
                             body,
                             &name,
@@ -807,6 +808,16 @@ impl<'a> Interpreter<'a> {
                             &args,
                             cmp_discriminants.as_deref(),
                         )?;
+                        // A `From` / `Into` conversion into a
+                        // `Box<dyn Trait>` returns the plain box
+                        // aggregate from the modelled conversion;
+                        // conversion baked the unsizing the
+                        // destination type implies, so the
+                        // destination holds the same `DynRef` a
+                        // coercion cast would have produced.
+                        if let Some(meta) = result_unsize {
+                            result = self.eval_unsize(frames, result, &meta)?;
+                        }
                         match target {
                             Some(bb) => {
                                 self.write_place(frames, body, &destination, result)?;
@@ -3377,6 +3388,57 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// Apply an unsizing decided at conversion time
+    /// ([`UnsizeMeta`]) to a value: the shared machinery of the
+    /// `Rvalue::Unsize` coercion cast and of a `From` / `Into`
+    /// conversion into a `Box<dyn Trait>`, whose result goes
+    /// through the same unsizing (see
+    /// `TerminatorKind::CallBuiltin::result_unsize`).
+    fn eval_unsize(&self, frames: &[Frame], v: Value, meta: &UnsizeMeta) -> InterpResult<Value> {
+        match meta {
+            UnsizeMeta::Slice => self.unsize_to_slice(frames, v),
+            UnsizeMeta::Dyn {
+                concrete,
+                traits,
+                glue,
+            } => match v {
+                // A supertrait upcast: the data pointer, the
+                // concrete type and its drop glue carry over;
+                // only the bounds the pointer answers to
+                // change.
+                Value::DynRef {
+                    base,
+                    concrete: existing,
+                    drop_glue,
+                    ..
+                } => Ok(Value::DynRef {
+                    base,
+                    concrete: existing,
+                    traits: traits.clone(),
+                    drop_glue,
+                }),
+                Value::Ref(_) | Value::FatRef { .. } | Value::Enum { .. } => {
+                    let concrete = concrete.clone().ok_or_else(|| {
+                        InterpError::UnsupportedRvalue {
+                            kind: "Unsize to dyn (no concrete type recorded)".to_string(),
+                        }
+                    })?;
+                    Ok(Value::DynRef {
+                        base: Box::new(v),
+                        concrete,
+                        traits: traits.clone(),
+                        drop_glue: glue.clone().map(Box::new),
+                    })
+                }
+                other => Err(InterpError::type_mismatch(
+                    "unsizing cast to dyn",
+                    "reference, fat pointer or box value",
+                    other.kind_name(),
+                )),
+            },
+        }
+    }
+
     /// Array-to-slice unsizing of a pointer-shaped value: a
     /// reference to an array becomes a fat reference over it, and
     /// a one-field wrapper value (a `Box`, or the `Unique` /
@@ -3654,49 +3716,7 @@ impl<'a> Interpreter<'a> {
             }
             Rvalue::Unsize(operand, meta) => {
                 let v = self.eval_operand(frames, body, operand)?;
-                match meta {
-                    UnsizeMeta::Slice => self.unsize_to_slice(frames, v),
-                    UnsizeMeta::Dyn {
-                        concrete,
-                        traits,
-                        glue,
-                    } => match v {
-                        // A supertrait upcast: the data pointer, the
-                        // concrete type and its drop glue carry over;
-                        // only the bounds the pointer answers to
-                        // change.
-                        Value::DynRef {
-                            base,
-                            concrete: existing,
-                            drop_glue,
-                            ..
-                        } => Ok(Value::DynRef {
-                            base,
-                            concrete: existing,
-                            traits: traits.clone(),
-                            drop_glue,
-                        }),
-                        Value::Ref(_) | Value::FatRef { .. } | Value::Enum { .. } => {
-                            let concrete = concrete.clone().ok_or_else(|| {
-                                InterpError::UnsupportedRvalue {
-                                    kind: "Unsize to dyn (no concrete type recorded)"
-                                        .to_string(),
-                                }
-                            })?;
-                            Ok(Value::DynRef {
-                                base: Box::new(v),
-                                concrete,
-                                traits: traits.clone(),
-                                drop_glue: glue.clone().map(Box::new),
-                            })
-                        }
-                        other => Err(InterpError::type_mismatch(
-                            "unsizing cast to dyn",
-                            "reference, fat pointer or box value",
-                            other.kind_name(),
-                        )),
-                    },
-                }
+                self.eval_unsize(frames, v, meta)
             }
             Rvalue::PtrToInt(operand) => {
                 let value = self.eval_operand(frames, body, operand)?;

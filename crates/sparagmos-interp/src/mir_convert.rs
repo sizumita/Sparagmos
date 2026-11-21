@@ -3528,6 +3528,59 @@ impl<'a> Converter<'a> {
         DropGlueBuilder::build(self, ty)
     }
 
+    /// The unsizing a `From` / `Into` conversion into a
+    /// `Box<dyn Trait>` applies to its result, decided here where
+    /// both types are known — exactly as for a sized-to-dyn
+    /// coercion cast: the destination type names the bounds, the
+    /// argument's type names the concrete pointee, and the
+    /// pointee's drop glue is built now so the resulting `DynRef`
+    /// carries it like a vtable's drop shim. The modelled `From`
+    /// impls for a dyn box take the payload itself (or a reference
+    /// to it), never an already-boxed value, so the pointee is
+    /// the argument's type with any reference stripped. `None`
+    /// when the destination is not a dyn box, when the argument's
+    /// type is not preserved, or when the argument is itself a
+    /// dyn value (no modelled conversion starts from one).
+    fn from_result_unsize(
+        &self,
+        body: &mir::Body,
+        destination: &mir::Place,
+        arg: Option<&mir::Operand>,
+        source_ty: Option<&mir::Ty>,
+    ) -> Option<ir::UnsizeMeta> {
+        let dest_ty = self.place_ty(body, destination)?;
+        let mir::Ty::Adt(def, dest_args) = &dest_ty else {
+            return None;
+        };
+        let name = self.names.get(def).or_else(|| self.def_names.get(def))?;
+        if name != "std::boxed::Box" {
+            return None;
+        }
+        let traits = dyn_traits_in(dest_args.first()?)?;
+        // A zero-sized argument travels as a constant operand,
+        // whose type the operand itself does not preserve; the
+        // callee's generic arguments still name the source type
+        // (the caller picks it out, as `mem_drop_glue` does for
+        // the dropped type).
+        let arg_ty = self
+            .operand_place_ty(body, arg?)
+            .or_else(|| source_ty.cloned())?;
+        if dyn_traits_in(&arg_ty).is_some() {
+            return None;
+        }
+        let pointee = match &arg_ty {
+            mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _) => inner,
+            other => other,
+        };
+        let concrete = self.concrete_ty_name(pointee);
+        let glue = DropGlueBuilder::build(self, pointee);
+        Some(ir::UnsizeMeta::Dyn {
+            concrete: Some(concrete),
+            traits,
+            glue,
+        })
+    }
+
     /// The drop glue of a `std::mem::drop` call's argument, mirroring
     /// the `Drop` terminator's treatment of the same type:
     /// `Ok(Some(glue))` when the argument's glue can be accounted
@@ -3826,6 +3879,40 @@ impl<'a> Converter<'a> {
                         } else {
                             None
                         };
+                        // A `From` / `Into` conversion into a
+                        // `Box<dyn Trait>`: the modelled conversion
+                        // returns the plain box aggregate, so bake
+                        // the unsizing the destination type implies
+                        // (see `from_result_unsize`); the
+                        // interpreter applies it to the result, as
+                        // it would for a coercion cast.
+                        let result_unsize = if matches!(
+                            kind,
+                            crate::builtins::Builtin::FromFrom
+                                | crate::builtins::Builtin::IntoInto
+                        ) {
+                            // The conversion's source type: `From`
+                            // renders the callee's generic arguments
+                            // as [target, source], `Into` (whose
+                            // `Self` is the source) as [source,
+                            // target].
+                            let source_ty = if matches!(
+                                kind,
+                                crate::builtins::Builtin::IntoInto
+                            ) {
+                                raw_generic_args.first()
+                            } else {
+                                raw_generic_args.get(1)
+                            };
+                            self.from_result_unsize(
+                                body,
+                                destination,
+                                args.first(),
+                                source_ty,
+                            )
+                        } else {
+                            None
+                        };
                         if unaccountable_drop {
                             ir::TerminatorKind::Unsupported(
                                 "Call to std::mem::drop (drop glue cannot be accounted for)"
@@ -3840,6 +3927,7 @@ impl<'a> Converter<'a> {
                                 target: target.map(|b| ir::BasicBlock(b.index())),
                                 drop_glue,
                                 cmp_discriminants,
+                                result_unsize,
                             }
                         }
                     } else if args.first().is_some_and(|a| {
