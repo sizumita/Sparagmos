@@ -5275,6 +5275,25 @@ impl<'a> Interpreter<'a> {
     ) -> InterpResult<Value> {
         let target = self.deref_value(frames, ref_arg)?;
         let state = self.read_resolved(frames, &target)?;
+        let (new_state, result) = self.iterator_next_state(frames, self_ty, state)?;
+        self.write_resolved(frames, &target, new_state)?;
+        Ok(result)
+    }
+
+    /// The state transition of `Iterator::next` for the modelled
+    /// iterator shapes, as a function of the iterator state value
+    /// alone: returns the successor state and the `Option` result.
+    /// `iterator_next` applies it to the state stored behind a
+    /// reference; the consumer builtins (`count`, `fold`,
+    /// `collect`, `for_each`) drive it directly over the owned
+    /// iterator value they receive, performing exactly the
+    /// sequence of `next` calls the core default bodies perform.
+    pub(crate) fn iterator_next_state(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        self_ty: &str,
+        state: Value,
+    ) -> InterpResult<(Value, Value)> {
         if self_ty.starts_with("std::sync::mpsc::Iter<") {
             // The state holds the receiver handle; iteration is
             // `recv` until the channel disconnects.
@@ -5296,8 +5315,8 @@ impl<'a> Interpreter<'a> {
                 ));
             };
             return match self.mpsc_recv(frames, id, "Iterator::next for mpsc::Iter")? {
-                Ok(value) => Ok(some_value(value)),
-                Err(()) => Ok(none_value()),
+                Ok(value) => Ok((state, some_value(value))),
+                Err(()) => Ok((state, none_value())),
             };
         }
         if self_ty.starts_with("std::sync::mpsc::IntoIter<") {
@@ -5320,8 +5339,8 @@ impl<'a> Interpreter<'a> {
                 ));
             };
             return match self.mpsc_recv(frames, id, "Iterator::next for mpsc::IntoIter")? {
-                Ok(value) => Ok(some_value(value)),
-                Err(()) => Ok(none_value()),
+                Ok(value) => Ok((state, some_value(value))),
+                Err(()) => Ok((state, none_value())),
             };
         }
         if self_ty_is(self_ty, "std::env::Args") || self_ty_is(self_ty, "std::env::ArgsOs") {
@@ -5499,8 +5518,7 @@ impl<'a> Interpreter<'a> {
             },
             _ => Value::Tuple(new_fields),
         };
-        self.write_resolved(frames, &target, new_state)?;
-        Ok(result)
+        Ok((new_state, result))
     }
 
     /// Step an iterator value to exhaustion with the

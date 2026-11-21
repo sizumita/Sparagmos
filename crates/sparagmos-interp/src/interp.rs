@@ -546,6 +546,15 @@ impl<'a> Interpreter<'a> {
         Ok(())
     }
 
+    /// Consume one step of the execution budget. Builtin loops
+    /// that drive modelled machinery without executing guest
+    /// statements (the iterator consumers) tick once per element,
+    /// so consuming an unbounded iterator still meets the step
+    /// limit instead of looping forever.
+    pub(crate) fn tick_step(&mut self) -> InterpResult<()> {
+        self.tick()
+    }
+
     fn fresh_frame_id(&mut self) -> u64 {
         let id = self.next_frame_id;
         self.next_frame_id += 1;
@@ -3206,6 +3215,47 @@ impl<'a> Interpreter<'a> {
             other => {
                 return Err(InterpError::type_mismatch(
                     "callable value",
+                    "a closure or function pointer",
+                    other.kind_name(),
+                ));
+            }
+        }
+        self.drive_frames(frames, base)
+    }
+
+    /// Call the callable denoted by `operand` (a closure or
+    /// function value in the current frame) with `args`, driving
+    /// the frame stack until the call returns, and return its
+    /// return value. The environment reference is built from the
+    /// operand exactly as for an indirect call, so a closure
+    /// place's captures are mutated in place and the mutations
+    /// persist across repeated calls — the `FnMut` semantics the
+    /// iterator consumer builtins (`fold`, `for_each`) rely on.
+    pub(crate) fn call_callable_operand_to_completion(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        body: &Body,
+        operand: &Operand,
+        args: Vec<Value>,
+    ) -> InterpResult<Value> {
+        let base = frames.len();
+        let (callee, env_ref) = self.eval_callable(&frames, body, operand)?;
+        let env_ref = match self.consumed_env_arg(frames, body, operand, &callee)? {
+            Some(by_value) => by_value,
+            None => env_ref,
+        };
+        match callee {
+            Value::Closure { def, .. } => {
+                let mut full = vec![env_ref];
+                full.extend(args);
+                self.start_call(frames, &def, full, &Place::local(Local::RETURN), None)?;
+            }
+            Value::FnPtr(name) => {
+                self.start_call(frames, &name, args, &Place::local(Local::RETURN), None)?;
+            }
+            other => {
+                return Err(InterpError::type_mismatch(
+                    "callable operand",
                     "a closure or function pointer",
                     other.kind_name(),
                 ));
