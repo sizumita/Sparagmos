@@ -296,6 +296,57 @@ pub fn convert_program(program: &MirProgram) -> Result<ir::Program, ConvertError
 /// tables stay coherent. A shared name whose bodies cannot be
 /// told apart by `DefId` — a missing id, or the same id twice —
 /// is a genuine duplicate and fails conversion as a whole.
+/// If the recorded body `f` is a closure body that the driver
+/// collected through an `Fn`-trait call instance — recognisable by
+/// its recorded name being one of the `Fn` / `FnMut` / `FnOnce`
+/// call methods (either `std::` or `core::` spelling, with or
+/// without the driver's demand-context suffix) and its first
+/// argument being the closure environment — return the `DefId` of
+/// the closure it is the body of. The driver resolves such an
+/// instance straight to the closure's body and records it under
+/// the instance's own key, so without this registration the
+/// closure's `DefId` names no body and every reference to the
+/// closure value falls back to its display name.
+///
+/// A body that is the call *shim* itself is not the closure body:
+/// it takes the environment plus the call's argument tuple as its
+/// two arguments (the second argument's type is the closure
+/// signature's input tuple) and forwards to the closure body, so
+/// it is recognised by that shape and skipped.
+fn closure_body_alias(f: &MirFunction) -> Option<mir::DefId> {
+    let base = f.name.split(" [").next().unwrap_or(&f.name);
+    if !matches!(
+        base,
+        "std::ops::Fn::call"
+            | "core::ops::Fn::call"
+            | "std::ops::FnMut::call_mut"
+            | "core::ops::FnMut::call_mut"
+            | "std::ops::FnOnce::call_once"
+            | "core::ops::FnOnce::call_once"
+    ) {
+        return None;
+    }
+    let env_ty = &f.body.local_decls.get(1)?.ty;
+    let env_ty = match env_ty {
+        mir::Ty::Ref(_, inner, _) => inner.as_ref(),
+        other => other,
+    };
+    let mir::Ty::Closure(def, args) = env_ty else {
+        return None;
+    };
+    if f.body.arg_count == 2 {
+        // The shim shape: (environment, argument tuple).
+        let sig = args.iter().find_map(|t| match t {
+            mir::Ty::FnPtr(sig) => Some(sig),
+            _ => None,
+        })?;
+        if sig.inputs.len() == 1 && sig.inputs[0] == f.body.local_decls.get(2)?.ty {
+            return None;
+        }
+    }
+    Some(*def)
+}
+
 fn program_keys(program: &MirProgram) -> Result<Vec<String>, ConvertError> {
     let mut counts: HashMap<&str, usize> = HashMap::new();
     for f in &program.functions {
@@ -1050,6 +1101,17 @@ impl<'a> Converter<'a> {
             }
             scan_body_fields(&mut adt_fields, &f.body);
             scan_body_aggregates(&mut adt_aggregates, &mut adt_fields, &f.body);
+        }
+        // A closure body collected through an `Fn`-trait call
+        // instance is recorded under the instance's key (the trait
+        // method's name), not under the closure's own `DefId`:
+        // register the closure `DefId` for that key so closure
+        // values and closure types resolve to the body (see
+        // `closure_body_alias`).
+        for (f, key) in program.functions.iter().zip(keys) {
+            if let Some(def) = closure_body_alias(f) {
+                def_names.entry(def).or_insert_with(|| key.clone());
+            }
         }
         let local_crate = program
             .functions
@@ -2661,6 +2723,39 @@ impl<'a> Converter<'a> {
                         destination: self.convert_place(destination)?,
                         target: target.map(|b| ir::BasicBlock(b.index())),
                     }
+                } else if let Some((kind, raw_generic_args)) = self
+                    .resolve_fn_trait_call(func)
+                    .filter(|_| args.len() == 2)
+                {
+                    // A call through the `Fn` / `FnMut` / `FnOnce`
+                    // trait methods — how rustc MIR calls a closure:
+                    // receiver (the callable or a reference to it)
+                    // plus the argument tuple. This interpretation
+                    // wins over the name-based resolution below: the
+                    // trait item's own name is not a reliable direct
+                    // callee, because the driver may have collected
+                    // an unrelated body under it — a closure body
+                    // reached through a `call_once` instance is
+                    // recorded under the trait method's name, with
+                    // the closure's environment as its only
+                    // parameter — and a direct call would then pass
+                    // (receiver, tuple) to a body of the wrong arity
+                    // and convention. The trait call instead
+                    // evaluates the receiver as a callable value,
+                    // which is the convention every `Fn`
+                    // implementation (closure, function item,
+                    // pointer, smart-pointer wrapper) is reached by.
+                    let receiver =
+                        self.convert_operand(body, &args[0], raw_generic_args.first())?;
+                    let tuple =
+                        self.convert_operand(body, &args[1], raw_generic_args.get(1))?;
+                    ir::TerminatorKind::CallTrait {
+                        kind,
+                        receiver,
+                        args: tuple,
+                        destination: self.convert_place(destination)?,
+                        target: target.map(|b| ir::BasicBlock(b.index())),
+                    }
                 } else if let Some(name) = self
                     .resolve_callee(func)
                     .or_else(|| self.resolve_impl_callee(func))
@@ -2675,25 +2770,6 @@ impl<'a> Converter<'a> {
                     ir::TerminatorKind::Call {
                         func: name,
                         args: ir_args,
-                        destination: self.convert_place(destination)?,
-                        target: target.map(|b| ir::BasicBlock(b.index())),
-                    }
-                } else if let Some((kind, raw_generic_args)) = self
-                    .resolve_fn_trait_call(func)
-                    .filter(|_| args.len() == 2)
-                {
-                    // A call through the `Fn` / `FnMut` / `FnOnce`
-                    // trait methods — how rustc MIR calls a closure:
-                    // receiver (the callable or a reference to it)
-                    // plus the argument tuple.
-                    let receiver =
-                        self.convert_operand(body, &args[0], raw_generic_args.first())?;
-                    let tuple =
-                        self.convert_operand(body, &args[1], raw_generic_args.get(1))?;
-                    ir::TerminatorKind::CallTrait {
-                        kind,
-                        receiver,
-                        args: tuple,
                         destination: self.convert_place(destination)?,
                         target: target.map(|b| ir::BasicBlock(b.index())),
                     }
