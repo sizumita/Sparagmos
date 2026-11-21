@@ -1742,6 +1742,95 @@ def proc_macro_extern_args(test_path, view, edition):
     return args, None
 
 
+_SYSROOT_EXTERN_CACHE = None
+_SYSROOT_RMETA_RE = re.compile(r"^lib(.+)-([0-9a-f]{16})\.(rmeta|rlib)$")
+_EXTERN_CRATE_RE = re.compile(r"\bextern\s+crate\s+([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def ambiguous_sysroot_crates():
+    """Sysroot crates with more than one rmeta candidate, mapped
+    to the candidate a link can use.
+
+    A rustup sysroot carrying the rustc-dev component holds two
+    rmetas for crates such as libc in its target lib dir: the
+    rust-std build's, paired with an rlib, and the compiler's own
+    build's, metadata only. An `extern crate` lookup then fails
+    with E0464 (multiple candidates), where the bootstrap sysroot
+    compiletest runs against holds a single candidate per crate.
+    The linkable candidate is the one whose hash also names an
+    rlib; the metadata-only candidate cannot satisfy a link
+    (rustc: "required to be available in rlib format"). Computed
+    once from the pinned toolchain's target lib dir.
+    """
+    global _SYSROOT_EXTERN_CACHE
+    if _SYSROOT_EXTERN_CACHE is None:
+        facts = host_facts()
+        if facts is None:
+            return {}
+        _SYSROOT_EXTERN_CACHE = {}
+        libdir = facts.target_lib_dir()
+        if libdir is not None:
+            try:
+                entries = os.listdir(libdir)
+            except OSError:
+                entries = []
+            by_name = {}
+            for entry in entries:
+                m = _SYSROOT_RMETA_RE.match(entry)
+                if m:
+                    by_name.setdefault(m.group(1), {}) \
+                        .setdefault(m.group(2), set()).add(m.group(3))
+            for name, hashes in by_name.items():
+                if len(hashes) < 2:
+                    continue
+                linkable = [h for h, kinds in hashes.items()
+                            if kinds == {"rmeta", "rlib"}]
+                if len(linkable) == 1:
+                    _SYSROOT_EXTERN_CACHE[name] = str(
+                        libdir / f"lib{name}-{linkable[0]}.rmeta")
+    return _SYSROOT_EXTERN_CACHE
+
+
+def sysroot_extern_args(path, flags):
+    """`--extern` arguments pinning the `extern crate` names a
+    source declares that the sysroot offers ambiguously (see
+    ambiguous_sysroot_crates).
+
+    Pinning reproduces the single-candidate lookup a bootstrap
+    sysroot gives the same source. Only names the source itself
+    declares are pinned, and only for a host-target compilation:
+    the pinned paths are the host target's. A name the flags
+    already bind with their own --extern is left to them.
+    """
+    ambiguous = ambiguous_sysroot_crates()
+    if not ambiguous:
+        return []
+    bound = set()
+    i = 0
+    while i < len(flags):
+        opt, eq, val = flags[i].partition("=")
+        if opt in ("--target", "--extern"):
+            if not eq:
+                if i + 1 >= len(flags):
+                    break
+                i += 1
+                val = flags[i]
+            if opt == "--target" and val != HOST_TARGET:
+                return []
+            if opt == "--extern":
+                bound.add(val.split("=", 1)[0].rsplit(":", 1)[-1])
+        i += 1
+    try:
+        text = Path(path).read_text(errors="ignore")
+    except OSError:
+        return []
+    args = []
+    for name in sorted(set(_EXTERN_CRATE_RE.findall(text))):
+        if name in ambiguous and name not in bound:
+            args += ["--extern", f"{name}={ambiguous[name]}"]
+    return args
+
+
 def native_side(path, edition, workdir, extra_flags=(), aux_specs=(),
                 run_args=(), run_env_extra=None, run_env_remove=()):
     """Compile and run natively. Returns (result_dict, error_reason).
@@ -1782,6 +1871,7 @@ def native_side(path, edition, workdir, extra_flags=(), aux_specs=(),
                 if prev_artifact is not None:
                     cmd += ["--extern",
                             f"{prev_binding}={prev_artifact}"]
+            cmd += sysroot_extern_args(src, ())
             cmd += [str(src)]
             build = run_cmd(cmd, timeout=NATIVE_COMPILE_TIMEOUT,
                             env_extra=BOOTSTRAP_ENV)
@@ -1806,6 +1896,7 @@ def native_side(path, edition, workdir, extra_flags=(), aux_specs=(),
         + (["-L", f"dependency={Path(workdir) / 'auxlibs'}"]
            if aux_specs else [])
         + externs
+        + sysroot_extern_args(path, extra_flags)
         + ["-o", str(binpath), str(path)] + list(extra_flags),
         timeout=NATIVE_COMPILE_TIMEOUT, env_extra=BOOTSTRAP_ENV)
     if build["timeout"]:
@@ -1848,6 +1939,7 @@ def sparagmos_side(path, edition, driver_bin, cwd=None, rustc_args=(),
     the guest runs in-process, so this is the environment
     compiletest's exec-env describes for it.
     """
+    rustc_args = list(rustc_args) + sysroot_extern_args(path, rustc_args)
     argv = [str(driver_bin), "run", str(path), "--edition", edition]
     for a in rustc_args:
         argv += ["--rustc-arg", a]
@@ -2526,6 +2618,7 @@ def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=(),
     per-revision arguments). Auxiliary crates are handed to the
     driver with `--aux`, in dependency order, as in run mode.
     """
+    rustc_args = list(rustc_args) + sysroot_extern_args(path, rustc_args)
     argv = [str(driver_bin), str(path), "--edition", edition]
     for a in rustc_args:
         argv += ["--rustc-arg", a]
