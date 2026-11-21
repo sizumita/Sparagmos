@@ -836,6 +836,66 @@ class JudgeCompileTests(unittest.TestCase):
         self.assertEqual(status, "fail")
         self.assertEqual(bucket, "timeout")
 
+    def test_failure_conversion_panic_is_unsupported_not_driver_error(self):
+        # Lane CI: a Stable MIR conversion panic on a
+        # failure-expecting test is a named conversion limit.
+        status, reason, bucket = run.judge_compile(
+            "failure", conv(
+                exit_code=1, converted=None, skipped=None,
+                conversion_panicked=True,
+                panic_reason="not implemented: FIXME(async_closures)",
+                stderr="sparagmos-driver: Stable MIR conversion "
+                       "panicked: not implemented"))
+        self.assertEqual(status, "unsupported")
+        self.assertIn("Stable MIR conversion panicked", bucket)
+        self.assertIn("async_closures", reason)
+
+    def test_success_conversion_panic_is_unsupported(self):
+        status, _r, bucket = run.judge_compile(
+            "success", conv(
+                exit_code=1, converted=None, skipped=None,
+                conversion_panicked=True,
+                panic_reason="internal error: entered unreachable code",
+                stderr="sparagmos-driver: Stable MIR conversion "
+                       "panicked: internal error"))
+        self.assertEqual(status, "unsupported")
+        self.assertIn("Stable MIR conversion panicked", bucket)
+
+    def test_panic_after_genuine_failure_stays_fail(self):
+        # A panic raised while reporting a real compilation
+        # failure (rustc's delayed-bug payloads) must not turn a
+        # success-expecting failure into "unsupported".
+        status, _r, bucket = run.judge_compile(
+            "success", conv(
+                exit_code=1, converted=None, skipped=None,
+                compilation_failed=True, conversion_panicked=True,
+                panic_reason="panic with a non-string payload",
+                stderr="error: internal compiler error\n"
+                       "sparagmos-driver: compilation failed"))
+        self.assertEqual(status, "fail")
+        self.assertIn("compilation failed", bucket)
+
+    def test_aux_failure_is_named_unsupported(self):
+        status, reason, bucket = run.judge_compile(
+            "failure", conv(
+                exit_code=1, converted=None, skipped=None,
+                aux_failure="failed to compile: error[E0463]: "
+                            "can't find crate for `minicore`"))
+        self.assertEqual(status, "unsupported")
+        self.assertEqual(bucket, "auxiliary crate build failure")
+        self.assertIn("minicore", reason)
+
+
+class ConcreteEditionTests(unittest.TestCase):
+    def test_closed_range_takes_last(self):
+        self.assertEqual(run._concrete_edition("2015..2021"), "2021")
+
+    def test_open_range_takes_first(self):
+        self.assertEqual(run._concrete_edition("2018.."), "2018")
+
+    def test_plain_edition_unchanged(self):
+        self.assertEqual(run._concrete_edition("2024"), "2024")
+
 
 class SnapshotFlagsTests(unittest.TestCase):
     def test_flags_from_siblings_and_text(self):
