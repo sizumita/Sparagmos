@@ -131,6 +131,12 @@ pub(crate) enum Resolved {
         name: String,
         projection: Vec<RefProj>,
     },
+    /// A place inside a heap allocation's storage in the
+    /// interpreter's allocation store (a `Box`'s pointee).
+    Alloc {
+        id: u64,
+        projection: Vec<RefProj>,
+    },
 }
 
 /// One spawned thread of the cooperative thread model: the
@@ -164,6 +170,28 @@ pub(crate) fn channel_handle_id(value: &Value) -> Option<u64> {
     match value {
         Value::Enum { fields, .. } if fields.len() == 1 => match &fields[0] {
             Value::Uint(id) => Some(*id as u64),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The allocation a `Box` value points at, if the value has the
+/// shape the construction builtins produce (see
+/// [`Interpreter::new_box`]): the allocation id and the
+/// projection the box's pointer itself carries (empty for a
+/// freshly built box; a pointer extracted from a box and stored
+/// on can carry one). Only a box's own field 0 is ever an
+/// allocation pointer in this model, so this shape test is
+/// exact: a one-field aggregate whose field is an allocation
+/// reference is a built box, and projecting its field 0 denotes
+/// the pointee, not the pointer slot.
+pub(crate) fn box_alloc_pointer(value: &Value) -> Option<(u64, Vec<RefProj>)> {
+    match value {
+        Value::Enum { fields, .. } if fields.len() == 1 => match &fields[0] {
+            Value::Ref(RefTarget::Alloc { id, projection }) => {
+                Some((*id, projection.clone()))
+            }
             _ => None,
         },
         _ => None,
@@ -209,6 +237,19 @@ pub struct Interpreter<'a> {
     channels: std::cell::RefCell<HashMap<u64, ChannelState>>,
     /// The id the next created channel gets.
     next_channel: std::cell::RefCell<u64>,
+    /// The program-level heap allocation store: one storage per
+    /// live `Box` allocation, keyed by the allocation id the box
+    /// value carries as its single field (see
+    /// [`RefTarget::Alloc`]). A box's pointee lives here, so the
+    /// box value itself is just the pointer: copying it copies the
+    /// id, and every copy denotes the same storage. An entry is
+    /// removed when the owning box's drop glue completes (a box
+    /// consumed by `Box::into_raw` is never dropped, so its entry
+    /// outlives the call, as a leaked allocation does). Interior-
+    /// mutable because most execution paths hold only `&self`.
+    allocs: std::cell::RefCell<HashMap<u64, Value>>,
+    /// The id the next created allocation gets.
+    next_alloc: std::cell::Cell<u64>,
 }
 
 /// The synthetic address of a pointer value (see
@@ -280,6 +321,8 @@ impl<'a> Interpreter<'a> {
             current_thread: std::cell::Cell::new(1),
             channels: std::cell::RefCell::new(HashMap::new()),
             next_channel: std::cell::RefCell::new(1),
+            allocs: std::cell::RefCell::new(HashMap::new()),
+            next_alloc: std::cell::Cell::new(1),
         }
     }
 
@@ -710,6 +753,9 @@ impl<'a> Interpreter<'a> {
                                     Resolved::Static { name, projection } => {
                                         RefTarget::Static { name, projection }
                                     }
+                                    Resolved::Alloc { id, projection } => {
+                                        RefTarget::Alloc { id, projection }
+                                    }
                                     Resolved::Value(_) => {
                                         return Err(InterpError::type_mismatch(
                                             "std::mem::drop",
@@ -766,6 +812,10 @@ impl<'a> Interpreter<'a> {
                         } => RefTarget::place(frames[frame_pos].id, local, projection),
                         Resolved::Static { name, projection } => RefTarget::Static {
                             name,
+                            projection,
+                        },
+                        Resolved::Alloc { id, projection } => RefTarget::Alloc {
+                            id,
                             projection,
                         },
                         Resolved::Value(value) => {
@@ -1229,6 +1279,9 @@ impl<'a> Interpreter<'a> {
                     Resolved::Static { name, projection } => {
                         Ok(Value::Ref(RefTarget::Static { name, projection }))
                     }
+                    Resolved::Alloc { id, projection } => {
+                        Ok(Value::Ref(RefTarget::Alloc { id, projection }))
+                    }
                 }
             }
             Operand::Constant(_) => Ok(Value::Ref(RefTarget::Value(Box::new(value.clone())))),
@@ -1299,6 +1352,52 @@ impl<'a> Interpreter<'a> {
         root: &RefTarget,
         path: &[RefProj],
     ) -> InterpResult<Option<Value>> {
+        let Some(value) = self.read_at_raw(frames, root, path)? else {
+            return Ok(None);
+        };
+        // A path that ends on a box's field 0 denotes the pointee
+        // (drop plans address a box's contents through its field
+        // 0), and the value stored there is the box's allocation
+        // pointer: follow it to the pointee itself.
+        self.follow_alloc(value)
+    }
+
+    /// Follow a value that is a box's allocation pointer to the
+    /// pointee it denotes; any other value passes through. A
+    /// freed allocation reads as nothing (no drop glue is left
+    /// to read in it), as a null pointer does in `read_at`.
+    fn follow_alloc(&self, value: Value) -> InterpResult<Option<Value>> {
+        match value {
+            Value::Ref(RefTarget::Alloc { id, projection }) => {
+                let Ok(base) = self.alloc_base(id) else {
+                    return Ok(None);
+                };
+                if base == Value::Uninit {
+                    return Ok(None);
+                }
+                match project_value(base, &projection, "<drop>", "drop glue") {
+                    Ok(v) if v == Value::Uninit => Ok(None),
+                    Ok(v) => Ok(Some(v)),
+                    Err(InterpError::UninitializedRead { .. }) => Ok(None),
+                    Err(e) => Err(e),
+                }
+            }
+            other => Ok(Some(other)),
+        }
+    }
+
+    /// The value at `root` + `path` for drop glue, without
+    /// following a box's allocation pointer the path ends on
+    /// (see `read_at`): a path that crosses a box's field 0
+    /// mid-way still applies its remaining steps inside the
+    /// allocation, because the crossed step denotes the pointee,
+    /// not the pointer slot.
+    fn read_at_raw(
+        &self,
+        frames: &[Frame],
+        root: &RefTarget,
+        path: &[RefProj],
+    ) -> InterpResult<Option<Value>> {
         let (base, prefix): (Value, &[RefProj]) = match root {
             RefTarget::Place {
                 frame,
@@ -1330,6 +1429,14 @@ impl<'a> Interpreter<'a> {
             }
             RefTarget::Value(v) => ((**v).clone(), &[]),
             RefTarget::Static { name, projection } => (self.static_base(name)?, projection),
+            RefTarget::Alloc { id, projection } => {
+                // A freed allocation holds nothing to read glue
+                // from, as with a null pointer below.
+                let Ok(base) = self.alloc_base(*id) else {
+                    return Ok(None);
+                };
+                (base, projection)
+            }
             // A null pointer denotes nothing; there is no drop
             // glue to read through it.
             RefTarget::Null => return Ok(None),
@@ -1341,6 +1448,13 @@ impl<'a> Interpreter<'a> {
         for step in prefix.iter().chain(path.iter()) {
             if value == Value::Uninit {
                 return Ok(None);
+            }
+            // A previous step crossed a box's field 0: the value
+            // here is the box's allocation pointer and this step
+            // applies inside the allocation.
+            match self.follow_alloc(value)? {
+                Some(v) => value = v,
+                None => return Ok(None),
             }
             match project_value(value, std::slice::from_ref(step), "<drop>", "drop glue") {
                 Ok(v) => value = v,
@@ -1356,40 +1470,75 @@ impl<'a> Interpreter<'a> {
     }
 
     /// A reference to `root` + `path`, for a destructor call.
-    fn extend_ref(&self, root: &RefTarget, path: &[RefProj]) -> InterpResult<RefTarget> {
-        match root {
-            RefTarget::Place {
-                frame,
-                local,
-                projection,
-            } => {
-                let mut projection = projection.clone();
-                projection.extend(path.iter().cloned());
-                Ok(RefTarget::place(*frame, *local, projection))
+    /// The path is walked one step at a time: a step that lands
+    /// on a box's allocation pointer crosses into the allocation
+    /// (the step denotes the pointee, as in `read_at`), so the
+    /// destructor's `&mut self` names the pointee's storage, not
+    /// the pointer slot inside a copy of the box. A step whose
+    /// landing value cannot be read (a never-written place the
+    /// glue gate let through) keeps the symbolic projection, as
+    /// before.
+    fn extend_ref(
+        &self,
+        frames: &[Frame],
+        root: &RefTarget,
+        path: &[RefProj],
+    ) -> InterpResult<RefTarget> {
+        let mut cur = root.clone();
+        for step in path {
+            let landed = self
+                .read_at_raw(frames, &cur, std::slice::from_ref(step))
+                .ok()
+                .flatten();
+            if let Some(Value::Ref(RefTarget::Alloc { id, projection })) = landed {
+                cur = RefTarget::Alloc { id, projection };
+                continue;
             }
-            RefTarget::Value(v) => {
-                let projected = project_value((**v).clone(), path, "<drop>", "drop glue")?;
-                Ok(RefTarget::Value(Box::new(projected)))
-            }
-            RefTarget::Static { name, projection } => {
-                let mut projection = projection.clone();
-                projection.extend(path.iter().cloned());
-                Ok(RefTarget::Static {
-                    name: name.clone(),
-                    projection,
-                })
-            }
-            RefTarget::Null => Err(InterpError::type_mismatch(
-                "drop glue reference",
-                "a valid reference",
-                "null pointer",
-            )),
-            RefTarget::Address(_) => Err(InterpError::type_mismatch(
-                "drop glue reference",
-                "a valid reference",
-                "address-only pointer",
-            )),
+            cur = match cur {
+                RefTarget::Place {
+                    frame,
+                    local,
+                    mut projection,
+                } => {
+                    projection.push(step.clone());
+                    RefTarget::place(frame, local, projection)
+                }
+                RefTarget::Value(v) => {
+                    let projected =
+                        project_value(*v, std::slice::from_ref(step), "<drop>", "drop glue")?;
+                    RefTarget::Value(Box::new(projected))
+                }
+                RefTarget::Static {
+                    name,
+                    mut projection,
+                } => {
+                    projection.push(step.clone());
+                    RefTarget::Static { name, projection }
+                }
+                RefTarget::Alloc {
+                    id,
+                    mut projection,
+                } => {
+                    projection.push(step.clone());
+                    RefTarget::Alloc { id, projection }
+                }
+                RefTarget::Null => {
+                    return Err(InterpError::type_mismatch(
+                        "drop glue reference",
+                        "a valid reference",
+                        "null pointer",
+                    ))
+                }
+                RefTarget::Address(_) => {
+                    return Err(InterpError::type_mismatch(
+                        "drop glue reference",
+                        "a valid reference",
+                        "address-only pointer",
+                    ))
+                }
+            };
         }
+        Ok(cur)
     }
 
     /// Execute drop glue: process `work` until it is empty or a
@@ -1660,6 +1809,19 @@ impl<'a> Interpreter<'a> {
                         // data pointer itself for a pointer-shaped
                         // base.
                         let pointee_root = match &*base {
+                            // A built box's single field is its
+                            // allocation pointer: the pointee lives
+                            // in the allocation store, behind that
+                            // very reference.
+                            Value::Enum { fields, .. }
+                                if fields.len() == 1
+                                    && matches!(fields[0], Value::Ref(_)) =>
+                            {
+                                match &fields[0] {
+                                    Value::Ref(target) => target.clone(),
+                                    _ => unreachable!("field shape checked"),
+                                }
+                            }
                             Value::Enum { fields, .. } if fields.len() == 1 => {
                                 RefTarget::Value(Box::new(fields[0].clone()))
                             }
@@ -1702,7 +1864,7 @@ impl<'a> Interpreter<'a> {
                                 format!("{} argument(s)", callee.arg_count),
                             ));
                         }
-                        let target_ref = self.extend_ref(&active.root, &path)?;
+                        let target_ref = self.extend_ref(frames, &active.root, &path)?;
                         let mut locals = vec![Value::Uninit; callee.local_count()];
                         locals[1] = Value::Ref(target_ref);
                         let frame_id = self.fresh_frame_id();
@@ -1730,6 +1892,20 @@ impl<'a> Interpreter<'a> {
                     // Glue finished: the dropped place is dead, as in
                     // MIR. A direct local of the owner frame is
                     // cleared.
+                    // A dropped box's allocation is freed with it:
+                    // the pointee's glue has run, and the storage
+                    // the box pointed at is gone, as a real free
+                    // makes it. (A box nested inside a larger
+                    // dropped value is reached as a work item of
+                    // that value's session, not as a session root;
+                    // its allocation entry is left in the store —
+                    // ids are never reused, so nothing can observe
+                    // the difference within a run.)
+                    if let Ok(Some(value)) = self.read_at(frames, &active.root, &[]) {
+                        if let Some((id, _)) = box_alloc_pointer(&value) {
+                            self.free_alloc(id);
+                        }
+                    }
                     if let RefTarget::Place {
                         frame,
                         local,
@@ -2020,6 +2196,56 @@ impl<'a> Interpreter<'a> {
             .ok_or_else(|| self.missing_static(name))
     }
 
+    /// The error for naming an allocation the store no longer
+    /// holds (its owning box was dropped, or the id never named
+    /// an allocation of this run).
+    fn missing_alloc(&self, id: u64) -> InterpError {
+        InterpError::type_mismatch(
+            "dereference",
+            "reference into a live allocation",
+            format!("reference into freed allocation #{id}"),
+        )
+    }
+
+    /// Allocate `pointee` in the allocation store and return the
+    /// `Box` value denoting it: the one-field aggregate whose
+    /// single field is the allocation pointer (see
+    /// [`RefTarget::Alloc`]). This is the only shape the `Box`
+    /// construction builtins produce; a box built from its MIR
+    /// aggregates instead carries the `Unique`/`NonNull` wrapper
+    /// chain above a pointer value.
+    pub(crate) fn new_box(&self, pointee: Value) -> Value {
+        let id = self.next_alloc.get();
+        self.next_alloc.set(id + 1);
+        self.allocs.borrow_mut().insert(id, pointee);
+        Value::Enum {
+            variant: 0,
+            fields: vec![Value::Ref(RefTarget::Alloc {
+                id,
+                projection: Vec::new(),
+            })],
+        }
+    }
+
+    /// The current contents of allocation `id` (a clone; the
+    /// store is the shared storage, so writes go through
+    /// `write_resolved`, never through this copy).
+    fn alloc_base(&self, id: u64) -> InterpResult<Value> {
+        self.allocs
+            .borrow()
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| self.missing_alloc(id))
+    }
+
+    /// Remove allocation `id` from the store (its owning box's
+    /// drop glue has completed). Removing an id that is not
+    /// present is not an error: glue also runs for places whose
+    /// box was fabricated rather than allocated.
+    fn free_alloc(&self, id: u64) {
+        self.allocs.borrow_mut().remove(&id);
+    }
+
     /// Set the discriminant of the ADT value `value` to `variant`,
     /// as a `SetDiscriminant` statement does: a coroutine keeps its
     /// state fields (they are the shared storage the transform
@@ -2107,6 +2333,16 @@ impl<'a> Interpreter<'a> {
                             .ok_or_else(|| self.missing_static(&name))?;
                         let place_desc = format!("static {name}");
                         let value = navigate_mut(slot, &projection, "<static>", &place_desc)?;
+                        Self::set_discriminant_value(value, *variant, place)
+                    }
+                    Resolved::Alloc { id, projection } => {
+                        let mut store = self.allocs.borrow_mut();
+                        let slot = store
+                            .get_mut(&id)
+                            .ok_or_else(|| self.missing_alloc(id))?;
+                        let place_desc = format!("allocation #{id}");
+                        let value =
+                            navigate_mut(slot, &projection, "<allocation>", &place_desc)?;
                         Self::set_discriminant_value(value, *variant, place)
                     }
                     Resolved::Value(_) => Err(InterpError::type_mismatch(
@@ -2284,6 +2520,31 @@ impl<'a> Interpreter<'a> {
             _ => return None,
         };
         let operand_target = self.resolve_place(frames, body, place).ok()?;
+        // A built box (see `Interpreter::new_box`) holds its
+        // pointee in the allocation store, not in the aggregate:
+        // when the operand value is the box aggregate itself, or
+        // the allocation pointer stored in its field 0 (or in a
+        // one-field pointer wrapper above it), the pointee place
+        // is the allocation itself. Naming the allocation keeps
+        // the extracted pointer valid after this frame is gone
+        // and makes every copy of the box extract the same
+        // pointer — the two properties of a real heap pointer
+        // this cast exists to expose.
+        if let Ok(value) = self.read_resolved(frames, &operand_target) {
+            let alloc = box_alloc_pointer(&value).or_else(|| match &value {
+                Value::Ref(RefTarget::Alloc { id, projection }) => {
+                    Some((*id, projection.clone()))
+                }
+                _ => None,
+            });
+            if let Some((id, projection)) = alloc {
+                return Some((
+                    operand_target,
+                    Resolved::Alloc { id, projection },
+                    depth,
+                ));
+            }
+        }
         let Resolved::Place {
             frame_pos,
             local,
@@ -2322,6 +2583,10 @@ impl<'a> Interpreter<'a> {
             }
             Resolved::Static { name, projection } => Value::Ref(RefTarget::Static {
                 name: name.clone(),
+                projection: projection.clone(),
+            }),
+            Resolved::Alloc { id, projection } => Value::Ref(RefTarget::Alloc {
+                id: *id,
                 projection: projection.clone(),
             }),
         }
@@ -2420,6 +2685,13 @@ impl<'a> Interpreter<'a> {
                 projection.push(step);
                 Ok(Resolved::Static { name, projection })
             }
+            Resolved::Alloc {
+                id,
+                mut projection,
+            } => {
+                projection.push(step);
+                Ok(Resolved::Alloc { id, projection })
+            }
         }
     }
 
@@ -2483,6 +2755,10 @@ impl<'a> Interpreter<'a> {
                 name: name.clone(),
                 projection: projection.clone(),
             }),
+            Value::Ref(RefTarget::Alloc { id, projection }) => Ok(Resolved::Alloc {
+                id: *id,
+                projection: projection.clone(),
+            }),
             Value::Ref(RefTarget::Null) => Err(InterpError::type_mismatch(
                 "dereference",
                 "reference",
@@ -2513,11 +2789,39 @@ impl<'a> Interpreter<'a> {
             // a box base (the box aggregate itself — exactly what
             // `Deref::deref` for `Box` yields).
             Value::DynRef { base, .. } => match &**base {
+                // A built box base: its single field is the
+                // allocation pointer, and the pointee lives in
+                // the allocation store behind it.
+                Value::Enum { fields, .. }
+                    if fields.len() == 1
+                        && matches!(fields[0], Value::Ref(RefTarget::Alloc { .. })) =>
+                {
+                    self.deref_value(frames, &fields[0])
+                }
                 Value::Enum { fields, .. } if fields.len() == 1 => {
                     Ok(Resolved::Value(fields[0].clone()))
                 }
                 _ => self.deref_value(frames, base),
             },
+            // Dereferencing a built box value itself (or a
+            // one-field pointer wrapper holding an allocation
+            // pointer, such as a `NonNull` extracted from a built
+            // box) reaches the allocation's storage: the field is
+            // the pointer, and the pointee lives behind it.
+            Value::Enum { fields, .. }
+                if fields.len() == 1
+                    && matches!(fields[0], Value::Ref(RefTarget::Alloc { .. })) =>
+            {
+                match &fields[0] {
+                    Value::Ref(RefTarget::Alloc { id, projection }) => {
+                        Ok(Resolved::Alloc {
+                            id: *id,
+                            projection: projection.clone(),
+                        })
+                    }
+                    _ => unreachable!("field shape checked by the guard"),
+                }
+            }
             other => Err(InterpError::type_mismatch(
                 "dereference",
                 "reference",
@@ -2558,6 +2862,13 @@ impl<'a> Interpreter<'a> {
             }) => {
                 projection.push(RefProj::Field(0));
                 Ok(Value::Ref(RefTarget::Static { name, projection }))
+            }
+            Value::Ref(RefTarget::Alloc {
+                id,
+                mut projection,
+            }) => {
+                projection.push(RefProj::Field(0));
+                Ok(Value::Ref(RefTarget::Alloc { id, projection }))
             }
             Value::Ref(RefTarget::Value(v)) => {
                 let inner = project_value(
@@ -2613,6 +2924,22 @@ impl<'a> Interpreter<'a> {
                     .map(|f| f.func.clone())
                     .unwrap_or_else(|| "<static>".to_string());
                 let place_desc = format!("static {name}");
+                let value = project_value(base, projection, &func, &place_desc)?;
+                if value == Value::Uninit {
+                    return Err(InterpError::UninitializedRead {
+                        func,
+                        place: place_desc,
+                    });
+                }
+                Ok(value)
+            }
+            Resolved::Alloc { id, projection } => {
+                let base = self.alloc_base(*id)?;
+                let func = frames
+                    .last()
+                    .map(|f| f.func.clone())
+                    .unwrap_or_else(|| "<allocation>".to_string());
+                let place_desc = format!("allocation #{id}");
                 let value = project_value(base, projection, &func, &place_desc)?;
                 if value == Value::Uninit {
                     return Err(InterpError::UninitializedRead {
@@ -2744,6 +3071,20 @@ impl<'a> Interpreter<'a> {
                 *slot = value;
                 Ok(())
             }
+            Resolved::Alloc { id, projection } => {
+                let mut store = self.allocs.borrow_mut();
+                let slot = store
+                    .get_mut(id)
+                    .ok_or_else(|| self.missing_alloc(*id))?;
+                if projection.is_empty() {
+                    *slot = value;
+                    return Ok(());
+                }
+                let place_desc = format!("allocation #{id}");
+                let slot = navigate_mut(slot, projection, "<allocation>", &place_desc)?;
+                *slot = value;
+                Ok(())
+            }
             Resolved::Place {
                 frame_pos,
                 local,
@@ -2818,6 +3159,17 @@ impl<'a> Interpreter<'a> {
                     },
                 )
             }
+            Resolved::Alloc { id, projection } => {
+                let mut projection = projection.clone();
+                projection.push(RefProj::Index(index));
+                self.read_resolved(
+                    frames,
+                    &Resolved::Alloc {
+                        id: *id,
+                        projection,
+                    },
+                )
+            }
             Resolved::Value(value) => project_value(
                 value.clone(),
                 &[RefProj::Index(index)],
@@ -2867,6 +3219,18 @@ impl<'a> Interpreter<'a> {
                     value,
                 )
             }
+            Resolved::Alloc { id, projection } => {
+                let mut projection = projection.clone();
+                projection.push(RefProj::Index(index));
+                self.write_resolved(
+                    frames,
+                    &Resolved::Alloc {
+                        id: *id,
+                        projection,
+                    },
+                    value,
+                )
+            }
             Resolved::Value(_) => self.write_resolved(frames, target, value),
         }
     }
@@ -2878,9 +3242,11 @@ impl<'a> Interpreter<'a> {
     /// unsupported error, never a silent no-op.
     pub(crate) fn refcell_place(&self, value: &Value, name: &str) -> InterpResult<RefTarget> {
         match value {
-            Value::Ref(target @ (RefTarget::Place { .. } | RefTarget::Static { .. })) => {
-                Ok(target.clone())
-            }
+            Value::Ref(
+                target @ (RefTarget::Place { .. }
+                | RefTarget::Static { .. }
+                | RefTarget::Alloc { .. }),
+            ) => Ok(target.clone()),
             Value::Ref(_) => Err(InterpError::UnsupportedTerminator {
                 kind: format!(
                     "runtime support: {name} on a RefCell with no live place \
@@ -3097,6 +3463,14 @@ impl<'a> Interpreter<'a> {
             // ADT locals hold the ADT value forms: aggregates, string
             // data (`String`), and the fmt value family.
             (Some(Ty::Adt(_)), Value::Enum { .. })
+            // A pointer-shaped ADT local (`Unique`, `NonNull`, a
+            // `Box` field slot) can hold a built box's allocation
+            // pointer directly: MIR moves the pointer between
+            // these wrapper locals verbatim (a box's field 0 read
+            // into a `Unique` local is the first step of every
+            // `Box::into_raw`), and the pointer is the value each
+            // of them denotes in this model.
+            | (Some(Ty::Adt(_)), Value::Ref(RefTarget::Alloc { .. }))
             | (Some(Ty::Adt(_)), Value::Str(_))
             // A smart-pointer ADT over a `dyn` pointee (`Box<dyn
             // Trait>`, `Rc<dyn Trait>`) holds the fat pointer.
@@ -3189,6 +3563,22 @@ impl<'a> Interpreter<'a> {
             }),
             Value::Enum { variant, mut fields } if fields.len() == 1 => {
                 let pointee = fields.pop().expect("one field");
+                // A built box's field is its allocation pointer:
+                // the array already lives in the allocation store
+                // under that pointer, and unsizing is only a view
+                // of it — every consumer derives the slice length
+                // from the pointee value in the store. The box
+                // keeps its shape (rewrapping the pointer into a
+                // fat reference here would leave the box holding
+                // a snapshot view instead of the pointer, and a
+                // pointer extracted from it later would name this
+                // place rather than the allocation).
+                if matches!(pointee, Value::Ref(RefTarget::Alloc { .. })) {
+                    return Ok(Value::Enum {
+                        variant,
+                        fields: vec![pointee],
+                    });
+                }
                 let fat = self.unsize_to_slice(frames, pointee)?;
                 Ok(Value::Enum {
                     variant,
@@ -3631,7 +4021,17 @@ impl<'a> Interpreter<'a> {
                                             projection,
                                         }));
                                     }
-                                    Resolved::Place { .. } | Resolved::Static { .. } => {}
+                                    Resolved::Alloc { id, projection }
+                                        if !projection.is_empty() =>
+                                    {
+                                        break Ok(Value::Ref(RefTarget::Alloc {
+                                            id,
+                                            projection,
+                                        }));
+                                    }
+                                    Resolved::Place { .. }
+                                    | Resolved::Static { .. }
+                                    | Resolved::Alloc { .. } => {}
                                 }
                             }
                             break Err(InterpError::type_mismatch(
@@ -3696,6 +4096,9 @@ impl<'a> Interpreter<'a> {
                     Resolved::Value(value) => Value::Ref(RefTarget::Value(Box::new(value))),
                     Resolved::Static { name, projection } => {
                         Value::Ref(RefTarget::Static { name, projection })
+                    }
+                    Resolved::Alloc { id, projection } => {
+                        Value::Ref(RefTarget::Alloc { id, projection })
                     }
                 };
                 match fat_len {
@@ -4677,6 +5080,23 @@ fn synthetic_addr(v: &Value) -> u128 {
                 mix(&mut h, n);
             }
         }
+        Value::Ref(RefTarget::Alloc { id, projection }) => {
+            // An allocation's address identity is its id: every
+            // copy of the box that owns it, and every pointer
+            // extracted from any of them, yields this same
+            // address, while distinct allocations differ.
+            mix(&mut h, 0xa110_ca7e_a110_ca7e);
+            mix(&mut h, *id as u128);
+            for step in projection {
+                let (tag, n) = match step {
+                    RefProj::Field(i) => (1u128, *i as u128),
+                    RefProj::Index(i) => (2u128, *i as u128),
+                    RefProj::Downcast(i) => (3u128, *i as u128),
+                };
+                mix(&mut h, tag);
+                mix(&mut h, n);
+            }
+        }
         Value::FatRef { base, .. } => {
             return synthetic_addr(base);
         }
@@ -4866,6 +5286,14 @@ pub(crate) fn refcell_sub_target(cell: &RefTarget, path: &[RefProj]) -> RefTarge
             projection.extend_from_slice(path);
             RefTarget::Static {
                 name: name.clone(),
+                projection,
+            }
+        }
+        RefTarget::Alloc { id, projection } => {
+            let mut projection = projection.clone();
+            projection.extend_from_slice(path);
+            RefTarget::Alloc {
+                id: *id,
                 projection,
             }
         }
