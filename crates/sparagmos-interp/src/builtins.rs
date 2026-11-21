@@ -1823,8 +1823,15 @@ impl<'a> Interpreter<'a> {
                 {
                     // The same one-field aggregate as `Box::new`
                     // in this model: `deref` yields a reference to
-                    // the held value.
+                    // the held value. An `Rc<dyn Trait>` /
+                    // `Arc<dyn Trait>` is the fat pointer itself,
+                    // as for `Box<dyn Trait>`, and dereferencing it
+                    // yields that pointer — the `&dyn` the trait
+                    // methods dispatch through.
                     let pointee = self.resolve_value(frames, &vals[0])?;
+                    if let Value::DynRef { .. } = pointee {
+                        return Ok(pointee);
+                    }
                     match pointee {
                         Value::Enum { fields, .. } if fields.len() == 1 => {
                             let inner = fields.into_iter().next().expect("len checked");
