@@ -1094,19 +1094,7 @@ impl<'a> Interpreter<'a> {
                         .get(&impl_func)
                         .and_then(|b| b.local_tys.get(1))
                     {
-                        Some(Ty::Ref(..)) => match receiver {
-                            Value::Enum { fields, .. } if fields.len() == 1 => {
-                                Value::Ref(RefTarget::Value(Box::new(
-                                    fields.into_iter().next().expect("one field"),
-                                )))
-                            }
-                            other @ (Value::Ref(_)
-                            | Value::FatRef { .. }
-                            | Value::DynRef { .. }) => other,
-                            other => {
-                                Value::Ref(RefTarget::Value(Box::new(other)))
-                            }
-                        },
+                        Some(Ty::Ref(..)) => ref_shaped_receiver(receiver),
                         _ => receiver,
                     };
                     let mut args = arg_values;
@@ -1168,17 +1156,7 @@ impl<'a> Interpreter<'a> {
                         .get(&impl_func)
                         .and_then(|b| b.local_tys.get(1))
                     {
-                        Some(Ty::Ref(..)) => match receiver {
-                            Value::Enum { fields, .. } if fields.len() == 1 => {
-                                Value::Ref(RefTarget::Value(Box::new(
-                                    fields.into_iter().next().expect("one field"),
-                                )))
-                            }
-                            other @ (Value::Ref(_)
-                            | Value::FatRef { .. }
-                            | Value::DynRef { .. }) => other,
-                            other => Value::Ref(RefTarget::Value(Box::new(other))),
-                        },
+                        Some(Ty::Ref(..)) => ref_shaped_receiver(receiver),
                         _ => receiver,
                     };
                     let mut args = arg_values;
@@ -1390,17 +1368,7 @@ impl<'a> Interpreter<'a> {
         let receiver = if wants_ref {
             match env_ref {
                 Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. } => env_ref,
-                _ => match callable {
-                    Value::Enum { fields, .. } if fields.len() == 1 => {
-                        Value::Ref(RefTarget::Value(Box::new(
-                            fields.into_iter().next().expect("one field"),
-                        )))
-                    }
-                    other @ (Value::Ref(_)
-                    | Value::FatRef { .. }
-                    | Value::DynRef { .. }) => other,
-                    other => Value::Ref(RefTarget::Value(Box::new(other))),
-                },
+                _ => ref_shaped_receiver(callable),
             }
         } else {
             callable
@@ -5565,6 +5533,32 @@ fn value_holds_callable(v: &Value) -> bool {
         Value::Tuple(items) => items.iter().any(value_holds_callable),
         Value::Enum { fields, .. } => fields.iter().any(value_holds_callable),
         _ => false,
+    }
+}
+
+/// Shape a dyn call's data pointer into the reference an impl
+/// body's reference-typed `self` expects. A reference, fat or dyn
+/// pointer already denotes the pointee and passes through as it
+/// is. A one-field smart-pointer wrapper (a built `Box`
+/// aggregate) denotes the pointee through its only field: when
+/// that field is itself a pointer — an allocation pointer for a
+/// built box, or any reference-shaped value — the field *is* the
+/// reference to the pointee, and wrapping it in a value reference
+/// instead would make the callee's deref yield the pointer itself,
+/// with every further field projection then failing on a
+/// reference where an aggregate belongs. A plain field value, and
+/// any other bare value, is referenced as a value.
+fn ref_shaped_receiver(value: Value) -> Value {
+    match value {
+        Value::Enum { fields, .. } if fields.len() == 1 => {
+            let field = fields.into_iter().next().expect("one field");
+            match field {
+                Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. } => field,
+                field => Value::Ref(RefTarget::Value(Box::new(field))),
+            }
+        }
+        other @ (Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. }) => other,
+        other => Value::Ref(RefTarget::Value(Box::new(other))),
     }
 }
 
