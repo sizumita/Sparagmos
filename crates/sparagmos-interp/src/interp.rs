@@ -571,6 +571,7 @@ impl<'a> Interpreter<'a> {
         frames: &mut Vec<Frame>,
         stop_depth: usize,
     ) -> InterpResult<Value> {
+        let program: &'a Program = self.program;
         loop {
             match self.drive_loop(frames, stop_depth) {
                 Ok(value) => return Ok(value),
@@ -610,9 +611,8 @@ impl<'a> Interpreter<'a> {
                                 ),
                             });
                         }
-                        let body = self.program.get(&func).cloned();
+                        let body = program.get(&func);
                         let action = body
-                            .as_ref()
                             .map(|b| b.unwind_action(block))
                             .unwrap_or(crate::ir::UnwindAction::Continue);
                         match action {
@@ -627,7 +627,7 @@ impl<'a> Interpreter<'a> {
                                 let frame = frames.last_mut().expect("frame");
                                 frame.unwind_payload = Some((message, payload));
                                 frame.in_cleanup = true;
-                                Self::jump(frames, &body, target)?;
+                                Self::jump(frames, body, target)?;
                                 break;
                             }
                             crate::ir::UnwindAction::Continue => {
@@ -691,24 +691,34 @@ impl<'a> Interpreter<'a> {
         mut frames: &mut Vec<Frame>,
         stop_depth: usize,
     ) -> InterpResult<Value> {
+        // The current frame's body, borrowed from the program for
+        // the whole step: bodies never change during a run, so the
+        // loop resolves the top frame's body once per frame switch
+        // (keyed by the frame's unique id; a frame's function never
+        // changes over its life) and borrows the current statement
+        // and terminator from it, instead of cloning the body — and
+        // with it every statement, type and operand it holds — on
+        // every step.
+        let program: &'a Program = self.program;
+        let mut cached: Option<(u64, &Body)> = None;
+        let mut func_name = String::new();
         loop {
-            // Fetch the current block's next unit of work, cloning the small
-            // pieces we need so the frame stack can be mutated freely after.
-            let (func_name, block_idx, stmt_idx) = {
+            let (block_idx, stmt_idx) = {
                 let frame = frames
                     .last()
                     .expect("frame stack is non-empty while running");
-                (frame.func.clone(), frame.block, frame.stmt)
-            };
-            // Clone the body for this iteration: the oracle favours clarity
-            // over speed, and owning the body lets the frame stack and the
-            // step counter be mutated without borrow conflicts.
-            let body = self.program.get(&func_name).cloned().ok_or_else(|| {
-                InterpError::UnknownFunction {
-                    name: func_name.clone(),
+                if cached.map(|(id, _)| id) != Some(frame.id) {
+                    func_name = frame.func.clone();
+                    let resolved = program.get(&func_name).ok_or_else(|| {
+                        InterpError::UnknownFunction {
+                            name: func_name.clone(),
+                        }
+                    })?;
+                    cached = Some((frame.id, resolved));
                 }
-            })?;
-            let body = &body;
+                (frame.block, frame.stmt)
+            };
+            let body = cached.expect("current frame body resolved").1;
             let block = body
                 .blocks
                 .get(block_idx)
@@ -718,28 +728,28 @@ impl<'a> Interpreter<'a> {
                 })?;
 
             if stmt_idx < block.statements.len() {
-                let statement = block.statements[stmt_idx].clone();
+                let statement = &block.statements[stmt_idx];
                 // Advance the program counter before executing, so a call
                 // (not possible in a statement) or an error leaves sane state.
                 frames.last_mut().expect("frame").stmt += 1;
                 self.tick()?;
-                self.exec_statement(frames, body, &statement)?;
+                self.exec_statement(frames, body, statement)?;
                 continue;
             }
 
             // Terminator.
-            let terminator = block.terminator.clone();
+            let terminator = &block.terminator;
             self.tick()?;
             match terminator {
                 TerminatorKind::Goto { target } => {
-                    Self::jump(frames, body, target)?;
+                    Self::jump(frames, body, *target)?;
                 }
                 TerminatorKind::SwitchInt {
                     discr,
                     targets,
                     otherwise,
                 } => {
-                    let value = self.eval_operand(frames, body, &discr)?;
+                    let value = self.eval_operand(frames, body, discr)?;
                     let bits = value.switch_bits().ok_or_else(|| {
                         InterpError::type_mismatch(
                             "SwitchInt discriminant",
@@ -751,7 +761,7 @@ impl<'a> Interpreter<'a> {
                         .iter()
                         .find(|(pattern, _)| *pattern == bits)
                         .map(|(_, bb)| *bb)
-                        .unwrap_or(otherwise);
+                        .unwrap_or(*otherwise);
                     Self::jump(frames, body, target)?;
                 }
                 TerminatorKind::Call {
@@ -761,10 +771,10 @@ impl<'a> Interpreter<'a> {
                     target,
                 } => {
                     let mut arg_values = Vec::with_capacity(args.len());
-                    for arg in &args {
+                    for arg in args {
                         arg_values.push(self.eval_operand(frames, body, arg)?);
                     }
-                    self.start_call(frames, &func, arg_values, &destination, target)?;
+                    self.start_call(frames, func, arg_values, destination, *target)?;
                 }
                 TerminatorKind::CallIndirect {
                     func,
@@ -778,13 +788,13 @@ impl<'a> Interpreter<'a> {
                     // body that takes its environment by value (an
                     // `FnOnce` closure's own body) gets the value
                     // itself instead (see `consumed_env_arg`).
-                    let (callee, env_ref) = self.eval_callable(&frames, body, &func)?;
-                    let env_ref = match self.consumed_env_arg(frames, body, &func, &callee)? {
+                    let (callee, env_ref) = self.eval_callable(&frames, body, func)?;
+                    let env_ref = match self.consumed_env_arg(frames, body, func, &callee)? {
                         Some(by_value) => by_value,
                         None => env_ref,
                     };
                     let mut arg_values = Vec::with_capacity(args.len());
-                    for arg in &args {
+                    for arg in args {
                         arg_values.push(self.eval_operand(frames, body, arg)?);
                     }
                     match callee {
@@ -793,14 +803,14 @@ impl<'a> Interpreter<'a> {
                                 frames,
                                 &name,
                                 arg_values,
-                                &destination,
-                                target,
+                                destination,
+                                *target,
                             )?;
                         }
                         Value::Closure { def, .. } => {
                             let mut full = vec![env_ref];
                             full.extend(arg_values);
-                            self.start_call(frames, &def, full, &destination, target)?;
+                            self.start_call(frames, &def, full, destination, *target)?;
                         }
                         other => {
                             return Err(InterpError::type_mismatch(
@@ -818,7 +828,7 @@ impl<'a> Interpreter<'a> {
                     destination,
                     target,
                 } => {
-                    let args_value = self.eval_operand(frames, body, &args)?;
+                    let args_value = self.eval_operand(frames, body, args)?;
                     let arg_values = match args_value {
                         Value::Tuple(items) => items,
                         Value::Unit => Vec::new(),
@@ -851,7 +861,7 @@ impl<'a> Interpreter<'a> {
                     let mut dyn_concrete: Option<String> = None;
                     let (callable, env_ref) = match kind {
                         FnCallKind::CallOnce => {
-                            let (value, env_ref) = self.eval_callable(&frames, body, &receiver)?;
+                            let (value, env_ref) = self.eval_callable(&frames, body, receiver)?;
                             let (value, env_ref) =
                                 if matches!(value, Value::DynRef { .. }) {
                                     if let Value::DynRef { concrete, .. } = &value {
@@ -875,7 +885,7 @@ impl<'a> Interpreter<'a> {
                             let env_ref = match self.consumed_env_arg(
                                 frames,
                                 body,
-                                &receiver,
+                                receiver,
                                 &value,
                             )? {
                                 Some(by_value) => by_value,
@@ -884,7 +894,7 @@ impl<'a> Interpreter<'a> {
                             (value, env_ref)
                         }
                         FnCallKind::Call | FnCallKind::CallMut => {
-                            let recv = self.eval_operand(frames, body, &receiver)?;
+                            let recv = self.eval_operand(frames, body, receiver)?;
                             match recv {
                                 Value::Ref(_) | Value::FatRef { .. } => {
                                     let resolved = self.deref_value(&frames, &recv)?;
@@ -975,7 +985,7 @@ impl<'a> Interpreter<'a> {
                                         self.callable_env_ref(
                                             &frames,
                                             body,
-                                            &receiver,
+                                            receiver,
                                             &value,
                                         )?
                                     };
@@ -988,15 +998,15 @@ impl<'a> Interpreter<'a> {
                         Value::Closure { def, .. } => {
                             let mut full = vec![env_ref];
                             full.extend(arg_values);
-                            self.start_call(frames, &def, full, &destination, target)?;
+                            self.start_call(frames, &def, full, destination, *target)?;
                         }
                         Value::FnPtr(name) => {
                             self.start_call(
                                 frames,
                                 &name,
                                 arg_values,
-                                &destination,
-                                target,
+                                destination,
+                                *target,
                             )?;
                         }
                         other => {
@@ -1007,13 +1017,13 @@ impl<'a> Interpreter<'a> {
                             if let Some(concrete) = dyn_concrete.clone() {
                                 if let Some(result) = self.dyn_adt_fn_call(
                                     frames,
-                                    kind,
+                                    *kind,
                                     &concrete,
                                     other.clone(),
                                     env_ref,
                                     arg_values,
-                                    &destination,
-                                    target,
+                                    destination,
+                                    *target,
                                 ) {
                                     result?;
                                 } else {
@@ -1104,16 +1114,16 @@ impl<'a> Interpreter<'a> {
                                 RefTarget::Value(Box::new(value))
                             }
                         };
-                        self.write_place(frames, body, &destination, Value::Unit)?;
+                        self.write_place(frames, body, destination, Value::Unit)?;
                         let work = vec![(Vec::new(), glue.root.clone())];
-                        self.run_drop_glue(frames, root, work, &glue.adts, bb)?;
+                        self.run_drop_glue(frames, root, work, &glue.adts, *bb)?;
                     } else {
                         let mut result = self.exec_builtin(
                             frames,
                             body,
-                            &name,
-                            &generic_args,
-                            &args,
+                            name,
+                            generic_args,
+                            args,
                             cmp_discriminants.as_deref(),
                         )?;
                         // A `From` / `Into` conversion into a
@@ -1124,12 +1134,12 @@ impl<'a> Interpreter<'a> {
                         // destination holds the same `DynRef` a
                         // coercion cast would have produced.
                         if let Some(meta) = result_unsize {
-                            result = self.eval_unsize(frames, result, &meta)?;
+                            result = self.eval_unsize(frames, result, meta)?;
                         }
                         match target {
                             Some(bb) => {
-                                self.write_place(frames, body, &destination, result)?;
-                                Self::jump(frames, body, bb)?;
+                                self.write_place(frames, body, destination, result)?;
+                                Self::jump(frames, body, *bb)?;
                             }
                             None => {
                                 return Err(InterpError::MissingContinuation {
@@ -1146,7 +1156,7 @@ impl<'a> Interpreter<'a> {
                     // (which jumps to `target`) or suspends on a
                     // destructor call and resumes when that call
                     // returns.
-                    let resolved = self.resolve_place(&frames, body, &place)?;
+                    let resolved = self.resolve_place(&frames, body, place)?;
                     let root = match resolved {
                         Resolved::Place {
                             frame_pos,
@@ -1171,7 +1181,7 @@ impl<'a> Interpreter<'a> {
                         }
                     };
                     let work = vec![(Vec::new(), glue.root.clone())];
-                    self.run_drop_glue(frames, root, work, &glue.adts, target)?;
+                    self.run_drop_glue(frames, root, work, &glue.adts, *target)?;
                 }
                 TerminatorKind::Resume => {
                     // The cleanup chain of the top frame is done:
@@ -1256,14 +1266,14 @@ impl<'a> Interpreter<'a> {
                         .expect("non-entry frame has a destination");
                     let resume = frame.return_block;
                     let caller_name = frames.last().expect("caller").func.clone();
-                    let caller_body = self.program.get(&caller_name).cloned().ok_or_else(|| {
+                    let caller_body = program.get(&caller_name).ok_or_else(|| {
                         InterpError::UnknownFunction {
                             name: caller_name.clone(),
                         }
                     })?;
-                    self.write_place(frames, &caller_body, &dest, value)?;
+                    self.write_place(frames, caller_body, &dest, value)?;
                     match resume {
-                        Some(bb) => Self::jump(frames, &caller_body, bb)?,
+                        Some(bb) => Self::jump(frames, caller_body, bb)?,
                         None => {
                             return Err(InterpError::MissingContinuation { func: caller_name });
                         }
@@ -1278,17 +1288,17 @@ impl<'a> Interpreter<'a> {
                     target,
                     message,
                 } => {
-                    let value = self.eval_operand(frames, body, &cond)?;
+                    let value = self.eval_operand(frames, body, cond)?;
                     let actual = value.as_bool().ok_or_else(|| {
                         InterpError::type_mismatch("Assert condition", "bool", value.kind_name())
                     })?;
-                    if actual != expected {
-                        return Err(InterpError::panic(message));
+                    if actual != *expected {
+                        return Err(InterpError::panic(message.clone()));
                     }
-                    Self::jump(frames, body, target)?;
+                    Self::jump(frames, body, *target)?;
                 }
                 TerminatorKind::Unsupported(kind) => {
-                    return Err(InterpError::UnsupportedTerminator { kind });
+                    return Err(InterpError::UnsupportedTerminator { kind: kind.clone() });
                 }
             }
         }
@@ -3164,8 +3174,7 @@ impl<'a> Interpreter<'a> {
     ) -> InterpResult<()> {
         match &statement.kind {
             StatementKind::Assign(place, rvalue) => {
-                let dest_ty = body.local_ty(place.local).cloned();
-                let value = self.eval_rvalue(frames, body, rvalue, dest_ty.as_ref())?;
+                let value = self.eval_rvalue(frames, body, rvalue, body.local_ty(place.local))?;
                 self.write_place(frames, body, place, value)
             }
             StatementKind::SetDiscriminant { place, variant } => {
