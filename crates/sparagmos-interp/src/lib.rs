@@ -51,6 +51,7 @@
 //! limits) is unchanged by that layer.
 
 pub mod builtins;
+mod decode;
 pub mod error;
 pub mod interp;
 pub mod ir;

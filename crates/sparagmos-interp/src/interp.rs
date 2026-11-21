@@ -373,6 +373,11 @@ pub struct Interpreter<'a> {
     allocs: std::cell::RefCell<HashMap<u64, Value>>,
     /// The id the next created allocation gets.
     next_alloc: std::cell::Cell<u64>,
+    /// Pre-decoded bodies for the run loop (see [`crate::decode`]),
+    /// decoded lazily per body and keyed by body address.
+    decoded: std::cell::RefCell<
+        std::collections::HashMap<usize, std::rc::Rc<crate::decode::DecodedBody>>,
+    >,
 }
 
 /// The synthetic address of a pointer value (see
@@ -457,7 +462,17 @@ impl<'a> Interpreter<'a> {
             next_channel: std::cell::RefCell::new(1),
             allocs: std::cell::RefCell::new(HashMap::new()),
             next_alloc: std::cell::Cell::new(1),
+            decoded: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// The pre-decoded body cache (see [`crate::decode`]).
+    pub(crate) fn decoded_cache(
+        &self,
+    ) -> &std::cell::RefCell<
+        std::collections::HashMap<usize, std::rc::Rc<crate::decode::DecodedBody>>,
+    > {
+        &self.decoded
     }
 
     /// Steps consumed by the most recent (or current) run.
@@ -709,25 +724,30 @@ impl<'a> Interpreter<'a> {
         // with it every statement, type and operand it holds — on
         // every step.
         let program: &'a Program = self.program;
-        let mut cached: Option<(u64, &Body)> = None;
+        let mut cached: Option<(u64, &Body, std::rc::Rc<crate::decode::DecodedBody>)> =
+            None;
         let mut func_name = String::new();
         loop {
             let (block_idx, stmt_idx) = {
                 let frame = frames
                     .last()
                     .expect("frame stack is non-empty while running");
-                if cached.map(|(id, _)| id) != Some(frame.id) {
+                if cached.as_ref().map(|(id, ..)| *id) != Some(frame.id) {
                     func_name = frame.func.clone();
                     let resolved = program.get(&func_name).ok_or_else(|| {
                         InterpError::UnknownFunction {
                             name: func_name.clone(),
                         }
                     })?;
-                    cached = Some((frame.id, resolved));
+                    let decoded = self.decoded_body(resolved);
+                    cached = Some((frame.id, resolved, decoded));
                 }
                 (frame.block, frame.stmt)
             };
-            let body = cached.expect("current frame body resolved").1;
+            let body = cached
+                .as_ref()
+                .expect("current frame body resolved")
+                .1;
             let block = body
                 .blocks
                 .get(block_idx)
@@ -735,14 +755,21 @@ impl<'a> Interpreter<'a> {
                     func: func_name.clone(),
                     block: block_idx,
                 })?;
+            // The decoded mirror of `block` (same block and
+            // statement layout by construction).
+            let dblock = &cached
+                .as_ref()
+                .expect("current frame body resolved")
+                .2
+                .blocks[block_idx];
 
             if stmt_idx < block.statements.len() {
-                let statement = &block.statements[stmt_idx];
+                let dstmt = &dblock.stmts[stmt_idx];
                 // Advance the program counter before executing, so a call
                 // (not possible in a statement) or an error leaves sane state.
                 frames.last_mut().expect("frame").stmt += 1;
                 self.tick()?;
-                self.exec_statement(frames, body, statement)?;
+                self.exec_dstmt(frames, body, dstmt)?;
                 continue;
             }
 
@@ -766,11 +793,20 @@ impl<'a> Interpreter<'a> {
                             value.kind_name(),
                         )
                     })?;
-                    let target = targets
-                        .iter()
-                        .find(|(pattern, _)| *pattern == bits)
-                        .map(|(_, bb)| *bb)
-                        .unwrap_or(*otherwise);
+                    let target = match &dblock.switch {
+                        // Sorted table with all-unique patterns:
+                        // binary search finds the same target the
+                        // linear scan would.
+                        Some(table) => table
+                            .binary_search_by_key(&bits, |(pattern, _)| *pattern)
+                            .map(|idx| table[idx].1)
+                            .unwrap_or(*otherwise),
+                        None => targets
+                            .iter()
+                            .find(|(pattern, _)| *pattern == bits)
+                            .map(|(_, bb)| *bb)
+                            .unwrap_or(*otherwise),
+                    };
                     Self::jump(frames, body, target)?;
                 }
                 TerminatorKind::Call {
@@ -3187,7 +3223,7 @@ impl<'a> Interpreter<'a> {
         }
     }
 
-    fn exec_statement(
+    pub(crate) fn exec_statement(
         &self,
         frames: &mut Vec<Frame>,
         body: &Body,
@@ -3612,7 +3648,7 @@ impl<'a> Interpreter<'a> {
     /// the base place and loses the fat length, so consumers that
     /// need the pointee's own length (`Len`, reference formation)
     /// recover it here from the pointer value itself.
-    fn fat_deref_len(
+    pub(crate) fn fat_deref_len(
         &self,
         frames: &[Frame],
         body: &Body,
@@ -4580,7 +4616,7 @@ impl<'a> Interpreter<'a> {
     }
 
     /// Validate / wrap a value being stored into a typed direct local.
-    fn normalize_for_ty(mut value: Value, ty: Option<&Ty>) -> InterpResult<Value> {
+    pub(crate) fn normalize_for_ty(mut value: Value, ty: Option<&Ty>) -> InterpResult<Value> {
         // Storing the uninitialized marker itself is not a type
         // mismatch: MIR materialises uninitialised locals with an
         // assignment of the `Uninit` constant (the storage a
@@ -4893,7 +4929,7 @@ impl<'a> Interpreter<'a> {
     /// a reference constant becomes a reference to the constant value
     /// it points at, a slice constant becomes a fat reference over
     /// its element tuple.
-    fn eval_constant(&self, c: &Constant) -> InterpResult<Value> {
+    pub(crate) fn eval_constant(&self, c: &Constant) -> InterpResult<Value> {
         Ok(match c {
             Constant::Unit => Value::Unit,
             Constant::Bool(b) => Value::Bool(*b),
@@ -5283,7 +5319,7 @@ impl<'a> Interpreter<'a> {
 
     // ----- rvalues -----------------------------------------------------------
 
-    fn eval_rvalue(
+    pub(crate) fn eval_rvalue(
         &self,
         frames: &mut Vec<Frame>,
         body: &Body,
@@ -6590,7 +6626,7 @@ fn unsigned_bits(dest_ty: Option<&Ty>) -> u32 {
 /// by zero panics in both forms — the operation itself requires it,
 /// independent of overflow checks. Comparison and bitwise-on-bool
 /// operations never overflow.
-fn eval_binary(
+pub(crate) fn eval_binary(
     op: BinOp,
     lhs: &Value,
     rhs: &Value,
@@ -7002,7 +7038,7 @@ fn float_ty_of(dest_ty: Option<&Ty>) -> Option<FloatTy> {
     }
 }
 
-fn eval_unary(op: UnOp, v: &Value, dest_ty: Option<&Ty>) -> InterpResult<Value> {
+pub(crate) fn eval_unary(op: UnOp, v: &Value, dest_ty: Option<&Ty>) -> InterpResult<Value> {
     match (op, v) {
         (UnOp::Neg, Value::Int(a)) => {
             // Plain `Neg` wraps, like the binary operators: the
@@ -7163,7 +7199,7 @@ fn synthetic_addr(v: &Value) -> u128 {
     BASE + (h % (1 << 40)) * 4096
 }
 
-fn eval_cast(v: &Value, ty: &Ty) -> InterpResult<Value> {
+pub(crate) fn eval_cast(v: &Value, ty: &Ty) -> InterpResult<Value> {
     match ty {
         Ty::Int(it) => {
             // A float source saturates; it does not wrap like an
