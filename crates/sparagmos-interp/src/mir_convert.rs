@@ -29,9 +29,13 @@
 //!   IR `Nop`s, exactly as an executor is expected to treat them.
 //! * `FalseEdge` / `FalseUnwind` go to their real target; the imaginary
 //!   edge is never taken at run time.
-//! * Unwind actions on `Call` / `Assert` are dropped: the interpreter has
-//!   no unwinding — a guest panic aborts the whole run as an
-//!   [`InterpError::Panic`], which is the oracle's model of a panic.
+//! * Unwind actions on `Call` / `Assert` / `Drop` / `InlineAsm` are
+//!   preserved per block in the IR body (see [`ir::Body::unwind`]):
+//!   a guest panic runs the cleanup blocks of each frame it unwinds
+//!   through — the `Drop` terminators of the live locals, in MIR's
+//!   own order — before the panic propagates, exactly as native
+//!   unwinding does. A panic that escapes a cleanup aborts the run
+//!   ([`InterpError::Abort`]).
 //! * `AggregateKind::Array` becomes a tuple value (the IR has no distinct
 //!   array value); `AggregateKind::Adt` becomes a variant + fields value.
 //!   ADT aggregate operands are typed by the fields' declared types,
@@ -1395,6 +1399,22 @@ impl<'a> Converter<'a> {
             blocks.push(self.convert_block(body, bb)?);
         }
         let mut out = ir::Body::new(key.to_string(), body.arg_count, local_tys, blocks);
+        out.unwind = body
+            .basic_blocks
+            .iter()
+            .map(|bb| {
+                use mir::TerminatorKind as T;
+                match bb.terminator.as_ref().map(|t| &t.kind) {
+                    Some(
+                        T::Call { unwind, .. }
+                        | T::Assert { unwind, .. }
+                        | T::Drop { unwind, .. }
+                        | T::InlineAsm { unwind, .. },
+                    ) => convert_unwind_action(unwind),
+                    _ => ir::UnwindAction::Continue,
+                }
+            })
+            .collect();
         out.zst_locals = body
             .local_decls
             .iter()
@@ -3905,8 +3925,9 @@ impl<'a> Converter<'a> {
                     None => ir::TerminatorKind::Unsupported("Drop".to_string()),
                 }
             }
-            T::Resume => ir::TerminatorKind::Unsupported("Resume".to_string()),
-            T::Terminate(k) => ir::TerminatorKind::Unsupported(format!("Terminate {k:?}")),
+            T::Resume => ir::TerminatorKind::Resume,
+            T::Terminate(mir::TerminateKind::Abort) => ir::TerminatorKind::Abort,
+            T::Terminate(mir::TerminateKind::Resume) => ir::TerminatorKind::Resume,
             T::Yield { .. } => ir::TerminatorKind::Unsupported("Yield".to_string()),
             T::CoroutineDrop => ir::TerminatorKind::Unsupported("CoroutineDrop".to_string()),
             T::InlineAsm {
@@ -3936,6 +3957,18 @@ impl<'a> Converter<'a> {
 }
 
 // ---------------------------------------------------------------------------
+
+/// Preserve one MIR unwind action in the IR (see [`ir::UnwindAction`]).
+fn convert_unwind_action(action: &mir::UnwindAction) -> ir::UnwindAction {
+    match action {
+        mir::UnwindAction::Cleanup(bb) => {
+            ir::UnwindAction::Cleanup(ir::BasicBlock(bb.index()))
+        }
+        mir::UnwindAction::Continue => ir::UnwindAction::Continue,
+        mir::UnwindAction::Terminate(_) => ir::UnwindAction::Terminate,
+        mir::UnwindAction::Unreachable => ir::UnwindAction::Unreachable,
+    }
+}
 
 fn convert_int_ty(ty: mir::IntTy) -> ir::IntTy {
     match ty {
