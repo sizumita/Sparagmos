@@ -4504,6 +4504,175 @@ fn run_mode_catch_unwind_state_survives_the_catch() {
     run_ok("catch-state", CATCH_STATE_SRC, "mark=7\nafter\n");
 }
 
+// ----- unwind drops (Lane EW) ------------------------------------------------
+// A panic unwinding through a frame runs the cleanup blocks MIR
+// built for it: the destructors of the locals live at the panic
+// point, in reverse declaration order per frame, innermost frame
+// first. A destructor that itself panics while unwinding aborts
+// the run (a native double panic); a destructor that panics on the
+// normal path is an ordinary, catchable panic.
+
+const UNWIND_DROP_SINGLE_SRC: &str = r#"
+struct M(i32);
+impl Drop for M { fn drop(&mut self) { println!("dtor {}", self.0); } }
+fn boom() { let _m = M(7); panic!("boom"); }
+fn main() {
+    let r = std::panic::catch_unwind(boom);
+    println!("caught {}", r.is_err());
+}
+"#;
+
+const UNWIND_DROP_NESTED_SRC: &str = r#"
+struct M(i32);
+impl Drop for M { fn drop(&mut self) { println!("dtor {}", self.0); } }
+fn inner() { let _a = M(1); let _b = M(2); panic!("deep"); }
+fn middle() { let _c = M(3); inner(); let _d = M(4); }
+fn main() {
+    let r = std::panic::catch_unwind(middle);
+    println!("caught {}", r.is_err());
+    let _e = M(5);
+    println!("end");
+}
+"#;
+
+const UNWIND_DROP_PAYLOAD_SRC: &str = r#"
+struct M(i32);
+impl Drop for M { fn drop(&mut self) { println!("dtor {}", self.0); } }
+fn main() {
+    let r = std::panic::catch_unwind(|| -> i32 {
+        let _m = M(3);
+        panic!("boom")
+    });
+    match r {
+        Ok(_) => println!("ok"),
+        Err(e) => {
+            if let Some(s) = e.downcast_ref::<&str>() {
+                println!("payload str: {s}");
+            } else {
+                println!("payload not str");
+            }
+        }
+    }
+}
+"#;
+
+const UNWIND_DROP_UNCAUGHT_SRC: &str = r#"
+struct M(i32);
+impl Drop for M { fn drop(&mut self) { println!("dtor {}", self.0); } }
+fn boom() { let _m = M(7); panic!("boom"); }
+fn main() { let _x = M(9); boom(); }
+"#;
+
+const UNWIND_DROP_PANICS_SRC: &str = r#"
+struct Bad;
+impl Drop for Bad { fn drop(&mut self) { panic!("dtor panic"); } }
+struct M(i32);
+impl Drop for M { fn drop(&mut self) { println!("dtor {}", self.0); } }
+fn boom() { let _b = Bad; let _m = M(1); panic!("orig"); }
+fn main() {
+    let r = std::panic::catch_unwind(boom);
+    println!("caught {}", r.is_err());
+}
+"#;
+
+const DROP_PANIC_NORMAL_SRC: &str = r#"
+struct Bad;
+impl Drop for Bad { fn drop(&mut self) { println!("bad dtor runs"); panic!("dtor panic"); } }
+fn main() {
+    let r = std::panic::catch_unwind(|| { let _b = Bad; });
+    println!("caught {}", r.is_err());
+}
+"#;
+
+#[test]
+fn run_mode_unwind_drops_single_frame() {
+    run_ok(
+        "unwind-drop-single",
+        UNWIND_DROP_SINGLE_SRC,
+        "dtor 7\ncaught true\n",
+    );
+}
+
+#[test]
+fn run_mode_unwind_drops_nested_frames_in_order() {
+    // Reverse declaration order within a frame (2 before 1), the
+    // inner frame before its caller (3), a local declared after
+    // the panicking call is never built (no dtor 4), and the
+    // normal scope-end drop after the catch is unaffected (5,
+    // after "end").
+    run_ok(
+        "unwind-drop-nested",
+        UNWIND_DROP_NESTED_SRC,
+        "dtor 2\ndtor 1\ndtor 3\ncaught true\nend\ndtor 5\n",
+    );
+}
+
+#[test]
+fn run_mode_unwind_drops_and_payload_downcast() {
+    // The destructor runs during the unwind, before the catch
+    // handler observes the payload; the payload itself (and its
+    // downcast) is exactly as without drops.
+    run_ok(
+        "unwind-drop-payload",
+        UNWIND_DROP_PAYLOAD_SRC,
+        "dtor 3\npayload str: boom\n",
+    );
+}
+
+#[test]
+fn run_mode_uncaught_panic_runs_drops() {
+    let dir = temp_dir("unwind-drop-uncaught");
+    let src = fixture(&dir, "case.rs", UNWIND_DROP_UNCAUGHT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "uncaught panic must exit 101; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "dtor 7\ndtor 9\n",
+        "drops run innermost frame first on an uncaught panic; stderr={stderr}"
+    );
+}
+
+#[test]
+fn run_mode_unwind_drop_panics_aborts_uncaught_by_catch_unwind() {
+    // Unwinding drops M(1) first (reverse order), then Bad's
+    // destructor panics while unwinding: a double panic. The run
+    // aborts (101, abort reason on stderr) and the surrounding
+    // catch_unwind does NOT observe it ("caught" never prints),
+    // exactly as a native abort is not a catchable panic.
+    let dir = temp_dir("unwind-drop-panics");
+    let src = fixture(&dir, "case.rs", UNWIND_DROP_PANICS_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "a panic in an unwind destructor must abort with 101; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "dtor 1\n",
+        "only the first unwind drop runs before the abort; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("aborted"),
+        "the abort must be named on stderr; stderr={stderr}"
+    );
+}
+
+#[test]
+fn run_mode_drop_panic_on_normal_path_is_caught() {
+    run_ok(
+        "drop-panic-normal",
+        DROP_PANIC_NORMAL_SRC,
+        "bad dtor runs\ncaught true\n",
+    );
+}
+
 #[test]
 fn run_mode_resume_unwind_repanics_out_of_the_catch() {
     let dir = temp_dir("catch-resume");

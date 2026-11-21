@@ -2639,6 +2639,15 @@ fn execute(c: &Collected, guest_args: &[String]) -> i32 {
             eprintln!("thread 'main' panicked: {message}");
             101
         }
+        Err(sparagmos_interp::MirRunError::Interp(sparagmos_interp::InterpError::Abort {
+            message,
+        })) => {
+            // A panic that escaped a cleanup (a native double
+            // panic aborts the process): the guest-panic exit, with
+            // the abort reason on stderr.
+            eprintln!("thread 'main' aborted: {message}");
+            101
+        }
         Err(e) => {
             eprintln!("sparagmos-driver run: unsupported: {e}");
             let ext = external_callees(c);

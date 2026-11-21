@@ -71,6 +71,15 @@ pub(crate) struct Frame {
     return_dest: Option<Place>,
     /// Block to resume in the caller after return.
     return_block: Option<BasicBlock>,
+    /// The panic in flight for this frame while its cleanup blocks
+    /// run: stashed by the unwinder when it jumps the frame to its
+    /// cleanup block, and taken back by the `Resume` terminator
+    /// that ends the cleanup chain. `None` at every other time.
+    unwind_payload: Option<(String, Option<PanicPayload>)>,
+    /// This frame is executing its cleanup blocks (the unwinder
+    /// jumped it there): a fresh panic raised directly in this
+    /// frame is a panic in a cleanup and aborts the run.
+    in_cleanup: bool,
 }
 
 /// Drop glue suspended while a destructor body runs. A `Drop`
@@ -210,6 +219,12 @@ pub struct Interpreter<'a> {
     /// Drop glue suspended on destructor calls (see
     /// [`DropContinuation`]); a stack, innermost last.
     drop_continuations: Vec<DropContinuation>,
+    /// Set by the `Resume` terminator right before it returns the
+    /// in-flight panic: the unwinder (see [`Interpreter::drive`])
+    /// reads and clears it to tell a completed cleanup (the panic
+    /// continues in the caller) from a fresh panic raised directly
+    /// in a cleanup frame (which aborts).
+    resume_signaled: bool,
     /// The program-level statics store: one storage per `static`
     /// item, keyed by the static's program key (see
     /// [`crate::ir::Constant::StaticRef`]). A static's storage is
@@ -314,6 +329,7 @@ impl<'a> Interpreter<'a> {
             next_frame_id: 0,
             output: String::new(),
             drop_continuations: Vec::new(),
+            resume_signaled: false,
             statics: std::cell::RefCell::new(HashMap::new()),
             statics_seeding: std::cell::RefCell::new(HashSet::new()),
             threads: std::cell::RefCell::new(HashMap::new()),
@@ -392,6 +408,8 @@ impl<'a> Interpreter<'a> {
             stmt: 0,
             return_dest: None,
             return_block: None,
+            unwind_payload: None,
+            in_cleanup: false,
         }];
         self.drive_frames(&mut frames, 0)
     }
@@ -402,14 +420,136 @@ impl<'a> Interpreter<'a> {
     /// success the loop stops exactly there; on an error — above
     /// all a guest panic, which a thread's join must observe as
     /// the thread's outcome rather than as a failure of the whole
-    /// run — the frames above the base are dead and are
-    /// discarded, as unwinding discards them.
+    /// run — the frames above the base are dead (a panic has
+    /// already unwound them, running their cleanups; see
+    /// [`Interpreter::drive`]) and are discarded.
     fn drive_frames(&mut self, frames_out: &mut Vec<Frame>, base: usize) -> InterpResult<Value> {
         let mut frames: Vec<Frame> = std::mem::take(frames_out);
         let result = self.drive(&mut frames, base);
         frames.truncate(base);
         *frames_out = frames;
         result
+    }
+
+    /// Drive the frame stack with unwinding: run the raw loop
+    /// ([`Interpreter::drive_loop`]); when it reports a guest
+    /// panic, unwind the stack frame by frame down to `stop_depth`
+    /// before reporting the panic. Each frame the panic passes
+    /// through runs the cleanup its current block prescribes (see
+    /// [`crate::ir::Body::unwind_action`]): a cleanup block chain
+    /// (the `Drop` terminators of the locals live at the panic
+    /// point, in MIR's own order) runs with the panic stashed in
+    /// the frame, and its closing `Resume` pops the frame and
+    /// continues the unwind in the caller at its call site. A
+    /// frame with no cleanup is simply discarded. A panic that may
+    /// not unwind — one raised directly in a cleanup frame, or one
+    /// whose block prescribes termination — aborts the run
+    /// ([`InterpError::Abort`]), as a native double panic does.
+    /// Non-panic errors never unwind: they are oracle failures,
+    /// not guest control flow.
+    fn drive(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        stop_depth: usize,
+    ) -> InterpResult<Value> {
+        loop {
+            match self.drive_loop(frames, stop_depth) {
+                Ok(value) => return Ok(value),
+                Err(InterpError::Panic { message, payload }) => {
+                    let resumed = std::mem::take(&mut self.resume_signaled);
+                    let mut panic = InterpError::Panic { message, payload };
+                    // Whether the panic was raised directly in the
+                    // top frame (as opposed to resuming into it from
+                    // a callee this unwinder already popped).
+                    let mut direct = true;
+                    // Unwind one frame at a time until the panic
+                    // leaves this drive region or a cleanup block
+                    // takes over execution.
+                    loop {
+                        if frames.len() <= stop_depth {
+                            return Err(panic);
+                        }
+                        let (func, block, in_cleanup) = {
+                            let frame = frames.last().expect("frame");
+                            (frame.func.clone(), frame.block, frame.in_cleanup)
+                        };
+                        if direct && in_cleanup && !resumed {
+                            // A fresh panic raised by the cleanup
+                            // frame itself (not one resuming into
+                            // it from a callee): panicking while
+                            // unwinding aborts, natively.
+                            let InterpError::Panic { message, .. } = &panic else {
+                                unreachable!("panic is a Panic")
+                            };
+                            return Err(InterpError::Abort {
+                                message: format!(
+                                    "panic `{message}` raised in a cleanup of `{func}`: \
+                                     panicking while unwinding aborts the run"
+                                ),
+                            });
+                        }
+                        let body = self.program.get(&func).cloned();
+                        let action = body
+                            .as_ref()
+                            .map(|b| b.unwind_action(block))
+                            .unwrap_or(crate::ir::UnwindAction::Continue);
+                        match action {
+                            crate::ir::UnwindAction::Cleanup(target) => {
+                                let Some(body) = body else {
+                                    unreachable!("cleanup action implies a body")
+                                };
+                                let InterpError::Panic { message, payload } = panic
+                                else {
+                                    unreachable!("panic is a Panic")
+                                };
+                                let frame = frames.last_mut().expect("frame");
+                                frame.unwind_payload = Some((message, payload));
+                                frame.in_cleanup = true;
+                                Self::jump(frames, &body, target)?;
+                                break;
+                            }
+                            crate::ir::UnwindAction::Continue => {
+                                self.pop_unwind_frame(frames);
+                                // The caller frame is now on top and
+                                // the panic resumes into it: that is
+                                // a resumption, not a fresh panic in
+                                // the caller, even when the caller is
+                                // itself running cleanups, so the
+                                // direct-panic guard no longer
+                                // applies; the caller's own call-site
+                                // action decides.
+                                direct = false;
+                                continue;
+                            }
+                            crate::ir::UnwindAction::Terminate
+                            | crate::ir::UnwindAction::Unreachable => {
+                                let InterpError::Panic { message, .. } = &panic else {
+                                    unreachable!("panic is a Panic")
+                                };
+                                return Err(InterpError::Abort {
+                                    message: format!(
+                                        "panic `{message}` may not unwind past `{func}`: \
+                                         the run aborts"
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Pop one frame during unwinding, discarding any suspended
+    /// drop glue that belonged to it (its destructors never resume:
+    /// the frame they would have resumed into is gone).
+    fn pop_unwind_frame(&mut self, frames: &mut Vec<Frame>) {
+        let Some(frame) = frames.pop() else {
+            return;
+        };
+        self.drop_continuations
+            .retain(|cont| cont.callee_frame != frame.id);
     }
 
     /// The run loop: execute until the frame stack shrinks to
@@ -424,7 +564,7 @@ impl<'a> Interpreter<'a> {
     /// destination (see `start_detached_call`); stack discipline
     /// guarantees such a frame returns exactly when the stack is
     /// back at `stop_depth + 1`.
-    fn drive(
+    fn drive_loop(
         &mut self,
         mut frames: &mut Vec<Frame>,
         stop_depth: usize,
@@ -911,6 +1051,43 @@ impl<'a> Interpreter<'a> {
                     let work = vec![(Vec::new(), glue.root.clone())];
                     self.run_drop_glue(frames, root, work, &glue.adts, target)?;
                 }
+                TerminatorKind::Resume => {
+                    // The cleanup chain of the top frame is done:
+                    // pop the frame and report the panic stashed in
+                    // it when the unwinder entered the cleanup. The
+                    // unwinder in `drive` continues the panic in
+                    // the caller at its call site.
+                    let frame = frames.pop().expect("frame");
+                    self.drop_continuations
+                        .retain(|cont| cont.callee_frame != frame.id);
+                    match frame.unwind_payload {
+                        Some((message, payload)) => {
+                            self.resume_signaled = true;
+                            return Err(InterpError::Panic { message, payload });
+                        }
+                        None => {
+                            return Err(InterpError::UnsupportedTerminator {
+                                kind: "Resume".to_string(),
+                            });
+                        }
+                    }
+                }
+                TerminatorKind::Abort => {
+                    // A panic escaped a cleanup or crossed a
+                    // nounwind boundary in the guest source: the
+                    // run aborts, uncatchably.
+                    let original = frames
+                        .last()
+                        .and_then(|f| f.unwind_payload.as_ref().map(|(m, _)| m.clone()));
+                    return Err(InterpError::Abort {
+                        message: match original {
+                            Some(message) => format!(
+                                "panicked while processing panic `{message}`: aborting"
+                            ),
+                            None => "abort terminator executed".to_string(),
+                        },
+                    });
+                }
                 TerminatorKind::Return => {
                     // A returning destructor frame resumes its
                     // suspended drop glue instead of delivering a
@@ -1143,6 +1320,8 @@ impl<'a> Interpreter<'a> {
             stmt: 0,
             return_dest: Some(destination.clone()),
             return_block: target,
+            unwind_payload: None,
+            in_cleanup: false,
         });
         Ok(())
     }
@@ -1203,6 +1382,8 @@ impl<'a> Interpreter<'a> {
             stmt: 0,
             return_dest: None,
             return_block: None,
+            unwind_payload: None,
+            in_cleanup: false,
         });
         Ok(())
     }
@@ -1222,18 +1403,18 @@ impl<'a> Interpreter<'a> {
 
     /// Execute the `catch_unwind` intrinsic's protocol: run
     /// `try_fn(data)`; when it returns, report `false` (no panic).
-    /// When it panics, roll the frame stack back to the depth at
-    /// entry — the panicking frames are discarded; MIR-level
-    /// unwinding does not exist in this IR (conversion drops unwind
-    /// edges), so no guest destructors run for the discarded
-    /// frames, exactly as for an uncaught panic, which likewise
-    /// runs none — then run `catch_fn(data, payload)` with the
-    /// panic's raw payload and report `true`. A panic raised by
-    /// the catch function itself, and any non-panic error,
-    /// propagate unchanged. State outside the frame stack (the
-    /// statics store, accumulated guest output) is not rolled
-    /// back: writes made before the panic persist, as they do
-    /// natively.
+    /// When it panics, the nested drive has already unwound the
+    /// panicking frames to the depth at entry, running each
+    /// frame's cleanup blocks (the destructors of its live
+    /// locals) on the way, exactly as native unwinding does; the
+    /// stack is then at the entry depth. Run
+    /// `catch_fn(data, payload)` with the panic's raw payload and
+    /// report `true`. A panic raised by the catch function itself,
+    /// an abort (a panic that escaped a cleanup), and any
+    /// non-panic error, propagate unchanged. State outside the
+    /// frame stack (the statics store, accumulated guest output)
+    /// is not rolled back: writes made before the panic persist,
+    /// as they do natively.
     pub(crate) fn exec_catch_unwind(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -2062,6 +2243,8 @@ impl<'a> Interpreter<'a> {
                             stmt: 0,
                             return_dest: None,
                             return_block: None,
+                            unwind_payload: None,
+                            in_cleanup: false,
                         });
                         return Ok(());
                     }
