@@ -7848,3 +7848,36 @@ fn run_mode_size_hint_unmodelled_iterator_gets_trait_default() {
         "stdout={stdout}"
     );
 }
+
+const CATCH_UNWIND_O3_DATA_SRC: &str = r#"
+#[inline(never)]
+fn boom() { std::panic::resume_unwind(Box::new(7i32)); }
+fn main() {
+    let r = std::panic::catch_unwind(|| 40 + 2);
+    let ok1 = matches!(r, Ok(42));
+    let r2 = std::panic::catch_unwind(|| -> i32 { boom(); 0 });
+    let ok2 = matches!(r2, Err(_));
+    std::process::exit(if ok1 && ok2 { 0 } else { 3 });
+}
+"#;
+
+/// At opt-level 3 `catch_unwind` is inlined into `main`, and its
+/// `Data` union local is materialized as an assignment of the
+/// uninitialized constant, filled field by field through a raw
+/// pointer by `do_call` / `do_catch`, with the zero-sized closure
+/// field never stored at all. The run must still complete: the
+/// uninitialized assignment is not a type mismatch, the field
+/// writes partially initialize the union, and the closure field's
+/// single value is synthesized on read.
+#[test]
+fn run_mode_catch_unwind_o3_data_union() {
+    let dir = temp_dir("catch-o3-data");
+    let src = fixture(&dir, "case.rs", CATCH_UNWIND_O3_DATA_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "-Copt-level=3"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "O3 catch_unwind Data flow must run to completion; stderr={stderr}"
+    );
+}

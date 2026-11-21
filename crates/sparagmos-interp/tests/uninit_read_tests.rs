@@ -544,3 +544,141 @@ fn drop_of_payload_enum_field_from_const_still_errors() {
         "expected unsupported Drop, got {err:?}"
     );
 }
+
+// ----- group D: partial initialization and single-valued fields (Lane GD) ---
+
+const PAIR: mir::DefId = mir::DefId::new(0, 60);
+const HOST: mir::DefId = mir::DefId::new(0, 61);
+const ZWRAP: mir::DefId = mir::DefId::new(0, 62);
+const ZLEAF: mir::DefId = mir::DefId::new(0, 63);
+
+fn const_uninit() -> mir::Operand {
+    mir::Operand::constant(mir::Constant::from_value(mir::ConstValue::Uninit))
+}
+
+fn gd_program(main: mir::Body, shapes: &[(mir::DefId, mir::AdtShape)]) -> MirProgram {
+    let mut prog = MirProgram::new();
+    for (def, s) in shapes {
+        prog.adt_shapes.insert(*def, s.clone());
+    }
+    prog.add("main", main);
+    prog
+}
+
+fn pair_program(main: mir::Body) -> MirProgram {
+    gd_program(
+        main,
+        &[(
+            PAIR,
+            shape(
+                mir::AdtShapeKind::Struct,
+                vec![vec![u32_ty(), u32_ty()]],
+            ),
+        )],
+    )
+}
+
+/// `struct Pair { a: u32, b: u32 }`
+/// `fn main() -> u32 { let p: Pair = <uninit>; p.b = 7; p.b }` —
+/// the shape of std's `catch_unwind` Data storage at opt-level 3:
+/// the local is materialized by an assignment of the uninitialized
+/// constant (which is not a type mismatch: the place simply holds
+/// no value yet) and then filled field by field. The field write
+/// into the never-written slot materializes the aggregate; the
+/// written field reads back.
+#[test]
+fn uninit_local_field_write_then_read() {
+    let main = mir::Body::new(
+        decls(&[u32_ty(), adt_ty(PAIR)]),
+        0,
+        vec![block(
+            vec![
+                assign(place(1), mir::Rvalue::Use(const_uninit())),
+                assign(
+                    place(1).field(1, u32_ty()),
+                    mir::Rvalue::Use(const_u32(7)),
+                ),
+                assign(
+                    place(0),
+                    mir::Rvalue::Use(mir::Operand::Copy(place(1).field(1, u32_ty()))),
+                ),
+            ],
+            ret(),
+        )],
+    );
+    let value = interpret_mir(&pair_program(main), "main", Vec::new()).expect("main runs");
+    assert_eq!(value, Value::Uint(7));
+}
+
+/// The sibling field the partial initialization never wrote stays
+/// uninitialized: materializing the aggregate fabricates nothing,
+/// so reading field 0 of the same local still fails.
+#[test]
+fn uninit_local_unwritten_field_still_errors() {
+    let main = mir::Body::new(
+        decls(&[u32_ty(), adt_ty(PAIR)]),
+        0,
+        vec![block(
+            vec![
+                assign(place(1), mir::Rvalue::Use(const_uninit())),
+                assign(
+                    place(1).field(1, u32_ty()),
+                    mir::Rvalue::Use(const_u32(7)),
+                ),
+                assign(
+                    place(0),
+                    mir::Rvalue::Use(mir::Operand::Copy(place(1).field(0, u32_ty()))),
+                ),
+            ],
+            ret(),
+        )],
+    );
+    let err = interpret_mir(&pair_program(main), "main", Vec::new())
+        .expect_err("unwritten field must fail");
+    assert!(
+        matches!(err, MirRunError::Interp(InterpError::UninitializedRead { .. })),
+        "expected UninitializedRead, got {err:?}"
+    );
+}
+
+/// `struct ZLeaf {} struct ZWrap { z: ZLeaf } struct Host { w: ZWrap, x: u32 }`
+/// `fn main() -> ZLeaf { let h: Host; h.w.z }` — a field whose type
+/// has a single value denotes that value even when no body ever
+/// wrote it: MIR elides the store of a zero-sized field (the
+/// closure slot of a `catch_unwind` Data union is read back by
+/// `do_call` exactly this way), so the read is not an
+/// uninitialized read. The local as a whole is not single-valued
+/// (its `x` field varies), which keeps this on the field-path
+/// table rather than the whole-local synthesis.
+#[test]
+fn single_valued_field_path_read_from_unwritten_local() {
+    let shapes = [
+        (
+            HOST,
+            shape(
+                mir::AdtShapeKind::Struct,
+                vec![vec![adt_ty(ZWRAP), u32_ty()]],
+            ),
+        ),
+        (
+            ZWRAP,
+            shape(mir::AdtShapeKind::Struct, vec![vec![adt_ty(ZLEAF)]]),
+        ),
+        (ZLEAF, shape(mir::AdtShapeKind::Struct, vec![vec![]])),
+    ];
+    let main = mir::Body::new(
+        decls(&[adt_ty(ZLEAF), adt_ty(HOST)]),
+        0,
+        vec![block(
+            vec![assign(
+                place(0),
+                mir::Rvalue::Use(mir::Operand::Copy(
+                    place(1).field(0, adt_ty(ZWRAP)).field(0, adt_ty(ZLEAF)),
+                )),
+            )],
+            ret(),
+        )],
+    );
+    let value = interpret_mir(&gd_program(main, &shapes), "main", Vec::new()).expect("main runs");
+    assert_eq!(value, Value::Enum { variant: 0, fields: vec![] });
+}
