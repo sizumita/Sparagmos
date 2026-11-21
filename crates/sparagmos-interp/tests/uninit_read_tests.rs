@@ -405,3 +405,142 @@ fn repeat_of_moved_array_replicates() {
     let row = Value::Tuple(vec![Value::Uint(7), Value::Uint(7)]);
     assert_eq!(value, Value::Tuple(vec![row.clone(), row.clone(), row]));
 }
+
+// ----- typed ZST constants under drop glue -----------------------------------
+//
+// A field written only by a constant operand has no recorded type
+// anywhere (the aggregate scan records field types for place
+// operands only), so its drop plan is `Untyped` and the glue
+// judges the value by shape. A fieldless enum value — which the
+// typed zero-sized constants of group B produce where an untyped
+// unit used to sit — has no contents and must pass; an enum value
+// with a payload must stay an explicit error.
+
+const FIELDLESS: mir::DefId = mir::DefId::new(0, 55);
+const RAW_T: mir::DefId = mir::DefId::new(0, 56);
+const PAYLOAD_ENUM: mir::DefId = mir::DefId::new(0, 57);
+const RAW_P: mir::DefId = mir::DefId::new(0, 58);
+
+fn adt_aggregate(def: mir::DefId, ops: Vec<mir::Operand>) -> mir::Rvalue {
+    mir::Rvalue::Aggregate(
+        Box::new(mir::AggregateKind::Adt {
+            def,
+            variant_index: 0,
+            generic_args: Vec::new(),
+            user_ty: None,
+            field_index: None,
+        }),
+        ops,
+    )
+}
+
+fn adt_const(variant: u32, fields: Vec<mir::ConstValue>) -> mir::Operand {
+    mir::Operand::constant(mir::Constant::from_value(mir::ConstValue::Adt {
+        variant,
+        fields,
+    }))
+}
+
+fn drop_term(idx: u32, next: u32) -> mir::TerminatorKind {
+    mir::TerminatorKind::Drop {
+        place: place(idx),
+        target: mir::BasicBlock(next),
+        unwind: mir::UnwindAction::Continue,
+        replace: false,
+    }
+}
+
+/// `enum TyS { Nil } struct RawT { struct_: TyS, hash: usize }
+/// fn main() -> i32 { let t = RawT { struct_: TyS::Nil, hash: 0 };
+/// drop(t); 7 }` — the fieldless field's value is the typed
+/// constant `Adt{0, []}`; its untyped drop plan must not reject
+/// it (the shape this regressed on in the rustc suite:
+/// codegen/alias-uninit-value).
+#[test]
+fn drop_of_fieldless_enum_field_from_const() {
+    let main = mir::Body::new(
+        decls(&[i32_ty(), adt_ty(RAW_T)]),
+        0,
+        vec![
+            block(
+                vec![assign(
+                    place(1),
+                    adt_aggregate(RAW_T, vec![adt_const(0, vec![]), const_int(0, 8)]),
+                )],
+                drop_term(1, 1),
+            ),
+            block(vec![assign(place(0), mir::Rvalue::Use(const_i32(7)))], ret()),
+        ],
+    );
+    let mut prog = MirProgram::new();
+    prog.fn_names.insert(FIELDLESS, "probe::TyS".to_string());
+    prog.fn_names.insert(RAW_T, "probe::RawT".to_string());
+    prog.adt_shapes.insert(
+        FIELDLESS,
+        shape(mir::AdtShapeKind::Enum, vec![vec![]]),
+    );
+    prog.adt_shapes.insert(
+        RAW_T,
+        shape(
+            mir::AdtShapeKind::Struct,
+            vec![vec![adt_ty(FIELDLESS), mir::Ty::Uint(mir::UintTy::Usize)]],
+        ),
+    );
+    prog.add("probe::main", main);
+    let value = interpret_mir(&prog, "probe::main", Vec::new()).expect("main runs");
+    assert_eq!(value, Value::Int(7));
+}
+
+/// The conservative half of the rule stays: an enum value WITH a
+/// payload under an untyped plan might hide a destructor in its
+/// contents, so the drop is still an explicit error.
+#[test]
+fn drop_of_payload_enum_field_from_const_still_errors() {
+    let main = mir::Body::new(
+        decls(&[i32_ty(), adt_ty(RAW_P)]),
+        0,
+        vec![
+            block(
+                vec![assign(
+                    place(1),
+                    adt_aggregate(
+                        RAW_P,
+                        vec![adt_const(
+                            0,
+                            vec![mir::ConstValue::Str("x".to_string())],
+                        )],
+                    ),
+                )],
+                drop_term(1, 1),
+            ),
+            block(vec![assign(place(0), mir::Rvalue::Use(const_i32(7)))], ret()),
+        ],
+    );
+    let mut prog = MirProgram::new();
+    prog.fn_names
+        .insert(PAYLOAD_ENUM, "probe::E".to_string());
+    prog.fn_names.insert(RAW_P, "probe::RawP".to_string());
+    prog.adt_shapes.insert(
+        PAYLOAD_ENUM,
+        shape(
+            mir::AdtShapeKind::Enum,
+            vec![vec![mir::Ty::Str]],
+        ),
+    );
+    prog.adt_shapes.insert(
+        RAW_P,
+        shape(
+            mir::AdtShapeKind::Struct,
+            vec![vec![adt_ty(PAYLOAD_ENUM)]],
+        ),
+    );
+    prog.add("probe::main", main);
+    let err = interpret_mir(&prog, "probe::main", Vec::new()).expect_err("payload drop must fail");
+    assert!(
+        matches!(
+            err,
+            MirRunError::Interp(InterpError::UnsupportedTerminator { ref kind }) if kind == "Drop"
+        ),
+        "expected unsupported Drop, got {err:?}"
+    );
+}
