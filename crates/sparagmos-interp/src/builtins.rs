@@ -2557,13 +2557,14 @@ impl<'a> Interpreter<'a> {
             Builtin::AtomicLoad => {
                 arity(1)?;
                 let target = self.deref_value(frames, &vals[0])?;
-                self.read_resolved(frames, &target)
+                let current = self.read_resolved(frames, &target)?;
+                Ok(unwrap_wrapper(&current).clone())
             }
             Builtin::AtomicStore => {
                 arity(2)?;
                 let target = self.deref_value(frames, &vals[0])?;
                 let value = vals.into_iter().nth(1).expect("arity checked");
-                self.write_resolved(frames, &target, value)?;
+                self.atomic_write(frames, &target, value)?;
                 Ok(Value::Unit)
             }
             Builtin::PtrCopy => {
@@ -2585,15 +2586,20 @@ impl<'a> Interpreter<'a> {
                 let current = self.read_resolved(frames, &target)?;
                 let success = self.atomic_value_eq(frames, &current, &vals[1])?;
                 if success {
-                    self.write_resolved(frames, &target, vals[2].clone())?;
+                    self.atomic_write(frames, &target, vals[2].clone())?;
                 }
-                Ok(Value::Tuple(vec![current, Value::Bool(success)]))
+                // The exchanged-out value the caller receives is the
+                // cell's scalar, not the wrapper aggregate the cell
+                // place holds.
+                let previous = unwrap_wrapper(&current).clone();
+                Ok(Value::Tuple(vec![previous, Value::Bool(success)]))
             }
             Builtin::AtomicXchg => {
                 arity(2)?;
                 let target = self.deref_value(frames, &vals[0])?;
-                let previous = self.read_resolved(frames, &target)?;
-                self.write_resolved(frames, &target, vals[1].clone())?;
+                let current = self.read_resolved(frames, &target)?;
+                let previous = unwrap_wrapper(&current).clone();
+                self.atomic_write(frames, &target, vals[1].clone())?;
                 Ok(previous)
             }
             Builtin::AtomicFence => {
@@ -2604,6 +2610,26 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::FloatMethod { f32, op } => exec_float_method(name, f32, op, &vals),
         }
+    }
+
+    /// Write an atomic cell's new scalar, preserving the wrapper
+    /// aggregates the cell place holds (`UnsafeCell` inside the
+    /// atomic struct): the pointer names the wrapper place, so a
+    /// bare scalar write would replace the aggregate and later
+    /// whole-place reads of the cell would see the wrong shape.
+    /// When the current contents cannot be read (an uninitialised
+    /// cell), the value is written as-is.
+    fn atomic_write(
+        &self,
+        frames: &mut Vec<Frame>,
+        target: &Resolved,
+        value: Value,
+    ) -> InterpResult<()> {
+        let value = match self.read_resolved(frames, target) {
+            Ok(current) => rewrap_like(&current, value),
+            Err(_) => value,
+        };
+        self.write_resolved(frames, target, value)
     }
 
     /// The equality an atomic compare-exchange performs: the
@@ -2617,6 +2643,8 @@ impl<'a> Interpreter<'a> {
         current: &Value,
         expected: &Value,
     ) -> InterpResult<bool> {
+        let current = unwrap_wrapper(current);
+        let expected = unwrap_wrapper(expected);
         match (synthetic_address(current), synthetic_address(expected)) {
             (Some(a), Some(b)) => Ok(a == b),
             _ => self.values_equal(frames, current, expected),
@@ -2907,6 +2935,21 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
             (Value::Uint(x), Value::Uint(y)) => x.cmp(y),
             (Value::Int(x), Value::Uint(y)) => int_uint_cmp(*x, *y),
             (Value::Uint(x), Value::Int(y)) => int_uint_cmp(*y, *x).reverse(),
+            // Floats order by `partial_cmp`. A comparison involving
+            // NaN has no `Ordering`; the `PartialCmp` builtin wraps
+            // this result in `Some`, so the NaN case cannot be
+            // represented here and stays an explicit error rather
+            // than an invented ordering.
+            (Value::Float(x), Value::Float(y)) => match x.partial_cmp(y) {
+                Some(ord) => ord,
+                None => {
+                    return Err(InterpError::type_mismatch(
+                        "value comparison",
+                        "comparable values",
+                        "float and float (NaN has no ordering)",
+                    ))
+                }
+            },
             (Value::Str(x), Value::Str(y)) => x.as_bytes().cmp(y.as_bytes()),
             (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y),
             (Value::Tuple(x), Value::Tuple(y)) => self.seq_cmp(frames, x, y)?,
@@ -3241,6 +3284,42 @@ fn slice_index_fail_message(start: usize, end: usize, len: usize) -> String {
         format!("slice index starts at {start} but ends at {end}")
     } else {
         format!("range end index {end} out of range for slice of length {len}")
+    }
+}
+
+/// Peel one-field wrapper aggregates off a value: reading through
+/// a raw pointer into a transparent wrapper (`UnsafeCell<T>`, the
+/// `AtomicUsize`-family structs, any one-field struct) yields the
+/// wrapper's aggregate, whose only field is the scalar the pointer
+/// denotes. Anything else is returned unchanged.
+pub(crate) fn unwrap_wrapper(value: &Value) -> &Value {
+    let mut current = value;
+    while let Value::Enum {
+        variant: 0,
+        fields,
+    } = current
+    {
+        if fields.len() != 1 {
+            break;
+        }
+        current = &fields[0];
+    }
+    current
+}
+
+/// Rebuild the wrapper chain `current` carries around a new core
+/// value: the mirror of [`unwrap_wrapper`] for writes, so a cell
+/// place keeps its aggregate shape with the new scalar inside.
+fn rewrap_like(current: &Value, core: Value) -> Value {
+    match current {
+        Value::Enum {
+            variant: 0,
+            fields,
+        } if fields.len() == 1 => Value::Enum {
+            variant: 0,
+            fields: vec![rewrap_like(&fields[0], core)],
+        },
+        _ => core,
     }
 }
 
