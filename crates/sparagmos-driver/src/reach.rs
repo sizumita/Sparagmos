@@ -631,6 +631,17 @@ pub fn unrepresentable_local(body: &sm::Body) -> Option<String> {
             | sm::Ty::Char
             | sm::Ty::Never
             | sm::Ty::Str
+            // Callable values are representable: the interpreter
+            // models function items and closures as values, and a
+            // body that merely holds one in a local (the shape of
+            // every generic adapter in core, e.g. `Iterator::fold`
+            // holding the closure it was given) converts like a
+            // local body does — local bodies are not screened at
+            // all. The closure/function bodies such a value names
+            // are demanded through the call graph as usual.
+            | sm::Ty::FnDef(..)
+            | sm::Ty::FnPtr(..)
+            | sm::Ty::Closure(..)
             | sm::Ty::Dynamic(..)
             // A coroutine type is representable: the interpreter
             // models the state object the coroutine transform
