@@ -186,6 +186,9 @@ const VEC_FROM_ELEM: mir::DefId = mir::DefId::new(0, 242);
 const BOX_NEW_UNINIT: mir::DefId = mir::DefId::new(0, 243);
 const BOX_ASSUME_INIT_INTO_VEC: mir::DefId = mir::DefId::new(0, 244);
 const VEC_TRY_RESERVE: mir::DefId = mir::DefId::new(0, 245);
+const RANGE_FULL_TY: mir::DefId = mir::DefId::new(0, 249);
+const RANGE_TO_TY: mir::DefId = mir::DefId::new(0, 250);
+const RANGE_TY: mir::DefId = mir::DefId::new(0, 251);
 const VEC_SHRINK_TO_FIT: mir::DefId = mir::DefId::new(0, 246);
 const VEC_SHRINK_TO: mir::DefId = mir::DefId::new(0, 247);
 const TRY_RESERVE_ERROR_TY: mir::DefId = mir::DefId::new(0, 248);
@@ -244,6 +247,9 @@ fn std_names() -> HashMap<mir::DefId, String> {
         (VEC_SHRINK_TO_FIT, "std::vec::Vec::<T, A>::shrink_to_fit".to_string()),
         (VEC_SHRINK_TO, "std::vec::Vec::<T, A>::shrink_to".to_string()),
         (TRY_RESERVE_ERROR_TY, "std::collections::TryReserveError".to_string()),
+        (RANGE_FULL_TY, "std::ops::RangeFull".to_string()),
+        (RANGE_TO_TY, "std::ops::RangeTo".to_string()),
+        (RANGE_TY, "std::ops::Range".to_string()),
         (BOX_NEW_UNINIT, "std::boxed::Box::<T>::new_uninit".to_string()),
         (
             BOX_ASSUME_INIT_INTO_VEC,
@@ -289,6 +295,22 @@ fn arguments_ty() -> mir::Ty {
 
 fn vec_i32_ty() -> mir::Ty {
     mir::Ty::Adt(VEC_TY, vec![i32_ty()])
+}
+
+fn range_full_ty() -> mir::Ty {
+    mir::Ty::Adt(RANGE_FULL_TY, vec![])
+}
+
+fn range_to_ty() -> mir::Ty {
+    mir::Ty::Adt(RANGE_TO_TY, vec![usize_ty()])
+}
+
+fn range_ty() -> mir::Ty {
+    mir::Ty::Adt(RANGE_TY, vec![usize_ty()])
+}
+
+fn slice_i32_ty() -> mir::Ty {
+    mir::Ty::Slice(Box::new(i32_ty()))
 }
 
 fn program(body: mir::Body) -> MirProgram {
@@ -1526,6 +1548,270 @@ fn index_mut_writes_an_array_element() {
     );
     let value = interpret_mir(&program(body), "main", vec![]).expect("run");
     assert_eq!(value, Value::Int(99));
+}
+
+#[test]
+fn index_mut_writes_a_vec_element() {
+    // fn main() -> i32 {
+    //   _1 = Vec::new(); push 10; push 20;
+    //   _7 = IndexMut::index_mut(&mut _1, 1);
+    //   *_7 = 99;
+    //   return _1[1];
+    // }
+    let body = mir::Body::new(
+        decls(&[
+            i32_ty(),
+            vec_i32_ty(),
+            ref_ty(vec_i32_ty(), true),
+            mir::Ty::unit(),
+            ref_ty(vec_i32_ty(), true),
+            mir::Ty::unit(),
+            ref_ty(vec_i32_ty(), true),
+            ref_ty(i32_ty(), true),
+        ]),
+        0,
+        vec![
+            block(vec![], call(fndef(VEC_NEW, vec![i32_ty()]), vec![], 1, 1)),
+            block(
+                vec![assign(place(2), ref_rvalue(1, true))],
+                call(
+                    fndef(VEC_PUSH, vec![i32_ty()]),
+                    vec![move_(2), const_i32(10)],
+                    3,
+                    2,
+                ),
+            ),
+            block(
+                vec![assign(place(4), ref_rvalue(1, true))],
+                call(
+                    fndef(VEC_PUSH, vec![i32_ty()]),
+                    vec![move_(4), const_i32(20)],
+                    5,
+                    3,
+                ),
+            ),
+            block(
+                vec![assign(place(6), ref_rvalue(1, true))],
+                call(
+                    fndef(INDEX_MUT, vec![vec_i32_ty(), usize_ty()]),
+                    vec![move_(6), const_usize(1)],
+                    7,
+                    4,
+                ),
+            ),
+            block(
+                vec![
+                    assign(deref_place(7), mir::Rvalue::Use(const_i32(99))),
+                    assign(
+                        place(0),
+                        mir::Rvalue::Use(mir::Operand::Copy(mir::Place {
+                            local: mir::Local(1),
+                            projection: vec![mir::PlaceElem::ConstantIndex {
+                                offset: 1,
+                                min_length: 2,
+                                from_end: false,
+                            }],
+                        })),
+                    ),
+                ],
+                ret(),
+            ),
+        ],
+    );
+    let value = interpret_mir(&program(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Int(99));
+}
+
+#[test]
+fn index_mut_range_full_writes_through_the_fat_ref() {
+    // fn main() -> i32 {
+    //   _1 = [1, 2, 3];
+    //   _4 = IndexMut::index_mut(&mut _1, ..);
+    //   _5 = IndexMut::index_mut(move _4, 0);
+    //   *_5 = 9;
+    //   return _1[0];
+    // }
+    let array_ty = mir::Ty::Array(Box::new(i32_ty()), mir::ArrayLen::Known(3));
+    let body = mir::Body::new(
+        decls(&[
+            i32_ty(),
+            array_ty.clone(),
+            ref_ty(array_ty.clone(), true),
+            range_full_ty(),
+            ref_ty(slice_i32_ty(), true),
+            ref_ty(i32_ty(), true),
+        ]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(
+                        place(1),
+                        mir::Rvalue::Aggregate(
+                            Box::new(mir::AggregateKind::Array(i32_ty())),
+                            vec![const_i32(1), const_i32(2), const_i32(3)],
+                        ),
+                    ),
+                    assign(place(2), ref_rvalue(1, true)),
+                    assign(
+                        place(3),
+                        adt_aggregate(RANGE_FULL_TY, 0, vec![], vec![]),
+                    ),
+                ],
+                call(
+                    fndef(INDEX_MUT, vec![array_ty, range_full_ty()]),
+                    vec![move_(2), move_(3)],
+                    4,
+                    1,
+                ),
+            ),
+            block(
+                vec![],
+                call(
+                    fndef(INDEX_MUT, vec![slice_i32_ty(), usize_ty()]),
+                    vec![move_(4), const_usize(0)],
+                    5,
+                    2,
+                ),
+            ),
+            block(
+                vec![
+                    assign(deref_place(5), mir::Rvalue::Use(const_i32(9))),
+                    assign(
+                        place(0),
+                        mir::Rvalue::Use(mir::Operand::Copy(mir::Place {
+                            local: mir::Local(1),
+                            projection: vec![mir::PlaceElem::ConstantIndex {
+                                offset: 0,
+                                min_length: 3,
+                                from_end: false,
+                            }],
+                        })),
+                    ),
+                ],
+                ret(),
+            ),
+        ],
+    );
+    let value = interpret_mir(&program(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Int(9));
+}
+
+#[test]
+fn index_mut_range_to_bounds_use_the_fat_len() {
+    // fn main() -> i32 {
+    //   _1 = [1, 2, 3, 4];
+    //   _4 = IndexMut::index_mut(&mut _1, ..2);
+    //   _5 = IndexMut::index_mut(move _4, 2);  // panics: len is 2
+    // }
+    let array_ty = mir::Ty::Array(Box::new(i32_ty()), mir::ArrayLen::Known(4));
+    let body = mir::Body::new(
+        decls(&[
+            i32_ty(),
+            array_ty.clone(),
+            ref_ty(array_ty.clone(), true),
+            range_to_ty(),
+            ref_ty(slice_i32_ty(), true),
+            ref_ty(i32_ty(), true),
+        ]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(
+                        place(1),
+                        mir::Rvalue::Aggregate(
+                            Box::new(mir::AggregateKind::Array(i32_ty())),
+                            vec![const_i32(1), const_i32(2), const_i32(3), const_i32(4)],
+                        ),
+                    ),
+                    assign(place(2), ref_rvalue(1, true)),
+                    assign(
+                        place(3),
+                        adt_aggregate(RANGE_TO_TY, 0, vec![usize_ty()], vec![const_usize(2)]),
+                    ),
+                ],
+                call(
+                    fndef(INDEX_MUT, vec![array_ty, range_to_ty()]),
+                    vec![move_(2), move_(3)],
+                    4,
+                    1,
+                ),
+            ),
+            block(
+                vec![],
+                call(
+                    fndef(INDEX_MUT, vec![slice_i32_ty(), usize_ty()]),
+                    vec![move_(4), const_usize(2)],
+                    5,
+                    2,
+                ),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let message = expect_panic(interpret_mir(&program(body), "main", vec![]));
+    assert_eq!(message, "index out of bounds: the len is 2 but the index is 2");
+}
+
+#[test]
+fn index_mut_range_with_nonzero_start_is_explicitly_unsupported() {
+    // A sub-slice starting above zero has no representation in
+    // the value model (a fat reference carries no offset), so
+    // `IndexMut::index_mut(&mut _1, 1..3)` stays an explicit
+    // unsupported error rather than a silent wrong answer.
+    let array_ty = mir::Ty::Array(Box::new(i32_ty()), mir::ArrayLen::Known(4));
+    let body = mir::Body::new(
+        decls(&[
+            i32_ty(),
+            array_ty.clone(),
+            ref_ty(array_ty.clone(), true),
+            range_ty(),
+            ref_ty(slice_i32_ty(), true),
+        ]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(
+                        place(1),
+                        mir::Rvalue::Aggregate(
+                            Box::new(mir::AggregateKind::Array(i32_ty())),
+                            vec![const_i32(1), const_i32(2), const_i32(3), const_i32(4)],
+                        ),
+                    ),
+                    assign(place(2), ref_rvalue(1, true)),
+                    assign(
+                        place(3),
+                        adt_aggregate(
+                            RANGE_TY,
+                            0,
+                            vec![usize_ty()],
+                            vec![const_usize(1), const_usize(3)],
+                        ),
+                    ),
+                ],
+                call(
+                    fndef(INDEX_MUT, vec![array_ty, range_ty()]),
+                    vec![move_(2), move_(3)],
+                    4,
+                    1,
+                ),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let err = interpret_mir(&program(body), "main", vec![])
+        .expect_err("a range starting above zero must fail explicitly");
+    match err {
+        MirRunError::Interp(InterpError::UnsupportedTerminator { kind }) => {
+            assert!(
+                kind.contains("range starting at 1 is not runtime-supported"),
+                "error names the limitation: {kind}"
+            );
+        }
+        other => panic!("expected an explicit unsupported error, got {other:?}"),
+    }
 }
 
 // ----- Round 2: intrinsics, ops traits, Rc/Arc, zeroed, null (Lane BI) --------
