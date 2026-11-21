@@ -5445,6 +5445,206 @@ fn run_mode_mem_drop_of_zst_union_runs_destructor() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "mem-drop ok\n");
 }
 
+const UNION_REINTERPRET_SRC: &str = r#"
+union W {
+    a: u32,
+    b: f32,
+}
+union V {
+    a: u32,
+    b: [u8; 4],
+    c: u16,
+}
+union T {
+    a: (u8, u8),
+    b: u16,
+}
+union U<A, B>
+where
+    A: Copy,
+    B: Copy,
+{
+    a: A,
+    b: B,
+}
+unsafe fn union_transmute<A, B>(a: A) -> B
+where
+    A: Copy,
+    B: Copy,
+{
+    U { a }.b
+}
+fn main() {
+    unsafe {
+        let w = W { a: 0x3F80_0000 };
+        assert_eq!(w.b, 1.0);
+        let mut w2 = W { b: 2.5 };
+        assert_eq!(w2.a, 0x4020_0000);
+        w2.a = 0x3F80_0000;
+        assert_eq!(w2.b, 1.0);
+        let v = V { a: 0x0403_0201 };
+        assert_eq!(v.b, [1, 2, 3, 4]);
+        assert_eq!(v.c, 0x0201);
+        let v2 = V { b: [9, 8, 7, 6] };
+        assert_eq!(v2.a, 0x0607_0809);
+        let mut m = V { a: 0 };
+        m.c = 0xBEEF;
+        assert_eq!(m.c, 0xBEEF);
+        assert_eq!(m.b, [0xEF, 0xBE, 0, 0]);
+        let t = T { a: (1, 1) };
+        assert_eq!(t.b, (1 << 8) + 1);
+        let g: u16 = union_transmute((1u8, 1u8));
+        assert_eq!(g, (1 << 8) + 1);
+        let f: f32 = union_transmute(0x3F80_0000u32);
+        assert_eq!(f, 1.0);
+        println!("union reinterpret ok");
+    }
+}
+"#;
+
+#[test]
+fn run_mode_union_field_reads_reinterpret_bits() {
+    // Reading a union through a different field than the one
+    // written reinterprets the held field's bits (little-endian:
+    // narrower fields read the low bytes), matching native runs
+    // of this same program.
+    let dir = temp_dir("union-reinterpret");
+    let src = fixture(&dir, "union_reinterpret.rs", UNION_REINTERPRET_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "union field reads must reinterpret the held field's bits; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "union reinterpret ok\n"
+    );
+}
+
+const UNION_WRAPPER_FIELDS_SRC: &str = r#"
+use std::mem::ManuallyDrop;
+union C {
+    a: u32,
+    b: char,
+}
+union B {
+    a: u8,
+    b: bool,
+}
+union M {
+    a: ManuallyDrop<u32>,
+    b: f32,
+}
+fn main() {
+    unsafe {
+        let c = C { a: 0x41 };
+        assert_eq!(c.b, 'A');
+        let b = B { a: 1 };
+        assert_eq!(b.b, true);
+        let m = M { b: 1.5 };
+        let md = m.a;
+        let m3 = M { a: md };
+        assert_eq!(m3.b, 1.5);
+        let m2 = M { a: ManuallyDrop::new(0x3F80_0000) };
+        assert_eq!(m2.b, 1.0);
+        println!("union wrapper fields ok");
+    }
+}
+"#;
+
+#[test]
+fn run_mode_union_field_reads_through_wrapper_fields() {
+    // `char` / `bool` fields and one-payload wrapper fields
+    // (ManuallyDrop) reinterpret through the same shapes.
+    let dir = temp_dir("union-wrapper-fields");
+    let src = fixture(&dir, "union_wrapper_fields.rs", UNION_WRAPPER_FIELDS_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "union reads through char/bool/ManuallyDrop fields must reinterpret; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "union wrapper fields ok\n"
+    );
+}
+
+const UNION_NO_SHAPE_SRC: &str = r#"
+#[derive(Copy, Clone)]
+struct P(u32, u32);
+union X {
+    a: P,
+    b: u64,
+}
+fn main() {
+    unsafe {
+        let x = X { b: 42 };
+        let _p = x.a;
+        println!("should not reach");
+    }
+}
+"#;
+
+#[test]
+fn run_mode_union_field_read_without_scalar_shape_is_explicit() {
+    // A field whose type has no scalar shape (a two-payload
+    // struct) cannot be reinterpreted from another field's
+    // bits: the read is a named unsupported error, not a
+    // fabricated value.
+    let dir = temp_dir("union-no-shape");
+    let src = fixture(&dir, "union_no_shape.rs", UNION_NO_SHAPE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a union read with no scalar shape must be a named unsupported; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("union field read"),
+        "stderr must name the union field read; stderr={stderr}"
+    );
+}
+
+const UNION_NESTED_WRITE_SRC: &str = r#"
+union U {
+    a: (u16, u16),
+    b: u32,
+}
+fn main() {
+    unsafe {
+        let mut u = U { b: 0xDEAD_DEAD };
+        u.a.0 = 0xBEEF;
+        println!("should not reach");
+    }
+}
+"#;
+
+#[test]
+fn run_mode_union_write_inside_unheld_field_is_explicit() {
+    // Writing inside a field the value does not currently hold
+    // would have to preserve the held field's remaining bytes;
+    // the model holds one field's value, so the write stays an
+    // uninitialized error rather than fabricating the field.
+    let dir = temp_dir("union-nested-write");
+    let src = fixture(&dir, "union_nested_write.rs", UNION_NESTED_WRITE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a write inside an unheld union field must fail explicitly; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("uninitialized"),
+        "stderr must name the uninitialized field; stderr={stderr}"
+    );
+}
+
 const WEAK_COW_DROP_SRC: &str = r#"
 enum Void {}
 fn main() {
