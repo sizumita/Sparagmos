@@ -4670,6 +4670,25 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
             "std::fmt::Arguments" | "core::fmt::rt::Argument" => return Some(P::Trivial),
             // `ManuallyDrop` is defined to run no glue at all.
             "std::mem::ManuallyDrop" | "core::mem::ManuallyDrop" => return Some(P::Trivial),
+            "std::panic::AssertUnwindSafe" | "core::panic::AssertUnwindSafe" => {
+                // A one-field transparent wrapper with no `Drop`
+                // impl of its own: dropping it drops the held
+                // value. `catch_unwind` arguments are dropped on
+                // every path through the panic machinery, so this
+                // glue is on the coroutine panic path as well.
+                let inner = self.plan(args.first()?)?;
+                return Some(at_field0(inner));
+            }
+            "std::pin::Pin" | "core::pin::Pin" => {
+                // `Pin<P>` has no destructor of its own (it is a
+                // transparent newtype with no `Drop` impl); dropping
+                // it drops the pointer it wraps, exactly as dropping
+                // the pointer itself would: `Pin<Box<T>>` runs the
+                // box's pointee glue, `Pin<&mut T>` drops nothing
+                // (`at_field0` collapses a trivial inner plan).
+                let inner = self.plan(args.first()?)?;
+                return Some(at_field0(inner));
+            }
             "std::vec::Vec" => {
                 let elem = self.plan(args.first()?)?;
                 return Some(match elem {
@@ -4750,6 +4769,21 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                         plan: Box::new(plan),
                     },
                 });
+            }
+            "std::ops::CoroutineState" | "core::ops::CoroutineState" => {
+                // The resume result: an enum (`Yielded` / `Complete`)
+                // with no `Drop` impl of its own, so its glue is its
+                // variants' fields' glue. Every `resume` produces
+                // one, and `catch_unwind` wraps it in a `Result`, so
+                // this glue is on the coroutine runtime path itself.
+                return Some(self.variant_fields_plan(def, args)?);
+            }
+            "std::task::Poll" | "core::task::Poll" => {
+                // The future poll result: an enum (`Pending` /
+                // `Ready`) with no `Drop` impl of its own; its glue
+                // is its variants' fields' glue, as for
+                // `CoroutineState`.
+                return Some(self.variant_fields_plan(def, args)?);
             }
             "std::result::Result" => {
                 // Same value shape as `Option`: variant 0 is `Ok`,
