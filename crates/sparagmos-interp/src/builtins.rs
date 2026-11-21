@@ -152,6 +152,26 @@ pub fn ty_tag(ty: &mir::Ty, names: &HashMap<mir::DefId, String>) -> String {
             .get(def)
             .cloned()
             .unwrap_or_else(|| format!("{def:?}")),
+        T::Coroutine(def, args) => {
+            // A coroutine type is named by its definition (the
+            // async fn / coroutine literal it was lowered from),
+            // with its generic arguments rendered like an ADT's, so
+            // the tag identifies one monomorphic coroutine instance.
+            // The driver records real layouts under this tag (a
+            // coroutine type has no ADT entry), which is what lets
+            // the `size_of_val` / `align_of_val` builtins answer
+            // for coroutine values.
+            let base = names
+                .get(def)
+                .cloned()
+                .unwrap_or_else(|| "Coroutine".to_string());
+            if args.is_empty() {
+                base
+            } else {
+                let parts: Vec<String> = args.iter().map(|t| ty_tag(t, names)).collect();
+                format!("{base}<{}>", parts.join(", "))
+            }
+        }
         T::Param(_, name) => name.clone(),
         _ => ty.kind_name().to_string(),
     }

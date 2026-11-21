@@ -2021,8 +2021,15 @@ impl Converter {
 
     pub fn ty(&mut self, ty: &rustc_public::ty::Ty) -> sm::Ty {
         let converted = self.ty_inner(ty);
-        if let TyKind::RigidTy(RigidTy::Adt(def, args)) = ty.kind() {
-            self.record_layout(ty, &def, &args, &converted);
+        match ty.kind() {
+            TyKind::RigidTy(RigidTy::Adt(def, args)) => {
+                self.record_layout(ty, &def, &args, &converted);
+            }
+            TyKind::RigidTy(RigidTy::Coroutine(..))
+            | TyKind::RigidTy(RigidTy::CoroutineClosure(..)) => {
+                self.record_coroutine_layout(ty, &converted);
+            }
+            _ => {}
         }
         converted
     }
@@ -2124,14 +2131,7 @@ impl Converter {
         args: &rustc_public::ty::GenericArgs,
         converted: &sm::Ty,
     ) {
-        while self.layout_names.len() < self.def_names.len() {
-            let index = self.layout_names.len();
-            self.layout_names.insert(
-                sm::DefId::new(0, index as u32),
-                self.def_names[index].clone(),
-            );
-        }
-        let key = sparagmos_interp::builtins::ty_tag(converted, &self.layout_names);
+        let key = self.layout_key(converted);
         if !self.layout_attempted.insert(key.clone()) {
             return;
         }
@@ -2146,6 +2146,52 @@ impl Converter {
         // the instance simply gets no entry and stays unsupported.
         // (The panic is silent under the driver's panic-capture
         // hook, which is installed while the compiler runs.)
+        let layout = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ty.layout()));
+        let Ok(Ok(layout)) = layout else {
+            return;
+        };
+        let shape = layout.shape();
+        if shape.is_unsized() {
+            return;
+        }
+        self.adt_layouts.insert(
+            key,
+            (shape.size.bytes() as u64, shape.abi_align),
+        );
+    }
+
+    /// The `adt_layouts` key for a converted type: its `ty_tag`
+    /// rendering against the layout name table, which is kept in
+    /// sync with `def_names` (the interpreter renders call-site
+    /// tags against the same names).
+    fn layout_key(&mut self, converted: &sm::Ty) -> String {
+        while self.layout_names.len() < self.def_names.len() {
+            let index = self.layout_names.len();
+            self.layout_names.insert(
+                sm::DefId::new(0, index as u32),
+                self.def_names[index].clone(),
+            );
+        }
+        sparagmos_interp::builtins::ty_tag(converted, &self.layout_names)
+    }
+
+    /// Record the compiler-computed layout of one monomorphic
+    /// coroutine instance under its type tag, once per distinct
+    /// instance. A coroutine's layout is the compiler's own
+    /// state-machine layout (which captures live across each
+    /// suspension point); it cannot be derived from the converted
+    /// MIR, so it comes from the same layout query the ADT path
+    /// uses. The entry lands in `adt_layouts`, the table the
+    /// `size_of_val` / `align_of_val` builtins consult by tag.
+    /// Instances the query cannot answer (generic parameters among
+    /// the arguments) are skipped under the same containment as
+    /// the ADT path: the query is caught, and the instance stays
+    /// explicitly unsupported.
+    fn record_coroutine_layout(&mut self, ty: &rustc_public::ty::Ty, converted: &sm::Ty) {
+        let key = self.layout_key(converted);
+        if !self.layout_attempted.insert(key.clone()) {
+            return;
+        }
         let layout = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ty.layout()));
         let Ok(Ok(layout)) = layout else {
             return;
