@@ -505,6 +505,37 @@ impl<'a> Interpreter<'a> {
         self.output.push_str(text);
     }
 
+    /// The current length of the guest's captured stdout, as a
+    /// mark for [`Interpreter::drain_output_since`].
+    pub(crate) fn output_len(&self) -> usize {
+        self.output.len()
+    }
+
+    /// The current length of the guest's captured stderr, as a
+    /// mark for [`Interpreter::drain_error_output_since`].
+    pub(crate) fn error_output_len(&self) -> usize {
+        self.error_output.len()
+    }
+
+    /// Remove and return everything written to the guest's stdout
+    /// since `mark` (see [`Interpreter::output_len`]). The libtest
+    /// harness model captures each test's output this way.
+    pub(crate) fn drain_output_since(&mut self, mark: usize) -> String {
+        if mark >= self.output.len() {
+            return String::new();
+        }
+        self.output.split_off(mark)
+    }
+
+    /// Remove and return everything written to the guest's stderr
+    /// since `mark` (see [`Interpreter::error_output_len`]).
+    pub(crate) fn drain_error_output_since(&mut self, mark: usize) -> String {
+        if mark >= self.error_output.len() {
+            return String::new();
+        }
+        self.error_output.split_off(mark)
+    }
+
     fn tick(&mut self) -> InterpResult<()> {
         self.steps += 1;
         if self.steps > self.config.max_steps {
@@ -1926,6 +1957,52 @@ impl<'a> Interpreter<'a> {
     /// (see [`Interpreter::last_panic_stamp`]).
     pub(crate) fn note_panic_stamp(&self, stamp: Value) {
         *self.last_panic_stamp.borrow_mut() = Some(stamp);
+    }
+
+    /// Forget the recorded panic stamp (the libtest harness model
+    /// clears it before each test so a stale stamp is never read
+    /// for a later test).
+    pub(crate) fn clear_panic_stamp(&self) {
+        *self.last_panic_stamp.borrow_mut() = None;
+    }
+
+    /// The (file, line, column) of the panic currently recorded,
+    /// read out of its caller-location stamp: a `Location` value
+    /// whose fields are the file string (possibly wrapped as the
+    /// one-field enum a `&str` constant decodes to), the line and
+    /// the column.
+    pub(crate) fn panic_location(&self) -> Option<(String, u64, u64)> {
+        let stamp = self.last_panic_stamp.borrow().clone()?;
+        fn fields_of(v: &Value) -> Option<&Vec<Value>> {
+            match v {
+                Value::Ref(RefTarget::Value(inner)) => fields_of(inner),
+                Value::Enum { fields, .. } | Value::Tuple(fields) => Some(fields),
+                _ => None,
+            }
+        }
+        let fields = fields_of(&stamp)?;
+        if fields.len() < 3 {
+            return None;
+        }
+        let file = match &fields[0] {
+            Value::Str(s) => s.clone(),
+            inner => match fields_of(inner) {
+                Some(f) if f.len() == 1 => match &f[0] {
+                    Value::Str(s) => s.clone(),
+                    _ => return None,
+                },
+                _ => return None,
+            },
+        };
+        let line = match &fields[1] {
+            Value::Uint(n) => *n as u64,
+            _ => return None,
+        };
+        let col = match &fields[2] {
+            Value::Uint(n) => *n as u64,
+            _ => return None,
+        };
+        Some((file, line, col))
     }
 
     /// Mark the panic about to be raised as a resumed one (the
