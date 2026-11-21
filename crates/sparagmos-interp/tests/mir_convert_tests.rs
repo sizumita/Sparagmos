@@ -471,35 +471,38 @@ fn tuple_and_array_aggregates_and_repeat() {
 // ----- explicit failures (nothing is silently skipped) ---------------------------
 
 #[test]
-fn f128_local_is_a_conversion_error() {
-    // f16 / f32 / f64 locals convert and execute (see float_tests.rs);
-    // f128 stays outside the type model and must fail conversion
-    // with an explicit reason. Conversion is isolated per body:
-    // the failure is recorded for `f`, and running `f` as the
-    // entry fails with that conversion error.
+fn f128_local_converts_and_executes() {
+    // f128 is part of the type model: the value rides as its raw
+    // binary128 bit pattern and arithmetic runs in the exact
+    // software module (see f128_tests.rs for the arithmetic
+    // itself). _1 = 1.5f128; return _1 + _1 == 3.0f128, bit-exact.
+    let const_1_5 = mir::Operand::constant(mir::Constant::from_value(
+        mir::ConstValue::Scalar(mir::Scalar::Float {
+            bits: 0x3fff_8000_0000_0000_0000_0000_0000_0000,
+            ty: mir::FloatTy::F128,
+        }),
+    ));
     let body = mir::Body::new(
-        decls(&[mir::Ty::Float(mir::FloatTy::F128)]),
+        decls(&[
+            mir::Ty::Float(mir::FloatTy::F128),
+            mir::Ty::Float(mir::FloatTy::F128),
+        ]),
         0,
-        vec![block(vec![], ret())],
+        vec![block(
+            vec![
+                assign(place(1), mir::Rvalue::Use(const_1_5)),
+                assign(place(0), binop(mir::BinOp::Add, copy(1), copy(1))),
+            ],
+            ret(),
+        )],
     );
     let mut prog = MirProgram::new();
     prog.add("f", body);
     let converted = convert_program(&prog).expect("conversion is per-body");
-    assert!(converted.get("f").is_none(), "f128 body must not convert");
-    let reason = converted
-        .unconverted_reason("f")
-        .expect("the failure must be recorded");
-    assert!(
-        reason.contains("unsupported type"),
-        "the recorded reason names the failure: {reason}"
-    );
-    let err = interpret_mir(&prog, "f", vec![]).expect_err("entry conversion must fail");
-    assert!(
-        matches!(
-            err,
-            MirRunError::Convert(ConvertError::UnsupportedType { .. })
-        ),
-        "expected Convert(UnsupportedType), got {err}"
+    assert!(converted.get("f").is_some(), "f128 body must convert");
+    assert_eq!(
+        interpret_mir(&prog, "f", vec![]).expect("f runs"),
+        Value::Float128(0x4000_8000_0000_0000_0000_0000_0000_0000)
     );
 }
 

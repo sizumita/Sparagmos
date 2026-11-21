@@ -380,3 +380,121 @@ fn trailing_str_field_constant_runs() {
     // bytes run to the end of the allocation.
     run_ok("str_newtype", STR_NEWTYPE_RS);
 }
+
+// ----- Lane DR: multi-payload unions, vtable / fat pointer constants, f128 -----
+
+const UNION_MULTI_RS: &str = "\
+union U { a: u32, b: f32 }
+const V: U = U { a: 0x3fc0_0000 };
+const W: U = U { b: 2.5 };
+fn main() {
+    unsafe {
+        assert_eq!(V.a, 0x3fc0_0000);
+        assert_eq!(V.b, 1.5);
+        assert_eq!(W.b, 2.5);
+        assert_eq!(W.a, 0x4020_0000);
+    }
+    println!(\"ok\");
+}
+";
+
+#[test]
+fn multi_payload_union_constant_runs() {
+    // A union with two payload fields: the allocation does not say
+    // which field is live, but the value model carries every field
+    // and a field read reinterprets the same bytes, so both reads
+    // are faithful.
+    run_ok("union_multi", UNION_MULTI_RS);
+}
+
+const UNION_PTR_RS: &str = "\
+union P { p: *const u8, n: usize }
+static X: u8 = 9;
+const PU: P = P { p: &X };
+fn main() {
+    unsafe {
+        assert_eq!(*PU.p, 9);
+    }
+    println!(\"ok\");
+}
+";
+
+#[test]
+fn union_with_pointer_field_constant_runs() {
+    // The provenance entry at the union's offset identifies the
+    // pointer field as the stored one; the overlapping integer
+    // field decodes as uninitialised rather than as a fabricated
+    // reinterpretation of the pointer's bytes.
+    run_ok("union_ptr", UNION_PTR_RS);
+}
+
+const DANGLING_SLICE_RS: &str = "\
+const P: *const [u16] = unsafe { std::slice::from_raw_parts(0x10 as *const u16, 3) };
+fn main() {
+    assert_eq!(P.len(), 3);
+    assert_eq!((P as *const u16) as usize, 0x10);
+    println!(\"ok\");
+}
+";
+
+#[test]
+fn dangling_slice_constant_runs() {
+    // A provenance-less fat pointer constant: there is no pointee,
+    // but the address identity and the length are exactly what the
+    // program observes. (A dangling slice *reference* constant is
+    // rejected by rustc's own validity check, so the raw-pointer
+    // form is the shape that reaches the decoder.)
+    run_ok("dangling_slice", DANGLING_SLICE_RS);
+}
+
+const VTABLE_CONST_RS: &str = "\
+trait T { fn m(&self) -> u8; }
+impl T for u32 { fn m(&self) -> u8 { 1 } }
+impl T for i32 { fn m(&self) -> u8 { 2 } }
+const VT1: [*const (); 2] = unsafe {
+    std::mem::transmute::<&dyn T, [*const (); 2]>(&42_u32 as &dyn T)
+};
+const VT1B: [*const (); 2] = unsafe {
+    std::mem::transmute::<&dyn T, [*const (); 2]>(&7_u32 as &dyn T)
+};
+const VT2: [*const (); 2] = unsafe {
+    std::mem::transmute::<&dyn T, [*const (); 2]>(&42_i32 as &dyn T)
+};
+fn main() {
+    assert!(!VT1[1].is_null());
+    assert_eq!(VT1[1], VT1B[1]);
+    assert_ne!(VT1[1], VT2[1]);
+    println!(\"ok\");
+}
+";
+
+#[test]
+fn vtable_pointer_constant_runs() {
+    // A vtable pointer decodes to a stable identity for the
+    // (concrete type, trait) pair: the same pair compares equal,
+    // different pairs compare unequal.
+    run_ok("vtable_const", VTABLE_CONST_RS);
+}
+
+const F128_CONST_RS: &str = "\
+#![feature(f128)]
+const A: f128 = 1.5;
+const B: f128 = 2.25;
+fn main() {
+    assert!(A + A == 3.0f128);
+    assert!(A * B == 3.375f128);
+    assert!((A * B) as f64 == 3.375f64);
+    assert!(A < B);
+    assert!(B.sqrt() == 1.5f128);
+    assert!(A.to_bits() == 0x3fff_8000_0000_0000_0000_0000_0000_0000u128);
+    println!(\"ok\");
+}
+";
+
+#[test]
+fn f128_constant_runs() {
+    // f128 constants decode to their raw binary128 bit pattern and
+    // execute in the exact software arithmetic; nothing is rounded
+    // through f64.
+    run_ok("f128_const", F128_CONST_RS);
+}
