@@ -5877,6 +5877,23 @@ fn is_dtor_name(name: &str, adt_name: &str) -> bool {
     false
 }
 
+/// The drop plan of a modelled owning iterator state
+/// (`Enum { fields: [Tuple(elements), Uint(cursor)] }`, the shape
+/// the `vec` / `array` / `option` `IntoIter` builtins build):
+/// the elements tuple's glue, element by element. Slots the
+/// iterator already yielded hold `Uninit`, which every plan
+/// skips, so exactly the unyielded elements are dropped — the
+/// real iterator's `Drop` impl semantics.
+fn owned_iter_plan(elem: ir::DropPlan) -> ir::DropPlan {
+    match elem {
+        ir::DropPlan::Trivial => ir::DropPlan::Trivial,
+        e => ir::DropPlan::At {
+            path: vec![RefProj::Field(0)],
+            plan: Box::new(ir::DropPlan::Each { elem: Box::new(e) }),
+        },
+    }
+}
+
 /// Run `plan` against field 0 of the value it applies to (the
 /// pointee of a `Box`, the payload of `Option::Some`).
 fn at_field0(plan: ir::DropPlan) -> ir::DropPlan {
@@ -6291,15 +6308,71 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                 return Some(collapse_fields(vec![bound], true));
             }
             "std::ops::RangeFull" => return Some(P::Trivial),
-            "std::array::IntoIter" => {
-                // The modelled value does not expose the buffer's
-                // elements as fields, so only a trivial element
-                // type is accounted for.
+            "std::array::IntoIter" | "core::array::IntoIter" => {
+                // The modelled state holds the buffer's elements
+                // in a tuple with yielded slots marked `Uninit`,
+                // so the elements' glue is exact (see
+                // `owned_iter_plan`).
                 let elem = self.plan(args.first()?)?;
-                return match elem {
-                    P::Trivial => Some(P::Trivial),
-                    _ => None,
-                };
+                return Some(owned_iter_plan(elem));
+            }
+            "std::vec::IntoIter" | "alloc::vec::IntoIter" => {
+                let elem = self.plan(args.first()?)?;
+                return Some(owned_iter_plan(elem));
+            }
+            "std::option::IntoIter" | "core::option::IntoIter" => {
+                let elem = self.plan(args.first()?)?;
+                return Some(owned_iter_plan(elem));
+            }
+            // Borrowing iterators own nothing: the references (and,
+            // for `IterMut`, the container snapshot) inside the
+            // modelled state are not owned values, and the real
+            // types have no glue of their own.
+            "std::option::Iter" | "core::option::Iter"
+            | "std::option::IterMut" | "core::option::IterMut"
+            | "std::slice::Iter" | "core::slice::Iter"
+            | "std::slice::IterMut" | "core::slice::IterMut"
+            | "std::str::Chars" | "core::str::Chars"
+            | "std::str::Bytes" | "core::str::Bytes"
+            | "std::iter::Empty" | "core::iter::Empty" => return Some(P::Trivial),
+            "std::iter::Map" | "core::iter::Map" => {
+                // State fields: the inner iterator's state and the
+                // closure value; glue is the two fields' glue.
+                let inner = self.plan(args.first()?)?;
+                let func = self.plan(args.get(1)?)?;
+                return Some(collapse_fields(vec![inner, func], true));
+            }
+            "std::iter::Enumerate" | "core::iter::Enumerate" => {
+                let inner = self.plan(args.first()?)?;
+                return Some(collapse_fields(vec![inner, P::Trivial], true));
+            }
+            "std::iter::Copied" | "core::iter::Copied" => {
+                let inner = self.plan(args.first()?)?;
+                return Some(at_field0(inner));
+            }
+            "std::iter::Take" | "core::iter::Take" => {
+                let inner = self.plan(args.first()?)?;
+                return Some(collapse_fields(vec![inner, P::Trivial], true));
+            }
+            "std::iter::Once" | "core::iter::Once" => {
+                // The state's only field is the wrapped
+                // `option::IntoIter` state.
+                let elem = self.plan(args.first()?)?;
+                return Some(at_field0(owned_iter_plan(elem)));
+            }
+            "std::iter::SkipWhile" | "core::iter::SkipWhile" => {
+                // Fields are the inner iterator, the `done` flag
+                // (a bool: no glue) and the predicate.
+                let inner = self.plan(args.first()?)?;
+                let func = self.plan(args.get(1)?)?;
+                return Some(collapse_fields(vec![inner, P::Trivial, func], true));
+            }
+            "std::iter::Repeat" | "core::iter::Repeat" => {
+                // The state's only field is the element the
+                // iterator clones from; dropping the iterator
+                // drops it.
+                let elem = self.plan(args.first()?)?;
+                return Some(at_field0(elem));
             }
             "std::vec::IntoIter" | "alloc::vec::IntoIter" => {
                 // Same modelled state as `array::IntoIter` (the
