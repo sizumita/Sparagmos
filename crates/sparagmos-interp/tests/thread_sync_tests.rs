@@ -356,13 +356,19 @@ fn spawned_thread_panic_becomes_the_join_error() {
     let value = run(main, &[(CLO_PANIC, "main::{closure#1}", clo_body)]);
     match value {
         Value::Enum { variant: 1, fields } => match &fields[0] {
-            Value::Enum { variant: 0, fields } => match &fields[0] {
-                Value::Str(message) => {
-                    assert!(message.contains("Option::unwrap"), "{message}")
+            // The join error is the panic payload as a
+            // `Box<dyn Any>`: a `DynRef` whose base is the
+            // payload value (here the `&str` message).
+            Value::DynRef { base, concrete, .. } => {
+                assert_eq!(concrete, "&str");
+                match &**base {
+                    Value::Str(message) => {
+                        assert!(message.contains("Option::unwrap"), "{message}")
+                    }
+                    other => panic!("expected the panic message string, got {other:?}"),
                 }
-                other => panic!("expected the panic message string, got {other:?}"),
-            },
-            other => panic!("expected the box-shaped payload, got {other:?}"),
+            }
+            other => panic!("expected the payload DynRef, got {other:?}"),
         },
         other => panic!("expected the join Err, got {other:?}"),
     }

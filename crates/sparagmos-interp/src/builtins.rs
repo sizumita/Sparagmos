@@ -427,6 +427,11 @@ pub enum Builtin {
     /// `#[track_caller]` function, the stamped call site
     /// otherwise).
     CallerLocation,
+    /// `std::panic::set_hook(hook)`: install the panic hook.
+    PanicSetHook,
+    /// `std::panic::take_hook()`: take the panic hook, leaving
+    /// the default in its place.
+    PanicTakeHook,
     /// `std::time::Instant::now()`: the host monotonic clock.
     InstantNow,
     /// `std::time::SystemTime::now()`: the host wall clock.
@@ -696,6 +701,14 @@ pub enum Builtin {
     /// `std::intrinsics::atomic_xchg(ptr, new) -> previous`: an
     /// unconditional exchange through the pointer.
     AtomicXchg,
+    /// `std::intrinsics::atomic_xadd(ptr, value) -> previous`:
+    /// a wrapping add through the pointer, in this
+    /// single-threaded interpreter a read, an add and a write.
+    AtomicXadd,
+    /// `std::intrinsics::atomic_xsub(ptr, value) -> previous`:
+    /// a wrapping subtract through the pointer, as for
+    /// `AtomicXadd`.
+    AtomicXsub,
     /// `std::intrinsics::atomic_fence()`: orders other threads'
     /// accesses; there are none, so it is a no-op.
     AtomicFence,
@@ -861,6 +874,8 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::time::Duration::from_micros" => Builtin::DurationFromMicros,
         "std::time::Duration::from_nanos" => Builtin::DurationFromNanos,
         "std::intrinsics::caller_location" => Builtin::CallerLocation,
+        "std::panic::set_hook" => Builtin::PanicSetHook,
+        "std::panic::take_hook" => Builtin::PanicTakeHook,
         "std::time::Instant::now" => Builtin::InstantNow,
         "std::time::SystemTime::now" => Builtin::SystemTimeNow,
         "std::time::Instant::checked_add" => Builtin::TimeCheckedAdd(false),
@@ -1179,6 +1194,8 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
             Builtin::AtomicCxchg
         }
         "std::intrinsics::atomic_xchg" | "core::intrinsics::atomic_xchg" => Builtin::AtomicXchg,
+        "std::intrinsics::atomic_xadd" | "core::intrinsics::atomic_xadd" => Builtin::AtomicXadd,
+        "std::intrinsics::atomic_xsub" | "core::intrinsics::atomic_xsub" => Builtin::AtomicXsub,
         "std::intrinsics::atomic_fence" | "core::intrinsics::atomic_fence" => {
             Builtin::AtomicFence
         }
@@ -1575,13 +1592,15 @@ impl<'a> Interpreter<'a> {
         }
         // The panic entry points are `#[track_caller]`: the
         // driver appends the caller-location stamp as a trailing
-        // argument, which the arms below do not consume.
+        // argument, which the arms below do not consume; it is
+        // the panic's location, recorded for the panic hook.
         if matches!(
             kind,
             Builtin::PanicStr | Builtin::PanicFmt | Builtin::PanicAny
         ) && vals.len() == 2
         {
-            vals.truncate(1);
+            let stamp = vals.pop().expect("two arguments");
+            self.note_panic_stamp(stamp);
         }
         let arity = |n: usize| -> InterpResult<()> {
             if vals.len() == n {
@@ -1788,13 +1807,18 @@ impl<'a> Interpreter<'a> {
                 };
                 match self.join_thread(frames, id)? {
                     Ok(value) => Ok(ok_result(value)),
-                    // The error payload is the thread's panic
-                    // message as a string inside the box-shaped
-                    // value; the original `panic_any` payload is
-                    // not preserved by the model.
-                    Err(message) => Ok(err_result(Value::Enum {
-                        variant: 0,
-                        fields: vec![Value::Str(message)],
+                    // The error is the thread's panic payload as
+                    // the `Box<dyn Any + Send>` the guest
+                    // downcasts, in the same shape the
+                    // `catch_unwind` cleanup produces.
+                    Err(payload) => Ok(err_result(Value::DynRef {
+                        base: Box::new((*payload.value).clone()),
+                        concrete: payload.ty.clone(),
+                        traits: vec![
+                            "std::any::Any".to_string(),
+                            "std::marker::Send".to_string(),
+                        ],
+                        drop_glue: None,
                     })),
                 }
             }
@@ -1889,6 +1913,15 @@ impl<'a> Interpreter<'a> {
                 arity(1)?;
                 let ns = uint_arg_bits(&vals[0], name)?;
                 self.duration_value(ns / 1_000_000_000, ns % 1_000_000_000)
+            }
+            Builtin::PanicSetHook => {
+                arity(1)?;
+                self.set_panic_hook(vals.into_iter().next().expect("one argument"));
+                Ok(Value::Unit)
+            }
+            Builtin::PanicTakeHook => {
+                arity(0)?;
+                Ok(self.take_panic_hook())
             }
             Builtin::CallerLocation => {
                 // A `#[track_caller]` function's location is the
@@ -2858,6 +2891,11 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::ResumeUnwind => {
                 arity(1)?;
+                // A resumed panic is not a new panic: the hook
+                // (already fired at the original raise) must not
+                // fire again, which the unwinder's resumed flag
+                // records.
+                self.note_resumed_panic();
                 let (concrete, value, _) = resolve_dyn_box(self, frames, &vals[0], name)?;
                 let message = match &value {
                     Value::Str(text) => text.clone(),
@@ -4042,6 +4080,51 @@ impl<'a> Interpreter<'a> {
                 let value = vals.into_iter().nth(1).expect("arity checked");
                 self.atomic_write(frames, &target, value)?;
                 Ok(Value::Unit)
+            }
+            Builtin::AtomicXadd | Builtin::AtomicXsub => {
+                arity(2)?;
+                let sub = kind == Builtin::AtomicXsub;
+                let target = self.deref_value(frames, &vals[0])?;
+                let current = self.read_resolved(frames, &target)?;
+                let old = unwrap_wrapper(&current).clone();
+                let tag = generic_args.first().map(String::as_str).unwrap_or("");
+                let (bits, signed) = int_tag(tag).ok_or_else(|| {
+                    unsupported(format!("{name} on `{tag}` is not runtime-supported"))
+                })?;
+                let new = match (&old, &vals[1]) {
+                    (Value::Uint(a), Value::Uint(b)) => {
+                        let mask = if bits >= 128 { u128::MAX } else { (1u128 << bits) - 1 };
+                        Value::Uint(if sub {
+                            a.wrapping_sub(*b) & mask
+                        } else {
+                            a.wrapping_add(*b) & mask
+                        })
+                    }
+                    (Value::Int(a), Value::Int(b)) => {
+                        let raw = if sub {
+                            a.wrapping_sub(*b)
+                        } else {
+                            a.wrapping_add(*b)
+                        };
+                        // Re-wrap at the operand's width.
+                        let shift = 128 - bits;
+                        Value::Int((raw << shift) >> shift)
+                    }
+                    _ => {
+                        return Err(InterpError::type_mismatch(
+                            name,
+                            "matching integer operands",
+                            format!(
+                                "{} and {}",
+                                old.kind_name(),
+                                vals[1].kind_name()
+                            ),
+                        ))
+                    }
+                };
+                let _ = signed;
+                self.atomic_write(frames, &target, new)?;
+                Ok(old)
             }
             Builtin::PtrCopy => {
                 arity(3)?;

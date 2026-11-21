@@ -165,7 +165,10 @@ pub(crate) enum Resolved {
 /// [`Interpreter::drain_threads`]).
 pub(crate) struct ThreadSlot {
     pub callable: Option<Value>,
-    pub outcome: Option<Result<Value, String>>,
+    /// The thread's outcome: its return value, or the panic
+    /// payload it ended with (kept whole, so `join`'s error can
+    /// be the `Box<dyn Any>` the guest downcasts).
+    pub outcome: Option<Result<Value, PanicPayload>>,
 }
 
 /// The shared state of one `std::sync::mpsc` channel, keyed by the
@@ -294,6 +297,27 @@ pub struct Interpreter<'a> {
     /// Drop glue suspended on destructor calls (see
     /// [`DropContinuation`]); a stack, innermost last.
     drop_continuations: Vec<DropContinuation>,
+    /// The guest's panic hook, installed by `std::panic::set_hook`
+    /// (the boxed `dyn Fn` value as the guest handed it over);
+    /// `None` is the default hook, which this runtime does not
+    /// call (its observable output is the driver's own panic
+    /// report). Interior-mutable: most execution paths hold only
+    /// `&self`.
+    panic_hook: std::cell::RefCell<Option<Value>>,
+    /// The caller-location stamp of the panic currently being
+    /// raised, stashed by the panic entry-point builtins (they
+    /// receive it as a trailing argument) for the hook's
+    /// `PanicHookInfo`.
+    last_panic_stamp: std::cell::RefCell<Option<Value>>,
+    /// Whether the panic hook is currently running (a panic
+    /// raised by the hook itself does not re-enter it).
+    in_panic_hook: bool,
+    /// The drive depth at which the in-flight panic already
+    /// fired the hook, so outer drive regions the panic
+    /// propagates through do not fire it again. Cleared when a
+    /// panic is consumed (caught, or turned into a thread
+    /// outcome).
+    hook_fired_depth: Option<usize>,
     /// Set by the `Resume` terminator right before it returns the
     /// in-flight panic: the unwinder (see [`Interpreter::drive`])
     /// reads and clears it to tell a completed cleanup (the panic
@@ -411,6 +435,10 @@ impl<'a> Interpreter<'a> {
             error_output: String::new(),
             drop_continuations: Vec::new(),
             resume_signaled: false,
+            panic_hook: std::cell::RefCell::new(None),
+            last_panic_stamp: std::cell::RefCell::new(None),
+            in_panic_hook: false,
+            hook_fired_depth: None,
             statics: std::cell::RefCell::new(HashMap::new()),
             statics_seeding: std::cell::RefCell::new(HashSet::new()),
             threads: std::cell::RefCell::new(HashMap::new()),
@@ -548,6 +576,9 @@ impl<'a> Interpreter<'a> {
                 Ok(value) => return Ok(value),
                 Err(InterpError::Panic { message, payload }) => {
                     let resumed = std::mem::take(&mut self.resume_signaled);
+                    if !resumed {
+                        self.fire_panic_hook(frames, stop_depth, &message, &payload);
+                    }
                     let mut panic = InterpError::Panic { message, payload };
                     // Whether the panic was raised directly in the
                     // top frame (as opposed to resuming into it from
@@ -1530,6 +1561,109 @@ impl<'a> Interpreter<'a> {
         self.drive(frames, depth)
     }
 
+    /// Run the guest's panic hook (if one is installed) for a
+    /// freshly raised panic, before unwinding begins. The hook
+    /// receives a modelled `PanicHookInfo`: field 0 is the
+    /// payload as a `dyn Any` reference, field 1 the panic's
+    /// location (the stamp the raising builtin received, or a
+    /// zero location for a panic raised without one), field 2
+    /// `can_unwind`. A panic raised by the hook itself is
+    /// swallowed: the original panic proceeds (natively a
+    /// panicking hook aborts the process; the model's runs are
+    /// judged by the panic that reaches the guest's catch
+    /// points, which is the original either way).
+    fn fire_panic_hook(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        stop_depth: usize,
+        message: &str,
+        payload: &Option<PanicPayload>,
+    ) {
+        if self.in_panic_hook {
+            return;
+        }
+        if matches!(self.hook_fired_depth, Some(d) if d > stop_depth) {
+            return;
+        }
+        let hook = self.panic_hook.borrow().clone();
+        let Some(hook) = hook else { return };
+        if is_default_hook(&hook) {
+            return;
+        }
+        self.hook_fired_depth = Some(stop_depth);
+        let payload = payload.clone().unwrap_or_else(|| PanicPayload {
+            ty: "&str".to_string(),
+            value: Box::new(Value::Str(message.to_string())),
+        });
+        let location = self
+            .last_panic_stamp
+            .borrow_mut()
+            .take()
+            .unwrap_or_else(|| {
+                Value::Ref(RefTarget::Value(Box::new(Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Str(String::new()), Value::Uint(0), Value::Uint(0)],
+                })))
+            });
+        let info = Value::Enum {
+            variant: 0,
+            fields: vec![
+                Value::DynRef {
+                    base: Box::new((*payload.value).clone()),
+                    concrete: payload.ty.clone(),
+                    traits: vec![
+                        "std::any::Any".to_string(),
+                        "std::marker::Send".to_string(),
+                    ],
+                    drop_glue: None,
+                },
+                location,
+                Value::Bool(true),
+            ],
+        };
+        let info_ref = Value::Ref(RefTarget::Value(Box::new(info)));
+        let Ok((callable, _)) = self.dyn_callable(frames, &hook) else {
+            return;
+        };
+        self.in_panic_hook = true;
+        let _ = self.call_callable_to_completion(frames, &callable, vec![info_ref]);
+        self.in_panic_hook = false;
+    }
+
+    /// Install the guest's panic hook (see
+    /// [`Interpreter::panic_hook`]); the default-hook marker
+    /// restores the default (no hook called).
+    pub(crate) fn set_panic_hook(&self, hook: Value) {
+        if is_default_hook(&hook) {
+            *self.panic_hook.borrow_mut() = None;
+        } else {
+            *self.panic_hook.borrow_mut() = Some(hook);
+        }
+    }
+
+    /// Take the guest's panic hook, leaving the default in its
+    /// place; taking the default yields the default-hook marker
+    /// value (see [`default_hook_value`]).
+    pub(crate) fn take_panic_hook(&self) -> Value {
+        self.panic_hook
+            .borrow_mut()
+            .take()
+            .unwrap_or_else(default_hook_value)
+    }
+
+    /// Record the caller-location stamp of a panic being raised
+    /// (see [`Interpreter::last_panic_stamp`]).
+    pub(crate) fn note_panic_stamp(&self, stamp: Value) {
+        *self.last_panic_stamp.borrow_mut() = Some(stamp);
+    }
+
+    /// Mark the panic about to be raised as a resumed one (the
+    /// `resume_unwind` builtin): the unwinder reads and clears
+    /// the flag, and the hook does not fire for it.
+    pub(crate) fn note_resumed_panic(&mut self) {
+        self.resume_signaled = true;
+    }
+
     /// Execute the `catch_unwind` intrinsic's protocol: run
     /// `try_fn(data)`; when it returns, report `false` (no panic).
     /// When it panics, the nested drive has already unwound the
@@ -1555,6 +1689,7 @@ impl<'a> Interpreter<'a> {
         match self.call_to_completion(frames, try_fn, vec![data.clone()]) {
             Ok(_) => Ok(false),
             Err(InterpError::Panic { message, payload }) => {
+                self.hook_fired_depth = None;
                 self.truncate_frames(frames, depth);
                 // A panic site that did not record a payload
                 // carries a core literal-message panic: the payload
@@ -2586,7 +2721,7 @@ impl<'a> Interpreter<'a> {
     }
 
     /// The recorded outcome of a thread that has run.
-    pub(crate) fn thread_outcome(&self, id: u64) -> Option<Result<Value, String>> {
+    pub(crate) fn thread_outcome(&self, id: u64) -> Option<Result<Value, PanicPayload>> {
         self.threads
             .borrow()
             .get(&id)
@@ -2613,7 +2748,13 @@ impl<'a> Interpreter<'a> {
         self.current_thread.set(previous);
         let outcome = match result {
             Ok(value) => Ok(value),
-            Err(InterpError::Panic { message, .. }) => Err(message),
+            Err(InterpError::Panic { message, payload }) => {
+                self.hook_fired_depth = None;
+                Err(payload.unwrap_or_else(|| PanicPayload {
+                    ty: "&str".to_string(),
+                    value: Box::new(Value::Str(message)),
+                }))
+            }
             Err(e) => return Err(e),
         };
         if let Some(slot) = self.threads.borrow_mut().get_mut(&id) {
@@ -2651,7 +2792,7 @@ impl<'a> Interpreter<'a> {
         &mut self,
         frames: &mut Vec<Frame>,
         id: u64,
-    ) -> InterpResult<Result<Value, String>> {
+    ) -> InterpResult<Result<Value, PanicPayload>> {
         if self.thread_pending(id) {
             self.run_thread(frames, id)?;
         }
@@ -6516,6 +6657,27 @@ fn value_holds_callable(v: &Value) -> bool {
 /// with every further field projection then failing on a
 /// reference where an aggregate belongs. A plain field value, and
 /// any other bare value, is referenced as a value.
+/// The value standing for the default panic hook (what
+/// `take_hook` returns when no guest hook is installed): a
+/// `dyn Fn` marker the runtime recognises instead of calling.
+fn default_hook_value() -> Value {
+    Value::DynRef {
+        base: Box::new(Value::Unit),
+        concrete: "std::panic::default_hook".to_string(),
+        traits: vec![
+            "std::ops::Fn".to_string(),
+            "std::marker::Send".to_string(),
+            "std::marker::Sync".to_string(),
+        ],
+        drop_glue: None,
+    }
+}
+
+/// Whether a hook value is the default-hook marker.
+fn is_default_hook(value: &Value) -> bool {
+    matches!(value, Value::DynRef { concrete, .. } if concrete == "std::panic::default_hook")
+}
+
 fn ref_shaped_receiver(value: Value) -> Value {
     // A reference-counted handle (the data pointer of an
     // `Rc<dyn Trait>` / `Arc<dyn Trait>`) names its pointee in
