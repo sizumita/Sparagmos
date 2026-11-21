@@ -5437,11 +5437,13 @@ impl<'a> Interpreter<'a> {
                     fields: vec![rebuilt],
                 };
             }
-            self.write_resolved(frames, &target, rebuilt)?;
-            return Ok(match item {
-                Some(value) => some_value(value),
-                None => none_value(),
-            });
+            return Ok((
+                rebuilt,
+                match item {
+                    Some(value) => some_value(value),
+                    None => none_value(),
+                },
+            ));
         }
         let fields = iterator_fields(&state, self_ty)?;
         let (new_fields, result) = if self_ty.starts_with("std::ops::RangeInclusive<") {
