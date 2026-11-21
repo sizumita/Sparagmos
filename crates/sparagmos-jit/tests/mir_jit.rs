@@ -639,7 +639,7 @@ fn div_program() -> (JitProgram, sparagmos_interp::MirProgram) {
 }
 
 #[test]
-fn unguarded_division_panics() {
+fn plain_division_wraps_and_zero_panics() {
     let (jit, prog) = div_program();
     check(&jit, &prog, "rawdiv", &[10, 3], vec![int(10), int(3)], Ok(3));
     check(&jit, &prog, "rawrem", &[10, 3], vec![int(10), int(3)], Ok(1));
@@ -659,13 +659,16 @@ fn unguarded_division_panics() {
         vec![int(1), int(0)],
         Err("attempt to calculate the remainder with a divisor of zero"),
     );
+    // The plain forms wrap: MIN / -1 is MIN and MIN % -1 is 0 in
+    // both engines (the panic belongs to the Assert after a
+    // *checked* division, which this body does not contain).
     check(
         &jit,
         &prog,
         "rawdiv",
         &[i64::MIN, -1],
         vec![int(i64::MIN as i128), int(-1)],
-        Err("arithmetic overflow in Div"),
+        Ok(i64::MIN),
     );
     check(
         &jit,
@@ -673,14 +676,14 @@ fn unguarded_division_panics() {
         "rawrem",
         &[i64::MIN, -1],
         vec![int(i64::MIN as i128), int(-1)],
-        Err("arithmetic overflow in Rem"),
+        Ok(0),
     );
 }
 
-// ----- plain arithmetic: the interpreter's overflow panics -------------------
+// ----- plain arithmetic wraps (the panic is the checked form's Assert) --------
 
 #[test]
-fn plain_arithmetic_overflow_panics() {
+fn plain_arithmetic_wraps() {
     let i32t = i(mir::IntTy::I32);
     let add_i32 = spec(
         "add_i32",
@@ -731,7 +734,7 @@ fn plain_arithmetic_overflow_panics() {
         "add_i32",
         &[2_000_000_000, 2_000_000_000],
         vec![int(2_000_000_000), int(2_000_000_000)],
-        Err("arithmetic overflow in Add"),
+        Ok(-294_967_296),
     );
     check(&jit, &prog, "add_u8", &[100, 55], vec![uint(100), uint(55)], Ok(155));
     check(
@@ -740,7 +743,7 @@ fn plain_arithmetic_overflow_panics() {
         "add_u8",
         &[200, 200],
         vec![uint(200), uint(200)],
-        Err("arithmetic overflow in Add"),
+        Ok(144),
     );
     check(&jit, &prog, "mul_i16", &[12, 11], vec![int(12), int(11)], Ok(132));
     check(
@@ -749,7 +752,7 @@ fn plain_arithmetic_overflow_panics() {
         "mul_i16",
         &[1000, 100],
         vec![int(1000), int(100)],
-        Err("arithmetic overflow in Mul"),
+        Ok(-31_072),
     );
 }
 
@@ -878,16 +881,17 @@ fn shifts_plain_and_checked() {
     let (jit, prog) = shift_program();
     check(&jit, &prog, "shl_u32", &[1, 10], vec![uint(1), uint(10)], Ok(1024));
     check(&jit, &prog, "shl_u32", &[3, 4], vec![uint(3), uint(4)], Ok(48));
+    // The plain form takes the amount modulo the width: shifting
+    // by 32 is shifting by 0.
     check(
         &jit,
         &prog,
         "shl_u32",
         &[1, 32],
         vec![uint(1), uint(32)],
-        Err("attempt to shift left with overflow"),
+        Ok(1),
     );
-    // Bits shifted out are simply lost, as natively: only the
-    // amount can overflow a shift.
+    // Bits shifted out are simply lost, as natively.
     check(
         &jit,
         &prog,
@@ -911,7 +915,7 @@ fn shifts_plain_and_checked() {
         "shr_i32",
         &[16, 33],
         vec![int(16), int(33)],
-        Err("attempt to shift right with overflow"),
+        Ok(8),
     );
     // Checked form: no panic, the flag and the wrapped value instead.
     // The flag reports the overshift only: bits shifted out leave
@@ -963,7 +967,7 @@ fn negation() {
         "neg_i32",
         &[i32::MIN as i64],
         vec![int(i32::MIN as i128)],
-        Err("arithmetic overflow in Neg"),
+        Ok(i32::MIN as i64),
     );
 }
 
