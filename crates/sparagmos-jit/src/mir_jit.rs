@@ -137,8 +137,7 @@
 //! `Assert`, `Drop`, `Return`, `Unreachable` (as a guest panic).
 //! Anything else — `f16` / `f128`, 128-bit integers, references
 //! to trait objects, unions, ADT values wider than the layout
-//! bound or with a field type the program never reveals, aggregate
-//! construction into a memory place, `Subslice`, a second dynamic
+//! bound or with a field type the program never reveals, `Subslice`, a second dynamic
 //! index within one place, an index of a signed integer type,
 //! a literal index from the end of a slice, return values of
 //! more than two words, arguments of more than two words,
@@ -2871,6 +2870,75 @@ impl<'a> FnLower<'a> {
                     return Err(self.err("reference value shape mismatch"));
                 }
                 Ok(words)
+            }
+            R::Aggregate(kind, ops) => {
+                // Build the aggregate into a fresh run of scratch
+                // slots (tag first for an ADT, then each field at
+                // its layout offset); the caller stores the words
+                // through the destination's address.
+                let base = self.fresh();
+                for _ in 1..count {
+                    self.fresh();
+                }
+                match &**kind {
+                    mir::AggregateKind::Tuple => {
+                        let mir::Ty::Tuple(tys) = dst_ty else {
+                            return Err(self.err("tuple aggregate type mismatch"));
+                        };
+                        if tys.len() != ops.len() {
+                            return Err(self.err("tuple aggregate field count mismatch"));
+                        }
+                        let mut off = 0usize;
+                        for (op, ty) in ops.iter().zip(tys.iter()) {
+                            self.store_operand_leaves(op, ty, base + off as u32)?;
+                            off += flatten(ty, &self.func.name, self.layouts)?;
+                        }
+                    }
+                    mir::AggregateKind::Adt {
+                        def,
+                        variant_index,
+                        field_index,
+                        ..
+                    } => {
+                        if field_index.is_some() {
+                            return Err(self.err(
+                                "ADT aggregate with an active-field index (union)",
+                            ));
+                        }
+                        let layout = self.adt_layout(dst_ty)?;
+                        if count != layout.total {
+                            return Err(self.err("ADT aggregate shape mismatch"));
+                        }
+                        let slots = layout
+                            .variants
+                            .get(*variant_index as usize)
+                            .ok_or_else(|| {
+                                self.err("ADT aggregate variant outside the layout")
+                            })?
+                            .clone();
+                        if slots.len() != ops.len() {
+                            return Err(self.err("ADT aggregate field count mismatch"));
+                        }
+                        if layout.tag {
+                            let tag = self.discriminant_value(*def, *variant_index)?;
+                            self.emit(Instr::Const { dst: base, imm: tag });
+                        }
+                        for (op, slot) in ops.iter().zip(slots.iter()) {
+                            self.store_operand_leaves(
+                                op,
+                                &slot.ty,
+                                base + slot.offset as u32,
+                            )?;
+                        }
+                    }
+                    other => {
+                        return Err(self.err(&format!(
+                            "{} aggregate assigned through a dereference",
+                            other.kind_name()
+                        )));
+                    }
+                }
+                Ok((0..count as u32).map(|k| base + k).collect())
             }
             other => Err(self.err(&format!(
                 "{} rvalue assigned through a dereference",

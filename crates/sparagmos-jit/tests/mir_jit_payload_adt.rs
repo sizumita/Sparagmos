@@ -653,6 +653,51 @@ fn payload_struct_copy_for_deref() {
 }
 
 #[test]
+fn payload_struct_aggregate_through_reference() {
+    // fn f() -> i32 { _1 = Pair { a: 0, b: 0 }; _2 = &mut _1;
+    //                 *_2 = Pair { a: 5, b: 6 }; _0 = _1.a + _1.b; return }
+    let f = spec(
+        "f",
+        0,
+        0,
+        &[i32t(), pair_ty(), refmty(pair_ty())],
+        vec![bb(
+            vec![
+                pair_agg(1, i32c(0), i32c(0)),
+                assign(
+                    pl(2),
+                    mir::Rvalue::Ref(mir::Region::Erased, mir::BorrowKind::mutable(), pl(1)),
+                ),
+                assign(
+                    pl(2).deref(),
+                    mir::Rvalue::Aggregate(
+                        Box::new(mir::AggregateKind::Adt {
+                            def: def(50),
+                            variant_index: 0,
+                            generic_args: vec![],
+                            user_ty: None,
+                            field_index: None,
+                        }),
+                        vec![i32c(5), i32c(6)],
+                    ),
+                ),
+                assign(
+                    pl(0),
+                    binop(
+                        mir::BinOp::Add,
+                        cp(pl(1).field(0, i32t())),
+                        cp(pl(1).field(1, i32t())),
+                    ),
+                ),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    let (jit, prog) = build_with_table(&[f], tables());
+    check(&jit, &prog, "f", 11);
+}
+
+#[test]
 fn payload_enum_discriminant_through_reference() {
     // fn f() -> i32 { _1 = Shape::One(9); _2 = &mut _1;
     //                 SetDiscriminant(*_2, 2); _0 = Discriminant(_1); return }
