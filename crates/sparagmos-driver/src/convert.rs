@@ -82,6 +82,9 @@ pub struct Converter {
     /// converted program: its `Debug` formatter prints ADT values
     /// from these shapes.
     pub adt_debug_shapes: sm::AdtDebugShapes,
+    /// Depth of nested `record_debug_shape` calls currently
+    /// unfolding field types (see there).
+    debug_shape_depth: usize,
     /// Declared types of the target crate's statics, recorded by
     /// the item scan before conversion (`note_static_ty`).
     static_tys: HashMap<sm::DefId, rustc_public::ty::Ty>,
@@ -207,6 +210,7 @@ impl Converter {
             layout_names: std::collections::HashMap::new(),
             adt_shapes: sm::AdtShapes::new(),
             adt_debug_shapes: sm::AdtDebugShapes::new(),
+            debug_shape_depth: 0,
             static_tys: HashMap::new(),
             errors: Vec::new(),
         }
@@ -2086,7 +2090,7 @@ impl Converter {
         match ty.kind() {
             TyKind::RigidTy(RigidTy::Adt(def, args)) => {
                 self.record_layout(ty, &def, &args, &converted);
-                self.record_debug_shape(&def, &args, &converted);
+                self.record_debug_shape(&def, &converted);
             }
             TyKind::RigidTy(RigidTy::Coroutine(..))
             | TyKind::RigidTy(RigidTy::CoroutineClosure(..)) => {
@@ -2187,29 +2191,40 @@ impl Converter {
     /// type, and the instance's own tag would collide across
     /// instantiations.
     ///
+    /// The field types are taken from the definition (in terms of
+    /// its generic parameters, exactly like `record_shape`) and the
+    /// instance's converted arguments are substituted into them
+    /// here, in converted form. Substituting through the compiler
+    /// instead (`FieldDef::ty_with_args`) is not an option: it can
+    /// ask the compiler to normalize a projection it cannot
+    /// normalize, which panics inside the compiler and poisons the
+    /// query it runs in.
+    ///
     /// Shape recording is auxiliary to the conversion in progress,
     /// exactly like `record_shape`: the current body's error list
     /// is saved and restored around the field conversions, and a
     /// placeholder entry is inserted before the fields are
-    /// converted so a recursive ADT terminates.
-    fn record_debug_shape(
-        &mut self,
-        def: &AdtDef,
-        args: &GenericArgs,
-        converted: &sm::Ty,
-    ) {
+    /// converted so a recursive ADT terminates. The unfolding is
+    /// also depth-capped as a belt-and-braces bound (instances past
+    /// the cap stay unsupported, like any other unrecorded
+    /// instance).
+    fn record_debug_shape(&mut self, def: &AdtDef, converted: &sm::Ty) {
         let kind = match def.kind() {
             AdtKind::Struct => sm::AdtShapeKind::Struct,
             AdtKind::Enum => sm::AdtShapeKind::Enum,
             AdtKind::Union => return,
         };
-        if ty_has_param(converted) {
+        if ty_has_param(converted) || self.debug_shape_depth >= 16 {
             return;
         }
         let key = self.layout_key(converted);
         if self.adt_debug_shapes.contains_key(&key) {
             return;
         }
+        let sm::Ty::Adt(_, instance_args) = converted else {
+            return;
+        };
+        let instance_args = instance_args.clone();
         self.adt_debug_shapes.insert(
             key.clone(),
             sm::AdtDebugShape {
@@ -2217,14 +2232,16 @@ impl Converter {
                 variants: Vec::new(),
             },
         );
+        self.debug_shape_depth += 1;
         let saved_errors = std::mem::take(&mut self.errors);
         let mut variants = Vec::new();
         for variant in def.variants() {
             let mut fields = Vec::new();
             for field in variant.fields() {
-                let fty = field.ty_with_args(args);
+                let fty = field.ty();
                 let converted_field = self.ty(&fty);
-                let tag = self.layout_key(&converted_field);
+                let substituted = substitute_params(&converted_field, &instance_args);
+                let tag = self.layout_key(&substituted);
                 // A tuple field's recorded name is its position
                 // written out as a number; anything else is a
                 // declared field name.
@@ -2243,7 +2260,9 @@ impl Converter {
             });
         }
         self.errors = saved_errors;
-        self.adt_debug_shapes.insert(key, sm::AdtDebugShape { kind, variants });
+        self.debug_shape_depth -= 1;
+        self.adt_debug_shapes
+            .insert(key, sm::AdtDebugShape { kind, variants });
     }
 
     /// Record the compiler-computed layout of one monomorphic ADT
@@ -2570,6 +2589,78 @@ fn read_uint_at(alloc: &Allocation, offset: usize, size: usize) -> Option<u128> 
 /// anywhere inside it (such a type is not one monomorphic
 /// instance, so per-instance tables keyed by its rendered tag
 /// would be wrong).
+/// Substitute an ADT instance's converted generic arguments for
+/// the definition's parameters in a converted field type. A
+/// parameter with no corresponding argument (which the instance's
+/// own monomorphic check should already have ruled out) is left
+/// as it is.
+fn substitute_params(ty: &sm::Ty, args: &[sm::Ty]) -> sm::Ty {
+    match ty {
+        sm::Ty::Param(index, _) => args
+            .get(*index as usize)
+            .cloned()
+            .unwrap_or_else(|| ty.clone()),
+        sm::Ty::Adt(def, inner) => sm::Ty::Adt(
+            *def,
+            inner.iter().map(|t| substitute_params(t, args)).collect(),
+        ),
+        sm::Ty::FnDef(def, inner) => sm::Ty::FnDef(
+            *def,
+            inner.iter().map(|t| substitute_params(t, args)).collect(),
+        ),
+        sm::Ty::Closure(def, inner) => sm::Ty::Closure(
+            *def,
+            inner.iter().map(|t| substitute_params(t, args)).collect(),
+        ),
+        sm::Ty::Coroutine(def, inner) => sm::Ty::Coroutine(
+            *def,
+            inner.iter().map(|t| substitute_params(t, args)).collect(),
+        ),
+        sm::Ty::CoroutineWitness(def, inner) => sm::Ty::CoroutineWitness(
+            *def,
+            inner.iter().map(|t| substitute_params(t, args)).collect(),
+        ),
+        sm::Ty::Alias(kind, def, inner) => sm::Ty::Alias(
+            *kind,
+            *def,
+            inner.iter().map(|t| substitute_params(t, args)).collect(),
+        ),
+        sm::Ty::Array(elem, len) => {
+            sm::Ty::Array(Box::new(substitute_params(elem, args)), len.clone())
+        }
+        sm::Ty::Pat(elem, pat) => {
+            sm::Ty::Pat(Box::new(substitute_params(elem, args)), pat.clone())
+        }
+        sm::Ty::Slice(elem) => sm::Ty::Slice(Box::new(substitute_params(elem, args))),
+        sm::Ty::RawPtr(elem, mutability) => {
+            sm::Ty::RawPtr(Box::new(substitute_params(elem, args)), *mutability)
+        }
+        sm::Ty::Ref(region, inner, mutability) => sm::Ty::Ref(
+            region.clone(),
+            Box::new(substitute_params(inner, args)),
+            *mutability,
+        ),
+        sm::Ty::FnPtr(sig) => sm::Ty::FnPtr(Box::new(sm::FnSig {
+            inputs: sig
+                .inputs
+                .iter()
+                .map(|t| substitute_params(t, args))
+                .collect(),
+            output: Box::new(substitute_params(&sig.output, args)),
+            ..(**sig).clone()
+        })),
+        sm::Ty::Dynamic(traits, inner, region) => sm::Ty::Dynamic(
+            traits.clone(),
+            Box::new(substitute_params(inner, args)),
+            region.clone(),
+        ),
+        sm::Ty::Tuple(items) => sm::Ty::Tuple(
+            items.iter().map(|t| substitute_params(t, args)).collect(),
+        ),
+        _ => ty.clone(),
+    }
+}
+
 fn ty_has_param(ty: &sm::Ty) -> bool {
     match ty {
         sm::Ty::Param(..) => true,
