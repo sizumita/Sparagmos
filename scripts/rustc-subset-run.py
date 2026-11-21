@@ -1935,7 +1935,8 @@ def fill_result(rec, rust_dir, driver_bin, out):
 
     revs = header.revisions()
     if revs:
-        fill_result_revisions(rec, header, revs, path, driver_bin, out)
+        fill_result_revisions(rec, header, revs, path, driver_bin, out,
+                              rust_dir)
         return
 
     aux_specs = []
@@ -1976,8 +1977,16 @@ def fill_result(rec, rust_dir, driver_bin, out):
         out["bucket"] = "not attempted (compile-flags)"
         return
 
+    src_base = suite_root(path)
     with tempfile.TemporaryDirectory(prefix="subset-run-") as td:
-        native, err = native_side(path, edition, td, flags, aux_specs)
+        env_pairs, env_unset = view_env(header.view(None),
+                                        "exec-env", "unset-exec-env",
+                                        src_base, td)
+        run_flags = view_run_flags(header.view(None), src_base, td)
+        native, err = native_side(path, edition, td, flags, aux_specs,
+                                  run_args=run_flags,
+                                  run_env_extra=env_pairs,
+                                  run_env_remove=env_unset)
         if err:
             out["reason"] = err
             out["bucket"] = bucket_reason(err)
@@ -1990,7 +1999,11 @@ def fill_result(rec, rust_dir, driver_bin, out):
             out["native"] = {"exit_code": native["exit_code"]}
             return
         got, kind, reason = sparagmos_side(path, edition, driver_bin, td,
-                                           rustc_args=flags, aux_specs=aux_specs)
+                                           rustc_args=flags,
+                                           aux_specs=aux_specs,
+                                           guest_args=run_flags,
+                                           env_extra=env_pairs,
+                                           env_remove=env_unset)
         if kind == "unsupported":
             out["status"] = "unsupported"
             out["reason"] = reason
@@ -2017,7 +2030,69 @@ def fill_result(rec, rust_dir, driver_bin, out):
 
 
 
-def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions):
+def stage1_compile_check(rec, view, path, driver_bin, revision, res,
+                         edition, rev_args, flags, aux_specs,
+                         rust_dir):
+    """Judge a stage-1 revision view that carries no run mode.
+
+    compiletest gives such a revision a compile-only verdict:
+    the ui pass/fail directives visible in the view decide the
+    expectation (check-pass / build-pass expect success,
+    check-fail / build-fail expect failure), and a ui revision
+    with no mode directive at all defaults to check-fail
+    (TestProps::from_file in compiletest). The revision is
+    judged exactly the way stage2_attempt judges a compile-check
+    view -- the driver's convert-only mode under the revision's
+    arguments, the view's rustc-env applied to the driver
+    process, and judge_compile's outcome comparison -- so the
+    same revision receives the same verdict shape in both
+    stages.
+    """
+    expectation = compile_expectation(rec["suite"], view)
+    res["expectation"] = expectation
+    if expectation is None:
+        res["reason"] = ("verdict involves executing the program "
+                         "(run-fail-or-crash / run mode), which a "
+                         "compile outcome alone cannot judge")
+        res["bucket"] = "not attempted (verdict needs execution)"
+        return res
+    args = list(rev_args)
+    if view.has("add-minicore"):
+        mc_args, mc_err = minicore_test_args(view, rust_dir, edition,
+                                             flags)
+        if mc_err is not None:
+            res["reason"] = mc_err
+            res["bucket"] = "not attempted (minicore build)"
+            return res
+        args += mc_args
+    args += flags
+    pm_args, pm_err = proc_macro_extern_args(path, view, edition)
+    if pm_err:
+        res["reason"] = pm_err
+        res["bucket"] = "not attempted (header feature)"
+        return res
+    args += pm_args
+    cenv, cunset = view_env(view, "rustc-env", "unset-rustc-env",
+                            suite_root(path), os.getcwd())
+    conv = convert_side(path, edition, driver_bin, rustc_args=args,
+                        aux_specs=aux_specs, env_extra=cenv,
+                        env_remove=cunset)
+    verdict, reason, bucket = judge_compile(expectation, conv)
+    res["status"] = verdict
+    res["reason"] = reason
+    res["bucket"] = bucket
+    res["driver"] = {
+        "exit_code": conv["exit_code"],
+        "converted": conv["converted"],
+        "skipped": conv["skipped"],
+        "skip_totals": conv["skip_totals"],
+        "ice": conv["ice"],
+    }
+    return res
+
+
+def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions,
+                   rust_dir):
     """Judge one revision view of an exec record.
 
     The stage-1 counterpart of stage2_attempt: the revision is
@@ -2025,12 +2100,18 @@ def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions):
     view -- its run mode, its compile-flags, and the `--cfg
     <revision>` / `--check-cfg` arguments compiletest adds -- and
     the execution is judged against the native run of the same
-    revision. Auxiliary crates are resolved through the same
-    revision view. Returns a dict with status/reason/bucket/mode,
-    plus the native and Sparagmos run details on a judged failure.
-    A "not-attempted" result carries the bucket that says why; the
-    "out of environment" bucket is kept distinct because the
-    revision-combining caller treats skipped revisions specially.
+    revision. The view's run-flags and exec-env are forwarded to
+    both runs the way compiletest applies them. A view with no
+    run mode is not an execution at all under compiletest (its
+    verdict is a compile outcome, defaulting to check-fail for
+    ui tests); stage1_compile_check judges it the way stage 2
+    judges compile-check views. Auxiliary crates are resolved
+    through the same revision view. Returns a dict with
+    status/reason/bucket/mode, plus the native and Sparagmos run
+    details on a judged failure. A "not-attempted" result
+    carries the bucket that says why; the "out of environment"
+    bucket is kept distinct because the revision-combining
+    caller treats skipped revisions specially.
     """
     res = {"status": "not-attempted", "reason": "", "bucket": "",
            "mode": None}
@@ -2066,9 +2147,23 @@ def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions):
         res["reason"] = screened
         res["bucket"] = "not attempted (compile-flags)"
         return res
-    args = revision_args(view, revision, all_revisions) + flags
+    rev_args = revision_args(view, revision, all_revisions)
+    args = rev_args + flags
+    if mode is None:
+        return stage1_compile_check(rec, view, path, driver_bin,
+                                    revision, res, edition,
+                                    rev_args, flags, aux_specs,
+                                    rust_dir)
+    src_base = suite_root(path)
     with tempfile.TemporaryDirectory(prefix="subset-run-") as td:
-        native, err = native_side(path, edition, td, args, aux_specs)
+        env_pairs, env_unset = view_env(view, "exec-env",
+                                        "unset-exec-env",
+                                        src_base, td)
+        run_flags = view_run_flags(view, src_base, td)
+        native, err = native_side(path, edition, td, args, aux_specs,
+                                  run_args=run_flags,
+                                  run_env_extra=env_pairs,
+                                  run_env_remove=env_unset)
         if err:
             res["reason"] = err
             res["bucket"] = bucket_reason(err)
@@ -2082,7 +2177,10 @@ def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions):
             return res
         got, kind, reason = sparagmos_side(path, edition, driver_bin,
                                            td, rustc_args=args,
-                                           aux_specs=aux_specs)
+                                           aux_specs=aux_specs,
+                                           guest_args=run_flags,
+                                           env_extra=env_pairs,
+                                           env_remove=env_unset)
         if kind == "unsupported":
             res["status"] = "unsupported"
             res["reason"] = reason
@@ -2107,7 +2205,8 @@ def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions):
         return res
 
 
-def fill_result_revisions(rec, header, revs, path, driver_bin, out):
+def fill_result_revisions(rec, header, revs, path, driver_bin, out,
+                          rust_dir):
     """Stage-1 judging for a test with `//@ revisions:`.
 
     The test is judged once per revision -- with that revision's
@@ -2123,7 +2222,8 @@ def fill_result_revisions(rec, header, revs, path, driver_bin, out):
     per_rev = {}
     for rev in revs:
         per_rev[rev] = stage1_attempt(rec, header.view(rev), path,
-                                      driver_bin, rev, revs)
+                                      driver_bin, rev, revs,
+                                      rust_dir)
     out["revisions"] = {
         rev: {k: r[k] for k in ("status", "reason", "bucket", "mode")
               if r.get(k)}
@@ -2185,6 +2285,11 @@ def fill_result_revisions(rec, header, revs, path, driver_bin, out):
 # adds. The record passes only when every revision that runs
 # passes; a revision removed by an ignore-/only- condition does not
 # run, as in compiletest.
+# A view's `//@ rustc-env:` pairs are applied to the driver process
+# environment (and `//@ unset-rustc-env:` names removed from it):
+# the driver's embedded rustc is the compiler compiletest would
+# set them for, and values a test reads at compile time with
+# env! / option_env! take effect in it unchanged.
 #
 # Tests carrying `//@ add-minicore` are attempted the way compiletest
 # runs them: the suite's minicore stub crate
@@ -2771,8 +2876,16 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
         res["bucket"] = "not attempted (header feature)"
         return res
     args += pm_args
+    # The view's `//@ rustc-env:` pairs are applied to the driver
+    # process: the driver's embedded rustc reads them exactly as
+    # compiletest's rustc invocation does (including values a
+    # test reads back with env! / option_env!), and
+    # `//@ unset-rustc-env:` names are removed from it.
+    cenv, cunset = view_env(view, "rustc-env", "unset-rustc-env",
+                            suite_root(path), os.getcwd())
     conv = convert_side(path, edition, driver_bin, rustc_args=args,
-                        aux_specs=specs)
+                        aux_specs=specs, env_extra=cenv,
+                        env_remove=cunset)
     verdict, reason, bucket = judge_compile(expectation, conv)
     res["status"] = verdict
     res["reason"] = reason
