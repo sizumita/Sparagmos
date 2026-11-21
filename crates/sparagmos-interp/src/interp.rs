@@ -6073,6 +6073,17 @@ fn value_holds_callable(v: &Value) -> bool {
 /// reference where an aggregate belongs. A plain field value, and
 /// any other bare value, is referenced as a value.
 fn ref_shaped_receiver(value: Value) -> Value {
+    // A reference-counted handle (the data pointer of an
+    // `Rc<dyn Trait>` / `Arc<dyn Trait>`) names its pointee in
+    // the allocation store, not inside the handle value: the
+    // receiver is a reference to the stored value field, live
+    // for every handle on the allocation.
+    if let Some(id) = rc_handle_id(&value) {
+        return Value::Ref(RefTarget::Alloc {
+            id,
+            projection: vec![RefProj::Field(2)],
+        });
+    }
     match value {
         Value::Enum { fields, .. } if fields.len() == 1 => {
             let field = fields.into_iter().next().expect("one field");
