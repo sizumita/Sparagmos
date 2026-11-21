@@ -5222,3 +5222,181 @@ fn run_mode_box_into_raw_write_and_read_back() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n9\n");
 }
+
+const BOX_DYN_FIELD_PROJ_SRC: &str = r#"
+trait G { fn get(&self) -> i32; }
+struct M(i32);
+impl Drop for M { fn drop(&mut self) { println!("dtor {}", self.0); } }
+struct S { m: M }
+impl G for S { fn get(&self) -> i32 { self.m.0 } }
+fn main() {
+    let b: Box<dyn G> = Box::new(S { m: M(9) });
+    println!("get {}", b.get());
+    drop(b);
+    println!("after drop");
+}
+"#;
+
+#[test]
+fn run_mode_box_dyn_field_projection_reads_payload_field() {
+    // The method body reads `self.m.0`: a multi-step field
+    // projection through the box deref, where the pointee lives
+    // behind the built box's allocation pointer. The receiver
+    // must denote the allocation, not a value holding the
+    // pointer, or the projection fails on a reference where an
+    // ADT value belongs. The payload's destructor runs at the
+    // `drop` point, after the read.
+    let dir = temp_dir("box-dyn-field-proj");
+    let src = fixture(&dir, "box_dyn_field_proj.rs", BOX_DYN_FIELD_PROJ_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a Box<dyn Trait> method reading a nested payload field must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "get 9\ndtor 9\nafter drop\n"
+    );
+}
+
+const BOX_SIZED_FIELD_RW_SRC: &str = r#"
+struct M(i32);
+struct S { m: M }
+fn main() {
+    let mut b = Box::new(S { m: M(9) });
+    println!("read {}", b.m.0);
+    b.m.0 += 5;
+    println!("after write {}", b.m.0);
+    (*b).m.0 = 100;
+    println!("after deref write {}", b.m.0);
+}
+"#;
+
+#[test]
+fn run_mode_box_sized_field_read_write_through_deref() {
+    // Field reads and writes through a sized Box's deref reach
+    // the pointee in the allocation store: both the auto-deref
+    // assignment and the explicit `(*b)` assignment land.
+    let dir = temp_dir("box-sized-field-rw");
+    let src = fixture(&dir, "box_sized_field_rw.rs", BOX_SIZED_FIELD_RW_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "field reads/writes through a sized Box deref must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "read 9\nafter write 14\nafter deref write 100\n"
+    );
+}
+
+const BOX_DYN_TUPLE_PAYLOAD_SRC: &str = r#"
+trait G { fn get(&self) -> i32; }
+struct M(i32);
+impl Drop for M { fn drop(&mut self) { println!("dtor {}", self.0); } }
+struct T(M, i32);
+impl G for T { fn get(&self) -> i32 { self.0.0 + self.1 } }
+fn main() {
+    let b: Box<dyn G> = Box::new(T(M(30), 12));
+    println!("get {}", b.get());
+    drop(b);
+    println!("after drop");
+}
+"#;
+
+#[test]
+fn run_mode_box_dyn_tuple_payload_field_projection() {
+    // A tuple-struct payload behind a Box<dyn Trait>: the
+    // method projects two fields of the tuple, one of them a
+    // nested tuple field of a Drop type.
+    let dir = temp_dir("box-dyn-tuple-payload");
+    let src = fixture(&dir, "box_dyn_tuple_payload.rs", BOX_DYN_TUPLE_PAYLOAD_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a Box<dyn Trait> method projecting tuple payload fields must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "get 42\ndtor 30\nafter drop\n"
+    );
+}
+
+const BOX_DYN_DEEP_FIELD_SRC: &str = r#"
+trait G { fn get(&self) -> i32; }
+struct M(i32);
+impl Drop for M { fn drop(&mut self) { println!("dtor {}", self.0); } }
+struct Inner { m: M }
+struct S { inner: Inner }
+impl G for S { fn get(&self) -> i32 { self.inner.m.0 } }
+fn main() {
+    let b: Box<dyn G> = Box::new(S { inner: Inner { m: M(7) } });
+    println!("get {}", b.get());
+    drop(b);
+    println!("after drop");
+}
+"#;
+
+#[test]
+fn run_mode_box_dyn_deep_field_projection() {
+    // Three projection steps past the box deref
+    // (`self.inner.m.0`) resolve through the allocation.
+    let dir = temp_dir("box-dyn-deep-field");
+    let src = fixture(&dir, "box_dyn_deep_field.rs", BOX_DYN_DEEP_FIELD_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a Box<dyn Trait> method projecting three fields deep must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "get 7\ndtor 7\nafter drop\n"
+    );
+}
+
+const BOX_DYN_MUT_WRITE_SRC: &str = r#"
+trait G { fn get(&self) -> i32; fn bump(&mut self); }
+struct M(i32);
+impl Drop for M { fn drop(&mut self) { println!("dtor {}", self.0); } }
+struct S { m: M }
+impl G for S {
+    fn get(&self) -> i32 { self.m.0 }
+    fn bump(&mut self) { self.m.0 += 1; }
+}
+fn main() {
+    let mut b: Box<dyn G> = Box::new(S { m: M(9) });
+    b.bump();
+    println!("get {}", b.get());
+    drop(b);
+    println!("after drop");
+}
+"#;
+
+#[test]
+fn run_mode_box_dyn_mut_method_writes_through_allocation() {
+    // A `&mut self` method writes through the same receiver:
+    // the write lands in the allocation store, so the later
+    // read sees it and the destructor observes the written
+    // value.
+    let dir = temp_dir("box-dyn-mut-write");
+    let src = fixture(&dir, "box_dyn_mut_write.rs", BOX_DYN_MUT_WRITE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a &mut dyn method writing a payload field must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "get 10\ndtor 10\nafter drop\n"
+    );
+}
