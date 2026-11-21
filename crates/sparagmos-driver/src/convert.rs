@@ -1625,13 +1625,10 @@ impl Converter {
                         .read_partial_uint(0..8)
                         .map(|v| v as u128)
                         .unwrap_or(0),
-                    _ => {
-                        // f128 has no exact f64 form; it stays an
-                        // explicit unsupported constant. (f16 widens
-                        // to f64 exactly and is decoded above.)
-                        self.err("ConstantKind::Allocated (f128)");
-                        0
-                    }
+                    SmirFloatTy::F128 => alloc
+                        .read_partial_uint(0..16)
+                        .map(|v| v as u128)
+                        .unwrap_or(0),
                 };
                 sm::ConstValue::Scalar(sm::Scalar::Float {
                     bits,
@@ -1795,9 +1792,26 @@ impl Converter {
                 offset: 0,
             };
         }
-        // No provenance at all: a stored zero word is a null
-        // pointer constant. Anything else is an integer-derived
-        // address, which has no faithful value form.
+        // No provenance at all. A fat pointer (a slice reference)
+        // is an address word plus a metadata (length) word: a
+        // dangling slice constant minted by
+        // `slice::from_raw_parts(ptr, len)` in a const context has
+        // no pointee, but its address identity and length are
+        // exactly observable, so it decodes as a `FatPtr`.
+        if matches!(inner.kind(), TyKind::RigidTy(RigidTy::Slice(_))) {
+            if let (Ok(addr), Ok(meta)) = (
+                alloc.read_partial_uint(0..PTR_SIZE),
+                alloc.read_partial_uint(PTR_SIZE..2 * PTR_SIZE),
+            ) {
+                return sm::ConstValue::FatPtr {
+                    addr: addr as u64,
+                    meta: meta as u64,
+                };
+            }
+        }
+        // A stored zero word is a null pointer constant. Anything
+        // else is an integer-derived address, which has no faithful
+        // value form.
         if alloc.read_partial_uint(0..PTR_SIZE).ok() == Some(0) {
             return sm::ConstValue::NullPtr;
         }
@@ -1891,7 +1905,7 @@ impl Converter {
                     SmirFloatTy::F16 => 2,
                     SmirFloatTy::F32 => 4,
                     SmirFloatTy::F64 => 8,
-                    _ => return None,
+                    SmirFloatTy::F128 => 16,
                 };
                 let bits = read_uint_at(alloc, offset, size)?;
                 Some(sm::ConstValue::Scalar(sm::Scalar::Float {
@@ -2148,14 +2162,16 @@ impl Converter {
     }
 
     /// Decode a union value. Which field is active is not recorded
-    /// in an allocation, so only the shape with a single payload
-    /// is faithful: at most one field is non-zero-sized (the
-    /// `MaybeUninit<T>` shape — an `uninit: ()` field beside a
-    /// `value: ManuallyDrop<T>` field — is the canonical case).
-    /// Every field is read at offset 0, where all union fields
-    /// live; zero-sized fields decode as their zero-sized values.
-    /// A union with two or more payload-sized fields stays
-    /// undecoded, since the bytes do not say which one is live.
+    /// in an allocation, but a union *value* in this model carries
+    /// every field, and reading a union field in Rust reinterprets
+    /// the stored bytes as that field's type — so decoding every
+    /// field from the same bytes at offset 0 (where all union
+    /// fields live) is exactly the semantics a later field read
+    /// performs. Scalar and aggregate decodes are total on bytes,
+    /// so a multi-payload union decodes field by field; a field
+    /// whose decode fails (a pointer without provenance is the
+    /// usual case, handled by the disambiguation below when it is
+    /// the stored field) fails the whole constant, honestly.
     fn decode_union(
         &mut self,
         def: &AdtDef,
@@ -2167,13 +2183,9 @@ impl Converter {
         let variant = def.variant(VariantIdx::to_val(0))?;
         let fields = variant.fields();
         let mut sizes = Vec::new();
-        let mut payload_fields = 0;
         for field in fields.iter() {
             let fty = field.ty_with_args(args);
             let size = fty.layout().ok()?.shape().size.bytes();
-            if size > 0 {
-                payload_fields += 1;
-            }
             sizes.push(size);
         }
         // A provenance entry at the union's offset can only belong
@@ -2242,9 +2254,6 @@ impl Converter {
                     fields: out,
                 });
             }
-        }
-        if payload_fields > 1 {
-            return None;
         }
         let mut out = Vec::new();
         for field in fields.iter() {
@@ -2362,11 +2371,26 @@ impl Converter {
             // is observable, as an address-only reference
             // whose reads are explicit errors (Lane CE).
             let addr = read_uint_at(alloc, offset, PTR_SIZE)?;
-            return Some(if addr == 0 {
-                sm::ConstValue::NullPtr
-            } else {
-                sm::ConstValue::IntPtr(addr as u64)
-            });
+            if addr == 0 {
+                return Some(sm::ConstValue::NullPtr);
+            }
+            // A fat pointer (slice / str pointee) carries a second
+            // word: the length. A dangling fat pointer constant
+            // (from_raw_parts in a const context) has no
+            // pointee, but its address identity and length are
+            // exactly observable, so it decodes as a FatPtr
+            // rather than dropping the metadata word.
+            if matches!(
+                inner.kind(),
+                TyKind::RigidTy(RigidTy::Slice(_) | RigidTy::Str)
+            ) {
+                let meta = read_uint_at(alloc, offset + PTR_SIZE, PTR_SIZE)?;
+                return Some(sm::ConstValue::FatPtr {
+                    addr: addr as u64,
+                    meta: meta as u64,
+                });
+            }
+            return Some(sm::ConstValue::IntPtr(addr as u64));
         };
         let target_off = read_uint_at(alloc, offset, PTR_SIZE)? as usize;
         let (target, static_def) = match mir::alloc::GlobalAlloc::from(prov.0) {
@@ -2413,8 +2437,14 @@ impl Converter {
                 }
                 return Some(sm::ConstValue::IntPtr(lo));
             }
-            // Vtables are not materialised.
-            _ => return None,
+            // A vtable pointer: vtables are not materialised, but
+            // the pointer's identity is observable (raw-pointer
+            // equality / ordering, `ptr::eq` on trait objects), so
+            // it decodes to a stable identity number for the
+            // (concrete type, trait) pair.
+            mir::alloc::GlobalAlloc::VTable(vty, trait_ref) => {
+                return Some(sm::ConstValue::VTablePtr(vtable_id(&vty, &trait_ref)));
+            }
         };
         match inner.kind() {
             TyKind::RigidTy(RigidTy::Str) => {
@@ -3344,6 +3374,25 @@ fn type_id_segments(ty: &rustc_public::ty::Ty) -> (u64, u64) {
         lane(bytes, 0xcbf2_9ce4_8422_2325),
         lane(bytes, 0x8422_2325_cbf2_9ce4),
     )
+}
+
+/// The identity number of a vtable for the (concrete type, trait
+/// reference) pair: an FNV-1a hash of the pair's debug form, with
+/// the top bit set to namespace it away from the small integer
+/// addresses dangling pointers carry. Only equality / ordering
+/// between vtable identities is observable, which a stable hash
+/// preserves.
+fn vtable_id(
+    ty: &rustc_public::ty::Ty,
+    trait_ref: &Option<rustc_public::ty::Binder<rustc_public::ty::ExistentialTraitRef>>,
+) -> u64 {
+    let text = format!("{ty:?}|{trait_ref:?}");
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in text.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h | (1 << 63)
 }
 
 /// Read an unsigned integer of `size` bytes at `offset` in `alloc`.

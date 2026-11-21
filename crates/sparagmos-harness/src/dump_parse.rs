@@ -958,6 +958,13 @@ impl Conv {
             ("IntPtr", Payload::Args(a)) if a.len() == 1 => {
                 mir::ConstValue::IntPtr(atom_parse(&a[0], "address")?)
             }
+            ("VTablePtr", Payload::Args(a)) if a.len() == 1 => {
+                mir::ConstValue::VTablePtr(atom_parse(&a[0], "vtable id")?)
+            }
+            ("FatPtr", Payload::Fields(f)) => mir::ConstValue::FatPtr {
+                addr: atom_parse(field(f, "addr")?, "address")?,
+                meta: atom_parse(field(f, "meta")?, "meta")?,
+            },
             ("ByRef", Payload::Fields(f)) => mir::ConstValue::ByRef {
                 alloc_id: atom_parse(field(f, "alloc_id")?, "alloc_id")?,
                 offset: atom_parse(field(f, "offset")?, "offset")?,

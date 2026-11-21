@@ -3032,6 +3032,12 @@ impl<'a> FnLower<'a> {
             mir::ConstValue::StaticRef { .. } => {
                 return Err(self.err("static reference constant"));
             }
+            mir::ConstValue::VTablePtr(_) => {
+                return Err(self.err("vtable pointer constant"));
+            }
+            mir::ConstValue::FatPtr { .. } => {
+                return Err(self.err("fat pointer constant"));
+            }
         })
     }
 

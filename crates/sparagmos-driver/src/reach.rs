@@ -873,7 +873,7 @@ pub fn unrepresentable_local(body: &sm::Body) -> Option<String> {
             | sm::Ty::Coroutine(..)
             | sm::Ty::Adt(..) => None,
             sm::Ty::Float(ft) => match ft {
-                sm::FloatTy::F32 | sm::FloatTy::F64 => None,
+                sm::FloatTy::F32 | sm::FloatTy::F64 | sm::FloatTy::F128 => None,
                 _ => Some(ty.kind_name().to_string()),
             },
             sm::Ty::Tuple(ts) => ts.iter().find_map(offending),

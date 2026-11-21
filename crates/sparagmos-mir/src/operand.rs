@@ -93,6 +93,20 @@ pub enum ConstValue {
     /// non-capturing closures coerce to function pointers, so the
     /// environment is empty by construction.
     Closure(DefId),
+    /// A vtable pointer value, decoded from an allocation whose
+    /// provenance names a vtable (`GlobalAlloc::VTable`). Vtables
+    /// are not materialised in this model; the only observable
+    /// property of a vtable pointer is its identity (equality and
+    /// ordering of the raw pointers a program forms from it), so
+    /// the value is a stable identity number for the (concrete
+    /// type, trait) pair, assigned by the driver.
+    VTablePtr(u64),
+    /// A fat pointer constant with no provenance: a dangling
+    /// address plus its metadata word (a slice length), as minted
+    /// by `slice::from_raw_parts(NonNull::dangling().as_ptr(), 0)`
+    /// in a const context. Only the pointer identity and the
+    /// metadata are observable; there is no pointee to read.
+    FatPtr { addr: u64, meta: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq)]
