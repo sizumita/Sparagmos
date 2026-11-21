@@ -5,8 +5,11 @@
 //! All functions are laid out in a single [`JitMemory`]; the `call
 //! rel32` fixups each function produced are patched once every
 //! function's offset is known. Functions use the plain System V
-//! signature `fn(i64, ...) -> i64` (at most six arguments), so a
-//! compiled program's entry points can be called from Rust directly.
+//! argument layout — the first six words in registers, the rest on
+//! the stack — and Rust-side entry goes through a small naked
+//! trampoline ([`call_entry`]) that sets up both, so a compiled
+//! program's entry points can be called from Rust directly with any
+//! number of argument words.
 //!
 //! Guest panics: generated code for [`crate::ir::Instr::Panic`] calls
 //! the runtime's `sparagmos_panic` entry point (which records the
@@ -46,6 +49,83 @@ struct PanicCtx {
 struct RetPair {
     first: i64,
     second: i64,
+}
+
+/// The Rust-side entry trampoline: call the compiled function at
+/// `f` with `nargs` argument words read from `args`, following the
+/// System V layout the generated code uses — the first six words in
+/// the argument registers, the rest on the stack in order (word 6 at
+/// the lowest address), with `rsp` 16-byte aligned at the `call`.
+/// The two result words come back as a [`RetPair`] (RAX, then RDX),
+/// which is this function's own return shape, so they pass through
+/// untouched.
+///
+/// It is a naked function because the whole point is a stack layout
+/// no Rust signature can express (a dynamic number of stack words);
+/// the frame it builds by hand is the standard one the generated
+/// prologues expect: after `push rbp; mov rbp, rsp`, the first
+/// stack-passed word sits at `[rbp + 16]`.
+///
+/// # Safety
+/// `f` must be the entry of a compiled function whose parameter word
+/// count is `nargs`, and `args` must point to at least
+/// `max(nargs, 6)` readable words (the register words are loaded
+/// unconditionally).
+#[unsafe(naked)]
+unsafe extern "C" fn call_entry(f: *const u8, args: *const i64, nargs: usize) -> RetPair {
+    core::arch::naked_asm!(
+        // Entry (System V): rdi = f, rsi = args, rdx = nargs, and
+        // rsp = 8 (mod 16) (the return address was just pushed).
+        "push rbp",
+        "mov rbp, rsp", // rbp = rsp = 0 (mod 16)
+        "push rbx",
+        "push r12",
+        "push r13",
+        "sub rsp, 8", // scratch slot at [rbp - 32]; rsp = 0 (mod 16)
+        "mov rbx, rdi", // rbx = target
+        "mov r12, rsi", // r12 = args
+        "mov r13, rdx", // r13 = nargs
+        // rcx = number of stack words = max(nargs - 6, 0).
+        "xor ecx, ecx",
+        "cmp rdx, 6",
+        "jbe 2f",
+        "lea rcx, [rdx - 6]",
+        "2:",
+        // Reserve round_up(8 * nstack, 16) bytes; rsp stays 0 (mod 16).
+        "lea rax, [rcx * 8 + 15]",
+        "and rax, -16",
+        "sub rsp, rax",
+        // Copy the stack words: [rsp + 8*k] = args[6 + k].
+        "xor edx, edx",
+        "3:",
+        "cmp rdx, rcx",
+        "jae 4f",
+        "mov rax, [r12 + rdx * 8 + 48]",
+        "mov [rsp + rdx * 8], rax",
+        "inc rdx",
+        "jmp 3b",
+        "4:",
+        // The register words (the caller zero-padded the buffer to
+        // at least six words).
+        "mov rdi, [r12]",
+        "mov rsi, [r12 + 8]",
+        "mov rdx, [r12 + 16]",
+        "mov rcx, [r12 + 24]",
+        "mov r8, [r12 + 32]",
+        "mov r9, [r12 + 40]",
+        "call rbx",
+        // rax = first result word (already in place for the return);
+        // park the second (rdx) in the scratch slot while the saved
+        // registers are restored, then pick it up again.
+        "mov [rbp - 32], rdx",
+        "lea rsp, [rbp - 24]",
+        "pop r13",
+        "pop r12",
+        "pop rbx",
+        "mov rdx, [rbp - 32]",
+        "pop rbp",
+        "ret",
+    )
 }
 
 /// Message index the generated code stores for a panic whose text
@@ -100,8 +180,9 @@ impl CompiledProgram {
         self.offsets.len()
     }
 
-    /// Call function `idx` with `args` (at most six, exactly the
-    /// function's parameter count). Returns the function's result, or
+    /// Call function `idx` with `args` (exactly the function's
+    /// parameter word count; words beyond the six argument registers
+    /// are passed on the stack). Returns the function's result, or
     /// the [`PanicRecord`] if the guest panicked anywhere in the call
     /// tree.
     ///
@@ -131,11 +212,11 @@ impl CompiledProgram {
         self.panic_ctx.panicked.set(0);
         self.panic_ctx.message_index.set(0);
         clear_last_panic();
-        let mut padded = [0i64; 6];
+        // The trampoline reads the first six words unconditionally,
+        // so hand it a zero-padded buffer of at least six words.
+        let mut padded = vec![0i64; args.len().max(6)];
         padded[..args.len()].copy_from_slice(args);
-        let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> RetPair =
-            unsafe { std::mem::transmute(self.function_ptr(idx)) };
-        let result = unsafe { f(padded[0], padded[1], padded[2], padded[3], padded[4], padded[5]) };
+        let result = unsafe { call_entry(self.function_ptr(idx), padded.as_ptr(), args.len()) };
         if self.panic_ctx.panicked.get() != 0 {
             let msg_idx = self.panic_ctx.message_index.get();
             let message = if msg_idx == DYNAMIC_MESSAGE {

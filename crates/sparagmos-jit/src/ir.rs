@@ -190,11 +190,13 @@ pub enum Instr {
         kind: IntKind,
     },
     /// Call function `func` (an index into the program's function
-    /// table) with the given arguments (at most six, passed in the
-    /// System V argument registers); the result lands in `dst`,
-    /// and its second word — when the callee returns two words —
-    /// in `dst2`. Results travel the way System V returns a pair:
-    /// the first word in RAX, the second in RDX.
+    /// table) with the given argument words: the first six in the
+    /// System V argument registers, the rest on the stack in order
+    /// (the seventh word at the lowest address), exactly as System V
+    /// passes them; the result lands in `dst`, and its second word
+    /// — when the callee returns two words — in `dst2`. Results
+    /// travel the way System V returns a pair: the first word in
+    /// RAX, the second in RDX.
     /// Only meaningful in a program compile ([`crate::program`]);
     /// the single-function entry points reject it.
     Call {

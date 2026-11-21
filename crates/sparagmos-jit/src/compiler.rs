@@ -3,9 +3,14 @@
 //!
 //! Strategy (deliberately simple — a baseline JIT):
 //! * Every IR value gets a fixed stack slot at `[rbp - 8*(slot+1)]`.
-//! * The prologue saves `rbp`, sets up the frame, and copies the first six
-//!   integer arguments (rdi, rsi, rdx, rcx, r8, r9) into the parameter
-//!   values' slots. More than six parameters is an error for now.
+//! * The prologue saves `rbp`, sets up the frame, and copies the
+//!   arguments into the parameter values' slots: the first six words
+//!   from the System V argument registers (rdi, rsi, rdx, rcx, r8,
+//!   r9), the remaining words from the caller's stack at
+//!   `[rbp + 16 + 8*k]` — the standard frame layout, where
+//!   `[rbp + 8]` is the return address. Call sites pass those words
+//!   by pushing them (in reverse, plus one alignment pad when the
+//!   count is odd) so `rsp` stays 16-byte aligned at the `call`.
 //! * Each instruction loads its operands into rax (lhs) / rcx (rhs),
 //!   computes in registers, and stores the result back to its slot.
 //!   Correctness first; register allocation is future work.
@@ -47,8 +52,6 @@ extern "C" fn float_rem_f32(a: f32, b: f32) -> f32 {
 
 #[derive(Debug)]
 pub enum CompileError {
-    TooManyParams(usize),
-    TooManyArgs(usize),
     UnknownBlock(u32),
     /// A call fixup referenced a function outside the program table.
     UnknownFunction(u32),
@@ -63,12 +66,6 @@ pub enum CompileError {
 impl std::fmt::Display for CompileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CompileError::TooManyParams(n) => {
-                write!(f, "too many parameters: {n} (max 6 register args for now)")
-            }
-            CompileError::TooManyArgs(n) => {
-                write!(f, "too many call arguments: {n} (max 6 register args for now)")
-            }
             CompileError::UnknownBlock(b) => write!(f, "jump to unknown block {b}"),
             CompileError::UnknownFunction(i) => write!(f, "call to unknown function index {i}"),
             CompileError::ValueOutOfRange(v) => write!(f, "value {v} out of range"),
@@ -686,14 +683,40 @@ impl<'a> Compiler<'a> {
                 if self.ctx.is_none() {
                     return Err(CompileError::ProgramOnly("Call"));
                 }
-                if args.len() > 6 {
-                    return Err(CompileError::TooManyArgs(args.len()));
+                // Words beyond the six argument registers travel on
+                // the stack (System V): pushed in reverse order so
+                // the first stack word (word 6) ends up at the
+                // lowest address, where the callee's prologue reads
+                // it at [rbp + 16]. `rsp` is 16-byte aligned in the
+                // function body (the frame size is a multiple of 16
+                // and `rbp` is 16-aligned), and the ABI wants it
+                // 16-byte aligned at the `call`, so an odd stack-word
+                // count gets one extra pad push above the arguments.
+                // The pushes are undone right after the call, before
+                // the result is stored, so the following CheckPanic's
+                // `leave` still sees the plain frame.
+                let nstack = args.len().saturating_sub(6);
+                let mut pushed = 0usize;
+                if nstack > 0 {
+                    if nstack % 2 == 1 {
+                        self.load_operand(Reg::Rax, Operand::Const(0))?;
+                        self.e.push(Reg::Rax);
+                        pushed += 1;
+                    }
+                    for a in args[6..].iter().rev() {
+                        self.load_operand(Reg::Rax, *a)?;
+                        self.e.push(Reg::Rax);
+                        pushed += 1;
+                    }
                 }
-                for (i, a) in args.iter().enumerate() {
+                for (i, a) in args.iter().take(6).enumerate() {
                     self.load_operand(Reg::SYSV_ARG_REGS[i], *a)?;
                 }
                 let at = self.e.call_rel32();
                 self.call_fixups.push((at, *func));
+                if pushed > 0 {
+                    self.e.add_ri(Reg::Rsp, (pushed * 8) as i32);
+                }
                 self.store_result(*dst)?;
                 if let Some(dst2) = dst2 {
                     // The result's second word comes back in RDX
@@ -811,9 +834,6 @@ impl<'a> Compiler<'a> {
 
     fn compile(mut self) -> Result<(Vec<u8>, CallFixups), CompileError> {
         let func = self.func;
-        if func.param_count > 6 {
-            return Err(CompileError::TooManyParams(func.param_count));
-        }
         // Prologue: push rbp; mov rbp, rsp; sub rsp, frame (16-byte aligned
         // frame size keeps rsp 16-aligned after the saved rbp + return addr
         // accounting: slots rounded up to an even count).
@@ -824,10 +844,19 @@ impl<'a> Compiler<'a> {
         if frame > 0 {
             self.e.sub_ri(Reg::Rsp, frame as i32);
         }
-        // Copy register arguments into their values' stack slots.
-        for i in 0..func.param_count {
+        // Copy the arguments into their values' stack slots: the
+        // first six words from the argument registers, the rest from
+        // the caller's stack — in the standard frame layout the
+        // first stack-passed word sits at [rbp + 16] ([rbp] is the
+        // saved rbp, [rbp + 8] the return address).
+        for i in 0..func.param_count.min(6) {
             let d = self.slot_disp(i as Value)?;
             self.e.mov_store(Reg::Rbp, d, Reg::SYSV_ARG_REGS[i]);
+        }
+        for i in 6..func.param_count {
+            let d = self.slot_disp(i as Value)?;
+            self.e.mov_load(Reg::Rax, Reg::Rbp, 16 + 8 * (i as i32 - 6));
+            self.e.mov_store(Reg::Rbp, d, Reg::Rax);
         }
 
         for (idx, block) in func.blocks.iter().enumerate() {
