@@ -120,6 +120,83 @@ impl Default for Converter {
 
 /// Whether a converted type mentions a type alias anywhere
 /// inside it (see `Converter::record_instance_shape`).
+/// Whether an ADT instance's generic arguments mention a
+/// generic parameter: a type parameter, a const parameter,
+/// a bound variable, or a free region (early-param or
+/// placeholder). A field's declared type can only mention
+/// the ADT's own parameters, so the field types after
+/// substitution are parameter-free exactly when the
+/// instance's arguments are — which is the condition for
+/// normalizing them in the driver's codegen typing
+/// environment (see `Converter::record_instance_shape`).
+fn instance_mentions_param(args: &GenericArgs) -> bool {
+    use rustc_public::visitor::Visitable;
+    struct MentionsParam(bool);
+    impl rustc_public::visitor::Visitor for MentionsParam {
+        type Break = ();
+        fn visit_ty(
+            &mut self,
+            ty: &rustc_public::ty::Ty,
+        ) -> std::ops::ControlFlow<()> {
+            match ty.kind() {
+                rustc_public::ty::TyKind::Param(_)
+                | rustc_public::ty::TyKind::Bound(..) => {
+                    self.0 = true;
+                    std::ops::ControlFlow::Break(())
+                }
+                _ => ty.super_visit(self),
+            }
+        }
+        fn visit_const(
+            &mut self,
+            c: &rustc_public::ty::TyConst,
+        ) -> std::ops::ControlFlow<()> {
+            match c.kind() {
+                rustc_public::ty::TyConstKind::Param(_)
+                | rustc_public::ty::TyConstKind::Bound(..) => {
+                    self.0 = true;
+                    std::ops::ControlFlow::Break(())
+                }
+                _ => c.super_visit(self),
+            }
+        }
+        fn visit_reg(
+            &mut self,
+            reg: &rustc_public::ty::Region,
+        ) -> std::ops::ControlFlow<()> {
+            match reg.kind {
+                rustc_public::ty::RegionKind::ReErased
+                | rustc_public::ty::RegionKind::ReStatic
+                | rustc_public::ty::RegionKind::ReBound(..) => {
+                    std::ops::ControlFlow::Continue(())
+                }
+                _ => {
+                    self.0 = true;
+                    std::ops::ControlFlow::Break(())
+                }
+            }
+        }
+    }
+    let mut screen = MentionsParam(false);
+    for arg in &args.0 {
+        match arg {
+            GenericArgKind::Type(t) => {
+                let _ = t.visit(&mut screen);
+            }
+            GenericArgKind::Const(c) => {
+                let _ = c.visit(&mut screen);
+            }
+            GenericArgKind::Lifetime(r) => {
+                let _ = r.visit(&mut screen);
+            }
+        }
+        if screen.0 {
+            return true;
+        }
+    }
+    false
+}
+
 fn ty_mentions_alias(ty: &sm::Ty) -> bool {
     match ty {
         sm::Ty::Alias(..) => true,
@@ -2292,7 +2369,7 @@ impl Converter {
             TyKind::RigidTy(RigidTy::Adt(def, args)) => {
                 self.record_layout(ty, &def, &args, &converted);
                 self.record_debug_shape(&def, &converted);
-                self.record_instance_shape(&def, &args, &converted);
+                self.record_instance_shape(ty, &def, &args, &converted);
             }
             TyKind::RigidTy(RigidTy::Coroutine(..))
             | TyKind::RigidTy(RigidTy::CoroutineClosure(..)) => {
@@ -2599,11 +2676,19 @@ impl Converter {
     /// `FieldDef::ty_with_args` instantiates a field's declared
     /// type with the instance's arguments and normalizes it in a
     /// monomorphic environment, which is exactly the resolution
-    /// the shape lacks. The query is not total (it fails fatally
-    /// on projections that do not normalize in a codegen
-    /// environment), so it is contained like the layout query:
-    /// an instance it cannot answer gets no entry and keeps the
-    /// generic shape's behaviour downstream.
+    /// the shape lacks. The query is not total: on a projection
+    /// that mentions a generic parameter it fails *fatally* —
+    /// an internal compiler error that no catch_unwind
+    /// contains — because the codegen typing environment's
+    /// parameter environment is empty. Instances are therefore
+    /// screened before any query: `instance_mentions_param`
+    /// rejects instances whose arguments mention a parameter,
+    /// and a contained layout query gates the rest — an
+    /// instance whose layout the compiler cannot compute has
+    /// field projections that only a where-clause on the
+    /// definition justifies, which normalize just as fatally.
+    /// Unrecorded instances keep the generic shape's
+    /// behaviour downstream.
     ///
     /// The recording is auxiliary, like `record_shape`'s: the
     /// body's error list is saved and restored around the field
@@ -2612,6 +2697,7 @@ impl Converter {
     /// its own conversion path.
     fn record_instance_shape(
         &mut self,
+        ty: &rustc_public::ty::Ty,
         def: &AdtDef,
         args: &GenericArgs,
         converted: &sm::Ty,
@@ -2627,6 +2713,34 @@ impl Converter {
             return;
         };
         if !shape.variants.iter().flatten().any(|t| ty_mentions_alias(t)) {
+            return;
+        }
+        // `ty_with_args` normalizes in a codegen typing
+        // environment whose parameter environment is empty: a
+        // projection that mentions a generic parameter — a
+        // type or const parameter, or a free region — cannot
+        // normalize there, and the failure is *fatal* to the
+        // whole compilation, not a catchable panic (the
+        // compiler's `Failed to normalize ... maybe try
+        // try_normalize_erasing_regions` ICE). Only
+        // parameter-free instances are recorded; the rest
+        // keep the generic shape's behaviour downstream.
+        if instance_mentions_param(args) {
+            return;
+        }
+        // Gate on the compiler's own layout query for the
+        // instance (contained, like every layout query in
+        // this driver; the query is memoized, so asking again
+        // here costs nothing measurable). Computing a layout
+        // normalizes the field types in the same codegen
+        // environment, so an instance with no computable
+        // layout has field projections `ty_with_args` would
+        // fail fatally on — typically projections justified
+        // only by a where-clause on the definition, whose
+        // trait has no unconditional implementation for the
+        // substituted arguments at all.
+        let layout = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ty.layout()));
+        if !matches!(layout, Ok(Ok(_))) {
             return;
         }
         let kind = shape.kind;
