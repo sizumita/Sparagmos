@@ -950,6 +950,24 @@ fn is_thin_ptr_ty(ty: &mir::Ty) -> bool {
     }
 }
 
+/// Whether `ty` is a fat pointer type: a raw pointer or
+/// reference whose pointee carries a metadata half (a slice,
+/// `str` or `dyn` pointee). A fat pointer's value in this model
+/// is its [`ir::Value::FatRef`] / [`ir::Value::DynRef`], so
+/// transmutes between fat pointer types — and between a fat
+/// pointer and a transparent wrapper around one — reinterpret
+/// nothing either: the metadata is part of the value, and the
+/// pointee type lives in the destination's declared type.
+fn is_fat_ptr_ty(ty: &mir::Ty) -> bool {
+    match ty {
+        mir::Ty::RawPtr(pointee, _) | mir::Ty::Ref(_, pointee, _) => matches!(
+            **pointee,
+            mir::Ty::Slice(_) | mir::Ty::Str | mir::Ty::Dynamic(..)
+        ),
+        _ => false,
+    }
+}
+
 /// The constant form of a uniquely determined zero-sized value
 /// (the only values [`Converter::zst_value`] synthesizes), or
 /// `None` for a value kind with no constant form.
@@ -989,14 +1007,16 @@ fn value_contains_callable(v: &Value) -> bool {
 }
 
 /// The shape of a transparent wrapper struct for `transmute`
-/// purposes: a struct whose fields are exactly one thin-pointer
-/// payload field plus any number of zero-sized fields whose
-/// values are uniquely determined by their types (`NonNull`,
-/// `Pin`, `PtrAndZst` are the shapes std transmutes through).
+/// purposes: a struct whose fields are exactly one pointer
+/// payload field (thin, or fat when matched by
+/// [`Converter::fat_wrapper_shape`]) plus any number of
+/// zero-sized fields whose values are uniquely determined by
+/// their types (`NonNull`, `Pin`, `PtrAndZst` are the shapes
+/// std transmutes through).
 struct WrapperShape {
     /// Total number of fields of the struct.
     field_count: usize,
-    /// Index of the payload (thin pointer) field.
+    /// Index of the payload (pointer) field.
     payload_index: usize,
     /// Instantiated type of the payload field.
     payload_ty: mir::Ty,
@@ -2549,7 +2569,14 @@ impl<'a> Converter<'a> {
     ///   ([`ir::Rvalue::Reinterpret`]): integers, floats, `bool`
     ///   and `char` in any combination, arrays of scalars, and
     ///   one-payload-field ADTs over those — the bit-level
-    ///   reinterpretation `transmute` means there.
+    ///   reinterpretation `transmute` means there;
+    /// * fat pointer <-> fat pointer, and fat pointer <->
+///   transparent wrapper struct (one fat-pointer payload
+    ///   field, the remaining fields zero-sized with unique
+    ///   values): `NonNull<str>` and its kin;
+    /// * one-field struct over a fieldless enum -> integer:
+    ///   the discriminant of the field's value (`mem::Alignment`
+    ///   -> `usize`).
     ///
     /// Every other shape — aggregate <-> aggregate byte
     /// reinterpretation beyond one payload field, fat pointers,
@@ -2654,6 +2681,20 @@ impl<'a> Converter<'a> {
             {
                 ir::Rvalue::Use(v.clone())
             }
+            // Fat pointer -> fat pointer: the value itself,
+            // exactly as for thin pointers (the metadata half
+            // travels with the value; the pointee type lives in
+            // the destination's declared type). The
+            // UnsafeCell / MaybeUninit wrapper crossing stays
+            // excluded, as for thin pointers: entering a wrapper
+            // field is a place change, not a value identity.
+            (Some(s), t)
+                if is_fat_ptr_ty(s)
+                    && is_fat_ptr_ty(t)
+                    && !self.pointee_crosses_cell_wrapper(s, t) =>
+            {
+                ir::Rvalue::Use(v.clone())
+            }
             // Integer -> thin pointer: an address-only reference.
             (_, t) if src_is_int && is_thin_ptr_ty(t) => {
                 ir::Rvalue::IntToPtr(v.clone())
@@ -2681,6 +2722,32 @@ impl<'a> Converter<'a> {
                     if field_ty == *target {
                         match self.field_operand(body, operand, v, 0, &field_ty) {
                             Some(op) => ir::Rvalue::Use(op),
+                            None => unsupported(),
+                        }
+                    } else if let mir::Ty::Adt(fdef, _) = &field_ty {
+                        // A transparent wrapper around a fieldless
+                        // enum: the struct's value is the field's
+                        // value, and the field transmutes to the
+                        // integer as its discriminant (the
+                        // `mem::Alignment` shape — a one-field
+                        // struct over a fieldless enum whose
+                        // discriminants are the alignment values,
+                        // transmuted to `usize` by RawVec's
+                        // allocation path).
+                        match self.fieldless_enum_discriminants(fdef) {
+                            Some(table) => match self
+                                .field_operand(operand, v, 0, &field_ty)
+                            {
+                                Some(op) => match self
+                                    .convert_ty(target, "cast target")
+                                {
+                                    Ok(t) => {
+                                        ir::Rvalue::EnumToInt(op, table, t)
+                                    }
+                                    Err(_) => unsupported(),
+                                },
+                                None => unsupported(),
+                            },
                             None => unsupported(),
                         }
                     } else {
@@ -2714,11 +2781,20 @@ impl<'a> Converter<'a> {
                     unsupported()
                 }
             }
-            // Thin pointer -> transparent wrapper struct: wrap
-            // the pointer, filling the zero-sized fields with
-            // their unique values.
-            (Some(s), mir::Ty::Adt(def, args)) if is_thin_ptr_ty(s) => {
-                match self.wrapper_shape(def, args) {
+            // Pointer -> transparent wrapper struct: wrap the
+            // pointer, filling the zero-sized fields with their
+            // unique values. The payload may be a fat pointer
+            // (`*const str` -> `NonNull<str>`), matched by the
+            // fat wrapper shape.
+            (Some(s), mir::Ty::Adt(def, args))
+                if is_thin_ptr_ty(s) || is_fat_ptr_ty(s) =>
+            {
+                let shape = if is_fat_ptr_ty(s) {
+                    self.fat_wrapper_shape(def, args)
+                } else {
+                    self.wrapper_shape(def, args)
+                };
+                match shape {
                     Some(shape) => {
                         let mut operands = Vec::with_capacity(shape.field_count);
                         for i in 0..shape.field_count {
@@ -2747,10 +2823,20 @@ impl<'a> Converter<'a> {
                     None => unsupported(),
                 }
             }
-            // Transparent wrapper struct -> thin pointer: read
-            // the payload field back out.
-            (Some(mir::Ty::Adt(def, args)), t) if is_thin_ptr_ty(t) => {
-                match self.wrapper_shape(def, args) {
+            // Transparent wrapper struct -> pointer: read the
+            // payload field back out. The payload may be a fat
+            // pointer (`NonNull<str>` -> `*const str`, the
+            // transmute `Location::file` performs), matched by
+            // the fat wrapper shape.
+            (Some(mir::Ty::Adt(def, args)), t)
+                if is_thin_ptr_ty(t) || is_fat_ptr_ty(t) =>
+            {
+                let shape = if is_fat_ptr_ty(t) {
+                    self.fat_wrapper_shape(def, args)
+                } else {
+                    self.wrapper_shape(def, args)
+                };
+                match shape {
                     Some(shape) => self.unwrap_wrapper(body, operand, v, &shape),
                     None => unsupported(),
                 }
@@ -3141,6 +3227,28 @@ impl<'a> Converter<'a> {
         def: &mir::AdtDefId,
         args: &[mir::Ty],
     ) -> Option<WrapperShape> {
+        self.wrapper_shape_matching(def, args, is_thin_ptr_ty)
+    }
+
+    /// The wrapper shape whose payload field is a fat pointer
+    /// (`NonNull<str>`, `NonNull<[T]>`, `NonNull<dyn Trait>`):
+    /// the same transparent-wrapper rule as
+    /// [`Self::wrapper_shape`], with the metadata-carrying
+    /// pointer as the payload.
+    fn fat_wrapper_shape(
+        &self,
+        def: &mir::AdtDefId,
+        args: &[mir::Ty],
+    ) -> Option<WrapperShape> {
+        self.wrapper_shape_matching(def, args, is_fat_ptr_ty)
+    }
+
+    fn wrapper_shape_matching(
+        &self,
+        def: &mir::AdtDefId,
+        args: &[mir::Ty],
+        payload_ok: fn(&mir::Ty) -> bool,
+    ) -> Option<WrapperShape> {
         let shape = self.adt_shapes.get(def)?;
         if shape.kind != mir::AdtShapeKind::Struct || shape.variants.len() != 1 {
             return None;
@@ -3149,7 +3257,7 @@ impl<'a> Converter<'a> {
         let mut payload: Option<(usize, mir::Ty)> = None;
         let mut fill = Vec::new();
         for (i, fty) in fields.iter().enumerate() {
-            if is_thin_ptr_ty(fty) {
+            if payload_ok(fty) {
                 if payload.is_some() {
                     return None;
                 }
