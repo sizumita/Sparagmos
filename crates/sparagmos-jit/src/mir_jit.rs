@@ -283,6 +283,7 @@ impl JitProgram {
                     .collect()
             })
             .collect();
+        let layouts = AdtLayouts::build(&input.functions, &input.adt_discriminants);
         let mut messages = MsgTable::default();
         let mut ir_funcs: Vec<IrFunction> = Vec::with_capacity(input.functions.len());
         for f in &input.functions {
@@ -292,6 +293,7 @@ impl JitProgram {
                 &input.names,
                 &param_tys,
                 &input.adt_discriminants,
+                &layouts,
                 &mut messages,
             );
             ir_funcs.push(lower.run()?);
@@ -405,6 +407,635 @@ impl MsgTable {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// ADT layouts
+// ---------------------------------------------------------------------------
+
+/// One ADT instantiation whose layout the program determines: the
+/// ADT definition and the generic arguments of one use. (A `Vec`
+/// table with linear lookup, like the interpreter's field table —
+/// `mir::Ty` has no `Hash`.)
+#[derive(Clone, PartialEq)]
+struct AdtKey {
+    def: mir::DefId,
+    generic_args: Vec<mir::Ty>,
+}
+
+/// One field of one variant in an [`AdtLayout`]: its declared
+/// type, its leaf offset from the value's first leaf, and its
+/// leaf width.
+#[derive(Clone, Debug)]
+struct AdtFieldSlot {
+    ty: mir::Ty,
+    offset: usize,
+    width: usize,
+}
+
+/// The slot layout of one ADT instantiation (see the module
+/// docs): an optional tag leaf, then the payload area the
+/// variants share.
+#[derive(Clone, Debug)]
+struct AdtLayout {
+    /// A tag leaf is present (the ADT has more than one variant).
+    tag: bool,
+    /// Total leaves of a value of this ADT.
+    total: usize,
+    /// Field slots per variant, in field order.
+    variants: Vec<Vec<AdtFieldSlot>>,
+}
+
+impl AdtLayout {
+    fn field(&self, variant: u32, field: u32) -> Option<&AdtFieldSlot> {
+        self.variants
+            .get(variant as usize)
+            .and_then(|v| v.get(field as usize))
+    }
+
+    /// The layout of an ADT the scan says nothing about: the
+    /// historical tag-only shape, one leaf holding the tag.
+    fn tag_only() -> Self {
+        AdtLayout {
+            tag: true,
+            total: 1,
+            variants: vec![Vec::new()],
+        }
+    }
+}
+
+/// Leaf bound for one ADT value. Every leaf is a physical stack
+/// slot in the compiled frame, so an unbounded payload would let
+/// a guest program demand an unbounded frame (the array bound
+/// [`MAX_ARRAY_LEAVES`] is the same consideration).
+const MAX_ADT_LEAVES: usize = 64;
+
+/// What the pre-lowering scan of all bodies recovers about ADT
+/// shapes: declared field types from `Field` projections (which
+/// carry the field's substituted declared type), variant field
+/// counts from aggregate constructions, variant sightings, and
+/// the ADT definitions built by union aggregates. This mirrors
+/// the interpreter's recovery in `sparagmos-interp`'s conversion,
+/// extended with the counts and sightings a slot layout needs.
+#[derive(Default)]
+struct AdtScan {
+    field_tys: Vec<(AdtKey, u32, u32, mir::Ty)>,
+    agg_counts: Vec<(AdtKey, u32, usize)>,
+    sightings: Vec<(AdtKey, u32)>,
+    unions: Vec<AdtKey>,
+}
+
+impl AdtScan {
+    fn record_field(&mut self, key: &AdtKey, variant: u32, field: u32, ty: mir::Ty) {
+        // Repeated sightings of one slot must agree (they are the
+        // same declared field); the first sighting wins.
+        if self
+            .field_tys
+            .iter()
+            .any(|(k, v, f, _)| k == key && *v == variant && *f == field)
+        {
+            return;
+        }
+        self.field_tys.push((key.clone(), variant, field, ty));
+    }
+
+    fn field_ty(&self, key: &AdtKey, variant: u32, field: u32) -> Option<&mir::Ty> {
+        self.field_tys
+            .iter()
+            .find(|(k, v, f, _)| k == key && *v == variant && *f == field)
+            .map(|(_, _, _, ty)| ty)
+    }
+
+    fn record_agg(&mut self, key: &AdtKey, variant: u32, count: usize) {
+        if self
+            .agg_counts
+            .iter()
+            .any(|(k, v, _)| k == key && *v == variant)
+        {
+            return;
+        }
+        self.agg_counts.push((key.clone(), variant, count));
+    }
+
+    fn agg_count(&self, key: &AdtKey, variant: u32) -> Option<usize> {
+        self.agg_counts
+            .iter()
+            .find(|(k, v, _)| k == key && *v == variant)
+            .map(|(_, _, c)| *c)
+    }
+
+    fn record_sighting(&mut self, key: &AdtKey, variant: u32) {
+        if self.sightings.iter().any(|(k, v)| k == key && *v == variant) {
+            return;
+        }
+        self.sightings.push((key.clone(), variant));
+    }
+
+    fn record_union(&mut self, key: &AdtKey) {
+        if !self.unions.contains(key) {
+            self.unions.push(key.clone());
+        }
+    }
+}
+
+/// Walk one place's projection chain, recording the declared
+/// type of every ADT field stepped into and every variant
+/// downcast to (the interpreter's `scan_place_fields`, narrowed
+/// to ADT owners and extended with variant sightings).
+fn scan_place_fields(scan: &mut AdtScan, body: &mir::Body, place: &mir::Place) {
+    let Some(decl) = body.local_decls.get(place.local.index()) else {
+        return;
+    };
+    let mut ty = decl.ty.clone();
+    let mut variant = 0u32;
+    for elem in &place.projection {
+        match elem {
+            mir::PlaceElem::Field(idx, field_ty) => {
+                if let mir::Ty::Adt(def, args) = &ty {
+                    let key = AdtKey {
+                        def: *def,
+                        generic_args: args.clone(),
+                    };
+                    scan.record_field(&key, variant, *idx, field_ty.clone());
+                }
+                ty = field_ty.clone();
+                variant = 0;
+            }
+            mir::PlaceElem::Downcast(_, v) => {
+                if let mir::Ty::Adt(def, args) = &ty {
+                    let key = AdtKey {
+                        def: *def,
+                        generic_args: args.clone(),
+                    };
+                    scan.record_sighting(&key, *v);
+                }
+                variant = *v;
+            }
+            mir::PlaceElem::Deref => match ty {
+                mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _) => {
+                    ty = *inner;
+                    variant = 0;
+                }
+                _ => return,
+            },
+            mir::PlaceElem::Index(_) | mir::PlaceElem::ConstantIndex { .. } => match ty {
+                mir::Ty::Array(elem, _) | mir::Ty::Slice(elem) => {
+                    ty = *elem;
+                    variant = 0;
+                }
+                _ => return,
+            },
+            mir::PlaceElem::Subslice { .. } => {}
+            mir::PlaceElem::OpaqueCast(t) | mir::PlaceElem::Subtype(t) => {
+                ty = t.clone();
+                variant = 0;
+            }
+        }
+    }
+}
+
+fn scan_operand_fields(scan: &mut AdtScan, body: &mir::Body, op: &mir::Operand) {
+    if let Some(place) = op.place() {
+        scan_place_fields(scan, body, place);
+    }
+}
+
+fn scan_rvalue_fields(scan: &mut AdtScan, body: &mir::Body, rv: &mir::Rvalue) {
+    use mir::Rvalue as R;
+    match rv {
+        R::Use(op)
+        | R::Repeat(op, _)
+        | R::Cast(_, op, _)
+        | R::UnaryOp(_, op)
+        | R::ShallowInitBox(op, _) => scan_operand_fields(scan, body, op),
+        R::BinaryOp(_, pair) | R::CheckedBinaryOp(_, pair) => {
+            scan_operand_fields(scan, body, &pair.0);
+            scan_operand_fields(scan, body, &pair.1);
+        }
+        R::Ref(_, _, place)
+        | R::RawPtr(_, place)
+        | R::Len(place)
+        | R::Discriminant(place)
+        | R::CopyForDeref(place) => scan_place_fields(scan, body, place),
+        R::Aggregate(_, ops) => {
+            for op in ops {
+                scan_operand_fields(scan, body, op);
+            }
+        }
+        R::ThreadLocalRef(_) | R::NullaryOp(..) => {}
+    }
+}
+
+fn scan_statement_fields(scan: &mut AdtScan, body: &mir::Body, stmt: &mir::Statement) {
+    use mir::StatementKind as S;
+    match &stmt.kind {
+        S::Assign(pair) => {
+            let (place, rv) = &**pair;
+            scan_place_fields(scan, body, place);
+            scan_rvalue_fields(scan, body, rv);
+        }
+        S::FakeRead(pair) => scan_place_fields(scan, body, &pair.1),
+        S::SetDiscriminant {
+            place,
+            variant_index,
+        } => {
+            scan_place_fields(scan, body, place);
+            if let Some(decl) = body.local_decls.get(place.local.index()) {
+                if let mir::Ty::Adt(def, args) = &decl.ty {
+                    let key = AdtKey {
+                        def: *def,
+                        generic_args: args.clone(),
+                    };
+                    scan.record_sighting(&key, *variant_index);
+                }
+            }
+        }
+        S::Retag(_, place) | S::PlaceMention(place) => scan_place_fields(scan, body, place),
+        S::AscribeUserType(pair, _) => scan_place_fields(scan, body, &pair.0),
+        S::Intrinsic(intr) => match &**intr {
+            mir::NonDivergingIntrinsic::CopyNonOverlapping { src, dst, count } => {
+                scan_operand_fields(scan, body, src);
+                scan_operand_fields(scan, body, dst);
+                scan_operand_fields(scan, body, count);
+            }
+            mir::NonDivergingIntrinsic::Assume(op) => scan_operand_fields(scan, body, op),
+        },
+        S::StorageLive(_)
+        | S::StorageDead(_)
+        | S::Coverage
+        | S::ConstEvalCounter
+        | S::Nop => {}
+    }
+}
+
+fn scan_terminator_fields(scan: &mut AdtScan, body: &mir::Body, kind: &mir::TerminatorKind) {
+    use mir::TerminatorKind as T;
+    match kind {
+        T::SwitchInt { discr, .. } => scan_operand_fields(scan, body, discr),
+        T::Call {
+            func,
+            args,
+            destination,
+            ..
+        } => {
+            scan_operand_fields(scan, body, func);
+            for arg in args {
+                scan_operand_fields(scan, body, arg);
+            }
+            scan_place_fields(scan, body, destination);
+        }
+        T::Assert { cond, .. } => scan_operand_fields(scan, body, cond),
+        T::Drop { place, .. } => scan_place_fields(scan, body, place),
+        T::Yield {
+            value, resume_arg, ..
+        } => {
+            scan_operand_fields(scan, body, value);
+            scan_place_fields(scan, body, resume_arg);
+        }
+        T::InlineAsm { operands, .. } => {
+            for op in operands {
+                scan_operand_fields(scan, body, op);
+            }
+        }
+        T::TailCall { func, args } => {
+            scan_operand_fields(scan, body, func);
+            for arg in args {
+                scan_operand_fields(scan, body, arg);
+            }
+        }
+        T::Goto { .. }
+        | T::Resume
+        | T::Terminate(_)
+        | T::Return
+        | T::Unreachable
+        | T::CoroutineDrop
+        | T::FalseEdge { .. }
+        | T::FalseUnwind { .. } => {}
+    }
+}
+
+fn scan_body_fields(scan: &mut AdtScan, body: &mir::Body) {
+    for bb in &body.basic_blocks {
+        for stmt in &bb.statements {
+            scan_statement_fields(scan, body, stmt);
+        }
+        if let Some(term) = &bb.terminator {
+            scan_terminator_fields(scan, body, &term.kind);
+        }
+    }
+}
+
+/// The declared type of a place, walking its projections the way
+/// [`scan_place_fields`] does. Used to type aggregate operands:
+/// an operand filled into field `i` of an ADT aggregate carries
+/// that field's declared type, so a construction site records
+/// field types that no `Field` projection anywhere ever reveals
+/// (a field that is only ever written, never read).
+fn place_decl_ty(body: &mir::Body, place: &mir::Place) -> Option<mir::Ty> {
+    let mut ty = body.local_decls.get(place.local.index())?.ty.clone();
+    for elem in &place.projection {
+        ty = match elem {
+            mir::PlaceElem::Field(_, t) => t.clone(),
+            mir::PlaceElem::Deref => match ty {
+                mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _) => *inner,
+                _ => return None,
+            },
+            mir::PlaceElem::Index(_) | mir::PlaceElem::ConstantIndex { .. } => match ty {
+                mir::Ty::Array(elem, _) | mir::Ty::Slice(elem) => *elem,
+                _ => return None,
+            },
+            mir::PlaceElem::Downcast(_, _)
+            | mir::PlaceElem::Subslice { .. } => ty,
+            mir::PlaceElem::OpaqueCast(t) | mir::PlaceElem::Subtype(t) => t.clone(),
+        };
+    }
+    Some(ty)
+}
+
+/// Record, for every ADT aggregate construction in `body`, the
+/// variant's field count, the types of the fields its place
+/// operands reveal, and the variant sighting itself; a union
+/// aggregate (one with an active-field index) marks its ADT as a
+/// union.
+fn scan_body_aggregates(scan: &mut AdtScan, body: &mir::Body) {
+    for bb in &body.basic_blocks {
+        for stmt in &bb.statements {
+            if let mir::StatementKind::Assign(pair) = &stmt.kind {
+                let (_, rv) = &**pair;
+                if let mir::Rvalue::Aggregate(kind, ops) = rv {
+                    if let mir::AggregateKind::Adt {
+                        def,
+                        variant_index,
+                        generic_args,
+                        field_index,
+                        ..
+                    } = &**kind
+                    {
+                        let key = AdtKey {
+                            def: *def,
+                            generic_args: generic_args.clone(),
+                        };
+                        if field_index.is_some() {
+                            scan.record_union(&key);
+                            continue;
+                        }
+                        scan.record_agg(&key, *variant_index, ops.len());
+                        scan.record_sighting(&key, *variant_index);
+                        for (i, op) in ops.iter().enumerate() {
+                            if let Some(place) = op.place() {
+                                if let Some(ty) = place_decl_ty(body, place) {
+                                    scan.record_field(&key, *variant_index, i as u32, ty);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The slot layouts of a whole program's ADT instantiations,
+/// computed once before lowering.
+struct AdtLayouts {
+    entries: Vec<(AdtKey, Result<AdtLayout, String>)>,
+}
+
+impl AdtLayouts {
+    fn build(
+        functions: &[MirFunctionInput],
+        discriminants: &mir::AdtDiscriminants,
+    ) -> AdtLayouts {
+        let mut scan = AdtScan::default();
+        for f in functions {
+            scan_body_fields(&mut scan, &f.body);
+            scan_body_aggregates(&mut scan, &f.body);
+        }
+        let mut keys: Vec<AdtKey> = Vec::new();
+        for (k, ..) in &scan.field_tys {
+            if !keys.contains(k) {
+                keys.push(k.clone());
+            }
+        }
+        for (k, ..) in &scan.agg_counts {
+            if !keys.contains(k) {
+                keys.push(k.clone());
+            }
+        }
+        for (k, _) in &scan.sightings {
+            if !keys.contains(k) {
+                keys.push(k.clone());
+            }
+        }
+        for k in &scan.unions {
+            if !keys.contains(k) {
+                keys.push(k.clone());
+            }
+        }
+        let mut entries: Vec<(AdtKey, Result<AdtLayout, String>)> = Vec::new();
+        for key in &keys {
+            let mut visiting = Vec::new();
+            let layout = compute_layout(key, &scan, discriminants, &mut entries, &mut visiting);
+            if !entries.iter().any(|(k, _)| k == key) {
+                entries.push((key.clone(), layout));
+            }
+        }
+        AdtLayouts { entries }
+    }
+
+    /// The layout of one instantiation: the computed layout, the
+    /// recorded reason it cannot be computed, or — for an ADT the
+    /// scan says nothing about — the tag-only shape.
+    fn layout(&self, def: mir::DefId, generic_args: &[mir::Ty]) -> Result<AdtLayout, String> {
+        let key = AdtKey {
+            def,
+            generic_args: generic_args.to_vec(),
+        };
+        match self.entries.iter().find(|(k, _)| *k == key) {
+            Some((_, r)) => r.clone(),
+            None => Ok(AdtLayout::tag_only()),
+        }
+    }
+
+    /// Total leaves of a value of the ADT type `ty` (which must be
+    /// an `Adt`), under the computed layouts.
+    fn adt_total(&self, ty: &mir::Ty) -> Result<usize, String> {
+        let mir::Ty::Adt(def, args) = ty else {
+            unreachable!("adt_total on a non-ADT type");
+        };
+        Ok(self.layout(*def, args)?.total)
+    }
+}
+
+/// Compute one instantiation's layout, memoising into `entries`
+/// (nested ADT field types recurse into their own layouts;
+/// `visiting` is the recursion stack, so a layout that mentions
+/// itself without indirection is an explicit error).
+fn compute_layout(
+    key: &AdtKey,
+    scan: &AdtScan,
+    discriminants: &mir::AdtDiscriminants,
+    entries: &mut Vec<(AdtKey, Result<AdtLayout, String>)>,
+    visiting: &mut Vec<AdtKey>,
+) -> Result<AdtLayout, String> {
+    if let Some((_, r)) = entries.iter().find(|(k, _)| k == key) {
+        return r.clone();
+    }
+    if visiting.contains(key) {
+        return Err("recursive ADT layout".to_string());
+    }
+    if scan.unions.contains(key) {
+        let r = Err("union ADT".to_string());
+        entries.push((key.clone(), r.clone()));
+        return r;
+    }
+    visiting.push(key.clone());
+    let result = compute_layout_inner(key, scan, discriminants, entries, visiting);
+    visiting.pop();
+    entries.push((key.clone(), result.clone()));
+    result
+}
+
+fn compute_layout_inner(
+    key: &AdtKey,
+    scan: &AdtScan,
+    discriminants: &mir::AdtDiscriminants,
+    entries: &mut Vec<(AdtKey, Result<AdtLayout, String>)>,
+    visiting: &mut Vec<AdtKey>,
+) -> Result<AdtLayout, String> {
+    let mut variant_count = 1usize;
+    if let Some(values) = discriminants.get(&key.def) {
+        variant_count = variant_count.max(values.len());
+    }
+    for (k, v) in &scan.sightings {
+        if k == key {
+            variant_count = variant_count.max(*v as usize + 1);
+        }
+    }
+    for (k, v, _) in &scan.agg_counts {
+        if k == key {
+            variant_count = variant_count.max(*v as usize + 1);
+        }
+    }
+    let tag = variant_count > 1;
+    let tag_leaves = tag as usize;
+    let mut variants: Vec<Vec<AdtFieldSlot>> = Vec::with_capacity(variant_count);
+    let mut payload = 0usize;
+    for v in 0..variant_count as u32 {
+        let mut field_count = scan.agg_count(key, v).unwrap_or(0);
+        for (k, vv, f, _) in &scan.field_tys {
+            if k == key && *vv == v {
+                field_count = field_count.max(*f as usize + 1);
+            }
+        }
+        let mut slots = Vec::with_capacity(field_count);
+        let mut offset = tag_leaves;
+        for f in 0..field_count as u32 {
+            let Some(ty) = scan.field_ty(key, v, f) else {
+                return Err(format!(
+                    "ADT field type not recoverable (variant {v}, field {f})"
+                ));
+            };
+            let width = build_leaf_count(ty, scan, discriminants, entries, visiting)?;
+            slots.push(AdtFieldSlot {
+                ty: ty.clone(),
+                offset,
+                width,
+            });
+            offset += width;
+        }
+        payload = payload.max(offset - tag_leaves);
+        variants.push(slots);
+    }
+    let total = tag_leaves + payload;
+    if total > MAX_ADT_LEAVES {
+        return Err(format!(
+            "ADT value of {total} leaves exceeds the JIT layout bound"
+        ));
+    }
+    Ok(AdtLayout {
+        tag,
+        total,
+        variants,
+    })
+}
+
+/// Leaf count of a field type at layout-build time: the `flatten`
+/// rules, with nested ADTs resolved through [`compute_layout`].
+fn build_leaf_count(
+    ty: &mir::Ty,
+    scan: &AdtScan,
+    discriminants: &mir::AdtDiscriminants,
+    entries: &mut Vec<(AdtKey, Result<AdtLayout, String>)>,
+    visiting: &mut Vec<AdtKey>,
+) -> Result<usize, String> {
+    match ty {
+        mir::Ty::Bool | mir::Ty::Char => Ok(1),
+        mir::Ty::Int(it) => {
+            if int_bits(*it) <= 64 {
+                Ok(1)
+            } else {
+                Err("128-bit integer type".to_string())
+            }
+        }
+        mir::Ty::Uint(ut) => {
+            if uint_bits(*ut) <= 64 {
+                Ok(1)
+            } else {
+                Err("128-bit integer type".to_string())
+            }
+        }
+        mir::Ty::Tuple(ts) => {
+            let mut n = 0;
+            for t in ts {
+                n += build_leaf_count(t, scan, discriminants, entries, visiting)?;
+            }
+            Ok(n)
+        }
+        mir::Ty::Never => Ok(0),
+        mir::Ty::Ref(_, pointee, _) | mir::Ty::RawPtr(pointee, _) => match &**pointee {
+            mir::Ty::Str | mir::Ty::Slice(_) => Ok(2),
+            mir::Ty::Dynamic(..) => Err("fat reference / pointer type".to_string()),
+            _ => Ok(1),
+        },
+        mir::Ty::Float(mir::FloatTy::F32) | mir::Ty::Float(mir::FloatTy::F64) => Ok(1),
+        mir::Ty::Float(mir::FloatTy::F16) => Err("16-bit floating-point type".to_string()),
+        mir::Ty::Float(mir::FloatTy::F128) => {
+            Err("128-bit floating-point type".to_string())
+        }
+        mir::Ty::Array(elem, len) => {
+            let mir::ArrayLen::Known(n) = len else {
+                return Err("array type with unknown length".to_string());
+            };
+            let per = build_leaf_count(elem, scan, discriminants, entries, visiting)?;
+            let total = (*n as usize).checked_mul(per).unwrap_or(usize::MAX);
+            if total > MAX_ARRAY_LEAVES {
+                return Err(
+                    "array type with more scalar elements than the JIT frame holds"
+                        .to_string(),
+                );
+            }
+            Ok(total)
+        }
+        mir::Ty::Adt(def, args) => {
+            let key = AdtKey {
+                def: *def,
+                generic_args: args.clone(),
+            };
+            // An ADT the scan says nothing about is the tag-only
+            // shape (one leaf), as in `AdtLayouts::layout`.
+            let known = scan.field_tys.iter().any(|(k, ..)| *k == key)
+                || scan.agg_counts.iter().any(|(k, ..)| *k == key)
+                || scan.sightings.iter().any(|(k, _)| *k == key)
+                || scan.unions.contains(&key);
+            if !known {
+                return Ok(1);
+            }
+            Ok(compute_layout(&key, scan, discriminants, entries, visiting)?.total)
+        }
+        other => Err(format!("type {}", other.kind_name())),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Type helpers
 // ---------------------------------------------------------------------------
@@ -461,7 +1092,7 @@ const MAX_ARRAY_LEAVES: usize = 4096;
 
 /// Number of scalar leaves a value of `ty` occupies, or the reason
 /// the type is outside the JIT's range.
-fn flatten(ty: &mir::Ty, fname: &str) -> Result<usize, JitError> {
+fn flatten(ty: &mir::Ty, fname: &str, layouts: &AdtLayouts) -> Result<usize, JitError> {
     match ty {
         mir::Ty::Bool | mir::Ty::Char => Ok(1),
         mir::Ty::Int(it) => {
@@ -481,7 +1112,7 @@ fn flatten(ty: &mir::Ty, fname: &str) -> Result<usize, JitError> {
         mir::Ty::Tuple(ts) => {
             let mut n = 0;
             for t in ts {
-                n += flatten(t, fname)?;
+                n += flatten(t, fname, layouts)?;
             }
             Ok(n)
         }
@@ -516,7 +1147,7 @@ fn flatten(ty: &mir::Ty, fname: &str) -> Result<usize, JitError> {
             let mir::ArrayLen::Known(n) = len else {
                 return Err(unsup(fname, "array type with unknown length"));
             };
-            let per = flatten(elem, fname)?;
+            let per = flatten(elem, fname, layouts)?;
             let total = (*n as usize).checked_mul(per).unwrap_or(usize::MAX);
             if total > MAX_ARRAY_LEAVES {
                 return Err(unsup(
@@ -527,15 +1158,14 @@ fn flatten(ty: &mir::Ty, fname: &str) -> Result<usize, JitError> {
             Ok(total)
         }
         mir::Ty::Adt(..) => {
-            // An ADT value is a single leaf holding its discriminant
-            // value. Payloads have no representation: every construct
-            // that would create or touch one (an aggregate or a
-            // constant with fields, a field or downcast projection)
-            // fails with an explicit unsupported error at its own
-            // lowering, so a program that only ever moves the tag —
-            // `Discriminant` reads, `SetDiscriminant`, `SwitchInt`
-            // on the discriminant — is exact.
-            Ok(1)
+            // An ADT value is its tag leaf (for a multi-variant
+            // ADT) plus its payload area, under the layout the
+            // program scan computed for this instantiation (see
+            // `AdtLayouts`). An ADT the scan says nothing about
+            // keeps the tag-only shape.
+            layouts
+                .adt_total(ty)
+                .map_err(|reason| unsup(fname, &reason))
         }
         other => Err(unsup(fname, &format!("type {}", other.kind_name()))),
     }
@@ -774,6 +1404,7 @@ struct FnLower<'a> {
     def_names: &'a HashMap<mir::DefId, String>,
     param_tys: &'a [Vec<mir::Ty>],
     discriminants: &'a mir::AdtDiscriminants,
+    layouts: &'a AdtLayouts,
     messages: &'a mut MsgTable,
     /// Per local: (first leaf slot, leaf count).
     local_slots: Vec<(u32, usize)>,
@@ -793,6 +1424,7 @@ impl<'a> FnLower<'a> {
         def_names: &'a HashMap<mir::DefId, String>,
         param_tys: &'a [Vec<mir::Ty>],
         discriminants: &'a mir::AdtDiscriminants,
+        layouts: &'a AdtLayouts,
         messages: &'a mut MsgTable,
     ) -> Self {
         Self {
@@ -802,6 +1434,7 @@ impl<'a> FnLower<'a> {
             def_names,
             param_tys,
             discriminants,
+            layouts,
             messages,
             local_slots: Vec::new(),
             next_value: 0,
@@ -813,6 +1446,16 @@ impl<'a> FnLower<'a> {
 
     fn err(&self, what: &str) -> JitError {
         unsup(&self.func.name, what)
+    }
+
+    /// The computed slot layout of the ADT type `ty`.
+    fn adt_layout(&self, ty: &mir::Ty) -> Result<AdtLayout, JitError> {
+        let mir::Ty::Adt(def, args) = ty else {
+            return Err(self.err("layout of a non-ADT type"));
+        };
+        self.layouts
+            .layout(*def, args)
+            .map_err(|reason| self.err(&reason))
     }
 
     /// The discriminant value of `variant_index` of the ADT `def`,
@@ -892,7 +1535,7 @@ impl<'a> FnLower<'a> {
         let mut ir_param_count = 0usize;
         for idx in 1..=arg_count {
             let decl = &body.local_decls[idx];
-            let count = flatten(&decl.ty, &self.func.name)?;
+            let count = flatten(&decl.ty, &self.func.name, self.layouts)?;
             if count > 2 {
                 return Err(self.err("function argument with more than two words"));
             }
@@ -905,7 +1548,7 @@ impl<'a> FnLower<'a> {
         }
         for idx in std::iter::once(0).chain(arg_count + 1..body.local_decls.len()) {
             let decl = &body.local_decls[idx];
-            let count = flatten(&decl.ty, &self.func.name)?;
+            let count = flatten(&decl.ty, &self.func.name, self.layouts)?;
             let first = self.next_value;
             for _ in 0..count.max(1) {
                 self.fresh();
@@ -969,7 +1612,7 @@ impl<'a> FnLower<'a> {
                     return Err(self.err("Field projection index out of range"));
                 }
                 for f in &fields[..idx] {
-                    *offset += flatten(f, &self.func.name)?;
+                    *offset += flatten(f, &self.func.name, self.layouts)?;
                 }
                 *ty = field_ty.clone();
                 Ok(())
@@ -1005,7 +1648,7 @@ impl<'a> FnLower<'a> {
                 } else {
                     return Err(self.err("ConstantIndex projection out of range"));
                 };
-                *offset += idx as usize * flatten(elem, &self.func.name)?;
+                *offset += idx as usize * flatten(elem, &self.func.name, self.layouts)?;
                 *ty = (**elem).clone();
                 Ok(())
             }
@@ -1063,7 +1706,7 @@ impl<'a> FnLower<'a> {
                     };
                     // Validates the pointer's own shape (a trait
                     // object pointee is rejected by `flatten`).
-                    flatten(&ty, &self.func.name)?;
+                    flatten(&ty, &self.func.name, self.layouts)?;
                     let ptr_slot = local_first + offset as u32;
                     let len = match &pointee {
                         mir::Ty::Slice(_) | mir::Ty::Str => {
@@ -1093,7 +1736,7 @@ impl<'a> FnLower<'a> {
                     let n = *n;
                     let elem = (**elem).clone();
                     let idx_slot = self.index_slot(*local)?;
-                    let per = flatten(&elem, &self.func.name)?;
+                    let per = flatten(&elem, &self.func.name, self.layouts)?;
                     let addr = AddrExpr {
                         source: PtrSrc::SlotAddr(local_first + offset as u32),
                         const_off: 0,
@@ -1111,7 +1754,7 @@ impl<'a> FnLower<'a> {
                 }
             }
         }
-        let count = flatten(&ty, &self.func.name)?;
+        let count = flatten(&ty, &self.func.name, self.layouts)?;
         Ok(PlaceLoc::Slots {
             first: local_first + offset as u32,
             count,
@@ -1144,7 +1787,7 @@ impl<'a> FnLower<'a> {
                         return Err(self.err("Field projection index out of range"));
                     }
                     for f in &fields[..idx] {
-                        addr.const_off += flatten(f, &self.func.name)?;
+                        addr.const_off += flatten(f, &self.func.name, self.layouts)?;
                     }
                     ty = field_ty.clone();
                     len = None;
@@ -1165,7 +1808,7 @@ impl<'a> FnLower<'a> {
                         }
                         let (elem_ty, per) = match &ty {
                             mir::Ty::Slice(elem) => {
-                                ((**elem).clone(), flatten(elem, &self.func.name)?)
+                                ((**elem).clone(), flatten(elem, &self.func.name, self.layouts)?)
                             }
                             _ => (mir::Ty::Uint(mir::UintTy::U8), 1),
                         };
@@ -1210,7 +1853,7 @@ impl<'a> FnLower<'a> {
                     } else {
                         return Err(self.err("ConstantIndex projection out of range"));
                     };
-                    addr.const_off += idx as usize * flatten(elem, &self.func.name)?;
+                    addr.const_off += idx as usize * flatten(elem, &self.func.name, self.layouts)?;
                     ty = (**elem).clone();
                     len = None;
                 }
@@ -1247,7 +1890,7 @@ impl<'a> FnLower<'a> {
                         return Err(self.err("second dynamic index in one place"));
                     }
                     let idx_slot = self.index_slot(*local)?;
-                    let per = flatten(&elem_ty, &self.func.name)?;
+                    let per = flatten(&elem_ty, &self.func.name, self.layouts)?;
                     addr.dyn_idx = Some((IndexSrc::Slot(idx_slot), per));
                     checks.push(IndexCheck {
                         index: IndexSrc::Slot(idx_slot),
@@ -1269,7 +1912,7 @@ impl<'a> FnLower<'a> {
                         }
                     };
                     // Rejects a trait-object pointee, as in frame.
-                    flatten(&ty, &self.func.name)?;
+                    flatten(&ty, &self.func.name, self.layouts)?;
                     let pair_addr = addr.clone();
                     match &pointee {
                         mir::Ty::Slice(_) | mir::Ty::Str => {
@@ -1308,7 +1951,7 @@ impl<'a> FnLower<'a> {
         // address and length source instead.
         let count = match &ty {
             mir::Ty::Slice(_) | mir::Ty::Str => None,
-            _ => Some(flatten(&ty, &self.func.name)?),
+            _ => Some(flatten(&ty, &self.func.name, self.layouts)?),
         };
         Ok(PlaceLoc::Mem {
             addr,
@@ -2292,7 +2935,7 @@ impl<'a> FnLower<'a> {
             return Err(self.err("Repeat rvalue with a non-array destination"));
         };
         let elem_ty = (**elem_ty).clone();
-        let per = flatten(&elem_ty, &self.func.name)?;
+        let per = flatten(&elem_ty, &self.func.name, self.layouts)?;
         if per == 0 {
             // A zero-leaf element (unit / never) stores nothing; the
             // destination necessarily has zero leaves too.
@@ -2399,7 +3042,7 @@ impl<'a> FnLower<'a> {
         {
             return self.lower_checked_binop_to(dst, dst_ty, op, lhs, rhs);
         }
-        if flatten(dst_ty, &self.func.name)? != 1 {
+        if flatten(dst_ty, &self.func.name, self.layouts)? != 1 {
             return Err(self.err("binary operation on an aggregate value"));
         }
         let is_compare = matches!(op, M::Eq | M::Ne | M::Lt | M::Le | M::Gt | M::Ge);
@@ -3258,7 +3901,7 @@ impl<'a> FnLower<'a> {
         }
         let mut ir_args: Vec<IrOperand> = Vec::new();
         for (arg, pty) in args.iter().zip(callee_tys.iter()) {
-            match flatten(pty, &self.func.name)? {
+            match flatten(pty, &self.func.name, self.layouts)? {
                 0 => { /* unit argument: passed as a dummy register, skipped here */ }
                 1 => {
                     let v = self.operand_value(arg, pty)?;
