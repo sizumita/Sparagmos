@@ -310,6 +310,9 @@ pub enum Constant {
     Adt { variant: u32, fields: Vec<Constant> },
     /// A reference to a constant value.
     Ref(Box<Constant>),
+    /// A wholly uninitialized constant: evaluates to the
+    /// uninitialized value.
+    Uninit,
     /// A null pointer constant: evaluates to the null reference
     /// value (equality with another null holds, dereference is an
     /// explicit error).

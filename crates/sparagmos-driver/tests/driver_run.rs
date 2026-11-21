@@ -1942,3 +1942,4 @@ fn run_mode_null_and_fn_pointer_constants_execute() {
         "true\nfalse\n9\n"
     );
 }
+

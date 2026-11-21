@@ -43,6 +43,11 @@ pub enum ConstValue {
     /// materialised form of a reference constant whose pointee is
     /// itself a constant value.
     Ref(Box<ConstValue>),
+    /// A wholly uninitialized constant of the constant's type
+    /// (the payload of a `MaybeUninit::uninit()` constant):
+    /// evaluating it yields the uninitialized value, and reading
+    /// it is the interpreter's usual uninitialized-read error.
+    Uninit,
     /// A null pointer constant: an allocation word of zero with no
     /// provenance. Equality with another null pointer holds; any
     /// dereference is an explicit error in the interpreter (the

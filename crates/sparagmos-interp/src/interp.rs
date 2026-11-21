@@ -1983,6 +1983,7 @@ impl<'a> Interpreter<'a> {
                 Value::Ref(RefTarget::Value(Box::new(self.eval_constant(inner)?)))
             }
             Constant::NullPtr => Value::Ref(RefTarget::Null),
+            Constant::Uninit => Value::Uninit,
             Constant::SliceVal(elems) => {
                 let elems = elems
                     .iter()

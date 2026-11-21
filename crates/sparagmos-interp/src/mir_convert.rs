@@ -1288,6 +1288,7 @@ impl<'a> Converter<'a> {
                 }
             }
             mir::ConstValue::NullPtr => ir::Constant::NullPtr,
+            mir::ConstValue::Uninit => ir::Constant::Uninit,
             mir::ConstValue::Tuple(fields) => ir::Constant::Tuple(
                 fields
                     .iter()

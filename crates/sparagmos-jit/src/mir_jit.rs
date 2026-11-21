@@ -1721,6 +1721,9 @@ impl<'a> FnLower<'a> {
             mir::ConstValue::NullPtr => {
                 return Err(self.err("null pointer constant"));
             }
+            mir::ConstValue::Uninit => {
+                return Err(self.err("uninitialized constant"));
+            }
             mir::ConstValue::SliceVal(_) => {
                 return Err(self.err("slice-value constant"));
             }
