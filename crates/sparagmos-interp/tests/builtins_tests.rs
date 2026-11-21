@@ -185,6 +185,10 @@ const VEC_CAPACITY: mir::DefId = mir::DefId::new(0, 241);
 const VEC_FROM_ELEM: mir::DefId = mir::DefId::new(0, 242);
 const BOX_NEW_UNINIT: mir::DefId = mir::DefId::new(0, 243);
 const BOX_ASSUME_INIT_INTO_VEC: mir::DefId = mir::DefId::new(0, 244);
+const VEC_TRY_RESERVE: mir::DefId = mir::DefId::new(0, 245);
+const VEC_SHRINK_TO_FIT: mir::DefId = mir::DefId::new(0, 246);
+const VEC_SHRINK_TO: mir::DefId = mir::DefId::new(0, 247);
+const TRY_RESERVE_ERROR_TY: mir::DefId = mir::DefId::new(0, 248);
 const VEC_LEN: mir::DefId = mir::DefId::new(0, 213);
 const INDEX: mir::DefId = mir::DefId::new(0, 214);
 const INDEX_MUT: mir::DefId = mir::DefId::new(0, 215);
@@ -231,6 +235,10 @@ fn std_names() -> HashMap<mir::DefId, String> {
         (VEC_RESERVE, "std::vec::Vec::<T, A>::reserve".to_string()),
         (VEC_CAPACITY, "std::vec::Vec::<T, A>::capacity".to_string()),
         (VEC_FROM_ELEM, "std::vec::from_elem".to_string()),
+        (VEC_TRY_RESERVE, "std::vec::Vec::<T, A>::try_reserve".to_string()),
+        (VEC_SHRINK_TO_FIT, "std::vec::Vec::<T, A>::shrink_to_fit".to_string()),
+        (VEC_SHRINK_TO, "std::vec::Vec::<T, A>::shrink_to".to_string()),
+        (TRY_RESERVE_ERROR_TY, "std::collections::TryReserveError".to_string()),
         (BOX_NEW_UNINIT, "std::boxed::Box::<T>::new_uninit".to_string()),
         (
             BOX_ASSUME_INIT_INTO_VEC,
@@ -307,6 +315,10 @@ fn registry_covers_the_modelled_callees() {
         ("std::vec::Vec::<T>::new", Builtin::VecNew),
         ("std::vec::Vec::<T, A>::push", Builtin::VecPush),
         ("std::vec::Vec::<T, A>::len", Builtin::VecLen),
+        ("std::vec::Vec::<T, A>::try_reserve", Builtin::VecTryReserve),
+        ("std::vec::Vec::<T, A>::try_reserve_exact", Builtin::VecTryReserve),
+        ("std::vec::Vec::<T, A>::shrink_to_fit", Builtin::VecShrink),
+        ("std::vec::Vec::<T, A>::shrink_to", Builtin::VecShrink),
         ("core::slice::<impl [T]>::iter", Builtin::SliceIter),
         ("std::ops::Index::index", Builtin::IndexIndex),
         ("std::ops::IndexMut::index_mut", Builtin::IndexMut),
@@ -343,6 +355,7 @@ fn registry_covers_the_modelled_callees() {
         ("std::string::String::len", Builtin::StringLen),
         ("std::string::String::is_empty", Builtin::StringIsEmpty),
         ("std::string::String::capacity", Builtin::StringCapacity),
+        ("std::string::String::with_capacity", Builtin::StringWithCapacity),
         ("std::string::String::as_str", Builtin::StringAsStr),
         ("std::string::String::as_bytes", Builtin::StringAsBytes),
         ("std::string::String::into_bytes", Builtin::StringIntoBytes),
@@ -1132,11 +1145,11 @@ fn slice_iter_next_loop_sums() {
     //   _1 = [1, 2, 3];
     //   _3 = core::slice::iter(&_1 as &[i32]);
     //   _4 = IntoIterator::into_iter(move _3);
-    //   loop { _6 = Iterator::next(&_4); match discriminant { 0 => break, _ => sum += payload } }
+    //   loop { _6 = Iterator::next(&_4); match discriminant { 0 => break, _ => sum += *payload } }
     //   return sum;   // 6
     // }
     let iter_ty = mir::Ty::Adt(ITER_TY, vec![i32_ty()]);
-    let option_ty = mir::Ty::Adt(OPTION_TY, vec![i32_ty()]);
+    let option_ty = mir::Ty::Adt(OPTION_TY, vec![ref_ty(i32_ty(), false)]);
     let array_ty = mir::Ty::Array(Box::new(i32_ty()), mir::ArrayLen::Known(3));
     let slice_ref_ty = ref_ty(mir::Ty::Slice(Box::new(i32_ty())), false);
     let body = mir::Body::new(
@@ -1148,10 +1161,11 @@ fn slice_iter_next_loop_sums() {
             iter_ty.clone(),                // _4 Iter
             iter_ty.clone(),                // _5 iterator state
             ref_ty(iter_ty.clone(), true),  // _6 &mut iter
-            option_ty,                      // _7 Option<i32>
+            option_ty,                      // _7 Option<&i32>
             mir::Ty::Int(mir::IntTy::Isize), // _8 discriminant
-            i32_ty(),                       // _9 payload
+            ref_ty(i32_ty(), false),        // _9 payload (&i32)
             i32_ty(),                       // _10 sum
+            i32_ty(),                       // _11 *payload
         ]),
         0,
         vec![
@@ -1205,14 +1219,15 @@ fn slice_iter_next_loop_sums() {
                     assign(
                         place(9),
                         mir::Rvalue::Use(mir::Operand::Copy(
-                            place(7).downcast(None, 1).field(0, i32_ty()),
+                            place(7).downcast(None, 1).field(0, ref_ty(i32_ty(), false)),
                         )),
                     ),
+                    assign(place(11), mir::Rvalue::Use(mir::Operand::Copy(deref_place(9)))),
                     assign(
                         place(10),
                         mir::Rvalue::BinaryOp(
                             mir::BinOp::Add,
-                            Box::new((copy(10), copy(9))),
+                            Box::new((copy(10), copy(11))),
                         ),
                     ),
                 ],
@@ -1390,12 +1405,14 @@ const ARC_TY: mir::DefId = mir::DefId::new(0, 320);
 const ARC_NEW: mir::DefId = mir::DefId::new(0, 321);
 const MEM_ZEROED: mir::DefId = mir::DefId::new(0, 322);
 const PTR_NULL: mir::DefId = mir::DefId::new(0, 323);
+const STRING_WITH_CAPACITY: mir::DefId = mir::DefId::new(0, 324);
 
 fn names_bi() -> HashMap<mir::DefId, String> {
     let mut names = std_names();
     names.extend([
         (BLACK_BOX, "std::intrinsics::black_box".to_string()),
         (STRING_NEW, "std::string::String::new".to_string()),
+        (STRING_WITH_CAPACITY, "std::string::String::with_capacity".to_string()),
         (CTPOP, "std::intrinsics::ctpop".to_string()),
         (CTLZ, "std::intrinsics::ctlz".to_string()),
         (CTTZ, "std::intrinsics::cttz".to_string()),
@@ -1477,6 +1494,7 @@ fn registry_round2_covers_the_new_callees() {
     let cases: &[(&str, Builtin)] = &[
         ("std::intrinsics::black_box", Builtin::BlackBox),
         ("std::string::String::new", Builtin::StringNew),
+        ("std::string::String::with_capacity", Builtin::StringWithCapacity),
         ("std::intrinsics::ctpop", Builtin::IntBitOp(BitOp::CtPop)),
         ("std::intrinsics::ctlz", Builtin::IntBitOp(BitOp::Ctlz)),
         ("std::intrinsics::cttz", Builtin::IntBitOp(BitOp::Cttz)),
@@ -1546,6 +1564,27 @@ fn string_new_builds_an_empty_string() {
         0,
         vec![
             block(vec![], call(fndef(STRING_NEW, vec![]), vec![], 0, 1)),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_bi(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Str(String::new()));
+}
+
+
+#[test]
+fn string_with_capacity_builds_an_empty_string() {
+    // The requested capacity is not represented (as for
+    // `Vec::with_capacity`): the result is the empty string.
+    let string_ty = mir::Ty::Adt(STRING_TY, vec![]);
+    let body = mir::Body::new(
+        decls(&[string_ty]),
+        0,
+        vec![
+            block(
+                vec![],
+                call(fndef(STRING_WITH_CAPACITY, vec![]), vec![const_usize(16)], 0, 1),
+            ),
             block(vec![], ret()),
         ],
     );
@@ -1937,6 +1976,321 @@ fn vec_with_capacity_reserve_then_push_and_len() {
     );
     let value = interpret_mir(&program(body), "main", vec![]).expect("run");
     assert_eq!(value, Value::Int(2));
+}
+
+
+#[test]
+fn vec_try_reserve_ok_below_the_capacity_limit() {
+    // fn main() -> i32 {
+    //   _1 = Vec::new();
+    //   Vec::push(&mut _1, 10); Vec::push(&mut _1, 20);
+    //   _7 = Vec::try_reserve(&mut _1, 10);
+    //   return discriminant(_7) as i32;   // 0 == Ok
+    // }
+    // Allocation never fails in the abstract model, and 2 + 10
+    // elements of 4 bytes are far below the capacity limit, so the
+    // verdict is Ok, exactly as natively.
+    let result_ty = mir::Ty::Adt(
+        RESULT_TY,
+        vec![mir::Ty::unit(), mir::Ty::Adt(TRY_RESERVE_ERROR_TY, vec![])],
+    );
+    let body = mir::Body::new(
+        decls(&[
+            i32_ty(),                        // _0
+            vec_i32_ty(),                    // _1 vec
+            ref_ty(vec_i32_ty(), true),      // _2 &mut vec (push)
+            mir::Ty::unit(),                 // _3
+            ref_ty(vec_i32_ty(), true),      // _4 &mut vec (push)
+            mir::Ty::unit(),                 // _5
+            ref_ty(vec_i32_ty(), true),      // _6 &mut vec (try_reserve)
+            result_ty,                       // _7 Result<(), TryReserveError>
+            mir::Ty::Int(mir::IntTy::Isize), // _8 discriminant
+        ]),
+        0,
+        vec![
+            block(vec![], call(fndef(VEC_NEW, vec![i32_ty()]), vec![], 1, 1)),
+            block(
+                vec![assign(place(2), ref_rvalue(1, true))],
+                call(fndef(VEC_PUSH, vec![i32_ty()]), vec![move_(2), const_i32(10)], 3, 2),
+            ),
+            block(
+                vec![assign(place(4), ref_rvalue(1, true))],
+                call(fndef(VEC_PUSH, vec![i32_ty()]), vec![move_(4), const_i32(20)], 5, 3),
+            ),
+            block(
+                vec![assign(place(6), ref_rvalue(1, true))],
+                call(
+                    fndef(VEC_TRY_RESERVE, vec![i32_ty()]),
+                    vec![move_(6), const_usize(10)],
+                    7,
+                    4,
+                ),
+            ),
+            block(
+                vec![
+                    assign(place(8), mir::Rvalue::Discriminant(place(7))),
+                    assign(
+                        place(0),
+                        mir::Rvalue::Cast(mir::CastKind::IntToInt, copy(8), i32_ty()),
+                    ),
+                ],
+                ret(),
+            ),
+        ],
+    );
+    let value = interpret_mir(&program(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Int(0));
+}
+
+#[test]
+fn vec_try_reserve_overflow_is_capacity_overflow() {
+    // fn main() -> i32 {
+    //   _1 = Vec::new();
+    //   _3 = Vec::try_reserve(&mut _1, usize::MAX);
+    //   return discriminant(_3) * 10 + discriminant((_3 as Err).0);
+    //   // 1 * 10 + 0: Err(TryReserveError::CapacityOverflow)
+    // }
+    let err_ty = mir::Ty::Adt(TRY_RESERVE_ERROR_TY, vec![]);
+    let result_ty = mir::Ty::Adt(RESULT_TY, vec![mir::Ty::unit(), err_ty.clone()]);
+    let body = mir::Body::new(
+        decls(&[
+            i32_ty(),                        // _0
+            vec_i32_ty(),                    // _1 vec
+            ref_ty(vec_i32_ty(), true),      // _2 &mut vec
+            result_ty,                       // _3 Result<(), TryReserveError>
+            mir::Ty::Int(mir::IntTy::Isize), // _4 discriminant of _3
+            err_ty.clone(),                  // _5 TryReserveError
+            mir::Ty::Int(mir::IntTy::Isize), // _6 discriminant of _5
+            i32_ty(),                        // _7 _4 as i32
+            i32_ty(),                        // _8 _6 as i32
+            i32_ty(),                        // _9 _7 * 10
+        ]),
+        0,
+        vec![
+            block(vec![], call(fndef(VEC_NEW, vec![i32_ty()]), vec![], 1, 1)),
+            block(
+                vec![assign(place(2), ref_rvalue(1, true))],
+                call(
+                    fndef(VEC_TRY_RESERVE, vec![i32_ty()]),
+                    vec![move_(2), const_usize(u64::MAX)],
+                    3,
+                    2,
+                ),
+            ),
+            block(
+                vec![
+                    assign(place(4), mir::Rvalue::Discriminant(place(3))),
+                    assign(
+                        place(5),
+                        mir::Rvalue::Use(mir::Operand::Copy(
+                            place(3).downcast(None, 1).field(0, err_ty),
+                        )),
+                    ),
+                    assign(place(6), mir::Rvalue::Discriminant(place(5))),
+                ],
+                goto(3),
+            ),
+            block(
+                vec![
+                    assign(
+                        place(7),
+                        mir::Rvalue::Cast(mir::CastKind::IntToInt, copy(4), i32_ty()),
+                    ),
+                    assign(
+                        place(8),
+                        mir::Rvalue::Cast(mir::CastKind::IntToInt, copy(6), i32_ty()),
+                    ),
+                    assign(
+                        place(9),
+                        mir::Rvalue::BinaryOp(
+                            mir::BinOp::Mul,
+                            Box::new((copy(7), const_i32(10))),
+                        ),
+                    ),
+                    assign(
+                        place(0),
+                        mir::Rvalue::BinaryOp(
+                            mir::BinOp::Add,
+                            Box::new((copy(9), copy(8))),
+                        ),
+                    ),
+                ],
+                ret(),
+            ),
+        ],
+    );
+    let value = interpret_mir(&program(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Int(10));
+}
+
+#[test]
+fn vec_shrink_to_fit_and_shrink_to_change_nothing_observable() {
+    // fn main() -> i32 {
+    //   _1 = Vec::with_capacity(4);
+    //   Vec::push(&mut _1, 10); Vec::push(&mut _1, 20);
+    //   Vec::shrink_to_fit(&mut _1);
+    //   Vec::shrink_to(&mut _1, 1);
+    //   return Vec::len(&_1) as i32;   // 2
+    // }
+    // Shrinking only moves the (unmodelled) capacity, so length
+    // and elements are exactly as natively.
+    let body = mir::Body::new(
+        decls(&[
+            i32_ty(),                    // _0
+            vec_i32_ty(),                // _1 vec
+            ref_ty(vec_i32_ty(), true),  // _2 &mut vec (push)
+            mir::Ty::unit(),             // _3
+            ref_ty(vec_i32_ty(), true),  // _4 &mut vec (push)
+            mir::Ty::unit(),             // _5
+            ref_ty(vec_i32_ty(), true),  // _6 &mut vec (shrink_to_fit)
+            mir::Ty::unit(),             // _7
+            ref_ty(vec_i32_ty(), true),  // _8 &mut vec (shrink_to)
+            mir::Ty::unit(),             // _9
+            ref_ty(vec_i32_ty(), false), // _10 &vec
+            usize_ty(),                  // _11 len
+        ]),
+        0,
+        vec![
+            block(
+                vec![],
+                call(fndef(VEC_WITH_CAPACITY, vec![i32_ty()]), vec![const_usize(4)], 1, 1),
+            ),
+            block(
+                vec![assign(place(2), ref_rvalue(1, true))],
+                call(fndef(VEC_PUSH, vec![i32_ty()]), vec![move_(2), const_i32(10)], 3, 2),
+            ),
+            block(
+                vec![assign(place(4), ref_rvalue(1, true))],
+                call(fndef(VEC_PUSH, vec![i32_ty()]), vec![move_(4), const_i32(20)], 5, 3),
+            ),
+            block(
+                vec![assign(place(6), ref_rvalue(1, true))],
+                call(fndef(VEC_SHRINK_TO_FIT, vec![i32_ty()]), vec![move_(6)], 7, 4),
+            ),
+            block(
+                vec![assign(place(8), ref_rvalue(1, true))],
+                call(
+                    fndef(VEC_SHRINK_TO, vec![i32_ty()]),
+                    vec![move_(8), const_usize(1)],
+                    9,
+                    5,
+                ),
+            ),
+            block(
+                vec![assign(place(10), ref_rvalue(1, false))],
+                call(fndef(VEC_LEN, vec![i32_ty()]), vec![move_(10)], 11, 6),
+            ),
+            block(
+                vec![assign(
+                    place(0),
+                    mir::Rvalue::Cast(mir::CastKind::IntToInt, copy(11), i32_ty()),
+                )],
+                ret(),
+            ),
+        ],
+    );
+    let value = interpret_mir(&program(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Int(2));
+}
+
+#[test]
+fn ref_vec_into_iter_sums_elements() {
+    // fn main() -> i32 {
+    //   _1 = Vec::new(); push 10, 20, 30;
+    //   _9 = IntoIterator::into_iter(&_1);
+    //   loop { _11 = Iterator::next(&mut _9);
+    //          match discriminant(_11) { 0 => break, _ => sum += *payload } }
+    //   return sum;   // 60
+    // }
+    // `&Vec<T>` iterates as `slice::Iter`, whose items are `&T`:
+    // the payload is a shared reference the body dereferences.
+    let iter_ty = mir::Ty::Adt(ITER_TY, vec![i32_ty()]);
+    let option_ty = mir::Ty::Adt(OPTION_TY, vec![ref_ty(i32_ty(), false)]);
+    let body = mir::Body::new(
+        decls(&[
+            i32_ty(),                    // _0 return
+            vec_i32_ty(),                // _1 vec
+            ref_ty(vec_i32_ty(), true),  // _2 &mut vec (push)
+            mir::Ty::unit(),             // _3
+            ref_ty(vec_i32_ty(), true),  // _4 &mut vec (push)
+            mir::Ty::unit(),             // _5
+            ref_ty(vec_i32_ty(), true),  // _6 &mut vec (push)
+            mir::Ty::unit(),             // _7
+            ref_ty(vec_i32_ty(), false), // _8 &vec
+            iter_ty.clone(),             // _9 iterator state
+            ref_ty(iter_ty.clone(), true), // _10 &mut iter
+            option_ty,                   // _11 Option<&i32>
+            mir::Ty::Int(mir::IntTy::Isize), // _12 discriminant
+            ref_ty(i32_ty(), false),     // _13 &i32 payload
+            i32_ty(),                    // _14 *payload
+            i32_ty(),                    // _15 sum
+        ]),
+        0,
+        vec![
+            block(vec![], call(fndef(VEC_NEW, vec![i32_ty()]), vec![], 1, 1)),
+            block(
+                vec![assign(place(2), ref_rvalue(1, true))],
+                call(fndef(VEC_PUSH, vec![i32_ty()]), vec![move_(2), const_i32(10)], 3, 2),
+            ),
+            block(
+                vec![assign(place(4), ref_rvalue(1, true))],
+                call(fndef(VEC_PUSH, vec![i32_ty()]), vec![move_(4), const_i32(20)], 5, 3),
+            ),
+            block(
+                vec![assign(place(6), ref_rvalue(1, true))],
+                call(fndef(VEC_PUSH, vec![i32_ty()]), vec![move_(6), const_i32(30)], 7, 4),
+            ),
+            block(
+                vec![
+                    assign(place(8), ref_rvalue(1, false)),
+                    assign(place(15), mir::Rvalue::Use(const_i32(0))),
+                ],
+                call(
+                    fndef(INTO_ITER, vec![ref_ty(vec_i32_ty(), false)]),
+                    vec![move_(8)],
+                    9,
+                    5,
+                ),
+            ),
+            block(
+                vec![assign(place(10), ref_rvalue(9, true))],
+                call(fndef(ITER_NEXT, vec![iter_ty.clone()]), vec![move_(10)], 11, 6),
+            ),
+            block(
+                vec![assign(place(12), mir::Rvalue::Discriminant(place(11)))],
+                mir::TerminatorKind::SwitchInt {
+                    discr: copy(12),
+                    targets: mir::SwitchTargets::new(
+                        vec![0],
+                        vec![mir::BasicBlock(8)],
+                        mir::BasicBlock(7),
+                    ),
+                },
+            ),
+            block(
+                vec![
+                    assign(
+                        place(13),
+                        mir::Rvalue::Use(mir::Operand::Copy(
+                            place(11).downcast(None, 1).field(0, ref_ty(i32_ty(), false)),
+                        )),
+                    ),
+                    assign(place(14), mir::Rvalue::Use(mir::Operand::Copy(deref_place(13)))),
+                    assign(
+                        place(15),
+                        mir::Rvalue::BinaryOp(
+                            mir::BinOp::Add,
+                            Box::new((copy(15), copy(14))),
+                        ),
+                    ),
+                ],
+                goto(5),
+            ),
+            block(vec![assign(place(0), mir::Rvalue::Use(copy(15)))], ret()),
+        ],
+    );
+    let value = interpret_mir(&program(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Int(60));
 }
 
 #[test]

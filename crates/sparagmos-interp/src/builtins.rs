@@ -229,6 +229,16 @@ pub enum Builtin {
     /// fields of the real struct, which the abstract value does not
     /// have, so the methods are modelled here instead.)
     StringNew,
+    /// `String::with_capacity(cap)`: the empty string. The
+    /// collected body inlines down to
+    /// `RawVecInner::with_capacity_in`, which has no converted
+    /// body, so the constructor is modelled here like the other
+    /// `String` constructors. The requested capacity is not
+    /// represented (the same convention as `Vec::with_capacity`,
+    /// including not modelling the capacity-overflow panic);
+    /// nothing a caller can observe changes, because `capacity`
+    /// itself is uniformly the explicit `StringCapacity` error.
+    StringWithCapacity,
     /// `String::len(&String)`: the byte length of the string data.
     StringLen,
     /// `String::is_empty(&String)`.
@@ -333,6 +343,30 @@ pub enum Builtin {
     /// does not represent capacity (the same convention as
     /// `Vec::with_capacity`).
     VecReserve,
+    /// `Vec::try_reserve(&mut vec, additional)` /
+    /// `Vec::try_reserve_exact(&mut vec, additional)`:
+    /// `Result<(), TryReserveError>`. The collected body bottoms
+    /// out in `RawVecInner::try_reserve`, which has no converted
+    /// body. In the abstract model allocation never fails, so the
+    /// only error the real body can produce is
+    /// `TryReserveError::CapacityOverflow`, decided by the exact
+    /// std rule: the required element count `len + additional`
+    /// must fit `isize::MAX / size_of::<T>()` elements (any count
+    /// up to `usize::MAX` for a zero-sized element). The two
+    /// spellings differ only in the capacity they would reach,
+    /// which the value model does not represent. An element type
+    /// whose layout the model does not know stays an explicit
+    /// unsupported error rather than a guessed verdict.
+    VecTryReserve,
+    /// `Vec::shrink_to_fit(&mut vec)` / `Vec::shrink_to(&mut vec,
+    /// min_capacity)`: no-ops. Shrinking changes only the
+    /// allocation's capacity, which the value model does not
+    /// represent and no modelled operation can observe
+    /// (`Vec::capacity` is the explicit `VecCapacity` error,
+    /// growth is the `VecReserve` no-op). The collected bodies
+    /// project the RawVec struct's fields off the abstract
+    /// aggregate and fail, so the entry points are modelled here.
+    VecShrink,
     /// `Vec::capacity(&vec)`: not modelled. Capacity has no
     /// representation in the value model, and returning the length
     /// would be observably wrong, so the call fails with an
@@ -586,6 +620,9 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::string::String::capacity" | "alloc::string::String::capacity" => {
             Builtin::StringCapacity
         }
+        "std::string::String::with_capacity" | "alloc::string::String::with_capacity" => {
+            Builtin::StringWithCapacity
+        }
         "std::string::String::as_str" | "alloc::string::String::as_str" => Builtin::StringAsStr,
         "std::string::String::as_bytes" | "alloc::string::String::as_bytes" => {
             Builtin::StringAsBytes
@@ -640,6 +677,18 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
                 || canonical.ends_with(">::reserve_exact")) =>
         {
             Builtin::VecReserve
+        }
+        _ if canonical.starts_with("std::vec::Vec")
+            && (canonical.ends_with(">::try_reserve")
+                || canonical.ends_with(">::try_reserve_exact")) =>
+        {
+            Builtin::VecTryReserve
+        }
+        _ if canonical.starts_with("std::vec::Vec")
+            && (canonical.ends_with(">::shrink_to_fit")
+                || canonical.ends_with(">::shrink_to")) =>
+        {
+            Builtin::VecShrink
         }
         _ if canonical.starts_with("std::vec::Vec") && canonical.ends_with(">::capacity") => {
             Builtin::VecCapacity
@@ -1078,6 +1127,20 @@ impl<'a> Interpreter<'a> {
                             other.kind_name(),
                         )),
                     }
+                } else if self_ty.starts_with("&std::vec::Vec<")
+                    || self_ty.starts_with("&alloc::vec::Vec<")
+                    || self_ty.starts_with("&[")
+                {
+                    // `&Vec<T>` and `&[T]` iterate as `slice::Iter`:
+                    // the state is the element snapshot plus the
+                    // next index, the shape the `slice::iter`
+                    // runtime support builds and `Iterator::next`
+                    // consumes for `std::slice::Iter`.
+                    let (elems, _) = self.slice_elements(frames, &value)?;
+                    Ok(Value::Enum {
+                        variant: 0,
+                        fields: vec![Value::Tuple(elems), Value::Uint(0)],
+                    })
                 } else {
                     Err(unsupported(format!(
                         "IntoIterator::into_iter for {self_ty} is not runtime-supported"
@@ -1240,6 +1303,13 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::StringNew => {
                 arity(0)?;
+                Ok(Value::Str(String::new()))
+            }
+            Builtin::StringWithCapacity => {
+                // The capacity argument is not represented, exactly
+                // as for `Vec::with_capacity`: the result is the
+                // empty string.
+                arity(1)?;
                 Ok(Value::Str(String::new()))
             }
             Builtin::StringLen | Builtin::StrLen => {
@@ -1648,6 +1718,71 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::VecReserve => {
                 arity(2)?;
+                Ok(Value::Unit)
+            }
+            Builtin::VecTryReserve => {
+                arity(2)?;
+                let additional = match vals[1] {
+                    Value::Uint(n) => n,
+                    // A `usize` argument whose high bit is set (e.g.
+                    // `usize::MAX`) materialises as a sign-extended
+                    // signed value; its bit pattern is the count.
+                    Value::Int(v) => (v as u64) as u128,
+                    ref other => {
+                        return Err(InterpError::type_mismatch(
+                            format!("builtin {name}"),
+                            "additional capacity (usize)",
+                            other.kind_name(),
+                        ));
+                    }
+                };
+                let resolved = self.resolve_value(frames, &vals[0])?;
+                let len = value_elements(&resolved)?.len() as u128;
+                let elem_tag = generic_args.first().map(String::as_str).unwrap_or("");
+                let (elem_size, _) = type_layout(elem_tag).ok_or_else(|| {
+                    unsupported(format!(
+                        "{name}: element type {elem_tag} has no layout known to the                          value model, so the capacity-overflow check cannot be decided"
+                    ))
+                })?;
+                // The std rule (RawVec's capacity-overflow check):
+                // the byte size `required * elem_size` must not
+                // exceed `isize::MAX`; a zero-sized element is
+                // bounded only by `usize::MAX` elements. Allocation
+                // failure, the other `TryReserveError` source, has
+                // no abstract counterpart.
+                let required = len + additional;
+                let overflow = if elem_size == 0 {
+                    required > usize::MAX as u128
+                } else {
+                    required > (isize::MAX as u128) / elem_size
+                };
+                if overflow {
+                    // Err(TryReserveError::CapacityOverflow)
+                    Ok(Value::Enum {
+                        variant: 1,
+                        fields: vec![Value::Enum {
+                            variant: 0,
+                            fields: Vec::new(),
+                        }],
+                    })
+                } else {
+                    Ok(Value::Enum {
+                        variant: 0,
+                        fields: vec![Value::Unit],
+                    })
+                }
+            }
+            Builtin::VecShrink => {
+                // `shrink_to_fit` passes one argument, `shrink_to`
+                // two; neither changes anything the value model can
+                // observe (see the variant's documentation).
+                if vals.len() != 1 && vals.len() != 2 {
+                    return Err(InterpError::type_mismatch(
+                        format!("builtin {name}"),
+                        "1 or 2 argument(s)",
+                        format!("{} argument(s)", vals.len()),
+                    ));
+                }
                 Ok(Value::Unit)
             }
             Builtin::VecCapacity => Err(unsupported(
@@ -2325,6 +2460,18 @@ impl<'a> Interpreter<'a> {
             };
             if idx < items.len() {
                 let item = items[idx].clone();
+                // `slice::Iter` yields `&T`: the item is a shared
+                // reference to the element value, the shape
+                // `Index::index` produces for a shared element
+                // reference (reads resolve against the element
+                // itself). The other iterators sharing this state
+                // shape (`array::IntoIter`, `Chars`, `Bytes`) yield
+                // owned values.
+                let item = if self_ty.starts_with("std::slice::Iter<") {
+                    Value::Ref(RefTarget::Value(Box::new(item)))
+                } else {
+                    item
+                };
                 (
                     vec![Value::Tuple(items), Value::Uint((idx + 1) as u128)],
                     some_value(item),
