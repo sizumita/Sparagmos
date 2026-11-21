@@ -263,6 +263,19 @@ pub enum Builtin {
     FromFrom,
     /// `std::hint::must_use(value)`: identity.
     MustUse,
+    /// `std::sys::thread_local::destructors::linux_like::register`:
+    /// thread-local values are never destroyed in this model (the
+    /// per-thread stores live for the whole run), so registering a
+    /// destructor is a no-op -- the same observable behaviour as
+    /// std's documented caveat that TLS destructors do not run for
+    /// the main thread on Unix.
+    TlsRegisterDtor,
+    /// `std::thread::local::panic_access_error(AccessError)`: the
+    /// panic raised when a destroyed thread-local is accessed. It
+    /// cannot fire in this model (thread-locals are never
+    /// destroyed); the builtin exists so the name has the exact
+    /// native behaviour if reached.
+    PanicAccessError,
     /// `std::ops::Deref::deref(&value)` (modelled types only).
     Deref,
     /// `str::to_uppercase(&str) -> String`.
@@ -895,6 +908,10 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         _ if canonical.contains("::Scope::") && canonical.ends_with("::spawn") => {
             Builtin::ThreadScopedSpawn
         }
+        "std::sys::thread_local::destructors::linux_like::register" => {
+            Builtin::TlsRegisterDtor
+        }
+        "std::thread::local::panic_access_error" => Builtin::PanicAccessError,
         "std::thread::Builder::new" => Builtin::ThreadBuilderNew,
         "std::thread::Builder::name" => Builtin::ThreadBuilderName,
         "std::thread::Builder::stack_size" => Builtin::ThreadBuilderStackSize,
@@ -1663,7 +1680,7 @@ impl<'a> Interpreter<'a> {
         // the panic's location, recorded for the panic hook.
         if matches!(
             kind,
-            Builtin::PanicStr | Builtin::PanicFmt | Builtin::PanicAny
+            Builtin::PanicStr | Builtin::PanicFmt | Builtin::PanicAny | Builtin::PanicAccessError
         ) && vals.len() == 2
         {
             let stamp = vals.pop().expect("two arguments");
@@ -2624,6 +2641,19 @@ impl<'a> Interpreter<'a> {
             Builtin::MustUse => {
                 arity(1)?;
                 Ok(vals.into_iter().next().expect("arity checked"))
+            }
+            Builtin::TlsRegisterDtor => {
+                arity(2)?;
+                Ok(Value::Unit)
+            }
+            Builtin::PanicAccessError => {
+                // `#[track_caller]`: the caller-location stamp was
+                // popped before the dispatch, like the other panic
+                // entry points.
+                arity(1)?;
+                Err(InterpError::panic_str_payload(
+                    "cannot access a Thread Local Storage value during or after destruction: AccessError",
+                ))
             }
             Builtin::Deref => {
                 arity(1)?;

@@ -3144,6 +3144,19 @@ impl<'a> Interpreter<'a> {
         Ok(())
     }
 
+    /// The statics-store key of thread `tid`'s storage for the
+    /// thread-local static `name`. TLS storage lives in the
+    /// statics store under a key no real static can carry (real
+    /// keys are item paths, optionally suffixed with a `DefId`
+    /// disambiguator), so reads and writes through a TLS reference
+    /// route through the ordinary static machinery while the
+    /// storage itself stays private to the owning thread: the
+    /// reference names that thread's storage permanently, exactly
+    /// as a native pointer names that thread's TLS block.
+    fn tls_store_key(tid: u64, name: &str) -> String {
+        format!("\u{1}tls\u{1}{tid}\u{1}{name}")
+    }
+
     fn missing_static(&self, name: &str) -> InterpError {
         InterpError::UnsupportedTerminator {
             kind: format!(
@@ -3938,6 +3951,7 @@ impl<'a> Interpreter<'a> {
         frames: &[Frame],
         body: &Body,
         value: Value,
+        depth: u32,
     ) -> InterpResult<Value> {
         match value {
             Value::Ref(RefTarget::Place {
@@ -3945,7 +3959,7 @@ impl<'a> Interpreter<'a> {
                 local,
                 mut projection,
             }) => {
-                projection.push(RefProj::Field(0));
+                projection.extend((0..depth).map(|_| RefProj::Field(0)));
                 Ok(Value::Ref(RefTarget::Place {
                     frame,
                     local,
@@ -3956,20 +3970,21 @@ impl<'a> Interpreter<'a> {
                 name,
                 mut projection,
             }) => {
-                projection.push(RefProj::Field(0));
+                projection.extend((0..depth).map(|_| RefProj::Field(0)));
                 Ok(Value::Ref(RefTarget::Static { name, projection }))
             }
             Value::Ref(RefTarget::Alloc {
                 id,
                 mut projection,
             }) => {
-                projection.push(RefProj::Field(0));
+                projection.extend((0..depth).map(|_| RefProj::Field(0)));
                 Ok(Value::Ref(RefTarget::Alloc { id, projection }))
             }
             Value::Ref(RefTarget::Value(v)) => {
+                let steps = vec![RefProj::Field(0); depth as usize];
                 let inner = project_value(
                     *v,
-                    &[RefProj::Field(0)],
+                    &steps,
                     &body.name,
                     "transparent wrapper pointer",
                 )?;
@@ -3978,7 +3993,7 @@ impl<'a> Interpreter<'a> {
             Value::Ref(RefTarget::Null) | Value::Ref(RefTarget::Address(_)) => Ok(value),
             Value::FatRef { base, len } => match *base {
                 Value::Ref(_) => {
-                    let base = self.ptr_field_value(frames, body, *base)?;
+                    let base = self.ptr_field_value(frames, body, *base, depth)?;
                     Ok(Value::FatRef {
                         base: Box::new(base),
                         len,
@@ -5442,6 +5457,41 @@ impl<'a> Interpreter<'a> {
                 for op in operands {
                     fields.push(self.eval_operand(frames, body, op)?);
                 }
+                // A `MaybeUninit::new(v)` construction (the union's
+                // `value` field, index 1): in this model a
+                // `MaybeUninit<T>` value holds its payload at field
+                // 0 -- the slot every pointer access to the union
+                // denotes (`as_ptr` / `as_mut_ptr` enter field 0, and
+                // the thread-local seed expansion builds the same
+                // shape) -- not at the declared field index with
+                // uninitialized padding before it. The construction
+                // therefore unwraps the `ManuallyDrop<T>` aggregate
+                // the operand arrives as and stores the payload at
+                // field 0. Without this, a value written through a
+                // `*mut MaybeUninit<T>` (e.g. `ptr::replace` in std's
+                // thread-local lazy initialization) would sit in the
+                // place where no reader of the payload can reach it.
+                if *field_index == Some(1) && operands.len() == 1 {
+                    let is_maybe_uninit = matches!(
+                        dest_ty,
+                        Some(Ty::Adt(name))
+                            if name.starts_with("std::mem::MaybeUninit")
+                                || name.starts_with("core::mem::MaybeUninit")
+                    );
+                    if is_maybe_uninit {
+                        let operand = fields.pop().expect("one operand pushed");
+                        let payload = match operand {
+                            Value::Enum { fields: inner, .. } if inner.len() == 1 => {
+                                inner.into_iter().next().expect("one field")
+                            }
+                            other => other,
+                        };
+                        return Ok(Value::Enum {
+                            variant: 0,
+                            fields: vec![payload],
+                        });
+                    }
+                }
                 Ok(Value::Enum {
                     variant: *variant,
                     fields,
@@ -5486,9 +5536,9 @@ impl<'a> Interpreter<'a> {
                     }),
                 }
             }
-            Rvalue::PtrField(operand) => {
+            Rvalue::PtrField(operand, depth) => {
                 let value = self.eval_operand(frames, body, operand)?;
-                self.ptr_field_value(frames, body, value)
+                self.ptr_field_value(frames, body, value, *depth)
             }
             Rvalue::IntToPtr(operand) => {
                 let value = self.eval_operand(frames, body, operand)?;
@@ -5802,13 +5852,34 @@ impl<'a> Interpreter<'a> {
                 // itself, exactly as a bitwise copy prescribes).
                 self.read_place(frames, body, place)
             }
-            Rvalue::ThreadLocalRef(name) => Err(InterpError::UnsupportedRvalue {
-                kind: format!(
-                    "ThreadLocalRef {name}: thread-local statics are not modelled \
-                     (the driver collects no static items, so there is no storage \
-                     or initializer to bind)"
-                ),
-            }),
+            Rvalue::ThreadLocalRef(name) => {
+                // A reference to the executing thread's storage for
+                // this thread-local static, seeded on first access
+                // from the initializer the driver recorded. The
+                // storage's own machinery (std's `LocalKey` and
+                // storage bodies, which are ordinary collected code)
+                // performs the user-visible initialization; the seed
+                // is only the storage struct's initial value.
+                // Destructors registered for a storage are not run
+                // at thread exit (see the destructor-registration
+                // builtin), so a thread's entries simply stay in
+                // the store under its unique id.
+                let Some(seed) = self.program.thread_locals.get(name) else {
+                    return Err(InterpError::UnsupportedRvalue {
+                        kind: format!(
+                            "ThreadLocalRef {name}: no thread-local definition \
+                             was collected for this static (its initializer \
+                             could not be decoded)"
+                        ),
+                    });
+                };
+                let key = Self::tls_store_key(self.current_thread_id(), name);
+                self.ensure_static(&key, seed)?;
+                Ok(Value::Ref(RefTarget::Static {
+                    name: key,
+                    projection: Vec::new(),
+                }))
+            }
             Rvalue::Unsupported(kind) => Err(InterpError::UnsupportedRvalue {
                 kind: kind.clone(),
             }),
