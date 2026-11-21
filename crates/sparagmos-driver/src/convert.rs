@@ -2254,7 +2254,16 @@ impl Converter {
             }
             RigidTy::Tuple(elems) => sm::Ty::Tuple(elems.iter().map(|t| self.ty(t)).collect()),
             RigidTy::Pat(inner, _) => {
-                self.err("Ty::Pat");
+                // A pattern type is a refinement of its base
+                // type with the same representation, so it
+                // converts as the base type everywhere: body
+                // locals, constants, and ADT shape fields alike
+                // (std's own `NonNull` carries a pattern-typed
+                // pointer field, and shape consumers judge fields
+                // by their base types). Construction in a valid
+                // program guarantees the range; layout facts that
+                // depend on it (niches) come from the rustc
+                // layout tables, not from this type.
                 self.ty(inner)
             }
         }

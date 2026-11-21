@@ -6310,3 +6310,148 @@ fn run_mode_arc_make_mut_shared_stops_at_the_allocator() {
         "the stop names itself as unsupported: {stderr}"
     );
 }
+
+// ----- subslice projections and pattern types (Lane FG) ---------------------
+
+const SUBSLICE_SRC: &str = r#"
+fn head_rest(s: &[i32]) -> i32 {
+    match s {
+        [first, rest @ ..] => first + rest.len() as i32,
+        [] => -1,
+    }
+}
+fn tail2(s: &[i32]) -> i32 {
+    match s {
+        [.., a, b] => a * 10 + b,
+        _ => 0,
+    }
+}
+fn mid_sum(s: &[i32]) -> i32 {
+    match s {
+        [_, m @ .., _] => {
+            let mut acc = 0;
+            let mut i = 0;
+            while i < m.len() { acc += m[i]; i += 1; }
+            acc
+        }
+        _ => 0,
+    }
+}
+fn main() {
+    let arr = [1, 2, 3, 4, 5];
+    let s = &arr[1..3];
+    println!("len {} sum {}", s.len(), s[0] + s[1]);
+    let mut arr2 = [10, 20, 30, 40];
+    arr2[1..3][0] = 99;
+    println!("w {}", arr2[1]);
+    let t = &arr[..2];
+    println!("head {}", t.len());
+    let u = &arr[3..];
+    println!("tail {}", u[0] + u[1]);
+    let v = [5, 1, 2, 3];
+    println!("hr {}", head_rest(&v));
+    println!("t2 {}", tail2(&v));
+    println!("mid {}", mid_sum(&v));
+    println!("hr2 {}", head_rest(&[9, 8]));
+    let mut arr3 = [0, 1, 2, 3, 4, 5];
+    arr3[2..5][1] = 77;
+    println!("nested {}", arr3[3]);
+    let w = &arr[1..4][1..];
+    println!("subsub {} {}", w.len(), w[0]);
+}
+"#;
+
+#[test]
+fn run_mode_subslice_projections_read_write_and_patterns() {
+    // Subslice places (from slice patterns and range indexing)
+    // convert and execute: shared range reads, writes through
+    // `IndexMut` ranges starting above zero, `@ ..` bindings, and
+    // nested sub-slices all alias the base storage.
+    let dir = temp_dir("subslice");
+    let src = fixture(&dir, "subslice.rs", SUBSLICE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "subslice program must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "len 2 sum 5\nw 99\nhead 2\ntail 9\nhr 8\nt2 23\nmid 3\nhr2 10\nnested 77\nsubsub 2 3\n",
+        "subslice stdout mismatch; stderr={stderr}"
+    );
+}
+
+const SUBSLICE_OOB_SRC: &str = r#"
+fn main() {
+    let v = [1, 2, 3];
+    let s: &[i32] = &v;
+    let a = 0usize;
+    let b = 9usize;
+    let _bad = &s[a..b];
+    println!("unreachable");
+}
+"#;
+
+#[test]
+fn run_mode_subslice_out_of_range_panics() {
+    // A dynamic range past the end of the slice is a guest panic
+    // (core's range-bounds check), exit 101, like native.
+    let dir = temp_dir("subslice-oob");
+    let src = fixture(&dir, "subslice_oob.rs", SUBSLICE_OOB_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "out-of-range subslice must panic; stderr={stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("unreachable"),
+        "the program must not continue past the panic"
+    );
+}
+
+const PATTERN_TYPE_SRC: &str = r#"
+#![feature(pattern_types, pattern_type_macro)]
+use std::pat::pattern_type;
+type Y = pattern_type!(u32 is 1..);
+struct Thing(Y);
+fn id_thing(t: Thing) -> Thing { t }
+fn describe(z: Option<Y>) -> u32 {
+    match z { Some(_) => 1, None => 0 }
+}
+fn main() {
+    let a = id_thing(Thing(2));
+    let _ = a.0;
+    println!("some {}", describe(Some(42)));
+    println!("none {}", describe(None));
+    println!("size {}", std::mem::size_of::<Y>());
+    let arr = [Thing(1), Thing(2)];
+    println!("moved {}", describe(Some(arr[0].0)) + describe(Some(arr[1].0)));
+}
+"#;
+
+#[test]
+fn run_mode_pattern_type_values_execute_as_base_type() {
+    // Pattern types (`Ty::Pat`) convert as their base type: the
+    // values move through calls, arrays and enum construction
+    // with the base representation. (The fixture needs the
+    // internal feature; the driver test harness runs with
+    // RUSTC_BOOTSTRAP=1, like compiletest.)
+    let dir = temp_dir("pattern-type");
+    let src = fixture(&dir, "pattern_type.rs", PATTERN_TYPE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "pattern-type program must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "some 1\nnone 0\nsize 4\nmoved 2\n",
+        "pattern-type stdout mismatch; stderr={stderr}"
+    );
+}
