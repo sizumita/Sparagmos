@@ -143,6 +143,8 @@ fn build_with_table(
         thread_locals: Default::default(),
         adt_instance_shapes: Default::default(),
         adt_niches: Default::default(),
+        track_caller_defs: Default::default(),
+        fn_shim_locations: Default::default(),
     };
     let jit = JitProgram::compile(&jit_in).expect("JIT compile failed");
     (jit, interp_in)
