@@ -996,6 +996,11 @@ impl Conv {
                 Self::mutability(&a[0])?,
                 Self::place(&a[1])?,
             ),
+            ("Reborrow", Payload::Args(a)) if a.len() == 3 => mir::Rvalue::Reborrow(
+                Self::ty(&a[0])?,
+                Self::mutability(&a[1])?,
+                Self::place(&a[2])?,
+            ),
             ("Len", Payload::Args(a)) if a.len() == 1 => mir::Rvalue::Len(Self::place(&a[0])?),
             ("Cast", Payload::Args(a)) if a.len() == 3 => mir::Rvalue::Cast(
                 Self::cast_kind(&a[0])?,

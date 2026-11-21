@@ -26,8 +26,8 @@
 //!    `Resume` / `Terminate` where rustc has `UnwindResume` /
 //!    `UnwindTerminate`, and splits `Len`, `CheckedBinaryOp`,
 //!    `NullaryOp` and `ShallowInitBox` out of `Rvalue` where rustc
-//!    1.100.0 folds them into other variants (and has `WrapUnsafeBinder`
-//!    and `Reborrow`, which the model does not).
+//!    1.100.0 folds them into other variants (and has `WrapUnsafeBinder`,
+//!    which the model does not).
 
 /// Metric-1 denominator: `StatementKind` variants of Rust 1.100.0 (12).
 pub const METRIC1_STATEMENT_KINDS: &[&str] = &[
@@ -93,6 +93,58 @@ pub fn metric1_tables() -> Vec<(&'static str, usize)> {
 /// The denominator of metric 1 (MIR variant coverage): 40.
 pub fn metric1_variant_count() -> usize {
     metric1_tables().iter().map(|(_, n)| n).sum()
+}
+
+/// Metric-1 denominator variants that are **unreachable**: they exist
+/// in rustc_middle's MIR enums (the denominator's source) but are
+/// absent from the Stable MIR enums the driver actually consumes
+/// (`rustc_public::mir` in the installed Rust 1.100.0 sources,
+/// `compiler/rustc_public/src/mir/body.rs`), so no program the driver
+/// can ever see contains them. They stay in the denominator (it does
+/// not shrink), and they are *not* counted as implemented: metric 1
+/// accounting is implemented / unreachable / remaining over 40.
+///
+/// Evidence, per enum (Stable MIR, Rust 1.100.0):
+/// - `StatementKind` has no `BackwardIncompatibleDropHint` (its
+///   variants are Assign, FakeRead, SetDiscriminant, StorageLive,
+///   StorageDead, Retag, PlaceMention, AscribeUserType, Coverage,
+///   Intrinsic, ConstEvalCounter, Nop).
+/// - `TerminatorKind` has exactly Goto, SwitchInt, Resume, Abort,
+///   Return, Unreachable, Drop, Call, Assert, InlineAsm: no `Yield`,
+///   `CoroutineDrop`, `TailCall`, `FalseEdge` or `FalseUnwind`, and
+///   the unwind terminators are named `Resume` / `Abort`, not
+///   `UnwindResume` / `UnwindTerminate`.
+/// - `Rvalue` has no `WrapUnsafeBinder`.
+pub const METRIC1_UNREACHABLE_STATEMENT_KINDS: &[&str] = &["BackwardIncompatibleDropHint"];
+
+/// See [`METRIC1_UNREACHABLE_STATEMENT_KINDS`].
+pub const METRIC1_UNREACHABLE_TERMINATOR_KINDS: &[&str] = &[
+    "UnwindResume",
+    "UnwindTerminate",
+    "TailCall",
+    "Yield",
+    "CoroutineDrop",
+    "FalseEdge",
+    "FalseUnwind",
+];
+
+/// See [`METRIC1_UNREACHABLE_STATEMENT_KINDS`].
+pub const METRIC1_UNREACHABLE_RVALUE_KINDS: &[&str] = &["WrapUnsafeBinder"];
+
+/// (enum name, unreachable variant count) for the three metric-1
+/// denominator tables.
+pub fn metric1_unreachable_tables() -> Vec<(&'static str, usize)> {
+    vec![
+        ("StatementKind", METRIC1_UNREACHABLE_STATEMENT_KINDS.len()),
+        ("TerminatorKind", METRIC1_UNREACHABLE_TERMINATOR_KINDS.len()),
+        ("Rvalue", METRIC1_UNREACHABLE_RVALUE_KINDS.len()),
+    ]
+}
+
+/// The number of metric-1 denominator variants that are unreachable
+/// through Stable MIR: 9.
+pub fn metric1_unreachable_count() -> usize {
+    metric1_unreachable_tables().iter().map(|(_, n)| n).sum()
 }
 
 // ---------------------------------------------------------------------------
@@ -221,6 +273,7 @@ pub const RVALUE_KINDS: &[&str] = &[
     "Aggregate",
     "ShallowInitBox",
     "CopyForDeref",
+    "Reborrow",
 ];
 pub const STATEMENT_KINDS: &[&str] = &[
     "Assign",
@@ -348,9 +401,9 @@ mod tests {
         assert!(METRIC1_TERMINATOR_KINDS.contains(&"UnwindResume"));
         assert!(METRIC1_TERMINATOR_KINDS.contains(&"UnwindTerminate"));
         // Rvalue: the model splits out Len / CheckedBinaryOp / NullaryOp /
-        // ShallowInitBox (15 kinds); rustc 1.100.0 has WrapUnsafeBinder
-        // and Reborrow instead (13 kinds).
-        assert_eq!(RVALUE_KINDS.len(), 15);
+        // ShallowInitBox and (since Lane CO) has Reborrow (16 kinds);
+        // rustc 1.100.0 has WrapUnsafeBinder instead (13 kinds).
+        assert_eq!(RVALUE_KINDS.len(), 16);
         for name in ["Len", "CheckedBinaryOp", "NullaryOp", "ShallowInitBox"] {
             assert!(RVALUE_KINDS.contains(&name), "model Rvalue has {name}");
             assert!(
@@ -358,9 +411,31 @@ mod tests {
                 "metric-1 Rvalue folds {name} into other variants"
             );
         }
-        for name in ["WrapUnsafeBinder", "Reborrow"] {
-            assert!(METRIC1_RVALUE_KINDS.contains(&name));
-            assert!(!RVALUE_KINDS.contains(&name));
+        assert!(METRIC1_RVALUE_KINDS.contains(&"WrapUnsafeBinder"));
+        assert!(!RVALUE_KINDS.contains(&"WrapUnsafeBinder"));
+        assert!(METRIC1_RVALUE_KINDS.contains(&"Reborrow"));
+        assert!(RVALUE_KINDS.contains(&"Reborrow"));
+    }
+
+    /// The unreachable set: exactly the 9 denominator variants absent
+    /// from Stable MIR (see the constants' documentation for the
+    /// evidence). They are a subset of the denominator, and the
+    /// reachable remainder of the denominator is 31.
+    #[test]
+    fn metric1_unreachable_set_is_nine_and_inside_the_denominator() {
+        assert_eq!(METRIC1_UNREACHABLE_STATEMENT_KINDS.len(), 1);
+        assert_eq!(METRIC1_UNREACHABLE_TERMINATOR_KINDS.len(), 7);
+        assert_eq!(METRIC1_UNREACHABLE_RVALUE_KINDS.len(), 1);
+        assert_eq!(metric1_unreachable_count(), 9);
+        for name in METRIC1_UNREACHABLE_STATEMENT_KINDS {
+            assert!(METRIC1_STATEMENT_KINDS.contains(name), "{name}");
         }
+        for name in METRIC1_UNREACHABLE_TERMINATOR_KINDS {
+            assert!(METRIC1_TERMINATOR_KINDS.contains(name), "{name}");
+        }
+        for name in METRIC1_UNREACHABLE_RVALUE_KINDS {
+            assert!(METRIC1_RVALUE_KINDS.contains(name), "{name}");
+        }
+        assert_eq!(metric1_variant_count() - metric1_unreachable_count(), 31);
     }
 }

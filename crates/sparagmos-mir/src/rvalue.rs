@@ -343,6 +343,13 @@ pub enum Rvalue {
     Aggregate(Box<AggregateKind>, Vec<Operand>),
     ShallowInitBox(Operand, Ty),
     CopyForDeref(Place),
+    /// A reborrow: a bitwise copy of the pointer/reference value held
+    /// at the place, reinterpreted as the target type (the layout is
+    /// guaranteed equal by the `CoerceShared` contract). Mirrors
+    /// Stable MIR's `Rvalue::Reborrow(Ty, Mutability, Place)`: with
+    /// `Mutability::Mut` the value keeps its type; otherwise it is
+    /// coerced to the (shared) target type.
+    Reborrow(Ty, Mutability, Place),
 }
 impl Rvalue {
     pub fn kind_name(&self) -> &'static str {
@@ -362,6 +369,7 @@ impl Rvalue {
             Self::Aggregate(..) => "Aggregate",
             Self::ShallowInitBox(..) => "ShallowInitBox",
             Self::CopyForDeref(_) => "CopyForDeref",
+            Self::Reborrow(..) => "Reborrow",
         }
     }
     pub fn samples() -> Vec<Rvalue> {
@@ -385,6 +393,7 @@ impl Rvalue {
             Self::Aggregate(Box::new(AggregateKind::Tuple), vec![]),
             Self::ShallowInitBox(op(), Ty::Bool),
             Self::CopyForDeref(p()),
+            Self::Reborrow(Ty::Bool, Mutability::Not, p()),
         ]
     }
 }
