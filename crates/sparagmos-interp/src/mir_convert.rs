@@ -1959,6 +1959,22 @@ impl<'a> Converter<'a> {
                 v,
                 ir::Operand::Constant(ir::Constant::Int(_) | ir::Constant::Uint(_))
             );
+        // A `ZeroSized` constant operand carries no value at
+        // all: transmuting it into a zero-sized type whose value
+        // is uniquely determined by the type yields that value,
+        // whatever the (also zero-sized) source type was.
+        if let mir::Operand::Constant(c) = operand {
+            if matches!(
+                c.literal,
+                mir::ConstKind::Value(mir::ConstValue::ZeroSized)
+            ) {
+                if let Some(tv) = self.zst_value(target, 0) {
+                    if let Some(k) = value_to_constant(&tv) {
+                        return ir::Rvalue::Use(ir::Operand::Constant(k));
+                    }
+                }
+            }
+        }
         match (&src, target) {
             // Pointer -> integer: the synthetic address (what the
             // compiler's UB precondition checks use to test a
@@ -1968,7 +1984,15 @@ impl<'a> Converter<'a> {
                 mir::Ty::Int(_) | mir::Ty::Uint(_),
             ) => ir::Rvalue::PtrToInt(v.clone()),
             // Thin pointer -> thin pointer: the value itself.
-            (Some(s), t) if is_thin_ptr_ty(s) && is_thin_ptr_ty(t) => {
+            // The exception is a transmute crossing an
+            // `UnsafeCell` / `MaybeUninit` wrapper boundary (see
+            // `pointee_crosses_cell_wrapper`): those stay
+            // unsupported here.
+            (Some(s), t)
+                if is_thin_ptr_ty(s)
+                    && is_thin_ptr_ty(t)
+                    && !self.pointee_crosses_cell_wrapper(s, t) =>
+            {
                 ir::Rvalue::Use(v.clone())
             }
             // Integer -> thin pointer: an address-only reference.
@@ -1976,21 +2000,51 @@ impl<'a> Converter<'a> {
                 ir::Rvalue::IntToPtr(v.clone())
             }
             // Fieldless enum -> integer: the discriminant value.
-            (Some(mir::Ty::Adt(def, _)), mir::Ty::Int(_) | mir::Ty::Uint(_)) => {
-                match self.fieldless_enum_discriminants(def) {
-                    Some(table) => match self.convert_ty(target, "cast target") {
+            // Single-field struct -> integer of exactly the
+            // field's type: the field itself (the struct is a
+            // transparent wrapper around it).
+            (Some(mir::Ty::Adt(def, args)), mir::Ty::Int(_) | mir::Ty::Uint(_)) => {
+                if let Some(table) = self.fieldless_enum_discriminants(def) {
+                    match self.convert_ty(target, "cast target") {
                         Ok(t) => ir::Rvalue::EnumToInt(v.clone(), table, t),
                         Err(_) => unsupported(),
-                    },
-                    None => unsupported(),
+                    }
+                } else if let Some(field_ty) = self.single_field_ty(def, args)
+                {
+                    if field_ty == *target {
+                        match self.field_operand(operand, v, 0, &field_ty) {
+                            Some(op) => ir::Rvalue::Use(op),
+                            None => unsupported(),
+                        }
+                    } else {
+                        unsupported()
+                    }
+                } else {
+                    unsupported()
                 }
             }
             // Integer -> fieldless enum: the variant whose
             // discriminant the integer's bit pattern equals.
-            (_, mir::Ty::Adt(def, _)) if src_is_int => {
-                match self.fieldless_enum_discriminants(def) {
-                    Some(table) => ir::Rvalue::IntToEnum(v.clone(), table),
-                    None => unsupported(),
+            // Integer -> enum with a single variant carrying a
+            // single integer field: that variant holding the
+            // integer as its payload.
+            (_, mir::Ty::Adt(def, args)) if src_is_int => {
+                if let Some(table) = self.fieldless_enum_discriminants(def) {
+                    ir::Rvalue::IntToEnum(v.clone(), table)
+                } else if let Some(payload) =
+                    self.single_variant_payload(def, args)
+                {
+                    if matches!(payload, mir::Ty::Int(_) | mir::Ty::Uint(_)) {
+                        ir::Rvalue::AggregateAdt {
+                            variant: 0,
+                            operands: vec![v.clone()],
+                            field_index: None,
+                        }
+                    } else {
+                        unsupported()
+                    }
+                } else {
+                    unsupported()
                 }
             }
             // Thin pointer -> transparent wrapper struct: wrap
@@ -2034,6 +2088,37 @@ impl<'a> Converter<'a> {
                     None => unsupported(),
                 }
             }
+            // Single-field struct wrapping an integer ->
+            // fieldless enum: the field is the discriminant (the
+            // `Bar { a }` -> `Foo` shape). Any other ADT -> ADT
+            // pair falls through to the zero-sized rule below.
+            (Some(mir::Ty::Adt(def, args)), mir::Ty::Adt(tdef, _)) => {
+                match (
+                    self.single_field_ty(def, args),
+                    self.fieldless_enum_discriminants(tdef),
+                ) {
+                    (Some(field_ty), Some(table))
+                        if matches!(
+                            field_ty,
+                            mir::Ty::Int(_) | mir::Ty::Uint(_)
+                        ) =>
+                    {
+                        match self.field_operand(operand, v, 0, &field_ty) {
+                            Some(op) => ir::Rvalue::IntToEnum(op, table),
+                            None => unsupported(),
+                        }
+                    }
+                    _ => match (self.zst_value(src.as_ref().unwrap(), 0), self.zst_value(target, 0)) {
+                        (Some(_), Some(tv)) => match value_to_constant(&tv) {
+                            Some(c) => {
+                                ir::Rvalue::Use(ir::Operand::Constant(c))
+                            }
+                            None => unsupported(),
+                        },
+                        _ => unsupported(),
+                    },
+                }
+            }
             // Zero-sized -> zero-sized with a uniquely determined
             // value: the value is the target type's unique value,
             // whatever the source value was (a zero-sized source
@@ -2059,35 +2144,130 @@ impl<'a> Converter<'a> {
         v: &ir::Operand,
         shape: &WrapperShape,
     ) -> ir::Rvalue {
-        fn unsupported() -> ir::Rvalue {
-            ir::Rvalue::Unsupported("Cast Transmute".to_string())
+        match self.field_operand(
+            operand,
+            v,
+            shape.payload_index as u32,
+            &shape.payload_ty,
+        ) {
+            Some(op) => ir::Rvalue::Use(op),
+            None => ir::Rvalue::Unsupported("Cast Transmute".to_string()),
         }
+    }
+
+    /// The operand denoting field `index` of the value `operand`
+    /// denotes: for a place operand, the place extended with the
+    /// field projection (preserving move-ness); for a constant
+    /// ADT operand, the field constant. `None` for operand forms
+    /// that carry no addressable field.
+    fn field_operand(
+        &self,
+        operand: &mir::Operand,
+        v: &ir::Operand,
+        index: u32,
+        field_ty: &mir::Ty,
+    ) -> Option<ir::Operand> {
         match operand.place() {
             Some(place) => {
-                let place = place
-                    .clone()
-                    .field(shape.payload_index as u32, shape.payload_ty.clone());
-                match self.convert_place(&place) {
-                    Ok(p) => match operand {
-                        mir::Operand::Move(_) => {
-                            ir::Rvalue::Use(ir::Operand::Move(p))
-                        }
-                        _ => ir::Rvalue::Use(ir::Operand::Copy(p)),
-                    },
-                    Err(_) => unsupported(),
-                }
+                let place = place.clone().field(index, field_ty.clone());
+                let p = self.convert_place(&place).ok()?;
+                Some(match operand {
+                    mir::Operand::Move(_) => ir::Operand::Move(p),
+                    _ => ir::Operand::Copy(p),
+                })
             }
             None => match v {
-                ir::Operand::Constant(ir::Constant::Adt { fields, .. }) => {
-                    match fields.get(shape.payload_index) {
-                        Some(c) => {
-                            ir::Rvalue::Use(ir::Operand::Constant(c.clone()))
-                        }
-                        None => unsupported(),
-                    }
-                }
-                _ => unsupported(),
+                ir::Operand::Constant(ir::Constant::Adt { fields, .. }) => fields
+                    .get(index as usize)
+                    .map(|c| ir::Operand::Constant(c.clone())),
+                _ => None,
             },
+        }
+    }
+
+    /// Whether a thin-pointer -> thin-pointer transmute crosses
+    /// an `UnsafeCell` / `MaybeUninit` wrapper boundary: one
+    /// side's pointee is the wrapper ADT and the other side's
+    /// pointee is exactly the type the wrapper wraps. Such a
+    /// pointer must come to denote the wrapper's inner field,
+    /// not the wrapper aggregate itself — the cast conversion
+    /// models that with an explicit field-entering rvalue (Lane
+    /// DP); until the transmute conversion composes the same
+    /// treatment, these shapes stay explicit unsupported instead
+    /// of silently pointing at the aggregate.
+    fn pointee_crosses_cell_wrapper(
+        &self,
+        src: &mir::Ty,
+        target: &mir::Ty,
+    ) -> bool {
+        fn pointee(ty: &mir::Ty) -> Option<&mir::Ty> {
+            match ty {
+                mir::Ty::RawPtr(inner, _) | mir::Ty::Ref(_, inner, _) => {
+                    Some(inner)
+                }
+                _ => None,
+            }
+        }
+        let (Some(sp), Some(tp)) = (pointee(src), pointee(target)) else {
+            return false;
+        };
+        let wrapped = |wrapper: &mir::Ty, plain: &mir::Ty| -> bool {
+            match wrapper {
+                mir::Ty::Adt(def, args) => {
+                    args.len() == 1
+                        && args[0] == *plain
+                        && matches!(
+                            self.def_display_name(def).as_str(),
+                            "core::cell::UnsafeCell"
+                                | "std::cell::UnsafeCell"
+                                | "core::mem::MaybeUninit"
+                                | "std::mem::MaybeUninit"
+                        )
+                }
+                _ => false,
+            }
+        };
+        wrapped(sp, tp) || wrapped(tp, sp)
+    }
+
+    /// The instantiated type of the only field of a struct with
+    /// exactly one field, or `None` for any other ADT.
+    fn single_field_ty(
+        &self,
+        def: &mir::AdtDefId,
+        args: &[mir::Ty],
+    ) -> Option<mir::Ty> {
+        let shape = self.adt_shapes.get(def)?;
+        if shape.kind != mir::AdtShapeKind::Struct || shape.variants.len() != 1
+        {
+            return None;
+        }
+        let fields = self.instantiated_field_tys(def, args, 0)?;
+        if fields.len() == 1 {
+            fields.into_iter().next()
+        } else {
+            None
+        }
+    }
+
+    /// The instantiated type of the only field of an enum with
+    /// exactly one variant carrying exactly one field, or `None`
+    /// for any other ADT.
+    fn single_variant_payload(
+        &self,
+        def: &mir::AdtDefId,
+        args: &[mir::Ty],
+    ) -> Option<mir::Ty> {
+        let shape = self.adt_shapes.get(def)?;
+        if shape.kind != mir::AdtShapeKind::Enum || shape.variants.len() != 1
+        {
+            return None;
+        }
+        let fields = self.instantiated_field_tys(def, args, 0)?;
+        if fields.len() == 1 {
+            fields.into_iter().next()
+        } else {
+            None
         }
     }
 
