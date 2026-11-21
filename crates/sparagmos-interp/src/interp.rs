@@ -917,6 +917,54 @@ impl<'a> Interpreter<'a> {
         {
             return Some(Ok((candidate, (**base).clone())));
         }
+        // The trait's own generic arguments are part of the
+        // instance name (`<S as G<i32>>::get`) but not of the call
+        // name the lookup starts from, so a trait with parameters
+        // misses the exact candidate above. Fall back to a scan:
+        // exactly one impl body for this concrete type, trait and
+        // method, under any generic-argument spelling. An
+        // ambiguous scan resolves nothing — the receiver's vtable
+        // identity carries no trait arguments to tell the
+        // instances apart, so the call stays an explicit error
+        // below instead of guessing.
+        {
+            let prefix = format!("<{concrete} as {trait_path}");
+            let suffix = format!(">::{method}");
+            let mut found: Option<String> = None;
+            let mut ambiguous = false;
+            for key in self
+                .program
+                .functions
+                .keys()
+                .chain(self.program.unconverted.keys())
+            {
+                let base_name = key.split('#').next().unwrap_or(key.as_str());
+                if !base_name.starts_with(&prefix) || !base_name.ends_with(&suffix) {
+                    continue;
+                }
+                // The trait path must be followed by `>` (no
+                // arguments, already handled exactly) or by `<`
+                // opening its argument list — not by more path
+                // characters naming a different trait.
+                let after = &base_name[prefix.len()..];
+                if !after.starts_with('<') && !after.starts_with('>') {
+                    continue;
+                }
+                if found.as_deref() == Some(key.as_str()) {
+                    continue;
+                }
+                if found.is_some() {
+                    ambiguous = true;
+                    break;
+                }
+                found = Some(key.clone());
+            }
+            if !ambiguous {
+                if let Some(key) = found {
+                    return Some(Ok((key, (**base).clone())));
+                }
+            }
+        }
         if traits.iter().any(|t| t == trait_path) {
             return Some(Err(InterpError::UnsupportedDynamicDispatch {
                 method: func.to_string(),
@@ -938,14 +986,24 @@ impl<'a> Interpreter<'a> {
         destination: &Place,
         target: Option<BasicBlock>,
     ) -> InterpResult<()> {
-        let callee = match self.program.get(func) {
-            Some(c) => c.clone(),
-            None => match self.virtual_call_target(func, &arg_values) {
+        // A call whose receiver is a `dyn` fat pointer is a vtable
+        // dispatch even when a body exists under the callee's own
+        // name: that body is one monomorphic instance of the trait
+        // method (static demand registers the first demanded
+        // instance of a trait method under the plain trait name),
+        // not a dispatch — calling it directly would run that one
+        // concrete type's instance for every receiver. The vtable
+        // lookup therefore goes first; it returns `None` for calls
+        // that are not dispatches through the receiver (a free
+        // function taking a `&dyn` argument is the common shape),
+        // which keep the direct lookup below.
+        let callee = match self.virtual_call_target(func, &arg_values) {
+            Some(vt) => match vt {
                 // A vtable call: dispatch to the concrete type's
                 // impl body, with the fat pointer's data pointer as
                 // the receiver (the box aggregate itself for a
                 // by-value `Box<dyn>` receiver).
-                Some(Ok((impl_func, receiver))) => {
+                Ok((impl_func, receiver)) => {
                     // Shape the receiver the way the impl body's
                     // `self` type expects: a reference receiver gets
                     // a reference to the concrete value (through the
@@ -975,7 +1033,10 @@ impl<'a> Interpreter<'a> {
                     args[0] = receiver;
                     return self.start_call(frames, &impl_func, args, destination, target);
                 }
-                Some(Err(e)) => return Err(e),
+                Err(e) => return Err(e),
+            },
+            None => match self.program.get(func) {
+                Some(c) => c.clone(),
                 None => return Err(self.missing_body_error(func)),
             },
         };
@@ -1020,11 +1081,11 @@ impl<'a> Interpreter<'a> {
         func: &str,
         arg_values: Vec<Value>,
     ) -> InterpResult<()> {
-        let body = match self.program.get(func) {
-            Some(b) => b.clone(),
-            None => match self.virtual_call_target(func, &arg_values) {
+        // The vtable lookup goes first, exactly as in `start_call`.
+        let body = match self.virtual_call_target(func, &arg_values) {
+            Some(vt) => match vt {
                 // A vtable call, shaped exactly as in `start_call`.
-                Some(Ok((impl_func, receiver))) => {
+                Ok((impl_func, receiver)) => {
                     let receiver = match self
                         .program
                         .get(&impl_func)
@@ -1047,7 +1108,10 @@ impl<'a> Interpreter<'a> {
                     args[0] = receiver;
                     return self.start_detached_call(frames, &impl_func, args);
                 }
-                Some(Err(e)) => return Err(e),
+                Err(e) => return Err(e),
+            },
+            None => match self.program.get(func) {
+                Some(b) => b.clone(),
                 None => return Err(self.missing_body_error(func)),
             },
         };
