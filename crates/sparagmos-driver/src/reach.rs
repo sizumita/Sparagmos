@@ -43,6 +43,11 @@
 //!   unlocked), and targets past the cap are recorded with that
 //!   reason instead of being collected, so the cutoff is visible
 //!   in the report.
+//! - `FnDef` constants a body materializes as *values* are demand
+//!   targets on equal footing with call targets (Lane CP): an
+//!   external constructor or function used as a value (`let f =
+//!   Some;`) gets its instance collected the same way, subject to
+//!   the same builtin exclusion and cap.
 //! - The Stable MIR bodies obtained during the walk are returned
 //!   alongside the converted bodies ([`CollectedFns::walked_bodies`]):
 //!   targets resolving to local items are skipped here, but a
@@ -102,6 +107,12 @@ enum RecordKind {
     /// A Stable MIR body was obtained; conversion is attempted
     /// after the walk.
     WithBody { inst: Instance, body: mir::Body },
+    /// No Stable MIR body exists for this target, but the target
+    /// is a data constructor and its body — a one-block aggregate
+    /// of the arguments, the same shape the compiler synthesizes
+    /// for a local constructor — was synthesized directly in
+    /// sparagmos-mir form by [`synthetic_ctor_body`].
+    SyntheticCtor { inst: Instance, body: sm::Body },
     /// No body is included for this target; `reason` says why.
     NoBody { reason: String },
 }
@@ -140,7 +151,19 @@ pub fn collect_reachable(
     let mut walked_bodies: Vec<mir::Body> = Vec::new();
 
     while let Some(body) = queue.pop_front() {
-        for (def, args) in call_targets(&body) {
+        // Demand targets of this body: its `FnDef` call targets,
+        // plus every `FnDef` constant it materializes. A foreign
+        // function or constructor used *as a value* (assigned to a
+        // local, passed to a higher-order function, returned) never
+        // appears as a call target of the body that demands it, so
+        // call targets alone miss the demand — `let f = Some; f(3)`
+        // is the common case. The per-target pipeline below is
+        // unchanged: builtin-owned definitions stay excluded,
+        // local targets stay the item loop's business, instances
+        // are deduplicated, and the shared cap applies.
+        let mut targets = call_targets(&body);
+        targets.extend(fndef_constants(&body));
+        for (def, args) in targets {
             let def_id = def.def_id();
             let def_name = def_id.name();
             // Builtin-owned definitions are not collected (see the
@@ -199,7 +222,21 @@ pub fn collect_reachable(
                     InstanceKind::Intrinsic => {
                         no_body("compiler intrinsic (no fallback body)")
                     }
-                    _ => no_body("no MIR body available"),
+                    _ if bodies_taken >= cap => {
+                        limit_reached = true;
+                        no_body("collection limit reached")
+                    }
+                    // A data constructor of another crate has no
+                    // MIR body in the crate metadata (the compiler
+                    // synthesizes the shim only for local defs);
+                    // synthesize the equivalent body directly.
+                    _ => match synthetic_ctor_body(conv, &def, &inst) {
+                        Some(body) => {
+                            bodies_taken += 1;
+                            RecordKind::SyntheticCtor { inst, body }
+                        }
+                        None => no_body("no MIR body available"),
+                    },
                 },
                 _ if bodies_taken >= cap => {
                     limit_reached = true;
@@ -231,6 +268,26 @@ pub fn collect_reachable(
         Vec::with_capacity(records.len());
     for rec in &records {
         match &rec.kind {
+            RecordKind::SyntheticCtor { body, .. } => {
+                match unrepresentable_local(body) {
+                    Some(what) => {
+                        let mut reasons: std::collections::BTreeMap<String, usize> =
+                            Default::default();
+                        reasons.insert(
+                            format!(
+                                "body uses a type the runtime cannot represent ({what})"
+                            ),
+                            1,
+                        );
+                        converted.push(None);
+                        failed.push(Some(reasons));
+                    }
+                    None => {
+                        converted.push(Some(body.clone()));
+                        failed.push(None);
+                    }
+                }
+            }
             RecordKind::WithBody { body, .. } => match conv.convert_body(body) {
                 Ok(b) => match unrepresentable_local(&b) {
                     Some(what) => {
@@ -276,7 +333,10 @@ pub fn collect_reachable(
     for (i, rec) in records.iter().enumerate() {
         let rank = if converted[i].is_some() {
             0
-        } else if matches!(rec.kind, RecordKind::WithBody { .. }) {
+        } else if matches!(
+            rec.kind,
+            RecordKind::WithBody { .. } | RecordKind::SyntheticCtor { .. }
+        ) {
             1
         } else {
             2
@@ -288,7 +348,10 @@ pub fn collect_reachable(
             Some(&cur) => {
                 let cur_rank = if converted[cur].is_some() {
                     0
-                } else if matches!(records[cur].kind, RecordKind::WithBody { .. }) {
+                } else if matches!(
+                    records[cur].kind,
+                    RecordKind::WithBody { .. } | RecordKind::SyntheticCtor { .. }
+                ) {
                     1
                 } else {
                     2
@@ -322,6 +385,11 @@ pub fn collect_reachable(
             RecordKind::WithBody { body, .. } => {
                 (body.blocks.len(), body.locals().len(), body.arg_locals().len())
             }
+            RecordKind::SyntheticCtor { body, .. } => (
+                body.basic_blocks.len(),
+                body.local_decls.len(),
+                body.arg_count,
+            ),
             RecordKind::NoBody { .. } => (0, 0, 0),
         };
         let outcome = match (&rec.kind, &converted[i], &failed[i]) {
@@ -332,7 +400,18 @@ pub fn collect_reachable(
                 out.stable_bodies.push(body.clone());
                 FnOutcome::Converted
             }
+            (RecordKind::SyntheticCtor { inst, .. }, Some(_), _) => {
+                out.bodies.push((name.clone(), converted[i].clone().unwrap()));
+                out.body_def_ids.push(conv.instance_def_id(rec.def, inst));
+                out.body_def_names.push(rec.def_name.clone());
+                FnOutcome::Converted
+            }
             (RecordKind::WithBody { .. }, None, Some(reasons)) => {
+                FnOutcome::Skipped {
+                    reasons: reasons.clone(),
+                }
+            }
+            (RecordKind::SyntheticCtor { .. }, None, Some(reasons)) => {
                 FnOutcome::Skipped {
                     reasons: reasons.clone(),
                 }
@@ -353,6 +432,87 @@ pub fn collect_reachable(
         });
     }
     out
+}
+
+/// Synthesize the body of a foreign data constructor (a
+/// tuple-struct or tuple-variant constructor of another crate).
+///
+/// Such a constructor has no MIR body in the crate metadata —
+/// `Instance::has_body` is false for it — because the compiler
+/// synthesizes the constructor shim only for definitions of the
+/// local crate (Lane CF converts those from the synthesized Stable
+/// MIR body). The shim's shape is fixed: one block that aggregates
+/// the arguments into the ADT and returns it, so the equivalent
+/// body is built here directly in sparagmos-mir form.
+///
+/// Identification is conservative. The target must have an
+/// instantiated signature whose output is an ADT (not a union: a
+/// union constructor writes a single field, a different aggregate
+/// shape), the definition's last path segment must name the
+/// variant the constructor builds (the only variant of a struct,
+/// or the matching variant of an enum), and the signature's input
+/// count must equal that variant's field count. Anything else
+/// returns `None` and the target keeps its "no MIR body available"
+/// record.
+fn synthetic_ctor_body(
+    conv: &mut Converter,
+    def: &rustc_public::ty::FnDef,
+    inst: &Instance,
+) -> Option<sm::Body> {
+    let sig = inst.ty().kind().fn_sig()?.skip_binder();
+    let (output, inputs) = sig.inputs_and_output.split_last()?;
+    let TyKind::RigidTy(RigidTy::Adt(adt_def, adt_args)) = output.kind() else {
+        return None;
+    };
+    if matches!(adt_def.kind(), rustc_public::ty::AdtKind::Union) {
+        return None;
+    }
+    let def_name = def.def_id().name();
+    let last = def_name.rsplit("::").next()?;
+    let variants = adt_def.variants();
+    let (variant_index, variant) = if variants.len() == 1 {
+        (0u32, variants.first()?)
+    } else {
+        variants
+            .iter()
+            .enumerate()
+            .find(|(_, v)| v.name() == last)
+            .map(|(i, v)| (i as u32, v))?
+    };
+    if variant.name() != last || variant.fields().len() != inputs.len() {
+        return None;
+    }
+    let mut local_decls = vec![sm::LocalDecl::new(conv.ty(output))];
+    for input in inputs {
+        local_decls.push(sm::LocalDecl::new(conv.ty(input)));
+    }
+    let generic_args = adt_args
+        .0
+        .iter()
+        .filter_map(|a| match a {
+            rustc_public::ty::GenericArgKind::Type(t) => Some(conv.ty(t)),
+            _ => None,
+        })
+        .collect();
+    let operands = (1..=inputs.len())
+        .map(|i| sm::Operand::Move(sm::Place::from_local(sm::Local(i as u32))))
+        .collect();
+    let stmt = sm::Statement::new(sm::StatementKind::Assign(Box::new((
+        sm::Place::from_local(sm::Local(0)),
+        sm::Rvalue::Aggregate(
+            Box::new(sm::AggregateKind::Adt {
+                def: conv.crate_def_id(&adt_def),
+                variant_index,
+                generic_args,
+                user_ty: None,
+                field_index: None,
+            }),
+            operands,
+        ),
+    ))));
+    let mut block = sm::BasicBlockData::new(sm::Terminator::new(sm::TerminatorKind::Return));
+    block.statements.push(stmt);
+    Some(sm::Body::new(local_decls, inputs.len(), vec![block]))
 }
 
 /// The `FnDef` call targets of one Stable MIR body: every `Call`

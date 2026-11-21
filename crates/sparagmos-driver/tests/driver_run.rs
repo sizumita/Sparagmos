@@ -2036,3 +2036,83 @@ fn summary_mode_generic_ctor_is_accounted_converted() {
         "no constructor is left as a missing instance: {stdout}"
     );
 }
+
+// ----- foreign functions and constructors as values (Lane CP) -----
+//
+// The reachability collection follows FnDef constants, not only
+// call targets, so a foreign function or constructor used *as a
+// value* gets its instance collected. A foreign constructor has no
+// MIR body in the crate metadata; the driver synthesizes the
+// one-block aggregate body the compiler synthesizes for local
+// constructors.
+
+const EXT_CTOR_VALUE_SRC: &str = r#"
+fn main() {
+    let f = Some;
+    let x = f(3);
+    match x { Some(v) => println!("{}", v + 1), None => println!("none") }
+}
+"#;
+
+#[test]
+fn run_mode_foreign_ctor_as_value_executes() {
+    let dir = temp_dir("ext-ctor-value");
+    let src = fixture(&dir, "ext_ctor_value.rs", EXT_CTOR_VALUE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a foreign constructor used as a value must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "4\n");
+}
+
+const EXT_CTOR_HOF_SRC: &str = r#"
+fn apply<F: FnOnce(u32) -> Option<u32>>(f: F, v: u32) -> u32 {
+    match f(v) { Some(x) => x, None => 0 }
+}
+fn main() {
+    println!("{}", apply(Some, 40) + 2);
+}
+"#;
+
+#[test]
+fn run_mode_foreign_ctor_passed_to_hof_executes() {
+    let dir = temp_dir("ext-ctor-hof");
+    let src = fixture(&dir, "ext_ctor_hof.rs", EXT_CTOR_HOF_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a foreign constructor passed to a higher-order function must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const EXT_FN_VALUE_SRC: &str = r#"
+fn main() {
+    let f = std::num::Wrapping;
+    let w = f(20u32) + std::num::Wrapping(22u32);
+    println!("{}", w.0);
+    let g = String::new;
+    let mut s = g();
+    s.push_str("hi");
+    println!("{}", s.len());
+}
+"#;
+
+#[test]
+fn run_mode_foreign_fn_and_tuple_struct_ctor_as_values_execute() {
+    let dir = temp_dir("ext-fn-value");
+    let src = fixture(&dir, "ext_fn_value.rs", EXT_FN_VALUE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a foreign plain function and tuple-struct constructor used as values must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n2\n");
+}
