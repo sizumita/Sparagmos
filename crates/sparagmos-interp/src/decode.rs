@@ -634,6 +634,36 @@ impl<'a> Interpreter<'a> {
                 for src in operands {
                     fields.push(self.eval_src(frames, body, src)?);
                 }
+                // The `MaybeUninit::new(v)` normalization the
+                // original evaluator performs (see `eval_rvalue`'s
+                // AggregateAdt arm): the payload is stored at
+                // field 0, not at the declared field index with
+                // uninitialized padding before it. This arm must
+                // mirror that exactly — a decoded aggregate that
+                // padded the payload to field 1 left every reader
+                // of the payload (which enters at field 0) looking
+                // at an uninitialized slot.
+                if *field_index == Some(1) && operands.len() == 1 {
+                    let is_maybe_uninit = matches!(
+                        dest_ty,
+                        Some(Ty::Adt(name))
+                            if name.starts_with("std::mem::MaybeUninit")
+                                || name.starts_with("core::mem::MaybeUninit")
+                    );
+                    if is_maybe_uninit {
+                        let operand = fields.pop().expect("one operand pushed");
+                        let payload = match operand {
+                            Value::Enum { fields: inner, .. } if inner.len() == 1 => {
+                                inner.into_iter().next().expect("one field")
+                            }
+                            other => other,
+                        };
+                        return Ok(Value::Enum {
+                            variant: 0,
+                            fields: vec![payload],
+                        });
+                    }
+                }
                 Ok(Value::Enum {
                     variant: *variant,
                     fields,
