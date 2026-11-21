@@ -4743,6 +4743,165 @@ fn run_mode_waker_from_arc_constructs_and_clones() {
     );
 }
 
+const TRANSMUTE_FLOAT_INT_SRC: &str = r#"
+fn inp32() -> f32 { let mut s = 0.0f32; let mut i = 0; while i < 7 { s += 0.5; i += 1; } s }
+fn inp64() -> f64 { let mut s = 0.0f64; let mut i = 0; while i < 7 { s += 1.0; i += 1; } s }
+fn main() {
+    let f = inp32();
+    let bits: u32 = unsafe { std::mem::transmute(f) };
+    let back: f32 = unsafe { std::mem::transmute(bits) };
+    let g = inp64();
+    let gbits: u64 = unsafe { std::mem::transmute(g) };
+    let sg: i64 = unsafe { std::mem::transmute(g) };
+    println!("{:x} {} {:x} {}", bits, back, gbits, sg);
+    println!("{:x} {} {}", f.to_bits(), f32::from_bits(bits), f64::from_bits(gbits));
+}
+"#;
+
+#[test]
+fn run_mode_transmute_float_int_bit_reinterpretation() {
+    run_ok(
+        "transmute-float-int",
+        TRANSMUTE_FLOAT_INT_SRC,
+        "40600000 3.5 401c000000000000 4619567317775286272\n40600000 3.5 7\n",
+    );
+}
+
+const TRANSMUTE_BOOL_CHAR_SRC: &str = r#"
+fn inpb() -> bool { let mut s = 0; let mut i = 0; while i < 41 { s += 1; i += 1; } s == 42 }
+fn inpc() -> char { let mut s = 0u32; let mut i = 0; while i < 65 { s += 1; i += 1; } char::from_u32(s).unwrap() }
+fn main() {
+    let b = inpb();
+    let n: u8 = unsafe { std::mem::transmute(b) };
+    let b2: bool = unsafe { std::mem::transmute(1u8) };
+    let c = inpc();
+    let cn: u32 = unsafe { std::mem::transmute(c) };
+    let c2: char = unsafe { std::mem::transmute(66u32) };
+    println!("{} {} {} {}", n, b2, cn, c2);
+}
+"#;
+
+#[test]
+fn run_mode_transmute_bool_and_char() {
+    run_ok("transmute-bool-char", TRANSMUTE_BOOL_CHAR_SRC, "0 true 65 B\n");
+}
+
+const TRANSMUTE_ARRAY_SRC: &str = r#"
+fn inp() -> u32 { let mut s = 0u32; let mut i = 0; while i < 41 { s += 1; i += 1; } s }
+fn main() {
+    let n = inp() + 0x04030200 - 41;
+    let a: [u8; 4] = unsafe { std::mem::transmute(n) };
+    let back: u32 = unsafe { std::mem::transmute(a) };
+    let wide: u64 = unsafe { std::mem::transmute([1u16, 2, 3, 4]) };
+    let pair: u64 = unsafe { std::mem::transmute([n, n + 1]) };
+    let halves: [u32; 2] = unsafe { std::mem::transmute(pair) };
+    let fpair: u64 = unsafe { std::mem::transmute([1.5f32, 2.5f32]) };
+    println!("{:?} {:x} {:x} {:x} {:?} {:x}", a, back, wide, pair, halves, fpair);
+}
+"#;
+
+#[test]
+fn run_mode_transmute_arrays_and_scalars() {
+    run_ok(
+        "transmute-arrays",
+        TRANSMUTE_ARRAY_SRC,
+        "[0, 2, 3, 4] 4030200 4000300020001 403020104030200 [67305984, 67305985] 402000003fc00000\n",
+    );
+}
+
+const TRANSMUTE_WRAPPER_SRC: &str = r#"
+use std::marker::PhantomData;
+use std::mem::ManuallyDrop;
+use std::num::Wrapping;
+struct Padded { x: u32, _m: PhantomData<u8> }
+fn inp() -> u32 { let mut s = 0u32; let mut i = 0; while i < 41 { s += 1; i += 1; } s }
+fn main() {
+    let n = inp();
+    let w: Wrapping<u32> = unsafe { std::mem::transmute(n) };
+    let back: u32 = unsafe { std::mem::transmute(w) };
+    let wf: Wrapping<f32> = unsafe { std::mem::transmute(0x3fc00000u32) };
+    let p: Padded = unsafe { std::mem::transmute(n + 1) };
+    let md: ManuallyDrop<u32> = unsafe { std::mem::transmute(n) };
+    let mback: u32 = unsafe { std::mem::transmute(md) };
+    println!("{} {} {} {} {}", w.0, back, wf.0, p.x, mback);
+}
+"#;
+
+#[test]
+fn run_mode_transmute_wrapper_adts() {
+    run_ok(
+        "transmute-wrappers",
+        TRANSMUTE_WRAPPER_SRC,
+        "41 41 1.5 42 41\n",
+    );
+}
+
+const TRANSMUTE_CONSTANTS_SRC: &str = r#"
+fn main() {
+    let a: u32 = unsafe { std::mem::transmute(1.5f32) };
+    let b: f32 = unsafe { std::mem::transmute(0x3fc00000u32) };
+    let c: u64 = unsafe { std::mem::transmute(-2.5f64) };
+    let d: u8 = unsafe { std::mem::transmute(true) };
+    let e: [u8; 4] = unsafe { std::mem::transmute(0x04030201u32) };
+    println!("{:x} {} {:x} {} {:?}", a, b, c, d, e);
+}
+"#;
+
+#[test]
+fn run_mode_transmute_constant_operands() {
+    run_ok(
+        "transmute-constants",
+        TRANSMUTE_CONSTANTS_SRC,
+        "3fc00000 1.5 c004000000000000 1 [1, 2, 3, 4]\n",
+    );
+}
+
+const TRANSMUTE_WIDE_SRC: &str = r#"
+fn main() {
+    let big: u128 = unsafe { std::mem::transmute(-1i128) };
+    let neg: i8 = unsafe { std::mem::transmute(0xffu8) };
+    let s16: i16 = unsafe { std::mem::transmute(0xffffu16) };
+    println!("{:x} {} {}", big, neg, s16);
+}
+"#;
+
+#[test]
+fn run_mode_transmute_wide_and_signed() {
+    run_ok(
+        "transmute-wide",
+        TRANSMUTE_WIDE_SRC,
+        "ffffffffffffffffffffffffffffffff -1 -1\n",
+    );
+}
+
+const TRANSMUTE_BAD_CHAR_SRC: &str = r#"
+fn inp() -> u32 { let mut s = 0x10000u32; s *= 17; s }
+fn main() {
+    let c: char = unsafe { std::mem::transmute(inp()) };
+    println!("{}", c);
+}
+"#;
+
+#[test]
+fn run_mode_transmute_invalid_char_is_explicit_unsupported() {
+    // Transmuting an invalid bit pattern into `char` is UB in
+    // real Rust; the model reports it as an explicit unsupported
+    // error instead of inventing a character.
+    let dir = temp_dir("transmute-bad-char");
+    let src = fixture(&dir, "case.rs", TRANSMUTE_BAD_CHAR_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "invalid char transmute must be a named unsupported; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("transmute to char"),
+        "stderr must name the char transmute; stderr={stderr}"
+    );
+}
+
 const RC_ARC_DROP_SRC: &str = r#"
 use std::rc::Rc;
 use std::sync::Arc;
