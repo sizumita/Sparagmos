@@ -39,8 +39,16 @@ metric-2(b) rate, whose denominator is always the full subset
 A test is *attempted* only when both sides can be run faithfully:
 
 - its header carries a run-pass / run-fail directive
-  (run-crash, run-flags, exec-env, stdin and
-  add-core-stubs are recorded as not-attempted reasons in stage 1;
+  (run-crash, stdin and add-core-stubs are recorded as
+  not-attempted reasons in stage 1; `//@ run-flags:` are
+  forwarded to both runs -- as the native run's argv and as the
+  driver's `--guest-arg` options -- and `//@ exec-env:` pairs
+  are applied to both runs' environments, the way compiletest
+  applies them, with `//@ unset-exec-env:` names removed; a
+  revision whose directive view carries no run mode is judged
+  as a compile check under compiletest's per-revision default
+  (ui tests default to check-fail), exactly as stage 2 judges
+  compile-check views;
   a test's `compile-flags` are honoured in both stages by forwarding
   them to the native rustc and, via the driver's `--rustc-arg`, to
   the driver's embedded rustc — the position compiletest gives them;
@@ -200,6 +208,97 @@ def run_mode(header):
         if header.has(mode):
             return mode
     return None
+
+
+_SYSROOT_BASE = None
+
+
+def sysroot_base():
+    """The reference toolchain's sysroot directory."""
+    global _SYSROOT_BASE
+    if _SYSROOT_BASE is None:
+        try:
+            out = subprocess.run(
+                rustc_cmd() + ["--print", "sysroot"],
+                capture_output=True, text=True, timeout=30)
+            _SYSROOT_BASE = out.stdout.strip()
+        except Exception:
+            _SYSROOT_BASE = ""
+    return _SYSROOT_BASE
+
+
+def suite_root(path, suite):
+    """The suite root directory of a test file (compiletest's
+    src-base for the test): the ancestor directory named `suite`
+    whose parent is `tests`."""
+    for parent in Path(path).parents:
+        if parent.name == suite and parent.parent.name == "tests":
+            return str(parent)
+    return str(Path(path).parent)
+
+
+def expand_variables(value, src_base, build_base):
+    """compiletest's `{{...}}` substitutions in directive values.
+
+    Mirrors expand_variables in compiletest's directives.rs (it
+    expands every name-value directive value): {{cwd}} is the
+    directory compiletest runs from -- here the runner's working
+    directory; {{src-base}} the test's suite root; {{build-base}}
+    the attempt's scratch directory; {{sysroot-base}} the
+    reference toolchain's sysroot; {{target}} the host target;
+    {{target-linker}} empty (no custom linker is configured on
+    this host); {{rust-src-base}} the sysroot's rust source tree.
+    """
+    if "{{" not in value:
+        return value
+    value = value.replace("{{cwd}}", os.getcwd())
+    value = value.replace("{{src-base}}", src_base)
+    value = value.replace("{{build-base}}", build_base)
+    value = value.replace("{{sysroot-base}}", sysroot_base())
+    value = value.replace("{{target-linker}}", "")
+    value = value.replace("{{target}}", HOST_TARGET)
+    value = value.replace(
+        "{{rust-src-base}}",
+        str(Path(sysroot_base()) / "lib" / "rustlib" / "src" / "rust"))
+    return value
+
+
+def parse_env_pairs(values):
+    """(name, value) pairs from env directive values, read the
+    way compiletest's parse_env reads them: split at the first
+    `=`, the name trimmed, a missing `=` means an empty value."""
+    pairs = []
+    for v in values:
+        name, sep, val = v.partition("=")
+        pairs.append((name.strip(), val if sep else ""))
+    return pairs
+
+
+def view_env(view, set_name, unset_name, src_base, build_base):
+    """The environment a directive view prescribes: (pairs, unset).
+
+    `pairs` is a dict of the view's `set_name` directives
+    (`rustc-env` / `exec-env`) with compiletest's variable
+    expansion applied to the values; `unset` is the list of
+    variable names the view's `unset_name` directives remove
+    (each value is one variable name, trimmed).
+    """
+    pairs = {}
+    for name, val in parse_env_pairs(view.values(set_name)):
+        pairs[name] = expand_variables(val, src_base, build_base)
+    unset = [v.strip() for v in view.values(unset_name) if v.strip()]
+    return pairs, unset
+
+
+def view_run_flags(view, src_base, build_base):
+    """The guest program arguments a directive view prescribes:
+    its `run-flags` values, variable-expanded and split the way
+    compiletest splits them."""
+    flags = []
+    for v in view.values("run-flags"):
+        flags.extend(split_flags(expand_variables(v, src_base,
+                                                  build_base)))
+    return flags
 
 
 # ---------------------------------------------------------------------------
@@ -1000,10 +1099,6 @@ def stage1_blocker(header, survey_rec):
         return "no unscoped run-pass/run-fail directive"
     if mode == "run-crash":
         return "run-crash mode (crash reproduction is out of stage-1 scope)"
-    if header.has("run-flags"):
-        return "run-flags present (guest program arguments are not supported)"
-    if header.has("exec-env"):
-        return "exec-env present (guest environment is not modelled)"
     if header.has("stdin"):
         return "stdin directive present (guest stdin is not modelled)"
     if header.has("add-core-stubs"):
@@ -1024,14 +1119,8 @@ def stage1_view_blocker(view):
     per revision (see fill_result_revisions).
     """
     mode = run_mode(view)
-    if mode is None:
-        return "no run-pass/run-fail directive for this revision"
     if mode == "run-crash":
         return "run-crash mode (crash reproduction is out of stage-1 scope)"
-    if view.has("run-flags"):
-        return "run-flags present (guest program arguments are not supported)"
-    if view.has("exec-env"):
-        return "exec-env present (guest environment is not modelled)"
     if view.has("stdin"):
         return "stdin directive present (guest stdin is not modelled)"
     if view.has("add-core-stubs"):
@@ -1045,10 +1134,12 @@ def stage1_view_blocker(view):
 # Process execution
 # ---------------------------------------------------------------------------
 
-def run_cmd(argv, *, timeout, cwd=None, env_extra=None):
+def run_cmd(argv, *, timeout, cwd=None, env_extra=None, env_remove=()):
     env = dict(os.environ)
     if env_extra:
         env.update(env_extra)
+    for key in env_remove:
+        env.pop(key, None)
     try:
         p = subprocess.run(argv, capture_output=True, timeout=timeout,
                            cwd=cwd, env=env, stdin=subprocess.DEVNULL)
@@ -2125,8 +2216,6 @@ def stage2_blocker(view, rec):
         return "add-core-stubs (test links the core stub crate)"
     if view.has("ignore-test"):
         return "ignore-test (compiletest itself never runs this test)"
-    if view.has("rustc-env"):
-        return "rustc-env present (compiler environment is not modelled)"
     return None
 
 
