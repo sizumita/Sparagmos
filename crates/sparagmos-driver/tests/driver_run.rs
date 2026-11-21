@@ -4821,6 +4821,86 @@ fn run_mode_box_dyn_drop_runs_concrete_destructor() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "box-dyn ok\n");
 }
 
+const RC_ARC_DYN_SRC: &str = r#"
+use std::rc::Rc;
+use std::sync::Arc;
+trait T {
+    fn val(&self) -> i32;
+    fn d(&self) -> i32 { 7 }
+}
+struct S(i32);
+impl T for S {
+    fn val(&self) -> i32 { self.0 }
+}
+fn main() {
+    let r: Rc<dyn T> = Rc::new(S(42));
+    let r2 = r.clone();
+    let a: Arc<dyn T> = Arc::new(S(43));
+    println!("{} {} {} {}", r.val(), r2.val(), r.d(), a.val());
+}
+"#;
+
+#[test]
+fn run_mode_rc_arc_dyn_trait_method_calls() {
+    // Method calls through an `Rc<dyn Trait>` / `Arc<dyn Trait>`
+    // receiver: the Deref builtin must yield the dyn fat pointer
+    // itself (as it does for Box), and dispatch must reach both
+    // the impl method (reading the pointee's state) and the
+    // trait's default method.
+    let dir = temp_dir("rc-arc-dyn");
+    let src = fixture(&dir, "rc_arc_dyn.rs", RC_ARC_DYN_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "calling trait methods through Rc<dyn Trait> / Arc<dyn Trait> must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42 42 7 43\n");
+}
+
+const DYN_DEFAULT_DISPATCH_SRC: &str = r#"
+use std::rc::Rc;
+trait T {
+    fn val(&self) -> i32;
+    fn extra(&self) -> i32 { self.val() + 1 }
+    fn d(&self) -> i32 { 7 }
+}
+struct A;
+impl T for A { fn val(&self) -> i32 { 10 } }
+struct B;
+impl T for B {
+    fn val(&self) -> i32 { 20 }
+    fn d(&self) -> i32 { 8 }
+}
+fn main() {
+    let a: Rc<dyn T> = Rc::new(A);
+    let b: Rc<dyn T> = Rc::new(B);
+    println!("{} {} {} {}", a.extra(), a.d(), b.extra(), b.d());
+    let r: &dyn T = &A;
+    println!("{} {}", r.extra(), r.d());
+}
+"#;
+
+#[test]
+fn run_mode_dyn_default_method_dispatch() {
+    // A trait method the impl does not override has only the
+    // trait's default body: dispatch through a dyn receiver must
+    // reach it (monomorphized at the concrete type), its inner
+    // self calls must hit the concrete overrides, and an
+    // overriding impl method must win over the default.
+    let dir = temp_dir("dyn-default");
+    let src = fixture(&dir, "dyn_default.rs", DYN_DEFAULT_DISPATCH_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "dispatching to trait default methods through dyn receivers must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "11 7 21 8\n11 7\n");
+}
+
 const DYN_EQ_REF_SRC: &str = r#"
 trait Foo: PartialEq<i32> + std::fmt::Debug {
     fn a(&self) -> i32 { 100 }
