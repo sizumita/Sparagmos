@@ -5952,16 +5952,17 @@ pub(crate) fn navigate_mut<'x>(
         // Partial initialization: MIR fills an aggregate place
         // field by field — a `catch_unwind` Data union written
         // through a raw pointer by the callee, a struct local
-        // stored field-wise — so a field or downcast write into a
-        // never-written slot materializes the aggregate with every
-        // other slot still uninitialized, the same sparse shape a
-        // union aggregate value has. The slots the write does not
-        // touch keep raising `UninitializedRead` when read, so no
-        // value is fabricated. Any other step into an uninitialized
-        // place (an index into an array that was never built) has
-        // no honest shape to materialize and stays an error.
+        // stored field-wise — so a field, union-field or downcast
+        // write into a never-written slot materializes the
+        // aggregate with every other slot still uninitialized, the
+        // same sparse shape a union aggregate value has. The slots
+        // the write does not touch keep raising
+        // `UninitializedRead` when read, so no value is fabricated.
+        // Any other step into an uninitialized place (an index
+        // into an array that was never built) has no honest shape
+        // to materialize and stays an error.
         match projection.first() {
-            Some(RefProj::Field(idx)) => {
+            Some(RefProj::Field(idx)) | Some(RefProj::UnionField { idx, .. }) => {
                 *slot = Value::Enum {
                     variant: 0,
                     fields: vec![Value::Uninit; *idx + 1],
