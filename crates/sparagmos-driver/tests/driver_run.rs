@@ -4232,6 +4232,146 @@ fn run_mode_box_dyn_drop_runs_concrete_destructor() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "box-dyn ok\n");
 }
 
+const FROM_BOX_DYN_ERROR_DROP_SRC: &str = r#"
+use std::error::Error;
+use std::fmt;
+#[derive(Debug)]
+struct MyErr { code: i32, other: i32 }
+impl fmt::Display for MyErr {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "err {}", self.code) }
+}
+impl Error for MyErr {}
+impl Drop for MyErr {
+    fn drop(&mut self) { println!("dropping MyErr {}", self.code); }
+}
+fn main() {
+    let b: Box<dyn Error> = Box::from(MyErr { code: 7, other: 1 });
+    println!("made the box");
+    drop(b);
+    println!("end of main");
+}
+"#;
+
+#[test]
+fn run_mode_from_box_dyn_error_payload_drop_order() {
+    let dir = temp_dir("from-box-dyn-error");
+    let src = fixture(&dir, "from_box_dyn_error.rs", FROM_BOX_DYN_ERROR_DROP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a From conversion into Box<dyn Error> must produce a droppable trait object; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "made the box\ndropping MyErr 7\nend of main\n"
+    );
+}
+
+const INTO_BOX_DYN_ERROR_DROP_SRC: &str = r#"
+use std::error::Error;
+use std::fmt;
+#[derive(Debug)]
+struct MyErr { code: i32 }
+impl fmt::Display for MyErr {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "err {}", self.code) }
+}
+impl Error for MyErr {}
+impl Drop for MyErr {
+    fn drop(&mut self) { println!("dropping MyErr {}", self.code); }
+}
+fn main() {
+    let b: Box<dyn Error> = MyErr { code: 9 }.into();
+    println!("made the box");
+    drop(b);
+    println!("end of main");
+}
+"#;
+
+#[test]
+fn run_mode_into_box_dyn_error_payload_drop_order() {
+    let dir = temp_dir("into-box-dyn-error");
+    let src = fixture(&dir, "into_box_dyn_error.rs", INTO_BOX_DYN_ERROR_DROP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an Into conversion into Box<dyn Error> must produce a droppable trait object; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "made the box\ndropping MyErr 9\nend of main\n"
+    );
+}
+
+const FROM_BOX_DYN_ERROR_ZST_SRC: &str = r#"
+use std::error::Error;
+use std::fmt;
+#[derive(Debug)]
+struct Unit;
+impl fmt::Display for Unit {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "unit") }
+}
+impl Error for Unit {}
+impl Drop for Unit {
+    fn drop(&mut self) { println!("dropping Unit"); }
+}
+fn main() {
+    let b: Box<dyn Error> = Box::from(Unit);
+    println!("made the box");
+    println!("end of main");
+}
+"#;
+
+#[test]
+fn run_mode_from_box_dyn_error_zst_payload_drop() {
+    let dir = temp_dir("from-box-dyn-error-zst");
+    let src = fixture(&dir, "from_box_dyn_error_zst.rs", FROM_BOX_DYN_ERROR_ZST_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a From conversion of a zero-sized payload into Box<dyn Error> must stay droppable; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "made the box\nend of main\ndropping Unit\n"
+    );
+}
+
+const FROM_BOX_DYN_FN_CAPTURE_SRC: &str = r#"
+struct S { v: i32, w: i32 }
+impl Drop for S {
+    fn drop(&mut self) { println!("dropping S {} {}", self.v, self.w); }
+}
+fn main() {
+    let s = S { v: 42, w: 1 };
+    let f: Box<dyn Fn(i32) -> i32> = Box::from(move |x: i32| x + s.v + s.w);
+    println!("f(1) = {}", f(1));
+    println!("end of main");
+}
+"#;
+
+#[test]
+fn run_mode_from_box_dyn_fn_reads_captures_and_drops() {
+    let dir = temp_dir("from-box-dyn-fn");
+    let src = fixture(&dir, "from_box_dyn_fn.rs", FROM_BOX_DYN_FN_CAPTURE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "calling a Box<dyn Fn> built by From must read the captures through the dyn reference; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "f(1) = 44\nend of main\ndropping S 42 1\n"
+    );
+}
+
 const UNION_DROP_SRC: &str = r#"
 use std::mem::ManuallyDrop;
 struct S;
