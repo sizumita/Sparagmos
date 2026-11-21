@@ -1489,17 +1489,128 @@ fn unsupported(what: impl Into<String>) -> InterpError {
 // Execution
 // ---------------------------------------------------------------------------
 
+/// The `ExitCode` value the harness main returns: the byte
+/// wrapped in the two single-field enums of its model shape.
+fn test_exit_code(byte: u128) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![Value::Enum {
+            variant: 0,
+            fields: vec![Value::Uint(byte)],
+        }],
+    }
+}
+
+/// The libtest command line, read from the guest's arguments:
+/// positional filters (a test is selected when it matches ANY
+/// of them, as a substring, or by equality with `--exact`),
+/// `--skip` exclusions, `--list`, `--nocapture`,
+/// `--include-ignored`, and the output format (`--quiet` is
+/// libtest's terse format). Flags the model does not act on
+/// (thread counts, colors, log files) are accepted and
+/// ignored: they cannot change a sequential run's output.
+/// `--ignored` (run only the ignored tests) is not modeled,
+/// and the terse run format is only honored for `--list`.
+struct HarnessOpts {
+    filters: Vec<String>,
+    exact: bool,
+    skips: Vec<String>,
+    list: bool,
+    nocapture: bool,
+    terse: bool,
+    include_ignored: bool,
+}
+
+impl HarnessOpts {
+    fn parse(args: &[String]) -> HarnessOpts {
+        let mut opts = HarnessOpts {
+            filters: Vec::new(),
+            exact: false,
+            skips: Vec::new(),
+            list: false,
+            nocapture: false,
+            terse: false,
+            include_ignored: false,
+        };
+        let mut i = 0;
+        while i < args.len() {
+            let arg = &args[i];
+            match arg.as_str() {
+                "--list" => opts.list = true,
+                "--nocapture" => opts.nocapture = true,
+                "--exact" => opts.exact = true,
+                "--quiet" => opts.terse = true,
+                "--include-ignored" => opts.include_ignored = true,
+                "--format" => {
+                    i += 1;
+                    if args.get(i).map(String::as_str) == Some("terse") {
+                        opts.terse = true;
+                    }
+                }
+                "--skip" => {
+                    i += 1;
+                    if let Some(v) = args.get(i) {
+                        opts.skips.push(v.clone());
+                    }
+                }
+                _ => {
+                    if let Some(v) = arg.strip_prefix("--format=") {
+                        if v == "terse" {
+                            opts.terse = true;
+                        }
+                    } else if let Some(v) = arg.strip_prefix("--skip=") {
+                        opts.skips.push(v.to_string());
+                    } else if !arg.starts_with('-') {
+                        opts.filters.push(arg.clone());
+                    }
+                }
+            }
+            i += 1;
+        }
+        opts
+    }
+
+    fn selected(&self, test: &TestDesc) -> bool {
+        if self.skips.iter().any(|s| test.name.contains(s.as_str())) {
+            return false;
+        }
+        if self.filters.is_empty() {
+            return true;
+        }
+        self.filters.iter().any(|f| {
+            if self.exact {
+                test.name == *f
+            } else {
+                test.name.contains(f.as_str())
+            }
+        })
+    }
+}
+
 /// One entry of the libtest harness's test list, read by
 /// `test_main_env_args` (see `Interpreter::read_test_descs`).
 struct TestDesc {
     name: String,
     ignore: bool,
-    should_panic: bool,
-    /// The expected substring of `ShouldPanic::Expected(..)`:
-    /// a panicking test passes only when its panic message
-    /// contains this string (libtest's rule).
-    should_panic_expected: Option<String>,
+    ignore_message: Option<String>,
+    should_panic: ShouldPanic,
+    /// The test function's definition site (the descriptor's
+    /// source file and the line/column of its name), which the
+    /// harness names in its did-not-panic note.
+    source_file: String,
+    start_line: u64,
+    start_col: u64,
     callable: Value,
+}
+
+/// The descriptor's should-panic mode: libtest's `ShouldPanic`
+/// enum, whose message-carrying variant holds the expected
+/// substring a panicking test's payload must contain.
+#[derive(Clone, PartialEq)]
+enum ShouldPanic {
+    No,
+    Yes,
+    YesWithMessage(String),
 }
 
 /// A point in time as the model stores it: seconds and
@@ -2008,104 +2119,59 @@ impl<'a> Interpreter<'a> {
             Builtin::TestMainEnvArgs => {
                 arity(1)?;
                 let tests = self.read_test_descs(frames, &vals[0])?;
-                // The harness's own command line (the guest
-                // arguments after argv[0]), read the way libtest
-                // reads it. `ExitCode` values are built through
-                // `exit_code`: success is 0, any failure is 101,
-                // as in libtest.
-                let args: Vec<String> = self.guest_args().to_vec();
-                let exit_code = |byte: u8| {
-                    Value::Enum {
-                        variant: 0,
-                        fields: vec![Value::Enum {
-                            variant: 0,
-                            fields: vec![Value::Uint(byte as u128)],
-                        }],
-                    }
-                };
                 // A `-Z` option is rejected before anything else
                 // happens: the harness this models is a
                 // stable-channel one (the toolchain's own harness
-                // refuses `-Z` without a nightly channel).
-                if args.iter().any(|a| a == "-Z" || a.starts_with("-Z")) {
+                // refuses `-Z` without a nightly channel). The
+                // json format is likewise an unstable option and
+                // is refused before listing or running.
+                let raw_args: Vec<String> = self.guest_args().to_vec();
+                if raw_args.iter().any(|a| a == "-Z" || a.starts_with("-Z")) {
                     self.push_error_output(
                         "error: the option `Z` is only accepted on the nightly compiler\n",
                     );
-                    return Ok(exit_code(101));
+                    return Ok(test_exit_code(101));
                 }
-                // `--list`, the output format, and the name filter
-                // (the first positional argument; options that
-                // take a value consume the following argument, so
-                // `--format json`'s `json` is not a filter).
-                let mut list = false;
-                let mut format_json = false;
-                let mut filter: Option<String> = None;
-                {
-                    let mut i = 0;
-                    while i < args.len() {
-                        match args[i].as_str() {
-                            "--list" => list = true,
-                            "--format" => {
-                                if args.get(i + 1).map(String::as_str) == Some("json") {
-                                    format_json = true;
-                                }
-                                i += 1;
-                            }
-                            "--logfile" | "--test-threads" | "--color" | "--report-time"
-                            | "--ensure-time" => {
-                                i += 1;
-                            }
-                            "--format=json" => format_json = true,
-                            a if a.starts_with('-') => {}
-                            a => {
-                                if filter.is_none() {
-                                    filter = Some(a.to_string());
-                                }
-                            }
-                        }
-                        i += 1;
-                    }
-                }
-                // The json format is an unstable option: without
-                // `-Z unstable-options` (rejected above) the
-                // harness refuses it before listing or running.
+                let format_json = raw_args.iter().enumerate().any(|(j, a)| {
+                    a == "--format=json"
+                        || (a == "--format"
+                            && raw_args.get(j + 1).map(String::as_str) == Some("json"))
+                });
                 if format_json {
                     self.push_error_output(
                         "error: The \"json\" format is only accepted on the nightly \
                          compiler with -Z unstable-options\n",
                     );
-                    return Ok(exit_code(101));
+                    return Ok(test_exit_code(101));
+                }
+                let opts = HarnessOpts::parse(self.guest_args());
+                let mut selected: Vec<&TestDesc> = Vec::new();
+                let mut filtered_out = 0usize;
+                for test in &tests {
+                    if opts.selected(test) {
+                        selected.push(test);
+                    } else {
+                        filtered_out += 1;
+                    }
+                }
+                if opts.list {
+                    // `--list`: one `{name}: test` line per
+                    // selected test; the default format adds the
+                    // count footer, the terse format does not.
+                    for test in &selected {
+                        self.push_output(&format!("{}: test\n", test.name));
+                    }
+                    if !opts.terse {
+                        self.push_output(&format!(
+                            "\n{} tests, 0 benchmarks\n",
+                            selected.len()
+                        ));
+                    }
+                    return Ok(test_exit_code(0));
                 }
                 let mut passed = 0usize;
                 let mut failed = 0usize;
                 let mut ignored = 0usize;
-                let mut filtered_out = 0usize;
-                let mut failures: Vec<String> = Vec::new();
-                let mut selected: Vec<&TestDesc> = Vec::new();
-                for test in &tests {
-                    if let Some(f) = &filter {
-                        if !test.name.contains(f.as_str()) {
-                            filtered_out += 1;
-                            continue;
-                        }
-                    }
-                    selected.push(test);
-                }
-                if list {
-                    // `--list`: the selected tests by name,
-                    // sorted, and nothing runs.
-                    let mut names: Vec<&str> =
-                        selected.iter().map(|t| t.name.as_str()).collect();
-                    names.sort_unstable();
-                    for n in &names {
-                        self.push_output(&format!("{n}: test\n"));
-                    }
-                    self.push_output(&format!(
-                        "\n{} tests, 0 benchmarks\n",
-                        names.len()
-                    ));
-                    return Ok(exit_code(0));
-                }
                 // libtest's concurrency setup reads
                 // RUST_TEST_THREADS before any test runs and
                 // panics on a value that is not a positive
@@ -2117,55 +2183,178 @@ impl<'a> Interpreter<'a> {
                         )));
                     }
                 }
-                self.push_output(&format!("running {} tests\n", selected.len()));
+                let mut failure_names: Vec<String> = Vec::new();
+                let mut failure_sections: Vec<String> = Vec::new();
+                self.push_output(&format!(
+                    "\nrunning {} {}\n",
+                    selected.len(),
+                    if selected.len() == 1 { "test" } else { "tests" }
+                ));
                 for test in selected {
-                    if test.ignore {
+                    let annotation = match test.should_panic {
+                        ShouldPanic::No => "",
+                        _ => " - should panic",
+                    };
+                    if test.ignore && !opts.include_ignored {
                         ignored += 1;
-                        self.push_output(&format!("test {} ... ignored\n", test.name));
+                        let note = match &test.ignore_message {
+                            Some(msg) => format!(", {msg}"),
+                            None => String::new(),
+                        };
+                        self.push_output(&format!(
+                            "test {}{} ... ignored{}\n",
+                            test.name, annotation, note
+                        ));
                         continue;
                     }
+                    if opts.nocapture {
+                        self.push_output(&format!(
+                            "test {}{} ... ",
+                            test.name, annotation
+                        ));
+                    }
+                    let out_mark = self.output_len();
+                    let err_mark = self.error_output_len();
+                    self.clear_panic_stamp();
                     let result = self.call_callable_to_completion(
                         frames,
                         &test.callable,
                         Vec::new(),
                     );
-                    // The panic's message, when the payload is a
-                    // string payload (libtest reads the message
-                    // from the payload; a non-string payload reads
-                    // as `Box<dyn Any>` there).
-                    let panic_message = match result {
-                        Ok(_) => None,
+                    // The test's own output since the marks: in
+                    // capture mode it is drained here (kept only
+                    // for a failure's section); in nocapture mode
+                    // it already flowed into the output live.
+                    let (cap_out, cap_err) = if opts.nocapture {
+                        (String::new(), String::new())
+                    } else {
+                        (
+                            self.drain_output_since(out_mark),
+                            self.drain_error_output_since(err_mark),
+                        )
+                    };
+                    // `Some(body)` is the failure's section body:
+                    // the captured output followed by the
+                    // failure's account. A bare panic in
+                    // nocapture mode has no section (its report
+                    // went to the guest's stderr as it ran).
+                    let failure_body: Option<Option<String>> = match result {
+                        Ok(_) => match test.should_panic {
+                            ShouldPanic::No => None,
+                            _ => Some(Some(format!(
+                                "{cap_out}{cap_err}note: test did not panic as expected at {}:{}:{}",
+                                test.source_file, test.start_line, test.start_col
+                            ))),
+                        },
                         Err(InterpError::Panic { message, payload }) => {
                             self.note_panic_consumed();
-                            Some(match &payload {
-                                Some(p) if matches!(
-                                    p.ty.as_str(),
-                                    "&str" | "str" | "String" | "std::string::String"
-                                ) => message,
-                                Some(_) => "Box<dyn Any>".to_string(),
-                                None => message,
-                            })
+                            match &test.should_panic {
+                                ShouldPanic::No => {
+                                    if opts.nocapture {
+                                        Some(None)
+                                    } else {
+                                        let report = match self.panic_location() {
+                                            Some((file, line, col)) => format!(
+                                                "\nthread '{}' ({}) panicked at {}:{}:{}:\n{}\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+                                                test.name,
+                                                self.current_thread_id(),
+                                                file,
+                                                line,
+                                                col,
+                                                message
+                                            ),
+                                            None => format!(
+                                                "\nthread '{}' ({}) panicked:\n{}\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+                                                test.name,
+                                                self.current_thread_id(),
+                                                message
+                                            ),
+                                        };
+                                        Some(Some(format!(
+                                            "{cap_out}{cap_err}{report}"
+                                        )))
+                                    }
+                                }
+                                ShouldPanic::Yes => None,
+                                ShouldPanic::YesWithMessage(expected) => {
+                                    let text = payload
+                                        .as_ref()
+                                        .and_then(|p| {
+                                            self.resolve_string(frames, &p.value).ok()
+                                        })
+                                        .unwrap_or_else(|| message.clone());
+                                    let is_string = match &payload {
+                                        None => true,
+                                        Some(p) => {
+                                            p.ty == "&str"
+                                                || p.ty == "std::string::String"
+                                                || self
+                                                    .resolve_string(frames, &p.value)
+                                                    .is_ok()
+                                        }
+                                    };
+                                    if !is_string {
+                                        let ty = payload
+                                            .as_ref()
+                                            .map(|p| p.ty.clone())
+                                            .unwrap_or_default();
+                                        Some(Some(format!(
+                                            "{cap_out}{cap_err}note: expected panic with string value,\n found non-string value: `{ty}`\n     expected substring: \"{expected}\""
+                                        )))
+                                    } else if text.contains(expected.as_str()) {
+                                        None
+                                    } else {
+                                        Some(Some(format!(
+                                            "{cap_out}{cap_err}note: panic did not contain expected string\n      panic message: \"{text}\"\n expected substring: \"{expected}\""
+                                        )))
+                                    }
+                                }
+                            }
                         }
                         Err(e) => return Err(e),
                     };
-                    let test_ok = match &test.should_panic_expected {
-                        Some(expected) => panic_message
-                            .as_ref()
-                            .is_some_and(|m| m.contains(expected.as_str())),
-                        None => panic_message.is_some() == test.should_panic,
-                    };
-                    if test_ok {
-                        passed += 1;
-                        self.push_output(&format!("test {} ... ok\n", test.name));
-                    } else {
-                        failed += 1;
-                        failures.push(test.name.clone());
-                        self.push_output(&format!("test {} ... FAILED\n", test.name));
+                    match failure_body {
+                        None => {
+                            passed += 1;
+                            if opts.nocapture {
+                                self.push_output("ok\n");
+                            } else {
+                                self.push_output(&format!(
+                                    "test {}{} ... ok\n",
+                                    test.name, annotation
+                                ));
+                            }
+                        }
+                        Some(body) => {
+                            failed += 1;
+                            failure_names.push(test.name.clone());
+                            if let Some(body) = body {
+                                failure_sections.push(format!(
+                                    "\n---- {} stdout ----\n{}",
+                                    test.name, body
+                                ));
+                            }
+                            if opts.nocapture {
+                                self.push_output("FAILED\n");
+                            } else {
+                                self.push_output(&format!(
+                                    "test {}{} ... FAILED\n",
+                                    test.name, annotation
+                                ));
+                            }
+                        }
                     }
                 }
-                if !failures.is_empty() {
+                if !failure_names.is_empty() {
                     self.push_output("\nfailures:\n");
-                    for name in &failures {
+                    for section in &failure_sections {
+                        self.push_output(section);
+                    }
+                    if !failure_sections.is_empty() {
+                        self.push_output("\n");
+                    }
+                    self.push_output("\nfailures:\n");
+                    for name in &failure_names {
                         self.push_output(&format!("    {name}\n"));
                     }
                 }
@@ -2173,9 +2362,12 @@ impl<'a> Interpreter<'a> {
                 self.push_output(&format!(
                     "\ntest result: {verdict}. {passed} passed; {failed} failed; \
                      {ignored} ignored; 0 measured; {filtered_out} filtered out; \
-                     finished in 0.00s\n"
+                     finished in 0.00s\n\n"
                 ));
-                Ok(exit_code(if failed == 0 { 0 } else { 101 }))
+                // `ExitCode`: success is 0, any failure is 101,
+                // as in libtest.
+                let byte = if failed == 0 { 0 } else { 101 };
+                Ok(test_exit_code(byte))
             }
             Builtin::PanicSetHook => {
                 arity(1)?;
@@ -4666,12 +4858,18 @@ impl<'a> Interpreter<'a> {
     }
 
     /// The tests of a `&[TestDescAndFn]` slice, read out of the
-    /// value the harness main hands to `test_main_env_args`:
-    /// each element's descriptor gives the name (field 0 of the
-    /// `TestName`), the ignore flag (field 1) and the
-    /// should-panic mode (field 2, variant 0 is `No`); the
-    /// second field of the element is the `TestFn` enum whose
-    /// payload is the callable.
+    /// value the harness main hands to `test_main_env_args`.
+    /// The descriptor layout below was measured against the
+    /// descriptors this toolchain's `--test` harness emits
+    /// (twelve fields): 0 the `TestName`, 1 the ignore flag,
+    /// 2 the ignore message (`Option`: variant 1 carries the
+    /// string), 3 the source file, 4..7 the definition span
+    /// (start line/column, end line/column, the start naming
+    /// the function's name), 8 the `ShouldPanic` mode (variant
+    /// 0 `No`, 1 `Yes`, 2 `YesWithMessage` with the expected
+    /// substring as its payload). The second field of the
+    /// element is the `TestFn` enum whose payload is the
+    /// callable.
     fn read_test_descs(
         &self,
         frames: &[Frame],
@@ -4723,27 +4921,40 @@ impl<'a> Interpreter<'a> {
                 }
                 other => self.resolve_string(frames, other)?,
             };
-            let ignore = matches!(desc[1], Value::Bool(true));
-            // The `ShouldPanic` field: in the layout the
-            // compiler emits for `TestDesc` in this toolchain it
-            // is the unit enum at field 8 (variant 0 is `No`);
-            // field 2 is checked as well, as it carries the mode
-            // in the declared field order.
-            let should_panic = [2usize, 8].iter().any(|&i| {
-                matches!(desc.get(i), Some(Value::Enum { variant, .. }) if *variant != 0)
-            });
-            // `ShouldPanic::Expected(&str)` is variant 2 and
-            // carries the expected message as its field; a test
-            // with an expected message passes only when the panic
-            // message contains it. An unreadable payload degrades
-            // to the plain `Yes` reading above.
-            let should_panic_expected = [2usize, 8]
-                .iter()
-                .find_map(|&i| match desc.get(i) {
-                    Some(Value::Enum { variant: 2, fields }) => fields.first(),
-                    _ => None,
-                })
-                .and_then(|v| self.resolve_string(frames, v).ok());
+            let ignore = matches!(desc.get(1), Some(Value::Bool(true)));
+            // A descriptor string field, read through the
+            // one-field enum a string constant may decode to.
+            let desc_string = |v: &Value| -> Option<String> {
+                match v {
+                    Value::Enum { fields, .. } if fields.len() == 1 => {
+                        self.resolve_string(frames, &fields[0]).ok()
+                    }
+                    other => self.resolve_string(frames, other).ok(),
+                }
+            };
+            let ignore_message = match desc.get(2) {
+                Some(Value::Enum { variant: 1, fields }) if !fields.is_empty() => {
+                    desc_string(&fields[0])
+                }
+                _ => None,
+            };
+            let source_file = desc.get(3).and_then(desc_string).unwrap_or_default();
+            let desc_uint = |i: usize| -> u64 {
+                match desc.get(i) {
+                    Some(Value::Uint(n)) => *n as u64,
+                    _ => 0,
+                }
+            };
+            let should_panic = match desc.get(8) {
+                Some(Value::Enum { variant: 1, .. }) => ShouldPanic::Yes,
+                Some(Value::Enum { variant: 2, fields }) if !fields.is_empty() => {
+                    match desc_string(&fields[0]) {
+                        Some(msg) => ShouldPanic::YesWithMessage(msg),
+                        None => ShouldPanic::Yes,
+                    }
+                }
+                _ => ShouldPanic::No,
+            };
             let callable = match &pair[1] {
                 Value::Enum { fields, .. } if fields.len() == 1 => {
                     self.resolve_value(frames, &fields[0])?
@@ -4753,8 +4964,11 @@ impl<'a> Interpreter<'a> {
             out.push(TestDesc {
                 name,
                 ignore,
+                ignore_message,
                 should_panic,
-                should_panic_expected,
+                source_file,
+                start_line: desc_uint(4),
+                start_col: desc_uint(5),
                 callable,
             });
         }
