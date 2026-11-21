@@ -1146,6 +1146,18 @@ impl Converter {
         else {
             return None;
         };
+        self.fn_pointer_value(&inst)
+    }
+
+    /// The callable constant naming a function instance: a plain
+    /// function item becomes the callable of that item; a closure
+    /// (named directly, or through the `Fn` adapter shim const
+    /// evaluation picks for a coercion) becomes the closure value
+    /// with an empty environment.
+    fn fn_pointer_value(
+        &mut self,
+        inst: &rustc_public::mir::mono::Instance,
+    ) -> Option<sm::ConstValue> {
         if matches!(inst.kind, InstanceKind::Shim) {
             for arg in &inst.args().0 {
                 if let GenericArgKind::Type(t) = arg {
@@ -1160,7 +1172,7 @@ impl Converter {
             let d = self.crate_def_id(&def);
             return Some(sm::ConstValue::Closure(d));
         }
-        let d = self.instance_def_id(inst.def.def_id(), &inst);
+        let d = self.instance_def_id(inst.def.def_id(), inst);
         Some(sm::ConstValue::FnDef(d))
     }
 
@@ -1186,7 +1198,15 @@ impl Converter {
             // initializer allocation (the value a constant read of
             // the static observes).
             mir::alloc::GlobalAlloc::Static(def) => def.eval_initializer().ok()?,
-            // Functions and vtables are not materialised.
+            // A pointer at a function item: the item is zero-sized,
+            // so the pointer's value is the callable itself. This
+            // covers both references to function items reached
+            // through pointer-typed fields and pointers to functions
+            // stored under a cast (`&(foo as *const u8)`).
+            mir::alloc::GlobalAlloc::Function(inst) => {
+                return self.fn_pointer_value(&inst);
+            }
+            // Vtables are not materialised.
             _ => return None,
         };
         match inner.kind() {

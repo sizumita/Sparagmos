@@ -129,6 +129,9 @@ fn synthetic_address(value: &Value) -> Option<u128> {
         Value::Ref(target) => format!("ref:{target:?}"),
         Value::FatRef { base, len } => format!("fat:{base:?}:{len}"),
         Value::FnPtr(name) => format!("fn:{name}"),
+        // A non-capturing closure value is a function pointer (it
+        // coerces to one); its address identity is its body.
+        Value::Closure { def, env } if env.is_empty() => format!("closure:{def}"),
         _ => return None,
     };
     let h = fnv1a(key.as_bytes());
@@ -1886,7 +1889,16 @@ impl<'a> Interpreter<'a> {
             | (Some(Ty::Ref(_)), Value::FatRef { .. })
             | (Some(Ty::Ref(_)), Value::DynRef { .. })
             | (Some(Ty::Ref(_)), Value::Str(_))
-            | (Some(Ty::Ref(_)), Value::Bytes(_)) => Ok(value),
+            | (Some(Ty::Ref(_)), Value::Bytes(_))
+            // A pointer to a function stored under a cast (a
+            // function item referenced through a data-pointer type,
+            // e.g. `&(foo as *const u8)` as a constant): the value
+            // is the callable, which is a pointer like any other
+            // for storage, address and equality purposes; reading
+            // the pointee through it stays an explicit error at the
+            // read site, as the model has no code bytes.
+            | (Some(Ty::Ref(_)), Value::FnPtr(_))
+            | (Some(Ty::Ref(_)), Value::Closure { .. }) => Ok(value),
             (Some(Ty::Str), Value::Str(_)) => Ok(value),
             (Some(Ty::Array(_, n)), Value::Tuple(items)) if items.len() as u64 == *n => Ok(value),
             (Some(Ty::Array(elem, n)), Value::Bytes(b))
@@ -2821,6 +2833,23 @@ fn eval_binary(
             }
         };
         return Ok((v, false));
+    }
+    // Pointer equality: raw pointers and function pointers compare
+    // by address identity, the same identity `PtrToInt` exposes, so
+    // `p == q` agrees with `p as usize == q as usize` in this model.
+    if matches!(op, Eq | Ne)
+        && matches!(
+            lhs,
+            Value::Ref(_) | Value::FatRef { .. } | Value::FnPtr(_) | Value::Closure { .. }
+        )
+        && matches!(
+            rhs,
+            Value::Ref(_) | Value::FatRef { .. } | Value::FnPtr(_) | Value::Closure { .. }
+        )
+    {
+        if let (Some(a), Some(b)) = (synthetic_address(lhs), synthetic_address(rhs)) {
+            return Ok((Value::Bool(if op == Eq { a == b } else { a != b }), false));
+        }
     }
     Err(InterpError::type_mismatch(
         format!("binary operation {op:?}"),
