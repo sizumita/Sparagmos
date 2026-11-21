@@ -412,7 +412,7 @@ fn registry_covers_the_modelled_callees() {
 
 #[test]
 fn catch_unwind_family_registers() {
-    let cases: [(&str, Builtin); 9] = [
+    let cases: [(&str, Builtin); 10] = [
         ("std::intrinsics::catch_unwind", Builtin::CatchUnwind),
         ("core::intrinsics::catch_unwind", Builtin::CatchUnwind),
         (
@@ -428,7 +428,11 @@ fn catch_unwind_family_registers() {
         ),
         (
             "<(dyn std::any::Any + 'static)>::downcast",
-            Builtin::DynAnyDowncast,
+            Builtin::DynAnyDowncast(0),
+        ),
+        (
+            "std::boxed::convert::<impl std::boxed::Box<(dyn std::any::Any + std::marker::Send + 'static), A>>::downcast",
+            Builtin::DynAnyDowncast(1),
         ),
         (
             "<(dyn std::any::Any + std::marker::Send + 'static)>::is",

@@ -338,9 +338,14 @@ pub enum Builtin {
     /// `<(dyn Any + ...)>::downcast_ref::<T>(&self) -> Option<&T>`:
     /// `Some` exactly when the payload's concrete type is `T`.
     DynAnyDowncastRef,
-    /// `<(dyn Any + ...)>::downcast::<T>(self) -> Result<T, Box>`:
-    /// the payload value on a type match, the box back otherwise.
-    DynAnyDowncast,
+    /// `<(dyn Any + ...)>::downcast::<T>(self) -> Result<T, Box>`
+    /// (and `Box<dyn Any + ...>::downcast`, the inherent method
+    /// guest code actually calls): the payload value on a type
+    /// match, the box back otherwise. The payload is the generic
+    /// argument at the given index: 0 for the dyn method itself,
+    /// 1 for the `Box` impl method, whose first generic argument
+    /// is the allocator.
+    DynAnyDowncast(usize),
     /// `<(dyn Any + ...)>::is::<T>(&self) -> bool`: whether the
     /// payload's concrete type is `T`.
     DynAnyIs,
@@ -700,10 +705,18 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         }
         "<(dyn std::any::Any + 'static)>::downcast"
         | "<(dyn std::any::Any + std::marker::Send + 'static)>::downcast" => {
-            Builtin::DynAnyDowncast
+            Builtin::DynAnyDowncast(0)
         }
         "<(dyn std::any::Any + 'static)>::is"
         | "<(dyn std::any::Any + std::marker::Send + 'static)>::is" => Builtin::DynAnyIs,
+        // By-value downcast is an inherent method on the `Box`
+        // itself (in alloc's `convert` module), not on the dyn
+        // type: `Box<dyn Any>::downcast` is the call guest code
+        // actually makes.
+        "std::boxed::convert::<impl std::boxed::Box<(dyn std::any::Any + 'static), A>>::downcast"
+        | "std::boxed::convert::<impl std::boxed::Box<(dyn std::any::Any + std::marker::Send + 'static), A>>::downcast" => {
+            Builtin::DynAnyDowncast(1)
+        }
         // Comparison traits: the impls for the modelled data types
         // are the derived ones, i.e. semantic value comparison.
         _ if canonical.ends_with("::PartialEq::eq") => Builtin::PartialEqEq,
@@ -1824,15 +1837,21 @@ impl<'a> Interpreter<'a> {
                     })
                 }
             }
-            Builtin::DynAnyDowncast => {
+            Builtin::DynAnyDowncast(t_index) => {
                 arity(1)?;
-                let want = expect_generic_ty(generic_args, name)?;
+                let want = expect_generic_ty_at(generic_args, name, t_index)?;
                 let (concrete, value, original) =
                     resolve_dyn_box(self, frames, &vals[0], name)?;
                 if concrete == want {
+                    // `Ok` holds a `Box<T>`: the box aggregate
+                    // around the payload value (the same shape
+                    // `Box::new` builds), not the bare payload.
                     Ok(Value::Enum {
                         variant: 0,
-                        fields: vec![value],
+                        fields: vec![Value::Enum {
+                            variant: 0,
+                            fields: vec![value],
+                        }],
                     })
                 } else {
                     Ok(Value::Enum {
@@ -3357,7 +3376,17 @@ fn expect_fn_ptr(value: &Value, name: &str) -> InterpResult<String> {
 /// The first generic argument of a builtin call (the `T` of a
 /// `dyn Any` downcast), rendered as a type tag.
 fn expect_generic_ty(generic_args: &[String], name: &str) -> InterpResult<String> {
-    generic_args.first().cloned().ok_or_else(|| {
+    expect_generic_ty_at(generic_args, name, 0)
+}
+
+/// The generic argument at `index` of a builtin call, rendered
+/// as a type tag.
+fn expect_generic_ty_at(
+    generic_args: &[String],
+    name: &str,
+    index: usize,
+) -> InterpResult<String> {
+    generic_args.get(index).cloned().ok_or_else(|| {
         InterpError::type_mismatch(
             format!("builtin {name}"),
             "a generic type argument",
@@ -3376,20 +3405,24 @@ fn resolve_dyn_box(
     value: &Value,
     name: &str,
 ) -> InterpResult<(String, Value, Value)> {
+    // Resolve references down to the box value itself (that value
+    // is what a failed by-value downcast hands back).
     let mut current = value.clone();
+    while matches!(current, Value::Ref(_) | Value::FatRef { .. }) {
+        let target = interp.deref_value(frames, &current)?;
+        current = interp.read_resolved(frames, &target)?;
+    }
+    let original = current.clone();
+    // Then unwrap the box-shaped wrappers (the one-field `Box` /
+    // `Unique` / `NonNull` aggregate chain) down to the `DynRef`,
+    // and read the payload out of it.
     loop {
         match current {
             Value::DynRef {
-                base,
-                concrete,
-                traits,
-            } => {
-                let original = Value::DynRef {
-                    base: base.clone(),
-                    concrete: concrete.clone(),
-                    traits,
-                };
-                return Ok((concrete, (*base).clone(), original));
+                base, concrete, ..
+            } => return Ok((concrete, (*base).clone(), original)),
+            Value::Enum { fields, .. } if fields.len() == 1 => {
+                current = fields.into_iter().next().expect("one field");
             }
             Value::Ref(_) | Value::FatRef { .. } => {
                 let target = interp.deref_value(frames, &current)?;

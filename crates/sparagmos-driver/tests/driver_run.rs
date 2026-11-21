@@ -3626,3 +3626,259 @@ fn run_mode_unbounded_self_instantiation_is_unsupported() {
         "the failure must name the recursion limit; stderr={stderr}"
     );
 }
+
+// ----- catch_unwind (Lane DH) ------------------------------------------------
+
+const CATCH_OK_SRC: &str = r#"
+fn main() {
+    let r = std::panic::catch_unwind(|| 40 + 2);
+    match r {
+        Ok(v) => println!("ok {v}"),
+        Err(_) => println!("err"),
+    }
+}
+"#;
+
+const CATCH_LITERAL_SRC: &str = r#"
+fn main() {
+    let r = std::panic::catch_unwind(|| -> i32 { panic!("boom") });
+    match r {
+        Ok(_) => println!("ok"),
+        Err(e) => {
+            if let Some(s) = e.downcast_ref::<&str>() {
+                println!("payload str: {s}");
+            } else {
+                println!("payload not str");
+            }
+            println!("is String: {}", e.is::<String>());
+        }
+    }
+}
+"#;
+
+const CATCH_FORMATTED_SRC: &str = r#"
+fn main() {
+    let mut x = 0usize;
+    for i in 0..7 { x += i; }
+    let r = std::panic::catch_unwind(|| -> i32 { panic!("fmt {}", x) });
+    match r {
+        Ok(_) => println!("ok"),
+        Err(e) => {
+            println!("is str: {}", e.is::<&str>());
+            if let Some(s) = e.downcast_ref::<String>() {
+                println!("payload String: {s}");
+            } else {
+                println!("payload not String");
+            }
+        }
+    }
+}
+"#;
+
+const CATCH_PANIC_ANY_SRC: &str = r#"
+fn main() {
+    let r = std::panic::catch_unwind(|| -> i32 { std::panic::panic_any(42i32) });
+    match r {
+        Ok(_) => println!("ok"),
+        Err(e) => {
+            if let Some(v) = e.downcast_ref::<i32>() {
+                println!("payload i32: {v}");
+            } else {
+                println!("payload not i32");
+            }
+            match e.downcast::<i32>() {
+                Ok(v) => println!("downcast value: {}", *v),
+                Err(_) => println!("downcast failed"),
+            }
+        }
+    }
+}
+"#;
+
+const CATCH_RESUME_SRC: &str = r#"
+fn main() {
+    let r = std::panic::catch_unwind(|| -> i32 { panic!("again") });
+    println!("caught: {}", r.is_err());
+    if let Err(e) = r {
+        std::panic::resume_unwind(e);
+    }
+    println!("unreachable");
+}
+"#;
+
+const CATCH_ASSERT_UNWIND_SAFE_SRC: &str = r#"
+use std::panic::{catch_unwind, AssertUnwindSafe};
+fn main() {
+    let mut state = 10;
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        state = 99;
+        panic!("inner");
+    }));
+    println!("caught={} state={}", r.is_err(), state);
+}
+"#;
+
+const CATCH_NESTED_SRC: &str = r#"
+use std::panic::catch_unwind;
+fn main() {
+    let r = catch_unwind(|| {
+        let inner = catch_unwind(|| -> i32 { panic!("deep") });
+        match inner { Ok(_) => 1, Err(_) => 2 }
+    });
+    match r {
+        Ok(v) => println!("outer ok {v}"),
+        Err(_) => println!("outer err"),
+    }
+    let r2 = catch_unwind(|| {
+        let inner = catch_unwind(|| -> i32 { panic!("deep2") });
+        if let Err(e) = inner { std::panic::resume_unwind(e); }
+        0
+    });
+    match r2 {
+        Ok(_) => println!("r2 ok"),
+        Err(e) => {
+            if let Some(s) = e.downcast_ref::<&str>() {
+                println!("r2 payload: {s}");
+            } else {
+                println!("r2 payload other");
+            }
+        }
+    }
+}
+"#;
+
+const CATCH_OVERFLOW_SRC: &str = r#"
+fn main() {
+    let mut x = 0i32;
+    for i in 0..7 { x += i; }
+    let r = std::panic::catch_unwind(|| { let a = i32::MAX; a + x });
+    match r {
+        Ok(v) => println!("ok {v}"),
+        Err(e) => {
+            if let Some(s) = e.downcast_ref::<&str>() {
+                println!("overflow payload: {s}");
+            } else {
+                println!("overflow payload other");
+            }
+        }
+    }
+}
+"#;
+
+const CATCH_STATE_SRC: &str = r#"
+use std::panic::catch_unwind;
+use std::sync::atomic::{AtomicI32, Ordering};
+static MARK: AtomicI32 = AtomicI32::new(0);
+fn main() {
+    MARK.store(5, Ordering::SeqCst);
+    let _ = catch_unwind(|| {
+        MARK.store(7, Ordering::SeqCst);
+        panic!("x");
+    });
+    println!("mark={}", MARK.load(Ordering::SeqCst));
+    println!("after");
+}
+"#;
+
+fn run_ok(tag: &str, src: &str, expected_stdout: &str) {
+    let dir = temp_dir(tag);
+    let src_path = fixture(&dir, "case.rs", src);
+    let out = run_driver(&src_path);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "catch_unwind case {tag} must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        expected_stdout,
+        "catch_unwind case {tag} stdout mismatch; stderr={stderr}"
+    );
+}
+
+#[test]
+fn run_mode_catch_unwind_ok_path() {
+    run_ok("catch-ok", CATCH_OK_SRC, "ok 42\n");
+}
+
+#[test]
+fn run_mode_catch_unwind_literal_payload_is_str() {
+    run_ok(
+        "catch-literal",
+        CATCH_LITERAL_SRC,
+        "payload str: boom\nis String: false\n",
+    );
+}
+
+#[test]
+fn run_mode_catch_unwind_formatted_payload_is_string() {
+    run_ok(
+        "catch-formatted",
+        CATCH_FORMATTED_SRC,
+        "is str: false\npayload String: fmt 21\n",
+    );
+}
+
+#[test]
+fn run_mode_catch_unwind_panic_any_payload() {
+    run_ok(
+        "catch-panic-any",
+        CATCH_PANIC_ANY_SRC,
+        "payload i32: 42\ndowncast value: 42\n",
+    );
+}
+
+#[test]
+fn run_mode_catch_unwind_assert_unwind_safe() {
+    run_ok(
+        "catch-aus",
+        CATCH_ASSERT_UNWIND_SAFE_SRC,
+        "caught=true state=99\n",
+    );
+}
+
+#[test]
+fn run_mode_catch_unwind_nested_and_resume_through() {
+    run_ok(
+        "catch-nested",
+        CATCH_NESTED_SRC,
+        "outer ok 2\nr2 payload: deep2\n",
+    );
+}
+
+#[test]
+fn run_mode_catch_unwind_overflow_payload_message() {
+    run_ok(
+        "catch-overflow",
+        CATCH_OVERFLOW_SRC,
+        "overflow payload: attempt to add with overflow\n",
+    );
+}
+
+#[test]
+fn run_mode_catch_unwind_state_survives_the_catch() {
+    run_ok("catch-state", CATCH_STATE_SRC, "mark=7\nafter\n");
+}
+
+#[test]
+fn run_mode_resume_unwind_repanics_out_of_the_catch() {
+    let dir = temp_dir("catch-resume");
+    let src = fixture(&dir, "resume.rs", CATCH_RESUME_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "a resumed payload escapes as a guest panic (101); stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "caught: true\n",
+        "output before the resume is kept; the line after it never runs"
+    );
+    assert!(
+        stderr.contains("again"),
+        "the resumed panic reports the payload message; stderr={stderr}"
+    );
+}
