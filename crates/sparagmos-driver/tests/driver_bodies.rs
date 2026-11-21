@@ -77,6 +77,7 @@ fn run_executes_collected_unwrap_bodies() {
 
 const ARGS_RS: &str = "\
 fn main() {
+    let _stdin = std::io::stdin();
     let n = std::env::args().count();
     println!(\"{}\", n);
 }
@@ -86,14 +87,15 @@ fn main() {
 fn report_records_bodyless_targets_with_reasons() {
     // Fixture note: this used to use Vec::push reaching the
     // allocator shims, but since Lane V those Vec operations are
-    // interpreter builtins and are no longer collected. env::args
-    // is a non-generic function of another crate, so no MIR body
-    // is shipped for it; Iterator::count is collected instead.
+    // interpreter builtins and are no longer collected; env::args
+    // joined them later (Lane FC). std::io::stdin is a
+    // non-generic function of another crate, so no MIR body is
+    // shipped for it; Iterator::count is collected instead.
     let fixture = write_fixture("args", ARGS_RS);
     let (stdout, status) = run_driver(&[], &fixture);
     assert!(status.success(), "driver failed: {stdout}");
     assert!(
-        stdout.contains("fn std::env::args: SKIPPED (no MIR body available"),
+        stdout.contains("fn std::io::stdin: SKIPPED (no MIR body available"),
         "body-less target not reported with its reason:\n{stdout}"
     );
     assert!(
