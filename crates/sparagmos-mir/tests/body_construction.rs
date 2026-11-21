@@ -81,6 +81,7 @@ fn never_body_like_real_mir() {
         func: Operand::constant(Constant {
             literal: ConstKind::Ty(Ty::FnDef(DefId::new(0, 1), vec![])),
             user_ty: None,
+            ty: None,
         }),
         args: vec![],
         destination: p(2),

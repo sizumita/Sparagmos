@@ -885,9 +885,17 @@ impl Conv {
             Some(v) => Some(atom_parse(v, "user_ty")?),
             None => None,
         };
+        let ty = match f.iter().find(|(name, _)| name == "ty") {
+            Some((_, node)) => match as_opt(node)? {
+                Some(v) => Some(Self::ty(v)?),
+                None => None,
+            },
+            None => None,
+        };
         Ok(mir::Constant {
             literal: Self::const_kind(field(f, "literal")?)?,
             user_ty,
+            ty,
         })
     }
 
@@ -1499,6 +1507,7 @@ Body {
                                             ),
                                         ),
                                         user_ty: None,
+                                        ty: None,
                                     },
                                 ),
                             ),

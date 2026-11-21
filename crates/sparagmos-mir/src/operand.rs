@@ -107,12 +107,20 @@ pub struct Constant {
     pub literal: ConstKind,
     /// Optional user-type annotation index (minimal form of rustc's `UserTypeAnnotationIndex`).
     pub user_ty: Option<u32>,
+    /// The constant's own type, when the producer recorded it and
+    /// it is a plain scalar type (int / uint / bool / char / float).
+    /// A scalar literal's bits carry no signedness of their own, so
+    /// a consumer with no typing context from the operation (a
+    /// comparison of two literals is the canonical case) reads the
+    /// bits under this type instead of guessing from the sign bit.
+    pub ty: Option<Ty>,
 }
 impl Constant {
     pub fn from_value(v: ConstValue) -> Self {
         Self {
             literal: ConstKind::Value(v),
             user_ty: None,
+            ty: None,
         }
     }
     pub fn int(v: u64) -> Self {

@@ -2530,7 +2530,15 @@ impl<'a> Converter<'a> {
         Ok(match op {
             mir::Operand::Copy(p) => ir::Operand::Copy(self.convert_place(body, p)?),
             mir::Operand::Move(p) => ir::Operand::Move(self.convert_place(body, p)?),
-            mir::Operand::Constant(c) => ir::Operand::Constant(self.convert_constant(c, ctx)?),
+            mir::Operand::Constant(c) => {
+                // With no context from the operation, a constant is
+                // read under its own recorded type when it has one:
+                // the bits of a scalar literal carry no signedness,
+                // and the sign-bit guess in `convert_scalar` reads
+                // `255u8` as `-1i8`.
+                let ctx = ctx.or(c.ty.as_ref());
+                ir::Operand::Constant(self.convert_constant(c, ctx)?)
+            }
         })
     }
 
@@ -2553,13 +2561,16 @@ impl<'a> Converter<'a> {
     ///    `bool` and say nothing about their operands. (Typing a
     ///    literal by the `bool` destination used to collapse every
     ///    nonzero literal to `true`.)
-    /// 3. Otherwise — a comparison of two literals — no declared type
-    ///    exists anywhere. The pair still needs ONE interpretation:
-    ///    guessing per literal can yield an `Int`/`Uint` pair that
-    ///    cannot even be compared. Both literals are read in the single
-    ///    interpretation of [`literal_pair_ty`]. This is the shape of
-    ///    rustc's expanded Div/Rem checks: `Eq(rhs, 0)`, `Eq(rhs, -1)`,
-    ///    `Eq(lhs, MIN)` over two literals.
+    /// 3. Otherwise — a comparison of two literals — the operation
+    ///    itself declares no type. The pair still needs ONE
+    ///    interpretation: guessing per literal can yield an
+    ///    `Int`/`Uint` pair that cannot even be compared. A
+    ///    literal's own recorded type (both literals share one type
+    ///    in MIR) is that interpretation when either side carries
+    ///    one; the sign-bit reading of [`literal_pair_ty`] remains
+    ///    for literals with no recorded type (the shape of rustc's
+    ///    expanded Div/Rem checks: `Eq(rhs, 0)`, `Eq(rhs, -1)`,
+    ///    `Eq(lhs, MIN)` over two literals).
     fn convert_binop_operands(
         &self,
         body: &mir::Body,
@@ -2583,6 +2594,7 @@ impl<'a> Converter<'a> {
                     dest_ty.cloned()
                 }
             })
+            .or_else(|| constant_recorded_ty(&pair.0).or_else(|| constant_recorded_ty(&pair.1)))
             .or_else(|| literal_pair_ty(&pair.0, &pair.1));
         let lhs = self.convert_operand(body, &pair.0, ctx.as_ref())?;
         let rhs = self.convert_operand(body, &pair.1, ctx.as_ref())?;
@@ -4885,6 +4897,14 @@ fn is_comparison(op: mir::BinOp) -> bool {
 /// rustc's expanded checks compare against, `-1` and the type
 /// minimum, both do), unsigned otherwise. `None` when the two operands
 /// are not integer literals of one standard width.
+/// The type a literal operand's producer recorded for it, if any.
+fn constant_recorded_ty(op: &mir::Operand) -> Option<mir::Ty> {
+    match op {
+        mir::Operand::Constant(c) => c.ty.clone(),
+        _ => None,
+    }
+}
+
 fn literal_pair_ty(lhs: &mir::Operand, rhs: &mir::Operand) -> Option<mir::Ty> {
     fn scalar_int(op: &mir::Operand) -> Option<(u128, u8)> {
         let mir::Operand::Constant(c) = op else {

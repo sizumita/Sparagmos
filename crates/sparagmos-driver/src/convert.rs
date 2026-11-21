@@ -793,6 +793,33 @@ impl Converter {
     }
 
     fn constant(&mut self, c: &mir::ConstOperand) -> sm::Constant {
+        let mut k = self.constant_literal(c);
+        if k.ty.is_none() {
+            k.ty = self.constant_scalar_ty(c);
+        }
+        k
+    }
+
+    /// The constant's own type when it is a plain scalar type:
+    /// the one reading of a scalar literal's bits that needs no
+    /// context from the operation using it (see
+    /// `sm::Constant::ty`). Other types are not recorded: their
+    /// conversion is not needed for the literal reading, and
+    /// asking for it could fail where the constant itself is fine.
+    fn constant_scalar_ty(&mut self, c: &mir::ConstOperand) -> Option<sm::Ty> {
+        match c.const_.ty().kind() {
+            TyKind::RigidTy(
+                RigidTy::Int(_)
+                | RigidTy::Uint(_)
+                | RigidTy::Bool
+                | RigidTy::Char
+                | RigidTy::Float(_),
+            ) => Some(self.ty(&c.const_.ty())),
+            _ => None,
+        }
+    }
+
+    fn constant_literal(&mut self, c: &mir::ConstOperand) -> sm::Constant {
         use ConstantKind as CK;
         let mc = &c.const_;
         match mc.kind() {
@@ -810,6 +837,7 @@ impl Converter {
                     return sm::Constant {
                         literal: sm::ConstKind::Ty(t),
                         user_ty: None,
+                        ty: None,
                     };
                 }
                 // Any other zero-sized constant still has a typed
@@ -845,6 +873,7 @@ impl Converter {
                         return sm::Constant {
                             literal: sm::ConstKind::Ty(t),
                             user_ty: None,
+                            ty: None,
                         };
                     }
                     if let Some(v) = self.zst_const_value(ty, 0) {
@@ -860,6 +889,7 @@ impl Converter {
                             args: self.type_args(args),
                         },
                         user_ty: None,
+                        ty: None,
                     }
                 }
                 TyConstKind::Param(p) => {
@@ -879,6 +909,7 @@ impl Converter {
                         args: self.type_args(&u.args),
                     },
                     user_ty: None,
+                    ty: None,
                 }
             }
             CK::Param(p) => {
