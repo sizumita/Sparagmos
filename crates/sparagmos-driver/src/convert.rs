@@ -53,6 +53,11 @@ pub struct Converter {
     /// `Discriminant` rvalues must yield these values, because the
     /// `SwitchInt` branch keys carry values, not variant indices.
     pub adt_discriminants: sm::AdtDiscriminants,
+    /// Declared shapes of every ADT converted so far, keyed by the
+    /// converted `DefId` (see `sm::AdtShape`). Handed to the
+    /// interpreter with the converted program, which uses them to
+    /// decide which types are zero-sized.
+    pub adt_shapes: sm::AdtShapes,
     /// Unsupported hits of the function currently being converted.
     errors: Vec<String>,
 }
@@ -70,6 +75,7 @@ impl Converter {
             instance_ids: HashMap::new(),
             def_names: Vec::new(),
             adt_discriminants: sm::AdtDiscriminants::new(),
+            adt_shapes: sm::AdtShapes::new(),
             errors: Vec::new(),
         }
     }
@@ -1280,6 +1286,50 @@ impl Converter {
         }
     }
 
+    /// Record the declared shape of an ADT under its converted
+    /// `DefId`, once per ADT (see `sm::AdtShape`). The entry is
+    /// inserted before the field types are converted so that a
+    /// recursive ADT terminates: the recursive reference observes
+    /// the placeholder (no variants), which no consumer mistakes
+    /// for a complete shape.
+    ///
+    /// Shape recording is auxiliary to the conversion of the body
+    /// in progress: converting a field type can hit constructs the
+    /// body itself never uses (pattern types on an unrelated std
+    /// ADT's fields, say), so the current body's error list is
+    /// saved and restored around the field conversions — a body
+    /// that genuinely uses such a type still reports the error
+    /// through its own conversion path.
+    fn record_shape(&mut self, def: &AdtDef, id: sm::AdtDefId) {
+        if self.adt_shapes.contains_key(&id) {
+            return;
+        }
+        let kind = match def.kind() {
+            AdtKind::Struct => sm::AdtShapeKind::Struct,
+            AdtKind::Enum => sm::AdtShapeKind::Enum,
+            AdtKind::Union => sm::AdtShapeKind::Union,
+        };
+        self.adt_shapes.insert(
+            id,
+            sm::AdtShape {
+                kind,
+                variants: Vec::new(),
+            },
+        );
+        let saved_errors = std::mem::take(&mut self.errors);
+        let mut variants = Vec::new();
+        for variant in def.variants() {
+            let mut fields = Vec::new();
+            for field in variant.fields() {
+                let fty = field.ty();
+                fields.push(self.ty(&fty));
+            }
+            variants.push(fields);
+        }
+        self.errors = saved_errors;
+        self.adt_shapes.insert(id, sm::AdtShape { kind, variants });
+    }
+
     /// Record the discriminant values of an enum ADT under its
     /// converted `DefId`, once per ADT. Structs and unions have no
     /// `Discriminant` semantics to record (a struct value is its
@@ -1309,6 +1359,7 @@ impl Converter {
             RigidTy::Adt(def, args) => {
                 let d = self.crate_def_id(def);
                 self.record_discriminants(def, d);
+                self.record_shape(def, d);
                 sm::Ty::Adt(d, self.type_args(args))
             }
             RigidTy::Foreign(def) => {

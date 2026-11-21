@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use crate::value::RefProj;
+use crate::value::{RefProj, Value};
 
 /// Index of a local variable. Local 0 is always the return place,
 /// locals `1..=arg_count` are the arguments (as in rustc MIR).
@@ -726,6 +726,14 @@ pub struct Body {
     pub arg_count: usize,
     pub local_tys: Vec<Ty>,
     pub blocks: Vec<BasicBlockData>,
+    /// Canonical values of the locals whose declared type is
+    /// provably zero-sized, indexed by local (conversion-computed;
+    /// see `mir_convert`'s `zst_value`). rustc MIR may never write
+    /// such a local's place; a never-written read of it denotes the
+    /// stored value. Empty for hand-built bodies: the interpreter
+    /// then falls back to the shapes derivable from the IR type
+    /// alone.
+    pub zst_locals: Vec<Option<Value>>,
 }
 
 impl Body {
@@ -740,6 +748,7 @@ impl Body {
             arg_count,
             local_tys,
             blocks,
+            zst_locals: Vec::new(),
         }
     }
     pub fn local_count(&self) -> usize {

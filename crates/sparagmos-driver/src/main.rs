@@ -112,6 +112,9 @@ struct Collected {
     /// Discriminant values of the converted enum ADTs, for the
     /// interpreter (see `Converter::adt_discriminants`).
     adt_discriminants: sparagmos_mir::AdtDiscriminants,
+    /// Declared shapes of the converted ADTs, for the interpreter
+    /// (see `Converter::adt_shapes`).
+    adt_shapes: sparagmos_mir::AdtShapes,
     /// Number of leading entries of `bodies` that come from the main
     /// crate itself (the rest are auxiliary-crate functions). The
     /// entry point is only ever searched among these: an auxiliary
@@ -1536,6 +1539,7 @@ fn collect() -> ControlFlow<()> {
         local_report_count,
         def_names: conv.def_names.clone(),
         adt_discriminants: conv.adt_discriminants.clone(),
+        adt_shapes: conv.adt_shapes.clone(),
     });
     ControlFlow::Continue(())
 }
@@ -1599,6 +1603,7 @@ fn execute(c: &Collected) -> i32 {
         );
     }
     program.adt_discriminants = c.adt_discriminants.clone();
+    program.adt_shapes = c.adt_shapes.clone();
     let Some(entry) = c.bodies[..c.local_body_count]
         .iter()
         .map(|(n, _)| n)

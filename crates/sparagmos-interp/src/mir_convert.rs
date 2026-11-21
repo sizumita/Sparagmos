@@ -102,6 +102,10 @@ pub struct MirProgram {
     /// values so they agree with the `SwitchInt` branch keys, which
     /// carry discriminant values rather than variant indices.
     pub adt_discriminants: mir::AdtDiscriminants,
+    /// Declared shapes of the program's ADTs, as recorded by the
+    /// driver (see `mir::AdtShape`). Used to decide which locals
+    /// are provably zero-sized.
+    pub adt_shapes: mir::AdtShapes,
 }
 
 impl MirProgram {
@@ -937,6 +941,8 @@ struct Converter<'a> {
     adt_fields: AdtFieldTys,
     /// Discriminant tables of the program (see `MirProgram`).
     discriminants: &'a mir::AdtDiscriminants,
+    /// ADT shape tables of the program (see `MirProgram`).
+    adt_shapes: &'a mir::AdtShapes,
     /// Operand counts of ADT aggregate constructions (see
     /// [`AdtAggregateCounts`]).
     adt_aggregates: AdtAggregateCounts,
@@ -977,6 +983,7 @@ impl<'a> Converter<'a> {
             names: &program.fn_names,
             adt_fields,
             discriminants: &program.adt_discriminants,
+            adt_shapes: &program.adt_shapes,
             adt_aggregates,
             local_crate,
             impl_targets: None,
