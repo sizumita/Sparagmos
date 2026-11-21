@@ -759,6 +759,7 @@ pub fn interpret_mir(
 pub struct CapturedRun {
     pub result: Result<Value, MirRunError>,
     pub stdout: String,
+    pub stderr: String,
 }
 
 /// Like [`interpret_mir`], but also returns the captured guest stdout.
@@ -793,6 +794,7 @@ pub fn interpret_mir_captured_with_config(
                 return CapturedRun {
                     result: Err(MirRunError::from(e.clone())),
                     stdout: String::new(),
+                    stderr: String::new(),
                 };
             }
             let mut interp = Interpreter::with_config(&ir_program, config);
@@ -800,11 +802,13 @@ pub fn interpret_mir_captured_with_config(
             CapturedRun {
                 result,
                 stdout: interp.output().to_string(),
+                stderr: interp.error_output().to_string(),
             }
         }
         Err(e) => CapturedRun {
             result: Err(MirRunError::from(e)),
             stdout: String::new(),
+            stderr: String::new(),
         },
     }
 }
@@ -5107,6 +5111,31 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                     P::Trivial => Some(P::Trivial),
                     _ => None,
                 };
+            }
+            "std::vec::IntoIter" | "alloc::vec::IntoIter" => {
+                // Same modelled state as `array::IntoIter` (the
+                // element snapshot plus the next index), so the
+                // same accounting: only a trivial element type is
+                // accounted for.
+                let elem = self.plan(args.first()?)?;
+                return match elem {
+                    P::Trivial => Some(P::Trivial),
+                    _ => None,
+                };
+            }
+            "std::ffi::OsString" | "std::ffi::OsStr" => {
+                // An `OsString` is the string value itself in this
+                // model (see the `env::args_os` builtin): no owned
+                // resource beyond it.
+                return Some(P::Trivial);
+            }
+            "std::env::Args" | "std::env::ArgsOs" => {
+                // The modelled value wraps the argument iterator
+                // state ([element snapshot, next index]) whose
+                // elements are the argument strings themselves:
+                // dropping the iterator drops the not-yet-yielded
+                // strings, which is unobservable for string values.
+                return Some(P::Trivial);
             }
             _ => {}
         }
