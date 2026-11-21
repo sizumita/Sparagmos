@@ -1725,6 +1725,96 @@ fn first_error_line(stderr: &str) -> String {
         .collect()
 }
 
+/// Index just past the balanced `open`..`close` group at the
+/// start of `s` (`s` must start with `open`), or `None` when the
+/// group never closes. Nesting of the same bracket pair counts;
+/// string literals inside are not lexed (attribute arguments in
+/// test sources do not hide brackets inside strings).
+fn skip_balanced(s: &str, open: char, close: char) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, c) in s.char_indices() {
+        if c == open {
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i + c.len_utf8());
+            }
+        }
+    }
+    None
+}
+
+/// The crate name an `extern crate <name>` item on this line
+/// declares, if the line is one. Attributes (`#[no_link]`,
+/// `#[macro_use]`, possibly several in a row, possibly carrying
+/// arguments) and a visibility (`pub`, `pub(crate)`) may precede
+/// the item — auxiliary sources write e.g.
+/// `#[macro_use] #[no_link] extern crate empty_crate_1 as t1;`,
+/// and missing those declarations left the dependency unbound
+/// (E0463 in the dependent's build). An `as` rename does not
+/// change the declared crate name, and `extern crate self as
+/// ...` declares no external crate.
+fn extern_crate_item_name(line: &str) -> Option<String> {
+    let mut rest = line.trim_start();
+    loop {
+        if rest.starts_with("#[") {
+            let brackets = &rest[1..];
+            rest = brackets[skip_balanced(brackets, '[', ']')?..].trim_start();
+        } else if let Some(after) = rest.strip_prefix("pub") {
+            if after.starts_with('(') {
+                rest = after[skip_balanced(after, '(', ')')?..].trim_start();
+            } else if after.starts_with(|c: char| c.is_whitespace()) {
+                rest = after.trim_start();
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    let rest = rest.strip_prefix("extern crate ")?;
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    if name.is_empty() || name == "self" {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// The crate names a flag list declares through `--extern`:
+/// both the valued form (`--extern name=path` /
+/// `--extern=name=path`) and the locator form (`--extern name` /
+/// `--extern=name`), where rustc is told the name and locates
+/// the crate itself. A test that locates an auxiliary crate this
+/// way (tests/ui/resolve/extern-prelude.rs passes `--extern Vec`
+/// for an auxiliary crate whose source declares
+/// `#![crate_name = "Vec"]`) declares the name exactly as much
+/// as an `extern crate` item does, so binding decisions count
+/// it. The name is the part before the first `=`, verbatim
+/// (modifiers included, as in `declared_aux_binding_names`).
+fn locator_extern_names(flags: &[String]) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut iter = flags.iter();
+    while let Some(flag) = iter.next() {
+        let value = if flag == "--extern" {
+            iter.next().map(|v| v.as_str())
+        } else {
+            flag.strip_prefix("--extern=")
+        };
+        if let Some(value) = value {
+            let name = value.split('=').next().unwrap_or("");
+            if !name.is_empty() {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
+}
+
 /// The `--extern` binding names a source file declares as its
 /// dependencies: for `//@ aux-crate:` the name before the `=`
 /// verbatim (modifiers and namespaced paths included), for
@@ -1737,16 +1827,8 @@ fn first_error_line(stderr: &str) -> String {
 fn declared_aux_binding_names(src_text: &str) -> std::collections::HashSet<String> {
     let mut names = std::collections::HashSet::new();
     for line in src_text.lines() {
-        let trimmed = line.trim_start();
-        let code = trimmed.strip_prefix("pub ").unwrap_or(trimmed);
-        if let Some(rest) = code.strip_prefix("extern crate ") {
-            let name: String = rest
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .collect();
-            if !name.is_empty() {
-                names.insert(name);
-            }
+        if let Some(name) = extern_crate_item_name(line) {
+            names.insert(name);
         }
         let Some(at) = line.find("//@") else { continue };
         let rest = line[at + 3..].trim_start();
@@ -1867,6 +1949,43 @@ struct AuxBuilt {
     collect: bool,
 }
 
+/// The names under which a consumer may declare a built
+/// auxiliary crate: the `--extern` binding name (the `--aux`
+/// spec's name verbatim) and the build name (the source's
+/// declared `#![crate_name]`, else the file stem). Which one a
+/// declaration uses depends on the declaring source: an
+/// `aux-crate:` directive names the binding, while an
+/// `extern crate` item that refers to a crate by the name its
+/// own source declares (`#![crate_name = "a"]` in the svh
+/// crates, `issue6919_3`, `Vec`) uses the build name. Matching
+/// only the binding name left those dependencies unbound
+/// (E0463 in the dependent's or the main compilation).
+fn binding_names_for(built: &AuxBuilt) -> [&str; 2] {
+    [built.extern_name.as_str(), built.name.as_str()]
+}
+
+/// The names to bind `built` under for a consumer declaring
+/// `declared`: every name of `binding_names_for(built)` the
+/// consumer declared (binding name first), or none. A consumer
+/// can declare both names of the same crate — a test file
+/// carries `//@ aux-build:iss-6919.rs` (the binding name) and
+/// `extern crate issue6919_3;` (the build name) — and its
+/// `extern crate` item looks the crate up by the name it
+/// writes, so binding only one of the two leaves the other
+/// reference unresolved (E0463). When two built crates share a
+/// declared name (two svh `a` crates, the duplicate-rlib `foo`
+/// crates), each is bound in build order and rustc's own
+/// `--extern` precedence decides, as under compiletest.
+fn bind_names_for<'a>(
+    built: &'a AuxBuilt,
+    declared: &std::collections::HashSet<String>,
+) -> Vec<&'a str> {
+    binding_names_for(built)
+        .into_iter()
+        .filter(|name| declared.contains(*name))
+        .collect()
+}
+
 /// Compile one auxiliary source file with the pinned rustc into
 /// `aux_dir`, under the source's declared `#![crate_name]` or the
 /// file-stem name compiletest's auxiliary builds use (never the
@@ -1940,12 +2059,13 @@ fn compile_aux(
     // accompany its declaration, and a crate visible as a direct
     // dependency is not a private one. Undeclared transitive deps
     // still resolve through the `-L dependency` directory above.
-    let deps = declared_aux_binding_names(&src_text);
+    let mut deps = declared_aux_binding_names(&src_text);
+    deps.extend(locator_extern_names(&declared_compile_flags(&src_text)));
     for prev in previous {
         if let Some(artifact) = &prev.artifact {
-            if deps.contains(&prev.extern_name) {
+            for bind in bind_names_for(prev, &deps) {
                 cmd.arg("--extern")
-                    .arg(format!("{}={}", prev.extern_name, artifact.display()));
+                    .arg(format!("{}={}", bind, artifact.display()));
             }
         }
     }
@@ -1964,23 +2084,36 @@ fn compile_aux(
             first_error_line(&stderr)
         ));
     }
-    // Locate the produced artifact: lib<name>.rlib / .rmeta / .so.
+    // Locate the produced artifact: lib<name>.rlib / .rmeta /
+    // .so. A build carrying `-C extra-filename=<suffix>` (an
+    // auxiliary source's own compile-flags can set one — the
+    // crateresolve crates use `-C extra-filename=-1`) names its
+    // artifact lib<name><suffix>.rlib instead, with the suffix
+    // between the crate name and the extension; accept that
+    // shape too, ranked below the plain lib<name>. artifact. A
+    // `-` after the name can only be that separator: crate names
+    // never contain one (declared names forbid it, and file
+    // stems had theirs replaced with underscores).
     let mut artifact: Option<std::path::PathBuf> = None;
-    let mut best_rank = u8::MAX;
+    let mut best_rank = (u8::MAX, u8::MAX);
     if let Ok(entries) = std::fs::read_dir(aux_dir) {
         for entry in entries.flatten() {
             let fname = entry.file_name().to_string_lossy().into_owned();
-            if !fname.starts_with(&format!("lib{effective_name}.")) {
+            let group = if fname.starts_with(&format!("lib{effective_name}.")) {
+                0
+            } else if fname.starts_with(&format!("lib{effective_name}-")) {
+                1
+            } else {
                 continue;
-            }
-            let rank = match fname.rsplit('.').next() {
+            };
+            let ext = match fname.rsplit('.').next() {
                 Some("rlib") => 0,
                 Some("rmeta") => 1,
                 Some("so") | Some("dylib") | Some("dll") => 2,
                 _ => continue,
             };
-            if rank < best_rank {
-                best_rank = rank;
+            if (group, ext) < best_rank {
+                best_rank = (group, ext);
                 artifact = Some(entry.path());
             }
         }
@@ -2147,6 +2280,9 @@ fn main() {
     }
     // Caller-supplied rustc arguments (a test's `//@ compile-flags`,
     // per-revision `--cfg`s) go last, as they do under compiletest.
+    // The `--extern` names among them are captured first: the
+    // auxiliary binding below counts them as declarations.
+    let locator_names = locator_extern_names(&rustc_args);
     args.extend(rustc_args);
     if !aux_built.is_empty() {
         args.push("-L".to_string());
@@ -2158,14 +2294,15 @@ fn main() {
         // directory, not as direct `--extern`s — a transitive crate
         // bound directly stops being a private dependency, which
         // changes lint outcomes like exported_private_dependencies).
-        let top_names = std::fs::read_to_string(&input)
+        let mut top_names = std::fs::read_to_string(&input)
             .map(|text| declared_aux_binding_names(&text))
             .unwrap_or_default();
+        top_names.extend(locator_names.iter().cloned());
         for built in &aux_built {
             if let Some(artifact) = &built.artifact {
-                if top_names.contains(&built.extern_name) {
+                for bind in bind_names_for(built, &top_names) {
                     args.push("--extern".to_string());
-                    args.push(format!("{}={}", built.extern_name, artifact.display()));
+                    args.push(format!("{}={}", bind, artifact.display()));
                 }
             }
         }
