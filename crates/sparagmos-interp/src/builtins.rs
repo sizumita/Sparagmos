@@ -2674,16 +2674,36 @@ impl<'a> Interpreter<'a> {
                     || self_ty.starts_with("std::ops::RangeInclusive<")
                     || self_ty.starts_with("std::iter::Rev<")
                     || self_ty.starts_with("std::slice::Iter<")
+                    || self_ty.starts_with("std::slice::IterMut<")
+                    || self_ty.starts_with("std::array::IntoIter<")
+                    || self_ty.starts_with("std::vec::IntoIter<")
+                    || self_ty.starts_with("alloc::vec::IntoIter<")
+                    || self_ty.starts_with("std::option::IntoIter<")
+                    || self_ty.starts_with("std::option::Iter<")
+                    || self_ty.starts_with("std::option::IterMut<")
+                    || self_ty.starts_with("std::iter::Map<")
+                    || self_ty.starts_with("std::iter::Enumerate<")
+                    || self_ty.starts_with("std::iter::Copied<")
+                    || self_ty.starts_with("std::iter::Take<")
+                    || self_ty.starts_with("std::iter::SkipWhile<")
+                    || self_ty.starts_with("std::iter::Once<")
+                    || self_ty.starts_with("std::iter::Empty<")
+                    || self_ty.starts_with("std::iter::Repeat<")
                     || self_ty_is(self_ty, "std::str::Chars")
                     || self_ty_is(self_ty, "core::str::Chars")
                     || self_ty_is(self_ty, "std::str::Bytes")
                     || self_ty_is(self_ty, "core::str::Bytes")
                 {
-                    // A range is its own iterator in this model, and a
-                    // slice / char / byte iterator is already in
-                    // `next`-ready shape (built by the `slice::iter`
-                    // runtime support, resp. the `str::chars` /
-                    // `str::bytes` runtime support).
+                    // These types are their own iterator: the
+                    // blanket `IntoIterator for I: Iterator` impl
+                    // is the identity, and the value is already in
+                    // the shape `Iterator::next` consumes for the
+                    // type — a range is its own state, a slice /
+                    // char / byte iterator was built by the
+                    // corresponding runtime support, an adapter or
+                    // source iterator by its constructor's
+                    // converted body, and the owning iterators by
+                    // the arms below.
                     Ok(value)
                 } else if self_ty.starts_with('[') {
                     // Array by value: iteration state is the element
@@ -2745,6 +2765,64 @@ impl<'a> Interpreter<'a> {
                         variant: 0,
                         fields: vec![value],
                     })
+                } else if self_ty.starts_with("std::option::Option<")
+                    || self_ty.starts_with("core::option::Option<")
+                {
+                    // An `Option<T>` by value iterates as
+                    // `option::IntoIter` over zero or one element,
+                    // in the same owning-iterator state shape.
+                    let elems = match &value {
+                        Value::Enum {
+                            variant: 1,
+                            fields,
+                        } => fields.clone(),
+                        Value::Enum { variant: 0, .. } => Vec::new(),
+                        other => {
+                            return Err(InterpError::type_mismatch(
+                                "IntoIterator::into_iter for an Option",
+                                "option value",
+                                other.kind_name(),
+                            ))
+                        }
+                    };
+                    Ok(owned_iter_state(elems))
+                } else if let Some(inner) = self_ty.strip_prefix("&mut ") {
+                    if inner.starts_with("std::vec::Vec<")
+                        || inner.starts_with("alloc::vec::Vec<")
+                        || inner.starts_with('[')
+                    {
+                        // `&mut Vec<T>`, `&mut [T; N]` and `&mut [T]`
+                        // iterate as `slice::IterMut`: the state is
+                        // the container reference, the next index
+                        // and the length. The elements stay in the
+                        // container's own storage; each step hands
+                        // out a reference to the element place (see
+                        // `Iterator::next` for `slice::IterMut`).
+                        let len = match &value {
+                            Value::FatRef { len, .. } => *len,
+                            _ => {
+                                let target = self.deref_value(frames, &value)?;
+                                let pointee = self.read_resolved(frames, &target)?;
+                                value_elements(&pointee)?.len() as u128
+                            }
+                        };
+                        Ok(Value::Enum {
+                            variant: 0,
+                            fields: vec![value, Value::Uint(0), Value::Uint(len)],
+                        })
+                    } else if inner.starts_with("std::option::Option<")
+                        || inner.starts_with("core::option::Option<")
+                    {
+                        self.option_ref_into_iter(frames, &value, true)
+                    } else {
+                        Err(unsupported(format!(
+                            "IntoIterator::into_iter for {self_ty} is not runtime-supported"
+                        )))
+                    }
+                } else if self_ty.starts_with("&std::option::Option<")
+                    || self_ty.starts_with("&core::option::Option<")
+                {
+                    self.option_ref_into_iter(frames, &value, false)
                 } else {
                     Err(unsupported(format!(
                         "IntoIterator::into_iter for {self_ty} is not runtime-supported"
@@ -5330,6 +5408,85 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    fn option_ref_into_iter(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        value: &Value,
+        mutable: bool,
+    ) -> InterpResult<Value> {
+        let target = self.deref_value(frames, value)?;
+        let option = self.read_resolved(frames, &target)?;
+        let elems = match &option {
+            Value::Enum { variant: 1, .. } => {
+                let elem = match &target {
+                    Resolved::Place {
+                        frame_pos,
+                        local,
+                        projection,
+                    } => {
+                        let mut projection = projection.clone();
+                        projection.push(RefProj::Field(0));
+                        Value::Ref(RefTarget::place(
+                            frames[*frame_pos].id,
+                            *local,
+                            projection,
+                        ))
+                    }
+                    Resolved::Static { name, projection } => {
+                        let mut projection = projection.clone();
+                        projection.push(RefProj::Field(0));
+                        Value::Ref(RefTarget::Static {
+                            name: name.clone(),
+                            projection,
+                        })
+                    }
+                    Resolved::Alloc { id, projection } => {
+                        let mut projection = projection.clone();
+                        projection.push(RefProj::Field(0));
+                        Value::Ref(RefTarget::Alloc {
+                            id: *id,
+                            projection,
+                        })
+                    }
+                    Resolved::Value(v) => {
+                        if mutable {
+                            return Err(unsupported(
+                                "IntoIterator::into_iter for &mut Option over a constant aggregate is not runtime-supported",
+                            ));
+                        }
+                        match v {
+                            Value::Enum { fields, .. } if !fields.is_empty() => {
+                                Value::Ref(RefTarget::Value(Box::new(fields[0].clone())))
+                            }
+                            other => {
+                                return Err(InterpError::type_mismatch(
+                                    "IntoIterator::into_iter for &Option",
+                                    "option value",
+                                    other.kind_name(),
+                                ))
+                            }
+                        }
+                    }
+                };
+                vec![elem]
+            }
+            Value::Enum { variant: 0, .. } => Vec::new(),
+            other => {
+                return Err(InterpError::type_mismatch(
+                    "IntoIterator::into_iter for &Option",
+                    "option value",
+                    other.kind_name(),
+                ))
+            }
+        };
+        Ok(Value::Enum {
+            variant: 0,
+            fields: vec![Value::Tuple(elems), Value::Uint(0)],
+        })
+    }
+
+    /// `Iterator::next`: mutate the iterator in place through the
+    /// `&mut` argument and return the `Option` value.
     fn iterator_next(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -5337,16 +5494,42 @@ impl<'a> Interpreter<'a> {
         ref_arg: &Value,
     ) -> InterpResult<Value> {
         let target = self.deref_value(frames, ref_arg)?;
-        let state = self.read_resolved(frames, &target)?;
+        self.iterator_next_at(frames, self_ty, &target)
+    }
+
+    /// `Iterator::next` on the iterator stored at `target`:
+    /// mutate it in place and return the `Option` value.
+    fn iterator_next_at(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        self_ty: &str,
+        target: &Resolved,
+    ) -> InterpResult<Value> {
+        // A `Map` on a place-based state is stepped in place
+        // (its closure's environment reference must name the
+        // closure field's own storage); `map_next` declines a
+        // state that does not live in a place, and the
+        // value-level step below then applies.
+        if self_ty.starts_with("std::iter::Map<") {
+            if let Some(result) = self.map_next(frames, self_ty, target)? {
+                return Ok(result);
+            }
+        }
+        if self_ty.starts_with("std::iter::SkipWhile<") {
+            if let Some(result) = self.skip_while_next(frames, self_ty, target)? {
+                return Ok(result);
+            }
+        }
+        let state = self.read_resolved(frames, target)?;
         let (new_state, result) = self.iterator_next_state(frames, self_ty, state)?;
-        self.write_resolved(frames, &target, new_state)?;
+        self.write_resolved(frames, target, new_state)?;
         Ok(result)
     }
 
     /// The state transition of `Iterator::next` for the modelled
     /// iterator shapes, as a function of the iterator state value
     /// alone: returns the successor state and the `Option` result.
-    /// `iterator_next` applies it to the state stored behind a
+    /// `iterator_next_at` applies it to the state stored behind a
     /// reference; the consumer builtins (`count`, `fold`,
     /// `collect`, `for_each`) drive it directly over the owned
     /// iterator value they receive, performing exactly the
@@ -5445,7 +5628,242 @@ impl<'a> Interpreter<'a> {
                 },
             ));
         }
-        let fields = iterator_fields(&state, self_ty)?;
+        let (new_state, result) = self.next_on_state(frames, self_ty, &state)?;
+        self.write_resolved(frames, target, new_state)?;
+        Ok(result)
+    }
+
+    fn map_next(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        self_ty: &str,
+        target: &Resolved,
+    ) -> InterpResult<Option<Value>> {
+        let Some(inner_target) = extend_target(target, RefProj::Field(0)) else {
+            return Ok(None);
+        };
+        let Some(closure_target) = extend_target(target, RefProj::Field(1)) else {
+            return Ok(None);
+        };
+        let inner_ty = first_generic_arg(self_ty).unwrap_or("");
+        let item = self.iterator_next_at(frames, inner_ty, &inner_target)?;
+        let Some(item) = option_payload(item) else {
+            return Ok(Some(none_value()));
+        };
+        let callable = self.read_resolved(frames, &closure_target)?;
+        let env_ref = match &closure_target {
+            Resolved::Place {
+                frame_pos,
+                local,
+                projection,
+            } => Value::Ref(RefTarget::place(
+                frames[*frame_pos].id,
+                *local,
+                projection.clone(),
+            )),
+            Resolved::Static { name, projection } => Value::Ref(RefTarget::Static {
+                name: name.clone(),
+                projection: projection.clone(),
+            }),
+            Resolved::Alloc { id, projection } => Value::Ref(RefTarget::Alloc {
+                id: *id,
+                projection: projection.clone(),
+            }),
+            Resolved::Value(_) => unreachable!("closure target is a place"),
+        };
+        let mapped = self.call_callable_sync(frames, &callable, Some(env_ref), vec![item])?;
+        Ok(Some(some_value(mapped)))
+    }
+
+    fn target_ref_value(&self, frames: &[Frame], target: &Resolved) -> InterpResult<Value> {
+        match target {
+            Resolved::Place {
+                frame_pos,
+                local,
+                projection,
+            } => Ok(Value::Ref(RefTarget::place(
+                frames[*frame_pos].id,
+                *local,
+                projection.clone(),
+            ))),
+            Resolved::Static { name, projection } => Ok(Value::Ref(RefTarget::Static {
+                name: name.clone(),
+                projection: projection.clone(),
+            })),
+            Resolved::Alloc { id, projection } => Ok(Value::Ref(RefTarget::Alloc {
+                id: *id,
+                projection: projection.clone(),
+            })),
+            Resolved::Value(_) => Err(unsupported(
+                "a closure environment reference for a value with no storage".to_string(),
+            )),
+        }
+    }
+
+    fn skip_while_next(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        self_ty: &str,
+        target: &Resolved,
+    ) -> InterpResult<Option<Value>> {
+        let Some(inner_target) = extend_target(target, RefProj::Field(0)) else {
+            return Ok(None);
+        };
+        let Some(flag_target) = extend_target(target, RefProj::Field(1)) else {
+            return Ok(None);
+        };
+        let Some(closure_target) = extend_target(target, RefProj::Field(2)) else {
+            return Ok(None);
+        };
+        let inner_ty = first_generic_arg(self_ty).unwrap_or("");
+        loop {
+            let state = self.read_resolved(frames, target)?;
+            let fields = iterator_fields(&state, self_ty)?;
+            let done = matches!(fields.get(1), Some(Value::Bool(true)));
+            let item = self.iterator_next_at(frames, inner_ty, &inner_target)?;
+            let Some(item) = option_payload(item) else {
+                return Ok(Some(none_value()));
+            };
+            if done {
+                return Ok(Some(some_value(item)));
+            }
+            let callable = self.read_resolved(frames, &closure_target)?;
+            let env_ref = self.target_ref_value(frames, &closure_target)?;
+            let arg = Value::Ref(RefTarget::Value(Box::new(item.clone())));
+            let keep = self.call_callable_sync(frames, &callable, Some(env_ref), vec![arg])?;
+            match keep {
+                Value::Bool(true) => continue,
+                Value::Bool(false) => {
+                    self.write_resolved(frames, &flag_target, Value::Bool(true))?;
+                    return Ok(Some(some_value(item)));
+                }
+                other => {
+                    return Err(InterpError::type_mismatch(
+                        "SkipWhile predicate result",
+                        "a boolean",
+                        other.kind_name(),
+                    ))
+                }
+            }
+        }
+    }
+
+    fn iter_mut_element_ref(
+        &self,
+        frames: &[Frame],
+        container: &Value,
+        idx: usize,
+    ) -> InterpResult<Value> {
+        match container {
+            Value::Ref(RefTarget::Place {
+                frame,
+                local,
+                projection,
+            }) => {
+                let target = Resolved::Place {
+                    frame_pos: self.frame_pos(frames, *frame)?,
+                    local: *local,
+                    projection: projection.clone(),
+                };
+                let base = self.read_resolved(frames, &target)?;
+                let mut projection = projection.clone();
+                match base {
+                    Value::Tuple(_) => projection.push(RefProj::Index(idx)),
+                    Value::Enum { .. } => projection.push(RefProj::Field(idx)),
+                    ref other => {
+                        return Err(unsupported(format!(
+                            "Iterator::next for slice::IterMut over a {} is not runtime-supported",
+                            other.kind_name()
+                        )))
+                    }
+                }
+                Ok(Value::Ref(RefTarget::Place {
+                    frame: *frame,
+                    local: *local,
+                    projection,
+                }))
+            }
+            Value::Ref(RefTarget::Static { name, projection }) => {
+                let target = Resolved::Static {
+                    name: name.clone(),
+                    projection: projection.clone(),
+                };
+                let base = self.read_resolved(frames, &target)?;
+                let mut projection = projection.clone();
+                match base {
+                    Value::Tuple(_) => projection.push(RefProj::Index(idx)),
+                    Value::Enum { .. } => projection.push(RefProj::Field(idx)),
+                    ref other => {
+                        return Err(unsupported(format!(
+                            "Iterator::next for slice::IterMut over a {} is not runtime-supported",
+                            other.kind_name()
+                        )))
+                    }
+                }
+                Ok(Value::Ref(RefTarget::Static {
+                    name: name.clone(),
+                    projection,
+                }))
+            }
+            Value::FatRef { base, .. } => self.iter_mut_element_ref(frames, base, idx),
+            other => Err(unsupported(format!(
+                "Iterator::next for slice::IterMut over {} is not runtime-supported",
+                other.kind_name()
+            ))),
+        }
+    }
+
+    /// One `Iterator::next` step on an iterator state value:
+    /// the new state and the step's `Option` value. Most
+    /// iterators are stepped here, on their state as a value;
+    /// a `Map` whose state lives in a place is stepped in
+    /// `map_next` instead, and this value-level step is the
+    /// fallback for a `Map` behind a constant aggregate.
+    fn next_on_state(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        self_ty: &str,
+        state: &Value,
+    ) -> InterpResult<(Value, Value)> {
+        if self_ty.starts_with("std::option::Iter<")
+            || self_ty.starts_with("std::option::IterMut<")
+        {
+            // Two state shapes reach here: the [elements, index]
+            // state `IntoIterator` builds for `&Option` /
+            // `&mut Option` (the element is the payload
+            // reference itself, yielded as it is), and the shape
+            // `Option::iter`'s own converted body builds — the
+            // option nested inside one-field wrappers
+            // (`Iter { inner: Item { .. } }`).
+            let fields = iterator_fields(state, self_ty)?;
+            if fields.len() == 2 {
+                if let (Value::Tuple(items), Value::Uint(idx)) = (&fields[0], &fields[1]) {
+                    let idx = *idx as usize;
+                    if idx < items.len() {
+                        let item = items[idx].clone();
+                        let new_state = rebuild_state(
+                            state,
+                            vec![
+                                Value::Tuple(items.clone()),
+                                Value::Uint((idx + 1) as u128),
+                            ],
+                        );
+                        return Ok((new_state, some_value(item)));
+                    }
+                    return Ok((state.clone(), none_value()));
+                }
+            }
+            return match take_option_payload(state) {
+                Ok(Some((new_state, item))) => Ok((new_state, some_value(item))),
+                Ok(None) => Ok((state.clone(), none_value())),
+                Err(()) => Err(InterpError::type_mismatch(
+                    format!("iterator state of {self_ty}"),
+                    "an Option value in one-field wrappers",
+                    state.kind_name(),
+                )),
+            };
+        }
+        let fields = iterator_fields(state, self_ty)?;
         let (new_fields, result) = if self_ty.starts_with("std::ops::RangeInclusive<") {
             if fields.len() != 3 {
                 return Err(InterpError::type_mismatch(
@@ -5493,6 +5911,7 @@ impl<'a> Interpreter<'a> {
         } else if self_ty.starts_with("std::array::IntoIter<")
             || self_ty.starts_with("std::vec::IntoIter<")
             || self_ty.starts_with("alloc::vec::IntoIter<")
+            || self_ty.starts_with("std::option::IntoIter<")
             || self_ty.starts_with("std::slice::Iter<")
             || self_ty_is(self_ty, "std::str::Chars")
             || self_ty_is(self_ty, "core::str::Chars")
@@ -5540,6 +5959,25 @@ impl<'a> Interpreter<'a> {
                 } else {
                     item
                 };
+                // An owning iterator's yielded element has moved
+                // out of the iterator's storage: mark the slot
+                // uninitialized in the new state, so the state's
+                // drop glue (which walks the element tuple) does
+                // not drop it a second time. A `slice::Iter`'s
+                // elements stay owned by the slice, and `Chars` /
+                // `Bytes` elements carry no glue, so their
+                // snapshots keep the elements.
+                let items = if self_ty.starts_with("std::array::IntoIter<")
+                    || self_ty.starts_with("std::vec::IntoIter<")
+                    || self_ty.starts_with("alloc::vec::IntoIter<")
+                    || self_ty.starts_with("std::option::IntoIter<")
+                {
+                    let mut items = items;
+                    items[idx] = Value::Uninit;
+                    items
+                } else {
+                    items
+                };
                 (
                     vec![Value::Tuple(items), Value::Uint((idx + 1) as u128)],
                     some_value(item),
@@ -5571,19 +6009,251 @@ impl<'a> Interpreter<'a> {
                     None => none_value(),
                 },
             )
+        } else if self_ty.starts_with("std::slice::IterMut<") {
+            // The state `IntoIterator` builds for `&mut Vec` /
+            // `&mut [T; N]` / `&mut [T]`: the container
+            // reference, the next index and the length. The
+            // element handed out is a reference to the element's
+            // place in the container's own storage.
+            if fields.len() != 3 {
+                return Err(InterpError::type_mismatch(
+                    "slice::IterMut state",
+                    "[container, next index, length]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let idx = match fields[1] {
+                Value::Uint(v) => v,
+                ref other => {
+                    return Err(InterpError::type_mismatch(
+                        "slice::IterMut index",
+                        "unsigned integer",
+                        other.kind_name(),
+                    ))
+                }
+            };
+            let len = match fields[2] {
+                Value::Uint(v) => v,
+                ref other => {
+                    return Err(InterpError::type_mismatch(
+                        "slice::IterMut length",
+                        "unsigned integer",
+                        other.kind_name(),
+                    ))
+                }
+            };
+            if idx < len {
+                let elem = self.iter_mut_element_ref(frames, &fields[0], idx as usize)?;
+                (
+                    vec![fields[0].clone(), Value::Uint(idx + 1), Value::Uint(len)],
+                    some_value(elem),
+                )
+            } else {
+                (fields, none_value())
+            }
+        } else if self_ty.starts_with("std::iter::Once<") {
+            // `Once` is a one-field struct wrapping an `Option`:
+            // the payload is taken on the first step.
+            if fields.len() != 1 {
+                return Err(InterpError::type_mismatch(
+                    "Once state",
+                    "[option]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            // The field wraps the option in the same one-field
+            // chain `option::IntoIter` is built from
+            // (`Once { inner: IntoIter { inner: Item { .. } } }`).
+            match take_option_payload(&fields[0]) {
+                Ok(Some((new_inner, item))) => (vec![new_inner], some_value(item)),
+                Ok(None) => (fields, none_value()),
+                Err(()) => {
+                    return Err(InterpError::type_mismatch(
+                        "Once state",
+                        "an Option value in one-field wrappers",
+                        fields[0].kind_name(),
+                    ))
+                }
+            }
+        } else if self_ty.starts_with("std::iter::Repeat<") {
+            // `Repeat` yields a clone of its one field forever;
+            // in the value model the clone is the value itself.
+            if fields.len() != 1 {
+                return Err(InterpError::type_mismatch(
+                    "Repeat state",
+                    "[element]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let elem = fields[0].clone();
+            (fields, some_value(elem))
+        } else if self_ty.starts_with("std::iter::Enumerate<") {
+            // `Enumerate` is (inner iterator, count): the step
+            // is the inner step paired with the current count.
+            if fields.len() != 2 {
+                return Err(InterpError::type_mismatch(
+                    "Enumerate state",
+                    "[iterator, count]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let count = match fields[1] {
+                Value::Uint(v) => v,
+                ref other => {
+                    return Err(InterpError::type_mismatch(
+                        "Enumerate count",
+                        "unsigned integer",
+                        other.kind_name(),
+                    ))
+                }
+            };
+            let inner_ty = first_generic_arg(self_ty).unwrap_or("");
+            let (new_inner, item) = self.next_on_state(frames, inner_ty, &fields[0])?;
+            match option_payload(item) {
+                None => (vec![new_inner, Value::Uint(count)], none_value()),
+                Some(x) => (
+                    vec![new_inner, Value::Uint(count + 1)],
+                    some_value(Value::Tuple(vec![Value::Uint(count), x])),
+                ),
+            }
+        } else if self_ty.starts_with("std::iter::Copied<") {
+            // `Copied` is (inner iterator): the step is the
+            // inner step with the yielded reference followed to
+            // the element it denotes.
+            if fields.len() != 1 {
+                return Err(InterpError::type_mismatch(
+                    "Copied state",
+                    "[iterator]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let inner_ty = first_generic_arg(self_ty).unwrap_or("");
+            let (new_inner, item) = self.next_on_state(frames, inner_ty, &fields[0])?;
+            match option_payload(item) {
+                None => (vec![new_inner], none_value()),
+                Some(x) => {
+                    let copied = self.resolve_value(frames, &x)?;
+                    (vec![new_inner], some_value(copied))
+                }
+            }
+        } else if self_ty.starts_with("std::iter::SkipWhile<") {
+            // `SkipWhile` is (inner iterator, done flag,
+            // predicate) — core's own field layout: the
+            // predicate is consulted only until its first
+            // failure, which sets the flag. The predicate takes
+            // the item by reference and is handed a reference
+            // to the pulled item.
+            if fields.len() != 3 {
+                return Err(InterpError::type_mismatch(
+                    "SkipWhile state",
+                    "[iterator, done, predicate]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let inner_ty = first_generic_arg(self_ty).unwrap_or("");
+            let mut inner = fields[0].clone();
+            let predicate = fields[2].clone();
+            let mut done = matches!(fields.get(1), Some(Value::Bool(true)));
+            let mut result = none_value();
+            loop {
+                let (new_inner, item) = self.next_on_state(frames, inner_ty, &inner)?;
+                inner = new_inner;
+                let Some(x) = option_payload(item) else {
+                    break;
+                };
+                if done {
+                    result = some_value(x);
+                    break;
+                }
+                let arg = Value::Ref(RefTarget::Value(Box::new(x.clone())));
+                let keep = self.call_callable_sync(frames, &predicate, None, vec![arg])?;
+                match keep {
+                    Value::Bool(true) => continue,
+                    Value::Bool(false) => {
+                        done = true;
+                        result = some_value(x);
+                        break;
+                    }
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            "SkipWhile predicate result",
+                            "a boolean",
+                            other.kind_name(),
+                        ))
+                    }
+                }
+            }
+            (vec![inner, Value::Bool(done), predicate], result)
+        } else if self_ty.starts_with("std::iter::Take<") {
+            // `Take` is (inner iterator, remaining count): at
+            // zero it yields `None` without touching the inner
+            // iterator.
+            if fields.len() != 2 {
+                return Err(InterpError::type_mismatch(
+                    "Take state",
+                    "[iterator, remaining]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let remaining = match fields[1] {
+                Value::Uint(v) => v,
+                ref other => {
+                    return Err(InterpError::type_mismatch(
+                        "Take remaining count",
+                        "unsigned integer",
+                        other.kind_name(),
+                    ))
+                }
+            };
+            if remaining == 0 {
+                (fields, none_value())
+            } else {
+                let inner_ty = first_generic_arg(self_ty).unwrap_or("");
+                let (new_inner, item) = self.next_on_state(frames, inner_ty, &fields[0])?;
+                match option_payload(item) {
+                    None => (vec![new_inner, Value::Uint(remaining)], none_value()),
+                    Some(x) => (
+                        vec![new_inner, Value::Uint(remaining - 1)],
+                        some_value(x),
+                    ),
+                }
+            }
+        } else if self_ty.starts_with("std::iter::Map<") {
+            // `Map` is (inner iterator, closure): the step is
+            // the inner step with the closure applied to the
+            // element. This is the value-level step, used when
+            // the Map does not live in a place (see `map_next`):
+            // the closure is applied with a reference to the
+            // value itself, so capture reads resolve and writes
+            // to by-value captures are the explicit
+            // constant-aggregate error inside the call.
+            if fields.len() != 2 {
+                return Err(InterpError::type_mismatch(
+                    "Map state",
+                    "[iterator, closure]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let inner_ty = first_generic_arg(self_ty).unwrap_or("");
+            let (new_inner, item) = self.next_on_state(frames, inner_ty, &fields[0])?;
+            match option_payload(item) {
+                None => (vec![new_inner, fields[1].clone()], none_value()),
+                Some(x) => {
+                    let mapped =
+                        self.call_callable_sync(frames, &fields[1], None, vec![x])?;
+                    (
+                        vec![new_inner, fields[1].clone()],
+                        some_value(mapped),
+                    )
+                }
+            }
         } else {
             return Err(unsupported(format!(
                 "Iterator::next for {self_ty} is not runtime-supported"
             )));
         };
-        let new_state = match state {
-            Value::Enum { variant, .. } => Value::Enum {
-                variant,
-                fields: new_fields,
-            },
-            _ => Value::Tuple(new_fields),
-        };
-        Ok((new_state, result))
+        Ok((rebuild_state(state, new_fields), result))
+
     }
 
     /// Step an iterator value to exhaustion with the
@@ -7187,6 +7857,96 @@ fn iterator_fields(state: &Value, self_ty: &str) -> InterpResult<Vec<Value>> {
             "ADT value",
             other.kind_name(),
         )),
+    }
+}
+
+fn rebuild_state(state: &Value, new_fields: Vec<Value>) -> Value {
+    match state {
+        Value::Enum { variant, .. } => Value::Enum {
+            variant: *variant,
+            fields: new_fields,
+        },
+        _ => Value::Tuple(new_fields),
+    }
+}
+
+fn option_payload(value: Value) -> Option<Value> {
+    match value {
+        Value::Enum {
+            variant: 1,
+            mut fields,
+        } if fields.len() == 1 => Some(fields.remove(0)),
+        _ => None,
+    }
+}
+
+fn extend_target(target: &Resolved, step: RefProj) -> Option<Resolved> {
+    match target {
+        Resolved::Place {
+            frame_pos,
+            local,
+            projection,
+        } => {
+            let mut projection = projection.clone();
+            projection.push(step);
+            Some(Resolved::Place {
+                frame_pos: *frame_pos,
+                local: *local,
+                projection,
+            })
+        }
+        Resolved::Static { name, projection } => {
+            let mut projection = projection.clone();
+            projection.push(step);
+            Some(Resolved::Static {
+                name: name.clone(),
+                projection,
+            })
+        }
+        Resolved::Alloc { id, projection } => {
+            let mut projection = projection.clone();
+            projection.push(step);
+            Some(Resolved::Alloc {
+                id: *id,
+                projection,
+            })
+        }
+        Resolved::Value(_) => None,
+    }
+}
+
+fn take_option_payload(state: &Value) -> Result<Option<(Value, Value)>, ()> {
+    match state {
+        Value::Enum {
+            variant: 1,
+            fields,
+        } if fields.len() == 1 => Ok(Some((
+            Value::Enum {
+                variant: 0,
+                fields: Vec::new(),
+            },
+            fields[0].clone(),
+        ))),
+        Value::Enum { variant: 0, fields } if fields.is_empty() => Ok(None),
+        Value::Enum { variant: 0, fields } if fields.len() == 1 => {
+            match take_option_payload(&fields[0])? {
+                Some((new_inner, item)) => Ok(Some((
+                    Value::Enum {
+                        variant: 0,
+                        fields: vec![new_inner],
+                    },
+                    item,
+                ))),
+                None => Ok(None),
+            }
+        }
+        Value::Tuple(items) if items.len() == 1 => match take_option_payload(&items[0])? {
+            Some((new_inner, item)) => {
+                Ok(Some((Value::Tuple(vec![new_inner]), item)))
+            }
+            None => Ok(None),
+        },
+        _ => Err(()),
     }
 }
 
