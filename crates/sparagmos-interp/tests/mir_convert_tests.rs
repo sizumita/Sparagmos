@@ -3086,3 +3086,199 @@ fn transmute_enum_with_payload_stays_unsupported() {
         "expected UnsupportedRvalue, got {err}"
     );
 }
+
+// A `ZeroSized` constant operand transmuted into a zero-sized
+// array type: the target type's unique value.
+#[test]
+fn transmute_zero_sized_constant_into_zst_array() {
+    let target = mir::Ty::Array(
+        Box::new(mir::Ty::Array(Box::new(u32_ty()), mir::ArrayLen::Known(0))),
+        mir::ArrayLen::Known(2),
+    );
+    let body = mir::Body::new(
+        decls(&[target.clone()]),
+        0,
+        vec![block(
+            vec![assign(
+                place(0),
+                transmute(
+                    mir::Operand::constant(mir::Constant::from_value(
+                        mir::ConstValue::ZeroSized,
+                    )),
+                    target,
+                ),
+            )],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("f", body);
+    assert_eq!(
+        interpret_mir(&prog, "f", vec![])
+            .expect("zero-sized constant transmute runs"),
+        Value::Tuple(vec![Value::Tuple(vec![]), Value::Tuple(vec![])])
+    );
+}
+
+const WRAP1_DEF: mir::DefId = mir::DefId::new(0, 81);
+
+fn wrap1_ty() -> mir::Ty {
+    mir::Ty::Adt(WRAP1_DEF, vec![])
+}
+
+// Integer -> enum with a single variant carrying a single
+// integer payload: that variant holding the integer.
+#[test]
+fn transmute_int_into_single_variant_payload_enum() {
+    let body = mir::Body::new(
+        decls(&[wrap1_ty()]),
+        0,
+        vec![block(
+            vec![assign(place(0), transmute(const_u32(2), wrap1_ty()))],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.adt_shapes.insert(
+        WRAP1_DEF,
+        mir::AdtShape {
+            kind: mir::AdtShapeKind::Enum,
+            variants: vec![vec![u32_ty()]],
+        },
+    );
+    prog.add("f", body);
+    assert_eq!(
+        interpret_mir(&prog, "f", vec![])
+            .expect("int-to-single-variant-enum transmute runs"),
+        Value::Enum {
+            variant: 0,
+            fields: vec![Value::Uint(2)],
+        }
+    );
+}
+
+const BAR_DEF: mir::DefId = mir::DefId::new(0, 82);
+
+fn bar_ty() -> mir::Ty {
+    mir::Ty::Adt(BAR_DEF, vec![])
+}
+
+// Single-field struct wrapping an integer -> fieldless enum:
+// the field is the discriminant (`Bar { a: 5 }` -> `Small`
+// variant with discriminant 5, read back as 5).
+#[test]
+fn transmute_single_field_struct_into_fieldless_enum() {
+    let body = mir::Body::new(
+        decls(&[u8_ty(), bar_ty(), small_ty()]),
+        0,
+        vec![block(
+            vec![
+                assign(
+                    place(1),
+                    adt_aggregate(BAR_DEF, 0, vec![], vec![const_u32(5)]),
+                ),
+                assign(place(2), transmute(copy(1), small_ty())),
+                assign(place(0), transmute(copy(2), u8_ty())),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = small_prog();
+    prog.adt_shapes.insert(
+        BAR_DEF,
+        mir::AdtShape {
+            kind: mir::AdtShapeKind::Struct,
+            variants: vec![vec![u32_ty()]],
+        },
+    );
+    prog.add("f", body);
+    assert_eq!(
+        interpret_mir(&prog, "f", vec![])
+            .expect("struct-to-enum transmute runs"),
+        Value::Uint(5)
+    );
+}
+
+// Single-field struct -> integer of the field's type: the
+// field itself (`Bar { a: 5 }` transmuted to u32 is 5).
+#[test]
+fn transmute_single_field_struct_into_int() {
+    let body = mir::Body::new(
+        decls(&[u32_ty(), bar_ty()]),
+        0,
+        vec![block(
+            vec![
+                assign(
+                    place(1),
+                    adt_aggregate(BAR_DEF, 0, vec![], vec![const_u32(5)]),
+                ),
+                assign(place(0), transmute(copy(1), u32_ty())),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.adt_shapes.insert(
+        BAR_DEF,
+        mir::AdtShape {
+            kind: mir::AdtShapeKind::Struct,
+            variants: vec![vec![u32_ty()]],
+        },
+    );
+    prog.add("f", body);
+    assert_eq!(
+        interpret_mir(&prog, "f", vec![])
+            .expect("struct-to-int transmute runs"),
+        Value::Uint(5)
+    );
+}
+
+const CELL_DEF: mir::DefId = mir::DefId::new(0, 83);
+
+// A transmute crossing an `UnsafeCell` wrapper boundary
+// (&UnsafeCell<u32> -> &u32) must NOT collapse to the identity:
+// the pointer would keep denoting the wrapper aggregate. It
+// stays an explicit unsupported until the field-entering
+// treatment the cast conversion uses is composed here.
+#[test]
+fn transmute_across_cell_wrapper_stays_unsupported() {
+    let cell_ty = mir::Ty::Adt(CELL_DEF, vec![u32_ty()]);
+    let ref_cell = mir::Ty::Ref(
+        mir::Region::Erased,
+        Box::new(cell_ty),
+        mir::Mutability::Not,
+    );
+    let ref_u32 = mir::Ty::Ref(
+        mir::Region::Erased,
+        Box::new(u32_ty()),
+        mir::Mutability::Not,
+    );
+    let body = mir::Body::new(
+        decls(&[ref_u32.clone(), ref_cell]),
+        0,
+        vec![block(
+            vec![assign(place(0), transmute(copy(1), ref_u32))],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.fn_names
+        .insert(CELL_DEF, "std::cell::UnsafeCell".to_string());
+    prog.adt_shapes.insert(
+        CELL_DEF,
+        mir::AdtShape {
+            kind: mir::AdtShapeKind::Struct,
+            variants: vec![vec![u32_ty()]],
+        },
+    );
+    prog.add("f", body);
+    let err = interpret_mir(&prog, "f", vec![])
+        .expect_err("cell-crossing transmute must stay unsupported");
+    assert!(
+        matches!(
+            err,
+            MirRunError::Interp(InterpError::UnsupportedRvalue { .. })
+        ),
+        "expected UnsupportedRvalue, got {err}"
+    );
+}
