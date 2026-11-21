@@ -3864,3 +3864,499 @@ fn reborrow_copies_the_pointer_value() {
     check(&jit, &prog, "read_shared", &[], vec![], Ok(41));
     check(&jit, &prog, "write_mut", &[], vec![], Ok(99));
 }
+
+// ----- signed integer indices -------------------------------------------------
+
+#[test]
+fn signed_index_into_a_local_array() {
+    let i32t = i(mir::IntTy::I32);
+    // fn idx(i: i32) -> i32 { _2 = Repeat(3, 2); _2[1] = 7; return _2[_1] }
+    let idx = spec(
+        "idx",
+        0,
+        1,
+        &[i32t.clone(), i32t.clone(), arr_i32(2)],
+        vec![bb(
+            vec![
+                assign(pl(2), mir::Rvalue::Repeat(i32c(3), 2)),
+                assign(cidx(2, 1, 2), mir::Rvalue::Use(i32c(7))),
+                assign(
+                    pl(0),
+                    mir::Rvalue::Use(mir::Operand::Copy(pl(2).index(mir::Local(1)))),
+                ),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    // fn set(i: i32, v: i32) -> i32 { _3 = Repeat(1, 2); _3[_1] = _2; return _3[_1] }
+    let set = spec(
+        "set",
+        1,
+        2,
+        &[i32t.clone(), i32t.clone(), i32t.clone(), arr_i32(2)],
+        vec![bb(
+            vec![
+                assign(pl(3), mir::Rvalue::Repeat(i32c(1), 2)),
+                assign(pl(3).index(mir::Local(1)), mir::Rvalue::Use(cp(2))),
+                assign(
+                    pl(0),
+                    mir::Rvalue::Use(mir::Operand::Copy(pl(3).index(mir::Local(1)))),
+                ),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    let (jit, prog) = build(&[idx, set]);
+    check(&jit, &prog, "idx", &[0], vec![int(0)], Ok(3));
+    check(&jit, &prog, "idx", &[1], vec![int(1)], Ok(7));
+    check(
+        &jit,
+        &prog,
+        "idx",
+        &[2],
+        vec![int(2)],
+        Err("index out of bounds: the len is 2 but the index is 2"),
+    );
+    check(
+        &jit,
+        &prog,
+        "idx",
+        &[-1],
+        vec![int(-1)],
+        Err("index out of bounds: negative index -1 used for _2[_1]"),
+    );
+    check(&jit, &prog, "set", &[1, 42], vec![int(1), int(42)], Ok(42));
+    check(
+        &jit,
+        &prog,
+        "set",
+        &[-2, 42],
+        vec![int(-2), int(42)],
+        Err("index out of bounds: negative index -2 used for _3[_1]"),
+    );
+}
+
+#[test]
+fn signed_index_into_a_slice() {
+    let i32t = i(mir::IntTy::I32);
+    // fn get(s: &[i32], i: i64) -> i32 { return (*s)[_2] }
+    let get = spec(
+        "get",
+        0,
+        2,
+        &[i32t.clone(), fatrefty(i32t.clone()), i(mir::IntTy::I64)],
+        vec![bb(
+            vec![assign(
+                pl(0),
+                mir::Rvalue::Use(mir::Operand::Copy(dpl(1).index(mir::Local(2)))),
+            )],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    let (jit, prog) = build(&[get]);
+    let store: [i64; 3] = [30, 20, 10];
+    let addr = store.as_ptr().wrapping_add(2) as i64;
+    check(
+        &jit,
+        &prog,
+        "get",
+        &[addr, 3, 1],
+        vec![fatval(&[10, 20, 30], 3), int(1)],
+        Ok(20),
+    );
+    check(
+        &jit,
+        &prog,
+        "get",
+        &[addr, 3, 5],
+        vec![fatval(&[10, 20, 30], 3), int(5)],
+        Err("index out of bounds: the len is 3 but the index is 5"),
+    );
+    check(
+        &jit,
+        &prog,
+        "get",
+        &[addr, 3, -2],
+        vec![fatval(&[10, 20, 30], 3), int(-2)],
+        Err("index out of bounds: negative index -2 used for _1.*[_2]"),
+    );
+}
+
+// ----- sub-slice projections ----------------------------------------------------
+
+/// `_n[from..to]`, or `_n[from..len - to]` when `from_end`: a
+/// sub-slice projection in the shape rustc emits for a range
+/// subscript of an array place.
+fn sub(n: u32, from: u64, to: u64, from_end: bool) -> mir::Place {
+    mir::Place {
+        local: mir::Local(n),
+        projection: vec![mir::PlaceElem::Subslice { from, to, from_end }],
+    }
+}
+
+/// `(*_n)[from..to]` (or the `from_end` form): a sub-slice of a
+/// slice reached through a dereference.
+fn dsub(n: u32, from: u64, to: u64, from_end: bool) -> mir::Place {
+    mir::Place {
+        local: mir::Local(n),
+        projection: vec![
+            mir::PlaceElem::Deref,
+            mir::PlaceElem::Subslice { from, to, from_end },
+        ],
+    }
+}
+
+/// Append a constant index projection to a place.
+fn then_cidx(mut p: mir::Place, offset: u64, min_length: u64) -> mir::Place {
+    p.projection.push(mir::PlaceElem::ConstantIndex {
+        offset,
+        min_length,
+        from_end: false,
+    });
+    p
+}
+
+/// Append a dynamic index projection to a place.
+fn then_idx(mut p: mir::Place, idx_local: u32) -> mir::Place {
+    p.projection.push(mir::PlaceElem::Index(mir::Local(idx_local)));
+    p
+}
+
+/// The statements that fill local `_1` (an `[i32; 5]`) with
+/// `[10, 20, 30, 40, 50]`.
+fn arr5_fill() -> Vec<mir::StatementKind> {
+    let mut stmts = vec![assign(pl(1), mir::Rvalue::Repeat(i32c(0), 5))];
+    for (k, v) in [10, 20, 30, 40, 50].iter().enumerate() {
+        stmts.push(assign(
+            cidx(1, k as u64, 5),
+            mir::Rvalue::Use(i32c(*v)),
+        ));
+    }
+    stmts
+}
+
+#[test]
+fn subslice_of_a_local_array() {
+    let i32t = i(mir::IntTy::I32);
+    let usizet = u(mir::UintTy::Usize);
+    // fn sublen() -> usize { _1 = [10,20,30,40,50]; return Len(_1[1..3]) }
+    let mut stmts = arr5_fill();
+    stmts.push(assign(pl(0), mir::Rvalue::Len(sub(1, 1, 3, false))));
+    let sublen = spec(
+        "sublen",
+        0,
+        0,
+        &[usizet.clone(), arr_i32(5)],
+        vec![bb(stmts, mir::TerminatorKind::Return)],
+    );
+    // fn subget() -> i32 { return _1[1..4][2] }
+    let mut stmts = arr5_fill();
+    stmts.push(assign(
+        pl(0),
+        mir::Rvalue::Use(mir::Operand::Copy(then_cidx(sub(1, 1, 4, false), 2, 3))),
+    ));
+    let subget = spec(
+        "subget",
+        1,
+        0,
+        &[i32t.clone(), arr_i32(5)],
+        vec![bb(stmts, mir::TerminatorKind::Return)],
+    );
+    // fn subdyn(i: usize) -> i32 { return _1[1..4][_2] }
+    let mut stmts = arr5_fill();
+    stmts.push(assign(
+        pl(0),
+        mir::Rvalue::Use(mir::Operand::Copy(then_idx(sub(1, 1, 4, false), 2))),
+    ));
+    let subdyn = spec(
+        "subdyn",
+        2,
+        1,
+        &[i32t.clone(), arr_i32(5), usizet.clone()],
+        vec![bb(stmts, mir::TerminatorKind::Return)],
+    );
+    // fn subend() -> usize { return Len(_1[1..len - 1]) }
+    let mut stmts = arr5_fill();
+    stmts.push(assign(pl(0), mir::Rvalue::Len(sub(1, 1, 1, true))));
+    let subend = spec(
+        "subend",
+        3,
+        0,
+        &[usizet.clone(), arr_i32(5)],
+        vec![bb(stmts, mir::TerminatorKind::Return)],
+    );
+    // fn subsub() -> i32 { return _1[1..4][1..3][1] }
+    let mut inner = sub(1, 1, 4, false);
+    inner.projection.push(mir::PlaceElem::Subslice {
+        from: 1,
+        to: 3,
+        from_end: false,
+    });
+    let mut stmts = arr5_fill();
+    stmts.push(assign(
+        pl(0),
+        mir::Rvalue::Use(mir::Operand::Copy(then_cidx(inner, 1, 2))),
+    ));
+    let subsub = spec(
+        "subsub",
+        4,
+        0,
+        &[i32t.clone(), arr_i32(5)],
+        vec![bb(stmts, mir::TerminatorKind::Return)],
+    );
+    // fn subref() -> i32 { _2 = &_1[1..4]; return (*_2)[2] }
+    let mut stmts = arr5_fill();
+    stmts.push(assign(pl(2), shared(sub(1, 1, 4, false))));
+    stmts.push(assign(
+        pl(0),
+        mir::Rvalue::Use(mir::Operand::Copy(then_cidx(dpl(2), 2, 3))),
+    ));
+    let subref = spec(
+        "subref",
+        5,
+        0,
+        &[i32t.clone(), arr_i32(5), fatrefty(i32t.clone())],
+        vec![bb(stmts, mir::TerminatorKind::Return)],
+    );
+    // fn subreflen() -> usize { _2 = &_1[1..4]; return Len(*_2) }
+    let mut stmts = arr5_fill();
+    stmts.push(assign(pl(2), shared(sub(1, 1, 4, false))));
+    stmts.push(assign(pl(0), mir::Rvalue::Len(dpl(2))));
+    let subreflen = spec(
+        "subreflen",
+        6,
+        0,
+        &[usizet.clone(), arr_i32(5), fatrefty(i32t.clone())],
+        vec![bb(stmts, mir::TerminatorKind::Return)],
+    );
+    let (jit, prog) = build(&[sublen, subget, subdyn, subend, subsub, subref, subreflen]);
+    check(&jit, &prog, "sublen", &[], vec![], Ok(2));
+    check(&jit, &prog, "subget", &[], vec![], Ok(40));
+    check(&jit, &prog, "subdyn", &[0], vec![uint(0)], Ok(20));
+    check(&jit, &prog, "subdyn", &[2], vec![uint(2)], Ok(40));
+    check(
+        &jit,
+        &prog,
+        "subdyn",
+        &[3],
+        vec![uint(3)],
+        Err("index out of bounds: the len is 3 but the index is 3"),
+    );
+    check(&jit, &prog, "subend", &[], vec![], Ok(3));
+    check(&jit, &prog, "subsub", &[], vec![], Ok(40));
+    check(&jit, &prog, "subref", &[], vec![], Ok(40));
+    check(&jit, &prog, "subreflen", &[], vec![], Ok(3));
+}
+
+#[test]
+fn subslice_of_a_local_array_out_of_range() {
+    let usizet = u(mir::UintTy::Usize);
+    // fn bad_end() -> usize { return Len(_1[3..9]) }
+    let mut stmts = arr5_fill();
+    stmts.push(assign(pl(0), mir::Rvalue::Len(sub(1, 3, 9, false))));
+    let bad_end = spec(
+        "bad_end",
+        0,
+        0,
+        &[usizet.clone(), arr_i32(5)],
+        vec![bb(stmts, mir::TerminatorKind::Return)],
+    );
+    // fn bad_inverted() -> usize { return Len(_1[4..2]) }
+    let mut stmts = arr5_fill();
+    stmts.push(assign(pl(0), mir::Rvalue::Len(sub(1, 4, 2, false))));
+    let bad_inverted = spec(
+        "bad_inverted",
+        1,
+        0,
+        &[usizet.clone(), arr_i32(5)],
+        vec![bb(stmts, mir::TerminatorKind::Return)],
+    );
+    // fn bad_from_end() -> usize { return Len(_1[0..len - 9]) }
+    let mut stmts = arr5_fill();
+    stmts.push(assign(pl(0), mir::Rvalue::Len(sub(1, 0, 9, true))));
+    let bad_from_end = spec(
+        "bad_from_end",
+        2,
+        0,
+        &[usizet.clone(), arr_i32(5)],
+        vec![bb(stmts, mir::TerminatorKind::Return)],
+    );
+    let (jit, prog) = build(&[bad_end, bad_inverted, bad_from_end]);
+    check(
+        &jit,
+        &prog,
+        "bad_end",
+        &[],
+        vec![],
+        Err("range end index 9 out of range for slice of length 5"),
+    );
+    check(
+        &jit,
+        &prog,
+        "bad_inverted",
+        &[],
+        vec![],
+        Err("slice index starts at 4 but ends at 2"),
+    );
+    check(
+        &jit,
+        &prog,
+        "bad_from_end",
+        &[],
+        vec![],
+        Err("range end index 9 out of range for slice of length 5"),
+    );
+}
+
+#[test]
+fn subslice_of_a_slice_argument() {
+    let i32t = i(mir::IntTy::I32);
+    let usizet = u(mir::UintTy::Usize);
+    // fn slen2(s: &[i32]) -> usize { return Len((*s)[1..3]) }
+    let slen2 = spec(
+        "slen2",
+        0,
+        1,
+        &[usizet.clone(), fatrefty(i32t.clone())],
+        vec![bb(
+            vec![assign(pl(0), mir::Rvalue::Len(dsub(1, 1, 3, false)))],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    // fn stail(s: &[i32]) -> usize { return Len((*s)[1..]) }
+    let stail = spec(
+        "stail",
+        1,
+        1,
+        &[usizet.clone(), fatrefty(i32t.clone())],
+        vec![bb(
+            vec![assign(pl(0), mir::Rvalue::Len(dsub(1, 1, 0, true)))],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    // fn send(s: &[i32]) -> i32 { return (*s)[1..len - 1][1] }
+    let send = spec(
+        "send",
+        2,
+        1,
+        &[i32t.clone(), fatrefty(i32t.clone())],
+        vec![bb(
+            vec![assign(
+                pl(0),
+                mir::Rvalue::Use(mir::Operand::Copy(then_cidx(dsub(1, 1, 1, true), 1, 2))),
+            )],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    // fn sset(s: &mut [i32], v: i32) -> i32 { (*s)[1..3][0] = _2; return (*s)[1] }
+    let sset = spec(
+        "sset",
+        3,
+        2,
+        &[i32t.clone(), fatrefmty(i32t.clone()), i32t.clone()],
+        vec![bb(
+            vec![
+                assign(then_cidx(dsub(1, 1, 3, false), 0, 2), mir::Rvalue::Use(cp(2))),
+                assign(
+                    pl(0),
+                    mir::Rvalue::Use(mir::Operand::Copy(then_cidx(dpl(1), 1, 4))),
+                ),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    // fn sbad_end(s: &[i32]) -> usize { return Len((*s)[2..9]) }
+    let sbad_end = spec(
+        "sbad_end",
+        4,
+        1,
+        &[usizet.clone(), fatrefty(i32t.clone())],
+        vec![bb(
+            vec![assign(pl(0), mir::Rvalue::Len(dsub(1, 2, 9, false)))],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    // fn sbad_from_end(s: &[i32]) -> usize { return Len((*s)[0..len - 9]) }
+    let sbad_from_end = spec(
+        "sbad_from_end",
+        5,
+        1,
+        &[usizet.clone(), fatrefty(i32t.clone())],
+        vec![bb(
+            vec![assign(pl(0), mir::Rvalue::Len(dsub(1, 0, 9, true)))],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    // fn sbad_inverted(s: &[i32]) -> usize { return Len((*s)[3..2]) }
+    let sbad_inverted = spec(
+        "sbad_inverted",
+        6,
+        1,
+        &[usizet.clone(), fatrefty(i32t.clone())],
+        vec![bb(
+            vec![assign(pl(0), mir::Rvalue::Len(dsub(1, 3, 2, false)))],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    // fn sbad_inverted_end(s: &[i32]) -> usize { return Len((*s)[3..len - 2]) }
+    let sbad_inverted_end = spec(
+        "sbad_inverted_end",
+        7,
+        1,
+        &[usizet.clone(), fatrefty(i32t.clone())],
+        vec![bb(
+            vec![assign(pl(0), mir::Rvalue::Len(dsub(1, 3, 2, true)))],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    let (jit, prog) = build(&[
+        slen2,
+        stail,
+        send,
+        sset,
+        sbad_end,
+        sbad_from_end,
+        sbad_inverted,
+        sbad_inverted_end,
+    ]);
+    let store: [i64; 4] = [40, 30, 20, 10];
+    let addr = store.as_ptr().wrapping_add(3) as i64;
+    let arg = |jit: &JitProgram, prog: &sparagmos_interp::MirProgram, name: &str, expected| {
+        check(jit, prog, name, &[addr, 4], vec![fatval(&[10, 20, 30, 40], 4)], expected);
+    };
+    arg(&jit, &prog, "slen2", Ok(2));
+    arg(&jit, &prog, "stail", Ok(3));
+    arg(&jit, &prog, "send", Ok(30));
+    check(
+        &jit,
+        &prog,
+        "sset",
+        &[addr, 4, 99],
+        vec![fatval(&[10, 20, 30, 40], 4), int(99)],
+        Ok(99),
+    );
+    arg(
+        &jit,
+        &prog,
+        "sbad_end",
+        Err("range end index 9 out of range for slice of length 4"),
+    );
+    arg(
+        &jit,
+        &prog,
+        "sbad_from_end",
+        Err("range end index 9 out of range for slice of length 4"),
+    );
+    arg(
+        &jit,
+        &prog,
+        "sbad_inverted",
+        Err("slice index starts at 3 but ends at 2"),
+    );
+    arg(
+        &jit,
+        &prog,
+        "sbad_inverted_end",
+        Err("slice index starts at 3 but ends at 2"),
+    );
+}
