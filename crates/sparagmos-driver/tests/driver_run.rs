@@ -8099,3 +8099,167 @@ fn run_mode_catch_unwind_o3_data_union() {
         "O3 catch_unwind Data flow must run to completion; stderr={stderr}"
     );
 }
+
+// ----- InlineAsm: the evaluable register class (Lane GI) -----
+// Expected outputs are the native results of the same sources.
+
+const ASM_MOV_ADD_SRC: &str = r#"
+use std::arch::asm;
+fn main() {
+    let x: u32 = 40;
+    let mut y: u32 = 0;
+    unsafe {
+        asm!("mov {0:e}, {1:e}", "add {0:e}, 2", out(reg) y, in(reg) x);
+    }
+    let mut z: u64 = 5;
+    unsafe {
+        asm!("add {}, 3", inout(reg) z);
+    }
+    println!("y={y} z={z}");
+}
+"#;
+
+#[test]
+fn run_mode_inline_asm_mov_add_inout() {
+    run_ok("asm-mov-add", ASM_MOV_ADD_SRC, "y=42 z=8\n");
+}
+
+const ASM_SHIFT_LOGIC_SRC: &str = r#"
+use std::arch::asm;
+fn main() {
+    let mut a: i32 = -16;
+    let mut b: u32 = 3;
+    let mut c: u32 = 0b1100;
+    unsafe {
+        asm!("sar {0:e}, 2", inout(reg) a);
+        asm!("shl {}, 4", inout(reg) b);
+        asm!("and {}, 0b1010", inout(reg) c);
+        asm!("or {}, 0b0101", inout(reg) c);
+        asm!("xor {}, {}", inout(reg) c, in(reg) 0b1111u32);
+    }
+    println!("{a} {b} {c}");
+}
+"#;
+
+#[test]
+fn run_mode_inline_asm_shifts_and_logic() {
+    run_ok("asm-shift-logic", ASM_SHIFT_LOGIC_SRC, "-4 48 2\n");
+}
+
+const ASM_SUBREG_SRC: &str = r#"
+use std::arch::asm;
+fn main() {
+    let mut x: u16 = 0x1234;
+    unsafe {
+        asm!("mov {0:l}, 0xAB", inout(reg) x);
+        asm!("mov {0:x}, 0xCD", inout(reg) x);
+    }
+    println!("{x}");
+}
+"#;
+
+#[test]
+fn run_mode_inline_asm_subregister_modifiers() {
+    run_ok("asm-subreg", ASM_SUBREG_SRC, "205\n");
+}
+
+const ASM_ZERO_EXTEND_SRC: &str = r#"
+use std::arch::asm;
+fn main() {
+    let mut x: u64 = u64::MAX;
+    unsafe {
+        asm!("mov {0:e}, 1", inout(reg) x);
+    }
+    println!("{x}");
+}
+"#;
+
+#[test]
+fn run_mode_inline_asm_32bit_write_zero_extends() {
+    run_ok("asm-zero-extend", ASM_ZERO_EXTEND_SRC, "1\n");
+}
+
+const ASM_CONST_SRC: &str = r#"
+use std::arch::asm;
+fn main() {
+    let y: u32;
+    let mut z: u32 = 10;
+    unsafe {
+        asm!("mov {}, {}", out(reg) y, const 7);
+        asm!("add {}, {}", inout(reg) z, const 5);
+    }
+    println!("{y} {z}");
+}
+"#;
+
+#[test]
+fn run_mode_inline_asm_const_operands() {
+    run_ok("asm-const", ASM_CONST_SRC, "7 15\n");
+}
+
+const ASM_UNARY_SRC: &str = r#"
+use std::arch::asm;
+fn main() {
+    let mut a: i32 = 5;
+    let mut b: u8 = 0x0f;
+    let mut c: u32 = 41;
+    unsafe {
+        asm!("neg {}", inout(reg) a);
+        asm!("not {}", inout(reg_byte) b);
+        asm!("inc {}", inout(reg) c);
+        asm!("dec {}", inout(reg) c);
+        asm!("dec {}", inout(reg) c);
+    }
+    println!("{a} {b} {c}");
+}
+"#;
+
+#[test]
+fn run_mode_inline_asm_unary_ops() {
+    run_ok("asm-unary", ASM_UNARY_SRC, "-5 240 40\n");
+}
+
+const ASM_NAKED_SRC: &str = r#"
+use std::arch::naked_asm;
+
+#[unsafe(naked)]
+pub extern "C" fn naked_ret() {
+    naked_asm!("ret");
+}
+
+fn main() {
+    naked_ret();
+    println!("back");
+}
+"#;
+
+#[test]
+fn run_mode_naked_fn_ret() {
+    run_ok("asm-naked-ret", ASM_NAKED_SRC, "back\n");
+}
+
+const ASM_PUSH_SRC: &str = r#"
+use std::arch::asm;
+fn main() {
+    let x: u32 = 1;
+    unsafe {
+        asm!("push {}", in(reg) x);
+    }
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_inline_asm_outside_class_is_named_error() {
+    // `push` is outside the evaluable class: the run fails with
+    // exit 2 and the reason names InlineAsm.
+    let dir = temp_dir("asm-push");
+    let src = fixture(&dir, "case.rs", ASM_PUSH_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr={stderr}");
+    assert!(
+        stderr.contains("TerminatorKind::InlineAsm"),
+        "the reason names InlineAsm: {stderr}"
+    );
+}
