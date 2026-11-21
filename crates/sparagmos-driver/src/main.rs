@@ -127,6 +127,10 @@ struct Collected {
     /// Declared shapes of the converted ADTs, for the interpreter
     /// (see `Converter::adt_shapes`).
     adt_shapes: sparagmos_mir::AdtShapes,
+    /// Derived-`Debug` shapes of the converted monomorphic ADT
+    /// instances, for the interpreter (see
+    /// `Converter::adt_debug_shapes`).
+    adt_debug_shapes: sparagmos_mir::AdtDebugShapes,
     /// Number of leading entries of `bodies` that come from the main
     /// crate itself (the rest are auxiliary-crate functions). The
     /// entry point is only ever searched among these: an auxiliary
@@ -2482,6 +2486,7 @@ fn collect() -> ControlFlow<()> {
         compile_error,
         adt_layouts: conv.adt_layouts.clone(),
         adt_shapes: conv.adt_shapes.clone(),
+        adt_debug_shapes: conv.adt_debug_shapes.clone(),
     });
     ControlFlow::Continue(())
 }
@@ -2614,6 +2619,7 @@ fn execute(c: &Collected, input: &str, guest_args: &[String]) -> i32 {
     program.adt_discriminants = c.adt_discriminants.clone();
     program.adt_layouts = c.adt_layouts.clone();
     program.adt_shapes = c.adt_shapes.clone();
+    program.adt_debug_shapes = c.adt_debug_shapes.clone();
     // The entry body: the one rustc designated (see
     // `Collected::entry_def_id`) when collection recorded it, and
     // otherwise the first local body named `main`. A `--test`

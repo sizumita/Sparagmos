@@ -76,6 +76,12 @@ pub struct Converter {
     /// interpreter with the converted program, which uses them to
     /// decide which types are zero-sized.
     pub adt_shapes: sm::AdtShapes,
+    /// Derived-`Debug` shapes of the monomorphic ADT instances
+    /// converted so far, keyed by the rendered instance name (see
+    /// `sm::AdtDebugShapes`). Handed to the interpreter with the
+    /// converted program: its `Debug` formatter prints ADT values
+    /// from these shapes.
+    pub adt_debug_shapes: sm::AdtDebugShapes,
     /// Declared types of the target crate's statics, recorded by
     /// the item scan before conversion (`note_static_ty`).
     static_tys: HashMap<sm::DefId, rustc_public::ty::Ty>,
@@ -200,6 +206,7 @@ impl Converter {
             layout_attempted: std::collections::HashSet::new(),
             layout_names: std::collections::HashMap::new(),
             adt_shapes: sm::AdtShapes::new(),
+            adt_debug_shapes: sm::AdtDebugShapes::new(),
             static_tys: HashMap::new(),
             errors: Vec::new(),
         }
@@ -2079,6 +2086,7 @@ impl Converter {
         match ty.kind() {
             TyKind::RigidTy(RigidTy::Adt(def, args)) => {
                 self.record_layout(ty, &def, &args, &converted);
+                self.record_debug_shape(&def, &args, &converted);
             }
             TyKind::RigidTy(RigidTy::Coroutine(..))
             | TyKind::RigidTy(RigidTy::CoroutineClosure(..)) => {
@@ -2169,6 +2177,73 @@ impl Converter {
             })
             .collect();
         self.adt_discriminants.insert(id, values);
+    }
+
+    /// Record the derived-`Debug` shape of one monomorphic ADT
+    /// instance under its rendered instance name, once per distinct
+    /// instance (see `sm::AdtDebugShapes`). Only struct and enum
+    /// instances with no remaining generic parameters get an entry:
+    /// a parameter would render into a field tag that names no real
+    /// type, and the instance's own tag would collide across
+    /// instantiations.
+    ///
+    /// Shape recording is auxiliary to the conversion in progress,
+    /// exactly like `record_shape`: the current body's error list
+    /// is saved and restored around the field conversions, and a
+    /// placeholder entry is inserted before the fields are
+    /// converted so a recursive ADT terminates.
+    fn record_debug_shape(
+        &mut self,
+        def: &AdtDef,
+        args: &GenericArgs,
+        converted: &sm::Ty,
+    ) {
+        let kind = match def.kind() {
+            AdtKind::Struct => sm::AdtShapeKind::Struct,
+            AdtKind::Enum => sm::AdtShapeKind::Enum,
+            AdtKind::Union => return,
+        };
+        if ty_has_param(converted) {
+            return;
+        }
+        let key = self.layout_key(converted);
+        if self.adt_debug_shapes.contains_key(&key) {
+            return;
+        }
+        self.adt_debug_shapes.insert(
+            key.clone(),
+            sm::AdtDebugShape {
+                kind,
+                variants: Vec::new(),
+            },
+        );
+        let saved_errors = std::mem::take(&mut self.errors);
+        let mut variants = Vec::new();
+        for variant in def.variants() {
+            let mut fields = Vec::new();
+            for field in variant.fields() {
+                let fty = field.ty_with_args(args);
+                let converted_field = self.ty(&fty);
+                let tag = self.layout_key(&converted_field);
+                // A tuple field's recorded name is its position
+                // written out as a number; anything else is a
+                // declared field name.
+                let name = if field.name.bytes().all(|b| b.is_ascii_digit())
+                    && !field.name.is_empty()
+                {
+                    None
+                } else {
+                    Some(field.name.clone())
+                };
+                fields.push(sm::AdtDebugField { name, ty: tag });
+            }
+            variants.push(sm::AdtDebugVariant {
+                name: variant.name(),
+                fields,
+            });
+        }
+        self.errors = saved_errors;
+        self.adt_debug_shapes.insert(key, sm::AdtDebugShape { kind, variants });
     }
 
     /// Record the compiler-computed layout of one monomorphic ADT
@@ -2491,6 +2566,33 @@ fn read_uint_at(alloc: &Allocation, offset: usize, size: usize) -> Option<u128> 
 /// the bare pattern cast to `i128` is a large positive number.
 /// Sign-extending the pattern from the discriminant type's width
 /// recovers the value; unsigned discriminants are already exact.
+/// Whether a converted type still mentions a generic parameter
+/// anywhere inside it (such a type is not one monomorphic
+/// instance, so per-instance tables keyed by its rendered tag
+/// would be wrong).
+fn ty_has_param(ty: &sm::Ty) -> bool {
+    match ty {
+        sm::Ty::Param(..) => true,
+        sm::Ty::Adt(_, args)
+        | sm::Ty::FnDef(_, args)
+        | sm::Ty::Closure(_, args)
+        | sm::Ty::Coroutine(_, args)
+        | sm::Ty::CoroutineWitness(_, args)
+        | sm::Ty::Alias(_, _, args) => args.iter().any(ty_has_param),
+        sm::Ty::Array(elem, _)
+        | sm::Ty::Pat(elem, _)
+        | sm::Ty::Slice(elem)
+        | sm::Ty::RawPtr(elem, _) => ty_has_param(elem),
+        sm::Ty::Ref(_, inner, _) => ty_has_param(inner),
+        sm::Ty::FnPtr(sig) => {
+            sig.inputs.iter().any(ty_has_param) || ty_has_param(&sig.output)
+        }
+        sm::Ty::Dynamic(_, inner, _) => ty_has_param(inner),
+        sm::Ty::Tuple(items) => items.iter().any(ty_has_param),
+        _ => false,
+    }
+}
+
 fn discr_value(d: &rustc_public::ty::Discr) -> Option<i128> {
     match d.ty.kind() {
         TyKind::RigidTy(RigidTy::Int(t)) => {

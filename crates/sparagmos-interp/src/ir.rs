@@ -1091,6 +1091,13 @@ pub struct Program {
     /// consulted by the `size_of` / `align_of` / `size_of_val`
     /// builtins for ADT tags the static layout table cannot answer.
     pub adt_layouts: std::collections::HashMap<String, (u64, u64)>,
+    /// Derived-`Debug` shapes of the program's monomorphic ADT
+    /// instances, keyed by the rendered instance name (the type
+    /// tag the formatter sees), as recorded by the driver (see
+    /// `sparagmos_mir::AdtDebugShapes`). Consulted by the `Debug`
+    /// formatter when it meets an ADT value.
+    pub adt_debug_shapes:
+        std::collections::HashMap<String, sparagmos_mir::AdtDebugShape>,
     pub functions: HashMap<String, Body>,
     /// Functions that exist in the source program but whose bodies
     /// could not be converted, keyed by name, with the reason

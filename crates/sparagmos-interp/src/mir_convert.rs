@@ -115,6 +115,11 @@ pub struct MirProgram {
     /// driver (see `mir::AdtShape`). Used to decide which locals
     /// are provably zero-sized.
     pub adt_shapes: mir::AdtShapes,
+    /// Derived-`Debug` shapes of the program's monomorphic ADT
+    /// instances, as recorded by the driver (see
+    /// `mir::AdtDebugShapes`). Consulted by the `Debug` formatter
+    /// for ADT values.
+    pub adt_debug_shapes: mir::AdtDebugShapes,
 }
 
 /// Widen an `f16` bit pattern to `f64`. The conversion is exact:
@@ -511,6 +516,7 @@ fn convert_all(
     }
     failures.retain(|key, _| !out.functions.contains_key(key));
     out.adt_layouts = program.adt_layouts.clone();
+    out.adt_debug_shapes = program.adt_debug_shapes.clone();
     mark_caller_location_bodies(&mut out);
     Ok((out, failures))
 }
