@@ -134,6 +134,10 @@ struct Collected {
     /// Thread-local statics of the converted program, for the
     /// interpreter (see `Converter::thread_locals`).
     thread_locals: sparagmos_mir::ThreadLocals,
+    /// Field types of monomorphic ADT instances whose generic
+    /// shape mentions a type alias, for the interpreter
+    /// (see `Converter::adt_instance_shapes`).
+    adt_instance_shapes: sparagmos_mir::AdtInstanceShapes,
     /// Number of leading entries of `bodies` that come from the main
     /// crate itself (the rest are auxiliary-crate functions). The
     /// entry point is only ever searched among these: an auxiliary
@@ -2491,6 +2495,7 @@ fn collect() -> ControlFlow<()> {
         adt_shapes: conv.adt_shapes.clone(),
         adt_debug_shapes: conv.adt_debug_shapes.clone(),
         thread_locals: conv.thread_locals.clone(),
+        adt_instance_shapes: conv.adt_instance_shapes.clone(),
     });
     ControlFlow::Continue(())
 }
@@ -2691,6 +2696,7 @@ fn execute(c: &Collected, input: &str, guest_args: &[String], overflow_checks: b
     program.adt_shapes = c.adt_shapes.clone();
     program.adt_debug_shapes = c.adt_debug_shapes.clone();
     program.thread_locals = c.thread_locals.clone();
+    program.adt_instance_shapes = c.adt_instance_shapes.clone();
     // The entry body: the one rustc designated (see
     // `Collected::entry_def_id`) when collection recorded it, and
     // otherwise the first local body named `main`. A `--test`

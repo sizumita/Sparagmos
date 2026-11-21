@@ -93,6 +93,16 @@ pub struct Converter {
     /// initializer cannot be decoded gets no entry, and its
     /// `ThreadLocalRef` stays an explicit error at run time.
     pub thread_locals: sm::ThreadLocals,
+    /// Field types of monomorphic ADT instances whose generic
+    /// shape mentions a type alias, keyed by the rendered instance
+    /// name (see `sm::AdtInstanceShapes`). Handed to the
+    /// interpreter with the converted program.
+    pub adt_instance_shapes: sm::AdtInstanceShapes,
+    /// Rendered instance keys whose instance-shape recording was
+    /// already attempted (successfully or not), so an instance
+    /// whose fields cannot be normalized is not retried at every
+    /// conversion.
+    instance_shape_attempted: std::collections::HashSet<String>,
     /// Declared types of the target crate's statics, recorded by
     /// the item scan before conversion (`note_static_ty`).
     static_tys: HashMap<sm::DefId, rustc_public::ty::Ty>,
@@ -106,6 +116,30 @@ impl Default for Converter {
     }
 }
 
+
+/// Whether a converted type mentions a type alias anywhere
+/// inside it (see `Converter::record_instance_shape`).
+fn ty_mentions_alias(ty: &sm::Ty) -> bool {
+    match ty {
+        sm::Ty::Alias(..) => true,
+        sm::Ty::Adt(_, args)
+        | sm::Ty::FnDef(_, args)
+        | sm::Ty::Closure(_, args)
+        | sm::Ty::Coroutine(_, args)
+        | sm::Ty::CoroutineWitness(_, args) => args.iter().any(ty_mentions_alias),
+        sm::Ty::Array(elem, _)
+        | sm::Ty::Slice(elem)
+        | sm::Ty::RawPtr(elem, _)
+        | sm::Ty::Ref(_, elem, _)
+        | sm::Ty::Pat(elem, _) => ty_mentions_alias(elem),
+        sm::Ty::FnPtr(sig) => {
+            sig.inputs.iter().any(ty_mentions_alias) || ty_mentions_alias(&sig.output)
+        }
+        sm::Ty::Dynamic(_, self_ty, _) => ty_mentions_alias(self_ty),
+        sm::Ty::Tuple(ts) => ts.iter().any(ty_mentions_alias),
+        _ => false,
+    }
+}
 
 /// Whether an ADT instance may be unsized — or otherwise unsafe
 /// to ask the compiler for its layout. The check walks the
@@ -220,6 +254,8 @@ impl Converter {
             adt_debug_shapes: sm::AdtDebugShapes::new(),
             debug_shape_depth: 0,
             thread_locals: sm::ThreadLocals::new(),
+            adt_instance_shapes: sm::AdtInstanceShapes::new(),
+            instance_shape_attempted: std::collections::HashSet::new(),
             static_tys: HashMap::new(),
             errors: Vec::new(),
         }
@@ -2254,6 +2290,7 @@ impl Converter {
             TyKind::RigidTy(RigidTy::Adt(def, args)) => {
                 self.record_layout(ty, &def, &args, &converted);
                 self.record_debug_shape(&def, &converted);
+                self.record_instance_shape(&def, &args, &converted);
             }
             TyKind::RigidTy(RigidTy::Coroutine(..))
             | TyKind::RigidTy(RigidTy::CoroutineClosure(..)) => {
@@ -2470,6 +2507,73 @@ impl Converter {
             key,
             (shape.size.bytes() as u64, shape.abi_align),
         );
+    }
+
+    /// Record the field types of one monomorphic ADT instance
+    /// whose generic shape mentions a type alias (see
+    /// `sm::AdtInstanceShapes`), once per distinct instance.
+    ///
+    /// The generic shape's field types are the definition's own,
+    /// so a projection alias among them reaches the interpreter
+    /// unresolved — the `NonZero<T>` field is declared as
+    /// `<T as ZeroablePrimitive>::NonZeroInner`, and the
+    /// interpreter has no trait solver. The compiler resolves it:
+    /// `FieldDef::ty_with_args` instantiates a field's declared
+    /// type with the instance's arguments and normalizes it in a
+    /// monomorphic environment, which is exactly the resolution
+    /// the shape lacks. The query is not total (it fails fatally
+    /// on projections that do not normalize in a codegen
+    /// environment), so it is contained like the layout query:
+    /// an instance it cannot answer gets no entry and keeps the
+    /// generic shape's behaviour downstream.
+    ///
+    /// The recording is auxiliary, like `record_shape`'s: the
+    /// body's error list is saved and restored around the field
+    /// conversions, and any error growth abandons the entry — a
+    /// body that genuinely uses such a type still reports through
+    /// its own conversion path.
+    fn record_instance_shape(
+        &mut self,
+        def: &AdtDef,
+        args: &GenericArgs,
+        converted: &sm::Ty,
+    ) {
+        let sm::Ty::Adt(id, _) = converted else {
+            return;
+        };
+        let key = self.layout_key(converted);
+        if !self.instance_shape_attempted.insert(key.clone()) {
+            return;
+        }
+        let Some(shape) = self.adt_shapes.get(id) else {
+            return;
+        };
+        if !shape.variants.iter().flatten().any(|t| ty_mentions_alias(t)) {
+            return;
+        }
+        let kind = shape.kind;
+        let saved_errors = std::mem::take(&mut self.errors);
+        let mut variants = Vec::new();
+        let mut complete = true;
+        'variants: for variant in def.variants() {
+            let mut fields = Vec::new();
+            for field in variant.fields() {
+                let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    field.ty_with_args(args)
+                }));
+                let Ok(resolved) = resolved else {
+                    complete = false;
+                    break 'variants;
+                };
+                fields.push(self.ty(&resolved));
+            }
+            variants.push(fields);
+        }
+        if complete && self.errors.is_empty() {
+            self.adt_instance_shapes
+                .insert(key, sm::AdtShape { kind, variants });
+        }
+        self.errors = saved_errors;
     }
 
     /// The `adt_layouts` key for a converted type: its `ty_tag`
