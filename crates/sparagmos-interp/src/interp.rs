@@ -259,6 +259,23 @@ impl<'a> Interpreter<'a> {
             return_block: None,
         }];
 
+        self.drive_frames(&mut frames, 0)
+    }
+
+    /// Drive the frame stack until it shrinks back to `base`
+    /// frames, returning the value the frame that crossed the
+    /// boundary returned. This is the interpreter main loop:
+    /// `run` drives with `base == 0`; a builtin that must execute
+    /// guest code to completion (a thread join, an mpsc blocking
+    /// point) pushes its frame and drives with the depth it found,
+    /// which runs the nested execution without disturbing the
+    /// suspended outer one.
+    fn drive_frames(&mut self, frames_out: &mut Vec<Frame>, base: usize) -> InterpResult<Value> {
+        // The loop below was written against an owned frame stack
+        // (it is `run`'s original body): take the caller's stack for
+        // the duration of the drive and hand it back at the one
+        // successful exit. Error exits abandon the run anyway.
+        let mut frames: Vec<Frame> = std::mem::take(frames_out);
         loop {
             // Fetch the current block's next unit of work, cloning the small
             // pieces we need so the frame stack can be mutated freely after.
@@ -688,7 +705,8 @@ impl<'a> Interpreter<'a> {
                             }
                         }
                     }
-                    if frames.is_empty() {
+                    if frames.len() == base {
+                        *frames_out = frames;
                         return Ok(value);
                     }
                     let dest = frame
