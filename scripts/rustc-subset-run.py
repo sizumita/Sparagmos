@@ -1536,6 +1536,21 @@ def _concrete_edition(edition):
     return edition
 
 
+def attempt_edition(view):
+    """The edition one attempt compiles under.
+
+    The view's last `//@ edition:` directive, collapsed to the
+    concrete edition the single attempt uses (see
+    _concrete_edition); the subset's default 2021 when the test
+    declares none. Every attempt path (stage-1 flat, stage-1 per
+    revision, stage 2) selects the edition through this one
+    helper, so a range directive reaches rustc only in its
+    collapsed form.
+    """
+    editions = view.values("edition")
+    return _concrete_edition(editions[-1].strip()) if editions else "2021"
+
+
 def _build_proc_macro_chain(chain, edition, outdir, extra_externs=()):
 
     """Build a resolved proc-macro chain into outdir.
@@ -2011,8 +2026,7 @@ def fill_result(rec, rust_dir, driver_bin, out):
         out["bucket"] = "out of stage-1 scope (multi-file)"
         return
 
-    editions = header.values("edition")
-    edition = editions[0].strip() if editions else "2021"
+    edition = attempt_edition(header)
 
     flags = compile_flags(header.view(None))
     screened = screen_flags(flags, targets={HOST_TARGET})
@@ -2182,9 +2196,7 @@ def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions,
             res["reason"] = aux_err
             res["bucket"] = "out of stage-1 scope (multi-file)"
             return res
-    editions = view.values("edition")
-    edition = _concrete_edition(editions[-1].strip()) \
-        if editions else "2021"
+    edition = attempt_edition(view)
     flags = compile_flags(view)
     screened = screen_flags(flags, targets={HOST_TARGET})
     if screened:
@@ -2860,9 +2872,7 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
                              "compile outcome alone cannot judge")
         res["bucket"] = "not attempted (verdict needs execution)"
         return res
-    editions = view.values("edition")
-    edition = _concrete_edition(editions[-1].strip()) \
-        if editions else "2021"
+    edition = attempt_edition(view)
     flags = compile_flags(view)
     screened = screen_flags(flags)
     if screened:
