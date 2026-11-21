@@ -1827,31 +1827,26 @@ fn transmute_pointer_to_usize_is_aligned_stable_and_distinct() {
 }
 
 #[test]
-fn transmute_non_pointer_stays_unsupported() {
-    // Only the pointer-to-integer transmute is modelled; an
-    // integer-to-integer transmute keeps failing explicitly.
+fn transmute_int_to_int_reinterprets_bits() {
+    // Since Lane FB an integer-to-integer transmute of the same
+    // width is modelled as a bit reinterpretation: -7i32 read as
+    // u32 is its two's-complement pattern.
     let body = mir::Body::new(
-        decls(&[i32_ty()]),
+        decls(&[u32_ty()]),
         0,
         vec![block(
             vec![assign(
                 place(0),
-                mir::Rvalue::Cast(mir::CastKind::Transmute, const_i32(7), i32_ty()),
+                mir::Rvalue::Cast(mir::CastKind::Transmute, const_i32(-7), u32_ty()),
             )],
             ret(),
         )],
     );
     let mut prog = MirProgram::new();
-    prog.add("bad_transmute", body);
-    let err = interpret_mir(&prog, "bad_transmute", vec![])
-        .expect_err("non-pointer transmute must stay unsupported");
-    assert!(
-        matches!(
-            err,
-            MirRunError::Interp(InterpError::UnsupportedRvalue { .. })
-        ),
-        "expected UnsupportedRvalue, got {err}"
-    );
+    prog.add("int_transmute", body);
+    let v = interpret_mir(&prog, "int_transmute", vec![])
+        .expect("same-width int transmute must run");
+    assert_eq!(v, Value::Uint(4_294_967_289));
 }
 
 #[test]
@@ -2314,13 +2309,14 @@ fn transmute_pointer_to_int_yields_aligned_nonzero_address() {
 
 #[test]
 fn transmute_between_non_pointers_stays_unsupported() {
-    // A transmute that is not pointer-to-integer (integer to
-    // integer of another width) cannot be honoured by a value
-    // model with no byte representation; it stays an explicit
-    // conversion error naming the cast. (Integer to pointer is
-    // modelled separately since Lane DN, as an address-only
-    // reference value; see the transmute tests at the end of
-    // this file.)
+    // A width-changing transmute (integer to integer of another
+    // width — a shape rustc itself rejects, exercised here as a
+    // synthetic body) cannot be honoured; it stays an explicit
+    // conversion error naming the cast. Same-width scalar
+    // transmutes are modelled since Lane FB (see
+    // `transmute_int_to_int_reinterprets_bits`), and integer to
+    // pointer is modelled separately since Lane DN, as an
+    // address-only reference value.
     for target in [i64_ty()] {
         let body = mir::Body::new(
             decls(&[i32_ty(), i32_ty(), target.clone()]),
