@@ -1120,8 +1120,10 @@ impl<'a> Converter<'a> {
     /// still has the single value `None`); zero-capture closures;
     /// function items. Enums with two or more inhabited variants
     /// are excluded (the type does not determine the variant), as
-    /// are unions (the type does not determine the active field)
-    /// and opaque aliases (the hidden type is not visible here).
+    /// are unions with more than one field (the type does not
+    /// determine the active field; a single-field union's value
+    /// is its one field's value) and opaque aliases (the hidden
+    /// type is not visible here).
     fn zst_value(&self, ty: &mir::Ty, depth: u32) -> Option<Value> {
         match self.unique_value(ty, depth) {
             UniqueValue::One(v) => Some(v),
@@ -1179,7 +1181,13 @@ impl<'a> Converter<'a> {
                 let Some(shape) = self.adt_shapes.get(def) else {
                     return UniqueValue::Many;
                 };
-                if shape.kind == mir::AdtShapeKind::Union {
+                if shape.kind == mir::AdtShapeKind::Union
+                    && shape.variants.first().map_or(0, |f| f.len()) != 1
+                {
+                    // A union's active field is not determined by
+                    // its type — except a single-field union, whose
+                    // one field's value the loop below determines
+                    // like a struct's.
                     return UniqueValue::Many;
                 }
                 let mut single: Option<(u32, Vec<Value>)> = None;
@@ -2514,29 +2522,51 @@ impl<'a> Converter<'a> {
 
     /// The drop glue of a `std::mem::drop` call's argument, mirroring
     /// the `Drop` terminator's treatment of the same type:
-    /// `Ok(Some(glue))` when the argument is a place whose type's
-    /// glue conversion can account for (the interpreter runs it
-    /// against the argument place), `Ok(None)` when there is nothing
-    /// to run (a constant argument whose glue is trivial, so
-    /// discarding it is already faithful), and `Err(())` when the
-    /// glue cannot be accounted for.
+    /// `Ok(Some(glue))` when the argument's glue can be accounted
+    /// for and the interpreter has something to run it against —
+    /// a place argument (run against the place), or a constant
+    /// argument (run against the constant's value; a zero-sized
+    /// constant carries no value, so the dropped type must
+    /// determine one, and the operand is rewritten to carry it) —
+    /// `Ok(None)` when there is nothing to run (the glue is
+    /// trivial, so discarding the value is already faithful), and
+    /// `Err(())` when the glue cannot be accounted for.
     fn mem_drop_glue(
         &self,
         body: &mir::Body,
         arg: &mir::Operand,
-        ir_arg: &ir::Operand,
+        ir_arg: &mut ir::Operand,
         raw_generic_args: &[mir::Ty],
     ) -> Result<Option<ir::DropGlue>, ()> {
         let dropped_ty = self
             .operand_place_ty(body, arg)
             .or_else(|| raw_generic_args.first().cloned());
-        let glue = dropped_ty.and_then(|t| self.drop_glue(&t)).ok_or(())?;
+        let glue = dropped_ty
+            .as_ref()
+            .and_then(|t| self.drop_glue(t))
+            .ok_or(())?;
+        if glue.root == ir::DropPlan::Trivial {
+            return Ok(None);
+        }
         match ir_arg {
             ir::Operand::Copy(_) | ir::Operand::Move(_) => Ok(Some(glue)),
-            _ if glue.root == ir::DropPlan::Trivial => Ok(None),
+            ir::Operand::Constant(ir::Constant::Unit) => {
+                // A zero-sized constant: the value being dropped is
+                // not carried by the operand. When the dropped type
+                // determines it, rewrite the operand to carry that
+                // value so the interpreter can run the glue against
+                // it; otherwise the drop stays unaccounted for.
+                let ty = dropped_ty.ok_or(())?;
+                let value = self.zst_value(&ty, 0).ok_or(())?;
+                let constant = value_as_constant(&value).ok_or(())?;
+                *ir_arg = ir::Operand::Constant(constant);
+                Ok(Some(glue))
+            }
+            ir::Operand::Constant(_) => Ok(Some(glue)),
             _ => Err(()),
         }
     }
+
 
     /// The converted body of `adt_name`'s `Drop` impl, if the
     /// program has one. The driver's name for the impl is
@@ -2733,7 +2763,7 @@ impl<'a> Converter<'a> {
                             match self.mem_drop_glue(
                                 body,
                                 &args[0],
-                                &ir_args[0],
+                                &mut ir_args[0],
                                 &raw_generic_args,
                             ) {
                                 Ok(glue) => glue,
@@ -3164,6 +3194,29 @@ fn collapse_fields(fields: Vec<ir::DropPlan>, complete: bool) -> ir::DropPlan {
     }
 }
 
+/// A synthesized value as an IR constant, for the shapes a
+/// unique-value type can take (units, tuples and ADT values);
+/// anything else has no constant form here.
+fn value_as_constant(value: &Value) -> Option<ir::Constant> {
+    Some(match value {
+        Value::Unit => ir::Constant::Unit,
+        Value::Enum { variant, fields } => ir::Constant::Adt {
+            variant: *variant,
+            fields: fields
+                .iter()
+                .map(value_as_constant)
+                .collect::<Option<Vec<_>>>()?,
+        },
+        Value::Tuple(fields) => ir::Constant::Tuple(
+            fields
+                .iter()
+                .map(value_as_constant)
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        _ => return None,
+    })
+}
+
 /// A sequence of glue steps, collapsed when at most one remains.
 fn collapse_seq(steps: Vec<ir::DropPlan>) -> ir::DropPlan {
     let mut steps: Vec<ir::DropPlan> = steps
@@ -3197,6 +3250,11 @@ struct DropGlueBuilder<'c, 'a> {
     conv: &'c Converter<'a>,
     adts: Vec<ir::DropPlan>,
     adt_index: HashMap<String, usize>,
+    /// Table entries whose plan is still being built: they hold a
+    /// `Trivial` placeholder that a recursive reference must keep
+    /// pointing at (the finished plan replaces it), so the
+    /// placeholder must never be read as a finished trivial plan.
+    in_progress: std::collections::HashSet<usize>,
 }
 
 impl<'c, 'a> DropGlueBuilder<'c, 'a> {
@@ -3205,6 +3263,7 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
             conv,
             adts: Vec::new(),
             adt_index: HashMap::new(),
+            in_progress: Default::default(),
         };
         let root = builder.plan(ty)?;
         Some(ir::DropGlue {
@@ -3256,6 +3315,17 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
             mir::Ty::Adt(def, args) => {
                 let key = format!("{ty:?}");
                 if let Some(&index) = self.adt_index.get(&key) {
+                    // A finished entry whose plan is trivial is the
+                    // trivial plan itself: returning it lets the
+                    // caller's field plans collapse, so a value
+                    // holding fewer fields than the plan lists (a
+                    // zero-sized field the value model elides) is
+                    // not mistaken for an unaccounted drop.
+                    if !self.in_progress.contains(&index)
+                        && self.adts[index] == P::Trivial
+                    {
+                        return Some(P::Trivial);
+                    }
                     return Some(P::Adt { index });
                 }
                 let index = self.adts.len();
@@ -3263,9 +3333,17 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                 // Placeholder while this ADT's fields are planned, so
                 // a recursive occurrence refers back to this entry.
                 self.adts.push(P::Trivial);
-                let plan = self.adt_plan(*def, args)?;
+                self.in_progress.insert(index);
+                let plan = self.adt_plan(*def, args);
+                self.in_progress.remove(&index);
+                let plan = plan?;
+                let trivial = plan == P::Trivial;
                 self.adts[index] = plan;
-                Some(P::Adt { index })
+                Some(if trivial {
+                    P::Trivial
+                } else {
+                    P::Adt { index }
+                })
             }
             mir::Ty::Dynamic(..) => {
                 // A trait object's glue is its concrete type's,
@@ -3277,6 +3355,11 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
             mir::Ty::Coroutine(def, args) => {
                 let key = format!("{ty:?}");
                 if let Some(&index) = self.adt_index.get(&key) {
+                    if !self.in_progress.contains(&index)
+                        && self.adts[index] == P::Trivial
+                    {
+                        return Some(P::Trivial);
+                    }
                     return Some(P::Adt { index });
                 }
                 let index = self.adts.len();
@@ -3286,9 +3369,17 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                 // awaiting another future of the same type) refers
                 // back to this entry.
                 self.adts.push(P::Trivial);
-                let plan = self.coroutine_plan(*def, args)?;
+                self.in_progress.insert(index);
+                let plan = self.coroutine_plan(*def, args);
+                self.in_progress.remove(&index);
+                let plan = plan?;
+                let trivial = plan == P::Trivial;
                 self.adts[index] = plan;
-                Some(P::Adt { index })
+                Some(if trivial {
+                    P::Trivial
+                } else {
+                    P::Adt { index }
+                })
             }
             _ => None,
         }
@@ -3329,6 +3420,21 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                     P::Dyn => P::Dyn,
                     other => at_field0(other),
                 });
+            }
+            "std::rc::Weak" | "std::sync::Weak" => {
+                // A weak pointer owns no pointee, and the value
+                // model does not track reference counts (see the
+                // `Rc::new` builtin), so dropping one runs no glue
+                // the model can observe.
+                return Some(P::Trivial);
+            }
+            "std::borrow::Cow" if matches!(args.first(), Some(mir::Ty::Str)) => {
+                // `Cow<str>`: the `Borrowed` variant holds a `&str`
+                // and the `Owned` variant a `String`; both are
+                // glue-free in this model. (Other borrowed types
+                // own a `B::Owned` whose glue this builder cannot
+                // derive from `B`, so they stay unmodelled.)
+                return Some(P::Trivial);
             }
             "std::option::Option" => {
                 let inner = self.plan(args.first()?)?;

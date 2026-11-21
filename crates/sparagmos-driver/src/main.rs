@@ -1287,6 +1287,22 @@ fn demand_drop_instances(
                     drop_candidates(&ty, &mut candidates, &mut seen);
                 }
             }
+            // A `std::mem::drop` call runs the dropped type's glue
+            // without a `Drop` terminator, and the interpreter
+            // accounts for that glue when it converts the call,
+            // which needs the same destructor bodies a terminator
+            // would demand.
+            for (def, args) in sparagmos_driver::reach::call_targets(body) {
+                if def.name() != "std::mem::drop" {
+                    continue;
+                }
+                if let Some(ty) = args.0.iter().find_map(|a| match a {
+                    GenericArgKind::Type(t) => Some(*t),
+                    _ => None,
+                }) {
+                    drop_candidates(&ty, &mut candidates, &mut seen);
+                }
+            }
         }
         let mut added = false;
         for (_, def, args) in candidates {

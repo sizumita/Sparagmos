@@ -565,7 +565,8 @@ impl<'a> Interpreter<'a> {
                     if let Some(glue) = drop_glue {
                         // `std::mem::drop` with the dropped type's glue
                         // attached by conversion: run it against the
-                        // argument place, exactly like a `Drop`
+                        // argument (a place, or a constant's value),
+                        // exactly like a `Drop`
                         // terminator — a destructor call suspends the
                         // remaining glue on a `DropContinuation` and
                         // resumes it when the destructor returns. The
@@ -584,33 +585,39 @@ impl<'a> Interpreter<'a> {
                                 "no arguments",
                             ));
                         };
-                        let place = match operand {
-                            Operand::Copy(place) | Operand::Move(place) => place,
-                            _ => {
-                                return Err(InterpError::type_mismatch(
-                                    "std::mem::drop",
-                                    "a place argument",
-                                    "a constant argument",
-                                ));
+                        // The glue runs against the argument place,
+                        // or — for a constant argument, whose value
+                        // conversion accounted for when it attached
+                        // the glue — against the constant's own value.
+                        let root = match operand {
+                            Operand::Copy(place) | Operand::Move(place) => {
+                                let place = place.clone();
+                                match self.resolve_place(&frames, body, &place)? {
+                                    Resolved::Place {
+                                        frame_pos,
+                                        local,
+                                        projection,
+                                    } => RefTarget::place(
+                                        frames[frame_pos].id,
+                                        local,
+                                        projection,
+                                    ),
+                                    Resolved::Static { name, projection } => {
+                                        RefTarget::Static { name, projection }
+                                    }
+                                    Resolved::Value(_) => {
+                                        return Err(InterpError::type_mismatch(
+                                            "std::mem::drop",
+                                            "a storage place",
+                                            "a constant aggregate",
+                                        ));
+                                    }
+                                }
                             }
-                        };
-                        let resolved = self.resolve_place(&frames, body, place)?;
-                        let root = match resolved {
-                            Resolved::Place {
-                                frame_pos,
-                                local,
-                                projection,
-                            } => RefTarget::place(frames[frame_pos].id, local, projection),
-                            Resolved::Static { name, projection } => RefTarget::Static {
-                                name,
-                                projection,
-                            },
-                            Resolved::Value(_) => {
-                                return Err(InterpError::type_mismatch(
-                                    "std::mem::drop",
-                                    "a storage place",
-                                    "a constant aggregate",
-                                ));
+                            Operand::Constant(_) => {
+                                let value =
+                                    self.eval_operand(&mut frames, body, operand)?;
+                                RefTarget::Value(Box::new(value))
                             }
                         };
                         self.write_place(&mut frames, body, &destination, Value::Unit)?;
@@ -656,12 +663,13 @@ impl<'a> Interpreter<'a> {
                             name,
                             projection,
                         },
-                        Resolved::Value(_) => {
-                            return Err(InterpError::type_mismatch(
-                                "Drop",
-                                "a storage place",
-                                "a constant aggregate",
-                            ));
+                        Resolved::Value(value) => {
+                            // The place is the deref of a value
+                            // reference (a `Box` / `ManuallyDrop`
+                            // deref in this model): the glue runs
+                            // against that value itself, as it does
+                            // for a `mem::drop` constant argument.
+                            RefTarget::Value(Box::new(value))
                         }
                     };
                     let work = vec![(Vec::new(), glue.root.clone())];

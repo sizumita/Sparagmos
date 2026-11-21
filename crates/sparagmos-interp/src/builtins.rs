@@ -2123,6 +2123,23 @@ impl<'a> Interpreter<'a> {
                             other.kind_name(),
                         )),
                     }
+                } else if self_ty.starts_with("std::mem::ManuallyDrop<") {
+                    // The same one-field aggregate as
+                    // `ManuallyDrop::new`: `deref_mut` yields a
+                    // reference to the held value, in the same
+                    // value-reference form as `Box` above.
+                    let pointee = self.resolve_value(frames, &vals[0])?;
+                    match pointee {
+                        Value::Enum { fields, .. } if fields.len() == 1 => {
+                            let inner = fields.into_iter().next().expect("len checked");
+                            Ok(Value::Ref(RefTarget::Value(Box::new(inner))))
+                        }
+                        ref other => Err(InterpError::type_mismatch(
+                            "DerefMut::deref_mut for ManuallyDrop",
+                            "one-field aggregate",
+                            other.kind_name(),
+                        )),
+                    }
                 } else if self_ty_is(self_ty, "std::cell::RefMut") {
                     // A mutable borrow guard: field 0 is the
                     // reference to the cell's value stored by the
