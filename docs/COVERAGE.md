@@ -1973,6 +1973,64 @@ Lane CL を含む): 指標2(b) 70.297%。both12 比で +90 件
 (うち +64 は Lane CL の incremental 分、+26 が本レーンの
 exec 改善: for ループ / &Vec 反復系が中心)、回帰 0 件。
 
+### SetDiscriminant 後の enum のインプレース再初期化 (Lane CR, 2026-11-21)
+
+Lane CB が JIT 側で見つけた非対称の解消。rustc が出す標準形状
+「SetDiscriminant で variant V に切り替えてから、V のフィールドを
+1つずつ書く」を interp が拒否していた。根本原因は
+crates/sparagmos-interp/src/interp.rs の2点。
+(1) SetDiscriminant の Enum アームがタグ変更と同時に
+fields.clear() で payload を消去するのに、navigate_mut の
+Field アームはスロットが無いと UninitializedRead を返すだけで、
+clear 後の最初の書き込みが拒否されていた (再現時のエラー:
+UninitializedRead { place: "_1 as variant 1.0" })。
+(2) 書き込み先行型 (Downcast で新 variant のフィールドを
+書いてから SetDiscriminant) は、navigate_mut の Downcast
+アームが「現在の variant と異なる」として TypeMismatch を
+返し、そもそも到達不能だった。JIT はこの形状を処理できていた。
+
+修正は3点 (いずれも navigate_mut / SetDiscriminant の Enum 処理)。
+- Field アーム: Enum については Coroutine の状態ストレージと
+  同じく、対象インデックスまで Value::Uninit でパディングして
+  (再)素材化してから書き込む。Tuple/Closure は従来通り厳密。
+- Downcast アーム: 書き込み方向で現在の variant と異なる
+  Downcast はインプレース再初期化として扱い、旧 payload を
+  無効化してタグを切り替えてから進む。
+- SetDiscriminant: variant が実際に変わる場合のみ payload を
+  無効化する。保持中の variant への SetDiscriminant はタグのみの
+  書き込みとし、Downcast 経由で先に書かれたフィールドを壊さない
+  (コルーチン変換も使う「書き込み→タグ」順序との整合)。
+
+不変条件は維持する。新 variant の未書き込みフィールドの読みは
+UninitializedRead のまま (テストで、フィールド0の書き込み成功後に
+フィールド1を読むと .1 の場所で UninitializedRead になることまで
+確認)。Coroutine 値は無変更で、コルーチンテストに回帰なし。
+
+検証: 新規意味テスト
+crates/sparagmos-interp/tests/setdisc_reinit_tests.rs 5件
+(フレームローカル形状で Discriminant + SwitchInt の分岐確認、
+`&mut` 経由 (RefTarget::Place のナビゲーション)、狭い variant への
+再初期化、書き込み先行型、未書き込みフィールド読みのエラー)。
+修正前は4件失敗・1件は偶然通過、修正後は 5/5 通過。
+ワークスペース 440 passed / 0 failed、ドライバ 89 passed /
+0 failed、コーパス 47/47。
+
+サブセット実測 (subset-cr.json、ベースは Lane CN 統合後の
+main 8b8ac6e): 指標2(b) 71.215% (17,759/24,937)。both12 比
++319 件・回帰 0 件。ただし +319 の内訳はコンパイル時検証系
++293 (Lane CF の寄与で、うち +64 は Lane CL の incremental 分) と
+実行系 +26 (Lane CN の寄与) で、本レーンのベースに既に含まれて
+いた統合済みレーン分として全て説明できる。本レーンの修正が直接
+flip させたレコードはこの subset では 0 件で、both12 で
+"read of uninitialized place" にいた 75 件は全て同バケットに
+残った (未初期化読み一般の問題で Lane CH の領域であり、
+本レーンの対象である「一度 variant として存在する値の
+再初期化」とは根本原因が異なる)。なお subset-cn との単純比較
+では +229 件に見えるが、これは CN 計測時のベースに Lane CF の
+ctor instance 化が未反映だったことによる見かけの差で、
+本レーンの寄与ではない。本修正の正しさは上記の意味テストと、
+24,937 件での回帰ゼロで担保する。
+
 ---
 
 ## 測定の規律
