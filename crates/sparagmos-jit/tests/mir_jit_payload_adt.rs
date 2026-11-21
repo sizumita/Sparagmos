@@ -60,6 +60,7 @@ fn fndef(d: u32) -> mir::Operand {
     mir::Operand::constant(mir::Constant {
         literal: mir::ConstKind::Ty(mir::Ty::FnDef(def(d), vec![])),
         user_ty: None,
+        ty: None,
     })
 }
 
@@ -557,6 +558,7 @@ fn payload_adt_constant_with_fields() {
             ],
         }),
         user_ty: None,
+        ty: None,
     });
     let f = spec(
         "f",

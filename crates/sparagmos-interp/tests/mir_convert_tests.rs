@@ -247,6 +247,7 @@ fn fndef_operand(def: mir::DefId) -> mir::Operand {
     mir::Operand::constant(mir::Constant {
         literal: mir::ConstKind::Ty(mir::Ty::FnDef(def, Vec::new())),
         user_ty: None,
+        ty: None,
     })
 }
 

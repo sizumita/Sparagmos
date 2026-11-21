@@ -99,6 +99,7 @@ fn unevaluated_operand(def: mir::DefId) -> mir::Operand {
             args: Vec::new(),
         },
         user_ty: None,
+        ty: None,
     })
 }
 
