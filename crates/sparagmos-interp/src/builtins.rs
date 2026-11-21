@@ -2304,10 +2304,10 @@ impl<'a> Interpreter<'a> {
             Builtin::ThreadScope => {
                 arity(1)?;
                 let callable = vals.into_iter().next().expect("arity checked");
-                let scope_ref = Value::Ref(RefTarget::Value(Box::new(Value::Enum {
+                let scope_ref = Value::Ref(RefTarget::value(Value::Enum {
                     variant: 0,
                     fields: Vec::new(),
-                })));
+                }));
                 let result =
                     self.call_callable_to_completion(frames, &callable, vec![scope_ref])?;
                 // Every thread spawned inside the scope must
@@ -2973,16 +2973,11 @@ impl<'a> Interpreter<'a> {
                     || self_ty.starts_with("&alloc::vec::Vec<")
                     || self_ty.starts_with("&[")
                 {
-                    // `&Vec<T>` and `&[T]` iterate as `slice::Iter`:
-                    // the state is the element snapshot plus the
-                    // next index, the shape the `slice::iter`
-                    // runtime support builds and `Iterator::next`
-                    // consumes for `std::slice::Iter`.
+                    // `&Vec<T>` and `&[T]` iterate as `slice::Iter`,
+                    // in the real field layout `slice_iter_value`
+                    // builds and `Iterator::next` consumes.
                     let (elems, _) = self.slice_elements(frames, &value)?;
-                    Ok(Value::Enum {
-                        variant: 0,
-                        fields: vec![Value::Tuple(elems), Value::Uint(0)],
-                    })
+                    Ok(slice_iter_value(elems))
                 } else if self_ty_is(self_ty, "std::env::Args")
                     || self_ty_is(self_ty, "std::env::ArgsOs")
                 {
@@ -3287,7 +3282,7 @@ impl<'a> Interpreter<'a> {
                             if let Value::Ref(RefTarget::Alloc { .. }) = inner {
                                 return Ok(inner);
                             }
-                            Ok(Value::Ref(RefTarget::Value(Box::new(inner))))
+                            Ok(Value::Ref(RefTarget::value(inner)))
                         }
                         ref other => Err(InterpError::type_mismatch(
                             "Deref::deref for Box",
@@ -3783,7 +3778,7 @@ impl<'a> Interpreter<'a> {
                 if concrete == want {
                     Ok(Value::Enum {
                         variant: 1,
-                        fields: vec![Value::Ref(RefTarget::Value(Box::new(value)))],
+                        fields: vec![Value::Ref(RefTarget::value(value))],
                     })
                 } else {
                     Ok(Value::Enum {
@@ -4303,10 +4298,7 @@ impl<'a> Interpreter<'a> {
             Builtin::SliceIter => {
                 arity(1)?;
                 let (elems, _) = self.slice_elements(frames, &vals[0])?;
-                Ok(Value::Enum {
-                    variant: 0,
-                    fields: vec![Value::Tuple(elems), Value::Uint(0)],
-                })
+                Ok(slice_iter_value(elems))
             }
             Builtin::IterEmpty => {
                 arity(0)?;
@@ -4337,7 +4329,7 @@ impl<'a> Interpreter<'a> {
                 // Only the one element is cloned out of the borrowed
                 // element storage.
                 let elem = elems.at(idx);
-                Ok(Value::Ref(RefTarget::Value(Box::new(elem))))
+                Ok(Value::Ref(RefTarget::value(elem)))
             }
             Builtin::IndexMut => {
                 arity(2)?;
@@ -4518,7 +4510,7 @@ impl<'a> Interpreter<'a> {
                             if let Value::Ref(RefTarget::Alloc { .. }) = inner {
                                 return Ok(inner);
                             }
-                            Ok(Value::Ref(RefTarget::Value(Box::new(inner))))
+                            Ok(Value::Ref(RefTarget::value(inner)))
                         }
                         ref other => Err(InterpError::type_mismatch(
                             "DerefMut::deref_mut for Box",
@@ -6157,11 +6149,40 @@ impl<'a> Interpreter<'a> {
         } else if self_ty.starts_with("std::iter::Empty<") {
             // An empty iterator yields `None` forever.
             (fields, none_value())
+        } else if self_ty.starts_with("std::slice::Iter<") {
+            // The state is the real field layout (see
+            // `slice_iter_value`): (ptr, end, marker) with element
+            // pointers into the element snapshot. `next` hands out
+            // the current pointer itself as the `&T` item and
+            // advances it by one element.
+            if fields.len() != 3 {
+                return Err(InterpError::type_mismatch(
+                    "slice::Iter state",
+                    "[ptr, end, marker]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let (ptr_field, end) = (fields[0].clone(), fields[1].clone());
+            let (Some(cur), Some(last)) = (iter_ptr_index(&ptr_field), iter_ptr_index(&end))
+            else {
+                return Err(InterpError::type_mismatch(
+                    "slice::Iter state",
+                    "element pointers into the element snapshot",
+                    format!("{} / {}", ptr_field.kind_name(), end.kind_name()),
+                ));
+            };
+            if cur < last {
+                let advanced =
+                    iter_ptr_with_index(&ptr_field, cur + 1).expect("index step checked");
+                let item = iter_ptr_value(&ptr_field).expect("pointer field checked");
+                (vec![advanced, end, fields[2].clone()], some_value(item))
+            } else {
+                (fields, none_value())
+            }
         } else if self_ty.starts_with("std::array::IntoIter<")
             || self_ty.starts_with("std::vec::IntoIter<")
             || self_ty.starts_with("alloc::vec::IntoIter<")
             || self_ty.starts_with("std::option::IntoIter<")
-            || self_ty.starts_with("std::slice::Iter<")
             || self_ty_is(self_ty, "std::str::Chars")
             || self_ty_is(self_ty, "core::str::Chars")
             || self_ty_is(self_ty, "std::str::Bytes")
@@ -6196,26 +6217,14 @@ impl<'a> Interpreter<'a> {
             };
             if idx < items.len() {
                 let item = items[idx].clone();
-                // `slice::Iter` yields `&T`: the item is a shared
-                // reference to the element value, the shape
-                // `Index::index` produces for a shared element
-                // reference (reads resolve against the element
-                // itself). The other iterators sharing this state
-                // shape (`array::IntoIter`, `Chars`, `Bytes`) yield
-                // owned values.
-                let item = if self_ty.starts_with("std::slice::Iter<") {
-                    Value::Ref(RefTarget::Value(Box::new(item)))
-                } else {
-                    item
-                };
                 // An owning iterator's yielded element has moved
                 // out of the iterator's storage: mark the slot
                 // uninitialized in the new state, so the state's
                 // drop glue (which walks the element tuple) does
-                // not drop it a second time. A `slice::Iter`'s
-                // elements stay owned by the slice, and `Chars` /
-                // `Bytes` elements carry no glue, so their
-                // snapshots keep the elements.
+                // not drop it a second time. `Chars` / `Bytes`
+                // elements carry no glue, so their snapshots keep
+                // the elements. (`slice::Iter` is stepped by its
+                // own real-layout arm above.)
                 let items = if self_ty.starts_with("std::array::IntoIter<")
                     || self_ty.starts_with("std::vec::IntoIter<")
                     || self_ty.starts_with("alloc::vec::IntoIter<")
@@ -6625,7 +6634,7 @@ impl<'a> Interpreter<'a> {
                     format!("{} field(s)", fields.len()),
                 ));
             }
-            let inner_ref = Value::Ref(RefTarget::Value(Box::new(fields[0].clone())));
+            let inner_ref = Value::Ref(RefTarget::value(fields[0].clone()));
             return self.iterator_size_hint(frames, inner_ty, &inner_ref);
         }
         let fields = iterator_fields(&state, self_ty)?;
@@ -6671,10 +6680,16 @@ impl<'a> Interpreter<'a> {
         if self_ty.starts_with("std::iter::Empty<") {
             return Ok(hint(0, Some(0)));
         }
+        if self_ty.starts_with("std::slice::Iter<") {
+            // The real layout's pointer pair: the remaining count
+            // is the distance between the two element pointers.
+            let (cur, end) = slice_iter_bounds(&state, self_ty)?;
+            let n = end.saturating_sub(cur) as u128;
+            return Ok(hint(n, Some(n)));
+        }
         if self_ty.starts_with("std::array::IntoIter<")
             || self_ty.starts_with("std::vec::IntoIter<")
             || self_ty.starts_with("alloc::vec::IntoIter<")
-            || self_ty.starts_with("std::slice::Iter<")
             || self_ty_is(self_ty, "std::str::Chars")
             || self_ty_is(self_ty, "core::str::Chars")
             || self_ty_is(self_ty, "std::str::Bytes")
@@ -7420,7 +7435,7 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                 Value::Ref(RefTarget::Alloc { id, projection })
             }
             Resolved::Value(value) => {
-                Value::Ref(RefTarget::Value(Box::new(one_field_value(value, what)?)))
+                Value::Ref(RefTarget::value(one_field_value(value, what)?))
             }
         })
     }
@@ -7766,7 +7781,7 @@ fn deref_pointer_value(pointer: Value) -> InterpResult<Value> {
             let inner = fields.into_iter().next().expect("one field");
             match inner {
                 Value::Ref(RefTarget::Alloc { .. }) => Ok(inner),
-                other => Ok(Value::Ref(RefTarget::Value(Box::new(other)))),
+                other => Ok(Value::Ref(RefTarget::value(other))),
             }
         }
         other => Err(InterpError::type_mismatch(
@@ -7975,13 +7990,6 @@ fn step_owned_iter_back(
     let (items, idx) = owned_iter_parts(state, self_ty)?;
     if items.len() > idx {
         let item = items[items.len() - 1].clone();
-        // `slice::Iter`'s back step yields `&T`, like its front
-        // step (see `iterator_next`).
-        let item = if self_ty.starts_with("std::slice::Iter<") {
-            Value::Ref(RefTarget::Value(Box::new(item)))
-        } else {
-            item
-        };
         let kept = items[..items.len() - 1].to_vec();
         Ok((
             iterator_state_like(state, vec![Value::Tuple(kept), Value::Uint(idx as u128)]),
@@ -8082,10 +8090,12 @@ fn iterator_next_back_state(
             _ => (state.clone(), None),
         });
     }
+    if self_ty.starts_with("std::slice::Iter<") {
+        return step_slice_iter_back(state, self_ty);
+    }
     if self_ty.starts_with("std::array::IntoIter<")
         || self_ty.starts_with("std::vec::IntoIter<")
         || self_ty.starts_with("alloc::vec::IntoIter<")
-        || self_ty.starts_with("std::slice::Iter<")
         || self_ty_is(self_ty, "std::str::Chars")
         || self_ty_is(self_ty, "core::str::Chars")
         || self_ty_is(self_ty, "std::str::Bytes")
@@ -8096,6 +8106,195 @@ fn iterator_next_back_state(
     Err(unsupported(format!(
         "DoubleEndedIterator::next_back for {self_ty} is not runtime-supported"
     )))
+}
+
+/// The `slice::Iter` value over an element snapshot, in the
+/// struct's real field layout: `ptr` and `end_or_len` are element
+/// pointers into the snapshot — value targets carrying an
+/// `Index` projection — and the third field is the
+/// `PhantomData` marker. The layout matters beyond the builtins:
+/// core's converted bodies for the iterator's other methods
+/// (`fold`, `count`, `nth`, `size_hint`, ...) project these very
+/// fields, so a fabricated (snapshot, cursor) pair in their place
+/// reads back as a bogus pointer pair and the run dies on the
+/// first field copy.
+fn slice_iter_value(elems: Vec<Value>) -> Value {
+    let len = elems.len();
+    let snapshot = Value::Tuple(elems);
+    let ptr = Value::Ref(RefTarget::Value(
+        Box::new(snapshot.clone()),
+        vec![RefProj::Index(0)],
+    ));
+    let end = Value::Ref(RefTarget::Value(
+        Box::new(snapshot),
+        vec![RefProj::Index(len)],
+    ));
+    Value::Enum {
+        variant: 0,
+        fields: vec![
+            // `ptr: NonNull<T>` — the one-field wrapper around
+            // the raw element pointer.
+            Value::Enum {
+                variant: 0,
+                fields: vec![ptr],
+            },
+            end,
+            // `_marker: PhantomData<&T>` — a zero-sized ADT
+            // value.
+            Value::Enum {
+                variant: 0,
+                fields: Vec::new(),
+            },
+        ],
+    }
+}
+
+/// The element pointer a slice-iterator `ptr` field holds: the
+/// field's declared type is `NonNull<T>`, a one-field wrapper
+/// around the raw pointer, so the pointer is the wrapper's only
+/// field when the value is wrapped, and the value itself when it
+/// is not.
+fn iter_ptr_value(field: &Value) -> Option<Value> {
+    match field {
+        Value::Enum { fields, .. } if fields.len() == 1 => Some(fields[0].clone()),
+        Value::Ref(_) => Some(field.clone()),
+        _ => None,
+    }
+}
+
+/// The element index a slice-iterator pointer denotes: the
+/// trailing `Index` step of its target's projection, if it has
+/// one.
+fn iter_ptr_index(value: &Value) -> Option<usize> {
+    if let Value::Enum { fields, .. } = value {
+        if fields.len() == 1 {
+            return iter_ptr_index(&fields[0]);
+        }
+    }
+    let projection = match value {
+        Value::Ref(RefTarget::Place { projection, .. }) => projection,
+        Value::Ref(RefTarget::Static { projection, .. }) => projection,
+        Value::Ref(RefTarget::Alloc { projection, .. }) => projection,
+        Value::Ref(RefTarget::Value(_, projection)) => projection,
+        _ => return None,
+    };
+    match projection.last() {
+        Some(RefProj::Index(i)) => Some(*i),
+        _ => None,
+    }
+}
+
+/// The same element pointer with its trailing `Index` step set
+/// to `idx`.
+fn iter_ptr_with_index(value: &Value, idx: usize) -> Option<Value> {
+    if let Value::Enum { variant, fields } = value {
+        if fields.len() == 1 {
+            let inner = iter_ptr_with_index(&fields[0], idx)?;
+            return Some(Value::Enum {
+                variant: *variant,
+                fields: vec![inner],
+            });
+        }
+    }
+    fn with_index(projection: &[RefProj], idx: usize) -> Option<Vec<RefProj>> {
+        let mut projection = projection.to_vec();
+        match projection.last_mut() {
+            Some(RefProj::Index(i)) => {
+                *i = idx;
+                Some(projection)
+            }
+            _ => None,
+        }
+    }
+    match value {
+        Value::Ref(RefTarget::Place {
+            frame,
+            local,
+            projection,
+        }) => Some(Value::Ref(RefTarget::place(
+            *frame,
+            *local,
+            with_index(projection, idx)?,
+        ))),
+        Value::Ref(RefTarget::Static { name, projection }) => {
+            Some(Value::Ref(RefTarget::Static {
+                name: name.clone(),
+                projection: with_index(projection, idx)?,
+            }))
+        }
+        Value::Ref(RefTarget::Alloc { id, projection }) => Some(Value::Ref(RefTarget::Alloc {
+            id: *id,
+            projection: with_index(projection, idx)?,
+        })),
+        Value::Ref(RefTarget::Value(v, projection)) => Some(Value::Ref(RefTarget::Value(
+            v.clone(),
+            with_index(projection, idx)?,
+        ))),
+        _ => None,
+    }
+}
+
+/// The (current, end) element indices of a real-layout
+/// `slice::Iter` state value, with the shape checks
+/// `iterator_next` performs for it.
+fn slice_iter_bounds(state: &Value, self_ty: &str) -> InterpResult<(usize, usize)> {
+    let fields = iterator_fields(state, self_ty)?;
+    if fields.len() != 3 {
+        return Err(InterpError::type_mismatch(
+            "slice::Iter state",
+            "[ptr, end, marker]",
+            format!("{} field(s)", fields.len()),
+        ));
+    }
+    let (Some(cur), Some(end)) = (iter_ptr_index(&fields[0]), iter_ptr_index(&fields[1]))
+    else {
+        return Err(InterpError::type_mismatch(
+            "slice::Iter state",
+            "element pointers into the element snapshot",
+            format!(
+                "{} / {}",
+                fields[0].kind_name(),
+                fields[1].kind_name()
+            ),
+        ));
+    };
+    Ok((cur, end))
+}
+
+/// One back step of a real-layout `slice::Iter` state: yields
+/// the last remaining element reference and pulls the end
+/// pointer back by one element. The front pointer is untouched,
+/// so front and back steps compose exactly as the real
+/// double-ended iterator's do.
+fn step_slice_iter_back(
+    state: &Value,
+    self_ty: &str,
+) -> InterpResult<(Value, Option<Value>)> {
+    let fields = iterator_fields(state, self_ty)?;
+    if fields.len() != 3 {
+        return Err(InterpError::type_mismatch(
+            "slice::Iter state",
+            "[ptr, end, marker]",
+            format!("{} field(s)", fields.len()),
+        ));
+    }
+    let (cur, end) = slice_iter_bounds(state, self_ty)?;
+    if cur < end {
+        let new_end =
+            iter_ptr_with_index(&fields[1], end - 1).expect("index step checked");
+        let item_field =
+            iter_ptr_with_index(&fields[0], end - 1).expect("index step checked");
+        let item = iter_ptr_value(&item_field).expect("pointer field checked");
+        Ok((
+            iterator_state_like(
+                state,
+                vec![fields[0].clone(), new_end, fields[2].clone()],
+            ),
+            Some(item),
+        ))
+    } else {
+        Ok((state.clone(), None))
+    }
 }
 
 fn iterator_fields(state: &Value, self_ty: &str) -> InterpResult<Vec<Value>> {
@@ -8640,10 +8839,10 @@ fn int_uint_cmp(x: i128, y: u128) -> Ordering {
 /// resolved `RefProj::Subslice` step appended, so reads and
 /// writes through it alias the original storage at the
 /// sub-slice's offset. A `Value` target (a constant aggregate)
-/// is projected eagerly: reads through it stay exact, and
-/// writes through it are refused by the write path, as for any
-/// constant.
-fn subslice_ref(value: &Value, offset: usize, len: usize, name: &str) -> InterpResult<Value> {
+/// carries the step in its projection, like the other targets:
+/// reads through it stay exact, and writes through it are
+/// refused by the write path, as for any constant.
+fn subslice_ref(value: &Value, offset: usize, len: usize, _name: &str) -> InterpResult<Value> {
     let step = RefProj::Subslice { offset, len };
     match value {
         Value::Ref(RefTarget::Place {
@@ -8674,10 +8873,10 @@ fn subslice_ref(value: &Value, offset: usize, len: usize, name: &str) -> InterpR
                 projection,
             }))
         }
-        Value::Ref(RefTarget::Value(v)) => {
-            let projected =
-                crate::interp::project_value((**v).clone(), &[step], name, "index_mut receiver")?;
-            Ok(Value::Ref(RefTarget::Value(Box::new(projected))))
+        Value::Ref(RefTarget::Value(v, projection)) => {
+            let mut projection = projection.clone();
+            projection.push(step);
+            Ok(Value::Ref(RefTarget::Value(v.clone(), projection)))
         }
         other => Err(InterpError::type_mismatch(
             "IndexMut::index_mut",

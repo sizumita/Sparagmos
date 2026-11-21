@@ -109,9 +109,16 @@ pub enum RefTarget {
         projection: Vec<RefProj>,
     },
     /// An immutable constant aggregate (the base of a constant slice
-    /// or array). Reads resolve against the stored value; writes
-    /// through it are an error.
-    Value(Box<Value>),
+    /// or array), projected by the stored projection: the target is
+    /// the sub-value of the aggregate the projection reaches (the
+    /// projection is applied when the reference is resolved, as for
+    /// the other targets). An empty projection denotes the whole
+    /// aggregate. Reads resolve against the stored value; writes
+    /// through it are an error. The (aggregate, projection) pair is
+    /// the pointer's identity, which is what lets a value target
+    /// denote one element of the aggregate — the element pointers
+    /// a `slice::Iter` value carries, for instance.
+    Value(Box<Value>, Vec<RefProj>),
     /// A `static` item's program-level storage, identified by the
     /// static's program key. The interpreter holds one value per
     /// static (see `Interpreter`'s statics store), seeded from the
@@ -155,6 +162,12 @@ pub enum RefTarget {
 }
 
 impl RefTarget {
+    /// A reference to a whole constant aggregate value (an empty
+    /// projection).
+    pub fn value(value: Value) -> RefTarget {
+        RefTarget::Value(Box::new(value), Vec::new())
+    }
+
     pub fn place(frame: u64, local: usize, projection: Vec<RefProj>) -> RefTarget {
         RefTarget::Place {
             frame,
@@ -379,7 +392,7 @@ impl fmt::Display for RefTarget {
                 }
                 Ok(())
             }
-            RefTarget::Value(_) => write!(f, "constant aggregate"),
+            RefTarget::Value(..) => write!(f, "constant aggregate"),
             RefTarget::Static { name, projection } => {
                 write!(f, "static {name}")?;
                 for proj in projection {

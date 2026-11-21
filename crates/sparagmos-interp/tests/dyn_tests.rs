@@ -500,7 +500,7 @@ fn str_content(v: &Value) -> Option<String> {
     match v {
         Value::Str(s) => Some(s.clone()),
         Value::FatRef { base, .. } => str_content(base),
-        Value::Ref(RefTarget::Value(inner)) => str_content(inner),
+        Value::Ref(RefTarget::Value(inner, _)) => str_content(inner),
         _ => None,
     }
 }

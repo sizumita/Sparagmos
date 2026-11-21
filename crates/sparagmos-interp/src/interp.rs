@@ -976,7 +976,7 @@ impl<'a> Interpreter<'a> {
                             // wrapped value is itself callable.
                             let (value, unwrapped) = unwrap_callable_wrapper(value);
                             let env_ref = if unwrapped {
-                                Value::Ref(RefTarget::Value(Box::new(value.clone())))
+                                Value::Ref(RefTarget::value(value.clone()))
                             } else {
                                 env_ref
                             };
@@ -1052,9 +1052,8 @@ impl<'a> Interpreter<'a> {
                                         // callable itself, which is
                                         // what capture reads resolve
                                         // through.
-                                        let env = Value::Ref(RefTarget::Value(
-                                            Box::new(value.clone()),
-                                        ));
+                                        let env =
+                                            Value::Ref(RefTarget::value(value.clone()));
                                         (value, env)
                                     } else {
                                         (value, recv)
@@ -1076,9 +1075,9 @@ impl<'a> Interpreter<'a> {
                                     let (value, unwrapped) =
                                         unwrap_callable_wrapper(value);
                                     let env = if unwrapped {
-                                        Value::Ref(RefTarget::Value(Box::new(
+                                        Value::Ref(RefTarget::value(
                                             value.clone(),
-                                        )))
+                                        ))
                                     } else {
                                         self.callable_env_ref(
                                             &frames,
@@ -1240,7 +1239,7 @@ impl<'a> Interpreter<'a> {
                             Operand::Constant(_) => {
                                 let value =
                                     self.eval_operand(&mut frames, body, operand)?;
-                                RefTarget::Value(Box::new(value))
+                                RefTarget::value(value)
                             }
                         };
                         self.write_place(frames, body, destination, Value::Unit)?;
@@ -1306,7 +1305,7 @@ impl<'a> Interpreter<'a> {
                             // deref in this model): the glue runs
                             // against that value itself, as it does
                             // for a `mem::drop` constant argument.
-                            RefTarget::Value(Box::new(value))
+                            RefTarget::value(value)
                         }
                     };
                     let work = vec![(Vec::new(), glue.root.clone())];
@@ -1978,10 +1977,10 @@ impl<'a> Interpreter<'a> {
             .borrow_mut()
             .take()
             .unwrap_or_else(|| {
-                Value::Ref(RefTarget::Value(Box::new(Value::Enum {
+                Value::Ref(RefTarget::value(Value::Enum {
                     variant: 0,
                     fields: vec![Value::Str(String::new()), Value::Uint(0), Value::Uint(0)],
-                })))
+                }))
             });
         let info = Value::Enum {
             variant: 0,
@@ -1999,7 +1998,7 @@ impl<'a> Interpreter<'a> {
                 Value::Bool(true),
             ],
         };
-        let info_ref = Value::Ref(RefTarget::Value(Box::new(info)));
+        let info_ref = Value::Ref(RefTarget::value(info));
         let Ok((callable, _)) = self.dyn_callable(frames, &hook) else {
             return;
         };
@@ -2286,7 +2285,7 @@ impl<'a> Interpreter<'a> {
         let callable = self.read_resolved(frames, &resolved)?;
         let env = match &**base {
             Value::Ref(_) | Value::FatRef { .. } => (**base).clone(),
-            _ => Value::Ref(RefTarget::Value(Box::new(callable.clone()))),
+            _ => Value::Ref(RefTarget::value(callable.clone())),
         };
         Ok((callable, env))
     }
@@ -2331,7 +2330,7 @@ impl<'a> Interpreter<'a> {
                         projection,
                     ))),
                     Resolved::Value(_) => {
-                        Ok(Value::Ref(RefTarget::Value(Box::new(value.clone()))))
+                        Ok(Value::Ref(RefTarget::value(value.clone())))
                     }
                     Resolved::Static { name, projection } => {
                         Ok(Value::Ref(RefTarget::Static { name, projection }))
@@ -2341,7 +2340,7 @@ impl<'a> Interpreter<'a> {
                     }
                 }
             }
-            Operand::Constant(_) => Ok(Value::Ref(RefTarget::Value(Box::new(value.clone())))),
+            Operand::Constant(_) => Ok(Value::Ref(RefTarget::value(value.clone()))),
         }
     }
 
@@ -2503,7 +2502,7 @@ impl<'a> Interpreter<'a> {
                 };
                 (base, projection)
             }
-            RefTarget::Value(v) => ((**v).clone(), &[]),
+            RefTarget::Value(v, projection) => ((**v).clone(), projection),
             RefTarget::Static { name, projection } => (self.static_base(name)?, projection),
             RefTarget::Alloc { id, projection } => {
                 // A freed allocation holds nothing to read glue
@@ -2579,10 +2578,10 @@ impl<'a> Interpreter<'a> {
                     projection.push(step.clone());
                     RefTarget::place(frame, local, projection)
                 }
-                RefTarget::Value(v) => {
-                    let projected =
-                        self.project_value_t(*v, std::slice::from_ref(step), "<drop>", "drop glue")?;
-                    RefTarget::Value(Box::new(projected))
+                RefTarget::Value(v, projection) => {
+                    let mut projection = projection.clone();
+                    projection.push(step.clone());
+                    RefTarget::Value(v.clone(), projection)
                 }
                 RefTarget::Static {
                     name,
@@ -2996,7 +2995,7 @@ impl<'a> Interpreter<'a> {
                                 }
                             }
                             Value::Enum { fields, .. } if fields.len() == 1 => {
-                                RefTarget::Value(Box::new(fields[0].clone()))
+                                RefTarget::value(fields[0].clone())
                             }
                             Value::Ref(target) => target.clone(),
                             other => {
@@ -3270,7 +3269,7 @@ impl<'a> Interpreter<'a> {
                 let env = if self.closure_body_takes_env_by_value(def) {
                     callable.clone()
                 } else {
-                    Value::Ref(RefTarget::Value(Box::new(callable.clone())))
+                    Value::Ref(RefTarget::value(callable.clone()))
                 };
                 let mut full = vec![env];
                 full.extend(args);
@@ -3939,7 +3938,7 @@ impl<'a> Interpreter<'a> {
                 projection.clone(),
             )),
             Resolved::Value(value) => {
-                Value::Ref(RefTarget::Value(Box::new(value.clone())))
+                Value::Ref(RefTarget::value(value.clone()))
             }
             Resolved::Static { name, projection } => Value::Ref(RefTarget::Static {
                 name: name.clone(),
@@ -4200,7 +4199,9 @@ impl<'a> Interpreter<'a> {
                 local: *local,
                 projection: projection.clone(),
             }),
-            Value::Ref(RefTarget::Value(v)) => Ok(Resolved::Value((**v).clone())),
+            Value::Ref(RefTarget::Value(v, projection)) => Ok(Resolved::Value(
+                self.project_value_t((**v).clone(), projection, "<deref>", "constant aggregate")?,
+            )),
             Value::Ref(RefTarget::Static { name, projection }) => Ok(Resolved::Static {
                 name: name.clone(),
                 projection: projection.clone(),
@@ -4339,15 +4340,10 @@ impl<'a> Interpreter<'a> {
                 projection.extend((0..depth).map(|_| RefProj::Field(0)));
                 Ok(Value::Ref(RefTarget::Alloc { id, projection }))
             }
-            Value::Ref(RefTarget::Value(v)) => {
-                let steps = vec![RefProj::Field(0); depth as usize];
-                let inner = project_value(
-                    *v,
-                    &steps,
-                    &body.name,
-                    "transparent wrapper pointer",
-                )?;
-                Ok(Value::Ref(RefTarget::Value(Box::new(inner))))
+            Value::Ref(RefTarget::Value(v, projection)) => {
+                let mut projection = projection.clone();
+                projection.extend((0..depth).map(|_| RefProj::Field(0)));
+                Ok(Value::Ref(RefTarget::Value(v.clone(), projection)))
             }
             Value::Ref(RefTarget::Null) | Value::Ref(RefTarget::Address(_)) => Ok(value),
             Value::FatRef { base, len } => match *base {
@@ -5406,7 +5402,7 @@ impl<'a> Interpreter<'a> {
                     .collect::<InterpResult<Vec<_>>>()?,
             },
             Constant::Ref(inner) => {
-                Value::Ref(RefTarget::Value(Box::new(self.eval_constant(inner)?)))
+                Value::Ref(RefTarget::value(self.eval_constant(inner)?))
             }
             Constant::IntPtr(addr) => Value::Ref(RefTarget::Address(*addr)),
             Constant::NullPtr => Value::Ref(RefTarget::Null),
@@ -6128,9 +6124,9 @@ impl<'a> Interpreter<'a> {
                                         )));
                                     }
                                     Resolved::Value(value) => {
-                                        break Ok(Value::Ref(RefTarget::Value(Box::new(
+                                        break Ok(Value::Ref(RefTarget::value(
                                             value,
-                                        ))));
+                                        )));
                                     }
                                     Resolved::Static { name, projection }
                                         if !projection.is_empty() =>
@@ -6214,7 +6210,7 @@ impl<'a> Interpreter<'a> {
                         local,
                         projection,
                     )),
-                    Resolved::Value(value) => Value::Ref(RefTarget::Value(Box::new(value))),
+                    Resolved::Value(value) => Value::Ref(RefTarget::value(value)),
                     Resolved::Static { name, projection } => {
                         Value::Ref(RefTarget::Static { name, projection })
                     }
@@ -7755,8 +7751,23 @@ fn synthetic_addr(v: &Value) -> u128 {
                 mix(&mut h, n);
             }
         }
-        Value::Ref(RefTarget::Value(_)) => {
+        Value::Ref(RefTarget::Value(_, projection)) => {
             mix(&mut h, 0x5eed_5eed_5eed_5eed);
+            for step in projection {
+                let (tag, n) = match step {
+                    RefProj::Field(i) => (1u128, *i as u128),
+                    RefProj::UnionField { idx, table } => {
+                        (5u128, ((*table as u128) << 64) | (*idx as u128))
+                    }
+                    RefProj::Index(i) => (2u128, *i as u128),
+                    RefProj::Downcast(i) => (3u128, *i as u128),
+                    RefProj::Subslice { offset, len } => {
+                        (4u128, ((*offset as u128) << 64) | (*len as u128))
+                    }
+                };
+                mix(&mut h, tag);
+                mix(&mut h, n);
+            }
         }
         Value::Ref(RefTarget::Static { name, projection }) => {
             mix(&mut h, 0x57a7_1c5_7a7_1c5);
@@ -8101,11 +8112,11 @@ fn ref_shaped_receiver(value: Value) -> Value {
             let field = fields.into_iter().next().expect("one field");
             match field {
                 Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. } => field,
-                field => Value::Ref(RefTarget::Value(Box::new(field))),
+                field => Value::Ref(RefTarget::value(field)),
             }
         }
         other @ (Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. }) => other,
-        other => Value::Ref(RefTarget::Value(Box::new(other))),
+        other => Value::Ref(RefTarget::value(other)),
     }
 }
 
