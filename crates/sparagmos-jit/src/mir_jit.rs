@@ -98,17 +98,16 @@
 //! code` — the interpreter's model — lowered to a jump into a panic
 //! block like a failed `Assert`, never to a hardware trap.
 //!
-//! The interpreter's model of the *plain* (unchecked) operators is
-//! that they panic on overflow — `arithmetic overflow in Add`, the
-//! shift-amount message, and so on — so the lowering gives the plain
-//! operators exactly those panics: plain `Add` / `Sub` / `Mul` are
-//! compiled through the checked backend operation plus a branch on
-//! its flag, plain division checks the `MIN / -1` case explicitly,
-//! plain shifts check the amount only (bits shifted out are
-//! lost, as natively), and plain `Neg` checks for the type's
-//! minimum. The checked
-//! forms (`CheckedBinaryOp`, `*WithOverflow`) yield the flag as a
-//! value instead, as in the interpreter.
+//! The *plain* (unchecked) operators wrap, in both engines: the
+//! overflow panic belongs to the `Assert` rustc emits after a
+//! checked operation, never to the plain operation itself. Plain
+//! `Add` / `Sub` / `Mul` are compiled through the checked backend
+//! operation with its flag unused, plain division wraps the
+//! `MIN / -1` case (rewritten so the hardware instruction cannot
+//! trap on it), plain shifts take the amount modulo the type
+//! width, and plain `Neg` wraps the type's minimum to itself. The
+//! checked forms (`CheckedBinaryOp`, `*WithOverflow`) yield the
+//! flag as a value instead, as in the interpreter.
 //!
 //! # Scope
 //!
@@ -3530,15 +3529,16 @@ impl<'a> FnLower<'a> {
         let signed = kind.signed;
         match op {
             M::Add | M::AddUnchecked | M::Sub | M::SubUnchecked | M::Mul | M::MulUnchecked => {
-                // In the interpreter's model a plain arithmetic
-                // operator panics on overflow; compile it as the
-                // checked operation plus a branch on the flag.
-                let (base, name) = match op {
-                    M::Add | M::AddUnchecked => (CheckedOp::Add, "Add"),
-                    M::Sub | M::SubUnchecked => (CheckedOp::Sub, "Sub"),
-                    _ => (CheckedOp::Mul, "Mul"),
+                // A plain arithmetic operator wraps on overflow
+                // (the overflow panic belongs to the `Assert` after
+                // a checked operation): compile it as the checked
+                // operation with the flag unused.
+                let base = match op {
+                    M::Add | M::AddUnchecked => CheckedOp::Add,
+                    M::Sub | M::SubUnchecked => CheckedOp::Sub,
+                    _ => CheckedOp::Mul,
                 };
-                self.lower_plain_arith(dst, base, name, lv, rv, kind)?;
+                self.lower_plain_arith(dst, base, lv, rv, kind)?;
             }
             M::BitAnd | M::BitOr | M::BitXor => {
                 let ir_op = match op {
@@ -3639,23 +3639,18 @@ impl<'a> FnLower<'a> {
         Ok(())
     }
 
-    /// Plain `Add` / `Sub` / `Mul`: the checked backend operation,
-    /// then a branch on its overflow flag to the interpreter's
-    /// overflow panic. (The checked result is already normalised to
-    /// the type by the backend, so no further fixup is needed.)
+    /// Plain `Add` / `Sub` / `Mul`: the checked backend operation
+    /// with its overflow flag unused — a plain operator's result
+    /// wraps, and the checked result is already normalised to the
+    /// type by the backend, so no further fixup is needed.
     fn lower_plain_arith(
         &mut self,
         dst: u32,
         base: CheckedOp,
-        name: &str,
         lv: u32,
         rv: u32,
         kind: IrIntKind,
     ) -> Result<(), JitError> {
-        let msg = self
-            .messages
-            .intern(&format!("arithmetic overflow in {name}"));
-        let pblk = self.panic_block(msg);
         let flag = self.fresh();
         self.emit(Instr::CheckedBinOp {
             dst_val: dst,
@@ -3665,23 +3660,17 @@ impl<'a> FnLower<'a> {
             rhs: IrOperand::Value(rv),
             kind,
         });
-        let cont = self.new_block();
-        self.seal_and_continue(
-            IrTerminator::Branch {
-                cond: IrOperand::Value(flag),
-                then_blk: pblk,
-                else_blk: cont,
-            },
-            cont,
-        );
         Ok(())
     }
 
-    /// Plain division / remainder with the guards the interpreter's
-    /// semantics (and the hardware) need: a zero divisor panics with
-    /// the divide-by-zero message, and the signed `MIN / -1` case —
-    /// an overflow in the interpreter's model, and a hardware trap
-    /// at 64 bits — panics with the arithmetic-overflow message.
+    /// Plain division / remainder with the guards the semantics
+    /// (and the hardware) need: a zero divisor panics with the
+    /// divide-by-zero message, and the signed 64-bit `MIN / -1`
+    /// case — which wraps, to `MIN` for division and `0` for
+    /// remainder, but traps the hardware instruction — is computed
+    /// through a rewritten divisor (see below). Narrower signed
+    /// kinds cannot trap: their values divide exactly in 64 bits
+    /// and the result is normalised to the type.
     fn lower_div_rem(
         &mut self,
         dst: u32,
@@ -3713,24 +3702,15 @@ impl<'a> FnLower<'a> {
             },
             cont,
         );
-        if kind.signed {
-            let name = if is_rem { "Rem" } else { "Div" };
-            let msg = self
-                .messages
-                .intern(&format!("arithmetic overflow in {name}"));
-            let pblk = self.panic_block(msg);
-            let min = if kind.bits == 64 {
-                i64::MIN
-            } else {
-                -(1i64 << (kind.bits - 1))
-            };
-            let is_min = self.fresh();
-            self.emit(Instr::BinOp {
-                dst: is_min,
-                op: IrBinOp::Eq,
-                lhs: IrOperand::Value(lv),
-                rhs: IrOperand::Const(min),
-            });
+        // A divisor of -1 in the signed 64-bit case: rewrite it
+        // to 1 (whose quotient is the dividend itself and whose
+        // remainder is 0) so the instruction cannot trap, and
+        // negate a division's result back below — wrapping
+        // negation, which maps `MIN` to itself and every other
+        // dividend to its true quotient by -1.
+        let mut divisor = rv;
+        let mut neg1: Option<u32> = None;
+        if kind.signed && kind.bits == 64 {
             let is_neg1 = self.fresh();
             self.emit(Instr::BinOp {
                 dst: is_neg1,
@@ -3738,22 +3718,22 @@ impl<'a> FnLower<'a> {
                 lhs: IrOperand::Value(rv),
                 rhs: IrOperand::Const(-1),
             });
-            let both = self.fresh();
+            let twice = self.fresh();
             self.emit(Instr::BinOp {
-                dst: both,
-                op: IrBinOp::And,
-                lhs: IrOperand::Value(is_min),
+                dst: twice,
+                op: IrBinOp::Add,
+                lhs: IrOperand::Value(is_neg1),
                 rhs: IrOperand::Value(is_neg1),
             });
-            let cont = self.new_block();
-            self.seal_and_continue(
-                IrTerminator::Branch {
-                    cond: IrOperand::Value(both),
-                    then_blk: pblk,
-                    else_blk: cont,
-                },
-                cont,
-            );
+            let adjusted = self.fresh();
+            self.emit(Instr::BinOp {
+                dst: adjusted,
+                op: IrBinOp::Add,
+                lhs: IrOperand::Value(rv),
+                rhs: IrOperand::Value(twice),
+            });
+            divisor = adjusted;
+            neg1 = Some(is_neg1);
         }
         let ir_op = match (is_rem, kind.signed) {
             (false, true) => IrBinOp::Div,
@@ -3765,17 +3745,43 @@ impl<'a> FnLower<'a> {
             dst,
             op: ir_op,
             lhs: IrOperand::Value(lv),
-            rhs: IrOperand::Value(rv),
+            rhs: IrOperand::Value(divisor),
         });
+        if let (Some(is_neg1), false) = (neg1, is_rem) {
+            let twice = self.fresh();
+            self.emit(Instr::BinOp {
+                dst: twice,
+                op: IrBinOp::Add,
+                lhs: IrOperand::Value(is_neg1),
+                rhs: IrOperand::Value(is_neg1),
+            });
+            let factor = self.fresh();
+            self.emit(Instr::BinOp {
+                dst: factor,
+                op: IrBinOp::Sub,
+                lhs: IrOperand::Const(1),
+                rhs: IrOperand::Value(twice),
+            });
+            let wrapped = self.fresh();
+            self.emit(Instr::BinOp {
+                dst: wrapped,
+                op: IrBinOp::Mul,
+                lhs: IrOperand::Value(dst),
+                rhs: IrOperand::Value(factor),
+            });
+            self.emit(Instr::Copy {
+                dst,
+                src: IrOperand::Value(wrapped),
+            });
+        }
         self.normalize(dst, dst_ty);
         Ok(())
     }
 
-    /// Plain shift: an amount meeting or exceeding the type width
-    /// panics with Rust 1.100.0's message for the direction
-    /// (`attempt to shift left with overflow` / `attempt to shift
-    /// right with overflow`), as the interpreter's plain form does.
-    /// Bits shifted out of the width are simply lost, as natively.
+    /// Plain shift: the amount is taken modulo the type width, as
+    /// the interpreter's plain form does (the overshift panic
+    /// belongs to the `Assert` after a checked shift). Bits shifted
+    /// out of the width are simply lost, as natively.
     fn lower_shift(
         &mut self,
         dst: u32,
@@ -3786,29 +3792,13 @@ impl<'a> FnLower<'a> {
         dst_ty: &mir::Ty,
     ) -> Result<(), JitError> {
         let bits = kind.bits as u32;
-        // Overshift check.
-        let over = self.fresh();
+        let masked = self.fresh();
         self.emit(Instr::BinOp {
-            dst: over,
-            op: IrBinOp::GeU,
+            dst: masked,
+            op: IrBinOp::And,
             lhs: IrOperand::Value(rv),
-            rhs: IrOperand::Const(bits as i64),
+            rhs: IrOperand::Const((bits - 1) as i64),
         });
-        let msg = self.messages.intern(if is_shl {
-            "attempt to shift left with overflow"
-        } else {
-            "attempt to shift right with overflow"
-        });
-        let pblk = self.panic_block(msg);
-        let cont = self.new_block();
-        self.seal_and_continue(
-            IrTerminator::Branch {
-                cond: IrOperand::Value(over),
-                then_blk: pblk,
-                else_blk: cont,
-            },
-            cont,
-        );
         let shift_op = if is_shl {
             IrBinOp::Shl
         } else if kind.signed {
@@ -3820,7 +3810,7 @@ impl<'a> FnLower<'a> {
             dst,
             op: shift_op,
             lhs: IrOperand::Value(lv),
-            rhs: IrOperand::Value(rv),
+            rhs: IrOperand::Value(masked),
         });
         self.normalize(dst, dst_ty);
         Ok(())
@@ -3917,33 +3907,10 @@ impl<'a> FnLower<'a> {
                 let mir::Ty::Int(it) = dst_ty else {
                     return Err(self.err("Neg on a non-signed-integer type"));
                 };
-                let bits = int_bits(*it);
                 let v = self.operand_value(operand, dst_ty)?;
-                // Negating the type's minimum overflows; the
-                // interpreter panics.
-                let min = if bits == 64 {
-                    i64::MIN
-                } else {
-                    -(1i64 << (bits - 1))
-                };
-                let is_min = self.fresh();
-                self.emit(Instr::BinOp {
-                    dst: is_min,
-                    op: IrBinOp::Eq,
-                    lhs: IrOperand::Value(v),
-                    rhs: IrOperand::Const(min),
-                });
-                let msg = self.messages.intern("arithmetic overflow in Neg");
-                let pblk = self.panic_block(msg);
-                let cont = self.new_block();
-                self.seal_and_continue(
-                    IrTerminator::Branch {
-                        cond: IrOperand::Value(is_min),
-                        then_blk: pblk,
-                        else_blk: cont,
-                    },
-                    cont,
-                );
+                // Plain negation wraps: the type's minimum maps
+                // to itself (the overflow panic belongs to the
+                // `Assert` after a checked negation).
                 self.emit(Instr::UnOp {
                     dst,
                     op: IrUnOp::Neg,
