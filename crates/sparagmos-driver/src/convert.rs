@@ -880,6 +880,42 @@ impl Converter {
                     ty: float_ty(f),
                 }))
             }
+            TyKind::RigidTy(RigidTy::Str) => {
+                // A `str` value in non-reference position is the
+                // trailing unsized field of an ADT (a newtype over
+                // `str`): its bytes run to the end of the allocation.
+                let raw = alloc.raw_bytes().ok()?;
+                let bytes = raw.get(offset..)?;
+                String::from_utf8(bytes.to_vec()).ok().map(sm::ConstValue::Str)
+            }
+            TyKind::RigidTy(RigidTy::Slice(elem)) => {
+                // Likewise a slice in non-reference position is a
+                // trailing unsized field (the `[u8]` inside `CStr`
+                // is the canonical case): its elements run to the
+                // end of the allocation.
+                let raw = alloc.raw_bytes().ok()?;
+                let bytes = raw.get(offset..)?;
+                if matches!(
+                    elem.kind(),
+                    TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8))
+                ) {
+                    return Some(sm::ConstValue::Bytes(bytes.to_vec()));
+                }
+                let stride = elem.layout().ok()?.shape().size.bytes();
+                if stride == 0 || bytes.len() % stride != 0 {
+                    return None;
+                }
+                let mut elems = Vec::new();
+                for i in 0..bytes.len() / stride {
+                    elems.push(self.decode_const(
+                        &elem,
+                        alloc,
+                        offset + i * stride,
+                        depth + 1,
+                    )?);
+                }
+                Some(sm::ConstValue::SliceVal(elems))
+            }
             TyKind::RigidTy(RigidTy::Ref(_, inner, _)) => {
                 self.decode_ref(&inner, alloc, offset, depth)
             }
