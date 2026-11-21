@@ -1939,6 +1939,71 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// The pointer a transparent-wrapper cast produces (see
+    /// [`Rvalue::PtrField`]): the operand pointer with a field-0
+    /// projection appended, so it denotes the wrapper's only
+    /// field. A pointer to a constant aggregate is projected
+    /// eagerly (such pointers are read-only in this model anyway,
+    /// so nothing observable is lost); null and address-only
+    /// pointers denote no field and pass through unchanged.
+    pub(crate) fn ptr_field_value(
+        &self,
+        frames: &[Frame],
+        body: &Body,
+        value: Value,
+    ) -> InterpResult<Value> {
+        match value {
+            Value::Ref(RefTarget::Place {
+                frame,
+                local,
+                mut projection,
+            }) => {
+                projection.push(RefProj::Field(0));
+                Ok(Value::Ref(RefTarget::Place {
+                    frame,
+                    local,
+                    projection,
+                }))
+            }
+            Value::Ref(RefTarget::Static {
+                name,
+                mut projection,
+            }) => {
+                projection.push(RefProj::Field(0));
+                Ok(Value::Ref(RefTarget::Static { name, projection }))
+            }
+            Value::Ref(RefTarget::Value(v)) => {
+                let inner = project_value(
+                    *v,
+                    &[RefProj::Field(0)],
+                    &body.name,
+                    "transparent wrapper pointer",
+                )?;
+                Ok(Value::Ref(RefTarget::Value(Box::new(inner))))
+            }
+            Value::Ref(RefTarget::Null) | Value::Ref(RefTarget::Address(_)) => Ok(value),
+            Value::FatRef { base, len } => match *base {
+                Value::Ref(_) => {
+                    let base = self.ptr_field_value(frames, body, *base)?;
+                    Ok(Value::FatRef {
+                        base: Box::new(base),
+                        len,
+                    })
+                }
+                ref other => Err(InterpError::type_mismatch(
+                    "transparent wrapper pointer cast",
+                    "fat pointer over a reference",
+                    other.kind_name(),
+                )),
+            },
+            other => Err(InterpError::type_mismatch(
+                "transparent wrapper pointer cast",
+                "pointer to an UnsafeCell/MaybeUninit wrapper",
+                other.kind_name(),
+            )),
+        }
+    }
+
     pub(crate) fn read_resolved(
         &self,
         frames: &[Frame],
@@ -2768,6 +2833,10 @@ impl<'a> Interpreter<'a> {
                         found: value.kind_name().to_string(),
                     }),
                 }
+            }
+            Rvalue::PtrField(operand) => {
+                let value = self.eval_operand(frames, body, operand)?;
+                self.ptr_field_value(frames, body, value)
             }
             Rvalue::BoxDerefTransmute(operand) => {
                 // The cast yields a pointer to the box's pointee.
