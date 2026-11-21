@@ -68,6 +68,17 @@ impl Default for Converter {
     }
 }
 
+/// The cardinality of a type's value set, for the zero-sized
+/// constant synthesis in `Converter::unique_const_value`.
+enum UniqueConst {
+    /// Exactly one value; here it is.
+    One(sm::ConstValue),
+    /// No values (an uninhabited type).
+    Uninhabited,
+    /// More than one value, or not provable here.
+    Many,
+}
+
 impl Converter {
     pub fn new() -> Self {
         Self {
@@ -522,6 +533,14 @@ impl Converter {
                         user_ty: None,
                     };
                 }
+                // Any other zero-sized constant still has a typed
+                // value when its type determines one (a unit struct,
+                // a single-variant enum, a tuple of zero-sized
+                // types): keep it, so the interpreter sees the ADT
+                // value rather than an untyped unit.
+                if let Some(v) = self.zst_const_value(&ty, 0) {
+                    return sm::Constant::from_value(v);
+                }
                 sm::Constant::from_value(sm::ConstValue::ZeroSized)
             }
             CK::Allocated(alloc) => {
@@ -548,6 +567,9 @@ impl Converter {
                             literal: sm::ConstKind::Ty(t),
                             user_ty: None,
                         };
+                    }
+                    if let Some(v) = self.zst_const_value(ty, 0) {
+                        return sm::Constant::from_value(v);
                     }
                     sm::Constant::from_value(sm::ConstValue::ZeroSized)
                 }
@@ -584,6 +606,110 @@ impl Converter {
                 self.err(format!("ConstantKind::Param({})", p.name));
                 sm::Constant::from_value(sm::ConstValue::ZeroSized)
             }
+        }
+    }
+
+    /// The typed constant value of a type that has exactly one
+    /// value: unit, tuples and arrays of such types, structs all
+    /// of whose fields are such types, and enums with a single
+    /// inhabited variant likewise (a variant with an uninhabited
+    /// field type — an empty enum, `!`, a struct containing one —
+    /// can never be constructed, so `Option<Empty>` has the single
+    /// value `None`). Types with no values or many values, and
+    /// unions (whose active field the type does not determine),
+    /// yield `None`.
+    fn zst_const_value(
+        &mut self,
+        ty: &rustc_public::ty::Ty,
+        depth: usize,
+    ) -> Option<sm::ConstValue> {
+        match self.unique_const_value(ty, depth) {
+            UniqueConst::One(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    fn unique_const_value(
+        &mut self,
+        ty: &rustc_public::ty::Ty,
+        depth: usize,
+    ) -> UniqueConst {
+        if depth > 32 {
+            return UniqueConst::Many;
+        }
+        match ty.kind() {
+            TyKind::RigidTy(RigidTy::Never) => UniqueConst::Uninhabited,
+            TyKind::RigidTy(RigidTy::Tuple(elems)) => {
+                let mut fields = Vec::with_capacity(elems.len());
+                for e in &elems {
+                    match self.unique_const_value(e, depth + 1) {
+                        UniqueConst::One(v) => fields.push(v),
+                        UniqueConst::Uninhabited => return UniqueConst::Uninhabited,
+                        UniqueConst::Many => return UniqueConst::Many,
+                    }
+                }
+                if fields.is_empty() {
+                    UniqueConst::One(sm::ConstValue::ZeroSized)
+                } else {
+                    UniqueConst::One(sm::ConstValue::Tuple(fields))
+                }
+            }
+            TyKind::RigidTy(RigidTy::Array(elem, len)) => {
+                let Ok(n) = len.eval_target_usize() else {
+                    return UniqueConst::Many;
+                };
+                if n == 0 {
+                    return UniqueConst::One(sm::ConstValue::Tuple(Vec::new()));
+                }
+                if n > 4096 {
+                    return UniqueConst::Many;
+                }
+                match self.unique_const_value(&elem, depth + 1) {
+                    UniqueConst::One(v) => {
+                        UniqueConst::One(sm::ConstValue::Tuple(vec![v; n as usize]))
+                    }
+                    UniqueConst::Uninhabited => UniqueConst::Uninhabited,
+                    UniqueConst::Many => UniqueConst::Many,
+                }
+            }
+            TyKind::RigidTy(RigidTy::Adt(def, args)) => {
+                if def.kind() == AdtKind::Union {
+                    return UniqueConst::Many;
+                }
+                let mut single: Option<(u32, Vec<sm::ConstValue>)> = None;
+                for vi in 0..def.num_variants() {
+                    let Some(variant) = def.variant(VariantIdx::to_val(vi)) else {
+                        return UniqueConst::Many;
+                    };
+                    let mut fields = Vec::new();
+                    let mut inhabited = true;
+                    for field in variant.fields() {
+                        let fty = field.ty_with_args(&args);
+                        match self.unique_const_value(&fty, depth + 1) {
+                            UniqueConst::One(v) => fields.push(v),
+                            UniqueConst::Uninhabited => {
+                                inhabited = false;
+                                break;
+                            }
+                            UniqueConst::Many => return UniqueConst::Many,
+                        }
+                    }
+                    if !inhabited {
+                        continue;
+                    }
+                    if single.is_some() {
+                        return UniqueConst::Many;
+                    }
+                    single = Some((vi as u32, fields));
+                }
+                match single {
+                    Some((variant, fields)) => {
+                        UniqueConst::One(sm::ConstValue::Adt { variant, fields })
+                    }
+                    None => UniqueConst::Uninhabited,
+                }
+            }
+            _ => UniqueConst::Many,
         }
     }
 
