@@ -227,12 +227,12 @@ def sysroot_base():
     return _SYSROOT_BASE
 
 
-def suite_root(path, suite):
+def suite_root(path):
     """The suite root directory of a test file (compiletest's
-    src-base for the test): the ancestor directory named `suite`
-    whose parent is `tests`."""
+    src-base for the test): the nearest ancestor directory whose
+    parent is `tests`."""
     for parent in Path(path).parents:
-        if parent.name == suite and parent.parent.name == "tests":
+        if parent.parent.name == "tests":
             return str(parent)
     return str(Path(path).parent)
 
@@ -1227,6 +1227,7 @@ class AuxSpec(NamedTuple):
     path: Path
     crate_type: Optional[str] = None
     edition: Optional[str] = None
+    modifiers: Optional[str] = None
 
 
 def as_aux_spec(spec):
@@ -1240,9 +1241,14 @@ def as_aux_spec(spec):
 
 def aux_spec_arg(spec):
     """The driver's `--aux` value for a spec: `name=path` plus the
-    `;crate-type=` / `;edition=` attributes the spec carries."""
+    `;crate-type=` / `;edition=` attributes the spec carries. A
+    spec with `--extern` modifiers binds under
+    `modifiers:name`, the verbatim binding name the driver keeps
+    for such specs."""
     spec = as_aux_spec(spec)
-    arg = f"{spec.name}={spec.path}"
+    binding = (f"{spec.modifiers}:{spec.name}" if spec.modifiers
+               else spec.name)
+    arg = f"{binding}={spec.path}"
     if spec.crate_type:
         arg += f";crate-type={spec.crate_type}"
     if spec.edition:
@@ -1250,38 +1256,63 @@ def aux_spec_arg(spec):
     return arg
 
 
+def parse_aux_crate_value(value):
+    """(modifiers, crate_name, file_name) from an `aux-crate:`
+    value, parsed the way compiletest's parse_aux_crate parses
+    it: `name=path` or `modifiers:name=path`, where the modifiers
+    are `--extern` modifiers (`priv`, `noprelude`, ...) the crate
+    is bound with. Returns None for a value without `=`."""
+    m = re.match(r"^(?:([^=]*?):)?([^=]*)=(.*)$", value.strip())
+    if not m:
+        return None
+    modifiers, name, fname = m.groups()
+    return (modifiers, name.strip(), fname.strip())
+
+
+def parse_proc_macro_value(value):
+    """(modifiers, file_name) from a `proc-macro:` value, parsed
+    the way compiletest's parse_proc_macro parses it: `path` or
+    `modifiers:path`."""
+    m = re.match(r"^(?:([^=]*?):)?(.*)$", value.strip())
+    modifiers, fname = m.groups()
+    return (modifiers, fname.strip())
+
+
 def aux_entries(header):
-    """(crate_name, file_name, crate_type) triples from a header's
-    aux directives.
+    """(crate_name, file_name, crate_type, modifiers) tuples from
+    a header's aux directives.
 
     `aux-build: foo-bar.rs` builds crate `foo_bar` (the file stem
     with dashes as underscores, as compiletest derives it);
-    `aux-crate: name=file.rs` names the crate explicitly;
+    `aux-crate: name=file.rs` names the crate explicitly and may
+    carry `--extern` modifiers (`aux-crate: priv:name=file.rs`);
     `proc-macro: foo-bar.rs` builds crate `foo_bar` as a proc-macro
-    crate (its crate_type is "proc-macro"; the others' is None).
+    crate (its crate_type is "proc-macro"; the others' is None)
+    and may likewise carry modifiers (`proc-macro: priv:foo.rs`).
     """
     out = []
     for value in header.values("aux-build"):
         fname = value.strip()
         if fname:
-            out.append((Path(fname).stem.replace("-", "_"), fname, None))
+            out.append((Path(fname).stem.replace("-", "_"), fname,
+                        None, None))
     for value in header.values("aux-crate"):
-        value = value.strip()
-        if "=" in value:
-            name, fname = value.split("=", 1)
-            out.append((name.strip(), fname.strip(), None))
+        parsed = parse_aux_crate_value(value)
+        if parsed:
+            modifiers, name, fname = parsed
+            out.append((name, fname, None, modifiers))
     for value in header.values("proc-macro"):
-        fname = value.strip()
+        modifiers, fname = parse_proc_macro_value(value)
         if fname:
             out.append((Path(fname).stem.replace("-", "_"), fname,
-                        "proc-macro"))
+                        "proc-macro", modifiers))
     return out
 
 
 def aux_directives(header):
     """(crate_name, file_name) pairs from a header's aux directives
     (see `aux_entries`)."""
-    return [(name, fname) for name, fname, _ in aux_entries(header)]
+    return [(name, fname) for name, fname, _, _ in aux_entries(header)]
 
 
 def resolve_aux_specs(test_path, revision=None, top=None,
@@ -1333,7 +1364,7 @@ def resolve_aux_specs(test_path, revision=None, top=None,
                 return cand
         return None
 
-    def visit(name, fname, from_dir, crate_type=None):
+    def visit(name, fname, from_dir, crate_type=None, modifiers=None):
         path = find_file(fname, from_dir)
         if path is None:
             return (f"auxiliary file {fname} for crate `{name}` "
@@ -1349,15 +1380,17 @@ def resolve_aux_specs(test_path, revision=None, top=None,
         visiting.add(name)
         by_name[name] = path
         header = file_header(path)
-        for dep_name, dep_file, dep_type in aux_entries(header):
-            err = visit(dep_name, dep_file, path.parent, dep_type)
+        for dep_name, dep_file, dep_type, dep_mod in aux_entries(header):
+            err = visit(dep_name, dep_file, path.parent, dep_type,
+                        dep_mod)
             if err:
                 return err
         visiting.discard(name)
         editions = header.values("edition")
         edition = _concrete_edition(editions[-1].strip()) \
             if editions else None
-        specs.append(AuxSpec(name, path, crate_type, edition))
+        specs.append(AuxSpec(name, path, crate_type, edition,
+                             modifiers))
         return None
 
     if top is not None:
@@ -1371,8 +1404,8 @@ def resolve_aux_specs(test_path, revision=None, top=None,
         # them twice. Proc-macro crates an auxiliary file names are
         # transitive entries, not top entries, and stay.
         top_entries = [e for e in top_entries if e[2] is None]
-    for name, fname, crate_type in top_entries:
-        err = visit(name, fname, test_dir, crate_type)
+    for name, fname, crate_type, modifiers in top_entries:
+        err = visit(name, fname, test_dir, crate_type, modifiers)
         if err:
             return [], err
     return specs, None
@@ -1417,16 +1450,18 @@ def _find_proc_macro_file(test_path, fname):
     return None
 
 
-def _proc_macro_chain(test_path, fname, edition):
+def _proc_macro_chain(test_path, fname, edition, modifiers=None):
     """Resolve one `//@ proc-macro:` directive to a build chain.
 
     Returns (chain, error): chain is a list of (crate_name,
-    source_path, forced_crate_type) in dependency order -- the
-    auxiliary crates the proc-macro crate itself depends on first
-    (its own aux directives, resolved transitively), the proc-macro
-    crate last with its type forced to proc-macro, the treatment
-    compiletest's directive names. Which edition each crate is
-    built with is decided at build time from its own header.
+    source_path, forced_crate_type, extern_modifiers) in
+    dependency order -- the auxiliary crates the proc-macro crate
+    itself depends on first (its own aux directives, resolved
+    transitively), the proc-macro crate last with its type forced
+    to proc-macro and the `//@ proc-macro:` directive's own
+    modifiers attached, the treatment compiletest's directive
+    names. Which edition each crate is built with is decided at
+    build time from its own header.
     """
     src = _find_proc_macro_file(test_path, fname)
     if src is None:
@@ -1436,8 +1471,9 @@ def _proc_macro_chain(test_path, fname, edition):
         return None, err
     text = src.read_text(errors="ignore")
     name = declared_crate_name(text) or Path(fname).stem.replace("-", "_")
-    chain = [(spec.name, spec.path, spec.crate_type) for spec in deps]
-    chain.append((name, src, "proc-macro"))
+    chain = [(spec.name, spec.path, spec.crate_type, spec.modifiers)
+             for spec in deps]
+    chain.append((name, src, "proc-macro", modifiers))
     return chain, None
 
 
@@ -1468,7 +1504,8 @@ def _build_proc_macro_chain(chain, edition, outdir, extra_externs=()):
     crate itself.
     """
     built = list(extra_externs)
-    for cname, csrc, forced in chain:
+    last_name, last_artifact = None, None
+    for cname, csrc, forced, cmod in chain:
         text = csrc.read_text(errors="ignore")
         eff_name = declared_crate_name(text) or cname
         aux_view = Header(text).view(None)
@@ -1491,9 +1528,10 @@ def _build_proc_macro_chain(chain, edition, outdir, extra_externs=()):
         # distinction for same-named auxiliary crates.
         meta = hashlib.sha256(str(csrc).encode()).hexdigest()[:12]
         cmd += ["-C", f"metadata=sparagmos-aux-{meta}"]
-        for prev_name, prev_artifact in built:
+        for prev_binding, prev_artifact in built:
             if prev_artifact is not None:
-                cmd += ["--extern", f"{prev_name}={prev_artifact}"]
+                cmd += ["--extern",
+                        f"{prev_binding}={prev_artifact}"]
         if forced is not None:
             # compiletest links the proc_macro library crate into
             # proc-macro auxiliary builds with a bare --extern, so
@@ -1502,28 +1540,51 @@ def _build_proc_macro_chain(chain, edition, outdir, extra_externs=()):
             cmd += ["--extern", "proc_macro"]
         cmd += compile_flags(aux_view)
         cmd += [str(csrc)]
+        # The crate's own `//@ rustc-env:` pairs apply to its
+        # build, as compiletest applies an auxiliary file's
+        # rustc-env to the auxiliary build.
+        cenv, cunset = view_env(aux_view, "rustc-env",
+                                "unset-rustc-env",
+                                suite_root(csrc),
+                                str(outdir))
+        env = dict(BOOTSTRAP_ENV)
+        env.update(cenv)
         build = run_cmd(cmd, timeout=NATIVE_COMPILE_TIMEOUT,
-                        env_extra=BOOTSTRAP_ENV)
+                        env_extra=env, env_remove=cunset)
         if build["timeout"]:
             return None, None, (f"build of auxiliary crate "
                                 f"`{eff_name}` timed out")
         if build["exit_code"] != 0:
+            first = first_error_line(build["stderr"])
+            if first.startswith("error: linking with `cc`"):
+                # The generic cc line hides the cause; the
+                # linker note names it (e.g. a bootstrap-built
+                # test helper library the official sysroot does
+                # not ship).
+                for line in build["stderr"].splitlines():
+                    if "unable to find library" in line:
+                        first += ": " + line.strip().split(
+                            "= note: ", 1)[-1]
+                        break
             return None, None, (
                 f"build of auxiliary crate `{eff_name}` failed: "
-                f"{first_error_line(build['stderr'])}")
+                f"{first}")
         effective = forced or declared or "rlib"
         artifact = (find_artifact(outdir, eff_name)
                     if effective in ("rlib", "lib", "dylib", "proc-macro")
                     else None)
-        built.append((eff_name, artifact))
-    name, artifact = built[-1]
-    if artifact is None:
-        return None, None, (f"build of proc-macro crate `{name}` "
-                            f"produced no linkable artifact")
-    return name, artifact, None
+        binding = f"{cmod}:{eff_name}" if cmod else eff_name
+        built.append((binding, artifact))
+        last_name, last_artifact = eff_name, artifact
+    if last_artifact is None:
+        return None, None, (f"build of proc-macro crate "
+                            f"`{last_name}` produced no linkable "
+                            f"artifact")
+    return last_name, last_artifact, None
 
 
-def build_proc_macro(test_path, fname, edition, extra_externs=()):
+def build_proc_macro(test_path, fname, edition, extra_externs=(),
+                     modifiers=None):
     """Build the proc-macro crate a `//@ proc-macro:` directive names.
 
     Returns (crate_name, artifact, error). Builds are cached: the
@@ -1535,22 +1596,24 @@ def build_proc_macro(test_path, fname, edition, extra_externs=()):
     and repeated runs.
     """
     edition = _concrete_edition(edition)
-    chain, err = _proc_macro_chain(test_path, fname, edition)
+    chain, err = _proc_macro_chain(test_path, fname, edition,
+                                   modifiers)
     if err:
         return None, None, err
     h = hashlib.sha256()
     # Recipe version: bump when the build recipe changes (crate
     # metadata disambiguation, the bare proc_macro extern, ...),
     # so artifacts built by an older recipe are never reused.
-    h.update(b"sparagmos-pm-recipe-2")
+    h.update(b"sparagmos-pm-recipe-3")
     h.update(edition.encode())
     for prev_name, prev_artifact in extra_externs:
         h.update(prev_name.encode())
         h.update(str(prev_artifact).encode())
-    for cname, csrc, forced in chain:
+    for cname, csrc, forced, cmod in chain:
         h.update(cname.encode())
         h.update(csrc.read_bytes())
         h.update((forced or "").encode())
+        h.update((cmod or "").encode())
     key = h.hexdigest()[:24]
     if key in _PROC_MACRO_CACHE:
         return _PROC_MACRO_CACHE[key]
@@ -1591,25 +1654,28 @@ def proc_macro_extern_args(test_path, view, edition):
     conversion is attempted with the same --extern set compiletest
     arranges. Returns (args, error).
     """
-    fnames = [v.strip() for v in view.values("proc-macro")]
-    fnames = [f for f in fnames if f]
-    if not fnames:
+    directives = [parse_proc_macro_value(v)
+                  for v in view.values("proc-macro")]
+    directives = [(mod, f) for mod, f in directives if f]
+    if not directives:
         return [], None
     args = []
     seen_dirs = set()
     built = []
-    for fname in fnames:
+    for modifiers, fname in directives:
         # Directive order matters: a later proc-macro crate may
         # use an earlier one (compiletest links each auxiliary
         # build against the ones before it), so each build sees
         # the crates already built for this view as externs.
         name, artifact, err = build_proc_macro(
-            test_path, fname, edition, extra_externs=built)
+            test_path, fname, edition, extra_externs=built,
+            modifiers=modifiers)
         if err:
             return [], (f"proc-macro auxiliary crate from {fname} "
                         f"could not be built: {err}")
-        built.append((name, artifact))
-        args += ["--extern", f"{name}={artifact}"]
+        binding = f"{modifiers}:{name}" if modifiers else name
+        built.append((binding, artifact))
+        args += ["--extern", f"{binding}={artifact}"]
         dep_dir = str(artifact.parent)
         if dep_dir not in seen_dirs:
             seen_dirs.add(dep_dir)
@@ -1617,7 +1683,8 @@ def proc_macro_extern_args(test_path, view, edition):
     return args, None
 
 
-def native_side(path, edition, workdir, extra_flags=(), aux_specs=()):
+def native_side(path, edition, workdir, extra_flags=(), aux_specs=(),
+                run_args=(), run_env_extra=None, run_env_remove=()):
     """Compile and run natively. Returns (result_dict, error_reason).
 
     error_reason is None when the native run completed (whatever its
@@ -1625,7 +1692,10 @@ def native_side(path, edition, workdir, extra_flags=(), aux_specs=()):
     `extra_flags` are the test's compile-flags, appended last as
     compiletest appends them. Auxiliary crates are compiled first,
     in dependency order, the way compiletest builds them for the
-    test's own compilation.
+    test's own compilation. `run_args` are the test's run-flags,
+    appended to the run's argv, and `run_env_extra` /
+    `run_env_remove` its exec-env pairs and unsets, applied to
+    the run only -- the positions compiletest gives them.
     """
     binpath = Path(workdir) / "prog"
     lib = sysroot_lib()
@@ -1649,9 +1719,10 @@ def native_side(path, edition, workdir, extra_flags=(), aux_specs=()):
                 cmd += ["--crate-type", spec.crate_type or "rlib"]
             if declared_crate_name(text) is None:
                 cmd += ["--crate-name", name]
-            for prev_name, prev_artifact in built:
+            for prev_binding, prev_artifact in built:
                 if prev_artifact is not None:
-                    cmd += ["--extern", f"{prev_name}={prev_artifact}"]
+                    cmd += ["--extern",
+                            f"{prev_binding}={prev_artifact}"]
             cmd += [str(src)]
             build = run_cmd(cmd, timeout=NATIVE_COMPILE_TIMEOUT,
                             env_extra=BOOTSTRAP_ENV)
@@ -1665,9 +1736,11 @@ def native_side(path, edition, workdir, extra_flags=(), aux_specs=()):
                         if effective in ("rlib", "lib", "dylib",
                                          "proc-macro")
                         else None)
-            built.append((eff_name, artifact))
+            binding = (f"{spec.modifiers}:{eff_name}"
+                       if spec.modifiers else eff_name)
+            built.append((binding, artifact))
             if artifact is not None:
-                externs += ["--extern", f"{eff_name}={artifact}"]
+                externs += ["--extern", f"{binding}={artifact}"]
     build = run_cmd(
         rustc_cmd() + ["--edition", edition, "-C", "opt-level=0"]
         + (["-L", lib] if lib else [])
@@ -1688,30 +1761,47 @@ def native_side(path, edition, workdir, extra_flags=(), aux_specs=()):
     if lib:
         prev = os.environ.get("LD_LIBRARY_PATH", "")
         run_env["LD_LIBRARY_PATH"] = lib + (":" + prev if prev else "")
-    run = run_cmd([str(binpath)], timeout=NATIVE_RUN_TIMEOUT,
-                  cwd=str(workdir), env_extra=run_env)
+    if run_env_extra:
+        run_env.update(run_env_extra)
+    run = run_cmd([str(binpath)] + list(run_args),
+                  timeout=NATIVE_RUN_TIMEOUT,
+                  cwd=str(workdir), env_extra=run_env,
+                  env_remove=run_env_remove)
     if run["timeout"]:
         return None, "native run timed out"
     return run, None
 
 
-def sparagmos_side(path, edition, driver_bin, cwd=None, rustc_args=(), aux_specs=()):
+def sparagmos_side(path, edition, driver_bin, cwd=None, rustc_args=(),
+                   aux_specs=(), guest_args=(), env_extra=None,
+                   env_remove=()):
     """Run through the driver. Returns (result_dict, kind, reason).
 
     kind is "result" (exit 0/101), "unsupported" (driver exit 2),
     "timeout", or "driver-error". `rustc_args` are the test's
     compile-flags, forwarded through the driver's `--rustc-arg`.
     Auxiliary crates are handed to the driver with `--aux`, in
-    dependency order.
+    dependency order. `guest_args` are the test's run-flags,
+    forwarded through the driver's `--guest-arg` (the guest
+    program's argv after argv[0], whose policy is the
+    interpreter's). `env_extra` / `env_remove` are the test's
+    exec-env pairs and unsets, applied to the driver process --
+    the guest runs in-process, so this is the environment
+    compiletest's exec-env describes for it.
     """
     argv = [str(driver_bin), "run", str(path), "--edition", edition]
     for a in rustc_args:
         argv += ["--rustc-arg", a]
     for spec in aux_specs:
         argv += ["--aux", aux_spec_arg(spec)]
+    for a in guest_args:
+        argv += ["--guest-arg", a]
+    env = dict(BOOTSTRAP_ENV)
+    if env_extra:
+        env.update(env_extra)
     res = run_cmd(argv,
                   timeout=DRIVER_TIMEOUT, cwd=cwd,
-                  env_extra=BOOTSTRAP_ENV)
+                  env_extra=env, env_remove=env_remove)
     if res["timeout"]:
         return None, "timeout", f"driver timed out after {DRIVER_TIMEOUT}s"
     if res["exit_code"] in (0, 101):
@@ -2255,7 +2345,8 @@ _CONVERTED_RE = re.compile(r"^converted: (\d+), skipped: (\d+)$", re.M)
 _TARGET_RE = re.compile(r"^target-crate converted: (\d+), skipped: (\d+)$", re.M)
 
 
-def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=()):
+def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=(),
+                 env_extra=None, env_remove=()):
     """Run the driver in convert-only mode and parse its report.
 
     Returns a dict with exit_code (None on timeout), converted and
@@ -2279,8 +2370,12 @@ def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=()):
         argv += ["--rustc-arg", a]
     for spec in aux_specs:
         argv += ["--aux", aux_spec_arg(spec)]
+    env = dict(BOOTSTRAP_ENV)
+    if env_extra:
+        env.update(env_extra)
     res = run_cmd(argv,
-                  timeout=CONVERT_TIMEOUT, env_extra=BOOTSTRAP_ENV)
+                  timeout=CONVERT_TIMEOUT, env_extra=env,
+                  env_remove=env_remove)
     out = {
         "exit_code": res["exit_code"],
         "timeout": res["timeout"],
@@ -2762,7 +2857,13 @@ def _aux_source_texts(test_path):
                             if n in ("aux-build", "aux-crate",
                                      "proc-macro")]):
         for value in values:
-            fname = value.strip().split("=")[-1].strip()
+            if name == "aux-crate":
+                parsed = parse_aux_crate_value(value)
+                fname = parsed[2] if parsed else ""
+            elif name == "proc-macro":
+                fname = parse_proc_macro_value(value)[1]
+            else:
+                fname = value.strip()
             if fname:
                 fnames.append(fname)
     test_dir = test_path.parent
