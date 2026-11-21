@@ -98,6 +98,80 @@ fn run(name: &str, tys: &[mir::Ty], stmts: Vec<mir::Statement>) -> Value {
     interpret_mir(&program, name, Vec::new()).unwrap_or_else(|e| panic!("{name} must run: {e}"))
 }
 
+fn const_f16_bits(bits: u16) -> mir::Operand {
+    mir::Operand::constant(mir::Constant::from_value(mir::ConstValue::Scalar(
+        mir::Scalar::Float {
+            bits: bits as u128,
+            ty: mir::FloatTy::F16,
+        },
+    )))
+}
+
+#[test]
+fn f16_add_rounds_to_f16() {
+    // 1.0 + 2^-11 is exactly halfway between 1.0 and the next f16
+    // (spacing 2^-10): round-to-nearest-even lands on 1.0.
+    let v = run(
+        "f16_add_tie",
+        &[mir::Ty::Float(mir::FloatTy::F16)],
+        vec![assign(
+            place(0),
+            binop(
+                mir::BinOp::Add,
+                const_f16_bits(0x3c00),
+                const_f16_bits(0x1000),
+            ),
+        )],
+    );
+    assert_eq!(v, Value::Float(1.0));
+    // 1.0 + 2^-10 is exactly representable.
+    let v = run(
+        "f16_add_exact",
+        &[mir::Ty::Float(mir::FloatTy::F16)],
+        vec![assign(
+            place(0),
+            binop(
+                mir::BinOp::Add,
+                const_f16_bits(0x3c00),
+                const_f16_bits(0x1400),
+            ),
+        )],
+    );
+    assert_eq!(v, Value::Float(1.0009765625));
+}
+
+#[test]
+fn f16_constant_widens_exactly() {
+    // 0x3e00 = 1.5, 0xc000 = -2.0, 0x0001 = 2^-24 (smallest
+    // subnormal), 0x7c00 = +inf: every f16 value is exact in f64.
+    for (bits, want) in [
+        (0x3e00u16, 1.5f64),
+        (0xc000, -2.0),
+        (0x0001, 2f64.powi(-24)),
+        (0x3555, 0.333251953125),
+        (0x7c00, f64::INFINITY),
+    ] {
+        let v = run(
+            "f16_const",
+            &[mir::Ty::Float(mir::FloatTy::F16)],
+            vec![assign(
+                place(0),
+                mir::Rvalue::Use(const_f16_bits(bits)),
+            )],
+        );
+        assert_eq!(v, Value::Float(want), "f16 bits {bits:#06x}");
+    }
+    let v = run(
+        "f16_nan",
+        &[mir::Ty::Float(mir::FloatTy::F16)],
+        vec![assign(
+            place(0),
+            mir::Rvalue::Use(const_f16_bits(0x7e00)),
+        )],
+    );
+    assert!(matches!(v, Value::Float(x) if x.is_nan()));
+}
+
 // ----- arithmetic ------------------------------------------------------------
 
 #[test]

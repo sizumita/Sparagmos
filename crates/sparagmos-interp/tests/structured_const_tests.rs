@@ -431,3 +431,101 @@ fn slice_of_u8_constants_convert_elements_as_unsigned() {
         Constant::SliceVal(vec![Constant::Uint(200), Constant::Uint(255)])
     );
 }
+
+// ----- MaybeUninit-shaped constants (Lane CK) -------------------------------
+
+#[test]
+fn maybeuninit_constant_payload_field_read() {
+    // fn main() -> u32 {
+    //   _1 = const MaybeUninit::<u32> { value: ManuallyDrop(11) };
+    //   _2 = copy ((_1.1).0); _0 = copy _2; return
+    // }
+    // The union constant is an ADT value whose field 0 is the
+    // zero-sized `uninit` field and field 1 is the payload wrapper.
+    let mu_ty = mir::Ty::Adt(mir::DefId::new(0, 950), vec![]);
+    let md_ty = mir::Ty::Adt(mir::DefId::new(0, 951), vec![]);
+    let body = mir::Body::new(
+        decls(&[u32_ty(), mu_ty, u32_ty()]),
+        0,
+        vec![block(
+            vec![
+                assign(
+                    place(1),
+                    use_op(const_op(mir::ConstValue::Adt {
+                        variant: 0,
+                        fields: vec![
+                            mir::ConstValue::ZeroSized,
+                            mir::ConstValue::Adt {
+                                variant: 0,
+                                fields: vec![scalar(11, 4)],
+                            },
+                        ],
+                    })),
+                ),
+                assign(
+                    place(2),
+                    use_op(copy_proj(
+                        1,
+                        vec![
+                            mir::PlaceElem::Field(1, md_ty),
+                            mir::PlaceElem::Field(0, u32_ty()),
+                        ],
+                    )),
+                ),
+                assign(place(0), use_op(copy(2))),
+            ],
+            ret(),
+        )],
+    );
+    assert_eq!(run(body), Value::Uint(11));
+}
+
+#[test]
+fn uninit_constant_assignment_and_read() {
+    // fn main() -> u32 { _1 = const <uninit u32>; _0 = copy _1; return }
+    // Assigning the uninitialized constant is fine; reading the
+    // local's value back is the uninitialized-read error.
+    let body = mir::Body::new(
+        decls(&[u32_ty(), u32_ty()]),
+        0,
+        vec![block(
+            vec![
+                assign(place(1), use_op(const_op(mir::ConstValue::Uninit))),
+                assign(place(0), use_op(copy(1))),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("main", body);
+    let err = interpret_mir(&prog, "main", vec![])
+        .expect_err("reading an uninitialized constant must fail");
+    assert!(
+        format!("{err}").contains("uninitialized"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn null_pointer_constant_evaluates_to_null_ref() {
+    // fn main() -> *const u8 { _1 = const null::<u8>(); _0 = copy _1; return }
+    // (Pointer equality itself is exercised through `is_null` in
+    // the driver end-to-end tests; a raw BinOp::Eq on references
+    // is a separate, pre-existing interpreter gap.)
+    let ptr_ty = mir::Ty::RawPtr(Box::new(u8_ty()), mir::Mutability::Not);
+    let body = mir::Body::new(
+        decls(&[ptr_ty.clone(), ptr_ty]),
+        0,
+        vec![block(
+            vec![
+                assign(place(1), use_op(const_op(mir::ConstValue::NullPtr))),
+                assign(place(0), use_op(copy(1))),
+            ],
+            ret(),
+        )],
+    );
+    assert_eq!(
+        run(body),
+        Value::Ref(sparagmos_interp::RefTarget::Null)
+    );
+}

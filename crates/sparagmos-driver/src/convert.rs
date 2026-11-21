@@ -773,6 +773,10 @@ impl Converter {
             },
             TyKind::RigidTy(RigidTy::Float(f)) => {
                 let bits = match f {
+                    SmirFloatTy::F16 => alloc
+                        .read_partial_uint(0..2)
+                        .map(|v| v as u16 as u128)
+                        .unwrap_or(0),
                     SmirFloatTy::F32 => alloc
                         .read_partial_uint(0..4)
                         .map(|v| v as u32 as u128)
@@ -782,7 +786,10 @@ impl Converter {
                         .map(|v| v as u128)
                         .unwrap_or(0),
                     _ => {
-                        self.err("ConstantKind::Allocated (f16/f128)");
+                        // f128 has no exact f64 form; it stays an
+                        // explicit unsupported constant. (f16 widens
+                        // to f64 exactly and is decoded above.)
+                        self.err("ConstantKind::Allocated (f128)");
                         0
                     }
                 };
@@ -943,6 +950,12 @@ impl Converter {
                 offset: 0,
             };
         }
+        // No provenance at all: a stored zero word is a null
+        // pointer constant. Anything else is an integer-derived
+        // address, which has no faithful value form.
+        if alloc.read_partial_uint(0..PTR_SIZE).ok() == Some(0) {
+            return sm::ConstValue::NullPtr;
+        }
         self.err(format!(
             "ConstantKind::Allocated (reference without provenance: {})",
             short_ty(inner)
@@ -985,6 +998,23 @@ impl Converter {
         if depth > MAX_CONST_DEPTH {
             return None;
         }
+        // A range whose bytes are all uninitialized is the
+        // uninitialized value of this type (the payload of a
+        // `MaybeUninit::uninit()` constant, at whichever nesting
+        // level it appears). A partially initialized range falls
+        // through to the structural decode below, which reads the
+        // initialized parts field by field.
+        if let Ok(layout) = ty.layout() {
+            let size = layout.shape().size.bytes() as usize;
+            if size > 0
+                && offset + size <= alloc.bytes.len()
+                && alloc.bytes[offset..offset + size]
+                    .iter()
+                    .all(|b| b.is_none())
+            {
+                return Some(sm::ConstValue::Uninit);
+            }
+        }
         match ty.kind() {
             TyKind::RigidTy(RigidTy::Bool) => match read_uint_at(alloc, offset, 1)? {
                 0 => Some(sm::ConstValue::Bool(false)),
@@ -1013,6 +1043,7 @@ impl Converter {
             }
             TyKind::RigidTy(RigidTy::Float(f)) => {
                 let size = match f {
+                    SmirFloatTy::F16 => 2,
                     SmirFloatTy::F32 => 4,
                     SmirFloatTy::F64 => 8,
                     _ => return None,
@@ -1261,13 +1292,123 @@ impl Converter {
                 }
                 VariantsShape::Empty => return None,
             },
-            AdtKind::Union => return None,
+            AdtKind::Union => return self.decode_union(&def, &args, alloc, offset, depth),
         };
         let variant = def.variant(VariantIdx::to_val(variant_idx))?;
         let fields = self.decode_fields(&variant, args, &offsets, alloc, offset, depth)?;
         Some(sm::ConstValue::Adt {
             variant: variant_idx as u32,
             fields,
+        })
+    }
+
+    /// Decode a union value. Which field is active is not recorded
+    /// in an allocation, so only the shape with a single payload
+    /// is faithful: at most one field is non-zero-sized (the
+    /// `MaybeUninit<T>` shape — an `uninit: ()` field beside a
+    /// `value: ManuallyDrop<T>` field — is the canonical case).
+    /// Every field is read at offset 0, where all union fields
+    /// live; zero-sized fields decode as their zero-sized values.
+    /// A union with two or more payload-sized fields stays
+    /// undecoded, since the bytes do not say which one is live.
+    fn decode_union(
+        &mut self,
+        def: &AdtDef,
+        args: &GenericArgs,
+        alloc: &Allocation,
+        offset: usize,
+        depth: usize,
+    ) -> Option<sm::ConstValue> {
+        let variant = def.variant(VariantIdx::to_val(0))?;
+        let fields = variant.fields();
+        let mut sizes = Vec::new();
+        let mut payload_fields = 0;
+        for field in fields.iter() {
+            let fty = field.ty_with_args(args);
+            let size = fty.layout().ok()?.shape().size.bytes();
+            if size > 0 {
+                payload_fields += 1;
+            }
+            sizes.push(size);
+        }
+        // A provenance entry at the union's offset can only belong
+        // to a pointer-shaped field stored there: pointer fields
+        // are the ones that carry provenance, and the entry spans
+        // exactly one pointer word. When exactly one field is a
+        // pointer of that size, it is the stored field; the other
+        // payload fields overlap its bytes and decode as
+        // uninitialized (they are not the live field, and reading
+        // them would reinterpret the pointer's representation).
+        let prov_at_offset = alloc
+            .provenance
+            .ptrs
+            .iter()
+            .any(|(at, _)| *at as usize == offset);
+        if prov_at_offset {
+            let ptr_fields: Vec<usize> = fields
+                .iter()
+                .enumerate()
+                .filter(|(i, field)| {
+                    if sizes[*i] != PTR_SIZE {
+                        return false;
+                    }
+                    // The pointer may sit under single-field
+                    // transparent wrappers (`ManuallyDrop`,
+                    // `UnsafeCell`, ...).
+                    let mut inner = field.ty_with_args(args);
+                    for _ in 0..8 {
+                        match inner.kind() {
+                            TyKind::RigidTy(RigidTy::Adt(def, inner_args)) => {
+                                let variants = def.variants();
+                                if variants.len() != 1 {
+                                    return false;
+                                }
+                                let vfields = variants[0].fields();
+                                if vfields.len() != 1 {
+                                    return false;
+                                }
+                                inner = vfields[0].ty_with_args(&inner_args);
+                            }
+                            _ => break,
+                        }
+                    }
+                    matches!(
+                        inner.kind(),
+                        TyKind::RigidTy(
+                            RigidTy::Ref(..) | RigidTy::RawPtr(..) | RigidTy::FnPtr(_)
+                        )
+                    )
+                })
+                .map(|(i, _)| i)
+                .collect();
+            if ptr_fields.len() == 1 {
+                let live = ptr_fields[0];
+                let mut out = Vec::new();
+                for (i, field) in fields.iter().enumerate() {
+                    let fty = field.ty_with_args(args);
+                    if i == live || sizes[i] == 0 {
+                        out.push(self.decode_const(&fty, alloc, offset, depth + 1)?);
+                    } else {
+                        out.push(sm::ConstValue::Uninit);
+                    }
+                }
+                return Some(sm::ConstValue::Adt {
+                    variant: 0,
+                    fields: out,
+                });
+            }
+        }
+        if payload_fields > 1 {
+            return None;
+        }
+        let mut out = Vec::new();
+        for field in fields.iter() {
+            let fty = field.ty_with_args(args);
+            out.push(self.decode_const(&fty, alloc, offset, depth + 1)?);
+        }
+        Some(sm::ConstValue::Adt {
+            variant: 0,
+            fields: out,
         })
     }
 
@@ -1362,19 +1503,25 @@ impl Converter {
         if depth > MAX_CONST_DEPTH {
             return None;
         }
-        let Some((_, prov)) = alloc
+        let prov = alloc
             .provenance
             .ptrs
             .iter()
-            .find(|(o, _)| *o as usize == offset)
-        else {
-            // No provenance at the pointer slot: the stored integer
-            // is the address itself — a null pointer or a dangling
-            // pointer from `without_provenance` (an empty `Vec`'s
-            // buffer pointer, `NonNull::dangling`, a `Waker`'s null
-            // data pointer). Only the address is observable.
+            .find(|(o, _)| *o as usize == offset);
+        let Some((_, prov)) = prov else {
+            // No provenance at the pointer slot: a stored
+            // zero word is a null pointer (Lane CK). A
+            // nonzero word is a dangling address from
+            // `without_provenance` (an empty `Vec`'s buffer
+            // pointer, `NonNull::dangling`): only the address
+            // is observable, as an address-only reference
+            // whose reads are explicit errors (Lane CE).
             let addr = read_uint_at(alloc, offset, PTR_SIZE)?;
-            return Some(sm::ConstValue::IntPtr(addr as u64));
+            return Some(if addr == 0 {
+                sm::ConstValue::NullPtr
+            } else {
+                sm::ConstValue::IntPtr(addr as u64)
+            });
         };
         let target_off = read_uint_at(alloc, offset, PTR_SIZE)? as usize;
         let target = match mir::alloc::GlobalAlloc::from(prov.0) {

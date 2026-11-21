@@ -116,10 +116,12 @@ impl UintTy {
     }
 }
 
-/// Floating-point types. Only the two widths Rust code computes
-/// with in practice here; `f16` / `f128` stay unsupported.
+/// Floating-point types. Values are stored widened to `f64`
+/// (see `Value::Float`); `f16` widens exactly and its operations
+/// round back to `f16` precision. `f128` stays unsupported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FloatTy {
+    F16,
     F32,
     F64,
 }
@@ -128,6 +130,7 @@ impl FloatTy {
     /// Width in bits.
     pub fn bits(self) -> u32 {
         match self {
+            FloatTy::F16 => 16,
             FloatTy::F32 => 32,
             FloatTy::F64 => 64,
         }
@@ -307,9 +310,16 @@ pub enum Constant {
     Adt { variant: u32, fields: Vec<Constant> },
     /// A reference to a constant value.
     Ref(Box<Constant>),
-    /// A pointer constant with no provenance (null or dangling):
+    /// A pointer constant with no provenance (dangling):
     /// evaluates to an address-only reference value.
     IntPtr(u64),
+    /// A wholly uninitialized constant: evaluates to the
+    /// uninitialized value.
+    Uninit,
+    /// A null pointer constant: evaluates to the null reference
+    /// value (equality with another null holds, dereference is an
+    /// explicit error).
+    NullPtr,
     /// A slice constant with decoded (non-byte) elements.
     SliceVal(Vec<Constant>),
     /// A function item constant: evaluates to the callable value

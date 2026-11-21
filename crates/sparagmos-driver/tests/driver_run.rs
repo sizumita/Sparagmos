@@ -2880,3 +2880,57 @@ fn run_mode_derived_partial_ord_uses_discriminant_values() {
         "derived PartialOrd on explicit discriminants must run and hold; stderr={stderr}"
     );
 }
+
+// ----- allocated constants: f16, null and fn pointers, uninit (Lane CK) -----
+
+const F16_SRC: &str = r#"#![feature(f16)]
+const A: f16 = 1.5;
+fn main() {
+    let b: f16 = A + 0.25;
+    println!("{}", b as f32);
+    println!("{}", (A * 2.0) as f64);
+}
+"#;
+
+const NULLPTR_SRC: &str = r#"fn target() {}
+const FN_AS_PTR: *const () = target as *const ();
+const NULLP: *const u8 = core::ptr::null();
+static WORD: u32 = 9;
+const STATIC_PTR: *const u32 = &raw const WORD;
+fn main() {
+    println!("{:?}", NULLP.is_null());
+    println!("{:?}", FN_AS_PTR.is_null());
+    println!("{:?}", unsafe { *STATIC_PTR });
+}
+"#;
+
+#[test]
+fn run_mode_f16_constants_execute() {
+    let dir = temp_dir("f16const");
+    let src = fixture(&dir, "f16const.rs", F16_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "f16 program must run to completion; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1.75\n3\n");
+}
+
+#[test]
+fn run_mode_null_and_fn_pointer_constants_execute() {
+    let dir = temp_dir("nullptr");
+    let src = fixture(&dir, "nullptr.rs", NULLPTR_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "null/fn pointer constant program must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "true\nfalse\n9\n"
+    );
+}
