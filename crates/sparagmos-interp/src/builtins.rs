@@ -32,7 +32,8 @@ use sparagmos_mir as mir;
 
 use crate::error::{InterpError, InterpResult};
 use crate::interp::{
-    channel_handle_id, rc_handle_id, synthetic_address, Frame, Interpreter, Resolved,
+    box_alloc_pointer, channel_handle_id, rc_handle_id, synthetic_address, Frame, Interpreter,
+    Resolved,
 };
 use crate::ir::{Body, Operand};
 use crate::value::{FmtArguments, FmtTrait, PanicPayload, RefProj, RefTarget, Value};
@@ -3271,6 +3272,27 @@ impl<'a> Interpreter<'a> {
                     Value::Ref(_) => {
                         let target = self.deref_value(frames, &vals[0])?;
                         let value = self.read_resolved(frames, &target)?;
+                        // A `Box` clone owns a fresh allocation
+                        // holding a clone of the pointee: copying
+                        // the box value itself would alias the
+                        // source allocation, so writes through the
+                        // clone would rewrite the original (and the
+                        // two boxes would free the same storage).
+                        // The pointee is cloned by
+                        // `clone_owned_value`, the same value-copy
+                        // reading this builtin applies everywhere,
+                        // with owned boxes re-allocated at every
+                        // level.
+                        if self_ty.starts_with("std::boxed::Box<") {
+                            if let Some((id, projection)) = box_alloc_pointer(&value) {
+                                let pointee = self.read_resolved(
+                                    frames,
+                                    &Resolved::Alloc { id, projection },
+                                )?;
+                                let cloned = self.clone_owned_value(frames, &pointee)?;
+                                return Ok(self.new_box(cloned));
+                            }
+                        }
                         if let (Some(kind), Some(id)) =
                             (chan_kind, channel_handle_id(&value))
                         {
@@ -4608,6 +4630,18 @@ impl<'a> Interpreter<'a> {
             let should_panic = [2usize, 8].iter().any(|&i| {
                 matches!(desc.get(i), Some(Value::Enum { variant, .. }) if *variant != 0)
             });
+            // `ShouldPanic::Expected(&str)` is variant 2 and
+            // carries the expected message as its field; a test
+            // with an expected message passes only when the panic
+            // message contains it. An unreadable payload degrades
+            // to the plain `Yes` reading above.
+            let should_panic_expected = [2usize, 8]
+                .iter()
+                .find_map(|&i| match desc.get(i) {
+                    Some(Value::Enum { variant: 2, fields }) => fields.first(),
+                    _ => None,
+                })
+                .and_then(|v| self.resolve_string(frames, v).ok());
             let callable = match &pair[1] {
                 Value::Enum { fields, .. } if fields.len() == 1 => {
                     self.resolve_value(frames, &fields[0])?
