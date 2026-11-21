@@ -5075,8 +5075,13 @@ impl<'a> Interpreter<'a> {
     /// exact std answers for each modelled state: an exact count
     /// where std knows one, `(0, None)` where std reports the
     /// trait default (the channel iterators do not override
-    /// `size_hint`). Iterators whose `next` the model does not
-    /// serve stay an explicit unsupported error, as for `next`.
+    /// `size_hint`). Iterators the model does not serve fall
+    /// back to that same trait default: `(0, None)` is valid
+    /// for every iterator, so the call succeeds where the
+    /// collected default body would have run before this
+    /// builtin was registered — at the price of returning
+    /// the default rather than the exact value for an
+    /// unmodelled iterator that overrides `size_hint`.
     fn iterator_size_hint(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -5227,9 +5232,23 @@ impl<'a> Interpreter<'a> {
             let n = remaining.len() as u128;
             return Ok(hint(n, Some(n)));
         }
-        Err(unsupported(format!(
-            "Iterator::size_hint for {self_ty} is not runtime-supported"
-        )))
+        // Any other iterator: the trait default, `(0, None)`.
+        // That pair is a valid `size_hint` answer for every
+        // iterator — a lower bound of zero and no upper bound
+        // satisfy the contract unconditionally — and it is the
+        // exact answer for iterators that do not override
+        // `size_hint` (a plain user iterator behind adapters
+        // such as `Fuse` is the common case). For an iterator
+        // that DOES override `size_hint` but whose state the
+        // model does not serve, this returns the contract-valid
+        // default rather than the implementation's exact value;
+        // callers may then under-reserve or check bounds less
+        // tightly, but never observe an invalid bound. (Before
+        // this fallback existed, registering the builtin name
+        // removed the default body from collection, so such
+        // calls failed outright even when the default was the
+        // whole story.)
+        Ok(hint(0, None))
     }
 
     /// Semantic (derived `PartialEq`) equality of two values:
