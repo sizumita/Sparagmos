@@ -4422,6 +4422,41 @@ impl<'a> Converter<'a> {
         })
     }
 
+    /// Whether a call to one of the iterator-consumer builtins
+    /// (`Iterator::count` / `fold` / `for_each` / `collect`,
+    /// `FromIterator::from_iter`) should be served by the
+    /// collected instance body instead of the builtin: the
+    /// builtins drive the modelled `next` state machine, which
+    /// only the builtin-produced iterator states satisfy. For
+    /// any other iterator type — adapters such as `Map` /
+    /// `Filter`, whose values are genuine structs built by
+    /// collected constructors — the instance body, including
+    /// its specializations, is the faithful execution, so it
+    /// wins whenever the program has one.
+    fn consumer_prefers_body(
+        &self,
+        kind: crate::builtins::Builtin,
+        func: &mir::Operand,
+        raw_generic_args: &[mir::Ty],
+    ) -> bool {
+        let iter_ty = match kind {
+            crate::builtins::Builtin::IteratorCount
+            | crate::builtins::Builtin::IteratorFold
+            | crate::builtins::Builtin::IteratorForEach
+            | crate::builtins::Builtin::IteratorCollect => raw_generic_args.first(),
+            crate::builtins::Builtin::FromIteratorFromIter => raw_generic_args.get(2),
+            _ => return false,
+        };
+        let Some(iter_ty) = iter_ty else {
+            return false;
+        };
+        let tag = crate::builtins::ty_tag(iter_ty, self.names);
+        if crate::builtins::iterator_next_modelled(&tag) {
+            return false;
+        }
+        self.resolve_body_callee(func).is_some()
+    }
+
     /// Resolve a trait-method call whose func operand names the
     /// trait item itself (which has no body) to the concrete impl
     /// body the driver collected for the call's `Self` type, if the
@@ -5214,7 +5249,10 @@ impl<'a> Converter<'a> {
                     self.resolve_external_callee(func)
                 {
                     let canonical = crate::builtins::canonical_name(&name);
-                    if let Some(kind) = crate::builtins::lookup(&canonical) {
+                    let kind = crate::builtins::lookup(&canonical).filter(|kind| {
+                        !self.consumer_prefers_body(*kind, func, &raw_generic_args)
+                    });
+                    if let Some(kind) = kind {
                         let mut ir_args = Vec::with_capacity(args.len());
                         for (i, arg) in args.iter().enumerate() {
                             let ctx = builtin_arg_ctx(kind, &raw_generic_args, i);

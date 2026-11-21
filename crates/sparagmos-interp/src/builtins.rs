@@ -6905,6 +6905,26 @@ fn refcell_guard(cell: &RefTarget) -> Value {
     }
 }
 
+/// Whether the modelled `Iterator::next` state transition
+/// (`iterator_next_state`) serves the iterator type the tag
+/// names: the shapes whose values the builtin iterator
+/// machinery itself produces — ranges, the `[items, index]`
+/// states of `slice::Iter` / `array::IntoIter` / `Chars` /
+/// `Bytes`, `Empty`, and the mpsc channel iterators.
+pub fn iterator_next_modelled(self_ty: &str) -> bool {
+    self_ty.starts_with("std::ops::Range<")
+        || self_ty.starts_with("std::ops::RangeInclusive<")
+        || self_ty.starts_with("std::slice::Iter<")
+        || self_ty.starts_with("std::array::IntoIter<")
+        || self_ty.starts_with("std::iter::Empty<")
+        || self_ty.starts_with("std::sync::mpsc::Iter<")
+        || self_ty.starts_with("std::sync::mpsc::IntoIter<")
+        || self_ty_is(self_ty, "std::str::Chars")
+        || self_ty_is(self_ty, "core::str::Chars")
+        || self_ty_is(self_ty, "std::str::Bytes")
+        || self_ty_is(self_ty, "core::str::Bytes")
+}
+
 fn self_ty_is(self_ty: &str, name: &str) -> bool {
     self_ty == name
         || self_ty

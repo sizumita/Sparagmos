@@ -315,7 +315,9 @@ pub fn collect_reachable(
             // module docs). The registry is keyed by canonical
             // definition name, so this check is per definition.
             let canonical = sparagmos_interp::builtins::canonical_name(&def_name);
-            if sparagmos_interp::builtins::lookup(&canonical).is_some() {
+            if sparagmos_interp::builtins::lookup(&canonical).is_some()
+                && !consumer_instance_needs_body(&canonical, &args)
+            {
                 if builtin_seen.insert(def_id) {
                     records.push(Record {
                         def: def_id,
@@ -961,6 +963,56 @@ fn walk_closure_ty(ty: &Ty, out: &mut Vec<(ClosureDef, GenericArgs)>) {
         TyKind::Alias(_, alias) => walk_closure_args(&alias.args, out),
         _ => {}
     }
+}
+
+/// Whether a call target naming one of the iterator-consumer
+/// builtins (`Iterator::count` / `fold` / `for_each` /
+/// `collect`, `FromIterator::from_iter`) must still have its
+/// instance body collected: the builtins drive the modelled
+/// `next` state machine, which only the builtin-produced
+/// iterator states satisfy, so for any other iterator type the
+/// instance body (including its specializations) is the
+/// faithful execution and conversion prefers it when present.
+/// The iterator type is the call's first generic argument, or
+/// the third for `from_iter` (whose first is the collection).
+fn consumer_instance_needs_body(canonical: &str, args: &GenericArgs) -> bool {
+    let iter_arg = match canonical {
+        "std::iter::Iterator::count"
+        | "std::iter::Iterator::fold"
+        | "std::iter::Iterator::for_each"
+        | "std::iter::Iterator::collect" => 0,
+        "std::iter::FromIterator::from_iter" => 2,
+        _ => return false,
+    };
+    let Some(GenericArgKind::Type(ty)) = args.0.get(iter_arg) else {
+        return false;
+    };
+    !iterator_self_modelled(ty)
+}
+
+/// The Stable MIR counterpart of the interpreter's modelled
+/// `next` shapes (see `iterator_next_modelled` in
+/// sparagmos-interp): ranges, the `[items, index]` iterators,
+/// `Empty`, and the mpsc channel iterators, judged by the
+/// iterator type's ADT name.
+fn iterator_self_modelled(ty: &Ty) -> bool {
+    let TyKind::RigidTy(RigidTy::Adt(def, _)) = ty.kind() else {
+        return false;
+    };
+    matches!(
+        def.name().as_str(),
+        "std::ops::Range"
+            | "std::ops::RangeInclusive"
+            | "std::slice::Iter"
+            | "std::array::IntoIter"
+            | "std::iter::Empty"
+            | "std::sync::mpsc::Iter"
+            | "std::sync::mpsc::IntoIter"
+            | "std::str::Chars"
+            | "core::str::Chars"
+            | "std::str::Bytes"
+            | "core::str::Bytes"
+    )
 }
 
 /// The closure types among one set of generic arguments.
