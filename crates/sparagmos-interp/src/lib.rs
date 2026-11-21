@@ -53,6 +53,7 @@
 pub mod builtins;
 mod decode;
 pub mod error;
+pub mod f128;
 pub mod interp;
 pub mod ir;
 pub mod mir_convert;

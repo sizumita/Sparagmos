@@ -118,14 +118,18 @@ impl UintTy {
     }
 }
 
-/// Floating-point types. Values are stored widened to `f64`
-/// (see `Value::Float`); `f16` widens exactly and its operations
-/// round back to `f16` precision. `f128` stays unsupported.
+/// Floating-point types. `f32` / `f64` values are stored widened
+/// to `f64` (see `Value::Float`); `f16` widens exactly and its
+/// operations round back to `f16` precision. `f128` has no exact
+/// `f64` form, so it is stored as its raw bit pattern
+/// (`Value::Float128`) and computed by the exact software
+/// arithmetic in [`crate::f128`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FloatTy {
     F16,
     F32,
     F64,
+    F128,
 }
 
 impl FloatTy {
@@ -135,6 +139,7 @@ impl FloatTy {
             FloatTy::F16 => 16,
             FloatTy::F32 => 32,
             FloatTy::F64 => 64,
+            FloatTy::F128 => 128,
         }
     }
 }
@@ -323,6 +328,8 @@ pub enum Constant {
     /// A floating-point constant, stored widened to `f64` (an `f32`
     /// value widens exactly, so nothing is lost).
     Float(f64),
+    /// An `f128` constant: the raw IEEE 754 binary128 bit pattern.
+    Float128(u128),
     /// String data (a `str` / `&str` constant).
     Str(String),
     /// Raw bytes (a byte-array constant, e.g. an fmt pieces template).
@@ -359,6 +366,16 @@ pub enum Constant {
     },
     /// A slice constant with decoded (non-byte) elements.
     SliceVal(Vec<Constant>),
+    /// A vtable pointer constant: evaluates to an address-only
+    /// reference whose address is the vtable's identity number
+    /// (see `sparagmos_mir::ConstValue::VTablePtr`), so pointer
+    /// equality / ordering between vtable pointers behaves as it
+    /// does natively (same vtable equal, distinct ones ordered).
+    VTablePtr(u64),
+    /// A provenance-less fat pointer constant (dangling address +
+    /// slice length): evaluates to a fat reference over an
+    /// address-only base.
+    FatPtr { addr: u64, meta: u64 },
     /// A function item constant: evaluates to the callable value
     /// naming the function.
     FnDef(String),
@@ -529,6 +546,15 @@ pub enum Rvalue {
     /// captured environment values (the aggregate's operands, in
     /// field order).
     ClosureAggregate { def: String, operands: Vec<Operand> },
+    /// Build a raw pointer from parts (`AggregateKind::RawPtr`,
+    /// what `ptr::from_raw_parts` lowers to): the data pointer
+    /// operand plus, for a slice pointee, the length operand.
+    /// Evaluates to the data pointer value itself, or to a fat
+    /// reference over it when a metadata operand is present.
+    RawPtrAggregate {
+        data: Operand,
+        meta: Option<Operand>,
+    },
     /// An `as` cast to the given scalar type (wrapping, as in Rust).
     Cast(Operand, Ty),
     /// An unsizing coercion (`PointerCoercion::Unsize`). The
@@ -540,6 +566,11 @@ pub enum Rvalue {
     /// (`Unique` around `NonNull` around the pointer); yields the
     /// raw pointer itself.
     BoxDerefTransmute(Operand),
+    /// The data pointer of a fat pointer value (a fat-to-thin
+    /// pointer cast, e.g. `<[T]>::as_ptr`'s `*const [T]` to
+    /// `*const T`): evaluates to the fat pointer's base, or to the
+    /// operand itself when it is not fat.
+    DataPtr(Operand),
     /// A `Transmute` cast from a pointer/reference value to an
     /// integer: the pointer's address. The model has no flat memory,
     /// so the address is synthetic: a deterministic, non-zero,

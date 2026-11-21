@@ -226,6 +226,10 @@ pub enum Value {
     /// by the double-rounding theorem (53 intermediate bits is more
     /// than twice 24).
     Float(f64),
+    /// An `f128` value: the raw IEEE 754 binary128 bit pattern.
+    /// Arithmetic on it is exact (see [`crate::f128`]); it is never
+    /// rounded through `f64`.
+    Float128(u128),
     /// A tuple, or an array (arrays ride as tuples of their elements;
     /// the length lives in the declared type).
     Tuple(Vec<Value>),
@@ -301,6 +305,7 @@ impl Value {
             Value::Int(_) => "signed integer",
             Value::Uint(_) => "unsigned integer",
             Value::Float(_) => "float",
+            Value::Float128(_) => "f128",
             Value::Tuple(_) => "tuple",
             Value::Str(_) => "string",
             Value::Bytes(_) => "bytes",
@@ -420,6 +425,7 @@ impl fmt::Display for Value {
             Value::Int(v) => write!(f, "{v}"),
             Value::Uint(v) => write!(f, "{v}"),
             Value::Float(v) => write!(f, "{v}"),
+            Value::Float128(bits) => write!(f, "f128:{bits:#034x}"),
             Value::Tuple(items) => {
                 write!(f, "(")?;
                 for (i, item) in items.iter().enumerate() {

@@ -149,6 +149,14 @@ pub struct MirProgram {
 /// Widen an `f16` bit pattern to `f64`. The conversion is exact:
 /// every f16 value (including subnormals) is representable in f64,
 /// and scaling by a power of two never rounds.
+/// The pointee type of a raw-pointer / reference type.
+fn ptr_pointee(t: &mir::Ty) -> Option<&mir::Ty> {
+    match t {
+        mir::Ty::RawPtr(p, _) | mir::Ty::Ref(_, p, _) => Some(&**p),
+        _ => None,
+    }
+}
+
 pub(crate) fn f16_to_f64(bits: u16) -> f64 {
     let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
     let exp = ((bits >> 10) & 0x1f) as i32;
@@ -2172,10 +2180,10 @@ impl<'a> Converter<'a> {
             mir::Ty::Bool => ir::Ty::Bool,
             mir::Ty::Int(it) => ir::Ty::Int(convert_int_ty(*it)),
             mir::Ty::Uint(ut) => ir::Ty::Uint(convert_uint_ty(*ut)),
-            // `f128` falls through to the unsupported arm.
             mir::Ty::Float(mir::FloatTy::F16) => ir::Ty::Float(ir::FloatTy::F16),
             mir::Ty::Float(mir::FloatTy::F32) => ir::Ty::Float(ir::FloatTy::F32),
             mir::Ty::Float(mir::FloatTy::F64) => ir::Ty::Float(ir::FloatTy::F64),
+            mir::Ty::Float(mir::FloatTy::F128) => ir::Ty::Float(ir::FloatTy::F128),
             // `char` is a 32-bit scalar; the IR models it as `u32`.
             mir::Ty::Char => ir::Ty::Uint(ir::UintTy::U32),
             mir::Ty::Never => ir::Ty::Never,
@@ -2792,6 +2800,11 @@ impl<'a> Converter<'a> {
                 ir::Constant::Closure(self.body_key(def))
             }
             mir::ConstValue::IntPtr(addr) => ir::Constant::IntPtr(*addr),
+            mir::ConstValue::VTablePtr(id) => ir::Constant::VTablePtr(*id),
+            mir::ConstValue::FatPtr { addr, meta } => ir::Constant::FatPtr {
+                addr: *addr,
+                meta: *meta,
+            },
             mir::ConstValue::ByRef { .. } => {
                 return Err(ConvertError::UnsupportedConstant {
                     kind: "by-reference constant".to_string(),
@@ -2812,9 +2825,7 @@ impl<'a> Converter<'a> {
                     Ok(ir::Constant::Float(f32::from_bits(*bits as u32) as f64))
                 }
                 mir::FloatTy::F64 => Ok(ir::Constant::Float(f64::from_bits(*bits as u64))),
-                other => Err(ConvertError::UnsupportedConstant {
-                    kind: format!("{other:?} float constant"),
-                }),
+                mir::FloatTy::F128 => Ok(ir::Constant::Float128(*bits)),
             },
             mir::Scalar::Ptr { .. } => Err(ConvertError::UnsupportedConstant {
                 kind: "pointer constant".to_string(),
@@ -3997,6 +4008,23 @@ impl<'a> Converter<'a> {
                             .and_then(|src| self.cast_wrapper_entry_depth(src, target));
                         if let Some(depth) = entry_depth {
                             ir::Rvalue::PtrField(v, depth)
+                        } else if ptr_pointee(target).is_some_and(|p| {
+                            // A pointer cast to a thin target drops
+                            // the metadata word when the source value
+                            // is fat (`*const [T]` to `*const T`, the
+                            // shape of `<[T]>::as_ptr`): the result is
+                            // the data pointer. `DataPtr` evaluates to
+                            // the operand itself when the value is not
+                            // fat, so it is correct for thin sources
+                            // too -- including constant operands, whose
+                            // source type this MIR form does not
+                            // preserve (`ctx` is None).
+                            !matches!(
+                                p,
+                                mir::Ty::Slice(_) | mir::Ty::Str | mir::Ty::Dynamic(..)
+                            )
+                        }) {
+                            ir::Rvalue::DataPtr(v)
                         } else {
                             ir::Rvalue::Use(v)
                         }
@@ -4202,6 +4230,46 @@ impl<'a> Converter<'a> {
                         fields.push(self.convert_operand(body, op, ctx)?);
                     }
                     ir::Rvalue::CoroutineAggregate(fields)
+                }
+                mir::AggregateKind::RawPtr { data_ty, .. } => {
+                    // `ptr::from_raw_parts` shape: one operand for a
+                    // sized pointee (the aggregate is the pointer
+                    // itself), two for an unsized one (data pointer
+                    // plus metadata). Slice metadata is a length and
+                    // becomes a fat reference; `dyn` metadata is a
+                    // vtable pointer, whose concrete type is erased
+                    // here, so it stays unsupported.
+                    let data_ctx = mir::Ty::RawPtr(
+                        Box::new(data_ty.clone()),
+                        mir::Mutability::Not,
+                    );
+                    match (data_ty, ops.len()) {
+                        (mir::Ty::Slice(_), 2) => {
+                            let data =
+                                self.convert_operand(body, &ops[0], Some(&data_ctx))?;
+                            let meta = self.convert_operand(
+                                body,
+                                &ops[1],
+                                Some(&mir::Ty::Uint(mir::UintTy::Usize)),
+                            )?;
+                            ir::Rvalue::RawPtrAggregate {
+                                data,
+                                meta: Some(meta),
+                            }
+                        }
+                        (mir::Ty::Dynamic(..), _) => ir::Rvalue::Unsupported(
+                            "Aggregate RawPtr (dyn metadata)".to_string(),
+                        ),
+                        (_, 1) => {
+                            let data =
+                                self.convert_operand(body, &ops[0], Some(&data_ctx))?;
+                            ir::Rvalue::RawPtrAggregate { data, meta: None }
+                        }
+                        _ => ir::Rvalue::Unsupported(format!(
+                            "Aggregate RawPtr ({} operands)",
+                            ops.len()
+                        )),
+                    }
                 }
                 other => ir::Rvalue::Unsupported(format!("Aggregate {}", other.kind_name())),
             },

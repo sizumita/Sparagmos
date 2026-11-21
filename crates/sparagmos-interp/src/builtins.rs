@@ -723,6 +723,15 @@ pub enum Builtin {
     /// (`core::f64::<impl f64>::sqrt`), so it is carried here and the
     /// operation runs at that width.
     FloatMethod { f32: bool, op: FloatOp },
+    /// A primitive `f128` inherent method. `f128` values are raw
+    /// bit patterns (`Value::Float128`) and the operations run in
+    /// the exact software binary128 module ([`crate::f128`]).
+    Float128Method { op: FloatOp },
+    /// A primitive `f16` inherent method. `f16` values ride in
+    /// `Value::Float` as their exact `f64` widening; the operation
+    /// computes in `f64` and rounds back to `f16`, the same model
+    /// the interpreter's `f16` arithmetic uses.
+    Float16Method { op: FloatOp },
     /// `std::intrinsics::black_box(value)`: the identity function.
     /// The value passes through unchanged; the hint exists only to
     /// block optimiser assumptions the interpreter does not make.
@@ -823,6 +832,7 @@ pub enum FloatOp {
     Floor,
     Ceil,
     Round,
+    RoundTiesEven,
     Trunc,
     Fract,
     Recip,
@@ -1311,6 +1321,18 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
 /// does not model (e.g. `sin_cos`, which returns a tuple) stays an
 /// explicit unsupported call.
 fn float_method(canonical: &str) -> Option<Builtin> {
+    if let Some(rest) = canonical
+        .strip_prefix("core::f128::<impl f128>::")
+        .or_else(|| canonical.strip_prefix("std::f128::<impl f128>::"))
+    {
+        return float128_method(rest);
+    }
+    if let Some(rest) = canonical
+        .strip_prefix("core::f16::<impl f16>::")
+        .or_else(|| canonical.strip_prefix("std::f16::<impl f16>::"))
+    {
+        return float_method_named(rest).map(|op| Builtin::Float16Method { op });
+    }
     let (method, f32) = if let Some(rest) = canonical
         .strip_prefix("core::f32::<impl f32>::")
         .or_else(|| canonical.strip_prefix("std::f32::<impl f32>::"))
@@ -1324,6 +1346,12 @@ fn float_method(canonical: &str) -> Option<Builtin> {
     } else {
         return None;
     };
+    let op = float_method_named(method)?;
+    Some(Builtin::FloatMethod { f32, op })
+}
+
+/// The shared inherent-method name table for the float types.
+fn float_method_named(method: &str) -> Option<FloatOp> {
     use FloatOp as O;
     let op = match method {
         "is_nan" => O::IsNan,
@@ -1336,6 +1364,7 @@ fn float_method(canonical: &str) -> Option<Builtin> {
         "floor" => O::Floor,
         "ceil" => O::Ceil,
         "round" => O::Round,
+        "round_ties_even" => O::RoundTiesEven,
         "trunc" => O::Trunc,
         "fract" => O::Fract,
         "recip" => O::Recip,
@@ -1350,7 +1379,225 @@ fn float_method(canonical: &str) -> Option<Builtin> {
         "from_bits" => O::FromBits,
         _ => return None,
     };
-    Some(Builtin::FloatMethod { f32, op })
+    Some(op)
+}
+
+/// Resolve an `f128` inherent method name to its builtin. Only
+/// the operations the binary128 module implements exactly are
+/// registered; the rest (e.g. `powf`, the trigonometric family)
+/// stay explicit unsupported calls.
+fn float128_method(method: &str) -> Option<Builtin> {
+    use FloatOp as O;
+    let op = match method {
+        "is_nan" => O::IsNan,
+        "is_infinite" => O::IsInfinite,
+        "is_finite" => O::IsFinite,
+        "is_sign_positive" => O::IsSignPositive,
+        "is_sign_negative" => O::IsSignNegative,
+        "abs" => O::Abs,
+        "sqrt" => O::Sqrt,
+        "floor" => O::Floor,
+        "ceil" => O::Ceil,
+        "round" => O::Round,
+        "round_ties_even" => O::RoundTiesEven,
+        "trunc" => O::Trunc,
+        "fract" => O::Fract,
+        "recip" => O::Recip,
+        "signum" => O::Signum,
+        "powi" => O::Powi,
+        "min" => O::Min,
+        "max" => O::Max,
+        "to_bits" => O::ToBits,
+        "from_bits" => O::FromBits,
+        _ => return None,
+    };
+    Some(Builtin::Float128Method { op })
+}
+
+/// Execute one primitive `f128` method on raw bit patterns.
+fn exec_float128_method(
+    name: &str,
+    op: FloatOp,
+    vals: &[Value],
+) -> InterpResult<Value> {
+    use crate::f128;
+    let arity = |n: usize| -> InterpResult<()> {
+        if vals.len() == n {
+            Ok(())
+        } else {
+            Err(InterpError::type_mismatch(
+                format!("builtin {name}"),
+                format!("{n} argument(s)"),
+                format!("{} argument(s)", vals.len()),
+            ))
+        }
+    };
+    let as_bits = |v: &Value| -> InterpResult<u128> {
+        match v {
+            Value::Float128(bits) => Ok(*bits),
+            other => Err(InterpError::type_mismatch(
+                format!("builtin {name}"),
+                "f128",
+                other.kind_name(),
+            )),
+        }
+    };
+    use FloatOp as O;
+    if op == O::FromBits {
+        arity(1)?;
+        let bits = match vals[0] {
+            Value::Uint(v) => v,
+            Value::Int(v) => v as u128,
+            ref other => {
+                return Err(InterpError::type_mismatch(
+                    format!("builtin {name}"),
+                    "integer",
+                    other.kind_name(),
+                ));
+            }
+        };
+        return Ok(Value::Float128(bits));
+    }
+    arity(if matches!(op, O::Powi | O::Min | O::Max) {
+        2
+    } else {
+        1
+    })?;
+    let x = as_bits(&vals[0])?;
+    Ok(match op {
+        O::IsNan => Value::Bool(f128::is_nan(x)),
+        O::IsInfinite => Value::Bool(f128::is_infinite(x)),
+        O::IsFinite => Value::Bool(f128::is_finite(x)),
+        O::IsSignPositive => Value::Bool(f128::is_sign_positive(x)),
+        O::IsSignNegative => Value::Bool(f128::is_sign_negative(x)),
+        O::Abs => Value::Float128(f128::abs(x)),
+        O::Sqrt => Value::Float128(f128::sqrt(x)),
+        O::Floor => Value::Float128(f128::floor(x)),
+        O::Ceil => Value::Float128(f128::ceil(x)),
+        O::Round => Value::Float128(f128::round_half_away(x)),
+        O::RoundTiesEven => Value::Float128(f128::round_ties_even(x)),
+        O::Trunc => Value::Float128(f128::trunc(x)),
+        O::Fract => Value::Float128(f128::fract(x)),
+        O::Recip => Value::Float128(f128::recip(x)),
+        O::Signum => Value::Float128(f128::signum(x)),
+        O::ToBits => Value::Uint(x),
+        O::Powi => {
+            let n = match vals[1] {
+                Value::Int(v) => v as i32,
+                Value::Uint(v) => v as i32,
+                ref other => {
+                    return Err(InterpError::type_mismatch(
+                        format!("builtin {name}"),
+                        "i32",
+                        other.kind_name(),
+                    ));
+                }
+            };
+            Value::Float128(f128::powi(x, n))
+        }
+        O::Min => Value::Float128(f128::min(x, as_bits(&vals[1])?)),
+        O::Max => Value::Float128(f128::max(x, as_bits(&vals[1])?)),
+        O::Powf | O::ToDegrees | O::ToRadians => {
+            return Err(unsupported(format!(
+                "f128 method {name} is not runtime-supported"
+            )));
+        }
+        O::FromBits => unreachable!("handled above"),
+    })
+}
+
+/// Execute one primitive `f16` method. The receiver rides as its
+/// exact `f64` widening; the operation computes in `f64` and the
+/// result rounds back to `f16` (exact for the operations modelled
+/// here, by the same double-rounding argument as `f32`).
+fn exec_float16_method(
+    name: &str,
+    op: FloatOp,
+    vals: &[Value],
+) -> InterpResult<Value> {
+    use crate::f128::{f16_bits_to_f64, f64_to_f16_bits};
+    let arity = |n: usize| -> InterpResult<()> {
+        if vals.len() == n {
+            Ok(())
+        } else {
+            Err(InterpError::type_mismatch(
+                format!("builtin {name}"),
+                format!("{n} argument(s)"),
+                format!("{} argument(s)", vals.len()),
+            ))
+        }
+    };
+    let as_float = |v: &Value| -> InterpResult<f64> {
+        match v {
+            Value::Float(x) => Ok(*x),
+            other => Err(InterpError::type_mismatch(
+                format!("builtin {name}"),
+                "f16",
+                other.kind_name(),
+            )),
+        }
+    };
+    use FloatOp as O;
+    if op == O::FromBits {
+        arity(1)?;
+        let bits = match vals[0] {
+            Value::Uint(v) => v,
+            Value::Int(v) => v as u128,
+            ref other => {
+                return Err(InterpError::type_mismatch(
+                    format!("builtin {name}"),
+                    "integer",
+                    other.kind_name(),
+                ));
+            }
+        };
+        return Ok(Value::Float(f16_bits_to_f64(bits as u16)));
+    }
+    arity(if matches!(op, O::Powi | O::Powf | O::Min | O::Max) {
+        2
+    } else {
+        1
+    })?;
+    let x = as_float(&vals[0])?;
+    let round = |r: f64| Value::Float(f16_bits_to_f64(f64_to_f16_bits(r)));
+    Ok(match op {
+        O::IsNan => Value::Bool(x.is_nan()),
+        O::IsInfinite => Value::Bool(x.is_infinite()),
+        O::IsFinite => Value::Bool(x.is_finite()),
+        O::IsSignPositive => Value::Bool(x.is_sign_positive()),
+        O::IsSignNegative => Value::Bool(x.is_sign_negative()),
+        O::Abs => round(x.abs()),
+        O::Sqrt => round(x.sqrt()),
+        O::Floor => round(x.floor()),
+        O::Ceil => round(x.ceil()),
+        O::Round => round(x.round()),
+        O::RoundTiesEven => round(x.round_ties_even()),
+        O::Trunc => round(x.trunc()),
+        O::Fract => round(x.fract()),
+        O::Recip => round(x.recip()),
+        O::Signum => round(x.signum()),
+        O::ToDegrees => round(x.to_degrees()),
+        O::ToRadians => round(x.to_radians()),
+        O::ToBits => Value::Uint(f64_to_f16_bits(x) as u128),
+        O::Powi => {
+            let n = match vals[1] {
+                Value::Int(v) => v as i32,
+                Value::Uint(v) => v as i32,
+                ref other => {
+                    return Err(InterpError::type_mismatch(
+                        format!("builtin {name}"),
+                        "i32",
+                        other.kind_name(),
+                    ));
+                }
+            };
+            round(x.powi(n))
+        }
+        O::Powf => round(x.powf(as_float(&vals[1])?)),
+        O::Min => round(x.min(as_float(&vals[1])?)),
+        O::Max => round(x.max(as_float(&vals[1])?)),
+        O::FromBits => unreachable!("handled above"),
+    })
 }
 
 /// Execute one primitive float method. The operation runs at the
@@ -1443,6 +1690,7 @@ fn exec_float_method(
         O::Floor => Value::Float(unary!(floor)),
         O::Ceil => Value::Float(unary!(ceil)),
         O::Round => Value::Float(unary!(round)),
+        O::RoundTiesEven => Value::Float(unary!(round_ties_even)),
         O::Trunc => Value::Float(unary!(trunc)),
         O::Fract => Value::Float(unary!(fract)),
         O::Recip => Value::Float(unary!(recip)),
@@ -4914,6 +5162,8 @@ impl<'a> Interpreter<'a> {
                 Ok(Value::Unit)
             }
             Builtin::FloatMethod { f32, op } => exec_float_method(name, f32, op, &vals),
+            Builtin::Float128Method { op } => exec_float128_method(name, op, &vals),
+            Builtin::Float16Method { op } => exec_float16_method(name, op, &vals),
         }
     }
 
@@ -6705,6 +6955,7 @@ impl<'a> Interpreter<'a> {
             // `PartialEq` on a float field performs it (NaN compares
             // unequal to itself).
             (Value::Float(x), Value::Float(y)) => x == y,
+            (Value::Float128(x), Value::Float128(y)) => crate::f128::eq(*x, *y),
             (Value::FnPtr(x), Value::FnPtr(y)) => x == y,
             (Value::Tuple(x), Value::Tuple(y)) => {
                 x.len() == y.len() && self.seq_equal(frames, x, y)?
@@ -8695,6 +8946,7 @@ fn zeroed_value_for_tag(tag: &str) -> Option<Value> {
         "i8" | "i16" | "i32" | "i64" | "i128" | "isize" => Value::Int(0),
         "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "char" => Value::Uint(0),
         "f32" | "f64" => Value::Float(0.0),
+        "f128" => Value::Float128(0),
         "()" => Value::Unit,
         _ if tag.starts_with('(') && tag.ends_with(')') => {
             let inner = &tag[1..tag.len() - 1];
@@ -9163,6 +9415,9 @@ impl<'a> Interpreter<'a> {
             }
             Value::Bool(b) => Ok(pad_str(bool_str(*b), options)),
             Value::Float(v) => Ok(format_float(*v, ty, options, false)),
+            Value::Float128(_) => Err(unsupported(
+                "Display formatting for an f128 value (decimal conversion is not modelled)",
+            )),
             Value::Str(s) => Ok(pad_str(s, options)),
             Value::FmtArguments(inner) => {
                 let text = self.format_arguments(frames, inner)?;

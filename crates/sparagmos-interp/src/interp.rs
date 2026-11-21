@@ -27,6 +27,7 @@
 //!   `tests/robustness_tests.rs`.
 
 use crate::error::{InterpError, InterpResult};
+use crate::f128;
 use crate::ir::*;
 use crate::value::{PanicPayload, RefProj, RefTarget, Value};
 use std::borrow::Cow;
@@ -4230,6 +4231,14 @@ impl<'a> Interpreter<'a> {
             // `Len` and index bounds see the fat pointer's length.
             Value::FatRef { base, .. } => match &**base {
                 Value::Tuple(_) => Ok(Resolved::Value(value.clone())),
+                // An address-only base has no pointee to reach: the
+                // fat pointer is self-contained (a dangling slice
+                // constant, a `from_raw_parts` result), and
+                // dereferencing it yields the slice value itself —
+                // the same treatment as the aggregate-base case.
+                Value::Ref(RefTarget::Address(_)) => {
+                    Ok(Resolved::Value(value.clone()))
+                }
                 _ => self.deref_value(frames, base),
             },
             // Dereferencing a dyn fat pointer reaches the value it
@@ -5124,6 +5133,7 @@ impl<'a> Interpreter<'a> {
                 Ok(Value::Float((*v as f32) as f64))
             }
             (Some(Ty::Float(FloatTy::F64)), Value::Float(_)) => Ok(value),
+            (Some(Ty::Float(FloatTy::F128)), Value::Float128(_)) => Ok(value),
             // An integer payload whose kind tag differs from the
             // declared type: the bits are reinterpreted at the
             // declared width. This arises for scalar leaves of
@@ -5369,6 +5379,12 @@ impl<'a> Interpreter<'a> {
             Constant::Int(v) => Value::Int(*v),
             Constant::Uint(v) => Value::Uint(*v),
             Constant::Float(v) => Value::Float(*v),
+            Constant::Float128(bits) => Value::Float128(*bits),
+            Constant::VTablePtr(id) => Value::Ref(RefTarget::Address(*id)),
+            Constant::FatPtr { addr, meta } => Value::FatRef {
+                base: Box::new(Value::Ref(RefTarget::Address(*addr))),
+                len: u128::from(*meta),
+            },
             Constant::FnDef(name) => Value::FnPtr(name.clone()),
             Constant::Closure(def) => Value::Closure {
                 def: def.clone(),
@@ -5809,6 +5825,37 @@ impl<'a> Interpreter<'a> {
     ) -> InterpResult<Value> {
         match rvalue {
             Rvalue::Use(op) => self.eval_operand(frames, body, op),
+            Rvalue::DataPtr(op) => {
+                let value = self.eval_operand(frames, body, op)?;
+                match value {
+                    Value::FatRef { base, .. } => Ok((*base).clone()),
+                    other => Ok(other),
+                }
+            }
+            Rvalue::RawPtrAggregate { data, meta } => {
+                let base = self.eval_operand(frames, body, data)?;
+                match meta {
+                    None => Ok(base),
+                    Some(meta_op) => {
+                        let meta_value = self.eval_operand(frames, body, meta_op)?;
+                        let len = match meta_value {
+                            Value::Uint(v) => v,
+                            Value::Int(v) => v as u128,
+                            other => {
+                                return Err(InterpError::type_mismatch(
+                                    "raw pointer metadata",
+                                    "integer length",
+                                    other.kind_name(),
+                                ))
+                            }
+                        };
+                        Ok(Value::FatRef {
+                            base: Box::new(base),
+                            len,
+                        })
+                    }
+                }
+            }
             Rvalue::BinaryOp(op, pair) => {
                 let lhs = self.eval_operand(frames, body, &pair.0)?;
                 let rhs = self.eval_operand(frames, body, &pair.1)?;
@@ -7348,6 +7395,38 @@ pub(crate) fn eval_binary(
         let result = Value::Uint(wrap_unsigned(raw, bits));
         return Ok((result, overflowed));
     }
+    // `f128` arithmetic: exact software binary128 (see
+    // `crate::f128`); never rounded through `f64`.
+    if let (Value::Float128(a), Value::Float128(b)) = (lhs, rhs) {
+        let (a, b) = (*a, *b);
+        let v = match op {
+            Eq => Value::Bool(f128::eq(a, b)),
+            Ne => Value::Bool(!f128::eq(a, b)),
+            Lt => Value::Bool(f128::partial_cmp(a, b) == Some(std::cmp::Ordering::Less)),
+            Le => Value::Bool(matches!(
+                f128::partial_cmp(a, b),
+                Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+            )),
+            Gt => Value::Bool(f128::partial_cmp(a, b) == Some(std::cmp::Ordering::Greater)),
+            Ge => Value::Bool(matches!(
+                f128::partial_cmp(a, b),
+                Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+            )),
+            Add => Value::Float128(f128::add(a, b)),
+            Sub => Value::Float128(f128::sub(a, b)),
+            Mul => Value::Float128(f128::mul(a, b)),
+            Div => Value::Float128(f128::div(a, b)),
+            Rem => Value::Float128(f128::rem(a, b)),
+            _ => {
+                return Err(InterpError::type_mismatch(
+                    format!("binary operation {op:?}"),
+                    "integer operands",
+                    "f128",
+                ))
+            }
+        };
+        return Ok((v, false));
+    }
     // Floating-point arithmetic, computed in `f64` (see `Value::Float`
     // for why that is exact at `f32` destinations too). Division by
     // zero and NaN follow IEEE 754, as in Rust: they are values, not
@@ -7586,6 +7665,7 @@ pub(crate) fn eval_unary(op: UnOp, v: &Value, dest_ty: Option<&Ty>) -> InterpRes
             Ok(Value::Int(wrap_signed(a.wrapping_neg(), bits)))
         }
         (UnOp::Neg, Value::Float(a)) => Ok(Value::Float(-a)),
+        (UnOp::Neg, Value::Float128(a)) => Ok(Value::Float128(f128::neg(*a))),
         (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
         (UnOp::Not, Value::Int(a)) => Ok(Value::Int(wrap_signed(!a, signed_bits(dest_ty)))),
         (UnOp::Not, Value::Uint(a)) => Ok(Value::Uint(wrap_unsigned(!a, unsigned_bits(dest_ty)))),
@@ -7744,6 +7824,9 @@ pub(crate) fn eval_cast(v: &Value, ty: &Ty) -> InterpResult<Value> {
             if let Value::Float(a) = v {
                 return Ok(Value::Int(float_to_int(*a, it.bits())));
             }
+            if let Value::Float128(a) = v {
+                return Ok(Value::Int(f128::to_int(*a, it.bits())));
+            }
             // A pointer source (a pointer-to-integer transmute)
             // yields the pointer's synthetic address.
             if matches!(v, Value::Ref(_) | Value::FatRef { .. } | Value::FnPtr(_)) {
@@ -7770,6 +7853,9 @@ pub(crate) fn eval_cast(v: &Value, ty: &Ty) -> InterpResult<Value> {
             if let Value::Float(a) = v {
                 return Ok(Value::Uint(float_to_uint(*a, ut.bits())));
             }
+            if let Value::Float128(a) = v {
+                return Ok(Value::Uint(f128::to_uint(*a, ut.bits())));
+            }
             // A pointer source (a pointer-to-integer transmute)
             // yields the pointer's synthetic address.
             if matches!(v, Value::Ref(_) | Value::FatRef { .. } | Value::FnPtr(_)) {
@@ -7790,6 +7876,37 @@ pub(crate) fn eval_cast(v: &Value, ty: &Ty) -> InterpResult<Value> {
             Ok(Value::Uint(wrap_unsigned(raw, ut.bits())))
         }
         Ty::Float(ft) => {
+            // `f128` sources and targets convert through the exact
+            // binary128 module, never through an `f64` rounding of
+            // the value (an `f64` *storage* widening of an `f16` /
+            // `f32` source is exact, so widening from `Value::Float`
+            // loses nothing).
+            match (v, ft) {
+                (Value::Float128(a), FloatTy::F128) => return Ok(Value::Float128(*a)),
+                (Value::Float128(a), FloatTy::F64) => {
+                    return Ok(Value::Float(f64::from_bits(f128::to_f64_bits(*a))))
+                }
+                (Value::Float128(a), FloatTy::F32) => {
+                    return Ok(Value::Float(
+                        f32::from_bits(f128::to_f32_bits(*a)) as f64,
+                    ))
+                }
+                (Value::Float128(a), FloatTy::F16) => {
+                    return Ok(Value::Float(f128::f16_bits_to_f64(f128::to_f16_bits(
+                        *a,
+                    ))))
+                }
+                (Value::Float(a), FloatTy::F128) => {
+                    return Ok(Value::Float128(f128::from_f64(a.to_bits())))
+                }
+                (Value::Int(a), FloatTy::F128) => {
+                    return Ok(Value::Float128(f128::from_int(*a)))
+                }
+                (Value::Uint(a), FloatTy::F128) => {
+                    return Ok(Value::Float128(f128::from_uint(*a)))
+                }
+                _ => {}
+            }
             // Convert at the target width directly: going through
             // `f64` first would double-round wide integer sources.
             let out = match (v, ft) {
