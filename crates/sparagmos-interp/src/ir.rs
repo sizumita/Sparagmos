@@ -726,6 +726,29 @@ pub enum DropPlan {
     Dyn,
 }
 
+/// What happens when execution of a basic block panics (the MIR
+/// `UnwindAction` of the block terminator, preserved by conversion):
+/// the cleanup block of the frame runs, the panic propagates to the
+/// caller, or the run aborts. A body built by hand carries no unwind
+/// table: every block then defaults to [`UnwindAction::Continue`],
+/// the pre-unwinding behaviour of discarding the frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnwindAction {
+    /// Jump to this cleanup block in the panicking frame; the block
+    /// chain ends with [`TerminatorKind::Resume`], which pops the
+    /// frame and continues the unwind in the caller.
+    Cleanup(BasicBlock),
+    /// No cleanup in this frame: discard it and continue the unwind
+    /// in the caller.
+    Continue,
+    /// The panic may not unwind past this point (a panic in a
+    /// cleanup, or a `nounwind` boundary): the run aborts.
+    Terminate,
+    /// The callee was assumed never to unwind; that it did is an
+    /// abort, exactly as for [`UnwindAction::Terminate`].
+    Unreachable,
+}
+
 /// The drop glue of one `Drop` terminator: the plan for the dropped
 /// type plus the table of ADT plans it references.
 #[derive(Debug, Clone, PartialEq)]
@@ -828,6 +851,17 @@ pub enum TerminatorKind {
         glue: DropGlue,
     },
     Return,
+    /// Resume an in-flight unwind after a cleanup block chain has
+    /// run: pop this frame and continue unwinding in the caller
+    /// with the panic stashed in the frame when its cleanup was
+    /// entered. Only reachable while unwinding; executing it at any
+    /// other time is an explicit error.
+    Resume,
+    /// Abort the run (MIR `Terminate(Abort)`): a panic escaped a
+    /// cleanup or crossed a `nounwind` boundary. Uncatchable: it is
+    /// reported as [`crate::error::InterpError::Abort`], never as a
+    /// guest panic a `catch_unwind` could observe.
+    Abort,
     Unreachable,
     Assert {
         cond: Operand,
@@ -871,6 +905,11 @@ pub struct Body {
     /// then falls back to the shapes derivable from the IR type
     /// alone.
     pub zst_locals: Vec<Option<Value>>,
+    /// The unwind action of each block terminator, indexed by
+    /// block (conversion-preserved from MIR; see [`UnwindAction`]).
+    /// Empty for hand-built bodies, and a block past the end of the
+    /// table defaults to [`UnwindAction::Continue`].
+    pub unwind: Vec<UnwindAction>,
 }
 
 impl Body {
@@ -886,6 +925,7 @@ impl Body {
             local_tys,
             blocks,
             zst_locals: Vec::new(),
+            unwind: Vec::new(),
         }
     }
     pub fn local_count(&self) -> usize {
@@ -893,6 +933,16 @@ impl Body {
     }
     pub fn local_ty(&self, local: Local) -> Option<&Ty> {
         self.local_tys.get(local.0)
+    }
+
+    /// The unwind action of the terminator of `block` (see
+    /// [`UnwindAction`]); [`UnwindAction::Continue`] when the body
+    /// carries no entry for the block.
+    pub fn unwind_action(&self, block: usize) -> UnwindAction {
+        self.unwind
+            .get(block)
+            .copied()
+            .unwrap_or(UnwindAction::Continue)
     }
 }
 

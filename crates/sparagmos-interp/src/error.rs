@@ -11,6 +11,9 @@
 //!   payload's concrete type leave it unset, and the catch site then
 //!   presents the message itself as a `&str` payload, which is what
 //!   core's literal-message panics carry.
+//! * [`InterpError::Abort`] models a panic that may not unwind
+//!   (a panic in a cleanup, a `nounwind` crossing): native execution
+//!   aborts the process, so no `catch_unwind` observes it.
 //! * Every other variant is an interpreter/oracle failure: the input MIR is
 //!   malformed, unsupported, or exhausted a resource limit. Unsupported
 //!   constructs always fail loudly here — the oracle must never silently
@@ -35,6 +38,15 @@ pub enum InterpError {
         message: String,
         payload: Option<PanicPayload>,
     },
+    /// The run aborted: a guest panic escaped a cleanup block or
+    /// crossed a `nounwind` boundary (MIR `UnwindAction::Terminate`
+    /// / `Unreachable`, or a `Terminate(Abort)` terminator). Native
+    /// execution aborts the process here (a double panic); this
+    /// model reports it as its own error so it stays distinct from
+    /// a catchable guest panic: `catch_unwind` never observes it,
+    /// and the driver maps it to the guest-panic exit (101) with
+    /// the abort reason on stderr.
+    Abort { message: String },
     /// The configured step budget was exhausted (probable infinite loop).
     StepLimitExceeded { limit: usize },
     /// The configured call-depth budget was exhausted.
@@ -142,6 +154,7 @@ impl fmt::Display for InterpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             InterpError::Panic { message, .. } => write!(f, "guest panic: {message}"),
+            InterpError::Abort { message } => write!(f, "guest abort: {message}"),
             InterpError::StepLimitExceeded { limit } => {
                 write!(f, "step limit exceeded ({limit} steps)")
             }

@@ -62,7 +62,7 @@ pub use interp::{interpret, InterpConfig, Interpreter};
 pub use ir::{
     BasicBlock, BasicBlockData, BinOp, Body, Constant, DropGlue, DropPlan, Local, Operand,
     Place, Program,
-    ProjectionElem, Rvalue, Statement, StatementKind, TerminatorKind, Ty, UnOp,
+    ProjectionElem, Rvalue, Statement, StatementKind, TerminatorKind, Ty, UnOp, UnwindAction,
 };
 pub use mir_convert::{
     convert_program, interpret_mir, interpret_mir_captured,
