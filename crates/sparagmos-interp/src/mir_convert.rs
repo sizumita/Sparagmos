@@ -1642,6 +1642,21 @@ impl<'a> Converter<'a> {
             .iter()
             .map(|decl| self.zst_value(&decl.ty, 0))
             .collect();
+        out.zst_fields = body
+            .local_decls
+            .iter()
+            .map(|decl| {
+                let mut map = std::collections::HashMap::new();
+                // The walk budget bounds the conversion cost on
+                // bodies whose types are enormous (iterator chains
+                // with type lengths in the millions): the paths it
+                // serves are shallow wrappers, collected long
+                // before the budget runs out.
+                let mut budget = 256usize;
+                self.collect_zst_fields(&decl.ty, &mut Vec::new(), &mut map, 0, &mut budget);
+                map
+            })
+            .collect();
         Ok(out)
     }
 
@@ -1670,6 +1685,60 @@ impl<'a> Converter<'a> {
         match self.unique_value(ty, depth) {
             UniqueValue::One(v) => Some(v),
             _ => None,
+        }
+    }
+
+    /// Collect the canonical values of the single-valued field
+    /// paths of `ty` into `out`, keyed by field-index path (see
+    /// `ir::Body::zst_fields`). Structs, unions and tuples expose
+    /// their fields under bare field projections; an enum's fields
+    /// sit behind a downcast step, which the runtime lookup does
+    /// not follow, so enum fields are not collected. The walk is
+    /// depth- and size-capped: it serves the shallow paths MIR
+    /// actually projects (a wrapper or two around a zero-sized
+    /// field), not arbitrary recursive types.
+    fn collect_zst_fields(
+        &self,
+        ty: &mir::Ty,
+        path: &mut Vec<usize>,
+        out: &mut std::collections::HashMap<Vec<usize>, Value>,
+        depth: u32,
+        budget: &mut usize,
+    ) {
+        if depth > 8 || out.len() > 4096 || *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+        let mut ty = ty.clone();
+        while let mir::Ty::Pat(inner, _) = ty {
+            ty = *inner;
+        }
+        let fields: Vec<mir::Ty> = match &ty {
+            mir::Ty::Tuple(ts) => ts.clone(),
+            mir::Ty::Adt(def, args) => {
+                let Some(shape) = self.adt_shapes.get(def) else {
+                    return;
+                };
+                if shape.kind == mir::AdtShapeKind::Enum {
+                    return;
+                }
+                match self.instantiated_field_tys(def, args, 0) {
+                    Some(fields) => fields,
+                    None => return,
+                }
+            }
+            _ => return,
+        };
+        for (i, field_ty) in fields.iter().enumerate() {
+            path.push(i);
+            if let Some(v) = self.zst_value(field_ty, 0) {
+                out.insert(path.clone(), v);
+            }
+            self.collect_zst_fields(field_ty, path, out, depth + 1, budget);
+            path.pop();
+            if out.len() > 4096 {
+                return;
+            }
         }
     }
 

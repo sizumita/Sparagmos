@@ -3951,17 +3951,36 @@ impl<'a> Interpreter<'a> {
                 } else {
                     describe_resolved(*local, projection)
                 };
-                let value = self.project_value_t(base, projection, &frame.func, &place_desc)?;
-                if value == Value::Uninit {
-                    return Err(InterpError::UninitializedRead {
-                        func: frame.func.clone(),
-                        place: if projection.is_empty() {
-                            describe_resolved(*local, projection)
-                        } else {
-                            place_desc
-                        },
-                    });
-                }
+                // A field whose type has a single value denotes
+                // that value when nothing was ever written there:
+                // the store of a zero-sized field is elided like a
+                // ZST local's (the closure slot of a `catch_unwind`
+                // Data union is read back by `do_call` without any
+                // body having stored it). The stored value wins
+                // whenever the read succeeds — a union's storage
+                // slot can be shared with a field of a different
+                // type — so the precomputed value (conversion's
+                // `Body::zst_fields` table) only rescues a read
+                // that otherwise fails as uninitialized.
+                let value = match self.project_value_t(base, projection, &frame.func, &place_desc) {
+                    Ok(v) if v != Value::Uninit => v,
+                    Ok(_) | Err(InterpError::UninitializedRead { .. }) => {
+                        match self.zst_field_value(frame, *local, projection) {
+                            Some(v) => v,
+                            None => {
+                                return Err(InterpError::UninitializedRead {
+                                    func: frame.func.clone(),
+                                    place: if projection.is_empty() {
+                                        describe_resolved(*local, projection)
+                                    } else {
+                                        place_desc
+                                    },
+                                });
+                            }
+                        }
+                    }
+                    Err(e) => return Err(e),
+                };
                 Ok(value)
             }
         }
@@ -3980,6 +3999,30 @@ impl<'a> Interpreter<'a> {
             return Some(v.clone());
         }
         zst_value_of_ty(body.local_ty(Local(local))?)
+    }
+
+    /// The canonical value of a single-valued field path of a
+    /// local (see the note in `read_resolved`); `None` when the
+    /// projection is not a pure field path or conversion recorded
+    /// no single-valued value for it.
+    fn zst_field_value(
+        &self,
+        frame: &Frame,
+        local: usize,
+        projection: &[RefProj],
+    ) -> Option<Value> {
+        if projection.is_empty() {
+            return None;
+        }
+        let mut path = Vec::with_capacity(projection.len());
+        for step in projection {
+            match step {
+                RefProj::Field(idx) => path.push(*idx),
+                _ => return None,
+            }
+        }
+        let body = self.program.get(&frame.func)?;
+        body.zst_fields.get(local)?.get(&path).cloned()
     }
 
     /// The value of a never-written local of an evidently
@@ -4421,6 +4464,17 @@ impl<'a> Interpreter<'a> {
 
     /// Validate / wrap a value being stored into a typed direct local.
     fn normalize_for_ty(mut value: Value, ty: Option<&Ty>) -> InterpResult<Value> {
+        // Storing the uninitialized marker itself is not a type
+        // mismatch: MIR materialises uninitialised locals with an
+        // assignment of the `Uninit` constant (the storage a
+        // `MaybeUninit` or a union is filled through a pointer
+        // afterwards), and moving a not-yet-initialised local into
+        // another local propagates the same marker. The place simply
+        // holds no value yet; any later read of it still raises
+        // `UninitializedRead`, so nothing is fabricated here.
+        if value == Value::Uninit {
+            return Ok(value);
+        }
         // A scalar place whose value arrives as a one-field wrapper
         // aggregate: reading through a raw pointer into a transparent
         // wrapper (`UnsafeCell<T>`, the `AtomicUsize`-family structs,
@@ -5882,10 +5936,37 @@ pub(crate) fn navigate_mut<'x>(
         return Ok(slot);
     }
     if *slot == Value::Uninit {
-        return Err(InterpError::UninitializedRead {
-            func: func.to_string(),
-            place: place.to_string(),
-        });
+        // Partial initialization: MIR fills an aggregate place
+        // field by field — a `catch_unwind` Data union written
+        // through a raw pointer by the callee, a struct local
+        // stored field-wise — so a field or downcast write into a
+        // never-written slot materializes the aggregate with every
+        // other slot still uninitialized, the same sparse shape a
+        // union aggregate value has. The slots the write does not
+        // touch keep raising `UninitializedRead` when read, so no
+        // value is fabricated. Any other step into an uninitialized
+        // place (an index into an array that was never built) has
+        // no honest shape to materialize and stays an error.
+        match projection.first() {
+            Some(RefProj::Field(idx)) => {
+                *slot = Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Uninit; *idx + 1],
+                };
+            }
+            Some(RefProj::Downcast(variant)) => {
+                *slot = Value::Enum {
+                    variant: *variant,
+                    fields: Vec::new(),
+                };
+            }
+            _ => {
+                return Err(InterpError::UninitializedRead {
+                    func: func.to_string(),
+                    place: place.to_string(),
+                });
+            }
+        }
     }
     let (step, rest) = projection.split_first().expect("non-empty");
     match step {

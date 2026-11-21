@@ -1023,6 +1023,18 @@ pub struct Body {
     /// then falls back to the shapes derivable from the IR type
     /// alone.
     pub zst_locals: Vec<Option<Value>>,
+    /// Canonical values of field paths whose type has a single
+    /// value, indexed by local, then by the field-index path from
+    /// the local (conversion-computed; see `mir_convert`'s
+    /// `collect_zst_fields`). A field of a single-valued type —
+    /// typically a zero-sized field such as the closure slot of a
+    /// `catch_unwind` Data union — may never be written by MIR at
+    /// all (its store is elided like a ZST local's), so a read of
+    /// the path that otherwise fails as uninitialized denotes this
+    /// value instead. A read that succeeds from storage is never
+    /// overridden: a union's storage slot can be shared with a
+    /// field of a different type. Empty for hand-built bodies.
+    pub zst_fields: Vec<std::collections::HashMap<Vec<usize>, Value>>,
     /// The unwind action of each block terminator, indexed by
     /// block (conversion-preserved from MIR; see [`UnwindAction`]).
     /// Empty for hand-built bodies, and a block past the end of the
@@ -1049,6 +1061,7 @@ impl Body {
             local_tys,
             blocks,
             zst_locals: Vec::new(),
+            zst_fields: Vec::new(),
             unwind: Vec::new(),
             caller_location_local: None,
         }
