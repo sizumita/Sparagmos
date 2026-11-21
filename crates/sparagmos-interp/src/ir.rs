@@ -986,6 +986,17 @@ pub enum TerminatorKind {
         expected: bool,
         target: BasicBlock,
         message: String,
+        /// The assertion guards an arithmetic overflow (a MIR
+        /// `AssertMessage::Overflow` / `OverflowNeg`): the kind of
+        /// assertion a checked build emits after a
+        /// `CheckedBinaryOp`. Whether it fires is the *session's*
+        /// overflow-checks decision, not the body's: bodies marked
+        /// `#[rustc_inherit_overflow_checks]` carry the assertion
+        /// in their MIR regardless of the session flag, and native
+        /// codegen drops it when the session has checks off. The
+        /// interpreter does the same at run time (see
+        /// `InterpConfig::overflow_checks`).
+        overflow: bool,
     },
     /// Any terminator kind not modelled yet; executing it is an explicit error.
     Unsupported(String),

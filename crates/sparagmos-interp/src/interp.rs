@@ -53,6 +53,13 @@ pub struct InterpConfig {
     /// Empty when no invocation path is known; `env::args` then
     /// yields just the guest arguments.
     pub program_path: String,
+    /// The session's overflow-checks setting, as the driver
+    /// resolved it from the compilation's flags. Overflow
+    /// assertions (see `TerminatorKind::Assert::overflow`) fire
+    /// only when this is set; the arithmetic operations themselves
+    /// wrap either way, exactly as in MIR. Defaults to `true`
+    /// (the debug-profile default).
+    pub overflow_checks: bool,
 }
 
 impl Default for InterpConfig {
@@ -62,6 +69,7 @@ impl Default for InterpConfig {
             max_call_depth: 1024,
             guest_args: Vec::new(),
             program_path: String::new(),
+            overflow_checks: true,
         }
     }
 }
@@ -1287,15 +1295,25 @@ impl<'a> Interpreter<'a> {
                     expected,
                     target,
                     message,
+                    overflow,
                 } => {
-                    let value = self.eval_operand(frames, body, cond)?;
-                    let actual = value.as_bool().ok_or_else(|| {
-                        InterpError::type_mismatch("Assert condition", "bool", value.kind_name())
-                    })?;
-                    if actual != *expected {
-                        return Err(InterpError::panic(message.clone()));
+                    // An overflow assertion in a session compiled
+                    // without overflow checks is dropped, as native
+                    // codegen drops it: the checked operation's
+                    // wrapped result is simply used, and the
+                    // condition is not evaluated at all.
+                    if *overflow && !self.config.overflow_checks {
+                        Self::jump(frames, body, *target)?;
+                    } else {
+                        let value = self.eval_operand(frames, body, cond)?;
+                        let actual = value.as_bool().ok_or_else(|| {
+                            InterpError::type_mismatch("Assert condition", "bool", value.kind_name())
+                        })?;
+                        if actual != *expected {
+                            return Err(InterpError::panic(message.clone()));
+                        }
+                        Self::jump(frames, body, *target)?;
                     }
-                    Self::jump(frames, body, *target)?;
                 }
                 TerminatorKind::Unsupported(kind) => {
                     return Err(InterpError::UnsupportedTerminator { kind: kind.clone() });
@@ -6261,9 +6279,14 @@ fn unsigned_bits(dest_ty: Option<&Ty>) -> u32 {
 }
 
 /// Evaluate a binary operation.
-/// Returns `(result, overflowed)`. In non-checked mode an overflow (or a
-/// division by zero / invalid shift) is a guest panic instead of a flag.
-/// Comparison and bitwise-on-bool operations never overflow.
+/// Returns `(result, overflowed)`. Overflow is reported only through
+/// the checked form's flag: MIR's plain `BinaryOp` wraps on overflow
+/// (the overflow panic of a checked build is the following `Assert`
+/// terminator's business, driven by that flag), so the plain form
+/// yields the wrapped result and never panics for overflow. Division
+/// by zero panics in both forms — the operation itself requires it,
+/// independent of overflow checks. Comparison and bitwise-on-bool
+/// operations never overflow.
 fn eval_binary(
     op: BinOp,
     lhs: &Value,
@@ -6365,8 +6388,9 @@ fn eval_binary(
                     }));
                 }
                 if a == min && b == -1 {
-                    // Overflow: checked form wraps (Div yields `min`,
-                    // Rem yields 0), plain form panics via the flag below.
+                    // Overflow: the value wraps in both forms (Div
+                    // yields `min`, Rem yields 0); the checked form
+                    // also reports it in the flag below.
                     Some(if op == Div { a } else { 0 })
                 } else if op == Div {
                     Some(a / b)
@@ -6395,9 +6419,6 @@ fn eval_binary(
             _ => false,
         };
         let result = Value::Int(wrap_signed(raw, bits));
-        if overflowed && !checked_form {
-            return Err(InterpError::panic(format!("arithmetic overflow in {op:?}")));
-        }
         return Ok((result, overflowed));
     }
     // Unsigned arithmetic.
@@ -6449,9 +6470,6 @@ fn eval_binary(
             _ => unreachable!("comparisons and shifts handled above"),
         };
         let result = Value::Uint(wrap_unsigned(raw, bits));
-        if overflowed && !checked_form {
-            return Err(InterpError::panic(format!("arithmetic overflow in {op:?}")));
-        }
         return Ok((result, overflowed));
     }
     // Floating-point arithmetic, computed in `f64` (see `Value::Float`
@@ -6535,17 +6553,6 @@ fn eval_binary(
     ))
 }
 
-/// The guest panic message for a shift whose amount meets or
-/// exceeds the value's width: Rust 1.100.0's native wording, which
-/// names only the direction (the amount is not part of the text).
-fn shift_overflow_message(op: BinOp) -> &'static str {
-    if op == BinOp::Shl {
-        "attempt to shift left with overflow"
-    } else {
-        "attempt to shift right with overflow"
-    }
-}
-
 /// Evaluate a `Shl` / `Shr` operation.
 ///
 /// The value (left operand) keeps its own type and signedness: the
@@ -6559,14 +6566,14 @@ fn shift_overflow_message(op: BinOp) -> &'static str {
 /// type width and so reports an overflowing amount either way.
 ///
 /// An amount at or above the value's width is the only overflow a
-/// shift has: the checked form yields the wrapped result (the
-/// amount taken modulo the width, the `wrapping_shl` /
-/// `wrapping_shr` reading) with the overflow flag set, and the
-/// plain form is a guest panic with Rust 1.100.0's native message
-/// (`attempt to shift left with overflow` / `attempt to shift
-/// right with overflow`). Bits shifted out of the declared width
-/// are simply lost, as natively: they set neither the overflow
-/// flag nor a panic, in either form.
+/// shift has: both forms yield the wrapped result (the amount
+/// taken modulo the width, the `wrapping_shl` / `wrapping_shr`
+/// reading); the checked form also sets the overflow flag, and
+/// the `Assert` that follows it in a checked build is what panics
+/// (with Rust 1.100.0's native message, synthesized at conversion
+/// time). Bits shifted out of the declared width are simply lost,
+/// as natively: they set neither the overflow flag nor a panic,
+/// in either form.
 fn eval_shift(
     op: BinOp,
     lhs: &Value,
@@ -6584,15 +6591,12 @@ fn eval_shift(
             let a = *a;
             let bits = signed_bits(dest_ty);
             if shift >= bits {
-                if checked_form {
-                    let wrapped = if op == BinOp::Shl {
-                        wrap_signed(a.wrapping_shl(shift % bits), bits)
-                    } else {
-                        wrap_signed(a.wrapping_shr(shift % bits), bits)
-                    };
-                    return Ok((Value::Int(wrapped), true));
-                }
-                return Err(InterpError::panic(shift_overflow_message(op)));
+                let wrapped = if op == BinOp::Shl {
+                    wrap_signed(a.wrapping_shl(shift % bits), bits)
+                } else {
+                    wrap_signed(a.wrapping_shr(shift % bits), bits)
+                };
+                return Ok((Value::Int(wrapped), checked_form));
             }
             let raw = if op == BinOp::Shl {
                 wrap_signed(a << shift, bits)
@@ -6605,15 +6609,12 @@ fn eval_shift(
             let a = *a;
             let bits = unsigned_bits(dest_ty);
             if shift >= bits {
-                if checked_form {
-                    let wrapped = if op == BinOp::Shl {
-                        wrap_unsigned(a.wrapping_shl(shift % bits), bits)
-                    } else {
-                        wrap_unsigned(a.wrapping_shr(shift % bits), bits)
-                    };
-                    return Ok((Value::Uint(wrapped), true));
-                }
-                return Err(InterpError::panic(shift_overflow_message(op)));
+                let wrapped = if op == BinOp::Shl {
+                    wrap_unsigned(a.wrapping_shl(shift % bits), bits)
+                } else {
+                    wrap_unsigned(a.wrapping_shr(shift % bits), bits)
+                };
+                return Ok((Value::Uint(wrapped), checked_form));
             }
             let raw = if op == BinOp::Shl {
                 a << shift
@@ -6701,16 +6702,12 @@ fn float_ty_of(dest_ty: Option<&Ty>) -> Option<FloatTy> {
 fn eval_unary(op: UnOp, v: &Value, dest_ty: Option<&Ty>) -> InterpResult<Value> {
     match (op, v) {
         (UnOp::Neg, Value::Int(a)) => {
+            // Plain `Neg` wraps, like the binary operators: the
+            // overflow panic of a checked build is the following
+            // `Assert`'s business (an `OverflowNeg` message), not
+            // this operation's.
             let bits = signed_bits(dest_ty);
-            match a.checked_neg() {
-                Some(r)
-                    if bits >= 128
-                        || (r >= -(1i128 << (bits - 1)) && r <= (1i128 << (bits - 1)) - 1) =>
-                {
-                    Ok(Value::Int(wrap_signed(r, bits)))
-                }
-                _ => Err(InterpError::panic("arithmetic overflow in Neg")),
-            }
+            Ok(Value::Int(wrap_signed(a.wrapping_neg(), bits)))
         }
         (UnOp::Neg, Value::Float(a)) => Ok(Value::Float(-a)),
         (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),

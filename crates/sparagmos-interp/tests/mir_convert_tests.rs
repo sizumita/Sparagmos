@@ -1958,23 +1958,6 @@ fn run_shift(
     interpret_mir(&prog, "f", vec![value, amount])
 }
 
-fn expect_shift_panic(
-    op: mir::BinOp,
-    value_ty: mir::Ty,
-    amount_ty: mir::Ty,
-    value: Value,
-    amount: Value,
-    message: &str,
-) {
-    match run_shift(op, value_ty, amount_ty, value, amount) {
-        Err(MirRunError::Interp(InterpError::Panic { message: got, .. })) => {
-            assert_eq!(got, message)
-        }
-        Err(e) => panic!("expected guest panic `{message}`, got error {e}"),
-        Ok(v) => panic!("expected guest panic `{message}`, got value {v:?}"),
-    }
-}
-
 #[test]
 fn mixed_type_shift_amounts_run() {
     use mir::BinOp::{Shl, Shr};
@@ -2078,72 +2061,50 @@ fn shift_amount_boundaries() {
         run_shift(Shl, i8_ty(), u8_ty(), Value::Int(10), Value::Uint(4)).expect("10i8 << 4"),
         Value::Int(-96)
     );
-    // Amount == bits is an overflowing shift, with Rust 1.100.0's
-    // native message (direction only; the amount is not in it).
-    expect_shift_panic(
-        Shl,
-        i32_ty(),
-        u8_ty(),
-        Value::Int(1),
-        Value::Uint(32),
-        "attempt to shift left with overflow",
+    // Amount == bits is an overflowing shift. These bodies are
+    // the plain form, which wraps the amount modulo the width
+    // (amount % bits == 0 here, so each result is the value
+    // itself); the panic of a checked build belongs to the
+    // `Assert` over the checked form's flag, not to this form.
+    assert_eq!(
+        run_shift(Shl, i32_ty(), u8_ty(), Value::Int(1), Value::Uint(32)).expect("1i32 << 32"),
+        Value::Int(1)
     );
-    expect_shift_panic(
-        Shr,
-        u8_ty(),
-        i16_ty(),
-        Value::Uint(1),
-        Value::Int(8),
-        "attempt to shift right with overflow",
+    assert_eq!(
+        run_shift(Shr, u8_ty(), i16_ty(), Value::Uint(1), Value::Int(8)).expect("1u8 >> 8"),
+        Value::Uint(1)
     );
-    expect_shift_panic(
-        Shl,
-        u32_ty(),
-        u32_ty(),
-        Value::Uint(1),
-        Value::Uint(32),
-        "attempt to shift left with overflow",
+    assert_eq!(
+        run_shift(Shl, u32_ty(), u32_ty(), Value::Uint(1), Value::Uint(32)).expect("1u32 << 32"),
+        Value::Uint(1)
     );
 }
 
 #[test]
-fn negative_and_huge_shift_amounts_panic() {
+fn negative_and_huge_shift_amounts_wrap() {
     use mir::BinOp::{Shl, Shr};
     // A negative amount does not fit the u32 reading; u32::MAX
-    // stands in for it, so it reports an overflowing amount, as in
-    // the same-type path. The message names only the direction.
-    expect_shift_panic(
-        Shl,
-        i32_ty(),
-        i8_ty(),
-        Value::Int(1),
-        Value::Int(-1),
-        "attempt to shift left with overflow",
+    // stands in for it, as in the same-type path. In the plain
+    // form the stand-in amount wraps modulo the width:
+    // u32::MAX % 32 == 31, so 1i32 << -1 == 1 << 31 and
+    // 16u32 >> -1 == 16 >> 31 == 0.
+    assert_eq!(
+        run_shift(Shl, i32_ty(), i8_ty(), Value::Int(1), Value::Int(-1)).expect("1i32 << -1i8"),
+        Value::Int(i32::MIN as i128)
     );
-    expect_shift_panic(
-        Shr,
-        u32_ty(),
-        i64_ty(),
-        Value::Uint(16),
-        Value::Int(-1),
-        "attempt to shift right with overflow",
+    assert_eq!(
+        run_shift(Shr, u32_ty(), i64_ty(), Value::Uint(16), Value::Int(-1)).expect("16u32 >> -1i64"),
+        Value::Uint(0)
     );
-    expect_shift_panic(
-        Shl,
-        i32_ty(),
-        i32_ty(),
-        Value::Int(1),
-        Value::Int(-1),
-        "attempt to shift left with overflow",
+    assert_eq!(
+        run_shift(Shl, i32_ty(), i32_ty(), Value::Int(1), Value::Int(-1)).expect("1i32 << -1i32"),
+        Value::Int(i32::MIN as i128)
     );
-    // An amount above u32::MAX overflows the same way.
-    expect_shift_panic(
-        Shl,
-        i32_ty(),
-        u64_ty(),
-        Value::Int(1),
-        Value::Uint(5_000_000_000),
-        "attempt to shift left with overflow",
+    // An amount above u32::MAX reads the same way.
+    assert_eq!(
+        run_shift(Shl, i32_ty(), u64_ty(), Value::Int(1), Value::Uint(5_000_000_000))
+            .expect("1i32 << 5000000000u64"),
+        Value::Int(i32::MIN as i128)
     );
 }
 
@@ -2207,28 +2168,27 @@ fn constant_shift_amounts_keep_their_own_type() {
         Value::Int(12)
     );
     // A negative constant amount (const -1_i8) is an overflowing
-    // shift; read under the value's i32 type it would have been 255.
+    // shift; read under the value's i32 type it would have been
+    // 255. The plain form wraps: the u32 reading of the amount is
+    // u32::MAX (the stand-in for an amount that does not fit),
+    // and u32::MAX % 32 == 31.
     let mut prog = MirProgram::new();
     prog.add("neg", body_with_amount(const_i8(-1)));
-    match interpret_mir(&prog, "neg", vec![Value::Int(1)]) {
-        Err(MirRunError::Interp(InterpError::Panic { message, .. })) => assert_eq!(
-            message,
-            "attempt to shift left with overflow"
-        ),
-        other => panic!("expected overflowing-shift panic, got {other:?}"),
-    }
+    assert_eq!(
+        interpret_mir(&prog, "neg", vec![Value::Int(1)]).expect("const -1i8 amount wraps"),
+        Value::Int(i32::MIN as i128)
+    );
     // A constant amount wider than the value (const 4294967296_u64)
     // keeps its value: read in the i32 context it truncated to 0
-    // and the shift silently succeeded before.
+    // and the shift silently succeeded (as 1 << 0) before; the
+    // u32 reading stands in u32::MAX for it, exactly as for a
+    // negative amount.
     let mut prog = MirProgram::new();
     prog.add("huge", body_with_amount(const_u64(1 << 32)));
-    match interpret_mir(&prog, "huge", vec![Value::Int(1)]) {
-        Err(MirRunError::Interp(InterpError::Panic { message, .. })) => assert_eq!(
-            message,
-            "attempt to shift left with overflow"
-        ),
-        other => panic!("expected overflowing-shift panic, got {other:?}"),
-    }
+    assert_eq!(
+        interpret_mir(&prog, "huge", vec![Value::Int(1)]).expect("const 2^32 amount wraps"),
+        Value::Int(i32::MIN as i128)
+    );
     // A constant value shifted by a differently-typed place amount
     // keeps the value's type: `fn f(_1: u8) -> i32 { _0 = Shl(const 3_i32, copy _1) }`.
     let body = mir::Body::new(

@@ -4757,6 +4757,10 @@ impl<'a> Converter<'a> {
                 expected: *expected,
                 target: ir::BasicBlock(target.index()),
                 message: assert_message_text(msg),
+                overflow: matches!(
+                    &**msg,
+                    mir::AssertMessage::Overflow(..) | mir::AssertMessage::OverflowNeg(..)
+                ),
             },
             // The imaginary edge of a false edge is never taken at run
             // time; execution continues at the real target.

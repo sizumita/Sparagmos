@@ -401,8 +401,11 @@ fn checked_result_fields_can_be_read() {
 }
 
 #[test]
-fn plain_binary_op_overflow_panics() {
-    // i64 overflow in a plain BinaryOp is a guest panic (checked semantics).
+fn plain_binary_op_overflow_wraps() {
+    // i64 overflow in a plain BinaryOp wraps: MIR's plain form is
+    // the unchecked operation; the overflow panic of a checked
+    // build belongs to the `Assert` that follows a
+    // `CheckedBinaryOp`, never to the plain operation itself.
     let body = Body::new(
         "add",
         2,
@@ -416,8 +419,10 @@ fn plain_binary_op_overflow_panics() {
         )],
     );
     let p = program_of(body);
-    let err = interpret(&p, "add", vec![Value::Int(i64::MAX as i128), Value::Int(1)]).unwrap_err();
-    assert!(matches!(err, InterpError::Panic { .. }), "got: {err}");
+    assert_eq!(
+        interpret(&p, "add", vec![Value::Int(i64::MAX as i128), Value::Int(1)]).unwrap(),
+        Value::Int(i64::MIN as i128)
+    );
 }
 
 #[test]
@@ -458,6 +463,7 @@ fn assert_terminator_panics_on_failure() {
                     expected: true,
                     target: BasicBlock(1),
                     message: "x must be positive".into(),
+                    overflow: false,
                 },
             ),
             bb(vec![assign(0, use_local(1))], ret()),
@@ -492,14 +498,17 @@ fn unsigned_arithmetic() {
         interpret(&p, "uadd", vec![Value::Uint(20), Value::Uint(22)]).unwrap(),
         Value::Uint(42)
     );
-    // u32 overflow in a plain op panics rather than wrapping silently.
-    let err = interpret(
-        &p,
-        "uadd",
-        vec![Value::Uint(u32::MAX as u128), Value::Uint(1)],
-    )
-    .unwrap_err();
-    assert!(matches!(err, InterpError::Panic { .. }), "got: {err}");
+    // u32 overflow in a plain op wraps (see
+    // `plain_binary_op_overflow_wraps`).
+    assert_eq!(
+        interpret(
+            &p,
+            "uadd",
+            vec![Value::Uint(u32::MAX as u128), Value::Uint(1)],
+        )
+        .unwrap(),
+        Value::Uint(0)
+    );
 }
 
 #[test]
@@ -514,6 +523,7 @@ fn step_limit_stops_infinite_loop() {
             max_call_depth: 16,
             guest_args: Vec::new(),
             program_path: String::new(),
+            overflow_checks: true,
         },
     );
     let err = interp.run("forever", vec![]).unwrap_err();
@@ -551,6 +561,7 @@ fn call_depth_limit_stops_unbounded_recursion() {
             max_call_depth: 8,
             guest_args: Vec::new(),
             program_path: String::new(),
+            overflow_checks: true,
         },
     );
     let err = interp.run("f", vec![]).unwrap_err();
@@ -741,8 +752,11 @@ fn mixed_type_shift_amounts() {
 }
 
 #[test]
-fn mixed_type_shift_amount_overflow_panics() {
-    // fn shl(a: i32, b: u32) -> i32 with an amount at the type width.
+fn mixed_type_shift_amount_overflow_wraps() {
+    // fn shl(a: i32, b: u32) -> i32 with an amount at the type
+    // width: the plain form wraps the amount modulo the width
+    // (1 << (32 % 32) == 1); only the checked form reports the
+    // overflow, in its flag.
     let shl = Body::new(
         "shl",
         2,
@@ -756,12 +770,8 @@ fn mixed_type_shift_amount_overflow_panics() {
         )],
     );
     let p = program_of(shl);
-    let err = interpret(&p, "shl", vec![Value::Int(1), Value::Uint(32)]).unwrap_err();
-    match err {
-        InterpError::Panic { message, .. } => assert_eq!(
-            message,
-            "attempt to shift left with overflow"
-        ),
-        other => panic!("expected shift-overflow panic, got {other}"),
-    }
+    assert_eq!(
+        interpret(&p, "shl", vec![Value::Int(1), Value::Uint(32)]).unwrap(),
+        Value::Int(1)
+    );
 }

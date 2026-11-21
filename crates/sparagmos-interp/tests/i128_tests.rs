@@ -1,5 +1,5 @@
 //! 128-bit integer semantics (Lane BL): `i128` / `u128` in the
-//! interpreter — boundary arithmetic, overflow panics, division and
+//! interpreter — boundary arithmetic, overflow wrapping, division and
 //! remainder edge cases, shifts, casts (including float saturation),
 //! comparisons, and the constant-decoding paths that carry 128-bit
 //! values (promoted by-reference array constants and context-free
@@ -119,7 +119,7 @@ fn expect_panic(res: Result<Value, MirRunError>) -> String {
     }
 }
 
-// ----- boundary arithmetic (plain form: overflow is a guest panic) ----------
+// ----- boundary arithmetic (plain form: overflow wraps) ---------------------
 
 #[test]
 fn i128_add_sub_mul_boundaries() {
@@ -130,14 +130,17 @@ fn i128_add_sub_mul_boundaries() {
     assert_eq!(run(Sub, i128::MIN, -1).unwrap(), Value::Int(i128::MIN + 1));
     assert_eq!(run(Mul, 1i128 << 64, 1i128 << 62).unwrap(), Value::Int(1i128 << 126));
     assert_eq!(run(Mul, -3, 5).unwrap(), Value::Int(-15));
-    // Plain-form overflow panics, with the interpreter's overflow message.
-    let msg = expect_panic(run(Add, i128::MAX, 1));
-    assert!(msg.contains("overflow"), "unexpected message: {msg}");
-    expect_panic(run(Sub, i128::MIN, 1));
-    expect_panic(run(Mul, 1i128 << 64, 1i128 << 64));
-    // 2^127 is one past the largest i128: it overflows too.
-    expect_panic(run(Mul, 1i128 << 64, 1i128 << 63));
-    expect_panic(run(Add, i128::MIN, -1));
+    // Plain-form overflow wraps (the panic of a checked build is
+    // the following `Assert`'s, over the checked form's flag).
+    assert_eq!(run(Add, i128::MAX, 1).unwrap(), Value::Int(i128::MIN));
+    assert_eq!(run(Sub, i128::MIN, 1).unwrap(), Value::Int(i128::MAX));
+    assert_eq!(run(Mul, 1i128 << 64, 1i128 << 64).unwrap(), Value::Int(0));
+    // 2^127 is one past the largest i128: it wraps to i128::MIN.
+    assert_eq!(
+        run(Mul, 1i128 << 64, 1i128 << 63).unwrap(),
+        Value::Int(i128::MIN)
+    );
+    assert_eq!(run(Add, i128::MIN, -1).unwrap(), Value::Int(i128::MAX));
 }
 
 #[test]
@@ -150,9 +153,10 @@ fn u128_add_sub_mul_boundaries() {
     assert_eq!(run(Add, u128::MAX - 1, 1).unwrap(), Value::Uint(u128::MAX));
     assert_eq!(run(Mul, 1u128 << 127, 1).unwrap(), Value::Uint(1u128 << 127));
     assert_eq!(run(Sub, 0, 0).unwrap(), Value::Uint(0));
-    expect_panic(run(Add, u128::MAX, 1));
-    expect_panic(run(Sub, 0, 1));
-    expect_panic(run(Mul, 1u128 << 127, 2));
+    // Plain-form overflow wraps.
+    assert_eq!(run(Add, u128::MAX, 1).unwrap(), Value::Uint(0));
+    assert_eq!(run(Sub, 0, 1).unwrap(), Value::Uint(u128::MAX));
+    assert_eq!(run(Mul, 1u128 << 127, 2).unwrap(), Value::Uint(0));
 }
 
 #[test]
@@ -169,9 +173,10 @@ fn i128_div_rem_edges() {
         expect_panic(run(Rem, 5, 0)),
         "attempt to calculate the remainder with a divisor of zero"
     );
-    // MIN / -1 and MIN % -1 overflow.
-    expect_panic(run(Div, i128::MIN, -1));
-    expect_panic(run(Rem, i128::MIN, -1));
+    // MIN / -1 and MIN % -1 overflow: the plain form wraps
+    // (Div yields MIN, Rem yields 0).
+    assert_eq!(run(Div, i128::MIN, -1).unwrap(), Value::Int(i128::MIN));
+    assert_eq!(run(Rem, i128::MIN, -1).unwrap(), Value::Int(0));
 }
 
 #[test]
@@ -310,10 +315,10 @@ fn i128_shifts() {
     assert_eq!(run(Shl, 1, 0).unwrap(), Value::Int(1));
     assert_eq!(run(Shr, -16, 2).unwrap(), Value::Int(-4));
     assert_eq!(run(Shr, i128::MIN, 127).unwrap(), Value::Int(-1));
-    // An out-of-range amount in the plain form is a guest panic.
-    let msg = expect_panic(run(Shl, 1, 128));
-    assert!(msg.contains("shift"), "unexpected message: {msg}");
-    expect_panic(run(Shr, 1, 200));
+    // An out-of-range amount in the plain form wraps the amount
+    // modulo the width: 1 << (128 % 128) == 1, 1 >> (200 % 128) == 0.
+    assert_eq!(run(Shl, 1, 128).unwrap(), Value::Int(1));
+    assert_eq!(run(Shr, 1, 200).unwrap(), Value::Int(0));
 }
 
 #[test]
@@ -324,7 +329,8 @@ fn u128_shifts() {
     };
     assert_eq!(run(Shl, 1, 127).unwrap(), Value::Uint(1u128 << 127));
     assert_eq!(run(Shr, u128::MAX, 64).unwrap(), Value::Uint((1u128 << 64) - 1));
-    expect_panic(run(Shl, 1, 128));
+    // Plain form: an out-of-range amount wraps modulo the width.
+    assert_eq!(run(Shl, 1, 128).unwrap(), Value::Uint(1));
 }
 
 // ----- comparisons and bitwise ops -------------------------------------------
@@ -391,13 +397,12 @@ fn i128_unary_ops() {
         interpret_mir(&prog, "neg", vec![Value::Int(5)]).unwrap(),
         Value::Int(-5)
     );
-    // Negating MIN overflows.
-    let err = interpret_mir(&prog, "neg", vec![Value::Int(i128::MIN)])
-        .expect_err("-(i128::MIN) must panic");
-    assert!(matches!(
-        err,
-        MirRunError::Interp(InterpError::Panic { .. })
-    ));
+    // Negating MIN overflows: the plain form wraps to MIN (the
+    // checked build's panic is its `Assert`'s, not the `Neg`'s).
+    assert_eq!(
+        interpret_mir(&prog, "neg", vec![Value::Int(i128::MIN)]).unwrap(),
+        Value::Int(i128::MIN)
+    );
 
     // fn f(_1: i128) -> i128 { _0 = Not(copy _1); return }
     let not = mir::Body::new(
