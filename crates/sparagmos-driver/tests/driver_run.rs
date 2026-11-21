@@ -1890,3 +1890,99 @@ fn run_mode_refcell_drop_runs_inner_destructor() {
         "dropping the cell runs the wrapped value's destructor"
     );
 }
+
+// ----- ADT layout table (Lane CG) -----
+
+const LAYOUT_SRC: &str = r#"
+#[repr(C)]
+struct Padded { a: u8, b: u32, c: u16 }
+#[repr(packed)]
+struct Packed { a: u8, b: u32 }
+enum E { A, B(u16), C(u64) }
+struct Outer { x: u8, inner: Padded }
+struct Pair<A, B> { a: A, b: B }
+fn main() {
+    println!("padded {} {}", std::mem::size_of::<Padded>(), std::mem::align_of::<Padded>());
+    println!("packed {} {}", std::mem::size_of::<Packed>(), std::mem::align_of::<Packed>());
+    println!("enum {} {}", std::mem::size_of::<E>(), std::mem::align_of::<E>());
+    println!("outer {} {}", std::mem::size_of::<Outer>(), std::mem::align_of::<Outer>());
+    println!("pair {} {}", std::mem::size_of::<Pair<u8, u64>>(), std::mem::align_of::<Pair<u8, u64>>());
+    let v = Padded { a: 1, b: 2, c: 3 };
+    println!("val {}", std::mem::size_of_val(&v));
+}
+"#;
+
+#[test]
+fn run_mode_size_of_align_of_user_adts() {
+    // The values are the compiler's own layouts (verified against a
+    // native 1.100.0 build of the same source): the driver records
+    // them per monomorphic ADT instance and the mem builtins answer
+    // from that table.
+    let dir = temp_dir("adt-layout");
+    let src = fixture(&dir, "layout.rs", LAYOUT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "size_of/align_of of user ADTs run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "padded 12 4\npacked 5 1\nenum 16 8\nouter 16 4\npair 16 8\nval 12\n",
+        "layouts match the native ones"
+    );
+}
+
+// The shape of tests/ui/derives/deriving-with-repr-packed-3.rs: the
+// derived `PartialEq` for a packed struct runs the manual `eq` of
+// its field type, which asserts via `align_of::<Aligned>()` — a
+// user ADT whose layout only the compiler can give.
+const PACKED_DERIVE_SRC: &str = r#"
+use std::mem;
+
+#[derive(Copy, Clone)]
+struct Aligned(usize);
+
+#[inline(never)]
+fn check_align(ptr: *const Aligned) {
+    assert_eq!(ptr as usize % mem::align_of::<Aligned>(), 0);
+}
+
+impl PartialEq for Aligned {
+    fn eq(&self, other: &Self) -> bool {
+        check_align(self);
+        check_align(other);
+        self.0 == other.0
+    }
+}
+
+#[repr(packed)]
+#[derive(Copy, Clone, PartialEq)]
+struct Packed(Aligned, Aligned);
+
+#[derive(PartialEq)]
+#[repr(C)]
+struct Dealigned<T>(u8, T);
+
+fn main() {
+    let d1 = Dealigned(0, Packed(Aligned(1), Aligned(2)));
+    let ck = d1 == d1;
+    assert!(ck);
+    println!("eq-ok");
+}
+"#;
+
+#[test]
+fn run_mode_derived_eq_on_packed_struct_uses_align_of() {
+    let dir = temp_dir("packed-derive");
+    let src = fixture(&dir, "packed_derive.rs", PACKED_DERIVE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "derived eq over a packed struct runs (align_of::<Aligned> resolves); stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "eq-ok\n");
+}
