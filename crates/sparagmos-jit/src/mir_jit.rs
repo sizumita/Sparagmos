@@ -93,7 +93,15 @@
 //! `MIN / -1` in the 64-bit signed case). An out-of-bounds index
 //! is a guest panic with the interpreter's message — `index out of
 //! bounds: the len is {len} but the index is {index}`, formatted
-//! at runtime from the actual length and index values. Reaching a MIR `Unreachable`
+//! at runtime from the actual length and index values. A negative
+//! signed index is the interpreter's negative-index panic —
+//! `index out of bounds: negative index {index} used for
+//! {place}`, naming the indexed place — and a sub-slice range
+//! that does not fit its base is one of the interpreter's range
+//! panics (`range end index {end} out of range for slice of
+//! length {len}`, or `slice index starts at {from} but ends at
+//! {end}` for an inverted range), likewise formatted at runtime.
+//! Reaching a MIR `Unreachable`
 //! block is a guest panic too, with the message `entered unreachable
 //! code` — the interpreter's model — lowered to a jump into a panic
 //! block like a failed `Assert`, never to a hardware trap.
@@ -114,8 +122,9 @@
 //! Supported: integer / `bool` / `char` / `f32` / `f64` /
 //! tuple-of-supported and array-of-supported locals (arrays are
 //! their elements' leaves in order, read and written through
-//! constant and dynamic index projections, the dynamic form with
-//! the interpreter's bounds-check panic), ADT locals (structs
+//! constant and dynamic index projections — signed indices
+//! included — and sub-slice projections, each with the
+//! interpreter's checks and panics), ADT locals (structs
 //! and enums with scalar, tuple, array, reference and nested-ADT
 //! payload fields, within the layout bound), thin references and
 //! raw pointers, fat
@@ -138,8 +147,8 @@
 //! `Assert`, `Drop`, `Return`, `Unreachable` (as a guest panic).
 //! Anything else — `f16` / `f128`, 128-bit integers, references
 //! to trait objects, unions, ADT values wider than the layout
-//! bound or with a field type the program never reveals, `Subslice`, a second dynamic
-//! index within one place, an index of a signed integer type,
+//! bound or with a field type the program never reveals, a second dynamic
+//! index within one place,
 //! a literal index from the end of a slice, return values of
 //! more than two words, arguments of more than two words,
 //! aggregates other than tuples and ADTs, calls to functions
@@ -285,6 +294,7 @@ impl JitProgram {
             .collect();
         let layouts = AdtLayouts::build(&input.functions, &input.adt_discriminants);
         let mut messages = MsgTable::default();
+        let mut places = MsgTable::default();
         let mut ir_funcs: Vec<IrFunction> = Vec::with_capacity(input.functions.len());
         for f in &input.functions {
             let lower = FnLower::new(
@@ -295,11 +305,12 @@ impl JitProgram {
                 &input.adt_discriminants,
                 &layouts,
                 &mut messages,
+                &mut places,
             );
             ir_funcs.push(lower.run()?);
         }
         let param_counts: Vec<usize> = ir_funcs.iter().map(|f| f.param_count).collect();
-        let inner = compile_program(&ir_funcs, messages.into_vec())?;
+        let inner = compile_program(&ir_funcs, messages.into_vec(), places.into_vec())?;
         Ok(JitProgram {
             inner,
             index_by_name: input
@@ -1150,6 +1161,54 @@ fn uint_bits(ut: mir::UintTy) -> u32 {
 }
 
 /// The integer shape of a scalar type, if it has one the JIT supports.
+/// Render a MIR place the way the interpreter's IR renders it
+/// (`_1`, `_1.0`, `_1.*[_2]`, `_1[0..3]`, ...): the string the
+/// interpreter's negative-index panic names. `OpaqueCast` /
+/// `Subtype` steps render as nothing (the interpreter's IR has no
+/// such steps).
+fn place_display(place: &mir::Place) -> String {
+    let mut out = format!("_{}", place.local.index());
+    for elem in &place.projection {
+        match elem {
+            mir::PlaceElem::Field(i, _) => out.push_str(&format!(".{i}")),
+            mir::PlaceElem::Deref => out.push_str(".*"),
+            mir::PlaceElem::Index(l) => out.push_str(&format!("[_{}]", l.index())),
+            mir::PlaceElem::ConstantIndex {
+                offset, from_end, ..
+            } => {
+                if *from_end {
+                    out.push_str(&format!("[len - {offset}]"));
+                } else {
+                    out.push_str(&format!("[{offset}]"));
+                }
+            }
+            mir::PlaceElem::Downcast(_, v) => out.push_str(&format!(" as variant {v}")),
+            mir::PlaceElem::Subslice { from, to, from_end } => {
+                if *from_end {
+                    out.push_str(&format!("[{from}..len - {to}]"));
+                } else {
+                    out.push_str(&format!("[{from}..{to}]"));
+                }
+            }
+            mir::PlaceElem::OpaqueCast(_) | mir::PlaceElem::Subtype(_) => {}
+        }
+    }
+    out
+}
+
+/// `from * per` as a leaf offset, clamped: a range that does not
+/// fit its base is caught by the place's sub-slice check before
+/// the address is ever materialised, so an overflowing product
+/// only needs a value that is never used.
+fn subslice_offset(from: u64, per: usize) -> usize {
+    let v = (from as u128) * (per as u128);
+    if v > usize::MAX as u128 {
+        usize::MAX
+    } else {
+        v as usize
+    }
+}
+
 fn int_kind(ty: &mir::Ty) -> Option<IrIntKind> {
     match ty {
         mir::Ty::Int(it) => {
@@ -1445,6 +1504,13 @@ enum LenSrc {
     /// The length word is in memory, at this address (the second
     /// word of a fat pair stored in memory).
     Mem(Box<AddrExpr>),
+    /// The length of a sub-slice taken from the end of a base of
+    /// this length: the base's length minus `skip` (the range's
+    /// `to` counted from the end, plus its `from`), computed when
+    /// the length is read. The place's sub-slice check runs before
+    /// any use of the place, so the base's length is known to be
+    /// at least `skip` by then.
+    Tail { base: Box<LenSrc>, skip: u64 },
 }
 
 /// How to compute the runtime address of a place in memory: a base
@@ -1483,12 +1549,38 @@ enum PtrSrc {
     Loaded(Box<AddrExpr>),
 }
 
+/// A check a memory place needs before it is touched, in
+/// projection order: the interpreter performs each one as it
+/// resolves the corresponding projection, and a failure is the
+/// interpreter's panic for that projection.
+#[derive(Clone, Debug)]
+enum PlaceCheck {
+    Index(IndexCheck),
+    Subslice(SubsliceCheck),
+}
+
 /// A bounds check an indexed place needs before it is touched:
 /// the index value must be below the length, or the access is the
-/// interpreter's index panic.
+/// interpreter's index panic. `neg` is set for an index of a
+/// signed integer type: the interpreter first panics on a negative
+/// value with its negative-index message, naming the place (the
+/// string is interned in the place table when the check is
+/// emitted, classification itself being pure).
 #[derive(Clone, Debug)]
 struct IndexCheck {
     index: IndexSrc,
+    len: LenSrc,
+    neg: Option<String>,
+}
+
+/// The range check a sub-slice projection needs: the selected
+/// range must fit the base's length (the source in `len`), or the
+/// access is the interpreter's range panic for the violated end.
+#[derive(Clone, Debug)]
+struct SubsliceCheck {
+    from: u64,
+    to: u64,
+    from_end: bool,
     len: LenSrc,
 }
 
@@ -1501,13 +1593,13 @@ enum PlaceLoc {
     /// or a dynamic index. `count` is `None` for a slice / `str`
     /// place itself, which has no word representation of its own;
     /// `len` is the length source when the type is a slice / `str`;
-    /// `checks` are the bounds checks to emit before touching it.
+    /// `checks` are the checks to emit before touching it.
     Mem {
         addr: AddrExpr,
         count: Option<usize>,
         ty: mir::Ty,
         len: Option<LenSrc>,
-        checks: Vec<IndexCheck>,
+        checks: Vec<PlaceCheck>,
     },
 }
 
@@ -1520,6 +1612,9 @@ struct FnLower<'a> {
     discriminants: &'a mir::AdtDiscriminants,
     layouts: &'a AdtLayouts,
     messages: &'a mut MsgTable,
+    /// Place strings for the negative-index panic, interned like
+    /// `messages`.
+    places: &'a mut MsgTable,
     /// Per local: (first leaf slot, leaf count).
     local_slots: Vec<(u32, usize)>,
     next_value: u32,
@@ -1540,6 +1635,7 @@ impl<'a> FnLower<'a> {
         discriminants: &'a mir::AdtDiscriminants,
         layouts: &'a AdtLayouts,
         messages: &'a mut MsgTable,
+        places: &'a mut MsgTable,
     ) -> Self {
         Self {
             func,
@@ -1550,6 +1646,7 @@ impl<'a> FnLower<'a> {
             discriminants,
             layouts,
             messages,
+            places,
             local_slots: Vec::new(),
             next_value: 0,
             blocks: Vec::new(),
@@ -1809,24 +1906,60 @@ impl<'a> FnLower<'a> {
         }
     }
 
-    /// The value slot of a dynamic `Index` projection's local. The
-    /// interpreter reads the index as a `usize`; the JIT supports
-    /// the unsigned integer index types (a signed index would need
-    /// the interpreter's negative-index message, which names the
-    /// place, so it stays an explicit error here).
-    fn index_slot(&self, local: mir::Local) -> Result<u32, JitError> {
+    /// The value slot of a dynamic `Index` projection's local, and
+    /// whether the index's type is signed. The interpreter reads
+    /// the index as a `usize`, panicking on a negative signed value
+    /// with its negative-index message; the JIT supports both
+    /// signednesses (the check a signed index needs is recorded
+    /// alongside the bounds check) and rejects any non-integer
+    /// index type by name.
+    fn index_slot(&self, local: mir::Local) -> Result<(u32, bool), JitError> {
         let decl = &self.body.local_decls[local.index()];
-        if !matches!(decl.ty, mir::Ty::Uint(_)) {
-            return Err(self.err(&format!(
-                "Index projection with index type {}",
-                decl.ty.kind_name()
-            )));
-        }
+        let signed = match decl.ty {
+            mir::Ty::Uint(_) => false,
+            mir::Ty::Int(_) => true,
+            _ => {
+                return Err(self.err(&format!(
+                    "Index projection with index type {}",
+                    decl.ty.kind_name()
+                )));
+            }
+        };
         let (slot, count) = self.local_slots[local.index()];
         if count != 1 {
             return Err(self.err("Index projection with a multi-word index"));
         }
-        Ok(slot)
+        Ok((slot, signed))
+    }
+
+
+    /// The resolved length source of a sub-slice selecting
+    /// `from..to` (or `from..len - to` when `from_end`) from a base
+    /// whose length source is `base_len`: the interpreter's
+    /// resolution of the same projection. A base length known at
+    /// lowering time resolves the count outright; a range that
+    /// does not fit resolves to a placeholder count instead — the
+    /// place's sub-slice check panics before any use reads the
+    /// length, exactly as the interpreter panics while resolving
+    /// the place.
+    fn subslice_len(base_len: &LenSrc, from: u64, to: u64, from_end: bool) -> LenSrc {
+        match base_len {
+            LenSrc::Const(n) => {
+                let end = if from_end { n.checked_sub(to) } else { Some(to) };
+                let count = end.and_then(|e| e.checked_sub(from)).unwrap_or(0);
+                LenSrc::Const(count)
+            }
+            _ => {
+                if from_end {
+                    LenSrc::Tail {
+                        base: Box::new(base_len.clone()),
+                        skip: to.saturating_add(from),
+                    }
+                } else {
+                    LenSrc::Const(to.checked_sub(from).unwrap_or(0))
+                }
+            }
+        }
     }
 
     /// Resolve a place against the slot model: either leaves of a
@@ -1885,18 +2018,56 @@ impl<'a> FnLower<'a> {
                     };
                     let n = *n;
                     let elem = (**elem).clone();
-                    let idx_slot = self.index_slot(*local)?;
+                    let (idx_slot, signed) = self.index_slot(*local)?;
                     let per = flatten(&elem, &self.func.name, self.layouts)?;
                     let addr = AddrExpr {
                         source: PtrSrc::SlotAddr(local_first + offset as u32),
                         const_off: 0,
                         dyn_idx: Some((IndexSrc::Slot(idx_slot), per)),
                     };
-                    let checks = vec![IndexCheck {
+                    let checks = vec![PlaceCheck::Index(IndexCheck {
                         index: IndexSrc::Slot(idx_slot),
                         len: LenSrc::Const(n),
-                    }];
+                        neg: signed.then(|| place_display(place)),
+                    })];
                     return self.classify_mem(place, i + 1, addr, elem, None, checks);
+                }
+                mir::PlaceElem::Subslice { from, to, from_end } => {
+                    let mir::Ty::Array(elem, arr_len) = &ty else {
+                        return Err(self.err(&format!(
+                            "Subslice projection on non-array type {}",
+                            ty.kind_name()
+                        )));
+                    };
+                    let mir::ArrayLen::Known(n) = arr_len else {
+                        return Err(
+                            self.err("Subslice projection on an array of unknown length")
+                        );
+                    };
+                    let n = *n;
+                    let elem = (**elem).clone();
+                    let per = flatten(&elem, &self.func.name, self.layouts)?;
+                    let base_len = LenSrc::Const(n);
+                    let checks = vec![PlaceCheck::Subslice(SubsliceCheck {
+                        from: *from,
+                        to: *to,
+                        from_end: *from_end,
+                        len: base_len.clone(),
+                    })];
+                    let len = Self::subslice_len(&base_len, *from, *to, *from_end);
+                    let addr = AddrExpr {
+                        source: PtrSrc::SlotAddr(local_first + offset as u32),
+                        const_off: subslice_offset(*from, per),
+                        dyn_idx: None,
+                    };
+                    return self.classify_mem(
+                        place,
+                        i + 1,
+                        addr,
+                        mir::Ty::Slice(Box::new(elem)),
+                        Some(len),
+                        checks,
+                    );
                 }
                 elem => {
                     self.frame_step(&mut offset, &mut ty, &mut variant, elem)?;
@@ -1921,7 +2092,7 @@ impl<'a> FnLower<'a> {
         mut addr: AddrExpr,
         mut ty: mir::Ty,
         mut len: Option<LenSrc>,
-        mut checks: Vec<IndexCheck>,
+        mut checks: Vec<PlaceCheck>,
     ) -> Result<PlaceLoc, JitError> {
         let mut variant = 0u32;
         while i < place.projection.len() {
@@ -1982,10 +2153,11 @@ impl<'a> FnLower<'a> {
                             return Err(self.err("second dynamic index in one place"));
                         }
                         addr.dyn_idx = Some((IndexSrc::Const(*idx), per));
-                        checks.push(IndexCheck {
+                        checks.push(PlaceCheck::Index(IndexCheck {
                             index: IndexSrc::Const(*idx),
                             len: len_src,
-                        });
+                            neg: None,
+                        }));
                         ty = elem_ty;
                         len = None;
                         i += 1;
@@ -2052,13 +2224,14 @@ impl<'a> FnLower<'a> {
                     if addr.dyn_idx.is_some() {
                         return Err(self.err("second dynamic index in one place"));
                     }
-                    let idx_slot = self.index_slot(*local)?;
+                    let (idx_slot, signed) = self.index_slot(*local)?;
                     let per = flatten(&elem_ty, &self.func.name, self.layouts)?;
                     addr.dyn_idx = Some((IndexSrc::Slot(idx_slot), per));
-                    checks.push(IndexCheck {
+                    checks.push(PlaceCheck::Index(IndexCheck {
                         index: IndexSrc::Slot(idx_slot),
                         len: len_src,
-                    });
+                        neg: signed.then(|| place_display(place)),
+                    }));
                     ty = elem_ty;
                     len = None;
                 }
@@ -2112,8 +2285,49 @@ impl<'a> FnLower<'a> {
                     ty = t.clone();
                     variant = 0;
                 }
-                other => {
-                    return Err(self.err(&format!("{} projection", other.kind_name())));
+                mir::PlaceElem::Subslice { from, to, from_end } => {
+                    let (elem_ty, base_len) = match &ty {
+                        mir::Ty::Array(elem, arr_len) => {
+                            let mir::ArrayLen::Known(n) = arr_len else {
+                                return Err(self.err(
+                                    "Subslice projection on an array of unknown length",
+                                ));
+                            };
+                            ((**elem).clone(), LenSrc::Const(*n))
+                        }
+                        mir::Ty::Slice(elem) => {
+                            let l = len.clone().ok_or_else(|| {
+                                self.err("sub-slice of a slice whose length is not available")
+                            })?;
+                            ((**elem).clone(), l)
+                        }
+                        mir::Ty::Str => {
+                            let l = len.clone().ok_or_else(|| {
+                                self.err("sub-slice of a str whose length is not available")
+                            })?;
+                            (mir::Ty::Uint(mir::UintTy::U8), l)
+                        }
+                        _ => {
+                            return Err(self.err(&format!(
+                                "Subslice projection on type {}",
+                                ty.kind_name()
+                            )));
+                        }
+                    };
+                    let per = flatten(&elem_ty, &self.func.name, self.layouts)?;
+                    addr.const_off = addr.const_off.saturating_add(subslice_offset(*from, per));
+                    checks.push(PlaceCheck::Subslice(SubsliceCheck {
+                        from: *from,
+                        to: *to,
+                        from_end: *from_end,
+                        len: base_len.clone(),
+                    }));
+                    len = Some(Self::subslice_len(&base_len, *from, *to, *from_end));
+                    ty = if matches!(ty, mir::Ty::Str) {
+                        mir::Ty::Str
+                    } else {
+                        mir::Ty::Slice(Box::new(elem_ty))
+                    };
                 }
             }
             i += 1;
@@ -2146,47 +2360,146 @@ impl<'a> FnLower<'a> {
     }
 
 
-    /// Emit the bounds checks a memory place needs, in projection
-    /// order. A failed check is the interpreter's index panic, with
-    /// the runtime length and index in the message.
-    fn emit_checks(&mut self, checks: &[IndexCheck]) {
+    /// Emit the checks a memory place needs, in projection order.
+    /// A failed check is the interpreter's panic for the projection
+    /// that needed it, with the runtime values in the message.
+    fn emit_checks(&mut self, checks: &[PlaceCheck]) {
         for check in checks {
-            let len_v = self.len_value(&check.len);
-            let idx_v = match check.index {
-                IndexSrc::Slot(s) => s,
-                IndexSrc::Const(n) => {
-                    let d = self.fresh();
-                    self.emit(Instr::Const {
-                        dst: d,
-                        imm: n as i64,
-                    });
-                    d
-                }
-            };
-            let pblk = self.new_block();
-            self.seal_block(
-                pblk,
-                vec![Instr::PanicIndexOob {
-                    len: IrOperand::Value(len_v),
-                    index: IrOperand::Value(idx_v),
-                }],
-                IrTerminator::Unreachable,
-            );
+            match check {
+                PlaceCheck::Index(check) => self.emit_index_check(check),
+                PlaceCheck::Subslice(check) => self.emit_subslice_check(check),
+            }
+        }
+    }
+
+    /// A constant materialised into a fresh value slot.
+    fn const_slot(&mut self, n: u64) -> u32 {
+        let d = self.fresh();
+        self.emit(Instr::Const {
+            dst: d,
+            imm: n as i64,
+        });
+        d
+    }
+
+    /// Continue in a fresh block when `ok` is nonzero; jump to a
+    /// panic block holding `panic_instrs` when it is zero.
+    fn branch_unless(&mut self, ok: u32, panic_instrs: Vec<Instr>) {
+        let pblk = self.new_block();
+        self.seal_block(pblk, panic_instrs, IrTerminator::Unreachable);
+        let cont = self.new_block();
+        self.seal_and_continue(
+            IrTerminator::Branch {
+                cond: IrOperand::Value(ok),
+                then_blk: cont,
+                else_blk: pblk,
+            },
+            cont,
+        );
+    }
+
+    /// Emit `ok = lhs <op> rhs` and continue only when it holds,
+    /// panicking with `panic_instrs` otherwise.
+    fn guard_cmp(&mut self, op: IrBinOp, lhs: u32, rhs: u32, panic_instrs: Vec<Instr>) {
+        let ok = self.fresh();
+        self.emit(Instr::BinOp {
+            dst: ok,
+            op,
+            lhs: IrOperand::Value(lhs),
+            rhs: IrOperand::Value(rhs),
+        });
+        self.branch_unless(ok, panic_instrs);
+    }
+
+    /// Emit an indexed place's bounds check: for a signed index,
+    /// the interpreter's negative-index panic first (the slot holds
+    /// the sign-extended value, so a signed `>= 0` test is exact,
+    /// and a value that passes it compares against the length on
+    /// its mathematical value), then the unsigned bounds check
+    /// with the interpreter's index panic.
+    fn emit_index_check(&mut self, check: &IndexCheck) {
+        let len_v = self.len_value(&check.len);
+        let idx_v = match check.index {
+            IndexSrc::Slot(s) => s,
+            IndexSrc::Const(n) => self.const_slot(n),
+        };
+        if let Some(place) = &check.neg {
+            let place = self.places.intern(place);
             let ok = self.fresh();
             self.emit(Instr::BinOp {
                 dst: ok,
-                op: IrBinOp::LtU,
+                op: IrBinOp::Ge,
                 lhs: IrOperand::Value(idx_v),
-                rhs: IrOperand::Value(len_v),
+                rhs: IrOperand::Const(0),
             });
-            let cont = self.new_block();
-            self.seal_and_continue(
-                IrTerminator::Branch {
-                    cond: IrOperand::Value(ok),
-                    then_blk: cont,
-                    else_blk: pblk,
-                },
-                cont,
+            self.branch_unless(
+                ok,
+                vec![Instr::PanicNegativeIndex {
+                    index: IrOperand::Value(idx_v),
+                    place,
+                }],
+            );
+        }
+        self.guard_cmp(
+            IrBinOp::LtU,
+            idx_v,
+            len_v,
+            vec![Instr::PanicIndexOob {
+                len: IrOperand::Value(len_v),
+                index: IrOperand::Value(idx_v),
+            }],
+        );
+    }
+
+    /// Emit a sub-slice projection's range check, in the
+    /// interpreter's order: with `from_end`, a `to` past the base's
+    /// length is the range-end panic before the end is even
+    /// resolved; then a start past the end is the inverted-range
+    /// panic; then (for a plain range) an end past the length is
+    /// the range-end panic.
+    fn emit_subslice_check(&mut self, check: &SubsliceCheck) {
+        let len_v = self.len_value(&check.len);
+        let end_v = if check.from_end {
+            let to_v = self.const_slot(check.to);
+            self.guard_cmp(
+                IrBinOp::LeU,
+                to_v,
+                len_v,
+                vec![Instr::PanicRangeEnd {
+                    end: IrOperand::Value(to_v),
+                    len: IrOperand::Value(len_v),
+                }],
+            );
+            let d = self.fresh();
+            self.emit(Instr::BinOp {
+                dst: d,
+                op: IrBinOp::Sub,
+                lhs: IrOperand::Value(len_v),
+                rhs: IrOperand::Value(to_v),
+            });
+            d
+        } else {
+            self.const_slot(check.to)
+        };
+        let from_v = self.const_slot(check.from);
+        self.guard_cmp(
+            IrBinOp::LeU,
+            from_v,
+            end_v,
+            vec![Instr::PanicSliceIndex {
+                from: IrOperand::Value(from_v),
+                end: IrOperand::Value(end_v),
+            }],
+        );
+        if !check.from_end {
+            self.guard_cmp(
+                IrBinOp::LeU,
+                end_v,
+                len_v,
+                vec![Instr::PanicRangeEnd {
+                    end: IrOperand::Value(end_v),
+                    len: IrOperand::Value(len_v),
+                }],
             );
         }
     }
@@ -2209,6 +2522,17 @@ impl<'a> FnLower<'a> {
                 self.emit(Instr::LoadPtr {
                     dst: d,
                     ptr: IrOperand::Value(addr),
+                });
+                d
+            }
+            LenSrc::Tail { base, skip } => {
+                let b = self.len_value(base);
+                let d = self.fresh();
+                self.emit(Instr::BinOp {
+                    dst: d,
+                    op: IrBinOp::Sub,
+                    lhs: IrOperand::Value(b),
+                    rhs: IrOperand::Const(*skip as i64),
                 });
                 d
             }
@@ -3145,18 +3469,26 @@ impl<'a> FnLower<'a> {
                 }
                 _ => Err(self.err(&format!("Len of type {}", ty.kind_name()))),
             },
-            PlaceLoc::Mem { ty, len, .. } => match ty {
-                mir::Ty::Array(_, mir::ArrayLen::Known(n)) => {
-                    Ok(self.len_value(&LenSrc::Const(*n)))
+            PlaceLoc::Mem {
+                ty, len, checks, ..
+            } => {
+                // The interpreter resolves the place before reading
+                // its length, so the place's checks (an index's
+                // bounds, a sub-slice's range) fire here too.
+                self.emit_checks(checks);
+                match ty {
+                    mir::Ty::Array(_, mir::ArrayLen::Known(n)) => {
+                        Ok(self.len_value(&LenSrc::Const(*n)))
+                    }
+                    mir::Ty::Slice(_) | mir::Ty::Str => {
+                        let l = len.clone().ok_or_else(|| {
+                            self.err("Len of a slice place without a length")
+                        })?;
+                        Ok(self.len_value(&l))
+                    }
+                    _ => Err(self.err(&format!("Len of type {}", ty.kind_name()))),
                 }
-                mir::Ty::Slice(_) | mir::Ty::Str => {
-                    let l = len.clone().ok_or_else(|| {
-                        self.err("Len of a slice place without a length")
-                    })?;
-                    Ok(self.len_value(&l))
-                }
-                _ => Err(self.err(&format!("Len of type {}", ty.kind_name()))),
-            },
+            }
         }
     }
 

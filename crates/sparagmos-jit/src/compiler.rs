@@ -60,6 +60,9 @@ pub enum CompileError {
     ProgramOnly(&'static str),
     /// A panic instruction referenced a message outside the table.
     BadMessageIndex(u32),
+    /// A panic instruction referenced a place string outside the
+    /// table.
+    BadPlaceIndex(u32),
     Memory(std::io::Error),
 }
 
@@ -73,6 +76,7 @@ impl std::fmt::Display for CompileError {
                 write!(f, "{what} is only available in a program compile")
             }
             CompileError::BadMessageIndex(i) => write!(f, "panic message index {i} out of range"),
+            CompileError::BadPlaceIndex(i) => write!(f, "panic place index {i} out of range"),
             CompileError::Memory(e) => write!(f, "jit memory error: {e}"),
         }
     }
@@ -103,6 +107,23 @@ pub struct ProgramCtx {
     /// writing a length-prefixed message into `scratch_buf` and
     /// returning the message length.
     pub index_fmt_fn: usize,
+    /// Address of the program layer's negative-index-message
+    /// formatter: `extern "C" fn(index: i64, place_ptr: *const u8,
+    /// place_len: usize, buf: *mut u8) -> usize`, with the same
+    /// buffer contract as `index_fmt_fn`.
+    pub neg_index_fmt_fn: usize,
+    /// Address of the program layer's range-end-message formatter:
+    /// `extern "C" fn(end: u64, len: u64, buf: *mut u8) -> usize`,
+    /// with the same buffer contract as `index_fmt_fn`.
+    pub range_end_fmt_fn: usize,
+    /// Address of the program layer's inverted-range-message
+    /// formatter: `extern "C" fn(from: u64, end: u64,
+    /// buf: *mut u8) -> usize`, with the same buffer contract as
+    /// `index_fmt_fn`.
+    pub slice_index_fmt_fn: usize,
+    /// The place strings a negative-index message names: `(ptr,
+    /// len)` of each string's UTF-8 bytes.
+    pub places: Vec<(usize, usize)>,
     /// Address of the scratch buffer the formatter writes into:
     /// 8 length bytes (little-endian u64) followed by message bytes.
     pub scratch_buf: usize,
@@ -150,6 +171,13 @@ impl CompiledFunction {
         let f: unsafe extern "C" fn() -> i64 = unsafe { self.function_ptr() };
         unsafe { f() }
     }
+}
+
+/// One argument to a panic-message formatter: a value operand, or
+/// an immediate (the address / length of a place string).
+enum FmtArg {
+    Op(Operand),
+    Imm(i64),
 }
 
 struct Compiler<'a> {
@@ -763,31 +791,98 @@ impl<'a> Compiler<'a> {
                 self.e.buf.patch_rel32(at, target);
             }
             Instr::PanicIndexOob { len, index } => {
+                let fmt_fn = self
+                    .ctx
+                    .ok_or(CompileError::ProgramOnly("PanicIndexOob"))?
+                    .index_fmt_fn;
+                self.emit_formatted_panic(
+                    "PanicIndexOob",
+                    fmt_fn,
+                    &[FmtArg::Op(*len), FmtArg::Op(*index)],
+                )?;
+            }
+            Instr::PanicNegativeIndex { index, place } => {
                 let ctx = self
                     .ctx
-                    .ok_or(CompileError::ProgramOnly("PanicIndexOob"))?;
-                // Format the message into the program's scratch
-                // buffer, then record it through the runtime's panic
-                // path like a static message (the u64::MAX sentinel
-                // index, as for the shift message).
-                self.load_operand(Reg::Rdi, *len)?;
-                self.load_operand(Reg::Rsi, *index)?;
-                self.e.mov_ri64(Reg::Rdx, ctx.scratch_buf as i64);
-                self.e.mov_ri64(Reg::Rax, ctx.index_fmt_fn as i64);
-                self.e.call_r(Reg::Rax);
-                self.e.mov_rr(Reg::Rsi, Reg::Rax);
-                self.e.mov_ri64(Reg::Rdi, (ctx.scratch_buf + 8) as i64);
-                self.e.mov_ri64(Reg::Rax, ctx.panic_fn as i64);
-                self.e.call_r(Reg::Rax);
-                self.e.mov_ri64(Reg::Rax, ctx.flag_addr as i64);
-                self.e.mov_ri64(Reg::Rcx, 1);
-                self.e.mov_store(Reg::Rax, 0, Reg::Rcx);
-                self.e.mov_ri64(Reg::Rcx, -1);
-                self.e.mov_store(Reg::Rax, 8, Reg::Rcx);
-                self.e.leave();
-                self.e.ret();
+                    .ok_or(CompileError::ProgramOnly("PanicNegativeIndex"))?;
+                let (ptr, len) = ctx
+                    .places
+                    .get(*place as usize)
+                    .copied()
+                    .ok_or(CompileError::BadPlaceIndex(*place))?;
+                let fmt_fn = ctx.neg_index_fmt_fn;
+                self.emit_formatted_panic(
+                    "PanicNegativeIndex",
+                    fmt_fn,
+                    &[
+                        FmtArg::Op(*index),
+                        FmtArg::Imm(ptr as i64),
+                        FmtArg::Imm(len as i64),
+                    ],
+                )?;
+            }
+            Instr::PanicRangeEnd { end, len } => {
+                let fmt_fn = self
+                    .ctx
+                    .ok_or(CompileError::ProgramOnly("PanicRangeEnd"))?
+                    .range_end_fmt_fn;
+                self.emit_formatted_panic(
+                    "PanicRangeEnd",
+                    fmt_fn,
+                    &[FmtArg::Op(*end), FmtArg::Op(*len)],
+                )?;
+            }
+            Instr::PanicSliceIndex { from, end } => {
+                let fmt_fn = self
+                    .ctx
+                    .ok_or(CompileError::ProgramOnly("PanicSliceIndex"))?
+                    .slice_index_fmt_fn;
+                self.emit_formatted_panic(
+                    "PanicSliceIndex",
+                    fmt_fn,
+                    &[FmtArg::Op(*from), FmtArg::Op(*end)],
+                )?;
             }
         }
+        Ok(())
+    }
+
+    /// Emit a run-time-formatted guest panic: call the formatter
+    /// at `fmt_fn` with `args` in the System V argument registers
+    /// (the scratch-buffer pointer goes in the register after the
+    /// last argument), then record the formatted message through
+    /// the runtime's panic path like a static message (the
+    /// u64::MAX sentinel index, as for the shift message) and
+    /// return from the function. This is the tail every formatted
+    /// panic instruction (`PanicIndexOob`, `PanicNegativeIndex`,
+    /// `PanicRangeEnd`, `PanicSliceIndex`) shares.
+    fn emit_formatted_panic(
+        &mut self,
+        name: &'static str,
+        fmt_fn: usize,
+        args: &[FmtArg],
+    ) -> Result<(), CompileError> {
+        let ctx = self.ctx.ok_or(CompileError::ProgramOnly(name))?;
+        for (i, a) in args.iter().enumerate() {
+            match a {
+                FmtArg::Op(op) => self.load_operand(Reg::SYSV_ARG_REGS[i], *op)?,
+                FmtArg::Imm(v) => self.e.mov_ri64(Reg::SYSV_ARG_REGS[i], *v),
+            }
+        }
+        self.e.mov_ri64(Reg::SYSV_ARG_REGS[args.len()], ctx.scratch_buf as i64);
+        self.e.mov_ri64(Reg::Rax, fmt_fn as i64);
+        self.e.call_r(Reg::Rax);
+        self.e.mov_rr(Reg::Rsi, Reg::Rax);
+        self.e.mov_ri64(Reg::Rdi, (ctx.scratch_buf + 8) as i64);
+        self.e.mov_ri64(Reg::Rax, ctx.panic_fn as i64);
+        self.e.call_r(Reg::Rax);
+        self.e.mov_ri64(Reg::Rax, ctx.flag_addr as i64);
+        self.e.mov_ri64(Reg::Rcx, 1);
+        self.e.mov_store(Reg::Rax, 0, Reg::Rcx);
+        self.e.mov_ri64(Reg::Rcx, -1);
+        self.e.mov_store(Reg::Rax, 8, Reg::Rcx);
+        self.e.leave();
+        self.e.ret();
         Ok(())
     }
 

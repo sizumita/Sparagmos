@@ -223,6 +223,24 @@ pub enum Instr {
     /// by a helper in the program layer into a scratch buffer and
     /// then recorded through the usual panic path. Program compiles only.
     PanicIndexOob { len: Operand, index: Operand },
+    /// Guest panic with the negative-index message, whose text
+    /// depends on the runtime index and on the place being indexed:
+    /// "index out of bounds: negative index {index} used for
+    /// {place}". `place` indexes the program's place-string table;
+    /// the message is formatted by a helper in the program layer
+    /// into a scratch buffer and then recorded through the usual
+    /// panic path. Program compiles only.
+    PanicNegativeIndex { index: Operand, place: u32 },
+    /// Guest panic with the sub-slice range-end message: "range
+    /// end index {end} out of range for slice of length {len}",
+    /// formatted at run time like [`Instr::PanicIndexOob`].
+    /// Program compiles only.
+    PanicRangeEnd { end: Operand, len: Operand },
+    /// Guest panic with the sub-slice inverted-range message:
+    /// "slice index starts at {from} but ends at {end}", formatted
+    /// at run time like [`Instr::PanicIndexOob`]. Program compiles
+    /// only.
+    PanicSliceIndex { from: Operand, end: Operand },
     /// `dst = lhs op rhs` on floating-point values of format `kind`.
     /// Operands and the result are bit patterns in their slots (see
     /// the module docs); for the comparison forms the result is the

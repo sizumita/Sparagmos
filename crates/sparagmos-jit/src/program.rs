@@ -144,12 +144,67 @@ const DYNAMIC_MESSAGE: u64 = u64::MAX;
 /// scratch buffer); the message is well under that.
 extern "C" fn format_index_message(len: u64, index: u64, buf: *mut u8) -> usize {
     let text = format!("index out of bounds: the len is {len} but the index is {index}");
+    write_formatted(&text, buf)
+}
+
+/// Write `text` into a scratch buffer in the formatters' contract:
+/// the byte length as a little-endian u64, then the bytes; returns
+/// the byte length.
+///
+/// # Safety
+/// `buf` must point to at least 128 writable bytes (the program's
+/// scratch buffer); every formatted message is well under that.
+fn write_formatted(text: &str, buf: *mut u8) -> usize {
     let bytes = text.as_bytes();
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.len().to_le_bytes().as_ptr(), buf, 8);
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.add(8), bytes.len());
     }
     bytes.len()
+}
+
+/// The negative-index message formatter: the interpreter's wording
+/// for a signed index below zero, naming the place being indexed
+/// (a string from the program's place table, passed by pointer and
+/// length).
+///
+/// # Safety
+/// `place_ptr` must point to `place_len` bytes of UTF-8 (a place
+/// string owned by the program), and `buf` to the scratch buffer,
+/// as in [`format_index_message`].
+extern "C" fn format_negative_index_message(
+    index: i64,
+    place_ptr: *const u8,
+    place_len: usize,
+    buf: *mut u8,
+) -> usize {
+    let place = unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(place_ptr, place_len))
+    };
+    let text = format!("index out of bounds: negative index {index} used for {place}");
+    write_formatted(&text, buf)
+}
+
+/// The sub-slice range-end message formatter: the interpreter's
+/// wording for a range whose end passes the base's length.
+///
+/// # Safety
+/// `buf` must point to the scratch buffer, as in
+/// [`format_index_message`].
+extern "C" fn format_range_end_message(end: u64, len: u64, buf: *mut u8) -> usize {
+    let text = format!("range end index {end} out of range for slice of length {len}");
+    write_formatted(&text, buf)
+}
+
+/// The sub-slice inverted-range message formatter: the
+/// interpreter's wording for a range whose start passes its end.
+///
+/// # Safety
+/// `buf` must point to the scratch buffer, as in
+/// [`format_index_message`].
+extern "C" fn format_slice_index_message(from: u64, end: u64, buf: *mut u8) -> usize {
+    let text = format!("slice index starts at {from} but ends at {end}");
+    write_formatted(&text, buf)
 }
 
 /// A whole compiled program: executable image plus the state its
@@ -165,6 +220,11 @@ pub struct CompiledProgram {
     /// these bytes to `sparagmos_panic`, so they must not move.
     #[allow(dead_code)]
     messages: Vec<Box<str>>,
+    /// The place strings a negative-index message names; generated
+    /// code passes pointers to these bytes to the message
+    /// formatter, so they must not move.
+    #[allow(dead_code)]
+    places: Vec<Box<str>>,
     /// Scratch buffer for run-time-formatted panic messages
     /// (address-stable; see [`format_index_message`]).
     scratch_buf: Box<[u8; 128]>,
@@ -242,6 +302,7 @@ impl CompiledProgram {
 pub fn compile_program(
     funcs: &[Function],
     messages: Vec<String>,
+    places: Vec<String>,
 ) -> Result<CompiledProgram, CompileError> {
     // Everything the generated code refers to by absolute address is
     // created first and kept in the returned program: the panic
@@ -251,6 +312,7 @@ pub fn compile_program(
         message_index: Cell::new(0),
     });
     let messages: Vec<Box<str>> = messages.into_iter().map(|s| s.into_boxed_str()).collect();
+    let places: Vec<Box<str>> = places.into_iter().map(|s| s.into_boxed_str()).collect();
     let scratch_buf: Box<[u8; 128]> = Box::new([0; 128]);
     let ctx = ProgramCtx {
         flag_addr: panic_ctx.as_ref() as *const PanicCtx as usize,
@@ -260,6 +322,13 @@ pub fn compile_program(
             .map(|s| (s.as_ptr() as usize, s.len()))
             .collect(),
         index_fmt_fn: format_index_message as usize,
+        neg_index_fmt_fn: format_negative_index_message as usize,
+        range_end_fmt_fn: format_range_end_message as usize,
+        slice_index_fmt_fn: format_slice_index_message as usize,
+        places: places
+            .iter()
+            .map(|s| (s.as_ptr() as usize, s.len()))
+            .collect(),
         scratch_buf: scratch_buf.as_ptr() as usize,
     };
 
@@ -303,6 +372,7 @@ pub fn compile_program(
         param_counts: funcs.iter().map(|f| f.param_count).collect(),
         panic_ctx,
         messages,
+        places,
         scratch_buf,
     })
 }
@@ -346,7 +416,7 @@ mod tests {
     #[test]
     fn call_between_functions() {
         let (funcs, msgs) = caller_and_callee();
-        let prog = compile_program(&funcs, msgs).unwrap();
+        let prog = compile_program(&funcs, msgs, vec![]).unwrap();
         // caller(4) = callee(5) + callee(10) = 15 + 30
         assert_eq!(prog.call(1, &[4]), Ok(45));
         assert_eq!(prog.call(0, &[7]), Ok(21));
@@ -380,7 +450,7 @@ mod tests {
             value: sum.into(),
             second: None,
         });
-        let prog = compile_program(&[callee, caller], vec![]).unwrap();
+        let prog = compile_program(&[callee, caller], vec![], vec![]).unwrap();
         // The pair travels in RAX/RDX; `call` reads the first word.
         assert_eq!(prog.call_pair(0, &[10]), Ok((11, 20)));
         assert_eq!(prog.call(0, &[10]), Ok(11));
@@ -408,7 +478,7 @@ mod tests {
         let mid = mk_caller("mid", 0);
         let top = mk_caller("top", 1);
         let prog =
-            compile_program(&[boom, mid, top], vec!["kaboom".to_string()]).unwrap();
+            compile_program(&[boom, mid, top], vec!["kaboom".to_string()], vec![]).unwrap();
         let err = prog.call(2, &[]).expect_err("panic must surface");
         assert_eq!(err.message, "kaboom");
         // The runtime's shared panic record was written too.
@@ -463,7 +533,7 @@ mod tests {
             value: d.into(),
             second: None,
         });
-        let prog = compile_program(&[callee, caller], vec![]).unwrap();
+        let prog = compile_program(&[callee, caller], vec![], vec![]).unwrap();
         // callee(1..=7) = 1 + 4 + 9 + 16 + 25 + 36 + 49
         assert_eq!(prog.call(1, &[6]), Ok(140));
         // Direct entry with seven words (through the trampoline).
@@ -500,7 +570,7 @@ mod tests {
             value: sum.into(),
             second: None,
         });
-        let prog = compile_program(&[c8, c10, caller], vec![]).unwrap();
+        let prog = compile_program(&[c8, c10, caller], vec![], vec![]).unwrap();
         // c8(1..=8) = 204; c10(1 x9, 2) = 45 + 20 = 65.
         assert_eq!(prog.call(2, &[2]), Ok(269));
         assert_eq!(prog.call(0, &[1; 8]), Ok(36));
@@ -528,7 +598,7 @@ mod tests {
             value: r.into(),
             second: None,
         });
-        let prog = compile_program(&[inner, outer], vec![]).unwrap();
+        let prog = compile_program(&[inner, outer], vec![], vec![]).unwrap();
         // inner(8, 7, 6, 5, 4, 3, 2, 1) = 8+14+18+20+20+18+14+8 = 120; + a = 1.
         assert_eq!(prog.call(1, &[1, 2, 3, 4, 5, 6, 7, 8]), Ok(121));
     }
@@ -565,7 +635,7 @@ mod tests {
             value: r.into(),
             second: None,
         });
-        let prog = compile_program(&[callee, caller], vec![]).unwrap();
+        let prog = compile_program(&[callee, caller], vec![], vec![]).unwrap();
         assert_eq!(prog.call(1, &[]), Ok(23));
         assert_eq!(prog.call_pair(0, &[1, 2, 3, 4, 5, 6, 7, 8]), Ok((9, 14)));
     }
