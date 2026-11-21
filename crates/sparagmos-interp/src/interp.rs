@@ -2990,11 +2990,13 @@ impl<'a> Interpreter<'a> {
                             Ok(Value::Int(*discr))
                         }
                     }
-                    other => Err(InterpError::type_mismatch(
-                        format!("Discriminant of {place}"),
-                        "ADT value",
-                        other.kind_name(),
-                    )),
+                    // A non-ADT value (a scalar, a tuple, a
+                    // reference, ...) has no variants: its
+                    // discriminant is 0. This is the shape
+                    // `mem::discriminant(&10)` produces — the
+                    // rvalue is well-defined for every type, and
+                    // only enum-like values carry a real tag.
+                    _ => Ok(Value::Int(0)),
                 }
             }
             Rvalue::CopyForDeref(place) => {
@@ -3164,6 +3166,15 @@ pub(crate) fn project_value(
                     .get(*idx)
                     .map(|byte| Value::Uint(*byte as u128))
                     .ok_or_else(|| index_oob(s.len(), *idx))?,
+                // A `Vec` value is the aggregate of its elements
+                // (see the `Vec::from` / `Deref` builtin model):
+                // indexing the vector's own place reads the
+                // element field. No other ADT value can be the
+                // base of an index projection in valid MIR.
+                Value::Enum { ref fields, .. } => fields
+                    .get(*idx)
+                    .cloned()
+                    .ok_or_else(|| index_oob(fields.len(), *idx))?,
                 ref other => {
                     return Err(InterpError::type_mismatch(
                         format!("index projection on {place}"),
@@ -3275,6 +3286,15 @@ pub(crate) fn navigate_mut<'x>(
                     return Err(index_oob(items.len(), *idx));
                 }
                 navigate_mut(&mut items[*idx], rest, func, place)
+            }
+            // A `Vec` value is the aggregate of its elements:
+            // indexing the vector's own place writes the element
+            // field (the read direction in `project_value`).
+            Value::Enum { fields, .. } => {
+                if *idx >= fields.len() {
+                    return Err(index_oob(fields.len(), *idx));
+                }
+                navigate_mut(&mut fields[*idx], rest, func, place)
             }
             Value::Bytes(b) => {
                 if *idx >= b.len() {
