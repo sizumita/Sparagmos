@@ -5615,8 +5615,16 @@ fn builtin_arg_ctx(
         // (Self, B, F for fold; Self, F for for_each; Self for
         // count), so a literal accumulator takes the accumulator
         // type instead of the default unsigned rendering.
-        Builtin::IteratorCount | Builtin::IteratorFold | Builtin::IteratorForEach => {
-            raw_generic_args.get(arg_index).cloned()
+        Builtin::IteratorCount
+        | Builtin::IteratorFold
+        | Builtin::IteratorForEach
+        | Builtin::IteratorCollect => raw_generic_args.get(arg_index).cloned(),
+        Builtin::FromIteratorFromIter => {
+            if arg_index == 0 {
+                raw_generic_args.get(2).cloned()
+            } else {
+                None
+            }
         }
         // The index argument of `Index` / `IndexMut` is the trait's
         // `Idx` parameter, the callee's second generic argument.

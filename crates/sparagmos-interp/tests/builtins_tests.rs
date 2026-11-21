@@ -1967,6 +1967,11 @@ fn registry_round2_covers_the_new_callees() {
         ("std::iter::Iterator::count", Builtin::IteratorCount),
         ("std::iter::Iterator::fold", Builtin::IteratorFold),
         ("std::iter::Iterator::for_each", Builtin::IteratorForEach),
+        ("std::iter::Iterator::collect", Builtin::IteratorCollect),
+        (
+            "std::iter::FromIterator::from_iter",
+            Builtin::FromIteratorFromIter,
+        ),
     ];
     for (name, expected) in cases {
         assert_eq!(

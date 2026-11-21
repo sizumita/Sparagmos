@@ -273,6 +273,8 @@ pub enum Builtin {
     /// `std::iter::Iterator::for_each(iter, f)`: a `next` loop
     /// invoking `f` per item, discarding the results.
     IteratorForEach,
+    IteratorCollect,
+    FromIteratorFromIter,
     /// `std::convert::From::from(value)` (modelled conversions only).
     FromFrom,
     /// `std::hint::must_use(value)`: identity.
@@ -903,6 +905,8 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::iter::Iterator::count" => Builtin::IteratorCount,
         "std::iter::Iterator::fold" => Builtin::IteratorFold,
         "std::iter::Iterator::for_each" => Builtin::IteratorForEach,
+        "std::iter::Iterator::collect" => Builtin::IteratorCollect,
+        "std::iter::FromIterator::from_iter" => Builtin::FromIteratorFromIter,
         // The thread surface (cooperative model, see `interp.rs`).
         // Registering these names also keeps the driver from
         // collecting the std thread machinery, whose internals
@@ -2776,6 +2780,20 @@ impl<'a> Interpreter<'a> {
                     }
                 }
                 Ok(Value::Uint(count))
+            }
+            Builtin::IteratorCollect => {
+                arity(1)?;
+                let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
+                let target = generic_args.get(1).map(String::as_str).unwrap_or("");
+                let state = vals.into_iter().next().expect("arity checked");
+                self.exec_collect(frames, self_ty, target, state)
+            }
+            Builtin::FromIteratorFromIter => {
+                arity(1)?;
+                let target = generic_args.first().map(String::as_str).unwrap_or("");
+                let self_ty = generic_args.get(2).map(String::as_str).unwrap_or("");
+                let state = vals.into_iter().next().expect("arity checked");
+                self.exec_collect(frames, self_ty, target, state)
             }
             Builtin::FromFrom | Builtin::IntoInto => {
                 arity(1)?;
@@ -5796,6 +5814,73 @@ impl<'a> Interpreter<'a> {
         // calls failed outright even when the default was the
         // whole story.)
         Ok(hint(0, None))
+    }
+
+    /// Execute `Iterator::collect` / `FromIterator::from_iter`:
+    /// drain the modelled `next` state transition into the
+    /// collection the call's target generic names. The value
+    /// model has a native shape for two targets: a `Vec` is its
+    /// element list, and a `String` is accumulated text (chars
+    /// arrive as code-point integers, string items as string
+    /// values or references to them). Every other target is
+    /// named in an explicit unsupported error rather than
+    /// approximated.
+    fn exec_collect(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        self_ty: &str,
+        target: &str,
+        mut state: Value,
+    ) -> InterpResult<Value> {
+        let mut items = Vec::new();
+        loop {
+            self.tick_step()?;
+            let (next_state, item) = self.iterator_next_state(frames, self_ty, state)?;
+            state = next_state;
+            match option_payload(item)? {
+                None => break,
+                Some(item) => items.push(item),
+            }
+        }
+        if target.starts_with("std::vec::Vec<") || target.starts_with("alloc::vec::Vec<") {
+            return Ok(Value::Enum {
+                variant: 0,
+                fields: items,
+            });
+        }
+        if target == "std::string::String" || target == "alloc::string::String" {
+            let mut out = String::new();
+            for item in items {
+                match item {
+                    Value::Uint(cp) => {
+                        let c = char::from_u32(cp as u32).ok_or_else(|| {
+                            InterpError::type_mismatch(
+                                "collect into String",
+                                "valid char code point",
+                                format!("{cp}"),
+                            )
+                        })?;
+                        out.push(c);
+                    }
+                    Value::Str(s) => out.push_str(&s),
+                    Value::Ref(_) => {
+                        let s = self.resolve_string(frames, &item)?;
+                        out.push_str(&s);
+                    }
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            "collect into String",
+                            "char or string item",
+                            other.kind_name(),
+                        ));
+                    }
+                }
+            }
+            return Ok(Value::Str(out));
+        }
+        Err(unsupported(format!(
+            "collect into {target} is not runtime-supported"
+        )))
     }
 
     /// Execute `Iterator::fold` / `Iterator::for_each`: drive
