@@ -1960,6 +1960,194 @@ fn main() {
 }
 "#;
 
+const DYN_DEFAULT_SRC: &str = r#"
+trait Foo {
+    fn a(&self) -> i32 { 100 }
+    fn b(&self) -> i32 { self.a() + 1 }
+}
+impl Foo for i32 {}
+trait Greeter {
+    fn name(&self) -> i32;
+    fn greet(&self) -> i32 { self.name() + 1 }
+}
+struct S;
+impl Greeter for S {
+    fn name(&self) -> i32 { 41 }
+}
+fn main() {
+    let f: &dyn Foo = &1i32;
+    assert_eq!(f.a(), 100);
+    assert_eq!(f.b(), 101);
+    let g: Box<dyn Foo> = Box::new(2i32);
+    assert_eq!(g.a(), 100);
+    assert_eq!(g.b(), 101);
+    let h: &dyn Greeter = &S;
+    assert_eq!(h.greet(), 42);
+    let h2: Box<dyn Greeter> = Box::new(S);
+    assert_eq!(h2.greet(), 42);
+    println!("dyn-default ok");
+}
+"#;
+
+#[test]
+fn run_mode_dyn_trait_default_method() {
+    // A trait default method called through a `dyn` receiver: the
+    // dispatch target is the trait's own body instantiated with
+    // the concrete `Self`, demanded from the vtable the unsizing
+    // cast forms (Lane EU). Both `&dyn` and `Box<dyn>` receivers,
+    // a default calling another default, and a default calling a
+    // required method the impl provides.
+    let dir = temp_dir("dyn-default");
+    let src = fixture(&dir, "dyn_default.rs", DYN_DEFAULT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "dyn default methods must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "dyn-default ok\n");
+}
+
+#[test]
+fn summary_mode_dyn_trait_default_method_is_converted() {
+    // The demanded vtable instance also settles the trait
+    // method's own accounting: it no longer stands as a skipped
+    // "dynamic dispatch target (virtual instance)".
+    let dir = temp_dir("dyn-default-summary");
+    let src = fixture(&dir, "dyn_default.rs", DYN_DEFAULT_SRC);
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for name in ["::Foo::a:", "::Foo::b:", "::Greeter::greet:"] {
+        let line = stdout
+            .lines()
+            .find(|l| l.contains(name))
+            .unwrap_or_else(|| panic!("summary lists {name}: {stdout}"));
+        assert!(
+            line.contains("[converted]"),
+            "the trait default method {name} is converted: {line}"
+        );
+    }
+    assert!(
+        !stdout.contains("target-crate unsupported:"),
+        "no target-crate function stays skipped: {stdout}"
+    );
+}
+
+const DYN_DEFAULT_OVERRIDE_SRC: &str = r#"
+trait D {
+    fn val(&self) -> u32 { 10 }
+    fn extra(&self) -> u32 { self.val() + 1 }
+}
+struct X;
+impl D for X {}
+struct Y;
+impl D for Y {
+    fn val(&self) -> u32 { 20 }
+}
+fn main() {
+    let x: &dyn D = &X;
+    let y: &dyn D = &Y;
+    println!("{} {} {} {}", x.val(), x.extra(), y.val(), y.extra());
+    let bx: Box<dyn D> = Box::new(X);
+    let by: Box<dyn D> = Box::new(Y);
+    println!("{} {} {} {}", bx.val(), bx.extra(), by.val(), by.extra());
+}
+"#;
+
+#[test]
+fn run_mode_dyn_trait_default_method_override_wins() {
+    // An impl that overrides the method is what a dyn call must
+    // reach — never the default — and the default `extra` body
+    // must dispatch its inner `self.val()` to the override for
+    // `Y` and to the default for `X`. This also pins the dispatch
+    // precedence: the statically demanded default instance of
+    // `val` (from `extra`'s inner call) sits in the program under
+    // the plain trait name, and a dyn call must not be served by
+    // it directly.
+    let dir = temp_dir("dyn-default-override");
+    let src = fixture(&dir, "dyn_default_override.rs", DYN_DEFAULT_OVERRIDE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "dyn default/override dispatch must execute; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "10 11 20 21\n10 11 20 21\n"
+    );
+}
+
+const DYN_DEFAULT_SUPER_SRC: &str = r#"
+trait Super {
+    fn s(&self) -> i32 { 1 }
+    fn s2(&self) -> i32;
+}
+trait Sub: Super {
+    fn b(&self) -> i32 { 2 }
+}
+struct S;
+impl Super for S {
+    fn s2(&self) -> i32 { 3 }
+}
+impl Sub for S {}
+fn main() {
+    let d: &dyn Sub = &S;
+    println!("{} {} {}", d.b(), d.s(), d.s2());
+    let u: &dyn Super = d;
+    println!("{} {}", u.s(), u.s2());
+}
+"#;
+
+#[test]
+fn run_mode_dyn_trait_default_method_supertrait_upcast() {
+    // Supertrait default methods are vtable entries of the
+    // supertrait vtable (`TraitVPtr`): calling them through the
+    // subtrait object and through an upcast `&dyn Super` both
+    // reach the default body.
+    let dir = temp_dir("dyn-default-super");
+    let src = fixture(&dir, "dyn_default_super.rs", DYN_DEFAULT_SUPER_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "supertrait dyn defaults must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2 1 3\n1 3\n");
+}
+
+const DYN_DEFAULT_GENERIC_TRAIT_SRC: &str = r#"
+trait G<T> {
+    fn get(&self, t: T) -> T { t }
+}
+struct S;
+impl G<i32> for S {}
+fn main() {
+    let d: &dyn G<i32> = &S;
+    println!("{}", d.get(41) + 1);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_trait_default_method_generic_trait() {
+    // A trait with generic arguments: the instance name carries
+    // them (`<S as G<i32>>::get`) while the dyn call name does
+    // not, so the vtable lookup resolves by its unique scan.
+    let dir = temp_dir("dyn-default-generic-trait");
+    let src = fixture(&dir, "dyn_default_generic.rs", DYN_DEFAULT_GENERIC_TRAIT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "generic-trait dyn defaults must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
 #[test]
 fn run_mode_trait_default_method_body() {
     // A trait default method keeps its own body: X uses both
