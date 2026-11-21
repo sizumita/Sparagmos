@@ -478,6 +478,9 @@ fn drop_glue_edges<'a>(glue: &'a ir::DropGlue, targets: &mut Vec<&'a str>) -> bo
     ) -> bool {
         match plan {
             ir::DropPlan::Trivial => true,
+            // A dyn value's glue is chosen from the value at run
+            // time, like a vtable call's target: no static edges.
+            ir::DropPlan::Dyn => true,
             // Releasing a RefCell borrow calls no destructor body.
             ir::DropPlan::RefCellRelease { .. } => true,
             ir::DropPlan::Unknown | ir::DropPlan::Untyped => false,
@@ -1952,18 +1955,25 @@ impl<'a> Converter<'a> {
                                             ir::UnsizeMeta::Dyn {
                                                 concrete: None,
                                                 traits,
+                                                glue: None,
                                             },
                                         )
                                     }
                                     Some(src) => {
                                         let pointee = unsize_pointee(&src);
+                                        let concrete = self.concrete_ty_name(pointee);
+                                        // The value carries the
+                                        // pointee's drop glue from
+                                        // here, like a vtable's
+                                        // drop shim (see
+                                        // `UnsizeMeta::Dyn`).
+                                        let glue = DropGlueBuilder::build(self, pointee);
                                         ir::Rvalue::Unsize(
                                             v,
                                             ir::UnsizeMeta::Dyn {
-                                                concrete: Some(
-                                                    self.concrete_ty_name(pointee),
-                                                ),
+                                                concrete: Some(concrete),
                                                 traits,
+                                                glue,
                                             },
                                         )
                                     }
@@ -3257,6 +3267,13 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                 self.adts[index] = plan;
                 Some(P::Adt { index })
             }
+            mir::Ty::Dynamic(..) => {
+                // A trait object's glue is its concrete type's,
+                // resolved at run time from the value (see
+                // `DropPlan::Dyn` and the registration at unsizing
+                // casts).
+                Some(P::Dyn)
+            }
             mir::Ty::Coroutine(def, args) => {
                 let key = format!("{ty:?}");
                 if let Some(&index) = self.adt_index.get(&key) {
@@ -3299,9 +3316,19 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                     e => P::Each { elem: Box::new(e) },
                 });
             }
-            "std::boxed::Box" => {
+            "std::boxed::Box" | "std::rc::Rc" | "std::sync::Arc" => {
+                // All three are one-field aggregates holding the
+                // pointee in this value model (see the `Rc::new` /
+                // `Arc::new` builtins), and dropping the pointer
+                // drops the pointee. A `dyn` pointee is the
+                // exception: the pointer value *is* the fat
+                // pointer then, with no field to project, so the
+                // plan is the dyn plan itself.
                 let inner = self.plan(args.first()?)?;
-                return Some(at_field0(inner));
+                return Some(match inner {
+                    P::Dyn => P::Dyn,
+                    other => at_field0(other),
+                });
             }
             "std::option::Option" => {
                 let inner = self.plan(args.first()?)?;

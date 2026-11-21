@@ -199,6 +199,12 @@ pub enum Value {
         base: Box<Value>,
         concrete: String,
         traits: Vec<String>,
+        /// The concrete type's drop glue, attached at the unsizing
+        /// cast that formed this value (the vtable's drop shim, in
+        /// this model). `None` when conversion could not account
+        /// for the concrete type's glue: dropping the value is then
+        /// an explicit error.
+        drop_glue: Option<Box<crate::ir::DropGlue>>,
     },
     /// An ADT value: variant index + field values.
     Enum { variant: u32, fields: Vec<Value> },
