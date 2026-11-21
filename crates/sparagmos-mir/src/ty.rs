@@ -118,6 +118,37 @@ pub struct AdtDebugField {
     /// its type known.
     pub ty: String,
 }
+/// The niche discriminant encoding of one monomorphic enum
+/// instance, as the compiler's layout describes it: the
+/// payload-carrying variant (`untagged_variant`) has a field
+/// whose invalid values — its niche — encode the variants
+/// `niche_variants.0..=niche_variants.1`; variant
+/// `niche_variants.0 + k` is stored as the field value
+/// `niche_start + k`, and the untagged variant stores its
+/// field's own value. `tag_field` is the index of the
+/// niche-carrying field in the enum layout's top-level field
+/// list, `tag_bits` the width of the scalar stored there, and
+/// `niche_offset` its byte offset within the enum. Keyed by
+/// the rendered instance name, like [`AdtLayouts`]. Only
+/// enums whose layout uses this encoding get an entry.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EnumNiche {
+    /// Variant index of the payload-carrying variant.
+    pub untagged_variant: u32,
+    /// First and last variant indices encoded in the niche.
+    pub niche_variants: (u32, u32),
+    /// Field value encoding `niche_variants.0`.
+    pub niche_start: u128,
+    /// Index of the niche-carrying field in the enum layout.
+    pub tag_field: u32,
+    /// Width in bits of the scalar stored at the niche.
+    pub tag_bits: u32,
+    /// Byte offset of the niche scalar within the enum.
+    pub niche_offset: u64,
+}
+
+/// Per-instance niche encodings, keyed like [`AdtLayouts`].
+pub type AdtNiches = std::collections::HashMap<String, EnumNiche>;
 
 /// The kind of an ADT, for shape purposes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
