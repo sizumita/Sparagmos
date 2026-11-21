@@ -157,6 +157,13 @@ impl<'a> Interpreter<'a> {
     }
 
     /// The guest stdout captured during the most recent run.
+    /// The program being executed (the builtin dispatch reads
+    /// program-level tables such as the ADT layout table through
+    /// this accessor).
+    pub(crate) fn program(&self) -> &Program {
+        self.program
+    }
+
     pub fn output(&self) -> &str {
         &self.output
     }
