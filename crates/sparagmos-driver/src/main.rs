@@ -55,6 +55,12 @@
 //! Stable MIR (`rustc_public`), and convert it to `sparagmos_mir::Body`.
 //! Build/run instructions: see the crate README.
 //!
+//! Run mode also caps lints (`--cap-lints=allow`): the lib pin
+//! removes the entry-point reachability roots a binary gets, so a
+//! denied lint could otherwise fail the front end on `main` itself
+//! where the native binary compile -- the run's reference --
+//! succeeded; lint levels are not part of an execution verdict.
+//!
 //! Run-mode exit codes: 0 = the guest program terminated normally,
 //! 101 = the guest program panicked (message on stderr), 2 = the
 //! program could not be converted or executed (concrete reason on
@@ -3339,6 +3345,22 @@ fn main() {
         .any(|a| a == "--crate-type" || a.starts_with("--crate-type="));
     if run_mode && !caller_sets_crate_type {
         args.push("--crate-type=lib".to_string());
+    }
+    // Lint levels are not part of an execution verdict, and the
+    // lib pin above changes them: it removes the entry-point
+    // reachability roots a binary crate gets, so a lint a test
+    // denies -- `#![deny(dead_code)]` in the source, a forwarded
+    // `-D warnings` -- can fire on `main` itself and fail the
+    // front end where the native binary compile (the run's
+    // reference) succeeded. Run mode therefore caps lints at
+    // allow, restoring the native compile's outcome under the
+    // pinned crate shape. A lint that fails the native compile
+    // keeps a test from ever reaching the driver, so the cap
+    // admits nothing the reference rejected. Convert mode caps
+    // nothing: its front end mirrors compiletest's, lint errors
+    // included.
+    if run_mode {
+        args.push("--cap-lints=allow".to_string());
     }
     // Caller-supplied rustc arguments (a test's `//@ compile-flags`,
     // per-revision `--cfg`s) go last, as they do under compiletest.
