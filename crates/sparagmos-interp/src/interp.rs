@@ -2033,8 +2033,23 @@ impl<'a> Interpreter<'a> {
                 }
                 Ok(Value::Tuple(items))
             }
-            Rvalue::AggregateAdt { variant, operands } => {
-                let mut fields = Vec::with_capacity(operands.len());
+            Rvalue::AggregateAdt {
+                variant,
+                operands,
+                field_index,
+            } => {
+                // A union aggregate's single operand initializes the
+                // active field; the slots before it stay
+                // uninitialized, exactly as a field write through a
+                // projection leaves the slots it skipped over (see
+                // `navigate_mut`'s coroutine arm). Reading the active
+                // field then finds the stored value, and reading any
+                // other field is an uninitialized read, as it should
+                // be: the model does not reinterpret a union's bytes.
+                let mut fields = match field_index {
+                    Some(active) => vec![Value::Uninit; *active as usize],
+                    None => Vec::with_capacity(operands.len()),
+                };
                 for op in operands {
                     fields.push(self.eval_operand(frames, body, op)?);
                 }
@@ -2500,6 +2515,18 @@ pub(crate) fn navigate_mut<'x>(
                     fields.resize(*idx + 1, Value::Uninit);
                 }
                 return navigate_mut(&mut fields[*idx], rest, func, place);
+            }
+            // A union value's field vector is sparse: it covers
+            // only the fields written so far (see the union arm of
+            // aggregate evaluation). Writing a further field extends
+            // it, leaving the skipped slots uninitialized — the same
+            // growth the coroutine arm above performs. Struct and
+            // enum values are always fully populated, so the growth
+            // never triggers for them.
+            if let Value::Enum { fields, .. } = slot {
+                if fields.len() <= *idx {
+                    fields.resize(*idx + 1, Value::Uninit);
+                }
             }
             let items = match slot {
                 Value::Tuple(items) => items,

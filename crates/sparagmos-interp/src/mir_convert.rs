@@ -1728,6 +1728,7 @@ impl<'a> Converter<'a> {
                     def,
                     variant_index,
                     generic_args,
+                    field_index,
                     ..
                 } => {
                     // For `Range` / `RangeInclusive` the two bound
@@ -1754,11 +1755,19 @@ impl<'a> Converter<'a> {
                         // stays as the fallback for fields no place
                         // ever projects (their values are consumed by
                         // runtime support, not by MIR places).
+                        // A union aggregate carries a single operand
+                        // for its active field (`field_index`), so
+                        // that field's declared type is the context,
+                        // not field 0's.
+                        let field = match field_index {
+                            Some(active) => *active,
+                            None => i as u32,
+                        };
                         let declared = self.adt_fields.get(
                             *def,
                             generic_args,
                             *variant_index,
-                            i as u32,
+                            field,
                         );
                         let ctx = declared.or_else(|| if i < 2 { bound_ty } else { None });
                         fields.push(self.convert_operand(body, op, ctx)?);
@@ -1766,6 +1775,7 @@ impl<'a> Converter<'a> {
                     ir::Rvalue::AggregateAdt {
                         variant: *variant_index,
                         operands: fields,
+                        field_index: *field_index,
                     }
                 }
                 mir::AggregateKind::Closure { def, generic_args } => {

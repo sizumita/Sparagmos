@@ -393,7 +393,15 @@ pub enum Rvalue {
     /// tuples too (the length lives in the declared type).
     AggregateTuple(Vec<Operand>),
     /// Build an ADT value: a variant index plus field values.
-    AggregateAdt { variant: u32, operands: Vec<Operand> },
+    AggregateAdt {
+        variant: u32,
+        operands: Vec<Operand>,
+        /// The active field of a union aggregate: a union value is
+        /// built from one operand, which initializes this field
+        /// rather than field 0. `None` for struct/enum aggregates,
+        /// whose operands fill the variant's fields from index 0.
+        field_index: Option<u32>,
+    },
     /// Build a closure value: the closure body's name plus the
     /// captured environment values (the aggregate's operands, in
     /// field order).
