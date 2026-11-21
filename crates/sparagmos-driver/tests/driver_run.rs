@@ -7299,3 +7299,121 @@ fn run_mode_panic_hook_fires_with_location() {
     // The `panic!` is on line 9 of the fixture.
     assert_eq!(stdout, "hook line 9\nfired 1\n", "stdout={stdout}");
 }
+// ----- reference deref identity and DST metadata (Lane GB) -----------------
+
+const COROUTINE_RESUME_ARGS_SRC: &str = r#"
+#![feature(coroutines, coroutine_trait, stmt_expr_attributes)]
+use std::ops::{Coroutine, CoroutineState};
+use std::pin::Pin;
+
+fn main() {
+    let mut gen = #[coroutine] |x: i32| {
+        let y = yield x + 1;
+        y * 2
+    };
+    let mut pinned = Pin::new(&mut gen);
+    match pinned.as_mut().resume(41) {
+        CoroutineState::Yielded(v) => println!("yielded {v}"),
+        CoroutineState::Complete(v) => println!("complete {v}"),
+    }
+    match pinned.as_mut().resume(10) {
+        CoroutineState::Yielded(v) => println!("yielded {v}"),
+        CoroutineState::Complete(v) => println!("complete {v}"),
+    }
+}
+"#;
+
+#[test]
+fn run_mode_coroutine_resume_args_through_pin() {
+    // `Pin::as_mut` dereferences the `&mut Coroutine` the pin
+    // wraps (`DerefMut` for a mutable reference): the result is
+    // the inner reference itself, and the coroutine state machine
+    // advances across resumes with the resume argument bound.
+    let dir = temp_dir("coroutine-resume-args");
+    let src = fixture(&dir, "coroutine_resume_args.rs", COROUTINE_RESUME_ARGS_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "yielded 42\ncomplete 20\n", "stdout={stdout}");
+}
+
+const DEREF_ON_REFERENCE_SRC: &str = r#"
+use std::ops::{Deref, DerefMut};
+
+fn bump(mut r: &mut i32) {
+    *r.deref_mut() += 1;
+}
+
+fn read(r: &i32) -> i32 {
+    *r.deref()
+}
+
+fn via_generic<P: DerefMut<Target = i32>>(mut p: P) {
+    *p += 10;
+}
+
+fn main() {
+    let mut x = 1;
+    bump(&mut x);
+    println!("x {x}");
+    println!("read {}", read(&x));
+    via_generic(&mut x);
+    println!("x {x}");
+}
+"#;
+
+#[test]
+fn run_mode_deref_and_deref_mut_on_references() {
+    // `<&mut T as DerefMut>::deref_mut` returns the inner
+    // reference itself (writing through it lands in the original
+    // place), and `<&T as Deref>::deref` likewise; generic code
+    // over `P: DerefMut` instantiated with a reference reaches
+    // the same impls.
+    let dir = temp_dir("deref-on-reference");
+    let src = fixture(&dir, "deref_on_reference.rs", DEREF_ON_REFERENCE_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "x 2\nread 2\nx 12\n", "stdout={stdout}");
+}
+
+const DST_STRUCT_SRC: &str = r#"
+struct Fat<T: ?Sized> {
+    f1: isize,
+    f2: &'static str,
+    ptr: T,
+}
+
+fn foo(x: &Fat<[isize]>) {
+    println!("f1 {} f2 {} len {} second {}", x.f1, x.f2, x.ptr.len(), x.ptr[1]);
+}
+
+fn main() {
+    let f1 = Fat { f1: 5, f2: "some str", ptr: [1, 2, 3] };
+    foo(&f1);
+    let f3: &Fat<[isize]> = &f1;
+    foo(f3);
+    let b: Box<[isize]> = Box::new([4, 5, 6, 7]);
+    println!("box len {}", b.len());
+}
+"#;
+
+#[test]
+fn run_mode_dst_struct_trailing_slice_metadata() {
+    // Unsizing `&Fat<[isize; 3]>` to `&Fat<[isize]>` computes the
+    // metadata of the struct value from its trailing field: the
+    // slice length, not the unit metadata of a sized value.
+    let dir = temp_dir("dst-struct");
+    let src = fixture(&dir, "dst_struct.rs", DST_STRUCT_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "f1 5 f2 some str len 3 second 2\nf1 5 f2 some str len 3 second 2\nbox len 4\n",
+        "stdout={stdout}"
+    );
+}
