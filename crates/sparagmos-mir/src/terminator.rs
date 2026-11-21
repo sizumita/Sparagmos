@@ -902,7 +902,13 @@ pub fn inline_asm_program(
     // A non-empty program runs on the virtual register file: gate
     // every operand.
     for op in operands {
-        if !op.reg_class || op.kind == AsmOperandKind::Sym {
+        if op.kind == AsmOperandKind::Sym {
+            return None;
+        }
+        // Register operands must be register-class (an explicit
+        // register is outside the class); a const operand has no
+        // register and is gated on its literal bits below instead.
+        if op.kind != AsmOperandKind::Const && !op.reg_class {
             return None;
         }
         if !matches!(op.width, 8 | 16 | 32 | 64) {
@@ -1263,5 +1269,19 @@ mod tests {
         assert!(inline_asm_program("mov {}, {}", "", &[in32.clone(), in32.clone()], true).is_none());
         // AT&T syntax
         assert!(inline_asm_program("mov {}, {}", "ATT_SYNTAX", &[out32, in32], true).is_none());
+        // A const operand has no register: it is gated on its
+        // literal bits, not on the register class.
+        let mut konst = asm_op(Const, 32);
+        konst.reg_class = false;
+        konst.const_bits = Some(7);
+        assert!(inline_asm_program(
+            "mov {}, {1}",
+            "",
+            &[asm_op(Out, 32), konst.clone()],
+            true,
+        )
+        .is_some());
+        konst.const_bits = None;
+        assert!(inline_asm_program("mov {}, {1}", "", &[asm_op(Out, 32), konst], true).is_none());
     }
 }
