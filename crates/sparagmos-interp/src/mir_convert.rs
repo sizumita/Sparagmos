@@ -313,6 +313,38 @@ pub fn convert_program(program: &MirProgram) -> Result<ir::Program, ConvertError
 /// two arguments (the second argument's type is the closure
 /// signature's input tuple) and forwards to the closure body, so
 /// it is recognised by that shape and skipped.
+/// Whether a body is a closure's own body (as opposed to the
+/// `Fn`-trait method's shim or a genuine trait implementation):
+/// its first parameter is the closure environment type, and it is
+/// not shim-shaped — the shim takes the environment plus the whole
+/// argument tuple, matching the closure signature's single tuple
+/// input, while the closure's own body takes the environment and
+/// the unpacked parameters.
+fn body_is_closure_body(body: &mir::Body) -> bool {
+    let Some(decl) = body.local_decls.get(1) else {
+        return false;
+    };
+    let env_ty = match &decl.ty {
+        mir::Ty::Ref(_, inner, _) => inner.as_ref(),
+        other => other,
+    };
+    let mir::Ty::Closure(_, args) = env_ty else {
+        return false;
+    };
+    if body.arg_count == 2 {
+        let sig = args.iter().find_map(|t| match t {
+            mir::Ty::FnPtr(sig) => Some(sig),
+            _ => None,
+        });
+        if let (Some(sig), Some(d2)) = (sig, body.local_decls.get(2)) {
+            if sig.inputs.len() == 1 && sig.inputs[0] == d2.ty {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn closure_body_alias(f: &MirFunction) -> Option<mir::DefId> {
     let base = f.name.split(" [").next().unwrap_or(&f.name);
     if !matches!(
@@ -1056,6 +1088,15 @@ fn scan_body_aggregates(
             }
         }
     }
+}
+
+/// The dispatch chosen for a call that names an `Fn` trait method
+/// (see `Converter::fn_trait_or_direct`).
+enum FnResolution {
+    /// Evaluate the receiver as a callable value (`CallTrait`).
+    Trait(ir::FnCallKind, Vec<mir::Ty>),
+    /// Call the named body directly.
+    Direct(String),
 }
 
 struct Converter<'a> {
@@ -2539,6 +2580,51 @@ impl<'a> Converter<'a> {
     /// kind and the callee's raw generic arguments, whose first two
     /// entries are the Self type and the argument tuple type (used
     /// to type the receiver and tuple operands).
+    /// How a non-indirect call is dispatched when both the `Fn`
+    /// trait interpretation and name-based resolution are in play.
+    ///
+    /// Name-based resolution wins when it names a genuine body for
+    /// the call: an inherent `Fn` implementation on a struct value,
+    /// or the trait method's own shim (environment plus the whole
+    /// argument tuple) — both take exactly the call's arguments.
+    /// The trait interpretation wins when there is no direct body,
+    /// and when the body recorded under the trait name is a
+    /// closure's own body collected through the trait-call instance
+    /// (see [`body_is_closure_body`]): a direct call would pass
+    /// (receiver, tuple) to a body of the wrong arity and
+    /// convention, while the trait call evaluates the receiver as a
+    /// callable value, which is the convention that body expects.
+    fn fn_trait_or_direct(
+        &self,
+        func: &mir::Operand,
+        arg_count: usize,
+    ) -> Option<FnResolution> {
+        let trait_call = self
+            .resolve_fn_trait_call(func)
+            .filter(|_| arg_count == 2);
+        let direct = self
+            .resolve_callee(func)
+            .or_else(|| self.resolve_impl_callee(func));
+        match (trait_call, direct) {
+            (Some(trait_call), Some(name)) => {
+                let mis_keyed = self
+                    .bodies
+                    .get(&name)
+                    .is_some_and(|b| body_is_closure_body(b));
+                if mis_keyed {
+                    Some(FnResolution::Trait(trait_call.0, trait_call.1))
+                } else {
+                    Some(FnResolution::Direct(name))
+                }
+            }
+            (Some(trait_call), None) => {
+                Some(FnResolution::Trait(trait_call.0, trait_call.1))
+            }
+            (None, Some(name)) => Some(FnResolution::Direct(name)),
+            (None, None) => None,
+        }
+    }
+
     fn resolve_fn_trait_call(
         &self,
         func: &mir::Operand,
@@ -2723,55 +2809,40 @@ impl<'a> Converter<'a> {
                         destination: self.convert_place(destination)?,
                         target: target.map(|b| ir::BasicBlock(b.index())),
                     }
-                } else if let Some((kind, raw_generic_args)) = self
-                    .resolve_fn_trait_call(func)
-                    .filter(|_| args.len() == 2)
-                {
-                    // A call through the `Fn` / `FnMut` / `FnOnce`
-                    // trait methods — how rustc MIR calls a closure:
-                    // receiver (the callable or a reference to it)
-                    // plus the argument tuple. This interpretation
-                    // wins over the name-based resolution below: the
-                    // trait item's own name is not a reliable direct
-                    // callee, because the driver may have collected
-                    // an unrelated body under it — a closure body
-                    // reached through a `call_once` instance is
-                    // recorded under the trait method's name, with
-                    // the closure's environment as its only
-                    // parameter — and a direct call would then pass
-                    // (receiver, tuple) to a body of the wrong arity
-                    // and convention. The trait call instead
-                    // evaluates the receiver as a callable value,
-                    // which is the convention every `Fn`
-                    // implementation (closure, function item,
-                    // pointer, smart-pointer wrapper) is reached by.
-                    let receiver =
-                        self.convert_operand(body, &args[0], raw_generic_args.first())?;
-                    let tuple =
-                        self.convert_operand(body, &args[1], raw_generic_args.get(1))?;
-                    ir::TerminatorKind::CallTrait {
-                        kind,
-                        receiver,
-                        args: tuple,
-                        destination: self.convert_place(destination)?,
-                        target: target.map(|b| ir::BasicBlock(b.index())),
-                    }
-                } else if let Some(name) = self
-                    .resolve_callee(func)
-                    .or_else(|| self.resolve_impl_callee(func))
-                {
-                    let callee = self.bodies.get(&name);
-                    let mut ir_args = Vec::with_capacity(args.len());
-                    for (i, arg) in args.iter().enumerate() {
-                        let ctx =
-                            callee.and_then(|b| b.local_decls.get(i + 1).map(|d| d.ty.clone()));
-                        ir_args.push(self.convert_operand(body, arg, ctx.as_ref())?);
-                    }
-                    ir::TerminatorKind::Call {
-                        func: name,
-                        args: ir_args,
-                        destination: self.convert_place(destination)?,
-                        target: target.map(|b| ir::BasicBlock(b.index())),
+                } else if let Some(name) = self.fn_trait_or_direct(func, args.len()) {
+                    match name {
+                        FnResolution::Trait(kind, raw_generic_args) => {
+                            let receiver = self.convert_operand(
+                                body,
+                                &args[0],
+                                raw_generic_args.first(),
+                            )?;
+                            let tuple = self
+                                .convert_operand(body, &args[1], raw_generic_args.get(1))?;
+                            ir::TerminatorKind::CallTrait {
+                                kind,
+                                receiver,
+                                args: tuple,
+                                destination: self.convert_place(destination)?,
+                                target: target.map(|b| ir::BasicBlock(b.index())),
+                            }
+                        }
+                        FnResolution::Direct(name) => {
+                            let callee = self.bodies.get(&name);
+                            let mut ir_args = Vec::with_capacity(args.len());
+                            for (i, arg) in args.iter().enumerate() {
+                                let ctx = callee.and_then(|b| {
+                                    b.local_decls.get(i + 1).map(|d| d.ty.clone())
+                                });
+                                ir_args.push(self.convert_operand(body, arg, ctx.as_ref())?);
+                            }
+                            ir::TerminatorKind::Call {
+                                func: name,
+                                args: ir_args,
+                                destination: self.convert_place(destination)?,
+                                target: target.map(|b| ir::BasicBlock(b.index())),
+                            }
+                        }
                     }
                 } else if let Some((name, generic_args, raw_generic_args)) =
                     self.resolve_external_callee(func)
