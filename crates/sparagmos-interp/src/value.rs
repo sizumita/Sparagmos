@@ -115,6 +115,23 @@ pub enum RefTarget {
         name: String,
         projection: Vec<RefProj>,
     },
+    /// A heap allocation's storage in the interpreter's
+    /// program-level allocation store, identified by the
+    /// allocation id a `Box` value carries as its single field.
+    /// A box's pointee lives in the store, not inside the box
+    /// aggregate, so copying or moving the box value (into a
+    /// callee frame, a pattern scrutinee, a return slot) copies
+    /// only the id — the pointer — and a reference to the pointee
+    /// denotes `(id, projection)` here, never a place in the
+    /// frame that happened to hold a copy of the box. That is
+    /// what lets a pointee reference outlive the frame that
+    /// formed it, exactly as a real heap pointer does. Reads and
+    /// writes resolve against the store entry; the entry is
+    /// removed when the owning box's drop glue completes.
+    Alloc {
+        id: u64,
+        projection: Vec<RefProj>,
+    },
     /// The null pointer: denotes no place and no value. Produced by
     /// `ptr::null` / `ptr::null_mut`; equal only to itself, and any
     /// dereference of it is an explicit error.
@@ -346,6 +363,17 @@ impl fmt::Display for RefTarget {
             RefTarget::Value(_) => write!(f, "constant aggregate"),
             RefTarget::Static { name, projection } => {
                 write!(f, "static {name}")?;
+                for proj in projection {
+                    match proj {
+                        RefProj::Field(i) => write!(f, ".{i}")?,
+                        RefProj::Index(i) => write!(f, "[{i}]")?,
+                        RefProj::Downcast(v) => write!(f, " as variant {v}")?,
+                    }
+                }
+                Ok(())
+            }
+            RefTarget::Alloc { id, projection } => {
+                write!(f, "allocation #{id}")?;
                 for proj in projection {
                     match proj {
                         RefProj::Field(i) => write!(f, ".{i}")?,

@@ -4738,3 +4738,487 @@ fn run_mode_test_crate_without_tests_still_enters_harness() {
         "the user's main is not the entry of a test crate and must not run"
     );
 }
+
+// ----- box allocation identity (Lane EP) ------------------------------------
+
+// A built `Box`'s pointee lives in the interpreter's allocation
+// store and the box value is the allocation pointer, so a
+// reference to the pointee names the allocation — never a place
+// in the frame that happened to hold a copy of the box. The
+// fixtures below are the rustc suite programs whose run used to
+// fail with "reference into finished frame #N" for exactly
+// that reason (directives stripped; the feature attributes are
+// accepted because the driver is built and run with
+// RUSTC_BOOTSTRAP=1, like compiletest).
+
+const FUNC_ARG_REF_PATTERN_SRC: &str = r#"// Test argument patterns where we create refs to the inside of
+// boxes. Make sure that we don't free the box as we match the
+// pattern.
+
+#![feature(deref_patterns)]
+
+fn getaddr(deref!(ref x): Box<usize>) -> *const usize {
+    let addr: *const usize = &*x;
+    addr
+}
+
+fn checkval(deref!(ref x): Box<usize>) -> usize {
+    *x
+}
+
+pub fn main() {
+    let obj: Box<_> = Box::new(1);
+    let objptr: *const usize = &*obj;
+    let xptr = getaddr(obj);
+    assert_eq!(objptr, xptr);
+
+    let obj = Box::new(22);
+    assert_eq!(checkval(obj), 22);
+}"#;
+
+#[test]
+fn run_mode_box_pointee_ref_pattern_arg() {
+    // a by-value `Box` argument matched with a ref pattern: the reference the pattern forms names the box's allocation, so the pointer taken in the callee equals the one taken before the move, and the box's drop at the callee's end does not invalidate it
+    let dir = temp_dir("func-arg-ref-pattern");
+    let src = fixture(&dir, "func_arg_ref_pattern.rs", FUNC_ARG_REF_PATTERN_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the program must run to completion; stderr={stderr}"
+    );
+}
+
+const UNSAFE_PTR_SRC: &str = r#"// Test that we can use raw ptrs when using `capture_disjoint_fields`.
+
+#![allow(dead_code)]
+
+#[derive(Debug)]
+struct S {
+    s: String,
+    t: String,
+}
+
+struct T(*const S);
+
+fn unsafe_imm() {
+    let s = "".into();
+    let t = "".into();
+    let my_speed: Box<S> = Box::new(S { s, t });
+
+    let p : *const S = Box::into_raw(my_speed);
+    let t = T(p);
+
+    let c = || unsafe {
+        println!("{:?}", (*t.0).s);
+    };
+
+    c();
+}
+
+fn unsafe_mut() {
+    let s = "".into();
+    let t = "".into();
+    let mut my_speed: Box<S> = Box::new(S { s, t });
+    let p : *mut S = &mut *my_speed;
+
+    let c = || {
+        let x = unsafe { &mut (*p).s };
+        *x = "s".into();
+    };
+    c();
+}
+
+fn main() {
+    unsafe_mut();
+    unsafe_imm();
+}"#;
+
+#[test]
+fn run_mode_box_into_raw_pointee_outlives_frame() {
+    // `Box::into_raw` leaks the allocation: closures created afterwards dereference the raw pointer into storage no frame owns any more, and must still read (and write) the pointee
+    let dir = temp_dir("unsafe-ptr");
+    let src = fixture(&dir, "unsafe_ptr.rs", UNSAFE_PTR_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the program must run to completion; stderr={stderr}"
+    );
+}
+
+const DEREF_MUT_CLOSURE_DROP_ORDER_SRC: &str = r#"//! Regression test for https://github.com/rust-lang/rust/issues/16774
+
+#![feature(deref_patterns)]
+
+use std::ops::{Deref, DerefMut};
+
+struct X(Box<isize>);
+
+static mut DESTRUCTOR_RAN: bool = false;
+
+impl Drop for X {
+    fn drop(&mut self) {
+        unsafe {
+            assert!(!DESTRUCTOR_RAN);
+            DESTRUCTOR_RAN = true;
+        }
+    }
+}
+
+impl Deref for X {
+    type Target = isize;
+
+    fn deref(&self) -> &isize {
+        let &X(ref x) = self;
+        x
+    }
+}
+
+impl DerefMut for X {
+    fn deref_mut(&mut self) -> &mut isize {
+        let &mut X(ref mut x) = self;
+        x
+    }
+}
+
+fn main() {
+    {
+        let mut test = X(Box::new(5));
+        {
+            let mut change = || { *test = 10 };
+            change();
+        }
+        assert_eq!(*test, 10);
+    }
+    assert!(unsafe { DESTRUCTOR_RAN });
+}"#;
+
+#[test]
+fn run_mode_box_deref_mut_write_through_pattern_copy() {
+    // a user `DerefMut` impl whose pattern match copies the `X` value (and its `Box` field) into its own frame: the `&mut` it returns names the box's allocation, so the closure's write through it is observed by the owner's later read, and the drop order is preserved
+    let dir = temp_dir("deref-mut-closure-drop-order");
+    let src = fixture(&dir, "deref_mut_closure_drop_order.rs", DEREF_MUT_CLOSURE_DROP_ORDER_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the program must run to completion; stderr={stderr}"
+    );
+}
+
+const DST_DEREF_SRC: &str = r#"// Test that a custom deref with a fat pointer return type does not ICE
+
+
+use std::ops::Deref;
+
+pub struct Arr {
+    ptr: Box<[usize]>
+}
+
+impl Deref for Arr {
+    type Target = [usize];
+
+    fn deref(&self) -> &[usize] {
+        &*self.ptr
+    }
+}
+
+pub fn foo(arr: &Arr) {
+    assert_eq!(arr.len(), 3);
+    let x: &[usize] = &**arr;
+    assert_eq!(x[0], 1);
+    assert_eq!(x[1], 2);
+    assert_eq!(x[2], 3);
+}
+
+fn main() {
+    let a = Arr { ptr: Box::new([1, 2, 3]) };
+    foo(&a);
+}"#;
+
+#[test]
+fn run_mode_box_dst_deref() {
+    // a custom `Deref` returning `&*self.ptr` for a `Box<[usize]>`: the slice reference is formed from a copy of the box inside the `Deref` shim and must name the allocation, not the shim's frame
+    let dir = temp_dir("dst-deref");
+    let src = fixture(&dir, "dst_deref.rs", DST_DEREF_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the program must run to completion; stderr={stderr}"
+    );
+}
+
+const DST_DEREF_MUT_SRC: &str = r#"// Test that a custom deref with a fat pointer return type does not ICE
+
+
+use std::ops::{Deref, DerefMut};
+
+pub struct Arr {
+    ptr: Box<[usize]>
+}
+
+impl Deref for Arr {
+    type Target = [usize];
+
+    fn deref(&self) -> &[usize] {
+        panic!();
+    }
+}
+
+impl DerefMut for Arr {
+    fn deref_mut(&mut self) -> &mut [usize] {
+        &mut *self.ptr
+    }
+}
+
+pub fn foo(arr: &mut Arr) {
+    let x: &mut [usize] = &mut **arr;
+    assert_eq!(x[0], 1);
+    assert_eq!(x[1], 2);
+    assert_eq!(x[2], 3);
+}
+
+fn main() {
+    let mut a = Arr { ptr: Box::new([1, 2, 3]) };
+    foo(&mut a);
+}"#;
+
+#[test]
+fn run_mode_box_dst_deref_mut() {
+    // the `DerefMut` counterpart: `&mut *self.ptr` for a `Box<[usize]>` names the allocation, so element reads through it in the caller observe the array
+    let dir = temp_dir("dst-deref-mut");
+    let src = fixture(&dir, "dst_deref_mut.rs", DST_DEREF_MUT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the program must run to completion; stderr={stderr}"
+    );
+}
+
+const REGIONS_DEPENDENT_ADDR_OF_SRC: &str = r#"// Test lifetimes are linked properly when we create dependent region pointers.
+// Issue #3148.
+#![feature(deref_patterns)]
+
+struct A {
+    value: B
+}
+
+struct B {
+    v1: isize,
+    v2: [isize; 3],
+    v3: Vec<isize> ,
+    v4: C,
+    v5: Box<C>,
+    v6: Option<C>
+}
+
+#[derive(Copy, Clone)]
+struct C {
+    f: isize
+}
+
+fn get_v1(a: &A) -> &isize {
+    // Region inferencer must deduce that &v < L2 < L1
+    let foo = &a.value; // L1
+    &foo.v1             // L2
+}
+
+fn get_v2(a: &A, i: usize) -> &isize {
+    let foo = &a.value;
+    &foo.v2[i]
+}
+
+fn get_v3(a: &A, i: usize) -> &isize {
+    let foo = &a.value;
+    &foo.v3[i]
+}
+
+fn get_v4(a: &A, _i: usize) -> &isize {
+    let foo = &a.value;
+    &foo.v4.f
+}
+
+fn get_v5(a: &A, _i: usize) -> &isize {
+    let foo = &a.value;
+    &foo.v5.f
+}
+
+fn get_v6_a(a: &A, _i: usize) -> &isize {
+    match a.value.v6 {
+        Some(ref v) => &v.f,
+        None => panic!()
+    }
+}
+
+fn get_v6_b(a: &A, _i: usize) -> &isize {
+    match *a {
+        A { value: B { v6: Some(ref v), .. } } => &v.f,
+        _ => panic!()
+    }
+}
+
+fn get_v6_c(a: &A, _i: usize) -> &isize {
+    match a {
+        &A { value: B { v6: Some(ref v), .. } } => &v.f,
+        _ => panic!()
+    }
+}
+
+fn get_v5_ref(a: &A, _i: usize) -> &isize {
+    match &a.value {
+        &B {v5: C {f: ref v}, ..} => v
+    }
+}
+
+pub fn main() {
+    let a = A {value: B {v1: 22,
+                         v2: [23, 24, 25],
+                         v3: vec![26, 27, 28],
+                         v4: C { f: 29 },
+                         v5: Box::new(C { f: 30 }),
+                         v6: Some(C { f: 31 })}};
+
+    let p = get_v1(&a);
+    assert_eq!(*p, a.value.v1);
+
+    let p = get_v2(&a, 1);
+    assert_eq!(*p, a.value.v2[1]);
+
+    let p = get_v3(&a, 1);
+    assert_eq!(*p, a.value.v3[1]);
+
+    let p = get_v4(&a, 1);
+    assert_eq!(*p, a.value.v4.f);
+
+    let p = get_v5(&a, 1);
+    assert_eq!(*p, a.value.v5.f);
+
+    let p = get_v6_a(&a, 1);
+    assert_eq!(*p, a.value.v6.unwrap().f);
+
+    let p = get_v6_b(&a, 1);
+    assert_eq!(*p, a.value.v6.unwrap().f);
+
+    let p = get_v6_c(&a, 1);
+    assert_eq!(*p, a.value.v6.unwrap().f);
+
+    let p = get_v5_ref(&a, 1);
+    assert_eq!(*p, a.value.v5.f);
+}"#;
+
+#[test]
+fn run_mode_box_dependent_addr_of() {
+    // `&foo.v5.f` where `v5: Box<C>` is copied out of the borrowed struct into the callee: the returned reference names the box's allocation and stays valid after the callee returns
+    let dir = temp_dir("regions-dependent-addr-of");
+    let src = fixture(&dir, "regions_dependent_addr_of.rs", REGIONS_DEPENDENT_ADDR_OF_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the program must run to completion; stderr={stderr}"
+    );
+}
+
+const ARBITRARY_SELF_TYPES_SRC: &str = r#"#![feature(arbitrary_self_types)]
+#![allow(unused_allocation)]
+
+struct SmartPtr<T: ?Sized>(T);
+
+impl<T: ?Sized> std::ops::Receiver for SmartPtr<T> {
+    type Target = T;
+}
+
+trait Trait {
+    fn trait_method<'a>(self: &'a Box<SmartPtr<Self>>) -> &'a [i32];
+}
+
+impl Trait for Vec<i32> {
+    fn trait_method<'a>(self: &'a Box<SmartPtr<Self>>) -> &'a [i32] {
+        &(**self).0
+    }
+}
+
+fn main() {
+    let v = vec![1, 2, 3];
+
+    assert_eq!(&[1, 2, 3], Box::new(SmartPtr(v)).trait_method());
+}"#;
+
+#[test]
+fn run_mode_box_arbitrary_self_types_receiver() {
+    // `&(**self).0` with `self: &Box<SmartPtr<Self>>`: the box is copied into the method's frame and the returned slice reference names the pointee chain inside the allocation
+    let dir = temp_dir("arbitrary-self-types");
+    let src = fixture(&dir, "arbitrary_self_types.rs", ARBITRARY_SELF_TYPES_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the program must run to completion; stderr={stderr}"
+    );
+}
+
+const BOX_PTR_IDENTITY_SRC: &str = r#"
+fn getaddr(b: Box<usize>) -> *const usize {
+    &*b as *const usize
+}
+fn main() {
+    let b = Box::new(3usize);
+    let p1 = &*b as *const usize;
+    let p2 = getaddr(b);
+    assert_eq!(p1, p2);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_box_pointer_identity_across_move() {
+    // Pointer identity of a moved box: the address taken from
+    // the box before the move and the address extracted from
+    // the moved box inside the callee are the same address,
+    // because both name the one allocation.
+    let dir = temp_dir("box-ptr-identity");
+    let src = fixture(&dir, "box_ptr_identity.rs", BOX_PTR_IDENTITY_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "pointer identity across a move must hold; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+const BOX_INTO_RAW_WRITE_SRC: &str = r#"
+fn main() {
+    let p = Box::into_raw(Box::new(7));
+    println!("{}", unsafe { *p });
+    unsafe { *p = 9; }
+    println!("{}", unsafe { *p });
+}
+"#;
+
+#[test]
+fn run_mode_box_into_raw_write_and_read_back() {
+    // A leaked allocation stays readable and writable through
+    // the raw pointer after `into_raw`'s frame is gone.
+    let dir = temp_dir("box-into-raw-write");
+    let src = fixture(&dir, "box_into_raw_write.rs", BOX_INTO_RAW_WRITE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the leaked pointee must stay accessible; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n9\n");
+}

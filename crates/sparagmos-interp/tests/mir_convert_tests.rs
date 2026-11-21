@@ -1440,10 +1440,11 @@ fn box_cast(operand: mir::Operand, dest: u32, target: mir::Ty) -> mir::Statement
 
 /// The shape the interpreter actually receives for
 /// `let b = Box::new(41); *b` when the box comes from the
-/// `Box::new` builtin: the builtin stores the pointee directly in
-/// the box value, so there is no Unique/NonNull wrapper chain in
-/// the value, while rustc's deref elaboration still reads the
-/// box's field 0 (the `Unique`) and casts it with
+/// `Box::new` builtin: the builtin allocates the pointee in the
+/// allocation store and the box value's single field is the
+/// allocation pointer, so there is no Unique/NonNull wrapper
+/// chain in the value, while rustc's deref elaboration still
+/// reads the box's field 0 (the `Unique`) and casts it with
 /// `BoxDerefTransmute`. Regression test: this used to fail with
 /// "type mismatch in BoxDerefTransmute cast: expected pointer
 /// wrapper ..., found signed integer" on every real program,
@@ -1486,16 +1487,45 @@ fn box_deref_transmute_builtin_box_field_reads_pointee() {
 
 #[test]
 fn box_deref_transmute_builtin_box_field_writes_pointee() {
-    // Write through the extracted pointer, then read the pointee
-    // back out of the box's field 0: the pointer must name the
-    // box's own storage.
-    let body = builtin_box_body(vec![
-        assign(place(2).deref(), mir::Rvalue::Use(const_i32(42))),
-        assign(
-            place(0),
-            mir::Rvalue::Use(mir::Operand::Copy(field(1, 0, adt_i32_ty(UNIQUE_DEF)))),
-        ),
-    ]);
+    // Write through the extracted pointer, then extract the
+    // pointer from the box a second time and read the pointee
+    // back through it: both extractions must name the box's one
+    // allocation, so the second read observes the first write.
+    let body = mir::Body::new(
+        decls(&[
+            i32_ty(),
+            adt_i32_ty(BOX_DEF),
+            raw_ptr_i32_ty(),
+            raw_ptr_i32_ty(),
+        ]),
+        0,
+        vec![
+            block(
+                vec![],
+                call(fndef_operand(BOX_NEW_DEF), const_i32(41), 1, 1),
+            ),
+            block(
+                vec![
+                    box_cast(
+                        mir::Operand::Copy(field(1, 0, adt_i32_ty(UNIQUE_DEF))),
+                        2,
+                        raw_ptr_i32_ty(),
+                    ),
+                    assign(place(2).deref(), mir::Rvalue::Use(const_i32(42))),
+                    box_cast(
+                        mir::Operand::Copy(field(1, 0, adt_i32_ty(UNIQUE_DEF))),
+                        3,
+                        raw_ptr_i32_ty(),
+                    ),
+                    assign(
+                        place(0),
+                        mir::Rvalue::Use(mir::Operand::Copy(place(3).deref())),
+                    ),
+                ],
+                ret(),
+            ),
+        ],
+    );
     let prog = box_prog(body, "unbox_builtin_write");
     let v = interpret_mir(&prog, "unbox_builtin_write", vec![])
         .expect("builtin box write must run");
