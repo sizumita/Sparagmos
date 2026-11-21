@@ -2581,14 +2581,16 @@ impl<'a> Interpreter<'a> {
                         )),
                     }
                 } else if self_ty.starts_with('&') {
-                    // A reference's own `Deref` is the identity on
-                    // the pointer value: `<&T as Deref>::deref` and
-                    // `<&mut T as Deref>::deref` both return the
-                    // inner reference itself. Generic code over
+                    // A reference's own `Deref` returns the inner
+                    // reference itself: `<&T as Deref>::deref` and
+                    // `<&mut T as Deref>::deref` take `&self`, so
+                    // the argument names the place holding the
+                    // inner reference, and reading it exactly once
+                    // yields that reference. Generic code over
                     // `P: Deref` instantiated with a reference (the
                     // `Pin<&mut T>` machinery, `ManuallyDrop`
                     // access, ...) reaches this arm.
-                    Ok(self.resolve_value(frames, &vals[0])?)
+                    Ok(self.read_ref_once(frames, &vals[0])?)
                 } else if self_ty.starts_with("std::pin::Pin<") {
                     // `Pin<P>` derefs exactly as the pointer it
                     // wraps: the wrapper is a one-field aggregate
@@ -3715,13 +3717,16 @@ impl<'a> Interpreter<'a> {
                     }
                 } else if self_ty.starts_with("&mut ") {
                     // A mutable reference's own `DerefMut` returns
-                    // the inner `&mut T` itself. The coroutine
+                    // the inner `&mut T` itself: the argument is
+                    // `&mut self`, naming the place that holds the
+                    // inner reference, so reading it exactly once
+                    // yields that reference. The coroutine
                     // runtime paths reach this arm constantly:
                     // `Pin<&mut C>` is built by dereferencing the
                     // `&mut C` it wraps, and async drop glue
                     // dereferences `&mut ManuallyDrop<C>` /
                     // `&mut Pin<..>` the same way.
-                    Ok(self.resolve_value(frames, &vals[0])?)
+                    Ok(self.read_ref_once(frames, &vals[0])?)
                 } else if self_ty.starts_with("std::pin::Pin<") {
                     // `Pin<P>` derefs exactly as the pointer it
                     // wraps: the wrapper is a one-field aggregate
@@ -5407,6 +5412,33 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                 Value::Ref(RefTarget::Value(Box::new(one_field_value(value, what)?)))
             }
         })
+    }
+
+    /// Read a reference value exactly one level: the value it
+    /// names, without following that value further if it is itself
+    /// a reference. The `Deref` / `DerefMut` impls for references
+    /// have exactly this shape: `deref(&&T) -> &T` reads the
+    /// argument place once and returns the inner reference itself.
+    /// (`resolve_value` follows the chain to the final pointee,
+    /// which hands the caller the pointee where the inner
+    /// reference was asked for.)
+    pub(crate) fn read_ref_once(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+    ) -> InterpResult<Value> {
+        match value {
+            // The null and address-only pointers denote no data;
+            // one more level of reading is the value itself.
+            Value::Ref(RefTarget::Null) | Value::Ref(RefTarget::Address(_)) => {
+                Ok(value.clone())
+            }
+            Value::Ref(_) => {
+                let target = self.deref_value(frames, value)?;
+                self.read_resolved(frames, &target)
+            }
+            _ => Ok(value.clone()),
+        }
     }
 
     /// Follow references in `value` until a non-reference value.
