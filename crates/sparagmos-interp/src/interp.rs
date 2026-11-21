@@ -2726,6 +2726,29 @@ impl<'a> Interpreter<'a> {
 
     /// Validate / wrap a value being stored into a typed direct local.
     fn normalize_for_ty(value: Value, ty: Option<&Ty>) -> InterpResult<Value> {
+        // A scalar place whose value arrives as a one-field wrapper
+        // aggregate: reading through a raw pointer into a transparent
+        // wrapper (`UnsafeCell<T>`, the `AtomicUsize`-family structs,
+        // any one-field struct) yields the wrapper's aggregate value,
+        // because the pointer names the wrapper place itself and the
+        // model has no separate address for the field. The wrapper's
+        // only field IS the scalar at that address (the layout fact
+        // the pointer arithmetic in the source relies on), so the
+        // store unwraps it, recursively for nested wrappers.
+        if matches!(
+            ty,
+            Some(Ty::Bool) | Some(Ty::Int(_)) | Some(Ty::Uint(_)) | Some(Ty::Float(_))
+        ) {
+            if let Value::Enum {
+                variant: 0,
+                fields,
+            } = &value
+            {
+                if fields.len() == 1 {
+                    return Self::normalize_for_ty(fields[0].clone(), ty);
+                }
+            }
+        }
         match (ty, &value) {
             (Some(Ty::Bool), Value::Bool(_))
             | (Some(Ty::Unit), Value::Unit)
@@ -3260,20 +3283,48 @@ impl<'a> Interpreter<'a> {
                     }
                 }
                 let target = self.resolve_place(frames, body, place)?;
-                match target {
+                // A pointer to an unsized pointee (a slice or
+                // `str`) is a fat pointer: it must carry the
+                // pointee's length as its metadata, or `PtrMetadata`
+                // and the slice consumers downstream see a thin
+                // pointer whose metadata was dropped when the place
+                // was resolved. The length is the element (or byte)
+                // count of the value the place currently holds.
+                // Where that value cannot be read (an uninitialised
+                // or address-only pointee), the thin pointer is
+                // formed as before and the metadata consumers report
+                // the gap at their own site.
+                let fat_len = match dest_ty {
+                    Some(Ty::Ref(inner))
+                        if matches!(&**inner, Ty::Slice(_) | Ty::Str) =>
+                    {
+                        self.read_resolved(frames, &target)
+                            .ok()
+                            .and_then(|v| v.len())
+                    }
+                    _ => None,
+                };
+                let thin = match target {
                     Resolved::Place {
                         frame_pos,
                         local,
                         projection,
-                    } => Ok(Value::Ref(RefTarget::place(
+                    } => Value::Ref(RefTarget::place(
                         frames[frame_pos].id,
                         local,
                         projection,
-                    ))),
-                    Resolved::Value(value) => Ok(Value::Ref(RefTarget::Value(Box::new(value)))),
+                    )),
+                    Resolved::Value(value) => Value::Ref(RefTarget::Value(Box::new(value))),
                     Resolved::Static { name, projection } => {
-                        Ok(Value::Ref(RefTarget::Static { name, projection }))
+                        Value::Ref(RefTarget::Static { name, projection })
                     }
+                };
+                match fat_len {
+                    Some(len) => Ok(Value::FatRef {
+                        base: Box::new(thin),
+                        len,
+                    }),
+                    None => Ok(thin),
                 }
             }
             Rvalue::Len(place) => {
@@ -3309,11 +3360,13 @@ impl<'a> Interpreter<'a> {
                             Ok(Value::Int(*discr))
                         }
                     }
-                    other => Err(InterpError::type_mismatch(
-                        format!("Discriminant of {place}"),
-                        "ADT value",
-                        other.kind_name(),
-                    )),
+                    // A non-ADT value (a scalar, a tuple, a
+                    // reference, ...) has no variants: its
+                    // discriminant is 0. This is the shape
+                    // `mem::discriminant(&10)` produces — the
+                    // rvalue is well-defined for every type, and
+                    // only enum-like values carry a real tag.
+                    _ => Ok(Value::Int(0)),
                 }
             }
             Rvalue::CopyForDeref(place) => {
@@ -3483,6 +3536,15 @@ pub(crate) fn project_value(
                     .get(*idx)
                     .map(|byte| Value::Uint(*byte as u128))
                     .ok_or_else(|| index_oob(s.len(), *idx))?,
+                // A `Vec` value is the aggregate of its elements
+                // (see the `Vec::from` / `Deref` builtin model):
+                // indexing the vector's own place reads the
+                // element field. No other ADT value can be the
+                // base of an index projection in valid MIR.
+                Value::Enum { ref fields, .. } => fields
+                    .get(*idx)
+                    .cloned()
+                    .ok_or_else(|| index_oob(fields.len(), *idx))?,
                 ref other => {
                     return Err(InterpError::type_mismatch(
                         format!("index projection on {place}"),
@@ -3594,6 +3656,15 @@ pub(crate) fn navigate_mut<'x>(
                     return Err(index_oob(items.len(), *idx));
                 }
                 navigate_mut(&mut items[*idx], rest, func, place)
+            }
+            // A `Vec` value is the aggregate of its elements:
+            // indexing the vector's own place writes the element
+            // field (the read direction in `project_value`).
+            Value::Enum { fields, .. } => {
+                if *idx >= fields.len() {
+                    return Err(index_oob(fields.len(), *idx));
+                }
+                navigate_mut(&mut fields[*idx], rest, func, place)
             }
             Value::Bytes(b) => {
                 if *idx >= b.len() {
