@@ -1857,6 +1857,73 @@ Vec::drain 等) へ前進した。issue-63787 は符号文脈を失った
 のみ存在する RefCell の借用 (ライブな場所が無くフラグの
 置き場が無いため)。
 
+### ADT レイアウト表 (Lane CG, 2026-11-21)
+
+`std::mem::size_of::<T>()` / `align_of::<T>()` / `size_of_val` は
+スカラーとスカラーのタプル・配列にしか答えられず、ユーザー ADT
+では明示的 Unsupported だった (インタプリタにレイアウト情報が
+無いため)。被害テストの代表は Lane BV 以降 `align_of::<Aligned>()`
+で正直に落ちていた deriving-with-repr-packed-3。
+
+設計 (AdtDiscriminants と同じ運搬パターン):
+
+- ドライバが rustc_public の `Ty::layout()` でコンパイラ自身の
+  レイアウトを引き、(size, align) を単相化インスタンスの描画名
+  (builtins が見る ty_tag 文字列) をキーに表へ記録する。
+  レイアウトは単相化ごとに決まるのでキーはインスタンス名であり、
+  repr(C) / repr(packed) / repr(align) と enum のタグ配置は
+  コンパイラ計算済みの値をそのまま使う (手計算しない)。
+- sparagmos-mir に `AdtLayouts` 型を追加し、MirProgram →
+  interp の ir::Program へ運ぶ。size_of / align_of / size_of_val
+  のビルトインは静的スカラー表の次にこの表を引く。
+- クエリが答えられない型 (unsized 形状、後述のスクリーン対象)
+  はエントリを持たず、明示的 Unsupported のまま。
+
+クエリの安全性 (実測で判明した2点):
+
+- レイアウト計算自体が ICE する ADT がある: unsized フィールド
+  を非末尾に持つ型 (trivial_bounds 前提の形状) がそれで、
+  rustc 自身もそのレイアウトを計算しない。変換時に宣言フィールド
+  型 (`FieldDef::ty`、代入も正規化もしない) を走査して
+  「unsized になり得る」ADT インスタンスを事前に除外する
+  (スライス / str / トレイトオブジェクト / エイリアス /
+  パラメータ経由を再帰的に判定、パラメータ解決は1フレーム分)。
+  代入版の `ty_with_args` は射影を正規化するため、正規化できない
+  射影 (issue-107691) で致命的に失敗する — 使わない。
+- クエリ自体は `catch_unwind` で包み、キー単位の試行済み管理を
+  スクリーンより前に置く (再スクリーンのコストで
+  next-solver/dedup-regions が制限時間を超えた回帰を実測し、
+  この順序で解消した)。
+
+検証: 意味テスト (表引き・汎用インスタンスキー・未記録 ADT の
+名前付きエラー) とドライバ e2e (repr(C) のパディング、packed、
+ペイロード付き enum、ネスト、汎用インスタンス、size_of_val、
+packed 構造体への derive Eq チェーン)。スモークでは native
+1.100.0 とバイト一致 (Padded 12/4、Packed 5/1、enum 16/8、
+ネスト 16/4、Pair 16/8、size_of_val 12)。
+deriving-with-repr-packed-3 は exit 0。
+ワークスペース 423 passed / 0 failed、ドライバ 82 passed /
+0 failed、コーパス 47/47。
+
+実測効果: subset-cg3 (本レーンのドライバによる単一ラン、
+/mnt/raid/measure/subset-cg3.json) で指標2(b) 70.229%
+(both12 の 69.936% から上昇)、both12 比の回帰は 0 件。
+本レーン帰属の改善は 9 件: deriving-with-repr-packed-3、
+enum/enum-discrim-manual-sizing、packed/packed-struct-size、
+packed/packed-tuple-struct-size、simd/size-align、
+structs-enums/enum-layout-optimization、
+structs-enums/multiple-reprs、
+symbol-names/struct-constructor-mangling、
+traits/method-on-deeply-nested-struct-perf。
+同じランに含まれる incremental スイートの +64 件は Lane CL の
+寄与であり、本レーンの数字には数えない。中間ランで一度だけ
+観測された境界フリップ (layout-cycle 等) は cg3 では再現せず、
+改善にも数えていない。
+
+明示的に未対応のまま: unsized 型とトレイトオブジェクト、
+スクリーンで除外された「unsized になり得る」ADT インスタンス、
+レイアウトクエリが失敗する型。
+
 ---
 
 ## 測定の規律
