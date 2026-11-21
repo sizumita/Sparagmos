@@ -483,6 +483,28 @@ struct DeferredFn {
 /// collection's cap for foreign bodies.
 const MAX_LOCAL_INSTANCES: usize = 1024;
 
+/// Depth at which the demand passes report rustc's
+/// monomorphization recursion limit: the number of instances of
+/// one definition nested along a single demand path (each a
+/// distinct instance — a repeated instance is deduplicated and
+/// never deepens the path). This mirrors
+/// `check_recursion_limit` in rustc's mono collector, which
+/// tracks exactly this per-definition path depth against the
+/// crate's recursion limit and fails compilation past it
+/// ("reached the recursion limit while instantiating ...").
+/// 128 is rustc's default recursion limit; a crate's
+/// `#![recursion_limit]` attribute is not exposed through
+/// Stable MIR, so the default is what the driver can mirror.
+const RECURSION_LIMIT_DEPTH: u16 = 128;
+
+/// How many instances of each definition sit on the demand path
+/// that led to one body: the chain of instances whose bodies
+/// demanded the next, from a collection root down to this body.
+/// Only repetitions matter to the recursion-limit check, but the
+/// full map is kept so any definition repeating deeper down the
+/// path is counted correctly.
+type DemandPath = std::collections::HashMap<rustc_public::DefId, u16>;
+
 /// Outcome accumulated for one deferred definition across every
 /// demand pass of a program.
 #[derive(Default)]
@@ -522,6 +544,10 @@ struct InstanceDemandState {
     plain_taken: HashSet<rustc_public::DefId>,
     taken: usize,
     demands: HashMap<rustc_public::DefId, Demand>,
+    /// The first recursion-limit failure the demand passes hit
+    /// (see [`RECURSION_LIMIT_DEPTH`]), reported as a compilation
+    /// failure alongside the monomorphization checks.
+    recursion_limit: Option<String>,
 }
 
 /// Convert the monomorphic instances of generic local function
@@ -568,13 +594,17 @@ fn collect_local_instances(
         plain_taken,
         taken,
         demands,
+        recursion_limit,
     } = state;
 
     let deferred_defs: HashSet<rustc_public::DefId> = deferred.iter().map(|d| d.def).collect();
-    let mut queue: VecDeque<rustc_public::mir::Body> = seeds.iter().cloned().collect();
+    let deferred_ctors: HashSet<rustc_public::DefId> =
+        deferred.iter().filter(|d| d.ctor).map(|d| d.def).collect();
+    let mut queue: VecDeque<(rustc_public::mir::Body, DemandPath)> =
+        seeds.iter().map(|b| (b.clone(), DemandPath::new())).collect();
     let mut extra_seeds: Vec<rustc_public::mir::Body> = Vec::new();
 
-    while let Some(body) = queue.pop_front() {
+    while let Some((body, path)) = queue.pop_front() {
         // Instance resolution and body access go through the
         // compiler's internals and can panic on exotic targets
         // (higher-ranked and late-bound types are known cases).
@@ -639,6 +669,28 @@ fn collect_local_instances(
             if resolved != referenced && deferred_defs.contains(&resolved) {
                 owners.push(resolved);
             }
+            // The recursion-limit check mirrors rustc's mono
+            // collector: if this instance nests its definition
+            // deeper along the current demand path than the
+            // recursion limit, instantiating it is the failure
+            // rustc reports, however large the collection as a
+            // whole legitimately is. A merely large but finite
+            // demand never nests one definition this deep along a
+            // single path, so the collection cap below stays the
+            // only consequence for it.
+            let depth = path.get(&resolved).copied().unwrap_or(0) + 1;
+            if depth > RECURSION_LIMIT_DEPTH {
+                if recursion_limit.is_none() {
+                    *recursion_limit = Some(format!(
+                        "reached the recursion limit while instantiating `{}`",
+                        inst.name()
+                    ));
+                }
+                fail_all(&mut *demands, &owners, "recursion limit reached".to_string());
+                continue;
+            }
+            let mut child_path = path.clone();
+            *child_path.entry(resolved).or_default() += 1;
             if *taken >= MAX_LOCAL_INSTANCES {
                 fail_all(&mut *demands, &owners, "collection limit reached".to_string());
                 continue;
@@ -679,7 +731,7 @@ fn collect_local_instances(
                     // recorded unconverted by the interpreter's own
                     // per-body isolation if it is ever called.
                     *taken += 1;
-                    queue.push_back(ibody.clone());
+                    queue.push_back((ibody.clone(), child_path.clone()));
                     extra_seeds.push(ibody.clone());
                     let counts = (ibody.blocks.len(), ibody.locals().len(), ibody.arg_locals().len());
                     // Display name: the first converted instance of
@@ -765,6 +817,7 @@ fn collect_closure_instances(
         plain_taken,
         taken,
         demands,
+        recursion_limit: _,
     } = state;
 
     let deferred_names: HashMap<rustc_public::DefId, &str> =
@@ -1773,15 +1826,22 @@ fn collect() -> ControlFlow<()> {
 
 
 
-    // Monomorphization checks rustc runs after MIR conversion
-    // (invalid SIMD intrinsic instantiations and SIMD layouts):
-    // a failure here fails the whole compilation, the way the
-    // corresponding rustc error does. The scan covers the Stable
-    // MIR bodies conversion walked (local seeds, demanded
-    // instances, and the reachability frontier); auxiliary-crate
-    // bodies converted by the loop above are not retained in that
-    // set and are not scanned.
-    let compile_error = sparagmos_driver::mono_check::check_bodies(&alias_sources);
+    // Monomorphization failures rustc reports around MIR
+    // conversion: the recursion limit the demand passes hit while
+    // collecting instances (a mono-collection error, so it takes
+    // precedence), and the checks of `sparagmos_driver::mono_check`
+    // over the converted bodies (invalid SIMD intrinsic
+    // instantiations and SIMD layouts, types too big for the
+    // target architecture). A failure here fails the whole
+    // compilation, the way the corresponding rustc error does.
+    // The scan covers the Stable MIR bodies conversion walked
+    // (local seeds, demanded instances, and the reachability
+    // frontier); auxiliary-crate bodies converted by the loop
+    // above are not retained in that set and are not scanned.
+    let compile_error = demand_state
+        .recursion_limit
+        .clone()
+        .or_else(|| sparagmos_driver::mono_check::check_bodies(&alias_sources));
 
     stash(Collected {
         report,
