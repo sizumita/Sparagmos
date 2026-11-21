@@ -3374,14 +3374,23 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
             "std::sync::mpsc::Receiver" => {
                 return Some(P::ChannelHandleDrop { sender: false })
             }
-            // `std::thread::Builder` and `std::io::Error` (the
-            // payload of a `Builder::spawn` result) have no `Drop`
-            // impl: their glue is their fields' glue, planned from
-            // the same evidence the generic path uses for the
-            // entry crate's types. An unevidenced field stays
-            // unaccounted for and fails the plan, as usual.
-            "std::thread::Builder" | "std::io::Error" => {
+            // `std::io::Error` (the payload of a `Builder::spawn`
+            // result) has no `Drop` impl: its glue is its fields'
+            // glue, planned from the same evidence the generic
+            // path uses for the entry crate's types. An
+            // unevidenced field stays unaccounted for and fails
+            // the plan, as usual.
+            "std::io::Error" => {
                 return Some(self.variant_fields_plan(def, args)?)
+            }
+            // A thread `Builder`'s two fields are `Option<String>`
+            // and `Option<usize>`, both trivial-glue; the value is
+            // built by the `Builder` builtins in that shape.
+            "std::thread::Builder" => {
+                return Some(P::Fields {
+                    fields: vec![P::Trivial, P::Trivial],
+                    complete: true,
+                })
             }
             // Join handles: the destructor detaches the thread.
             // In the cooperative thread model a detached thread

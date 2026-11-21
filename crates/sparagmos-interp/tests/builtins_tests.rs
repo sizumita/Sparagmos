@@ -417,6 +417,23 @@ fn registry_covers_the_modelled_callees() {
             Builtin::MpscRecvTimeout,
         ),
         ("std::sync::mpsc::Receiver::<T>::iter", Builtin::MpscIter),
+        ("std::thread::Builder::new", Builtin::ThreadBuilderNew),
+        ("std::thread::Builder::name", Builtin::ThreadBuilderName),
+        (
+            "std::thread::Builder::stack_size",
+            Builtin::ThreadBuilderStackSize,
+        ),
+        ("std::time::Duration::new", Builtin::DurationNew),
+        ("std::time::Duration::from_secs", Builtin::DurationFromSecs),
+        (
+            "std::time::Duration::from_millis",
+            Builtin::DurationFromMillis,
+        ),
+        (
+            "std::time::Duration::from_micros",
+            Builtin::DurationFromMicros,
+        ),
+        ("std::time::Duration::from_nanos", Builtin::DurationFromNanos),
     ];
     for (name, expected) in cases {
         assert_eq!(

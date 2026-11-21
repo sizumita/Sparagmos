@@ -360,6 +360,26 @@ pub enum Builtin {
     /// `Receiver::iter(&self)`: an iterator over the channel's
     /// incoming values.
     MpscIter,
+    /// `std::thread::Builder::new()`: a builder value in the real
+    /// field shape (`name`, `stack_size`, both unset).
+    ThreadBuilderNew,
+    /// `std::thread::Builder::name(builder, name)`: the builder
+    /// with its name field set.
+    ThreadBuilderName,
+    /// `std::thread::Builder::stack_size(builder, size)`: the
+    /// builder with its stack-size field set.
+    ThreadBuilderStackSize,
+    /// `std::time::Duration::new(secs, nanos)`: a duration value
+    /// in the real field shape (`secs`, `nanos`, normalized).
+    DurationNew,
+    /// `std::time::Duration::from_secs(n)`.
+    DurationFromSecs,
+    /// `std::time::Duration::from_millis(n)`.
+    DurationFromMillis,
+    /// `std::time::Duration::from_micros(n)`.
+    DurationFromMicros,
+    /// `std::time::Duration::from_nanos(n)`.
+    DurationFromNanos,
     /// `PartialEq::eq(&a, &b)`: semantic (derived) value equality.
     PartialEqEq,
     /// `PartialEq::ne(&a, &b)`.
@@ -699,6 +719,14 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         _ if canonical.contains("::Scope::") && canonical.ends_with("::spawn") => {
             Builtin::ThreadScopedSpawn
         }
+        "std::thread::Builder::new" => Builtin::ThreadBuilderNew,
+        "std::thread::Builder::name" => Builtin::ThreadBuilderName,
+        "std::thread::Builder::stack_size" => Builtin::ThreadBuilderStackSize,
+        "std::time::Duration::new" => Builtin::DurationNew,
+        "std::time::Duration::from_secs" => Builtin::DurationFromSecs,
+        "std::time::Duration::from_millis" => Builtin::DurationFromMillis,
+        "std::time::Duration::from_micros" => Builtin::DurationFromMicros,
+        "std::time::Duration::from_nanos" => Builtin::DurationFromNanos,
         "std::thread::scope" => Builtin::ThreadScope,
         "std::thread::current" => Builtin::ThreadCurrent,
         "std::thread::Thread::id" => Builtin::ThreadIdOf,
@@ -1277,11 +1305,19 @@ impl<'a> Interpreter<'a> {
                 let callable = vals.into_iter().next().expect("arity checked");
                 self.spawn_callable(callable)
             }
-            Builtin::ThreadBuilderSpawn | Builtin::ThreadScopedSpawn => {
-                // `(builder, f)` resp. `(&scope, f)`: the first
-                // argument carries nothing the model observes (a
-                // builder's name and stack size, a scope's
-                // identity); the callable is the second.
+            Builtin::ThreadBuilderSpawn => {
+                // `(builder, f)`: the builder carries nothing the
+                // model observes beyond what its fields hold; the
+                // callable is the second argument. `Builder::spawn`
+                // returns `io::Result<JoinHandle>`: the model's
+                // spawn cannot fail, so the handle is the `Ok`.
+                arity(2)?;
+                let callable = vals.into_iter().nth(1).expect("arity checked");
+                Ok(ok_result(self.spawn_callable(callable)?))
+            }
+            Builtin::ThreadScopedSpawn => {
+                // `(&scope, f)`: the scope's identity is not
+                // observed; the callable is the second argument.
                 arity(2)?;
                 let callable = vals.into_iter().nth(1).expect("arity checked");
                 self.spawn_callable(callable)
@@ -1348,6 +1384,56 @@ impl<'a> Interpreter<'a> {
                 arity(0)?;
                 self.drain_threads(frames)?;
                 Ok(Value::Unit)
+            }
+            Builtin::ThreadBuilderNew => {
+                arity(0)?;
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields: vec![none_value(), none_value()],
+                })
+            }
+            Builtin::ThreadBuilderName | Builtin::ThreadBuilderStackSize => {
+                arity(2)?;
+                let field = if kind == Builtin::ThreadBuilderName { 0 } else { 1 };
+                let mut vals = vals.into_iter();
+                let builder = vals.next().expect("arity checked");
+                let setting = vals.next().expect("arity checked");
+                match builder {
+                    Value::Enum { variant: 0, mut fields } if fields.len() == 2 => {
+                        fields[field] = some_value(setting);
+                        Ok(Value::Enum { variant: 0, fields })
+                    }
+                    other => Err(InterpError::type_mismatch(
+                        "thread Builder",
+                        "a builder value",
+                        other.kind_name(),
+                    )),
+                }
+            }
+            Builtin::DurationNew => {
+                arity(2)?;
+                let secs = uint_arg(&vals[0], name)?;
+                let nanos = uint_arg(&vals[1], name)?;
+                self.duration_value(secs, nanos)
+            }
+            Builtin::DurationFromSecs => {
+                arity(1)?;
+                self.duration_value(uint_arg(&vals[0], name)?, 0)
+            }
+            Builtin::DurationFromMillis => {
+                arity(1)?;
+                let ms = uint_arg(&vals[0], name)?;
+                self.duration_value(ms / 1_000, (ms % 1_000) * 1_000_000)
+            }
+            Builtin::DurationFromMicros => {
+                arity(1)?;
+                let us = uint_arg(&vals[0], name)?;
+                self.duration_value(us / 1_000_000, (us % 1_000_000) * 1_000)
+            }
+            Builtin::DurationFromNanos => {
+                arity(1)?;
+                let ns = uint_arg(&vals[0], name)?;
+                self.duration_value(ns / 1_000_000_000, ns % 1_000_000_000)
             }
             Builtin::MpscChannel => {
                 arity(0)?;
@@ -1497,6 +1583,9 @@ impl<'a> Interpreter<'a> {
                         variant: 0,
                         fields: vec![Value::Tuple(elems), Value::Uint(0)],
                     })
+                } else if self_ty.starts_with("std::sync::mpsc::Iter<") {
+                    // `mpsc::Iter` is its own `IntoIterator`.
+                    Ok(value)
                 } else if self_ty.starts_with("std::sync::mpsc::Receiver<") {
                     // The channel iterator holds the receiver
                     // handle as its one field (see `iterator_next`).
@@ -2940,6 +3029,26 @@ impl<'a> Interpreter<'a> {
 
     /// `Iterator::next`: mutate the iterator in place through the
     /// `&mut` argument and return the `Option` value.
+    /// A `Duration` value in the real field shape (`secs`,
+    /// `nanos`), with the normalization `Duration::new` performs
+    /// (a nanosecond count at or past one second carries into the
+    /// seconds; the carry is checked, as in std).
+    fn duration_value(&self, secs: u64, nanos: u64) -> InterpResult<Value> {
+        let (secs, nanos) = if nanos >= 1_000_000_000 {
+            let carry = nanos / 1_000_000_000;
+            let secs = secs
+                .checked_add(carry)
+                .ok_or_else(|| InterpError::panic("overflow in Duration::new"))?;
+            (secs, nanos % 1_000_000_000)
+        } else {
+            (secs, nanos)
+        };
+        Ok(Value::Enum {
+            variant: 0,
+            fields: vec![Value::Uint(u128::from(secs)), Value::Uint(u128::from(nanos))],
+        })
+    }
+
     /// Register a thread spawn: the callable must be a closure or
     /// a function pointer (a `Box<dyn FnOnce>` has no body the
     /// model can run and stays an explicit error). Returns the
@@ -3797,6 +3906,18 @@ fn increment(value: &Value) -> InterpResult<Value> {
         other => Err(InterpError::type_mismatch(
             "iterator bound increment",
             "integer",
+            other.kind_name(),
+        )),
+    }
+}
+
+/// A `u64`/`u32` argument of a time constructor.
+fn uint_arg(value: &Value, name: &str) -> InterpResult<u64> {
+    match value {
+        Value::Uint(n) => Ok(*n as u64),
+        other => Err(InterpError::type_mismatch(
+            format!("builtin {name}"),
+            "an unsigned integer",
             other.kind_name(),
         )),
     }
