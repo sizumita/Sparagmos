@@ -339,31 +339,92 @@ fn convert_all(
     // bodies convert at all.
     let conv = Converter::new(program, &keys);
     let (mut out, mut failures) = convert_each(&conv, program, &keys);
-    // Second phase: convert again with trait-impl call resolution
-    // on, restricted to the first phase's *clean* bodies (see
-    // `clean_targets`): bodies that converted and cannot, directly
-    // or transitively, run into an unmodelled construct or an
-    // unconverted body. Resolution only retargets calls, so the
-    // converted set is unchanged in principle; a body whose
-    // second-phase conversion unexpectedly fails keeps its
-    // first-phase form, and the failure records are reconciled with
-    // the merged program at the end.
-    let converted = clean_targets(&out);
-    if !converted.is_empty() {
-        let conv = Converter::with_impl_targets(program, &keys, converted);
+    // Joint fixpoint of conversion, cleanliness and the
+    // builtin-served set. Each round recomputes, from the merged
+    // program so far:
+    //
+    // * the *clean* bodies (see `clean_targets`) — the bodies
+    //   trait-impl call resolution may target, and
+    // * the *unconverted* bodies — the bodies that failed
+    //   conversion. A call naming one of them is served another
+    //   way when it honestly can be (see `resolve_body_callee`):
+    //   by a clean impl body for the same trait call, or by the
+    //   builtin model of the callee.
+    //
+    // and converts every body again with those two sets, merging
+    // the results in (a body whose re-conversion fails keeps its
+    // previous form; a converted body is never lost). Iterating
+    // matters because the sets feed each other: resolving a trait
+    // call inside a body can make that body clean, which makes it
+    // a resolution target for the next round, and a body withheld
+    // only because it called an unconverted body becomes clean
+    // once that call is builtin-served. The rounds are monotone —
+    // the clean set only grows and the unconverted set only
+    // shrinks, because a re-conversion only retargets calls to
+    // bodies proven clean in the previous round or replaces an
+    // edge to an unconverted body with a neutral builtin call —
+    // so the loop reaches a fixpoint: in the final program, every
+    // resolution target is clean in that same program, and every
+    // diverted call names a body that is unconverted in that same
+    // program. The round cap is a defensive bound only.
+    let mut used: Option<(HashSet<String>, HashMap<String, String>)> = None;
+    for _ in 0..MAX_RESOLUTION_ROUNDS {
+        let targets = clean_targets(&out);
+        let unconverted = unconverted_bodies(program, &keys, &out);
+        if used
+            .as_ref()
+            .is_some_and(|(t, u)| *t == targets && *u == unconverted)
+        {
+            break;
+        }
+        if targets.is_empty() && unconverted.is_empty() {
+            break;
+        }
+        let conv = Converter::with_resolution(
+            program,
+            &keys,
+            targets.clone(),
+            unconverted.clone(),
+        );
         let (resolved, _) = convert_each(&conv, program, &keys);
         for (key, body) in resolved.functions {
             out.unconverted.remove(&key);
             out.functions.insert(key, body);
         }
+        used = Some((targets, unconverted));
     }
     failures.retain(|key, _| !out.functions.contains_key(key));
     out.adt_layouts = program.adt_layouts.clone();
     Ok((out, failures))
 }
 
-/// The bodies of a first-phase program that trait-impl call
-/// resolution may target in the second phase (see `convert_all`):
+/// The defensive bound on the joint-fixpoint rounds in
+/// `convert_all` (see there). The rounds are monotone, so the
+/// bound is never the reason the loop stops in practice.
+const MAX_RESOLUTION_ROUNDS: usize = 16;
+
+/// The bodies of `out` that failed conversion, keyed by program
+/// key with the function's plain name (the key itself can carry a
+/// `DefId` disambiguation suffix; see `program_keys`). Later
+/// fixpoint rounds use the table to serve calls naming an
+/// unconverted body another way (see `resolve_body_callee`).
+fn unconverted_bodies(
+    program: &MirProgram,
+    keys: &[String],
+    out: &ir::Program,
+) -> HashMap<String, String> {
+    program
+        .functions
+        .iter()
+        .zip(keys)
+        .filter(|(_, key)| out.unconverted.contains_key(*key))
+        .map(|(f, key)| (key.clone(), f.name.clone()))
+        .collect()
+}
+
+/// The bodies of a converted program that trait-impl call
+/// resolution may target in the next fixpoint round (see
+/// `convert_all`):
 /// the *clean* bodies — running one can never hit an unmodelled
 /// construct or a body that is not itself clean.
 ///
@@ -1033,8 +1094,14 @@ struct Converter<'a> {
     /// The bodies trait-impl call resolution may target (see
     /// `resolve_impl_callee`): `None` disables resolution (the
     /// first conversion phase in `convert_all`), `Some` restricts
-    /// it to the named bodies (the second phase).
+    /// it to the named bodies (later fixpoint rounds).
     impl_targets: Option<HashSet<String>>,
+    /// The bodies that failed conversion in the previous fixpoint
+    /// round, keyed by program key with the function's plain name:
+    /// a call naming one of them is served another way when it
+    /// honestly can be (see `resolve_body_callee`). Empty in the
+    /// first conversion phase.
+    unconverted: HashMap<String, String>,
 }
 
 impl<'a> Converter<'a> {
@@ -1066,18 +1133,25 @@ impl<'a> Converter<'a> {
             adt_aggregates,
             local_crate,
             impl_targets: None,
+            unconverted: HashMap::new(),
         }
     }
 
-    /// A converter with trait-impl call resolution enabled,
-    /// restricted to `targets` (see `resolve_impl_callee`).
-    fn with_impl_targets(
+    /// A converter for a joint-fixpoint round in `convert_all`:
+    /// trait-impl call resolution restricted to `targets` (the
+    /// previous round's clean bodies), and calls naming a body in
+    /// `unconverted` (the previous round's conversion failures)
+    /// served another way where that is honest (see
+    /// `resolve_body_callee`).
+    fn with_resolution(
         program: &'a MirProgram,
         keys: &[String],
         targets: HashSet<String>,
+        unconverted: HashMap<String, String>,
     ) -> Self {
         let mut conv = Self::new(program, keys);
         conv.impl_targets = Some(targets);
+        conv.unconverted = unconverted;
         conv
     }
 
@@ -2319,6 +2393,67 @@ impl<'a> Converter<'a> {
         }
     }
 
+    /// Resolve a direct call to the program body that serves it,
+    /// if any (the caller falls through to the `Fn`-trait and
+    /// external/builtin shapes when this returns `None`).
+    ///
+    /// The ordinary case is `resolve_callee`: the collected body
+    /// the operand names. When that body failed conversion in the
+    /// previous fixpoint round, calling it can only fail with its
+    /// recorded reason, so the call is served another way when it
+    /// honestly can be:
+    ///
+    /// * If the call names that very item — the shape of a trait
+    ///   call whose collected body is the trait item's default
+    ///   implementation — a clean impl body for the call's `Self`
+    ///   type is the faithful target (it is what native execution
+    ///   dispatches to), exactly as when the trait item has no
+    ///   collected body at all.
+    /// * Otherwise, when the builtin model serves the callee, the
+    ///   call falls through to the external/builtin conversion
+    ///   below — the same treatment a callee the driver never
+    ///   collected receives. The interpreter's builtin is the
+    ///   model of that very function, so the value computed is
+    ///   the function's own semantics, not an approximation of a
+    ///   different one.
+    ///
+    /// When neither applies, the unconverted body still serves
+    /// the call, so running it raises the recorded conversion
+    /// failure (and a `dyn` receiver still dispatches through the
+    /// vtable at run time): an explicit error, never a silently
+    /// different result.
+    fn resolve_body_callee(&self, func: &mir::Operand) -> Option<String> {
+        let Some(name) = self.resolve_callee(func) else {
+            return self.resolve_impl_callee(func);
+        };
+        let Some(plain) = self.unconverted.get(&name) else {
+            return Some(name);
+        };
+        if self
+            .resolve_external_callee(func)
+            .is_some_and(|(item, _, _)| item == *plain)
+        {
+            if let Some(key) = self.resolve_impl_callee(func) {
+                return Some(key);
+            }
+        }
+        if self.external_builtin(func) {
+            return None;
+        }
+        Some(name)
+    }
+
+    /// Whether the external/builtin conversion below would serve
+    /// this call with a builtin: the callee's canonical name has a
+    /// builtin model. Checked exactly as that conversion checks
+    /// it, so a call is only ever diverted to a builtin that the
+    /// external path would really produce.
+    fn external_builtin(&self, func: &mir::Operand) -> bool {
+        self.resolve_external_callee(func).is_some_and(|(name, _, _)| {
+            crate::builtins::lookup(&crate::builtins::canonical_name(&name)).is_some()
+        })
+    }
+
     /// Resolve a trait-method call whose func operand names the
     /// trait item itself (which has no body) to the concrete impl
     /// body the driver collected for the call's `Self` type, if the
@@ -2339,9 +2474,9 @@ impl<'a> Converter<'a> {
     /// is the faithful semantics and wins over the builtin, exactly
     /// as a `DefId`-resolved body does in `resolve_callee`.
     fn resolve_impl_callee(&self, func: &mir::Operand) -> Option<String> {
-        // Resolution runs only in the second conversion phase,
-        // against the first phase's clean bodies (see
-        // `clean_targets`): resolving to an impl body that cannot
+        // Resolution runs only in the joint-fixpoint rounds of
+        // `convert_all`, against the previous round's clean
+        // bodies (see `clean_targets`): resolving to an impl body that cannot
         // itself convert — or that calls, however indirectly, a
         // body that cannot — would trade a working builtin model
         // of the trait method for an unconverted-body error. A
@@ -2661,10 +2796,7 @@ impl<'a> Converter<'a> {
                         destination: self.convert_place(destination)?,
                         target: target.map(|b| ir::BasicBlock(b.index())),
                     }
-                } else if let Some(name) = self
-                    .resolve_callee(func)
-                    .or_else(|| self.resolve_impl_callee(func))
-                {
+                } else if let Some(name) = self.resolve_body_callee(func) {
                     let callee = self.bodies.get(&name);
                     let mut ir_args = Vec::with_capacity(args.len());
                     for (i, arg) in args.iter().enumerate() {
