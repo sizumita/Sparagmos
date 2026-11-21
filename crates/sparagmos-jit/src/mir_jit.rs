@@ -3169,7 +3169,24 @@ impl<'a> FnLower<'a> {
             T::Terminate(_) => Err(self.err("Terminate terminator")),
             T::Yield { .. } => Err(self.err("Yield terminator")),
             T::CoroutineDrop => Err(self.err("CoroutineDrop terminator")),
-            T::InlineAsm { .. } => Err(self.err("InlineAsm terminator")),
+            T::InlineAsm {
+                template,
+                options,
+                destination,
+                ..
+            } => {
+                if mir::inline_asm_is_noop(template, options) {
+                    match destination {
+                        Some(target) => {
+                            self.seal_terminator(IrTerminator::Jump(target.index() as u32));
+                            Ok(())
+                        }
+                        None => Err(self.err("InlineAsm terminator without a destination")),
+                    }
+                } else {
+                    Err(self.err("InlineAsm terminator"))
+                }
+            }
             T::TailCall { .. } => Err(self.err("TailCall terminator")),
         }
     }

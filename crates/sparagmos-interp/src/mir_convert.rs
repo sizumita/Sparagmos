@@ -2448,7 +2448,27 @@ impl<'a> Converter<'a> {
             T::Terminate(k) => ir::TerminatorKind::Unsupported(format!("Terminate {k:?}")),
             T::Yield { .. } => ir::TerminatorKind::Unsupported("Yield".to_string()),
             T::CoroutineDrop => ir::TerminatorKind::Unsupported("CoroutineDrop".to_string()),
-            T::InlineAsm { .. } => ir::TerminatorKind::Unsupported("InlineAsm".to_string()),
+            T::InlineAsm {
+                template,
+                options,
+                destination,
+                ..
+            } => {
+                if mir::inline_asm_is_noop(template, options) {
+                    match destination {
+                        Some(target) => ir::TerminatorKind::Goto {
+                            target: ir::BasicBlock(target.index()),
+                        },
+                        None => ir::TerminatorKind::Unsupported(
+                            "InlineAsm (no-op template without a destination)".to_string(),
+                        ),
+                    }
+                } else {
+                    ir::TerminatorKind::Unsupported(format!(
+                        "InlineAsm (template {template:?} is not a no-op)"
+                    ))
+                }
+            }
             T::TailCall { .. } => ir::TerminatorKind::Unsupported("TailCall".to_string()),
         })
     }

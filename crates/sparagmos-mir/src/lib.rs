@@ -30,8 +30,8 @@ pub use statement::{
     UserTypeProjection, Variance,
 };
 pub use terminator::{
-    AssertMessage, BasicBlock, CallSource, CoroutineKind, SwitchTargets, TerminateKind, Terminator,
-    TerminatorKind, UnwindAction, UnwindTerminateReason,
+    inline_asm_is_noop, AssertMessage, BasicBlock, CallSource, CoroutineKind, SwitchTargets,
+    TerminateKind, Terminator, TerminatorKind, UnwindAction, UnwindTerminateReason,
 };
 pub use ty::{
     Abi, AdtDefId, AdtDiscriminants, AliasKind, ArrayLen, DefId, DiscriminantValues, FloatTy,

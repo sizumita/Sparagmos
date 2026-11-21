@@ -196,6 +196,107 @@ pub enum TerminatorKind {
         args: Vec<Operand>,
     },
 }
+/// Whether an `InlineAsm` terminator is a **no-op**: executing it
+/// has no observable effect, so an executor may step over it.
+///
+/// The template, with block comments (`/* ... */`), line comments
+/// (`// ...`) and operand placeholders (`{...}`) removed, must consist
+/// only of empty pieces and `nop` instructions (separated by `;` or
+/// newlines), and the options must not contain `NORETURN` (a
+/// noreturn block never reaches its destination, so stepping over it
+/// would invent a continuation the program does not have). Anything
+/// else — real instructions, port I/O, fences, `cpuid` — has effects
+/// this predicate does not model, and the caller keeps it an explicit
+/// error. Whether the block may be *converted* at all additionally
+/// depends on its operands (an operand with an out place is written
+/// by the assembly, which no executor here models); that check is
+/// the driver's, since only it sees the operand places.
+pub fn inline_asm_is_noop(template: &str, options: &str) -> bool {
+    if options.contains("NORETURN") {
+        return false;
+    }
+    let template: &str = &inline_asm_template_text(template);
+    let mut stripped = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find("/*") {
+        stripped.push_str(&rest[..start]);
+        match rest[start + 2..].find("*/") {
+            Some(end) => rest = &rest[start + 2 + end + 2..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    stripped.push_str(rest);
+    let mut body = String::with_capacity(stripped.len());
+    for line in stripped.lines() {
+        body.push_str(line.split("//").next().unwrap_or(""));
+        body.push('\n');
+    }
+    let mut depth = 0usize;
+    let mut visible = String::with_capacity(body.len());
+    for c in body.chars() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => visible.push(c),
+            _ => {}
+        }
+    }
+    visible
+        .split([';', '\n'])
+        .all(|piece| piece.trim().is_empty() || piece.trim().eq_ignore_ascii_case("nop"))
+}
+
+/// The literal instruction text of an asm template. Stable MIR
+/// renders the template as the Debug form of a
+/// `Vec<InlineAsmTemplatePiece>` (`[String("nop")]`,
+/// `[String("mov "), Placeholder { .. }, String("")]`): the
+/// `String("...")` pieces are the literal text and the placeholders
+/// are operand references, which contribute no instruction text.
+/// A template that is not in that form (hand-built programs) is
+/// taken as the literal text itself.
+fn inline_asm_template_text(template: &str) -> String {
+    let t = template.trim();
+    if !t.starts_with('[') {
+        return template.to_string();
+    }
+    let mut out = String::new();
+    let mut rest = t;
+    while let Some(i) = rest.find("String(\"") {
+        let start = i + "String(\"".len();
+        let mut chars = rest[start..].chars();
+        let mut consumed = 0usize;
+        loop {
+            match chars.next() {
+                None => break,
+                Some('\\') => {
+                    if let Some(c) = chars.next() {
+                        out.push(match c {
+                            'n' => '\n',
+                            't' => '\t',
+                            'r' => '\r',
+                            other => other,
+                        });
+                        consumed += 1 + c.len_utf8();
+                    }
+                }
+                Some('"') => {
+                    consumed += 1;
+                    break;
+                }
+                Some(c) => {
+                    out.push(c);
+                    consumed += c.len_utf8();
+                }
+            }
+        }
+        rest = &rest[start + consumed..];
+    }
+    out
+}
+
 impl TerminatorKind {
     pub fn kind_name(&self) -> &'static str {
         match self {
