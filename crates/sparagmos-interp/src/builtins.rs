@@ -410,7 +410,9 @@ pub enum Builtin {
     IndexMut,
     /// `std::ops::DerefMut::deref_mut(&mut value)` (modelled types).
     DerefMut,
-    /// `Cell::new(value)`: a cell is an ADT aggregate of one field.
+    /// `Cell::new(value)`: a cell is the natural two-level
+    /// aggregate `Cell { UnsafeCell { value } }` - the shape
+    /// collected bodies and decoded constants produce.
     CellNew,
     /// `Cell::get(&cell)`.
     CellGet,
@@ -2146,21 +2148,17 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::CellNew => {
                 arity(1)?;
-                Ok(Value::Enum {
-                    variant: 0,
-                    fields: vec![vals.into_iter().next().expect("arity checked")],
-                })
+                Ok(cell_value(vals.into_iter().next().expect("arity checked")))
             }
             Builtin::CellGet | Builtin::CellIntoInner => {
                 arity(1)?;
-                match self.resolve_value(frames, &vals[0])? {
-                    Value::Enum { fields, .. } if fields.len() == 1 => {
-                        Ok(fields.into_iter().next().expect("len checked"))
-                    }
-                    ref other => Err(InterpError::type_mismatch(
+                let state = self.resolve_value(frames, &vals[0])?;
+                match cell_held(&state).cloned() {
+                    Some(value) => Ok(value),
+                    None => Err(InterpError::type_mismatch(
                         "Cell value",
                         "cell aggregate",
-                        other.kind_name(),
+                        state.kind_name(),
                     )),
                 }
             }
@@ -2168,30 +2166,25 @@ impl<'a> Interpreter<'a> {
                 arity(2)?;
                 let target = self.deref_value(frames, &vals[0])?;
                 let state = self.read_resolved(frames, &target)?;
-                match state {
-                    Value::Enum { variant, fields } if fields.len() == 1 => {
-                        let old = fields.into_iter().next().expect("len checked");
-                        self.write_resolved(
-                            frames,
-                            &target,
-                            Value::Enum {
-                                variant,
-                                fields: vec![
-                                    vals.into_iter().nth(1).expect("arity checked"),
-                                ],
-                            },
-                        )?;
-                        if kind == Builtin::CellReplace {
-                            Ok(old)
-                        } else {
-                            Ok(Value::Unit)
-                        }
+                let old = match cell_held(&state).cloned() {
+                    Some(value) => value,
+                    None => {
+                        return Err(InterpError::type_mismatch(
+                            "Cell::set",
+                            "cell aggregate",
+                            state.kind_name(),
+                        ))
                     }
-                    ref other => Err(InterpError::type_mismatch(
-                        "Cell::set",
-                        "cell aggregate",
-                        other.kind_name(),
-                    )),
+                };
+                self.write_resolved(
+                    frames,
+                    &target,
+                    cell_value(vals.into_iter().nth(1).expect("arity checked")),
+                )?;
+                if kind == Builtin::CellReplace {
+                    Ok(old)
+                } else {
+                    Ok(Value::Unit)
                 }
             }
             Builtin::RefCellNew => {
@@ -3169,6 +3162,32 @@ fn expect_arguments<'v>(value: &'v Value, name: &str) -> InterpResult<&'v FmtArg
 /// aggregate holding the value. Building the natural shape keeps
 /// collected bodies that project `RefCell` fields (e.g. `into_inner`)
 /// working on builtin-constructed cells.
+/// A `Cell` value of the natural shape `Cell { UnsafeCell { value
+/// } }`: the shape a collected `Cell` aggregate and a decoded
+/// constant produce, which the `Cell` builtins and the
+/// `UnsafeCell::get` pointer path must agree on.
+fn cell_value(value: Value) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![Value::Enum {
+            variant: 0,
+            fields: vec![value],
+        }],
+    }
+}
+
+/// The value a `Cell` aggregate of the natural shape holds;
+/// `None` for any other value.
+fn cell_held(state: &Value) -> Option<&Value> {
+    match state {
+        Value::Enum { fields, .. } if fields.len() == 1 => match &fields[0] {
+            Value::Enum { fields, .. } if fields.len() == 1 => Some(&fields[0]),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn refcell_value(value: Value) -> Value {
     Value::Enum {
         variant: 0,

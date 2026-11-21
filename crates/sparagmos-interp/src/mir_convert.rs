@@ -1403,6 +1403,37 @@ impl<'a> Converter<'a> {
         }
     }
 
+    /// Whether a pointer cast from `source` to `target` goes from
+    /// a transparent single-field wrapper (`UnsafeCell<T>` /
+    /// `MaybeUninit<T>`) to the wrapped type itself. Decided from
+    /// the cast's two types, both known at conversion time: the
+    /// source pointee is the wrapper ADT and its single generic
+    /// argument is exactly the target pointee.
+    fn cast_enters_wrapper_field(&self, source: &mir::Ty, target: &mir::Ty) -> bool {
+        fn pointee(ty: &mir::Ty) -> Option<&mir::Ty> {
+            match ty {
+                mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _) => Some(inner),
+                _ => None,
+            }
+        }
+        let (Some(src), Some(tgt)) = (pointee(source), pointee(target)) else {
+            return false;
+        };
+        match src {
+            mir::Ty::Adt(def, args) => {
+                matches!(
+                    self.def_display_name(def).as_str(),
+                    "std::cell::UnsafeCell"
+                        | "core::cell::UnsafeCell"
+                        | "std::mem::MaybeUninit"
+                        | "core::mem::MaybeUninit"
+                ) && args.len() == 1
+                    && args[0] == *tgt
+            }
+            _ => false,
+        }
+    }
+
     fn convert_ty(&self, ty: &mir::Ty, context: &str) -> Result<ir::Ty, ConvertError> {
         let unsupported = || ConvertError::UnsupportedType {
             context: context.to_string(),
@@ -2081,7 +2112,22 @@ impl<'a> Converter<'a> {
                         mir::PointerCoercion::MutToConstPointer
                         | mir::PointerCoercion::ArrayToPointer,
                     ) => ir::Rvalue::Use(v),
-                    mir::CastKind::PtrToPtr => ir::Rvalue::Use(v),
+                    mir::CastKind::PtrToPtr => {
+                        // A cast from a transparent single-field
+                        // wrapper (`UnsafeCell<T>` / `MaybeUninit<T>`)
+                        // to the wrapped type changes what the
+                        // pointer denotes: the wrapper's only field.
+                        // Every other pointer-to-pointer cast leaves
+                        // the denoted place unchanged in this model.
+                        if ctx
+                            .as_ref()
+                            .is_some_and(|src| self.cast_enters_wrapper_field(src, target))
+                        {
+                            ir::Rvalue::PtrField(v)
+                        } else {
+                            ir::Rvalue::Use(v)
+                        }
+                    }
                     // Reifying a function item into a function
                     // pointer does not change the value in this
                     // model: both are the callable value naming the

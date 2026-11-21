@@ -455,6 +455,17 @@ pub enum Rvalue {
     /// those) behave correctly; the numeric value itself is not a
     /// real address and must not be turned back into a pointer.
     PtrToInt(Operand),
+    /// A pointer cast from a transparent single-field wrapper
+    /// (`UnsafeCell<T>` / `MaybeUninit<T>`) to the wrapped type
+    /// itself - what `UnsafeCell::get` and `MaybeUninit::as_mut_ptr`
+    /// return. The wrapper is `repr(transparent)`: its only field
+    /// is the value, at offset 0, so the cast pointer denotes that
+    /// field. In this projection-based model the result is the
+    /// operand pointer with a field-0 projection appended, decided
+    /// at conversion time from the cast's source and target types.
+    /// Any other pointer-to-pointer cast leaves the denoted place
+    /// unchanged and stays a plain `Use`.
+    PtrField(Operand),
     /// `&place` (also raw-pointer creation): a resolved reference value.
     Ref(Place),
     /// The length of the value at a place (array / slice / `str`).
