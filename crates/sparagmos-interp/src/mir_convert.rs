@@ -892,6 +892,17 @@ fn value_to_constant(v: &Value) -> Option<ir::Constant> {
     }
 }
 
+/// Whether `v` holds a callable value (a closure or a function
+/// pointer) anywhere inside it.
+fn value_contains_callable(v: &Value) -> bool {
+    match v {
+        Value::Closure { .. } | Value::FnPtr(_) => true,
+        Value::Tuple(items) => items.iter().any(value_contains_callable),
+        Value::Enum { fields, .. } => fields.iter().any(value_contains_callable),
+        _ => false,
+    }
+}
+
 /// The shape of a transparent wrapper struct for `transmute`
 /// purposes: a struct whose fields are exactly one thin-pointer
 /// payload field plus any number of zero-sized fields whose
@@ -1865,7 +1876,28 @@ impl<'a> Converter<'a> {
         Ok(match value {
             mir::ConstValue::Bool(b) => ir::Constant::Bool(*b),
             mir::ConstValue::Char(c) => ir::Constant::Uint(*c as u128),
-            mir::ConstValue::ZeroSized => ir::Constant::Unit,
+            mir::ConstValue::ZeroSized => {
+                // A zero-sized constant carries no value of its own:
+                // its value is the one its context type determines.
+                // When that value is a structure holding a callable
+                // (a closure / function pointer inside an enum or
+                // tuple - e.g. a `Fun<F>` wrapper whose only field is
+                // a zero-capture closure passed as a constant
+                // receiver), materialise it so projections and calls
+                // through it can reach the callable. Every other
+                // zero-sized constant keeps the unit reading: most
+                // ZST types' unique values are plain aggregates whose
+                // constant form would change existing handling.
+                match ctx.and_then(|ty| self.zst_value(ty, 0)) {
+                    Some(v) if value_contains_callable(&v) => {
+                        match value_to_constant(&v) {
+                            Some(k) => k,
+                            None => ir::Constant::Unit,
+                        }
+                    }
+                    _ => ir::Constant::Unit,
+                }
+            }
             mir::ConstValue::Scalar(s) => return self.convert_scalar(s, ctx),
             mir::ConstValue::Str(s) => ir::Constant::Str(s.clone()),
             mir::ConstValue::Bytes(b) => {
@@ -3278,17 +3310,22 @@ impl<'a> Converter<'a> {
     /// `self_name` with method `method`, under any generic-argument
     /// spelling of the trait; `None` when there is not exactly one.
     fn scan_impl_key(&self, self_name: &str, trait_path: &str, method: &str) -> Option<String> {
-        let prefix = format!("<{self_name} as {trait_path}");
-        let suffix = format!(">::{method}");
         let mut found: Option<&String> = None;
         for key in self.bodies.keys() {
             let base = key.split('#').next().unwrap_or(key.as_str());
-            if base.starts_with(&prefix) && base.ends_with(&suffix) {
-                if found.is_some() {
-                    return None;
-                }
-                found = Some(key);
+            let Some((self_part, trait_base, key_method)) = parse_impl_key(base) else {
+                continue;
+            };
+            if key_method != method || trait_base != trait_path {
+                continue;
             }
+            if !impl_self_matches(&self_part, self_name) {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some(key);
         }
         found.cloned()
     }
@@ -3342,6 +3379,73 @@ impl<'a> Converter<'a> {
     /// (receiver, tuple) to a body of the wrong arity and
     /// convention, while the trait call evaluates the receiver as a
     /// callable value, which is the convention that body expects.
+    /// Convert a direct `Drop::drop` call into a `Drop` terminator
+    /// against the receiver's pointee place, when the call's shape
+    /// allows it (see the call conversion): the callee names the
+    /// `Drop` trait item (`std::ops::Drop::drop` / `core::ops::
+    /// Drop::drop`) or a `Drop` impl item (`<T as std::ops::Drop>::
+    /// drop`), there is exactly one argument (the `&mut Self`
+    /// receiver), and the dropped type's glue can be built. The
+    /// receiver place plus a `Deref` projection is the pointee
+    /// place the glue runs against; running it clears that place
+    /// (the glue machinery clears a direct local), so a following
+    /// `Drop` terminator for the same place reads it as
+    /// uninitialised and runs no glue a second time.
+    ///
+    /// An impl-item call whose own converted body exists keeps
+    /// that body: the inherent-body priority rule — a collected
+    /// impl body is the faithful semantics of the call — wins over
+    /// the glue conversion. A call whose glue cannot be built
+    /// falls through to the ordinary call conversion.
+    fn drop_call_terminator(
+        &self,
+        body: &mir::Body,
+        func: &mir::Operand,
+        args: &[mir::Operand],
+        target: Option<mir::BasicBlock>,
+    ) -> Option<ir::TerminatorKind> {
+        if args.len() != 1 {
+            return None;
+        }
+        let target = target?;
+        let (name, _, raw_generic_args) = self.resolve_external_callee(func)?;
+        let is_trait_item = matches!(
+            name.as_str(),
+            "std::ops::Drop::drop" | "core::ops::Drop::drop"
+        );
+        let is_impl_item = name.starts_with('<')
+            && (name.ends_with(" as std::ops::Drop>::drop")
+                || name.ends_with(" as core::ops::Drop>::drop"));
+        if !is_trait_item && !is_impl_item {
+            return None;
+        }
+        if is_impl_item && self.resolve_body_callee(func).is_some() {
+            return None;
+        }
+        // Self type: the receiver argument's pointee type (the
+        // argument is `&mut Self`), falling back to the call's
+        // first generic argument.
+        let self_ty = self
+            .operand_place_ty(body, &args[0])
+            .map(|t| match t {
+                mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _) => *inner,
+                other => other,
+            })
+            .or_else(|| raw_generic_args.first().cloned())?;
+        let glue = self.drop_glue(&self_ty)?;
+        let arg_place = match &args[0] {
+            mir::Operand::Copy(place) | mir::Operand::Move(place) => place.clone(),
+            _ => return None,
+        };
+        let mut pointee = arg_place;
+        pointee.projection.push(mir::PlaceElem::Deref);
+        Some(ir::TerminatorKind::Drop {
+            place: self.convert_place(&pointee).ok()?,
+            target: ir::BasicBlock(target.index()),
+            glue,
+        })
+    }
+
     fn fn_trait_or_direct(
         &self,
         func: &mir::Operand,
@@ -3557,7 +3661,11 @@ impl<'a> Converter<'a> {
                         )
                     )
                 );
-                if indirect {
+                if let Some(drop_term) =
+                    self.drop_call_terminator(body, func, args, *target)
+                {
+                    drop_term
+                } else if indirect {
                     let func_ty = self.operand_place_ty(body, func);
                     // A constant callable carries no type of its own;
                     // type the arguments from the target body's
@@ -3597,11 +3705,35 @@ impl<'a> Converter<'a> {
                         }
                         FnResolution::Direct(name) => {
                             let callee = self.bodies.get(&name);
+                            // The receiver (argument 0) of a call that
+                            // also resolves as an `Fn`-trait call is
+                            // typed by the call's own `Self` type, not
+                            // by the callee body's declared receiver
+                            // type: the body is the generic impl
+                            // definition (its receiver mentions the
+                            // definition's parameters), while the call
+                            // names the concrete `Self` — a zero-sized
+                            // constant receiver only materialises
+                            // under the concrete type (see
+                            // `convert_const_value`).
+                            let self_ctx = self
+                                .resolve_fn_trait_call(func)
+                                .and_then(|(_, raw)| raw.first().cloned());
                             let mut ir_args = Vec::with_capacity(args.len());
                             for (i, arg) in args.iter().enumerate() {
-                                let ctx = callee.and_then(|b| {
-                                    b.local_decls.get(i + 1).map(|d| d.ty.clone())
-                                });
+                                let ctx = if i == 0 {
+                                    self_ctx.clone().or_else(|| {
+                                        callee.and_then(|b| {
+                                            b.local_decls
+                                                .get(i + 1)
+                                                .map(|d| d.ty.clone())
+                                        })
+                                    })
+                                } else {
+                                    callee.and_then(|b| {
+                                        b.local_decls.get(i + 1).map(|d| d.ty.clone())
+                                    })
+                                };
                                 ir_args.push(self.convert_operand(body, arg, ctx.as_ref())?);
                             }
                             ir::TerminatorKind::Call {
@@ -4056,6 +4188,56 @@ fn plain_binop(op: mir::BinOp) -> Option<ir::BinOp> {
 // ---------------------------------------------------------------------------
 // Drop glue construction
 // ---------------------------------------------------------------------------
+
+/// Parse an impl-instance key `<Self as Trait>::method` (the
+/// trait may carry a generic argument list, and `Self` may carry
+/// one too) into `(Self section, trait path without arguments,
+/// method)`. `None` for any other key shape.
+fn parse_impl_key(base: &str) -> Option<(String, String, String)> {
+    let (head, method) = base.rsplit_once(">::")?;
+    if method.is_empty() || method.contains("::") {
+        return None;
+    }
+    let inner = head.strip_prefix('<')?;
+    let (self_part, trait_part) = inner.split_once(" as ")?;
+    if self_part.is_empty() || trait_part.is_empty() {
+        return None;
+    }
+    let trait_base = trait_part.split('<').next().unwrap_or(trait_part);
+    Some((
+        self_part.to_string(),
+        trait_base.to_string(),
+        method.to_string(),
+    ))
+}
+
+/// Whether the `Self` section of an impl key denotes the type
+/// named `self_name`: either the name itself, or the name with a
+/// generic argument list appended (`YCombinator<F, A, R>` for the
+/// type `YCombinator` — an impl body recorded under its generic
+/// definition name, while a call's `Self` type renders without
+/// the definition's parameter list). The crate prefix may be
+/// present on either side or on neither.
+fn impl_self_matches(self_part: &str, self_name: &str) -> bool {
+    let self_base = self_part.split('<').next().unwrap_or(self_part);
+    // A generic Self section must be exactly `name<...>` (the
+    // argument list runs to the end of the section).
+    if self_part != self_base && !self_part.ends_with('>') {
+        return false;
+    }
+    if self_base == self_name {
+        return true;
+    }
+    // When both sides carry a crate path they must agree exactly;
+    // the short-name comparison is only for a side that omits it
+    // (the generic-definition spelling above).
+    if self_base.contains("::") && self_name.contains("::") {
+        return false;
+    }
+    let short = self_name.rsplit("::").next().unwrap_or(self_name);
+    let self_short = self_base.rsplit("::").next().unwrap_or(self_base);
+    self_short == short
+}
 
 /// Whether `name` is the driver name of `adt_name`'s `Drop` impl:
 /// `<{adt_name} as std::ops::Drop>::drop`, with any generic
