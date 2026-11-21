@@ -2596,7 +2596,7 @@ def compile_expectation(suite, header):
             if header.has(name):
                 return "failure"
         if run_mode(header) is not None:
-            return None  # run modes are stage-1 territory
+            return None  # judged by execution, not compilation
         # compiletest: UI tests default to check-fail when no
         # pass/fail directive is present (directives.rs from_file).
         return "failure"
@@ -3007,7 +3007,8 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
         return res
     expectation = compile_expectation(rec["suite"], view)
     res["expectation"] = expectation
-    if expectation is None:
+    if expectation is None and run_mode(view) not in ("run-pass",
+                                                     "run-fail"):
         if rec["suite"] == "incremental":
             if revision is None:
                 res["reason"] = ("incremental test declares no "
@@ -3085,6 +3086,12 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
         res["bucket"] = "not attempted (header feature)"
         return res
     args += pm_args
+    if expectation is None:
+        # A run-pass / run-fail view: compiletest's verdict for
+        # it is the execution, judged under the same arguments
+        # this conversion would have used.
+        return stage2_run_attempt(rec, view, path, driver_bin, res,
+                                  edition, args, flags, specs)
     # The view's `//@ rustc-env:` pairs are applied to the driver
     # process: the driver's embedded rustc reads them exactly as
     # compiletest's rustc invocation does (including values a
@@ -3109,6 +3116,88 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
     if verdict == "fail":
         res["driver"]["stderr_first"] = first_error_line(conv["stderr"])
     return res
+
+
+def stage2_run_attempt(rec, view, path, driver_bin, res, edition,
+                       args, flags, aux_specs):
+    """Judge a stage-2 view whose verdict is a program run.
+
+    The view's mode is run-pass / run-fail (a scoped mode
+    directive, or a revision name compiletest's ui mode reads as
+    one), so compiletest compiles and *runs* the revision and
+    judges the execution; no compile outcome decides it. The
+    judging mirrors stage 1's execution of an exec record under
+    the same view exactly -- native compile and run under the
+    revision's arguments, the native exit checked against the
+    mode expectation, the driver in run mode under the same
+    arguments, exit codes and stdout compared -- so the same
+    revision receives the same verdict in both stages. `args`
+    are the arguments stage2_attempt assembled for the view's
+    conversion; the native compile and the driver's run both
+    take them, as compiletest compiles a run test with its
+    mode arguments. Execution is host-only, so the flags are
+    screened again against the host target alone. run-crash and
+    run-fail-or-crash views never reach here: crash reproduction
+    is out of the subset's scope in stage 1 as well, and they
+    keep the not-attempted verdict compile_expectation's None
+    produced for them.
+    """
+    mode = run_mode(view)
+    res["expectation"] = mode
+    screened = screen_flags(flags, targets={HOST_TARGET})
+    if screened:
+        res["reason"] = screened
+        res["bucket"] = "not attempted (compile-flags)"
+        return res
+    src_base = suite_root(path)
+    with tempfile.TemporaryDirectory(prefix="subset-run-") as td:
+        env_pairs, env_unset = view_env(view, "exec-env",
+                                        "unset-exec-env",
+                                        src_base, td)
+        run_flags = view_run_flags(view, src_base, td)
+        native, err = native_side(path, edition, td, args, aux_specs,
+                                  run_args=run_flags,
+                                  run_env_extra=env_pairs,
+                                  run_env_remove=env_unset)
+        if err:
+            res["reason"] = err
+            res["bucket"] = bucket_reason(err)
+            return res
+        exp = expected_exit(mode, view)
+        if native["exit_code"] != exp:
+            res["reason"] = (f"native run exit {native['exit_code']} does "
+                             f"not match the mode expectation {exp}")
+            res["bucket"] = "native run does not match mode expectation"
+            res["native"] = {"exit_code": native["exit_code"]}
+            return res
+        got, kind, reason = sparagmos_side(path, edition, driver_bin,
+                                           td, rustc_args=args,
+                                           aux_specs=aux_specs,
+                                           guest_args=run_flags,
+                                           env_extra=env_pairs,
+                                           env_remove=env_unset)
+        if kind == "unsupported":
+            res["status"] = "unsupported"
+            res["reason"] = reason
+            res["bucket"] = bucket_reason(reason)
+            return res
+        if kind in ("timeout", "driver-error"):
+            res["status"] = "fail"
+            res["reason"] = reason
+            res["bucket"] = bucket_reason(reason)
+            return res
+        verdict, detail = judge(mode, view, native, got)
+        res["status"] = "pass" if verdict == "pass" else "fail"
+        if verdict != "pass":
+            res["reason"] = detail
+            res["bucket"] = ("stdout mismatch"
+                             if detail == "stdout mismatch"
+                             else "exit-code mismatch")
+            res["native"] = {"exit_code": native["exit_code"],
+                             "stdout": native["stdout"][:500]}
+            res["sparagmos"] = {"exit_code": got["exit_code"],
+                                "stdout": got["stdout"][:500]}
+        return res
 
 
 # ---------------------------------------------------------------------------
@@ -3302,7 +3391,7 @@ def fill_result_stage2(rec, rust_dir, driver_bin, out):
                              None, [], rust_dir, aux_specs,
                              aux_per_revision)
         for key in ("status", "reason", "bucket", "expectation",
-                    "driver"):
+                    "driver", "native", "sparagmos"):
             if key in res:
                 out[key] = res[key]
         return
@@ -3340,6 +3429,9 @@ def fill_result_stage2(rec, rust_dir, driver_bin, out):
                 out["bucket"] = r["bucket"]
                 if "driver" in r:
                     out["driver"] = r["driver"]
+                for key in ("native", "sparagmos"):
+                    if key in r:
+                        out[key] = r[key]
                 return
     out["status"] = "pass"
 
