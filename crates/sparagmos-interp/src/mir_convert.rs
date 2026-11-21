@@ -130,6 +130,11 @@ pub struct MirProgram {
     /// instance's field types before the generic shape, whose
     /// alias field types cannot be resolved here.
     pub adt_instance_shapes: mir::AdtInstanceShapes,
+    /// Niche discriminant encodings of monomorphic enum
+    /// instances, as recorded by the driver (see
+    /// `mir::AdtNiches`). Consulted when a transmute involves
+    /// a niche-encoded enum such as `Option<NonZero<T>>`.
+    pub adt_niches: mir::AdtNiches,
 }
 
 /// Widen an `f16` bit pattern to `f64`. The conversion is exact:
@@ -1411,6 +1416,7 @@ struct Converter<'a> {
     adt_shapes: &'a mir::AdtShapes,
     /// Instance ADT shape tables of the program (see `MirProgram`).
     adt_instance_shapes: &'a mir::AdtInstanceShapes,
+    adt_niches: &'a mir::AdtNiches,
     /// Operand counts of ADT aggregate constructions (see
     /// [`AdtAggregateCounts`]).
     adt_aggregates: AdtAggregateCounts,
@@ -1478,6 +1484,7 @@ impl<'a> Converter<'a> {
             discriminants: &program.adt_discriminants,
             adt_shapes: &program.adt_shapes,
             adt_instance_shapes: &program.adt_instance_shapes,
+            adt_niches: &program.adt_niches,
             adt_aggregates,
             local_crate,
             impl_targets: None,
@@ -2848,7 +2855,8 @@ impl<'a> Converter<'a> {
     /// * scalar-shaped -> scalar-shaped of the same total width
     ///   ([`ir::Rvalue::Reinterpret`]): integers, floats, `bool`
     ///   and `char` in any combination, arrays of scalars, and
-    ///   one-payload-field ADTs over those — the bit-level
+    ///   one-payload-field ADTs over those, and niche-encoded
+    ///   enums over a scalar payload — the bit-level
     ///   reinterpretation `transmute` means there;
     /// * fat pointer <-> fat pointer, and fat pointer <->
 ///   transparent wrapper struct (one fat-pointer payload
@@ -2860,7 +2868,8 @@ impl<'a> Converter<'a> {
     ///
     /// Every other shape — aggregate <-> aggregate byte
     /// reinterpretation beyond one payload field, fat pointers,
-    /// enums with payloads — stays [`ir::Rvalue::Unsupported`]:
+    /// enums with payloads beyond the niche-encoded shape —
+    /// stays [`ir::Rvalue::Unsupported`]:
     /// the model has no flat byte memory to reinterpret through.
     fn convert_transmute(
         &self,
@@ -3377,7 +3386,7 @@ impl<'a> Converter<'a> {
             mir::Ty::Adt(def, args) => {
                 let shape = self.adt_shapes.get(def)?;
                 if shape.variants.len() != 1 {
-                    return None;
+                    return self.niche_enum_shape(def, args, shape, depth);
                 }
                 let fields = self.instantiated_field_tys(def, args, 0)?;
                 let mut payload: Option<(u32, ir::ScalarShape)> = None;
@@ -3406,6 +3415,63 @@ impl<'a> Converter<'a> {
             }
             _ => None,
         }
+    }
+
+    /// The scalar shape of a niche-encoded enum instance: an
+    /// enum whose layout stores the discriminant in the
+    /// invalid values of its one payload field (see
+    /// `mir::EnumNiche`), such as `Option<NonZero<T>>`. The
+    /// shape applies only when the recorded encoding is
+    /// exactly the one this value model reinterprets through:
+    /// the niche scalar is the payload field itself (offset 0
+    /// and the field's own width), the payload variant
+    /// carries exactly that one field, and every other
+    /// variant is fieldless and niche-encoded. Anything else
+    /// — a niche inside a wider field, several payload
+    /// variants — has no shape and stays unsupported.
+    fn niche_enum_shape(
+        &self,
+        def: &mir::AdtDefId,
+        args: &[mir::Ty],
+        shape: &mir::AdtShape,
+        depth: u32,
+    ) -> Option<ir::ScalarShape> {
+        let tag = crate::builtins::ty_tag(&mir::Ty::Adt(*def, args.to_vec()), self.names);
+        let niche = self.adt_niches.get(&tag)?;
+        if niche.niche_offset != 0 {
+            return None;
+        }
+        let (first, last) = niche.niche_variants;
+        let niche_count = last.checked_sub(first)? + 1;
+        if shape.variants.len() as u32 != niche_count + 1 {
+            return None;
+        }
+        let untagged = niche.untagged_variant as usize;
+        if untagged >= shape.variants.len()
+            || (first..=last).contains(&niche.untagged_variant)
+        {
+            return None;
+        }
+        for (i, fields) in shape.variants.iter().enumerate() {
+            let expected = if i == untagged { 1 } else { 0 };
+            if fields.len() != expected {
+                return None;
+            }
+        }
+        let fields = self.instantiated_field_tys(def, args, niche.untagged_variant)?;
+        let [fty] = fields.as_slice() else {
+            return None;
+        };
+        let inner = self.scalar_shape(fty, depth + 1)?;
+        if inner.bits() == 0 || inner.bits() != niche.tag_bits {
+            return None;
+        }
+        Some(ir::ScalarShape::NicheEnum {
+            inner: Box::new(inner),
+            untagged_variant: niche.untagged_variant,
+            niche_variants: niche.niche_variants,
+            niche_start: niche.niche_start,
+        })
     }
 
     /// The scalar shape of a constant operand, whose MIR form

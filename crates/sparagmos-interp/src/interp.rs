@@ -5250,6 +5250,34 @@ impl<'a> Interpreter<'a> {
                     "an ADT value without it",
                 )),
             },
+            (
+                ScalarShape::NicheEnum {
+                    inner,
+                    untagged_variant,
+                    niche_variants,
+                    niche_start,
+                },
+                Value::Enum { variant, fields },
+            ) => {
+                if (niche_variants.0..=niche_variants.1).contains(variant) {
+                    Ok(*niche_start + u128::from(*variant - niche_variants.0))
+                } else if variant == untagged_variant {
+                    match fields.first() {
+                        Some(field) => self.flatten_scalar(field, inner),
+                        None => Err(InterpError::type_mismatch(
+                            "transmute",
+                            "an enum value holding the payload field",
+                            "an enum value without it",
+                        )),
+                    }
+                } else {
+                    Err(InterpError::type_mismatch(
+                        "transmute",
+                        "a variant of the niche-encoded enum",
+                        format!("variant {variant}"),
+                    ))
+                }
+            }
             (_, other) => Err(InterpError::type_mismatch(
                 "transmute",
                 "a value of the source shape",
@@ -5311,6 +5339,26 @@ impl<'a> Interpreter<'a> {
                     variant: 0,
                     fields,
                 })
+            }
+            ScalarShape::NicheEnum {
+                inner,
+                untagged_variant,
+                niche_variants,
+                niche_start,
+            } => {
+                let span = u128::from(niche_variants.1 - niche_variants.0);
+                if bits >= *niche_start && bits - *niche_start <= span {
+                    Ok(Value::Enum {
+                        variant: niche_variants.0 + (bits - *niche_start) as u32,
+                        fields: Vec::new(),
+                    })
+                } else {
+                    let payload = self.construct_scalar(bits, inner)?;
+                    Ok(Value::Enum {
+                        variant: *untagged_variant,
+                        fields: vec![payload],
+                    })
+                }
             }
         }
     }

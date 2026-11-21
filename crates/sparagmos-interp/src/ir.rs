@@ -475,6 +475,19 @@ pub enum ScalarShape {
         fill: Vec<(u32, Constant)>,
         inner: Box<ScalarShape>,
     },
+    /// A niche-encoded enum: the payload-carrying variant
+    /// (`untagged_variant`) stores its single field's own bit
+    /// pattern (the `inner` shape), and the fieldless variants
+    /// `niche_variants.0..=niche_variants.1` are stored as
+    /// `niche_start + (variant - niche_variants.0)` in that
+    /// same field — the encoding `Option<NonZero<T>>` and its
+    /// kin use for their discriminant.
+    NicheEnum {
+        inner: Box<ScalarShape>,
+        untagged_variant: u32,
+        niche_variants: (u32, u32),
+        niche_start: u128,
+    },
 }
 
 impl ScalarShape {
@@ -486,6 +499,7 @@ impl ScalarShape {
             ScalarShape::Char => 32,
             ScalarShape::Array(elem, n) => elem.bits() * (*n as u32),
             ScalarShape::AdtField { inner, .. } => inner.bits(),
+            ScalarShape::NicheEnum { inner, .. } => inner.bits(),
         }
     }
 }
