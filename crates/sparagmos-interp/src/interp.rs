@@ -3930,12 +3930,23 @@ impl<'a> Interpreter<'a> {
                 } else {
                     base
                 };
-                let place_desc = describe_resolved(*local, projection);
+                // The description is only read inside projection
+                // steps and by the error below, so with an empty
+                // projection it is built only if that error fires.
+                let place_desc = if projection.is_empty() {
+                    String::new()
+                } else {
+                    describe_resolved(*local, projection)
+                };
                 let value = project_value(base, projection, &frame.func, &place_desc)?;
                 if value == Value::Uninit {
                     return Err(InterpError::UninitializedRead {
                         func: frame.func.clone(),
-                        place: place_desc,
+                        place: if projection.is_empty() {
+                            describe_resolved(*local, projection)
+                        } else {
+                            place_desc
+                        },
                     });
                 }
                 Ok(value)
@@ -5300,14 +5311,21 @@ impl<'a> Interpreter<'a> {
 
 /// Human-readable form of a resolved place, for error messages.
 pub(crate) fn describe_resolved(local: usize, projection: &[RefProj]) -> String {
+    use std::fmt::Write as _;
     let mut out = format!("_{local}");
     for proj in projection {
         match proj {
-            RefProj::Field(i) => out.push_str(&format!(".{i}")),
-            RefProj::Index(i) => out.push_str(&format!("[{i}]")),
-            RefProj::Downcast(v) => out.push_str(&format!(" as variant {v}")),
+            RefProj::Field(i) => {
+                let _ = write!(out, ".{i}");
+            }
+            RefProj::Index(i) => {
+                let _ = write!(out, "[{i}]");
+            }
+            RefProj::Downcast(v) => {
+                let _ = write!(out, " as variant {v}");
+            }
             RefProj::Subslice { offset, len } => {
-                out.push_str(&format!("[{offset}..{}]", offset + len))
+                let _ = write!(out, "[{offset}..{}]", offset + len);
             }
         }
     }
