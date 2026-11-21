@@ -1975,6 +1975,67 @@ exec 改善: for ループ / &Vec 反復系が中心)、回帰 0 件。
 
 ---
 
+### 「期待失敗だが変換成功」バケットの census と単相化検査 (Lane CA, 2026-11-21)
+
+both12 時点でこのバケットは 142 件 (全てコンパイル時検証系)。
+各テストの companion `.stderr` が示す rustc の拒否理由で分類した
+(バッククォート内識別子は正規化済み)。
+
+| 拒否理由 | 件数 | 主経路で検出可能か |
+|---|---|---|
+| E0511 SIMD intrinsic の不正な単相化 (引数/戻り値が非 SIMD、要素型不一致、shuffle 索引、bitmask 戻り値、gather/scatter 要素型、masked load/store 引数長、原子操作の非整数要素) | 14 | 一部 (下記) |
+| 型がターゲットに大きすぎる (byval 通過、size_of_val、巨大構造体) | 13 | 未実装 (レイアウトサイズの上限検査が必要) |
+| E0080 const-eval の明示 panic (required-consts が dead code でも評価される) | 10 | 原理的に可能だが未実装 (変換は required const を評価しない) |
+| panic 戦略の不整合 (panic=abort 必須クレート等) | 10 | 不可 (クレートメタデータ/リンク段の検査で、MIR 変換の範囲外) |
+| シンボル重複 (定義済みシンボル、エントリシンボル多重宣言) | 9 | 不可 (リンク段) |
+| dep-graph 表明・出力ダンプ系 (symbol 名、def-path、グラフ経路の表明) | 23 | 不可 (出力照合で決まる検証系) |
+| 再帰・実体化の上限 (instantiating、型長、query 深度) | 8 | 未実装 |
+| SIMD レーン上限・ゼロレーン (32768 超、0、per-type 上限 8/64) | 7 | 実装済み (レイアウト検査) |
+| large_assignments lint (9999 バイト移動) | 6 | 不可 (lint の出力照合で決まる) |
+| E0464 複数クレート候補・E0463 クレート不在 | 6 | 不可 (クレート解決はドライバの前段で別経路) |
+| 最適化 MIR の不在を前提とするテスト | 5 | 不可 (テスト前提そのものが変換対象外) |
+| E0391 レイアウト循環 | 2 | レイアウト query の失敗として部分的に現れるが、対象2件は未反転 |
+| その他 (ネイティブ静的ライブラリ不在、rmeta 形式、asm 無効ニーモニック、LTO、LLVM intrinsic のアーキ/署名、対象固有 feature 未有効、stderr ファイル無し等) | 29 | 不可または未実装 |
+
+分類上の注意: Stable MIR の本体は borrowck/typeck 後なので、
+借用・型・トレイト解決のエラーはドライバ内蔵の rustc フロント
+エンドが変換前に既に拒否しており、このバケットには現れない。
+残るのは単相化・レイアウト・const-eval・リンク・lint・出力照合
+といった後段の理由であり、大半は変換の主経路では原理的に
+検出できない (正直な限界として記録する)。
+
+実装 (検出可能な部分集合): ドライバに単相化妥当性検査
+(`mono_check`) を追加し、変換が歩いた Stable MIR 本体に対して
+rustc 自身の単相化時検査を再現する。(1) `Instance::resolve` が
+Intrinsic を返す `simd_*` 呼び出しについて、最初の引数の型
+(`simd_splat` は戻り値、`simd_select_bitmask` は第2引数) が
+SIMD 型でなければ E0511 相当の失敗とする。(2) 変換済み本体の
+全ローカルについて、SIMD 型のレイアウトが存在しない場合
+(ゼロレーン/レーン上限超過) を失敗とする。検出時はコンパイル
+全体の失敗として `sparagmos-driver: compilation failed: <理由>`
+を出し、convert で exit 1、run で exit 2 とする (フロントエンド
+失敗と同じ契約)。テスト名やエラー文へのパターンマッチは
+行っていない。
+
+実測 (subset-ca、clone ドライバ単独ラン、both12 との差分):
+本バケットから 12 件が反転してパスになった (E0511 系:
+E0511.rs、generic-arithmetic-2、generic-cast、generic-comparison、
+generic-elements、bad-intrinsic-monomorphization。レーン系:
+monomorphize-too-long、monomorphize-zero-length、
+simd-lane-limit-err、同 -npow2、
+type-generic-monomorphisation-empty、同 -oversized)。
+残りの E0511 系 (要素型の一致、shuffle 索引の範囲、bitmask
+戻り値、gather/scatter 要素型、masked 引数長) は引数の要素型
+レベルまでの検査が必要で未実装。バケット残数は 131 件
+(新規に 1 件 tests/incremental/link_order/main.rs が入ったが、
+これは Lane CL の revision 別判定で incremental 系が測定対象に
+なったために新たに現れたもので、本レーンの変更による悪化では
+ない)。subset-ca 全体では both12 比 +76 件で、このうち +64 件は
+既に main 統合済みの Lane CL の増分、+12 件が本レーン分。
+指標2(b) は subset-ca で 70.241% (17,516/24,937)。
+both12 でパスしていたテストの回帰は 0 件。ドライバテスト
+83 件 (新規 3 件)、workspace 422 件、コーパス 47/47。
+
 ## 測定の規律
 
 - 測定は fleur 上で、ツールチェーンとコマンドを併記して記録する。
