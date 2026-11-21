@@ -770,6 +770,10 @@ pub enum Builtin {
     /// implementation, whose source snapshot makes it a correct
     /// memmove for the overlapping `copy` as well).
     PtrCopy,
+    /// `std::intrinsics::compare_bytes(x, y, count) -> c_int`:
+    /// the memcmp of two byte ranges (the inlined slice / `str`
+    /// ordering core).
+    CompareBytes,
 }
 
 /// A relational operator selected by a `PartialOrd` method.
@@ -1265,6 +1269,9 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::mem::zeroed" => Builtin::MemZeroed,
         "std::ptr::null" | "std::ptr::null_mut" => Builtin::PtrNull,
         "std::ptr::copy_nonoverlapping" | "std::ptr::copy" => Builtin::PtrCopy,
+        "std::intrinsics::compare_bytes" | "core::intrinsics::compare_bytes" => {
+            Builtin::CompareBytes
+        }
         _ if canonical.starts_with("std::rc::Rc") && canonical.ends_with(">::new") => {
             Builtin::RcNew
         }
@@ -4513,6 +4520,34 @@ impl<'a> Interpreter<'a> {
                 self.exec_copy_nonoverlapping(frames, src, dst, count)?;
                 Ok(Value::Unit)
             }
+            Builtin::CompareBytes => {
+                arity(3)?;
+                let n = match &vals[2] {
+                    Value::Uint(n) => usize::try_from(*n).map_err(|_| {
+                        InterpError::type_mismatch(
+                            "compare_bytes count",
+                            "count that fits in usize",
+                            format!("{n}"),
+                        )
+                    })?,
+                    Value::Int(n) if *n >= 0 => *n as usize,
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            "compare_bytes count",
+                            "unsigned integer",
+                            other.kind_name(),
+                        ));
+                    }
+                };
+                let a = self.read_byte_range(frames, &vals[0], n)?;
+                let b = self.read_byte_range(frames, &vals[1], n)?;
+                let ord = a.cmp(&b);
+                Ok(Value::Int(match ord {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                }))
+            }
             Builtin::AtomicCxchg => {
                 arity(3)?;
                 // Single-threaded: nothing can intervene between
@@ -6114,6 +6149,52 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
     /// when it is already a fat reference, or over a snapshot of
     /// the bytes when the receiver is the string data itself (the
     /// shape of a byte-slice constant).
+    /// The `n` bytes starting at a raw byte pointer, for
+    /// `compare_bytes`: string and byte data read directly, any
+    /// other aggregate element by element.
+    fn read_byte_range(
+        &self,
+        frames: &[Frame],
+        ptr: &Value,
+        n: usize,
+    ) -> InterpResult<Vec<u8>> {
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let target = self.deref_value(frames, ptr)?;
+        let base = self.read_resolved(frames, &target)?;
+        let direct: Option<&[u8]> = match &base {
+            Value::Str(s) => Some(s.as_bytes()),
+            Value::Bytes(b) => Some(b.as_slice()),
+            _ => None,
+        };
+        if let Some(bytes) = direct {
+            if bytes.len() < n {
+                return Err(InterpError::type_mismatch(
+                    "compare_bytes range",
+                    "byte range of the requested length",
+                    format!("{} bytes", bytes.len()),
+                ));
+            }
+            return Ok(bytes[..n].to_vec());
+        }
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            match self.read_resolved_at(frames, &target, i)? {
+                Value::Uint(b) => out.push(b as u8),
+                Value::Int(b) if (0..=255).contains(&b) => out.push(b as u8),
+                other => {
+                    return Err(InterpError::type_mismatch(
+                        "compare_bytes element",
+                        "byte",
+                        other.kind_name(),
+                    ));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     fn string_bytes_ref(&self, frames: &[Frame], receiver: &Value) -> InterpResult<Value> {
         let s = self.resolve_string(frames, receiver)?;
         let len = s.len() as u128;
