@@ -80,15 +80,23 @@ impl Default for Converter {
 }
 
 
-/// Whether an ADT instance may be unsized: any field of any
-/// variant whose type may itself be unsized (a slice, `str`, a
-/// trait object, or a nested ADT that may be unsized). Such types
-/// are only legal with unsized fields in tail position — except
-/// under `trivial_bounds`, where they can sit anywhere and the
-/// compiler's layout computation itself ICEs on them (rustc never
-/// computes their layouts). The layout query is skipped for them:
-/// they stay explicitly unsupported. Aliases and parameters count
-/// as suspect (their layout is not computable here anyway).
+/// Whether an ADT instance may be unsized — or otherwise unsafe
+/// to ask the compiler for its layout. The check walks the
+/// *declared* field types (`FieldDef::ty`, which neither
+/// substitutes nor normalizes; the substituting variant
+/// `ty_with_args` normalizes projections and fails fatally on
+/// ones that do not normalize in a codegen environment). A field
+/// may be unsized when its type is a slice, `str`, a trait object,
+/// an alias (whose sizedness is not decidable here), a parameter
+/// bound to such a type by the instance's arguments, or a nested
+/// ADT that may be unsized. Such types are only legal with the
+/// unsized field in tail position — except under `trivial_bounds`,
+/// where they can sit anywhere and the compiler's layout
+/// computation itself ICEs on them (rustc never computes their
+/// layouts). Screened instances get no layout entry and stay
+/// explicitly unsupported. Parameter resolution goes one frame
+/// deep: a parameter that resolves to another parameter counts as
+/// suspect, which only ever skips a query, never enables one.
 fn adt_may_be_unsized(
     def: &AdtDef,
     args: &rustc_public::ty::GenericArgs,
@@ -101,18 +109,31 @@ fn adt_may_be_unsized(
         variant
             .fields()
             .iter()
-            .any(|field| ty_may_be_unsized(&field.ty_with_args(args), depth + 1))
+            .any(|field| ty_may_be_unsized(&field.ty(), Some(args), depth + 1))
     })
 }
 
-fn ty_may_be_unsized(ty: &rustc_public::ty::Ty, depth: usize) -> bool {
+fn ty_may_be_unsized(
+    ty: &rustc_public::ty::Ty,
+    args: Option<&rustc_public::ty::GenericArgs>,
+    depth: usize,
+) -> bool {
+    if depth >= 8 {
+        return true;
+    }
     match ty.kind() {
         TyKind::RigidTy(r) => match r {
             RigidTy::Slice(_) | RigidTy::Str | RigidTy::Dynamic(..) => true,
-            RigidTy::Adt(def, args) => adt_may_be_unsized(&def, &args, depth),
-            RigidTy::Array(elem, _) => ty_may_be_unsized(&elem, depth),
-            RigidTy::Tuple(ts) => ts.iter().any(|t| ty_may_be_unsized(t, depth)),
+            RigidTy::Adt(def, a2) => adt_may_be_unsized(&def, &a2, depth),
+            RigidTy::Array(elem, _) => ty_may_be_unsized(&elem, args, depth),
+            RigidTy::Tuple(ts) => ts.iter().any(|t| ty_may_be_unsized(t, args, depth)),
             _ => false,
+        },
+        TyKind::Param(p) => match args.and_then(|a| a.0.get(p.index as usize)) {
+            Some(rustc_public::ty::GenericArgKind::Type(t)) => {
+                ty_may_be_unsized(t, None, depth + 1)
+            }
+            _ => true,
         },
         _ => true,
     }
@@ -1378,9 +1399,6 @@ impl Converter {
         args: &rustc_public::ty::GenericArgs,
         converted: &sm::Ty,
     ) {
-        if adt_may_be_unsized(def, args, 0) {
-            return;
-        }
         while self.layout_names.len() < self.def_names.len() {
             let index = self.layout_names.len();
             self.layout_names.insert(
@@ -1390,6 +1408,9 @@ impl Converter {
         }
         let key = sparagmos_interp::builtins::ty_tag(converted, &self.layout_names);
         if !self.layout_attempted.insert(key.clone()) {
+            return;
+        }
+        if adt_may_be_unsized(def, args, 0) {
             return;
         }
         // The layout query is not total: for some types that can
