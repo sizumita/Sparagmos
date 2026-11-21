@@ -2589,7 +2589,7 @@ impl<'a> Interpreter<'a> {
                             // with rustc's drop flags.
                             continue;
                         }
-                        let callee = self.program.get(&func).cloned().ok_or_else(|| {
+                        let callee = self.program.get(&func).ok_or_else(|| {
                             InterpError::UnknownFunction { name: func.clone() }
                         })?;
                         if frames.len() >= self.config.max_call_depth {
@@ -2597,15 +2597,17 @@ impl<'a> Interpreter<'a> {
                                 limit: self.config.max_call_depth,
                             });
                         }
-                        if callee.arg_count != 1 || callee.local_count() < 2 {
+                        let (arg_count, local_count) =
+                            (callee.arg_count, callee.local_count());
+                        if arg_count != 1 || local_count < 2 {
                             return Err(InterpError::type_mismatch(
                                 format!("destructor `{func}`"),
                                 "one argument",
-                                format!("{} argument(s)", callee.arg_count),
+                                format!("{arg_count} argument(s)"),
                             ));
                         }
                         let target_ref = self.extend_ref(frames, &active.root, &path)?;
-                        let mut locals = vec![Value::Uninit; callee.local_count()];
+                        let mut locals = vec![Value::Uninit; local_count];
                         locals[1] = Value::Ref(target_ref);
                         let frame_id = self.fresh_frame_id();
                         self.drop_continuations.push(DropContinuation {
@@ -4052,7 +4054,8 @@ impl<'a> Interpreter<'a> {
                     // Direct local of the target frame: normalize
                     // against that frame's declared type.
                     let func = frames[*frame_pos].func.clone();
-                    let target_body = self.program.get(&func).cloned().ok_or_else(|| {
+                    let program: &'a Program = self.program;
+                    let target_body = program.get(&func).ok_or_else(|| {
                         InterpError::UnknownFunction { name: func.clone() }
                     })?;
                     let frame = &mut frames[*frame_pos];
