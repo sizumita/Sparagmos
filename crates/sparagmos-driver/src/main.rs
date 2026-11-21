@@ -92,7 +92,7 @@ use rustc_public::ty::{
 use rustc_public::{CrateDef, CrateDefType};
 use rustc_public::ItemKind;
 
-use sparagmos_driver::convert::Converter;
+use sparagmos_driver::convert::{args_mention_params, closure_kind, Converter};
 use sparagmos_driver::report::{ConversionReport, FnOutcome, FnReport};
 use sparagmos_mir::Body;
 
@@ -398,6 +398,14 @@ enum ClosureAttempt {
     NotClosure,
     /// The item is a closure that stays skipped, with the reason.
     Unsupported(String),
+    /// The closure is defined in a generic context: its own
+    /// arguments still mention the enclosing definition's
+    /// parameters, so it has no instance as an item — but a
+    /// monomorphic instance of the enclosing definition mentions
+    /// the closure with concrete arguments, and the closure
+    /// collection after the item loop converts the instances
+    /// actually demanded (the same deferral generic functions get).
+    GenericContext,
 }
 
 /// Instantiate a local closure item's body.
@@ -412,9 +420,12 @@ enum ClosureAttempt {
 /// the instance's body is the closure body itself. Closures whose
 /// arguments still mention generic parameters (defined inside a
 /// generic function, method or impl) have no single monomorphic
-/// body to collect — the same limitation as generic functions —
-/// and stay skipped. Async closures are coroutine closures; their
-/// bodies are coroutines, which are not converted.
+/// body to collect as an item — the same limitation as generic
+/// functions — so the item loop defers it and the closure
+/// collection after the loop converts the instances that
+/// monomorphic bodies actually demand. Async closures are
+/// coroutine closures; their bodies are coroutines, which are
+/// not converted.
 fn closure_instance(item: &rustc_public::CrateItem) -> ClosureAttempt {
     match item.ty().kind() {
         TyKind::RigidTy(RigidTy::CoroutineClosure(..)) => ClosureAttempt::Unsupported(
@@ -422,11 +433,7 @@ fn closure_instance(item: &rustc_public::CrateItem) -> ClosureAttempt {
         ),
         TyKind::RigidTy(RigidTy::Closure(def, args)) => {
             if args_mention_params(&args) {
-                return ClosureAttempt::Unsupported(
-                    "closure is defined in a generic context (its generic arguments \
-                     still mention parameters); only monomorphic closures are converted"
-                        .to_string(),
-                );
+                return ClosureAttempt::GenericContext;
             }
             let Some(kind) = closure_kind(&args) else {
                 return ClosureAttempt::Unsupported(
@@ -441,75 +448,6 @@ fn closure_instance(item: &rustc_public::CrateItem) -> ClosureAttempt {
             }
         }
         _ => ClosureAttempt::NotClosure,
-    }
-}
-
-/// The closure kind (`Fn` / `FnMut` / `FnOnce`) recorded in a
-/// closure type's generic arguments. rustc appends three synthetic
-/// arguments to a closure's parent arguments — the kind, the
-/// signature as a function-pointer type, and the tupled captures —
-/// and encodes the kind itself as an integer type: `i8` for `Fn`,
-/// `i16` for `FnMut`, `i32` for `FnOnce` (this is rustc's
-/// `Ty::from_closure_kind`; the encoding is part of the Stable MIR
-/// boundary this crate pins to Rust 1.100.0).
-fn closure_kind(args: &GenericArgs) -> Option<ClosureKind> {
-    let kind_arg = args.0.iter().rev().nth(2)?;
-    let GenericArgKind::Type(ty) = kind_arg else {
-        return None;
-    };
-    match ty.kind() {
-        TyKind::RigidTy(RigidTy::Int(IntTy::I8)) => Some(ClosureKind::Fn),
-        TyKind::RigidTy(RigidTy::Int(IntTy::I16)) => Some(ClosureKind::FnMut),
-        TyKind::RigidTy(RigidTy::Int(IntTy::I32)) => Some(ClosureKind::FnOnce),
-        _ => None,
-    }
-}
-
-/// Whether any generic argument still mentions a type or const
-/// parameter, i.e. the item is not fully monomorphic.
-fn args_mention_params(args: &GenericArgs) -> bool {
-    args.0.iter().any(|arg| match arg {
-        GenericArgKind::Type(ty) => ty_mentions_param(ty),
-        GenericArgKind::Const(konst) => const_mentions_param(konst),
-        GenericArgKind::Lifetime(_) => false,
-    })
-}
-
-fn const_mentions_param(konst: &rustc_public::ty::TyConst) -> bool {
-    match konst.kind() {
-        TyConstKind::Param(_) => true,
-        TyConstKind::Unevaluated(_, args) => args_mention_params(args),
-        TyConstKind::Value(ty, _) | TyConstKind::ZSTValue(ty) => ty_mentions_param(ty),
-        _ => false,
-    }
-}
-
-fn ty_mentions_param(ty: &Ty) -> bool {
-    match ty.kind() {
-        TyKind::Param(_) => true,
-        TyKind::Alias(_, alias) => args_mention_params(&alias.args),
-        TyKind::RigidTy(rigid) => match rigid {
-            RigidTy::Ref(_, inner, _) | RigidTy::RawPtr(inner, _) | RigidTy::Slice(inner) => {
-                ty_mentions_param(&inner)
-            }
-            RigidTy::Array(inner, len) => ty_mentions_param(&inner) || const_mentions_param(&len),
-            RigidTy::Pat(inner, _) => ty_mentions_param(&inner),
-            RigidTy::Tuple(elems) => elems.iter().any(ty_mentions_param),
-            RigidTy::FnPtr(sig) => sig.value.inputs_and_output.iter().any(ty_mentions_param),
-            RigidTy::Adt(_, args)
-            | RigidTy::FnDef(_, args)
-            | RigidTy::Closure(_, args)
-            | RigidTy::Coroutine(_, args)
-            | RigidTy::CoroutineClosure(_, args)
-            | RigidTy::CoroutineWitness(_, args) => args_mention_params(&args),
-            RigidTy::Dynamic(bounds, _) => bounds.iter().any(|b| match &b.value {
-                ExistentialPredicate::Trait(t) => args_mention_params(&t.generic_args),
-                ExistentialPredicate::Projection(p) => args_mention_params(&p.generic_args),
-                ExistentialPredicate::AutoTrait(_) => false,
-            }),
-            _ => false,
-        },
-        _ => false,
     }
 }
 
@@ -782,6 +720,152 @@ fn collect_local_instances(
     extra_seeds
 }
 
+/// Convert the monomorphic instances of closures defined in
+/// generic contexts that a set of bodies actually mentions.
+///
+/// A closure defined inside a generic function has no instance as
+/// an item (see [`closure_instance`]), but every monomorphic
+/// instance of the enclosing definition mentions the closure type
+/// with the enclosing substitution applied — in a closure
+/// aggregate, a local's type, or a call target's generic
+/// arguments. This pass walks `seeds` (and, transitively, the
+/// closure bodies themselves) for such mentions via
+/// [`sparagmos_driver::reach::closure_targets`], resolves each
+/// concrete one through `Instance::resolve_closure` with the
+/// closure's own kind, and converts it, registering the body under
+/// the same `(closure definition, instance)` key
+/// [`sparagmos_driver::convert::Converter::closure_def_id`] assigns
+/// to references. Mentions whose arguments still mention
+/// parameters are not demands this pass can satisfy — the
+/// enclosing body is itself generic — and are left to the pass
+/// over the monomorphic instances. Outcomes accumulate in the
+/// shared demand state (cap and deduplication are shared with the
+/// function-instance collection); the caller records them with
+/// [`apply_instance_demands`]. The Stable MIR bodies converted
+/// here are returned so the reachability collection can walk them
+/// for foreign targets too.
+fn collect_closure_instances(
+    conv: &mut Converter,
+    bodies: &mut Vec<(String, Body)>,
+    body_def_ids: &mut Vec<sparagmos_mir::DefId>,
+    body_def_names: &mut Vec<String>,
+    deferred: &[DeferredFn],
+    seeds: &[rustc_public::mir::Body],
+    state: &mut InstanceDemandState,
+) -> Vec<rustc_public::mir::Body> {
+    use std::collections::VecDeque;
+
+    let InstanceDemandState {
+        seen,
+        unresolved_seen,
+        plain_taken,
+        taken,
+        demands,
+    } = state;
+
+    let deferred_names: HashMap<rustc_public::DefId, &str> =
+        deferred.iter().map(|d| (d.def, d.name.as_str())).collect();
+    let mut queue: VecDeque<rustc_public::mir::Body> = seeds.iter().cloned().collect();
+    let mut extra_seeds: Vec<rustc_public::mir::Body> = Vec::new();
+
+    while let Some(body) = queue.pop_front() {
+        // Instance resolution goes through the compiler's
+        // internals and can panic on exotic targets; isolate each
+        // scanned body exactly as the function-instance collection
+        // does, so closure collection can never make a crate
+        // convert worse than the item loop alone did.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for (def, args) in sparagmos_driver::reach::closure_targets(&body) {
+                let referenced = def.def_id();
+                let Some(&base_name) = deferred_names.get(&referenced) else {
+                    continue;
+                };
+                if args_mention_params(&args) {
+                    continue;
+                }
+                let owners = [referenced];
+                let Some(kind) = closure_kind(&args) else {
+                    if unresolved_seen.insert((referenced, format!("{args:?}"))) {
+                        *demands
+                            .entry(referenced)
+                            .or_default()
+                            .failures
+                            .entry(
+                                "closure kind is not recoverable from its generic arguments"
+                                    .to_string(),
+                            )
+                            .or_default() += 1;
+                    }
+                    continue;
+                };
+                let inst = match Instance::resolve_closure(def, &args, kind) {
+                    Ok(inst) => inst,
+                    Err(_) => {
+                        if unresolved_seen.insert((referenced, format!("{args:?}"))) {
+                            *demands
+                                .entry(referenced)
+                                .or_default()
+                                .failures
+                                .entry("closure instance resolution failed".to_string())
+                                .or_default() += 1;
+                        }
+                        continue;
+                    }
+                };
+                if !seen.insert((referenced, inst)) {
+                    continue;
+                }
+                if *taken >= MAX_LOCAL_INSTANCES {
+                    fail_all(&mut *demands, &owners, "collection limit reached".to_string());
+                    continue;
+                }
+                if !inst.has_body() {
+                    fail_all(&mut *demands, &owners, "no MIR body available".to_string());
+                    continue;
+                }
+                let Some(ibody) = inst.body() else {
+                    fail_all(&mut *demands, &owners, "no MIR body available".to_string());
+                    continue;
+                };
+                match conv.convert_body(&ibody) {
+                    Ok(converted) => {
+                        *taken += 1;
+                        queue.push_back(ibody.clone());
+                        extra_seeds.push(ibody.clone());
+                        let counts =
+                            (ibody.blocks.len(), ibody.locals().len(), ibody.arg_locals().len());
+                        let display = if plain_taken.insert(referenced) {
+                            base_name.to_string()
+                        } else {
+                            format!("{} [{}]", base_name, inst.name())
+                        };
+                        bodies.push((display, converted));
+                        body_def_ids.push(conv.instance_def_id(referenced, &inst));
+                        body_def_names.push(base_name.to_string());
+                        let demand = demands.entry(referenced).or_default();
+                        demand.converted += 1;
+                        if demand.first_counts.is_none() {
+                            demand.first_counts = Some(counts);
+                        }
+                    }
+                    Err(errs) => {
+                        for e in errs {
+                            fail_all(&mut *demands, &owners, e);
+                        }
+                    }
+                }
+            }
+        }));
+        if outcome.is_err() {
+            // Contained panic: clear the capture slot, as the
+            // function-instance collection does.
+            let _ = take_captured_panic();
+        }
+    }
+
+    extra_seeds
+}
+
 /// Record the demand outcomes accumulated by
 /// [`collect_local_instances`] in the report: a deferred
 /// definition is converted when every instance demanded of it
@@ -877,6 +961,19 @@ fn register_trait_key_aliases(
                     continue;
                 };
                 if matches!(inst.kind, rustc_public::mir::mono::InstanceKind::Virtual { .. }) {
+                    continue;
+                }
+                // A call through an `Fn`-family trait whose Self
+                // type is a closure resolves to the closure
+                // instance itself. Its body must NOT be aliased
+                // under the trait key: the call passes the
+                // arguments as one RustCall tuple, while the
+                // closure body takes them spread, and the
+                // interpreter's trait-call path performs that
+                // adaptation when it invokes the closure value.
+                // A direct call to an alias copy would hand the
+                // body the unspread tuple.
+                if matches!(inst.ty().kind(), TyKind::RigidTy(RigidTy::Closure(..))) {
                     continue;
                 }
                 let resolved = inst.def.def_id();
@@ -1253,6 +1350,9 @@ fn collect() -> ControlFlow<()> {
     // Generic function definitions deferred by the item loop; the
     // instance collection after the loop accounts for them.
     let mut deferred: Vec<DeferredFn> = Vec::new();
+    // Closures defined in generic contexts, deferred the same way;
+    // the closure collection after the loop accounts for them.
+    let mut deferred_closures: Vec<DeferredFn> = Vec::new();
 
     let items = rustc_public::all_local_items();
     for item in items.iter() {
@@ -1264,14 +1364,53 @@ fn collect() -> ControlFlow<()> {
         // keyed by their resolved instance (the same key `FnDef` call
         // targets resolve through); other items keep the definition's
         // own id.
-        let def_id = match &item_instance {
+        let mut def_id = match &item_instance {
             Ok(inst) => conv.instance_def_id(item.def_id(), inst),
             Err(_) => conv.crate_def_id(item),
         };
         let instance = match item_instance {
             Ok(i) => i,
             Err(_) => match closure_instance(item) {
-                ClosureAttempt::Instance(i) => i,
+                ClosureAttempt::Instance(i) => {
+                    // A closure body is keyed by its instance, like
+                    // a function item: references to the closure
+                    // type resolve through `closure_def_id` to the
+                    // same key, and two instances of one closure
+                    // definition stay distinct bodies.
+                    def_id = conv.instance_def_id(item.def_id(), &i);
+                    i
+                }
+                ClosureAttempt::GenericContext => {
+                    // A closure defined inside a generic function,
+                    // method or impl: no instance as an item, but
+                    // monomorphic instances of the enclosing
+                    // definition mention it with concrete arguments.
+                    // Defer it like a generic function: a placeholder
+                    // report entry keeps the target-crate accounting
+                    // in place, and the closure collection after
+                    // this loop fills in the outcome.
+                    let mut reasons = BTreeMap::new();
+                    reasons.insert(
+                        "closure is defined in a generic context (its generic arguments \
+                         still mention parameters); only monomorphic closures are converted"
+                            .to_string(),
+                        1,
+                    );
+                    deferred_closures.push(DeferredFn {
+                        def: item.def_id(),
+                        name: name.clone(),
+                        report_idx: report.functions.len(),
+                        ctor: false,
+                    });
+                    report.functions.push(FnReport {
+                        name,
+                        blocks: 0,
+                        locals: 0,
+                        arg_count: 0,
+                        outcome: FnOutcome::Skipped { reasons },
+                    });
+                    continue;
+                }
                 ClosureAttempt::NotClosure => {
                     if matches!(item.kind(), ItemKind::Fn)
                         || matches!(
@@ -1419,8 +1558,25 @@ fn collect() -> ControlFlow<()> {
         &seed_bodies,
         &mut demand_state,
     );
+    // Convert the demanded instances of closures defined in
+    // generic contexts: the converted local bodies and the
+    // demanded function instances mention them with concrete
+    // arguments. The closure bodies join the reachability seeds,
+    // so the foreign functions they call are collected too.
+    let mut closure_scan = seed_bodies.clone();
+    closure_scan.extend(instance_seeds.iter().cloned());
+    let closure_seeds = collect_closure_instances(
+        &mut conv,
+        &mut bodies,
+        &mut body_def_ids,
+        &mut body_def_names,
+        &deferred_closures,
+        &closure_scan,
+        &mut demand_state,
+    );
     let mut reach_seeds = seed_bodies;
     reach_seeds.extend(instance_seeds);
+    reach_seeds.extend(closure_seeds);
 
     // Collect the bodies of non-local functions reachable from the
     // converted local bodies (std / core / alloc and other library
@@ -1473,7 +1629,20 @@ fn collect() -> ControlFlow<()> {
             &frontier,
             &mut demand_state,
         );
-        if new_instances.is_empty() {
+        // Newly collected foreign bodies and demanded instances
+        // can also mention generic-context closures concretely.
+        let mut closure_scan = frontier.clone();
+        closure_scan.extend(new_instances.iter().cloned());
+        let new_closure_bodies = collect_closure_instances(
+            &mut conv,
+            &mut bodies,
+            &mut body_def_ids,
+            &mut body_def_names,
+            &deferred_closures,
+            &closure_scan,
+            &mut demand_state,
+        );
+        if new_instances.is_empty() && new_closure_bodies.is_empty() {
             break;
         }
         for id in &body_def_ids[ids_before..] {
@@ -1482,14 +1651,17 @@ fn collect() -> ControlFlow<()> {
         if foreign_taken >= sparagmos_driver::reach::MAX_COLLECTED_BODIES {
             break;
         }
+        let mut reach_input = new_instances;
+        reach_input.extend(new_closure_bodies.iter().cloned());
         let reached = sparagmos_driver::reach::collect_reachable(
             &mut conv,
-            &new_instances,
+            &reach_input,
             &local_defs,
             sparagmos_driver::reach::MAX_COLLECTED_BODIES - foreign_taken,
         );
         frontier = reached.walked_bodies;
         alias_sources.extend(frontier.iter().cloned());
+        alias_sources.extend(new_closure_bodies.iter().cloned());
         for ((name, body), (def_id, def_name)) in reached
             .bodies
             .into_iter()
@@ -1509,6 +1681,7 @@ fn collect() -> ControlFlow<()> {
         }
     }
     apply_instance_demands(&mut report, &deferred, &demand_state.demands);
+    apply_instance_demands(&mut report, &deferred_closures, &demand_state.demands);
 
     // Register converted impl method bodies under the trait keys
     // their call sites resolve through (Issue #64). Demands can

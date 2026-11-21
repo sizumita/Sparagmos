@@ -829,11 +829,11 @@ fn main() {
 "#;
 
 #[test]
-fn summary_mode_generic_context_closure_is_skipped_with_reason() {
-    // A closure inside a generic function has no single monomorphic
-    // body to collect (the same limitation as the generic function
-    // itself). It stays skipped, with the reason naming the generic
-    // context instead of the generic "no monomorphic instance".
+fn summary_mode_generic_context_closure_is_converted_when_demanded() {
+    // A closure inside a generic function has no instance as an
+    // item, but the monomorphic instance of the enclosing function
+    // (`wrap::<i32>` here) mentions it with concrete arguments, and
+    // the closure collection converts the demanded instance.
     let dir = temp_dir("closure-generic");
     let src = fixture(&dir, "closure_generic.rs", CLOSURE_GENERIC_CONTEXT_SRC);
     let out = summarize_driver(&src);
@@ -843,9 +843,110 @@ fn summary_mode_generic_context_closure_is_skipped_with_reason() {
         .find(|l| l.contains("{closure#0}"))
         .expect("summary lists the closure item");
     assert!(
-        line.contains("SKIPPED") && line.contains("generic context"),
-        "the closure is skipped with the generic-context reason: {line}"
+        line.contains("[converted]"),
+        "the demanded generic-context closure instance is converted: {line}"
     );
+}
+
+const CLOSURE_GENERIC_UNDEMANDED_SRC: &str = r#"
+fn wrap<T: Copy>(v: T) -> T {
+    let id = |x: T| x;
+    id(v)
+}
+fn main() { println!("hi"); }
+"#;
+
+#[test]
+fn summary_mode_undemanded_generic_context_closure_stays_skipped() {
+    // The same closure with no monomorphic caller anywhere stays
+    // skipped, with the reason naming the generic context.
+    let dir = temp_dir("closure-generic-undemanded");
+    let src = fixture(
+        &dir,
+        "closure_generic_undemanded.rs",
+        CLOSURE_GENERIC_UNDEMANDED_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("{closure#0}"))
+        .expect("summary lists the closure item");
+    assert!(
+        line.contains("SKIPPED") && line.contains("generic context"),
+        "the undemanded closure stays skipped with the generic-context reason: {line}"
+    );
+}
+
+#[test]
+fn run_mode_generic_context_closure_runs() {
+    let dir = temp_dir("closure-generic-run");
+    let src = fixture(&dir, "closure_generic.rs", CLOSURE_GENERIC_CONTEXT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a closure inside a generic function must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
+}
+
+const CLOSURE_GENERIC_TWO_TYPES_SRC: &str = r#"
+fn twice<T: Copy + std::ops::Add<Output = T>>(v: T) -> T {
+    let f = |x: T| x + x;
+    f(v)
+}
+fn main() {
+    println!("{}", twice::<i32>(21));
+    println!("{}", twice::<f64>(1.5));
+}
+"#;
+
+#[test]
+fn run_mode_generic_closure_two_instantiations() {
+    // Two monomorphic instances of one closure definition coexist
+    // in the program and each call reaches its own body.
+    let dir = temp_dir("closure-generic-two-types");
+    let src = fixture(
+        &dir,
+        "closure_generic_two_types.rs",
+        CLOSURE_GENERIC_TWO_TYPES_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "both instantiations of the generic-context closure must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n3\n");
+}
+
+const GENERIC_HOF_FNONCE_SRC: &str = r#"
+fn apply<F: FnOnce() -> i32>(f: F) -> i32 { f() }
+fn main() {
+    let base = 40;
+    let r = apply(|| base + 2);
+    println!("{r}");
+}
+"#;
+
+#[test]
+fn run_mode_generic_hof_fnonce_with_closure() {
+    // A generic higher-order function applied to a closure: the
+    // `FnOnce::call_once` call inside the generic body resolves to
+    // the closure instance the caller monomorphized it with.
+    let dir = temp_dir("generic-hof-fnonce");
+    let src = fixture(&dir, "generic_hof_fnonce.rs", GENERIC_HOF_FNONCE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a generic HOF applied to a closure must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
 }
 
 #[test]

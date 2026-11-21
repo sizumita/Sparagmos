@@ -25,7 +25,9 @@ use rustc_public::mir;
 use rustc_public::mir::mono::{Instance, InstanceKind};
 use rustc_public::ty::{
     AdtDef, AdtKind, AliasKind as SmirAliasKind, Allocation, ConstantKind, FloatTy as SmirFloatTy,
-    FnDef, GenericArgKind, GenericArgs, IntTy as SmirIntTy, RigidTy, TyConstKind, TyKind,
+    ClosureKind, ExistentialPredicate, FnDef, GenericArgKind, GenericArgs,
+    IntTy as SmirIntTy, RigidTy,
+    Ty, TyConstKind, TyKind,
     UintTy as SmirUintTy, VariantIdx,
 };
 use rustc_public_bridge::IndexedVal;
@@ -207,6 +209,36 @@ impl Converter {
             Err(_) => self.def_id(def.def_id()),
         }
     }
+
+
+    /// The Sparagmos `DefId` for a closure type as it appears in a
+    /// body: the id of the monomorphic closure instance the type
+    /// denotes, resolved through `Instance::resolve_closure` with
+    /// the closure's own kind — the closure counterpart of
+    /// `fn_def_id` for function items. Two instances of one closure
+    /// definition (the same closure demanded from different generic
+    /// contexts) are different bodies and must not share an id.
+    /// A closure type whose arguments still mention generic
+    /// parameters (the closure seen from inside the generic body
+    /// that defines it) or whose instance cannot be resolved keeps
+    /// the definition's own id, which no converted body carries,
+    /// so the reference stays unresolved downstream.
+    pub fn closure_def_id(
+        &mut self,
+        def: &rustc_public::ty::ClosureDef,
+        args: &GenericArgs,
+    ) -> sm::DefId {
+        let raw = def.def_id();
+        if !args_mention_params(args) {
+            if let Some(kind) = closure_kind(args) {
+                if let Ok(inst) = Instance::resolve_closure(*def, args, kind) {
+                    return self.instance_def_id(raw, &inst);
+                }
+            }
+        }
+        self.def_id(raw)
+    }
+
 
     /// Convert one Stable MIR body. On any unsupported construct, returns
     /// the list of reasons (variant names) instead of a body.
@@ -544,7 +576,7 @@ impl Converter {
                 }
             }
             A::Closure(def, args) => sm::AggregateKind::Closure {
-                def: self.crate_def_id(def),
+                def: self.closure_def_id(def, args),
                 generic_args: self.type_args(args),
             },
             A::Coroutine(def, args) => sm::AggregateKind::Coroutine {
@@ -1045,7 +1077,7 @@ impl Converter {
                 // callable itself; a captured environment has no
                 // constant form here and stays undecoded.
                 if Self::closure_env_is_empty(&args) {
-                    let d = self.crate_def_id(&def);
+                    let d = self.closure_def_id(&def, &args);
                     Some(sm::ConstValue::Closure(d))
                 } else {
                     None
@@ -1276,15 +1308,15 @@ impl Converter {
         if matches!(inst.kind, InstanceKind::Shim) {
             for arg in &inst.args().0 {
                 if let GenericArgKind::Type(t) = arg {
-                    if let TyKind::RigidTy(RigidTy::Closure(def, _)) = t.kind() {
-                        let d = self.crate_def_id(&def);
+                    if let TyKind::RigidTy(RigidTy::Closure(def, args)) = t.kind() {
+                        let d = self.closure_def_id(&def, &args);
                         return Some(sm::ConstValue::Closure(d));
                     }
                 }
             }
         }
-        if let TyKind::RigidTy(RigidTy::Closure(def, _)) = inst.ty().kind() {
-            let d = self.crate_def_id(&def);
+        if let TyKind::RigidTy(RigidTy::Closure(def, args)) = inst.ty().kind() {
+            let d = self.closure_def_id(&def, &args);
             return Some(sm::ConstValue::Closure(d));
         }
         let d = self.instance_def_id(inst.def.def_id(), inst);
@@ -1611,7 +1643,7 @@ impl Converter {
                 sm::Ty::Dynamic(names, Box::new(sm::Ty::unit()), sm::Region::Erased)
             }
             RigidTy::Closure(def, args) => {
-                let d = self.crate_def_id(def);
+                let d = self.closure_def_id(def, args);
                 sm::Ty::Closure(d, self.type_args(args))
             }
             RigidTy::Coroutine(def, args) => {
@@ -1962,3 +1994,73 @@ fn abi_of(abi: &rustc_public::ty::Abi) -> sm::Abi {
         other => sm::Abi::Other(format!("{other:?}")),
     }
 }
+
+/// The closure kind (`Fn` / `FnMut` / `FnOnce`) recorded in a
+/// closure type's generic arguments. rustc appends three synthetic
+/// arguments to a closure's parent arguments — the kind, the
+/// signature as a function-pointer type, and the tupled captures —
+/// and encodes the kind itself as an integer type: `i8` for `Fn`,
+/// `i16` for `FnMut`, `i32` for `FnOnce` (this is rustc's
+/// `Ty::from_closure_kind`; the encoding is part of the Stable MIR
+/// boundary this crate pins to Rust 1.100.0).
+pub fn closure_kind(args: &GenericArgs) -> Option<ClosureKind> {
+    let kind_arg = args.0.iter().rev().nth(2)?;
+    let GenericArgKind::Type(ty) = kind_arg else {
+        return None;
+    };
+    match ty.kind() {
+        TyKind::RigidTy(RigidTy::Int(SmirIntTy::I8)) => Some(ClosureKind::Fn),
+        TyKind::RigidTy(RigidTy::Int(SmirIntTy::I16)) => Some(ClosureKind::FnMut),
+        TyKind::RigidTy(RigidTy::Int(SmirIntTy::I32)) => Some(ClosureKind::FnOnce),
+        _ => None,
+    }
+}
+
+/// Whether any generic argument still mentions a type or const
+/// parameter, i.e. the item is not fully monomorphic.
+pub fn args_mention_params(args: &GenericArgs) -> bool {
+    args.0.iter().any(|arg| match arg {
+        GenericArgKind::Type(ty) => ty_mentions_param(ty),
+        GenericArgKind::Const(konst) => const_mentions_param(konst),
+        GenericArgKind::Lifetime(_) => false,
+    })
+}
+
+fn const_mentions_param(konst: &rustc_public::ty::TyConst) -> bool {
+    match konst.kind() {
+        TyConstKind::Param(_) => true,
+        TyConstKind::Unevaluated(_, args) => args_mention_params(args),
+        TyConstKind::Value(ty, _) | TyConstKind::ZSTValue(ty) => ty_mentions_param(ty),
+        _ => false,
+    }
+}
+
+fn ty_mentions_param(ty: &Ty) -> bool {
+    match ty.kind() {
+        TyKind::Param(_) => true,
+        TyKind::Alias(_, alias) => args_mention_params(&alias.args),
+        TyKind::RigidTy(rigid) => match rigid {
+            RigidTy::Ref(_, inner, _) | RigidTy::RawPtr(inner, _) | RigidTy::Slice(inner) => {
+                ty_mentions_param(&inner)
+            }
+            RigidTy::Array(inner, len) => ty_mentions_param(&inner) || const_mentions_param(&len),
+            RigidTy::Pat(inner, _) => ty_mentions_param(&inner),
+            RigidTy::Tuple(elems) => elems.iter().any(ty_mentions_param),
+            RigidTy::FnPtr(sig) => sig.value.inputs_and_output.iter().any(ty_mentions_param),
+            RigidTy::Adt(_, args)
+            | RigidTy::FnDef(_, args)
+            | RigidTy::Closure(_, args)
+            | RigidTy::Coroutine(_, args)
+            | RigidTy::CoroutineClosure(_, args)
+            | RigidTy::CoroutineWitness(_, args) => args_mention_params(&args),
+            RigidTy::Dynamic(bounds, _) => bounds.iter().any(|b| match &b.value {
+                ExistentialPredicate::Trait(t) => args_mention_params(&t.generic_args),
+                ExistentialPredicate::Projection(p) => args_mention_params(&p.generic_args),
+                ExistentialPredicate::AutoTrait(_) => false,
+            }),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+

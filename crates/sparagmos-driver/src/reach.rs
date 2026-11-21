@@ -54,8 +54,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use rustc_public::mir::mono::{Instance, InstanceKind};
-use rustc_public::mir::{self, Operand, TerminatorKind};
-use rustc_public::ty::{GenericArgs, RigidTy, TyKind};
+use rustc_public::mir::{self, AggregateKind, Operand, Rvalue, StatementKind, TerminatorKind};
+use rustc_public::ty::{ClosureDef, GenericArgKind, GenericArgs, RigidTy, Ty, TyKind};
 use rustc_public::CrateDef;
 
 use sparagmos_mir as sm;
@@ -500,4 +500,132 @@ pub fn unrepresentable_local(body: &sm::Body) -> Option<String> {
         .iter()
         .enumerate()
         .find_map(|(i, decl)| offending(&decl.ty).map(|kind| format!("{kind} in local _{i}")))
+}
+
+/// The closure types one Stable MIR body mentions: every
+/// `Closure(def, args)` type reachable from the body's local
+/// declarations, its operands' types, and its closure aggregate
+/// rvalues, walking nested types (a closure captured by another
+/// closure, a closure in a call target's generic arguments, ...).
+/// The arguments are the body's own substitution applied — inside
+/// a monomorphic instance body they are concrete; inside the
+/// generic definition's body they still mention parameters, and
+/// the caller decides what that means for each entry.
+pub fn closure_targets(body: &mir::Body) -> Vec<(ClosureDef, GenericArgs)> {
+    fn walk_args(args: &GenericArgs, out: &mut Vec<(ClosureDef, GenericArgs)>) {
+        for arg in &args.0 {
+            match arg {
+                GenericArgKind::Type(ty) => walk_ty(ty, out),
+                GenericArgKind::Const(konst) => match konst.kind() {
+                    rustc_public::ty::TyConstKind::Unevaluated(_, inner) => {
+                        walk_args(&inner, out)
+                    }
+                    rustc_public::ty::TyConstKind::Value(ty, _)
+                    | rustc_public::ty::TyConstKind::ZSTValue(ty) => walk_ty(&ty, out),
+                    _ => {}
+                },
+                GenericArgKind::Lifetime(_) => {}
+            }
+        }
+    }
+
+    fn walk_ty(ty: &Ty, out: &mut Vec<(ClosureDef, GenericArgs)>) {
+        match ty.kind() {
+            TyKind::RigidTy(RigidTy::Closure(def, args)) => {
+                out.push((def, args.clone()));
+                walk_args(&args, out);
+            }
+            TyKind::RigidTy(RigidTy::Ref(_, inner, _))
+            | TyKind::RigidTy(RigidTy::RawPtr(inner, _))
+            | TyKind::RigidTy(RigidTy::Slice(inner)) => walk_ty(&inner, out),
+            TyKind::RigidTy(RigidTy::Array(inner, _)) => walk_ty(&inner, out),
+            TyKind::RigidTy(RigidTy::Pat(inner, _)) => walk_ty(&inner, out),
+            TyKind::RigidTy(RigidTy::Tuple(elems)) => {
+                for elem in &elems {
+                    walk_ty(elem, out);
+                }
+            }
+            TyKind::RigidTy(RigidTy::FnPtr(sig)) => {
+                for t in &sig.value.inputs_and_output {
+                    walk_ty(t, out);
+                }
+            }
+            TyKind::RigidTy(RigidTy::Adt(_, args))
+            | TyKind::RigidTy(RigidTy::FnDef(_, args))
+            | TyKind::RigidTy(RigidTy::Coroutine(_, args))
+            | TyKind::RigidTy(RigidTy::CoroutineClosure(_, args))
+            | TyKind::RigidTy(RigidTy::CoroutineWitness(_, args)) => walk_args(&args, out),
+            TyKind::RigidTy(RigidTy::Dynamic(bounds, _)) => {
+                for bound in &bounds {
+                    match &bound.value {
+                        rustc_public::ty::ExistentialPredicate::Trait(t) => {
+                            walk_args(&t.generic_args, out)
+                        }
+                        rustc_public::ty::ExistentialPredicate::Projection(p) => {
+                            walk_args(&p.generic_args, out)
+                        }
+                        rustc_public::ty::ExistentialPredicate::AutoTrait(_) => {}
+                    }
+                }
+            }
+            TyKind::Alias(_, alias) => walk_args(&alias.args, out),
+            _ => {}
+        }
+    }
+
+    let locals = body.locals();
+    let mut out = Vec::new();
+    for decl in locals {
+        walk_ty(&decl.ty, &mut out);
+    }
+    let mut operand_ty = |op: &Operand, out: &mut Vec<(ClosureDef, GenericArgs)>| {
+        if let Ok(ty) = op.ty(&locals) {
+            walk_ty(&ty, out);
+        }
+    };
+    for bb in &body.blocks {
+        for stmt in &bb.statements {
+            let StatementKind::Assign(_, rvalue) = &stmt.kind else {
+                continue;
+            };
+            match rvalue {
+                Rvalue::Aggregate(AggregateKind::Closure(def, args), ops) => {
+                    out.push((*def, args.clone()));
+                    walk_args(args, &mut out);
+                    for op in ops {
+                        operand_ty(op, &mut out);
+                    }
+                }
+                Rvalue::Aggregate(_, ops) => {
+                    for op in ops {
+                        operand_ty(op, &mut out);
+                    }
+                }
+                Rvalue::Use(op, _)
+                | Rvalue::Repeat(op, _)
+                | Rvalue::UnaryOp(_, op) => operand_ty(op, &mut out),
+                Rvalue::Cast(_, op, ty) => {
+                    operand_ty(op, &mut out);
+                    walk_ty(ty, &mut out);
+                }
+                Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) => {
+                    operand_ty(a, &mut out);
+                    operand_ty(b, &mut out);
+                }
+                _ => {}
+            }
+        }
+        match &bb.terminator.kind {
+            TerminatorKind::Call { func, args, .. } => {
+                operand_ty(func, &mut out);
+                for op in args {
+                    operand_ty(op, &mut out);
+                }
+            }
+            TerminatorKind::Assert { cond, .. } => operand_ty(cond, &mut out),
+            TerminatorKind::SwitchInt { discr, .. } => operand_ty(discr, &mut out),
+            _ => {}
+        }
+    }
+    out
 }
