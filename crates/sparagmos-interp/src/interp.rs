@@ -1314,9 +1314,19 @@ impl<'a> Interpreter<'a> {
                         variant: current,
                         fields,
                     } => {
-                        *current = *variant;
-                        // The old payload is invalidated, as in MIR.
-                        fields.clear();
+                        if *current != *variant {
+                            *current = *variant;
+                            // The old payload is invalidated, as in MIR.
+                            fields.clear();
+                        }
+                        // A SetDiscriminant naming the variant the
+                        // place already holds is a tag-only write: in
+                        // the writes-first order (the order the
+                        // coroutine transform also uses) the new
+                        // variant's fields were already stored through
+                        // its downcast, which switched the tag when it
+                        // rematerialized the payload, and those stores
+                        // must survive this statement.
                         Ok(())
                     }
                     other => Err(InterpError::type_mismatch(
@@ -2539,9 +2549,24 @@ pub(crate) fn navigate_mut<'x>(
                 }
                 return navigate_mut(&mut fields[*idx], rest, func, place);
             }
+            if let Value::Enum { fields, .. } = slot {
+                // An enum place being (re)initialized in place has
+                // no live payload slots for the variant being
+                // written: SetDiscriminant invalidated the old
+                // payload, and a downcast write to a different
+                // variant rematerialized it empty. The field slots
+                // of the variant being entered are materialized
+                // with Uninit padding up to the written index,
+                // exactly like the coroutine state storage above
+                // and the field-write padding elsewhere; slots
+                // never written keep reading as uninitialized.
+                if fields.len() <= *idx {
+                    fields.resize(*idx + 1, Value::Uninit);
+                }
+                return navigate_mut(&mut fields[*idx], rest, func, place);
+            }
             let items = match slot {
                 Value::Tuple(items) => items,
-                Value::Enum { fields, .. } => fields,
                 Value::Closure { env, .. } => env,
                 other => {
                     return Err(InterpError::type_mismatch(
@@ -2589,14 +2614,22 @@ pub(crate) fn navigate_mut<'x>(
             // whatever the current tag is.
             Value::Coroutine { .. } => navigate_mut(slot, rest, func, place),
             Value::Enum {
-                variant: current, ..
+                variant: current,
+                fields,
             } => {
                 if current != variant {
-                    return Err(InterpError::type_mismatch(
-                        format!("downcast write on {place}"),
-                        format!("variant {variant}"),
-                        format!("variant {current}"),
-                    ));
+                    // A mutable navigation through the downcast of
+                    // a variant other than the one the tag names is
+                    // an in-place reinitialization: the old variant's
+                    // payload is invalidated and the new variant's
+                    // storage is rematerialized empty (the Field arm
+                    // pads it with Uninit slots as fields are
+                    // written). The tag switches here so that the
+                    // closing SetDiscriminant, when the MIR emits
+                    // one after the stores, names the held variant
+                    // and leaves the stored fields in place.
+                    *current = *variant;
+                    fields.clear();
                 }
                 navigate_mut(slot, rest, func, place)
             }
