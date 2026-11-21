@@ -62,6 +62,10 @@ pub struct Converter {
     /// compiler cannot give (generic parameters, unsized types) get
     /// no entry.
     pub adt_layouts: sm::AdtLayouts,
+    /// Rendered instance keys whose layout query was already
+    /// attempted (successfully or not), so a type whose query
+    /// cannot be answered is not re-queried at every conversion.
+    layout_attempted: std::collections::HashSet<String>,
     /// Name table for rendering ADT instance keys, kept in sync
     /// with `def_names` (which is indexed by the converted `DefId`).
     layout_names: std::collections::HashMap<sm::DefId, String>,
@@ -75,6 +79,45 @@ impl Default for Converter {
     }
 }
 
+
+/// Whether an ADT instance may be unsized: any field of any
+/// variant whose type may itself be unsized (a slice, `str`, a
+/// trait object, or a nested ADT that may be unsized). Such types
+/// are only legal with unsized fields in tail position — except
+/// under `trivial_bounds`, where they can sit anywhere and the
+/// compiler's layout computation itself ICEs on them (rustc never
+/// computes their layouts). The layout query is skipped for them:
+/// they stay explicitly unsupported. Aliases and parameters count
+/// as suspect (their layout is not computable here anyway).
+fn adt_may_be_unsized(
+    def: &AdtDef,
+    args: &rustc_public::ty::GenericArgs,
+    depth: usize,
+) -> bool {
+    if depth >= 8 {
+        return true;
+    }
+    def.variants().iter().any(|variant| {
+        variant
+            .fields()
+            .iter()
+            .any(|field| ty_may_be_unsized(&field.ty_with_args(args), depth + 1))
+    })
+}
+
+fn ty_may_be_unsized(ty: &rustc_public::ty::Ty, depth: usize) -> bool {
+    match ty.kind() {
+        TyKind::RigidTy(r) => match r {
+            RigidTy::Slice(_) | RigidTy::Str | RigidTy::Dynamic(..) => true,
+            RigidTy::Adt(def, args) => adt_may_be_unsized(&def, &args, depth),
+            RigidTy::Array(elem, _) => ty_may_be_unsized(&elem, depth),
+            RigidTy::Tuple(ts) => ts.iter().any(|t| ty_may_be_unsized(t, depth)),
+            _ => false,
+        },
+        _ => true,
+    }
+}
+
 impl Converter {
     pub fn new() -> Self {
         Self {
@@ -83,6 +126,7 @@ impl Converter {
             def_names: Vec::new(),
             adt_discriminants: sm::AdtDiscriminants::new(),
             adt_layouts: sm::AdtLayouts::new(),
+            layout_attempted: std::collections::HashSet::new(),
             layout_names: std::collections::HashMap::new(),
             errors: Vec::new(),
         }
@@ -1278,8 +1322,8 @@ impl Converter {
 
     pub fn ty(&mut self, ty: &rustc_public::ty::Ty) -> sm::Ty {
         let converted = self.ty_inner(ty);
-        if matches!(ty.kind(), TyKind::RigidTy(RigidTy::Adt(..))) {
-            self.record_layout(ty, &converted);
+        if let TyKind::RigidTy(RigidTy::Adt(def, args)) = ty.kind() {
+            self.record_layout(ty, &def, &args, &converted);
         }
         converted
     }
@@ -1327,7 +1371,16 @@ impl Converter {
     /// answer (generic parameters among the arguments, unsized
     /// types, trait objects) are skipped: they stay explicitly
     /// unsupported in the interpreter.
-    fn record_layout(&mut self, ty: &rustc_public::ty::Ty, converted: &sm::Ty) {
+    fn record_layout(
+        &mut self,
+        ty: &rustc_public::ty::Ty,
+        def: &AdtDef,
+        args: &rustc_public::ty::GenericArgs,
+        converted: &sm::Ty,
+    ) {
+        if adt_may_be_unsized(def, args, 0) {
+            return;
+        }
         while self.layout_names.len() < self.def_names.len() {
             let index = self.layout_names.len();
             self.layout_names.insert(
@@ -1336,10 +1389,19 @@ impl Converter {
             );
         }
         let key = sparagmos_interp::builtins::ty_tag(converted, &self.layout_names);
-        if self.adt_layouts.contains_key(&key) {
+        if !self.layout_attempted.insert(key.clone()) {
             return;
         }
-        let Ok(layout) = ty.layout() else {
+        // The layout query is not total: for some types that can
+        // appear in converted bodies (ill-formed bounds, types the
+        // layout computation itself rejects) it panics inside the
+        // compiler. The table is auxiliary — a failed query must
+        // never fail the conversion — so the query is contained:
+        // the instance simply gets no entry and stays unsupported.
+        // (The panic is silent under the driver's panic-capture
+        // hook, which is installed while the compiler runs.)
+        let layout = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ty.layout()));
+        let Ok(Ok(layout)) = layout else {
             return;
         };
         let shape = layout.shape();
