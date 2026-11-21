@@ -4472,6 +4472,138 @@ impl<'a> Interpreter<'a> {
         })
     }
 
+    /// A scalar `Transmute` reinterpretation: flatten the
+    /// operand value to its bit pattern through the source
+    /// shape, then construct the target shape's value from the
+    /// same bits.
+    fn reinterpret_value(
+        &self,
+        value: &Value,
+        src: &ScalarShape,
+        dst: &ScalarShape,
+    ) -> InterpResult<Value> {
+        let bits = self.flatten_scalar(value, src)?;
+        self.construct_scalar(bits, dst)
+    }
+
+    /// The bit pattern of `value` read through `shape`
+    /// (little-endian: earlier array elements and lower fields
+    /// occupy the lower bits).
+    fn flatten_scalar(
+        &self,
+        value: &Value,
+        shape: &ScalarShape,
+    ) -> InterpResult<u128> {
+        match (shape, value) {
+            (ScalarShape::Int { bits, .. }, Value::Int(i)) => {
+                Ok((*i as u128) & bit_mask(*bits))
+            }
+            (ScalarShape::Int { bits, .. }, Value::Uint(u)) => {
+                Ok(*u & bit_mask(*bits))
+            }
+            (ScalarShape::Float { bits }, Value::Float(f)) => Ok(match bits {
+                16 => u128::from(f64_to_f16_bits(*f)),
+                32 => u128::from((*f as f32).to_bits()),
+                _ => u128::from(f.to_bits()),
+            }),
+            (ScalarShape::Bool, Value::Bool(b)) => Ok(u128::from(*b)),
+            (ScalarShape::Char, Value::Uint(u)) => Ok(*u & bit_mask(32)),
+            (ScalarShape::Array(elem, n), Value::Tuple(items))
+                if items.len() as u64 == *n =>
+            {
+                let eb = elem.bits();
+                let mut out = 0u128;
+                for (i, item) in items.iter().enumerate() {
+                    out |= self.flatten_scalar(item, elem)? << (i as u32 * eb);
+                }
+                Ok(out)
+            }
+            // A byte-array constant's value is its bytes.
+            (ScalarShape::Array(elem, n), Value::Bytes(b))
+                if elem.bits() == 8 && b.len() as u64 == *n =>
+            {
+                let mut out = 0u128;
+                for (i, byte) in b.iter().enumerate() {
+                    out |= u128::from(*byte) << (8 * i);
+                }
+                Ok(out)
+            }
+            (
+                ScalarShape::AdtField { index, inner, .. },
+                Value::Enum { fields, .. },
+            ) => match fields.get(*index as usize) {
+                Some(field) => self.flatten_scalar(field, inner),
+                None => Err(InterpError::type_mismatch(
+                    "transmute",
+                    "an ADT value holding the payload field",
+                    "an ADT value without it",
+                )),
+            },
+            (_, other) => Err(InterpError::type_mismatch(
+                "transmute",
+                "a value of the source shape",
+                other.kind_name(),
+            )),
+        }
+    }
+
+    /// The value of `shape` whose bit pattern is `bits`
+    /// (the low `shape.bits()` bits; higher bits are ignored).
+    fn construct_scalar(
+        &self,
+        bits: u128,
+        shape: &ScalarShape,
+    ) -> InterpResult<Value> {
+        match shape {
+            ScalarShape::Int { bits: w, signed } => {
+                if *signed {
+                    Ok(Value::Int(wrap_signed(bits as i128, *w)))
+                } else {
+                    Ok(Value::Uint(wrap_unsigned(bits, *w)))
+                }
+            }
+            ScalarShape::Float { bits: w } => Ok(Value::Float(match w {
+                16 => crate::mir_convert::f16_to_f64(bits as u16),
+                32 => f64::from(f32::from_bits(bits as u32)),
+                _ => f64::from_bits(bits as u64),
+            })),
+            ScalarShape::Bool => Ok(Value::Bool(bits != 0)),
+            ScalarShape::Char => match char::from_u32(bits as u32) {
+                Some(c) => Ok(Value::Uint(u128::from(c as u32))),
+                None => Err(InterpError::type_mismatch(
+                    "transmute to char",
+                    "a valid Unicode code point",
+                    format!("bit pattern {bits:#x}"),
+                )),
+            },
+            ScalarShape::Array(elem, n) => {
+                let eb = elem.bits();
+                let mut items = Vec::with_capacity(*n as usize);
+                for i in 0..*n {
+                    let part = (bits >> (i as u32 * eb)) & bit_mask(eb);
+                    items.push(self.construct_scalar(part, elem)?);
+                }
+                Ok(Value::Tuple(items))
+            }
+            ScalarShape::AdtField {
+                index,
+                count,
+                fill,
+                inner,
+            } => {
+                let mut fields = vec![Value::Uninit; *count];
+                for (i, c) in fill {
+                    fields[*i as usize] = self.eval_constant(c)?;
+                }
+                fields[*index as usize] = self.construct_scalar(bits, inner)?;
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields,
+                })
+            }
+        }
+    }
+
     // ----- rvalues -----------------------------------------------------------
 
     fn eval_rvalue(
@@ -4674,6 +4806,10 @@ impl<'a> Interpreter<'a> {
                         format!("integer {bits}"),
                     )),
                 }
+            }
+            Rvalue::Reinterpret(operand, src, dst) => {
+                let value = self.eval_operand(frames, body, operand)?;
+                self.reinterpret_value(&value, src, dst)
             }
             Rvalue::BoxDerefTransmute(operand) => {
                 // The cast yields a pointer to the box's pointee.
@@ -5455,6 +5591,15 @@ fn wrap_signed(v: i128, bits: u32) -> i128 {
     }
     let shift = 128 - bits;
     (v << shift) >> shift
+}
+
+/// The mask of the low `bits` bits (all bits for 128).
+fn bit_mask(bits: u32) -> u128 {
+    if bits >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << bits) - 1
+    }
 }
 
 fn wrap_unsigned(v: u128, bits: u32) -> u128 {
