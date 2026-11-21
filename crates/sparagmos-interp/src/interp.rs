@@ -111,6 +111,43 @@ pub(crate) enum Resolved {
     },
 }
 
+/// One spawned thread of the cooperative thread model: the
+/// callable captured at `spawn` time, and the outcome once it has
+/// run. A spawned thread never runs concurrently with the thread
+/// that spawned it; it runs to completion when the running thread
+/// reaches a point where it would block (see
+/// [`Interpreter::drain_threads`]).
+pub(crate) struct ThreadSlot {
+    pub callable: Option<Value>,
+    pub outcome: Option<Result<Value, String>>,
+}
+
+/// The shared state of one `std::sync::mpsc` channel, keyed by the
+/// id carried inside the `Sender` / `Receiver` handle values.
+/// `senders` / `receivers` count live handles: handle creation and
+/// `Clone` increment them, and dropping a handle place decrements
+/// them (see the `Drop` terminator's note in `drive_frames`), which
+/// is what makes disconnection observable exactly when the last
+/// handle of a side goes away.
+pub(crate) struct ChannelState {
+    pub queue: std::collections::VecDeque<Value>,
+    pub senders: usize,
+    pub receivers: usize,
+    pub bound: Option<usize>,
+}
+
+/// The channel id carried by an mpsc handle value, if the value
+/// has the handle shape (a one-field aggregate holding the id).
+pub(crate) fn channel_handle_id(value: &Value) -> Option<u64> {
+    match value {
+        Value::Enum { fields, .. } if fields.len() == 1 => match &fields[0] {
+            Value::Uint(id) => Some(*id as u64),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// The interpreter state for one program.
 pub struct Interpreter<'a> {
     program: &'a Program,
@@ -136,6 +173,20 @@ pub struct Interpreter<'a> {
     /// must not start over — the outer seeding fills the storage,
     /// and the nested reference simply names it.
     statics_seeding: std::cell::RefCell<HashSet<String>>,
+    /// Spawned threads of the cooperative thread model (see
+    /// [`ThreadSlot`]), keyed by thread id. The entry thread is
+    /// id 1, matching `std`'s numbering of the main thread.
+    threads: std::cell::RefCell<HashMap<u64, ThreadSlot>>,
+    /// The id the next spawned thread gets.
+    next_thread: std::cell::RefCell<u64>,
+    /// The thread whose code is currently executing (the entry
+    /// thread outside any spawned thread's run).
+    current_thread: std::cell::Cell<u64>,
+    /// mpsc channel states (see [`ChannelState`]), keyed by the id
+    /// carried inside the handle values.
+    channels: std::cell::RefCell<HashMap<u64, ChannelState>>,
+    /// The id the next created channel gets.
+    next_channel: std::cell::RefCell<u64>,
 }
 
 /// The synthetic address of a pointer value (see
@@ -202,6 +253,11 @@ impl<'a> Interpreter<'a> {
             drop_continuations: Vec::new(),
             statics: std::cell::RefCell::new(HashMap::new()),
             statics_seeding: std::cell::RefCell::new(HashSet::new()),
+            threads: std::cell::RefCell::new(HashMap::new()),
+            next_thread: std::cell::RefCell::new(2),
+            current_thread: std::cell::Cell::new(1),
+            channels: std::cell::RefCell::new(HashMap::new()),
+            next_channel: std::cell::RefCell::new(1),
         }
     }
 
@@ -273,6 +329,26 @@ impl<'a> Interpreter<'a> {
             return_block: None,
         }];
 
+        self.drive_frames(&mut frames, 0)
+    }
+
+    /// Drive the frame stack until the frame at depth `base`
+    /// returns, yielding its return value. The caller's stack is
+    /// always restored to the depth this drive started from: on
+    /// success the loop stops exactly there; on an error — above
+    /// all a guest panic, which a thread's join must observe as
+    /// the thread's outcome rather than as a failure of the whole
+    /// run — the frames above the base are dead and are
+    /// discarded, as unwinding discards them.
+    fn drive_frames(&mut self, frames_out: &mut Vec<Frame>, base: usize) -> InterpResult<Value> {
+        let mut frames: Vec<Frame> = std::mem::take(frames_out);
+        let result = self.drive_frames_loop(&mut frames, base);
+        frames.truncate(base);
+        *frames_out = frames;
+        result
+    }
+
+    fn drive_frames_loop(&mut self, frames: &mut Vec<Frame>, base: usize) -> InterpResult<Value> {
         loop {
             // Fetch the current block's next unit of work, cloning the small
             // pieces we need so the frame stack can be mutated freely after.
@@ -305,7 +381,7 @@ impl<'a> Interpreter<'a> {
                 // (not possible in a statement) or an error leaves sane state.
                 frames.last_mut().expect("frame").stmt += 1;
                 self.tick()?;
-                self.exec_statement(&mut frames, body, &statement)?;
+                self.exec_statement(frames, body, &statement)?;
                 continue;
             }
 
@@ -314,14 +390,14 @@ impl<'a> Interpreter<'a> {
             self.tick()?;
             match terminator {
                 TerminatorKind::Goto { target } => {
-                    Self::jump(&mut frames, body, target)?;
+                    Self::jump(frames, body, target)?;
                 }
                 TerminatorKind::SwitchInt {
                     discr,
                     targets,
                     otherwise,
                 } => {
-                    let value = self.eval_operand(&mut frames, body, &discr)?;
+                    let value = self.eval_operand(frames, body, &discr)?;
                     let bits = value.switch_bits().ok_or_else(|| {
                         InterpError::type_mismatch(
                             "SwitchInt discriminant",
@@ -334,7 +410,7 @@ impl<'a> Interpreter<'a> {
                         .find(|(pattern, _)| *pattern == bits)
                         .map(|(_, bb)| *bb)
                         .unwrap_or(otherwise);
-                    Self::jump(&mut frames, body, target)?;
+                    Self::jump(frames, body, target)?;
                 }
                 TerminatorKind::Call {
                     func,
@@ -344,9 +420,9 @@ impl<'a> Interpreter<'a> {
                 } => {
                     let mut arg_values = Vec::with_capacity(args.len());
                     for arg in &args {
-                        arg_values.push(self.eval_operand(&mut frames, body, arg)?);
+                        arg_values.push(self.eval_operand(frames, body, arg)?);
                     }
-                    self.start_call(&mut frames, &func, arg_values, &destination, target)?;
+                    self.start_call(frames, &func, arg_values, &destination, target)?;
                 }
                 TerminatorKind::CallIndirect {
                     func,
@@ -361,18 +437,18 @@ impl<'a> Interpreter<'a> {
                     // `FnOnce` closure's own body) gets the value
                     // itself instead (see `consumed_env_arg`).
                     let (callee, env_ref) = self.eval_callable(&frames, body, &func)?;
-                    let env_ref = match self.consumed_env_arg(&mut frames, body, &func, &callee)? {
+                    let env_ref = match self.consumed_env_arg(frames, body, &func, &callee)? {
                         Some(by_value) => by_value,
                         None => env_ref,
                     };
                     let mut arg_values = Vec::with_capacity(args.len());
                     for arg in &args {
-                        arg_values.push(self.eval_operand(&mut frames, body, arg)?);
+                        arg_values.push(self.eval_operand(frames, body, arg)?);
                     }
                     match callee {
                         Value::FnPtr(name) => {
                             self.start_call(
-                                &mut frames,
+                                frames,
                                 &name,
                                 arg_values,
                                 &destination,
@@ -382,7 +458,7 @@ impl<'a> Interpreter<'a> {
                         Value::Closure { def, .. } => {
                             let mut full = vec![env_ref];
                             full.extend(arg_values);
-                            self.start_call(&mut frames, &def, full, &destination, target)?;
+                            self.start_call(frames, &def, full, &destination, target)?;
                         }
                         other => {
                             return Err(InterpError::type_mismatch(
@@ -400,7 +476,7 @@ impl<'a> Interpreter<'a> {
                     destination,
                     target,
                 } => {
-                    let args_value = self.eval_operand(&mut frames, body, &args)?;
+                    let args_value = self.eval_operand(frames, body, &args)?;
                     let arg_values = match args_value {
                         Value::Tuple(items) => items,
                         Value::Unit => Vec::new(),
@@ -436,7 +512,7 @@ impl<'a> Interpreter<'a> {
                                     (value, env_ref)
                                 };
                             let env_ref = match self.consumed_env_arg(
-                                &mut frames,
+                                frames,
                                 body,
                                 &receiver,
                                 &value,
@@ -447,7 +523,7 @@ impl<'a> Interpreter<'a> {
                             (value, env_ref)
                         }
                         FnCallKind::Call | FnCallKind::CallMut => {
-                            let recv = self.eval_operand(&mut frames, body, &receiver)?;
+                            let recv = self.eval_operand(frames, body, &receiver)?;
                             match recv {
                                 Value::Ref(_) | Value::FatRef { .. } => {
                                     let resolved = self.deref_value(&frames, &recv)?;
@@ -525,11 +601,11 @@ impl<'a> Interpreter<'a> {
                         Value::Closure { def, .. } => {
                             let mut full = vec![env_ref];
                             full.extend(arg_values);
-                            self.start_call(&mut frames, &def, full, &destination, target)?;
+                            self.start_call(frames, &def, full, &destination, target)?;
                         }
                         Value::FnPtr(name) => {
                             self.start_call(
-                                &mut frames,
+                                frames,
                                 &name,
                                 arg_values,
                                 &destination,
@@ -605,12 +681,12 @@ impl<'a> Interpreter<'a> {
                                 ));
                             }
                         };
-                        self.write_place(&mut frames, body, &destination, Value::Unit)?;
+                        self.write_place(frames, body, &destination, Value::Unit)?;
                         let work = vec![(Vec::new(), glue.root.clone())];
-                        self.run_drop_glue(&mut frames, root, work, &glue.adts, bb)?;
+                        self.run_drop_glue(frames, root, work, &glue.adts, bb)?;
                     } else {
                         let result = self.exec_builtin(
-                            &mut frames,
+                            frames,
                             body,
                             &name,
                             &generic_args,
@@ -619,8 +695,8 @@ impl<'a> Interpreter<'a> {
                         )?;
                         match target {
                             Some(bb) => {
-                                self.write_place(&mut frames, body, &destination, result)?;
-                                Self::jump(&mut frames, body, bb)?;
+                                self.write_place(frames, body, &destination, result)?;
+                                Self::jump(frames, body, bb)?;
                             }
                             None => {
                                 return Err(InterpError::MissingContinuation {
@@ -657,7 +733,7 @@ impl<'a> Interpreter<'a> {
                         }
                     };
                     let work = vec![(Vec::new(), glue.root.clone())];
-                    self.run_drop_glue(&mut frames, root, work, &glue.adts, target)?;
+                    self.run_drop_glue(frames, root, work, &glue.adts, target)?;
                 }
                 TerminatorKind::Return => {
                     // A returning destructor frame resumes its
@@ -672,7 +748,7 @@ impl<'a> Interpreter<'a> {
                         let cont = self.drop_continuations.remove(pos);
                         frames.pop();
                         self.run_drop_glue(
-                            &mut frames,
+                            frames,
                             cont.root,
                             cont.work,
                             &cont.adts,
@@ -702,7 +778,7 @@ impl<'a> Interpreter<'a> {
                             }
                         }
                     }
-                    if frames.is_empty() {
+                    if frames.len() == base {
                         return Ok(value);
                     }
                     let dest = frame
@@ -716,9 +792,9 @@ impl<'a> Interpreter<'a> {
                             name: caller_name.clone(),
                         }
                     })?;
-                    self.write_place(&mut frames, &caller_body, &dest, value)?;
+                    self.write_place(frames, &caller_body, &dest, value)?;
                     match resume {
-                        Some(bb) => Self::jump(&mut frames, &caller_body, bb)?,
+                        Some(bb) => Self::jump(frames, &caller_body, bb)?,
                         None => {
                             return Err(InterpError::MissingContinuation { func: caller_name });
                         }
@@ -733,14 +809,14 @@ impl<'a> Interpreter<'a> {
                     target,
                     message,
                 } => {
-                    let value = self.eval_operand(&mut frames, body, &cond)?;
+                    let value = self.eval_operand(frames, body, &cond)?;
                     let actual = value.as_bool().ok_or_else(|| {
                         InterpError::type_mismatch("Assert condition", "bool", value.kind_name())
                     })?;
                     if actual != expected {
                         return Err(InterpError::panic(message));
                     }
-                    Self::jump(&mut frames, body, target)?;
+                    Self::jump(frames, body, target)?;
                 }
                 TerminatorKind::Unsupported(kind) => {
                     return Err(InterpError::UnsupportedTerminator { kind });
@@ -1312,6 +1388,22 @@ impl<'a> Interpreter<'a> {
                         .unwrap_or(P::Unknown);
                     work.push((path, plan));
                 }
+                P::ChannelHandleDrop { sender } => {
+                    // A moved-out / never-written handle has no
+                    // count to decrement, exactly like drop flags
+                    // in real MIR.
+                    let Some(value) = self.read_at(frames, &root, &path)? else {
+                        continue;
+                    };
+                    let Some(id) = channel_handle_id(&value) else {
+                        return Err(InterpError::type_mismatch(
+                            "channel handle drop glue",
+                            "an mpsc channel handle",
+                            value.kind_name(),
+                        ));
+                    };
+                    self.channel_handle_dropped(id, if sender { "sender" } else { "receiver" });
+                }
                 P::RefCellRelease { mutable } => {
                     // A moved-out / never-written guard has no
                     // borrow to release, exactly like drop flags in
@@ -1410,6 +1502,201 @@ impl<'a> Interpreter<'a> {
     /// seeded value to read or write. (Every reference to a static
     /// carries its initializer and seeds the store when evaluated,
     /// so this is unreachable for driver-produced programs.)
+    /// The id of the thread whose code is currently executing.
+    pub(crate) fn current_thread_id(&self) -> u64 {
+        self.current_thread.get()
+    }
+
+    /// Register a spawned thread: the callable is captured, not
+    /// run. Returns the new thread's id.
+    pub(crate) fn spawn_thread(&self, callable: Value) -> u64 {
+        let id = {
+            let mut next = self.next_thread.borrow_mut();
+            let id = *next;
+            *next += 1;
+            id
+        };
+        self.threads.borrow_mut().insert(
+            id,
+            ThreadSlot {
+                callable: Some(callable),
+                outcome: None,
+            },
+        );
+        id
+    }
+
+    /// Whether the thread has been spawned but not yet run.
+    pub(crate) fn thread_pending(&self, id: u64) -> bool {
+        self.threads
+            .borrow()
+            .get(&id)
+            .is_some_and(|slot| slot.callable.is_some())
+    }
+
+    /// The recorded outcome of a thread that has run.
+    pub(crate) fn thread_outcome(&self, id: u64) -> Option<Result<Value, String>> {
+        self.threads
+            .borrow()
+            .get(&id)
+            .and_then(|slot| slot.outcome.clone())
+    }
+
+    /// Run one pending thread to completion, recording its
+    /// outcome. A guest panic in the thread is its outcome (the
+    /// `Err` a joiner observes), not a failure of the run; any
+    /// other error (an unsupported feature inside the thread)
+    /// aborts the run, as it would on the entry thread.
+    pub(crate) fn run_thread(&mut self, frames: &mut Vec<Frame>, id: u64) -> InterpResult<()> {
+        let callable = self
+            .threads
+            .borrow_mut()
+            .get_mut(&id)
+            .and_then(|slot| slot.callable.take());
+        let Some(callable) = callable else {
+            return Ok(());
+        };
+        let previous = self.current_thread.get();
+        self.current_thread.set(id);
+        let result = self.call_callable_to_completion(frames, &callable, Vec::new());
+        self.current_thread.set(previous);
+        let outcome = match result {
+            Ok(value) => Ok(value),
+            Err(InterpError::Panic { message }) => Err(message),
+            Err(e) => return Err(e),
+        };
+        if let Some(slot) = self.threads.borrow_mut().get_mut(&id) {
+            slot.outcome = Some(outcome);
+        }
+        Ok(())
+    }
+
+    /// Run every pending thread to completion, in spawn order.
+    /// This is the cooperative scheduling point: the running
+    /// thread has reached a place where it would block, so the
+    /// threads it might be waiting for get their turn. Returns
+    /// whether any thread ran.
+    pub(crate) fn drain_threads(&mut self, frames: &mut Vec<Frame>) -> InterpResult<bool> {
+        let mut ran = false;
+        loop {
+            let next = self
+                .threads
+                .borrow()
+                .iter()
+                .filter(|(_, slot)| slot.callable.is_some())
+                .map(|(id, _)| *id)
+                .min();
+            let Some(id) = next else {
+                return Ok(ran);
+            };
+            self.run_thread(frames, id)?;
+            ran = true;
+        }
+    }
+
+    /// Join a thread: run it if it is still pending, then return
+    /// its recorded outcome.
+    pub(crate) fn join_thread(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        id: u64,
+    ) -> InterpResult<Result<Value, String>> {
+        if self.thread_pending(id) {
+            self.run_thread(frames, id)?;
+        }
+        self.thread_outcome(id).ok_or_else(|| InterpError::UnsupportedTerminator {
+            kind: format!("join of unknown thread {id}"),
+        })
+    }
+
+    /// Call a callable value (a closure or a function pointer)
+    /// with `args`, driving the frame stack until the call
+    /// returns, and return its return value. Used by builtins
+    /// that must execute guest code synchronously (thread join,
+    /// `Once::call_once`, scoped threads).
+    pub(crate) fn call_callable_to_completion(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        callable: &Value,
+        args: Vec<Value>,
+    ) -> InterpResult<Value> {
+        let base = frames.len();
+        match callable {
+            Value::Closure { def, .. } => {
+                let env = if self.closure_body_takes_env_by_value(def) {
+                    callable.clone()
+                } else {
+                    Value::Ref(RefTarget::Value(Box::new(callable.clone())))
+                };
+                let mut full = vec![env];
+                full.extend(args);
+                self.start_call(frames, def, full, &Place::local(Local::RETURN), None)?;
+            }
+            Value::FnPtr(name) => {
+                self.start_call(frames, name, args, &Place::local(Local::RETURN), None)?;
+            }
+            other => {
+                return Err(InterpError::type_mismatch(
+                    "callable value",
+                    "a closure or function pointer",
+                    other.kind_name(),
+                ));
+            }
+        }
+        self.drive_frames(frames, base)
+    }
+
+    /// Create a channel state (one sender, one receiver) and
+    /// return its id.
+    pub(crate) fn new_channel(&self, bound: Option<usize>) -> u64 {
+        let id = {
+            let mut next = self.next_channel.borrow_mut();
+            let id = *next;
+            *next += 1;
+            id
+        };
+        self.channels.borrow_mut().insert(
+            id,
+            ChannelState {
+                queue: std::collections::VecDeque::new(),
+                senders: 1,
+                receivers: 1,
+                bound,
+            },
+        );
+        id
+    }
+
+    /// Access one channel's state, if it exists.
+    pub(crate) fn with_channel<R>(
+        &self,
+        id: u64,
+        f: impl FnOnce(&mut ChannelState) -> R,
+    ) -> Option<R> {
+        self.channels.borrow_mut().get_mut(&id).map(f)
+    }
+
+    /// Record a channel handle's drop (see [`ChannelState`]):
+    /// `kind` is `"sender"` or `"receiver"`.
+    pub(crate) fn channel_handle_dropped(&self, id: u64, kind: &str) {
+        if let Some(state) = self.channels.borrow_mut().get_mut(&id) {
+            match kind {
+                "sender" => state.senders = state.senders.saturating_sub(1),
+                _ => state.receivers = state.receivers.saturating_sub(1),
+            }
+        }
+    }
+
+    /// Record a channel handle's clone (see [`ChannelState`]).
+    pub(crate) fn channel_handle_cloned(&self, id: u64, kind: &str) {
+        if let Some(state) = self.channels.borrow_mut().get_mut(&id) {
+            match kind {
+                "sender" => state.senders += 1,
+                _ => state.receivers += 1,
+            }
+        }
+    }
+
     fn missing_static(&self, name: &str) -> InterpError {
         InterpError::UnsupportedTerminator {
             kind: format!(

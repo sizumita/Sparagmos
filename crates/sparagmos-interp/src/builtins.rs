@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use sparagmos_mir as mir;
 
 use crate::error::{InterpError, InterpResult};
-use crate::interp::{synthetic_address, Frame, Interpreter, Resolved};
+use crate::interp::{channel_handle_id, synthetic_address, Frame, Interpreter, Resolved};
 use crate::ir::{Body, Operand};
 use crate::value::{FmtArguments, FmtTrait, RefProj, RefTarget, Value};
 
@@ -311,6 +311,75 @@ pub enum Builtin {
     /// `Vec::remove`'s nested `assert_failed(index, len)`: raise
     /// a guest panic with alloc's removal-index message.
     VecRemoveAssertFailed,
+    /// `std::thread::spawn(f)` / `spawn_unchecked(f)`: capture the
+    /// callable as a pending thread (cooperative model, see
+    /// `interp.rs`) and return its join handle.
+    ThreadSpawn,
+    /// `std::thread::Builder::spawn(builder, f)` /
+    /// `spawn_unchecked(builder, f)`: `ThreadSpawn` with a builder
+    /// (the builder's name and stack size are not observable in the
+    /// value model beyond the thread's name, which is not tracked).
+    ThreadBuilderSpawn,
+    /// `std::thread::JoinHandle::join(handle)`: run the thread if
+    /// it is still pending and return its outcome as a `Result`.
+    ThreadJoin,
+    /// `std::thread::ScopedJoinHandle::join(handle)`.
+    ScopedThreadJoin,
+    /// `std::thread::Scope::spawn(&scope, f)`: `ThreadSpawn` whose
+    /// handle the enclosing `std::thread::scope` joins at scope
+    /// exit.
+    ThreadScopedSpawn,
+    /// `std::thread::scope(f)`: call `f` with a fresh scope value,
+    /// then run every pending thread (the scope's threads must
+    /// finish before the scope returns).
+    ThreadScope,
+    /// `std::thread::current()`: the executing thread's value.
+    ThreadCurrent,
+    /// `std::thread::Thread::id(&thread)`: the thread's id value.
+    ThreadIdOf,
+    /// `std::thread::sleep(dur)` / `sleep_ms(ms)`: a cooperative
+    /// scheduling point (pending threads run to completion); the
+    /// passage of time itself is not observable in the value model.
+    ThreadSleep,
+    /// `std::thread::yield_now()`: a cooperative scheduling point.
+    ThreadYield,
+    /// `std::sync::mpsc::channel()`: a new unbounded channel.
+    MpscChannel,
+    /// `std::sync::mpsc::sync_channel(bound)`: a new bounded channel.
+    MpscSyncChannel,
+    /// `Sender::send(&self, value)` / `SyncSender::send(&self, value)`.
+    MpscSend,
+    /// `SyncSender::try_send(&self, value)`.
+    MpscTrySend,
+    /// `Receiver::recv(&self)`.
+    MpscRecv,
+    /// `Receiver::try_recv(&self)`.
+    MpscTryRecv,
+    /// `Receiver::recv_timeout(&self, dur)`.
+    MpscRecvTimeout,
+    /// `Receiver::iter(&self)`: an iterator over the channel's
+    /// incoming values.
+    MpscIter,
+    /// `std::thread::Builder::new()`: a builder value in the real
+    /// field shape (`name`, `stack_size`, both unset).
+    ThreadBuilderNew,
+    /// `std::thread::Builder::name(builder, name)`: the builder
+    /// with its name field set.
+    ThreadBuilderName,
+    /// `std::thread::Builder::stack_size(builder, size)`: the
+    /// builder with its stack-size field set.
+    ThreadBuilderStackSize,
+    /// `std::time::Duration::new(secs, nanos)`: a duration value
+    /// in the real field shape (`secs`, `nanos`, normalized).
+    DurationNew,
+    /// `std::time::Duration::from_secs(n)`.
+    DurationFromSecs,
+    /// `std::time::Duration::from_millis(n)`.
+    DurationFromMillis,
+    /// `std::time::Duration::from_micros(n)`.
+    DurationFromMicros,
+    /// `std::time::Duration::from_nanos(n)`.
+    DurationFromNanos,
     /// `PartialEq::eq(&a, &b)`: semantic (derived) value equality.
     PartialEqEq,
     /// `PartialEq::ne(&a, &b)`.
@@ -626,6 +695,76 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "core::fmt::rt::Argument::from_usize" => Builtin::ArgumentFromUsize,
         "std::iter::IntoIterator::into_iter" => Builtin::IntoIter,
         "std::iter::Iterator::next" => Builtin::IteratorNext,
+        // The thread surface (cooperative model, see `interp.rs`).
+        // Registering these names also keeps the driver from
+        // collecting the std thread machinery, whose internals
+        // (spawn hooks, OS threads, packet transmutes) the value
+        // model does not serve; the builtins model the observable
+        // semantics instead.
+        "std::thread::spawn" | "std::thread::spawn_unchecked" => Builtin::ThreadSpawn,
+        _ if canonical.starts_with("std::thread::Builder")
+            && (canonical.ends_with("::spawn")
+                || canonical.ends_with("::spawn_unchecked")) =>
+        {
+            Builtin::ThreadBuilderSpawn
+        }
+        _ if canonical.starts_with("std::thread::JoinHandle")
+            && canonical.ends_with("::join") =>
+        {
+            Builtin::ThreadJoin
+        }
+        _ if canonical.starts_with("std::thread::ScopedJoinHandle")
+            && canonical.ends_with("::join") =>
+        {
+            Builtin::ScopedThreadJoin
+        }
+        _ if canonical.contains("::Scope::") && canonical.ends_with("::spawn") => {
+            Builtin::ThreadScopedSpawn
+        }
+        "std::thread::Builder::new" => Builtin::ThreadBuilderNew,
+        "std::thread::Builder::name" => Builtin::ThreadBuilderName,
+        "std::thread::Builder::stack_size" => Builtin::ThreadBuilderStackSize,
+        "std::time::Duration::new" => Builtin::DurationNew,
+        "std::time::Duration::from_secs" => Builtin::DurationFromSecs,
+        "std::time::Duration::from_millis" => Builtin::DurationFromMillis,
+        "std::time::Duration::from_micros" => Builtin::DurationFromMicros,
+        "std::time::Duration::from_nanos" => Builtin::DurationFromNanos,
+        "std::thread::scope" => Builtin::ThreadScope,
+        "std::thread::current" => Builtin::ThreadCurrent,
+        "std::thread::Thread::id" => Builtin::ThreadIdOf,
+        "std::thread::sleep" | "std::thread::sleep_ms" => Builtin::ThreadSleep,
+        "std::thread::yield_now" => Builtin::ThreadYield,
+        // The mpsc surface: the channel state lives in the
+        // interpreter (see `ChannelState` in `interp.rs`).
+        "std::sync::mpsc::channel" => Builtin::MpscChannel,
+        "std::sync::mpsc::sync_channel" => Builtin::MpscSyncChannel,
+        _ if canonical.contains("mpsc::SyncSender") && canonical.ends_with("::send") => {
+            Builtin::MpscSend
+        }
+        _ if canonical.contains("mpsc::Sender") && canonical.ends_with("::send") => {
+            Builtin::MpscSend
+        }
+        _ if canonical.contains("mpsc::SyncSender")
+            && canonical.ends_with("::try_send") =>
+        {
+            Builtin::MpscTrySend
+        }
+        _ if canonical.contains("mpsc::Receiver") && canonical.ends_with("::recv") => {
+            Builtin::MpscRecv
+        }
+        _ if canonical.contains("mpsc::Receiver")
+            && canonical.ends_with("::try_recv") =>
+        {
+            Builtin::MpscTryRecv
+        }
+        _ if canonical.contains("mpsc::Receiver")
+            && canonical.ends_with("::recv_timeout") =>
+        {
+            Builtin::MpscRecvTimeout
+        }
+        _ if canonical.contains("mpsc::Receiver") && canonical.ends_with("::iter") => {
+            Builtin::MpscIter
+        }
         "std::convert::From::from" => Builtin::FromFrom,
         "std::hint::must_use" => Builtin::MustUse,
         "std::ops::Deref::deref" => Builtin::Deref,
@@ -1163,6 +1302,241 @@ impl<'a> Interpreter<'a> {
                     fields: vec![start, end, Value::Bool(false)],
                 })
             }
+            Builtin::ThreadSpawn => {
+                arity(1)?;
+                let callable = vals.into_iter().next().expect("arity checked");
+                self.spawn_callable(callable)
+            }
+            Builtin::ThreadBuilderSpawn => {
+                // `(builder, f)`: the builder carries nothing the
+                // model observes beyond what its fields hold; the
+                // callable is the second argument. `Builder::spawn`
+                // returns `io::Result<JoinHandle>`: the model's
+                // spawn cannot fail, so the handle is the `Ok`.
+                arity(2)?;
+                let callable = vals.into_iter().nth(1).expect("arity checked");
+                Ok(ok_result(self.spawn_callable(callable)?))
+            }
+            Builtin::ThreadScopedSpawn => {
+                // `(&scope, f)`: the scope's identity is not
+                // observed; the callable is the second argument.
+                arity(2)?;
+                let callable = vals.into_iter().nth(1).expect("arity checked");
+                self.spawn_callable(callable)
+            }
+            Builtin::ThreadJoin | Builtin::ScopedThreadJoin => {
+                arity(1)?;
+                let Some(id) = channel_handle_id(&vals[0]) else {
+                    return Err(InterpError::type_mismatch(
+                        "JoinHandle::join",
+                        "a join handle value",
+                        vals[0].kind_name(),
+                    ));
+                };
+                match self.join_thread(frames, id)? {
+                    Ok(value) => Ok(ok_result(value)),
+                    // The error payload is the thread's panic
+                    // message as a string inside the box-shaped
+                    // value; the original `panic_any` payload is
+                    // not preserved by the model.
+                    Err(message) => Ok(err_result(Value::Enum {
+                        variant: 0,
+                        fields: vec![Value::Str(message)],
+                    })),
+                }
+            }
+            Builtin::ThreadScope => {
+                arity(1)?;
+                let callable = vals.into_iter().next().expect("arity checked");
+                let scope_ref = Value::Ref(RefTarget::Value(Box::new(Value::Enum {
+                    variant: 0,
+                    fields: Vec::new(),
+                })));
+                let result =
+                    self.call_callable_to_completion(frames, &callable, vec![scope_ref])?;
+                // Every thread spawned inside the scope must
+                // finish before the scope returns; the cooperative
+                // model runs all pending threads here.
+                self.drain_threads(frames)?;
+                Ok(result)
+            }
+            Builtin::ThreadCurrent => {
+                arity(0)?;
+                Ok(id_handle(self.current_thread_id()))
+            }
+            Builtin::ThreadIdOf => {
+                arity(1)?;
+                let target = self.deref_value(frames, &vals[0])?;
+                let thread = self.read_resolved(frames, &target)?;
+                match channel_handle_id(&thread) {
+                    Some(id) => Ok(id_handle(id)),
+                    None => Err(InterpError::type_mismatch(
+                        "Thread::id",
+                        "a thread value",
+                        thread.kind_name(),
+                    )),
+                }
+            }
+            Builtin::ThreadSleep => {
+                arity(1)?;
+                self.drain_threads(frames)?;
+                Ok(Value::Unit)
+            }
+            Builtin::ThreadYield => {
+                arity(0)?;
+                self.drain_threads(frames)?;
+                Ok(Value::Unit)
+            }
+            Builtin::ThreadBuilderNew => {
+                arity(0)?;
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields: vec![none_value(), none_value()],
+                })
+            }
+            Builtin::ThreadBuilderName | Builtin::ThreadBuilderStackSize => {
+                arity(2)?;
+                let field = if kind == Builtin::ThreadBuilderName { 0 } else { 1 };
+                let mut vals = vals.into_iter();
+                let builder = vals.next().expect("arity checked");
+                let setting = vals.next().expect("arity checked");
+                match builder {
+                    Value::Enum { variant: 0, mut fields } if fields.len() == 2 => {
+                        fields[field] = some_value(setting);
+                        Ok(Value::Enum { variant: 0, fields })
+                    }
+                    other => Err(InterpError::type_mismatch(
+                        "thread Builder",
+                        "a builder value",
+                        other.kind_name(),
+                    )),
+                }
+            }
+            Builtin::DurationNew => {
+                arity(2)?;
+                let secs = uint_arg(&vals[0], name)?;
+                let nanos = uint_arg(&vals[1], name)?;
+                self.duration_value(secs, nanos)
+            }
+            Builtin::DurationFromSecs => {
+                arity(1)?;
+                self.duration_value(uint_arg(&vals[0], name)?, 0)
+            }
+            Builtin::DurationFromMillis => {
+                arity(1)?;
+                let ms = uint_arg(&vals[0], name)?;
+                self.duration_value(ms / 1_000, (ms % 1_000) * 1_000_000)
+            }
+            Builtin::DurationFromMicros => {
+                arity(1)?;
+                let us = uint_arg(&vals[0], name)?;
+                self.duration_value(us / 1_000_000, (us % 1_000_000) * 1_000)
+            }
+            Builtin::DurationFromNanos => {
+                arity(1)?;
+                let ns = uint_arg(&vals[0], name)?;
+                self.duration_value(ns / 1_000_000_000, ns % 1_000_000_000)
+            }
+            Builtin::MpscChannel => {
+                arity(0)?;
+                let id = self.new_channel(None);
+                Ok(Value::Tuple(vec![id_handle(id), id_handle(id)]))
+            }
+            Builtin::MpscSyncChannel => {
+                arity(1)?;
+                let bound = match &vals[0] {
+                    Value::Uint(n) => *n as usize,
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            "sync_channel",
+                            "a bound",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                let id = self.new_channel(Some(bound));
+                Ok(Value::Tuple(vec![id_handle(id), id_handle(id)]))
+            }
+            Builtin::MpscSend => {
+                arity(2)?;
+                let id = self.handle_id_of_ref(frames, &vals[0], name)?;
+                let value = vals.into_iter().nth(1).expect("arity checked");
+                self.mpsc_send(frames, id, value, name)
+            }
+            Builtin::MpscTrySend => {
+                arity(2)?;
+                let id = self.handle_id_of_ref(frames, &vals[0], name)?;
+                let value = vals.into_iter().nth(1).expect("arity checked");
+                match self.with_channel(id, |st| {
+                    if st.receivers == 0 {
+                        Err(1) // TrySendError::Disconnected(value)
+                    } else if st.bound.is_some_and(|b| st.queue.len() >= b) {
+                        Err(0) // TrySendError::Full(value)
+                    } else {
+                        st.queue.push_back(value.clone());
+                        Ok(())
+                    }
+                }) {
+                    Some(Ok(())) => Ok(ok_result(Value::Unit)),
+                    Some(Err(variant)) => Ok(err_result(Value::Enum {
+                        variant,
+                        fields: vec![value],
+                    })),
+                    None => Err(unsupported(format!("{name} on an unknown channel"))),
+                }
+            }
+            Builtin::MpscRecv => {
+                arity(1)?;
+                let id = self.handle_id_of_ref(frames, &vals[0], name)?;
+                match self.mpsc_recv(frames, id, name)? {
+                    Ok(value) => Ok(ok_result(value)),
+                    // `RecvError` is a fieldless one-variant struct.
+                    Err(()) => Ok(err_result(Value::Enum {
+                        variant: 0,
+                        fields: Vec::new(),
+                    })),
+                }
+            }
+            Builtin::MpscTryRecv => {
+                arity(1)?;
+                let id = self.handle_id_of_ref(frames, &vals[0], name)?;
+                match self.with_channel(id, |st| match st.queue.pop_front() {
+                    Some(v) => Ok(v),
+                    None => Err(if st.senders == 0 { 1 } else { 0 }),
+                }) {
+                    Some(Ok(value)) => Ok(ok_result(value)),
+                    // `TryRecvError`: Empty = 0, Disconnected = 1,
+                    // both fieldless.
+                    Some(Err(variant)) => Ok(err_result(Value::Enum {
+                        variant,
+                        fields: Vec::new(),
+                    })),
+                    None => Err(unsupported(format!("{name} on an unknown channel"))),
+                }
+            }
+            Builtin::MpscRecvTimeout => {
+                arity(2)?;
+                let id = self.handle_id_of_ref(frames, &vals[0], name)?;
+                // The model cannot wait out a duration: a value
+                // that no pending thread produces is a timeout,
+                // exactly what a native run whose producers have
+                // all finished would observe.
+                match self.mpsc_recv_or(frames, id, name)? {
+                    Ok(value) => Ok(ok_result(value)),
+                    Err(variant) => Ok(err_result(Value::Enum {
+                        variant,
+                        fields: Vec::new(),
+                    })),
+                }
+            }
+            Builtin::MpscIter => {
+                arity(1)?;
+                let id = self.handle_id_of_ref(frames, &vals[0], name)?;
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields: vec![id_handle(id)],
+                })
+            }
             Builtin::IntoIter => {
                 arity(1)?;
                 let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
@@ -1210,6 +1584,16 @@ impl<'a> Interpreter<'a> {
                     Ok(Value::Enum {
                         variant: 0,
                         fields: vec![Value::Tuple(elems), Value::Uint(0)],
+                    })
+                } else if self_ty.starts_with("std::sync::mpsc::Iter<") {
+                    // `mpsc::Iter` is its own `IntoIterator`.
+                    Ok(value)
+                } else if self_ty.starts_with("std::sync::mpsc::Receiver<") {
+                    // The channel iterator holds the receiver
+                    // handle as its one field (see `iterator_next`).
+                    Ok(Value::Enum {
+                        variant: 0,
+                        fields: vec![value],
                     })
                 } else {
                     Err(unsupported(format!(
@@ -1690,13 +2074,33 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::CloneClone => {
                 arity(1)?;
+                // Cloning an mpsc handle creates another live
+                // handle: the channel's handle count must move
+                // with it, or disconnection would be observed
+                // while a clone still lives.
+                let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
+                let chan_kind = if self_ty.starts_with("std::sync::mpsc::Sender<")
+                    || self_ty.starts_with("std::sync::mpsc::SyncSender<")
+                {
+                    Some("sender")
+                } else if self_ty.starts_with("std::sync::mpsc::Receiver<") {
+                    Some("receiver")
+                } else {
+                    None
+                };
                 match &vals[0] {
                     // `&self`: the clone is a copy of the pointee
                     // value (which may itself be a reference value
                     // when `Self` is a reference type).
                     Value::Ref(_) => {
                         let target = self.deref_value(frames, &vals[0])?;
-                        self.read_resolved(frames, &target)
+                        let value = self.read_resolved(frames, &target)?;
+                        if let (Some(kind), Some(id)) =
+                            (chan_kind, channel_handle_id(&value))
+                        {
+                            self.channel_handle_cloned(id, kind);
+                        }
+                        Ok(value)
                     }
                     // A fat pointer clones as the pointer itself
                     // (slices are `Clone` through their reference).
@@ -2618,6 +3022,196 @@ impl<'a> Interpreter<'a> {
 
     /// `Iterator::next`: mutate the iterator in place through the
     /// `&mut` argument and return the `Option` value.
+    /// A `Duration` value in the real field shape (`secs`,
+    /// `nanos`), with the normalization `Duration::new` performs
+    /// (a nanosecond count at or past one second carries into the
+    /// seconds; the carry is checked, as in std).
+    fn duration_value(&self, secs: u64, nanos: u64) -> InterpResult<Value> {
+        let (secs, nanos) = if nanos >= 1_000_000_000 {
+            let carry = nanos / 1_000_000_000;
+            let secs = secs
+                .checked_add(carry)
+                .ok_or_else(|| InterpError::panic("overflow in Duration::new"))?;
+            (secs, nanos % 1_000_000_000)
+        } else {
+            (secs, nanos)
+        };
+        Ok(Value::Enum {
+            variant: 0,
+            fields: vec![Value::Uint(u128::from(secs)), Value::Uint(u128::from(nanos))],
+        })
+    }
+
+    /// Register a thread spawn: the callable must be a closure or
+    /// a function pointer (a `Box<dyn FnOnce>` has no body the
+    /// model can run and stays an explicit error). Returns the
+    /// join handle value.
+    fn spawn_callable(&mut self, callable: Value) -> InterpResult<Value> {
+        match callable {
+            Value::Closure { .. } | Value::FnPtr(_) => {
+                let id = self.spawn_thread(callable);
+                Ok(id_handle(id))
+            }
+            other => Err(unsupported(format!(
+                "thread spawn of a {} value is not runtime-supported",
+                other.kind_name()
+            ))),
+        }
+    }
+
+    /// The channel id of the handle an mpsc method's `&self`
+    /// argument points at.
+    fn handle_id_of_ref(
+        &self,
+        frames: &[Frame],
+        arg: &Value,
+        name: &str,
+    ) -> InterpResult<u64> {
+        let target = self.deref_value(frames, arg)?;
+        let value = self.read_resolved(frames, &target)?;
+        channel_handle_id(&value).ok_or_else(|| {
+            InterpError::type_mismatch(
+                format!("builtin {name}"),
+                "an mpsc channel handle",
+                value.kind_name(),
+            )
+        })
+    }
+
+    /// Why a blocking channel operation cannot proceed: either
+    /// every pending thread has already run (or none exists), or —
+    /// when the block happens inside a spawned thread's run — the
+    /// thread that must act next is the very thread that spawned
+    /// this one and is itself blocked waiting for it: a cyclic
+    /// wait no run-to-completion schedule can serve.
+    fn block_forever_message(&self, name: &str, situation: &str) -> String {
+        if self.current_thread_id() != 1 {
+            format!(
+                "{name} would block forever: {situation}; the thread that \
+                 must act next is the blocked spawner of the running thread \
+                 (a cyclic wait between threads is not servable by the \
+                 single-threaded model)"
+            )
+        } else {
+            format!(
+                "{name} would block forever: {situation} (single-threaded model)"
+            )
+        }
+    }
+
+    /// `Sender::send` / `SyncSender::send`: enqueue the value,
+    /// running pending threads while a bounded channel is full
+    /// (the sender would block; the threads it waits for run
+    /// first). Disconnection hands the value back inside a
+    /// `SendError`.
+    fn mpsc_send(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        id: u64,
+        value: Value,
+        name: &str,
+    ) -> InterpResult<Value> {
+        enum Step {
+            Sent,
+            Disconnected,
+            Full,
+            Unknown,
+        }
+        loop {
+            let step = match self.with_channel(id, |st| {
+                if st.receivers == 0 {
+                    Step::Disconnected
+                } else if st.bound.is_none_or(|b| st.queue.len() < b) {
+                    st.queue.push_back(value.clone());
+                    Step::Sent
+                } else {
+                    Step::Full
+                }
+            }) {
+                Some(step) => step,
+                None => Step::Unknown,
+            };
+            match step {
+                Step::Sent => return Ok(ok_result(Value::Unit)),
+                Step::Disconnected => {
+                    return Ok(err_result(Value::Enum {
+                        variant: 0,
+                        fields: vec![value],
+                    }))
+                }
+                Step::Full => {
+                    if !self.drain_threads(frames)? {
+                        return Err(unsupported(self.block_forever_message(
+                            name,
+                            "the channel is full and no pending thread can receive",
+                        )));
+                    }
+                }
+                Step::Unknown => {
+                    return Err(unsupported(format!("{name} on an unknown channel")))
+                }
+            }
+        }
+    }
+
+    /// `Receiver::recv`: dequeue the oldest value, running
+    /// pending threads while the channel is empty but senders
+    /// live. `Err(())` is disconnection (queue empty and the last
+    /// sender gone).
+    fn mpsc_recv(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        id: u64,
+        name: &str,
+    ) -> InterpResult<Result<Value, ()>> {
+        loop {
+            let step = self.with_channel(id, |st| (st.queue.pop_front(), st.senders));
+            let Some((popped, senders)) = step else {
+                return Err(unsupported(format!("{name} on an unknown channel")));
+            };
+            if let Some(value) = popped {
+                return Ok(Ok(value));
+            }
+            if senders == 0 {
+                return Ok(Err(()));
+            }
+            if !self.drain_threads(frames)? {
+                return Err(unsupported(self.block_forever_message(
+                    name,
+                    "the channel is empty and no pending thread can send",
+                )));
+            }
+        }
+    }
+
+    /// `Receiver::recv_timeout`: like `mpsc_recv`, except that
+    /// when no pending thread can produce a value the outcome is
+    /// a timeout (`Err(0)`) rather than an error — the model
+    /// cannot wait, and a native run whose producers have all
+    /// finished observes exactly that. Disconnection is `Err(1)`.
+    fn mpsc_recv_or(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        id: u64,
+        name: &str,
+    ) -> InterpResult<Result<Value, u32>> {
+        loop {
+            let step = self.with_channel(id, |st| (st.queue.pop_front(), st.senders));
+            let Some((popped, senders)) = step else {
+                return Err(unsupported(format!("{name} on an unknown channel")));
+            };
+            if let Some(value) = popped {
+                return Ok(Ok(value));
+            }
+            if senders == 0 {
+                return Ok(Err(1));
+            }
+            if !self.drain_threads(frames)? {
+                return Ok(Err(0));
+            }
+        }
+    }
+
     fn iterator_next(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -2626,6 +3220,55 @@ impl<'a> Interpreter<'a> {
     ) -> InterpResult<Value> {
         let target = self.deref_value(frames, ref_arg)?;
         let state = self.read_resolved(frames, &target)?;
+        if self_ty.starts_with("std::sync::mpsc::Iter<") {
+            // The state holds the receiver handle; iteration is
+            // `recv` until the channel disconnects.
+            let handle = match &state {
+                Value::Enum { fields, .. } if fields.len() == 1 => fields[0].clone(),
+                other => {
+                    return Err(InterpError::type_mismatch(
+                        "mpsc Iter state",
+                        "an iterator holding a receiver handle",
+                        other.kind_name(),
+                    ))
+                }
+            };
+            let Some(id) = channel_handle_id(&handle) else {
+                return Err(InterpError::type_mismatch(
+                    "mpsc Iter state",
+                    "a receiver handle",
+                    handle.kind_name(),
+                ));
+            };
+            return match self.mpsc_recv(frames, id, "Iterator::next for mpsc::Iter")? {
+                Ok(value) => Ok(some_value(value)),
+                Err(()) => Ok(none_value()),
+            };
+        }
+        if self_ty.starts_with("std::sync::mpsc::IntoIter<") {
+            // The state holds the receiver handle as its one field.
+            let handle = match &state {
+                Value::Enum { fields, .. } if fields.len() == 1 => fields[0].clone(),
+                other => {
+                    return Err(InterpError::type_mismatch(
+                        "mpsc IntoIter state",
+                        "an iterator holding a receiver handle",
+                        other.kind_name(),
+                    ))
+                }
+            };
+            let Some(id) = channel_handle_id(&handle) else {
+                return Err(InterpError::type_mismatch(
+                    "mpsc IntoIter state",
+                    "a receiver handle",
+                    handle.kind_name(),
+                ));
+            };
+            return match self.mpsc_recv(frames, id, "Iterator::next for mpsc::IntoIter")? {
+                Ok(value) => Ok(some_value(value)),
+                Err(()) => Ok(none_value()),
+            };
+        }
         let fields = iterator_fields(&state, self_ty)?;
         let (new_fields, result) = if self_ty.starts_with("std::ops::RangeInclusive<") {
             if fields.len() != 3 {
@@ -3284,6 +3927,44 @@ fn increment(value: &Value) -> InterpResult<Value> {
             "integer",
             other.kind_name(),
         )),
+    }
+}
+
+/// A `u64`/`u32` argument of a time constructor.
+fn uint_arg(value: &Value, name: &str) -> InterpResult<u64> {
+    match value {
+        Value::Uint(n) => Ok(*n as u64),
+        other => Err(InterpError::type_mismatch(
+            format!("builtin {name}"),
+            "an unsigned integer",
+            other.kind_name(),
+        )),
+    }
+}
+
+/// `Ok(value)` in the value model.
+fn ok_result(value: Value) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![value],
+    }
+}
+
+/// `Err(value)` in the value model.
+fn err_result(value: Value) -> Value {
+    Value::Enum {
+        variant: 1,
+        fields: vec![value],
+    }
+}
+
+/// A one-field handle value carrying an id: the shape of the
+/// thread model's `JoinHandle` / `Thread` / `ThreadId` values and
+/// of the mpsc `Sender` / `Receiver` handle values.
+fn id_handle(id: u64) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![Value::Uint(u128::from(id))],
     }
 }
 

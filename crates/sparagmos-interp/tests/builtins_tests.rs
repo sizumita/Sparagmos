@@ -387,6 +387,53 @@ fn registry_covers_the_modelled_callees() {
         ),
         ("std::borrow::ToOwned::to_owned", Builtin::ToOwned),
         ("std::convert::Into::into", Builtin::IntoInto),
+        ("std::thread::spawn", Builtin::ThreadSpawn),
+        ("std::thread::spawn_unchecked", Builtin::ThreadSpawn),
+        ("std::thread::Builder::spawn", Builtin::ThreadBuilderSpawn),
+        (
+            "std::thread::JoinHandle::<T>::join",
+            Builtin::ThreadJoin,
+        ),
+        ("std::thread::scope", Builtin::ThreadScope),
+        ("std::thread::current", Builtin::ThreadCurrent),
+        ("std::thread::Thread::id", Builtin::ThreadIdOf),
+        ("std::thread::sleep", Builtin::ThreadSleep),
+        ("std::thread::yield_now", Builtin::ThreadYield),
+        ("std::sync::mpsc::channel", Builtin::MpscChannel),
+        ("std::sync::mpsc::sync_channel", Builtin::MpscSyncChannel),
+        ("std::sync::mpsc::Sender::<T>::send", Builtin::MpscSend),
+        ("std::sync::mpsc::SyncSender::<T>::send", Builtin::MpscSend),
+        (
+            "std::sync::mpsc::SyncSender::<T>::try_send",
+            Builtin::MpscTrySend,
+        ),
+        ("std::sync::mpsc::Receiver::<T>::recv", Builtin::MpscRecv),
+        (
+            "std::sync::mpsc::Receiver::<T>::try_recv",
+            Builtin::MpscTryRecv,
+        ),
+        (
+            "std::sync::mpsc::Receiver::<T>::recv_timeout",
+            Builtin::MpscRecvTimeout,
+        ),
+        ("std::sync::mpsc::Receiver::<T>::iter", Builtin::MpscIter),
+        ("std::thread::Builder::new", Builtin::ThreadBuilderNew),
+        ("std::thread::Builder::name", Builtin::ThreadBuilderName),
+        (
+            "std::thread::Builder::stack_size",
+            Builtin::ThreadBuilderStackSize,
+        ),
+        ("std::time::Duration::new", Builtin::DurationNew),
+        ("std::time::Duration::from_secs", Builtin::DurationFromSecs),
+        (
+            "std::time::Duration::from_millis",
+            Builtin::DurationFromMillis,
+        ),
+        (
+            "std::time::Duration::from_micros",
+            Builtin::DurationFromMicros,
+        ),
+        ("std::time::Duration::from_nanos", Builtin::DurationFromNanos),
     ];
     for (name, expected) in cases {
         assert_eq!(
@@ -396,11 +443,10 @@ fn registry_covers_the_modelled_callees() {
         );
     }
     // Callees that stay unsupported: filesystem, unwinding through
-    // closures, channels — no name-only registrations.
+    // closures — no name-only registrations.
     for name in [
         "std::fs::File::create",
         "std::panic::catch_unwind",
-        "std::sync::mpsc::channel",
         "std::io::stdout",
         "std::env::args",
     ] {

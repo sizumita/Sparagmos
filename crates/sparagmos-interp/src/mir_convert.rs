@@ -541,6 +541,7 @@ fn drop_glue_edges<'a>(glue: &'a ir::DropGlue, targets: &mut Vec<&'a str>) -> bo
             ir::DropPlan::Trivial => true,
             // Releasing a RefCell borrow calls no destructor body.
             ir::DropPlan::RefCellRelease { .. } => true,
+            ir::DropPlan::ChannelHandleDrop { .. } => true,
             ir::DropPlan::Unknown | ir::DropPlan::Untyped => false,
             ir::DropPlan::Seq(plans) => plans.iter().all(|p| walk(p, adts, targets, seen)),
             ir::DropPlan::At { plan, .. } => walk(plan, adts, targets, seen),
@@ -3496,6 +3497,17 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                 });
             }
             "std::boxed::Box" => {
+                // A box of a trait object: the pointee's
+                // destructor would be the vtable drop of a
+                // concrete type the value model does not record,
+                // and the values the model itself places behind a
+                // `dyn` — above all a joined thread's panic
+                // payload — carry no guest-observable destructor;
+                // freeing the box is not observable either. The
+                // glue is trivial.
+                if matches!(args.first(), Some(mir::Ty::Dynamic(..))) {
+                    return Some(P::Trivial);
+                }
                 let inner = self.plan(args.first()?)?;
                 return Some(at_field0(inner));
             }
@@ -3545,6 +3557,42 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
             // The `try_borrow` error types: unit structs with no
             // fields and no `Drop` impl.
             "std::cell::BorrowError" | "core::cell::BorrowError" => {
+                return Some(P::Trivial)
+            }
+            // mpsc handles: the value is the channel id, and the
+            // destructor's only observable effect — the shared
+            // handle count going down, which is what disconnects
+            // the channel — is the interpreter's channel-handle
+            // drop plan.
+            "std::sync::mpsc::Sender" | "std::sync::mpsc::SyncSender" => {
+                return Some(P::ChannelHandleDrop { sender: true })
+            }
+            "std::sync::mpsc::Receiver" => {
+                return Some(P::ChannelHandleDrop { sender: false })
+            }
+            // `std::io::Error` (the payload of a `Builder::spawn`
+            // result) has no `Drop` impl: its glue is its fields'
+            // glue, planned from the same evidence the generic
+            // path uses for the entry crate's types. An
+            // unevidenced field stays unaccounted for and fails
+            // the plan, as usual.
+            "std::io::Error" => {
+                return Some(self.variant_fields_plan(def, args)?)
+            }
+            // A thread `Builder`'s two fields are `Option<String>`
+            // and `Option<usize>`, both trivial-glue; the value is
+            // built by the `Builder` builtins in that shape.
+            "std::thread::Builder" => {
+                return Some(P::Fields {
+                    fields: vec![P::Trivial, P::Trivial],
+                    complete: true,
+                })
+            }
+            // Join handles: the destructor detaches the thread.
+            // In the cooperative thread model a detached thread
+            // simply stays pending (it runs at the next scheduling
+            // point), so there is no glue to run.
+            "std::thread::JoinHandle" | "std::thread::ScopedJoinHandle" => {
                 return Some(P::Trivial)
             }
             "std::cell::BorrowMutError" | "core::cell::BorrowMutError" => {
