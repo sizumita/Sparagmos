@@ -1264,7 +1264,8 @@ def resolve_aux_specs(test_path, revision=None, top=None,
                 return err
         visiting.discard(name)
         editions = header.values("edition")
-        edition = editions[-1].strip() if editions else None
+        edition = _concrete_edition(editions[-1].strip()) \
+            if editions else None
         specs.append(AuxSpec(name, path, crate_type, edition))
         return None
 
@@ -1354,9 +1355,13 @@ def _concrete_edition(edition):
     at. compiletest runs one instance per edition in the range;
     the subset collapses a test to one attempt, and its aux
     builds use the range's last edition, the same value the
-    attempt's own edition selection takes from the directive."""
+    attempt's own edition selection takes from the directive.
+    An open-ended range (`2018..`) has no last edition; the
+    collapse takes its first, the earliest edition the test
+    claims to support."""
     if ".." in edition:
-        return edition.rsplit("..", 1)[-1].strip()
+        start, _, end = edition.partition("..")
+        return (end.strip() or start.strip())
     return edition
 
 
@@ -1872,7 +1877,8 @@ def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions):
             res["bucket"] = "out of stage-1 scope (multi-file)"
             return res
     editions = view.values("edition")
-    edition = editions[-1].strip() if editions else "2021"
+    edition = _concrete_edition(editions[-1].strip()) \
+        if editions else "2021"
     flags = compile_flags(view)
     screened = screen_flags(flags)
     if screened:
@@ -2166,13 +2172,18 @@ def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=()):
     Returns a dict with exit_code (None on timeout), converted and
     skipped counts (None when no report was printed), skip_totals
     ([(kind, count)] from the report's `unsupported:` section, most
-    frequent first), compilation_failed (the driver reported a clean
-    compilation failure), ice (stderr shows an internal compiler
-    error), and stderr. `rustc_args` are forwarded to the driver's
-    embedded rustc through its `--rustc-arg` option (a test's
-    compile-flags and the per-revision arguments). Auxiliary crates
-    are handed to the driver with `--aux`, in dependency order, as
-    in run mode.
+    frequent first), compilation_failed (the embedded rustc cleanly
+    rejected the program: the driver's own marker, rustc's
+    `error: aborting due to` line, or LLVM rejecting a forwarded
+    `-Cllvm-args` value before compilation), conversion_panicked
+    (the driver's catch_unwind reported a Stable MIR conversion
+    panic, with panic_reason), aux_failure (an auxiliary crate's
+    build failed, with the driver's reason), ice (stderr shows an
+    internal compiler error), and stderr. `rustc_args` are
+    forwarded to the driver's embedded rustc through its
+    `--rustc-arg` option (a test's compile-flags and the
+    per-revision arguments). Auxiliary crates are handed to the
+    driver with `--aux`, in dependency order, as in run mode.
     """
     argv = [str(driver_bin), str(path), "--edition", edition]
     for a in rustc_args:
@@ -2187,12 +2198,23 @@ def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=()):
         "converted": None,
         "skipped": None,
         "skip_totals": [],
-        "compilation_failed": "sparagmos-driver: compilation failed"
-                              in res["stderr"],
+        "compilation_failed": (
+            "sparagmos-driver: compilation failed" in res["stderr"]
+            or re.search(r"^error: aborting due to", res["stderr"],
+                         re.M) is not None
+            or "Unknown command line argument" in res["stderr"]),
         "ice": "internal compiler error" in res["stderr"],
         "stderr": res["stderr"],
         "stdout": res["stdout"],
     }
+    pm = re.search(r"sparagmos-driver: Stable MIR conversion "
+                   r"panicked: (.+)", res["stderr"])
+    out["conversion_panicked"] = pm is not None
+    out["panic_reason"] = pm.group(1).strip() if pm else ""
+    am = re.search(r"sparagmos-driver: auxiliary crate `[^`]+` "
+                   r"(failed to compile: .+|produced no linkable "
+                   r"artifact[^\n]*)", res["stderr"])
+    out["aux_failure"] = am.group(1).strip() if am else ""
     m = _CONVERTED_RE.search(res["stdout"])
     if m:
         out["converted"] = int(m.group(1))
@@ -2261,6 +2283,11 @@ def judge_compile(expectation, conv):
         return ("fail",
                 f"driver timed out after {CONVERT_TIMEOUT}s",
                 "timeout")
+    if conv.get("aux_failure"):
+        return ("unsupported",
+                f"auxiliary crate build failed: "
+                f"{conv['aux_failure']}",
+                "auxiliary crate build failure")
     code = conv["exit_code"]
     if expectation == "success":
         if code == 0:
@@ -2286,6 +2313,13 @@ def judge_compile(expectation, conv):
                     f"function(s) skipped ({totals})",
                     skip_bucket(totals_list))
         if code == 1:
+            if conv.get("conversion_panicked") \
+                    and not conv["compilation_failed"]:
+                return ("unsupported",
+                        "conversion panicked in Stable MIR: "
+                        f"{conv['panic_reason'][:160]}",
+                        "conversion incomplete "
+                        "(Stable MIR conversion panicked)")
             first = first_error_line(conv["stderr"])
             return ("fail",
                     "expected compile success, but the driver "
@@ -2298,6 +2332,12 @@ def judge_compile(expectation, conv):
     if expectation == "failure":
         if code == 1 and conv["compilation_failed"]:
             return ("pass", "", "")
+        if code == 1 and conv.get("conversion_panicked"):
+            return ("unsupported",
+                    "conversion panicked in Stable MIR: "
+                    f"{conv['panic_reason'][:160]}",
+                    "conversion incomplete "
+                    "(Stable MIR conversion panicked)")
         if code == 1:
             return ("fail",
                     "driver exit 1 without a compilation-failure report",
@@ -2488,7 +2528,8 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
         res["bucket"] = "not attempted (verdict needs execution)"
         return res
     editions = view.values("edition")
-    edition = editions[-1].strip() if editions else "2021"
+    edition = _concrete_edition(editions[-1].strip()) \
+        if editions else "2021"
     flags = compile_flags(view)
     screened = screen_flags(flags)
     if screened:
