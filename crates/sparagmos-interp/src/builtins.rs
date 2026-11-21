@@ -255,6 +255,8 @@ pub enum Builtin {
     IntoIter,
     /// `std::iter::Iterator::next(&mut iter)`.
     IteratorNext,
+    /// `std::iter::Iterator::size_hint(&iter)`.
+    IteratorSizeHint,
     /// `std::convert::From::from(value)` (modelled conversions only).
     FromFrom,
     /// `std::hint::must_use(value)`: identity.
@@ -577,6 +579,26 @@ pub enum Builtin {
     /// project the RawVec struct's fields off the abstract
     /// aggregate and fail, so the entry points are modelled here.
     VecShrink,
+    /// `Vec::extend_trusted(&mut vec, iter)`: append every item
+    /// the iterator yields. The collected body is the TrustedLen
+    /// fast path (`SpecFromIter::from_iter` reaches it for every
+    /// `TrustedLen` iterator): it drives the RawVec allocation
+    /// machinery directly, projecting the real buffer fields off
+    /// the abstract aggregate, so it cannot run in this model.
+    /// The observable semantics are the appends themselves,
+    /// performed here by stepping the iterator with the same
+    /// machinery `Iterator::next` uses.
+    VecExtendTrusted,
+    /// `SpecFromIterNested::from_iter(iter) -> Vec<T>`: build a
+    /// vector from every item the iterator yields. The collected
+    /// body has `Vec::with_capacity` inlined into it and drives
+    /// `RawVecInner` directly, which the value model does not
+    /// serve; the observable semantics are the collected items in
+    /// order, produced here by stepping the iterator with the
+    /// same machinery `Iterator::next` uses. This is the entry
+    /// every `Iterator::collect::<Vec<_>>` reaches (the
+    /// `SpecFromIter` instance delegates to it).
+    VecFromIterNested,
     /// `Vec::capacity(&vec)`: not modelled. Capacity has no
     /// representation in the value model, and returning the length
     /// would be observably wrong, so the call fails with an
@@ -844,6 +866,7 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "core::fmt::rt::Argument::from_usize" => Builtin::ArgumentFromUsize,
         "std::iter::IntoIterator::into_iter" => Builtin::IntoIter,
         "std::iter::Iterator::next" => Builtin::IteratorNext,
+        "std::iter::Iterator::size_hint" => Builtin::IteratorSizeHint,
         // The thread surface (cooperative model, see `interp.rs`).
         // Registering these names also keeps the driver from
         // collecting the std thread machinery, whose internals
@@ -1091,6 +1114,14 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
                 || canonical.ends_with(">::shrink_to")) =>
         {
             Builtin::VecShrink
+        }
+        _ if canonical.starts_with("std::vec::Vec")
+            && canonical.ends_with(">::extend_trusted") =>
+        {
+            Builtin::VecExtendTrusted
+        }
+        "std::vec::spec_from_iter_nested::SpecFromIterNested::from_iter" => {
+            Builtin::VecFromIterNested
         }
         _ if canonical.starts_with("std::vec::Vec") && canonical.ends_with(">::capacity") => {
             Builtin::VecCapacity
@@ -2295,6 +2326,7 @@ impl<'a> Interpreter<'a> {
                 let value = vals.into_iter().next().expect("arity checked");
                 if self_ty.starts_with("std::ops::Range<")
                     || self_ty.starts_with("std::ops::RangeInclusive<")
+                    || self_ty.starts_with("std::iter::Rev<")
                     || self_ty.starts_with("std::slice::Iter<")
                     || self_ty_is(self_ty, "std::str::Chars")
                     || self_ty_is(self_ty, "core::str::Chars")
@@ -2377,6 +2409,11 @@ impl<'a> Interpreter<'a> {
                 arity(1)?;
                 let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
                 self.iterator_next(frames, self_ty, &vals[0])
+            }
+            Builtin::IteratorSizeHint => {
+                arity(1)?;
+                let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
+                self.iterator_size_hint(frames, self_ty, &vals[0])
             }
             Builtin::FromFrom | Builtin::IntoInto => {
                 arity(1)?;
@@ -3431,6 +3468,55 @@ impl<'a> Interpreter<'a> {
                     ));
                 }
                 Ok(Value::Unit)
+            }
+            Builtin::VecExtendTrusted => {
+                arity(2)?;
+                // The callee's generic arguments are the Vec's own
+                // parameters followed by the iterator type, which
+                // is the stepping dispatch key.
+                let iter_ty = generic_args.last().map(String::as_str).unwrap_or("");
+                let target = self.deref_value(frames, &vals[0])?;
+                let mut fields = match self.read_resolved(frames, &target)? {
+                    Value::Enum { fields, .. } => fields,
+                    ref other => {
+                        return Err(InterpError::type_mismatch(
+                            "Vec::extend_trusted",
+                            "vector value",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                let items = self.drain_iterator(
+                    frames,
+                    iter_ty,
+                    vals.into_iter().nth(1).expect("arity checked"),
+                )?;
+                fields.extend(items);
+                self.write_resolved(
+                    frames,
+                    &target,
+                    Value::Enum {
+                        variant: 0,
+                        fields,
+                    },
+                )?;
+                Ok(Value::Unit)
+            }
+            Builtin::VecFromIterNested => {
+                arity(1)?;
+                // The trait's generic arguments are the element
+                // type followed by the iterator type, which is
+                // the stepping dispatch key.
+                let iter_ty = generic_args.last().map(String::as_str).unwrap_or("");
+                let items = self.drain_iterator(
+                    frames,
+                    iter_ty,
+                    vals.into_iter().next().expect("arity checked"),
+                )?;
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields: items,
+                })
             }
             Builtin::VecCapacity => Err(unsupported(
                 "Vec::capacity is not runtime-supported (capacity is not represented in the value model)"
@@ -4893,6 +4979,30 @@ impl<'a> Interpreter<'a> {
             } else {
                 (fields, none_value())
             }
+        } else if self_ty.starts_with("std::iter::Rev<") {
+            // `Rev::next` is the inner iterator's `next_back`,
+            // computed on the inner state value (see
+            // `iterator_next_back_state`); the Rev state is the
+            // one-field wrapper around it.
+            if fields.len() != 1 {
+                return Err(InterpError::type_mismatch(
+                    "Rev state",
+                    "[inner iterator]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let inner_ty = self_ty
+                .strip_prefix("std::iter::Rev<")
+                .and_then(|rest| rest.strip_suffix('>'))
+                .unwrap_or("");
+            let (new_inner, item) = iterator_next_back_state(&fields[0], inner_ty)?;
+            (
+                vec![new_inner],
+                match item {
+                    Some(value) => some_value(value),
+                    None => none_value(),
+                },
+            )
         } else {
             return Err(unsupported(format!(
                 "Iterator::next for {self_ty} is not runtime-supported"
@@ -4907,6 +5017,219 @@ impl<'a> Interpreter<'a> {
         };
         self.write_resolved(frames, &target, new_state)?;
         Ok(result)
+    }
+
+    /// Step an iterator value to exhaustion with the
+    /// [`Self::iterator_next`] machinery, returning the items in
+    /// order. The iterator arrives by value; it is parked in a
+    /// fresh allocation so the place-based machinery can step it.
+    /// Callers consume the iterator, so the parked state is never
+    /// read back.
+    fn drain_iterator(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        iter_ty: &str,
+        iter_value: Value,
+    ) -> InterpResult<Vec<Value>> {
+        let id = self.alloc_insert(iter_value);
+        let iter_ref = Value::Ref(RefTarget::Alloc {
+            id,
+            projection: Vec::new(),
+        });
+        let mut items = Vec::new();
+        loop {
+            match self.iterator_next(frames, iter_ty, &iter_ref)? {
+                Value::Enum {
+                    variant: 1,
+                    fields: item,
+                } if item.len() == 1 => {
+                    items.push(item.into_iter().next().expect("length checked"));
+                }
+                Value::Enum { variant: 0, .. } => break,
+                ref other => {
+                    return Err(InterpError::type_mismatch(
+                        "iterator drain",
+                        "an Option value from Iterator::next",
+                        other.kind_name(),
+                    ))
+                }
+            }
+        }
+        Ok(items)
+    }
+
+    /// `Iterator::size_hint` for the modelled iterators: the
+    /// `(lower, Option<upper>)` pair the standard library reports
+    /// for each, computed from the iterator's state the same way
+    /// [`Self::iterator_next`] steps it.
+    ///
+    /// Registering the name stops the driver collecting the real
+    /// `size_hint` bodies. Those bodies cannot run against the
+    /// modelled states: `env::Args::size_hint` — the caller that
+    /// motivated this — delegates through `ArgsOs` to
+    /// `vec::IntoIter::size_hint`, whose body reads the real
+    /// struct layout (the buffer pointer and end fields) off the
+    /// model's snapshot state and fails on an uninitialized deep
+    /// field; the range and string iterators' bodies project
+    /// their real layouts the same way. The values below are the
+    /// exact std answers for each modelled state: an exact count
+    /// where std knows one, `(0, None)` where std reports the
+    /// trait default (the channel iterators do not override
+    /// `size_hint`). Iterators whose `next` the model does not
+    /// serve stay an explicit unsupported error, as for `next`.
+    fn iterator_size_hint(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        self_ty: &str,
+        ref_arg: &Value,
+    ) -> InterpResult<Value> {
+        let target = self.deref_value(frames, ref_arg)?;
+        let state = self.read_resolved(frames, &target)?;
+        fn hint(lower: u128, upper: Option<u128>) -> Value {
+            Value::Tuple(vec![
+                Value::Uint(lower),
+                match upper {
+                    Some(v) => some_value(Value::Uint(v)),
+                    None => none_value(),
+                },
+            ])
+        }
+        if self_ty.starts_with("std::sync::mpsc::Iter<")
+            || self_ty.starts_with("std::sync::mpsc::IntoIter<")
+        {
+            // Not overridden in std: the trait default.
+            return Ok(hint(0, None));
+        }
+        if self_ty_is(self_ty, "std::env::Args") || self_ty_is(self_ty, "std::env::ArgsOs") {
+            // Delegates to the inner `vec::IntoIter`'s exact count.
+            let depth = if self_ty_is(self_ty, "std::env::Args") { 2 } else { 1 };
+            let mut inner = &state;
+            for _ in 0..depth {
+                inner = match inner {
+                    Value::Enum { fields, .. } if fields.len() == 1 => &fields[0],
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            format!("{self_ty} state"),
+                            "nested one-field iterator wrappers",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+            }
+            let (items, idx) = owned_iter_parts(inner, self_ty)?;
+            let n = items.len().saturating_sub(idx) as u128;
+            return Ok(hint(n, Some(n)));
+        }
+        if self_ty.starts_with("std::iter::Rev<") {
+            // `Rev::size_hint` is its inner iterator's.
+            let inner_ty = self_ty
+                .strip_prefix("std::iter::Rev<")
+                .and_then(|rest| rest.strip_suffix('>'))
+                .unwrap_or("");
+            let fields = iterator_fields(&state, self_ty)?;
+            if fields.len() != 1 {
+                return Err(InterpError::type_mismatch(
+                    "Rev state",
+                    "[inner iterator]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let inner_ref = Value::Ref(RefTarget::Value(Box::new(fields[0].clone())));
+            return self.iterator_size_hint(frames, inner_ty, &inner_ref);
+        }
+        let fields = iterator_fields(&state, self_ty)?;
+        if self_ty.starts_with("std::ops::RangeInclusive<") {
+            if fields.len() != 3 {
+                return Err(InterpError::type_mismatch(
+                    "RangeInclusive state",
+                    "[start, end, exhausted]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            if fields[2] == Value::Bool(true) {
+                return Ok(hint(0, Some(0)));
+            }
+            return Ok(match range_count(
+                &fields[0],
+                &fields[1],
+                true,
+                range_elem_ty(self_ty),
+            )? {
+                Some(n) => hint(n, Some(n)),
+                None => hint(u128::from(u64::MAX), None),
+            });
+        }
+        if self_ty.starts_with("std::ops::Range<") {
+            if fields.len() != 2 {
+                return Err(InterpError::type_mismatch(
+                    "Range state",
+                    "[start, end]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            return Ok(match range_count(
+                &fields[0],
+                &fields[1],
+                false,
+                range_elem_ty(self_ty),
+            )? {
+                Some(n) => hint(n, Some(n)),
+                None => hint(u128::from(u64::MAX), None),
+            });
+        }
+        if self_ty.starts_with("std::iter::Empty<") {
+            return Ok(hint(0, Some(0)));
+        }
+        if self_ty.starts_with("std::array::IntoIter<")
+            || self_ty.starts_with("std::vec::IntoIter<")
+            || self_ty.starts_with("alloc::vec::IntoIter<")
+            || self_ty.starts_with("std::slice::Iter<")
+            || self_ty_is(self_ty, "std::str::Chars")
+            || self_ty_is(self_ty, "core::str::Chars")
+            || self_ty_is(self_ty, "std::str::Bytes")
+            || self_ty_is(self_ty, "core::str::Bytes")
+        {
+            let (items, idx) = owned_iter_parts(&state, self_ty)?;
+            let remaining = &items[idx.min(items.len())..];
+            if self_ty_is(self_ty, "std::str::Chars")
+                || self_ty_is(self_ty, "core::str::Chars")
+            {
+                // std's `Chars::size_hint`: the remaining byte
+                // count bounds the char count from above, and a
+                // char is at most 4 bytes, so the lower bound is
+                // the byte count divided by 4 rounded up. The
+                // state holds the decoded code points, so the
+                // remaining byte count is exact.
+                let mut bytes: u128 = 0;
+                for item in remaining {
+                    bytes += match item {
+                        Value::Uint(cp) => char::from_u32(*cp as u32)
+                            .map(|c| c.len_utf8() as u128)
+                            .ok_or_else(|| {
+                                InterpError::type_mismatch(
+                                    "Chars state",
+                                    "char code points",
+                                    format!("code point {cp}"),
+                                )
+                            })?,
+                        Value::Str(text) => text.len() as u128,
+                        other => {
+                            return Err(InterpError::type_mismatch(
+                                "Chars state",
+                                "char values",
+                                other.kind_name(),
+                            ))
+                        }
+                    };
+                }
+                return Ok(hint(bytes.div_ceil(4), Some(bytes)));
+            }
+            let n = remaining.len() as u128;
+            return Ok(hint(n, Some(n)));
+        }
+        Err(unsupported(format!(
+            "Iterator::size_hint for {self_ty} is not runtime-supported"
+        )))
     }
 
     /// Semantic (derived `PartialEq`) equality of two values:
@@ -5831,6 +6154,187 @@ fn owned_iter_state(items: Vec<Value>) -> Value {
     }
 }
 
+/// The (items, next index) of an owned-sequence iterator state,
+/// with the shape checks [`step_owned_iter`] performs.
+fn owned_iter_parts(state: &Value, self_ty: &str) -> InterpResult<(Vec<Value>, usize)> {
+    let fields = iterator_fields(state, self_ty)?;
+    if fields.len() != 2 {
+        return Err(InterpError::type_mismatch(
+            format!("{self_ty} state"),
+            "[items, next index]",
+            format!("{} field(s)", fields.len()),
+        ));
+    }
+    let items = match &fields[0] {
+        Value::Tuple(items) => items.clone(),
+        ref other => {
+            return Err(InterpError::type_mismatch(
+                format!("{self_ty} items"),
+                "tuple of elements",
+                other.kind_name(),
+            ))
+        }
+    };
+    let idx = match fields[1] {
+        Value::Uint(v) => v as usize,
+        ref other => {
+            return Err(InterpError::type_mismatch(
+                format!("{self_ty} index"),
+                "unsigned integer",
+                other.kind_name(),
+            ))
+        }
+    };
+    Ok((items, idx))
+}
+
+/// An iterator state value with `state`'s shape (ADT aggregate
+/// or tuple) and new fields: the rebuild `iterator_next`
+/// performs on a stepped state.
+fn iterator_state_like(state: &Value, fields: Vec<Value>) -> Value {
+    match state {
+        Value::Enum { variant, .. } => Value::Enum {
+            variant: *variant,
+            fields,
+        },
+        _ => Value::Tuple(fields),
+    }
+}
+
+/// One back step of an owned-sequence iterator state: yields
+/// the last remaining item and drops it from the snapshot. The
+/// front index is untouched, so front and back steps compose
+/// exactly as the real double-ended iterators' do.
+fn step_owned_iter_back(
+    state: &Value,
+    self_ty: &str,
+) -> InterpResult<(Value, Option<Value>)> {
+    let (items, idx) = owned_iter_parts(state, self_ty)?;
+    if items.len() > idx {
+        let item = items[items.len() - 1].clone();
+        // `slice::Iter`'s back step yields `&T`, like its front
+        // step (see `iterator_next`).
+        let item = if self_ty.starts_with("std::slice::Iter<") {
+            Value::Ref(RefTarget::Value(Box::new(item)))
+        } else {
+            item
+        };
+        let kept = items[..items.len() - 1].to_vec();
+        Ok((
+            iterator_state_like(state, vec![Value::Tuple(kept), Value::Uint(idx as u128)]),
+            Some(item),
+        ))
+    } else {
+        Ok((state.clone(), None))
+    }
+}
+
+/// One back step (`DoubleEndedIterator::next_back`) of an
+/// iterator state, computed on the state value itself: returns
+/// the new state and the yielded item. This is what `Rev<I>`'s
+/// `next` runs. The shapes served are the ones `iterator_next`
+/// serves whose back step is a state transition of the same
+/// kind; anything else stays an explicit unsupported error.
+fn iterator_next_back_state(
+    state: &Value,
+    self_ty: &str,
+) -> InterpResult<(Value, Option<Value>)> {
+    if self_ty_is(self_ty, "std::env::Args") || self_ty_is(self_ty, "std::env::ArgsOs") {
+        // Step the innermost owned-iterator state from the back
+        // and rebuild the wrappers, mirroring the front step in
+        // `iterator_next`.
+        let depth = if self_ty_is(self_ty, "std::env::Args") { 2 } else { 1 };
+        let mut inner = state;
+        for _ in 0..depth {
+            inner = match inner {
+                Value::Enum { fields, .. } if fields.len() == 1 => &fields[0],
+                other => {
+                    return Err(InterpError::type_mismatch(
+                        format!("{self_ty} state"),
+                        "nested one-field iterator wrappers",
+                        other.kind_name(),
+                    ))
+                }
+            };
+        }
+        let (new_inner, item) = step_owned_iter_back(inner, self_ty)?;
+        let mut rebuilt = new_inner;
+        for _ in 0..depth {
+            rebuilt = Value::Enum {
+                variant: 0,
+                fields: vec![rebuilt],
+            };
+        }
+        return Ok((rebuilt, item));
+    }
+    let fields = iterator_fields(state, self_ty)?;
+    if self_ty.starts_with("std::ops::RangeInclusive<") {
+        if fields.len() != 3 {
+            return Err(InterpError::type_mismatch(
+                "RangeInclusive state",
+                "[start, end, exhausted]",
+                format!("{} field(s)", fields.len()),
+            ));
+        }
+        let (start, end, exhausted) = (
+            fields[0].clone(),
+            fields[1].clone(),
+            fields[2].clone(),
+        );
+        if exhausted == Value::Bool(true) {
+            return Ok((state.clone(), None));
+        }
+        return Ok(match compare_values(&start, &end)? {
+            Ordering::Less => (
+                iterator_state_like(
+                    state,
+                    vec![start, decrement(&end)?, Value::Bool(false)],
+                ),
+                Some(end),
+            ),
+            Ordering::Equal => (
+                iterator_state_like(state, vec![start, end.clone(), Value::Bool(true)]),
+                Some(end),
+            ),
+            Ordering::Greater => (state.clone(), None),
+        });
+    }
+    if self_ty.starts_with("std::ops::Range<") {
+        if fields.len() != 2 {
+            return Err(InterpError::type_mismatch(
+                "Range state",
+                "[start, end]",
+                format!("{} field(s)", fields.len()),
+            ));
+        }
+        let (start, end) = (fields[0].clone(), fields[1].clone());
+        return Ok(match compare_values(&start, &end)? {
+            Ordering::Less => {
+                let new_end = decrement(&end)?;
+                (
+                    iterator_state_like(state, vec![start, new_end.clone()]),
+                    Some(new_end),
+                )
+            }
+            _ => (state.clone(), None),
+        });
+    }
+    if self_ty.starts_with("std::array::IntoIter<")
+        || self_ty.starts_with("std::vec::IntoIter<")
+        || self_ty.starts_with("alloc::vec::IntoIter<")
+        || self_ty.starts_with("std::slice::Iter<")
+        || self_ty_is(self_ty, "std::str::Chars")
+        || self_ty_is(self_ty, "core::str::Chars")
+        || self_ty_is(self_ty, "std::str::Bytes")
+        || self_ty_is(self_ty, "core::str::Bytes")
+    {
+        return step_owned_iter_back(state, self_ty);
+    }
+    Err(unsupported(format!(
+        "DoubleEndedIterator::next_back for {self_ty} is not runtime-supported"
+    )))
+}
+
 fn iterator_fields(state: &Value, self_ty: &str) -> InterpResult<Vec<Value>> {
     match state {
         Value::Enum { fields, .. } => Ok(fields.clone()),
@@ -5917,6 +6421,123 @@ fn increment(value: &Value) -> InterpResult<Value> {
         )),
     }
 }
+
+fn decrement(value: &Value) -> InterpResult<Value> {
+    match value {
+        Value::Int(v) => Ok(Value::Int(v - 1)),
+        Value::Uint(v) => Ok(Value::Uint(v - 1)),
+        other => Err(InterpError::type_mismatch(
+            "iterator bound decrement",
+            "integer",
+            other.kind_name(),
+        )),
+    }
+}
+
+/// The element type tag of a `Range<elem>` / `RangeInclusive<elem>`
+/// type tag.
+fn range_elem_ty(self_ty: &str) -> &str {
+    self_ty
+        .strip_prefix("std::ops::RangeInclusive<")
+        .or_else(|| self_ty.strip_prefix("std::ops::Range<"))
+        .and_then(|rest| rest.strip_suffix('>'))
+        .unwrap_or("")
+}
+
+/// The element count of a range, as `size_hint` reports it:
+/// `end - start` (plus one for an inclusive range), zero when
+/// the range is empty, with the surrogate gap [0xD800, 0xE000)
+/// removed for `char` ranges (std's char range iterators skip
+/// the gap, and their `size_hint` accounts for it). `None` when
+/// the count exceeds `usize::MAX` — std then reports
+/// `(usize::MAX, None)`.
+///
+/// The bounds are read in the element type's own arithmetic:
+/// for an unsigned element type a bound is its bit pattern (a
+/// constant with the high bit set, `u64::MAX`, materialises as
+/// a signed value in this model — see `uint_arg_bits` — and an
+/// unassigned temporary's fields keep that form), for a signed
+/// element type its value.
+fn range_count(
+    start: &Value,
+    end: &Value,
+    inclusive: bool,
+    elem: &str,
+) -> InterpResult<Option<u128>> {
+    fn bits(value: &Value) -> InterpResult<u128> {
+        match value {
+            Value::Uint(v) => Ok(*v),
+            Value::Int(v) => Ok(*v as u128),
+            other => Err(InterpError::type_mismatch(
+                "range bounds",
+                "integer bounds",
+                other.kind_name(),
+            )),
+        }
+    }
+    fn signed(value: &Value) -> InterpResult<i128> {
+        match value {
+            Value::Int(v) => Ok(*v),
+            Value::Uint(v) => i128::try_from(*v).map_err(|_| {
+                InterpError::type_mismatch(
+                    "range bounds",
+                    "signed integer bounds",
+                    "an out-of-range unsigned integer",
+                )
+            }),
+            other => Err(InterpError::type_mismatch(
+                "range bounds",
+                "integer bounds",
+                other.kind_name(),
+            )),
+        }
+    }
+    let span: Option<u128> = match elem {
+        "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "char" => {
+            let (a, b) = (bits(start)?, bits(end)?);
+            if b < a {
+                Some(0)
+            } else {
+                (b - a).checked_add(u128::from(inclusive))
+            }
+        }
+        "i8" | "i16" | "i32" | "i64" | "i128" | "isize" => {
+            let (a, b) = (signed(start)?, signed(end)?);
+            if b < a {
+                Some(0)
+            } else {
+                b.checked_sub(a)
+                    .and_then(|d| d.checked_add(i128::from(inclusive)))
+                    .map(|v| v as u128)
+            }
+        }
+        _ => {
+            return Err(InterpError::type_mismatch(
+                "range bounds",
+                "an integer element type",
+                elem,
+            ))
+        }
+    };
+    let Some(mut span) = span else {
+        return Ok(None);
+    };
+    if elem == "char" {
+        let (a, b) = (bits(start)?, bits(end)?);
+        let hi = if inclusive { b + 1 } else { b };
+        let g_lo = a.max(0xD800);
+        let g_hi = hi.min(0xE000);
+        if g_hi > g_lo {
+            span -= g_hi - g_lo;
+        }
+    }
+    if span > u128::from(u64::MAX) {
+        Ok(None)
+    } else {
+        Ok(Some(span))
+    }
+}
+
 
 /// A `u64` argument read as its bit pattern: a constant with
 /// the high bit set (e.g. `u64::MAX`) materialises as a signed
