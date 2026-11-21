@@ -2022,6 +2022,20 @@ impl<'a> Converter<'a> {
                         _ => None,
                     };
                     let v = self.convert_operand(body, op, elem_ty.as_ref())?;
+                    // A repeat evaluates its operand once and
+                    // replicates the value; the operand is written
+                    // as a move in MIR even for `Copy` element
+                    // types (an array of `Copy` elements is itself
+                    // `Copy`). Replicating a move operand would
+                    // read the source place once per element and
+                    // fail on the second read, the source having
+                    // been moved out of. Read it as a copy instead:
+                    // the value is replicated, not moved per
+                    // element.
+                    let v = match v {
+                        ir::Operand::Move(place) => ir::Operand::Copy(place),
+                        other => other,
+                    };
                     ir::Rvalue::AggregateTuple(vec![v; *count as usize])
                 }
             }
