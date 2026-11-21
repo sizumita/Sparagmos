@@ -2976,6 +2976,27 @@ impl<'a> Interpreter<'a> {
         })
     }
 
+    /// Why a blocking channel operation cannot proceed: either
+    /// every pending thread has already run (or none exists), or —
+    /// when the block happens inside a spawned thread's run — the
+    /// thread that must act next is the very thread that spawned
+    /// this one and is itself blocked waiting for it: a cyclic
+    /// wait no run-to-completion schedule can serve.
+    fn block_forever_message(&self, name: &str, situation: &str) -> String {
+        if self.current_thread_id() != 1 {
+            format!(
+                "{name} would block forever: {situation}; the thread that \
+                 must act next is the blocked spawner of the running thread \
+                 (a cyclic wait between threads is not servable by the \
+                 single-threaded model)"
+            )
+        } else {
+            format!(
+                "{name} would block forever: {situation} (single-threaded model)"
+            )
+        }
+    }
+
     /// `Sender::send` / `SyncSender::send`: enqueue the value,
     /// running pending threads while a bounded channel is full
     /// (the sender would block; the threads it waits for run
@@ -3018,8 +3039,9 @@ impl<'a> Interpreter<'a> {
                 }
                 Step::Full => {
                     if !self.drain_threads(frames)? {
-                        return Err(unsupported(format!(
-                            "{name} would block forever: the channel is full                              and no pending thread can receive (single-threaded model)"
+                        return Err(unsupported(self.block_forever_message(
+                            name,
+                            "the channel is full and no pending thread can receive",
                         )));
                     }
                 }
@@ -3052,8 +3074,9 @@ impl<'a> Interpreter<'a> {
                 return Ok(Err(()));
             }
             if !self.drain_threads(frames)? {
-                return Err(unsupported(format!(
-                    "{name} would block forever: the channel is empty                      and no pending thread can send (single-threaded model)"
+                return Err(unsupported(self.block_forever_message(
+                    name,
+                    "the channel is empty and no pending thread can send",
                 )));
             }
         }
