@@ -120,6 +120,10 @@ pub struct MirProgram {
     /// `mir::AdtDebugShapes`). Consulted by the `Debug` formatter
     /// for ADT values.
     pub adt_debug_shapes: mir::AdtDebugShapes,
+    /// Thread-local statics of the program, as recorded by the
+    /// driver (see `mir::ThreadLocalDef`): each entry's initializer
+    /// seeds one thread's storage for that static.
+    pub thread_locals: mir::ThreadLocals,
 }
 
 /// Widen an `f16` bit pattern to `f64`. The conversion is exact:
@@ -517,6 +521,20 @@ fn convert_all(
     failures.retain(|key, _| !out.functions.contains_key(key));
     out.adt_layouts = program.adt_layouts.clone();
     out.adt_debug_shapes = program.adt_debug_shapes.clone();
+    // The thread-locals table: each recorded static's initializer,
+    // converted with its declared type as context and keyed by the
+    // same static key the `ThreadLocalRef` rvalues carry. A seed
+    // that does not convert is dropped; evaluating that static's
+    // `ThreadLocalRef` then fails with an explicit error.
+    out.thread_locals = program
+        .thread_locals
+        .iter()
+        .filter_map(|(def, defn)| {
+            let seed = conv.convert_const_value(&defn.init, Some(&defn.ty)).ok()?;
+            let seed = conv.expand_uninit_constant(&seed, &defn.ty, 0);
+            Some((conv.static_key(def), seed))
+        })
+        .collect();
     mark_caller_location_bodies(&mut out);
     Ok((out, failures))
 }
@@ -1938,34 +1956,55 @@ impl<'a> Converter<'a> {
         }
     }
 
-    /// Whether a pointer cast from `source` to `target` goes from
-    /// a transparent single-field wrapper (`UnsafeCell<T>` /
-    /// `MaybeUninit<T>`) to the wrapped type itself. Decided from
-    /// the cast's two types, both known at conversion time: the
-    /// source pointee is the wrapper ADT and its single generic
-    /// argument is exactly the target pointee.
-    fn cast_enters_wrapper_field(&self, source: &mir::Ty, target: &mir::Ty) -> bool {
+    /// The field-entry depth of a pointer cast from `source` to
+    /// `target` that crosses transparent single-field wrappers
+    /// (`UnsafeCell<T>` / `MaybeUninit<T>`) to reach the wrapped
+    /// type itself, or `None` when the cast is not of that shape.
+    /// Decided from the cast's two types, both known at conversion
+    /// time: the source pointee is peeled wrapper by wrapper until
+    /// it is exactly the target pointee.
+    fn cast_wrapper_entry_depth(
+        &self,
+        source: &mir::Ty,
+        target: &mir::Ty,
+    ) -> Option<u32> {
         fn pointee(ty: &mir::Ty) -> Option<&mir::Ty> {
             match ty {
                 mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _) => Some(inner),
                 _ => None,
             }
         }
-        let (Some(src), Some(tgt)) = (pointee(source), pointee(target)) else {
-            return false;
-        };
-        match src {
-            mir::Ty::Adt(def, args) => {
-                matches!(
-                    self.def_display_name(def).as_str(),
-                    "std::cell::UnsafeCell"
-                        | "core::cell::UnsafeCell"
-                        | "std::mem::MaybeUninit"
-                        | "core::mem::MaybeUninit"
-                ) && args.len() == 1
-                    && args[0] == *tgt
+        let mut current = pointee(source)?;
+        let target = pointee(target)?;
+        let mut depth = 0u32;
+        loop {
+            let mir::Ty::Adt(def, args) = current else {
+                return None;
+            };
+            // Both wrapper kinds are one-field aggregates in the
+            // value model -- `UnsafeCell` by its declared shape, and
+            // `MaybeUninit` by the field-0 convention its pointer
+            // accesses use (`MaybeUninit::new` constructions store
+            // the payload at field 0 of the union value) -- so
+            // entering either appends a field-0 projection. The
+            // layers must be peeled to know whether the cast lands
+            // exactly on the target pointee.
+            let name = self.def_display_name(def);
+            let is_wrapper = matches!(
+                name.as_str(),
+                "std::cell::UnsafeCell"
+                    | "core::cell::UnsafeCell"
+                    | "std::mem::MaybeUninit"
+                    | "core::mem::MaybeUninit"
+            );
+            if !is_wrapper || args.len() != 1 {
+                return None;
             }
-            _ => false,
+            depth += 1;
+            if args[0] == *target {
+                return Some(depth);
+            }
+            current = &args[0];
         }
     }
 
@@ -2292,6 +2331,133 @@ impl<'a> Converter<'a> {
                 })
             }
         })
+    }
+
+    /// Expand the `Uninit` leaves of a thread-local seed into the
+    /// aggregate skeleton of their declared type.
+    ///
+    /// The constant decoder collapses every all-uninitialized byte
+    /// range into a bare `Uninit`, whatever its type. For a
+    /// thread-local storage that loses the storage's shape: the
+    /// `data` field is an `UnsafeCell<MaybeUninit<T>>`, a real value
+    /// of an aggregate type, and std's lazy initialization copies
+    /// the `MaybeUninit` out by value (`ptr::replace` in
+    /// `get_or_init_slow`) -- a read that must yield the uninitialized
+    /// `MaybeUninit` itself, not fail for touching uninitialized
+    /// memory. Guest code materializes that same value as the union
+    /// aggregate with its `()` field active (`MaybeUninit::uninit()`),
+    /// so the expansion rebuilds exactly that form: structs and
+    /// tuples get one slot per field, a union gets its unit-typed
+    /// field (the `uninit: ()` pattern) with `Uninit` padding before
+    /// it, and scalar leaves stay `Uninit`. Unions without a unit
+    /// field have no canonical uninitialized form and keep the bare
+    /// `Uninit`, as do enums (no variant is determined).
+    fn expand_uninit_constant(
+        &self,
+        value: &ir::Constant,
+        ty: &mir::Ty,
+        depth: usize,
+    ) -> ir::Constant {
+        if depth > 16 {
+            return value.clone();
+        }
+        match (value, ty) {
+            (ir::Constant::Uninit, mir::Ty::Adt(def, args)) => {
+                let Some(shape) = self.adt_shapes.get(def) else {
+                    return value.clone();
+                };
+                match shape.kind {
+                    mir::AdtShapeKind::Struct => {
+                        let Some(fields) = shape.variants.first() else {
+                            return value.clone();
+                        };
+                        let fields = fields
+                            .iter()
+                            .enumerate()
+                            .map(|(fi, fty)| {
+                                let fty = self
+                                    .adt_fields
+                                    .get(*def, args, 0, fi as u32)
+                                    .cloned()
+                                    .unwrap_or_else(|| subst_ty(fty, args));
+                                self.expand_uninit_constant(&ir::Constant::Uninit, &fty, depth + 1)
+                            })
+                            .collect();
+                        ir::Constant::Adt {
+                            variant: 0,
+                            fields,
+                        }
+                    }
+                    mir::AdtShapeKind::Union => {
+                        let Some(fields) = shape.variants.first() else {
+                            return value.clone();
+                        };
+                        let unit_idx = fields
+                            .iter()
+                            .position(|f| subst_ty(f, args).is_unit() || f.is_unit());
+                        match unit_idx {
+                            Some(k) => {
+                                let mut fields =
+                                    vec![ir::Constant::Uninit; k];
+                                fields.push(ir::Constant::Unit);
+                                ir::Constant::Adt {
+                                    variant: 0,
+                                    fields,
+                                }
+                            }
+                            None => value.clone(),
+                        }
+                    }
+                    mir::AdtShapeKind::Enum => value.clone(),
+                }
+            }
+            (ir::Constant::Uninit, mir::Ty::Tuple(ts)) => ir::Constant::Tuple(
+                ts.iter()
+                    .map(|t| self.expand_uninit_constant(&ir::Constant::Uninit, t, depth + 1))
+                    .collect(),
+            ),
+            (ir::Constant::Adt { variant, fields }, mir::Ty::Adt(def, args)) => {
+                let Some(shape) = self.adt_shapes.get(def) else {
+                    return value.clone();
+                };
+                let Some(field_tys) = shape.variants.get(*variant as usize) else {
+                    return value.clone();
+                };
+                let fields = fields
+                    .iter()
+                    .enumerate()
+                    .map(|(fi, f)| match field_tys.get(fi) {
+                        Some(fty) => {
+                            let fty = self
+                                .adt_fields
+                                .get(*def, args, *variant, fi as u32)
+                                .cloned()
+                                .unwrap_or_else(|| subst_ty(fty, args));
+                            self.expand_uninit_constant(f, &fty, depth + 1)
+                        }
+                        None => f.clone(),
+                    })
+                    .collect();
+                ir::Constant::Adt {
+                    variant: *variant,
+                    fields,
+                }
+            }
+            (ir::Constant::Tuple(fields), mir::Ty::Tuple(ts)) => ir::Constant::Tuple(
+                fields
+                    .iter()
+                    .zip(ts.iter())
+                    .map(|(f, t)| self.expand_uninit_constant(f, t, depth + 1))
+                    .collect(),
+            ),
+            (ir::Constant::Tuple(fields), mir::Ty::Array(elem, _)) => ir::Constant::Tuple(
+                fields
+                    .iter()
+                    .map(|f| self.expand_uninit_constant(f, elem, depth + 1))
+                    .collect(),
+            ),
+            _ => value.clone(),
+        }
     }
 
     fn convert_const_value(
@@ -2766,9 +2932,13 @@ impl<'a> Converter<'a> {
             (Some(s), t)
                 if is_thin_ptr_ty(s)
                     && is_thin_ptr_ty(t)
-                    && self.cast_enters_wrapper_field(s, t) =>
+                    && self.cast_wrapper_entry_depth(s, t).is_some() =>
             {
-                ir::Rvalue::PtrField(v.clone())
+                ir::Rvalue::PtrField(
+                    v.clone(),
+                    self.cast_wrapper_entry_depth(s, t)
+                        .expect("guard checked"),
+                )
             }
             // Thin pointer -> thin pointer: the value itself.
             // The one crossing still excluded here is the
@@ -3052,7 +3222,7 @@ impl<'a> Converter<'a> {
     /// pointee is exactly the type the wrapper wraps. The
     /// entering direction (wrapper -> wrapped type) is composed
     /// with the cast conversion's field-entering treatment
-    /// (`cast_enters_wrapper_field` -> `Rvalue::PtrField`) in
+    /// (`cast_wrapper_entry_depth` -> `Rvalue::PtrField`) in
     /// `convert_transmute` before this guard is consulted, so
     /// the crossings this guard still excludes are the exiting
     /// direction (wrapped type -> wrapper), which has no
@@ -3560,11 +3730,11 @@ impl<'a> Converter<'a> {
                         // pointer denotes: the wrapper's only field.
                         // Every other pointer-to-pointer cast leaves
                         // the denoted place unchanged in this model.
-                        if ctx
+                        let entry_depth = ctx
                             .as_ref()
-                            .is_some_and(|src| self.cast_enters_wrapper_field(src, target))
-                        {
-                            ir::Rvalue::PtrField(v)
+                            .and_then(|src| self.cast_wrapper_entry_depth(src, target));
+                        if let Some(depth) = entry_depth {
+                            ir::Rvalue::PtrField(v, depth)
                         } else {
                             ir::Rvalue::Use(v)
                         }
@@ -3812,7 +3982,7 @@ impl<'a> Converter<'a> {
             // Raw pointer creation shares the reference representation.
             R::RawPtr(_, place) => ir::Rvalue::Ref(self.convert_place(body, place)?),
             R::Reborrow(_, _, place) => ir::Rvalue::Reborrow(self.convert_place(body, place)?),
-            R::ThreadLocalRef(def) => ir::Rvalue::ThreadLocalRef(format!("{def}")),
+            R::ThreadLocalRef(def) => ir::Rvalue::ThreadLocalRef(self.static_key(def)),
             R::Len(place) => ir::Rvalue::Len(self.convert_place(body, place)?),
             R::NullaryOp(op, _) => ir::Rvalue::Unsupported(format!("NullaryOp {}", op.kind_name())),
             R::Discriminant(place) => {

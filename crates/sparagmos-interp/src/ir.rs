@@ -547,7 +547,15 @@ pub enum Rvalue {
     /// at conversion time from the cast's source and target types.
     /// Any other pointer-to-pointer cast leaves the denoted place
     /// unchanged and stays a plain `Use`.
-    PtrField(Operand),
+    ///
+    /// The `u32` is the number of wrapper layers the cast enters:
+    /// usually 1, but a cast that crosses nested wrappers in one
+    /// step (a pointer to the thread-local storage's
+    /// `UnsafeCell<MaybeUninit<T>>` cast straight to `T`, which is
+    /// how std's lazy thread-local access returns its pointer after
+    /// `UnsafeCell::get` and `cast` are inlined together) appends
+    /// one field-0 projection per layer.
+    PtrField(Operand, u32),
     /// An integer-to-pointer `Transmute` cast: the mirror image of
     /// [`Rvalue::PtrToInt`]. The integer is an address in the
     /// model's synthetic address space, so the result is an
@@ -1163,6 +1171,11 @@ pub struct Program {
     /// formatter when it meets an ADT value.
     pub adt_debug_shapes:
         std::collections::HashMap<String, sparagmos_mir::AdtDebugShape>,
+    /// Thread-local statics of the program, keyed by the static
+    /// key a `ThreadLocalRef` rvalue carries: the initializer
+    /// constant each thread's storage for that static is seeded
+    /// from on first access.
+    pub thread_locals: std::collections::HashMap<String, Constant>,
     pub functions: HashMap<String, Body>,
     /// Functions that exist in the source program but whose bodies
     /// could not be converted, keyed by name, with the reason
