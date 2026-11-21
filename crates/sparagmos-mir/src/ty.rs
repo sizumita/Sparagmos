@@ -145,6 +145,20 @@ pub struct AdtShape {
 /// (see [`AdtShape`]).
 pub type AdtShapes = std::collections::HashMap<AdtDefId, AdtShape>;
 
+/// Declared field types of one *monomorphic instance* of an ADT,
+/// keyed by the rendered instance name (the same key as
+/// [`AdtLayouts`]). The driver records an entry only for instances
+/// whose generic shape (see [`AdtShapes`]) mentions a type alias:
+/// the shape's field types are the definition's own, so a
+/// projection alias among them (the `NonZero<T>` field is
+/// `<T as ZeroablePrimitive>::NonZeroInner`) reaches the
+/// interpreter unresolved, and the interpreter has no trait solver
+/// to resolve it with. An instance entry's field types are the
+/// compiler's own instantiation of the declared fields with the
+/// instance's arguments, which normalizes such projections to the
+/// concrete types they denote.
+pub type AdtInstanceShapes = std::collections::HashMap<String, AdtShape>;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum IntTy {
     I8,
