@@ -2773,6 +2773,10 @@ impl<'a> Interpreter<'a> {
                     let wrapper = self.resolve_value(frames, &vals[0])?;
                     let pointer = one_field_value(wrapper, "Deref::deref for Pin")?;
                     deref_pointer_value(pointer)
+                } else if self_ty.starts_with("std::mem::ManuallyDrop<") {
+                    // A one-field newtype wrapper: the result is a
+                    // reference to the held value.
+                    self.field_zero_ref(frames, &vals[0], "Deref::deref for ManuallyDrop")
                 } else if self_ty.starts_with("std::panic::AssertUnwindSafe<") {
                     // A one-field newtype wrapper: the result is a
                     // reference to the held value.
@@ -3942,22 +3946,18 @@ impl<'a> Interpreter<'a> {
                         )),
                     }
                 } else if self_ty.starts_with("std::mem::ManuallyDrop<") {
-                    // The same one-field aggregate as
-                    // `ManuallyDrop::new`: `deref_mut` yields a
-                    // reference to the held value, in the same
-                    // value-reference form as `Box` above.
-                    let pointee = self.resolve_value(frames, &vals[0])?;
-                    match pointee {
-                        Value::Enum { fields, .. } if fields.len() == 1 => {
-                            let inner = fields.into_iter().next().expect("len checked");
-                            Ok(Value::Ref(RefTarget::Value(Box::new(inner))))
-                        }
-                        ref other => Err(InterpError::type_mismatch(
-                            "DerefMut::deref_mut for ManuallyDrop",
-                            "one-field aggregate",
-                            other.kind_name(),
-                        )),
-                    }
+                    // A one-field newtype wrapper: the result is a
+                    // mutable reference to the held value. As for
+                    // `AssertUnwindSafe` below, a place-backed
+                    // argument yields a live place reference, so
+                    // writes through the result land in the wrapper
+                    // (a resolved-value snapshot would silently
+                    // drop them).
+                    self.field_zero_ref(
+                        frames,
+                        &vals[0],
+                        "DerefMut::deref_mut for ManuallyDrop",
+                    )
                 } else if self_ty.starts_with("std::rc::Rc<")
                     || self_ty.starts_with("std::sync::Arc<")
                 {
