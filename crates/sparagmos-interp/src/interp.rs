@@ -129,6 +129,11 @@ fn synthetic_address(value: &Value) -> Option<u128> {
         Value::Ref(target) => format!("ref:{target:?}"),
         Value::FatRef { base, len } => format!("fat:{base:?}:{len}"),
         Value::FnPtr(name) => format!("fn:{name}"),
+        // A dyn fat pointer's data address is its base pointer's
+        // identity together with the concrete type (two dyn values
+        // over the same base but different concrete types are
+        // different values' pointers in this model).
+        Value::DynRef { base, concrete, .. } => format!("dyn:{base:?}:{concrete}"),
         _ => return None,
     };
     let h = fnv1a(key.as_bytes());
@@ -390,9 +395,57 @@ impl<'a> Interpreter<'a> {
                             match recv {
                                 Value::Ref(_) | Value::FatRef { .. } => {
                                     let resolved = self.deref_value(&frames, &recv)?;
-                                    let value = self.read_resolved(&frames, &resolved)?;
+                                    let mut value =
+                                        self.read_resolved(&frames, &resolved)?;
+                                    // Blanket `Fn` impls make
+                                    // references and one-field
+                                    // smart-pointer wrappers (an
+                                    // `&F`, a `Box<dyn Fn>`) callable
+                                    // themselves: follow the deref
+                                    // chain until the callable value
+                                    // itself shows.
+                                    let mut unwrapped = false;
+                                    for _ in 0..8 {
+                                        let next = match &value {
+                                            Value::Ref(_) | Value::FatRef { .. } => {
+                                                let Ok(t) =
+                                                    self.deref_value(&frames, &value)
+                                                else {
+                                                    break;
+                                                };
+                                                let Ok(v) =
+                                                    self.read_resolved(&frames, &t)
+                                                else {
+                                                    break;
+                                                };
+                                                v
+                                            }
+                                            Value::Enum { fields, .. }
+                                                if fields.len() == 1 =>
+                                            {
+                                                unwrapped = true;
+                                                fields[0].clone()
+                                            }
+                                            _ => break,
+                                        };
+                                        value = next;
+                                    }
                                     if matches!(value, Value::DynRef { .. }) {
                                         self.dyn_callable(&frames, &value)?
+                                    } else if unwrapped {
+                                        // The callable was reached by
+                                        // unwrapping aggregate values
+                                        // (smart pointers), so no place
+                                        // reference names it: its
+                                        // environment reference is a
+                                        // value reference to the
+                                        // callable itself, which is
+                                        // what capture reads resolve
+                                        // through.
+                                        let env = Value::Ref(RefTarget::Value(
+                                            Box::new(value.clone()),
+                                        ));
+                                        (value, env)
                                     } else {
                                         (value, recv)
                                     }
@@ -1556,6 +1609,11 @@ impl<'a> Interpreter<'a> {
                 "reference",
                 "null pointer",
             )),
+            // A byte-array reference local holds the byte data
+            // itself (see `normalize_for_ty`), and a `&str` value
+            // that was materialised as bare string data likewise:
+            // dereferencing yields the data value.
+            Value::Bytes(_) | Value::Str(_) => Ok(Resolved::Value(value.clone())),
             // Dereferencing a fat pointer whose base is a reference
             // reaches through to the base place. A self-contained
             // fat pointer (a slice constant: the base is the element
@@ -1909,6 +1967,65 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// Array-to-slice unsizing of a pointer-shaped value: a
+    /// reference to an array becomes a fat reference over it, and
+    /// a one-field wrapper value (a `Box`, or the `Unique` /
+    /// `NonNull` aggregate chain a MIR-built box is made of) is
+    /// rewrapped around the unsized pointee, so `Box<[T; N]>`
+    /// becomes the same shape a directly built `Box<[T]>` has.
+    fn unsize_to_slice(&self, frames: &[Frame], v: Value) -> InterpResult<Value> {
+        match v {
+            Value::Ref(_) => {
+                let target = self.deref_value(frames, &v)?;
+                let pointee = self.read_resolved(frames, &target)?;
+                let len = pointee.len().ok_or_else(|| {
+                    InterpError::type_mismatch(
+                        "unsizing cast",
+                        "array pointee",
+                        pointee.kind_name(),
+                    )
+                })?;
+                Ok(Value::FatRef {
+                    base: Box::new(v),
+                    len,
+                })
+            }
+            Value::Bytes(b) => {
+                let len = b.len() as u128;
+                Ok(Value::FatRef {
+                    base: Box::new(Value::Bytes(b)),
+                    len,
+                })
+            }
+            Value::Tuple(items) => {
+                let len = items.len() as u128;
+                Ok(Value::FatRef {
+                    base: Box::new(Value::Tuple(items)),
+                    len,
+                })
+            }
+            // An empty array aggregate is the unit value in this
+            // model: unsizing it yields an empty slice.
+            Value::Unit => Ok(Value::FatRef {
+                base: Box::new(Value::Tuple(Vec::new())),
+                len: 0,
+            }),
+            Value::Enum { variant, mut fields } if fields.len() == 1 => {
+                let pointee = fields.pop().expect("one field");
+                let fat = self.unsize_to_slice(frames, pointee)?;
+                Ok(Value::Enum {
+                    variant,
+                    fields: vec![fat],
+                })
+            }
+            other => Err(InterpError::type_mismatch(
+                "unsizing cast",
+                "reference to an array",
+                other.kind_name(),
+            )),
+        }
+    }
+
     pub(crate) fn eval_operand(
         &self,
         frames: &mut Vec<Frame>,
@@ -2015,6 +2132,35 @@ impl<'a> Interpreter<'a> {
                 match &v {
                     Value::FatRef { len, .. } => Ok(Value::Uint(*len)),
                     Value::Str(s) => Ok(Value::Uint(s.len() as u128)),
+                    // The metadata of a dyn pointer is its vtable,
+                    // which this model represents by the fat value
+                    // itself (it is only ever passed along or
+                    // compared opaquely).
+                    Value::DynRef { .. } => Ok(v.clone()),
+                    // A reference to a constant slice value (a static
+                    // slice, materialised as a reference to the fat
+                    // value) carries the slice's length.
+                    Value::Ref(RefTarget::Value(inner)) => match &**inner {
+                        Value::FatRef { len, .. } => Ok(Value::Uint(*len)),
+                        Value::Str(s) => Ok(Value::Uint(s.len() as u128)),
+                        // Any other reference points at a sized
+                        // value: its metadata is the unit value.
+                        _ => Ok(Value::Unit),
+                    },
+                    // A reference value naming a place whose
+                    // contents are a fat value (a slice reference
+                    // formed as `&*box`, stored as a place reference)
+                    // carries that fat value's metadata; any other
+                    // reference points at a sized value, whose
+                    // metadata is the unit value.
+                    Value::Ref(_) => {
+                        let target = self.deref_value(frames, &v)?;
+                        match self.read_resolved(frames, &target)? {
+                            Value::FatRef { len, .. } => Ok(Value::Uint(len)),
+                            Value::Str(text) => Ok(Value::Uint(text.len() as u128)),
+                            _ => Ok(Value::Unit),
+                        }
+                    }
                     other => Err(InterpError::type_mismatch(
                         "PtrMetadata",
                         "fat pointer",
@@ -2070,35 +2216,7 @@ impl<'a> Interpreter<'a> {
             Rvalue::Unsize(operand, meta) => {
                 let v = self.eval_operand(frames, body, operand)?;
                 match meta {
-                    UnsizeMeta::Slice => match v {
-                        Value::Ref(_) => {
-                            let target = self.deref_value(frames, &v)?;
-                            let pointee = self.read_resolved(frames, &target)?;
-                            let len = pointee.len().ok_or_else(|| {
-                                InterpError::type_mismatch(
-                                    "unsizing cast",
-                                    "array pointee",
-                                    pointee.kind_name(),
-                                )
-                            })?;
-                            Ok(Value::FatRef {
-                                base: Box::new(v),
-                                len,
-                            })
-                        }
-                        Value::Bytes(b) => {
-                            let len = b.len() as u128;
-                            Ok(Value::FatRef {
-                                base: Box::new(Value::Bytes(b)),
-                                len,
-                            })
-                        }
-                        other => Err(InterpError::type_mismatch(
-                            "unsizing cast",
-                            "reference to an array",
-                            other.kind_name(),
-                        )),
-                    },
+                    UnsizeMeta::Slice => self.unsize_to_slice(frames, v),
                     UnsizeMeta::Dyn { concrete, traits } => match v {
                         // A supertrait upcast: the data pointer and
                         // the concrete type carry over; only the
@@ -2821,6 +2939,38 @@ fn eval_binary(
             }
         };
         return Ok((v, false));
+    }
+    // Pointer operations: MIR compares raw pointers and function
+    // pointers directly. Equality is address identity in the
+    // synthetic-address model (the same identity `PtrToInt`
+    // exposes); a fat pointer's equality also compares the
+    // metadata word (its length). Ordering is defined on the
+    // synthetic addresses, which is deterministic within a run.
+    if matches!(op, Eq | Ne | Lt | Le | Gt | Ge) {
+        let key = |v: &Value| -> Option<(u128, Option<u128>)> {
+            match v {
+                Value::FatRef { len, .. } => {
+                    synthetic_address(v).map(|a| (a, Some(*len)))
+                }
+                Value::Ref(_) | Value::FnPtr(_) | Value::DynRef { .. } => {
+                    synthetic_address(v).map(|a| (a, None))
+                }
+                _ => None,
+            }
+        };
+        if let (Some(a), Some(b)) = (key(lhs), key(rhs)) {
+            let ord = a.cmp(&b);
+            let v = match op {
+                Eq => a == b,
+                Ne => a != b,
+                Lt => ord == std::cmp::Ordering::Less,
+                Le => ord != std::cmp::Ordering::Greater,
+                Gt => ord == std::cmp::Ordering::Greater,
+                Ge => ord != std::cmp::Ordering::Less,
+                _ => unreachable!(),
+            };
+            return Ok((Value::Bool(v), false));
+        }
     }
     Err(InterpError::type_mismatch(
         format!("binary operation {op:?}"),
