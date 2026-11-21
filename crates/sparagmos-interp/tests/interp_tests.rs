@@ -512,6 +512,7 @@ fn step_limit_stops_infinite_loop() {
         InterpConfig {
             max_steps: 1_000,
             max_call_depth: 16,
+            guest_args: Vec::new(),
         },
     );
     let err = interp.run("forever", vec![]).unwrap_err();
@@ -547,6 +548,7 @@ fn call_depth_limit_stops_unbounded_recursion() {
         InterpConfig {
             max_steps: 1_000_000,
             max_call_depth: 8,
+            guest_args: Vec::new(),
         },
     );
     let err = interp.run("f", vec![]).unwrap_err();

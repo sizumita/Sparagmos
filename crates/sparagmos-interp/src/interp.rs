@@ -32,12 +32,19 @@ use crate::value::{RefProj, RefTarget, Value};
 use std::collections::{HashMap, HashSet};
 
 /// Interpreter limits / configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterpConfig {
     /// Maximum number of statements + terminators executed in one run.
     pub max_steps: usize,
     /// Maximum number of simultaneously live call frames.
     pub max_call_depth: usize,
+    /// The guest program's command-line arguments after argv[0]
+    /// (the run-flags a test prescribes), as handed to the driver
+    /// through its `--guest-arg` options. The `env::args` /
+    /// `env::args_os` runtime support reads them from here;
+    /// argv[0] itself is the interpreter's policy, not part of
+    /// this list.
+    pub guest_args: Vec<String>,
 }
 
 impl Default for InterpConfig {
@@ -45,6 +52,7 @@ impl Default for InterpConfig {
         InterpConfig {
             max_steps: 1_000_000,
             max_call_depth: 1024,
+            guest_args: Vec::new(),
         }
     }
 }
@@ -176,6 +184,12 @@ pub(crate) fn synthetic_address(value: &Value) -> Option<u128> {
 impl<'a> Interpreter<'a> {
     pub fn new(program: &'a Program) -> Self {
         Interpreter::with_config(program, InterpConfig::default())
+    }
+
+    /// The guest program's command-line arguments after argv[0],
+    /// as configured for this run (see [`InterpConfig::guest_args`]).
+    pub fn guest_args(&self) -> &[String] {
+        &self.config.guest_args
     }
 
     pub fn with_config(program: &'a Program, config: InterpConfig) -> Self {

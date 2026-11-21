@@ -65,7 +65,8 @@ pub use ir::{
     ProjectionElem, Rvalue, Statement, StatementKind, TerminatorKind, Ty, UnOp,
 };
 pub use mir_convert::{
-    convert_program, interpret_mir, interpret_mir_captured, CapturedRun, ConvertError,
-    MirFunction, MirProgram, MirRunError,
+    convert_program, interpret_mir, interpret_mir_captured,
+    interpret_mir_captured_with_config, CapturedRun, ConvertError, MirFunction, MirProgram,
+    MirRunError,
 };
 pub use value::{FmtArguments, FmtTrait, RefProj, RefTarget, Value};

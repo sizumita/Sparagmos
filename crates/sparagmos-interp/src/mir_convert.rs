@@ -581,6 +581,24 @@ pub fn interpret_mir_captured(
     entry: &str,
     args: Vec<Value>,
 ) -> CapturedRun {
+    interpret_mir_captured_with_config(
+        program,
+        entry,
+        args,
+        crate::InterpConfig::default(),
+    )
+}
+
+/// Like [`interpret_mir_captured`], with an explicit interpreter
+/// configuration (the driver hands the guest program's
+/// command-line arguments through it; see
+/// [`crate::InterpConfig::guest_args`]).
+pub fn interpret_mir_captured_with_config(
+    program: &MirProgram,
+    entry: &str,
+    args: Vec<Value>,
+    config: crate::InterpConfig,
+) -> CapturedRun {
     match convert_all(program) {
         Ok((ir_program, failures)) => {
             // The entry function's own conversion failure is a
@@ -591,7 +609,7 @@ pub fn interpret_mir_captured(
                     stdout: String::new(),
                 };
             }
-            let mut interp = Interpreter::new(&ir_program);
+            let mut interp = Interpreter::with_config(&ir_program, config);
             let result = interp.run(entry, args).map_err(MirRunError::from);
             CapturedRun {
                 result,
