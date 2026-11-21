@@ -1269,24 +1269,6 @@ impl<'a> Interpreter<'a> {
                     if let Some(value) = self.exec_return(frames, stop_depth)? {
                         return Ok(value);
                     }
-                    let dest = frame
-                        .return_dest
-                        .clone()
-                        .expect("non-entry frame has a destination");
-                    let resume = frame.return_block;
-                    let caller_name = frames.last().expect("caller").func.clone();
-                    let caller_body = program.get(&caller_name).ok_or_else(|| {
-                        InterpError::UnknownFunction {
-                            name: caller_name.clone(),
-                        }
-                    })?;
-                    self.write_place(frames, caller_body, &dest, value)?;
-                    match resume {
-                        Some(bb) => Self::jump(frames, caller_body, bb)?,
-                        None => {
-                            return Err(InterpError::MissingContinuation { func: caller_name });
-                        }
-                    }
                 }
                 TerminatorKind::Unreachable => {
                     return Err(InterpError::panic("entered unreachable code"));
@@ -1319,7 +1301,7 @@ impl<'a> Interpreter<'a> {
                 TerminatorKind::InlineAsm { regs, steps, target } => {
                     self.exec_inline_asm(frames, body, &regs, &steps)?;
                     match target {
-                        Some(target) => Self::jump(frames, body, target)?,
+                        Some(target) => Self::jump(frames, body, *target)?,
                         None => {
                             if let Some(value) = self.exec_return(frames, stop_depth)? {
                                 return Ok(value);

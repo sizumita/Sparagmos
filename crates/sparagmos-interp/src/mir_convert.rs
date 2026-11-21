@@ -4532,7 +4532,7 @@ impl<'a> Converter<'a> {
                         .out_place
                         .as_ref()
                         .expect("the driver sets out_place for out operands");
-                    Some(self.convert_place(place)?)
+                    Some(self.convert_place(body, place)?)
                 }
                 _ => None,
             };
