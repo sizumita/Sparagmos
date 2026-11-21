@@ -513,4 +513,28 @@ mod tests {
         };
         assert!(d.successors().is_empty());
     }
+
+    #[test]
+    fn inline_asm_noop_classification() {
+        // Empty, comment-only and nop-only templates are no-ops.
+        assert!(inline_asm_is_noop("", ""));
+        assert!(inline_asm_is_noop("nop", ""));
+        assert!(inline_asm_is_noop("nop; nop", "NOMEM"));
+        assert!(inline_asm_is_noop("/* {0} */", ""));
+        assert!(inline_asm_is_noop("// just a comment", ""));
+        // Stable MIR's Debug-form template pieces.
+        assert!(inline_asm_is_noop("[]", ""));
+        assert!(inline_asm_is_noop("[String(\"nop\")]", ""));
+        assert!(inline_asm_is_noop(
+            "[String(\"/* \"), Placeholder { operand_idx: 0 }, String(\" */\")]",
+            ""
+        ));
+        // Real instructions, fences and queries are not.
+        assert!(!inline_asm_is_noop("mov eax, 1", ""));
+        assert!(!inline_asm_is_noop("cpuid", ""));
+        assert!(!inline_asm_is_noop("mfence", ""));
+        assert!(!inline_asm_is_noop("[String(\"nop; cpuid\")]", ""));
+        // A noreturn block never reaches its destination.
+        assert!(!inline_asm_is_noop("", "NORETURN"));
+    }
 }

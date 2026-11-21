@@ -3438,3 +3438,105 @@ fn three_word_return_is_unsupported() {
         Ok(_) => panic!("expected Unsupported, but the program compiled"),
     }
 }
+
+// ----- Reborrow / Intrinsic / no-op InlineAsm (Lane CO) ---------------------
+
+#[test]
+fn reborrow_copies_the_pointer_value() {
+    let i32t = i(mir::IntTy::I32);
+    // fn read_shared() -> i32 { _1 = 41; _2 = &mut _1; _3 = Reborrow(*const i32, _2); return *_3 }
+    let read_shared = spec(
+        "read_shared",
+        0,
+        0,
+        &[
+            i32t.clone(),
+            i32t.clone(),
+            refmty(i32t.clone()),
+            rawty(i32t.clone(), false),
+        ],
+        vec![bb(
+            vec![
+                assign(pl(1), mir::Rvalue::Use(i32c(41))),
+                assign(pl(2), mutref(pl(1))),
+                assign(
+                    pl(3),
+                    mir::Rvalue::Reborrow(
+                        mir::Ty::RawPtr(Box::new(i32t.clone()), mir::Mutability::Not),
+                        mir::Mutability::Not,
+                        pl(2),
+                    ),
+                ),
+                assign(pl(0), mir::Rvalue::Use(cpd(3))),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    // fn write_mut() -> i32 { _1 = 1; _2 = &mut _1; _3 = Reborrow(*mut i32, _2); *_3 = 99; return _1 }
+    let write_mut = spec(
+        "write_mut",
+        1,
+        0,
+        &[
+            i32t.clone(),
+            i32t.clone(),
+            refmty(i32t.clone()),
+            rawty(i32t.clone(), true),
+        ],
+        vec![bb(
+            vec![
+                assign(pl(1), mir::Rvalue::Use(i32c(1))),
+                assign(pl(2), mutref(pl(1))),
+                assign(
+                    pl(3),
+                    mir::Rvalue::Reborrow(
+                        mir::Ty::RawPtr(Box::new(i32t.clone()), mir::Mutability::Mut),
+                        mir::Mutability::Mut,
+                        pl(2),
+                    ),
+                ),
+                assign(dpl(3), mir::Rvalue::Use(i32c(99))),
+                assign(pl(0), mir::Rvalue::Use(cp(1))),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    let (jit, prog) = build(&[read_shared, write_mut]);
+    check(&jit, &prog, "read_shared", &[], vec![], Ok(41));
+    check(&jit, &prog, "write_mut", &[], vec![], Ok(99));
+}
+
+#[test]
+fn intrinsic_assume_true_and_inline_asm_noop_do_not_affect_execution() {
+    let i32t = i(mir::IntTy::I32);
+    // fn f() -> i32 { _1 = 7; assume(true); asm!("nop"); return _1 }
+    let f = spec(
+        "f",
+        0,
+        0,
+        &[i32t.clone(), i32t.clone()],
+        vec![
+            bb(
+                vec![
+                    assign(pl(1), mir::Rvalue::Use(i32c(7))),
+                    mir::StatementKind::Intrinsic(Box::new(mir::NonDivergingIntrinsic::Assume(
+                        mir::Operand::constant(mir::Constant::bool(true)),
+                    ))),
+                ],
+                mir::TerminatorKind::InlineAsm {
+                    template: "nop".to_string(),
+                    operands: Vec::new(),
+                    options: String::new(),
+                    destination: Some(mir::BasicBlock(1)),
+                    unwind: mir::UnwindAction::Continue,
+                },
+            ),
+            bb(
+                vec![assign(pl(0), mir::Rvalue::Use(cp(1)))],
+                mir::TerminatorKind::Return,
+            ),
+        ],
+    );
+    let (jit, prog) = build(&[f]);
+    check(&jit, &prog, "f", &[], vec![], Ok(7));
+}

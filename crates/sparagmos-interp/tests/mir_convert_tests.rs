@@ -2344,3 +2344,299 @@ fn expose_provenance_non_pointer_stays_unsupported() {
         "expected UnsupportedRvalue, got {err}"
     );
 }
+
+// ----- Reborrow: a bitwise copy of the pointer value at the place (Lane CO) --
+
+#[test]
+fn reborrow_copies_the_pointer_value() {
+    // fn read_shared() -> i32 { _1 = 41; _2 = &mut _1; _3 = Reborrow(*const i32, _2); return *_3 }
+    let raw_ty = mir::Ty::RawPtr(Box::new(i32_ty()), mir::Mutability::Not);
+    let ref_mut_ty = mir::Ty::Ref(mir::Region::Erased, Box::new(i32_ty()), mir::Mutability::Mut);
+    let read_shared = mir::Body::new(
+        decls(&[i32_ty(), i32_ty(), ref_mut_ty.clone(), raw_ty]),
+        0,
+        vec![block(
+            vec![
+                assign(place(1), mir::Rvalue::Use(const_i32(41))),
+                assign(
+                    place(2),
+                    mir::Rvalue::Ref(
+                        mir::Region::Erased,
+                        mir::BorrowKind::Mut {
+                            allow_two_phase_borrow: false,
+                        },
+                        place(1),
+                    ),
+                ),
+                assign(
+                    place(3),
+                    mir::Rvalue::Reborrow(
+                        mir::Ty::RawPtr(Box::new(i32_ty()), mir::Mutability::Not),
+                        mir::Mutability::Not,
+                        place(2),
+                    ),
+                ),
+                assign(
+                    place(0),
+                    mir::Rvalue::Use(mir::Operand::Copy(place(3).deref())),
+                ),
+            ],
+            ret(),
+        )],
+    );
+    // fn write_mut() -> i32 { _1 = 1; _2 = &mut _1; _3 = Reborrow(*mut i32, _2); *_3 = 99; return _1 }
+    let raw_mut_ty = mir::Ty::RawPtr(Box::new(i32_ty()), mir::Mutability::Mut);
+    let write_mut = mir::Body::new(
+        decls(&[i32_ty(), i32_ty(), ref_mut_ty, raw_mut_ty]),
+        0,
+        vec![block(
+            vec![
+                assign(place(1), mir::Rvalue::Use(const_i32(1))),
+                assign(
+                    place(2),
+                    mir::Rvalue::Ref(
+                        mir::Region::Erased,
+                        mir::BorrowKind::Mut {
+                            allow_two_phase_borrow: false,
+                        },
+                        place(1),
+                    ),
+                ),
+                assign(
+                    place(3),
+                    mir::Rvalue::Reborrow(
+                        mir::Ty::RawPtr(Box::new(i32_ty()), mir::Mutability::Mut),
+                        mir::Mutability::Mut,
+                        place(2),
+                    ),
+                ),
+                assign(place(3).deref(), mir::Rvalue::Use(const_i32(99))),
+                assign(place(0), mir::Rvalue::Use(copy(1))),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("read_shared", read_shared);
+    prog.add("write_mut", write_mut);
+    assert_eq!(
+        interpret_mir(&prog, "read_shared", vec![]).expect("read_shared runs"),
+        Value::Int(41)
+    );
+    assert_eq!(
+        interpret_mir(&prog, "write_mut", vec![]).expect("write_mut runs"),
+        Value::Int(99)
+    );
+}
+
+// ----- ThreadLocalRef: a named explicit error, never a fabricated value -----
+
+#[test]
+fn thread_local_ref_is_a_named_execution_error() {
+    // fn f() -> i32 { _1 = ThreadLocalRef(some static); return *_1 }
+    let ref_ty = mir::Ty::Ref(mir::Region::Erased, Box::new(i32_ty()), mir::Mutability::Not);
+    let body = mir::Body::new(
+        decls(&[i32_ty(), ref_ty]),
+        0,
+        vec![block(
+            vec![assign(
+                place(1),
+                mir::Rvalue::ThreadLocalRef(mir::DefId::new(0, 3)),
+            )],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("f", body);
+    match interpret_mir(&prog, "f", vec![]) {
+        Err(MirRunError::Interp(InterpError::UnsupportedRvalue { kind })) => {
+            assert!(
+                kind.contains("ThreadLocalRef") && kind.contains("not modelled"),
+                "error names the gap: {kind}"
+            );
+        }
+        Err(e) => panic!("expected UnsupportedRvalue for ThreadLocalRef, got {e}"),
+        Ok(v) => panic!("expected UnsupportedRvalue for ThreadLocalRef, got {v:?}"),
+    }
+}
+
+// ----- StatementKind::Intrinsic: Assume and CopyNonOverlapping (Lane CO) -----
+
+fn intrinsic_stmt(intr: mir::NonDivergingIntrinsic) -> mir::Statement {
+    mir::Statement::new(mir::StatementKind::Intrinsic(Box::new(intr)))
+}
+
+#[test]
+fn intrinsic_assume_true_is_a_noop_and_false_is_a_guest_panic() {
+    let mk = |assumed: bool| {
+        mir::Body::new(
+            decls(&[i32_ty()]),
+            0,
+            vec![block(
+                vec![
+                    intrinsic_stmt(mir::NonDivergingIntrinsic::Assume(
+                        mir::Operand::constant(mir::Constant::bool(assumed)),
+                    )),
+                    assign(place(0), mir::Rvalue::Use(const_i32(5))),
+                ],
+                ret(),
+            )],
+        )
+    };
+    let mut prog = MirProgram::new();
+    prog.add("assume_true", mk(true));
+    prog.add("assume_false", mk(false));
+    assert_eq!(
+        interpret_mir(&prog, "assume_true", vec![]).expect("assume(true) runs"),
+        Value::Int(5)
+    );
+    match interpret_mir(&prog, "assume_false", vec![]) {
+        Err(MirRunError::Interp(InterpError::Panic { message })) => {
+            assert!(message.contains("assume"), "panic names assume: {message}");
+        }
+        Err(e) => panic!("expected guest panic from assume(false), got {e}"),
+        Ok(v) => panic!("expected guest panic from assume(false), got {v:?}"),
+    }
+}
+
+#[test]
+fn intrinsic_copy_nonoverlapping_copies_elements() {
+    // fn copy_arr() -> i32 {
+    //   _1 = [10, 20, 30]; _2 = [0, 0, 0];
+    //   _3 = &raw const _1; _4 = &raw mut _2;
+    //   copy_nonoverlapping(_3, _4, 3);
+    //   return _2[0] + _2[2]
+    // }
+    let array_ty = mir::Ty::Array(Box::new(i32_ty()), mir::ArrayLen::Known(3));
+    let elem = |local: u32, offset: u64| mir::Place {
+        local: mir::Local(local),
+        projection: vec![mir::PlaceElem::ConstantIndex {
+            offset,
+            min_length: 3,
+            from_end: false,
+        }],
+    };
+    let body = mir::Body::new(
+        decls(&[
+            i32_ty(),
+            array_ty.clone(),
+            array_ty,
+            mir::Ty::RawPtr(Box::new(i32_ty()), mir::Mutability::Not),
+            mir::Ty::RawPtr(Box::new(i32_ty()), mir::Mutability::Mut),
+        ]),
+        0,
+        vec![block(
+            vec![
+                assign(
+                    place(1),
+                    mir::Rvalue::Aggregate(
+                        Box::new(mir::AggregateKind::Array(i32_ty())),
+                        vec![const_i32(10), const_i32(20), const_i32(30)],
+                    ),
+                ),
+                assign(
+                    place(2),
+                    mir::Rvalue::Aggregate(
+                        Box::new(mir::AggregateKind::Array(i32_ty())),
+                        vec![const_i32(0), const_i32(0), const_i32(0)],
+                    ),
+                ),
+                assign(
+                    place(3),
+                    mir::Rvalue::RawPtr(mir::Mutability::Not, place(1)),
+                ),
+                assign(
+                    place(4),
+                    mir::Rvalue::RawPtr(mir::Mutability::Mut, place(2)),
+                ),
+                intrinsic_stmt(mir::NonDivergingIntrinsic::CopyNonOverlapping {
+                    src: copy(3),
+                    dst: copy(4),
+                    count: const_int(3, 8),
+                }),
+                assign(
+                    place(0),
+                    binop(
+                        mir::BinOp::Add,
+                        mir::Operand::Copy(elem(2, 0)),
+                        mir::Operand::Copy(elem(2, 2)),
+                    ),
+                ),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("copy_arr", body);
+    assert_eq!(
+        interpret_mir(&prog, "copy_arr", vec![]).expect("copy_arr runs"),
+        Value::Int(40)
+    );
+}
+
+// ----- InlineAsm: the no-op class steps over, the rest is a named error -----
+
+fn asm_term(template: &str, options: &str, destination: Option<u32>) -> mir::TerminatorKind {
+    mir::TerminatorKind::InlineAsm {
+        template: template.to_string(),
+        operands: Vec::new(),
+        options: options.to_string(),
+        destination: destination.map(mir::BasicBlock),
+        unwind: mir::UnwindAction::Continue,
+    }
+}
+
+#[test]
+fn inline_asm_noop_templates_step_to_the_destination() {
+    for (template, options) in [
+        ("", ""),
+        ("nop", ""),
+        ("[String(\"nop\")]", ""),
+        ("/* placeholder */", "NOMEM"),
+    ] {
+        // fn f() -> i32 { _1 = 7; asm!(...); return _1 }
+        let body = mir::Body::new(
+            decls(&[i32_ty(), i32_ty()]),
+            0,
+            vec![
+                block(
+                    vec![assign(place(1), mir::Rvalue::Use(const_i32(7)))],
+                    asm_term(template, options, Some(1)),
+                ),
+                block(
+                    vec![assign(place(0), mir::Rvalue::Use(copy(1)))],
+                    ret(),
+                ),
+            ],
+        );
+        let mut prog = MirProgram::new();
+        prog.add("f", body);
+        assert_eq!(
+            interpret_mir(&prog, "f", vec![]).expect("no-op asm runs"),
+            Value::Int(7),
+            "template {template:?} options {options:?}"
+        );
+    }
+}
+
+#[test]
+fn inline_asm_with_real_instructions_is_a_named_error() {
+    // fn f() -> i32 { asm!("mov eax, 1"); return 0 }
+    let body = mir::Body::new(
+        decls(&[i32_ty()]),
+        0,
+        vec![
+            block(vec![], asm_term("mov eax, 1", "", Some(1))),
+            block(vec![], ret()),
+        ],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("f", body);
+    match interpret_mir(&prog, "f", vec![]) {
+        Err(MirRunError::Interp(InterpError::UnsupportedTerminator { kind })) => {
+            assert!(kind.contains("InlineAsm"), "error names InlineAsm: {kind}");
+        }
+        Err(e) => panic!("expected UnsupportedTerminator for InlineAsm, got {e}"),
+        Ok(v) => panic!("expected UnsupportedTerminator for InlineAsm, got {v:?}"),
+    }
+}
