@@ -49,7 +49,7 @@
 
 use rustc_public::mir::mono::{Instance, InstanceKind};
 use rustc_public::mir::{Body, Operand, TerminatorKind};
-use rustc_public::ty::{RigidTy, Ty, TyKind};
+use rustc_public::ty::{AdtKind, RigidTy, Ty, TyKind};
 use rustc_public::{CrateDef, CrateDefType};
 
 /// Scan the Stable MIR bodies that were converted for this program
@@ -153,8 +153,10 @@ fn raw_layout_too_big(ty: Ty) -> Option<String> {
 /// structurally first, asking the compiler nothing: a type is
 /// safe when every component in field position is a concrete
 /// sized shape, with unsized components only in tail position
-/// (the last field of a variant, the last element of a tuple,
-/// or nested under either). Pointer and reference types are
+/// (the last field of a struct or single-variant enum, the
+/// last element of a tuple, or nested under either — a
+/// multi-variant ADT and a union have no tail position; see
+/// the ADT arm of the walk). Pointer and reference types are
 /// walked through as well: their layout needs the pointee's
 /// metadata, which is computed from the pointee's tail. Type
 /// parameters are resolved one frame at a time through the
@@ -191,6 +193,23 @@ fn walk_layout_type(
             if !visited.insert(ty) {
                 return true;
             }
+            // Tail position exists only in a struct-like type.
+            // The layout calculator lays out a struct (and a
+            // single-variant enum, and a tuple) with at most one
+            // unsized field, in last position; but every variant
+            // of a multi-variant ADT is laid out prefixed by the
+            // discriminant, where an unsized field is always an
+            // error, and a union's fields all overlap, so no
+            // field is in tail position. Under the monomorphic
+            // typing environment this query runs in, that error
+            // is not returned — it is recorded as a delayed bug
+            // that aborts the whole compilation when flushed
+            // (the layout of `Poll<str>` in
+            // tests/ui/mir/gvn-nonsensical-sized-str.rs). A
+            // possibly unsized field of a multi-variant ADT or
+            // a union therefore makes the query unsafe wherever
+            // it sits.
+            let has_tail = def.variants().len() <= 1 && def.kind() != AdtKind::Union;
             let mut frames = frames.to_vec();
             frames.push(args);
             def.variants().iter().all(|variant| {
@@ -200,7 +219,7 @@ fn walk_layout_type(
                     walk_layout_type(
                         field.ty(),
                         &frames,
-                        tail && i == last,
+                        tail && i == last && has_tail,
                         visited,
                         depth + 1,
                     )
