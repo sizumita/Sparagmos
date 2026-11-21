@@ -3626,3 +3626,141 @@ fn run_mode_unbounded_self_instantiation_is_unsupported() {
         "the failure must name the recursion limit; stderr={stderr}"
     );
 }
+
+// ----- transparent-wrapper pointers (Lane DP) --------------------------------
+
+const UNSAFECELL_GET_SRC: &str = r#"
+use std::cell::UnsafeCell;
+fn main() {
+    let cell = UnsafeCell::new(5i32);
+    unsafe {
+        let p = cell.get();
+        *p = 7;
+        println!("{}", *p);
+    }
+}
+"#;
+
+const MAYBEUNINIT_PTR_SRC: &str = r#"
+use std::mem::MaybeUninit;
+fn main() {
+    let mut slot = MaybeUninit::<i32>::uninit();
+    unsafe {
+        slot.as_mut_ptr().write(11);
+        println!("{}", *slot.as_ptr());
+    }
+}
+"#;
+
+const CELL_AS_PTR_SRC: &str = r#"
+use std::cell::Cell;
+fn main() {
+    let c = Cell::new(4i32);
+    unsafe { *c.as_ptr() = 6; }
+    println!("{}", c.get());
+}
+"#;
+
+const REFCELL_COMPOUND_SRC: &str = r#"
+use std::cell::RefCell;
+fn main() {
+    let cell = RefCell::new(1u32);
+    *cell.borrow_mut() += 1;
+    let v = *cell.borrow();
+    println!("{v}");
+}
+"#;
+
+const REFCELL_NESTED_SRC: &str = r#"
+use std::cell::RefCell;
+fn main() {
+    let cell = RefCell::new(1i32);
+    *cell.borrow_mut() = *cell.borrow() + 1;
+    println!("{}", cell.borrow());
+}
+"#;
+
+#[test]
+fn run_mode_unsafecell_get_reads_and_writes_the_wrapped_value() {
+    // `UnsafeCell::get` returns a pointer to the wrapped value
+    // itself (the wrapper is transparent). Writing and reading
+    // through it must reach the `i32`, not the `UnsafeCell`
+    // aggregate: this used to fail with a type mismatch naming
+    // `Adt("std::cell::UnsafeCell")` on both directions.
+    let dir = temp_dir("unsafecell-get");
+    let src = fixture(&dir, "unsafecell_get.rs", UNSAFECELL_GET_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "UnsafeCell::get program must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
+}
+
+#[test]
+fn run_mode_maybeuninit_pointer_reads_and_writes_the_wrapped_value() {
+    let dir = temp_dir("maybeuninit-ptr");
+    let src = fixture(&dir, "maybeuninit_ptr.rs", MAYBEUNINIT_PTR_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "MaybeUninit pointer program must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "11\n");
+}
+
+#[test]
+fn run_mode_cell_as_ptr_writes_the_cell_value() {
+    // `Cell::as_ptr` is `UnsafeCell::get` on the cell's inner
+    // field: the builtin `Cell` value shape and the collected
+    // `get` body must agree on the natural
+    // `Cell { UnsafeCell { value } }` nesting.
+    let dir = temp_dir("cell-as-ptr");
+    let src = fixture(&dir, "cell_as_ptr.rs", CELL_AS_PTR_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Cell::as_ptr program must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "6\n");
+}
+
+#[test]
+fn run_mode_refcell_compound_assign_through_borrow_mut() {
+    let dir = temp_dir("refcell-compound");
+    let src = fixture(&dir, "refcell_compound.rs", REFCELL_COMPOUND_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "compound assignment through a RefMut guard must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n");
+}
+
+#[test]
+fn run_mode_refcell_nested_borrow_panics_like_native() {
+    // `*cell.borrow_mut() = *cell.borrow() + 1` panics under real
+    // Rust too (the shared borrow is taken while the mutable one
+    // is still live): the guest panic is the correct outcome.
+    let dir = temp_dir("refcell-nested");
+    let src = fixture(&dir, "refcell_nested.rs", REFCELL_NESTED_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "nested borrow must panic like native; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("RefCell already borrowed"),
+        "the panic must be the borrow conflict; stderr={stderr}"
+    );
+}
