@@ -935,6 +935,16 @@ pub enum TerminatorKind {
         kind: FnCallKind,
         receiver: Operand,
         args: Operand,
+        /// The caller-location stamp the driver appended to the
+        /// `Fn`-trait call when the resolved shim instance is
+        /// `#[track_caller]` (a track-caller closure called
+        /// directly or through a generic `Fn` bound): the
+        /// interpreter binds it to the callee's location local,
+        /// exactly like the stamp of a direct call. Absent for
+        /// `dyn` receivers, whose call passes through the vtable
+        /// shim: the shim's own location is bound instead (see
+        /// `Program::fn_shim_locations`).
+        stamp: Option<Operand>,
         destination: Place,
         target: Option<BasicBlock>,
     },
@@ -1198,6 +1208,23 @@ pub struct Program {
     /// fails with the recorded reason (see
     /// []).
     pub unconverted: HashMap<String, String>,
+    /// Definition-location stamps of the program's
+    /// `#[track_caller]` bodies, keyed by body key: the
+    /// `&'static Location` constant of the body's own
+    /// definition. Bound when a call reaches the body through
+    /// a shim with no call-site stamp on the edge (a function
+    /// pointer call, a vtable dispatch to an impl-only
+    /// `#[track_caller]` method), which is the location the
+    /// compiler's shim presents to the callee (see
+    /// `Interpreter::start_call`).
+    pub track_caller_defs: HashMap<String, Constant>,
+    /// The location stamps of the `Fn` / `FnMut` / `FnOnce`
+    /// vtable shims (index 0 is `call`, 1 is `call_mut`, 2 is
+    /// `call_once`): the trait method definitions in core,
+    /// which compiler-generated `Fn` impls are attributed to.
+    /// Bound when a track-caller closure is entered through a
+    /// `dyn` receiver.
+    pub fn_shim_locations: [Option<Constant>; 3],
 }
 
 impl Program {

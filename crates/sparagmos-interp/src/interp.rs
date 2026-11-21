@@ -870,10 +870,22 @@ impl<'a> Interpreter<'a> {
                     kind,
                     receiver,
                     args,
+                    stamp,
                     destination,
                     target,
                 } => {
-                    let args_value = self.eval_operand(frames, body, args)?;
+                    // The caller-location stamp the conversion
+                    // carried on this edge (a track-caller
+                    // closure called directly or through a
+                    // generic `Fn` bound), evaluated in the
+                    // caller frame like any other argument.
+                    let edge_stamp = match &stamp {
+                        Some(op) => {
+                            Some(self.eval_operand(frames, body, op)?)
+                        }
+                        None => None,
+                    };
+                    let args_value = self.eval_operand(frames, body, &args)?;
                     let arg_values = match args_value {
                         Value::Tuple(items) => items,
                         Value::Unit => Vec::new(),
@@ -1039,18 +1051,49 @@ impl<'a> Interpreter<'a> {
                             }
                         }
                     };
+                    // A `dyn` receiver's call passes through
+                    // the `Fn` vtable shim, which presents its
+                    // own location (the trait method's definition
+                    // in core) to a track-caller callee: with no
+                    // edge stamp, that shim location is the fixed
+                    // stamp for this entry.
+                    let shim_stamp = if edge_stamp.is_none()
+                        && dyn_concrete.is_some()
+                    {
+                        let idx = match kind {
+                            FnCallKind::Call => 0,
+                            FnCallKind::CallMut => 1,
+                            FnCallKind::CallOnce => 2,
+                        };
+                        match &self.program.fn_shim_locations[idx] {
+                            Some(c) => Some(self.eval_constant(c)?),
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
                     match callable {
                         Value::Closure { def, .. } => {
                             let mut full = vec![env_ref];
                             full.extend(arg_values);
-                            self.start_call(frames, &def, full, destination, *target)?;
+                            self.start_call_stamped(
+                                frames,
+                                &def,
+                                full,
+                                edge_stamp,
+                                shim_stamp,
+                                &destination,
+                                *target,
+                            )?;
                         }
                         Value::FnPtr(name) => {
-                            self.start_call(
+                            self.start_call_stamped(
                                 frames,
                                 &name,
                                 arg_values,
-                                destination,
+                                edge_stamp,
+                                shim_stamp,
+                                &destination,
                                 *target,
                             )?;
                         }
@@ -1508,16 +1551,67 @@ impl<'a> Interpreter<'a> {
         destination: &Place,
         target: Option<BasicBlock>,
     ) -> InterpResult<()> {
+        self.start_call_stamped(
+            frames,
+            func,
+            arg_values,
+            None,
+            None,
+            destination,
+            target,
+        )
+    }
+
+    /// The definition-location stamp value recorded for the
+    /// track-caller body `func`, if the driver recorded one.
+    fn def_stamp_value(&self, func: &str) -> Option<Value> {
+        let c = self.program.track_caller_defs.get(func)?;
+        self.eval_constant(c).ok()
+    }
+
+    /// [`Interpreter::start_call`] with the caller-location
+    /// stamps a call edge can carry beyond its argument list:
+    /// `edge_stamp` is a call-site stamp (the stamp a
+    /// `CallTrait` terminator carries for a track-caller
+    /// closure), which forwards through track-caller callers
+    /// like the driver-appended argument of a direct call;
+    /// `fixed_stamp` names the shim the call passed through (an
+    /// `Fn` vtable shim's location) and is bound as-is, never
+    /// forwarded — the shim presents its own location, not the
+    /// location it received.
+    ///
+    /// A marked callee ends up with exactly one stamp, from the
+    /// first of these sources that has one: the appended
+    /// argument of the call, the edge stamp, the fixed stamp,
+    /// and finally the callee's definition location (the stamp
+    /// of last resort for entries through a shim that fabricates
+    /// one: a function-pointer call, a vtable dispatch to an
+    /// impl-only `#[track_caller]` method).
+    #[allow(clippy::too_many_arguments)]
+    fn start_call_stamped(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        func: &str,
+        arg_values: Vec<Value>,
+        edge_stamp: Option<Value>,
+        fixed_stamp: Option<Value>,
+        destination: &Place,
+        target: Option<BasicBlock>,
+    ) -> InterpResult<()> {
         // A `#[track_caller]` callee (marked at conversion) may
         // arrive with one extra argument: the caller-location
         // stamp the driver appended to the call. Pop it before
         // anything else inspects the arguments; it is bound to
-        // the callee's synthetic location local below (and simply
-        // dropped when the call turns out to be a vtable
-        // dispatch to an unmarked impl body, whose location the
-        // model does not track).
+        // the callee's synthetic location local below. The pop
+        // is keyed on the body registered under `func`, which
+        // for a trait-method call is one instance of the method:
+        // the popped stamp is threaded through the vtable
+        // dispatch below, so it reaches the impl body that
+        // actually runs (and is simply dropped when that body
+        // turns out unmarked, whose location the model does not
+        // track).
         let mut arg_values = arg_values;
-        let stamp = match self.program.get(func) {
+        let mut stamp = match self.program.get(func) {
             Some(callee)
                 if callee.caller_location_local.is_some()
                     && arg_values.len() == callee.arg_count + 1 =>
@@ -1526,6 +1620,15 @@ impl<'a> Interpreter<'a> {
             }
             _ => None,
         };
+        let mut forwardable = stamp.is_some();
+        if stamp.is_none() {
+            if let Some(e) = edge_stamp {
+                stamp = Some(e);
+                forwardable = true;
+            } else if let Some(f) = fixed_stamp {
+                stamp = Some(f);
+            }
+        }
         // A call whose receiver is a `dyn` fat pointer is a vtable
         // dispatch even when a body exists under the callee's own
         // name: that body is one monomorphic instance of the trait
@@ -1559,7 +1662,20 @@ impl<'a> Interpreter<'a> {
                     };
                     let mut args = arg_values;
                     args[0] = receiver;
-                    return self.start_call(frames, &impl_func, args, destination, target);
+                    let (edge, fixed) = if forwardable {
+                        (stamp, None)
+                    } else {
+                        (None, stamp)
+                    };
+                    return self.start_call_stamped(
+                        frames,
+                        &impl_func,
+                        args,
+                        edge,
+                        fixed,
+                        destination,
+                        target,
+                    );
                 }
                 Err(e) => return Err(e),
             },
@@ -1573,14 +1689,6 @@ impl<'a> Interpreter<'a> {
                 limit: self.config.max_call_depth,
             });
         }
-        // When the calling frame is itself a track-caller frame,
-        // the location forwards — the stamp is replaced by the
-        // caller's own received location — matching the
-        // compiler's propagation (a call written in a plain
-        // function inlined into a track-caller body is the one
-        // case this runtime forwarding cannot tell apart; the
-        // stamp then still names a location in the call chain,
-        // one frame further out).
         if arg_values.len() != callee.arg_count {
             return Err(InterpError::type_mismatch(
                 format!("call to `{func}`"),
@@ -1588,18 +1696,40 @@ impl<'a> Interpreter<'a> {
                 format!("{} argument(s)", arg_values.len()),
             ));
         }
+        // No stamp on the edge at all: the call reached this
+        // body through a shim that fabricates the callee's
+        // definition location (a function-pointer call, a
+        // vtable dispatch to an impl-only `#[track_caller]`
+        // method), so bind the definition stamp the driver
+        // recorded for the body.
+        if callee.caller_location_local.is_some() && stamp.is_none() {
+            stamp = self.def_stamp_value(func);
+        }
         let mut locals = vec![Value::Uninit; callee.local_count()];
         for (i, v) in arg_values.into_iter().enumerate() {
             locals[i + 1] = v;
         }
         if let (Some(idx), Some(mut stamp)) = (callee.caller_location_local, stamp) {
-            if let Some(caller) = frames.last() {
-                if let Some(caller_idx) = self
-                    .program
-                    .get(&caller.func)
-                    .and_then(|b| b.caller_location_local)
-                {
-                    stamp = caller.locals[caller_idx].clone();
+            // When the calling frame is itself a track-caller
+            // frame, a call-site stamp forwards — it is replaced
+            // by the caller's own received location — matching
+            // the compiler's propagation (a call written in a
+            // plain function inlined into a track-caller body is
+            // the one case this runtime forwarding cannot tell
+            // apart; the stamp then still names a location in
+            // the call chain, one frame further out). A shim
+            // stamp (a fixed stamp, or a definition stamp bound
+            // above) does not forward: the shim is a frame of
+            // its own, and it presents its own location.
+            if forwardable {
+                if let Some(caller) = frames.last() {
+                    if let Some(caller_idx) = self
+                        .program
+                        .get(&caller.func)
+                        .and_then(|b| b.caller_location_local)
+                    {
+                        stamp = caller.locals[caller_idx].clone();
+                    }
                 }
             }
             locals[idx] = stamp;
@@ -1665,6 +1795,14 @@ impl<'a> Interpreter<'a> {
         let mut locals = vec![Value::Uninit; body.local_count()];
         for (i, arg) in arg_values.into_iter().enumerate() {
             locals[i + 1] = arg;
+        }
+        // A detached entry is a shim entry (runtime support
+        // calling back into guest code): a track-caller body
+        // receives its definition stamp, as in `start_call`.
+        if let Some(idx) = body.caller_location_local {
+            if let Some(stamp) = self.def_stamp_value(func) {
+                locals[idx] = stamp;
+            }
         }
         let id = self.fresh_frame_id();
         frames.push(Frame {

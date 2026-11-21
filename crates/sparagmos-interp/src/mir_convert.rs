@@ -135,6 +135,15 @@ pub struct MirProgram {
     /// `mir::AdtNiches`). Consulted when a transmute involves
     /// a niche-encoded enum such as `Option<NonZero<T>>`.
     pub adt_niches: mir::AdtNiches,
+    /// Definition-location stamps of the program's
+    /// `#[track_caller]` instances, keyed by the instance's
+    /// `DefId`, as recorded by the driver (see
+    /// `Converter::track_caller_defs` in the driver crate).
+    pub track_caller_defs: HashMap<mir::DefId, mir::ConstValue>,
+    /// The location stamps of the `Fn` / `FnMut` / `FnOnce`
+    /// vtable shims (index 0 is `call`, 1 is `call_mut`, 2 is
+    /// `call_once`), as recorded by the driver.
+    pub fn_shim_locations: [Option<mir::ConstValue>; 3],
 }
 
 /// Widen an `f16` bit pattern to `f64`. The conversion is exact:
@@ -372,6 +381,31 @@ fn body_is_closure_body(body: &mir::Body) -> bool {
     true
 }
 
+/// Whether an `Fn`-trait call's `Self` type denotes a closure
+/// or a trait object (possibly behind a reference or pointer):
+/// callables the `CallTrait` dispatch resolves from the
+/// receiver value. A concrete ADT `Self` instead names a
+/// hand-written `Fn` impl, whose collected shim body the
+/// direct resolution should keep.
+fn fn_self_is_closure_or_dyn(ty: &mir::Ty) -> bool {
+    match ty {
+        mir::Ty::Closure(..) | mir::Ty::Dynamic(..) => true,
+        mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _) => {
+            fn_self_is_closure_or_dyn(inner)
+        }
+        // An ADT `Self` wraps the callable in its first type
+        // argument (`Box<dyn FnOnce>` — with its allocator
+        // argument behind it — is the `Self` of its `call_once`
+        // call, `Box<closure>` of a boxed closure's): look
+        // through it.
+        mir::Ty::Adt(_, args) => match args.first() {
+            Some(first) => fn_self_is_closure_or_dyn(first),
+            None => false,
+        }
+        _ => false,
+    }
+}
+
 fn closure_body_alias(f: &MirFunction) -> Option<mir::DefId> {
     let base = f.name.split(" [").next().unwrap_or(&f.name);
     if !matches!(
@@ -546,6 +580,30 @@ fn convert_all(
             Some((conv.static_key(def), seed))
         })
         .collect();
+    // The definition-location stamps, keyed by the program key
+    // of the body each belongs to (the `DefId` a function's
+    // calls and constants resolve through), in the same
+    // constant form the driver-appended call-site stamps take.
+    for (f, key) in program.functions.iter().zip(keys.iter()) {
+        let Some(def) = f.def_id else { continue };
+        let Some(stamp) = program.track_caller_defs.get(&def) else {
+            continue;
+        };
+        if let Ok(c) = conv.convert_const_value(stamp, None) {
+            out.track_caller_defs.insert(key.clone(), c);
+        }
+    }
+    out.fn_shim_locations = [
+        program.fn_shim_locations[0]
+            .as_ref()
+            .and_then(|v| conv.convert_const_value(v, None).ok()),
+        program.fn_shim_locations[1]
+            .as_ref()
+            .and_then(|v| conv.convert_const_value(v, None).ok()),
+        program.fn_shim_locations[2]
+            .as_ref()
+            .and_then(|v| conv.convert_const_value(v, None).ok()),
+    ];
     mark_caller_location_bodies(&mut out);
     Ok((out, failures))
 }
@@ -558,7 +616,17 @@ fn convert_all(
 /// local (typed as the location reference) that the interpreter
 /// binds the stamp to (see `Body::caller_location_local`).
 fn mark_caller_location_bodies(program: &mut ir::Program) {
-    let mut marked: Vec<String> = Vec::new();
+    // Bodies the driver recorded a definition-location stamp
+    // for are track-caller bodies by the compiler's own
+    // resolution, whether or not any converted direct call
+    // passes a stamp: a body reached only through a function
+    // pointer or a vtable is never called directly at all.
+    let mut marked: Vec<String> = program
+        .track_caller_defs
+        .keys()
+        .filter(|k| program.functions.contains_key(*k))
+        .cloned()
+        .collect();
     for body in program.functions.values() {
         for block in &body.blocks {
             if let ir::TerminatorKind::Call { func, args, .. } = &block.terminator {
@@ -997,6 +1065,27 @@ fn is_fat_ptr_ty(ty: &mir::Ty) -> bool {
     }
 }
 
+/// Whether a type mentions a trait object anywhere inside it
+/// (a `dyn` type itself, a reference or pointer to one, a
+/// `Box<dyn ...>`, a tuple holding one): such a value's method
+/// calls dispatch through a vtable.
+fn ty_mentions_dyn(ty: &mir::Ty) -> bool {
+    match ty {
+        mir::Ty::Dynamic(..) => true,
+        mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _) => {
+            ty_mentions_dyn(inner)
+        }
+        mir::Ty::Adt(_, args) | mir::Ty::Closure(_, args) => {
+            args.iter().any(ty_mentions_dyn)
+        }
+        mir::Ty::Tuple(ts) => ts.iter().any(ty_mentions_dyn),
+        mir::Ty::Slice(elem) | mir::Ty::Array(elem, _) => {
+            ty_mentions_dyn(elem)
+        }
+        _ => false,
+    }
+}
+
 /// The pointee type of a pointer or reference type.
 fn ptr_pointee(ty: &mir::Ty) -> Option<&mir::Ty> {
     match ty {
@@ -1404,7 +1493,10 @@ fn scan_body_aggregates(
 /// (see `Converter::fn_trait_or_direct`).
 enum FnResolution {
     /// Evaluate the receiver as a callable value (`CallTrait`).
-    Trait(ir::FnCallKind, Vec<mir::Ty>),
+    /// The `bool` is whether the call carries a caller-location
+    /// stamp as a third argument (the driver appends one when
+    /// the resolved `Fn` shim instance is `#[track_caller]`).
+    Trait(ir::FnCallKind, Vec<mir::Ty>, bool),
     /// Call the named body directly.
     Direct(String),
 }
@@ -1968,6 +2060,34 @@ impl<'a> Converter<'a> {
             .unwrap_or_else(|| self.def_display_name(def))
     }
 
+    /// The program key a function-item *value* names (an `FnDef`
+    /// type constant materialised as a callable value, e.g. a
+    /// trait method coerced to a function pointer). The constant
+    /// names the item's definition, whose own key is the body
+    /// key only for a free function: for a trait method the body
+    /// in the program is the impl instance for the constant's
+    /// `Self` type, resolved exactly as a trait-method call
+    /// resolves it (see `find_impl_key_for`). When neither
+    /// resolution lands, the definition's key stands (the call
+    /// then fails naming the item, as before).
+    fn fn_def_value_key(&self, def: &mir::DefId, args: &[mir::Ty]) -> String {
+        let key = self.body_key(def);
+        if self.bodies.contains_key(&key) {
+            return key;
+        }
+        let name = self.def_display_name(def);
+        if let Some((trait_path, method)) = name.rsplit_once("::") {
+            if !trait_path.is_empty() && !method.is_empty() {
+                if let Some(impl_key) =
+                    self.find_impl_key_for(trait_path, method, args)
+                {
+                    return impl_key;
+                }
+            }
+        }
+        key
+    }
+
     /// The name of a concrete type as it appears in the `Self`
     /// position of its impl method names in the program
     /// (`<{name} as Trait>::method`): the definition's display name
@@ -2297,8 +2417,8 @@ impl<'a> Converter<'a> {
             // A function item in operand position is a value (the
             // zero-sized fn item, reifiable to a function pointer):
             // it becomes a callable constant naming the function.
-            mir::ConstKind::Ty(mir::Ty::FnDef(def, _)) => {
-                Ok(ir::Constant::FnDef(self.body_key(def)))
+            mir::ConstKind::Ty(mir::Ty::FnDef(def, args)) => {
+                Ok(ir::Constant::FnDef(self.fn_def_value_key(def, args)))
             }
             // A closure in constant position is a value too (the
             // zero-sized closure constant a `ClosureFnPointer` cast
@@ -4311,6 +4431,21 @@ impl<'a> Converter<'a> {
         if trait_path.is_empty() || method.is_empty() {
             return None;
         }
+        self.find_impl_key_for(trait_path, method, &raw_generic_args)
+    }
+
+    /// The collected impl body key for a trait method named by
+    /// its trait path and method name, instantiated with
+    /// `raw_generic_args` (whose first entry is the `Self`
+    /// type): the resolution `find_impl_callee` performs for
+    /// calls, shared with the `FnDef`-constant resolution in
+    /// `fn_def_value_key`.
+    fn find_impl_key_for(
+        &self,
+        trait_path: &str,
+        method: &str,
+        raw_generic_args: &[mir::Ty],
+    ) -> Option<String> {
         let self_ty = raw_generic_args.first()?;
         let self_name = self.concrete_ty_name(self_ty);
         // The impl's instance name spells the trait path as the
@@ -4569,9 +4704,16 @@ impl<'a> Converter<'a> {
         func: &mir::Operand,
         arg_count: usize,
     ) -> Option<FnResolution> {
+        // A call to an `Fn`-trait method takes the receiver and
+        // the argument tuple; a third argument is the
+        // caller-location stamp the driver appended for a
+        // `#[track_caller]` shim instance (a track-caller
+        // closure), which the `CallTrait` conversion carries
+        // along instead of dropping the call.
         let trait_call = self
             .resolve_fn_trait_call(func)
-            .filter(|_| arg_count == 2);
+            .filter(|_| arg_count == 2 || arg_count == 3);
+        let stamped = arg_count == 3;
         let direct = self.resolve_body_callee(func);
         match (trait_call, direct) {
             (Some(trait_call), Some(name)) => {
@@ -4579,14 +4721,36 @@ impl<'a> Converter<'a> {
                     .bodies
                     .get(&name)
                     .is_some_and(|b| body_is_closure_body(b));
-                if mis_keyed {
-                    Some(FnResolution::Trait(trait_call.0, trait_call.1))
+                // When the callable is a closure or a trait
+                // object, the receiver value carries the
+                // callable and the `CallTrait` dispatch owns
+                // the call: a body registered under the trait
+                // method's name is one instance's body (a shim,
+                // a forwarding impl), not the dispatch, and the
+                // interpreter's vtable dispatch refuses to treat
+                // it as one. A concrete ADT `Self` instead names
+                // a hand-written `Fn` impl, whose collected body
+                // the direct resolution keeps.
+                let value_keyed = trait_call
+                    .1
+                    .first()
+                    .is_some_and(fn_self_is_closure_or_dyn);
+                if mis_keyed || value_keyed {
+                    Some(FnResolution::Trait(
+                        trait_call.0,
+                        trait_call.1,
+                        stamped,
+                    ))
                 } else {
                     Some(FnResolution::Direct(name))
                 }
             }
             (Some(trait_call), None) => {
-                Some(FnResolution::Trait(trait_call.0, trait_call.1))
+                Some(FnResolution::Trait(
+                    trait_call.0,
+                    trait_call.1,
+                    stamped,
+                ))
             }
             (None, Some(name)) => Some(FnResolution::Direct(name)),
             (None, None) => None,
@@ -4936,7 +5100,7 @@ impl<'a> Converter<'a> {
                     term
                 } else if let Some(name) = self.fn_trait_or_direct(func, args.len()) {
                     match name {
-                        FnResolution::Trait(kind, raw_generic_args) => {
+                        FnResolution::Trait(kind, raw_generic_args, stamped) => {
                             let receiver = self.convert_operand(
                                 body,
                                 &args[0],
@@ -4944,10 +5108,28 @@ impl<'a> Converter<'a> {
                             )?;
                             let tuple = self
                                 .convert_operand(body, &args[1], raw_generic_args.get(1))?;
+                            // The stamp is carried for a direct or
+                            // generic call, whose shim forwards
+                            // the call-site location. For a `dyn`
+                            // receiver the call passes through the
+                            // vtable shim, which presents its own
+                            // location instead (see
+                            // `ir::Program::fn_shim_locations`), so
+                            // the appended stamp is dropped here.
+                            let stamp = if stamped
+                                && !raw_generic_args
+                                    .first()
+                                    .is_some_and(|t| ty_mentions_dyn(t))
+                            {
+                                Some(self.convert_operand(body, &args[2], None)?)
+                            } else {
+                                None
+                            };
                             ir::TerminatorKind::CallTrait {
                                 kind,
                                 receiver,
                                 args: tuple,
+                                stamp,
                                 destination: self.convert_place(body, destination)?,
                                 target: target.map(|b| ir::BasicBlock(b.index())),
                             }
