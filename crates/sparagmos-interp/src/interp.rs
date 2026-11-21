@@ -1872,6 +1872,72 @@ impl<'a> Interpreter<'a> {
         self.drive(frames, depth)
     }
 
+    /// Call `func` synchronously from within the interpreter
+    /// (a builtin that must apply a callable it holds as a value,
+    /// such as an iterator adapter's closure): push a frame for it
+    /// on the caller's stack, drive the stack until that frame
+    /// returns, and yield its return value. The caller's frames
+    /// below are left exactly as they were. A guest panic inside
+    /// the callee propagates as the call's error, as a nested call
+    /// from guest code would. On the current drive structure this
+    /// is [`Self::call_to_completion`]: a detached frame driven by
+    /// a nested [`Self::drive`] region, unwinding included.
+    pub(crate) fn call_sync(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        func: &str,
+        arg_values: Vec<Value>,
+    ) -> InterpResult<Value> {
+        self.call_to_completion(frames, func, arg_values)
+    }
+
+    /// Apply a callable value (a closure or a function pointer)
+    /// to `args` synchronously, via [`Self::call_sync`]. For a
+    /// closure whose body takes its environment by reference,
+    /// `env_ref` is the reference the body receives as its first
+    /// argument: a caller that knows where the closure value lives
+    /// (an iterator adapter's state field, say) passes a reference
+    /// to that storage so `FnMut` capture writes persist in place;
+    /// with `None` the environment is a reference to the value
+    /// itself, through which capture reads resolve and capture
+    /// writes are the explicit constant-aggregate error. A body
+    /// that takes its environment by value (an `FnOnce` closure's
+    /// own body) receives the closure value itself, as with a
+    /// direct `FnOnce::call_once`.
+    pub(crate) fn call_callable_sync(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        callable: &Value,
+        env_ref: Option<Value>,
+        args: Vec<Value>,
+    ) -> InterpResult<Value> {
+        if frames.len() >= self.config.max_call_depth {
+            return Err(InterpError::CallDepthExceeded {
+                limit: self.config.max_call_depth,
+            });
+        }
+        match callable {
+            Value::FnPtr(name) => self.call_sync(frames, name, args),
+            Value::Closure { def, .. } => {
+                let mut full = Vec::with_capacity(args.len() + 1);
+                if self.closure_body_takes_env_by_value(def) {
+                    full.push(callable.clone());
+                } else {
+                    full.push(env_ref.unwrap_or_else(|| {
+                        Value::Ref(RefTarget::Value(Box::new(callable.clone())))
+                    }));
+                }
+                full.extend(args);
+                self.call_sync(frames, def, full)
+            }
+            other => Err(InterpError::type_mismatch(
+                "synchronous call",
+                "callable value",
+                other.kind_name(),
+            )),
+        }
+    }
+
     /// Run the guest's panic hook (if one is installed) for a
     /// freshly raised panic, before unwinding begins. The hook
     /// receives a modelled `PanicHookInfo`: field 0 is the
