@@ -5015,6 +5015,91 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// The metadata of a pointer value (`PtrMetadata` rvalue):
+    /// a slice or string pointer's length, a dyn pointer's vtable
+    /// (the fat value itself in this model, only ever passed along
+    /// or compared opaquely), and the unit value for a sized
+    /// pointee. A reference to a constant slice value (a static
+    /// slice, materialised as a reference to the fat value) and a
+    /// reference naming a place whose contents are a fat value (a
+    /// slice reference formed as `&*box`, stored as a place
+    /// reference) both carry that fat value's metadata.
+    fn ptr_metadata(
+        &self,
+        frames: &[Frame],
+        v: &Value,
+        dest_ty: Option<&Ty>,
+    ) -> InterpResult<Value> {
+        match v {
+            Value::FatRef { len, .. } => Ok(Value::Uint(*len)),
+            Value::Str(s) => Ok(Value::Uint(s.len() as u128)),
+            Value::DynRef { .. } => Ok(v.clone()),
+            Value::Ref(_) => {
+                let target = self.deref_value(frames, v)?;
+                let pointee = self.read_resolved(frames, &target)?;
+                self.metadata_of_pointee(frames, &pointee, dest_ty)
+            }
+            // A built box (a one-field aggregate whose field is
+            // the allocation pointer) carries its pointee's
+            // metadata, as the box pointer does.
+            Value::Enum { fields, .. } if fields.len() == 1 => {
+                let target = self.deref_value(frames, v)?;
+                let pointee = self.read_resolved(frames, &target)?;
+                self.metadata_of_pointee(frames, &pointee, dest_ty)
+            }
+            other => Err(InterpError::type_mismatch(
+                "PtrMetadata",
+                "fat pointer",
+                other.kind_name(),
+            )),
+        }
+    }
+
+    /// The metadata denoted by a pointee value (see
+    /// [`Self::ptr_metadata`]). A value with a dynamically sized
+    /// tail — a custom DST struct value, or the array value a
+    /// slice pointer names — carries the tail's metadata: the
+    /// last field's metadata, recursively, or the element count.
+    /// The recursion is gated on the destination being
+    /// length-typed: MIR types a sized pointee's metadata as
+    /// `()`, so a `usize` destination is exactly the case where
+    /// the metadata is a length; every other shape's metadata is
+    /// the unit value.
+    fn metadata_of_pointee(
+        &self,
+        frames: &[Frame],
+        pointee: &Value,
+        dest_ty: Option<&Ty>,
+    ) -> InterpResult<Value> {
+        match pointee {
+            Value::FatRef { len, .. } => Ok(Value::Uint(*len)),
+            Value::Str(s) => Ok(Value::Uint(s.len() as u128)),
+            Value::DynRef { .. } => Ok(pointee.clone()),
+            Value::Ref(_) => self.ptr_metadata(frames, pointee, dest_ty),
+            Value::Tuple(items) => {
+                if matches!(dest_ty, Some(Ty::Uint(_))) {
+                    Ok(Value::Uint(items.len() as u128))
+                } else {
+                    Ok(Value::Unit)
+                }
+            }
+            Value::Enum { fields, .. } => {
+                if matches!(dest_ty, Some(Ty::Uint(_))) {
+                    match fields.last() {
+                        Some(last) => {
+                            let last = last.clone();
+                            self.metadata_of_pointee(frames, &last, dest_ty)
+                        }
+                        None => Ok(Value::Unit),
+                    }
+                } else {
+                    Ok(Value::Unit)
+                }
+            }
+            _ => Ok(Value::Unit),
+        }
+    }
+
     // ----- rvalues -----------------------------------------------------------
 
     fn eval_rvalue(
@@ -5039,44 +5124,7 @@ impl<'a> Interpreter<'a> {
             }
             Rvalue::UnaryOp(UnOp::PtrMetadata, operand) => {
                 let v = self.eval_operand(frames, body, operand)?;
-                match &v {
-                    Value::FatRef { len, .. } => Ok(Value::Uint(*len)),
-                    Value::Str(s) => Ok(Value::Uint(s.len() as u128)),
-                    // The metadata of a dyn pointer is its vtable,
-                    // which this model represents by the fat value
-                    // itself (it is only ever passed along or
-                    // compared opaquely).
-                    Value::DynRef { .. } => Ok(v.clone()),
-                    // A reference to a constant slice value (a static
-                    // slice, materialised as a reference to the fat
-                    // value) carries the slice's length.
-                    Value::Ref(RefTarget::Value(inner)) => match &**inner {
-                        Value::FatRef { len, .. } => Ok(Value::Uint(*len)),
-                        Value::Str(s) => Ok(Value::Uint(s.len() as u128)),
-                        // Any other reference points at a sized
-                        // value: its metadata is the unit value.
-                        _ => Ok(Value::Unit),
-                    },
-                    // A reference value naming a place whose
-                    // contents are a fat value (a slice reference
-                    // formed as `&*box`, stored as a place reference)
-                    // carries that fat value's metadata; any other
-                    // reference points at a sized value, whose
-                    // metadata is the unit value.
-                    Value::Ref(_) => {
-                        let target = self.deref_value(frames, &v)?;
-                        match self.read_resolved(frames, &target)? {
-                            Value::FatRef { len, .. } => Ok(Value::Uint(len)),
-                            Value::Str(text) => Ok(Value::Uint(text.len() as u128)),
-                            _ => Ok(Value::Unit),
-                        }
-                    }
-                    other => Err(InterpError::type_mismatch(
-                        "PtrMetadata",
-                        "fat pointer",
-                        other.kind_name(),
-                    )),
-                }
+                self.ptr_metadata(frames, &v, dest_ty)
             }
             Rvalue::UnaryOp(op, operand) => {
                 let v = self.eval_operand(frames, body, operand)?;
