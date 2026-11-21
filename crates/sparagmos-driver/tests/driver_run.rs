@@ -2419,3 +2419,231 @@ fn run_mode_derived_eq_on_packed_struct_uses_align_of() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "eq-ok\n");
 }
+
+// ----- type-mismatch bucket fixes (Lane CD) -----
+
+const BLANKET_FN_SRC: &str = r#"
+fn a<F: Fn() -> i32>(f: F) -> i32 { f() }
+fn b(f: &dyn Fn() -> i32) -> i32 { a(f) }
+fn c<F: Fn() -> i32>(f: &F) -> i32 { a(f) }
+fn main() {
+    assert_eq!(b(&|| 22), 22);
+    assert_eq!(c(&|| 23), 23);
+    println!("blanket fn ok");
+}
+"#;
+
+const BOX_UNSIZE_SRC: &str = r#"
+fn main() {
+    let xs: Box<[()]> = Box::<[(); 0]>::new([]);
+    assert_eq!(xs.len(), 0);
+    let ys: Box<[i32]> = Box::new([1, 2, 3]);
+    assert_eq!(ys.len(), 3);
+    assert_eq!(&*ys, &[1, 2, 3]);
+    println!("unsize ok");
+}
+"#;
+
+const BYTES_MATCH_SRC: &str = r#"
+fn main() {
+    match *b"abc" {
+        [b'a', b'b', b'c'] => println!("bytes ok"),
+        _ => panic!("no"),
+    }
+    match *b"abd" {
+        [b'a', b'b', b'c'] => panic!("wrong arm"),
+        _ => println!("bytes ok 2"),
+    }
+}
+"#;
+
+const FLOAT_EQ_SRC: &str = r#"
+#[derive(PartialEq, Debug)]
+struct P { x: f64, y: i32 }
+#[derive(PartialEq, Debug)]
+struct Pair(u32, u32);
+fn main() {
+    let a = P { x: 1.5, y: 2 };
+    let b = P { x: 1.5, y: 2 };
+    assert!(a == b);
+    let nan = P { x: f64::NAN, y: 0 };
+    assert!(nan != nan);
+    assert!(Pair(3, 4) == Pair(3, 4));
+    assert!(Pair(3, 4) != Pair(3, 5));
+    let t1 = (1.25f32, 7u8);
+    let t2 = (1.25f32, 7u8);
+    assert!(t1 == t2);
+    println!("float eq ok");
+}
+"#;
+
+const PLACE_SLICE_META_SRC: &str = r#"
+static C: &[i32] = &[10, 20, 30];
+fn main() {
+    assert_eq!(C.len(), 3);
+    assert_eq!(C[1], 20);
+    let ys: Box<[i32]> = Box::new([1, 2, 3]);
+    let s: &[i32] = &*ys;
+    assert_eq!(s.len(), 3);
+    assert_eq!(s[1], 2);
+    println!("meta ok");
+}
+"#;
+
+const PTR_EQ_SRC: &str = r#"
+fn f() {}
+fn g() {}
+fn main() {
+    let x = 5;
+    let p = &x as *const i32;
+    let q = &x as *const i32;
+    assert!(p == q);
+    assert!(!p.is_null());
+    let fp: fn() = f;
+    let fq: fn() = f;
+    let fg: fn() = g;
+    assert!(fp == fq);
+    assert!(fp != fg);
+    let a = &x;
+    let b = &x;
+    assert!(std::ptr::eq(a, b));
+    println!("ptr eq ok");
+}
+"#;
+
+const RANGE_INDEX_SRC: &str = r#"
+fn main() {
+    let a = [1, 2, 3, 4];
+    assert_eq!(&a[1..3], &[2, 3]);
+    assert_eq!(&a[..2], &[1, 2]);
+    assert_eq!(&a[2..], &[3, 4]);
+    assert_eq!(&a[..], &[1, 2, 3, 4]);
+    assert_eq!(&a[1..=2], &[2, 3]);
+    let st = "héllo";
+    assert_eq!(&st[0..1], "h");
+    assert_eq!(&st[1..3], "é");
+    println!("ranges ok");
+}
+"#;
+
+const RANGE_PANIC_SRC: &str = r#"
+fn main() {
+    let a = [1, 2, 3, 4];
+    let _s = &a[2..9];
+    println!("unreachable");
+}
+"#;
+
+#[test]
+fn run_mode_blanket_fn_impls_for_references() {
+    let dir = temp_dir("blanket-fn");
+    let src = fixture(&dir, "blanket_fn.rs", BLANKET_FN_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "calling through &F / &dyn Fn blanket impls must work; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "blanket fn ok\n");
+}
+
+#[test]
+fn run_mode_boxed_slice_unsize() {
+    let dir = temp_dir("box-unsize");
+    let src = fixture(&dir, "box_unsize.rs", BOX_UNSIZE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Box<[T; N]> to Box<[T]> unsizing must work; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "unsize ok\n");
+}
+
+#[test]
+fn run_mode_byte_string_pattern_match() {
+    let dir = temp_dir("bytes-match");
+    let src = fixture(&dir, "bytes_match.rs", BYTES_MATCH_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "byte-string pattern matching must work; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "bytes ok\nbytes ok 2\n"
+    );
+}
+
+#[test]
+fn run_mode_derived_eq_over_floats_and_tuple_structs() {
+    let dir = temp_dir("float-eq");
+    let src = fixture(&dir, "float_eq.rs", FLOAT_EQ_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "derived equality over float fields must work; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "float eq ok\n");
+}
+
+#[test]
+fn run_mode_pointer_and_fn_pointer_equality() {
+    let dir = temp_dir("ptr-eq");
+    let src = fixture(&dir, "ptr_eq.rs", PTR_EQ_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "pointer equality must run to completion; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ptr eq ok\n");
+}
+
+#[test]
+fn run_mode_range_indexing() {
+    let dir = temp_dir("range-index");
+    let src = fixture(&dir, "range_index.rs", RANGE_INDEX_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "range indexing must run to completion; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ranges ok\n");
+}
+
+#[test]
+fn run_mode_range_index_out_of_bounds_panics() {
+    let dir = temp_dir("range-panic");
+    let src = fixture(&dir, "range_panic.rs", RANGE_PANIC_SRC);
+    let out = run_driver(&src);
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "an out-of-bounds slice range is a guest panic (101)"
+    );
+}
+
+#[test]
+fn run_mode_slice_metadata_through_places() {
+    let dir = temp_dir("place-slice-meta");
+    let src = fixture(&dir, "place_slice_meta.rs", PLACE_SLICE_META_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "PtrMetadata/Len through place references must work; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "meta ok\n");
+}
+

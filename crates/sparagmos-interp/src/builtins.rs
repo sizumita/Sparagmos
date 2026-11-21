@@ -1806,6 +1806,13 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::IndexIndex => {
                 arity(2)?;
+                // A range index (`slice[1..3]`, `slice[..]`, ...)
+                // yields a sub-slice; the index type tag names the
+                // range kind. Anything else is a plain integer index.
+                let idx_tag = generic_args.get(1).map(String::as_str).unwrap_or("");
+                if idx_tag.contains("ops::Range") {
+                    return self.index_range(frames, name, &vals[0], &vals[1], idx_tag);
+                }
                 let idx = expect_index(&vals[1], name)?;
                 let (elems, len) = self.slice_elements(frames, &vals[0])?;
                 if idx as u128 >= len {
@@ -2521,6 +2528,19 @@ impl<'a> Interpreter<'a> {
         }
         let a = self.resolve_value(frames, a)?;
         let b = self.resolve_value(frames, b)?;
+        // A side that resolves to a self-contained fat value (a
+        // slice constant or materialised sub-slice held in a local)
+        // compares as a slice against the other side's elements:
+        // the other side may resolve to the bare array value, whose
+        // elements are exactly its own.
+        if matches!(a, Value::FatRef { .. }) || matches!(b, Value::FatRef { .. }) {
+            let (ea, la) = self.slice_elements(frames, &a)?;
+            let (eb, lb) = self.slice_elements(frames, &b)?;
+            if la != lb {
+                return Ok(false);
+            }
+            return self.seq_equal(frames, &ea, &eb);
+        }
         Ok(match (&a, &b) {
             (Value::Ref(RefTarget::Null), Value::Ref(RefTarget::Null)) => true,
             // Address-only pointers compare by address; address 0
@@ -2539,9 +2559,37 @@ impl<'a> Interpreter<'a> {
             (Value::Uint(x), Value::Int(y)) => int_uint_eq(*y, *x),
             (Value::Str(x), Value::Str(y)) => x == y,
             (Value::Bytes(x), Value::Bytes(y)) => x == y,
+            // Float equality is IEEE equality, as derived
+            // `PartialEq` on a float field performs it (NaN compares
+            // unequal to itself).
+            (Value::Float(x), Value::Float(y)) => x == y,
+            (Value::FnPtr(x), Value::FnPtr(y)) => x == y,
             (Value::Tuple(x), Value::Tuple(y)) => {
                 x.len() == y.len() && self.seq_equal(frames, x, y)?
             }
+            // A byte string and an array of byte values are the
+            // same data in two of the model's shapes (a `[u8; N]`
+            // constant decodes to bytes; the same array built by an
+            // aggregate is a tuple).
+            (Value::Bytes(x), Value::Tuple(y)) | (Value::Tuple(y), Value::Bytes(x)) => {
+                x.len() == y.len()
+                    && x.iter().zip(y.iter()).all(|(byte, elem)| {
+                        matches!(elem, Value::Uint(v) if *v == u128::from(*byte))
+                            || matches!(elem, Value::Int(v) if *v == i128::from(*byte))
+                    })
+            }
+            // A single-variant ADT value (a tuple struct) and a
+            // plain tuple of the same fields: the constant decoder
+            // and aggregate construction produce the two shapes for
+            // the same source value.
+            (
+                Value::Enum { variant: 0, fields: x },
+                Value::Tuple(y),
+            )
+            | (
+                Value::Tuple(y),
+                Value::Enum { variant: 0, fields: x },
+            ) => x.len() == y.len() && self.seq_equal(frames, x, y)?,
             (
                 Value::Enum {
                     variant: va,
@@ -2661,6 +2709,84 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// `Index::index` with a range argument: the sub-slice of the
+    /// receiver between the range's bounds, with core's own panic
+    /// messages for out-of-range bounds. The result is a fat
+    /// reference over a materialised copy of the sub-slice's
+    /// elements (a shared slice: reads through it are exact; the
+    /// model has no offsettable place to alias the original
+    /// storage). A `str` receiver yields the sub-string, with
+    /// char-boundary checks as in core.
+    fn index_range(
+        &self,
+        frames: &[Frame],
+        name: &str,
+        receiver: &Value,
+        index: &Value,
+        idx_tag: &str,
+    ) -> InterpResult<Value> {
+        // The bounds as stored in the range value: `Range` and
+        // `RangeInclusive` carry [start, end], `RangeFrom` [start],
+        // `RangeTo` / `RangeToInclusive` [end], `RangeFull` none
+        // (it arrives as the unit value).
+        let fields: &[Value] = match index {
+            Value::Unit => &[],
+            Value::Enum { fields, .. } => fields,
+            Value::Tuple(fields) => fields,
+            other => {
+                return Err(InterpError::type_mismatch(
+                    format!("builtin {name}"),
+                    "range index value",
+                    other.kind_name(),
+                ))
+            }
+        };
+        let bound = |i: usize| -> InterpResult<usize> {
+            match fields.get(i) {
+                Some(v) => expect_index(v, name),
+                None => Err(InterpError::type_mismatch(
+                    format!("builtin {name}"),
+                    "range index value with bounds",
+                    index.kind_name(),
+                )),
+            }
+        };
+        let kind = if idx_tag.contains("RangeFull") {
+            RangeKindForIndex::Full
+        } else if idx_tag.contains("RangeToInclusive") {
+            RangeKindForIndex::ToInclusive
+        } else if idx_tag.contains("RangeInclusive") {
+            RangeKindForIndex::Inclusive
+        } else if idx_tag.contains("RangeFrom") {
+            RangeKindForIndex::From
+        } else if idx_tag.contains("RangeTo") {
+            RangeKindForIndex::To
+        } else {
+            RangeKindForIndex::Range
+        };
+        // Resolve the receiver's length first: for a `str` the
+        // length is in bytes, as range indices on strings are byte
+        // indices.
+        let resolved = self.resolve_value(frames, receiver)?;
+        if let Value::Str(text) = &resolved {
+            let len = text.len();
+            let (start, end) = range_bounds(&kind, &bound, len)?;
+            return match text.get(start..end) {
+                Some(sub) => Ok(Value::Str(sub.to_string())),
+                None => Err(InterpError::panic(str_slice_error(text, start, end))),
+            };
+        }
+        let (elems, len) = self.slice_elements(frames, receiver)?;
+        let len = usize::try_from(len).unwrap_or(usize::MAX);
+        let (start, end) = range_bounds(&kind, &bound, len)?;
+        let sub: Vec<Value> = elems[start..end].to_vec();
+        let sub_len = sub.len() as u128;
+        Ok(Value::FatRef {
+            base: Box::new(Value::Tuple(sub)),
+            len: sub_len,
+        })
+    }
+
     /// Follow references in `value` until a non-reference value.
     pub(crate) fn resolve_value(
         &self,
@@ -2675,6 +2801,14 @@ impl<'a> Interpreter<'a> {
                 // address-only pointer likewise denotes no readable
                 // data; it resolves to itself.
                 Value::Ref(RefTarget::Null) | Value::Ref(RefTarget::Address(_)) => {
+                    return Ok(value)
+                }
+                // A fat pointer over a self-contained element tuple
+                // (a slice constant, a materialised sub-slice) is
+                // already data: dereferencing it yields itself, so
+                // following it would spin. Its elements are read
+                // through the fat value itself.
+                Value::FatRef { base, .. } if matches!(&**base, Value::Tuple(_)) => {
                     return Ok(value)
                 }
                 Value::Ref(_) | Value::FatRef { .. } => {
@@ -2921,6 +3055,81 @@ fn int_uint_cmp(x: i128, y: u128) -> Ordering {
 }
 
 /// An integer index argument as a `usize`.
+/// The (start, end) element bounds of a range index against a
+/// receiver of length `len`, applying core's checks in core's
+/// order with core's panic messages. Inclusive ends are converted
+/// to exclusive ones first (an inclusive end of `usize::MAX`
+/// overflows that conversion, which core reports separately).
+fn range_bounds(
+    kind: &RangeKindForIndex,
+    bound: &dyn Fn(usize) -> InterpResult<usize>,
+    len: usize,
+) -> InterpResult<(usize, usize)> {
+    use RangeKindForIndex::*;
+    let (start, end) = match kind {
+        Full => (0, len),
+        Range => (bound(0)?, bound(1)?),
+        From => (bound(0)?, len),
+        To => (0, bound(0)?),
+        Inclusive => {
+            let start = bound(0)?;
+            let end = bound(1)?;
+            if end == usize::MAX {
+                return Err(InterpError::panic("range end index overflow".to_string()));
+            }
+            (start, end + 1)
+        }
+        ToInclusive => {
+            let end = bound(0)?;
+            if end == usize::MAX {
+                return Err(InterpError::panic("range end index overflow".to_string()));
+            }
+            (0, end + 1)
+        }
+    };
+    if start > end {
+        return Err(InterpError::panic(format!(
+            "slice index starts at {start} but ends at {end}"
+        )));
+    }
+    if end > len {
+        return Err(InterpError::panic(format!(
+            "range end index {end} out of range for slice of length {len}"
+        )));
+    }
+    if start > len {
+        return Err(InterpError::panic(format!(
+            "range start index {start} out of range for slice of length {len}"
+        )));
+    }
+    Ok((start, end))
+}
+
+enum RangeKindForIndex {
+    Full,
+    Range,
+    From,
+    To,
+    Inclusive,
+    ToInclusive,
+}
+
+/// core's message for a string slice index that is not a char
+/// boundary (`str::slice_error_fail`).
+fn str_slice_error(text: &str, start: usize, end: usize) -> String {
+    for idx in [start, end] {
+        if idx != 0 && idx != text.len() && !text.is_char_boundary(idx) {
+            let lo = text[..idx].chars().next_back().map_or(0, |c| idx - c.len_utf8());
+            let ch = text[lo..].chars().next().expect("char at boundary");
+            let hi = lo + ch.len_utf8();
+            return format!(
+                "byte index {idx} is not a char boundary; it is inside {ch:?} (bytes {lo}..{hi}) of `{text}`"
+            );
+        }
+    }
+    format!("byte index {start} is not a char boundary")
+}
+
 fn expect_index(value: &Value, name: &str) -> InterpResult<usize> {
     match value {
         Value::Uint(v) => usize::try_from(*v).map_err(|_| {

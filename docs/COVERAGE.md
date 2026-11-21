@@ -1548,6 +1548,39 @@ Lane CL の寄与 (both12 未収録分)、Lane CJ 自身の寄与は
 バケットの外にある。
 
 
+#### 型不一致バケットの修正 (Lane CD、2026-11-21、lane/type-mismatch-bucket)
+
+both12 の再 census で「型不一致 (type mismatch in interp conversion)」
+を主バケットとするレコードは 252 件 (both11 時点の 235 件は
+BF/BR/BY/BS/CC 統合前の数え直し)。グループ別の結果:
+
+| グループ | 件数 | 結果 |
+|---|---|---|
+| unsizing キャスト「配列への参照を期待したが ADT 値」 | 約16+関連 | 修正済み。`unsize_to_slice` が1フィールドのラッパ集約 (Box/Unique/NonNull の連鎖) を再帰的に辿り、`Box<[T; N]>` から `Box<[T]>` の形状を構築する。空配列 (unit 値) は空スライスへ unsizing する |
+| PtrMetadata「fat ポインタを期待したが参照/thin」 | 18 | 修正済み。DynRef は fat 値そのもの、定数スライスへの参照はその長さ、place 参照の中身が fat 値ならそのメタデータ、それ以外の thin 参照は unit メタデータを返す (`&*box` の `.len()` 失敗がこの形状) |
+| builtin Index::index「ADT/unit を発見」 | 30 | 修正済み。範囲インデックス型 (Range/From/To/Inclusive/ToInclusive/Full) が配列・スライス・文字列をスライスできるようになり、core の境界チェック・panic 文言・文字境界チェックを伴う。結果は fat 値として実体化する |
+| Bytes の deref | 20 中 15 | 修正済み。Bytes/Str への `deref_value` はデータそのものを返し、バイト文字列のパターンマッチが動く |
+| 値の等価比較「ADT 対タプル」等 | 26 | 修正済み。`values_equal` に Float (IEEE、NaN≠NaN)、FnPtr (名前で比較)、Bytes↔要素タプル、タプル構造体 enum↔定数タプルの腕と、解決済みスライス経路を追加。あわせて自己完結した FatRef の解決で無限ループする潜在バグ (`resolve_value`) を修正 |
+| BinaryOp Eq の参照対参照 / fn ポインタ | 16 | 修正済み。ポインタ形状のオペランドは合成アドレスで比較・順序付けする (FatRef のキーには長さワードを含む)。`synthetic_address` に DynRef の腕を追加 |
+| Fn トレイト呼び出し「参照/ADT を発見」 | 5 | バケットから解消。CallTrait がレシーバの deref 連鎖 (blanket `&F`/`&dyn Fn` impl、1フィールドのスマートポインタラッパ) を辿る。blanket-fn / blanket-fn-mut は exit 0、残りは他バケットの理由 (Drop 未対応、手動 Fn impl のディスパッチ) へ前進 |
+| 代入「変更可能な place を期待したが定数集約」 | 約36 | 残件。参照先の static が初期化子の定数集約として復号されており、変更可能な static ストレージのモデルが無いことが根本原因。static ストレージモデル (Lane CQ) の領域 |
+| 代入「Uint(Usize) を期待したが ADT」 | 約15 | 残件。atomic/simd 文脈の値形状に紐づく (深掘り未実施) |
+| 代入 Box/NonNull/Cell 雑多 (約9)、index 投影 (約7)、Debug 整形 (5)、フィールド/Discriminant「unit を発見」(約8) | — | 残件。本ランでは規模順に上記グループを処理し、ここには到達しなかった |
+| `values_cmp` の float 腕 | — | 意図的に未投入。`values_cmp` は `Ordering` を返すため NaN の正直な表現が無く、でっち上げると `partial_cmp` の意味論を偽る |
+
+実測 (subset-cd.json、ベース 87d8acd = both12 + Lane CL、--jobs 48):
+指標2(b) 全体 **69.936% → 70.450%** (17,440 → 17,568 / 24,937)。
+実行系 2,214/4,149 = 53.362% → 2,278/4,149 = 54.905%、
+コンパイル時検証系 15,226/18,332 = 83.057% → 15,290/18,332 = 83.406%。
+型不一致バケットは **252 → 159 件** (-93): 61 件が pass になり、
+32 件が他バケットへ前進した (本体なし呼び出し 19、Drop 未対応 6、
+未初期化読み 3、exit-code 不一致 3、stdout 不一致 1)。
+pass → fail の反転は **0 件**。純増 +128 件の内訳は、本レーン帰属の
+61 件、ベースに含まれる Lane CL の incremental 寄与 64 件
+(both12 未収録分)、timeout バケットの変動 3 件。
+検証はワークスペース 422 件全パス、ドライバ 88 件全パス
+(新規 run モードテスト 8 件を含む)、コーパス 47/47。
+
 ---
 
 #### JIT の6ワード超引数 (Lane CM、2026-11-21)
