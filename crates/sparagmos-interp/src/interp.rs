@@ -6223,6 +6223,16 @@ pub(crate) fn project_value_ref<'a>(
                     ))
                 }
             },
+            RefProj::UnionField { .. } => {
+                // Same contract as `project_value`: union field
+                // reads need the program's scalar shapes and route
+                // through the typed projector (`project_value_t`).
+                return Err(InterpError::type_mismatch(
+                    format!("union field projection on {place}"),
+                    "a union field read through the typed projection path",
+                    "the untyped value projector",
+                ));
+            }
         }
     }
     Ok(Cow::Borrowed(cur))
