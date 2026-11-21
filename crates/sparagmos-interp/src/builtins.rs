@@ -1666,24 +1666,43 @@ impl<'a> Interpreter<'a> {
             Builtin::PartialCmp => {
                 arity(2)?;
                 let ord = self.values_cmp(frames, &vals[0], &vals[1], cmp_discriminants)?;
-                Ok(Value::Enum {
-                    variant: 1,
-                    fields: vec![ordering_value(ord)],
+                Ok(match ord {
+                    Some(ord) => Value::Enum {
+                        variant: 1,
+                        fields: vec![ordering_value(ord)],
+                    },
+                    None => Value::Enum {
+                        variant: 0,
+                        fields: vec![],
+                    },
                 })
             }
             Builtin::OrdCmp => {
                 arity(2)?;
                 let ord = self.values_cmp(frames, &vals[0], &vals[1], cmp_discriminants)?;
-                Ok(ordering_value(ord))
+                match ord {
+                    Some(ord) => Ok(ordering_value(ord)),
+                    // `Ord` is a total ordering: an unordered pair
+                    // (a NaN-carrying value) cannot reach a genuine
+                    // `Ord` implementation, so this stays explicit.
+                    None => Err(InterpError::type_mismatch(
+                        "Ord::cmp",
+                        "a total ordering",
+                        "an unordered value (NaN comparison)",
+                    )),
+                }
             }
             Builtin::PartialOrdRel(op) => {
                 arity(2)?;
                 let ord = self.values_cmp(frames, &vals[0], &vals[1], cmp_discriminants)?;
-                Ok(Value::Bool(match op {
-                    RelOp::Lt => ord == Ordering::Less,
-                    RelOp::Le => ord != Ordering::Greater,
-                    RelOp::Gt => ord == Ordering::Greater,
-                    RelOp::Ge => ord != Ordering::Less,
+                // An unordered pair makes every relational operator
+                // false, as `partial_cmp` returning `None` does.
+                Ok(Value::Bool(match (ord, op) {
+                    (Some(Ordering::Less), RelOp::Lt) => true,
+                    (Some(Ordering::Greater), RelOp::Gt) => true,
+                    (Some(Ordering::Less | Ordering::Equal), RelOp::Le) => true,
+                    (Some(Ordering::Greater | Ordering::Equal), RelOp::Ge) => true,
+                    _ => false,
                 }))
             }
             Builtin::CloneClone => {
@@ -2908,50 +2927,43 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         .unwrap_or(variant as i128)
 }
 
+    /// The comparison behind the `PartialOrd` / `Ord` builtins,
+    /// with `partial_cmp` semantics: the result is `None` when the
+    /// values are unordered (a float comparison involving NaN,
+    /// propagated out of the first field or element whose comparison
+    /// is unordered, exactly as a derived `partial_cmp` returns the
+    /// first non-`Equal` field result). Callers that need a total
+    /// ordering treat `None` as an error at their own site.
     pub(crate) fn values_cmp(
         &self,
         frames: &[Frame],
         a: &Value,
         b: &Value,
         discriminants: Option<&[i128]>,
-    ) -> InterpResult<Ordering> {
+    ) -> InterpResult<Option<Ordering>> {
         if matches!(a, Value::FatRef { .. }) || matches!(b, Value::FatRef { .. }) {
             let (ea, la) = self.slice_elements(frames, a)?;
             let (eb, lb) = self.slice_elements(frames, b)?;
             for (x, y) in ea.iter().zip(eb.iter()) {
                 match self.values_cmp(frames, x, y, None)? {
-                    Ordering::Equal => {}
+                    Some(Ordering::Equal) => {}
                     other => return Ok(other),
                 }
             }
-            return Ok(la.cmp(&lb));
+            return Ok(Some(la.cmp(&lb)));
         }
         let a = self.resolve_value(frames, a)?;
         let b = self.resolve_value(frames, b)?;
         Ok(match (&a, &b) {
-            (Value::Unit, Value::Unit) => Ordering::Equal,
-            (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-            (Value::Int(x), Value::Int(y)) => x.cmp(y),
-            (Value::Uint(x), Value::Uint(y)) => x.cmp(y),
-            (Value::Int(x), Value::Uint(y)) => int_uint_cmp(*x, *y),
-            (Value::Uint(x), Value::Int(y)) => int_uint_cmp(*y, *x).reverse(),
-            // Floats order by `partial_cmp`. A comparison involving
-            // NaN has no `Ordering`; the `PartialCmp` builtin wraps
-            // this result in `Some`, so the NaN case cannot be
-            // represented here and stays an explicit error rather
-            // than an invented ordering.
-            (Value::Float(x), Value::Float(y)) => match x.partial_cmp(y) {
-                Some(ord) => ord,
-                None => {
-                    return Err(InterpError::type_mismatch(
-                        "value comparison",
-                        "comparable values",
-                        "float and float (NaN has no ordering)",
-                    ))
-                }
-            },
-            (Value::Str(x), Value::Str(y)) => x.as_bytes().cmp(y.as_bytes()),
-            (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y),
+            (Value::Unit, Value::Unit) => Some(Ordering::Equal),
+            (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)),
+            (Value::Int(x), Value::Int(y)) => Some(x.cmp(y)),
+            (Value::Uint(x), Value::Uint(y)) => Some(x.cmp(y)),
+            (Value::Int(x), Value::Uint(y)) => Some(int_uint_cmp(*x, *y)),
+            (Value::Uint(x), Value::Int(y)) => Some(int_uint_cmp(*y, *x).reverse()),
+            (Value::Float(x), Value::Float(y)) => x.partial_cmp(y),
+            (Value::Str(x), Value::Str(y)) => Some(x.as_bytes().cmp(y.as_bytes())),
+            (Value::Bytes(x), Value::Bytes(y)) => Some(x.cmp(y)),
             (Value::Tuple(x), Value::Tuple(y)) => self.seq_cmp(frames, x, y)?,
             (
                 Value::Enum {
@@ -2966,7 +2978,7 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                 .cmp(&Self::cmp_discriminant(discriminants, *vb))
             {
                 Ordering::Equal => self.seq_cmp(frames, fa, fb)?,
-                other => other,
+                other => Some(other),
             },
             _ => {
                 return Err(InterpError::type_mismatch(
@@ -2978,14 +2990,19 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         })
     }
 
-    fn seq_cmp(&self, frames: &[Frame], a: &[Value], b: &[Value]) -> InterpResult<Ordering> {
+    fn seq_cmp(
+        &self,
+        frames: &[Frame],
+        a: &[Value],
+        b: &[Value],
+    ) -> InterpResult<Option<Ordering>> {
         for (x, y) in a.iter().zip(b.iter()) {
             match self.values_cmp(frames, x, y, None)? {
-                Ordering::Equal => {}
+                Some(Ordering::Equal) => {}
                 other => return Ok(other),
             }
         }
-        Ok(a.len().cmp(&b.len()))
+        Ok(Some(a.len().cmp(&b.len())))
     }
 
     /// The elements a slice-like value denotes, with its length: a
@@ -4127,6 +4144,8 @@ impl<'a> Interpreter<'a> {
         indent: usize,
     ) -> InterpResult<String> {
         match value {
+            // The unit value's Debug (and Display) text is `()`.
+            Value::Unit => Ok("()".to_string()),
             Value::Int(v) => {
                 if options.flags & DEBUG_LOWER_HEX != 0 {
                     Ok(format_int_radix(*v, Some(ty), 16, "0x", options))
@@ -4265,6 +4284,21 @@ impl<'a> Interpreter<'a> {
     ) -> InterpResult<String> {
         let items = match value {
             Value::Tuple(items) => items,
+            // A self-contained fat pointer (a slice constant, a
+            // materialised sub-slice) resolves to itself, so it can
+            // reach this formatter directly: its elements are the
+            // base's elements truncated to the carried length.
+            Value::FatRef { .. } => {
+                let (items, _) = self.slice_elements(frames, value)?;
+                return self.format_debug_seq_items(
+                    frames,
+                    &items,
+                    options,
+                    indent,
+                    open,
+                    close,
+                );
+            }
             Value::Bytes(b) => {
                 let items: Vec<Value> = b.iter().map(|byte| Value::Uint(*byte as u128)).collect();
                 return self.format_debug_seq_items(frames, &items, options, indent, open, close);
