@@ -1355,6 +1355,238 @@ fn run_mode_mem_drop_runs_destructors() {
     );
 }
 
+
+// ----- Box<dyn Fn> drop timing (Lane EV) --------------------------------------
+
+const BOX_DYN_FN_WHOLE_CAPTURE_SRC: &str = r#"
+struct M(i32, i32);
+impl M { fn get(&self) -> i32 { self.0 } }
+impl Drop for M { fn drop(&mut self) { println!("dtor {}", self.0); } }
+fn main() {
+    let m = M(7, 8);
+    let f: Box<dyn Fn(i32) -> i32> = Box::new(move |x| x + m.get());
+    println!("call {}", f(1));
+    drop(f);
+    println!("after drop");
+}
+"#;
+
+#[test]
+fn run_mode_box_dyn_fn_drop_runs_captured_dtor_at_drop() {
+    // The closure owns the captured `M` (the body uses the whole
+    // place through a method call, so edition-2021 disjoint capture
+    // still captures all of `m`): dropping the box at `drop(f)`
+    // runs the capture's destructor there, before the next
+    // statement — the native interleaving, byte for byte.
+    let dir = temp_dir("box-dyn-fn-drop");
+    let src = fixture(&dir, "box_dyn_fn_drop.rs", BOX_DYN_FN_WHOLE_CAPTURE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Box<dyn Fn> drop program must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "call 8\ndtor 7\nafter drop\n",
+        "the captured value's destructor runs at the explicit drop"
+    );
+}
+
+const BOX_DYN_FN_FIELD_CAPTURE_SRC: &str = r#"
+struct M(i32, i32);
+impl Drop for M { fn drop(&mut self) { println!("dtor {}", self.0); } }
+fn main() {
+    let m = M(7, 8);
+    let f: Box<dyn Fn(i32) -> i32> = Box::new(move |x| x + m.0);
+    println!("call {}", f(1));
+    drop(f);
+    println!("after drop");
+}
+"#;
+
+#[test]
+fn run_mode_box_dyn_fn_field_capture_dtor_stays_with_captured_place() {
+    // The same source means different captures in different
+    // editions, and the destructor follows the capture: in edition
+    // 2021 the closure captures only the place `m.0` (an `i32`
+    // copy), so `M` itself stays in `main` and its destructor runs
+    // at scope end, after the explicit drop of the box — exactly
+    // the native 2021 output. In edition 2015 the closure captures
+    // all of `m`, so the destructor runs at `drop(f)`. Both
+    // interleavings are pinned so a change in capture or drop
+    // semantics cannot silently move the destructor.
+    let dir = temp_dir("box-dyn-fn-field-capture");
+    let src = fixture(
+        &dir,
+        "box_dyn_fn_field_capture.rs",
+        BOX_DYN_FN_FIELD_CAPTURE_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "field-capture program must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "call 8\nafter drop\ndtor 7\n",
+        "edition 2021: only m.0 was captured, so M's destructor stays at scope end"
+    );
+    let out = run_driver_with_aux_specs(&src, Some("2015"), &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "field-capture program must terminate normally in edition 2015; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "call 8\ndtor 7\nafter drop\n",
+        "edition 2015: the whole M was captured, so its destructor runs at drop(f)"
+    );
+}
+
+const BOX_DYN_TRAIT_PAYLOAD_SRC: &str = r#"
+trait G { fn get(&self) -> i32; }
+struct M(i32);
+impl Drop for M { fn drop(&mut self) { println!("dtor {}", self.0); } }
+struct S { m: M }
+impl G for S { fn get(&self) -> i32 { self.m.0 } }
+fn main() {
+    let b: Box<dyn G> = Box::new(S { m: M(9) });
+    println!("get {}", b.get());
+    drop(b);
+    println!("after drop");
+}
+"#;
+
+#[test]
+fn run_mode_box_dyn_trait_drop_runs_payload_dtor_at_drop() {
+    // A `Box<dyn Trait>` whose payload is a plain ADT: the
+    // payload's field destructor runs at the explicit drop, as
+    // with the closure case.
+    let dir = temp_dir("box-dyn-trait-drop");
+    let src = fixture(&dir, "box_dyn_trait_drop.rs", BOX_DYN_TRAIT_PAYLOAD_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Box<dyn Trait> drop program must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "get 9\ndtor 9\nafter drop\n",
+        "the payload's destructor runs at the explicit drop"
+    );
+}
+
+const BOX_DYN_FNONCE_SRC: &str = r#"
+struct M(i32, i32);
+impl Drop for M { fn drop(&mut self) { println!("dtor {}", self.0); } }
+fn main() {
+    let m = M(7, 8);
+    let f: Box<dyn FnOnce(i32) -> i32> = Box::new(move |x| { let mm = m; x + mm.0 });
+    println!("made");
+    drop(f);
+    println!("after drop");
+}
+"#;
+
+#[test]
+fn run_mode_box_dyn_fnonce_uncalled_drop_runs_captured_dtor() {
+    // An uncalled `Box<dyn FnOnce>` still owns its capture:
+    // dropping the box runs the captured value's destructor at
+    // the drop, even though the closure body (which would have
+    // moved the capture out) never ran.
+    let dir = temp_dir("box-dyn-fnonce-drop");
+    let src = fixture(&dir, "box_dyn_fnonce_drop.rs", BOX_DYN_FNONCE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Box<dyn FnOnce> drop program must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "made\ndtor 7\nafter drop\n",
+        "the uncalled FnOnce capture's destructor runs at the explicit drop"
+    );
+}
+
+const BOX_DYN_FN_INNER_SCOPE_SRC: &str = r#"
+struct M(i32, i32);
+impl M { fn get(&self) -> i32 { self.0 } }
+impl Drop for M { fn drop(&mut self) { println!("dtor {}", self.0); } }
+fn main() {
+    let m = M(7, 8);
+    let f: Box<dyn Fn(i32) -> i32> = Box::new(move |x| x + m.get());
+    println!("call {}", f(1));
+    { let _g = f; println!("in inner"); }
+    println!("after inner");
+}
+"#;
+
+#[test]
+fn run_mode_box_dyn_fn_moved_into_inner_scope_drops_at_inner_end() {
+    // Moving the box into an inner scope moves the capture's
+    // destructor with it: it runs at the inner scope's end (the
+    // `Drop` terminator for the moved-to local), not at the
+    // outer function's end.
+    let dir = temp_dir("box-dyn-fn-inner-scope");
+    let src = fixture(&dir, "box_dyn_fn_inner_scope.rs", BOX_DYN_FN_INNER_SCOPE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "inner-scope program must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "call 8\nin inner\ndtor 7\nafter inner\n",
+        "the destructor runs at the inner scope's end"
+    );
+}
+
+const SIZED_CLOSURE_DROP_SRC: &str = r#"
+struct M(i32, i32);
+impl M { fn get(&self) -> i32 { self.0 } }
+impl Drop for M { fn drop(&mut self) { println!("dtor {}", self.0); } }
+fn main() {
+    let m = M(7, 8);
+    let c = move |x| x + m.get();
+    println!("call {}", c(1));
+    drop(c);
+    println!("after drop c");
+}
+"#;
+
+#[test]
+fn run_mode_sized_closure_drop_runs_captured_dtor_at_drop() {
+    // The sized counterpart of the `Box<dyn Fn>` case: an explicit
+    // drop of the closure value itself runs its capture's
+    // destructor at the drop.
+    let dir = temp_dir("sized-closure-drop");
+    let src = fixture(&dir, "sized_closure_drop.rs", SIZED_CLOSURE_DROP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "sized closure drop program must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "call 8\ndtor 7\nafter drop c\n",
+        "the sized closure's captured destructor runs at the explicit drop"
+    );
+}
+
 // ----- generic function definitions (Lane BA) --------------------------------
 
 const GENERIC_CALLS_SRC: &str = r#"
