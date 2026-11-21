@@ -1017,6 +1017,15 @@ impl<'a> Interpreter<'a> {
                                 work.push((sub, P::Untyped));
                             }
                         }
+                        // An enum with no fields has no contents
+                        // whose glue could hide here (its own
+                        // destructor, if any, is a separate plan
+                        // node): nothing to judge, like an empty
+                        // tuple. Typed zero-sized constants make
+                        // this shape common — a fieldless variant
+                        // written by an aggregate and never
+                        // projected lands here with an untyped plan.
+                        Some(Value::Enum { fields, .. }) if fields.is_empty() => {}
                         Some(Value::Enum { .. }) | Some(Value::Coroutine { .. }) => {
                             return Err(InterpError::UnsupportedTerminator {
                                 kind: "Drop".to_string(),
