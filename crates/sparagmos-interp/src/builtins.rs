@@ -3721,6 +3721,32 @@ impl<'a> Interpreter<'a> {
         }
         let a = self.resolve_value(frames, a)?;
         let b = self.resolve_value(frames, b)?;
+        // A `dyn Trait` value denotes its concrete pointee: two
+        // trait objects compare equal when their concrete types
+        // agree and the pointees compare equal, and unequal when
+        // the concrete types differ -- the semantics a hand-written
+        // `PartialEq for dyn Trait` computes. For the primitive
+        // `PartialEq` supertrait comparisons (the trait-upcasting
+        // tests, whose concrete type is `i32`) the structural
+        // comparison of the pointee is the concrete type's own
+        // `PartialEq`; for a user-defined `PartialEq` the builtin's
+        // structural evaluation is the same policy the model applies
+        // to direct calls. A dyn side against a sized side compares
+        // the pointee against that side.
+        if matches!(a, Value::DynRef { .. }) || matches!(b, Value::DynRef { .. }) {
+            if let (
+                Value::DynRef { concrete: ca, .. },
+                Value::DynRef { concrete: cb, .. },
+            ) = (&a, &b)
+            {
+                if ca != cb {
+                    return Ok(false);
+                }
+            }
+            let pa = self.dyn_pointee(frames, &a)?;
+            let pb = self.dyn_pointee(frames, &b)?;
+            return self.values_equal(frames, &pa, &pb);
+        }
         // A side that resolves to a self-contained fat value (a
         // slice constant or materialised sub-slice held in a local)
         // compares as a slice against the other side's elements:
@@ -3801,6 +3827,25 @@ impl<'a> Interpreter<'a> {
                 ))
             }
         })
+    }
+
+    /// The concrete value a `dyn Trait` value denotes: the
+    /// pointee of its data pointer. A box-shaped base (the
+    /// one-field handle aggregate a `Box` / `Rc` / `Arc` coercion
+    /// records, the same judgment the dereference of a dyn fat
+    /// pointer makes) holds the pointee as its only field; a
+    /// reference or slice base resolves to the value it points at.
+    /// A non-dyn value denotes itself. An upcast chain (a box
+    /// whose field is itself a `DynRef`) yields that `DynRef`,
+    /// which the caller's recursion unwraps one layer at a time.
+    fn dyn_pointee(&self, frames: &[Frame], value: &Value) -> InterpResult<Value> {
+        match value {
+            Value::DynRef { base, .. } => match &**base {
+                Value::Enum { fields, .. } if fields.len() == 1 => Ok(fields[0].clone()),
+                _ => self.resolve_value(frames, base),
+            },
+            other => Ok(other.clone()),
+        }
     }
 
     fn seq_equal(&self, frames: &[Frame], a: &[Value], b: &[Value]) -> InterpResult<bool> {
