@@ -258,3 +258,125 @@ fn collected_hashmap_new_converts() {
         "allocated constant still unsupported:\n{stdout}"
     );
 }
+
+// ----- Lane CE: by-reference constant shapes ---------------------
+
+fn run_ok(name: &str, src: &str) {
+    let fixture = write_fixture(name, src);
+    let (stdout, stderr, status) = run_driver(&["run"], &fixture);
+    assert!(
+        status.success(),
+        "run failed ({status:?}): {stdout} {stderr}"
+    );
+    assert!(
+        stdout.contains("ok"),
+        "expected ok output, got: {stdout} {stderr}"
+    );
+}
+
+const NEG_DISCR_RS: &str = "\
+#[derive(PartialEq, Debug)]
+enum E { A = -1, B = 0, C = 1 }
+const X: &E = &E::A;
+const Y: &E = &E::C;
+fn main() {
+    assert_eq!(*X, E::A);
+    assert_eq!(*Y, E::C);
+    assert_ne!(*X, *Y);
+    println!(\"ok\");
+}
+";
+
+#[test]
+fn negative_discriminant_reference_constant_runs() {
+    // The stored tag of a negative discriminant is the bit pattern
+    // in the discriminant type's own width; matching it against the
+    // zero-extended `Discriminant::val` used to fail every such
+    // constant into the by-reference fallback.
+    run_ok("neg_discr", NEG_DISCR_RS);
+}
+
+const FN_PTR_TABLE_RS: &str = "\
+struct VTable { make: fn() -> u32, size: usize }
+fn mk() -> u32 { 7 }
+const VT: &VTable = &VTable { make: mk, size: 3 };
+fn main() {
+    assert_eq!((VT.make)(), 7);
+    assert_eq!(VT.size, 3);
+    println!(\"ok\");
+}
+";
+
+#[test]
+fn fn_pointer_table_constant_runs() {
+    // A vtable-shaped static: an ADT constant behind a reference
+    // whose fields are function pointers (the RawWakerVTable shape).
+    run_ok("fn_table", FN_PTR_TABLE_RS);
+}
+
+const FN_UNDER_CAST_RS: &str = "\
+fn target() {}
+const P: *const u8 = target as *const u8;
+const Q: *const u8 = target as *const u8;
+fn main() {
+    assert_eq!(P, Q);
+    assert!(!P.is_null());
+    println!(\"ok\");
+}
+";
+
+#[test]
+fn function_pointer_under_cast_constant_runs() {
+    // A pointer to a function item stored under a data-pointer
+    // cast: the pointee is a function allocation, and the value is
+    // the callable itself.
+    run_ok("fn_cast", FN_UNDER_CAST_RS);
+}
+
+const DANGLING_RS: &str = "\
+use std::ptr::NonNull;
+const D: NonNull<u8> = NonNull::dangling();
+const D2: NonNull<u8> = NonNull::dangling();
+fn main() {
+    assert_eq!(D, D2);
+    println!(\"ok\");
+}
+";
+
+#[test]
+fn dangling_pointer_constant_runs() {
+    // A dangling pointer constant has no provenance; the stored
+    // integer is the address itself.
+    run_ok("dangling", DANGLING_RS);
+}
+
+const TYPEID_RS: &str = "\
+use std::any::TypeId;
+fn main() {
+    assert_eq!(TypeId::of::<u32>(), TypeId::of::<u32>());
+    assert_ne!(TypeId::of::<u32>(), TypeId::of::<u64>());
+    println!(\"ok\");
+}
+";
+
+#[test]
+fn type_id_constant_runs() {
+    run_ok("typeid", TYPEID_RS);
+}
+
+const STR_NEWTYPE_RS: &str = "\
+#[repr(transparent)]
+struct Wrapper(str);
+const W: &Wrapper = unsafe { &*(\"abc\" as *const str as *const Wrapper) };
+fn main() {
+    assert_eq!(W.0.len(), 3);
+    println!(\"ok\");
+}
+";
+
+#[test]
+fn trailing_str_field_constant_runs() {
+    // An ADT whose trailing field is unsized `str`: the field's
+    // bytes run to the end of the allocation.
+    run_ok("str_newtype", STR_NEWTYPE_RS);
+}
