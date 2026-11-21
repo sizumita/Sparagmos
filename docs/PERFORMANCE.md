@@ -279,3 +279,32 @@ rescue for never-written fields, so read semantics are
 unchanged. Semantics are unchanged: the full test suites
 pass and the subset flip-diff for this integration is
 recorded with it.
+
+## Update 2026-11-22 (gpu-3070): pre-decode dispatch layer
+
+Statement execution now runs through a per-body pre-decode
+cache (keyed by body address): projection-free locals are
+accessed by direct slot, projections and place descriptions
+are pre-resolved/prebuilt, constants are pre-evaluated
+(except static references), and `SwitchInt` uses binary
+search when all patterns are unique. Shapes the decoder
+does not specialise delegate to the same engine functions
+as before; there is no second execution path. A function
+pointer dispatch table was prototyped and measured slower
+than the match it would replace (54.56 ns/op against
+53.87 ns/op), so the match stays; the prototype remains as
+an ignored test in decode.rs.
+
+Bench-helper medians against the pre-pass tree:
+
+| kernel | speedup |
+|---|---|
+| loop_sum | 1.64x |
+| string_concat | 1.52x |
+| fib_rec | 1.32x |
+| matmul | 1.30x |
+| vec_push_sum | 1.26x |
+| statement-heavy small kernels | 1.44-1.47x |
+
+Call- and builtin-heavy kernels are unchanged (about 1.0x),
+as expected: their cost sits below the statement layer.
