@@ -126,6 +126,11 @@ struct Collected {
     /// library body that stays unconverted does not make the
     /// target crate's compilation incomplete.
     local_report_count: usize,
+    /// A monomorphization failure rustc would have reported for
+    /// this program (see `sparagmos_driver::mono_check`), detected
+    /// after conversion. When set, the compilation as a whole has
+    /// failed even though every converted body translated cleanly.
+    compile_error: Option<String>,
 }
 
 static COLLECTED: OnceLock<Mutex<Option<Collected>>> = OnceLock::new();
@@ -1527,6 +1532,16 @@ fn collect() -> ControlFlow<()> {
 
 
 
+    // Monomorphization checks rustc runs after MIR conversion
+    // (invalid SIMD intrinsic instantiations and SIMD layouts):
+    // a failure here fails the whole compilation, the way the
+    // corresponding rustc error does. The scan covers the Stable
+    // MIR bodies conversion walked (local seeds, demanded
+    // instances, and the reachability frontier); auxiliary-crate
+    // bodies converted by the loop above are not retained in that
+    // set and are not scanned.
+    let compile_error = sparagmos_driver::mono_check::check_bodies(&alias_sources);
+
     stash(Collected {
         report,
         bodies,
@@ -1536,6 +1551,7 @@ fn collect() -> ControlFlow<()> {
         local_report_count,
         def_names: conv.def_names.clone(),
         adt_discriminants: conv.adt_discriminants.clone(),
+        compile_error,
     });
     ControlFlow::Continue(())
 }
@@ -2077,6 +2093,12 @@ fn main() {
     let collected = take();
     match (result, collected) {
         (Ok(()), Some(c)) => {
+            if let Some(e) = &c.compile_error {
+                eprintln!("sparagmos-driver: compilation failed: {e}");
+                // Same contract as a front-end failure: exit 1 in
+                // convert mode, exit 2 (unsupported) in run mode.
+                std::process::exit(if run_mode { 2 } else { 1 });
+            }
             if run_mode {
                 if let Some(path) = &dump_path {
                     let text =
