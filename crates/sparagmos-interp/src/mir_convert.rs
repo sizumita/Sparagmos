@@ -1157,7 +1157,19 @@ impl<'a> Converter<'a> {
                     let mut fields = Vec::with_capacity(variant_fields.len());
                     let mut inhabited = true;
                     for (fi, fty) in variant_fields.iter().enumerate() {
-                        let fty = subst_ty(fty, args);
+                        // A field type recovered from a projection
+                        // in some body is already instantiated for
+                        // this `args`; the shape's declared type is
+                        // in terms of the definition's parameters,
+                        // whose indices also count lifetimes and
+                        // consts that the converted argument list
+                        // omits, so substitution can misalign.
+                        // Prefer the recovered type when one exists.
+                        let fty = self
+                            .adt_fields
+                            .get(*def, args, vi as u32, fi as u32)
+                            .cloned()
+                            .unwrap_or_else(|| subst_ty(fty, args));
                         match self.unique_value(&fty, depth + 1) {
                             UniqueValue::One(v) => fields.push(v),
                             UniqueValue::Uninhabited => {
