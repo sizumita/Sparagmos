@@ -2338,13 +2338,26 @@ impl<'a> Interpreter<'a> {
             local: place.local.0,
             projection: Vec::new(),
         };
+        // The length a `Deref` step through a fat pointer carries:
+        // dereferencing a sub-slice reference reaches the base
+        // place, whose own length is longer, so the fat length is
+        // kept alongside and applied to the immediately following
+        // index step (the only step it can bound).
+        let mut fat_cap: Option<u128> = None;
         for elem in &place.projection {
             cur = match elem {
                 ProjectionElem::Field(idx) => {
+                    fat_cap = None;
                     self.project_step(frames, cur, RefProj::Field(*idx), body, place)?
                 }
                 ProjectionElem::Index(local) => {
                     let idx = self.read_index_local(frames, body, *local, place)?;
+                    if let Some(cap) = fat_cap {
+                        if idx as u128 >= cap {
+                            return Err(index_oob(cap as usize, idx));
+                        }
+                    }
+                    fat_cap = None;
                     self.project_step(frames, cur, RefProj::Index(idx), body, place)?
                 }
                 ProjectionElem::ConstantIndex { offset, from_end } => {
@@ -2358,10 +2371,14 @@ impl<'a> Interpreter<'a> {
                                 "value without a length",
                             )
                         })?;
+                    let len = fat_cap.unwrap_or(len);
+                    fat_cap = None;
                     let idx = if *from_end {
                         len.checked_sub(*offset as u128).ok_or_else(|| {
                             index_oob(len as usize, *offset as usize)
                         })?
+                    } else if *offset as u128 >= len {
+                        return Err(index_oob(len as usize, *offset as usize));
                     } else {
                         *offset as u128
                     };
@@ -2373,15 +2390,45 @@ impl<'a> Interpreter<'a> {
                     self.project_step(frames, cur, RefProj::Index(idx), body, place)?
                 }
                 ProjectionElem::Downcast(variant) => {
+                    fat_cap = None;
                     self.project_step(frames, cur, RefProj::Downcast(*variant), body, place)?
                 }
                 ProjectionElem::Deref => {
                     let value = self.read_resolved(frames, &cur)?;
+                    fat_cap = match &value {
+                        Value::FatRef { len, .. } => Some(*len),
+                        _ => None,
+                    };
                     self.deref_value(frames, &value)?
                 }
             };
         }
         Ok(cur)
+    }
+
+    /// The length carried by the fat pointer a place's final
+    /// `Deref` step traverses (`(*p)` where `p` holds a fat
+    /// reference), when there is one. Resolving that place reaches
+    /// the base place and loses the fat length, so consumers that
+    /// need the pointee's own length (`Len`, reference formation)
+    /// recover it here from the pointer value itself.
+    fn fat_deref_len(
+        &self,
+        frames: &[Frame],
+        body: &Body,
+        place: &Place,
+    ) -> Option<u128> {
+        if !matches!(place.projection.last(), Some(ProjectionElem::Deref)) {
+            return None;
+        }
+        let prefix = Place {
+            local: place.local,
+            projection: place.projection[..place.projection.len() - 1].to_vec(),
+        };
+        match self.read_place(frames, body, &prefix) {
+            Ok(Value::FatRef { len, .. }) => Some(len),
+            _ => None,
+        }
     }
 
     fn project_step(
@@ -3677,9 +3724,11 @@ impl<'a> Interpreter<'a> {
                     Some(Ty::Ref(inner))
                         if matches!(&**inner, Ty::Slice(_) | Ty::Str) =>
                     {
-                        self.read_resolved(frames, &target)
-                            .ok()
-                            .and_then(|v| v.len())
+                        self.fat_deref_len(frames, body, place).or_else(|| {
+                            self.read_resolved(frames, &target)
+                                .ok()
+                                .and_then(|v| v.len())
+                        })
                     }
                     _ => None,
                 };
@@ -3708,7 +3757,12 @@ impl<'a> Interpreter<'a> {
             }
             Rvalue::Len(place) => {
                 let value = self.read_place(frames, body, place)?;
-                let len = value.len().ok_or_else(|| {
+                let len = self.fat_deref_len(frames, body, place);
+                let len = match len {
+                    Some(len) => Some(len),
+                    None => value.len(),
+                };
+                let len = len.ok_or_else(|| {
                     InterpError::type_mismatch(
                         format!("Len of {place}"),
                         "array, slice or string value",
