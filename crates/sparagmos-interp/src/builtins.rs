@@ -6754,6 +6754,32 @@ impl<'a> Interpreter<'a> {
             // formatter models.
             if trait_ == FmtTrait::Debug {
                 let pointee = self.resolve_value(frames, base)?;
+                // The base is the data pointer in the shape the
+                // sized value had: a `Box<dyn Trait>` base is the
+                // box aggregate (a one-field wrapper around the
+                // pointee reference) and an `Rc`/`Arc` base is the
+                // handle, so shape the value the way method
+                // dispatch shapes its receiver (see
+                // `ref_shaped_receiver` in the interpreter).
+                let pointee = if let Some(id) = rc_handle_id(&pointee) {
+                    Value::Ref(RefTarget::Alloc {
+                        id,
+                        projection: vec![RefProj::Field(2)],
+                    })
+                } else if let Value::Enum { fields, .. } = &pointee {
+                    if fields.len() == 1
+                        && matches!(
+                            fields[0],
+                            Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. }
+                        )
+                    {
+                        fields[0].clone()
+                    } else {
+                        pointee
+                    }
+                } else {
+                    pointee
+                };
                 return self.format_value(frames, &pointee, trait_, concrete, options, indent);
             }
         }
