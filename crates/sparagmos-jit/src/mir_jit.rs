@@ -116,9 +116,11 @@
 //! pointer casts and the array-to-slice `Unsize` coercion, `Len`,
 //! tuple aggregates, fieldless ADT aggregates, `Repeat`,
 //! `Discriminant`, `SetDiscriminant`; `Goto`, `SwitchInt`, `Call`
-//! (within the program, up to six register words of arguments,
-//! and results of up to two words — a fat pointer or a pair —
-//! returned in RAX/RDX, the System V pair-return convention),
+//! (within the program, any number of argument words — the first
+//! six in the System V registers, the rest on the stack; see
+//! [`arg_word_layout`] for the exact contract — and results of up
+//! to two words — a fat pointer or a pair — returned in RAX/RDX,
+//! the System V pair-return convention),
 //! `Assert`, `Drop`, `Return`, `Unreachable` (as a guest panic).
 //! Anything else — `f16` / `f128`, 128-bit integers, references
 //! to trait objects, ADT payloads, `Subslice`, a second dynamic
@@ -299,10 +301,15 @@ impl JitProgram {
         self.names.iter().map(|s| s.as_str()).collect()
     }
 
-    /// Call the function called `name` with one word per scalar
-    /// leaf of each MIR parameter, in order (unit parameters are
-    /// passed as a dummy 0 word and ignored; a fat pointer
-    /// parameter is two words: the address, then the length).
+    /// Call the function called `name` with the function's
+    /// argument words in layout order (see [`arg_word_layout`]):
+    /// one word per scalar leaf of each MIR parameter, in order
+    /// (unit parameters are passed as a dummy 0 word and ignored; a
+    /// fat pointer parameter is two words: the address, then the
+    /// length; a two-word parameter that would straddle the
+    /// register/stack boundary is preceded by a pad 0 word, so the
+    /// slice length is the function's parameter word count, pads
+    /// included). Words past the sixth travel on the stack.
     /// Arguments are the parameters' canonical 64-bit representations
     /// (sign-extended for signed types). The result is the return
     /// value's canonical representation (0 for a unit return).
@@ -391,6 +398,40 @@ impl MsgTable {
 // ---------------------------------------------------------------------------
 // Type helpers
 // ---------------------------------------------------------------------------
+
+/// The argument word layout: where each MIR argument's words sit
+/// in the flat word sequence a call passes and a callee's prologue
+/// reads. This is the single contract both sides compute — the
+/// caller in `lower_call`, the callee in `FnLower::run` — from the
+/// callee's parameter types (via [`flatten`]), so the two always
+/// agree.
+///
+/// * Arguments are laid out in order, one flat word per scalar leaf.
+/// * A zero-word argument (unit, never) still occupies one dummy
+///   word, whose value nobody reads.
+/// * A two-word argument (a fat reference, a two-scalar pair) is
+///   never split across the register/stack boundary: if it would
+///   start at word 5 — the last register word — one pad word is
+///   inserted before it, so the pair lies entirely on the stack.
+/// * Words 0..6 travel in the System V argument registers, words
+///   6.. on the stack in order (word 6 at the lowest address).
+///
+/// Returns `(start word of each argument, total word count)`; the
+/// total is the function's IR `param_count`, dummies and pads
+/// included.
+fn arg_word_layout(counts: &[usize]) -> (Vec<usize>, usize) {
+    let mut starts = Vec::with_capacity(counts.len());
+    let mut word = 0usize;
+    for &count in counts {
+        let width = count.max(1);
+        if width == 2 && word == 5 {
+            word += 1; // pad: keep the pair off the register/stack seam
+        }
+        starts.push(word);
+        word += width;
+    }
+    (starts, word)
+}
 
 /// Bit width of an integer type on this 64-bit target.
 fn int_bits(it: mir::IntTy) -> u32 {
@@ -869,22 +910,31 @@ impl<'a> FnLower<'a> {
         // model). The return place and the remaining locals follow.
         let arg_count = body.arg_count;
         self.local_slots = vec![(0, 0); body.local_decls.len()];
-        // The IR parameter count: one register word per leaf of
-        // each argument (a unit argument still occupies a dummy
-        // word, as before; a fat argument occupies two).
-        let mut ir_param_count = 0usize;
+        // The IR parameter layout: one word per leaf of each
+        // argument, laid out by `arg_word_layout` (a unit argument
+        // still occupies a dummy word; a fat argument occupies two;
+        // a pair that would straddle the register/stack boundary is
+        // preceded by a pad word, which gets a slot nobody reads).
+        let mut counts = Vec::with_capacity(arg_count);
         for idx in 1..=arg_count {
             let decl = &body.local_decls[idx];
             let count = flatten(&decl.ty, &self.func.name)?;
             if count > 2 {
                 return Err(self.err("function argument with more than two words"));
             }
+            counts.push(count);
+        }
+        let (starts, ir_param_count) = arg_word_layout(&counts);
+        for (idx, &count) in (1..=arg_count).zip(counts.iter()) {
+            let start = starts[idx - 1];
+            while (self.next_value as usize) < start {
+                self.fresh(); // the pad word's slot
+            }
             let slot = self.fresh();
             for _ in 1..count.max(1) {
                 self.fresh();
             }
             self.local_slots[idx] = (slot, count);
-            ir_param_count += count.max(1);
         }
         for idx in std::iter::once(0).chain(arg_count + 1..body.local_decls.len()) {
             let decl = &body.local_decls[idx];
@@ -3239,10 +3289,27 @@ impl<'a> FnLower<'a> {
         if args.len() != callee_tys.len() {
             return Err(self.err("call argument count does not match the callee"));
         }
+        // Lay the argument words out by the shared contract
+        // (`arg_word_layout`): a unit argument contributes a dummy
+        // zero word, and a pad zero word precedes a pair that would
+        // straddle the register/stack boundary. Words past the
+        // sixth travel on the stack; the backend call handles them.
+        let mut counts = Vec::with_capacity(callee_tys.len());
+        for pty in callee_tys.iter() {
+            let count = flatten(pty, &self.func.name)?;
+            if count > 2 {
+                return Err(self.err("call with an argument of more than two words"));
+            }
+            counts.push(count);
+        }
+        let (starts, _) = arg_word_layout(&counts);
         let mut ir_args: Vec<IrOperand> = Vec::new();
-        for (arg, pty) in args.iter().zip(callee_tys.iter()) {
-            match flatten(pty, &self.func.name)? {
-                0 => { /* unit argument: passed as a dummy register, skipped here */ }
+        for (i, (arg, pty)) in args.iter().zip(callee_tys.iter()).enumerate() {
+            while ir_args.len() < starts[i] {
+                ir_args.push(IrOperand::Const(0)); // the pad word
+            }
+            match counts[i] {
+                0 => ir_args.push(IrOperand::Const(0)), // unit: the dummy word
                 1 => {
                     let v = self.operand_value(arg, pty)?;
                     ir_args.push(IrOperand::Value(v));
@@ -3252,11 +3319,8 @@ impl<'a> FnLower<'a> {
                     ir_args.push(IrOperand::Value(a));
                     ir_args.push(IrOperand::Value(b));
                 }
-                _ => return Err(self.err("call with an argument of more than two words")),
+                _ => unreachable!("argument word count checked above"),
             }
-        }
-        if ir_args.len() > 6 {
-            return Err(self.err("call with more than 6 arguments"));
         }
         // A call whose destination is in memory (`*p = f()`)
         // receives into a scratch slot and stores through the
