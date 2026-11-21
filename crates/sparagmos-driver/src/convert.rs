@@ -107,6 +107,26 @@ pub struct Converter {
     /// Declared types of the target crate's statics, recorded by
     /// the item scan before conversion (`note_static_ty`).
     static_tys: HashMap<sm::DefId, rustc_public::ty::Ty>,
+    /// Definition-location stamps of the `#[track_caller]`
+    /// instances registered so far, keyed by the instance's
+    /// Sparagmos `DefId` (see `note_track_caller_instance`).
+    /// Handed to the interpreter with the converted program: a
+    /// call that reaches a track-caller body through a shim (a
+    /// function pointer, a vtable slot) carries no call-site
+    /// stamp, and the interpreter binds this definition stamp
+    /// instead, which is the location the compiler's shim
+    /// presents to the callee.
+    pub track_caller_defs: HashMap<sm::DefId, sm::ConstValue>,
+    /// The location stamps of the `Fn` / `FnMut` / `FnOnce`
+    /// vtable shims — the trait method definitions in core,
+    /// which compiler-generated `Fn` impls are attributed to —
+    /// recorded by the dyn demand pass (see
+    /// `note_fn_shim_location`). Index 0 is `call`, 1 is
+    /// `call_mut`, 2 is `call_once`.
+    pub fn_shim_locations: [Option<sm::ConstValue>; 3],
+    /// Reentrancy guard for `note_track_caller_instance`: the
+    /// stamp decode itself resolves (and registers) instances.
+    noting_track_caller: bool,
     /// Unsupported hits of the function currently being converted.
     errors: Vec<String>,
 }
@@ -409,6 +429,9 @@ impl Converter {
             adt_niches: sm::AdtNiches::new(),
             instance_shape_attempted: std::collections::HashSet::new(),
             static_tys: HashMap::new(),
+            track_caller_defs: HashMap::new(),
+            fn_shim_locations: [None, None, None],
+            noting_track_caller: false,
             errors: Vec::new(),
         }
     }
@@ -498,7 +521,106 @@ impl Converter {
         let idx = self.def_names.len() as u32;
         self.instance_ids.insert(key, idx);
         self.def_names.push(through.name());
-        sm::DefId::new(0, idx)
+        let id = sm::DefId::new(0, idx);
+        self.note_track_caller_instance(id, inst);
+        id
+    }
+
+    /// If `inst` is a `#[track_caller]` instance with a body,
+    /// record its definition-location stamp (see
+    /// `track_caller_defs`). Runs once per registered instance —
+    /// every instance resolution in the driver flows through
+    /// `instance_def_id`, so every track-caller body the program
+    /// can enter is recorded, whether it is ever called directly
+    /// or only reached through a function pointer or a vtable.
+    fn note_track_caller_instance(&mut self, id: sm::DefId, inst: &Instance) {
+        if self.noting_track_caller || !inst.requires_caller_location() {
+            return;
+        }
+        // A virtual instance has no body of its own to take a
+        // definition span from (asking the compiler for one is
+        // an ICE); the impl instances a dispatch can land on
+        // are registered separately and carry the stamps.
+        if matches!(inst.kind, InstanceKind::Virtual { .. }) {
+            return;
+        }
+        self.noting_track_caller = true;
+        let stamp = std::panic::catch_unwind(
+            std::panic::AssertUnwindSafe(|| {
+                inst.body()
+                    .and_then(|body| self.def_location_stamp(&body))
+            }),
+        )
+        .ok()
+        .flatten();
+        self.noting_track_caller = false;
+        if let Some(stamp) = stamp {
+            self.track_caller_defs.insert(id, stamp);
+        }
+    }
+
+    /// The `&'static Location` of a body's own definition: the
+    /// stamp the compiler's call shims present to a
+    /// `#[track_caller]` callee entered without a call-site
+    /// stamp. Computed with the compiler's own resolution over
+    /// a terminator of the body re-spanned to the body's
+    /// definition span (the same fabrication
+    /// `caller_location_stamp` performs for call sites, whose
+    /// terminator already carries the call span).
+    fn def_location_stamp(&mut self, body: &mir::Body) -> Option<sm::ConstValue> {
+        let mut term = body.blocks.first()?.terminator.clone();
+        term.source_info.span = body.span;
+        let stamp = self.call_site_stamp(body, &term)?;
+        Some(stamp)
+    }
+
+    /// Decode the caller-location stamp the compiler resolves
+    /// for the call edge `term` of `body` (see
+    /// `caller_location_stamp` for the call-site use).
+    fn call_site_stamp(
+        &mut self,
+        body: &mir::Body,
+        term: &mir::Terminator,
+    ) -> Option<sm::ConstValue> {
+        let mc = body.caller_location(term, None);
+        let constant = self.constant(&mir::ConstOperand {
+            span: term.source_info.span,
+            user_ty: None,
+            const_: mc,
+        });
+        match constant.literal {
+            sm::ConstKind::Value(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Record the location stamp of one `Fn`-family vtable
+    /// shim: the stamp of the shim body's own call into the
+    /// callable body, which is the location a track-caller
+    /// closure entered through a `dyn` receiver observes (the
+    /// compiler attributes the generated `Fn` impl to the trait
+    /// method's definition in core). `kind` is 0 for `call`, 1
+    /// for `call_mut`, 2 for `call_once`. The first shim seen
+    /// for a kind wins: the location is a property of the trait
+    /// method, not of the callable.
+    pub fn note_fn_shim_location(&mut self, kind: usize, shim_body: &mir::Body) {
+        if self.fn_shim_locations[kind].is_some() || self.noting_track_caller {
+            return;
+        }
+        self.noting_track_caller = true;
+        let stamp = shim_body
+            .blocks
+            .iter()
+            .filter_map(|b| match &b.terminator.kind {
+                mir::TerminatorKind::Call { .. } => Some(&b.terminator),
+                _ => None,
+            })
+            .next()
+            .and_then(|term| self.call_site_stamp(shim_body, term));
+        self.noting_track_caller = false;
+        if let Some(stamp) = stamp {
+            self.fn_shim_locations[kind] = Some(stamp);
+        }
     }
 
     /// The Sparagmos `DefId` for an `FnDef` type as it appears in a
@@ -726,7 +848,16 @@ impl Converter {
                 return None;
             }
         }
-        let mc = body.caller_location(term, None);
+        // The location of a call is the span of its function
+        // operand (the `fn_span` the compiler recorded for the
+        // call): for a free function that is the call
+        // expression's own start, and for a method call it is
+        // the method name — the terminator's own span covers
+        // the whole receiver expression and would name the
+        // receiver instead.
+        let mut term = term.clone();
+        term.source_info.span = c.span;
+        let mc = body.caller_location(&term, None);
         let constant = self.constant(&mir::ConstOperand {
             span: term.source_info.span,
             user_ty: None,

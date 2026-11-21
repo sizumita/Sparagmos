@@ -165,6 +165,15 @@ struct Collected {
     /// with the user's own `main`; run mode enters through this
     /// id, never through the name alone.
     entry_def_id: Option<sparagmos_mir::DefId>,
+    /// Definition-location stamps of the program's
+    /// `#[track_caller]` instances (see
+    /// `Converter::track_caller_defs`), for the interpreter.
+    track_caller_defs:
+        std::collections::HashMap<sparagmos_mir::DefId, sparagmos_mir::ConstValue>,
+    /// The `Fn` / `FnMut` / `FnOnce` vtable-shim location
+    /// stamps (see `Converter::fn_shim_locations`), for the
+    /// interpreter.
+    fn_shim_locations: [Option<sparagmos_mir::ConstValue>; 3],
 }
 
 static COLLECTED: OnceLock<Mutex<Option<Collected>>> = OnceLock::new();
@@ -1805,6 +1814,49 @@ const MAX_DEMANDED_DYN_BODIES: usize = 256;
 /// caller credits it in the demand accounting once the demand
 /// passes have run (see the call sites in `collect`).
 #[allow(clippy::too_many_arguments)]
+/// Record the location stamp of the `Fn`-family vtable shim
+/// for the trait reference `tr` (whose `Self` is a concrete
+/// callable type), if this trait is one of the `Fn` traits and
+/// its shim location is not recorded yet. The vtable's method
+/// entry for the trait's own call method is the shim instance;
+/// its body is the generated shim, and the stamp of the shim's
+/// call into the callable body is the trait method's definition
+/// location in core.
+fn note_fn_shim(
+    conv: &mut Converter,
+    tr: &rustc_public::ty::TraitRef,
+) {
+    let (kind, method) = match tr.def_id.name().as_str() {
+        "std::ops::Fn" | "core::ops::Fn" => (0, "call"),
+        "std::ops::FnMut" | "core::ops::FnMut" => (1, "call_mut"),
+        "std::ops::FnOnce" | "core::ops::FnOnce" => (2, "call_once"),
+        _ => return,
+    };
+    if conv.fn_shim_locations[kind].is_some() {
+        return;
+    }
+    let Ok(entries) = std::panic::catch_unwind(
+        std::panic::AssertUnwindSafe(|| tr.vtable_entries()),
+    ) else {
+        return;
+    };
+    for entry in entries {
+        let rustc_public::ty::VtblEntry::Method(inst) = entry else {
+            continue;
+        };
+        if !inst.name().ends_with(method) {
+            continue;
+        }
+        let Ok(Some(shim_body)) = std::panic::catch_unwind(
+            std::panic::AssertUnwindSafe(|| inst.body()),
+        ) else {
+            continue;
+        };
+        conv.note_fn_shim_location(kind, &shim_body);
+        return;
+    }
+}
+
 fn demand_dyn_instances(
     conv: &mut Converter,
     report: &mut ConversionReport,
@@ -1843,6 +1895,16 @@ fn demand_dyn_instances(
                             | "std::ops::FnOnce"
                             | "core::ops::FnOnce"
                     ) {
+                        // `Fn`-trait dispatch is the interpreter's
+                        // own `CallTrait` machinery, so no vtable
+                        // bodies are demanded — but the vtable's
+                        // method entry is the compiler-generated
+                        // shim whose location a track-caller
+                        // closure entered through this `dyn`
+                        // receiver observes, so record it before
+                        // skipping (see
+                        // `Converter::note_fn_shim_location`).
+                        note_fn_shim(conv, &tr);
                         continue;
                     }
                     let Ok(entries) = std::panic::catch_unwind(
@@ -2556,6 +2618,8 @@ fn collect() -> ControlFlow<()> {
         thread_locals: conv.thread_locals.clone(),
         adt_instance_shapes: conv.adt_instance_shapes.clone(),
         adt_niches: conv.adt_niches.clone(),
+        track_caller_defs: conv.track_caller_defs.clone(),
+        fn_shim_locations: conv.fn_shim_locations.clone(),
     });
     ControlFlow::Continue(())
 }
@@ -2758,6 +2822,8 @@ fn execute(c: &Collected, input: &str, guest_args: &[String], overflow_checks: b
     program.thread_locals = c.thread_locals.clone();
     program.adt_instance_shapes = c.adt_instance_shapes.clone();
     program.adt_niches = c.adt_niches.clone();
+    program.track_caller_defs = c.track_caller_defs.clone();
+    program.fn_shim_locations = c.fn_shim_locations.clone();
     // The entry body: the one rustc designated (see
     // `Collected::entry_def_id`) when collection recorded it, and
     // otherwise the first local body named `main`. A `--test`
