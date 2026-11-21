@@ -103,6 +103,43 @@ pub(crate) enum Resolved {
     },
 }
 
+/// One spawned thread of the cooperative thread model: the
+/// callable captured at `spawn` time, and the outcome once it has
+/// run. A spawned thread never runs concurrently with the thread
+/// that spawned it; it runs to completion when the running thread
+/// reaches a point where it would block (see
+/// [`Interpreter::drain_threads`]).
+pub(crate) struct ThreadSlot {
+    pub callable: Option<Value>,
+    pub outcome: Option<Result<Value, String>>,
+}
+
+/// The shared state of one `std::sync::mpsc` channel, keyed by the
+/// id carried inside the `Sender` / `Receiver` handle values.
+/// `senders` / `receivers` count live handles: handle creation and
+/// `Clone` increment them, and dropping a handle place decrements
+/// them (see the `Drop` terminator's note in `drive_frames`), which
+/// is what makes disconnection observable exactly when the last
+/// handle of a side goes away.
+pub(crate) struct ChannelState {
+    pub queue: std::collections::VecDeque<Value>,
+    pub senders: usize,
+    pub receivers: usize,
+    pub bound: Option<usize>,
+}
+
+/// The channel id carried by an mpsc handle value, if the value
+/// has the handle shape (a one-field aggregate holding the id).
+pub(crate) fn channel_handle_id(value: &Value) -> Option<u64> {
+    match value {
+        Value::Enum { fields, .. } if fields.len() == 1 => match &fields[0] {
+            Value::Uint(id) => Some(*id as u64),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// The interpreter state for one program.
 pub struct Interpreter<'a> {
     program: &'a Program,
@@ -128,6 +165,20 @@ pub struct Interpreter<'a> {
     /// must not start over — the outer seeding fills the storage,
     /// and the nested reference simply names it.
     statics_seeding: std::cell::RefCell<HashSet<String>>,
+    /// Spawned threads of the cooperative thread model (see
+    /// [`ThreadSlot`]), keyed by thread id. The entry thread is
+    /// id 1, matching `std`'s numbering of the main thread.
+    threads: std::cell::RefCell<HashMap<u64, ThreadSlot>>,
+    /// The id the next spawned thread gets.
+    next_thread: std::cell::RefCell<u64>,
+    /// The thread whose code is currently executing (the entry
+    /// thread outside any spawned thread's run).
+    current_thread: std::cell::Cell<u64>,
+    /// mpsc channel states (see [`ChannelState`]), keyed by the id
+    /// carried inside the handle values.
+    channels: std::cell::RefCell<HashMap<u64, ChannelState>>,
+    /// The id the next created channel gets.
+    next_channel: std::cell::RefCell<u64>,
 }
 
 /// The synthetic address of a pointer value (see
@@ -188,6 +239,11 @@ impl<'a> Interpreter<'a> {
             drop_continuations: Vec::new(),
             statics: std::cell::RefCell::new(HashMap::new()),
             statics_seeding: std::cell::RefCell::new(HashSet::new()),
+            threads: std::cell::RefCell::new(HashMap::new()),
+            next_thread: std::cell::RefCell::new(2),
+            current_thread: std::cell::Cell::new(1),
+            channels: std::cell::RefCell::new(HashMap::new()),
+            next_channel: std::cell::RefCell::new(1),
         }
     }
 
@@ -634,6 +690,7 @@ impl<'a> Interpreter<'a> {
                     }
                 }
                 TerminatorKind::Drop { place, target, glue } => {
+                    self.note_channel_handle_drop(&frames, body, &place);
                     // Run the dropped type's glue (conversion built
                     // it; see `mir_convert`). The glue work starts
                     // here and either finishes in `run_drop_glue`
@@ -1414,6 +1471,235 @@ impl<'a> Interpreter<'a> {
     /// seeded value to read or write. (Every reference to a static
     /// carries its initializer and seeds the store when evaluated,
     /// so this is unreachable for driver-produced programs.)
+    /// The id of the thread whose code is currently executing.
+    pub(crate) fn current_thread_id(&self) -> u64 {
+        self.current_thread.get()
+    }
+
+    /// Register a spawned thread: the callable is captured, not
+    /// run. Returns the new thread's id.
+    pub(crate) fn spawn_thread(&self, callable: Value) -> u64 {
+        let id = {
+            let mut next = self.next_thread.borrow_mut();
+            let id = *next;
+            *next += 1;
+            id
+        };
+        self.threads.borrow_mut().insert(
+            id,
+            ThreadSlot {
+                callable: Some(callable),
+                outcome: None,
+            },
+        );
+        id
+    }
+
+    /// Whether the thread has been spawned but not yet run.
+    pub(crate) fn thread_pending(&self, id: u64) -> bool {
+        self.threads
+            .borrow()
+            .get(&id)
+            .is_some_and(|slot| slot.callable.is_some())
+    }
+
+    /// The recorded outcome of a thread that has run.
+    pub(crate) fn thread_outcome(&self, id: u64) -> Option<Result<Value, String>> {
+        self.threads
+            .borrow()
+            .get(&id)
+            .and_then(|slot| slot.outcome.clone())
+    }
+
+    /// Run one pending thread to completion, recording its
+    /// outcome. A guest panic in the thread is its outcome (the
+    /// `Err` a joiner observes), not a failure of the run; any
+    /// other error (an unsupported feature inside the thread)
+    /// aborts the run, as it would on the entry thread.
+    pub(crate) fn run_thread(&mut self, frames: &mut Vec<Frame>, id: u64) -> InterpResult<()> {
+        let callable = self
+            .threads
+            .borrow_mut()
+            .get_mut(&id)
+            .and_then(|slot| slot.callable.take());
+        let Some(callable) = callable else {
+            return Ok(());
+        };
+        let previous = self.current_thread.get();
+        self.current_thread.set(id);
+        let result = self.call_callable_to_completion(frames, &callable, Vec::new());
+        self.current_thread.set(previous);
+        let outcome = match result {
+            Ok(value) => Ok(value),
+            Err(InterpError::Panic { message }) => Err(message),
+            Err(e) => return Err(e),
+        };
+        if let Some(slot) = self.threads.borrow_mut().get_mut(&id) {
+            slot.outcome = Some(outcome);
+        }
+        Ok(())
+    }
+
+    /// Run every pending thread to completion, in spawn order.
+    /// This is the cooperative scheduling point: the running
+    /// thread has reached a place where it would block, so the
+    /// threads it might be waiting for get their turn. Returns
+    /// whether any thread ran.
+    pub(crate) fn drain_threads(&mut self, frames: &mut Vec<Frame>) -> InterpResult<bool> {
+        let mut ran = false;
+        loop {
+            let next = self
+                .threads
+                .borrow()
+                .iter()
+                .filter(|(_, slot)| slot.callable.is_some())
+                .map(|(id, _)| *id)
+                .min();
+            let Some(id) = next else {
+                return Ok(ran);
+            };
+            self.run_thread(frames, id)?;
+            ran = true;
+        }
+    }
+
+    /// Join a thread: run it if it is still pending, then return
+    /// its recorded outcome.
+    pub(crate) fn join_thread(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        id: u64,
+    ) -> InterpResult<Result<Value, String>> {
+        if self.thread_pending(id) {
+            self.run_thread(frames, id)?;
+        }
+        self.thread_outcome(id).ok_or_else(|| InterpError::UnsupportedTerminator {
+            kind: format!("join of unknown thread {id}"),
+        })
+    }
+
+    /// Call a callable value (a closure or a function pointer)
+    /// with `args`, driving the frame stack until the call
+    /// returns, and return its return value. Used by builtins
+    /// that must execute guest code synchronously (thread join,
+    /// `Once::call_once`, scoped threads).
+    pub(crate) fn call_callable_to_completion(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        callable: &Value,
+        args: Vec<Value>,
+    ) -> InterpResult<Value> {
+        let base = frames.len();
+        match callable {
+            Value::Closure { def, .. } => {
+                let env = if self.closure_body_takes_env_by_value(def) {
+                    callable.clone()
+                } else {
+                    Value::Ref(RefTarget::Value(Box::new(callable.clone())))
+                };
+                let mut full = vec![env];
+                full.extend(args);
+                self.start_call(frames, def, full, &Place::local(Local::RETURN), None)?;
+            }
+            Value::FnPtr(name) => {
+                self.start_call(frames, name, args, &Place::local(Local::RETURN), None)?;
+            }
+            other => {
+                return Err(InterpError::type_mismatch(
+                    "callable value",
+                    "a closure or function pointer",
+                    other.kind_name(),
+                ));
+            }
+        }
+        self.drive_frames(frames, base)
+    }
+
+    /// Create a channel state (one sender, one receiver) and
+    /// return its id.
+    pub(crate) fn new_channel(&self, bound: Option<usize>) -> u64 {
+        let id = {
+            let mut next = self.next_channel.borrow_mut();
+            let id = *next;
+            *next += 1;
+            id
+        };
+        self.channels.borrow_mut().insert(
+            id,
+            ChannelState {
+                queue: std::collections::VecDeque::new(),
+                senders: 1,
+                receivers: 1,
+                bound,
+            },
+        );
+        id
+    }
+
+    /// Access one channel's state, if it exists.
+    pub(crate) fn with_channel<R>(
+        &self,
+        id: u64,
+        f: impl FnOnce(&mut ChannelState) -> R,
+    ) -> Option<R> {
+        self.channels.borrow_mut().get_mut(&id).map(f)
+    }
+
+    /// Record a channel handle's drop (see [`ChannelState`]):
+    /// `kind` is `"sender"` or `"receiver"`.
+    pub(crate) fn channel_handle_dropped(&self, id: u64, kind: &str) {
+        if let Some(state) = self.channels.borrow_mut().get_mut(&id) {
+            match kind {
+                "sender" => state.senders = state.senders.saturating_sub(1),
+                _ => state.receivers = state.receivers.saturating_sub(1),
+            }
+        }
+    }
+
+    /// Record a channel handle's clone (see [`ChannelState`]).
+    pub(crate) fn channel_handle_cloned(&self, id: u64, kind: &str) {
+        if let Some(state) = self.channels.borrow_mut().get_mut(&id) {
+            match kind {
+                "sender" => state.senders += 1,
+                _ => state.receivers += 1,
+            }
+        }
+    }
+
+    /// If the place a `Drop` terminator is about to drop holds an
+    /// mpsc channel handle directly, record the drop with the
+    /// channel state. A handle nested inside another aggregate
+    /// that is dropped whole is not tracked (the glue recursion
+    /// does not pass through here), and a moved-out place reads as
+    /// uninitialized and is skipped, so a handle is counted
+    /// exactly once per place that actually holds it.
+    fn note_channel_handle_drop(&self, frames: &[Frame], body: &Body, place: &Place) {
+        let Some(Ty::Adt(name)) = body.local_ty(place.local) else {
+            return;
+        };
+        let kind = if name.starts_with("std::sync::mpsc::Sender")
+            || name.starts_with("std::sync::mpsc::SyncSender")
+        {
+            "sender"
+        } else if name.starts_with("std::sync::mpsc::Receiver") {
+            "receiver"
+        } else {
+            return;
+        };
+        if !place.projection.is_empty() {
+            return;
+        }
+        let Ok(resolved) = self.resolve_place(frames, body, place) else {
+            return;
+        };
+        let Ok(value) = self.read_resolved(frames, &resolved) else {
+            return;
+        };
+        if let Some(id) = channel_handle_id(&value) {
+            self.channel_handle_dropped(id, kind);
+        }
+    }
+
     fn missing_static(&self, name: &str) -> InterpError {
         InterpError::UnsupportedTerminator {
             kind: format!(
