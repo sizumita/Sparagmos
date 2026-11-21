@@ -2,7 +2,8 @@
 """MIR variant implementation matrix for metric 1 in docs/COVERAGE.md.
 
 For each of the 40 denominator variants (StatementKind 12 + TerminatorKind
-15 + Rvalue 13, as tabulated in docs/COVERAGE.md from rustc 1.100.0), this
+15 + Rvalue 13, tabulated in crates/sparagmos-mir/src/coverage.rs
+from a mechanical extraction of rustc 1.100.0's MIR enums), this
 script mechanically cross-references three kinds of evidence:
 
   driver  -- crates/sparagmos-driver/src/convert.rs has a match arm for the
@@ -61,7 +62,16 @@ MIR_SRC = {
     "Rvalue": "crates/sparagmos-mir/src/rvalue.rs",
 }
 DRIVER_SRC = "crates/sparagmos-driver/src/convert.rs"
-COVERAGE_MD = "docs/COVERAGE.md"
+COVERAGE_RS = "crates/sparagmos-mir/src/coverage.rs"
+# Metric-1 tables in coverage.rs: enum -> (denominator const,
+# unreachable const).
+METRIC1_TABLES = {
+    "StatementKind": ("METRIC1_STATEMENT_KINDS",
+                      "METRIC1_UNREACHABLE_STATEMENT_KINDS"),
+    "TerminatorKind": ("METRIC1_TERMINATOR_KINDS",
+                       "METRIC1_UNREACHABLE_TERMINATOR_KINDS"),
+    "Rvalue": ("METRIC1_RVALUE_KINDS", "METRIC1_UNREACHABLE_RVALUE_KINDS"),
+}
 
 # Denominator name -> sparagmos-mir variant name, where they differ.
 # Anything not listed maps to itself; a denominator name whose image is
@@ -248,33 +258,64 @@ def strip_rust(src: str) -> str:
     return "".join(out)
 
 
-def parse_denominator(coverage_text: str) -> dict:
-    """Extract the 40 denominator variant names from the tables in
-    docs/COVERAGE.md, anchored at the '**<Enum>: <n>**' headings."""
-    result = {}
-    lines = coverage_text.splitlines()
-    for enum in ENUMS:
-        heading = re.compile(r"\*\*" + enum + r": \d+\*\*")
-        start = None
-        for idx, line in enumerate(lines):
-            if heading.search(line):
-                start = idx
+def parse_str_table(rust_src: str, const_name: str) -> list:
+    """String literals of `pub const <const_name>: &[&str] = &[...];`.
+
+    Comments inside the array are skipped; the scan stops at the
+    array's closing bracket."""
+    m = re.search(r"pub const " + const_name + r"\b", rust_src)
+    if not m:
+        raise ValueError(f"const {const_name} not found")
+    eq = rust_src.index("=", m.end())
+    start = rust_src.index("[", eq)
+    names = []
+    i, n = start + 1, len(rust_src)
+    while i < n:
+        c = rust_src[i]
+        if c == "]":
+            return names
+        if c == "/" and rust_src[i + 1 : i + 2] == "/":
+            j = rust_src.find("\n", i)
+            i = n if j == -1 else j + 1
+        elif c == "/" and rust_src[i + 1 : i + 2] == "*":
+            j = rust_src.find("*/", i + 2)
+            if j == -1:
                 break
-        if start is None:
-            raise ValueError(f"denominator heading for {enum} not found")
-        names = []
-        for line in lines[start + 1 :]:
-            if not line.startswith("|"):
-                if names:
-                    break
-                continue
-            cells = [c.strip() for c in line.strip().strip("|").split("|")]
-            first = cells[0]
-            if first in ("バリアント", "") or set(first) <= set("-: "):
-                continue
-            names.append(first)
-        result[enum] = names
-    return result
+            i = j + 2
+        elif c == '"':
+            j = i + 1
+            buf = []
+            while j < n and rust_src[j] != '"':
+                if rust_src[j] == "\\" and j + 1 < n:
+                    j += 1
+                buf.append(rust_src[j])
+                j += 1
+            names.append("".join(buf))
+            i = j + 1
+        else:
+            i += 1
+    raise ValueError(f"unterminated string table {const_name}")
+
+
+def parse_metric1_tables(coverage_rs: str) -> tuple:
+    """The metric-1 denominator and unreachable set, parsed from the
+    METRIC1_* tables in crates/sparagmos-mir/src/coverage.rs.
+
+    Those tables are the mechanically extracted variant lists of
+    rustc 1.100.0's MIR enums, pinned by unit tests in coverage.rs
+    itself.  docs/COVERAGE.md defines the metric in prose but no
+    longer tabulates the names, so the code tables are the parseable
+    source of truth.
+
+    Returns ({enum: [variant, ...]}, {(enum, variant), ...})."""
+    denominator = {}
+    unreachable = set()
+    for enum in ENUMS:
+        denom_const, unreach_const = METRIC1_TABLES[enum]
+        denominator[enum] = parse_str_table(coverage_rs, denom_const)
+        for name in parse_str_table(coverage_rs, unreach_const):
+            unreachable.add((enum, name))
+    return denominator, unreachable
 
 
 def parse_enum_variants(rust_src: str, enum_name: str) -> list:
@@ -657,11 +698,14 @@ def main():
     repo = args.repo
 
     global DENOMINATOR, SM_VARIANTS
-    with open(os.path.join(repo, COVERAGE_MD)) as f:
-        DENOMINATOR = parse_denominator(f.read())
+    with open(os.path.join(repo, COVERAGE_RS)) as f:
+        DENOMINATOR, unreachable_in_tables = parse_metric1_tables(f.read())
     total = sum(len(v) for v in DENOMINATOR.values())
     if total != 40:
         print(f"warning: denominator has {total} variants, expected 40", file=sys.stderr)
+    if unreachable_in_tables != UNREACHABLE:
+        print("warning: UNREACHABLE disagrees with the METRIC1_UNREACHABLE_* "
+              "tables in coverage.rs", file=sys.stderr)
     SM_VARIANTS = {}
     for enum in ENUMS:
         with open(os.path.join(repo, MIR_SRC[enum])) as f:

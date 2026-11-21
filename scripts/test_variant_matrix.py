@@ -2,7 +2,8 @@
 """Unit tests for scripts/variant-matrix.py.
 
 Run: python3 -m unittest scripts.test_variant_matrix
-(the parsing tests read the real docs/COVERAGE.md and sparagmos-mir
+(the parsing tests read the real METRIC1_* tables in
+crates/sparagmos-mir/src/coverage.rs and the sparagmos-mir enum
 sources, so they also guard the denominator against silent drift.)
 """
 
@@ -20,11 +21,18 @@ vm = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(vm)
 
 
+def load_metric1_tables():
+    """(denominator, unreachable) parsed from the METRIC1_* tables
+    in crates/sparagmos-mir/src/coverage.rs."""
+    path = os.path.join(REPO, "crates", "sparagmos-mir", "src", "coverage.rs")
+    with open(path) as f:
+        return vm.parse_metric1_tables(f.read())
+
+
 class DenominatorTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        with open(os.path.join(REPO, "docs", "COVERAGE.md")) as f:
-            cls.denom = vm.parse_denominator(f.read())
+        cls.denom, _unreach = load_metric1_tables()
 
     def test_total_is_40(self):
         self.assertEqual(sum(len(v) for v in self.denom.values()), 40)
@@ -68,8 +76,7 @@ class EnumParseTest(unittest.TestCase):
 class MappingTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        with open(os.path.join(REPO, "docs", "COVERAGE.md")) as f:
-            vm.DENOMINATOR = vm.parse_denominator(f.read())
+        vm.DENOMINATOR, _unreach = load_metric1_tables()
 
     def test_renamed_terminators(self):
         self.assertEqual(vm.sm_to_denominator("TerminatorKind", "Resume"), "UnwindResume")
@@ -97,11 +104,16 @@ class StripRustTest(unittest.TestCase):
 class UnreachableTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        with open(os.path.join(REPO, "docs", "COVERAGE.md")) as f:
-            cls.denom = vm.parse_denominator(f.read())
+        cls.denom, cls.unreach = load_metric1_tables()
 
     def test_nine_unreachable(self):
         self.assertEqual(len(vm.UNREACHABLE), 9)
+
+    def test_unreachable_matches_coverage_rs(self):
+        # The tool's UNREACHABLE set and the METRIC1_UNREACHABLE_*
+        # tables in coverage.rs are two tabulations of the same
+        # fact; they must not drift apart.
+        self.assertEqual(vm.UNREACHABLE, self.unreach)
 
     def test_unreachable_are_denominator_members(self):
         for enum, name in vm.UNREACHABLE:
