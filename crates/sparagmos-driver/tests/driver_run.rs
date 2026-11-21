@@ -6455,3 +6455,290 @@ fn run_mode_pattern_type_values_execute_as_base_type() {
         "pattern-type stdout mismatch; stderr={stderr}"
     );
 }
+
+// ----- coroutine drop glue and runtime support (Lane FF) ---------------------
+
+const COROUTINE_SUSPENDED_DROP_SRC: &str = r#"
+#![feature(coroutines, coroutine_trait, stmt_expr_attributes)]
+use std::ops::Coroutine;
+use std::pin::Pin;
+struct D(u32);
+impl Drop for D { fn drop(&mut self) { println!("dtor {}", self.0); } }
+fn main() {
+    let mut g = #[coroutine] || {
+        let d = D(1);
+        yield;
+        println!("resumed {}", d.0);
+    };
+    let _s = Pin::new(&mut g).resume(());
+    println!("suspended");
+    drop(g);
+    println!("after drop");
+}
+"#;
+
+#[test]
+fn run_mode_suspended_coroutine_drop_runs_live_local_dtor() {
+    // Dropping a coroutine suspended at a yield runs the
+    // destructors of the locals live in that state, at the drop
+    // point - the state the value is in selects the glue.
+    let dir = temp_dir("coroutine-suspended-drop");
+    let src = fixture(&dir, "coroutine_suspended_drop.rs", COROUTINE_SUSPENDED_DROP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "suspended coroutine drop must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "suspended\ndtor 1\nafter drop\n",
+        "the live local's destructor runs when the suspended coroutine is dropped"
+    );
+}
+
+const COROUTINE_COMPLETED_DROP_SRC: &str = r#"
+#![feature(coroutines, coroutine_trait, stmt_expr_attributes)]
+use std::ops::Coroutine;
+use std::pin::Pin;
+struct D(u32);
+impl Drop for D { fn drop(&mut self) { println!("dtor {}", self.0); } }
+fn main() {
+    let mut g = #[coroutine] || {
+        let d = D(1);
+        yield;
+        println!("resumed {}", d.0);
+    };
+    let _s = Pin::new(&mut g).resume(());
+    let _s2 = Pin::new(&mut g).resume(());
+    println!("completed");
+    drop(g);
+    println!("after drop");
+}
+"#;
+
+#[test]
+fn run_mode_completed_coroutine_drop_runs_dtor_once() {
+    // A completed coroutine's locals were already dropped by the
+    // coroutine's own completion path; dropping the exhausted
+    // value afterwards runs nothing a second time.
+    let dir = temp_dir("coroutine-completed-drop");
+    let src = fixture(&dir, "coroutine_completed_drop.rs", COROUTINE_COMPLETED_DROP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "completed coroutine drop must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "resumed 1\ndtor 1\ncompleted\nafter drop\n",
+        "the destructor runs exactly once, inside the completion"
+    );
+}
+
+const COROUTINE_UNRESUMED_DROP_SRC: &str = r#"
+#![feature(coroutines, coroutine_trait, stmt_expr_attributes)]
+struct D(u32);
+impl Drop for D { fn drop(&mut self) { println!("dtor {}", self.0); } }
+fn main() {
+    let d = D(9);
+    let g = #[coroutine] move || { let dd = d; yield; println!("inner {}", dd.0); };
+    println!("created");
+    drop(g);
+    println!("after drop");
+}
+"#;
+
+#[test]
+fn run_mode_unresumed_coroutine_drop_runs_capture_dtor() {
+    // Dropping a coroutine that was never resumed drops the
+    // values it captured, at the drop point.
+    let dir = temp_dir("coroutine-unresumed-drop");
+    let src = fixture(&dir, "coroutine_unresumed_drop.rs", COROUTINE_UNRESUMED_DROP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "unresumed coroutine drop must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "created\ndtor 9\nafter drop\n",
+        "the captured value's destructor runs when the unresumed coroutine is dropped"
+    );
+}
+
+const PIN_BOX_DROP_SRC: &str = r#"
+struct D(u32);
+impl Drop for D { fn drop(&mut self) { println!("dtor {}", self.0); } }
+fn main() {
+    { let _p = std::pin::Pin::new(Box::new(D(1))); }
+    println!("scope done");
+    let p = std::pin::Pin::new(Box::new(D(2)));
+    std::mem::drop(p);
+    println!("end");
+}
+"#;
+
+#[test]
+fn run_mode_pin_box_drop_and_mem_drop_run_pointee_dtor() {
+    // `Pin<P>` has no destructor of its own: dropping it drops
+    // the wrapped pointer, so a `Pin<Box<T>>` runs the pointee's
+    // glue both at scope end and through `mem::drop`.
+    let dir = temp_dir("pin-box-drop");
+    let src = fixture(&dir, "pin_box_drop.rs", PIN_BOX_DROP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Pin<Box<T>> drops must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "dtor 1\nscope done\ndtor 2\nend\n",
+        "the pointee destructor runs at each Pin drop"
+    );
+}
+
+const PIN_REF_DEREF_SRC: &str = r#"
+fn main() {
+    let mut x = 5;
+    let mut p = std::pin::Pin::new(&mut x);
+    *p = 8;
+    println!("{}", *p);
+    println!("{}", x);
+}
+"#;
+
+#[test]
+fn run_mode_pin_ref_deref_reads_and_writes_through() {
+    // Dereferencing a `Pin<&mut T>` goes through the wrapped
+    // reference: reads and writes land on the pointee.
+    let dir = temp_dir("pin-ref-deref");
+    let src = fixture(&dir, "pin_ref_deref.rs", PIN_REF_DEREF_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Pin<&mut T> deref must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "8\n8\n",
+        "the write through the Pin is visible on the pointee"
+    );
+}
+
+const ASSERT_UNWIND_SAFE_DROP_SRC: &str = r#"
+use std::panic::AssertUnwindSafe;
+struct D(u32);
+impl Drop for D { fn drop(&mut self) { println!("dtor {}", self.0); } }
+fn main() {
+    { let _w = AssertUnwindSafe(D(3)); }
+    println!("after");
+    let w = AssertUnwindSafe(D(4));
+    std::mem::drop(w);
+    println!("end");
+}
+"#;
+
+#[test]
+fn run_mode_assert_unwind_safe_drop_runs_held_dtor() {
+    // The one-field `AssertUnwindSafe` wrapper's glue is the held
+    // value's glue, at scope end and through `mem::drop` alike.
+    let dir = temp_dir("assert-unwind-safe-drop");
+    let src = fixture(&dir, "assert_unwind_safe_drop.rs", ASSERT_UNWIND_SAFE_DROP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "AssertUnwindSafe drops must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "dtor 3\nafter\ndtor 4\nend\n",
+        "the held value's destructor runs at each wrapper drop"
+    );
+}
+
+const CATCH_UNWIND_RESUME_SRC: &str = r#"
+#![feature(coroutines, coroutine_trait, stmt_expr_attributes)]
+use std::ops::Coroutine;
+use std::pin::Pin;
+use std::panic;
+fn main() {
+    let mut foo = #[coroutine] || { yield; };
+    let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        Pin::new(&mut foo).resume(())
+    }));
+    println!("err={}", res.is_err());
+}
+"#;
+
+#[test]
+fn run_mode_catch_unwind_resume_coroutine() {
+    // The panic machinery's path through a coroutine resume:
+    // `AssertUnwindSafe` derefs to the closure, the resume result
+    // (`CoroutineState`) drops out of the returned `Result`.
+    let dir = temp_dir("catch-unwind-resume");
+    let src = fixture(&dir, "catch_unwind_resume.rs", CATCH_UNWIND_RESUME_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "catch_unwind around a resume must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "err=false\n",
+        "the resume completed without a panic"
+    );
+}
+
+const ASYNC_SIZE_OF_VAL_SRC: &str = r#"
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+struct Nop;
+impl Future for Nop {
+    type Output = u8;
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<u8> { Poll::Ready(3) }
+}
+
+async fn one() -> u8 { Nop.await }
+
+fn main() {
+    println!("size {}", std::mem::size_of_val(&one()));
+    println!("size {}", std::mem::size_of_val(&Nop));
+}
+"#;
+
+#[test]
+fn run_mode_size_of_val_on_async_future_uses_compiler_layout() {
+    // `size_of_val` on a future answers with the compiler's own
+    // state-machine layout for that coroutine instance (the same
+    // values a native build prints), not with a model guess.
+    let dir = temp_dir("async-size-of-val");
+    let src = fixture(&dir, "async_size_of_val.rs", ASYNC_SIZE_OF_VAL_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "size_of_val on a future must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "size 1\nsize 0\n",
+        "the future's size is the compiler layout size"
+    );
+}
