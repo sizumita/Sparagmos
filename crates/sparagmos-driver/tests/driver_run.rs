@@ -4232,6 +4232,169 @@ fn run_mode_box_dyn_drop_runs_concrete_destructor() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "box-dyn ok\n");
 }
 
+const DYN_EQ_REF_SRC: &str = r#"
+trait Foo: PartialEq<i32> + std::fmt::Debug {
+    fn a(&self) -> i32 { 100 }
+}
+impl Foo for i32 {}
+fn main() {
+    let x: i32 = 1;
+    assert_eq!(x.a(), 100);
+    let foo: &dyn Foo = &x;
+    assert_eq!(*foo, 1);
+    assert!(*foo != 2);
+    println!("dyn-eq-ref ok");
+}
+"#;
+
+#[test]
+fn run_mode_dyn_ref_partial_eq_compares_pointee() {
+    let dir = temp_dir("dyn-eq-ref");
+    let src = fixture(&dir, "dyn_eq_ref.rs", DYN_EQ_REF_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "comparing through a &dyn trait object with a PartialEq supertrait must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "dyn-eq-ref ok\n");
+}
+
+const DYN_EQ_BOX_SRC: &str = r#"
+trait Foo: PartialEq<i32> + std::fmt::Debug {
+    fn a(&self) -> i32 { 100 }
+}
+impl Foo for i32 {}
+fn main() {
+    let obj: Box<dyn Foo> = Box::new(1);
+    assert_eq!(*obj, 1);
+    assert!(*obj != 2);
+    println!("dyn-eq-box ok");
+}
+"#;
+
+#[test]
+fn run_mode_box_dyn_partial_eq_compares_pointee() {
+    let dir = temp_dir("dyn-eq-box");
+    let src = fixture(&dir, "dyn_eq_box.rs", DYN_EQ_BOX_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "comparing through a Box<dyn trait> with a PartialEq supertrait must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "dyn-eq-box ok\n");
+}
+
+const DYN_EQ_ADT_SRC: &str = r#"
+trait Foo: PartialEq<Bar> + std::fmt::Debug {}
+#[derive(PartialEq, Debug)]
+struct Bar(i32);
+impl Foo for Bar {}
+fn main() {
+    let obj: &dyn Foo = &Bar(7);
+    assert_eq!(*obj, Bar(7));
+    assert!(*obj != Bar(8));
+    println!("dyn-eq-adt ok");
+}
+"#;
+
+#[test]
+fn run_mode_dyn_ref_partial_eq_against_adt() {
+    let dir = temp_dir("dyn-eq-adt");
+    let src = fixture(&dir, "dyn_eq_adt.rs", DYN_EQ_ADT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "comparing a trait object against an ADT value must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "dyn-eq-adt ok\n");
+}
+
+const DYN_EQ_DYN_SRC: &str = r#"
+trait T: std::fmt::Debug {
+    fn val(&self) -> i32;
+    fn type_id(&self) -> u32;
+}
+#[derive(Debug)]
+struct A(i32);
+#[derive(Debug)]
+struct B(i32);
+impl T for A {
+    fn val(&self) -> i32 { self.0 }
+    fn type_id(&self) -> u32 { 1 }
+}
+impl T for B {
+    fn val(&self) -> i32 { self.0 }
+    fn type_id(&self) -> u32 { 2 }
+}
+impl PartialEq for dyn T {
+    fn eq(&self, other: &Self) -> bool {
+        self.type_id() == other.type_id() && self.val() == other.val()
+    }
+}
+fn main() {
+    let a1: &dyn T = &A(1);
+    let a2: &dyn T = &A(1);
+    let a3: &dyn T = &A(2);
+    let b1: &dyn T = &B(1);
+    assert!(a1 == a2);
+    assert!(a1 != a3);
+    assert!(a1 != b1);
+    println!("dyn-eq-dyn ok");
+}
+"#;
+
+#[test]
+fn run_mode_dyn_partial_eq_against_dyn() {
+    let dir = temp_dir("dyn-eq-dyn");
+    let src = fixture(&dir, "dyn_eq_dyn.rs", DYN_EQ_DYN_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "comparing two trait objects must run (unequal concrete types are unequal); stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "dyn-eq-dyn ok\n");
+}
+
+const DYN_EQ_UPCAST_SRC: &str = r#"
+trait Super: PartialEq<i32> + std::fmt::Debug {}
+trait Sub: Super {}
+impl Super for i32 {}
+impl Sub for i32 {}
+fn main() {
+    let sub: &dyn Sub = &1;
+    let sup: &dyn Super = sub;
+    assert_eq!(*sup, 1);
+    assert!(*sup != 2);
+    let boxed: Box<dyn Sub> = Box::new(5);
+    let boxed_super: Box<dyn Super> = boxed;
+    assert_eq!(*boxed_super, 5);
+    assert!(*boxed_super != 6);
+    println!("dyn-eq-upcast ok");
+}
+"#;
+
+#[test]
+fn run_mode_upcast_dyn_partial_eq_compares_pointee() {
+    let dir = temp_dir("dyn-eq-upcast");
+    let src = fixture(&dir, "dyn_eq_upcast.rs", DYN_EQ_UPCAST_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "comparing through an upcast trait object must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "dyn-eq-upcast ok\n");
+}
+
 const UNION_DROP_SRC: &str = r#"
 use std::mem::ManuallyDrop;
 struct S;
