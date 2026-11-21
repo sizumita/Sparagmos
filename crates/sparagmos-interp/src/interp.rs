@@ -964,6 +964,19 @@ impl<'a> Interpreter<'a> {
                         local: *local,
                     }
                 })?;
+                // A never-written place of an evidently zero-sized
+                // type still denotes a value for drop glue: optimized
+                // MIR deletes the (no-op) write of a ZST aggregate,
+                // yet the place's destructor must run — it can have
+                // observable effects, such as writing a static. The
+                // synthesized value is only a gate for glue: field
+                // glue beneath a fabricated ADT reads as never-written
+                // and skips, exactly as drop flags dictate.
+                let base = if base == Value::Uninit {
+                    self.zst_glue_value(frame, *local).unwrap_or(base)
+                } else {
+                    base
+                };
                 (base, projection)
             }
             RefTarget::Value(v) => ((**v).clone(), &[]),
@@ -1772,6 +1785,53 @@ impl<'a> Interpreter<'a> {
             Some(Ty::Closure(def, 0)) => Some(Value::Closure {
                 def: def.clone(),
                 env: Vec::new(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// The value of a never-written local of an evidently
+    /// zero-sized type, for drop glue only (see the note in
+    /// `read_at`); `None` for any other local. `read_resolved`
+    /// deliberately does not do this: a genuine read of a
+    /// never-written place is an uninitialized read, but drop glue
+    /// must still run the destructor of a ZST place whose write
+    /// optimized MIR elided.
+    fn zst_glue_value(&self, frame: &Frame, local: usize) -> Option<Value> {
+        let body = self.program.get(&frame.func)?;
+        let ty = body.local_ty(Local(local))?;
+        Self::zst_value_of(ty)
+    }
+
+    /// The unique value of an evidently zero-sized type, when the
+    /// type alone determines one. ADT values are fabricated as
+    /// variant 0 with no fields: exact for unit-like and fieldless
+    /// structs; for payload-carrying types the fabrication is only
+    /// a drop-glue gate — field glue beneath it reads as
+    /// never-written and is skipped.
+    fn zst_value_of(ty: &Ty) -> Option<Value> {
+        match ty {
+            Ty::Unit => Some(Value::Unit),
+            Ty::Tuple(tys) => tys
+                .iter()
+                .map(Self::zst_value_of)
+                .collect::<Option<Vec<_>>>()
+                .map(Value::Tuple),
+            Ty::Array(elem, n) => {
+                if *n > 1_000_000 {
+                    return None;
+                }
+                let elem = Self::zst_value_of(elem)?;
+                Some(Value::Tuple(vec![elem; *n as usize]))
+            }
+            Ty::Closure(def, 0) => Some(Value::Closure {
+                def: def.clone(),
+                env: Vec::new(),
+            }),
+            Ty::FnDef(name) => Some(Value::FnPtr(name.clone())),
+            Ty::Adt(_) => Some(Value::Enum {
+                variant: 0,
+                fields: Vec::new(),
             }),
             _ => None,
         }
