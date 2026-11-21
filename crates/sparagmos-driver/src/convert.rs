@@ -53,6 +53,18 @@ pub struct Converter {
     /// `Discriminant` rvalues must yield these values, because the
     /// `SwitchInt` branch keys carry values, not variant indices.
     pub adt_discriminants: sm::AdtDiscriminants,
+    /// Layouts of the monomorphic ADT instances converted so far,
+    /// keyed by the rendered instance name (the interpreter's type
+    /// tag). Handed to the interpreter with the converted program:
+    /// its `size_of` / `align_of` builtins consult the table for ADT
+    /// tags. Filled from the compiler's own layout query, so repr
+    /// attributes are already reflected; instances whose layout the
+    /// compiler cannot give (generic parameters, unsized types) get
+    /// no entry.
+    pub adt_layouts: sm::AdtLayouts,
+    /// Name table for rendering ADT instance keys, kept in sync
+    /// with `def_names` (which is indexed by the converted `DefId`).
+    layout_names: std::collections::HashMap<sm::DefId, String>,
     /// Unsupported hits of the function currently being converted.
     errors: Vec<String>,
 }
@@ -70,6 +82,8 @@ impl Converter {
             instance_ids: HashMap::new(),
             def_names: Vec::new(),
             adt_discriminants: sm::AdtDiscriminants::new(),
+            adt_layouts: sm::AdtLayouts::new(),
+            layout_names: std::collections::HashMap::new(),
             errors: Vec::new(),
         }
     }
@@ -1263,6 +1277,14 @@ impl Converter {
     }
 
     pub fn ty(&mut self, ty: &rustc_public::ty::Ty) -> sm::Ty {
+        let converted = self.ty_inner(ty);
+        if matches!(ty.kind(), TyKind::RigidTy(RigidTy::Adt(..))) {
+            self.record_layout(ty, &converted);
+        }
+        converted
+    }
+
+    fn ty_inner(&mut self, ty: &rustc_public::ty::Ty) -> sm::Ty {
         match ty.kind() {
             TyKind::RigidTy(r) => self.rigid_ty(&r),
             TyKind::Alias(kind, alias) => {
@@ -1295,6 +1317,39 @@ impl Converter {
             .map(|i| def.discriminant_for_variant(VariantIdx::to_val(i)).val as i128)
             .collect();
         self.adt_discriminants.insert(id, values);
+    }
+
+    /// Record the compiler-computed layout of one monomorphic ADT
+    /// instance under its rendered instance name, once per distinct
+    /// instance. The layout query is the compiler's own, so
+    /// `repr(C)` / `repr(packed)` / `repr(align)` and enum tag
+    /// placement are reflected exactly. Instances the query cannot
+    /// answer (generic parameters among the arguments, unsized
+    /// types, trait objects) are skipped: they stay explicitly
+    /// unsupported in the interpreter.
+    fn record_layout(&mut self, ty: &rustc_public::ty::Ty, converted: &sm::Ty) {
+        while self.layout_names.len() < self.def_names.len() {
+            let index = self.layout_names.len();
+            self.layout_names.insert(
+                sm::DefId::new(0, index as u32),
+                self.def_names[index].clone(),
+            );
+        }
+        let key = sparagmos_interp::builtins::ty_tag(converted, &self.layout_names);
+        if self.adt_layouts.contains_key(&key) {
+            return;
+        }
+        let Ok(layout) = ty.layout() else {
+            return;
+        };
+        let shape = layout.shape();
+        if shape.is_unsized() {
+            return;
+        }
+        self.adt_layouts.insert(
+            key,
+            (shape.size.bytes() as u64, shape.abi_align),
+        );
     }
 
     fn rigid_ty(&mut self, r: &RigidTy) -> sm::Ty {
