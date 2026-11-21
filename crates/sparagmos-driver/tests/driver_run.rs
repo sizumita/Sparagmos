@@ -7638,7 +7638,10 @@ fn run_mode_libtest_harness_runs_tests() {
     assert_eq!(out.status.code(), Some(0), "stderr={stderr} stdout={stdout}");
     assert!(stdout.contains("running 3 tests"), "stdout={stdout}");
     assert!(stdout.contains("test alpha ... ok"), "stdout={stdout}");
-    assert!(stdout.contains("test panics ... ok"), "stdout={stdout}");
+    assert!(
+        stdout.contains("test panics - should panic ... ok"),
+        "stdout={stdout}"
+    );
     assert!(stdout.contains("test gamma ... ignored"), "stdout={stdout}");
     assert!(
         stdout.contains("test result: ok. 2 passed; 0 failed; 1 ignored"),
@@ -7824,7 +7827,77 @@ fn run_mode_libtest_listing_and_nightly_only_options() {
     assert!(
         stderr.contains("the option `Z` is only accepted on the nightly compiler"),
         "stderr={stderr}"
+    );}
+const LIBTEST_SP_SRC: &str = r#"
+#[test]
+#[should_panic(expected = "hello")]
+fn wrong_msg() { panic!("bye"); }
+#[test]
+#[should_panic]
+fn no_panic() {}
+#[test]
+#[ignore = "later"]
+fn skipped() {}
+"#;
+
+#[test]
+fn run_mode_libtest_harness_output_fidelity() {
+    let dir = temp_dir("libtest-fidelity");
+    let src = fixture(&dir, "sp.rs", LIBTEST_SP_SRC);
+    // `--list`: one line per test plus the count footer, and
+    // nothing runs.
+    let out = run_driver_extra(&src, &["--rustc-arg", "--test", "--guest-arg", "--list"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "stdout={stdout}");
+    assert_eq!(
+        stdout, "no_panic: test\nskipped: test\nwrong_msg: test\n\n3 tests, 0 benchmarks\n",
+        "stdout={stdout}"
     );
+    // Should-panic verdicts: a panic whose message misses the
+    // expected substring and a test that does not panic both
+    // fail, with the harness's notes as their failure sections;
+    // the ignored test's line carries its ignore message.
+    let out = run_driver_extra(&src, &["--rustc-arg", "--test", "--guest-arg", "--nocapture"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(101), "stdout={stdout}");
+    assert!(
+        stdout.starts_with("\nrunning 3 tests\n"),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("test no_panic - should panic ... FAILED"),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("note: test did not panic as expected at "),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "note: panic did not contain expected string\n      panic message: \"bye\"\n expected substring: \"hello\""
+        ),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("test skipped ... ignored, later"),
+        "stdout={stdout}"
+    );
+    // Multiple positional filters select the union of matches.
+    let out = run_driver_extra(
+        &src,
+        &[
+            "--rustc-arg",
+            "--test",
+            "--guest-arg",
+            "wrong_msg",
+            "--guest-arg",
+            "no_panic",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("running 2 tests"), "stdout={stdout}");
+    assert!(stdout.contains("1 filtered out"), "stdout={stdout}");
+
 }
 
 #[test]
