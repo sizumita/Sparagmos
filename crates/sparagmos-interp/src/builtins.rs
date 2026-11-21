@@ -693,9 +693,7 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         _ if canonical.starts_with("std::boxed::Box") && canonical.ends_with(">::new") => {
             Builtin::BoxNew
         }
-        _ if canonical.starts_with("std::boxed::Box")
-            && canonical.ends_with(">::new_uninit") =>
-        {
+        _ if canonical.starts_with("std::boxed::Box") && canonical.ends_with(">::new_uninit") => {
             Builtin::BoxNewUninit
         }
         "std::boxed::box_assume_init_into_vec_unsafe" => Builtin::BoxAssumeInitIntoVec,
