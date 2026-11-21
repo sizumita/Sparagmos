@@ -38,6 +38,27 @@ pub type DiscriminantValues = Vec<i128>;
 /// `Discriminant` rvalues.
 pub type AdtDiscriminants = std::collections::HashMap<AdtDefId, DiscriminantValues>;
 
+/// One thread-local static of a program: its declared type and its
+/// decoded initializer — the value each thread's storage starts
+/// from. For `std`'s thread-local storages this is the storage
+/// struct's `new()` value, not the user-visible initial value,
+/// which the storage's own `get_or_init` machinery produces on
+/// first access. The driver records one entry per `ThreadLocalRef`
+/// target it converts, decoding the static's initializer
+/// allocation against its declared type, exactly as for a plain
+/// static's seed. A thread-local whose initializer cannot be
+/// decoded gets no entry; evaluating its `ThreadLocalRef` then
+/// fails with an explicit error.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThreadLocalDef {
+    pub ty: Ty,
+    pub init: crate::ConstValue,
+}
+
+/// Thread-local static definitions of a program, keyed by the
+/// `DefId` of the static item.
+pub type ThreadLocals = std::collections::HashMap<DefId, ThreadLocalDef>;
+
 /// Layout of one monomorphic ADT instance: `(size, align)` in bytes,
 /// as computed by the compiler's own layout query (so `repr(C)`,
 /// `repr(packed)`, `repr(align)` and enum tag placement are already
