@@ -622,6 +622,7 @@ fn run_steps(local_tys: Vec<Ty>, steps: Vec<Step>) -> String {
                         target: Some(target),
                         drop_glue: None,
                         cmp_discriminants: None,
+                        result_unsize: None,
                     },
                 ));
             }
