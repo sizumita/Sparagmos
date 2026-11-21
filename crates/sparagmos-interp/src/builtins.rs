@@ -422,6 +422,35 @@ pub enum Builtin {
     DurationFromMicros,
     /// `std::time::Duration::from_nanos(n)`.
     DurationFromNanos,
+    /// `std::time::Instant::now()`: the host monotonic clock.
+    InstantNow,
+    /// `std::time::SystemTime::now()`: the host wall clock.
+    SystemTimeNow,
+    /// `Instant::checked_add` / `SystemTime::checked_add`
+    /// (payload: true for `SystemTime`).
+    TimeCheckedAdd(bool),
+    /// `Instant::checked_sub` / `SystemTime::checked_sub`
+    /// (payload: true for `SystemTime`).
+    TimeCheckedSub(bool),
+    /// `std::time::Instant::duration_since(earlier)`.
+    InstantDurationSince,
+    /// `std::time::Instant::checked_duration_since(earlier)`.
+    InstantCheckedDurationSince,
+    /// `std::time::Instant::saturating_duration_since(earlier)`.
+    InstantSaturatingDurationSince,
+    /// `std::time::Instant::elapsed()`.
+    InstantElapsed,
+    /// `std::time::SystemTime::duration_since(earlier)`.
+    SystemTimeDurationSince,
+    /// `std::time::SystemTime::elapsed()`.
+    SystemTimeElapsed,
+    /// `std::ops::Add::add` for the modelled time types (the
+    /// only `Add` instances whose bodies are unavailable; other
+    /// instances keep their collected bodies because their call
+    /// targets are the impl definitions, not this name).
+    OpsAdd,
+    /// `std::ops::Sub::sub` for the modelled time types.
+    OpsSub,
     /// `std::intrinsics::catch_unwind(try_fn, data, catch_fn) -> bool`:
     /// run the try function to completion; on a guest panic, roll
     /// the frame stack back to the call and run the catch function
@@ -817,6 +846,24 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::time::Duration::from_millis" => Builtin::DurationFromMillis,
         "std::time::Duration::from_micros" => Builtin::DurationFromMicros,
         "std::time::Duration::from_nanos" => Builtin::DurationFromNanos,
+        "std::time::Instant::now" => Builtin::InstantNow,
+        "std::time::SystemTime::now" => Builtin::SystemTimeNow,
+        "std::time::Instant::checked_add" => Builtin::TimeCheckedAdd(false),
+        "std::time::SystemTime::checked_add" => Builtin::TimeCheckedAdd(true),
+        "std::time::Instant::checked_sub" => Builtin::TimeCheckedSub(false),
+        "std::time::SystemTime::checked_sub" => Builtin::TimeCheckedSub(true),
+        "std::time::Instant::duration_since" => Builtin::InstantDurationSince,
+        "std::time::Instant::checked_duration_since" => {
+            Builtin::InstantCheckedDurationSince
+        }
+        "std::time::Instant::saturating_duration_since" => {
+            Builtin::InstantSaturatingDurationSince
+        }
+        "std::time::Instant::elapsed" => Builtin::InstantElapsed,
+        "std::time::SystemTime::duration_since" => Builtin::SystemTimeDurationSince,
+        "std::time::SystemTime::elapsed" => Builtin::SystemTimeElapsed,
+        "std::ops::Add::add" => Builtin::OpsAdd,
+        "std::ops::Sub::sub" => Builtin::OpsSub,
         "std::thread::scope" => Builtin::ThreadScope,
         "std::thread::current" => Builtin::ThreadCurrent,
         "std::thread::Thread::id" => Builtin::ThreadIdOf,
@@ -1342,6 +1389,145 @@ fn unsupported(what: impl Into<String>) -> InterpError {
 // Execution
 // ---------------------------------------------------------------------------
 
+/// A point in time as the model stores it: seconds and
+/// nanoseconds (0 <= nsec < 1e9) since the clock's epoch (the
+/// monotonic clock's unspecified epoch for `Instant`, the Unix
+/// epoch for `SystemTime`).
+type TimePair = (i128, i128);
+
+/// The host monotonic clock as a [`TimePair`]: the elapsed time
+/// since this process's first reading, so the values are
+/// non-negative and strictly follow the host clock's order (the
+/// epoch itself is unobservable for `Instant`, as natively).
+fn monotonic_now() -> TimePair {
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let base = BASE.get_or_init(std::time::Instant::now);
+    let d = std::time::Instant::now().duration_since(*base);
+    (d.as_secs() as i128, d.subsec_nanos() as i128)
+}
+
+/// The host wall clock as a [`TimePair`] (seconds since the Unix
+/// epoch; negative for earlier times, as `SystemTime` allows).
+fn wall_now() -> TimePair {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => (d.as_secs() as i128, d.subsec_nanos() as i128),
+        Err(e) => {
+            let d = e.duration();
+            (-(d.as_secs() as i128), -(d.subsec_nanos() as i128))
+        }
+    }
+}
+
+/// The stored value of an `Instant` / `SystemTime`: the nesting
+/// the constant decoder produces for `UNIX_EPOCH`
+/// (`{ t: { t: { sec, { nsec } } } }`), so modelled values and
+/// decoded constants have the same shape and compare field-wise.
+fn instant_value(pair: TimePair) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![Value::Enum {
+            variant: 0,
+            fields: vec![Value::Enum {
+                variant: 0,
+                fields: vec![
+                    Value::Int(pair.0),
+                    Value::Enum {
+                        variant: 0,
+                        fields: vec![Value::Int(pair.1)],
+                    },
+                ],
+            }],
+        }],
+    }
+}
+
+/// Read a [`TimePair`] out of a stored time value, unwrapping
+/// the single-field wrapper layers (and the nanoseconds
+/// wrapper), so both modelled values and constants decoded from
+/// allocations are accepted.
+fn time_pair(value: &Value) -> Option<TimePair> {
+    fn as_int(value: &Value) -> Option<i128> {
+        match value {
+            Value::Int(v) => Some(*v),
+            Value::Uint(v) => Some(*v as i128),
+            Value::Enum { fields, .. } | Value::Tuple(fields) if fields.len() == 1 => {
+                as_int(&fields[0])
+            }
+            _ => None,
+        }
+    }
+    match value {
+        Value::Enum { fields, .. } | Value::Tuple(fields) => {
+            if fields.len() == 1 {
+                return time_pair(&fields[0]);
+            }
+            if fields.len() == 2 {
+                return Some((as_int(&fields[0])?, as_int(&fields[1])?));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Read a `Duration` value as a (secs, nanos) pair in the same
+/// form as a [`TimePair`]. The fields are unsigned (`u64` secs,
+/// `u32` nanos, the nanos possibly behind its wrapper struct in
+/// a decoded constant), so an integer field is read as the bit
+/// pattern of the unsigned value.
+fn duration_pair(value: &Value) -> Option<TimePair> {
+    fn as_unsigned(value: &Value) -> Option<i128> {
+        match value {
+            Value::Uint(v) => Some(*v as i128),
+            Value::Int(v) => Some(*v as u64 as i128),
+            Value::Enum { fields, .. } | Value::Tuple(fields) if fields.len() == 1 => {
+                as_unsigned(&fields[0])
+            }
+            _ => None,
+        }
+    }
+    match value {
+        Value::Enum { fields, .. } | Value::Tuple(fields) if fields.len() == 2 => {
+            Some((as_unsigned(&fields[0])?, as_unsigned(&fields[1])?))
+        }
+        _ => None,
+    }
+}
+
+/// `base + dur` on time pairs, normalized; `None` on overflow of
+/// the seconds range. For `Instant` (system = false) the result
+/// must stay in the monotonic clock's representable range, which
+/// this model takes as the i64 seconds range; `SystemTime` and
+/// `Duration` arithmetic shares the same bound here.
+fn checked_time_add(base: TimePair, dur: TimePair, _system: bool) -> Option<TimePair> {
+    let mut secs = base.0.checked_add(dur.0)?;
+    let mut nanos = base.1 + dur.1;
+    if nanos >= 1_000_000_000 {
+        nanos -= 1_000_000_000;
+        secs = secs.checked_add(1)?;
+    }
+    if secs > i64::MAX as i128 {
+        return None;
+    }
+    Some((secs, nanos))
+}
+
+/// `base - dur` on time pairs, normalized; `None` when the
+/// result would be negative (for a duration-since computation)
+/// or underflow the seconds range.
+fn checked_time_sub(base: TimePair, dur: TimePair, _system: bool) -> Option<TimePair> {
+    let mut secs = base.0.checked_sub(dur.0)?;
+    let mut nanos = base.1 - dur.1;
+    if nanos < 0 {
+        nanos += 1_000_000_000;
+        secs = secs.checked_sub(1)?;
+    }
+    if secs < 0 {
+        return None;
+    }
+    Some((secs, nanos))
+}
+
 impl<'a> Interpreter<'a> {
     /// Execute one `CallBuiltin` terminator. `name` is canonical;
     /// `generic_args` are the callee's rendered generic type tags.
@@ -1644,28 +1830,259 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::DurationNew => {
                 arity(2)?;
-                let secs = uint_arg(&vals[0], name)?;
-                let nanos = uint_arg(&vals[1], name)?;
+                let secs = uint_arg_bits(&vals[0], name)?;
+                let nanos = uint_arg_bits(&vals[1], name)?;
                 self.duration_value(secs, nanos)
             }
             Builtin::DurationFromSecs => {
                 arity(1)?;
-                self.duration_value(uint_arg(&vals[0], name)?, 0)
+                self.duration_value(uint_arg_bits(&vals[0], name)?, 0)
             }
             Builtin::DurationFromMillis => {
                 arity(1)?;
-                let ms = uint_arg(&vals[0], name)?;
+                let ms = uint_arg_bits(&vals[0], name)?;
                 self.duration_value(ms / 1_000, (ms % 1_000) * 1_000_000)
             }
             Builtin::DurationFromMicros => {
                 arity(1)?;
-                let us = uint_arg(&vals[0], name)?;
+                let us = uint_arg_bits(&vals[0], name)?;
                 self.duration_value(us / 1_000_000, (us % 1_000_000) * 1_000)
             }
             Builtin::DurationFromNanos => {
                 arity(1)?;
-                let ns = uint_arg(&vals[0], name)?;
+                let ns = uint_arg_bits(&vals[0], name)?;
                 self.duration_value(ns / 1_000_000_000, ns % 1_000_000_000)
+            }
+            Builtin::InstantNow => {
+                arity(0)?;
+                Ok(instant_value(monotonic_now()))
+            }
+            Builtin::SystemTimeNow => {
+                arity(0)?;
+                Ok(instant_value(wall_now()))
+            }
+            Builtin::TimeCheckedAdd(system) => {
+                arity(2)?;
+                let base = time_pair(&self.resolve_value(frames, &vals[0])?).ok_or_else(|| {
+                    InterpError::type_mismatch(name, "a time value", vals[0].kind_name())
+                })?;
+                let dur = duration_pair(&vals[1]).ok_or_else(|| {
+                    InterpError::type_mismatch(name, "a Duration value", vals[1].kind_name())
+                })?;
+                Ok(match checked_time_add(base, dur, system) {
+                    Some(pair) => some_value(instant_value(pair)),
+                    None => none_value(),
+                })
+            }
+            Builtin::TimeCheckedSub(system) => {
+                arity(2)?;
+                let base = time_pair(&self.resolve_value(frames, &vals[0])?).ok_or_else(|| {
+                    InterpError::type_mismatch(name, "a time value", vals[0].kind_name())
+                })?;
+                let dur = duration_pair(&vals[1]).ok_or_else(|| {
+                    InterpError::type_mismatch(name, "a Duration value", vals[1].kind_name())
+                })?;
+                Ok(match checked_time_sub(base, dur, system) {
+                    Some(pair) => some_value(instant_value(pair)),
+                    None => none_value(),
+                })
+            }
+            Builtin::InstantDurationSince => {
+                arity(2)?;
+                let a = time_pair(&self.resolve_value(frames, &vals[0])?).ok_or_else(|| {
+                    InterpError::type_mismatch(name, "a time value", vals[0].kind_name())
+                })?;
+                let b = time_pair(&vals[1]).ok_or_else(|| {
+                    InterpError::type_mismatch(name, "a time value", vals[1].kind_name())
+                })?;
+                match checked_time_sub(a, b, false) {
+                    Some(pair) => self.duration_value(pair.0 as u64, pair.1 as u64),
+                    None => Err(InterpError::panic_str_payload(
+                        "supplied instant is later than self",
+                    )),
+                }
+            }
+            Builtin::InstantCheckedDurationSince => {
+                arity(2)?;
+                let a = time_pair(&self.resolve_value(frames, &vals[0])?).ok_or_else(|| {
+                    InterpError::type_mismatch(name, "a time value", vals[0].kind_name())
+                })?;
+                let b = time_pair(&vals[1]).ok_or_else(|| {
+                    InterpError::type_mismatch(name, "a time value", vals[1].kind_name())
+                })?;
+                match checked_time_sub(a, b, false) {
+                    Some(pair) => Ok(some_value(
+                        self.duration_value(pair.0 as u64, pair.1 as u64)?,
+                    )),
+                    None => Ok(none_value()),
+                }
+            }
+            Builtin::InstantSaturatingDurationSince => {
+                arity(2)?;
+                let a = time_pair(&self.resolve_value(frames, &vals[0])?).ok_or_else(|| {
+                    InterpError::type_mismatch(name, "a time value", vals[0].kind_name())
+                })?;
+                let b = time_pair(&vals[1]).ok_or_else(|| {
+                    InterpError::type_mismatch(name, "a time value", vals[1].kind_name())
+                })?;
+                match checked_time_sub(a, b, false) {
+                    Some(pair) => self.duration_value(pair.0 as u64, pair.1 as u64),
+                    None => self.duration_value(0, 0),
+                }
+            }
+            Builtin::InstantElapsed => {
+                arity(1)?;
+                let a = time_pair(&self.resolve_value(frames, &vals[0])?).ok_or_else(|| {
+                    InterpError::type_mismatch(name, "a time value", vals[0].kind_name())
+                })?;
+                match checked_time_sub(monotonic_now(), a, false) {
+                    Some(pair) => self.duration_value(pair.0 as u64, pair.1 as u64),
+                    None => Err(InterpError::panic_str_payload(
+                        "supplied instant is later than self",
+                    )),
+                }
+            }
+            Builtin::SystemTimeDurationSince => {
+                arity(2)?;
+                let a = time_pair(&self.resolve_value(frames, &vals[0])?).ok_or_else(|| {
+                    InterpError::type_mismatch(name, "a time value", vals[0].kind_name())
+                })?;
+                let b = time_pair(&vals[1]).ok_or_else(|| {
+                    InterpError::type_mismatch(name, "a time value", vals[1].kind_name())
+                })?;
+                match checked_time_sub(a, b, true) {
+                    Some(pair) => Ok(Value::Enum {
+                        variant: 0,
+                        fields: vec![self.duration_value(pair.0 as u64, pair.1 as u64)?],
+                    }),
+                    None => {
+                        // `Err(SystemTimeError(duration))`: the
+                        // error wraps the positive difference.
+                        let back = checked_time_sub(b, a, true)
+                            .expect("one direction is non-negative");
+                        Ok(Value::Enum {
+                            variant: 1,
+                            fields: vec![Value::Enum {
+                                variant: 0,
+                                fields: vec![
+                                    self.duration_value(back.0 as u64, back.1 as u64)?,
+                                ],
+                            }],
+                        })
+                    }
+                }
+            }
+            Builtin::SystemTimeElapsed => {
+                arity(1)?;
+                let a = time_pair(&self.resolve_value(frames, &vals[0])?).ok_or_else(|| {
+                    InterpError::type_mismatch(name, "a time value", vals[0].kind_name())
+                })?;
+                match checked_time_sub(wall_now(), a, true) {
+                    Some(pair) => Ok(Value::Enum {
+                        variant: 0,
+                        fields: vec![self.duration_value(pair.0 as u64, pair.1 as u64)?],
+                    }),
+                    None => {
+                        let back = checked_time_sub(a, wall_now(), true)
+                            .expect("one direction is non-negative");
+                        Ok(Value::Enum {
+                            variant: 1,
+                            fields: vec![Value::Enum {
+                                variant: 0,
+                                fields: vec![
+                                    self.duration_value(back.0 as u64, back.1 as u64)?,
+                                ],
+                            }],
+                        })
+                    }
+                }
+            }
+            Builtin::OpsAdd | Builtin::OpsSub => {
+                arity(2)?;
+                let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
+                let sub = kind == Builtin::OpsSub;
+                match self_ty {
+                    "std::time::Instant" | "std::time::SystemTime" => {
+                        let system = self_ty == "std::time::SystemTime";
+                        let base = time_pair(&vals[0]).ok_or_else(|| {
+                            InterpError::type_mismatch(
+                                name,
+                                "a time value",
+                                vals[0].kind_name(),
+                            )
+                        })?;
+                        let dur = duration_pair(&vals[1]).ok_or_else(|| {
+                            InterpError::type_mismatch(
+                                name,
+                                "a Duration value",
+                                vals[1].kind_name(),
+                            )
+                        })?;
+                        let pair = if sub {
+                            checked_time_sub(base, dur, system)
+                        } else {
+                            checked_time_add(base, dur, system)
+                        };
+                        match pair {
+                            Some(pair) => Ok(instant_value(pair)),
+                            None => Err(InterpError::panic_str_payload(
+                                match (system, sub) {
+                                    (false, false) => {
+                                        "overflow when adding duration to instant"
+                                    }
+                                    (false, true) => {
+                                        "overflow when subtracting duration from instant"
+                                    }
+                                    (true, false) => {
+                                        "overflow when adding duration to system time"
+                                    }
+                                    (true, true) => {
+                                        "overflow when subtracting duration from system time"
+                                    }
+                                },
+                            )),
+                        }
+                    }
+                    "std::time::Duration" => {
+                        let a = duration_pair(&vals[0]).ok_or_else(|| {
+                            InterpError::type_mismatch(
+                                name,
+                                "a Duration value",
+                                vals[0].kind_name(),
+                            )
+                        })?;
+                        let b = duration_pair(&vals[1]).ok_or_else(|| {
+                            InterpError::type_mismatch(
+                                name,
+                                "a Duration value",
+                                vals[1].kind_name(),
+                            )
+                        })?;
+                        if sub {
+                            match checked_time_sub(a, b, true) {
+                                Some(pair) => {
+                                    self.duration_value(pair.0 as u64, pair.1 as u64)
+                                }
+                                None => Err(InterpError::panic_str_payload(
+                                    "overflow when subtracting duration",
+                                )),
+                            }
+                        } else {
+                            match checked_time_add(a, b, true) {
+                                Some(pair) => {
+                                    self.duration_value(pair.0 as u64, pair.1 as u64)
+                                }
+                                None => Err(InterpError::panic_str_payload(
+                                    "overflow when adding duration",
+                                )),
+                            }
+                        }
+                    }
+                    _ => Err(unsupported(format!(
+                        "{} for {self_ty} is not runtime-supported",
+                        if sub { "Sub::sub" } else { "Add::add" }
+                    ))),
+                }
             }
             Builtin::MpscChannel => {
                 arity(0)?;
@@ -3751,6 +4168,7 @@ impl<'a> Interpreter<'a> {
     /// `nanos`), with the normalization `Duration::new` performs
     /// (a nanosecond count at or past one second carries into the
     /// seconds; the carry is checked, as in std).
+
     fn duration_value(&self, secs: u64, nanos: u64) -> InterpResult<Value> {
         let (secs, nanos) = if nanos >= 1_000_000_000 {
             let carry = nanos / 1_000_000_000;
@@ -5126,6 +5544,22 @@ fn increment(value: &Value) -> InterpResult<Value> {
         other => Err(InterpError::type_mismatch(
             "iterator bound increment",
             "integer",
+            other.kind_name(),
+        )),
+    }
+}
+
+/// A `u64` argument read as its bit pattern: a constant with
+/// the high bit set (e.g. `u64::MAX`) materialises as a signed
+/// value in this model, and a time constructor's argument is the
+/// unsigned value with that pattern.
+fn uint_arg_bits(value: &Value, name: &str) -> InterpResult<u64> {
+    match value {
+        Value::Uint(n) => Ok(*n as u64),
+        Value::Int(n) => Ok(*n as u64),
+        other => Err(InterpError::type_mismatch(
+            format!("builtin {name}"),
+            "an unsigned integer",
             other.kind_name(),
         )),
     }
