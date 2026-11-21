@@ -209,6 +209,11 @@ const ITER_TY: mir::DefId = mir::DefId::new(0, 233);
 const INTO_ITER: mir::DefId = mir::DefId::new(0, 234);
 const ITER_NEXT: mir::DefId = mir::DefId::new(0, 235);
 const SIZE_OF: mir::DefId = mir::DefId::new(0, 236);
+const ALIGN_OF: mir::DefId = mir::DefId::new(0, 330);
+const SIZE_OF_VAL: mir::DefId = mir::DefId::new(0, 331);
+const PADDED_TY: mir::DefId = mir::DefId::new(0, 332);
+const PAIR_TY: mir::DefId = mir::DefId::new(0, 333);
+const UNKNOWN_TY: mir::DefId = mir::DefId::new(0, 334);
 const MEM_SWAP: mir::DefId = mir::DefId::new(0, 237);
 const MEM_DROP: mir::DefId = mir::DefId::new(0, 238);
 
@@ -260,6 +265,11 @@ fn std_names() -> HashMap<mir::DefId, String> {
         (INTO_ITER, "std::iter::IntoIterator::into_iter".to_string()),
         (ITER_NEXT, "std::iter::Iterator::next".to_string()),
         (SIZE_OF, "std::mem::size_of".to_string()),
+        (ALIGN_OF, "std::mem::align_of".to_string()),
+        (SIZE_OF_VAL, "std::mem::size_of_val".to_string()),
+        (PADDED_TY, "Padded".to_string()),
+        (PAIR_TY, "Pair".to_string()),
+        (UNKNOWN_TY, "Unknown".to_string()),
         (MEM_SWAP, "std::mem::swap".to_string()),
         (MEM_DROP, "std::mem::drop".to_string()),
     ])
@@ -1302,6 +1312,57 @@ fn size_of_swap_and_drop() {
 }
 
 // ----- IndexMut ------------------------------------------------------------------------
+
+#[test]
+fn size_of_align_of_adt_from_layout_table() {
+    // The driver records compiler layouts of monomorphic ADT
+    // instances in the program's layout table; the mem builtins
+    // answer ADT tags from it. `Padded` stands for a repr(C) struct
+    // { u8, u32, u16 } (size 12, align 4); `Pair<i32, u8>` is a
+    // generic instance (size 8, align 4).
+    let padded_ty = mir::Ty::Adt(PADDED_TY, vec![]);
+    let pair_ty = mir::Ty::Adt(PAIR_TY, vec![i32_ty(), mir::Ty::Uint(mir::UintTy::U8)]);
+
+    let with_layouts = |body: mir::Body| {
+        let mut prog = program(body);
+        prog.adt_layouts.insert("Padded".to_string(), (12, 4));
+        prog.adt_layouts.insert("Pair<i32, u8>".to_string(), (8, 4));
+        prog
+    };
+    let call0 = |def: mir::DefId, arg: mir::Ty| {
+        mir::Body::new(
+            decls(&[usize_ty()]),
+            0,
+            vec![
+                block(vec![], call(fndef(def, vec![arg]), vec![], 0, 1)),
+                block(vec![], ret()),
+            ],
+        )
+    };
+
+    let value = interpret_mir(&with_layouts(call0(SIZE_OF, padded_ty.clone())), "main", vec![])
+        .expect("run");
+    assert_eq!(value, Value::Uint(12));
+    let value = interpret_mir(&with_layouts(call0(ALIGN_OF, padded_ty)), "main", vec![])
+        .expect("run");
+    assert_eq!(value, Value::Uint(4));
+    let value = interpret_mir(&with_layouts(call0(SIZE_OF, pair_ty)), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Uint(8));
+
+    // An ADT with no recorded layout stays explicitly unsupported.
+    let unknown_ty = mir::Ty::Adt(UNKNOWN_TY, vec![]);
+    let err = interpret_mir(&with_layouts(call0(SIZE_OF, unknown_ty)), "main", vec![])
+        .expect_err("size_of of an unrecorded ADT must fail explicitly");
+    match err {
+        MirRunError::Interp(InterpError::UnsupportedTerminator { kind }) => {
+            assert!(
+                kind.contains("size_of/align_of for Unknown is not runtime-supported"),
+                "error names the type: {kind}"
+            );
+        }
+        other => panic!("expected an explicit unsupported error, got {other:?}"),
+    }
+}
 
 #[test]
 fn index_mut_writes_an_array_element() {
