@@ -668,6 +668,140 @@ fn run_mode_aux_commented_crate_name_is_not_a_declaration() {
 }
 
 #[test]
+fn run_mode_aux_build_name_binding() {
+    // Lane CI round 2: a consumer can declare an auxiliary crate
+    // by the name the crate's own source declares
+    // (`#![crate_name = "buildname"]`), not only by the `--aux`
+    // spec name (the svh crates and issue-6919 shape). Binding
+    // only the spec name left the `extern crate buildname;` item
+    // unresolved (E0463).
+    let dir = temp_dir("aux-build-name");
+    let aux = fixture(
+        &dir,
+        "iss-x.rs",
+        "#![crate_name = \"buildname\"]\npub fn val() -> i32 { 33 }\n",
+    );
+    let src = fixture(
+        &dir,
+        "bmain.rs",
+        "extern crate buildname;\n\
+         fn main() { println!(\"v={}\", buildname::val()); }\n",
+    );
+    let out = run_driver_with_aux(&src, &[("iss_x", &aux)]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "build-name declaration must bind; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "v=33\n");
+}
+
+#[test]
+fn run_mode_aux_attribute_prefixed_extern_crate() {
+    // Lane CI round 2: an auxiliary source can declare its
+    // dependency with an attribute-prefixed item
+    // (`#[macro_use] extern crate base;` — the no_link-crate
+    // shape). The declaration scan skipped lines not starting
+    // with `extern crate`, so the dependency was never bound
+    // and the auxiliary build failed with E0463.
+    let dir = temp_dir("aux-attr-extern");
+    let base = fixture(&dir, "base.rs", "pub fn base_val() -> i32 { 40 }\n");
+    let mid = fixture(
+        &dir,
+        "mid.rs",
+        "#[macro_use] extern crate base;\n\
+         pub fn with_base() -> i32 { base::base_val() + 2 }\n",
+    );
+    let src = fixture(
+        &dir,
+        "amain.rs",
+        "extern crate mid;\n\
+         fn main() { println!(\"val={}\", mid::with_base()); }\n",
+    );
+    let out = run_driver_with_aux(&src, &[("base", &base), ("mid", &mid)]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "attribute-prefixed extern crate must declare the dependency; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "val=42\n");
+}
+
+#[test]
+fn run_mode_aux_extra_filename_artifact() {
+    // Lane CI round 2: an auxiliary source whose own
+    // compile-flags carry `-C extra-filename=-1` (the
+    // crateresolve shape) produces `lib<name>-1.rlib`; the
+    // artifact search only recognised `lib<name>.rlib` and
+    // reported the successful build as producing no linkable
+    // artifact.
+    let dir = temp_dir("aux-extra-filename");
+    let aux = fixture(
+        &dir,
+        "xflag.rs",
+        "//@ compile-flags: -C extra-filename=-1\n\
+         pub fn val() -> i32 { 5 }\n",
+    );
+    let src = fixture(
+        &dir,
+        "xmain.rs",
+        "extern crate xflag;\n\
+         fn main() { println!(\"v={}\", xflag::val()); }\n",
+    );
+    let out = run_driver_with_aux(&src, &[("xflag", &aux)]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "extra-filename artifact must be found; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "v=5\n");
+}
+
+#[test]
+fn run_mode_aux_locator_extern_name() {
+    // Lane CI round 2: a caller can declare an auxiliary crate
+    // with a locator `--extern` flag (no path) in the forwarded
+    // rustc arguments — tests/ui/resolve/extern-prelude.rs
+    // passes `--extern Vec` for an auxiliary crate declared
+    // `#![crate_name = "Vec"]` and refers to it through the
+    // extern prelude with no `extern crate` item. The name
+    // counts as a declaration, so the driver binds the built
+    // crate under it.
+    let dir = temp_dir("aux-locator");
+    let aux = fixture(
+        &dir,
+        "vec-aux.rs",
+        "#![crate_name = \"Vec\"]\npub fn new(x: i32) -> i32 { x + 1 }\n",
+    );
+    let src = fixture(
+        &dir,
+        "lmain.rs",
+        "fn main() { println!(\"v={}\", Vec::new(41)); }\n",
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run")
+        .arg(&src)
+        .arg("--rustc-arg")
+        .arg("--extern")
+        .arg("--rustc-arg")
+        .arg("Vec")
+        .arg("--aux")
+        .arg(aux_spec("vec_aux", &aux, ""))
+        .output()
+        .expect("failed to run sparagmos-driver");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "locator --extern name must bind the built crate; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "v=42\n");
+}
+
+#[test]
 fn run_mode_nested_aux_crates_execute() {
     // Auxiliary crates are passed in dependency order: `mid` uses
     // `base`, and the main crate uses `mid`.
