@@ -2664,7 +2664,22 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::IndexMut => {
                 arity(2)?;
+                // A range index (`slice[1..3]`, `slice[..]`, ...)
+                // yields a mutable sub-slice; the index type tag
+                // names the range kind, as for the shared `Index`.
+                let idx_tag = generic_args.get(1).map(String::as_str).unwrap_or("");
+                if idx_tag.contains("ops::Range") {
+                    return self.index_range_mut(frames, name, &vals[0], &vals[1], idx_tag);
+                }
                 let idx = expect_index(&vals[1], name)?;
+                // A fat receiver's bounds are its carried length,
+                // not the length of the base it points into (a
+                // sub-slice of a longer array must panic at its
+                // own length).
+                let fat_len = match &vals[0] {
+                    Value::FatRef { len, .. } => Some(*len),
+                    _ => None,
+                };
                 let target = match &vals[0] {
                     Value::Ref(_) | Value::FatRef { .. } => {
                         self.deref_value(frames, &vals[0])?
@@ -2688,25 +2703,28 @@ impl<'a> Interpreter<'a> {
                             local,
                             projection: projection.clone(),
                         })?;
-                        let len = base.len().ok_or_else(|| {
-                            InterpError::type_mismatch(
-                                "IndexMut::index_mut",
-                                "indexable value",
-                                base.kind_name(),
-                            )
-                        })?;
+                        let len = match fat_len {
+                            Some(len) => len,
+                            None => base.len().ok_or_else(|| {
+                                InterpError::type_mismatch(
+                                    "IndexMut::index_mut",
+                                    "indexable value",
+                                    base.kind_name(),
+                                )
+                            })?,
+                        };
                         if idx as u128 >= len {
                             return Err(InterpError::panic(format!(
                                 "index out of bounds: the len is {len} but the index is {idx}"
                             )));
                         }
                         match base {
-                            // Only array (tuple) elements are
-                            // addressable places in this model; a
-                            // vector's elements live inside its
-                            // aggregate value and cannot be pointed
-                            // into, so those stay unsupported.
-                            Value::Tuple(_) => {
+                            // Array (tuple) elements and vector
+                            // (ADT aggregate) elements are both
+                            // addressable through an index projection:
+                            // the projection layer reads and writes
+                            // `RefProj::Index` on both shapes.
+                            Value::Tuple(_) | Value::Enum { .. } => {
                                 let mut projection = projection;
                                 projection.push(RefProj::Index(idx));
                                 let frame_id = frames[frame_pos].id;
@@ -2740,7 +2758,7 @@ impl<'a> Interpreter<'a> {
                             )));
                         }
                         match base {
-                            Value::Tuple(_) => {
+                            Value::Tuple(_) | Value::Enum { .. } => {
                                 let mut projection = projection;
                                 projection.push(RefProj::Index(idx));
                                 Ok(Value::Ref(RefTarget::Static { name, projection }))
@@ -4004,6 +4022,104 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
             base: Box::new(Value::Tuple(sub)),
             len: sub_len,
         })
+    }
+
+    /// `IndexMut::index_mut` with a range argument: the mutable
+    /// sub-slice of the receiver between the range's bounds, with
+    /// core's own panic messages for out-of-range bounds (via
+    /// [`range_bounds`], as for the shared `Index`). The result is
+    /// a fat reference aliasing the receiver's storage: over the
+    /// receiver reference itself for a place/static receiver, and
+    /// over the same base for a fat receiver. A range starting
+    /// above zero cannot be expressed in this model (a fat
+    /// reference carries a length but no offset, and `RefProj`
+    /// has no offset step), so those stay explicitly unsupported;
+    /// a range starting at zero is exactly a length adjustment.
+    fn index_range_mut(
+        &self,
+        frames: &[Frame],
+        name: &str,
+        receiver: &Value,
+        index: &Value,
+        idx_tag: &str,
+    ) -> InterpResult<Value> {
+        // The bounds as stored in the range value, in the same
+        // shapes as `index_range`.
+        let fields: &[Value] = match index {
+            Value::Unit => &[],
+            Value::Enum { fields, .. } => fields,
+            Value::Tuple(fields) => fields,
+            other => {
+                return Err(InterpError::type_mismatch(
+                    format!("builtin {name}"),
+                    "range index value",
+                    other.kind_name(),
+                ))
+            }
+        };
+        let bound = |i: usize| -> InterpResult<usize> {
+            match fields.get(i) {
+                Some(v) => expect_index(v, name),
+                None => Err(InterpError::type_mismatch(
+                    format!("builtin {name}"),
+                    "range index value with bounds",
+                    index.kind_name(),
+                )),
+            }
+        };
+        let kind = if idx_tag.contains("RangeFull") {
+            RangeKindForIndex::Full
+        } else if idx_tag.contains("RangeToInclusive") {
+            RangeKindForIndex::ToInclusive
+        } else if idx_tag.contains("RangeInclusive") {
+            RangeKindForIndex::Inclusive
+        } else if idx_tag.contains("RangeFrom") {
+            RangeKindForIndex::From
+        } else if idx_tag.contains("RangeTo") {
+            RangeKindForIndex::To
+        } else {
+            RangeKindForIndex::Range
+        };
+        // The receiver's effective length: a fat receiver's
+        // carried length, otherwise the pointed-to value's length.
+        let len: usize = match receiver {
+            Value::FatRef { len, .. } => usize::try_from(*len).unwrap_or(usize::MAX),
+            Value::Ref(_) => {
+                let resolved = self.resolve_value(frames, receiver)?;
+                if matches!(resolved, Value::Str(_)) {
+                    return Err(unsupported(
+                        "IndexMut::index_mut with a range on a str is not runtime-supported"
+                            .to_string(),
+                    ));
+                }
+                let (_, len) = self.slice_elements(frames, receiver)?;
+                usize::try_from(len).unwrap_or(usize::MAX)
+            }
+            other => {
+                return Err(InterpError::type_mismatch(
+                    "IndexMut::index_mut",
+                    "mutable reference",
+                    other.kind_name(),
+                ))
+            }
+        };
+        let (start, end) = range_bounds(&kind, &bound, len)?;
+        if start != 0 {
+            return Err(unsupported(format!(
+                "IndexMut::index_mut with a range starting at {start} is not runtime-supported (a sub-slice offset has no representation in the value model)"
+            )));
+        }
+        match receiver {
+            Value::FatRef { base, .. } => Ok(Value::FatRef {
+                base: base.clone(),
+                len: end as u128,
+            }),
+            Value::Ref(_) => Ok(Value::FatRef {
+                base: Box::new(receiver.clone()),
+                len: end as u128,
+            }),
+            _ => unreachable!("receiver shapes checked above"),
+        }
     }
 
     /// Follow references in `value` until a non-reference value.
