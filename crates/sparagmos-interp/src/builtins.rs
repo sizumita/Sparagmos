@@ -6739,7 +6739,23 @@ impl<'a> Interpreter<'a> {
                 )));
             }
             let pointee = self.resolve_value(frames, value)?;
-            return self.format_debug_seq(frames, &pointee, options, indent, '[', ']');
+            let elem = slice_elem_tag(pointee_tag(ty));
+            return self.format_debug_seq(frames, &pointee, options, indent, '[', ']', elem);
+        }
+        if let Value::DynRef {
+            base, concrete, ..
+        } = value
+        {
+            // A trait object's `Debug` is its concrete type's
+            // `Debug` (that is the vtable entry), so format the
+            // pointee with the concrete type as the tag. The other
+            // traits keep their existing behaviour: their impls
+            // are handwritten bodies, not the derived shape this
+            // formatter models.
+            if trait_ == FmtTrait::Debug {
+                let pointee = self.resolve_value(frames, base)?;
+                return self.format_value(frames, &pointee, trait_, concrete, options, indent);
+            }
         }
         match trait_ {
             FmtTrait::DebugNoop => Ok(String::new()),
@@ -6845,17 +6861,22 @@ impl<'a> Interpreter<'a> {
             // The tag names the type the fmt argument was built
             // over, which may sit behind references (`&mut [i32; 4]`
             // for `println!("{:#?}", mref)`), so strip those first.
-            Value::Tuple(_) if pointee_tag(ty).starts_with('[') => {
-                self.format_debug_seq(frames, value, options, indent, '[', ']')
+            Value::Tuple(items) if pointee_tag(ty).starts_with('[') => {
+                let elem = slice_elem_tag(pointee_tag(ty));
+                let tys: Vec<&str> = items.iter().map(|_| elem).collect();
+                self.format_debug_seq_items(frames, items, options, indent, '[', ']', &tys)
             }
-            Value::Tuple(_) => self.format_debug_seq(frames, value, options, indent, '(', ')'),
+            Value::Tuple(items) => {
+                let tys = tuple_elem_tags(pointee_tag(ty), items.len());
+                self.format_debug_seq_items(frames, items, options, indent, '(', ')', &tys)
+            }
             Value::FmtArguments(inner) => {
                 let text = self.format_arguments(frames, inner)?;
                 Ok(pad_width(&text, options))
             }
-            Value::Enum { .. } => Err(unsupported(
-                "Debug formatting for an ADT value (variant names are not tracked in values)",
-            )),
+            Value::Enum { variant, fields } => {
+                self.format_debug_adt(frames, *variant, fields, ty, options, indent)
+            }
             other => Err(InterpError::type_mismatch(
                 "Debug formatting",
                 "integer, bool, float, string, char or tuple value",
@@ -6931,6 +6952,187 @@ impl<'a> Interpreter<'a> {
         Ok(pad_integral(negative, "", &body, options))
     }
 
+    /// Format one operand of an `ops::Range`-family value with
+    /// the field's recorded type tag.
+    fn format_range_operand(
+        &self,
+        frames: &[Frame],
+        variant_shape: &sparagmos_mir::AdtDebugVariant,
+        index: usize,
+        fields: &[Value],
+        options: &FmtOptions,
+        indent: usize,
+    ) -> InterpResult<String> {
+        self.format_value(
+            frames,
+            &fields[index],
+            FmtTrait::Debug,
+            &variant_shape.fields[index].ty,
+            options,
+            indent,
+        )
+    }
+
+    /// Derived-`Debug` formatting of an ADT value (`{:?}` /
+    /// `{:#?}` of a struct or enum): the shape the driver recorded
+    /// for the value's type tag supplies the variant name, the
+    /// field names and each field's own type tag, so nested values
+    /// format with their types known. This is exactly the output
+    /// the compiler's `#[derive(Debug)]` expansion produces; a
+    /// handwritten `Debug` impl is a body like any other and never
+    /// reaches this formatter unless it itself formats a field
+    /// with `{:?}`.
+    ///
+    /// Two std shapes the value model does not store in declared
+    /// shape are recognised by tag first: a `Vec` value's fields
+    /// are its elements (it prints as the list it is), and a `Box`
+    /// value's one field is the pointee reference (its `Debug`
+    /// forwards to the pointee). An ADT with no recorded shape
+    /// stays an explicit unsupported error.
+    fn format_debug_adt(
+        &self,
+        frames: &[Frame],
+        variant: u32,
+        fields: &[Value],
+        ty: &str,
+        options: &FmtOptions,
+        indent: usize,
+    ) -> InterpResult<String> {
+        let tag = pointee_tag(ty);
+        match tag_base_name(tag) {
+            "Vec" => {
+                let elem = first_generic_arg(tag).unwrap_or("");
+                let tys: Vec<&str> = fields.iter().map(|_| elem).collect();
+                return self.format_debug_seq_items(
+                    frames, fields, options, indent, '[', ']', &tys,
+                );
+            }
+            "Box" if fields.len() == 1 => {
+                let elem = first_generic_arg(tag).unwrap_or("");
+                return self.format_value(
+                    frames,
+                    &fields[0],
+                    FmtTrait::Debug,
+                    elem,
+                    options,
+                    indent,
+                );
+            }
+            _ => {}
+        }
+        let Some(shape) = self.program().adt_debug_shapes.get(tag) else {
+            return Err(unsupported(
+                "Debug formatting for an ADT value (no derived-Debug shape was recorded for its type)",
+            ));
+        };
+        let Some(variant_shape) = shape.variants.get(variant as usize) else {
+            return Err(unsupported(format!(
+                "Debug formatting for an ADT value (variant {variant} of {tag} has no recorded shape)"
+            )));
+        };
+        if variant_shape.fields.len() != fields.len() {
+            return Err(InterpError::type_mismatch(
+                "Debug formatting",
+                "an ADT value whose fields match the recorded shape",
+                "an ADT value with a different field count",
+            ));
+        }
+        // The `ops::Range` family's `Debug` impls are handwritten
+        // in core, but their output is a fixed function of the
+        // fields (`start..end` and its siblings), so it is produced
+        // here from the recorded shape like the derived form. The
+        // match is on the tag's head (the path before any generic
+        // arguments): a user type that merely shares the base name
+        // renders without the `core::ops` path and keeps its
+        // derived shape.
+        let tag_head = tag.split('<').next().unwrap_or(tag).trim();
+        let range_text = match tag_head {
+            "core::ops::Range" | "std::ops::Range" if fields.len() == 2 => {
+                let start = self.format_range_operand(frames, variant_shape, 0, fields, options, indent)?;
+                let end = self.format_range_operand(frames, variant_shape, 1, fields, options, indent)?;
+                Some(format!("{start}..{end}"))
+            }
+            "core::ops::RangeInclusive" | "std::ops::RangeInclusive" if fields.len() == 3 => {
+                // Fields are `start`, `end`, `exhausted`; the
+                // printed form uses the first two.
+                let start = self.format_range_operand(frames, variant_shape, 0, fields, options, indent)?;
+                let end = self.format_range_operand(frames, variant_shape, 1, fields, options, indent)?;
+                Some(format!("{start}..={end}"))
+            }
+            "core::ops::RangeFrom" | "std::ops::RangeFrom" if fields.len() == 1 => {
+                let start = self.format_range_operand(frames, variant_shape, 0, fields, options, indent)?;
+                Some(format!("{start}.."))
+            }
+            "core::ops::RangeTo" | "std::ops::RangeTo" if fields.len() == 1 => {
+                let end = self.format_range_operand(frames, variant_shape, 0, fields, options, indent)?;
+                Some(format!("..{end}"))
+            }
+            "core::ops::RangeToInclusive" | "std::ops::RangeToInclusive" if fields.len() == 1 => {
+                let end = self.format_range_operand(frames, variant_shape, 0, fields, options, indent)?;
+                Some(format!("..={end}"))
+            }
+            "core::ops::RangeFull" | "std::ops::RangeFull" if fields.is_empty() => {
+                Some("..".to_string())
+            }
+            _ => None,
+        };
+        if let Some(text) = range_text {
+            return Ok(pad_width(&text, options));
+        }
+        let name = variant_shape.name.as_str();
+        if fields.is_empty() {
+            return Ok(pad_width(name, options));
+        }
+        let named = variant_shape.fields.iter().all(|f| f.name.is_some());
+        if options.alternate() {
+            let inner = indent + 4;
+            let pad = " ".repeat(inner);
+            let mut out = String::new();
+            out.push_str(name);
+            out.push_str(if named { " {\n" } else { "(\n" });
+            for (field, value) in variant_shape.fields.iter().zip(fields) {
+                out.push_str(&pad);
+                if let Some(field_name) = &field.name {
+                    out.push_str(field_name);
+                    out.push_str(": ");
+                }
+                out.push_str(&self.format_value(
+                    frames,
+                    value,
+                    FmtTrait::Debug,
+                    &field.ty,
+                    options,
+                    inner,
+                )?);
+                out.push_str(",\n");
+            }
+            out.push_str(&" ".repeat(indent));
+            out.push(if named { '}' } else { ')' });
+            return Ok(out);
+        }
+        let mut parts = Vec::with_capacity(fields.len());
+        for (field, value) in variant_shape.fields.iter().zip(fields) {
+            let text = self.format_value(
+                frames,
+                value,
+                FmtTrait::Debug,
+                &field.ty,
+                &FmtOptions::new(),
+                indent,
+            )?;
+            match &field.name {
+                Some(field_name) => parts.push(format!("{field_name}: {text}")),
+                None => parts.push(text),
+            }
+        }
+        let body = if named {
+            format!("{name} {{ {} }}", parts.join(", "))
+        } else {
+            format!("{name}({})", parts.join(", "))
+        };
+        Ok(pad_width(&body, options))
+    }
+
     /// Debug formatting of a tuple or slice value: `(a, b)` / `[a, b]`,
     /// or the multi-line form under `{:#?}`.
     fn format_debug_seq(
@@ -6941,6 +7143,7 @@ impl<'a> Interpreter<'a> {
         indent: usize,
         open: char,
         close: char,
+        elem_ty: &str,
     ) -> InterpResult<String> {
         let items = match value {
             Value::Tuple(items) => items,
@@ -6950,6 +7153,7 @@ impl<'a> Interpreter<'a> {
             // base's elements truncated to the carried length.
             Value::FatRef { .. } => {
                 let (items, _) = self.slice_elements(frames, value)?;
+                let tys: Vec<&str> = items.iter().map(|_| elem_ty).collect();
                 return self.format_debug_seq_items(
                     frames,
                     &items,
@@ -6957,11 +7161,13 @@ impl<'a> Interpreter<'a> {
                     indent,
                     open,
                     close,
+                    &tys,
                 );
             }
             Value::Bytes(b) => {
                 let items: Vec<Value> = b.iter().map(|byte| Value::Uint(*byte as u128)).collect();
-                return self.format_debug_seq_items(frames, &items, options, indent, open, close);
+                let tys: Vec<&str> = items.iter().map(|_| "u8").collect();
+                return self.format_debug_seq_items(frames, &items, options, indent, open, close, &tys);
             }
             other => {
                 return Err(InterpError::type_mismatch(
@@ -6971,7 +7177,8 @@ impl<'a> Interpreter<'a> {
                 ))
             }
         };
-        self.format_debug_seq_items(frames, items, options, indent, open, close)
+        let tys: Vec<&str> = items.iter().map(|_| elem_ty).collect();
+        self.format_debug_seq_items(frames, items, options, indent, open, close, &tys)
     }
 
     fn format_debug_seq_items(
@@ -6982,9 +7189,12 @@ impl<'a> Interpreter<'a> {
         indent: usize,
         open: char,
         close: char,
+        elem_tys: &[&str],
     ) -> InterpResult<String> {
-        // Element type tags are not tracked in values, so elements
-        // are formatted from their value kind alone.
+        // Element type tags are not tracked in values; the caller
+        // supplies the ones it can recover from the container's own
+        // tag (an empty tag formats the element from its value kind
+        // alone, as before).
         if options.alternate() {
             if items.is_empty() {
                 return Ok(format!("{open}{close}"));
@@ -6993,13 +7203,13 @@ impl<'a> Interpreter<'a> {
             let mut out = String::new();
             out.push(open);
             out.push('\n');
-            for item in items {
+            for (i, item) in items.iter().enumerate() {
                 out.push_str(&" ".repeat(inner));
                 out.push_str(&self.format_value(
                     frames,
                     item,
                     FmtTrait::Debug,
-                    "",
+                    elem_tys.get(i).copied().unwrap_or(""),
                     options,
                     inner,
                 )?);
@@ -7010,12 +7220,12 @@ impl<'a> Interpreter<'a> {
             return Ok(out);
         }
         let mut parts = Vec::with_capacity(items.len());
-        for item in items {
+        for (i, item) in items.iter().enumerate() {
             parts.push(self.format_value(
                 frames,
                 item,
                 FmtTrait::Debug,
-                "",
+                elem_tys.get(i).copied().unwrap_or(""),
                 &FmtOptions::new(),
                 indent,
             )?);
@@ -7232,6 +7442,111 @@ fn pointee_tag(ty: &str) -> &str {
         } else {
             return ty;
         }
+    }
+}
+
+/// The base name of a rendered type tag: the last path segment
+/// of the head before any generic argument list or tuple body
+/// (`std::vec::Vec<i32>` -> `Vec`, `Pair<i32, u8>` -> `Pair`).
+fn tag_base_name(tag: &str) -> &str {
+    let head = tag.split(['<', '(']).next().unwrap_or(tag).trim();
+    head.rsplit("::").next().unwrap_or(head).trim()
+}
+
+/// Split a rendered tag list on its top-level commas: commas
+/// inside `<...>`, `(...)` and `[...]` groups do not split.
+fn split_tag_list(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let tail = s[start..].trim();
+    if !tail.is_empty() {
+        parts.push(tail);
+    }
+    parts
+}
+
+/// The inside of the bracket group that opens at byte `open` in a
+/// rendered tag, honouring nested groups of every bracket kind.
+fn tag_group_inner(tag: &str, open: usize) -> Option<&str> {
+    let bytes = tag.as_bytes();
+    let mut depth = 0i32;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'<' | b'(' | b'[' => depth += 1,
+            b'>' | b')' | b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&tag[open + 1..i]);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The first generic argument of a rendered tag
+/// (`Vec<Point, Global>` -> `Point`), if it has a `<...>` list.
+fn first_generic_arg(tag: &str) -> Option<&str> {
+    let open = tag.find('<')?;
+    let inner = tag_group_inner(tag, open)?;
+    split_tag_list(inner).into_iter().next()
+}
+
+/// The element tag of a rendered array or slice tag
+/// (`[Point; 2]` / `[Point]` -> `Point`); empty when the tag is
+/// not in that form.
+fn slice_elem_tag(tag: &str) -> &str {
+    let Some(rest) = tag.strip_prefix('[') else {
+        return "";
+    };
+    let Some(inner) = rest.strip_suffix(']') else {
+        return "";
+    };
+    // An array length sits behind a top-level `;`.
+    let mut depth = 0i32;
+    for (i, c) in inner.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth -= 1,
+            ';' if depth == 0 => return inner[..i].trim(),
+            _ => {}
+        }
+    }
+    inner.trim()
+}
+
+/// The per-element tags of a rendered tuple tag, one per element
+/// (`(Point, i32)` -> [`Point`, `i32`]); an element whose tag
+/// cannot be recovered gets the empty tag (it then formats from
+/// its value kind alone).
+fn tuple_elem_tags(tag: &str, count: usize) -> Vec<&str> {
+    let empty: Vec<&str> = vec![""; count];
+    let Some(open) = tag.find('(') else {
+        return empty;
+    };
+    let Some(inner) = tag_group_inner(tag, open) else {
+        return empty;
+    };
+    let parts = split_tag_list(inner);
+    if parts.len() == count {
+        parts
+    } else {
+        empty
     }
 }
 
