@@ -207,6 +207,69 @@ pub(crate) fn box_alloc_pointer(value: &Value) -> Option<(u64, Vec<RefProj>)> {
     }
 }
 
+/// The allocation id a reference-counted handle value names,
+/// if the value has the handle shape: an aggregate (the `Rc` /
+/// `Arc` / `Weak` struct) whose first field is a one-field
+/// `NonNull` aggregate holding a reference to the allocation's
+/// storage. Any further fields (the zero-sized phantom and
+/// allocator fields of `Rc` / `Arc`) do not name the allocation.
+pub(crate) fn rc_handle_id(value: &Value) -> Option<u64> {
+    let fields = match value {
+        Value::Enum { fields, .. } if !fields.is_empty() => fields,
+        _ => return None,
+    };
+    let inner = match &fields[0] {
+        Value::Enum { fields, .. } if fields.len() == 1 => fields,
+        _ => return None,
+    };
+    match &inner[0] {
+        Value::Ref(RefTarget::Alloc { id, projection }) if projection.is_empty() => Some(*id),
+        _ => None,
+    }
+}
+
+/// The count leaf of one reference count of an `RcInner` /
+/// `ArcInner` aggregate: field `field` (0 = strong, 1 = weak) is
+/// a `Cell<usize>` / `AtomicUsize` wrapper around an
+/// `UnsafeCell<usize>` holding the count.
+fn count_leaf(inner: &Value, field: usize) -> Option<u128> {
+    fn unwrap1(v: &Value) -> Option<&Value> {
+        match v {
+            Value::Enum { fields, .. } if fields.len() == 1 => Some(&fields[0]),
+            _ => None,
+        }
+    }
+    let fields = match inner {
+        Value::Enum { fields, .. } => fields,
+        _ => return None,
+    };
+    let leaf = unwrap1(unwrap1(fields.get(field)?)?)?;
+    match leaf {
+        Value::Uint(n) => Some(*n),
+        _ => None,
+    }
+}
+
+/// The mutable count leaf of one reference count (see
+/// [`count_leaf`]).
+fn count_leaf_mut(inner: &mut Value, field: usize) -> Option<&mut u128> {
+    fn unwrap1_mut(v: &mut Value) -> Option<&mut Value> {
+        match v {
+            Value::Enum { fields, .. } if fields.len() == 1 => fields.first_mut(),
+            _ => None,
+        }
+    }
+    let fields = match inner {
+        Value::Enum { fields, .. } => fields,
+        _ => return None,
+    };
+    let leaf = unwrap1_mut(unwrap1_mut(fields.get_mut(field)?)?)?;
+    match leaf {
+        Value::Uint(n) => Some(n),
+        _ => None,
+    }
+}
+
 /// The interpreter state for one program.
 pub struct Interpreter<'a> {
     program: &'a Program,
@@ -2123,6 +2186,94 @@ impl<'a> Interpreter<'a> {
                             if sender { "sender" } else { "receiver" },
                         );
                     }
+                    P::RcHandleDrop { value } => {
+                        // A moved-out / never-written handle has no
+                        // count to decrement, exactly like drop
+                        // flags in real MIR.
+                        let Some(handle) = self.read_at(frames, &active.root, &path)? else {
+                            continue;
+                        };
+                        let Some(id) = rc_handle_id(&handle) else {
+                            return Err(InterpError::type_mismatch(
+                                "reference-counted handle drop glue",
+                                "an Rc/Arc handle",
+                                handle.kind_name(),
+                            ));
+                        };
+                        if !self.rc_dec_strong(id)? {
+                            continue;
+                        }
+                        // The last strong handle is gone: the
+                        // pointee's glue runs against the stored
+                        // value in a nested session rooted at the
+                        // allocation, and the weak bundle the
+                        // strong handles held is released in a
+                        // second nested session after it — so the
+                        // storage, and its counts, stay observable
+                        // to the destructor exactly as long as they
+                        // are natively (a `Weak::upgrade` inside the
+                        // destructor still reads strong = 0 and
+                        // returns `None`, never a dangling error).
+                        let release = GlueSession {
+                            root: RefTarget::Alloc {
+                                id,
+                                projection: Vec::new(),
+                            },
+                            work: vec![(Vec::new(), P::RcWeakRelease)],
+                            adts: active.adts.clone(),
+                            completion: GlueCompletion::Resume,
+                        };
+                        let nested = GlueSession {
+                            root: RefTarget::Alloc {
+                                id,
+                                projection: Vec::new(),
+                            },
+                            work: vec![(vec![RefProj::Field(2)], *value)],
+                            adts: active.adts.clone(),
+                            completion: GlueCompletion::Resume,
+                        };
+                        suspended.push(std::mem::replace(&mut active, release));
+                        suspended.push(std::mem::replace(&mut active, nested));
+                        continue 'sessions;
+                    }
+                    P::RcWeakRelease => {
+                        // The weak reference being released: the
+                        // handle at the work path, or — for the
+                        // bundle release the interpreter synthesizes
+                        // after a pointee's glue — the allocation
+                        // the session itself is rooted at.
+                        let rooted = if path.is_empty() {
+                            match &active.root {
+                                RefTarget::Alloc { id, projection }
+                                    if projection.is_empty() =>
+                                {
+                                    Some(*id)
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        let id = match rooted {
+                            Some(id) => id,
+                            None => {
+                                let Some(handle) =
+                                    self.read_at(frames, &active.root, &path)?
+                                else {
+                                    continue;
+                                };
+                                let Some(id) = rc_handle_id(&handle) else {
+                                    return Err(InterpError::type_mismatch(
+                                        "weak handle drop glue",
+                                        "a Weak handle",
+                                        handle.kind_name(),
+                                    ));
+                                };
+                                id
+                            }
+                        };
+                        self.rc_dec_weak(id)?;
+                    }
                     P::Dynamic => {
                         // A moved-out / never-written place holds
                         // nothing to drop, as with rustc's drop flags.
@@ -2170,7 +2321,15 @@ impl<'a> Interpreter<'a> {
                         // built by the `new` builtins, or behind the
                         // data pointer itself for a pointer-shaped
                         // base.
+                        let rc_base = rc_handle_id(&base);
                         let pointee_root = match &*base {
+                            // A reference-counted handle base:
+                            // the pointee is the allocation's
+                            // value field in the store.
+                            Value::Enum { .. } if rc_base.is_some() => RefTarget::Alloc {
+                                id: rc_base.expect("checked"),
+                                projection: vec![RefProj::Field(2)],
+                            },
                             // A built box's single field is its
                             // allocation pointer: the pointee lives
                             // in the allocation store, behind that
@@ -2522,6 +2681,119 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// The handle value naming reference-counted allocation `id`,
+    /// in the struct's real field shape: `ptr` (a `NonNull`
+    /// aggregate holding the allocation reference), then the
+    /// zero-sized `phantom: PhantomData` and `alloc: A` fields -
+    /// the default allocator is the unit struct `Global`.
+    /// Converted std bodies read all three: `make_mut` reads the
+    /// allocator field to build the replacement allocation.
+    pub(crate) fn rc_handle(&self, id: u64) -> Value {
+        Value::Enum {
+            variant: 0,
+            fields: vec![
+                Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Ref(RefTarget::Alloc {
+                        id,
+                        projection: Vec::new(),
+                    })],
+                },
+                Value::Enum {
+                    variant: 0,
+                    fields: Vec::new(),
+                },
+                Value::Enum {
+                    variant: 0,
+                    fields: Vec::new(),
+                },
+            ],
+        }
+    }
+
+    /// Create the allocation a fresh `Rc::new` / `Arc::new`
+    /// produces — an `RcInner` / `ArcInner` aggregate
+    /// `{ strong, weak, value }` with both counts at 1 (the weak
+    /// count includes the bundle the strong handles collectively
+    /// hold, as natively) — and return the handle naming it.
+    pub(crate) fn rc_new_handle(&self, pointee: Value) -> Value {
+        fn count_cell(count: u128) -> Value {
+            // A `Cell<usize>` (for `Rc`) or `AtomicUsize` (for
+            // `Arc`) aggregate: a one-field wrapper around an
+            // `UnsafeCell<usize>` holding the count.
+            Value::Enum {
+                variant: 0,
+                fields: vec![Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Uint(count)],
+                }],
+            }
+        }
+        let inner = Value::Enum {
+            variant: 0,
+            fields: vec![count_cell(1), count_cell(1), pointee],
+        };
+        let id = self.alloc_insert(inner);
+        self.rc_handle(id)
+    }
+
+    /// Adjust one reference count (field 0 = strong, 1 = weak) of
+    /// allocation `id` by `delta`; returns the new count.
+    fn rc_adjust_count(&self, id: u64, field: usize, delta: i128) -> InterpResult<u128> {
+        let mut store = self.allocs.borrow_mut();
+        let inner = store.get_mut(&id).ok_or_else(|| self.missing_alloc(id))?;
+        let kind = inner.kind_name();
+        let leaf = count_leaf_mut(inner, field).ok_or_else(|| {
+            InterpError::type_mismatch(
+                "reference-counted allocation",
+                "an RcInner/ArcInner aggregate",
+                kind,
+            )
+        })?;
+        let next = *leaf as i128 + delta;
+        if next < 0 {
+            return Err(InterpError::panic(
+                "reference count underflow (a handle was dropped twice)".to_string(),
+            ));
+        }
+        *leaf = next as u128;
+        Ok(next as u128)
+    }
+
+    /// Record a reference-counted handle's clone: another live
+    /// strong handle on the same allocation.
+    pub(crate) fn rc_inc_strong(&self, id: u64) -> InterpResult<()> {
+        self.rc_adjust_count(id, 0, 1)?;
+        Ok(())
+    }
+
+    /// Record a strong handle's drop; returns true when the
+    /// strong count reached zero and the pointee's glue must run.
+    pub(crate) fn rc_dec_strong(&self, id: u64) -> InterpResult<bool> {
+        Ok(self.rc_adjust_count(id, 0, -1)? == 0)
+    }
+
+    /// Record a weak handle's creation (a `Weak` clone; a
+    /// downgrade adjusts the count through the stored aggregate
+    /// itself, as the converted body does).
+    pub(crate) fn rc_inc_weak(&self, id: u64) -> InterpResult<()> {
+        self.rc_adjust_count(id, 1, 1)?;
+        Ok(())
+    }
+
+    /// Record a weak reference's release; frees the allocation's
+    /// storage when both counts are zero.
+    pub(crate) fn rc_dec_weak(&self, id: u64) -> InterpResult<()> {
+        let weak = self.rc_adjust_count(id, 1, -1)?;
+        if weak == 0 {
+            let inner = self.alloc_base(id)?;
+            if count_leaf(&inner, 0) == Some(0) {
+                self.allocs.borrow_mut().remove(&id);
+            }
+        }
+        Ok(())
+    }
+
     fn missing_static(&self, name: &str) -> InterpError {
         InterpError::UnsupportedTerminator {
             kind: format!(
@@ -2578,10 +2850,21 @@ impl<'a> Interpreter<'a> {
     /// construction builtins produce; a box built from its MIR
     /// aggregates instead carries the `Unique`/`NonNull` wrapper
     /// chain above a pointer value.
-    pub(crate) fn new_box(&self, pointee: Value) -> Value {
+    /// Create a heap allocation holding `value` in the
+    /// allocation store and return the id that names it. The
+    /// storage lives until the model frees it: for a box, when
+    /// the owning box's drop glue completes; for a
+    /// reference-counted allocation, when its strong and weak
+    /// counts both reach zero.
+    pub(crate) fn alloc_insert(&self, value: Value) -> u64 {
         let id = self.next_alloc.get();
         self.next_alloc.set(id + 1);
-        self.allocs.borrow_mut().insert(id, pointee);
+        self.allocs.borrow_mut().insert(id, value);
+        id
+    }
+
+    pub(crate) fn new_box(&self, pointee: Value) -> Value {
+        let id = self.alloc_insert(pointee);
         Value::Enum {
             variant: 0,
             fields: vec![Value::Ref(RefTarget::Alloc {
@@ -3199,20 +3482,30 @@ impl<'a> Interpreter<'a> {
             // reference or slice base, and to the held pointee for
             // a box base (the box aggregate itself — exactly what
             // `Deref::deref` for `Box` yields).
-            Value::DynRef { base, .. } => match &**base {
-                // A built box base: its single field is the
-                // allocation pointer, and the pointee lives in
-                // the allocation store behind it.
-                Value::Enum { fields, .. }
-                    if fields.len() == 1
-                        && matches!(fields[0], Value::Ref(RefTarget::Alloc { .. })) =>
-                {
-                    self.deref_value(frames, &fields[0])
+            Value::DynRef { base, .. } => {
+                // A reference-counted base names its pointee in the
+                // allocation store, not inside the handle value.
+                if let Some(id) = rc_handle_id(base) {
+                    return Ok(Resolved::Alloc {
+                        id,
+                        projection: vec![RefProj::Field(2)],
+                    });
                 }
-                Value::Enum { fields, .. } if fields.len() == 1 => {
-                    Ok(Resolved::Value(fields[0].clone()))
+                match &**base {
+                    // A built box base: its single field is the
+                    // allocation pointer, and the pointee lives in
+                    // the allocation store behind it.
+                    Value::Enum { fields, .. }
+                        if fields.len() == 1
+                            && matches!(fields[0], Value::Ref(RefTarget::Alloc { .. })) =>
+                    {
+                        self.deref_value(frames, &fields[0])
+                    }
+                    Value::Enum { fields, .. } if fields.len() == 1 => {
+                        Ok(Resolved::Value(fields[0].clone()))
+                    }
+                    _ => self.deref_value(frames, base),
                 }
-                _ => self.deref_value(frames, base),
             },
             // Dereferencing a built box value itself (or a
             // one-field pointer wrapper holding an allocation
@@ -5252,7 +5545,7 @@ fn eval_binary(
             return Ok((Value::Bool(v), false));
         }
     }
-    Err(InterpError::type_mismatch(
+        Err(InterpError::type_mismatch(
         format!("binary operation {op:?}"),
         "matching integer/bool operands",
         format!("{} and {}", lhs.kind_name(), rhs.kind_name()),

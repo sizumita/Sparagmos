@@ -702,6 +702,23 @@ pub enum DropPlan {
     /// and dropping the receiver for its senders. A moved-out
     /// handle has no count to decrement.
     ChannelHandleDrop { sender: bool },
+    /// Drop one strong handle of a reference-counted allocation
+    /// (the `Rc` / `Arc` destructor in the interpreter's allocation
+    /// model, see `RefTarget::Alloc`): decrement the allocation's
+    /// strong count, and when it reaches zero run `value` — the
+    /// pointee type's glue — against the stored value, then
+    /// release the weak bundle the strong handles collectively
+    /// held (an [`DropPlan::RcWeakRelease`] the interpreter
+    /// synthesizes for the allocation). A moved-out handle has no
+    /// count to decrement.
+    RcHandleDrop { value: Box<DropPlan> },
+    /// Release one weak reference to a reference-counted
+    /// allocation: decrement its weak count, freeing the storage
+    /// when both counts are zero. The drop glue of a `Weak`
+    /// handle; also synthesized by the interpreter itself for the
+    /// strong bundle's weak release once a pointee's glue has run
+    /// (the session is then rooted at the allocation itself).
+    RcWeakRelease,
     /// The glue of a value of dynamic type (`dyn Trait`): the
     /// concrete type is known only from the value itself, which in
     /// this model is a `DynRef` carrying the payload value.

@@ -660,6 +660,9 @@ fn drop_glue_edges<'a>(glue: &'a ir::DropGlue, targets: &mut Vec<&'a str>) -> bo
             // Releasing a RefCell borrow calls no destructor body.
             ir::DropPlan::RefCellRelease { .. } => true,
             ir::DropPlan::ChannelHandleDrop { .. } => true,
+            // Releasing a weak reference calls no destructor body.
+            ir::DropPlan::RcWeakRelease => true,
+            ir::DropPlan::RcHandleDrop { value } => walk(value, adts, targets, seen),
             // Judged from the value at run time; calls no
             // destructor body.
             ir::DropPlan::Dynamic => true,
@@ -4648,26 +4651,43 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                     e => P::Each { elem: Box::new(e) },
                 });
             }
-            "std::boxed::Box" | "std::rc::Rc" | "std::sync::Arc" => {
-                // All three are one-field aggregates holding the
-                // pointee in this value model (see the `Rc::new` /
-                // `Arc::new` builtins), and dropping the pointer
-                // drops the pointee. A `dyn` pointee is the
-                // exception: the pointer value *is* the fat
-                // pointer then, with no field to project, so the
-                // plan is the dyn plan itself.
+            "std::boxed::Box" => {
+                // A box is a one-field aggregate holding the
+                // pointee in this value model (see the `Box::new`
+                // builtin), and dropping the pointer drops the
+                // pointee. A `dyn` pointee is the exception: the
+                // pointer value *is* the fat pointer then, with no
+                // field to project, so the plan is the dyn plan
+                // itself.
                 let inner = self.plan(args.first()?)?;
                 return Some(match inner {
                     P::Dyn => P::Dyn,
                     other => at_field0(other),
                 });
             }
+            "std::rc::Rc" | "std::sync::Arc" => {
+                // The handle names a reference-counted allocation
+                // in the interpreter's store (see the `Rc::new` /
+                // `Arc::new` builtins): dropping it decrements the
+                // strong count, and the pointee's glue runs only
+                // when the last strong handle goes away. A `dyn`
+                // pointee keeps the dyn plan: the handle value *is*
+                // the fat pointer then, and its baked glue applies
+                // to the pointee in the allocation.
+                let inner = self.plan(args.first()?)?;
+                return Some(match inner {
+                    P::Dyn => P::Dyn,
+                    other => P::RcHandleDrop {
+                        value: Box::new(other),
+                    },
+                });
+            }
             "std::rc::Weak" | "std::sync::Weak" => {
-                // A weak pointer owns no pointee, and the value
-                // model does not track reference counts (see the
-                // `Rc::new` builtin), so dropping one runs no glue
-                // the model can observe.
-                return Some(P::Trivial);
+                // A weak pointer owns no pointee; dropping it
+                // releases its weak reference on the allocation,
+                // which is observable through the counts and
+                // through `upgrade` once the storage is freed.
+                return Some(P::RcWeakRelease);
             }
             "std::borrow::Cow" if matches!(args.first(), Some(mir::Ty::Str)) => {
                 // `Cow<str>`: the `Borrowed` variant holds a `&str`

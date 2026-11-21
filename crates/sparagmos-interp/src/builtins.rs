@@ -31,7 +31,9 @@ use std::collections::HashMap;
 use sparagmos_mir as mir;
 
 use crate::error::{InterpError, InterpResult};
-use crate::interp::{channel_handle_id, synthetic_address, Frame, Interpreter, Resolved};
+use crate::interp::{
+    channel_handle_id, rc_handle_id, synthetic_address, Frame, Interpreter, Resolved,
+};
 use crate::ir::{Body, Operand};
 use crate::value::{FmtArguments, FmtTrait, PanicPayload, RefProj, RefTarget, Value};
 
@@ -575,6 +577,8 @@ pub enum Builtin {
     MemAlignOf,
     /// `std::mem::size_of_val(&value)`.
     MemSizeOfVal,
+    /// `std::mem::align_of_val(&value)`.
+    MemAlignOfVal,
     /// `std::mem::needs_drop::<T>()` (types with a known answer only).
     MemNeedsDrop,
     /// `ManuallyDrop::new(value)`: an ADT aggregate of one field.
@@ -593,13 +597,13 @@ pub enum Builtin {
     /// The value passes through unchanged; the hint exists only to
     /// block optimiser assumptions the interpreter does not make.
     BlackBox,
-    /// `Rc::new(value)`: a one-field ADT aggregate holding the
-    /// value, the same shape as `Box::new` in this model. The
-    /// reference count is not observable through the modelled
-    /// operations (`new`, `Deref`, `Clone` as a value copy).
+    /// `Rc::new(value)`: a fresh reference-counted allocation
+    /// in the interpreter's allocation store (an `RcInner`
+    /// aggregate holding the strong/weak counts and the value);
+    /// the result is the handle naming it (see
+    /// `Interpreter::rc_new_handle`).
     RcNew,
-    /// `Arc::new(value)`: the `Rc` shape; the interpreter is
-    /// single-threaded, so the atomic count is unobservable too.
+    /// `Arc::new(value)`: the `Rc` shape, with an `ArcInner`.
     ArcNew,
     /// An integer bit intrinsic (`ctpop`, `ctlz`, `cttz`,
     /// `bitreverse`, `bswap`): a unary operation on the operand
@@ -1036,6 +1040,16 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::mem::size_of" => Builtin::MemSizeOf,
         "std::mem::align_of" => Builtin::MemAlignOf,
         "std::mem::size_of_val" => Builtin::MemSizeOfVal,
+        "std::mem::align_of_val" => Builtin::MemAlignOfVal,
+        // The same two intrinsics in their direct call form
+        // (`Layout::for_value` inside a converted std body calls
+        // them as functions, not as `std::mem` wrappers).
+        "std::intrinsics::size_of_val" | "core::intrinsics::size_of_val" => {
+            Builtin::MemSizeOfVal
+        }
+        "std::intrinsics::align_of_val" | "core::intrinsics::align_of_val" => {
+            Builtin::MemAlignOfVal
+        }
         "std::mem::needs_drop" => Builtin::MemNeedsDrop,
         _ if canonical.starts_with("std::mem::ManuallyDrop") && canonical.ends_with(">::new") => {
             Builtin::ManuallyDropNew
@@ -1821,26 +1835,26 @@ impl<'a> Interpreter<'a> {
                 } else if self_ty.starts_with("std::rc::Rc<")
                     || self_ty.starts_with("std::sync::Arc<")
                 {
-                    // The same one-field aggregate as `Box::new`
-                    // in this model: `deref` yields a reference to
-                    // the held value. An `Rc<dyn Trait>` /
-                    // `Arc<dyn Trait>` is the fat pointer itself,
-                    // as for `Box<dyn Trait>`, and dereferencing it
-                    // yields that pointer — the `&dyn` the trait
-                    // methods dispatch through.
+                    // The handle names an allocation in the store:
+                    // `deref` yields a reference to the stored
+                    // value field — a live place, so reads and
+                    // writes reach the storage every handle shares.
+                    // An `Rc<dyn Trait>` / `Arc<dyn Trait>`
+                    // dereferences to the fat pointer itself, as
+                    // `Box<dyn Trait>` does.
                     let pointee = self.resolve_value(frames, &vals[0])?;
                     if let Value::DynRef { .. } = pointee {
                         return Ok(pointee);
                     }
-                    match pointee {
-                        Value::Enum { fields, .. } if fields.len() == 1 => {
-                            let inner = fields.into_iter().next().expect("len checked");
-                            Ok(Value::Ref(RefTarget::Value(Box::new(inner))))
-                        }
-                        ref other => Err(InterpError::type_mismatch(
+                    match rc_handle_id(&pointee) {
+                        Some(id) => Ok(Value::Ref(RefTarget::Alloc {
+                            id,
+                            projection: vec![RefProj::Field(2)],
+                        })),
+                        None => Err(InterpError::type_mismatch(
                             "Deref::deref for Rc/Arc",
-                            "one-field aggregate",
-                            other.kind_name(),
+                            "a reference-counted handle",
+                            pointee.kind_name(),
                         )),
                     }
                 } else if self_ty_is(self_ty, "std::cell::Ref")
@@ -2394,6 +2408,25 @@ impl<'a> Interpreter<'a> {
                         {
                             self.channel_handle_cloned(id, kind);
                         }
+                        // Cloning a reference-counted handle makes
+                        // another live handle on the same
+                        // allocation: the count the converted
+                        // bodies read must move with it, or
+                        // uniqueness (`Rc::get_mut`, the counts,
+                        // drop) would be observed wrong.
+                        if self_ty.starts_with("std::rc::Rc<")
+                            || self_ty.starts_with("std::sync::Arc<")
+                        {
+                            if let Some(id) = rc_handle_id(&value) {
+                                self.rc_inc_strong(id)?;
+                            }
+                        } else if self_ty.starts_with("std::rc::Weak<")
+                            || self_ty.starts_with("std::sync::Weak<")
+                        {
+                            if let Some(id) = rc_handle_id(&value) {
+                                self.rc_inc_weak(id)?;
+                            }
+                        }
                         Ok(value)
                     }
                     // A fat pointer clones as the pointer itself
@@ -2440,17 +2473,23 @@ impl<'a> Interpreter<'a> {
                 // `Interpreter::new_box`).
                 Ok(self.new_box(vals.into_iter().next().expect("arity checked")))
             }
-            Builtin::ManuallyDropNew | Builtin::RcNew | Builtin::ArcNew => {
+            Builtin::ManuallyDropNew => {
                 arity(1)?;
-                // One-field ADT aggregates in this model: a
-                // `ManuallyDrop` holds its value, an `Rc` / `Arc`
-                // its pointee (the reference-counted sharing a
-                // real `Rc` would give its copies is a documented
-                // approximation of this model, unlike `Box`).
+                // A one-field ADT aggregate holding its value.
                 Ok(Value::Enum {
                     variant: 0,
                     fields: vec![vals.into_iter().next().expect("arity checked")],
                 })
+            }
+            Builtin::RcNew | Builtin::ArcNew => {
+                arity(1)?;
+                // A fresh reference-counted allocation in the
+                // store: the handle is the `NonNull` pointer to the
+                // stored `RcInner` / `ArcInner`, so the converted
+                // std bodies (`get_mut`, `make_mut`, the count
+                // accessors, `Weak`) operate on the real layout.
+                let v = vals.into_iter().next().expect("arity checked");
+                Ok(self.rc_new_handle(v))
             }
             Builtin::BoxNewUninit => {
                 arity(0)?;
@@ -2912,6 +2951,29 @@ impl<'a> Interpreter<'a> {
                             other.kind_name(),
                         )),
                     }
+                } else if self_ty.starts_with("std::rc::Rc<")
+                    || self_ty.starts_with("std::sync::Arc<")
+                {
+                    // As in `Deref`: a reference to the stored
+                    // value field, a live place in the allocation
+                    // store, so a write through it is observed by
+                    // every handle on the allocation. A dyn pointee
+                    // yields the fat pointer itself.
+                    let pointee = self.resolve_value(frames, &vals[0])?;
+                    if let Value::DynRef { .. } = pointee {
+                        return Ok(pointee);
+                    }
+                    match rc_handle_id(&pointee) {
+                        Some(id) => Ok(Value::Ref(RefTarget::Alloc {
+                            id,
+                            projection: vec![RefProj::Field(2)],
+                        })),
+                        None => Err(InterpError::type_mismatch(
+                            "DerefMut::deref_mut for Rc/Arc",
+                            "a reference-counted handle",
+                            pointee.kind_name(),
+                        )),
+                    }
                 } else if self_ty_is(self_ty, "std::cell::RefMut") {
                     // A mutable borrow guard: field 0 is the
                     // reference to the cell's value stored by the
@@ -3193,6 +3255,28 @@ impl<'a> Interpreter<'a> {
                         Some((size, _)) => Ok(Value::Uint(size)),
                         None => Err(unsupported(format!(
                             "size_of_val for {tag} is not runtime-supported"
+                        ))),
+                    }
+                }
+            }
+            Builtin::MemAlignOfVal => {
+                arity(1)?;
+                let tag = generic_args.first().map(String::as_str).unwrap_or("");
+                if tag == "str" {
+                    Ok(Value::Uint(1))
+                } else if tag.starts_with('[') && tag.ends_with(']') && !tag.contains(';') {
+                    let elem = &tag[1..tag.len() - 1];
+                    let (_, align) = self.layout_of(elem).ok_or_else(|| {
+                        unsupported(format!(
+                            "align_of_val for {tag} is not runtime-supported"
+                        ))
+                    })?;
+                    Ok(Value::Uint(align))
+                } else {
+                    match self.layout_of(tag) {
+                        Some((_, align)) => Ok(Value::Uint(align)),
+                        None => Err(unsupported(format!(
+                            "align_of_val for {tag} is not runtime-supported"
                         ))),
                     }
                 }
