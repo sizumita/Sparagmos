@@ -7237,6 +7237,224 @@ fn run_mode_libtest_harness_runs_tests() {
     );
 }
 
+
+const WRAPPING_SRC: &str = r#"
+fn main() {
+    let a = 255u8.wrapping_add(1);
+    assert_eq!(a, 0);
+    let b = i64::MAX.wrapping_add(1);
+    assert_eq!(b, i64::MIN);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_wrapping_methods_wrap_in_a_checked_session() {
+    // The plain arithmetic inside the `wrapping_*` method bodies
+    // wraps; only the `Assert` after a checked operation may panic,
+    // and these bodies contain none.
+    run_ok("wrapping", WRAPPING_SRC, "ok\n");
+}
+
+const TRAIT_OVERFLOW_SRC: &str = r#"
+use std::ops::*;
+fn main() {
+    assert_eq!(i8::neg(-0x80), -0x80);
+    assert_eq!(u8::add(0xff, 1), 0_u8);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_overflow_asserts_follow_the_session_setting() {
+    let dir = temp_dir("overflow-assert");
+    let src = fixture(&dir, "neg.rs", TRAIT_OVERFLOW_SRC);
+    // The default session checks overflow: the trait bodies'
+    // overflow asserts fire and the guest panics (101).
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(101), "default session must panic");
+    // `-C overflow-checks=off`: the same asserts are not evaluated
+    // and the wrapped results stand.
+    let out = run_driver_extra(
+        &src,
+        &["--rustc-arg", "-C", "--rustc-arg", "overflow-checks=off"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+    // `-C debug-assertions=no` implies overflow checks off as well.
+    let out = run_driver_extra(
+        &src,
+        &["--rustc-arg", "-C", "--rustc-arg", "debug-assertions=no"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+const LITERAL_CMP_SRC: &str = r#"
+fn main() {
+    let a: u8 = 0;
+    let b: u8 = 255;
+    assert!(a < b, "locals failed");
+    assert!(0u8 < 255u8, "consts failed");
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_literal_operands_compare_under_their_own_type() {
+    // A literal-vs-literal comparison reads each literal under its
+    // own recorded type: `255u8` is unsigned 255, not -1.
+    run_ok("literal-cmp", LITERAL_CMP_SRC, "ok\n");
+}
+
+const ADT_CONST_SRC: &str = r#"
+#![feature(test)]
+extern crate test;
+use test::black_box as b;
+fn main() {
+    assert_eq!(b(1u128).checked_shl(b(127)), Some(1 << 127));
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_adt_constant_fields_use_their_field_types() {
+    // The `Some(1 << 127)` constant's payload decodes under the
+    // field's own `u128` type, not by a sign-bit guess.
+    run_ok("adt-const", ADT_CONST_SRC, "ok\n");
+}
+
+const SHOULD_PANIC_MATCH_SRC: &str = r#"
+#[test]
+#[should_panic(expected = "hello")]
+fn panics_with_hello() {
+    panic!("hello world");
+}
+"#;
+
+const SHOULD_PANIC_MISS_SRC: &str = r#"
+#[test]
+#[should_panic(expected = "bye")]
+fn panics_with_hello() {
+    panic!("hello world");
+}
+"#;
+
+#[test]
+fn run_mode_libtest_should_panic_expected_message() {
+    let dir = temp_dir("libtest-should-panic");
+    let src = fixture(&dir, "match.rs", SHOULD_PANIC_MATCH_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "--test"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "stdout={stdout}");
+    let src = fixture(&dir, "miss.rs", SHOULD_PANIC_MISS_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "--test"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(101), "stdout={stdout}");
+    assert!(stdout.contains("FAILED"), "stdout={stdout}");
+}
+
+const LISTING_SRC: &str = r#"
+#[test]
+fn beta() {}
+#[test]
+fn alpha() {}
+"#;
+
+#[test]
+fn run_mode_libtest_listing_and_nightly_only_options() {
+    let dir = temp_dir("libtest-listing");
+    let src = fixture(&dir, "listing.rs", LISTING_SRC);
+    // `--list` prints the sorted test names and succeeds.
+    let out = run_driver_extra(
+        &src,
+        &["--rustc-arg", "--test", "--guest-arg", "--list"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "stdout={stdout}");
+    assert!(stdout.contains("alpha: test"), "stdout={stdout}");
+    assert!(stdout.contains("beta: test"), "stdout={stdout}");
+    assert!(stdout.contains("2 tests, 0 benchmarks"), "stdout={stdout}");
+    // `--format json` without `-Z unstable-options` is the nightly
+    // error, exit 101.
+    let out = run_driver_extra(
+        &src,
+        &[
+            "--rustc-arg",
+            "--test",
+            "--guest-arg",
+            "--format",
+            "--guest-arg",
+            "json",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(101), "stderr={stderr}");
+    assert!(
+        stderr.contains("The \"json\" format is only accepted on the nightly compiler"),
+        "stderr={stderr}"
+    );
+    // Any `-Z` option is rejected the same way.
+    let out = run_driver_extra(
+        &src,
+        &["--rustc-arg", "--test", "--guest-arg", "-Zunstable-options"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(101), "stderr={stderr}");
+    assert!(
+        stderr.contains("the option `Z` is only accepted on the nightly compiler"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn run_mode_libtest_invalid_rust_test_threads() {
+    let dir = temp_dir("libtest-threads");
+    let src = fixture(&dir, "listing.rs", LISTING_SRC);
+    let out = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run")
+        .arg(&src)
+        .args(["--rustc-arg", "--test"])
+        .env("RUST_TEST_THREADS", "foo")
+        .output()
+        .expect("failed to run sparagmos-driver");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(101), "stderr={stderr}");
+    assert!(
+        stderr.contains("should be a positive integer"),
+        "stderr={stderr}"
+    );
+}
+
+const BOX_CLONE_SRC: &str = r#"
+fn main() {
+    let mut i = Box::new(1);
+    let mut j = i.clone();
+    *j = 3;
+    println!("i={} j={}", *i, *j);
+    let p1 = &*i as *const i32 as usize;
+    let p2 = &*j as *const i32 as usize;
+    println!("same_addr={}", p1 == p2);
+    let mut a: Vec<Box<_>> = vec![Box::new(10)];
+    let b = a.clone();
+    *a[0] = 20;
+    println!("a={} b={}", *a[0], *b[0]);
+}
+"#;
+
+#[test]
+fn run_mode_box_clone_owns_its_pointee() {
+    // A cloned box (and the boxes inside a cloned vector) own fresh
+    // storage: writing through one must not rewrite the other.
+    run_ok(
+        "box-clone",
+        BOX_CLONE_SRC,
+        "i=1 j=3\nsame_addr=false\na=20 b=10\n",
+    );
+}
+
 const TIME_SRC: &str = r#"
 fn main() {
     let a = std::time::Instant::now();
