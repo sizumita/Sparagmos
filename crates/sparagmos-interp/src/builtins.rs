@@ -434,13 +434,13 @@ pub enum Builtin {
     DefaultDefault,
     /// `ToString::to_string(&value)` for the modelled `Display` types.
     ToStringToString,
-    /// `Box::new(value)`: the box is an ADT aggregate holding its
-    /// pointee in this value model.
+    /// `Box::new(value)`: the box is an ADT aggregate whose single
+    /// field is the pointer to the allocation holding its pointee
+    /// (see `Interpreter::new_box`).
     BoxNew,
     /// `Box::new_uninit()`: a box whose pointee is uninitialized,
     /// with the shape its type fixes (an array pointee is a tuple of
-    /// uninitialized elements). The allocation the real body would
-    /// perform is not observable in this value model.
+    /// uninitialized elements), allocated like `Box::new`.
     BoxNewUninit,
     /// `box_assume_init_into_vec_unsafe(box)`: the `vec!` expansion's
     /// final step — the box's array pointee becomes a `Vec` value
@@ -1710,10 +1710,7 @@ impl<'a> Interpreter<'a> {
                     }
                 } else if target.starts_with("std::boxed::Box<") {
                     // `Box::from(value)` is `Box::new` by definition.
-                    Ok(Value::Enum {
-                        variant: 0,
-                        fields: vec![value],
-                    })
+                    Ok(self.new_box(value))
                 } else if (target == "std::task::Waker"
                     && (source.starts_with("std::sync::Arc<")
                         || source.starts_with("alloc::sync::Arc<")))
@@ -1774,13 +1771,19 @@ impl<'a> Interpreter<'a> {
                         len,
                     })
                 } else if self_ty.starts_with("std::boxed::Box<") {
-                    // A box in this model is an ADT aggregate holding
-                    // its pointee; `deref` yields a reference to that
-                    // pointee value (reads resolve against the value,
-                    // as they do for constant aggregates). A
-                    // `Box<dyn Trait>` is the fat pointer itself, and
-                    // dereferencing it yields that pointer — the
-                    // `&dyn` the trait methods dispatch through.
+                    // A built box's single field is its allocation
+                    // pointer, and `deref` yields that very
+                    // reference: it names the pointee's storage in
+                    // the allocation store, live for as long as the
+                    // allocation is. (A box value of the older
+                    // aggregate shape — one built by a converted
+                    // body or a downcast — holds its pointee as the
+                    // field value itself; `deref` then yields a
+                    // reference to that value, as it does for
+                    // constant aggregates.) A `Box<dyn Trait>` is
+                    // the fat pointer itself, and dereferencing it
+                    // yields that pointer — the `&dyn` the trait
+                    // methods dispatch through.
                     let pointee = self.resolve_value(frames, &vals[0])?;
                     if let Value::DynRef { .. } = pointee {
                         return Ok(pointee);
@@ -1788,6 +1791,9 @@ impl<'a> Interpreter<'a> {
                     match pointee {
                         Value::Enum { fields, .. } if fields.len() == 1 => {
                             let inner = fields.into_iter().next().expect("len checked");
+                            if let Value::Ref(RefTarget::Alloc { .. }) = inner {
+                                return Ok(inner);
+                            }
                             Ok(Value::Ref(RefTarget::Value(Box::new(inner))))
                         }
                         ref other => Err(InterpError::type_mismatch(
@@ -2404,10 +2410,20 @@ impl<'a> Interpreter<'a> {
                     ))),
                 }
             }
-            Builtin::BoxNew | Builtin::ManuallyDropNew | Builtin::RcNew | Builtin::ArcNew => {
+            Builtin::BoxNew => {
                 arity(1)?;
-                // Both are one-field ADT aggregates in this model:
-                // a box holds its pointee, a `ManuallyDrop` its value.
+                // A box's pointee lives in the allocation store;
+                // the box value is the allocation pointer (see
+                // `Interpreter::new_box`).
+                Ok(self.new_box(vals.into_iter().next().expect("arity checked")))
+            }
+            Builtin::ManuallyDropNew | Builtin::RcNew | Builtin::ArcNew => {
+                arity(1)?;
+                // One-field ADT aggregates in this model: a
+                // `ManuallyDrop` holds its value, an `Rc` / `Arc`
+                // its pointee (the reference-counted sharing a
+                // real `Rc` would give its copies is a documented
+                // approximation of this model, unlike `Box`).
                 Ok(Value::Enum {
                     variant: 0,
                     fields: vec![vals.into_iter().next().expect("arity checked")],
@@ -2417,10 +2433,7 @@ impl<'a> Interpreter<'a> {
                 arity(0)?;
                 let tag = generic_args.first().map(String::as_str).unwrap_or("");
                 match uninit_value_for_tag(tag) {
-                    Some(pointee) => Ok(Value::Enum {
-                        variant: 0,
-                        fields: vec![pointee],
-                    }),
+                    Some(pointee) => Ok(self.new_box(pointee)),
                     None => Err(unsupported(format!(
                         "Box::new_uninit for {tag} is not runtime-supported"
                     ))),
@@ -2439,6 +2452,16 @@ impl<'a> Interpreter<'a> {
                 match boxed {
                     Value::Enum { fields, .. } if fields.len() == 1 => {
                         let pointee = fields.into_iter().next().expect("one field");
+                        // A built box's field is its allocation
+                        // pointer: the array lives behind it in
+                        // the allocation store.
+                        let pointee = match &pointee {
+                            Value::Ref(RefTarget::Alloc { .. }) => {
+                                let target = self.deref_value(frames, &pointee)?;
+                                self.read_resolved(frames, &target)?
+                            }
+                            _ => pointee,
+                        };
                         match assume_init_elements(pointee) {
                             Some(elems) => Ok(Value::Enum {
                                 variant: 0,
@@ -2751,6 +2774,35 @@ impl<'a> Interpreter<'a> {
                             ))),
                         }
                     }
+                    Resolved::Alloc { id, projection } => {
+                        let base = self.read_resolved(frames, &Resolved::Alloc {
+                            id,
+                            projection: projection.clone(),
+                        })?;
+                        let len = base.len().ok_or_else(|| {
+                            InterpError::type_mismatch(
+                                "IndexMut::index_mut",
+                                "indexable value",
+                                base.kind_name(),
+                            )
+                        })?;
+                        if idx as u128 >= len {
+                            return Err(InterpError::panic(format!(
+                                "index out of bounds: the len is {len} but the index is {idx}"
+                            )));
+                        }
+                        match base {
+                            Value::Tuple(_) => {
+                                let mut projection = projection;
+                                projection.push(RefProj::Index(idx));
+                                Ok(Value::Ref(RefTarget::Alloc { id, projection }))
+                            }
+                            ref other => Err(unsupported(format!(
+                                "IndexMut::index_mut on a {} is not runtime-supported",
+                                other.kind_name()
+                            ))),
+                        }
+                    }
                     Resolved::Value(_) => Err(unsupported(
                         "IndexMut::index_mut on a constant aggregate is not runtime-supported",
                     )),
@@ -2779,13 +2831,21 @@ impl<'a> Interpreter<'a> {
                 } else if self_ty.starts_with("std::boxed::Box<") {
                     let pointee = self.resolve_value(frames, &vals[0])?;
                     // As in `Deref`: a `Box<dyn Trait>` dereferences
-                    // to the fat pointer itself.
+                    // to the fat pointer itself, and a built box
+                    // dereferences to its allocation pointer — a
+                    // live reference into the allocation store, so
+                    // writes through it land in the pointee's
+                    // storage and are observed through every copy
+                    // of the box.
                     if let Value::DynRef { .. } = pointee {
                         return Ok(pointee);
                     }
                     match pointee {
                         Value::Enum { fields, .. } if fields.len() == 1 => {
                             let inner = fields.into_iter().next().expect("len checked");
+                            if let Value::Ref(RefTarget::Alloc { .. }) = inner {
+                                return Ok(inner);
+                            }
                             Ok(Value::Ref(RefTarget::Value(Box::new(inner))))
                         }
                         ref other => Err(InterpError::type_mismatch(
@@ -4169,7 +4229,16 @@ fn resolve_dyn_box(
                 base, concrete, ..
             } => return Ok((concrete, (*base).clone(), original)),
             Value::Enum { fields, .. } if fields.len() == 1 => {
-                current = fields.into_iter().next().expect("one field");
+                let field = fields.into_iter().next().expect("one field");
+                // A built box's field is its allocation pointer:
+                // unwrapping the box reads the pointee out of
+                // the allocation store.
+                if matches!(field, Value::Ref(RefTarget::Alloc { .. })) {
+                    let target = interp.deref_value(frames, &field)?;
+                    current = interp.read_resolved(frames, &target)?;
+                } else {
+                    current = field;
+                }
             }
             Value::Ref(_) | Value::FatRef { .. } => {
                 let target = interp.deref_value(frames, &current)?;
