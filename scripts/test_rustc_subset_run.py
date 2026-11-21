@@ -627,10 +627,13 @@ class Stage2BlockerTests(unittest.TestCase):
         self.assertIn("core stub", run.stage2_blocker(h.view(None),
                                                       self.rec()))
 
-    def test_rustc_env_blocks(self):
+    def test_rustc_env_no_longer_blocks(self):
+        # rustc-env pairs are applied to the driver process
+        # environment (see EnvDirectiveTests); they block neither
+        # stage.
         h = header("//@ rustc-env: FOO=1\n")
-        self.assertIn("rustc-env", run.stage2_blocker(h.view(None),
-                                                      self.rec()))
+        self.assertIsNone(run.stage2_blocker(h.view(None),
+                                             self.rec()))
 
     def test_scoped_blocker_only_blocks_its_revision(self):
         h = header("//@ revisions: a b\n//@[a] add-core-stubs\n")
@@ -942,7 +945,8 @@ class ProcessStage2Tests(unittest.TestCase):
     def run_with_conv_capture(self, rec, conv_result):
         captured = {}
 
-        def stub(path, edition, driver_bin, rustc_args=(), aux_specs=()):
+        def stub(path, edition, driver_bin, rustc_args=(),
+                 aux_specs=(), env_extra=None, env_remove=()):
             captured["rustc_args"] = list(rustc_args)
             return conv_result
 
@@ -1092,7 +1096,8 @@ class ProcessStage2Tests(unittest.TestCase):
             "//@ revisions: rpass1 bfail2\nfn main() {}\n",
             suite="incremental")
 
-        def stub(path, edition, driver_bin, rustc_args=(), aux_specs=()):
+        def stub(path, edition, driver_bin, rustc_args=(),
+                 aux_specs=(), env_extra=None, env_remove=()):
             if "bfail2" in rustc_args:
                 return conv(exit_code=1, compilation_failed=True,
                             converted=None, skipped=None)
@@ -1176,7 +1181,8 @@ class ConvertSideTests(unittest.TestCase):
         orig = run.run_cmd
         seen = []
 
-        def stub(argv, *, timeout, cwd=None, env_extra=None):
+        def stub(argv, *, timeout, cwd=None, env_extra=None,
+                 env_remove=()):
             seen.append(argv)
             return {"exit_code": 0, "timeout": False,
                     "stdout": "converted: 1, skipped: 0\n",
@@ -1234,7 +1240,8 @@ class ProcessStage2AuxTests(unittest.TestCase):
     def run_with_conv(self, rec, conv_result):
         orig = run.convert_side
 
-        def stub(path, edition, driver_bin, rustc_args=(), aux_specs=()):
+        def stub(path, edition, driver_bin, rustc_args=(),
+                 aux_specs=(), env_extra=None, env_remove=()):
             self.seen.append([(spec.name, spec.path.name)
                                for spec in aux_specs])
             return conv_result
@@ -1414,7 +1421,8 @@ class ProcessStage2RevisionTests(unittest.TestCase):
 
     def run_with_fake(self, rec, fake):
         orig = run.convert_side
-        def stub(path, edition, driver_bin, rustc_args=(), aux_specs=()):
+        def stub(path, edition, driver_bin, rustc_args=(),
+                 aux_specs=(), env_extra=None, env_remove=()):
             self.calls.append(list(rustc_args))
             return fake(list(rustc_args))
         run.convert_side = stub
@@ -1516,10 +1524,12 @@ class ProcessStage1FlagsTests(unittest.TestCase):
 
     def run_with_capture(self, rec):
         orig_n, orig_s = run.native_side, run.sparagmos_side
-        def fake_native(path, edition, workdir, extra_flags=(), aux_specs=()):
+        def fake_native(path, edition, workdir, extra_flags=(),
+                        aux_specs=(), **kw):
             self.seen["native_flags"] = list(extra_flags)
             return ({"exit_code": 0, "stdout": "", "stderr": ""}, None)
-        def fake_spar(path, edition, driver_bin, cwd=None, rustc_args=(), aux_specs=()):
+        def fake_spar(path, edition, driver_bin, cwd=None,
+                      rustc_args=(), aux_specs=(), **kw):
             self.seen["driver_args"] = list(rustc_args)
             return ({"exit_code": 0, "stdout": "", "stderr": ""},
                     "result", "")
@@ -1585,7 +1595,8 @@ class AuxDirectivesTests(unittest.TestCase):
     def test_proc_macro_entry_carries_crate_type(self):
         header = run.Header("//@ proc-macro: my-macro.rs\n")
         self.assertEqual(run.aux_entries(header),
-                         [("my_macro", "my-macro.rs", "proc-macro")])
+                         [("my_macro", "my-macro.rs", "proc-macro",
+                           None)])
         # The pair view keeps the crate (it is an aux dependency).
         self.assertEqual(run.aux_directives(header),
                          [("my_macro", "my-macro.rs")])
@@ -1698,16 +1709,17 @@ class ViewBlockerTests(unittest.TestCase):
         self.assertIsNone(run.stage1_view_blocker(h.view("a")))
         self.assertIsNone(run.stage1_view_blocker(h.view("b")))
 
-    def test_revision_without_a_mode_is_blocked(self):
+    def test_revision_without_a_mode_is_not_blocked(self):
+        # A revision view with no run mode is judged as a compile
+        # check (compiletest's per-revision default), not blocked.
         h = header("//@ revisions: a b\n//@[a] run-pass\n")
         self.assertIsNone(run.stage1_view_blocker(h.view("a")))
-        self.assertIn("no run-pass/run-fail",
-                      run.stage1_view_blocker(h.view("b")))
+        self.assertIsNone(run.stage1_view_blocker(h.view("b")))
 
     def test_scoped_blocker_only_blocks_its_revision(self):
         h = header("//@ revisions: a b\n//@[a] run-pass\n"
-                   "//@[b] run-pass\n//@[a] run-flags: --foo\n")
-        self.assertIn("run-flags", run.stage1_view_blocker(h.view("a")))
+                   "//@[b] run-pass\n//@[a] add-core-stubs\n")
+        self.assertIn("core stub", run.stage1_view_blocker(h.view("a")))
         self.assertIsNone(run.stage1_view_blocker(h.view("b")))
 
     def test_scoped_run_crash_blocks_only_its_revision(self):
@@ -1751,7 +1763,7 @@ class ProcessStage1RevisionTests(unittest.TestCase):
         orig_n, orig_s = run.native_side, run.sparagmos_side
 
         def fake_native(path, edition, workdir, extra_flags=(),
-                        aux_specs=()):
+                        aux_specs=(), **kw):
             seen = {"rev": self.revision_of(list(extra_flags)),
                     "edition": edition, "flags": list(extra_flags),
                     "aux": [spec.name for spec in aux_specs]}
@@ -1761,7 +1773,7 @@ class ProcessStage1RevisionTests(unittest.TestCase):
             return ({"exit_code": 0, "stdout": "", "stderr": ""}, None)
 
         def fake_spar(path, edition, driver_bin, cwd=None,
-                      rustc_args=(), aux_specs=()):
+                      rustc_args=(), aux_specs=(), **kw):
             seen = {"rev": self.revision_of(list(rustc_args)),
                     "args": list(rustc_args),
                     "aux": [spec.name for spec in aux_specs]}
@@ -1841,14 +1853,23 @@ class ProcessStage1RevisionTests(unittest.TestCase):
         self.assertEqual(res["bucket"], "out of environment")
         self.assertEqual(self.native_seen, [])
 
-    def test_revision_without_a_run_mode_blocks_the_record(self):
+    def test_revision_without_a_run_mode_is_compile_checked(self):
+        # Revision b's view carries no run mode: compiletest
+        # judges it by its compile outcome, and a ui revision
+        # with no mode directive defaults to check-fail -- so b
+        # passes when the driver rejects the program cleanly,
+        # while a still runs on both sides as before.
         rec = self.write_test(
             "//@ revisions: a b\n//@[a] run-pass\nfn main() {}\n")
-        res = self.run_with_fakes(rec)
-        self.assertEqual(res["status"], "not-attempted")
-        self.assertEqual(res["bucket"],
-                         "not attempted (header feature)")
-        self.assertIn("revision b", res["reason"])
+        orig = run.convert_side
+        run.convert_side = lambda *a, **kw: conv(
+            exit_code=1, compilation_failed=True, converted=0)
+        try:
+            res = self.run_with_fakes(rec)
+        finally:
+            run.convert_side = orig
+        self.assertEqual(res["status"], "pass")
+        self.assertEqual(res["revisions"]["b"]["status"], "pass")
         self.assertEqual([s["rev"] for s in self.native_seen], ["a"])
 
     def test_scoped_flags_reach_only_their_revision(self):
@@ -1972,7 +1993,8 @@ class ProcMacroExternTests(unittest.TestCase):
     def stub_build(self, result):
         calls = []
 
-        def fake(test_path, fname, edition, extra_externs=()):
+        def fake(test_path, fname, edition, extra_externs=(),
+                 modifiers=None):
             calls.append((test_path, fname, edition,
                           list(extra_externs)))
             return result
@@ -2032,7 +2054,7 @@ class ProcMacroExternTests(unittest.TestCase):
         chain, err = run._proc_macro_chain(main, "test-macros.rs",
                                            "2021")
         self.assertIsNone(err)
-        self.assertEqual([(n, f) for n, _, f in chain],
+        self.assertEqual([(n, f) for n, _, f, _mod in chain],
                          [("test_macros", "proc-macro")])
 
     def test_chain_uses_declared_crate_name(self):
@@ -2057,13 +2079,14 @@ class ProcMacroExternTests(unittest.TestCase):
         self.write("auxiliary/dep.rs", "pub fn f() {}\n")
         chain, err = run._proc_macro_chain(main, "pm.rs", "2021")
         self.assertIsNone(err)
-        self.assertEqual([(n, f) for n, _, f in chain],
+        self.assertEqual([(n, f) for n, _, f, _mod in chain],
                          [("dep", None), ("pm", "proc-macro")])
 
     def test_later_directive_build_sees_earlier_crate(self):
         seen_extra = []
 
-        def fake(test_path, fname, edition, extra_externs=()):
+        def fake(test_path, fname, edition, extra_externs=(),
+                 modifiers=None):
             seen_extra.append((fname, list(extra_externs)))
             stem = fname[:-3].replace("-", "_")
             return (stem, Path(f"/c/lib{stem}.so"), None)
@@ -2103,7 +2126,8 @@ class ProcMacroExternTests(unittest.TestCase):
         seen = {}
         orig = run.convert_side
 
-        def capture(path, edition, driver_bin, rustc_args=(), aux_specs=()):
+        def capture(path, edition, driver_bin, rustc_args=(),
+                    aux_specs=(), env_extra=None, env_remove=()):
             seen["args"] = list(rustc_args)
             return conv()
 
@@ -2132,3 +2156,116 @@ class ProcMacroExternTests(unittest.TestCase):
         self.assertEqual(res["status"], "not-attempted")
         self.assertIn("header feature", res["bucket"])
         self.assertIn("kaboom", res["reason"])
+
+
+class EnvDirectiveTests(unittest.TestCase):
+    """The env / run-flags header helpers (compiletest semantics)."""
+
+    def test_parse_env_pairs_splits_at_first_equals(self):
+        # compiletest's parse_env: the name is trimmed, the value
+        # is not, and a missing `=` means an empty value.
+        self.assertEqual(
+            run.parse_env_pairs(["A=1", "B=x=y", "C", " D = 2"]),
+            [("A", "1"), ("B", "x=y"), ("C", ""), ("D", " 2")])
+
+    def test_expand_variables(self):
+        out = run.expand_variables(
+            "{{src-base}}/a {{cwd}} {{build-base}} {{target}} "
+            "{{target-linker}} {{unknown}}", "/src", "/build")
+        self.assertEqual(
+            out, "/src/a " + os.getcwd() + " /build "
+            + run.HOST_TARGET + "  {{unknown}}")
+
+    def test_view_env_pairs_unsets_and_expansion(self):
+        h = header("//@ exec-env: FOO={{src-base}}/x\n"
+                   "//@ exec-env: BAR=1\n"
+                   "//@ unset-exec-env: BAZ\n")
+        pairs, unset = run.view_env(h.view(None), "exec-env",
+                                    "unset-exec-env", "/src", "/b")
+        self.assertEqual(pairs, {"FOO": "/src/x", "BAR": "1"})
+        self.assertEqual(unset, ["BAZ"])
+
+    def test_view_env_is_revision_scoped(self):
+        h = header("//@ revisions: a b\n//@[a] rustc-env: X=1\n")
+        pairs_a, _ = run.view_env(h.view("a"), "rustc-env",
+                                  "unset-rustc-env", "/s", "/b")
+        pairs_b, _ = run.view_env(h.view("b"), "rustc-env",
+                                  "unset-rustc-env", "/s", "/b")
+        self.assertEqual(pairs_a, {"X": "1"})
+        self.assertEqual(pairs_b, {})
+
+    def test_view_run_flags_split_and_expand(self):
+        h = header("//@ run-flags: --test-threads=1 --opt "
+                   "{{src-base}}/f\n")
+        self.assertEqual(run.view_run_flags(h.view(None), "/src",
+                                            "/b"),
+                         ["--test-threads=1", "--opt", "/src/f"])
+
+    def test_run_flags_and_exec_env_do_not_block_stage1(self):
+        h = header("//@ run-pass\n//@ run-flags: --foo\n"
+                   "//@ exec-env: A=1\n")
+        self.assertIsNone(run.stage1_view_blocker(h.view(None)))
+
+
+class AuxModifierTests(unittest.TestCase):
+    """--extern modifiers (priv:, noprelude:) in aux directives."""
+
+    def test_aux_entries_carry_modifiers(self):
+        h = header("//@ aux-crate:priv:priv_dep=priv_dep.rs\n"
+                   "//@ proc-macro:priv:pm.rs\n")
+        entries = {(n, f): (t, m)
+                   for n, f, t, m in run.aux_entries(h)}
+        self.assertEqual(entries[("priv_dep", "priv_dep.rs")],
+                         (None, "priv"))
+        self.assertEqual(entries[("pm", "pm.rs")],
+                         ("proc-macro", "priv"))
+
+    def test_aux_spec_arg_includes_modifiers(self):
+        spec = run.AuxSpec("priv_dep", "/x/priv_dep.rs", None, None,
+                           "priv")
+        self.assertEqual(run.aux_spec_arg(spec),
+                         "priv:priv_dep=/x/priv_dep.rs")
+        spec = run.AuxSpec("plain", "/x/plain.rs")
+        self.assertEqual(run.aux_spec_arg(spec), "plain=/x/plain.rs")
+
+    def test_parse_proc_macro_value(self):
+        self.assertEqual(run.parse_proc_macro_value("priv:pm.rs"),
+                         ("priv", "pm.rs"))
+        self.assertEqual(run.parse_proc_macro_value("pm.rs"),
+                         (None, "pm.rs"))
+
+
+class GuestArgForwardingTests(unittest.TestCase):
+    """sparagmos_side forwards run-flags and exec-env to the driver."""
+
+    def test_guest_args_and_env_reach_run_cmd(self):
+        captured = {}
+        orig = run.run_cmd
+
+        def stub(argv, *, timeout, cwd=None, env_extra=None,
+                 env_remove=()):
+            captured["argv"] = list(argv)
+            captured["env_extra"] = env_extra
+            captured["env_remove"] = env_remove
+            return {"exit_code": 0, "stdout": "", "stderr": "",
+                    "timeout": False}
+
+        run.run_cmd = stub
+        try:
+            got, kind, _ = run.sparagmos_side(
+                Path("t.rs"), "2021", Path("/fake/driver"),
+                guest_args=("--test-threads=1", "--list"),
+                env_extra={"EXAMPLE_ENV": "1"},
+                env_remove=("RUST_BACKTRACE",))
+        finally:
+            run.run_cmd = orig
+        self.assertEqual(kind, "result")
+        argv = captured["argv"]
+        i = argv.index("--guest-arg")
+        self.assertEqual(argv[i + 1:i + 4],
+                         ["--test-threads=1", "--guest-arg", "--list"])
+        self.assertEqual(captured["env_extra"]["EXAMPLE_ENV"], "1")
+        self.assertEqual(captured["env_extra"]["RUSTC_BOOTSTRAP"],
+                         "1")
+        self.assertEqual(captured["env_remove"],
+                         ("RUST_BACKTRACE",))
