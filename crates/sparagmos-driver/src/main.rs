@@ -2545,7 +2545,7 @@ fn external_callees(c: &Collected) -> Vec<String> {
 
 /// Execute the collected program's `main` in the interpreter and
 /// return the run-mode process exit code (see the crate docs).
-fn execute(c: &Collected, guest_args: &[String]) -> i32 {
+fn execute(c: &Collected, input: &str, guest_args: &[String]) -> i32 {
     let mut program = sparagmos_interp::MirProgram::new();
     for ((name, body), def_id) in c.bodies.iter().zip(c.body_def_ids.iter()) {
         program.functions.push(sparagmos_interp::MirFunction {
@@ -2614,6 +2614,7 @@ fn execute(c: &Collected, guest_args: &[String]) -> i32 {
     let entry_name = program.functions[entry_index].name.clone();
     let config = sparagmos_interp::InterpConfig {
         guest_args: guest_args.to_vec(),
+        program_path: input.to_string(),
         ..sparagmos_interp::InterpConfig::default()
     };
     let run = sparagmos_interp::interpret_mir_captured_with_config(
@@ -2623,12 +2624,15 @@ fn execute(c: &Collected, guest_args: &[String]) -> i32 {
         config,
     );
     // The guest's stdout is this process's stdout, whatever the
-    // outcome was.
+    // outcome was; the guest's stderr likewise goes to stderr.
     {
         use std::io::Write;
         let mut out = std::io::stdout().lock();
         let _ = out.write_all(run.stdout.as_bytes());
         let _ = out.flush();
+        let mut err = std::io::stderr().lock();
+        let _ = err.write_all(run.stderr.as_bytes());
+        let _ = err.flush();
     }
     match run.result {
         Ok(sparagmos_interp::Value::Unit) => 0,
@@ -3461,7 +3465,7 @@ fn main() {
                         std::process::exit(1);
                     }
                 }
-                std::process::exit(execute(&c, &guest_args));
+                std::process::exit(execute(&c, &input, &guest_args));
             }
             println!(
                 "sparagmos-driver: {input} (Stable MIR, {})",

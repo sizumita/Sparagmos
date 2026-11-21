@@ -45,6 +45,14 @@ pub struct InterpConfig {
     /// argv[0] itself is the interpreter's policy, not part of
     /// this list.
     pub guest_args: Vec<String>,
+    /// The guest program's argv[0]: the path the program was
+    /// invoked as. The driver sets it to the source path it was
+    /// handed (the stand-in for the compiled binary's path: a
+    /// natively built test binary is invoked by its own path, and
+    /// the source path is the corresponding name in this model).
+    /// Empty when no invocation path is known; `env::args` then
+    /// yields just the guest arguments.
+    pub program_path: String,
 }
 
 impl Default for InterpConfig {
@@ -53,6 +61,7 @@ impl Default for InterpConfig {
             max_steps: 1_000_000,
             max_call_depth: 1024,
             guest_args: Vec::new(),
+            program_path: String::new(),
         }
     }
 }
@@ -279,6 +288,9 @@ pub struct Interpreter<'a> {
     /// Everything the guest wrote to its stdout (via the runtime
     /// print support) during the most recent run.
     output: String,
+    /// Everything the guest wrote to its stderr (via the runtime
+    /// print support) during the most recent run.
+    error_output: String,
     /// Drop glue suspended on destructor calls (see
     /// [`DropContinuation`]); a stack, innermost last.
     drop_continuations: Vec<DropContinuation>,
@@ -384,6 +396,11 @@ impl<'a> Interpreter<'a> {
         &self.config.guest_args
     }
 
+    /// The guest program's argv[0] (see [`InterpConfig::program_path`]).
+    pub fn program_path(&self) -> &str {
+        &self.config.program_path
+    }
+
     pub fn with_config(program: &'a Program, config: InterpConfig) -> Self {
         Interpreter {
             program,
@@ -391,6 +408,7 @@ impl<'a> Interpreter<'a> {
             steps: 0,
             next_frame_id: 0,
             output: String::new(),
+            error_output: String::new(),
             drop_continuations: Vec::new(),
             resume_signaled: false,
             statics: std::cell::RefCell::new(HashMap::new()),
@@ -422,6 +440,15 @@ impl<'a> Interpreter<'a> {
         &self.output
     }
 
+    /// The guest stderr captured during the most recent run.
+    pub fn error_output(&self) -> &str {
+        &self.error_output
+    }
+
+    pub(crate) fn push_error_output(&mut self, text: &str) {
+        self.error_output.push_str(text);
+    }
+
     pub(crate) fn push_output(&mut self, text: &str) {
         self.output.push_str(text);
     }
@@ -447,6 +474,7 @@ impl<'a> Interpreter<'a> {
         self.steps = 0;
         self.next_frame_id = 0;
         self.output.clear();
+        self.error_output.clear();
         let body = self
             .program
             .get(entry)
