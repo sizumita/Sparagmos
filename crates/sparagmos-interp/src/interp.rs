@@ -4591,6 +4591,7 @@ impl<'a> Interpreter<'a> {
                 base,
                 concrete,
                 traits,
+                drop_glue,
             } => match *base {
                 Value::Ref(_) => {
                     let base = self.ptr_offset_value(frames, *base, count, elem_size, wrapping)?;
@@ -4598,6 +4599,7 @@ impl<'a> Interpreter<'a> {
                         base: Box::new(base),
                         concrete,
                         traits,
+                        drop_glue,
                     })
                 }
                 ref other => Err(InterpError::type_mismatch(
@@ -4645,6 +4647,13 @@ impl<'a> Interpreter<'a> {
                 // statics: the displacement is carried.
                 let projection = self.offset_projection(frames, None, projection, disp)?;
                 Ok(RefTarget::Static { name, projection })
+            }
+            RefTarget::Alloc { id, projection } => {
+                // An allocation's pointee is not a declared local
+                // type either, so no array absorption is attempted:
+                // the displacement is carried, as for a static.
+                let projection = self.offset_projection(frames, None, projection, disp)?;
+                Ok(RefTarget::Alloc { id, projection })
             }
             RefTarget::Value(v) => Ok(RefTarget::Value(Box::new(
                 self.offset_value_target(*v, count, elem_size)?,

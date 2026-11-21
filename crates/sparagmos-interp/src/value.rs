@@ -417,6 +417,7 @@ impl fmt::Display for RefTarget {
                         RefProj::Subslice { offset, len } => {
                             write!(f, "[{offset}..{}]", offset + len)?
                         }
+                        RefProj::ByteOffset(d) => write!(f, " +byte {d}")?,
                     }
                 }
                 Ok(())
