@@ -320,6 +320,20 @@ pub enum Constant {
     /// value (equality with another null holds, dereference is an
     /// explicit error).
     NullPtr,
+    /// A reference to a `static` item's storage: `name` is the
+    /// static's program key and `value` is its initializer constant.
+    /// Evaluating it seeds the interpreter's statics store from
+    /// `value` on first touch and yields a reference to the store,
+    /// so writes through the reference are observed by later reads
+    /// (unlike [`Constant::Ref`], whose pointee is an immutable
+    /// snapshot).
+    StaticRef {
+        name: String,
+        value: Box<Constant>,
+        /// The path from the static's base to the pointee (empty
+        /// for a reference to the static itself).
+        projection: Vec<RefProj>,
+    },
     /// A slice constant with decoded (non-byte) elements.
     SliceVal(Vec<Constant>),
     /// A function item constant: evaluates to the callable value

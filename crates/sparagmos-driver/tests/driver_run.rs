@@ -3195,3 +3195,238 @@ fn run_mode_null_and_fn_pointer_constants_execute() {
         "true\nfalse\n9\n"
     );
 }
+
+// ----- statics storage model (Lane CQ) -----
+
+const DROP_15858_SRC: &str = r#"
+#![allow(static_mut_refs)]
+static mut DROP_RAN: bool = false;
+
+trait Bar {
+    fn do_something(&mut self);
+}
+
+struct BarImpl;
+
+impl Bar for BarImpl {
+    fn do_something(&mut self) {}
+}
+
+struct Foo<B: Bar>(B);
+
+impl<B: Bar> Drop for Foo<B> {
+    fn drop(&mut self) {
+        unsafe {
+            DROP_RAN = true;
+        }
+    }
+}
+
+fn main() {
+    {
+        let _x: Foo<BarImpl> = Foo(BarImpl);
+    }
+    unsafe {
+        assert_eq!(DROP_RAN, true);
+        println!("drop ran");
+    }
+}
+"#;
+
+const STATIC_INDEPENDENT_SRC: &str = r#"
+static mut A: i32 = 1;
+static mut B: i32 = 2;
+
+fn main() {
+    unsafe {
+        A += 10;
+        println!("a={} b={}", A, B);
+    }
+}
+"#;
+
+const STATIC_INTERIOR_PTR_SRC: &str = r#"
+use std::cell::UnsafeCell;
+
+#[repr(transparent)]
+struct SyncUnsafeCellLike(UnsafeCell<u32>);
+unsafe impl Sync for SyncUnsafeCellLike {}
+
+#[repr(C)]
+struct SyncPtr {
+    foo: *mut u32,
+}
+unsafe impl Sync for SyncPtr {}
+
+static mut STATIC: u32 = 42;
+static PTR: SyncPtr = SyncPtr { foo: std::ptr::addr_of_mut!(STATIC) };
+
+static WRAPPED: SyncUnsafeCellLike = SyncUnsafeCellLike(UnsafeCell::new(7));
+static PTR2: SyncPtr =
+    SyncPtr { foo: std::ptr::addr_of!(WRAPPED) as *mut u32 };
+
+fn main() {
+    unsafe {
+        assert_eq!(*PTR.foo, 42);
+        *PTR.foo = 0;
+        assert_eq!(*PTR.foo, 0);
+        assert_eq!(*PTR2.foo, 7);
+        *PTR2.foo = 9;
+        assert_eq!(*PTR2.foo, 9);
+        println!("done");
+    }
+}
+"#;
+
+const STATIC_INTERIOR_REF_SRC: &str = r#"
+struct S { a: usize }
+
+static A: S = S { a: 3 };
+static B: &'static usize = &A.a;
+static D: [usize; 1] = [1];
+static F: &'static usize = &D[0];
+
+fn main() {
+    assert_eq!(*B, A.a);
+    assert_eq!(*F, D[0]);
+    println!("b={} f={}", *B, *F);
+}
+"#;
+
+const STATIC_INTERIOR_SRC: &str = r#"
+use std::cell::RefCell;
+
+static mut CELL: RefCell<i32> = RefCell::new(10);
+
+fn main() {
+    unsafe {
+        *CELL.borrow_mut() = 5;
+        let v = *CELL.borrow();
+        *CELL.borrow_mut() = v + 2;
+        println!("cell={}", *CELL.borrow());
+    }
+}
+"#;
+
+const STATIC_MUT_COUNTER_SRC: &str = r#"
+static mut COUNT: i32 = 0;
+
+fn bump() {
+    unsafe { COUNT += 1; }
+}
+
+fn main() {
+    bump();
+    bump();
+    bump();
+    unsafe { println!("count={}", COUNT); }
+}
+"#;
+
+#[test]
+fn run_mode_generic_drop_trait_bound_15858() {
+    let dir = temp_dir("drop-15858");
+    let src = fixture(&dir, "drop_15858.rs", DROP_15858_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the 15858 destructor must run and write the static; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "drop ran\n",
+        "main observes the static write the destructor made"
+    );
+}
+
+#[test]
+fn run_mode_static_interior_mutability() {
+    let dir = temp_dir("static-interior");
+    let src = fixture(&dir, "interior.rs", STATIC_INTERIOR_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a RefCell living in a static must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "cell=7\n",
+        "guard writes to a static are stored back and read by later borrows"
+    );
+}
+
+#[test]
+fn run_mode_static_interior_pointer_writes_through() {
+    let dir = temp_dir("static-interior-ptr");
+    let src = fixture(&dir, "interior_ptr.rs", STATIC_INTERIOR_PTR_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a raw pointer to a static (or into its wrapper) must write the store; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "done\n",
+        "writes through interior pointers are observed by later reads"
+    );
+}
+
+#[test]
+fn run_mode_static_interior_reference_reads_the_field() {
+    let dir = temp_dir("static-interior-ref");
+    let src = fixture(&dir, "interior_ref.rs", STATIC_INTERIOR_REF_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a reference into a static must read the field it names; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "b=3 f=1\n",
+        "the store seed is the full initializer; the reference carries the projection"
+    );
+}
+
+#[test]
+fn run_mode_static_mut_counter_across_calls() {
+    let dir = temp_dir("static-counter");
+    let src = fixture(&dir, "counter.rs", STATIC_MUT_COUNTER_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a static mut counter must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "count=3\n",
+        "writes to a static persist across calls"
+    );
+}
+
+#[test]
+fn run_mode_two_statics_of_same_type_stay_independent() {
+    let dir = temp_dir("static-independent");
+    let src = fixture(&dir, "independent.rs", STATIC_INDEPENDENT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "two statics must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a=11 b=2\n",
+        "statics are keyed by identity, not by type or initializer"
+    );
+}

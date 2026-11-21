@@ -94,6 +94,19 @@ pub enum RefTarget {
     /// or array). Reads resolve against the stored value; writes
     /// through it are an error.
     Value(Box<Value>),
+    /// A `static` item's program-level storage, identified by the
+    /// static's program key. The interpreter holds one value per
+    /// static (see `Interpreter`'s statics store), seeded from the
+    /// static's initializer; reads copy out of the store and writes
+    /// store back, so a write through any reference to the static
+    /// is observed by every later read — the read-after-write
+    /// consistency `static mut` and interior-mutable statics rely
+    /// on. The stored projection never contains a `Deref` step, as
+    /// for [`RefTarget::Place`].
+    Static {
+        name: String,
+        projection: Vec<RefProj>,
+    },
     /// The null pointer: denotes no place and no value. Produced by
     /// `ptr::null` / `ptr::null_mut`; equal only to itself, and any
     /// dereference of it is an explicit error.
@@ -295,6 +308,17 @@ impl fmt::Display for RefTarget {
                 Ok(())
             }
             RefTarget::Value(_) => write!(f, "constant aggregate"),
+            RefTarget::Static { name, projection } => {
+                write!(f, "static {name}")?;
+                for proj in projection {
+                    match proj {
+                        RefProj::Field(i) => write!(f, ".{i}")?,
+                        RefProj::Index(i) => write!(f, "[{i}]")?,
+                        RefProj::Downcast(v) => write!(f, " as variant {v}")?,
+                    }
+                }
+                Ok(())
+            }
             RefTarget::Null => write!(f, "null pointer"),
             RefTarget::Address(addr) => write!(f, "address pointer {addr:#x}"),
         }

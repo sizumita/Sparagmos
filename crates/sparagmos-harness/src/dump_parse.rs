@@ -954,6 +954,14 @@ impl Conv {
                 alloc_id: atom_parse(field(f, "alloc_id")?, "alloc_id")?,
                 offset: atom_parse(field(f, "offset")?, "offset")?,
             },
+            ("StaticRef", Payload::Fields(f)) => mir::ConstValue::StaticRef {
+                def: Self::def_id(field(f, "def")?)?,
+                value: Box::new(Self::const_value(field(f, "value")?)?),
+                projection: as_list(field(f, "projection")?)?
+                    .iter()
+                    .map(Self::place_elem)
+                    .collect::<Result<_, _>>()?,
+            },
             (other, _) => return unsupported("ConstValue", other),
         })
     }

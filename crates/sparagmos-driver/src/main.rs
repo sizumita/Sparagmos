@@ -1359,6 +1359,21 @@ fn collect() -> ControlFlow<()> {
     let mut deferred_closures: Vec<DeferredFn> = Vec::new();
 
     let items = rustc_public::all_local_items();
+    // Record the local statics' declared types before converting
+    // anything: a reference into a static's interior is decoded
+    // against the static's own type (see Converter::decode_static_ref),
+    // and the type query is only safe for real items — an anonymous
+    // promoted static's type_of can ICE the compilation — so it is
+    // asked here, for items, never from the constant decoder.
+    for item in items.iter() {
+        if matches!(item.kind(), ItemKind::Static) {
+            if let Ok(ty) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| item.ty()))
+            {
+                conv.note_static_ty(item, ty);
+            }
+        }
+    }
     for item in items.iter() {
         let name = item.name();
         let item_instance = Instance::try_from(item.clone());
