@@ -1258,6 +1258,35 @@ impl<'a> Interpreter<'a> {
                         variant: 0,
                         fields: vec![value],
                     })
+                } else if (target == "std::task::Waker"
+                    && (source.starts_with("std::sync::Arc<")
+                        || source.starts_with("alloc::sync::Arc<")))
+                    || (target == "std::task::LocalWaker"
+                        && (source.starts_with("std::rc::Rc<")
+                            || source.starts_with("alloc::rc::Rc<")))
+                {
+                    // `Waker::from(Arc<T: Wake>)` (and the
+                    // `LocalWaker` impl, which takes `Rc<T: LocalWake>`):
+                    // std builds a `RawWaker` whose data pointer is
+                    // the smart pointer's allocation and whose vtable
+                    // forwards wake/clone/drop to that allocation.
+                    // In this value model the waker is the source
+                    // value carried in a one-field aggregate: the
+                    // data the vtable would act on *is* the Arc/Rc
+                    // value, and the reference count the vtable
+                    // would maintain is unobservable (as it is for
+                    // the modelled `Arc` itself). Carrying the
+                    // waker, handing it to `Context::from_waker`
+                    // and cloning it (a value copy, exactly how the
+                    // modelled `Arc` clones) are faithful. Calls
+                    // that would go through the vtable -
+                    // `Waker::wake` / `wake_by_ref` - are not
+                    // modelled and stay unsupported at their own
+                    // call sites.
+                    Ok(Value::Enum {
+                        variant: 0,
+                        fields: vec![value],
+                    })
                 } else {
                     Err(unsupported(format!(
                         "From::from from {source} to {target} is not runtime-supported"
