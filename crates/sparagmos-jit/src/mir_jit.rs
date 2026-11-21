@@ -1591,16 +1591,29 @@ impl<'a> FnLower<'a> {
     // ----- places, operands, constants -------------------------------------
 
     /// One in-frame projection step (`Field` / `ConstantIndex` /
-    /// `OpaqueCast` / `Subtype`) applied to a running leaf offset
-    /// and type. Shared by the frame segment of place resolution.
+    /// `Downcast` / `OpaqueCast` / `Subtype`) applied to a running
+    /// leaf offset, type and — for an ADT place — the variant the
+    /// projections have downcast to (0 until one does). Shared by
+    /// the frame segment of place resolution.
     fn frame_step(
         &self,
         offset: &mut usize,
         ty: &mut mir::Ty,
+        variant: &mut u32,
         elem: &mir::PlaceElem,
     ) -> Result<(), JitError> {
         match elem {
             mir::PlaceElem::Field(idx, field_ty) => {
+                if let mir::Ty::Adt(..) = &*ty {
+                    let layout = self.adt_layout(ty)?;
+                    let slot = layout.field(*variant, *idx).ok_or_else(|| {
+                        self.err("Field projection outside the ADT layout")
+                    })?;
+                    *offset += slot.offset;
+                    *ty = field_ty.clone();
+                    *variant = 0;
+                    return Ok(());
+                }
                 let mir::Ty::Tuple(fields) = &*ty else {
                     return Err(self.err(&format!(
                         "Field projection on non-tuple type {}",
@@ -1615,6 +1628,17 @@ impl<'a> FnLower<'a> {
                     *offset += flatten(f, &self.func.name, self.layouts)?;
                 }
                 *ty = field_ty.clone();
+                *variant = 0;
+                Ok(())
+            }
+            mir::PlaceElem::Downcast(_, v) => {
+                if !matches!(&*ty, mir::Ty::Adt(..)) {
+                    return Err(self.err(&format!(
+                        "Downcast projection on non-ADT type {}",
+                        ty.kind_name()
+                    )));
+                }
+                *variant = *v;
                 Ok(())
             }
             mir::PlaceElem::ConstantIndex {
@@ -1650,10 +1674,12 @@ impl<'a> FnLower<'a> {
                 };
                 *offset += idx as usize * flatten(elem, &self.func.name, self.layouts)?;
                 *ty = (**elem).clone();
+                *variant = 0;
                 Ok(())
             }
             mir::PlaceElem::OpaqueCast(t) | mir::PlaceElem::Subtype(t) => {
                 *ty = t.clone();
+                *variant = 0;
                 Ok(())
             }
             other => Err(self.err(&format!("{} projection", other.kind_name()))),
@@ -1689,6 +1715,7 @@ impl<'a> FnLower<'a> {
         let (local_first, _) = self.local_slots[place.local.index()];
         let mut ty = self.body.local_decls[place.local.index()].ty.clone();
         let mut offset = 0usize;
+        let mut variant = 0u32;
         let mut i = 0usize;
         while i < place.projection.len() {
             match &place.projection[i] {
@@ -1749,7 +1776,7 @@ impl<'a> FnLower<'a> {
                     return self.classify_mem(place, i + 1, addr, elem, None, checks);
                 }
                 elem => {
-                    self.frame_step(&mut offset, &mut ty, elem)?;
+                    self.frame_step(&mut offset, &mut ty, &mut variant, elem)?;
                     i += 1;
                 }
             }
@@ -1773,9 +1800,22 @@ impl<'a> FnLower<'a> {
         mut len: Option<LenSrc>,
         mut checks: Vec<IndexCheck>,
     ) -> Result<PlaceLoc, JitError> {
+        let mut variant = 0u32;
         while i < place.projection.len() {
             match &place.projection[i] {
                 mir::PlaceElem::Field(idx, field_ty) => {
+                    if let mir::Ty::Adt(..) = &ty {
+                        let layout = self.adt_layout(&ty)?;
+                        let slot = layout.field(variant, *idx).ok_or_else(|| {
+                            self.err("Field projection outside the ADT layout")
+                        })?;
+                        addr.const_off += slot.offset;
+                        ty = field_ty.clone();
+                        variant = 0;
+                        len = None;
+                        i += 1;
+                        continue;
+                    }
                     let mir::Ty::Tuple(fields) = &ty else {
                         return Err(self.err(&format!(
                             "Field projection on non-tuple type {}",
@@ -1936,8 +1976,18 @@ impl<'a> FnLower<'a> {
                     }
                     ty = pointee;
                 }
+                mir::PlaceElem::Downcast(_, v) => {
+                    if !matches!(ty, mir::Ty::Adt(..)) {
+                        return Err(self.err(&format!(
+                            "Downcast projection on non-ADT type {}",
+                            ty.kind_name()
+                        )));
+                    }
+                    variant = *v;
+                }
                 mir::PlaceElem::OpaqueCast(t) | mir::PlaceElem::Subtype(t) => {
                     ty = t.clone();
+                    variant = 0;
                 }
                 other => {
                     return Err(self.err(&format!("{} projection", other.kind_name())));
