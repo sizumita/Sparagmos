@@ -2180,6 +2180,66 @@ def fill_result(rec, rust_dir, driver_bin, out):
 
 
 
+def _opt_pairs(flags):
+    """(name, value) pairs of the -C / -Z / --name options in a
+    flag list.
+
+    compile-flags reach the runner already split into tokens, so
+    an option appears joined (`-Ccodegen-units=1`) or as two
+    tokens (`-C`, `codegen-units=1`); both spellings yield the
+    same pair. Tokens that are not options are ignored.
+    """
+    pairs = []
+    i = 0
+    while i < len(flags):
+        tok = flags[i]
+        body = None
+        if tok in ("-C", "-Z"):
+            if i + 1 < len(flags):
+                body = flags[i + 1]
+                i += 1
+        elif tok.startswith("-C") or tok.startswith("-Z"):
+            body = tok[2:]
+        elif tok.startswith("--") and "=" in tok:
+            body = tok[2:]
+        if body:
+            name, _, value = body.partition("=")
+            pairs.append((name, value))
+        i += 1
+    return pairs
+
+
+def compiletest_mode_args(suite, flags):
+    """Arguments compiletest adds for a suite's mode, which the
+    subset must supply itself because it drives the same
+    compilations outside compiletest.
+
+    - Every UI test is compiled with `-Ccodegen-units=1`
+      (make_compile_args, TestMode::Ui). The subset's stage-2 UI
+      conversions, and stage 1's compile-checked UI revisions,
+      take the same argument.
+    - `-Zsanitizer=cfi` combined with LTO is accepted by rustc
+      only with `-Ccodegen-units=1`. compiletest never trips
+      that check for codegen tests: it compiles them with
+      --emit=llvm-ir, under which no LTO validation runs. The
+      driver's --emit=metadata conversion does trip it, so the
+      value rustc itself requires is supplied; the codegen-unit
+      count does not change the MIR a conversion sees.
+
+    Nothing is added when the test sets codegen-units itself.
+    """
+    pairs = _opt_pairs(flags)
+    if any(name == "codegen-units" for name, _ in pairs):
+        return []
+    if suite in ("ui", "ui-fulldeps"):
+        return ["-Ccodegen-units=1"]
+    sanitizers = [v for name, v in pairs if name == "sanitizer"]
+    if any("cfi" in v.split(",") for v in sanitizers) and \
+            any(name == "lto" for name, _ in pairs):
+        return ["-Ccodegen-units=1"]
+    return []
+
+
 def stage1_compile_check(rec, view, path, driver_bin, revision, res,
                          edition, rev_args, flags, aux_specs,
                          rust_dir):
@@ -2215,6 +2275,7 @@ def stage1_compile_check(rec, view, path, driver_bin, revision, res,
             res["bucket"] = "not attempted (minicore build)"
             return res
         args += mc_args
+    args += compiletest_mode_args(rec["suite"], flags)
     args += flags
     pm_args, pm_err = proc_macro_extern_args(path, view, edition)
     if pm_err:
@@ -3002,6 +3063,7 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
         elif rec["suite"] == "pretty" and not declared_crate_type(
                 path.read_text(errors="ignore")):
             args += ["--crate-type", "lib"]
+    args += compiletest_mode_args(rec["suite"], flags)
     args += flags
     specs = aux_specs
     if aux_per_revision:
