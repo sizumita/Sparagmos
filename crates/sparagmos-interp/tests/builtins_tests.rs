@@ -1964,6 +1964,9 @@ fn registry_round2_covers_the_new_callees() {
         ("std::ptr::null_mut", Builtin::PtrNull),
         ("std::rc::Rc::<T>::new", Builtin::RcNew),
         ("std::sync::Arc::<T>::new", Builtin::ArcNew),
+        ("std::iter::Iterator::count", Builtin::IteratorCount),
+        ("std::iter::Iterator::fold", Builtin::IteratorFold),
+        ("std::iter::Iterator::for_each", Builtin::IteratorForEach),
     ];
     for (name, expected) in cases {
         assert_eq!(
@@ -1974,8 +1977,10 @@ fn registry_round2_covers_the_new_callees() {
     }
     // Deliberately unmodelled: allocation machinery (its callers
     // write through the returned raw pointer, which the value
-    // model cannot serve), closure-taking callees (a builtin
-    // cannot invoke a guest closure), contract thunks, channels
+    // model cannot serve), closure-taking *adapters* such as
+    // `Iterator::map` (they produce lazy iterator values, unlike
+    // the terminal consumers `fold` / `for_each`, which a builtin
+    // can drive synchronously), contract thunks, channels
     // and thread-locals. The `std::ops` arithmetic traits are
     // likewise not registered: their core default bodies are
     // collected and executed as ordinary functions (which also
@@ -1990,7 +1995,6 @@ fn registry_round2_covers_the_new_callees() {
         "std::alloc::Global::alloc_impl_runtime",
         "std::intrinsics::contract_check_requires",
         "std::iter::Iterator::map",
-        "std::iter::Iterator::fold",
         "std::option::Option::<T>::map",
         "std::sync::mpmc::channel",
         "std::thread::LocalKey::<T>::with",

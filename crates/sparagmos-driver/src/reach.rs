@@ -65,7 +65,7 @@ use rustc_public::CrateDef;
 
 use sparagmos_mir as sm;
 
-use crate::convert::{stable_mir_panic_reason, Converter};
+use crate::convert::{args_mention_params, closure_kind, stable_mir_panic_reason, Converter};
 use crate::report::{FnOutcome, FnReport};
 
 /// Cap on collected bodies per program; see the module docs.
@@ -325,6 +325,80 @@ pub fn collect_reachable(
                             reason: "implemented as an interpreter builtin; body not collected"
                                 .to_string(),
                         },
+                    });
+                }
+                // The excluded body is also where the demand for
+                // the closures handed to it would have come from:
+                // a generic consumer's body calls its closure
+                // through an Fn-trait shim, and collecting that
+                // call is what used to bring the closure's body
+                // into the program (the interpreter's consumers —
+                // `Iterator::fold` and friends — call the closure
+                // value directly). Create the same demand from
+                // the call site instead: the concrete closure
+                // types among the call's generic arguments get
+                // their bodies collected here. Local closures are
+                // the closure-demand pass's business, and mentions
+                // still mentioning parameters are left to the
+                // monomorphic instance bodies.
+                for (cdef, cargs) in closures_in_args(&args) {
+                    let cdef_id = cdef.def_id();
+                    if local_defs.contains(&cdef_id) || args_mention_params(&cargs) {
+                        continue;
+                    }
+                    let Some(kind) = closure_kind(&cargs) else {
+                        continue;
+                    };
+                    let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        Instance::resolve_closure(cdef, &cargs, kind)
+                    }));
+                    let inst = match resolved {
+                        Ok(Ok(inst)) => inst,
+                        _ => {
+                            let key = (cdef_id, format!("{cargs:?}"));
+                            if unresolved_seen.insert(key) {
+                                records.push(Record {
+                                    def: cdef_id,
+                                    def_name: cdef_id.name(),
+                                    detail: truncate(&format!("{cargs:?}"), 100),
+                                    kind: RecordKind::NoBody {
+                                        reason: "closure instance resolution failed"
+                                            .to_string(),
+                                    },
+                                });
+                            }
+                            continue;
+                        }
+                    };
+                    if by_instance.contains_key(&(cdef_id, inst)) {
+                        continue;
+                    }
+                    by_instance.insert((cdef_id, inst), ());
+                    let detail = inst.name().to_string();
+                    let kind = if !inst.has_body() {
+                        RecordKind::NoBody {
+                            reason: "no MIR body available".to_string(),
+                        }
+                    } else if bodies_taken >= cap {
+                        limit_reached = true;
+                        RecordKind::NoBody {
+                            reason: "collection limit reached".to_string(),
+                        }
+                    } else if let Some(cbody) = inst.body() {
+                        bodies_taken += 1;
+                        queue.push_back(cbody.clone());
+                        walked_bodies.push(cbody.clone());
+                        RecordKind::WithBody { inst, body: cbody }
+                    } else {
+                        RecordKind::NoBody {
+                            reason: "no MIR body available".to_string(),
+                        }
+                    };
+                    records.push(Record {
+                        def: cdef_id,
+                        def_name: cdef_id.name(),
+                        detail,
+                        kind,
                     });
                 }
                 continue;
@@ -828,76 +902,83 @@ pub fn unrepresentable_local(body: &sm::Body) -> Option<String> {
 /// a monomorphic instance body they are concrete; inside the
 /// generic definition's body they still mention parameters, and
 /// the caller decides what that means for each entry.
+fn walk_closure_args(args: &GenericArgs, out: &mut Vec<(ClosureDef, GenericArgs)>) {
+    for arg in &args.0 {
+        match arg {
+            GenericArgKind::Type(ty) => walk_closure_ty(ty, out),
+            GenericArgKind::Const(konst) => match konst.kind() {
+                rustc_public::ty::TyConstKind::Unevaluated(_, inner) => {
+                    walk_closure_args(&inner, out)
+                }
+                rustc_public::ty::TyConstKind::Value(ty, _)
+                | rustc_public::ty::TyConstKind::ZSTValue(ty) => walk_closure_ty(&ty, out),
+                _ => {}
+            },
+            GenericArgKind::Lifetime(_) => {}
+        }
+    }
+}
+
+fn walk_closure_ty(ty: &Ty, out: &mut Vec<(ClosureDef, GenericArgs)>) {
+    match ty.kind() {
+        TyKind::RigidTy(RigidTy::Closure(def, args)) => {
+            out.push((def, args.clone()));
+            walk_closure_args(&args, out);
+        }
+        TyKind::RigidTy(RigidTy::Ref(_, inner, _))
+        | TyKind::RigidTy(RigidTy::RawPtr(inner, _))
+        | TyKind::RigidTy(RigidTy::Slice(inner)) => walk_closure_ty(&inner, out),
+        TyKind::RigidTy(RigidTy::Array(inner, _)) => walk_closure_ty(&inner, out),
+        TyKind::RigidTy(RigidTy::Pat(inner, _)) => walk_closure_ty(&inner, out),
+        TyKind::RigidTy(RigidTy::Tuple(elems)) => {
+            for elem in &elems {
+                walk_closure_ty(elem, out);
+            }
+        }
+        TyKind::RigidTy(RigidTy::FnPtr(sig)) => {
+            for t in &sig.value.inputs_and_output {
+                walk_closure_ty(t, out);
+            }
+        }
+        TyKind::RigidTy(RigidTy::Adt(_, args))
+        | TyKind::RigidTy(RigidTy::FnDef(_, args))
+        | TyKind::RigidTy(RigidTy::Coroutine(_, args))
+        | TyKind::RigidTy(RigidTy::CoroutineClosure(_, args))
+        | TyKind::RigidTy(RigidTy::CoroutineWitness(_, args)) => walk_closure_args(&args, out),
+        TyKind::RigidTy(RigidTy::Dynamic(bounds, _)) => {
+            for bound in &bounds {
+                match &bound.value {
+                    rustc_public::ty::ExistentialPredicate::Trait(t) => {
+                        walk_closure_args(&t.generic_args, out)
+                    }
+                    rustc_public::ty::ExistentialPredicate::Projection(p) => {
+                        walk_closure_args(&p.generic_args, out)
+                    }
+                    rustc_public::ty::ExistentialPredicate::AutoTrait(_) => {}
+                }
+            }
+        }
+        TyKind::Alias(_, alias) => walk_closure_args(&alias.args, out),
+        _ => {}
+    }
+}
+
+/// The closure types among one set of generic arguments.
+pub fn closures_in_args(args: &GenericArgs) -> Vec<(ClosureDef, GenericArgs)> {
+    let mut out = Vec::new();
+    walk_closure_args(args, &mut out);
+    out
+}
+
 pub fn closure_targets(body: &mir::Body) -> Vec<(ClosureDef, GenericArgs)> {
-    fn walk_args(args: &GenericArgs, out: &mut Vec<(ClosureDef, GenericArgs)>) {
-        for arg in &args.0 {
-            match arg {
-                GenericArgKind::Type(ty) => walk_ty(ty, out),
-                GenericArgKind::Const(konst) => match konst.kind() {
-                    rustc_public::ty::TyConstKind::Unevaluated(_, inner) => {
-                        walk_args(&inner, out)
-                    }
-                    rustc_public::ty::TyConstKind::Value(ty, _)
-                    | rustc_public::ty::TyConstKind::ZSTValue(ty) => walk_ty(&ty, out),
-                    _ => {}
-                },
-                GenericArgKind::Lifetime(_) => {}
-            }
-        }
-    }
-
-    fn walk_ty(ty: &Ty, out: &mut Vec<(ClosureDef, GenericArgs)>) {
-        match ty.kind() {
-            TyKind::RigidTy(RigidTy::Closure(def, args)) => {
-                out.push((def, args.clone()));
-                walk_args(&args, out);
-            }
-            TyKind::RigidTy(RigidTy::Ref(_, inner, _))
-            | TyKind::RigidTy(RigidTy::RawPtr(inner, _))
-            | TyKind::RigidTy(RigidTy::Slice(inner)) => walk_ty(&inner, out),
-            TyKind::RigidTy(RigidTy::Array(inner, _)) => walk_ty(&inner, out),
-            TyKind::RigidTy(RigidTy::Pat(inner, _)) => walk_ty(&inner, out),
-            TyKind::RigidTy(RigidTy::Tuple(elems)) => {
-                for elem in &elems {
-                    walk_ty(elem, out);
-                }
-            }
-            TyKind::RigidTy(RigidTy::FnPtr(sig)) => {
-                for t in &sig.value.inputs_and_output {
-                    walk_ty(t, out);
-                }
-            }
-            TyKind::RigidTy(RigidTy::Adt(_, args))
-            | TyKind::RigidTy(RigidTy::FnDef(_, args))
-            | TyKind::RigidTy(RigidTy::Coroutine(_, args))
-            | TyKind::RigidTy(RigidTy::CoroutineClosure(_, args))
-            | TyKind::RigidTy(RigidTy::CoroutineWitness(_, args)) => walk_args(&args, out),
-            TyKind::RigidTy(RigidTy::Dynamic(bounds, _)) => {
-                for bound in &bounds {
-                    match &bound.value {
-                        rustc_public::ty::ExistentialPredicate::Trait(t) => {
-                            walk_args(&t.generic_args, out)
-                        }
-                        rustc_public::ty::ExistentialPredicate::Projection(p) => {
-                            walk_args(&p.generic_args, out)
-                        }
-                        rustc_public::ty::ExistentialPredicate::AutoTrait(_) => {}
-                    }
-                }
-            }
-            TyKind::Alias(_, alias) => walk_args(&alias.args, out),
-            _ => {}
-        }
-    }
-
     let locals = body.locals();
     let mut out = Vec::new();
     for decl in locals {
-        walk_ty(&decl.ty, &mut out);
+        walk_closure_ty(&decl.ty, &mut out);
     }
     let mut operand_ty = |op: &Operand, out: &mut Vec<(ClosureDef, GenericArgs)>| {
         if let Ok(ty) = op.ty(&locals) {
-            walk_ty(&ty, out);
+            walk_closure_ty(&ty, out);
         }
     };
     for bb in &body.blocks {
@@ -908,7 +989,7 @@ pub fn closure_targets(body: &mir::Body) -> Vec<(ClosureDef, GenericArgs)> {
             match rvalue {
                 Rvalue::Aggregate(AggregateKind::Closure(def, args), ops) => {
                     out.push((*def, args.clone()));
-                    walk_args(args, &mut out);
+                    walk_closure_args(args, &mut out);
                     for op in ops {
                         operand_ty(op, &mut out);
                     }
@@ -923,7 +1004,7 @@ pub fn closure_targets(body: &mir::Body) -> Vec<(ClosureDef, GenericArgs)> {
                 | Rvalue::UnaryOp(_, op) => operand_ty(op, &mut out),
                 Rvalue::Cast(_, op, ty) => {
                     operand_ty(op, &mut out);
-                    walk_ty(ty, &mut out);
+                    walk_closure_ty(ty, &mut out);
                 }
                 Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) => {
                     operand_ty(a, &mut out);

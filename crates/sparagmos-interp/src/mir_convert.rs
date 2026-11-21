@@ -5609,6 +5609,15 @@ fn builtin_arg_ctx(
                 None
             }
         }
+        // The iterator consumers take the iterator itself, the
+        // accumulator and the closure as their arguments: each is
+        // typed by the callee's corresponding generic parameter
+        // (Self, B, F for fold; Self, F for for_each; Self for
+        // count), so a literal accumulator takes the accumulator
+        // type instead of the default unsigned rendering.
+        Builtin::IteratorCount | Builtin::IteratorFold | Builtin::IteratorForEach => {
+            raw_generic_args.get(arg_index).cloned()
+        }
         // The index argument of `Index` / `IndexMut` is the trait's
         // `Idx` parameter, the callee's second generic argument.
         Builtin::IndexIndex | Builtin::IndexMut => {

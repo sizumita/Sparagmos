@@ -259,6 +259,20 @@ pub enum Builtin {
     IteratorNext,
     /// `std::iter::Iterator::size_hint(&iter)`.
     IteratorSizeHint,
+    /// `std::iter::Iterator::count(iter)`: drive the modelled
+    /// `next` state transition to exhaustion and count the items.
+    /// (Core's own default body is a `fold`, and several iterator
+    /// types override `count` with pointer machinery over the
+    /// remaining items; the observable result is the same count.)
+    IteratorCount,
+    /// `std::iter::Iterator::fold(iter, init, f)`: the core
+    /// default body is a `next` loop applying `f` per item;
+    /// modelled by driving the `next` state transition and
+    /// invoking `f` synchronously per item.
+    IteratorFold,
+    /// `std::iter::Iterator::for_each(iter, f)`: a `next` loop
+    /// invoking `f` per item, discarding the results.
+    IteratorForEach,
     /// `std::convert::From::from(value)` (modelled conversions only).
     FromFrom,
     /// `std::hint::must_use(value)`: identity.
@@ -886,6 +900,9 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::iter::IntoIterator::into_iter" => Builtin::IntoIter,
         "std::iter::Iterator::next" => Builtin::IteratorNext,
         "std::iter::Iterator::size_hint" => Builtin::IteratorSizeHint,
+        "std::iter::Iterator::count" => Builtin::IteratorCount,
+        "std::iter::Iterator::fold" => Builtin::IteratorFold,
+        "std::iter::Iterator::for_each" => Builtin::IteratorForEach,
         // The thread surface (cooperative model, see `interp.rs`).
         // Registering these names also keeps the driver from
         // collecting the std thread machinery, whose internals
@@ -1788,6 +1805,14 @@ impl<'a> Interpreter<'a> {
         }
         let kind = lookup(name)
             .ok_or_else(|| unsupported(format!("call to {name} is not runtime-supported")))?;
+        // The closure-taking consumers evaluate their callable
+        // operand themselves: the generic evaluation below moves
+        // the closure out of its place, destroying the environment
+        // reference the calls must alias for `FnMut` semantics
+        // (see `call_callable_operand_to_completion`).
+        if matches!(kind, Builtin::IteratorFold | Builtin::IteratorForEach) {
+            return self.exec_iterator_fold_like(frames, body, kind, generic_args, args);
+        }
         let mut vals = Vec::with_capacity(args.len());
         for arg in args {
             vals.push(self.eval_operand(frames, body, arg)?);
@@ -2731,6 +2756,26 @@ impl<'a> Interpreter<'a> {
                 arity(1)?;
                 let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
                 self.iterator_size_hint(frames, self_ty, &vals[0])
+            }
+            Builtin::IteratorFold | Builtin::IteratorForEach => {
+                unreachable!("fold-like builtins are dispatched before argument evaluation")
+            }
+            Builtin::IteratorCount => {
+                arity(1)?;
+                let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
+                let mut state = vals.into_iter().next().expect("arity checked");
+                let mut count: u128 = 0;
+                loop {
+                    self.tick_step()?;
+                    let (next_state, item) =
+                        self.iterator_next_state(frames, self_ty, state)?;
+                    state = next_state;
+                    match option_payload(item)? {
+                        None => break,
+                        Some(_) => count += 1,
+                    }
+                }
+                Ok(Value::Uint(count))
             }
             Builtin::FromFrom | Builtin::IntoInto => {
                 arity(1)?;
@@ -5753,6 +5798,70 @@ impl<'a> Interpreter<'a> {
         Ok(hint(0, None))
     }
 
+    /// Execute `Iterator::fold` / `Iterator::for_each`: drive
+    /// the modelled `next` state transition over the owned
+    /// iterator value and invoke the closure operand per item —
+    /// exactly the loop the core default bodies spell out. The
+    /// closure is invoked through its operand (not a
+    /// pre-evaluated value) so its environment aliases its
+    /// place, as through the real `FnMut` shim, and mutations
+    /// of its captures persist from one item to the next.
+    fn exec_iterator_fold_like(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        body: &Body,
+        kind: Builtin,
+        generic_args: &[String],
+        args: &[Operand],
+    ) -> InterpResult<Value> {
+        let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
+        let (mut state, mut accum, f) = match kind {
+            Builtin::IteratorFold => {
+                if args.len() != 3 {
+                    return Err(InterpError::type_mismatch(
+                        "builtin Iterator::fold",
+                        "3 argument(s)",
+                        format!("{} argument(s)", args.len()),
+                    ));
+                }
+                let state = self.eval_operand(frames, body, &args[0])?;
+                let accum = self.eval_operand(frames, body, &args[1])?;
+                (state, accum, &args[2])
+            }
+            Builtin::IteratorForEach => {
+                if args.len() != 2 {
+                    return Err(InterpError::type_mismatch(
+                        "builtin Iterator::for_each",
+                        "2 argument(s)",
+                        format!("{} argument(s)", args.len()),
+                    ));
+                }
+                let state = self.eval_operand(frames, body, &args[0])?;
+                (state, Value::Unit, &args[1])
+            }
+            _ => unreachable!("fold-like dispatch covers fold and for_each only"),
+        };
+        loop {
+            self.tick_step()?;
+            let (next_state, item) = self.iterator_next_state(frames, self_ty, state)?;
+            state = next_state;
+            let Some(item) = option_payload(item)? else {
+                break;
+            };
+            let call_args = match kind {
+                Builtin::IteratorFold => {
+                    vec![std::mem::replace(&mut accum, Value::Unit), item]
+                }
+                _ => vec![item],
+            };
+            let result = self.call_callable_operand_to_completion(frames, body, f, call_args)?;
+            if kind == Builtin::IteratorFold {
+                accum = result;
+            }
+        }
+        Ok(accum)
+    }
+
     /// Semantic (derived `PartialEq`) equality of two values:
     /// references are followed to the data they denote and aggregates
     /// compare element-wise. This is the equality of the *data*, not
@@ -7227,6 +7336,23 @@ fn none_value() -> Value {
     Value::Enum {
         variant: 0,
         fields: Vec::new(),
+    }
+}
+
+/// Split the `Option` value an `Iterator::next` transition
+/// returns into its payload; `None` for the `None` variant.
+fn option_payload(value: Value) -> InterpResult<Option<Value>> {
+    match value {
+        Value::Enum { variant: 0, .. } => Ok(None),
+        Value::Enum {
+            variant: 1,
+            mut fields,
+        } if fields.len() == 1 => Ok(Some(fields.pop().expect("len checked"))),
+        other => Err(InterpError::type_mismatch(
+            "Iterator::next result",
+            "an Option value",
+            other.kind_name(),
+        )),
     }
 }
 

@@ -88,9 +88,12 @@ fn report_records_bodyless_targets_with_reasons() {
     // Fixture note: this used to use Vec::push reaching the
     // allocator shims, but since Lane V those Vec operations are
     // interpreter builtins and are no longer collected; env::args
-    // joined them later (Lane FC). std::io::stdin is a
-    // non-generic function of another crate, so no MIR body is
-    // shipped for it; Iterator::count is collected instead.
+    // joined them later (Lane FC), so std::io::stdin — a
+    // non-generic function of another crate, for which no MIR body
+    // is shipped — stands as the body-less witness here.
+    // Iterator::count is likewise an interpreter builtin since
+    // Lane EE and is reported with the builtin reason; the local
+    // main body stands in as the collected-body witness.
     let fixture = write_fixture("args", ARGS_RS);
     let (stdout, status) = run_driver(&[], &fixture);
     assert!(status.success(), "driver failed: {stdout}");
@@ -99,8 +102,14 @@ fn report_records_bodyless_targets_with_reasons() {
         "body-less target not reported with its reason:\n{stdout}"
     );
     assert!(
-        stdout.contains("fn std::iter::Iterator::count: blocks="),
-        "collected Iterator::count body missing:\n{stdout}"
+        stdout.contains(
+            "fn std::iter::Iterator::count: SKIPPED (implemented as an interpreter builtin"
+        ),
+        "builtin-owned target not reported with its reason:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("fn args::main: blocks="),
+        "collected main body missing:\n{stdout}"
     );
 }
 
