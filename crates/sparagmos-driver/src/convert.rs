@@ -1222,11 +1222,20 @@ impl Converter {
         if depth > MAX_CONST_DEPTH {
             return None;
         }
-        let (_, prov) = alloc
+        let Some((_, prov)) = alloc
             .provenance
             .ptrs
             .iter()
-            .find(|(o, _)| *o as usize == offset)?;
+            .find(|(o, _)| *o as usize == offset)
+        else {
+            // No provenance at the pointer slot: the stored integer
+            // is the address itself — a null pointer or a dangling
+            // pointer from `without_provenance` (an empty `Vec`'s
+            // buffer pointer, `NonNull::dangling`, a `Waker`'s null
+            // data pointer). Only the address is observable.
+            let addr = read_uint_at(alloc, offset, PTR_SIZE)?;
+            return Some(sm::ConstValue::IntPtr(addr as u64));
+        };
         let target_off = read_uint_at(alloc, offset, PTR_SIZE)? as usize;
         let target = match mir::alloc::GlobalAlloc::from(prov.0) {
             mir::alloc::GlobalAlloc::Memory(target) => target,

@@ -117,6 +117,11 @@ pub struct Interpreter<'a> {
 /// null and alignment checks on transmuted pointers behave as they
 /// do natively; distinct targets collide only on a hash collision.
 fn synthetic_address(value: &Value) -> Option<u128> {
+    // An address-only pointer's address is the stored integer
+    // itself (address 0 is the null address).
+    if let Value::Ref(RefTarget::Address(addr)) = value {
+        return Some(*addr as u128);
+    }
     fn fnv1a(bytes: &[u8]) -> u64 {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for &b in bytes {
@@ -940,6 +945,9 @@ impl<'a> Interpreter<'a> {
             // A null pointer denotes nothing; there is no drop
             // glue to read through it.
             RefTarget::Null => return Ok(None),
+            // An address-only pointer denotes nothing readable;
+            // there is no drop glue to read through it.
+            RefTarget::Address(_) => return Ok(None),
         };
         let mut value = base;
         for step in prefix.iter().chain(path.iter()) {
@@ -979,6 +987,11 @@ impl<'a> Interpreter<'a> {
                 "drop glue reference",
                 "a valid reference",
                 "null pointer",
+            )),
+            RefTarget::Address(_) => Err(InterpError::type_mismatch(
+                "drop glue reference",
+                "a valid reference",
+                "address-only pointer",
             )),
         }
     }
@@ -1559,6 +1572,11 @@ impl<'a> Interpreter<'a> {
                 "reference",
                 "null pointer",
             )),
+            Value::Ref(RefTarget::Address(_)) => Err(InterpError::type_mismatch(
+                "dereference",
+                "reference",
+                "address-only pointer (no pointee in this model)",
+            )),
             // Dereferencing a fat pointer whose base is a reference
             // reaches through to the base place. A self-contained
             // fat pointer (a slice constant: the base is the element
@@ -1986,6 +2004,7 @@ impl<'a> Interpreter<'a> {
             Constant::Ref(inner) => {
                 Value::Ref(RefTarget::Value(Box::new(self.eval_constant(inner)?)))
             }
+            Constant::IntPtr(addr) => Value::Ref(RefTarget::Address(*addr)),
             Constant::SliceVal(elems) => {
                 let elems = elems
                     .iter()
@@ -2847,7 +2866,15 @@ fn eval_binary(
             Value::Ref(_) | Value::FatRef { .. } | Value::FnPtr(_) | Value::Closure { .. }
         )
     {
-        if let (Some(a), Some(b)) = (synthetic_address(lhs), synthetic_address(rhs)) {
+        // For comparison purposes the null pointer's address is 0,
+        // matching an address-only pointer holding address 0 (the
+        // synthetic range keeps `PtrToInt` of null itself non-zero,
+        // a model choice the equality relation does not inherit).
+        let cmp_addr = |v: &Value| match v {
+            Value::Ref(RefTarget::Null) => Some(0),
+            _ => synthetic_address(v),
+        };
+        if let (Some(a), Some(b)) = (cmp_addr(lhs), cmp_addr(rhs)) {
             return Ok((Value::Bool(if op == Eq { a == b } else { a != b }), false));
         }
     }

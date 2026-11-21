@@ -98,6 +98,12 @@ pub enum RefTarget {
     /// `ptr::null` / `ptr::null_mut`; equal only to itself, and any
     /// dereference of it is an explicit error.
     Null,
+    /// A pointer known only by its address: a null or dangling
+    /// pointer constant (a `without_provenance` address, an empty
+    /// allocation's buffer pointer). It denotes no readable place;
+    /// address identity is its only observable property, and
+    /// address 0 is the null address (equal to `Null`).
+    Address(u64),
 }
 
 impl RefTarget {
@@ -290,6 +296,7 @@ impl fmt::Display for RefTarget {
             }
             RefTarget::Value(_) => write!(f, "constant aggregate"),
             RefTarget::Null => write!(f, "null pointer"),
+            RefTarget::Address(addr) => write!(f, "address pointer {addr:#x}"),
         }
     }
 }

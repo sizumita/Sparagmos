@@ -1340,6 +1340,7 @@ impl<'a> Converter<'a> {
             mir::ConstValue::Closure(def) => {
                 ir::Constant::Closure(self.def_display_name(def))
             }
+            mir::ConstValue::IntPtr(addr) => ir::Constant::IntPtr(*addr),
             mir::ConstValue::ByRef { .. } => {
                 return Err(ConvertError::UnsupportedConstant {
                     kind: "by-reference constant".to_string(),
