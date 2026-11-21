@@ -40,6 +40,10 @@ fn copy(idx: u32) -> mir::Operand {
     mir::Operand::Copy(place(idx))
 }
 
+fn copy_deref(idx: u32) -> mir::Operand {
+    mir::Operand::Copy(place(idx).deref())
+}
+
 fn move_(idx: u32) -> mir::Operand {
     mir::Operand::Move(place(idx))
 }
@@ -2481,11 +2485,15 @@ fn reborrow_copies_the_pointer_value() {
     );
 }
 
-// ----- ThreadLocalRef: a named explicit error, never a fabricated value -----
+// ----- ThreadLocalRef: per-thread storage seeded from the recorded
+// ----- initializer; a static with no recorded definition is a named
+// ----- explicit error, never a fabricated value -----
 
 #[test]
-fn thread_local_ref_is_a_named_execution_error() {
+fn thread_local_ref_without_a_definition_is_a_named_execution_error() {
     // fn f() -> i32 { _1 = ThreadLocalRef(some static); return *_1 }
+    // The program records no thread-local definition for the static,
+    // so evaluating the reference fails, naming the gap.
     let ref_ty = mir::Ty::Ref(mir::Region::Erased, Box::new(i32_ty()), mir::Mutability::Not);
     let body = mir::Body::new(
         decls(&[i32_ty(), ref_ty]),
@@ -2503,13 +2511,68 @@ fn thread_local_ref_is_a_named_execution_error() {
     match interpret_mir(&prog, "f", vec![]) {
         Err(MirRunError::Interp(InterpError::UnsupportedRvalue { kind })) => {
             assert!(
-                kind.contains("ThreadLocalRef") && kind.contains("not modelled"),
+                kind.contains("ThreadLocalRef")
+                    && kind.contains("no thread-local definition was collected"),
                 "error names the gap: {kind}"
             );
         }
         Err(e) => panic!("expected UnsupportedRvalue for ThreadLocalRef, got {e}"),
         Ok(v) => panic!("expected UnsupportedRvalue for ThreadLocalRef, got {v:?}"),
     }
+}
+
+#[test]
+fn thread_local_ref_reads_and_writes_the_seeded_thread_storage() {
+    // fn read_seed() -> i32 { _1 = ThreadLocalRef(def); return *_1 }
+    // fn write_then_read() -> i32 {
+    //     _1 = ThreadLocalRef(def); *_1 = 99; return *_1
+    // }
+    // The recorded initializer (41) seeds the executing thread's
+    // storage for the static: the first body reads the seed, the
+    // second overwrites its own storage and reads the new value.
+    let ref_ty = mir::Ty::Ref(mir::Region::Erased, Box::new(i32_ty()), mir::Mutability::Not);
+    let def = mir::DefId::new(0, 3);
+    let read_seed = mir::Body::new(
+        decls(&[i32_ty(), ref_ty.clone()]),
+        0,
+        vec![block(
+            vec![
+                assign(place(1), mir::Rvalue::ThreadLocalRef(def)),
+                assign(place(0), mir::Rvalue::Use(copy_deref(1))),
+            ],
+            ret(),
+        )],
+    );
+    let write_then_read = mir::Body::new(
+        decls(&[i32_ty(), ref_ty]),
+        0,
+        vec![block(
+            vec![
+                assign(place(1), mir::Rvalue::ThreadLocalRef(def)),
+                assign(place(1).deref(), mir::Rvalue::Use(const_i32(99))),
+                assign(place(0), mir::Rvalue::Use(copy_deref(1))),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.thread_locals.insert(
+        def,
+        mir::ThreadLocalDef {
+            ty: i32_ty(),
+            init: mir::ConstValue::Scalar(mir::Scalar::Int { data: 41, size: 4 }),
+        },
+    );
+    prog.add("read_seed", read_seed);
+    prog.add("write_then_read", write_then_read);
+    assert_eq!(
+        interpret_mir(&prog, "read_seed", vec![]).expect("read_seed runs"),
+        Value::Int(41)
+    );
+    assert_eq!(
+        interpret_mir(&prog, "write_then_read", vec![]).expect("write_then_read runs"),
+        Value::Int(99)
+    );
 }
 
 // ----- StatementKind::Intrinsic: Assume and CopyNonOverlapping (Lane CO) -----

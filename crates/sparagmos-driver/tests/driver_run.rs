@@ -8263,3 +8263,125 @@ fn run_mode_inline_asm_outside_class_is_named_error() {
         "the reason names InlineAsm: {stderr}"
     );
 }
+
+const THREAD_LOCAL_EAGER_SRC: &str = r#"
+use std::cell::Cell;
+
+thread_local! {
+    static COUNTER: Cell<u32> = const { Cell::new(7) };
+}
+
+fn main() {
+    COUNTER.with(|c| {
+        println!("first {}", c.get());
+        c.set(42);
+        println!("second {}", c.get());
+    });
+}
+"#;
+
+#[test]
+fn run_mode_thread_local_eager_cell_get_set() {
+    let dir = temp_dir("tls-eager");
+    let src = fixture(&dir, "tls_eager.rs", THREAD_LOCAL_EAGER_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "first 7\nsecond 42\n");
+}
+
+const THREAD_LOCAL_LAZY_SRC: &str = r#"
+use std::cell::RefCell;
+
+thread_local! {
+    static LIST: RefCell<Vec<u32>> = RefCell::new(vec![1, 2]);
+    static NAME: RefCell<String> = RefCell::new(String::from("hello"));
+}
+
+fn show(list: &[u32]) -> String {
+    let mut s = String::new();
+    let mut i = 0;
+    while i < list.len() {
+        if i > 0 { s.push_str(","); }
+        s.push_str(&list[i].to_string());
+        i += 1;
+    }
+    s
+}
+
+fn main() {
+    LIST.with(|list| {
+        list.borrow_mut().push(3);
+        println!("list {}", show(&list.borrow()));
+    });
+    NAME.with(|name| {
+        let s: String = name.borrow().clone();
+        println!("name {s}");
+    });
+    let t = std::thread::spawn(|| {
+        LIST.with(|list| {
+            println!("in thread {}", show(&list.borrow()));
+            list.borrow_mut().push(9);
+            println!("thread own {}", show(&list.borrow()));
+        });
+    });
+    t.join().unwrap();
+    LIST.with(|list| {
+        println!("back {}", show(&list.borrow()));
+    });
+}
+"#;
+
+#[test]
+fn run_mode_thread_local_lazy_refcell_and_thread_separation() {
+    // The lazy storage initializes on first access in each thread:
+    // the spawned thread starts from the initializer value (not the
+    // main thread's mutated one), its own mutation stays its own,
+    // and the main thread's value is unchanged after the join.
+    let dir = temp_dir("tls-lazy");
+    let src = fixture(&dir, "tls_lazy.rs", THREAD_LOCAL_LAZY_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "list 1,2,3\nname hello\nin thread 1,2\nthread own 1,2,9\nback 1,2,3\n"
+    );
+}
+
+const THREAD_LOCAL_INIT_ONCE_SRC: &str = r#"
+use std::cell::Cell;
+
+static mut INIT_RUNS: u32 = 0;
+
+thread_local! {
+    static VAL: Cell<u32> = {
+        unsafe { INIT_RUNS += 1; }
+        Cell::new(5)
+    };
+}
+
+fn main() {
+    VAL.with(|v| println!("a {}", v.get()));
+    VAL.with(|v| println!("b {}", v.get()));
+    let t = std::thread::spawn(|| {
+        VAL.with(|v| println!("t {}", v.get()));
+        VAL.with(|v| println!("t2 {}", v.get()));
+    });
+    t.join().unwrap();
+    println!("runs {}", unsafe { INIT_RUNS });
+}
+"#;
+
+#[test]
+fn run_mode_thread_local_initializer_runs_once_per_thread() {
+    let dir = temp_dir("tls-init-once");
+    let src = fixture(&dir, "tls_init_once.rs", THREAD_LOCAL_INIT_ONCE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a 5\nb 5\nt 5\nt2 5\nruns 2\n"
+    );
+}

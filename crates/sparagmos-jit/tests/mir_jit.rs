@@ -173,6 +173,7 @@ fn build_with_table(
         adt_layouts: Default::default(),
         adt_shapes: Default::default(),
         adt_debug_shapes: Default::default(),
+        thread_locals: Default::default(),
     };
     let jit = JitProgram::compile(&jit_in).expect("JIT compile failed");
     (jit, interp_in)
