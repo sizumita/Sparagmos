@@ -1857,6 +1857,62 @@ Vec::drain 等) へ前進した。issue-63787 は符号文脈を失った
 のみ存在する RefCell の借用 (ライブな場所が無くフラグの
 置き場が無いため)。
 
+### by-reference 定数の復号 (Lane CE, 2026-11-21)
+
+「unsupported constant: by-reference constant」バケット (both12 で 47 件、全て
+exec/ui) を形状別に実測し、頻度順に復号経路を実装した。バケットは 47 → 13 件に
+減少し、残り 13 件は復号不能として明示的エラーを維持する形状 (後述)。
+
+実測した形状ランキング (バケット 47 件の失敗点):
+
+1. **負の判別子を持つ enum の定数** (Ordering 定数・ユーザー定義 C-like enum):
+   `decode_adt` の Direct タグ照合が、格納タグを 128bit に符号拡張して
+   `Discriminant::val` (宣言型幅でゼロ拡張) と比較していたため、負の判別子が
+   狭い幅で格納された定数は常に照合失敗 → ByRef 化していた。タグ幅でマスクして
+   比較するよう修正。
+2. **関数アイテムへのポインタ** (Waker/RawWakerVTable スタティックを含む):
+   provenance 先が関数アロケーションのポインタを `decode_ref` が拒否していた。
+   関数アイテムは ZST なのでポインタの値そのものが呼び出し可能値であり、
+   `decode_fn_pointer` と同じ FnDef/Closure 値に復号する (vtable 形状 =
+   関数ポインタ表の ADT 定数もこの経路で復号できる)。interp 側の随伴として、
+   参照型の場所への関数ポインタ値の格納を許可し、BinaryOp の Eq/Ne を
+   ポインタ形状の値について synthetic address (PtrToInt と同じ同一性) で
+   評価するようにした。非キャプチャクロージャ値にも本体キーの synthetic
+   address を与えた。
+3. **provenance を持たないポインタ定数** (null・dangling): 空 Vec のバッファ
+   ポインタ、`NonNull::dangling`、RawWaker の data ポインタ等。格納整数そのものが
+   アドレスである新規定数形 `ConstValue::IntPtr` を導入し、interp に
+   `RefTarget::Address(u64)` を追加した (読み取りは明示的エラー、ドロップ
+   グルー読みなし、同一性はアドレス、0 は null アドレス)。JIT では ByRef と
+   同様に明示的 unsupported のまま。
+4. **末尾 unsized フィールド** (CStr の `[u8]`、str newtype): `decode_const` に
+   Str/Slice アームがなく ADT ごと復号失敗していた。非参照位置の unsized
+   フィールドはアロケーション末尾までがその値なので、オフセットから末尾までを
+   復号する。
+5. **TypeId 定数**: symbolic な TypeId アロケーションを指すポインタを拒否して
+   いた。TypeId 値は型の 128bit ハッシュ (ポインタ幅セグメント×2) であり、
+   ハッシュ関数自体は観測不能 (等価性だけが意味を持つ) ため、型の安定ハッシュ
+   からセグメントを合成して復号する。
+
+明示的エラーのまま残す形状 (13 件): trait オブジェクト定数 (vtable アロケーション
+を指す定数、5 件)、union を含む定数 (4 件)、再帰スタティックの深さ上限 (1 件)、
+補助クレート/テストフレームワーク経由で runner 文脈でのみ ByRef になるもの (3 件)。
+
+async ファイル (Waker::noop 使用側) のスポットチェック: for-await、
+async-default-fn-overridden、ex-ice-132103 はいずれも by-ref 定数を越えて
+`Cast Transmute` (RawWaker 変換) が次のブロッカーになった。CStr リテラル
+2 件は定数が復号できるようになったが、`CStr::to_bytes_with_nul` 本体が
+`Operand::RuntimeChecks(UbChecks)` で未変換のため残る。derive-partial-ord 2 件は
+実行に到達し、既存の derived PartialOrd 判別子比較の欠落 (定数とは無関係に
+通常値でも再現する既知の欠落) で 101 になる。
+
+subset-ce 単一ラン実測 (subset-ce.json、--jobs 48、ベースは CL 統合後の main):
+指標2(b) は both12 の 69.936% (17,440/24,937) から **70.357% (17,545/24,937)**
+へ (+105 件、回帰 0 件)。うち +64 件は CL の寄与 (both12 未収録分) で、
+CE 単独の寄与は +41 件。実行系 2,238/4,149 = 53.941%、コンパイル時検証系
+15,307/18,332 = 83.499%。「ConstantKind::Allocated」バケットは 44 → 25 件。
+
+---
 ---
 
 ## 測定の規律
