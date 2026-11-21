@@ -800,3 +800,138 @@ pub fn closure_targets(body: &mir::Body) -> Vec<(ClosureDef, GenericArgs)> {
     }
     out
 }
+
+/// The coroutine types one Stable MIR body mentions: every
+/// `Coroutine(def, args)` type reachable from the body's local
+/// declarations, its operands' types, and its coroutine aggregate
+/// rvalues, walking nested types. This is the coroutine counterpart
+/// of [`closure_targets`]: a coroutine (an `async` block, an
+/// `async fn`'s future, a `gen` block) is created by an
+/// `AggregateKind::Coroutine` rvalue in the enclosing body and held
+/// in locals of coroutine type, but it is neither a call target nor
+/// a closure, so neither the instance demand nor the closure demand
+/// ever sees it — without this scan a demanded coroutine stays
+/// unconverted however concrete its context is. The arguments are
+/// the body's own substitution applied, as in [`closure_targets`].
+pub fn coroutine_targets(body: &mir::Body) -> Vec<(rustc_public::ty::CoroutineDef, GenericArgs)> {
+    fn walk_args(
+        args: &GenericArgs,
+        out: &mut Vec<(rustc_public::ty::CoroutineDef, GenericArgs)>,
+    ) {
+        for arg in &args.0 {
+            match arg {
+                GenericArgKind::Type(ty) => walk_ty(ty, out),
+                GenericArgKind::Const(konst) => match konst.kind() {
+                    rustc_public::ty::TyConstKind::Unevaluated(_, inner) => {
+                        walk_args(&inner, out)
+                    }
+                    rustc_public::ty::TyConstKind::Value(ty, _)
+                    | rustc_public::ty::TyConstKind::ZSTValue(ty) => walk_ty(&ty, out),
+                    _ => {}
+                },
+                GenericArgKind::Lifetime(_) => {}
+            }
+        }
+    }
+
+    fn walk_ty(ty: &Ty, out: &mut Vec<(rustc_public::ty::CoroutineDef, GenericArgs)>) {
+        match ty.kind() {
+            TyKind::RigidTy(RigidTy::Coroutine(def, args)) => {
+                out.push((def, args.clone()));
+                walk_args(&args, out);
+            }
+            TyKind::RigidTy(RigidTy::Ref(_, inner, _))
+            | TyKind::RigidTy(RigidTy::RawPtr(inner, _))
+            | TyKind::RigidTy(RigidTy::Slice(inner)) => walk_ty(&inner, out),
+            TyKind::RigidTy(RigidTy::Array(inner, _)) => walk_ty(&inner, out),
+            TyKind::RigidTy(RigidTy::Pat(inner, _)) => walk_ty(&inner, out),
+            TyKind::RigidTy(RigidTy::Tuple(elems)) => {
+                for elem in &elems {
+                    walk_ty(elem, out);
+                }
+            }
+            TyKind::RigidTy(RigidTy::FnPtr(sig)) => {
+                for t in &sig.value.inputs_and_output {
+                    walk_ty(t, out);
+                }
+            }
+            TyKind::RigidTy(RigidTy::Adt(_, args))
+            | TyKind::RigidTy(RigidTy::FnDef(_, args))
+            | TyKind::RigidTy(RigidTy::Closure(_, args))
+            | TyKind::RigidTy(RigidTy::CoroutineClosure(_, args))
+            | TyKind::RigidTy(RigidTy::CoroutineWitness(_, args)) => walk_args(&args, out),
+            TyKind::RigidTy(RigidTy::Dynamic(bounds, _)) => {
+                for bound in &bounds {
+                    match &bound.value {
+                        rustc_public::ty::ExistentialPredicate::Trait(t) => {
+                            walk_args(&t.generic_args, out)
+                        }
+                        rustc_public::ty::ExistentialPredicate::Projection(p) => {
+                            walk_args(&p.generic_args, out)
+                        }
+                        rustc_public::ty::ExistentialPredicate::AutoTrait(_) => {}
+                    }
+                }
+            }
+            TyKind::Alias(_, alias) => walk_args(&alias.args, out),
+            _ => {}
+        }
+    }
+
+    let locals = body.locals();
+    let mut out = Vec::new();
+    for decl in locals {
+        walk_ty(&decl.ty, &mut out);
+    }
+    let mut operand_ty = |op: &Operand,
+                          out: &mut Vec<(rustc_public::ty::CoroutineDef, GenericArgs)>| {
+        if let Ok(ty) = op.ty(&locals) {
+            walk_ty(&ty, out);
+        }
+    };
+    for bb in &body.blocks {
+        for stmt in &bb.statements {
+            let StatementKind::Assign(_, rvalue) = &stmt.kind else {
+                continue;
+            };
+            match rvalue {
+                Rvalue::Aggregate(AggregateKind::Coroutine(def, args), ops) => {
+                    out.push((*def, args.clone()));
+                    walk_args(args, &mut out);
+                    for op in ops {
+                        operand_ty(op, &mut out);
+                    }
+                }
+                Rvalue::Aggregate(_, ops) => {
+                    for op in ops {
+                        operand_ty(op, &mut out);
+                    }
+                }
+                Rvalue::Use(op, _) | Rvalue::Repeat(op, _) | Rvalue::UnaryOp(_, op) => {
+                    operand_ty(op, &mut out)
+                }
+                Rvalue::Cast(_, op, ty) => {
+                    operand_ty(op, &mut out);
+                    walk_ty(ty, &mut out);
+                }
+                Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) => {
+                    operand_ty(a, &mut out);
+                    operand_ty(b, &mut out);
+                }
+                _ => {}
+            }
+        }
+        match &bb.terminator.kind {
+            TerminatorKind::Call { func, args, .. } => {
+                operand_ty(func, &mut out);
+                for op in args {
+                    operand_ty(op, &mut out);
+                }
+            }
+            TerminatorKind::Assert { cond, .. } => operand_ty(cond, &mut out),
+            TerminatorKind::SwitchInt { discr, .. } => operand_ty(discr, &mut out),
+            _ => {}
+        }
+    }
+    out
+}
