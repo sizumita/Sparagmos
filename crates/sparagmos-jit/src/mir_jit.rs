@@ -31,12 +31,24 @@
 //! semantics — which are exactly Rust's — with no normalisation
 //! step in the lowering.
 //!
-//! An ADT value is a single leaf holding its discriminant value,
-//! taken from the program's discriminant table exactly as the
-//! interpreter computes `Discriminant` results. Only the tag is
-//! represented; payloads are outside the model, and every construct
-//! that would create or touch one fails with an explicit
-//! unsupported error at its own lowering.
+//! An ADT value is its discriminant tag followed by its payload:
+//! one tag leaf (for a multi-variant ADT) holding the discriminant
+//! value from the program's discriminant table, exactly as the
+//! interpreter computes `Discriminant` results, then the payload
+//! leaves — for an enum, the variants share one payload area, each
+//! variant's fields laid out in order from its start; a struct
+//! (a single-variant ADT) has no tag leaf and is just its fields.
+//! The layout of each ADT instantiation is recovered from the
+//! program itself before lowering: every `Field` projection in
+//! MIR carries the field's declared type, and every aggregate
+//! construction lists its variant's field count, so a scan of all
+//! bodies (the interpreter's own recovery method) pins down each
+//! variant's field types. An ADT the scan says nothing about keeps
+//! the historical tag-only shape. Shapes the scan cannot pin down
+//! — a field whose type no projection or construction reveals, a
+//! value wider than the layout bound, a recursive layout — fail
+//! with an explicit unsupported error, as do unions and payload
+//! shapes outside the layout (see the scope list).
 //!
 //! A thin reference or raw pointer is one word: the address of
 //! the pointee's first leaf. Taking a reference to a frame place
@@ -104,29 +116,34 @@
 //! tuple-of-supported and array-of-supported locals (arrays are
 //! their elements' leaves in order, read and written through
 //! constant and dynamic index projections, the dynamic form with
-//! the interpreter's bounds-check panic), ADT locals holding only
-//! a discriminant tag, thin references and raw pointers, fat
+//! the interpreter's bounds-check panic), ADT locals (structs
+//! and enums with scalar, tuple, array, reference and nested-ADT
+//! payload fields, within the layout bound), thin references and
+//! raw pointers, fat
 //! references to slices and `str` (as address+length pairs), and
 //! projections through dereferences — fields, indices, further
-//! dereferences, `Discriminant` / `SetDiscriminant` of a tag-only
-//! ADT in memory, and references taken of memory places;
+//! dereferences, `Discriminant` / `SetDiscriminant` of an ADT
+//! in memory, and references taken of memory places;
 //! `Use`, `CopyForDeref`, plain and checked `BinaryOp`, `UnaryOp`
 //! (including `PtrMetadata`), `IntToInt` / `FloatToInt` /
 //! `IntToFloat` / `FloatToFloat` casts, the address-preserving
 //! pointer casts and the array-to-slice `Unsize` coercion, `Len`,
-//! tuple aggregates, fieldless ADT aggregates, `Repeat`,
+//! tuple aggregates, ADT aggregates (structs and enums,
+//! including payloads), `Repeat`,
 //! `Discriminant`, `SetDiscriminant`; `Goto`, `SwitchInt`, `Call`
 //! (within the program, up to six register words of arguments,
 //! and results of up to two words — a fat pointer or a pair —
 //! returned in RAX/RDX, the System V pair-return convention),
 //! `Assert`, `Drop`, `Return`, `Unreachable` (as a guest panic).
 //! Anything else — `f16` / `f128`, 128-bit integers, references
-//! to trait objects, ADT payloads, `Subslice`, a second dynamic
+//! to trait objects, unions, ADT values wider than the layout
+//! bound or with a field type the program never reveals, aggregate
+//! construction into a memory place, `Subslice`, a second dynamic
 //! index within one place, an index of a signed integer type,
 //! a literal index from the end of a slice, return values of
 //! more than two words, arguments of more than two words,
-//! aggregates other than tuples and fieldless ADTs, calls to
-//! functions outside the program, and
+//! aggregates other than tuples and ADTs, calls to functions
+//! outside the program, and
 //! so on — fails the whole function's compilation with
 //! [`JitError::Unsupported`] naming the construct. There is
 //! deliberately no partial or fallback execution: a program
