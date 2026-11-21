@@ -208,6 +208,37 @@ def run_mode(header):
 
 HOST_TARGET = "x86_64-unknown-linux-gnu"
 
+_INSTALLED_TARGETS = None
+
+
+def _targets_in_sysroot(sysroot):
+    """The triples with a std installed under a sysroot: the
+    subdirectories of lib/rustlib that hold a lib directory (one per
+    installed target, the host target included)."""
+    rustlib = Path(sysroot) / "lib" / "rustlib"
+    try:
+        return {p.name for p in rustlib.iterdir()
+                if p.is_dir() and (p / "lib").is_dir()}
+    except OSError:
+        return set()
+
+
+def installed_targets():
+    """The triples with a std installed in the pinned toolchain's
+    sysroot. Computed once per process; an empty set when the
+    sysroot cannot be queried, which keeps --target screening
+    conservative."""
+    global _INSTALLED_TARGETS
+    if _INSTALLED_TARGETS is None:
+        try:
+            out = subprocess.run(
+                rustc_cmd() + ["--print", "sysroot"],
+                capture_output=True, text=True, timeout=30)
+            _INSTALLED_TARGETS = _targets_in_sysroot(out.stdout.strip())
+        except Exception:
+            _INSTALLED_TARGETS = set()
+    return _INSTALLED_TARGETS
+
 
 def split_flags(flags):
     """Split a compile-flags value the way compiletest does.
@@ -232,23 +263,36 @@ def compile_flags(view):
     return flags
 
 
-def screen_flags(flags):
+def screen_flags(flags, targets=None):
     """Why this flag set cannot be honoured here, or None.
 
     The driver forwards flags verbatim to its embedded rustc (and
     stage 1 to the native rustc), so almost everything compiletest
     accepts works unchanged. The exceptions are flags that would
     replace the compilation itself or contradict the driver's fixed
-    invocation (its pinned sysroot and scratch output directory, the
-    one installed target).
+    invocation (its pinned sysroot and scratch output directory).
+
+    `targets` is the set of triples a --target flag may name. The
+    default (None) is every target installed in the pinned sysroot:
+    conversion for an installed target is judged exactly like the
+    host target's, and no foreign code is executed. Stage 1 passes
+    just the host target instead, because it executes the program
+    and a foreign binary cannot run on this host.
     """
+    if targets is None:
+        targets = installed_targets()
     i = 0
     while i < len(flags):
         t = flags[i]
         nxt = flags[i + 1] if i + 1 < len(flags) else None
         if t == "--target" or t.startswith("--target="):
             tgt = t[len("--target="):] if t.startswith("--target=") else nxt
-            if tgt is not None and tgt != HOST_TARGET:
+            if tgt is not None and tgt not in targets:
+                if tgt in installed_targets():
+                    return (f"compile-flags specify --target {tgt} "
+                            "(that target is installed, but this "
+                            "stage executes the program and only the "
+                            "host target can run here)")
                 return (f"compile-flags specify --target {tgt} "
                         "(that target is not installed on this host)")
         elif t == "--print" or t.startswith("--print="):
@@ -1789,7 +1833,7 @@ def fill_result(rec, rust_dir, driver_bin, out):
     edition = editions[0].strip() if editions else "2021"
 
     flags = compile_flags(header.view(None))
-    screened = screen_flags(flags)
+    screened = screen_flags(flags, targets={HOST_TARGET})
     if screened:
         out["reason"] = screened
         out["bucket"] = "not attempted (compile-flags)"
@@ -1880,7 +1924,7 @@ def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions):
     edition = _concrete_edition(editions[-1].strip()) \
         if editions else "2021"
     flags = compile_flags(view)
-    screened = screen_flags(flags)
+    screened = screen_flags(flags, targets={HOST_TARGET})
     if screened:
         res["reason"] = screened
         res["bucket"] = "not attempted (compile-flags)"
@@ -1997,7 +2041,7 @@ def fill_result_revisions(rec, header, revs, path, driver_bin, out):
 #
 # Per-test compile-flags are forwarded to the driver's embedded
 # rustc (screened only for flags that would replace the compilation
-# itself: a non-host --target, --print, --sysroot, an output
+# itself: a --target that is not installed, --print, --sysroot, an output
 # location, -Zunpretty), and revision tests are judged once per
 # revision — with the revision's directive view, its compile-flags,
 # and the `--cfg <revision>` / `--check-cfg` arguments compiletest

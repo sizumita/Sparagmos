@@ -1361,11 +1361,55 @@ class ScreenFlagsTests(unittest.TestCase):
             ["--target=x86_64-unknown-linux-gnu"]))
 
     def test_other_target_blocked(self):
-        for flags in (["--target", "aarch64-unknown-linux-gnu"],
-                      ["--target=i686-pc-windows-msvc"]):
-            reason = run.screen_flags(flags)
+        orig = run.installed_targets
+        run.installed_targets = lambda: {run.HOST_TARGET}
+        try:
+            for flags in (["--target", "aarch64-unknown-linux-gnu"],
+                          ["--target=i686-pc-windows-msvc"]):
+                reason = run.screen_flags(flags)
+                self.assertIn("--target", reason)
+                self.assertIn("not installed", reason)
+        finally:
+            run.installed_targets = orig
+
+    def test_installed_target_passes(self):
+        targets = {"aarch64-unknown-linux-gnu", run.HOST_TARGET}
+        self.assertIsNone(run.screen_flags(
+            ["--target", "aarch64-unknown-linux-gnu"], targets=targets))
+        self.assertIsNone(run.screen_flags(
+            ["--target=aarch64-unknown-linux-gnu"], targets=targets))
+
+    def test_default_targets_are_the_installed_ones(self):
+        orig = run.installed_targets
+        run.installed_targets = lambda: {"aarch64-unknown-linux-gnu",
+                                         run.HOST_TARGET}
+        try:
+            self.assertIsNone(run.screen_flags(
+                ["--target", "aarch64-unknown-linux-gnu"]))
+            # The executing stage passes only the host target: an
+            # installed foreign target is then blocked, with the
+            # execution reason rather than the not-installed one.
+            reason = run.screen_flags(
+                ["--target", "aarch64-unknown-linux-gnu"],
+                targets={run.HOST_TARGET})
             self.assertIn("--target", reason)
-            self.assertIn("not installed", reason)
+            self.assertIn("executes the program", reason)
+        finally:
+            run.installed_targets = orig
+
+    def test_targets_in_sysroot(self):
+        with tempfile.TemporaryDirectory() as td:
+            rustlib = Path(td) / "lib" / "rustlib"
+            for triple in ("x86_64-unknown-linux-gnu",
+                           "aarch64-unknown-linux-gnu"):
+                (rustlib / triple / "lib").mkdir(parents=True)
+            (rustlib / "src").mkdir(parents=True)
+            (rustlib / "components").write_text("")
+            self.assertEqual(
+                run._targets_in_sysroot(td),
+                {"x86_64-unknown-linux-gnu",
+                 "aarch64-unknown-linux-gnu"})
+        self.assertEqual(run._targets_in_sysroot("/nonexistent"), set())
 
     def test_print_blocked(self):
         self.assertIn("--print", run.screen_flags(["--print", "cfg"]))
@@ -1483,10 +1527,33 @@ class ProcessStage2RevisionTests(unittest.TestCase):
             "//@ revisions: a b\n//@[a] check-pass\n//@[b] check-pass\n"
             "//@[b] compile-flags: --target aarch64-unknown-linux-gnu\n"
             "fn main() {}\n")
-        res = self.run_with_fake(rec, lambda args: conv())
+        orig = run.installed_targets
+        run.installed_targets = lambda: {run.HOST_TARGET}
+        try:
+            res = self.run_with_fake(rec, lambda args: conv())
+        finally:
+            run.installed_targets = orig
         self.assertEqual(res["status"], "not-attempted")
         self.assertEqual(res["bucket"], "not attempted (compile-flags)")
         self.assertIn("revision b", res["reason"])
+
+    def test_installed_target_flags_reach_the_driver(self):
+        rec = self.write_test(
+            "//@ revisions: a b\n//@[a] check-pass\n//@[b] check-pass\n"
+            "//@[b] compile-flags: --target aarch64-unknown-linux-gnu\n"
+            "fn main() {}\n")
+        orig = run.installed_targets
+        run.installed_targets = lambda: {"aarch64-unknown-linux-gnu",
+                                         run.HOST_TARGET}
+        try:
+            res = self.run_with_fake(rec, lambda args: conv())
+        finally:
+            run.installed_targets = orig
+        self.assertEqual(res["status"], "pass")
+        b_calls = [c for c in self.calls if c[:2] == ["--cfg", "b"]]
+        self.assertEqual(len(b_calls), 1)
+        self.assertIn("--target", b_calls[0])
+        self.assertIn("aarch64-unknown-linux-gnu", b_calls[0])
 
     def test_unscoped_flags_reach_every_revision(self):
         rec = self.write_test(
