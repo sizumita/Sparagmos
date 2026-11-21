@@ -1055,6 +1055,15 @@ fn is_thin_ptr_ty(ty: &mir::Ty) -> bool {
 /// pointer and a transparent wrapper around one — reinterpret
 /// nothing either: the metadata is part of the value, and the
 /// pointee type lives in the destination's declared type.
+/// Is `ty` the `str` type or a byte slice `[u8]`?
+fn is_str_or_byte_slice(ty: &mir::Ty) -> bool {
+    match ty {
+        mir::Ty::Str => true,
+        mir::Ty::Slice(elem) => matches!(**elem, mir::Ty::Uint(mir::UintTy::U8)),
+        _ => false,
+    }
+}
+
 fn is_fat_ptr_ty(ty: &mir::Ty) -> bool {
     match ty {
         mir::Ty::RawPtr(pointee, _) | mir::Ty::Ref(_, pointee, _) => matches!(
@@ -3035,6 +3044,17 @@ impl<'a> Converter<'a> {
                 }
             }
         }
+        // A string constant transmuted to a byte-slice pointer:
+        // the constant's value is the string itself, which the
+        // model's consumers read as bytes as readily as as text
+        // (`PtrMetadata` reports its byte length, byte reads go
+        // through the same storage), so the value carries over.
+        if matches!(v, ir::Operand::Constant(ir::Constant::Str(_)))
+            && is_fat_ptr_ty(target)
+            && matches!(ptr_pointee(target), Some(t) if is_str_or_byte_slice(t))
+        {
+            return ir::Rvalue::Use(v.clone());
+        }
         // The scalar-shape reinterpretation, decided from the
         // two types alone: when both sides flatten to the same
         // nonzero bit width, the cast is a `Reinterpret`. The
@@ -3115,6 +3135,21 @@ impl<'a> Converter<'a> {
                 if is_fat_ptr_ty(s)
                     && is_fat_ptr_ty(t)
                     && !self.pointee_crosses_cell_wrapper(s, t) =>
+            {
+                ir::Rvalue::Use(v.clone())
+            }
+            // Fat pointer between a `str` and a `[u8]` view of the
+            // same bytes: both are stored over the same allocation
+            // in this model (the `str::as_bytes` builtin relies on
+            // the same sharing), so the pair carries over unchanged.
+            (Some(s), t)
+                if is_fat_ptr_ty(s)
+                    && is_fat_ptr_ty(t)
+                    && matches!(
+                        (ptr_pointee(s), ptr_pointee(t)),
+                        (Some(a), Some(b))
+                            if is_str_or_byte_slice(a) && is_str_or_byte_slice(b)
+                    ) =>
             {
                 ir::Rvalue::Use(v.clone())
             }
