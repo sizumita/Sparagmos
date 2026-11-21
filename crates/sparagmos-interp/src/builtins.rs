@@ -1469,6 +1469,10 @@ struct TestDesc {
     name: String,
     ignore: bool,
     should_panic: bool,
+    /// The expected substring of `ShouldPanic::Expected(..)`:
+    /// a panicking test passes only when its panic message
+    /// contains this string (libtest's rule).
+    should_panic_expected: Option<String>,
     callable: Value,
 }
 
@@ -1978,13 +1982,74 @@ impl<'a> Interpreter<'a> {
             Builtin::TestMainEnvArgs => {
                 arity(1)?;
                 let tests = self.read_test_descs(frames, &vals[0])?;
-                // libtest's filter: the first non-flag argument
-                // is a substring filter on test names.
-                let filter = self
-                    .guest_args()
-                    .iter()
-                    .find(|a| !a.starts_with('-'))
-                    .cloned();
+                // The harness's own command line (the guest
+                // arguments after argv[0]), read the way libtest
+                // reads it. `ExitCode` values are built through
+                // `exit_code`: success is 0, any failure is 101,
+                // as in libtest.
+                let args: Vec<String> = self.guest_args().to_vec();
+                let exit_code = |byte: u8| {
+                    Value::Enum {
+                        variant: 0,
+                        fields: vec![Value::Enum {
+                            variant: 0,
+                            fields: vec![Value::Uint(byte as u128)],
+                        }],
+                    }
+                };
+                // A `-Z` option is rejected before anything else
+                // happens: the harness this models is a
+                // stable-channel one (the toolchain's own harness
+                // refuses `-Z` without a nightly channel).
+                if args.iter().any(|a| a == "-Z" || a.starts_with("-Z")) {
+                    self.push_error_output(
+                        "error: the option `Z` is only accepted on the nightly compiler\n",
+                    );
+                    return Ok(exit_code(101));
+                }
+                // `--list`, the output format, and the name filter
+                // (the first positional argument; options that
+                // take a value consume the following argument, so
+                // `--format json`'s `json` is not a filter).
+                let mut list = false;
+                let mut format_json = false;
+                let mut filter: Option<String> = None;
+                {
+                    let mut i = 0;
+                    while i < args.len() {
+                        match args[i].as_str() {
+                            "--list" => list = true,
+                            "--format" => {
+                                if args.get(i + 1).map(String::as_str) == Some("json") {
+                                    format_json = true;
+                                }
+                                i += 1;
+                            }
+                            "--logfile" | "--test-threads" | "--color" | "--report-time"
+                            | "--ensure-time" => {
+                                i += 1;
+                            }
+                            "--format=json" => format_json = true,
+                            a if a.starts_with('-') => {}
+                            a => {
+                                if filter.is_none() {
+                                    filter = Some(a.to_string());
+                                }
+                            }
+                        }
+                        i += 1;
+                    }
+                }
+                // The json format is an unstable option: without
+                // `-Z unstable-options` (rejected above) the
+                // harness refuses it before listing or running.
+                if format_json {
+                    self.push_error_output(
+                        "error: The \"json\" format is only accepted on the nightly \
+                         compiler with -Z unstable-options\n",
+                    );
+                    return Ok(exit_code(101));
+                }
                 let mut passed = 0usize;
                 let mut failed = 0usize;
                 let mut ignored = 0usize;
@@ -2000,6 +2065,32 @@ impl<'a> Interpreter<'a> {
                     }
                     selected.push(test);
                 }
+                if list {
+                    // `--list`: the selected tests by name,
+                    // sorted, and nothing runs.
+                    let mut names: Vec<&str> =
+                        selected.iter().map(|t| t.name.as_str()).collect();
+                    names.sort_unstable();
+                    for n in &names {
+                        self.push_output(&format!("{n}: test\n"));
+                    }
+                    self.push_output(&format!(
+                        "\n{} tests, 0 benchmarks\n",
+                        names.len()
+                    ));
+                    return Ok(exit_code(0));
+                }
+                // libtest's concurrency setup reads
+                // RUST_TEST_THREADS before any test runs and
+                // panics on a value that is not a positive
+                // integer; the panic escapes the harness main.
+                if let Ok(v) = std::env::var("RUST_TEST_THREADS") {
+                    if !matches!(v.parse::<usize>(), Ok(n) if n > 0) {
+                        return Err(InterpError::panic(format!(
+                            "RUST_TEST_THREADS is `{v}`, should be a positive integer."
+                        )));
+                    }
+                }
                 self.push_output(&format!("running {} tests\n", selected.len()));
                 for test in selected {
                     if test.ignore {
@@ -2012,15 +2103,32 @@ impl<'a> Interpreter<'a> {
                         &test.callable,
                         Vec::new(),
                     );
-                    let panicked = match result {
-                        Ok(_) => false,
-                        Err(InterpError::Panic { .. }) => {
+                    // The panic's message, when the payload is a
+                    // string payload (libtest reads the message
+                    // from the payload; a non-string payload reads
+                    // as `Box<dyn Any>` there).
+                    let panic_message = match result {
+                        Ok(_) => None,
+                        Err(InterpError::Panic { message, payload }) => {
                             self.note_panic_consumed();
-                            true
+                            Some(match &payload {
+                                Some(p) if matches!(
+                                    p.ty.as_str(),
+                                    "&str" | "str" | "String" | "std::string::String"
+                                ) => message,
+                                Some(_) => "Box<dyn Any>".to_string(),
+                                None => message,
+                            })
                         }
                         Err(e) => return Err(e),
                     };
-                    if panicked == test.should_panic {
+                    let test_ok = match &test.should_panic_expected {
+                        Some(expected) => panic_message
+                            .as_ref()
+                            .is_some_and(|m| m.contains(expected.as_str())),
+                        None => panic_message.is_some() == test.should_panic,
+                    };
+                    if test_ok {
                         passed += 1;
                         self.push_output(&format!("test {} ... ok\n", test.name));
                     } else {
@@ -2041,16 +2149,7 @@ impl<'a> Interpreter<'a> {
                      {ignored} ignored; 0 measured; {filtered_out} filtered out; \
                      finished in 0.00s\n"
                 ));
-                // `ExitCode`: success is 0, any failure is 101,
-                // as in libtest.
-                let byte = if failed == 0 { 0 } else { 101 };
-                Ok(Value::Enum {
-                    variant: 0,
-                    fields: vec![Value::Enum {
-                        variant: 0,
-                        fields: vec![Value::Uint(byte)],
-                    }],
-                })
+                Ok(exit_code(if failed == 0 { 0 } else { 101 }))
             }
             Builtin::PanicSetHook => {
                 arity(1)?;
@@ -4408,6 +4507,40 @@ impl<'a> Interpreter<'a> {
     /// seconds; the carry is checked, as in std).
 
 
+    /// Clone an owned value the way this module's `Clone::clone`
+    /// model does: a value copy, except that a built box (the
+    /// one-field aggregate holding an allocation pointer — the
+    /// shape `box_alloc_pointer` documents as exact) is
+    /// re-allocated around a recursively cloned pointee, so the
+    /// clone owns its storage at every level. References, fat
+    /// pointers and trait objects copy as the pointers they are,
+    /// exactly as a field-wise `Clone` of a struct containing
+    /// them behaves.
+    fn clone_owned_value(&self, frames: &[Frame], value: &Value) -> InterpResult<Value> {
+        if let Some((id, projection)) = box_alloc_pointer(value) {
+            let pointee =
+                self.read_resolved(frames, &Resolved::Alloc { id, projection })?;
+            let cloned = self.clone_owned_value(frames, &pointee)?;
+            return Ok(self.new_box(cloned));
+        }
+        Ok(match value {
+            Value::Enum { variant, fields } => Value::Enum {
+                variant: *variant,
+                fields: fields
+                    .iter()
+                    .map(|f| self.clone_owned_value(frames, f))
+                    .collect::<InterpResult<Vec<_>>>()?,
+            },
+            Value::Tuple(items) => Value::Tuple(
+                items
+                    .iter()
+                    .map(|f| self.clone_owned_value(frames, f))
+                    .collect::<InterpResult<Vec<_>>>()?,
+            ),
+            other => other.clone(),
+        })
+    }
+
     /// The tests of a `&[TestDescAndFn]` slice, read out of the
     /// value the harness main hands to `test_main_env_args`:
     /// each element's descriptor gives the name (field 0 of the
@@ -4485,6 +4618,7 @@ impl<'a> Interpreter<'a> {
                 name,
                 ignore,
                 should_panic,
+                should_panic_expected,
                 callable,
             });
         }
