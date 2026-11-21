@@ -4947,6 +4947,25 @@ fn wrap_unsigned(v: u128, bits: u32) -> u128 {
     }
 }
 
+/// The value `v` read under a binary operation's declared
+/// operand type: an integer stored under the other kind tag is
+/// reinterpreted at the declared width, exactly as an assignment
+/// to a place of that type reinterprets it (see
+/// `normalize_for_ty`). A checked operation's destination is the
+/// `(T, bool)` tuple; the operand type lives in its first
+/// element.
+fn reinterpret_int(v: &Value, dest_ty: Option<&Ty>) -> Value {
+    let operand_ty = match dest_ty {
+        Some(Ty::Tuple(ts)) => ts.first(),
+        other => other,
+    };
+    match (v, operand_ty) {
+        (Value::Uint(u), Some(Ty::Int(it))) => Value::Int(wrap_signed(*u as i128, it.bits())),
+        (Value::Int(i), Some(Ty::Uint(ut))) => Value::Uint((*i as u128) & ut.max()),
+        _ => v.clone(),
+    }
+}
+
 fn signed_bits(dest_ty: Option<&Ty>) -> u32 {
     match dest_ty {
         Some(Ty::Int(it)) => it.bits(),
@@ -5023,6 +5042,18 @@ fn eval_binary(
     {
         return eval_shift(op, lhs, rhs, dest_ty, checked_form);
     }
+
+    // An integer operand whose kind tag differs from the
+    // operation's declared operand type: reinterpret its bits at
+    // the declared width before the strict kind dispatch below. A
+    // value stored inside an aggregate keeps the kind it was
+    // built with - a constant's bits are stored unsigned - and a
+    // direct place operand reads it without an intervening typed
+    // place that would reinterpret it, so the declared type is
+    // the only exact reading (the same rule `normalize_for_ty`
+    // applies at every place write).
+    let lhs = &reinterpret_int(lhs, dest_ty);
+    let rhs = &reinterpret_int(rhs, dest_ty);
     // Signed arithmetic.
     if let (Value::Int(a), Value::Int(b)) = (lhs, rhs) {
         let (a, b) = (*a, *b);
