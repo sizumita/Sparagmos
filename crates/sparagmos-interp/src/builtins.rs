@@ -444,13 +444,6 @@ pub enum Builtin {
     SystemTimeDurationSince,
     /// `std::time::SystemTime::elapsed()`.
     SystemTimeElapsed,
-    /// `std::ops::Add::add` for the modelled time types (the
-    /// only `Add` instances whose bodies are unavailable; other
-    /// instances keep their collected bodies because their call
-    /// targets are the impl definitions, not this name).
-    OpsAdd,
-    /// `std::ops::Sub::sub` for the modelled time types.
-    OpsSub,
     /// `std::intrinsics::catch_unwind(try_fn, data, catch_fn) -> bool`:
     /// run the try function to completion; on a guest panic, roll
     /// the frame stack back to the call and run the catch function
@@ -862,8 +855,6 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::time::Instant::elapsed" => Builtin::InstantElapsed,
         "std::time::SystemTime::duration_since" => Builtin::SystemTimeDurationSince,
         "std::time::SystemTime::elapsed" => Builtin::SystemTimeElapsed,
-        "std::ops::Add::add" => Builtin::OpsAdd,
-        "std::ops::Sub::sub" => Builtin::OpsSub,
         "std::thread::scope" => Builtin::ThreadScope,
         "std::thread::current" => Builtin::ThreadCurrent,
         "std::thread::Thread::id" => Builtin::ThreadIdOf,
@@ -1540,6 +1531,20 @@ impl<'a> Interpreter<'a> {
         args: &[Operand],
         cmp_discriminants: Option<&[i128]>,
     ) -> InterpResult<Value> {
+        // `Add` / `Sub` on a modelled time type: conversion emits
+        // a builtin node only for those calls (see
+        // `time_add_sub_terminator` in mir_convert). The names are
+        // deliberately absent from `lookup`, so the driver's reach
+        // pass still collects the other instances' bodies (the
+        // generic shims, guest impls) as usual.
+        if name == "std::ops::Add::add" || name == "std::ops::Sub::sub" {
+            let mut vals = Vec::with_capacity(args.len());
+            for arg in args {
+                vals.push(self.eval_operand(frames, body, arg)?);
+            }
+            let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
+            return self.time_add_sub(name, self_ty, name.ends_with("Sub::sub"), &vals);
+        }
         let kind = lookup(name)
             .ok_or_else(|| unsupported(format!("call to {name} is not runtime-supported")))?;
         let mut vals = Vec::with_capacity(args.len());
@@ -1995,93 +2000,6 @@ impl<'a> Interpreter<'a> {
                             }],
                         })
                     }
-                }
-            }
-            Builtin::OpsAdd | Builtin::OpsSub => {
-                arity(2)?;
-                let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
-                let sub = kind == Builtin::OpsSub;
-                match self_ty {
-                    "std::time::Instant" | "std::time::SystemTime" => {
-                        let system = self_ty == "std::time::SystemTime";
-                        let base = time_pair(&vals[0]).ok_or_else(|| {
-                            InterpError::type_mismatch(
-                                name,
-                                "a time value",
-                                vals[0].kind_name(),
-                            )
-                        })?;
-                        let dur = duration_pair(&vals[1]).ok_or_else(|| {
-                            InterpError::type_mismatch(
-                                name,
-                                "a Duration value",
-                                vals[1].kind_name(),
-                            )
-                        })?;
-                        let pair = if sub {
-                            checked_time_sub(base, dur, system)
-                        } else {
-                            checked_time_add(base, dur, system)
-                        };
-                        match pair {
-                            Some(pair) => Ok(instant_value(pair)),
-                            None => Err(InterpError::panic_str_payload(
-                                match (system, sub) {
-                                    (false, false) => {
-                                        "overflow when adding duration to instant"
-                                    }
-                                    (false, true) => {
-                                        "overflow when subtracting duration from instant"
-                                    }
-                                    (true, false) => {
-                                        "overflow when adding duration to system time"
-                                    }
-                                    (true, true) => {
-                                        "overflow when subtracting duration from system time"
-                                    }
-                                },
-                            )),
-                        }
-                    }
-                    "std::time::Duration" => {
-                        let a = duration_pair(&vals[0]).ok_or_else(|| {
-                            InterpError::type_mismatch(
-                                name,
-                                "a Duration value",
-                                vals[0].kind_name(),
-                            )
-                        })?;
-                        let b = duration_pair(&vals[1]).ok_or_else(|| {
-                            InterpError::type_mismatch(
-                                name,
-                                "a Duration value",
-                                vals[1].kind_name(),
-                            )
-                        })?;
-                        if sub {
-                            match checked_time_sub(a, b, true) {
-                                Some(pair) => {
-                                    self.duration_value(pair.0 as u64, pair.1 as u64)
-                                }
-                                None => Err(InterpError::panic_str_payload(
-                                    "overflow when subtracting duration",
-                                )),
-                            }
-                        } else {
-                            match checked_time_add(a, b, true) {
-                                Some(pair) => {
-                                    self.duration_value(pair.0 as u64, pair.1 as u64)
-                                }
-                                None => Err(InterpError::panic_str_payload(
-                                    "overflow when adding duration",
-                                )),
-                            }
-                        }
-                    }
-                    _ => Err(unsupported(format!(
-                        "{} for {self_ty} is not runtime-supported",
-                        if sub { "Sub::sub" } else { "Add::add" }
-                    ))),
                 }
             }
             Builtin::MpscChannel => {
@@ -4168,6 +4086,113 @@ impl<'a> Interpreter<'a> {
     /// `nanos`), with the normalization `Duration::new` performs
     /// (a nanosecond count at or past one second carries into the
     /// seconds; the carry is checked, as in std).
+
+
+    /// `Add::add` / `Sub::sub` for the modelled time types,
+    /// completed by the interpreter when the demanded instance
+    /// has no collected body (the `std::time` instances are not
+    /// available from the compiler). Instances with bodies — a
+    /// guest impl, a generic instantiation's shim — always take
+    /// the normal call path and never reach here, so the
+    /// collected-body priority is untouched. Returns the result
+    /// value, or an error for a Self type outside the model.
+    pub(crate) fn time_add_sub(
+        &self,
+        name: &str,
+        self_ty: &str,
+        sub: bool,
+        vals: &[Value],
+    ) -> InterpResult<Value> {
+        if vals.len() != 2 {
+            return Err(InterpError::type_mismatch(
+                name,
+                "2 argument(s)",
+                format!("{} argument(s)", vals.len()),
+            ));
+        }
+        match self_ty {
+                "std::time::Instant" | "std::time::SystemTime" => {
+                    let system = self_ty == "std::time::SystemTime";
+                    let base = time_pair(&vals[0]).ok_or_else(|| {
+                        InterpError::type_mismatch(
+                            name,
+                            "a time value",
+                            vals[0].kind_name(),
+                        )
+                    })?;
+                    let dur = duration_pair(&vals[1]).ok_or_else(|| {
+                        InterpError::type_mismatch(
+                            name,
+                            "a Duration value",
+                            vals[1].kind_name(),
+                        )
+                    })?;
+                    let pair = if sub {
+                        checked_time_sub(base, dur, system)
+                    } else {
+                        checked_time_add(base, dur, system)
+                    };
+                    match pair {
+                        Some(pair) => Ok(instant_value(pair)),
+                        None => Err(InterpError::panic_str_payload(
+                            match (system, sub) {
+                                (false, false) => {
+                                    "overflow when adding duration to instant"
+                                }
+                                (false, true) => {
+                                    "overflow when subtracting duration from instant"
+                                }
+                                (true, false) => {
+                                    "overflow when adding duration to system time"
+                                }
+                                (true, true) => {
+                                    "overflow when subtracting duration from system time"
+                                }
+                            },
+                        )),
+                    }
+                }
+                "std::time::Duration" => {
+                    let a = duration_pair(&vals[0]).ok_or_else(|| {
+                        InterpError::type_mismatch(
+                            name,
+                            "a Duration value",
+                            vals[0].kind_name(),
+                        )
+                    })?;
+                    let b = duration_pair(&vals[1]).ok_or_else(|| {
+                        InterpError::type_mismatch(
+                            name,
+                            "a Duration value",
+                            vals[1].kind_name(),
+                        )
+                    })?;
+                    if sub {
+                        match checked_time_sub(a, b, true) {
+                            Some(pair) => {
+                                self.duration_value(pair.0 as u64, pair.1 as u64)
+                            }
+                            None => Err(InterpError::panic_str_payload(
+                                "overflow when subtracting duration",
+                            )),
+                        }
+                    } else {
+                        match checked_time_add(a, b, true) {
+                            Some(pair) => {
+                                self.duration_value(pair.0 as u64, pair.1 as u64)
+                            }
+                            None => Err(InterpError::panic_str_payload(
+                                "overflow when adding duration",
+                            )),
+                        }
+                    }
+                }
+                _ => Err(unsupported(format!(
+                    "{} for {self_ty} is not runtime-supported",
+                    if sub { "Sub::sub" } else { "Add::add" }
+                ))),
+            }
+    }
 
     fn duration_value(&self, secs: u64, nanos: u64) -> InterpResult<Value> {
         let (secs, nanos) = if nanos >= 1_000_000_000 {

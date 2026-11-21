@@ -3679,6 +3679,55 @@ impl<'a> Converter<'a> {
         }
     }
 
+    /// A direct `Add::add` / `Sub::sub` call whose Self type is
+    /// one of the modelled time types converts to a builtin node:
+    /// the `Instant` / `SystemTime` instances have no body at
+    /// all, and the collected `Duration` instance body does not
+    /// run in this model (it writes a raw nanos count into the
+    /// niche-typed `Nanoseconds` field). Every other `Add` /
+    /// `Sub` call keeps the normal paths (a collected body wins;
+    /// the names are not in the builtin registry, so reach still
+    /// collects the generic shim bodies).
+    fn time_add_sub_terminator(
+        &self,
+        body: &mir::Body,
+        func: &mir::Operand,
+        args: &[mir::Operand],
+        destination: &mir::Place,
+        target: Option<mir::BasicBlock>,
+    ) -> Result<Option<ir::TerminatorKind>, ConvertError> {
+        let Some((name, generic_args, _raw)) = self.resolve_external_callee(func) else {
+            return Ok(None);
+        };
+        let canonical = crate::builtins::canonical_name(&name);
+        if canonical != "std::ops::Add::add" && canonical != "std::ops::Sub::sub" {
+            return Ok(None);
+        }
+        let Some(self_ty) = generic_args.first() else {
+            return Ok(None);
+        };
+        if !matches!(
+            self_ty.as_str(),
+            "std::time::Instant" | "std::time::SystemTime" | "std::time::Duration"
+        ) {
+            return Ok(None);
+        }
+        let mut ir_args = Vec::with_capacity(args.len());
+        for arg in args.iter() {
+            ir_args.push(self.convert_operand(body, arg, None)?);
+        }
+        Ok(Some(ir::TerminatorKind::CallBuiltin {
+            name: canonical,
+            generic_args: vec![self_ty.clone()],
+            args: ir_args,
+            destination: self.convert_place(destination)?,
+            target: target.map(|b| ir::BasicBlock(b.index())),
+            drop_glue: None,
+            cmp_discriminants: None,
+            result_unsize: None,
+        }))
+    }
+
     /// Whether this call's func operand names an `Fn`-family trait
     /// method (`Fn::call`, `FnMut::call_mut`, `FnOnce::call_once` in
     /// their `std::ops` / `core::ops` spellings): returns the call
@@ -4062,6 +4111,14 @@ impl<'a> Converter<'a> {
                         destination: self.convert_place(destination)?,
                         target: target.map(|b| ir::BasicBlock(b.index())),
                     }
+                } else if let Some(term) = self.time_add_sub_terminator(
+                    body,
+                    func,
+                    args,
+                    destination,
+                    *target,
+                )? {
+                    term
                 } else if let Some(name) = self.fn_trait_or_direct(func, args.len()) {
                     match name {
                         FnResolution::Trait(kind, raw_generic_args) => {
