@@ -4957,6 +4957,95 @@ fn run_mode_nonzero_layout_sizes() {
     run_ok("nonzero-layout", NONZERO_LAYOUT_SRC, "4 4\n8\n4\n");
 }
 
+const NONZERO_NEW_SRC: &str = r#"
+use std::num::NonZero;
+fn main() {
+    let x: NonZero<u32> = unsafe { std::mem::transmute(42u32) };
+    println!("nz {}", x.get());
+    let y: u32 = unsafe { std::mem::transmute(x) };
+    println!("back {}", y);
+    println!("new {}", NonZero::new(7).unwrap().get());
+}
+"#;
+
+#[test]
+fn run_mode_nonzero_new_constructor() {
+    // `NonZero::new` itself is a transmute between the bare
+    // integer and `Option<NonZero<T>>` in core: it converts
+    // through the enum's niche encoding, which the driver
+    // records from the compiler's layout and the interpreter
+    // reinterprets through.
+    run_ok("nonzero-new", NONZERO_NEW_SRC, "nz 42\nback 42\nnew 7\n");
+}
+
+const NONZERO_OPTION_SRC: &str = r#"
+use std::num::NonZero;
+fn main() {
+    println!("size {} {}", std::mem::size_of::<Option<NonZero<u32>>>(), std::mem::size_of::<u32>());
+    let a: Option<NonZero<u32>> = NonZero::new(5);
+    let bits: u32 = unsafe { std::mem::transmute(a) };
+    println!("bits {}", bits);
+    let b: Option<NonZero<u32>> = unsafe { std::mem::transmute(0u32) };
+    println!("none {}", b.is_none());
+}
+"#;
+
+#[test]
+fn run_mode_option_nonzero_transmutes() {
+    run_ok("option-nonzero", NONZERO_OPTION_SRC, "size 4 4\nbits 5\nnone true\n");
+}
+
+const NONZERO_FIELD_NEW_SRC: &str = r#"
+use std::num::NonZero;
+struct Wrap { tag: u8, val: NonZero<u32> }
+fn main() {
+    let w = Wrap { tag: 3, val: NonZero::new(9).unwrap() };
+    println!("field {} {}", w.tag, w.val.get());
+    let raw: u32 = unsafe { std::mem::transmute(w.val) };
+    println!("raw {}", raw);
+}
+"#;
+
+#[test]
+fn run_mode_nonzero_field_constructed_by_new() {
+    run_ok("nonzero-field-new", NONZERO_FIELD_NEW_SRC, "field 3 9\nraw 9\n");
+}
+
+const NICHE_GENERAL_SRC: &str = r#"
+use std::num::NonZero;
+fn main() {
+    let nz = NonZero::new(1u64 << 40);
+    let bits: u64 = unsafe { std::mem::transmute(nz) };
+    println!("bits {}", bits);
+    let opt: Option<NonZero<u32>> = unsafe { std::mem::transmute(0u32) };
+    println!("zero-none {}", opt.is_none());
+    let nz8 = NonZero::new(200u8);
+    println!("nz8 {}", nz8.map(|n| n.get()).unwrap_or(0));
+    let s: Option<NonZero<u32>> = Some(NonZero::new(77u32).unwrap());
+    let sbits: u32 = unsafe { std::mem::transmute(s) };
+    println!("sbits {}", sbits);
+    let b2: Option<bool> = unsafe { std::mem::transmute(2u8) };
+    let back: u8 = unsafe { std::mem::transmute(b2) };
+    println!("bback {}", back);
+    match NonZero::new(0u32) {
+        None => println!("new0 none"),
+        Some(n) => println!("new0 some {}", n.get()),
+    }
+}
+"#;
+
+#[test]
+fn run_mode_niche_enum_transmutes_general() {
+    // The niche encoding is not NonZero-specific: widths
+    // other than 32 bits and `Option<bool>` (whose None is
+    // the value 2, not 0) follow the same recorded encoding.
+    run_ok(
+        "niche-general",
+        NICHE_GENERAL_SRC,
+        "bits 1099511627776\nzero-none true\nnz8 200\nsbits 77\nbback 2\nnew0 none\n",
+    );
+}
+
 const RC_ARC_DROP_SRC: &str = r#"
 use std::rc::Rc;
 use std::sync::Arc;
