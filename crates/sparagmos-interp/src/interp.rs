@@ -2018,7 +2018,7 @@ impl<'a> Interpreter<'a> {
                 if base == Value::Uninit {
                     return Ok(None);
                 }
-                match project_value(base, &projection, "<drop>", "drop glue") {
+                match self.project_value_t(base, &projection, "<drop>", "drop glue") {
                     Ok(v) if v == Value::Uninit => Ok(None),
                     Ok(v) => Ok(Some(v)),
                     Err(InterpError::UninitializedRead { .. }) => Ok(None),
@@ -2099,7 +2099,7 @@ impl<'a> Interpreter<'a> {
                 Some(v) => value = v,
                 None => return Ok(None),
             }
-            match project_value(value, std::slice::from_ref(step), "<drop>", "drop glue") {
+            match self.project_value_t(value, std::slice::from_ref(step), "<drop>", "drop glue") {
                 Ok(v) => value = v,
                 Err(InterpError::UninitializedRead { .. }) => return Ok(None),
                 Err(e) => return Err(e),
@@ -2148,7 +2148,7 @@ impl<'a> Interpreter<'a> {
                 }
                 RefTarget::Value(v) => {
                     let projected =
-                        project_value(*v, std::slice::from_ref(step), "<drop>", "drop glue")?;
+                        self.project_value_t(*v, std::slice::from_ref(step), "<drop>", "drop glue")?;
                     RefTarget::Value(Box::new(projected))
                 }
                 RefTarget::Static {
@@ -3488,6 +3488,19 @@ impl<'a> Interpreter<'a> {
                     fat_cap = None;
                     self.project_step(frames, cur, RefProj::Field(*idx), body, place)?
                 }
+                ProjectionElem::UnionField { idx, table } => {
+                    fat_cap = None;
+                    self.project_step(
+                        frames,
+                        cur,
+                        RefProj::UnionField {
+                            idx: *idx,
+                            table: *table,
+                        },
+                        body,
+                        place,
+                    )?
+                }
                 ProjectionElem::Index(local) => {
                     let idx = self.read_index_local(frames, body, *local, place)?;
                     if let Some(cap) = fat_cap {
@@ -3625,7 +3638,7 @@ impl<'a> Interpreter<'a> {
                     .last()
                     .map(|f| f.func.clone())
                     .unwrap_or_else(|| body.name.clone());
-                let projected = project_value(value, &[step], &func, &place.to_string())?;
+                let projected = self.project_value_t(value, &[step], &func, &place.to_string())?;
                 Ok(Resolved::Value(projected))
             }
             Resolved::Static {
@@ -3884,7 +3897,7 @@ impl<'a> Interpreter<'a> {
                     .map(|f| f.func.clone())
                     .unwrap_or_else(|| "<static>".to_string());
                 let place_desc = format!("static {name}");
-                let value = project_value(base, projection, &func, &place_desc)?;
+                let value = self.project_value_t(base, projection, &func, &place_desc)?;
                 if value == Value::Uninit {
                     return Err(InterpError::UninitializedRead {
                         func,
@@ -3900,7 +3913,7 @@ impl<'a> Interpreter<'a> {
                     .map(|f| f.func.clone())
                     .unwrap_or_else(|| "<allocation>".to_string());
                 let place_desc = format!("allocation #{id}");
-                let value = project_value(base, projection, &func, &place_desc)?;
+                let value = self.project_value_t(base, projection, &func, &place_desc)?;
                 if value == Value::Uninit {
                     return Err(InterpError::UninitializedRead {
                         func,
@@ -3938,7 +3951,7 @@ impl<'a> Interpreter<'a> {
                 } else {
                     describe_resolved(*local, projection)
                 };
-                let value = project_value(base, projection, &frame.func, &place_desc)?;
+                let value = self.project_value_t(base, projection, &frame.func, &place_desc)?;
                 if value == Value::Uninit {
                     return Err(InterpError::UninitializedRead {
                         func: frame.func.clone(),
@@ -4767,6 +4780,109 @@ impl<'a> Interpreter<'a> {
         })
     }
 
+    /// Project `value` through `projection`, resolving union
+    /// field steps against the program's union tables: the plain
+    /// projector ([`project_value`]) is type-free, so runs of
+    /// ordinary steps go through it and each union step is
+    /// applied here, where the scalar shapes are in reach.
+    fn project_value_t(
+        &self,
+        value: Value,
+        projection: &[RefProj],
+        func: &str,
+        place: &str,
+    ) -> InterpResult<Value> {
+        let mut value = value;
+        let mut i = 0;
+        while i < projection.len() {
+            if let RefProj::UnionField { idx, table } = projection[i] {
+                value = self.union_field_read(value, idx, table, func, place)?;
+                i += 1;
+            } else {
+                let start = i;
+                while i < projection.len()
+                    && !matches!(projection[i], RefProj::UnionField { .. })
+                {
+                    i += 1;
+                }
+                value = project_value(value, &projection[start..i], func, place)?;
+            }
+        }
+        Ok(value)
+    }
+
+    /// Read field `idx` of a union `value`. The value holds one
+    /// field's value — the last one written; every other slot is
+    /// uninitialized (see the union arm of aggregate evaluation
+    /// and of `navigate_mut`). Reading the held field returns it
+    /// as it stands. Reading any other field reinterprets the
+    /// held field's bits as this field's type, little-endian: a
+    /// narrower field reads the low bytes, and a wider field
+    /// reads zeros above the held field's width (the bytes a
+    /// native read would find there are unspecified, so the
+    /// model fixes them at zero rather than fabricating data).
+    /// A union holding no live field is an uninitialized read;
+    /// a field whose type has no scalar shape, and a value
+    /// holding several live fields (which the write side never
+    /// produces), are explicit errors.
+    fn union_field_read(
+        &self,
+        value: Value,
+        idx: usize,
+        table: usize,
+        func: &str,
+        place: &str,
+    ) -> InterpResult<Value> {
+        let Value::Enum { ref fields, .. } = value else {
+            return Err(InterpError::type_mismatch(
+                format!("union field read on {place}"),
+                "union (ADT) value",
+                value.kind_name(),
+            ));
+        };
+        if let Some(held) = fields.get(idx) {
+            if *held != Value::Uninit {
+                return Ok(held.clone());
+            }
+        }
+        let mut live = fields
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| **v != Value::Uninit);
+        let Some((src_idx, stored)) = live.next() else {
+            return Err(InterpError::UninitializedRead {
+                func: func.to_string(),
+                place: place.to_string(),
+            });
+        };
+        if live.next().is_some() {
+            return Err(InterpError::type_mismatch(
+                format!("union field read on {place}"),
+                "a union value holding one field",
+                "a union value holding several fields",
+            ));
+        }
+        let stored = stored.clone();
+        let shapes = self.program.union_tables.get(table).ok_or_else(|| {
+            InterpError::type_mismatch(
+                format!("union field read on {place}"),
+                "a union instance with a scalar-shape table",
+                "a union instance without one",
+            )
+        })?;
+        let src = shapes.get(src_idx).and_then(|o| o.as_ref());
+        let dst = shapes.get(idx).and_then(|o| o.as_ref());
+        let (Some(src), Some(dst)) = (src, dst) else {
+            return Err(InterpError::type_mismatch(
+                format!("union field read on {place}"),
+                "scalar-shaped union fields on both sides of the read",
+                "a union field whose type has no scalar shape",
+            ));
+        };
+        let bits = self.flatten_scalar(&stored, src)?;
+        self.construct_scalar(bits, dst)
+    }
+
     /// A scalar `Transmute` reinterpretation: flatten the
     /// operand value to its bit pattern through the source
     /// shape, then construct the target shape's value from the
@@ -5376,6 +5492,9 @@ pub(crate) fn describe_resolved(local: usize, projection: &[RefProj]) -> String 
             RefProj::Field(i) => {
                 let _ = write!(out, ".{i}");
             }
+            RefProj::UnionField { idx, .. } => {
+                let _ = write!(out, ".{idx}");
+            }
             RefProj::Index(i) => {
                 let _ = write!(out, "[{i}]");
             }
@@ -5543,6 +5662,20 @@ pub(crate) fn project_value(
                     ));
                 }
             },
+            RefProj::UnionField { .. } => {
+                // Union field reads need the program's scalar
+                // shapes, which this type-free projector does not
+                // carry: every interpreter read path routes union
+                // steps through `project_value_t` instead. Landing
+                // here means a caller applied a stored projection
+                // directly; that is an explicit error, not a slot
+                // read.
+                return Err(InterpError::type_mismatch(
+                    format!("union field projection on {place}"),
+                    "a union field read through the typed projection path",
+                    "the untyped value projector",
+                ));
+            }
             RefProj::Index(idx) => match value {
                 Value::FatRef {
                     ref base,
@@ -5708,6 +5841,41 @@ pub(crate) fn navigate_mut<'x>(
     }
     let (step, rest) = projection.split_first().expect("non-empty");
     match step {
+        RefProj::UnionField { idx, .. } => {
+            // A union holds one field's value: writing field
+            // `idx` makes it the held field, so every other slot
+            // is cleared (a later read of another field then
+            // reinterprets this field's bits; see
+            // `union_field_read`). Writing *inside* the field
+            // (`u.a.0 = ...`) navigates into the held value as
+            // usual, but a field that holds no value has nothing
+            // to write inside of: the bytes a native write would
+            // preserve there belong to a field this model does
+            // not hold, so that stays an uninitialized error
+            // rather than a fabricated partial value.
+            let Value::Enum { fields, .. } = slot else {
+                return Err(InterpError::type_mismatch(
+                    format!("union field write on {place}"),
+                    "union (ADT) value",
+                    slot.kind_name(),
+                ));
+            };
+            if fields.len() <= *idx {
+                fields.resize(*idx + 1, Value::Uninit);
+            }
+            if !rest.is_empty() && fields[*idx] == Value::Uninit {
+                return Err(InterpError::UninitializedRead {
+                    func: func.to_string(),
+                    place: place.to_string(),
+                });
+            }
+            for (i, field) in fields.iter_mut().enumerate() {
+                if i != *idx {
+                    *field = Value::Uninit;
+                }
+            }
+            navigate_mut(&mut fields[*idx], rest, func, place)
+        }
         RefProj::Field(idx) => {
             if let Value::Coroutine { fields, .. } = slot {
                 // The state storage grows to the written slot: a
@@ -6478,6 +6646,9 @@ fn synthetic_addr(v: &Value) -> u128 {
             for step in projection {
                 let (tag, n) = match step {
                     RefProj::Field(i) => (1u128, *i as u128),
+                    RefProj::UnionField { idx, table } => {
+                        (5u128, ((*table as u128) << 64) | (*idx as u128))
+                    }
                     RefProj::Index(i) => (2u128, *i as u128),
                     RefProj::Downcast(i) => (3u128, *i as u128),
                     RefProj::Subslice { offset, len } => {
@@ -6499,6 +6670,9 @@ fn synthetic_addr(v: &Value) -> u128 {
             for step in projection {
                 let (tag, n) = match step {
                     RefProj::Field(i) => (1u128, *i as u128),
+                    RefProj::UnionField { idx, table } => {
+                        (5u128, ((*table as u128) << 64) | (*idx as u128))
+                    }
                     RefProj::Index(i) => (2u128, *i as u128),
                     RefProj::Downcast(i) => (3u128, *i as u128),
                     RefProj::Subslice { offset, len } => {
@@ -6519,6 +6693,9 @@ fn synthetic_addr(v: &Value) -> u128 {
             for step in projection {
                 let (tag, n) = match step {
                     RefProj::Field(i) => (1u128, *i as u128),
+                    RefProj::UnionField { idx, table } => {
+                        (5u128, ((*table as u128) << 64) | (*idx as u128))
+                    }
                     RefProj::Index(i) => (2u128, *i as u128),
                     RefProj::Downcast(i) => (3u128, *i as u128),
                     RefProj::Subslice { offset, len } => {

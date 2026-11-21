@@ -231,6 +231,13 @@ impl Ty {
 pub enum ProjectionElem {
     /// Tuple / aggregate field access, e.g. `_1.0`.
     Field(usize),
+    /// Field access on a union value, e.g. `_1.0` where `_1` is a
+    /// union: the read reinterprets the bits of whichever field
+    /// the value currently holds (see [`Program::union_tables`]),
+    /// and the write makes this field the held one. `table`
+    /// indexes the union instance's per-field scalar shapes in
+    /// the program's union tables.
+    UnionField { idx: usize, table: usize },
     /// `*_1`: follow a reference value.
     Deref,
     /// `_1[_2]`: index by a local (read in the executing frame).
@@ -280,6 +287,7 @@ impl fmt::Display for Place {
         for elem in &self.projection {
             match elem {
                 ProjectionElem::Field(i) => write!(f, ".{i}")?,
+                ProjectionElem::UnionField { idx, .. } => write!(f, ".{idx}")?,
                 ProjectionElem::Deref => write!(f, ".*")?,
                 ProjectionElem::Index(l) => write!(f, "[{l}]")?,
                 ProjectionElem::ConstantIndex { offset, from_end } => {
@@ -1066,6 +1074,16 @@ impl Body {
 /// A whole program: a set of named function bodies in one module.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Program {
+    /// Per-field scalar shapes of the program's union instances,
+    /// indexed by the `table` of [`ProjectionElem::UnionField`]:
+    /// entry `t` is one union instance's field list, in field
+    /// order, with the [`ScalarShape`] a field's bits flatten to
+    /// (`None` for a field whose type has no scalar shape:
+    /// reading such a field through another field's bits is an
+    /// explicit error). Filled from the MIR types at conversion;
+    /// consulted when a union field is read through a field
+    /// other than the one the value currently holds.
+    pub union_tables: Vec<Vec<Option<ScalarShape>>>,
     /// Layouts of the program's monomorphic ADT instances
     /// (`(size, align)` in bytes), keyed by the rendered instance
     /// name (the type tag the builtins see). Filled from

@@ -85,6 +85,11 @@ use std::fmt;
 #[derive(Clone, Debug, PartialEq)]
 pub enum RefProj {
     Field(usize),
+    /// A field access on a union value (the resolved form of
+    /// `ProjectionElem::UnionField`): reading reinterprets the
+    /// held field's bits as field `idx`'s type, through the
+    /// scalar shapes of union table `table`.
+    UnionField { idx: usize, table: usize },
     Index(usize),
     Downcast(u32),
     /// A sub-slice of the value's element sequence, resolved to
@@ -359,6 +364,7 @@ impl fmt::Display for RefTarget {
                 for proj in projection {
                     match proj {
                         RefProj::Field(i) => write!(f, ".{i}")?,
+                        RefProj::UnionField { idx, .. } => write!(f, ".{idx}")?,
                         RefProj::Index(i) => write!(f, "[{i}]")?,
                         RefProj::Downcast(v) => write!(f, " as variant {v}")?,
                         RefProj::Subslice { offset, len } => {
@@ -374,6 +380,7 @@ impl fmt::Display for RefTarget {
                 for proj in projection {
                     match proj {
                         RefProj::Field(i) => write!(f, ".{i}")?,
+                        RefProj::UnionField { idx, .. } => write!(f, ".{idx}")?,
                         RefProj::Index(i) => write!(f, "[{i}]")?,
                         RefProj::Downcast(v) => write!(f, " as variant {v}")?,
                         RefProj::Subslice { offset, len } => {
@@ -388,6 +395,7 @@ impl fmt::Display for RefTarget {
                 for proj in projection {
                     match proj {
                         RefProj::Field(i) => write!(f, ".{i}")?,
+                        RefProj::UnionField { idx, .. } => write!(f, ".{idx}")?,
                         RefProj::Index(i) => write!(f, "[{i}]")?,
                         RefProj::Downcast(v) => write!(f, " as variant {v}")?,
                         RefProj::Subslice { offset, len } => {
