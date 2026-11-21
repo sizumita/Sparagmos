@@ -7808,3 +7808,43 @@ fn run_mode_size_hint_reports_std_values() {
         "stdout={stdout}"
     );
 }
+
+const SIZE_HINT_DEFAULT_SRC: &str = r#"
+struct Thing<'a>(&'a str);
+impl<'a> Iterator for Thing<'a> {
+    type Item = &'a str;
+    fn next(&mut self) -> Option<&'a str> {
+        None
+    }
+}
+fn main() {
+    let n = Thing("test").fuse().filter(|_| true).count();
+    println!("count {n}");
+    let (l, u) = Thing("test").size_hint();
+    println!("hint {l} {}", u.is_none());
+    let (l, u) = Thing("test").fuse().size_hint();
+    println!("fused {l} {}", u.is_none());
+}
+"#;
+
+#[test]
+fn run_mode_size_hint_unmodelled_iterator_gets_trait_default() {
+    // Regression (tests/ui/inference/issue-36053.rs): a user
+    // iterator that does not override `size_hint`, reached
+    // through adapters (`Fuse`, `Filter::count`). Registering
+    // the `Iterator::size_hint` builtin removes the trait's
+    // default body from collection, so the builtin itself
+    // answers unmodelled iterators with that default,
+    // `(0, None)` — the exact native answer here, and a
+    // contract-valid one for every iterator.
+    let dir = temp_dir("size-hint-default");
+    let src = fixture(&dir, "sizehintdefault.rs", SIZE_HINT_DEFAULT_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout, "count 0\nhint 0 true\nfused 0 true\n",
+        "stdout={stdout}"
+    );
+}
