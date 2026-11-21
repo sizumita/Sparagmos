@@ -5129,6 +5129,14 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                 // resource beyond it.
                 return Some(P::Trivial);
             }
+            "std::io::Stdout" | "std::io::Stderr" | "std::io::StdoutLock"
+            | "std::io::StderrLock" => {
+                // The modelled handle holds no owned resource:
+                // writes through it take effect immediately in
+                // this model, so the native drop-time flush of
+                // the line writer is unobservable.
+                return Some(P::Trivial);
+            }
             "std::env::Args" | "std::env::ArgsOs" => {
                 // The modelled value wraps the argument iterator
                 // state ([element snapshot, next index]) whose

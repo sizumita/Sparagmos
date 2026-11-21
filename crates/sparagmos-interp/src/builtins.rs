@@ -231,6 +231,14 @@ pub enum Builtin {
     /// `std::process::exit(code)`: end the run with the given
     /// exit code (see `InterpError::ProcessExit`).
     ProcessExit,
+    /// `std::io::stdout() -> Stdout`: the standard output handle.
+    /// The handle value is a marker in this model: writes through
+    /// it are modelled by the `Write` builtins, which dispatch on
+    /// the receiver type, not on the handle's contents.
+    Stdout,
+    /// `std::io::Write::write_fmt(&mut self, Arguments)` for the
+    /// modelled receivers (the std handles and `Vec<u8>`).
+    WriteFmt,
     /// `std::fmt::format(Arguments) -> String`.
     Format,
     /// `std::fmt::Arguments::from_str(&str)`.
@@ -755,6 +763,8 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::env::args" => Builtin::EnvArgs,
         "std::env::args_os" => Builtin::EnvArgsOs,
         "std::process::exit" => Builtin::ProcessExit,
+        "std::io::stdout" => Builtin::Stdout,
+        "std::io::Write::write_fmt" => Builtin::WriteFmt,
         "std::fmt::format" => Builtin::Format,
         "std::fmt::Arguments::from_str" | "std::fmt::Arguments::from_str_nonconst" => {
             Builtin::ArgumentsFromStr
@@ -1405,6 +1415,68 @@ impl<'a> Interpreter<'a> {
                 arity(1)?;
                 let code = as_i128(&vals[0], name)? as i32;
                 Err(InterpError::ProcessExit { code })
+            }
+            Builtin::Stdout => {
+                arity(0)?;
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Unit],
+                })
+            }
+            Builtin::WriteFmt => {
+                arity(2)?;
+                let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
+                let self_ty = self_ty
+                    .strip_prefix("&mut ")
+                    .or_else(|| self_ty.strip_prefix("&"))
+                    .unwrap_or(self_ty);
+                let text =
+                    self.format_arguments(frames, expect_arguments(&vals[1], name)?)?;
+                match self_ty {
+                    "std::io::Stdout" | "std::io::StdoutLock" => {
+                        self.push_output(&text);
+                    }
+                    "std::io::Stderr" | "std::io::StderrLock" => {
+                        self.push_error_output(&text);
+                    }
+                    _ if self_ty.starts_with("std::vec::Vec<u8") => {
+                        // `Write for Vec<u8>` appends the formatted
+                        // bytes to the vector.
+                        let target = self.deref_value(frames, &vals[0])?;
+                        let state = self.read_resolved(frames, &target)?;
+                        match state {
+                            Value::Enum {
+                                variant,
+                                mut fields,
+                            } => {
+                                fields.extend(
+                                    text.bytes().map(|b| Value::Uint(b as u128)),
+                                );
+                                self.write_resolved(
+                                    frames,
+                                    &target,
+                                    Value::Enum { variant, fields },
+                                )?;
+                            }
+                            ref other => {
+                                return Err(InterpError::type_mismatch(
+                                    "Write::write_fmt for Vec<u8>",
+                                    "vector value",
+                                    other.kind_name(),
+                                ))
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(unsupported(format!(
+                            "Write::write_fmt for {self_ty} is not runtime-supported"
+                        )))
+                    }
+                }
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Unit],
+                })
             }
             Builtin::Format => {
                 arity(1)?;
