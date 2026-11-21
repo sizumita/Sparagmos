@@ -243,3 +243,39 @@ the JIT backend still has no register allocation. Semantics
 are unchanged: the full test suites pass and a subset
 flip-diff against the pre-pass tree shows no gains or losses
 attributable to the pass.
+
+## Update 2026-11-22 (gpu-3070): borrowing read paths
+
+The read side of the clone problem named in the previous
+update: `IndexIndex` element reads cloned the whole aggregate
+twice per element (an O(n^2) read-back loop), and slice
+comparisons cloned both operands elements. The interpreter
+
+## Update 2026-11-22 (gpu-3070): borrowing read paths
+
+The read side of the clone problem named in the previous
+update: `IndexIndex` element reads cloned the whole aggregate
+twice per element (an O(n^2) read-back loop), and slice
+comparisons cloned both operands' elements. The interpreter
+now has borrowing read paths (`project_value_ref` /
+`read_resolved_ref`, returning `Cow`), builtins resolve
+references and slice elements through them (`slice_elements`
+rebuilt on top, two clones down to one), indexed reads clone
+only the target element, and slice equality/comparison
+borrows and stops at the first deciding element.
+
+Bench-helper medians against the pre-pass tree:
+
+| kernel | speedup |
+|---|---|
+| vec_push_sum (20k pushes) | 11.06x |
+| vec_push_sum_s | 2.39x |
+| vec_eq | 1.56x |
+
+Integration notes: union projections delegate to the owned
+read (union field reads need the typed projector), and the
+borrowing path mirrors the owned read's zero-sized-field
+rescue for never-written fields, so read semantics are
+unchanged. Semantics are unchanged: the full test suites
+pass and the subset flip-diff for this integration is
+recorded with it.
