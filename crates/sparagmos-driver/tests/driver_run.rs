@@ -1890,3 +1890,26 @@ fn run_mode_refcell_drop_runs_inner_destructor() {
         "dropping the cell runs the wrapped value's destructor"
     );
 }
+
+const F16_SRC: &str = r#"#![feature(f16)]
+const A: f16 = 1.5;
+fn main() {
+    let b: f16 = A + 0.25;
+    println!("{}", b as f32);
+    println!("{}", (A * 2.0) as f64);
+}
+"#;
+
+#[test]
+fn run_mode_f16_constants_execute() {
+    let dir = temp_dir("f16const");
+    let src = fixture(&dir, "f16const.rs", F16_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "f16 program must run to completion; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1.75\n3\n");
+}

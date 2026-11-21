@@ -1845,6 +1845,9 @@ impl<'a> Interpreter<'a> {
             (Some(Ty::Uint(ut)), Value::Uint(v)) => Ok(Value::Uint(*v & ut.max())),
             // An `f32` place holds the `f32` rounding of the stored
             // (exactly widened) value; an `f64` place holds it as-is.
+            (Some(Ty::Float(FloatTy::F16)), Value::Float(v)) => {
+                Ok(Value::Float(round_to_f16(*v)))
+            }
             (Some(Ty::Float(FloatTy::F32)), Value::Float(v)) => {
                 Ok(Value::Float((*v as f32) as f64))
             }
@@ -2797,6 +2800,7 @@ fn eval_binary(
     if let (Value::Float(a), Value::Float(b)) = (lhs, rhs) {
         let (a, b) = (*a, *b);
         let round = |r: f64| match float_ty_of(dest_ty) {
+            Some(FloatTy::F16) => round_to_f16(r),
             Some(FloatTy::F32) => (r as f32) as f64,
             _ => r,
         };
@@ -2923,6 +2927,67 @@ fn eval_shift(
 /// The float width a binary operation's destination declares, if any.
 /// A checked operation's destination is the `(T, bool)` tuple; the
 /// operand width lives in its first element.
+/// Round an `f64` value to `f16` precision (round-to-nearest-even,
+/// as IEEE 754 requires) and widen it back: the stored form of an
+/// `f16` place's value. Computing in `f64` first is exact for
+/// `f16` operands by the same double-rounding argument as `f32`
+/// (53 mantissa bits >= 2*11 + 2).
+fn round_to_f16(v: f64) -> f64 {
+    crate::mir_convert::f16_to_f64(f64_to_f16_bits(v))
+}
+
+/// The `f16` bit pattern nearest to `v` (round-to-nearest-even).
+fn f64_to_f16_bits(v: f64) -> u16 {
+    let bits = v.to_bits();
+    let sign = (((bits >> 63) & 1) as u16) << 15;
+    let exp = ((bits >> 52) & 0x7ff) as i64;
+    let mant = bits & ((1u64 << 52) - 1);
+    if exp == 0x7ff {
+        // Infinity / NaN (a NaN keeps a nonzero payload marker).
+        return sign | 0x7c00 | if mant != 0 { 0x0200 } else { 0 };
+    }
+    let e = exp - 1023;
+    if e > 15 {
+        return sign | 0x7c00;
+    }
+    if e >= -14 {
+        // Normal f16: keep the top 10 mantissa bits.
+        let mut kept = (mant >> 42) as u32;
+        let dropped = mant & ((1u64 << 42) - 1);
+        let half = 1u64 << 41;
+        if dropped > half || (dropped == half && kept & 1 == 1) {
+            kept += 1;
+        }
+        let mut e = e;
+        if kept == 0x400 {
+            kept = 0;
+            e += 1;
+            if e > 15 {
+                return sign | 0x7c00;
+            }
+        }
+        return sign | (((e + 15) as u16) << 10) | kept as u16;
+    }
+    if e < -25 {
+        // Below the tie point of the smallest subnormal: zero
+        // (the sign is preserved).
+        return sign;
+    }
+    // Subnormal: the f16 subnormal unit is 2^-24 and the value is
+    // m * 2^(e-52) with m carrying the implicit leading bit.
+    let m = mant | (1u64 << 52);
+    let shift = (28 - e) as u32;
+    let mut kept = (m >> shift) as u32;
+    let dropped = m & ((1u64 << shift) - 1);
+    let half = 1u64 << (shift - 1);
+    if dropped > half || (dropped == half && kept & 1 == 1) {
+        kept += 1;
+    }
+    // `kept` may reach 0x400, which is exactly the smallest
+    // normal's encoding, so it is used as-is.
+    sign | kept as u16
+}
+
 fn float_ty_of(dest_ty: Option<&Ty>) -> Option<FloatTy> {
     match dest_ty {
         Some(Ty::Float(ft)) => Some(*ft),
@@ -3100,10 +3165,13 @@ fn eval_cast(v: &Value, ty: &Ty) -> InterpResult<Value> {
             // Convert at the target width directly: going through
             // `f64` first would double-round wide integer sources.
             let out = match (v, ft) {
+                (Value::Int(a), FloatTy::F16) => round_to_f16(*a as f64),
                 (Value::Int(a), FloatTy::F32) => (*a as f32) as f64,
                 (Value::Int(a), FloatTy::F64) => *a as f64,
+                (Value::Uint(a), FloatTy::F16) => round_to_f16(*a as f64),
                 (Value::Uint(a), FloatTy::F32) => (*a as f32) as f64,
                 (Value::Uint(a), FloatTy::F64) => *a as f64,
+                (Value::Float(a), FloatTy::F16) => round_to_f16(*a),
                 (Value::Float(a), FloatTy::F32) => (*a as f32) as f64,
                 (Value::Float(a), FloatTy::F64) => *a,
                 (other, _) => {

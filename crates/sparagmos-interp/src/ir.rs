@@ -116,10 +116,12 @@ impl UintTy {
     }
 }
 
-/// Floating-point types. Only the two widths Rust code computes
-/// with in practice here; `f16` / `f128` stay unsupported.
+/// Floating-point types. Values are stored widened to `f64`
+/// (see `Value::Float`); `f16` widens exactly and its operations
+/// round back to `f16` precision. `f128` stays unsupported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FloatTy {
+    F16,
     F32,
     F64,
 }
@@ -128,6 +130,7 @@ impl FloatTy {
     /// Width in bits.
     pub fn bits(self) -> u32 {
         match self {
+            FloatTy::F16 => 16,
             FloatTy::F32 => 32,
             FloatTy::F64 => 64,
         }

@@ -104,6 +104,26 @@ pub struct MirProgram {
     pub adt_discriminants: mir::AdtDiscriminants,
 }
 
+/// Widen an `f16` bit pattern to `f64`. The conversion is exact:
+/// every f16 value (including subnormals) is representable in f64,
+/// and scaling by a power of two never rounds.
+pub(crate) fn f16_to_f64(bits: u16) -> f64 {
+    let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exp = ((bits >> 10) & 0x1f) as i32;
+    let frac = (bits & 0x3ff) as f64;
+    let v = match exp {
+        0 => frac * 2f64.powi(-24),
+        31 => {
+            if frac == 0.0 {
+                return sign * f64::INFINITY;
+            }
+            return f64::NAN;
+        }
+        e => (1024.0 + frac) * 2f64.powi(e - 25),
+    };
+    sign * v
+}
+
 impl MirProgram {
     pub fn new() -> Self {
         Self::default()
@@ -1066,6 +1086,7 @@ impl<'a> Converter<'a> {
             mir::Ty::Int(it) => ir::Ty::Int(convert_int_ty(*it)),
             mir::Ty::Uint(ut) => ir::Ty::Uint(convert_uint_ty(*ut)),
             // `f16` / `f128` fall through to the unsupported arm.
+            mir::Ty::Float(mir::FloatTy::F16) => ir::Ty::Float(ir::FloatTy::F16),
             mir::Ty::Float(mir::FloatTy::F32) => ir::Ty::Float(ir::FloatTy::F32),
             mir::Ty::Float(mir::FloatTy::F64) => ir::Ty::Float(ir::FloatTy::F64),
             // `char` is a 32-bit scalar; the IR models it as `u32`.
@@ -1355,6 +1376,7 @@ impl<'a> Converter<'a> {
     ) -> Result<ir::Constant, ConvertError> {
         match scalar {
             mir::Scalar::Float { bits, ty } => match ty {
+                mir::FloatTy::F16 => Ok(ir::Constant::Float(f16_to_f64(*bits as u16))),
                 mir::FloatTy::F32 => {
                     Ok(ir::Constant::Float(f32::from_bits(*bits as u32) as f64))
                 }

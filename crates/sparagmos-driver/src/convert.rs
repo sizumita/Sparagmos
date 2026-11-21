@@ -630,6 +630,10 @@ impl Converter {
             },
             TyKind::RigidTy(RigidTy::Float(f)) => {
                 let bits = match f {
+                    SmirFloatTy::F16 => alloc
+                        .read_partial_uint(0..2)
+                        .map(|v| v as u16 as u128)
+                        .unwrap_or(0),
                     SmirFloatTy::F32 => alloc
                         .read_partial_uint(0..4)
                         .map(|v| v as u32 as u128)
@@ -639,7 +643,10 @@ impl Converter {
                         .map(|v| v as u128)
                         .unwrap_or(0),
                     _ => {
-                        self.err("ConstantKind::Allocated (f16/f128)");
+                        // f128 has no exact f64 form; it stays an
+                        // explicit unsupported constant. (f16 widens
+                        // to f64 exactly and is decoded above.)
+                        self.err("ConstantKind::Allocated (f128)");
                         0
                     }
                 };
@@ -870,6 +877,7 @@ impl Converter {
             }
             TyKind::RigidTy(RigidTy::Float(f)) => {
                 let size = match f {
+                    SmirFloatTy::F16 => 2,
                     SmirFloatTy::F32 => 4,
                     SmirFloatTy::F64 => 8,
                     _ => return None,
