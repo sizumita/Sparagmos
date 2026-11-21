@@ -4889,7 +4889,7 @@ fn run_mode_dyn_default_method_dispatch() {
     // reach it (monomorphized at the concrete type), its inner
     // self calls must hit the concrete overrides, and an
     // overriding impl method must win over the default.
-    let dir = temp_dir("dyn-default");
+    let dir = temp_dir("dyn-default-dispatch");
     let src = fixture(&dir, "dyn_default.rs", DYN_DEFAULT_DISPATCH_SRC);
     let out = run_driver(&src);
     let stderr = String::from_utf8_lossy(&out.stderr);
