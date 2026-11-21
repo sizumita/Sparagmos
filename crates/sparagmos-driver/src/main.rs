@@ -1678,15 +1678,34 @@ fn declared_crate_name(src: &str) -> Option<String> {
 }
 
 /// Read an inner-attribute string value (`#![<attr> = "..."]`) from
-/// a source file: the first quoted string after the first
-/// occurrence of the attribute name.
+/// a source file. Only a real inner attribute at the top of the
+/// file counts — one written inside a comment does not (the
+/// open-ns auxiliary `open-ns-my_api_core.rs` carries
+/// `// #![crate_name = "my_api::core"]` as a comment, and treating
+/// it as a declaration made the driver look for an artifact under
+/// a namespaced name the build never produced).
 fn declared_inner_attr(src: &str, attr: &str) -> Option<String> {
-    let idx = src.find(attr)?;
-    let rest = &src[idx + attr.len()..];
-    let q1 = rest.find('"')?;
-    let rest = &rest[q1 + 1..];
-    let q2 = rest.find('"')?;
-    Some(rest[..q2].to_string())
+    for line in src.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        if !line.starts_with("#![") {
+            break;
+        }
+        let Some(rest) = line[3..].trim_start().strip_prefix(attr) else {
+            continue;
+        };
+        let Some(rest) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let Some(rest) = rest.trim_start().strip_prefix('"') else {
+            continue;
+        };
+        let end = rest.find('"')?;
+        return Some(rest[..end].to_string());
+    }
+    None
 }
 
 /// First `error` line of a compiler's stderr, for failure reasons.
@@ -1704,6 +1723,82 @@ fn first_error_line(stderr: &str) -> String {
         .chars()
         .take(200)
         .collect()
+}
+
+/// The `--extern` binding names a source file declares as its
+/// dependencies: for `//@ aux-crate:` the name before the `=`
+/// verbatim (modifiers and namespaced paths included), for
+/// `//@ aux-build:` / `//@ proc-macro:` the file stem with dashes
+/// as underscores, and for an `extern crate <name>;` item the
+/// crate name. Scoped directives (`//@[rev] ...`) count too: the
+/// union over revisions is what a caller that does not track
+/// revisions can bind, and it is still exactly the set the file
+/// declares somewhere — never unrelated crates.
+fn declared_aux_binding_names(src_text: &str) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    for line in src_text.lines() {
+        let trimmed = line.trim_start();
+        let code = trimmed.strip_prefix("pub ").unwrap_or(trimmed);
+        if let Some(rest) = code.strip_prefix("extern crate ") {
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() {
+                names.insert(name);
+            }
+        }
+        let Some(at) = line.find("//@") else { continue };
+        let rest = line[at + 3..].trim_start();
+        let rest = if rest.starts_with('[') {
+            match rest.find(']') {
+                Some(end) => rest[end + 1..].trim_start(),
+                None => continue,
+            }
+        } else {
+            rest
+        };
+        if let Some(value) = rest.strip_prefix("aux-crate:") {
+            if let Some((name, _)) = value.trim().split_once('=') {
+                names.insert(name.trim().to_string());
+            }
+        } else {
+            for directive in ["aux-build:", "proc-macro:"] {
+                if let Some(value) = rest.strip_prefix(directive) {
+                    let fname = value.trim().split_whitespace().next().unwrap_or("");
+                    if let Some(stem) = std::path::Path::new(fname).file_stem() {
+                        names.insert(stem.to_string_lossy().replace('-', "_"));
+                    }
+                }
+            }
+        }
+    }
+    names
+}
+
+/// The flags a source file's own `//@ compile-flags:` directives
+/// declare (whitespace-split; scoped directives included, as in
+/// [`declared_aux_binding_names`]). compiletest compiles each
+/// auxiliary crate with its own file's flags; the main
+/// compilation's flags come from the caller instead.
+fn declared_compile_flags(src_text: &str) -> Vec<String> {
+    let mut flags = Vec::new();
+    for line in src_text.lines() {
+        let Some(at) = line.find("//@") else { continue };
+        let rest = line[at + 3..].trim_start();
+        let rest = if rest.starts_with('[') {
+            match rest.find(']') {
+                Some(end) => rest[end + 1..].trim_start(),
+                None => continue,
+            }
+        } else {
+            rest
+        };
+        if let Some(value) = rest.strip_prefix("compile-flags:") {
+            flags.extend(value.split_whitespace().map(str::to_string));
+        }
+    }
+    flags
 }
 
 /// One `--aux` specification: the crate name and source path from
@@ -1751,7 +1846,19 @@ fn parse_aux_spec(spec: &str) -> Result<AuxSpec, String> {
 
 /// One compiled auxiliary crate.
 struct AuxBuilt {
+    /// The name the crate was compiled under: its source's own
+    /// `#![crate_name]` when it declares one, else the source file
+    /// stem with dashes as underscores — the name compiletest's
+    /// auxiliary builds carry, and the name the crate's metadata
+    /// (and so the Stable MIR session) knows it by.
     name: String,
+    /// The name dependents and the main compilation bind the crate
+    /// under with `--extern`: the `--aux` spec's name verbatim. It
+    /// may carry `--extern` modifiers (`priv:foo`,
+    /// `priv,noprelude:foo`) or a namespaced-crates path
+    /// (`my_api::utils`), neither of which is a valid `--crate-name`
+    /// for the auxiliary build itself.
+    extern_name: String,
     /// Artifact to link with `--extern`; `None` for crate types
     /// that expose no Rust API (cdylib and friends).
     artifact: Option<std::path::PathBuf>,
@@ -1760,8 +1867,12 @@ struct AuxBuilt {
     collect: bool,
 }
 
-/// Compile one auxiliary source file with the pinned rustc, as a
-/// library crate named `spec.name`, into `aux_dir`. Previously built
+/// Compile one auxiliary source file with the pinned rustc into
+/// `aux_dir`, under the source's declared `#![crate_name]` or the
+/// file-stem name compiletest's auxiliary builds use (never the
+/// `--aux` spec's binding name: that string may carry `--extern`
+/// modifiers or a namespaced-crates path, which are binding syntax,
+/// not crate names). Previously built
 /// auxiliary crates are visible through `--extern`, so callers pass
 /// the crates in dependency order. The crate is built with
 /// `spec.edition` when the caller attached one (compiletest builds
@@ -1788,7 +1899,14 @@ fn compile_aux(
         .or(spec.crate_type.as_deref())
         .unwrap_or("rlib");
     let declared_name = declared_crate_name(&src_text);
-    let effective_name = declared_name.as_deref().unwrap_or(name);
+    // The build name: the declared `#![crate_name]`, else the file
+    // stem with dashes as underscores (compiletest's
+    // path_to_crate_name). The spec's binding name is used only for
+    // `--extern`, never as `--crate-name`.
+    let stem_name = std::path::Path::new(src_path)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().replace('-', "_"));
+    let effective_name = declared_name.as_deref().or(stem_name.as_deref()).unwrap_or(name);
     let rustc = std::path::Path::new(sysroot).join("bin").join("rustc");
     let mut cmd = std::process::Command::new(&rustc);
     // `-Zalways-encode-mir` makes the compiler encode every
@@ -1812,13 +1930,29 @@ fn compile_aux(
         cmd.arg(format!("--crate-type={effective_type}"));
     }
     if declared_name.is_none() {
-        cmd.arg(format!("--crate-name={name}"));
+        cmd.arg(format!("--crate-name={effective_name}"));
     }
+    // Bind only the auxiliary crates this source declares as its
+    // own dependencies (compiletest binds an auxiliary crate's
+    // declared deps, not every crate built so far): binding an
+    // unrelated crate can change the outcome — a `priv:`-modified
+    // or namespaced binding is invalid without the flags that
+    // accompany its declaration, and a crate visible as a direct
+    // dependency is not a private one. Undeclared transitive deps
+    // still resolve through the `-L dependency` directory above.
+    let deps = declared_aux_binding_names(&src_text);
     for prev in previous {
         if let Some(artifact) = &prev.artifact {
-            cmd.arg("--extern")
-                .arg(format!("{}={}", prev.name, artifact.display()));
+            if deps.contains(&prev.extern_name) {
+                cmd.arg("--extern")
+                    .arg(format!("{}={}", prev.extern_name, artifact.display()));
+            }
         }
+    }
+    // The auxiliary crate's own `//@ compile-flags:` (compiletest
+    // compiles each auxiliary crate with its own file's flags).
+    for flag in declared_compile_flags(&src_text) {
+        cmd.arg(flag);
     }
     let out = cmd
         .output()
@@ -1864,6 +1998,7 @@ fn compile_aux(
     }
     Ok(AuxBuilt {
         name: effective_name.to_string(),
+        extern_name: name.to_string(),
         artifact: if link { artifact } else { None },
         collect,
     })
@@ -2016,10 +2151,22 @@ fn main() {
     if !aux_built.is_empty() {
         args.push("-L".to_string());
         args.push(format!("dependency={}", aux_dir.display()));
+        // Bind only the auxiliary crates the test file itself
+        // declares (compiletest binds a test's own aux directives;
+        // transitive auxiliary crates reach the main compilation
+        // through their dependents' re-exports and the `-L`
+        // directory, not as direct `--extern`s — a transitive crate
+        // bound directly stops being a private dependency, which
+        // changes lint outcomes like exported_private_dependencies).
+        let top_names = std::fs::read_to_string(&input)
+            .map(|text| declared_aux_binding_names(&text))
+            .unwrap_or_default();
         for built in &aux_built {
             if let Some(artifact) = &built.artifact {
-                args.push("--extern".to_string());
-                args.push(format!("{}={}", built.name, artifact.display()));
+                if top_names.contains(&built.extern_name) {
+                    args.push("--extern".to_string());
+                    args.push(format!("{}={}", built.extern_name, artifact.display()));
+                }
             }
         }
         // An auxiliary crate may carry the same name as the main

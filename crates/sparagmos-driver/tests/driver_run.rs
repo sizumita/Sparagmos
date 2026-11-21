@@ -593,6 +593,81 @@ fn run_mode_aux_without_edition_attribute_uses_main_edition() {
 }
 
 #[test]
+fn run_mode_aux_namespaced_binding_name() {
+    // Lane CI: an `--aux` spec name is an `--extern` binding
+    // string, not a crate name: `my_api::utils` is a namespaced
+    // binding (compiletest's open-ns tests, enabled by the test's
+    // own `-Z namespaced-crates` compile-flag). The crate builds
+    // under its file stem and binds under the namespaced name;
+    // passing the binding to `--crate-name` made rustc reject
+    // the build ("invalid character ':' in crate name").
+    let dir = temp_dir("aux-namespaced");
+    let aux = fixture(
+        &dir,
+        "open-ns-my_api_utils.rs",
+        "pub fn val() -> i32 { 7 }\n",
+    );
+    let src = fixture(
+        &dir,
+        "nsmain2.rs",
+        "//@ aux-crate:my_api::utils=open-ns-my_api_utils.rs\n\
+         fn main() { println!(\"v={}\", my_api::utils::val()); }\n",
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run")
+        .arg(&src)
+        .arg("--rustc-arg")
+        .arg("-Z")
+        .arg("--rustc-arg")
+        .arg("namespaced-crates")
+        .arg("--aux")
+        .arg(aux_spec("my_api::utils", &aux, ""))
+        .output()
+        .expect("failed to run sparagmos-driver");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "namespaced aux binding must build and run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "v=7\n");
+}
+
+#[test]
+fn run_mode_aux_commented_crate_name_is_not_a_declaration() {
+    // Lane CI: `// #![crate_name = "my_api::core"]` at the top of
+    // an auxiliary source is a comment, not a declaration. Reading
+    // it as one made the driver search for an artifact under the
+    // namespaced name and report "produced no linkable artifact"
+    // for a build that had in fact succeeded under the file stem.
+    let dir = temp_dir("aux-commented-name");
+    let aux = fixture(
+        &dir,
+        "thing-core.rs",
+        "// #![crate_name = \"my_api::core\"]\n\
+         pub fn val() -> i32 { 9 }\n",
+    );
+    let src = fixture(
+        &dir,
+        "cmain.rs",
+        "extern crate thing_core;\n\
+         fn main() { println!(\"v={}\", thing_core::val()); }\n",
+    );
+    let out = run_driver_with_aux_specs(
+        &src,
+        None,
+        &[aux_spec("thing_core", &aux, "")],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "commented crate_name must be ignored; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "v=9\n");
+}
+
+#[test]
 fn run_mode_nested_aux_crates_execute() {
     // Auxiliary crates are passed in dependency order: `mid` uses
     // `base`, and the main crate uses `mid`.
