@@ -303,6 +303,11 @@ pub struct Interpreter<'a> {
     /// Everything the guest wrote to its stderr (via the runtime
     /// print support) during the most recent run.
     error_output: String,
+    /// Guest output capture for the libtest harness: while a
+    /// test runs, its stdout and stderr writes (in write order)
+    /// accumulate here instead of the run's own buffers, the way
+    /// libtest captures a test's output for its failure report.
+    guest_capture: Option<String>,
     /// Drop glue suspended on destructor calls (see
     /// [`DropContinuation`]); a stack, innermost last.
     drop_continuations: Vec<DropContinuation>,
@@ -447,6 +452,7 @@ impl<'a> Interpreter<'a> {
             next_frame_id: 0,
             output: String::new(),
             error_output: String::new(),
+            guest_capture: None,
             drop_continuations: Vec::new(),
             resume_signaled: false,
             panic_hook: std::cell::RefCell::new(None),
@@ -498,11 +504,85 @@ impl<'a> Interpreter<'a> {
     }
 
     pub(crate) fn push_error_output(&mut self, text: &str) {
-        self.error_output.push_str(text);
+        if let Some(capture) = &mut self.guest_capture {
+            capture.push_str(text);
+        } else {
+            self.error_output.push_str(text);
+        }
     }
 
     pub(crate) fn push_output(&mut self, text: &str) {
-        self.output.push_str(text);
+        if let Some(capture) = &mut self.guest_capture {
+            capture.push_str(text);
+        } else {
+            self.output.push_str(text);
+        }
+    }
+
+    /// Begin capturing guest output (see the `guest_capture`
+    /// field): writes go to a fresh capture buffer until
+    /// [`Interpreter::end_guest_capture`].
+    pub(crate) fn begin_guest_capture(&mut self) {
+        self.guest_capture = Some(String::new());
+    }
+
+    /// End the capture begun by
+    /// [`Interpreter::begin_guest_capture`] and return what the
+    /// guest wrote meanwhile.
+    pub(crate) fn end_guest_capture(&mut self) -> String {
+        self.guest_capture.take().unwrap_or_default()
+    }
+
+    /// The location of the most recently raised guest panic, as
+    /// (file, line, column): the caller-location stamp the panic
+    /// entry builtins recorded (see
+    /// [`Interpreter::last_panic_stamp`]). `None` when the panic
+    /// carried no stamp (the interpreter's own modelled panics).
+    pub(crate) fn panic_stamp_location(&self) -> Option<(String, u32, u32)> {
+        let stamp = self.last_panic_stamp.borrow().clone()?;
+        let value = match stamp {
+            Value::Ref(RefTarget::Value(inner)) => *inner,
+            other => other,
+        };
+        let Value::Enum { fields, .. } = value else {
+            return None;
+        };
+        if fields.len() < 3 {
+            return None;
+        }
+        // The file is a `&str`: the value itself, or the
+        // one-field wrapper the constant decoder gives a fat
+        // pointer constant.
+        let file = match &fields[0] {
+            Value::Str(file) => file,
+            Value::Enum { fields, .. } if fields.len() == 1 => match &fields[0] {
+                Value::Str(file) => file,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let line = match &fields[1] {
+            Value::Uint(n) => *n as u32,
+            Value::Int(n) => *n as u32,
+            _ => return None,
+        };
+        let col = match &fields[2] {
+            Value::Uint(n) => *n as u32,
+            Value::Int(n) => *n as u32,
+            _ => return None,
+        };
+        Some((file.clone(), line, col))
+    }
+
+    /// Whether the guest's panic hook is the default one (no
+    /// custom hook installed): only then does a panicking test's
+    /// captured output carry the default hook's report, which
+    /// the libtest harness reproduces.
+    pub(crate) fn default_panic_hook_active(&self) -> bool {
+        match &*self.panic_hook.borrow() {
+            None => true,
+            Some(hook) => is_default_hook(hook),
+        }
     }
 
     /// The current length of the guest's captured stdout, as a
