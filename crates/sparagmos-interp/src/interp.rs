@@ -3925,6 +3925,15 @@ impl<'a> Interpreter<'a> {
                 local,
                 projection,
             } => {
+                // Union field reads need the typed projector and
+                // the owned path's rescue rules; they take the
+                // owned read unchanged (the pre-GK behaviour).
+                if projection
+                    .iter()
+                    .any(|step| matches!(step, RefProj::UnionField { .. }))
+                {
+                    return Ok(Cow::Owned(self.read_resolved(frames, target)?));
+                }
                 let frame = &frames[*frame_pos];
                 let base = frame.locals.get(*local).ok_or_else(|| {
                     InterpError::UnknownLocal {
@@ -3953,17 +3962,28 @@ impl<'a> Interpreter<'a> {
                         return Ok(Cow::Owned(value));
                     }
                 }
-                let value = project_value_ref(base, projection, &frame.func, &place_desc)?;
-                if *value == Value::Uninit {
-                    return Err(InterpError::UninitializedRead {
-                        func: frame.func.clone(),
-                        place: if projection.is_empty() {
-                            describe_resolved(*local, projection)
-                        } else {
-                            place_desc
-                        },
-                    });
-                }
+                let value = match project_value_ref(base, projection, &frame.func, &place_desc) {
+                    Ok(v) if *v != Value::Uninit => v,
+                    Ok(_) | Err(InterpError::UninitializedRead { .. }) => {
+                        // Mirror the owned read: a single-valued
+                        // field denotes its value when nothing was
+                        // ever written there.
+                        match self.zst_field_value(frame, *local, projection) {
+                            Some(v) => return Ok(Cow::Owned(v)),
+                            None => {
+                                return Err(InterpError::UninitializedRead {
+                                    func: frame.func.clone(),
+                                    place: if projection.is_empty() {
+                                        describe_resolved(*local, projection)
+                                    } else {
+                                        place_desc
+                                    },
+                                });
+                            }
+                        }
+                    }
+                    Err(e) => return Err(e),
+                };
                 Ok(value)
             }
         }
