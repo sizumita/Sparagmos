@@ -4902,6 +4902,61 @@ fn run_mode_transmute_invalid_char_is_explicit_unsupported() {
     );
 }
 
+const NONZERO_TRANSMUTE_SRC: &str = r#"
+use std::num::NonZero;
+fn main() {
+    let x: NonZero<u32> = unsafe { std::mem::transmute(42u32) };
+    println!("nz {}", x.get());
+    let y: u32 = unsafe { std::mem::transmute(x) };
+    println!("back {}", y);
+    let z: NonZero<i32> = unsafe { std::mem::transmute(-5i32) };
+    println!("neg {}", z.get());
+    let w: NonZero<u16> = unsafe { std::mem::transmute(7u16) };
+    println!("w {}", w.get());
+}
+"#;
+
+#[test]
+fn run_mode_nonzero_transmute_roundtrip() {
+    // `NonZero<T>`'s only field is declared as the projection
+    // alias `<T as ZeroablePrimitive>::NonZeroInner`; the driver
+    // records the compiler-normalized field type of each
+    // monomorphic instance, so the transmutes (and `get`, itself
+    // a transmute in core) execute.
+    run_ok("nonzero-transmute", NONZERO_TRANSMUTE_SRC, "nz 42\nback 42\nneg -5\nw 7\n");
+}
+
+const NONZERO_FIELD_SRC: &str = r#"
+use std::num::NonZero;
+struct Wrap { tag: u8, val: NonZero<u32> }
+fn main() {
+    let v: NonZero<u32> = unsafe { std::mem::transmute(9u32) };
+    let w = Wrap { tag: 3, val: v };
+    println!("field {} {}", w.tag, w.val.get());
+    let raw: u32 = unsafe { std::mem::transmute(w.val) };
+    println!("raw {}", raw);
+}
+"#;
+
+#[test]
+fn run_mode_nonzero_field_in_struct() {
+    run_ok("nonzero-field", NONZERO_FIELD_SRC, "field 3 9\nraw 9\n");
+}
+
+const NONZERO_LAYOUT_SRC: &str = r#"
+use std::num::NonZero;
+fn main() {
+    println!("{} {}", std::mem::size_of::<Option<NonZero<u32>>>(), std::mem::size_of::<u32>());
+    println!("{}", std::mem::size_of::<Option<NonZero<u64>>>());
+    println!("{}", std::mem::size_of::<NonZero<u32>>());
+}
+"#;
+
+#[test]
+fn run_mode_nonzero_layout_sizes() {
+    run_ok("nonzero-layout", NONZERO_LAYOUT_SRC, "4 4\n8\n4\n");
+}
+
 const RC_ARC_DROP_SRC: &str = r#"
 use std::rc::Rc;
 use std::sync::Arc;
