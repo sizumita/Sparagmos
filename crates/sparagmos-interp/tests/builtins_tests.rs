@@ -3197,3 +3197,171 @@ fn atomic_fence_is_a_no_op() {
     let value = interpret_mir(&program_cu(body), "main", vec![]).expect("run");
     assert_eq!(value, Value::Int(5));
 }
+
+// ----- Waker construction from smart pointers (Lane DQ) ----------------------
+//
+// `Waker::from(Arc<T: Wake>)` (and the unstable `LocalWaker`'s
+// `From<Rc<T: LocalWake>>`): std builds a `RawWaker` whose data
+// pointer is the smart pointer's allocation and whose vtable
+// forwards wake/clone/drop to it. The modelled waker is that
+// allocation's value carried in a one-field aggregate.
+
+const FROM_FROM: mir::DefId = mir::DefId::new(0, 430);
+const WAKER_TY: mir::DefId = mir::DefId::new(0, 431);
+const LOCAL_WAKER_TY: mir::DefId = mir::DefId::new(0, 432);
+
+fn names_dq() -> HashMap<mir::DefId, String> {
+    let mut names = names_bi();
+    names.extend([
+        (FROM_FROM, "std::convert::From::from".to_string()),
+        (WAKER_TY, "std::task::Waker".to_string()),
+        (LOCAL_WAKER_TY, "std::task::LocalWaker".to_string()),
+    ]);
+    names
+}
+
+fn program_dq(body: mir::Body) -> MirProgram {
+    let mut prog = MirProgram::new();
+    prog.add("main", body);
+    prog.fn_names = names_dq();
+    prog
+}
+
+fn waker_ty() -> mir::Ty {
+    mir::Ty::Adt(WAKER_TY, vec![])
+}
+
+fn local_waker_ty() -> mir::Ty {
+    mir::Ty::Adt(LOCAL_WAKER_TY, vec![])
+}
+
+fn arc_i32_ty() -> mir::Ty {
+    mir::Ty::Adt(ARC_TY, vec![i32_ty()])
+}
+
+fn rc_i32_ty() -> mir::Ty {
+    mir::Ty::Adt(RC_TY, vec![i32_ty()])
+}
+
+#[test]
+fn waker_from_arc_carries_the_arc_value() {
+    // fn main() -> Waker {
+    //   _1 = Arc::new(7);
+    //   _0 = From::from::<Waker, Arc<i32>>(move _1);
+    //   return _0;
+    // }
+    let body = mir::Body::new(
+        decls(&[waker_ty(), arc_i32_ty()]),
+        0,
+        vec![
+            block(
+                vec![],
+                call(fndef(ARC_NEW, vec![i32_ty()]), vec![const_i32(7)], 1, 1),
+            ),
+            block(
+                vec![],
+                call(
+                    fndef(FROM_FROM, vec![waker_ty(), arc_i32_ty()]),
+                    vec![move_(1)],
+                    0,
+                    2,
+                ),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_dq(body), "main", vec![]).expect("run");
+    assert_eq!(
+        value,
+        Value::Enum {
+            variant: 0,
+            fields: vec![Value::Enum {
+                variant: 0,
+                fields: vec![Value::Uint(7)],
+            }],
+        }
+    );
+}
+
+#[test]
+fn local_waker_from_rc_carries_the_rc_value() {
+    // fn main() -> LocalWaker {
+    //   _1 = Rc::new(9);
+    //   _0 = From::from::<LocalWaker, Rc<i32>>(move _1);
+    //   return _0;
+    // }
+    let body = mir::Body::new(
+        decls(&[local_waker_ty(), rc_i32_ty()]),
+        0,
+        vec![
+            block(
+                vec![],
+                call(fndef(RC_NEW, vec![i32_ty()]), vec![const_i32(9)], 1, 1),
+            ),
+            block(
+                vec![],
+                call(
+                    fndef(FROM_FROM, vec![local_waker_ty(), rc_i32_ty()]),
+                    vec![move_(1)],
+                    0,
+                    2,
+                ),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_dq(body), "main", vec![]).expect("run");
+    assert_eq!(
+        value,
+        Value::Enum {
+            variant: 0,
+            fields: vec![Value::Enum {
+                variant: 0,
+                fields: vec![Value::Uint(9)],
+            }],
+        }
+    );
+}
+
+#[test]
+fn waker_from_rc_stays_unsupported() {
+    // std has no `From<Rc<T>> for Waker` (a `Waker` crosses
+    // threads, an `Rc` cannot), so the conversion stays an
+    // explicit error rather than silently producing a waker.
+    // fn main() -> Waker {
+    //   _1 = Rc::new(7);
+    //   _0 = From::from::<Waker, Rc<i32>>(move _1);
+    //   return _0;
+    // }
+    let body = mir::Body::new(
+        decls(&[waker_ty(), rc_i32_ty()]),
+        0,
+        vec![
+            block(
+                vec![],
+                call(fndef(RC_NEW, vec![i32_ty()]), vec![const_i32(7)], 1, 1),
+            ),
+            block(
+                vec![],
+                call(
+                    fndef(FROM_FROM, vec![waker_ty(), rc_i32_ty()]),
+                    vec![move_(1)],
+                    0,
+                    2,
+                ),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let err = interpret_mir(&program_dq(body), "main", vec![])
+        .expect_err("Waker from Rc must fail explicitly");
+    match err {
+        MirRunError::Interp(InterpError::UnsupportedTerminator { kind }) => {
+            assert!(
+                kind.contains("to std::task::Waker is not runtime-supported"),
+                "error names the conversion: {kind}"
+            );
+        }
+        other => panic!("expected an explicit unsupported error, got {other:?}"),
+    }
+}
