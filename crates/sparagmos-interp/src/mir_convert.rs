@@ -1042,6 +1042,20 @@ impl<'a> Converter<'a> {
             .unwrap_or_else(|| format!("{def:?}"))
     }
 
+    /// The program key of the body a `DefId` names, for references
+    /// that must land on one specific converted body (closure
+    /// values and closure types): the converted-body table first —
+    /// it is keyed by the exact (definition, instance) id the
+    /// driver assigned, so two instances of one closure definition
+    /// resolve to their own bodies — and the display name only as
+    /// a fallback for definitions with no body in the program.
+    fn body_key(&self, def: &mir::DefId) -> String {
+        self.def_names
+            .get(def)
+            .cloned()
+            .unwrap_or_else(|| self.def_display_name(def))
+    }
+
     /// The name of a concrete type as it appears in the `Self`
     /// position of its impl method names in the program
     /// (`<{name} as Trait>::method`): the definition's display name
@@ -1091,7 +1105,7 @@ impl<'a> Converter<'a> {
                     Some(mir::Ty::Tuple(ts)) => ts.len(),
                     _ => 0,
                 };
-                ir::Ty::Closure(self.def_display_name(def), upvars)
+                ir::Ty::Closure(self.body_key(def), upvars)
             }
             mir::Ty::Ref(_, inner, _) => {
                 ir::Ty::Ref(Box::new(self.convert_ty(inner, context)?))
@@ -1211,7 +1225,7 @@ impl<'a> Converter<'a> {
                     _ => usize::MAX,
                 };
                 if upvars == 0 {
-                    Ok(ir::Constant::Closure(self.def_display_name(def)))
+                    Ok(ir::Constant::Closure(self.body_key(def)))
                 } else {
                     Err(ConvertError::UnsupportedConstant {
                         kind: format!(
@@ -1338,7 +1352,7 @@ impl<'a> Converter<'a> {
                 ir::Constant::FnDef(self.def_display_name(def))
             }
             mir::ConstValue::Closure(def) => {
-                ir::Constant::Closure(self.def_display_name(def))
+                ir::Constant::Closure(self.body_key(def))
             }
             mir::ConstValue::ByRef { .. } => {
                 return Err(ConvertError::UnsupportedConstant {
@@ -1781,7 +1795,7 @@ impl<'a> Converter<'a> {
                         fields.push(self.convert_operand(body, op, upvar_tys.get(i))?);
                     }
                     ir::Rvalue::ClosureAggregate {
-                        def: self.def_display_name(def),
+                        def: self.body_key(def),
                         operands: fields,
                     }
                 }
