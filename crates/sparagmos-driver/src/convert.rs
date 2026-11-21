@@ -587,20 +587,32 @@ impl Converter {
                 unwind,
                 ..
             } => {
-                // The no-op class (empty / comment-only / nop-only
-                // template, no NORETURN) converts for real: stepping
-                // over it is the execution semantics. An operand
-                // with an out place is *written* by the assembly,
-                // which no executor models, so any such operand —
-                // like any non-trivial template — keeps the named
-                // conversion error.
+                // Two classes convert for real (see
+                // `sm::inline_asm_is_noop` and
+                // `sm::inline_asm_program`): the no-op class
+                // (empty / comment-only / nop-only template, no
+                // NORETURN) when no operand place is written, and
+                // the evaluable register-program class, whose
+                // operands the structured form below carries in
+                // full. Anything else keeps the named conversion
+                // error.
                 let has_out_place = operands.iter().any(|op| op.out_place.is_some());
                 let noop = !has_out_place && sm::inline_asm_is_noop(template, options);
-                let ops = if noop {
+                let supported = noop
+                    || sm::inline_asm_program(
+                        template,
+                        options,
+                        &operands
+                            .iter()
+                            .map(|op| self.asm_operand(body, op, false))
+                            .collect::<Vec<_>>(),
+                        destination.is_some(),
+                    )
+                    .is_some();
+                let ops = if supported {
                     operands
                         .iter()
-                        .filter_map(|op| op.in_value.as_ref())
-                        .map(|op| self.operand(op))
+                        .map(|op| self.asm_operand(body, op, true))
                         .collect()
                 } else {
                     self.err("TerminatorKind::InlineAsm");
@@ -614,6 +626,72 @@ impl Converter {
                     unwind: self.unwind(unwind),
                 }
             }
+        }
+    }
+
+    /// One Stable MIR inline-asm operand in the structured form
+    /// the executors consume. The public operand struct keeps only
+    /// the value/place pair, so the kind and the register are read
+    /// from its raw representation (`In { reg: RegClass(X86(reg)),
+    /// value: .. }`, `Const { value: const 5_usize }`, ...). With
+    /// `convert` false only the classification facts are computed
+    /// (the value and place stay empty): classification must not
+    /// itself convert operands of a terminator it may reject.
+    fn asm_operand(
+        &mut self,
+        body: &mir::Body,
+        op: &mir::InlineAsmOperand,
+        convert: bool,
+    ) -> sm::InlineAsmOperand {
+        let raw = op.raw_rpr.as_str();
+        let kind = if raw.starts_with("InOut {") {
+            sm::AsmOperandKind::InOut
+        } else if raw.starts_with("In {") {
+            sm::AsmOperandKind::In
+        } else if raw.starts_with("Out {") {
+            sm::AsmOperandKind::Out
+        } else if raw.starts_with("Const {") {
+            sm::AsmOperandKind::Const
+        } else {
+            sm::AsmOperandKind::Sym
+        };
+        let reg_class = raw.contains("reg: RegClass(");
+        let (width, const_bits) = match kind {
+            sm::AsmOperandKind::Const => match asm_const_literal(raw) {
+                Some((bits, width)) => (width, Some(bits)),
+                None => (0, None),
+            },
+            sm::AsmOperandKind::Sym => (0, None),
+            sm::AsmOperandKind::In => (
+                op.in_value
+                    .as_ref()
+                    .and_then(|v| v.ty(body.locals()).ok())
+                    .map_or(0, |t| asm_type_width(&t)),
+                None,
+            ),
+            _ => (
+                op.out_place
+                    .as_ref()
+                    .and_then(|p| p.ty(body.locals()).ok())
+                    .map_or(0, |t| asm_type_width(&t)),
+                None,
+            ),
+        };
+        sm::InlineAsmOperand {
+            kind,
+            reg_class,
+            width,
+            const_bits,
+            in_value: if convert {
+                op.in_value.as_ref().map(|v| self.operand(v))
+            } else {
+                None
+            },
+            out_place: if convert {
+                op.out_place.as_ref().map(|p| self.place(p))
+            } else {
+                None
+            },
         }
     }
 
@@ -2906,6 +2984,64 @@ fn borrow_kind(b: &mir::BorrowKind) -> sm::BorrowKind {
             allow_two_phase_borrow: matches!(kind, mir::MutBorrowKind::TwoPhaseBorrow),
         },
     }
+}
+
+/// The width in bits of an inline-asm operand type: a plain
+/// integer type, `bool` (8) or `char` (32). 0 for anything else
+/// (floats, aggregates, pointers), which keeps the terminator
+/// outside the evaluable class. `isize`/`usize` are 64 on the
+/// x86_64 target Sparagmos aims at.
+fn asm_type_width(ty: &Ty) -> u32 {
+    match ty.kind() {
+        TyKind::RigidTy(RigidTy::Int(t)) => match t {
+            SmirIntTy::I8 => 8,
+            SmirIntTy::I16 => 16,
+            SmirIntTy::I32 => 32,
+            SmirIntTy::I64 | SmirIntTy::Isize => 64,
+            SmirIntTy::I128 => 128,
+        },
+        TyKind::RigidTy(RigidTy::Uint(t)) => match t {
+            SmirUintTy::U8 => 8,
+            SmirUintTy::U16 => 16,
+            SmirUintTy::U32 => 32,
+            SmirUintTy::U64 | SmirUintTy::Usize => 64,
+            SmirUintTy::U128 => 128,
+        },
+        TyKind::RigidTy(RigidTy::Bool) => 8,
+        TyKind::RigidTy(RigidTy::Char) => 32,
+        _ => 0,
+    }
+}
+
+/// Read an integer literal out of a `Const` asm operand's raw
+/// representation (`Const { value: const 5_usize }`): the bits
+/// (masked to the type width) and the width. `None` for any other
+/// shape (an unevaluated or non-integer constant).
+fn asm_const_literal(raw: &str) -> Option<(u64, u32)> {
+    let inner = raw
+        .strip_prefix("Const { value: const ")?
+        .strip_suffix(" }")?;
+    let (num, width) = match inner.rsplit_once('_') {
+        Some((num, suffix)) => {
+            let width = match suffix {
+                "i8" | "u8" => 8,
+                "i16" | "u16" => 16,
+                "i32" | "u32" => 32,
+                "i64" | "u64" | "isize" | "usize" => 64,
+                "i128" | "u128" => 128,
+                _ => return None,
+            };
+            (num, width)
+        }
+        None => return None,
+    };
+    let value: i128 = num.parse().ok()?;
+    let bits = if width >= 128 {
+        value as u64
+    } else {
+        (value as u64) & ((1u64 << width) - 1)
+    };
+    Some((bits, width))
 }
 
 fn fake_read_cause(c: &mir::FakeReadCause) -> sm::FakeReadCause {
