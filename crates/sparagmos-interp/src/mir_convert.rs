@@ -288,7 +288,10 @@ pub fn convert_program(program: &MirProgram) -> Result<ir::Program, ConvertError
 /// A function's key is its name — except when several functions
 /// share one name. That is the case for anonymous `const _` items:
 /// the driver names every one of them by the same item path (a
-/// crate's `::_`), while their bodies are distinct items. Bodies
+/// crate's `::_`), while their bodies are distinct items. It is
+/// also the case for a `--test` crate's two `main` functions —
+/// the user's and the generated harness entry — which share the
+/// definition name `<crate>::main`. Bodies
 /// sharing a name are disambiguated by their `DefId`, which is
 /// also how every reference to them resolves (call and constant
 /// operands name a `DefId`, never the shared display name), so a
@@ -407,6 +410,31 @@ fn program_keys(program: &MirProgram) -> Result<Vec<String>, ConvertError> {
         keys.push(key);
     }
     Ok(keys)
+}
+
+/// The key [`program_keys`] stores one member of `program` under:
+/// its name, or the `DefId`-disambiguated form when another member
+/// shares the name. A caller that addresses a single known
+/// function from outside the program — the driver naming the run
+/// entry point — uses this, so the name it hands the interpreter
+/// is the one conversion actually stored the body under. (With a
+/// shared name and no `DefId` to disambiguate by, conversion as a
+/// whole fails in [`program_keys`]; the bare name is returned here
+/// and that failure surfaces first.)
+pub fn program_key_of(program: &MirProgram, func: &MirFunction) -> String {
+    match func.def_id {
+        Some(def)
+            if program
+                .functions
+                .iter()
+                .filter(|f| f.name == func.name)
+                .count()
+                > 1 =>
+        {
+            format!("{}#{def}", func.name)
+        }
+        _ => func.name.clone(),
+    }
 }
 
 /// [`convert_program`] plus the per-function conversion failures,

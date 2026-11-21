@@ -66,7 +66,7 @@ pub use ir::{
 };
 pub use mir_convert::{
     convert_program, interpret_mir, interpret_mir_captured,
-    interpret_mir_captured_with_config, CapturedRun, ConvertError, MirFunction, MirProgram,
-    MirRunError,
+    interpret_mir_captured_with_config, program_key_of, CapturedRun, ConvertError, MirFunction,
+    MirProgram, MirRunError,
 };
 pub use value::{FmtArguments, FmtTrait, RefProj, RefTarget, Value};

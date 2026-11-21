@@ -140,6 +140,13 @@ struct Collected {
     /// after conversion. When set, the compilation as a whole has
     /// failed even though every converted body translated cleanly.
     compile_error: Option<String>,
+    /// The entry point rustc designated for this crate, as a
+    /// Sparagmos `DefId` into `body_def_ids`, when the crate has
+    /// one. In a `--test` crate this is the generated harness
+    /// main, which shares the definition name `<crate>::main`
+    /// with the user's own `main`; run mode enters through this
+    /// id, never through the name alone.
+    entry_def_id: Option<sparagmos_mir::DefId>,
 }
 
 static COLLECTED: OnceLock<Mutex<Option<Collected>>> = OnceLock::new();
@@ -2133,6 +2140,8 @@ fn collect() -> ControlFlow<()> {
         .clone()
         .or_else(|| sparagmos_driver::mono_check::check_bodies(&alias_sources));
 
+    let entry_def_id = entry_point_def_id(&mut conv, &items);
+
     stash(Collected {
         report,
         bodies,
@@ -2140,6 +2149,7 @@ fn collect() -> ControlFlow<()> {
         body_def_names,
         local_body_count,
         local_report_count,
+        entry_def_id,
         def_names: conv.def_names.clone(),
         adt_discriminants: conv.adt_discriminants.clone(),
         compile_error,
@@ -2147,6 +2157,26 @@ fn collect() -> ControlFlow<()> {
         adt_shapes: conv.adt_shapes.clone(),
     });
     ControlFlow::Continue(())
+}
+
+/// The Sparagmos `DefId` of the entry point rustc designated
+/// for this crate, if it has one: the user's `main` in a binary
+/// crate, the generated harness main in a `--test` crate. The
+/// two share the definition name `<crate>::main` in a test
+/// crate, so the entry cannot be recovered from names; it is
+/// resolved here through the same instance the item loop
+/// converted, to the id that body carries in
+/// `Collected::body_def_ids`.
+fn entry_point_def_id(
+    conv: &mut Converter,
+    items: &[rustc_public::CrateItem],
+) -> Option<sparagmos_mir::DefId> {
+    let entry = std::panic::catch_unwind(rustc_public::entry_fn).ok()??;
+    let item = items.iter().find(|item| item.def_id() == entry.def_id())?;
+    match Instance::try_from(item.clone()) {
+        Ok(inst) => Some(conv.instance_def_id(item.def_id(), &inst)),
+        Err(_) => None,
+    }
 }
 
 fn is_main(name: &str) -> bool {
@@ -2210,11 +2240,26 @@ fn execute(c: &Collected, guest_args: &[String]) -> i32 {
     program.adt_discriminants = c.adt_discriminants.clone();
     program.adt_layouts = c.adt_layouts.clone();
     program.adt_shapes = c.adt_shapes.clone();
-    let Some(entry) = c.bodies[..c.local_body_count]
-        .iter()
-        .map(|(n, _)| n)
-        .find(|n| is_main(n))
-    else {
+    // The entry body: the one rustc designated (see
+    // `Collected::entry_def_id`) when collection recorded it, and
+    // otherwise the first local body named `main`. A `--test`
+    // crate has two bodies named `<crate>::main` — the user's and
+    // the harness's — and only the designated one is the entry:
+    // the user's `main` is an ordinary function there, neither
+    // the entry nor run twice.
+    let entry_index = c
+        .entry_def_id
+        .and_then(|def| {
+            c.body_def_ids[..c.local_body_count]
+                .iter()
+                .position(|id| *id == def)
+        })
+        .or_else(|| {
+            c.bodies[..c.local_body_count]
+                .iter()
+                .position(|(n, _)| is_main(n))
+        });
+    let Some(entry_index) = entry_index else {
         for f in &c.report.functions {
             if is_main(&f.name) {
                 if let FnOutcome::Skipped { reasons } = &f.outcome {
@@ -2233,13 +2278,20 @@ fn execute(c: &Collected, guest_args: &[String]) -> i32 {
         );
         return 2;
     };
+    // The interpreter keys a body whose name another body shares
+    // under a `DefId`-disambiguated key; hand it the key
+    // conversion stored this body under, not the bare name (the
+    // bare name of a `--test` crate's harness main is also the
+    // user's `main`, and names no stored body at all).
+    let entry = sparagmos_interp::program_key_of(&program, &program.functions[entry_index]);
+    let entry_name = program.functions[entry_index].name.clone();
     let config = sparagmos_interp::InterpConfig {
         guest_args: guest_args.to_vec(),
         ..sparagmos_interp::InterpConfig::default()
     };
     let run = sparagmos_interp::interpret_mir_captured_with_config(
         &program,
-        entry,
+        &entry,
         Vec::new(),
         config,
     );
@@ -2255,7 +2307,7 @@ fn execute(c: &Collected, guest_args: &[String]) -> i32 {
         Ok(sparagmos_interp::Value::Unit) => 0,
         Ok(other) => {
             eprintln!(
-                "sparagmos-driver run: unsupported: entry `{entry}` returned {other}, expected ()"
+                "sparagmos-driver run: unsupported: entry `{entry_name}` returned {other}, expected ()"
             );
             2
         }

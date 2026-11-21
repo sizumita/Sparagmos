@@ -4339,3 +4339,99 @@ fn run_mode_weak_and_cow_str_drop() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "weak-cow ok\n");
 }
+const TEST_CRATE_WITH_MAIN_SRC: &str = r#"
+fn main() {
+    println!("USER MAIN RAN");
+}
+
+#[test]
+fn sample_test() {
+    assert_eq!(1 + 1, 2);
+}
+"#;
+
+#[test]
+fn run_mode_test_crate_enters_harness_main_not_user_main() {
+    // Lane ET: a `--test` crate has two bodies named
+    // `<crate>::main` -- the user's and the generated harness
+    // entry. Run mode used to hand the interpreter the bare
+    // name, which names no stored body (bodies that share a
+    // name are keyed by their `DefId`), and the run failed with
+    // `unknown function <crate>::main`; picking the entry by
+    // name alone would also have entered the user's `main`,
+    // which natively is an ordinary function in a test crate.
+    // The driver now enters the entry point rustc designated.
+    // The run then stops at the harness's call into the libtest
+    // runner, whose local wrapper has no converted body yet --
+    // the same stop a test crate without a user `main` hits --
+    // and the user's `main` must not have run.
+    let dir = temp_dir("test-crate-main");
+    let src = fixture(&dir, "testcrate.rs", TEST_CRATE_WITH_MAIN_SRC);
+    let out = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run")
+        .arg(&src)
+        .arg("--rustc-arg")
+        .arg("--test")
+        .output()
+        .expect("failed to run sparagmos-driver");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "the harness entry must be reached and stop at the libtest runner call; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("Call to testcrate::test::test_main_env_args (no converted body)"),
+        "the stop must name the harness runner call; stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("unknown function"),
+        "entry resolution must not lose the entry body; stderr={stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("USER MAIN RAN"),
+        "the user's main is not the entry of a test crate and must not run"
+    );
+}
+
+const TEST_CRATE_NO_TESTS_SRC: &str = r#"
+fn main() {
+    println!("USER MAIN RAN");
+}
+"#;
+
+#[test]
+fn run_mode_test_crate_without_tests_still_enters_harness() {
+    // Lane ET: under `--test` with no `#[test]` items the
+    // harness main is still the crate's entry (natively it runs
+    // an empty test list and calls the libtest runner directly);
+    // the user's `main` -- the only `main` in the source -- is
+    // not entered.
+    let dir = temp_dir("test-crate-no-tests");
+    let src = fixture(&dir, "notests.rs", TEST_CRATE_NO_TESTS_SRC);
+    let out = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run")
+        .arg(&src)
+        .arg("--rustc-arg")
+        .arg("--test")
+        .output()
+        .expect("failed to run sparagmos-driver");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "the harness entry must be reached and stop at the libtest runner call; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("Call to test::test_main_env_args (no converted body)"),
+        "the stop must name the libtest runner call; stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("unknown function"),
+        "entry resolution must not lose the entry body; stderr={stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("USER MAIN RAN"),
+        "the user's main is not the entry of a test crate and must not run"
+    );
+}
