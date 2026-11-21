@@ -1014,6 +1014,7 @@ impl<'a> Interpreter<'a> {
         name: &str,
         generic_args: &[String],
         args: &[Operand],
+        cmp_discriminants: Option<&[i128]>,
     ) -> InterpResult<Value> {
         let kind = lookup(name)
             .ok_or_else(|| unsupported(format!("call to {name} is not runtime-supported")))?;
@@ -1500,7 +1501,7 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::PartialCmp => {
                 arity(2)?;
-                let ord = self.values_cmp(frames, &vals[0], &vals[1])?;
+                let ord = self.values_cmp(frames, &vals[0], &vals[1], cmp_discriminants)?;
                 Ok(Value::Enum {
                     variant: 1,
                     fields: vec![ordering_value(ord)],
@@ -1508,12 +1509,12 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::OrdCmp => {
                 arity(2)?;
-                let ord = self.values_cmp(frames, &vals[0], &vals[1])?;
+                let ord = self.values_cmp(frames, &vals[0], &vals[1], cmp_discriminants)?;
                 Ok(ordering_value(ord))
             }
             Builtin::PartialOrdRel(op) => {
                 arity(2)?;
-                let ord = self.values_cmp(frames, &vals[0], &vals[1])?;
+                let ord = self.values_cmp(frames, &vals[0], &vals[1], cmp_discriminants)?;
                 Ok(Value::Bool(match op {
                     RelOp::Lt => ord == Ordering::Less,
                     RelOp::Le => ord != Ordering::Greater,
@@ -2568,17 +2569,28 @@ impl<'a> Interpreter<'a> {
     /// and booleans by value, strings byte-wise (as `str`'s `Ord`
     /// is), aggregates lexicographically with enum variants ordered
     /// by declaration order — the derived semantics.
+/// The discriminant value a variant index stands for in a
+/// structural comparison: the baked table's entry when the
+/// comparison's `Self` type has one, else the index itself (the
+/// sequential default, where the two agree).
+fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
+    discriminants
+        .and_then(|table| table.get(variant as usize).copied())
+        .unwrap_or(variant as i128)
+}
+
     pub(crate) fn values_cmp(
         &self,
         frames: &[Frame],
         a: &Value,
         b: &Value,
+        discriminants: Option<&[i128]>,
     ) -> InterpResult<Ordering> {
         if matches!(a, Value::FatRef { .. }) || matches!(b, Value::FatRef { .. }) {
             let (ea, la) = self.slice_elements(frames, a)?;
             let (eb, lb) = self.slice_elements(frames, b)?;
             for (x, y) in ea.iter().zip(eb.iter()) {
-                match self.values_cmp(frames, x, y)? {
+                match self.values_cmp(frames, x, y, None)? {
                     Ordering::Equal => {}
                     other => return Ok(other),
                 }
@@ -2606,7 +2618,9 @@ impl<'a> Interpreter<'a> {
                     variant: vb,
                     fields: fb,
                 },
-            ) => match va.cmp(vb) {
+            ) => match Self::cmp_discriminant(discriminants, *va)
+                .cmp(&Self::cmp_discriminant(discriminants, *vb))
+            {
                 Ordering::Equal => self.seq_cmp(frames, fa, fb)?,
                 other => other,
             },
@@ -2622,7 +2636,7 @@ impl<'a> Interpreter<'a> {
 
     fn seq_cmp(&self, frames: &[Frame], a: &[Value], b: &[Value]) -> InterpResult<Ordering> {
         for (x, y) in a.iter().zip(b.iter()) {
-            match self.values_cmp(frames, x, y)? {
+            match self.values_cmp(frames, x, y, None)? {
                 Ordering::Equal => {}
                 other => return Ok(other),
             }

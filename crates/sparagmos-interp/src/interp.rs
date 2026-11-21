@@ -443,6 +443,7 @@ impl<'a> Interpreter<'a> {
                     destination,
                     target,
                     drop_glue,
+                    cmp_discriminants,
                 } => {
                     if let Some(glue) = drop_glue {
                         // `std::mem::drop` with the dropped type's glue
@@ -495,8 +496,14 @@ impl<'a> Interpreter<'a> {
                         let work = vec![(Vec::new(), glue.root.clone())];
                         self.run_drop_glue(&mut frames, root, work, &glue.adts, bb)?;
                     } else {
-                        let result =
-                            self.exec_builtin(&mut frames, body, &name, &generic_args, &args)?;
+                        let result = self.exec_builtin(
+                            &mut frames,
+                            body,
+                            &name,
+                            &generic_args,
+                            &args,
+                            cmp_discriminants.as_deref(),
+                        )?;
                         match target {
                             Some(bb) => {
                                 self.write_place(&mut frames, body, &destination, result)?;

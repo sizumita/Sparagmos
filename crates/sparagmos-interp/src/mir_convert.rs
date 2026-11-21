@@ -1175,6 +1175,38 @@ impl<'a> Converter<'a> {
         Some(ty)
     }
 
+    /// The discriminant table of the `Self` type of a comparison
+    /// call: the callee's first generic argument, falling back to
+    /// the receiver operand's type (a constant receiver carries no
+    /// place type). `None` unless that type is an enum with a
+    /// recorded table.
+    fn comparison_discriminants(
+        &self,
+        body: &mir::Body,
+        args: &[mir::Operand],
+        raw_generic_args: &[mir::Ty],
+    ) -> Option<Vec<i128>> {
+        let self_ty = raw_generic_args.first().cloned().or_else(|| {
+            args.first()
+                .and_then(|a| self.operand_place_ty(body, a))
+        })?;
+        let self_ty = match self_ty {
+            mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _) => *inner,
+            t => t,
+        };
+        match self_ty {
+            mir::Ty::Adt(def, _) => {
+                let table = self.discriminants.get(&def)?;
+                if table.is_empty() {
+                    None
+                } else {
+                    Some(table.clone())
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn operand_place_ty(&self, body: &mir::Body, op: &mir::Operand) -> Option<mir::Ty> {
         match op.place() {
             Some(place) => self.place_ty(body, place),
@@ -2353,6 +2385,22 @@ impl<'a> Converter<'a> {
                         } else {
                             None
                         };
+                        // The `PartialOrd` / `Ord` comparison
+                        // builtins compare values structurally; for
+                        // an enum `Self` type that comparison must
+                        // order by discriminant value, so bake the
+                        // type's table while it is at hand (the
+                        // `Discriminant` rvalue does the same).
+                        let cmp_discriminants = if matches!(
+                            kind,
+                            crate::builtins::Builtin::PartialCmp
+                                | crate::builtins::Builtin::OrdCmp
+                                | crate::builtins::Builtin::PartialOrdRel(_)
+                        ) {
+                            self.comparison_discriminants(body, args, &raw_generic_args)
+                        } else {
+                            None
+                        };
                         if unaccountable_drop {
                             ir::TerminatorKind::Unsupported(
                                 "Call to std::mem::drop (drop glue cannot be accounted for)"
@@ -2366,6 +2414,7 @@ impl<'a> Converter<'a> {
                                 destination: self.convert_place(destination)?,
                                 target: target.map(|b| ir::BasicBlock(b.index())),
                                 drop_glue,
+                                cmp_discriminants,
                             }
                         }
                     } else if args.first().is_some_and(|a| {

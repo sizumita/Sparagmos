@@ -672,6 +672,16 @@ pub enum TerminatorKind {
         /// `mem::drop` whose glue conversion cannot account for
         /// the dropped type stays `Unsupported` instead.
         drop_glue: Option<DropGlue>,
+        /// Discriminant values of the comparison's `Self` type,
+        /// baked by conversion for the `PartialOrd` / `Ord`
+        /// comparison builtins: their structural comparison orders
+        /// enum values by discriminant value (the derived
+        /// semantics), which the variant index alone cannot
+        /// express for enums with explicit discriminants. `None`
+        /// when the `Self` type is not an enum with a recorded
+        /// table (the sequential default, where index and value
+        /// agree).
+        cmp_discriminants: Option<Vec<i128>>,
     },
     /// Drop the value at a place, running its `glue` (converted
     /// destructor calls and field glue; see `mir_convert`), and

@@ -2153,3 +2153,164 @@ fn summary_mode_generic_ctor_is_accounted_converted() {
         "no constructor is left as a missing instance: {stdout}"
     );
 }
+
+// ----- derived comparisons on enums with explicit discriminants (Lane CT) ---
+
+const DERIVE_DISCRIMINANT_SRC: &str = r#"
+// The shape of tests/ui/derives/eq-ord/derive-partial-ord-discriminant:
+// derived PartialOrd must order by discriminant value, not by
+// variant declaration order, including negative discriminants and
+// 64-bit extremes. Operands are constants, so they also arrive as
+// promoted by-reference constants.
+#[derive(PartialEq, PartialOrd)]
+enum E1 {
+    Pos2 = 2,
+    Neg1 = -1,
+    Pos1 = 1,
+}
+
+#[derive(PartialEq, PartialOrd)]
+#[repr(i8)]
+enum E3 {
+    Pos2 = 2,
+    Neg1 = -1_i8,
+    Pos1 = 1,
+}
+
+#[derive(PartialEq, PartialOrd)]
+#[repr(i64)]
+enum Ei64 {
+    Pos2 = 2,
+    Neg1 = -1,
+    NegMin = 1 << 63,
+    PosMax = !(1 << 63),
+    Pos1 = 1,
+}
+
+fn main() {
+    assert!(E1::Pos2 > E1::Pos1);
+    assert!(E1::Pos1 > E1::Neg1);
+    assert!(E1::Pos2 > E1::Neg1);
+
+    assert!(E3::Pos2 > E3::Pos1);
+    assert!(E3::Pos1 > E3::Neg1);
+    assert!(E3::Pos2 > E3::Neg1);
+
+    assert!(Ei64::Pos2 > Ei64::Pos1);
+    assert!(Ei64::Pos2 > Ei64::Neg1);
+    assert!(Ei64::Pos1 > Ei64::Neg1);
+    assert!(Ei64::Pos2 > Ei64::NegMin);
+    assert!(Ei64::Pos1 > Ei64::NegMin);
+    assert!(Ei64::Pos2 < Ei64::PosMax);
+    assert!(Ei64::Pos1 < Ei64::PosMax);
+}
+"#;
+
+const DERIVE_NEGATIVE_EQ_SRC: &str = r#"
+// Derived PartialEq and Ordering comparisons where a negative
+// discriminant is involved: the constant operand is a promoted
+// by-reference constant whose stored tag is the width-truncated
+// pattern of the discriminant.
+#[derive(PartialEq)]
+enum P {
+    X = -1,
+    Y = 7,
+}
+
+fn check() -> u32 {
+    let mut n = 0;
+    if P::X == P::X { n += 1; }
+    if P::X != P::Y { n += 1; }
+    let o = core::cmp::Ordering::Less;
+    if o == core::cmp::Ordering::Less { n += 1; }
+    if o < core::cmp::Ordering::Equal { n += 1; }
+    if core::cmp::Ordering::Greater > o { n += 1; }
+    n
+}
+
+fn main() {
+    if check() == 5 { println!("neg eq ok"); } else { println!("neg eq BAD"); }
+}
+"#;
+
+const DERIVE_PAYLOAD_ORD_SRC: &str = r#"
+// Derived PartialOrd/Ord on an enum with payloads: the
+// discriminant decides across variants, fields within a variant.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum E {
+    A(u8),
+    B,
+    C(u16),
+}
+
+fn check() -> u32 {
+    let a1 = E::A(1);
+    let a2 = E::A(2);
+    let b = E::B;
+    let c = E::C(0);
+    let mut n = 0;
+    if a1 < a2 { n += 1; }
+    if a2 < b { n += 1; }
+    if b < c { n += 1; }
+    if a1 < c { n += 1; }
+    if a1 == E::A(1) { n += 1; }
+    if a1 != a2 { n += 1; }
+    if a1.cmp(&a2) == core::cmp::Ordering::Less { n += 1; }
+    if b.cmp(&c) == core::cmp::Ordering::Less { n += 1; }
+    if c.cmp(&c) == core::cmp::Ordering::Equal { n += 1; }
+    n
+}
+
+fn main() {
+    if check() == 9 { println!("payload ord ok"); } else { println!("payload ord BAD"); }
+}
+"#;
+
+#[test]
+fn run_mode_derived_partial_ord_uses_discriminant_values() {
+    let dir = temp_dir("derive-discr");
+    let src = fixture(&dir, "derive_discr.rs", DERIVE_DISCRIMINANT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "derived PartialOrd on explicit discriminants must run and hold; stderr={stderr}"
+    );
+}
+
+#[test]
+fn run_mode_derived_eq_negative_discriminant_constants() {
+    let dir = temp_dir("derive-neg-eq");
+    let src = fixture(&dir, "derive_neg_eq.rs", DERIVE_NEGATIVE_EQ_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "negative-discriminant constant comparisons must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "neg eq ok\n",
+        "derived equality and Ordering comparisons must hold"
+    );
+}
+
+#[test]
+fn run_mode_derived_ord_payload_enum() {
+    let dir = temp_dir("derive-payload-ord");
+    let src = fixture(&dir, "derive_payload_ord.rs", DERIVE_PAYLOAD_ORD_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "derived Ord on a payload enum must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "payload ord ok\n",
+        "derived Ord must order by discriminant, then fields"
+    );
+}
