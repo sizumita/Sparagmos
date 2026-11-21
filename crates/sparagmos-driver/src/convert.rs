@@ -428,15 +428,34 @@ impl Converter {
             }
             TK::InlineAsm {
                 template,
+                operands,
                 options,
                 destination,
                 unwind,
                 ..
             } => {
-                self.err("TerminatorKind::InlineAsm");
+                // The no-op class (empty / comment-only / nop-only
+                // template, no NORETURN) converts for real: stepping
+                // over it is the execution semantics. An operand
+                // with an out place is *written* by the assembly,
+                // which no executor models, so any such operand —
+                // like any non-trivial template — keeps the named
+                // conversion error.
+                let has_out_place = operands.iter().any(|op| op.out_place.is_some());
+                let noop = !has_out_place && sm::inline_asm_is_noop(template, options);
+                let ops = if noop {
+                    operands
+                        .iter()
+                        .filter_map(|op| op.in_value.as_ref())
+                        .map(|op| self.operand(op))
+                        .collect()
+                } else {
+                    self.err("TerminatorKind::InlineAsm");
+                    Vec::new()
+                };
                 sm::TerminatorKind::InlineAsm {
                     template: template.clone(),
-                    operands: Vec::new(),
+                    operands: ops,
                     options: options.clone(),
                     destination: destination.map(bb),
                     unwind: self.unwind(unwind),
@@ -553,9 +572,10 @@ impl Converter {
                 let p = self.place(place);
                 sm::Rvalue::CopyForDeref(p)
             }
-            R::Reborrow(..) => {
-                self.err("Rvalue::Reborrow");
-                sm::Rvalue::Use(sm::Operand::constant(sm::Constant::bool(false)))
+            R::Reborrow(ty, m, place) => {
+                let t = self.ty(ty);
+                let p = self.place(place);
+                sm::Rvalue::Reborrow(t, mutability(*m), p)
             }
         }
     }

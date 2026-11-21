@@ -18,6 +18,9 @@ script mechanically cross-references three kinds of evidence:
 
 A variant is "implemented" only when all three hold (the definition in
 docs/COVERAGE.md).  Exactly one engine having a test makes it "partial".
+Nine denominator variants cannot occur in Stable MIR 1.100.0 output at
+all; they are reported with the third status "unreachable" (see
+UNREACHABLE below) and are never counted as implemented.
 
 Method, and its limits:
 
@@ -123,6 +126,28 @@ CONDITIONAL_ERR_OK = {
     # convert.rs: cast_kind() records an error only for
     # CastKind::BoxDerefTransmute; other CastKinds construct Rvalue::Cast.
     ("Rvalue", "Cast"),
+    # convert.rs: TK::InlineAsm records an error only when the template
+    # is outside the no-op class (see inline_asm_is_noop in
+    # sparagmos-mir); no-op templates construct TerminatorKind::InlineAsm.
+    ("TerminatorKind", "InlineAsm"),
+}
+
+# Denominator variants that cannot occur in Stable MIR 1.100.0 output at
+# all: none of them exists in the rustc_public mir/body.rs enums the
+# driver consumes (verified against the installed 1.100.0 sources; the
+# same set is tabulated in crates/sparagmos-mir/src/coverage.rs as
+# METRIC1_UNREACHABLE_*).  They stay in the denominator (40) and are
+# reported with the third status "unreachable", never as "implemented".
+UNREACHABLE = {
+    ("StatementKind", "BackwardIncompatibleDropHint"),
+    ("TerminatorKind", "UnwindResume"),
+    ("TerminatorKind", "UnwindTerminate"),
+    ("TerminatorKind", "TailCall"),
+    ("TerminatorKind", "Yield"),
+    ("TerminatorKind", "CoroutineDrop"),
+    ("TerminatorKind", "FalseEdge"),
+    ("TerminatorKind", "FalseUnwind"),
+    ("Rvalue", "WrapUnsafeBinder"),
 }
 
 
@@ -675,7 +700,7 @@ def main():
     results = {} if args.skip_tests else run_cargo_tests(repo)
 
     variants_out = []
-    summary = {"implemented": 0, "partial": 0, "none": 0}
+    summary = {"implemented": 0, "partial": 0, "none": 0, "unreachable": 0}
     flagged = []
     for enum in ENUMS:
         for name in DENOMINATOR[enum]:
@@ -712,7 +737,9 @@ def main():
             drv = driver[enum][name]
             driver_ok = drv["class"] in ("ok", "conditional")
             has_i, has_j = bool(interp_tests), bool(jit_tests)
-            if driver_ok and has_i and has_j:
+            if (enum, name) in UNREACHABLE:
+                status = "unreachable"
+            elif driver_ok and has_i and has_j:
                 status = "implemented"
             elif has_i or has_j:
                 status = "partial"

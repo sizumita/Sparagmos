@@ -490,6 +490,15 @@ pub enum Builtin {
     /// pointer, a dedicated `RefTarget::Null` denoting no place
     /// and no value.
     PtrNull,
+    /// `std::ptr::copy_nonoverlapping(src, dst, count)` and
+    /// `std::ptr::copy(src, dst, count)`: the element copy the
+    /// `copy_nonoverlapping` intrinsic performs, arriving as an
+    /// ordinary call to the `std::ptr` wrapper (a direct
+    /// `core::intrinsics::copy_nonoverlapping` call arrives as a
+    /// `StatementKind::Intrinsic` instead; both share one
+    /// implementation, whose source snapshot makes it a correct
+    /// memmove for the overlapping `copy` as well).
+    PtrCopy,
 }
 
 /// A relational operator selected by a `PartialOrd` method.
@@ -787,6 +796,7 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::intrinsics::atomic_store" => Builtin::AtomicStore,
         "std::mem::zeroed" => Builtin::MemZeroed,
         "std::ptr::null" | "std::ptr::null_mut" => Builtin::PtrNull,
+        "std::ptr::copy_nonoverlapping" | "std::ptr::copy" => Builtin::PtrCopy,
         _ if canonical.starts_with("std::rc::Rc") && canonical.ends_with(">::new") => {
             Builtin::RcNew
         }
@@ -2370,6 +2380,15 @@ impl<'a> Interpreter<'a> {
                 let target = self.deref_value(frames, &vals[0])?;
                 let value = vals.into_iter().nth(1).expect("arity checked");
                 self.write_resolved(frames, &target, value)?;
+                Ok(Value::Unit)
+            }
+            Builtin::PtrCopy => {
+                arity(3)?;
+                let mut vals = vals.into_iter();
+                let src = vals.next().expect("arity checked");
+                let dst = vals.next().expect("arity checked");
+                let count = vals.next().expect("arity checked");
+                self.exec_copy_nonoverlapping(frames, src, dst, count)?;
                 Ok(Value::Unit)
             }
             Builtin::FloatMethod { f32, op } => exec_float_method(name, f32, op, &vals),

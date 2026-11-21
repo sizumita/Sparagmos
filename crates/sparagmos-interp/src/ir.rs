@@ -445,6 +445,18 @@ pub enum Rvalue {
     /// written by the coroutine body itself through downcast field
     /// writes.
     CoroutineAggregate(Vec<Operand>),
+    /// A reborrow: a bitwise copy of the pointer/reference value held
+    /// at the place, reinterpreted as the target pointer type. The
+    /// value model does not track pointer mutability or provenance,
+    /// so the copy is the value itself; the target type only matters
+    /// to the destination local's declared type, which conversion
+    /// already accounts for.
+    Reborrow(Place),
+    /// A reference to a thread-local static, named by the static's
+    /// identity. The driver collects no static items at all, so there
+    /// is no storage and no initializer to bind a cell to; executing
+    /// this is a named explicit error, never a fabricated value.
+    ThreadLocalRef(String),
     /// Any rvalue kind not modelled yet; executing it is an explicit error.
     Unsupported(String),
 }
@@ -490,6 +502,20 @@ pub enum StatementKind {
     StorageLive(Local),
     /// Hint only in rustc MIR; a no-op here.
     StorageDead(Local),
+    /// `core::intrinsics::assume`: the operand is a boolean the
+    /// programmer promises is true. Execution evaluates it; a false
+    /// operand is undefined behaviour in the guest and is reported
+    /// as a guest panic, a true one is a no-op.
+    Assume(Operand),
+    /// `core::intrinsics::copy_nonoverlapping`: copy `count` elements
+    /// from the place `src` points at to the place `dst` points at.
+    /// The operands are the pointer values themselves (references or
+    /// raw pointers in the value model).
+    CopyNonOverlapping {
+        src: Operand,
+        dst: Operand,
+        count: Operand,
+    },
     Nop,
     /// Any statement kind not modelled yet; executing it is an explicit error.
     Unsupported(String),

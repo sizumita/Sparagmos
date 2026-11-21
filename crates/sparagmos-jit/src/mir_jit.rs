@@ -618,6 +618,7 @@ fn scan_rvalue_fields(scan: &mut AdtScan, body: &mir::Body, rv: &mir::Rvalue) {
             scan_operand_fields(scan, body, &pair.1);
         }
         R::Ref(_, _, place)
+        | R::Reborrow(_, _, place)
         | R::RawPtr(_, place)
         | R::Len(place)
         | R::Discriminant(place)
@@ -2764,7 +2765,17 @@ impl<'a> FnLower<'a> {
                 // only variant) writes nothing.
                 Ok(())
             }
-            S::Intrinsic(_) => Err(self.err("Intrinsic statement")),
+            S::Intrinsic(intr) => match &**intr {
+                // `assume` is an optimisation hint: the JIT emits
+                // nothing for it. (On a false operand the guest has
+                // undefined behaviour; the interpreter reports it as
+                // a guest panic, the JIT simply proceeds — both are
+                // legitimate readings of UB.)
+                mir::NonDivergingIntrinsic::Assume(_) => Ok(()),
+                mir::NonDivergingIntrinsic::CopyNonOverlapping { .. } => {
+                    Err(self.err("Intrinsic statement CopyNonOverlapping"))
+                }
+            },
         }
     }
 
@@ -2917,6 +2928,17 @@ impl<'a> FnLower<'a> {
                 self.lower_cast_to(tmp, kind, operand, target)?;
                 Ok(vec![tmp])
             }
+            R::Reborrow(_, _, src_place) => match count {
+                1 => Ok(vec![
+                    self.operand_value(&mir::Operand::Copy(src_place.clone()), dst_ty)?,
+                ]),
+                2 => {
+                    let (a, b) =
+                        self.operand_pair(&mir::Operand::Copy(src_place.clone()))?;
+                    Ok(vec![a, b])
+                }
+                _ => Err(self.err("reborrow of an aggregate value")),
+            },
             R::Ref(_, _, target) | R::RawPtr(_, target) => {
                 let words = self.ref_words(target, dst_ty)?;
                 if words.len() != count {
@@ -3264,6 +3286,13 @@ impl<'a> FnLower<'a> {
                 }
                 self.normalize(dst, &dst_ty);
                 Ok(())
+            }
+            R::Reborrow(_, _, src_place) => {
+                // A bitwise copy of the pointer value held at the
+                // place, reinterpreted as the target pointer type:
+                // exactly a `Use` copy of the place's value.
+                let use_rv = mir::Rvalue::Use(mir::Operand::Copy(src_place.clone()));
+                self.lower_assign(place, &use_rv)
             }
             R::NullaryOp(..) => Err(self.err("NullaryOp rvalue")),
             R::ShallowInitBox(..) => Err(self.err("ShallowInitBox rvalue")),
@@ -4207,7 +4236,24 @@ impl<'a> FnLower<'a> {
             T::Terminate(_) => Err(self.err("Terminate terminator")),
             T::Yield { .. } => Err(self.err("Yield terminator")),
             T::CoroutineDrop => Err(self.err("CoroutineDrop terminator")),
-            T::InlineAsm { .. } => Err(self.err("InlineAsm terminator")),
+            T::InlineAsm {
+                template,
+                options,
+                destination,
+                ..
+            } => {
+                if mir::inline_asm_is_noop(template, options) {
+                    match destination {
+                        Some(target) => {
+                            self.seal_terminator(IrTerminator::Jump(target.index() as u32));
+                            Ok(())
+                        }
+                        None => Err(self.err("InlineAsm terminator without a destination")),
+                    }
+                } else {
+                    Err(self.err("InlineAsm terminator"))
+                }
+            }
             T::TailCall { .. } => Err(self.err("TailCall terminator")),
         }
     }
