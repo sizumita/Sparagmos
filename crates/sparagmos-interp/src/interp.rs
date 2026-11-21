@@ -539,15 +539,34 @@ impl<'a> Interpreter<'a> {
                     // consumes an `Fn` / `FnMut` closure (aliasing
                     // the moved-from place is equivalent because that
                     // place is dead after the call).
+                    // The concrete type behind a dyn receiver, when
+                    // the receiver is one: the dispatch for an ADT
+                    // concrete value (a hand-written Fn impl) keys
+                    // on it, and `dyn_callable` erases it.
+                    let mut dyn_concrete: Option<String> = None;
                     let (callable, env_ref) = match kind {
                         FnCallKind::CallOnce => {
                             let (value, env_ref) = self.eval_callable(&frames, body, &receiver)?;
                             let (value, env_ref) =
                                 if matches!(value, Value::DynRef { .. }) {
+                                    if let Value::DynRef { concrete, .. } = &value {
+                                        dyn_concrete = Some(concrete.clone());
+                                    }
                                     self.dyn_callable(&frames, &value)?
                                 } else {
                                     (value, env_ref)
                                 };
+                            // A by-value receiver may still be a
+                            // transparent one-field wrapper around
+                            // the callable (an `FnOnce` wrapper
+                            // struct): unwrap it, but only when the
+                            // wrapped value is itself callable.
+                            let (value, unwrapped) = unwrap_callable_wrapper(value);
+                            let env_ref = if unwrapped {
+                                Value::Ref(RefTarget::Value(Box::new(value.clone())))
+                            } else {
+                                env_ref
+                            };
                             let env_ref = match self.consumed_env_arg(
                                 frames,
                                 body,
@@ -595,11 +614,20 @@ impl<'a> Interpreter<'a> {
                                                 unwrapped = true;
                                                 fields[0].clone()
                                             }
+                                            Value::Tuple(items)
+                                                if items.len() == 1 =>
+                                            {
+                                                unwrapped = true;
+                                                items[0].clone()
+                                            }
                                             _ => break,
                                         };
                                         value = next;
                                     }
                                     if matches!(value, Value::DynRef { .. }) {
+                                        if let Value::DynRef { concrete, .. } = &value {
+                                            dyn_concrete = Some(concrete.clone());
+                                        }
                                         self.dyn_callable(&frames, &value)?
                                     } else if unwrapped {
                                         // The callable was reached by
@@ -620,15 +648,32 @@ impl<'a> Interpreter<'a> {
                                     }
                                 }
                                 Value::DynRef { .. } => {
+                                    if let Value::DynRef { concrete, .. } = &recv {
+                                        dyn_concrete = Some(concrete.clone());
+                                    }
                                     self.dyn_callable(&frames, &recv)?
                                 }
                                 value => {
-                                    let env = self.callable_env_ref(
-                                        &frames,
-                                        body,
-                                        &receiver,
-                                        &value,
-                                    )?;
+                                    // A by-value receiver may be a
+                                    // transparent one-field wrapper
+                                    // around the callable: unwrap it
+                                    // when the wrapped value is
+                                    // callable, as in the `CallOnce`
+                                    // arm.
+                                    let (value, unwrapped) =
+                                        unwrap_callable_wrapper(value);
+                                    let env = if unwrapped {
+                                        Value::Ref(RefTarget::Value(Box::new(
+                                            value.clone(),
+                                        )))
+                                    } else {
+                                        self.callable_env_ref(
+                                            &frames,
+                                            body,
+                                            &receiver,
+                                            &value,
+                                        )?
+                                    };
                                     (value, env)
                                 }
                             }
@@ -650,11 +695,36 @@ impl<'a> Interpreter<'a> {
                             )?;
                         }
                         other => {
-                            return Err(InterpError::type_mismatch(
-                                "Fn trait call",
-                                "callable value",
-                                other.kind_name(),
-                            ));
+                            // A dyn receiver whose concrete value
+                            // is an ADT value: a hand-written Fn
+                            // impl on that type, when the program
+                            // has its body, is the callable.
+                            if let Some(concrete) = dyn_concrete.clone() {
+                                if let Some(result) = self.dyn_adt_fn_call(
+                                    frames,
+                                    kind,
+                                    &concrete,
+                                    other.clone(),
+                                    env_ref,
+                                    arg_values,
+                                    &destination,
+                                    target,
+                                ) {
+                                    result?;
+                                } else {
+                                    return Err(InterpError::type_mismatch(
+                                        "Fn trait call",
+                                        "callable value",
+                                        other.kind_name(),
+                                    ));
+                                }
+                            } else {
+                                return Err(InterpError::type_mismatch(
+                                    "Fn trait call",
+                                    "callable value",
+                                    other.kind_name(),
+                                ));
+                            }
                         }
                     }
                 }
@@ -917,6 +987,13 @@ impl<'a> Interpreter<'a> {
         {
             return Some(Ok((candidate, (**base).clone())));
         }
+        // The impl key may carry the trait's generic arguments
+        // (`<S as std::ops::FnMut<(i32,)>>::call_mut`) or spell the
+        // trait through the other of `std::` / `core::`: scan the
+        // program's keys for the unique matching impl body.
+        if let Some(found) = self.scan_virtual_impl(concrete, trait_path, method) {
+            return Some(Ok((found, (**base).clone())));
+        }
         if traits.iter().any(|t| t == trait_path) {
             return Some(Err(InterpError::UnsupportedDynamicDispatch {
                 method: func.to_string(),
@@ -1167,6 +1244,115 @@ impl<'a> Interpreter<'a> {
     /// (an owned `Box<dyn Fn>` — the closure value inside the box
     /// aggregate; its captures are place references, so calls
     /// through the copy still reach them).
+    /// The unique program key of an impl of `trait_path` for the
+    /// concrete type `concrete` with method `method`, under any
+    /// generic-argument spelling of the trait (or of `Self`) and
+    /// under either the `std::` or the `core::` spelling of the
+    /// trait path. `None` when there is not exactly one candidate
+    /// among the converted and unconverted bodies.
+    fn scan_virtual_impl(
+        &self,
+        concrete: &str,
+        trait_path: &str,
+        method: &str,
+    ) -> Option<String> {
+        let mut paths = vec![trait_path.to_string()];
+        if let Some(rest) = trait_path.strip_prefix("std::") {
+            paths.push(format!("core::{rest}"));
+        } else if let Some(rest) = trait_path.strip_prefix("core::") {
+            paths.push(format!("std::{rest}"));
+        }
+        let mut found: Option<String> = None;
+        for key in self
+            .program
+            .functions
+            .keys()
+            .chain(self.program.unconverted.keys())
+        {
+            let base = key.split('#').next().unwrap_or(key.as_str());
+            let Some((self_part, trait_base, key_method)) = parse_impl_key(base) else {
+                continue;
+            };
+            if key_method != method
+                || !paths.iter().any(|p| p == &trait_base)
+                || !impl_self_matches(&self_part, concrete)
+            {
+                continue;
+            }
+            if found.as_deref() == Some(key.as_str()) {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some(key.clone());
+        }
+        found
+    }
+
+    /// Dispatch an `Fn`-trait call whose dyn concrete value is an
+    /// ADT value (a hand-written `Fn` / `FnMut` / `FnOnce` impl on
+    /// a struct, reached through a `&dyn FnMut` and the like): scan
+    /// for the concrete type's impl body for the call's kind and
+    /// start it with `(receiver, argument tuple)`, the receiver
+    /// shaped exactly as `start_call` shapes a vtable receiver —
+    /// a reference when the impl body takes one (unwrapping a
+    /// one-field aggregate data pointer, keeping an existing
+    /// reference, otherwise referencing the value), the value
+    /// itself when it takes the receiver by value. `None` when no
+    /// impl body matches, leaving the caller to report the value
+    /// as not callable.
+    #[allow(clippy::too_many_arguments)]
+    fn dyn_adt_fn_call(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        kind: FnCallKind,
+        concrete: &str,
+        callable: Value,
+        env_ref: Value,
+        arg_values: Vec<Value>,
+        destination: &Place,
+        target: Option<BasicBlock>,
+    ) -> Option<InterpResult<()>> {
+        let (trait_path, method) = match kind {
+            FnCallKind::Call => ("std::ops::Fn", "call"),
+            FnCallKind::CallMut => ("std::ops::FnMut", "call_mut"),
+            FnCallKind::CallOnce => ("std::ops::FnOnce", "call_once"),
+        };
+        let impl_name = self.scan_virtual_impl(concrete, trait_path, method)?;
+        let wants_ref = matches!(
+            self.program
+                .get(&impl_name)
+                .and_then(|b| b.local_tys.get(1)),
+            Some(Ty::Ref(..))
+        );
+        let receiver = if wants_ref {
+            match env_ref {
+                Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. } => env_ref,
+                _ => match callable {
+                    Value::Enum { fields, .. } if fields.len() == 1 => {
+                        Value::Ref(RefTarget::Value(Box::new(
+                            fields.into_iter().next().expect("one field"),
+                        )))
+                    }
+                    other @ (Value::Ref(_)
+                    | Value::FatRef { .. }
+                    | Value::DynRef { .. }) => other,
+                    other => Value::Ref(RefTarget::Value(Box::new(other))),
+                },
+            }
+        } else {
+            callable
+        };
+        Some(self.start_call(
+            frames,
+            &impl_name,
+            vec![receiver, Value::Tuple(arg_values)],
+            destination,
+            target,
+        ))
+    }
+
     fn dyn_callable(
         &self,
         frames: &[Frame],
@@ -4836,6 +5022,89 @@ fn drop_dyn_value(value: &Value) -> InterpResult<()> {
             })
         }
     }
+}
+
+/// Parse an impl-instance key `<Self as Trait>::method` into
+/// `(Self section, trait path without generic arguments, method)`,
+/// mirroring `mir_convert`'s key parsing. `None` for other shapes.
+fn parse_impl_key(base: &str) -> Option<(String, String, String)> {
+    let (head, method) = base.rsplit_once(">::")?;
+    if method.is_empty() || method.contains("::") {
+        return None;
+    }
+    let inner = head.strip_prefix('<')?;
+    let (self_part, trait_part) = inner.split_once(" as ")?;
+    if self_part.is_empty() || trait_part.is_empty() {
+        return None;
+    }
+    let trait_base = trait_part.split('<').next().unwrap_or(trait_part);
+    Some((
+        self_part.to_string(),
+        trait_base.to_string(),
+        method.to_string(),
+    ))
+}
+
+/// Whether an impl key's `Self` section denotes `name`: the name
+/// itself, or the name with a generic argument list appended; the
+/// crate prefix may be omitted on a side that carries none.
+fn impl_self_matches(self_part: &str, name: &str) -> bool {
+    let self_base = self_part.split('<').next().unwrap_or(self_part);
+    if self_part != self_base && !self_part.ends_with('>') {
+        return false;
+    }
+    if self_base == name {
+        return true;
+    }
+    if self_base.contains("::") && name.contains("::") {
+        return false;
+    }
+    self_base.rsplit("::").next().unwrap_or(self_base)
+        == name.rsplit("::").next().unwrap_or(name)
+}
+
+/// Whether `v` holds a callable value anywhere inside it (a
+/// closure, a function pointer, or a dyn callable).
+fn value_holds_callable(v: &Value) -> bool {
+    match v {
+        Value::Closure { .. } | Value::FnPtr(_) | Value::DynRef { .. } => true,
+        Value::Tuple(items) => items.iter().any(value_holds_callable),
+        Value::Enum { fields, .. } => fields.iter().any(value_holds_callable),
+        _ => false,
+    }
+}
+
+/// Unwrap transparent one-field wrappers (`Enum` / `Tuple` values
+/// with exactly one field) around a callable value, returning the
+/// inner value and whether any unwrapping happened. A wrapper is
+/// only entered when its sole field holds a callable, so an
+/// ordinary one-field ADT value that is not a callable wrapper is
+/// left untouched.
+fn unwrap_callable_wrapper(v: Value) -> (Value, bool) {
+    let mut value = v;
+    let mut unwrapped = false;
+    for _ in 0..8 {
+        let next = match &value {
+            Value::Enum { fields, .. } if fields.len() == 1 => {
+                if value_holds_callable(&fields[0]) {
+                    fields[0].clone()
+                } else {
+                    break;
+                }
+            }
+            Value::Tuple(items) if items.len() == 1 => {
+                if value_holds_callable(&items[0]) {
+                    items[0].clone()
+                } else {
+                    break;
+                }
+            }
+            _ => break,
+        };
+        value = next;
+        unwrapped = true;
+    }
+    (value, unwrapped)
 }
 
 pub fn interpret(program: &Program, entry: &str, args: Vec<Value>) -> InterpResult<Value> {
