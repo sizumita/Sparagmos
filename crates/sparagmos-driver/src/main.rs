@@ -509,11 +509,24 @@ fn ty_mentions_param(ty: &Ty) -> bool {
 /// item (a generic function definition): it is deferred during the
 /// item loop and accounted for by [`collect_local_instances`] once
 /// the instances its call sites demand are known.
+///
+/// Tuple-struct and tuple-variant constructors (`ItemKind::Ctor`)
+/// are deferred the same way: a generic constructor has no
+/// instance as an item either. A constructor differs from a plain
+/// function in one respect — when nothing demands it as a value,
+/// there is nothing left unconverted: its direct uses are
+/// aggregate rvalues in the callers, and the constructor item
+/// itself has no body in any monomorphization that was not
+/// demanded. [`apply_instance_demands`] accounts such a
+/// constructor as converted without a body.
 struct DeferredFn {
     def: rustc_public::DefId,
     name: String,
     /// Index of this item's placeholder entry in the report.
     report_idx: usize,
+    /// Whether this deferred item is a data constructor
+    /// (`ItemKind::Ctor(CtorKind::Fn)`).
+    ctor: bool,
 }
 
 /// Cap on monomorphic instance bodies collected for generic local
@@ -609,6 +622,8 @@ fn collect_local_instances(
     } = state;
 
     let deferred_defs: HashSet<rustc_public::DefId> = deferred.iter().map(|d| d.def).collect();
+    let deferred_ctors: HashSet<rustc_public::DefId> =
+        deferred.iter().filter(|d| d.ctor).map(|d| d.def).collect();
     let mut queue: VecDeque<rustc_public::mir::Body> = seeds.iter().cloned().collect();
     let mut extra_seeds: Vec<rustc_public::mir::Body> = Vec::new();
 
@@ -621,7 +636,23 @@ fn collect_local_instances(
         // instance collection can never make a crate convert worse
         // than the item loop alone did.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        for (def, args) in sparagmos_driver::reach::call_targets(&body) {
+        // The demand targets of this body: its `FnDef` call
+        // targets, plus — for deferred constructors — every
+        // `FnDef` constant it materializes. A constructor used
+        // as a value (assigned, passed on, returned) never
+        // appears as a call target of the body that demands it,
+        // so call targets alone would miss the demand; a plain
+        // function's value uses stay call-target-only, exactly
+        // as before.
+        let mut targets = sparagmos_driver::reach::call_targets(&body);
+        if !deferred_ctors.is_empty() {
+            for (def, args) in sparagmos_driver::reach::fndef_constants(&body) {
+                if deferred_ctors.contains(&def.def_id()) {
+                    targets.push((def, args));
+                }
+            }
+        }
+        for (def, args) in targets {
             let referenced = def.def_id();
             let inst = match Instance::resolve(def, &args) {
                 Ok(inst) => inst,
@@ -749,7 +780,12 @@ fn collect_local_instances(
 /// converted; when some instance could not be converted it stays
 /// skipped with that instance's reasons, and a definition nothing
 /// demands keeps the item loop's "no monomorphic instance
-/// available" record.
+/// available" record. One exception: a *constructor* nothing
+/// demands is accounted converted without a body — its direct
+/// uses are aggregate rvalues in the callers (already converted
+/// with them), and the constructor item has no body in any
+/// monomorphization that was not demanded, so there is nothing
+/// left unconverted (the same accounting as a trivial constant).
 fn apply_instance_demands(
     report: &mut ConversionReport,
     deferred: &[DeferredFn],
@@ -757,6 +793,9 @@ fn apply_instance_demands(
 ) {
     for dfn in deferred {
         let Some(demand) = demands.get(&dfn.def) else {
+            if dfn.ctor {
+                report.functions[dfn.report_idx].outcome = FnOutcome::Converted;
+            }
             continue;
         };
         let entry = &mut report.functions[dfn.report_idx];
@@ -1226,8 +1265,14 @@ fn collect() -> ControlFlow<()> {
             Err(_) => match closure_instance(item) {
                 ClosureAttempt::Instance(i) => i,
                 ClosureAttempt::NotClosure => {
-                    if matches!(item.kind(), ItemKind::Fn) {
-                        // A generic function definition: it has no
+                    if matches!(item.kind(), ItemKind::Fn)
+                        || matches!(
+                            item.kind(),
+                            ItemKind::Ctor(rustc_public::CtorKind::Fn)
+                        )
+                    {
+                        // A generic function definition (or a
+                        // generic data constructor): it has no
                         // monomorphic instance as an item, but its
                         // call sites may demand concrete instances.
                         // Defer it: a placeholder report entry keeps
@@ -1246,6 +1291,7 @@ fn collect() -> ControlFlow<()> {
                             def: item.def_id(),
                             name: name.clone(),
                             report_idx: report.functions.len(),
+                            ctor: matches!(item.kind(), ItemKind::Ctor(..)),
                         });
                         report.functions.push(FnReport {
                             name,
