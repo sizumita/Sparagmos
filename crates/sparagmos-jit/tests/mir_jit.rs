@@ -3438,3 +3438,397 @@ fn three_word_return_is_unsupported() {
         Ok(_) => panic!("expected Unsupported, but the program compiled"),
     }
 }
+
+// ----- Calls with more than six argument words (Lane CM) ---------------------
+
+/// fn wsum(a, b, c, d, e, f, g, h: i64) -> i64
+///   { a + 2*b + 3*c + ... + 8*h }  (distinct weights: any word
+///   misalignment changes the result), plus a `main` that calls it
+///   with constants.
+fn many_scalar_args_program() -> (JitProgram, sparagmos_interp::MirProgram) {
+    let i64t = i(mir::IntTy::I64);
+    // locals: 0 ret, 1..=8 args, 9 acc, 10 tmp
+    let mut stmts = vec![assign(pl(9), mir::Rvalue::Use(cp(1)))];
+    for k in 2..=8u32 {
+        stmts.push(assign(
+            pl(10),
+            mir::Rvalue::BinaryOp(
+                mir::BinOp::Mul,
+                Box::new((cp(k), i64c(k as i64))),
+            ),
+        ));
+        stmts.push(assign(
+            pl(9),
+            mir::Rvalue::BinaryOp(mir::BinOp::Add, Box::new((cp(9), cp(10)))),
+        ));
+    }
+    stmts.push(assign(pl(0), mir::Rvalue::Use(cp(9))));
+    let tys: Vec<mir::Ty> = (0..11).map(|_| i64t.clone()).collect();
+    let wsum = spec("wsum", 0, 8, &tys, vec![bb(stmts, mir::TerminatorKind::Return)]);
+    // fn main() -> i64 { wsum(1, 2, 3, 4, 5, 6, 7, 8) }
+    let main = spec(
+        "main_wsum",
+        1,
+        0,
+        &[i64t.clone(), i64t.clone()],
+        vec![
+            bb(
+                vec![],
+                call_term(fndef(def(0)), (1..=8).map(i64c).collect(), 1, 1),
+            ),
+            bb(
+                vec![assign(pl(0), mir::Rvalue::Use(cp(1)))],
+                mir::TerminatorKind::Return,
+            ),
+        ],
+    );
+    build(&[wsum, main])
+}
+
+#[test]
+fn many_scalar_arguments() {
+    let (jit, prog) = many_scalar_args_program();
+    // Through a JIT-compiled caller (words 7 and 8 travel on the stack).
+    check(&jit, &prog, "main_wsum", &[], vec![], Ok(204));
+    // Through the Rust-side entry (the trampoline path).
+    check(
+        &jit,
+        &prog,
+        "wsum",
+        &[1, 2, 3, 4, 5, 6, 7, 8],
+        (1..=8).map(int).collect(),
+        Ok(204),
+    );
+    check(
+        &jit,
+        &prog,
+        "wsum",
+        &[8, 7, 6, 5, 4, 3, 2, 1],
+        [8, 7, 6, 5, 4, 3, 2, 1].iter().map(|v| int(*v)).collect(),
+        Ok(120),
+    );
+}
+
+/// fn pick6(a..f: i32, s: &[i32], i: usize) -> i32 { (*s)[i] + a }
+/// (six scalars fill the registers; the fat reference is words 6-7
+/// and the index word 8, both on the stack), and
+/// fn pick_straddle(a..e: i32, s: &[i32], i: usize) -> i32
+///   { (*s)[i] + a }
+/// (five scalars: the fat reference would start at the last
+/// register word, so a pad word precedes it and the pair lies
+/// entirely on the stack — words 6-7, the index at word 8).
+fn fat_ref_stack_args_program() -> (JitProgram, sparagmos_interp::MirProgram) {
+    let i32t = i(mir::IntTy::I32);
+    let usizet = u(mir::UintTy::Usize);
+    let pick = |name: &'static str, def_id: u32, scalars: usize| {
+        // locals: 0 ret, 1..=scalars i32, scalars+1 fat, scalars+2 usize,
+        // scalars+3 tmp
+        let fat_local = scalars as u32 + 1;
+        let idx_local = fat_local + 1;
+        let tmp_local = idx_local + 1;
+        let mut tys: Vec<mir::Ty> = vec![i32t.clone()];
+        tys.extend((0..scalars).map(|_| i32t.clone()));
+        tys.push(fatrefty(i32t.clone()));
+        tys.push(usizet.clone());
+        tys.push(i32t.clone());
+        spec(
+            name,
+            def_id,
+            scalars + 2,
+            &tys,
+            vec![bb(
+                vec![
+                    assign(
+                        pl(tmp_local),
+                        mir::Rvalue::Use(mir::Operand::Copy(
+                            dpl(fat_local).index(mir::Local(idx_local)),
+                        )),
+                    ),
+                    assign(
+                        pl(0),
+                        mir::Rvalue::BinaryOp(
+                            mir::BinOp::Add,
+                            Box::new((cp(tmp_local), cp(1))),
+                        ),
+                    ),
+                ],
+                mir::TerminatorKind::Return,
+            )],
+        )
+    };
+    // fn main_pick() -> i32 {
+    //   _1 = [5, 6, 7]; _5 = &_1; _2 = _5 as &[i32];
+    //   pick6(10, 0, 0, 0, 0, 0, _2, 1)
+    // }
+    let main = spec(
+        "main_pick",
+        2,
+        0,
+        &[
+            i32t.clone(),
+            arr_i32(3),
+            fatrefty(i32t.clone()),
+            i32t.clone(),
+            i32t.clone(),
+            refty(arr_i32(3)),
+        ],
+        vec![
+            bb(
+                vec![
+                    assign(pl(1), mir::Rvalue::Repeat(i32c(5), 3)),
+                    assign(cidx(1, 1, 3), mir::Rvalue::Use(i32c(6))),
+                    assign(cidx(1, 2, 3), mir::Rvalue::Use(i32c(7))),
+                    assign(pl(5), shared(pl(1))),
+                    assign(
+                        pl(2),
+                        mir::Rvalue::Cast(
+                            mir::CastKind::PointerCoercion(mir::PointerCoercion::Unsize),
+                            cp(5),
+                            fatrefty(i32t.clone()),
+                        ),
+                    ),
+                ],
+                call_term(
+                    fndef(def(0)),
+                    vec![
+                        i32c(10),
+                        i32c(0),
+                        i32c(0),
+                        i32c(0),
+                        i32c(0),
+                        i32c(0),
+                        cp(2),
+                        u64c(1),
+                    ],
+                    3,
+                    1,
+                ),
+            ),
+            bb(
+                vec![assign(pl(0), mir::Rvalue::Use(cp(3)))],
+                mir::TerminatorKind::Return,
+            ),
+        ],
+    );
+    build(&[pick("pick6", 0, 6), pick("pick_straddle", 1, 5), main])
+}
+
+#[test]
+fn fat_reference_beyond_the_registers() {
+    let (jit, prog) = fat_ref_stack_args_program();
+    // The backing store, laid out the way a caller frame's slots
+    // lie (element 0 at the highest address), as in the fat
+    // reference tests above.
+    let store: [i64; 3] = [30, 20, 10];
+    let addr = store.as_ptr().wrapping_add(2) as i64;
+    // JIT-compiled caller passing the fat reference on the stack.
+    check(&jit, &prog, "main_pick", &[], vec![], Ok(16));
+    // Rust-side entry: six scalars, then (addr, len), then the index.
+    check(
+        &jit,
+        &prog,
+        "pick6",
+        &[10, 0, 0, 0, 0, 0, addr, 3, 1],
+        vec![
+            int(10),
+            int(0),
+            int(0),
+            int(0),
+            int(0),
+            int(0),
+            fatval(&[10, 20, 30], 3),
+            uint(1),
+        ],
+        Ok(30),
+    );
+    // The straddling shape: five scalars, a pad word (0), the pair,
+    // the index. The interpreter sees only the MIR-level arguments.
+    check(
+        &jit,
+        &prog,
+        "pick_straddle",
+        &[10, 0, 0, 0, 0, 0, addr, 3, 2],
+        vec![
+            int(10),
+            int(0),
+            int(0),
+            int(0),
+            int(0),
+            fatval(&[10, 20, 30], 3),
+            uint(2),
+        ],
+        Ok(40),
+    );
+    // An out-of-bounds index through the straddled pair panics
+    // identically on both engines (the length word arrived intact).
+    check(
+        &jit,
+        &prog,
+        "pick_straddle",
+        &[10, 0, 0, 0, 0, 0, addr, 3, 5],
+        vec![
+            int(10),
+            int(0),
+            int(0),
+            int(0),
+            int(0),
+            fatval(&[10, 20, 30], 3),
+            uint(5),
+        ],
+        Err("index out of bounds: the len is 3 but the index is 5"),
+    );
+}
+
+#[test]
+fn many_arguments_returning_a_pair() {
+    let i64t = i(mir::IntTy::I64);
+    let pair_ty = mir::Ty::Tuple(vec![i64t.clone(), i64t.clone()]);
+    // fn mkpair(a..g: i64) -> (i64, i64) { (a + g, b * f) }
+    // locals: 0 ret, 1..=7 args, 8 t0, 9 t1
+    let mkpair = spec(
+        "mkpair",
+        0,
+        7,
+        &[
+            pair_ty.clone(),
+            i64t.clone(),
+            i64t.clone(),
+            i64t.clone(),
+            i64t.clone(),
+            i64t.clone(),
+            i64t.clone(),
+            i64t.clone(),
+            i64t.clone(),
+            i64t.clone(),
+        ],
+        vec![bb(
+            vec![
+                assign(
+                    pl(8),
+                    mir::Rvalue::BinaryOp(mir::BinOp::Add, Box::new((cp(1), cp(7)))),
+                ),
+                assign(
+                    pl(9),
+                    mir::Rvalue::BinaryOp(mir::BinOp::Mul, Box::new((cp(2), cp(6)))),
+                ),
+                assign(
+                    pl(0),
+                    mir::Rvalue::Aggregate(
+                        Box::new(mir::AggregateKind::Tuple),
+                        vec![cp(8), cp(9)],
+                    ),
+                ),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    // fn main() -> i64 { let p = mkpair(1, 2, 3, 4, 5, 6, 7); p.0 + p.1 }
+    let main = spec(
+        "main_mkpair",
+        1,
+        0,
+        &[i64t.clone(), pair_ty.clone()],
+        vec![
+            bb(
+                vec![],
+                call_term(fndef(def(0)), (1..=7).map(i64c).collect(), 1, 1),
+            ),
+            bb(
+                vec![assign(
+                    pl(0),
+                    mir::Rvalue::BinaryOp(
+                        mir::BinOp::Add,
+                        Box::new((cpf(1, 0, i64t.clone()), cpf(1, 1, i64t.clone()))),
+                    ),
+                )],
+                mir::TerminatorKind::Return,
+            ),
+        ],
+    );
+    let (jit, prog) = build(&[mkpair, main]);
+    check(&jit, &prog, "main_mkpair", &[], vec![], Ok(20));
+    // The pair itself, through the Rust-side pair entry.
+    assert_eq!(
+        jit.call_pair("mkpair", &[1, 2, 3, 4, 5, 6, 7]).unwrap(),
+        (8, 12)
+    );
+}
+
+#[test]
+fn unit_argument_occupies_a_dummy_word() {
+    let i64t = i(mir::IntTy::I64);
+    let unit = mir::Ty::Tuple(vec![]);
+    // fn with_unit(a: i64, u: (), b..f: i64) -> i64 { a + b + c + d + e + f }
+    // The unit parameter's dummy word is word 1; f is word 6, on the
+    // stack. locals: 0 ret, 1 a, 2 u, 3..=7 b..f, 8 acc
+    let mut stmts = vec![assign(pl(8), mir::Rvalue::Use(cp(1)))];
+    for k in 3..=7u32 {
+        stmts.push(assign(
+            pl(8),
+            mir::Rvalue::BinaryOp(mir::BinOp::Add, Box::new((cp(8), cp(k)))),
+        ));
+    }
+    stmts.push(assign(pl(0), mir::Rvalue::Use(cp(8))));
+    let with_unit = spec(
+        "with_unit",
+        0,
+        7,
+        &[
+            i64t.clone(),
+            i64t.clone(),
+            unit.clone(),
+            i64t.clone(),
+            i64t.clone(),
+            i64t.clone(),
+            i64t.clone(),
+            i64t.clone(),
+            i64t.clone(),
+        ],
+        vec![bb(stmts, mir::TerminatorKind::Return)],
+    );
+    // fn main() -> i64 { _1 = (); with_unit(10, _1, 1, 2, 3, 4, 5) }
+    // locals: 0 ret, 1 unit placeholder, 2 dest
+    let main = spec(
+        "main_unit",
+        1,
+        0,
+        &[i64t.clone(), unit.clone(), i64t.clone()],
+        vec![
+            bb(
+                vec![assign(
+                    pl(1),
+                    mir::Rvalue::Aggregate(Box::new(mir::AggregateKind::Tuple), vec![]),
+                )],
+                call_term(
+                    fndef(def(0)),
+                    vec![i64c(10), cp(1), i64c(1), i64c(2), i64c(3), i64c(4), i64c(5)],
+                    2,
+                    1,
+                ),
+            ),
+            bb(
+                vec![assign(pl(0), mir::Rvalue::Use(cp(2)))],
+                mir::TerminatorKind::Return,
+            ),
+        ],
+    );
+    let (jit, prog) = build(&[with_unit, main]);
+    check(&jit, &prog, "main_unit", &[], vec![], Ok(25));
+    // Rust-side entry: the dummy word is passed explicitly.
+    check(
+        &jit,
+        &prog,
+        "with_unit",
+        &[10, 0, 1, 2, 3, 4, 5],
+        vec![
+            int(10),
+            Value::Unit,
+            int(1),
+            int(2),
+            int(3),
+            int(4),
+            int(5),
+        ],
+        Ok(25),
+    );
+}

@@ -417,4 +417,156 @@ mod tests {
             Some("kaboom".to_string())
         );
     }
+
+    /// fn callee(p0..p{n-1}) = p0 + 2*p1 + ... + n*p{n-1}: distinct
+    /// weights, so any argument misalignment changes the result.
+    fn weighted_sum_callee(name: &str, n: usize) -> Function {
+        let mut b = FunctionBuilder::new(name, n);
+        let mut acc = b.param(0);
+        for i in 1..n {
+            let p = b.param(i);
+            let w = b.binop(B::Mul, p, Operand::Const((i + 1) as i64));
+            acc = b.binop(B::Add, acc, w);
+        }
+        b.finish(Terminator::Return {
+            value: acc.into(),
+            second: None,
+        })
+    }
+
+    #[test]
+    fn call_with_seven_arguments() {
+        let callee = weighted_sum_callee("callee", 7);
+        // fn caller(x) = callee(1, 2, 3, 4, 5, 6, x + 1): the seventh
+        // word is a computed value passed on the stack (one stack
+        // word, so the call site also emits the alignment pad push).
+        let mut b = FunctionBuilder::new("caller", 1);
+        let x = b.param(0);
+        let xp1 = b.binop(B::Add, x, Operand::Const(1));
+        let d = b.fresh();
+        b.push_raw(Instr::Call {
+            dst: d,
+            dst2: None,
+            func: 0,
+            args: vec![
+                Operand::Const(1),
+                Operand::Const(2),
+                Operand::Const(3),
+                Operand::Const(4),
+                Operand::Const(5),
+                Operand::Const(6),
+                xp1.into(),
+            ],
+        });
+        b.push_raw(Instr::CheckPanic);
+        let caller = b.finish(Terminator::Return {
+            value: d.into(),
+            second: None,
+        });
+        let prog = compile_program(&[callee, caller], vec![]).unwrap();
+        // callee(1..=7) = 1 + 4 + 9 + 16 + 25 + 36 + 49
+        assert_eq!(prog.call(1, &[6]), Ok(140));
+        // Direct entry with seven words (through the trampoline).
+        assert_eq!(prog.call(0, &[1, 1, 1, 1, 1, 1, 1]), Ok(28));
+    }
+
+    #[test]
+    fn call_with_eight_and_ten_arguments() {
+        let c8 = weighted_sum_callee("c8", 8);
+        let c10 = weighted_sum_callee("c10", 10);
+        // fn caller(x) = c8(1..=8) + c10(1, 1, 1, 1, 1, 1, 1, 1, 1, x)
+        let mut b = FunctionBuilder::new("caller", 1);
+        let x = b.param(0);
+        let d8 = b.fresh();
+        b.push_raw(Instr::Call {
+            dst: d8,
+            dst2: None,
+            func: 0,
+            args: (1..=8).map(Operand::Const).collect(),
+        });
+        b.push_raw(Instr::CheckPanic);
+        let d10 = b.fresh();
+        let mut args10: Vec<Operand> = (0..9).map(|_| Operand::Const(1)).collect();
+        args10.push(x.into());
+        b.push_raw(Instr::Call {
+            dst: d10,
+            dst2: None,
+            func: 1,
+            args: args10,
+        });
+        b.push_raw(Instr::CheckPanic);
+        let sum = b.binop(B::Add, d8, d10);
+        let caller = b.finish(Terminator::Return {
+            value: sum.into(),
+            second: None,
+        });
+        let prog = compile_program(&[c8, c10, caller], vec![]).unwrap();
+        // c8(1..=8) = 204; c10(1 x9, 2) = 45 + 20 = 65.
+        assert_eq!(prog.call(2, &[2]), Ok(269));
+        assert_eq!(prog.call(0, &[1; 8]), Ok(36));
+        assert_eq!(prog.call(1, &[1; 10]), Ok(55));
+    }
+
+    #[test]
+    fn nested_many_argument_calls() {
+        let inner = weighted_sum_callee("inner", 8);
+        // fn outer(a..h) = inner(h, g, f, e, d, c, b, a) + a: the
+        // outer function's own stack-passed words (g, h) are read
+        // from its frame and passed on, in reverse order.
+        let mut b = FunctionBuilder::new("outer", 8);
+        let params: Vec<_> = (0..8).map(|i| b.param(i)).collect();
+        let d = b.fresh();
+        b.push_raw(Instr::Call {
+            dst: d,
+            dst2: None,
+            func: 0,
+            args: params.iter().rev().map(|p| (*p).into()).collect(),
+        });
+        b.push_raw(Instr::CheckPanic);
+        let r = b.binop(B::Add, d, params[0]);
+        let outer = b.finish(Terminator::Return {
+            value: r.into(),
+            second: None,
+        });
+        let prog = compile_program(&[inner, outer], vec![]).unwrap();
+        // inner(8, 7, 6, 5, 4, 3, 2, 1) = 8+14+18+20+20+18+14+8 = 120; + a = 1.
+        assert_eq!(prog.call(1, &[1, 2, 3, 4, 5, 6, 7, 8]), Ok(121));
+    }
+
+    #[test]
+    fn many_argument_call_returning_pair() {
+        // fn callee(a..h) -> (a + h, b * g): a two-word result from
+        // an eight-word call (the Lane BU pair convention, with
+        // stack-passed arguments).
+        let mut b = FunctionBuilder::new("callee", 8);
+        let a = b.param(0);
+        let bb = b.param(1);
+        let g = b.param(6);
+        let h = b.param(7);
+        let s = b.binop(B::Add, a, h);
+        let p = b.binop(B::Mul, bb, g);
+        let callee = b.finish(Terminator::Return {
+            value: s.into(),
+            second: Some(p.into()),
+        });
+        // fn caller() = { let (x, y) = callee(1..=8); x + y }
+        let mut b = FunctionBuilder::new("caller", 0);
+        let d0 = b.fresh();
+        let d1 = b.fresh();
+        b.push_raw(Instr::Call {
+            dst: d0,
+            dst2: Some(d1),
+            func: 0,
+            args: (1..=8).map(Operand::Const).collect(),
+        });
+        b.push_raw(Instr::CheckPanic);
+        let r = b.binop(B::Add, d0, d1);
+        let caller = b.finish(Terminator::Return {
+            value: r.into(),
+            second: None,
+        });
+        let prog = compile_program(&[callee, caller], vec![]).unwrap();
+        assert_eq!(prog.call(1, &[]), Ok(23));
+        assert_eq!(prog.call_pair(0, &[1, 2, 3, 4, 5, 6, 7, 8]), Ok((9, 14)));
+    }
 }
