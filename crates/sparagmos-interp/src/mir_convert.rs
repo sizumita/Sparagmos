@@ -997,6 +997,16 @@ fn is_fat_ptr_ty(ty: &mir::Ty) -> bool {
     }
 }
 
+/// The pointee type of a pointer or reference type.
+fn ptr_pointee(ty: &mir::Ty) -> Option<&mir::Ty> {
+    match ty {
+        mir::Ty::RawPtr(pointee, _) | mir::Ty::Ref(_, pointee, _) => {
+            Some(pointee)
+        }
+        _ => None,
+    }
+}
+
 /// The constant form of a uniquely determined zero-sized value
 /// (the only values [`Converter::zst_value`] synthesizes), or
 /// `None` for a value kind with no constant form.
