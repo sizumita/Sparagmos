@@ -29,6 +29,7 @@
 use crate::error::{InterpError, InterpResult};
 use crate::ir::*;
 use crate::value::{PanicPayload, RefProj, RefTarget, Value};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 /// Interpreter limits / configuration.
@@ -3893,6 +3894,81 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// The borrowing form of [`read_resolved`]: a place read lends
+    /// the projected value out of the frame's storage instead of
+    /// cloning it, for consumers that only inspect the value (or
+    /// clone a small part of it). Reads out of the statics and
+    /// allocation stores cannot lend (the stores sit behind
+    /// `RefCell`s), and a detached `Resolved::Value` is itself a
+    /// copy, so those arms yield an owned value — exactly what
+    /// `read_resolved` returns. Errors are identical.
+    pub(crate) fn read_resolved_ref<'x>(
+        &self,
+        frames: &'x [Frame],
+        target: &Resolved,
+    ) -> InterpResult<Cow<'x, Value>> {
+        match target {
+            Resolved::Value(value) => {
+                if *value == Value::Uninit {
+                    return Err(InterpError::UninitializedRead {
+                        func: "<constant>".to_string(),
+                        place: "constant aggregate".to_string(),
+                    });
+                }
+                Ok(Cow::Owned(value.clone()))
+            }
+            Resolved::Static { .. } | Resolved::Alloc { .. } => {
+                Ok(Cow::Owned(self.read_resolved(frames, target)?))
+            }
+            Resolved::Place {
+                frame_pos,
+                local,
+                projection,
+            } => {
+                let frame = &frames[*frame_pos];
+                let base = frame.locals.get(*local).ok_or_else(|| {
+                    InterpError::UnknownLocal {
+                        func: frame.func.clone(),
+                        local: *local,
+                    }
+                })?;
+                let place_desc = if projection.is_empty() {
+                    String::new()
+                } else {
+                    describe_resolved(*local, projection)
+                };
+                if *base == Value::Uninit {
+                    if let Some(zst) = self.zst_local_value(frame, *local) {
+                        let value = project_value(zst, projection, &frame.func, &place_desc)?;
+                        if value == Value::Uninit {
+                            return Err(InterpError::UninitializedRead {
+                                func: frame.func.clone(),
+                                place: if projection.is_empty() {
+                                    describe_resolved(*local, projection)
+                                } else {
+                                    place_desc
+                                },
+                            });
+                        }
+                        return Ok(Cow::Owned(value));
+                    }
+                }
+                let value = project_value_ref(base, projection, &frame.func, &place_desc)?;
+                if *value == Value::Uninit {
+                    return Err(InterpError::UninitializedRead {
+                        func: frame.func.clone(),
+                        place: if projection.is_empty() {
+                            describe_resolved(*local, projection)
+                        } else {
+                            place_desc
+                        },
+                    });
+                }
+                Ok(value)
+            }
+        }
+    }
+
     pub(crate) fn read_resolved(
         &self,
         frames: &[Frame],
@@ -5953,6 +6029,203 @@ pub(crate) fn project_value(
         };
     }
     Ok(value)
+}
+
+/// Project through `projection` by reference: the borrowing form
+/// of [`project_value`]. Steps that only navigate (field, index
+/// into an aggregate, downcast) lend the sub-value out of the
+/// input; steps that construct a fresh value (byte/string indexing,
+/// sub-slices) materialise it and finish the remaining steps with
+/// the owning projection. Errors are exactly those of
+/// `project_value`.
+pub(crate) fn project_value_ref<'a>(
+    value: &'a Value,
+    projection: &[RefProj],
+    func: &str,
+    place: &str,
+) -> InterpResult<Cow<'a, Value>> {
+    let mut cur: &'a Value = value;
+    let mut rest = projection;
+    while let Some((step, tail)) = rest.split_first() {
+        if *cur == Value::Uninit {
+            return Err(InterpError::UninitializedRead {
+                func: func.to_string(),
+                place: place.to_string(),
+            });
+        }
+        rest = tail;
+        match step {
+            RefProj::Field(idx) => {
+                cur = match cur {
+                    Value::Tuple(items) => items.get(*idx).ok_or_else(|| {
+                        InterpError::UninitializedRead {
+                            func: func.to_string(),
+                            place: place.to_string(),
+                        }
+                    })?,
+                    Value::Enum { fields, .. } => fields.get(*idx).ok_or_else(|| {
+                        InterpError::UninitializedRead {
+                            func: func.to_string(),
+                            place: place.to_string(),
+                        }
+                    })?,
+                    Value::Coroutine { fields, .. } => fields.get(*idx).ok_or_else(|| {
+                        InterpError::UninitializedRead {
+                            func: func.to_string(),
+                            place: place.to_string(),
+                        }
+                    })?,
+                    Value::Closure { env, .. } => env.get(*idx).ok_or_else(|| {
+                        InterpError::UninitializedRead {
+                            func: func.to_string(),
+                            place: place.to_string(),
+                        }
+                    })?,
+                    Value::DynRef { .. } if *idx == 0 => cur,
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            format!("field projection on {place}"),
+                            "tuple or ADT value",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+            }
+            RefProj::Index(idx) => match cur {
+                Value::FatRef { base, len } => {
+                    if *idx as u128 >= *len {
+                        return Err(index_oob(*len as usize, *idx));
+                    }
+                    match project_value_ref(base, std::slice::from_ref(step), func, place)? {
+                        Cow::Borrowed(v) => cur = v,
+                        Cow::Owned(v) => {
+                            return Ok(Cow::Owned(project_value(v, rest, func, place)?));
+                        }
+                    }
+                }
+                Value::Tuple(items) => {
+                    cur = items.get(*idx).ok_or_else(|| index_oob(items.len(), *idx))?;
+                }
+                Value::Enum { fields, .. } => {
+                    cur = fields.get(*idx).ok_or_else(|| index_oob(fields.len(), *idx))?;
+                }
+                Value::Bytes(b) => {
+                    let byte = b.get(*idx).ok_or_else(|| index_oob(b.len(), *idx))?;
+                    let v = Value::Uint(*byte as u128);
+                    return Ok(Cow::Owned(project_value(v, rest, func, place)?));
+                }
+                Value::Str(text) => {
+                    let byte = text
+                        .as_bytes()
+                        .get(*idx)
+                        .ok_or_else(|| index_oob(text.len(), *idx))?;
+                    let v = Value::Uint(*byte as u128);
+                    return Ok(Cow::Owned(project_value(v, rest, func, place)?));
+                }
+                other => {
+                    return Err(InterpError::type_mismatch(
+                        format!("index projection on {place}"),
+                        "array, byte or string value",
+                        other.kind_name(),
+                    ))
+                }
+            },
+            RefProj::Subslice { offset, len } => {
+                let (start, end) = (*offset, *offset + *len);
+                let v = match cur {
+                    Value::Tuple(items) => {
+                        check_subslice(items.len(), start, *len)?;
+                        Value::Tuple(items[start..end].to_vec())
+                    }
+                    Value::Bytes(b) => {
+                        check_subslice(b.len(), start, *len)?;
+                        Value::Bytes(b[start..end].to_vec())
+                    }
+                    Value::Str(text) => match text.get(start..end) {
+                        Some(sub) => Value::Str(sub.to_string()),
+                        None => {
+                            return Err(InterpError::panic(format!(
+                                "byte range {start}..{end} is not a valid slice of the string at {place}"
+                            )))
+                        }
+                    },
+                    Value::Enum { variant, fields } => {
+                        check_subslice(fields.len(), start, *len)?;
+                        Value::Enum {
+                            variant: *variant,
+                            fields: fields[start..end].to_vec(),
+                        }
+                    }
+                    Value::FatRef {
+                        base,
+                        len: fat_len,
+                    } => {
+                        if start == 0 {
+                            if end as u128 > *fat_len {
+                                return Err(InterpError::panic(format!(
+                                    "range end index {end} out of range for slice of length {fat_len}"
+                                )));
+                            }
+                            Value::FatRef {
+                                base: base.clone(),
+                                len: end as u128,
+                            }
+                        } else {
+                            match &**base {
+                                Value::Tuple(_) | Value::Bytes(_) | Value::Str(_) => {
+                                    project_value_ref(
+                                        base,
+                                        std::slice::from_ref(step),
+                                        func,
+                                        place,
+                                    )?
+                                    .into_owned()
+                                }
+                                other => {
+                                    return Err(InterpError::type_mismatch(
+                                        format!("subslice projection on {place}"),
+                                        "materialised slice value",
+                                        other.kind_name(),
+                                    ))
+                                }
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            format!("subslice projection on {place}"),
+                            "array, slice or string value",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                return Ok(Cow::Owned(project_value(v, rest, func, place)?));
+            }
+            RefProj::Downcast(variant) => match cur {
+                Value::Coroutine { .. } => {}
+                Value::Enum {
+                    variant: current, ..
+                } => {
+                    if current != variant {
+                        return Err(InterpError::type_mismatch(
+                            format!("downcast of {place}"),
+                            format!("variant {variant}"),
+                            format!("variant {current}"),
+                        ));
+                    }
+                }
+                Value::Tuple(_) if *variant == 0 => {}
+                other => {
+                    return Err(InterpError::type_mismatch(
+                        format!("downcast of {place}"),
+                        "ADT value",
+                        other.kind_name(),
+                    ))
+                }
+            },
+        }
+    }
+    Ok(Cow::Borrowed(cur))
 }
 
 /// Navigate a projection mutably inside a stored value and return the
