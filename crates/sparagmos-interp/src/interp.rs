@@ -3479,6 +3479,7 @@ impl<'a> Interpreter<'a> {
             Rvalue::PtrField(operand) => {
                 let value = self.eval_operand(frames, body, operand)?;
                 self.ptr_field_value(frames, body, value)
+            }
             Rvalue::IntToPtr(operand) => {
                 let value = self.eval_operand(frames, body, operand)?;
                 match value {
