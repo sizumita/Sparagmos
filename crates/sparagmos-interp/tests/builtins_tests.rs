@@ -1755,11 +1755,17 @@ fn index_mut_range_to_bounds_use_the_fat_len() {
 }
 
 #[test]
-fn index_mut_range_with_nonzero_start_is_explicitly_unsupported() {
-    // A sub-slice starting above zero has no representation in
-    // the value model (a fat reference carries no offset), so
-    // `IndexMut::index_mut(&mut _1, 1..3)` stays an explicit
-    // unsupported error rather than a silent wrong answer.
+fn index_mut_range_with_nonzero_start_aliases_the_base() {
+    // fn main() -> i32 {
+    //   _1 = [1, 2, 3, 4];
+    //   _4 = IndexMut::index_mut(&mut _1, 1..3);
+    //   _5 = IndexMut::index_mut(move _4, 1);
+    //   *_5 = 99;
+    //   return _1[2];
+    // }
+    // The range result is a fat reference over the receiver with
+    // a resolved sub-slice step, so indexing and writing through
+    // it alias the base array at the range's offset.
     let array_ty = mir::Ty::Array(Box::new(i32_ty()), mir::ArrayLen::Known(4));
     let body = mir::Body::new(
         decls(&[
@@ -1768,6 +1774,7 @@ fn index_mut_range_with_nonzero_start_is_explicitly_unsupported() {
             ref_ty(array_ty.clone(), true),
             range_ty(),
             ref_ty(slice_i32_ty(), true),
+            ref_ty(i32_ty(), true),
         ]),
         0,
         vec![
@@ -1798,20 +1805,36 @@ fn index_mut_range_with_nonzero_start_is_explicitly_unsupported() {
                     1,
                 ),
             ),
-            block(vec![], ret()),
+            block(
+                vec![],
+                call(
+                    fndef(INDEX_MUT, vec![slice_i32_ty(), usize_ty()]),
+                    vec![move_(4), const_usize(1)],
+                    5,
+                    2,
+                ),
+            ),
+            block(
+                vec![
+                    assign(deref_place(5), mir::Rvalue::Use(const_i32(99))),
+                    assign(
+                        place(0),
+                        mir::Rvalue::Use(mir::Operand::Copy(mir::Place {
+                            local: mir::Local(1),
+                            projection: vec![mir::PlaceElem::ConstantIndex {
+                                offset: 2,
+                                min_length: 4,
+                                from_end: false,
+                            }],
+                        })),
+                    ),
+                ],
+                ret(),
+            ),
         ],
     );
-    let err = interpret_mir(&program(body), "main", vec![])
-        .expect_err("a range starting above zero must fail explicitly");
-    match err {
-        MirRunError::Interp(InterpError::UnsupportedTerminator { kind }) => {
-            assert!(
-                kind.contains("range starting at 1 is not runtime-supported"),
-                "error names the limitation: {kind}"
-            );
-        }
-        other => panic!("expected an explicit unsupported error, got {other:?}"),
-    }
+    let value = interpret_mir(&program(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Int(99));
 }
 
 // ----- Round 2: intrinsics, ops traits, Rc/Arc, zeroed, null (Lane BI) --------

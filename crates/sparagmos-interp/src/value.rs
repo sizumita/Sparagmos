@@ -87,6 +87,11 @@ pub enum RefProj {
     Field(usize),
     Index(usize),
     Downcast(u32),
+    /// A sub-slice of the value's element sequence, resolved to
+    /// an absolute offset and element count against the base
+    /// value's length at resolution time. Reads materialise the
+    /// sub-sequence; writes navigate into it element-wise.
+    Subslice { offset: usize, len: usize },
 }
 
 /// Where a [`Value::Ref`] points.
@@ -356,6 +361,9 @@ impl fmt::Display for RefTarget {
                         RefProj::Field(i) => write!(f, ".{i}")?,
                         RefProj::Index(i) => write!(f, "[{i}]")?,
                         RefProj::Downcast(v) => write!(f, " as variant {v}")?,
+                        RefProj::Subslice { offset, len } => {
+                            write!(f, "[{offset}..{}]", offset + len)?
+                        }
                     }
                 }
                 Ok(())
@@ -368,6 +376,9 @@ impl fmt::Display for RefTarget {
                         RefProj::Field(i) => write!(f, ".{i}")?,
                         RefProj::Index(i) => write!(f, "[{i}]")?,
                         RefProj::Downcast(v) => write!(f, " as variant {v}")?,
+                        RefProj::Subslice { offset, len } => {
+                            write!(f, "[{offset}..{}]", offset + len)?
+                        }
                     }
                 }
                 Ok(())
@@ -379,6 +390,9 @@ impl fmt::Display for RefTarget {
                         RefProj::Field(i) => write!(f, ".{i}")?,
                         RefProj::Index(i) => write!(f, "[{i}]")?,
                         RefProj::Downcast(v) => write!(f, " as variant {v}")?,
+                        RefProj::Subslice { offset, len } => {
+                            write!(f, "[{offset}..{}]", offset + len)?
+                        }
                     }
                 }
                 Ok(())

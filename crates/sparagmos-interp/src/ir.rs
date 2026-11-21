@@ -239,6 +239,12 @@ pub enum ProjectionElem {
     ConstantIndex { offset: u64, from_end: bool },
     /// Project an enum value to one variant's fields.
     Downcast(u32),
+    /// `_1[from..to]`: the sub-slice of an array or slice place.
+    /// With `from_end`, `to` counts back from the base's length
+    /// (the range is `from..len - to`); otherwise it is the
+    /// range's end. The bounds are the constants MIR carries;
+    /// resolution checks them against the base's actual length.
+    Subslice { from: u64, to: u64, from_end: bool },
 }
 
 /// A place: a local plus a (possibly empty) projection chain.
@@ -284,6 +290,13 @@ impl fmt::Display for Place {
                     }
                 }
                 ProjectionElem::Downcast(v) => write!(f, " as variant {v}")?,
+                ProjectionElem::Subslice { from, to, from_end } => {
+                    if *from_end {
+                        write!(f, "[{from}..len - {to}]")?
+                    } else {
+                        write!(f, "[{from}..{to}]")?
+                    }
+                }
             }
         }
         Ok(())

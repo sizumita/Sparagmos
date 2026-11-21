@@ -499,56 +499,118 @@ fn f128_local_is_a_conversion_error() {
 }
 
 #[test]
-fn subslice_projection_is_a_conversion_error() {
-    // _0 = copy (_1[0..1]) with a Subslice projection.
-    let indexed = mir::Place {
+fn subslice_projection_converts_and_executes() {
+    // _1 = [10, 20]; _1[0..2][1] = 7; _0 = copy (_1[1])
+    // The Subslice step converts, and a write through it composed
+    // with a constant index lands on the base array element.
+    let write_place = mir::Place {
         local: mir::Local(1),
-        projection: vec![mir::PlaceElem::Subslice {
-            from: 0,
-            to: 1,
+        projection: vec![
+            mir::PlaceElem::Subslice {
+                from: 0,
+                to: 2,
+                from_end: false,
+            },
+            mir::PlaceElem::ConstantIndex {
+                offset: 1,
+                min_length: 2,
+                from_end: false,
+            },
+        ],
+    };
+    let read_place = mir::Place {
+        local: mir::Local(1),
+        projection: vec![mir::PlaceElem::ConstantIndex {
+            offset: 1,
+            min_length: 2,
             from_end: false,
         }],
     };
+    let array_ty = mir::Ty::Array(Box::new(u32_ty()), mir::ArrayLen::Known(2));
     let body = mir::Body::new(
-        decls(&[
-            u32_ty(),
-            mir::Ty::Array(Box::new(u32_ty()), mir::ArrayLen::Known(2)),
-        ]),
+        decls(&[u32_ty(), array_ty]),
         0,
         vec![block(
-            vec![assign(
-                place(0),
-                mir::Rvalue::Use(mir::Operand::Copy(indexed)),
-            )],
+            vec![
+                assign(
+                    place(1),
+                    mir::Rvalue::Aggregate(
+                        Box::new(mir::AggregateKind::Array(u32_ty())),
+                        vec![const_u32(10), const_u32(20)],
+                    ),
+                ),
+                assign(write_place, mir::Rvalue::Use(const_u32(7))),
+                assign(
+                    place(0),
+                    mir::Rvalue::Use(mir::Operand::Copy(read_place)),
+                ),
+            ],
             ret(),
         )],
     );
     let mut prog = MirProgram::new();
-    prog.add("idx", body);
-    // The conversion must fail explicitly, never guess: the body
-    // is recorded as unconverted, and running it as the entry
-    // fails with the conversion error.
-    let converted = convert_program(&prog).expect("conversion is per-body");
-    assert!(
-        converted.get("idx").is_none(),
-        "subslice body must not convert"
-    );
-    assert!(
-        converted.unconverted_reason("idx").is_some(),
-        "the failure must be recorded"
-    );
-    let err = interpret_mir(&prog, "idx", vec![]).expect_err("entry conversion must fail");
-    assert!(
-        matches!(
-            err,
-            MirRunError::Convert(
-                ConvertError::UnsupportedProjection { .. } | ConvertError::UnsupportedType { .. }
-            )
-        ),
-        "expected a projection/type conversion error, got {err}"
-    );
+    prog.add("sub", body);
+    let result = interpret_mir(&prog, "sub", vec![]).expect("subslice body must run");
+    assert_eq!(result, Value::Uint(7));
 }
 
+#[test]
+fn subslice_len_resolves_against_the_base() {
+    // _1 = [10, 20, 30]; _0 = Len(_1[1..]) -> 2: the from_end
+    // Subslice form resolves its length against the base place.
+    let len_place = mir::Place {
+        local: mir::Local(1),
+        projection: vec![mir::PlaceElem::Subslice {
+            from: 1,
+            to: 0,
+            from_end: true,
+        }],
+    };
+    let array_ty = mir::Ty::Array(Box::new(u32_ty()), mir::ArrayLen::Known(3));
+    let body = mir::Body::new(
+        decls(&[mir::Ty::Uint(mir::UintTy::Usize), array_ty]),
+        0,
+        vec![block(
+            vec![
+                assign(
+                    place(1),
+                    mir::Rvalue::Aggregate(
+                        Box::new(mir::AggregateKind::Array(u32_ty())),
+                        vec![const_u32(10), const_u32(20), const_u32(30)],
+                    ),
+                ),
+                assign(place(0), mir::Rvalue::Len(len_place)),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("sublen", body);
+    let result = interpret_mir(&prog, "sublen", vec![]).expect("subslice Len must run");
+    assert_eq!(result, Value::Uint(2));
+}
+
+#[test]
+fn pattern_type_converts_and_executes_as_its_base_type() {
+    // _0 = copy _1 with _1: Pat(u32, "1.."): a pattern type is a
+    // refinement of its base type with the same representation,
+    // so conversion keeps the base type and the value flows
+    // through unchanged.
+    let pat_ty = mir::Ty::Pat(Box::new(u32_ty()), "1..".to_string());
+    let body = mir::Body::new(
+        decls(&[u32_ty(), pat_ty]),
+        1,
+        vec![block(
+            vec![assign(place(0), mir::Rvalue::Use(copy(1)))],
+            ret(),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("patid", body);
+    let result = interpret_mir(&prog, "patid", vec![Value::Uint(41)])
+        .expect("pattern-typed body must run");
+    assert_eq!(result, Value::Uint(41));
+}
 #[test]
 fn drop_terminator_fails_at_execution_not_silently() {
     // The dropped place has an ADT type the value model does not know:

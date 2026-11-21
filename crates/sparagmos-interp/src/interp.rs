@@ -3302,6 +3302,36 @@ impl<'a> Interpreter<'a> {
                     })?;
                     self.project_step(frames, cur, RefProj::Index(idx), body, place)?
                 }
+                ProjectionElem::Subslice { from, to, from_end } => {
+                    // The range is resolved against the length the
+                    // base place currently has: the fat length when
+                    // the base was reached through a fat deref,
+                    // otherwise the base value's own length. The
+                    // resolved step carries an absolute offset and
+                    // element count, so later steps (and reference
+                    // targets formed from this place) need no
+                    // knowledge of the MIR range shape.
+                    let base_len = self.read_resolved(frames, &cur)?.len().ok_or_else(|| {
+                        InterpError::type_mismatch(
+                            format!("subslice of {place}"),
+                            "array, slice or string value",
+                            "value without a length",
+                        )
+                    })?;
+                    let len = fat_cap.unwrap_or(base_len);
+                    fat_cap = None;
+                    let (offset, sub_len) = subslice_offset_len(*from, *to, *from_end, len)?;
+                    self.project_step(
+                        frames,
+                        cur,
+                        RefProj::Subslice {
+                            offset,
+                            len: sub_len,
+                        },
+                        body,
+                        place,
+                    )?
+                }
                 ProjectionElem::Downcast(variant) => {
                     fat_cap = None;
                     self.project_step(frames, cur, RefProj::Downcast(*variant), body, place)?
@@ -4914,12 +4944,71 @@ pub(crate) fn describe_resolved(local: usize, projection: &[RefProj]) -> String 
             RefProj::Field(i) => out.push_str(&format!(".{i}")),
             RefProj::Index(i) => out.push_str(&format!("[{i}]")),
             RefProj::Downcast(v) => out.push_str(&format!(" as variant {v}")),
+            RefProj::Subslice { offset, len } => {
+                out.push_str(&format!("[{offset}..{}]", offset + len))
+            }
         }
     }
     out
 }
 
 /// The guest panic rustc raises for an out-of-bounds index.
+/// The (offset, element count) a MIR `Subslice` projection
+/// selects from a base of `len` elements, with core's own panic
+/// messages for an out-of-range selection. With `from_end`, `to`
+/// counts back from the end of the base (the range is
+/// `from..len - to`); otherwise `to` is the range's end.
+fn subslice_offset_len(
+    from: u64,
+    to: u64,
+    from_end: bool,
+    len: u128,
+) -> InterpResult<(usize, usize)> {
+    let from = from as u128;
+    let end = if from_end {
+        len.checked_sub(to as u128).ok_or_else(|| {
+            InterpError::panic(format!(
+                "range end index {to} out of range for slice of length {len}"
+            ))
+        })?
+    } else {
+        to as u128
+    };
+    if from > end {
+        return Err(InterpError::panic(format!(
+            "slice index starts at {from} but ends at {end}"
+        )));
+    }
+    if end > len {
+        return Err(InterpError::panic(format!(
+            "range end index {end} out of range for slice of length {len}"
+        )));
+    }
+    let offset = usize::try_from(from).map_err(|_| {
+        InterpError::panic(format!("slice index {from} does not fit in usize"))
+    })?;
+    let count = usize::try_from(end - from).map_err(|_| {
+        InterpError::panic(format!(
+            "slice length {} does not fit in usize",
+            end - from
+        ))
+    })?;
+    Ok((offset, count))
+}
+
+/// Check an already-resolved (offset, count) sub-slice selection
+/// against a materialised value's element count, with the same
+/// panic messages as [`subslice_offset_len`].
+fn check_subslice(value_len: usize, offset: usize, count: usize) -> InterpResult<()> {
+    let end = offset + count;
+    if end > value_len {
+        return Err(InterpError::panic(format!(
+            "range end index {end} out of range for slice of length {value_len}"
+        )));
+    }
+    Ok(())
+}
+
 fn index_oob(len: usize, index: usize) -> InterpError {
     InterpError::panic(format!(
         "index out of bounds: the len is {len} but the index is {index}"
@@ -5056,6 +5145,79 @@ pub(crate) fn project_value(
                     ));
                 }
             },
+            RefProj::Subslice { offset, len } => {
+                let (start, end) = (*offset, *offset + *len);
+                match value {
+                    Value::Tuple(ref items) => {
+                        check_subslice(items.len(), start, *len)?;
+                        Value::Tuple(items[start..end].to_vec())
+                    }
+                    Value::Bytes(ref b) => {
+                        check_subslice(b.len(), start, *len)?;
+                        Value::Bytes(b[start..end].to_vec())
+                    }
+                    Value::Str(ref s) => match s.get(start..end) {
+                        Some(sub) => Value::Str(sub.to_string()),
+                        None => {
+                            return Err(InterpError::panic(format!(
+                                "byte range {start}..{end} is not a valid slice of the string at {place}"
+                            )))
+                        }
+                    },
+                    // A `Vec` value is the aggregate of its
+                    // elements: its sub-slice is the aggregate of
+                    // the sub-range's elements.
+                    Value::Enum { variant, ref fields } => {
+                        check_subslice(fields.len(), start, *len)?;
+                        Value::Enum {
+                            variant,
+                            fields: fields[start..end].to_vec(),
+                        }
+                    }
+                    // A sub-slice of a fat reference value (a
+                    // constant slice's representation): a zero
+                    // offset only adjusts the carried length; a
+                    // materialised base is projected directly.
+                    Value::FatRef { ref base, len: fat_len } => {
+                        if start == 0 {
+                            if end as u128 > fat_len {
+                                return Err(InterpError::panic(format!(
+                                    "range end index {end} out of range for slice of length {fat_len}"
+                                )));
+                            }
+                            Value::FatRef {
+                                base: base.clone(),
+                                len: end as u128,
+                            }
+                        } else {
+                            match &**base {
+                                Value::Tuple(_) | Value::Bytes(_) | Value::Str(_) => {
+                                    project_value(
+                                        (**base).clone(),
+                                        &[RefProj::Subslice { offset: start, len: *len }],
+                                        func,
+                                        place,
+                                    )?
+                                }
+                                other => {
+                                    return Err(InterpError::type_mismatch(
+                                        format!("subslice projection on {place}"),
+                                        "materialised slice value",
+                                        other.kind_name(),
+                                    ))
+                                }
+                            }
+                        }
+                    }
+                    ref other => {
+                        return Err(InterpError::type_mismatch(
+                            format!("subslice projection on {place}"),
+                            "array, slice or string value",
+                            other.kind_name(),
+                        ));
+                    }
+                }
+            }
             RefProj::Downcast(variant) => match value {
                 // A coroutine's downcast names the state whose field
                 // layout the access uses; the storage is shared
@@ -5188,6 +5350,68 @@ pub(crate) fn navigate_mut<'x>(
                 other.kind_name(),
             )),
         },
+        RefProj::Subslice { offset, len } => {
+            // A sub-slice has no single slot to hand out: the
+            // navigation continues into one of its elements (an
+            // `Index` step composes the offset into the base) or
+            // into a nested sub-slice (the offsets compose). A
+            // write to the whole sub-slice would have to splice
+            // the base's element sequence in place; no MIR
+            // assignment targets an unsized place that way, so it
+            // stays an explicit error rather than a silent
+            // partial write.
+            match rest.first() {
+                Some(RefProj::Index(j)) => {
+                    let j = *j;
+                    if j >= *len {
+                        return Err(index_oob(*len, j));
+                    }
+                    let target = *offset + j;
+                    let rest = &rest[1..];
+                    match slot {
+                        Value::Tuple(items) => {
+                            if target >= items.len() {
+                                return Err(index_oob(items.len(), target));
+                            }
+                            navigate_mut(&mut items[target], rest, func, place)
+                        }
+                        Value::Enum { fields, .. } => {
+                            if target >= fields.len() {
+                                return Err(index_oob(fields.len(), target));
+                            }
+                            navigate_mut(&mut fields[target], rest, func, place)
+                        }
+                        other => Err(InterpError::type_mismatch(
+                            format!("subslice element write on {place}"),
+                            "array value",
+                            other.kind_name(),
+                        )),
+                    }
+                }
+                Some(RefProj::Subslice {
+                    offset: inner_offset,
+                    len: inner_len,
+                }) => {
+                    if inner_offset + inner_len > *len {
+                        return Err(InterpError::panic(format!(
+                            "range end index {} out of range for slice of length {len}",
+                            inner_offset + inner_len
+                        )));
+                    }
+                    let mut composed = vec![RefProj::Subslice {
+                        offset: offset + inner_offset,
+                        len: *inner_len,
+                    }];
+                    composed.extend_from_slice(&rest[1..]);
+                    navigate_mut(slot, &composed, func, place)
+                }
+                _ => Err(InterpError::type_mismatch(
+                    format!("write through sub-slice on {place}"),
+                    "an element or nested sub-slice of the sub-slice",
+                    "the whole sub-slice",
+                )),
+            }
+        }
         RefProj::Downcast(variant) => match slot {
             // See the read direction: a coroutine's field writes go
             // through the downcast of the state being entered,
@@ -5809,6 +6033,9 @@ fn synthetic_addr(v: &Value) -> u128 {
                     RefProj::Field(i) => (1u128, *i as u128),
                     RefProj::Index(i) => (2u128, *i as u128),
                     RefProj::Downcast(i) => (3u128, *i as u128),
+                    RefProj::Subslice { offset, len } => {
+                        (4u128, ((*offset as u128) << 64) | (*len as u128))
+                    }
                 };
                 mix(&mut h, tag);
                 mix(&mut h, n);
@@ -5827,6 +6054,9 @@ fn synthetic_addr(v: &Value) -> u128 {
                     RefProj::Field(i) => (1u128, *i as u128),
                     RefProj::Index(i) => (2u128, *i as u128),
                     RefProj::Downcast(i) => (3u128, *i as u128),
+                    RefProj::Subslice { offset, len } => {
+                        (4u128, ((*offset as u128) << 64) | (*len as u128))
+                    }
                 };
                 mix(&mut h, tag);
                 mix(&mut h, n);
@@ -5844,6 +6074,9 @@ fn synthetic_addr(v: &Value) -> u128 {
                     RefProj::Field(i) => (1u128, *i as u128),
                     RefProj::Index(i) => (2u128, *i as u128),
                     RefProj::Downcast(i) => (3u128, *i as u128),
+                    RefProj::Subslice { offset, len } => {
+                        (4u128, ((*offset as u128) << 64) | (*len as u128))
+                    }
                 };
                 mix(&mut h, tag);
                 mix(&mut h, n);

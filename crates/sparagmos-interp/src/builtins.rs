@@ -4240,13 +4240,14 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
     /// sub-slice of the receiver between the range's bounds, with
     /// core's own panic messages for out-of-range bounds (via
     /// [`range_bounds`], as for the shared `Index`). The result is
-    /// a fat reference aliasing the receiver's storage: over the
-    /// receiver reference itself for a place/static receiver, and
-    /// over the same base for a fat receiver. A range starting
-    /// above zero cannot be expressed in this model (a fat
-    /// reference carries a length but no offset, and `RefProj`
-    /// has no offset step), so those stay explicitly unsupported;
-    /// a range starting at zero is exactly a length adjustment.
+    /// a fat reference aliasing the receiver's storage: its base
+    /// is the receiver reference with a resolved
+    /// `RefProj::Subslice` step appended (the step carries the
+    /// range's offset, which is what makes a range starting above
+    /// zero expressible), over the receiver reference itself for a
+    /// place/static receiver and over the same base for a fat
+    /// receiver. A fat receiver whose base is a materialised copy
+    /// has no storage to alias and stays explicitly unsupported.
     fn index_range_mut(
         &self,
         frames: &[Frame],
@@ -4316,20 +4317,28 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
             }
         };
         let (start, end) = range_bounds(&kind, &bound, len)?;
-        if start != 0 {
-            return Err(unsupported(format!(
-                "IndexMut::index_mut with a range starting at {start} is not runtime-supported (a sub-slice offset has no representation in the value model)"
-            )));
-        }
+        let sub_len = end - start;
         match receiver {
-            Value::FatRef { base, .. } => Ok(Value::FatRef {
-                base: base.clone(),
-                len: end as u128,
-            }),
-            Value::Ref(_) => Ok(Value::FatRef {
-                base: Box::new(receiver.clone()),
-                len: end as u128,
-            }),
+            Value::FatRef { base, .. } => match &**base {
+                Value::Ref(_) => {
+                    let base = subslice_ref(base, start, sub_len, name)?;
+                    Ok(Value::FatRef {
+                        base: Box::new(base),
+                        len: sub_len as u128,
+                    })
+                }
+                other => Err(unsupported(format!(
+                    "IndexMut::index_mut with a range over a {} base is not runtime-supported (a materialised copy has no storage to alias)",
+                    other.kind_name()
+                ))),
+            },
+            Value::Ref(_) => {
+                let base = subslice_ref(receiver, start, sub_len, name)?;
+                Ok(Value::FatRef {
+                    base: Box::new(base),
+                    len: sub_len as u128,
+                })
+            }
             _ => unreachable!("receiver shapes checked above"),
         }
     }
@@ -4810,6 +4819,58 @@ fn int_uint_cmp(x: i128, y: u128) -> Ordering {
 /// order with core's panic messages. Inclusive ends are converted
 /// to exclusive ones first (an inclusive end of `usize::MAX`
 /// overflows that conversion, which core reports separately).
+/// A reference value one sub-slice deeper: `value` must be a
+/// `Value::Ref`; the result names the same target with a
+/// resolved `RefProj::Subslice` step appended, so reads and
+/// writes through it alias the original storage at the
+/// sub-slice's offset. A `Value` target (a constant aggregate)
+/// is projected eagerly: reads through it stay exact, and
+/// writes through it are refused by the write path, as for any
+/// constant.
+fn subslice_ref(value: &Value, offset: usize, len: usize, name: &str) -> InterpResult<Value> {
+    let step = RefProj::Subslice { offset, len };
+    match value {
+        Value::Ref(RefTarget::Place {
+            frame,
+            local,
+            projection,
+        }) => {
+            let mut projection = projection.clone();
+            projection.push(step);
+            Ok(Value::Ref(RefTarget::place(*frame, *local, projection)))
+        }
+        Value::Ref(RefTarget::Static {
+            name: static_name,
+            projection,
+        }) => {
+            let mut projection = projection.clone();
+            projection.push(step);
+            Ok(Value::Ref(RefTarget::Static {
+                name: static_name.clone(),
+                projection,
+            }))
+        }
+        Value::Ref(RefTarget::Alloc { id, projection }) => {
+            let mut projection = projection.clone();
+            projection.push(step);
+            Ok(Value::Ref(RefTarget::Alloc {
+                id: *id,
+                projection,
+            }))
+        }
+        Value::Ref(RefTarget::Value(v)) => {
+            let projected =
+                crate::interp::project_value((**v).clone(), &[step], name, "index_mut receiver")?;
+            Ok(Value::Ref(RefTarget::Value(Box::new(projected))))
+        }
+        other => Err(InterpError::type_mismatch(
+            "IndexMut::index_mut",
+            "reference value",
+            other.kind_name(),
+        )),
+    }
+}
+
 fn range_bounds(
     kind: &RangeKindForIndex,
     bound: &dyn Fn(usize) -> InterpResult<usize>,

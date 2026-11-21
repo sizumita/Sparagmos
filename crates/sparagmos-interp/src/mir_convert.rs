@@ -1218,6 +1218,11 @@ impl AdtAggregateCounts {
 fn operand_place_ty(body: &mir::Body, place: &mir::Place) -> Option<mir::Ty> {
     let mut ty = body.local_decls.get(place.local.index())?.ty.clone();
     for elem in &place.projection {
+        // A pattern type is its base type for every
+        // projection step.
+        while let mir::Ty::Pat(inner, _) = ty {
+            ty = *inner;
+        }
         ty = match elem {
             mir::PlaceElem::Field(_, t) => t.clone(),
             mir::PlaceElem::Deref => match ty {
@@ -1740,6 +1745,14 @@ impl<'a> Converter<'a> {
                 ir::Ty::Array(Box::new(self.convert_ty(elem, context)?), n)
             }
             mir::Ty::Slice(elem) => ir::Ty::Slice(Box::new(self.convert_ty(elem, context)?)),
+            // A pattern type shares its base type's
+            // representation: a value of the pattern type is a
+            // base value, and no execution step needs the range
+            // itself. Construction in a valid program guarantees
+            // the range, and layout facts that depend on it
+            // (niches) reach the interpreter through the driver's
+            // rustc-derived tables, not through this type.
+            mir::Ty::Pat(inner, _) => self.convert_ty(inner, context)?,
             // `dyn Trait` is representable: behind a reference it is
             // a fat pointer whose value carries the concrete type;
             // as a bare place type it names the unsized pointee a
@@ -1773,6 +1786,11 @@ impl<'a> Converter<'a> {
                     from_end: *from_end,
                 },
                 mir::PlaceElem::Downcast(_, variant) => ir::ProjectionElem::Downcast(*variant),
+                mir::PlaceElem::Subslice { from, to, from_end } => ir::ProjectionElem::Subslice {
+                    from: *from,
+                    to: *to,
+                    from_end: *from_end,
+                },
                 other => {
                     return Err(ConvertError::UnsupportedProjection {
                         kind: other.kind_name().to_string(),
@@ -1788,6 +1806,11 @@ impl<'a> Converter<'a> {
     fn place_ty(&self, body: &mir::Body, place: &mir::Place) -> Option<mir::Ty> {
         let mut ty = body.local_decls.get(place.local.index())?.ty.clone();
         for elem in &place.projection {
+            // A pattern type is its base type for every
+            // projection step.
+            while let mir::Ty::Pat(inner, _) = ty {
+                ty = *inner;
+            }
             ty = match elem {
                 mir::PlaceElem::Field(_, t) => t.clone(),
                 mir::PlaceElem::Deref => match ty {
@@ -1799,7 +1822,10 @@ impl<'a> Converter<'a> {
                     _ => return None,
                 },
                 mir::PlaceElem::Downcast(..) => ty,
-                mir::PlaceElem::Subslice { .. } => ty,
+                mir::PlaceElem::Subslice { .. } => match ty {
+                    mir::Ty::Array(elem, _) => mir::Ty::Slice(elem),
+                    t => t,
+                },
                 mir::PlaceElem::OpaqueCast(t) | mir::PlaceElem::Subtype(t) => t.clone(),
             };
         }
