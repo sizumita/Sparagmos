@@ -8441,6 +8441,20 @@ pub(crate) fn eval_cast(v: &Value, ty: &Ty) -> InterpResult<Value> {
                 other.kind_name(),
             )),
         },
+        Ty::Ref(_) => match v {
+            // A fat pointer cast to a thin pointer type keeps
+            // only its data pointer: the metadata half (a slice
+            // length, a string length, a vtable) has no
+            // counterpart in the target type.
+            Value::FatRef { base, .. } => Ok((**base).clone()),
+            Value::DynRef { base, .. } => Ok((**base).clone()),
+            Value::Ref(_) => Ok(v.clone()),
+            other => Err(InterpError::type_mismatch(
+                "cast",
+                "pointer source",
+                other.kind_name(),
+            )),
+        },
         _ => Err(InterpError::UnsupportedRvalue {
             kind: format!("Cast to {ty:?}"),
         }),
