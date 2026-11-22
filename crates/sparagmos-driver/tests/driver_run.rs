@@ -4256,6 +4256,12 @@ fn main() {
 }
 "#;
 
+const HUGE_ZST_ARRAY_CONST_SRC: &str = r#"
+fn main() {
+    println!("{}", [(); usize::MAX].len());
+}
+"#;
+
 const TOO_BIG_LOCAL_SRC: &str = r#"
 fn main() { let _a = [0u8; usize::MAX]; }
 "#;
@@ -4415,6 +4421,26 @@ fn convert_mode_pointer_to_huge_type_converts() {
         out.status.code(),
         Some(0),
         "a pointer to a huge type must convert; stderr={stderr}"
+    );
+}
+
+#[test]
+fn convert_mode_huge_zst_array_constant_converts() {
+    // A constant of a huge zero-sized array type (`[(); usize::MAX]`,
+    // the shape of rustc's own compile-time regression test 68010)
+    // has an empty allocation; decoding it element by element would
+    // materialise `usize::MAX` values and abort the host process.
+    // The constant is not materialised past the decode bound, and
+    // the program converts.
+    let dir = temp_dir("mono-huge-zst-array-const");
+    let src = fixture(&dir, "huge_zst_array_const.rs", HUGE_ZST_ARRAY_CONST_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a huge ZST array constant must not be materialised element \
+         by element and the program must convert; stderr={stderr}"
     );
 }
 
