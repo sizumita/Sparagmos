@@ -11659,6 +11659,85 @@ fn convert_mode_simd_shuffle_with_in_bounds_index_converts() {
     );
 }
 
+const SIMD_INSERT_OOB_SRC: &str = r#"
+#![feature(core_intrinsics, repr_simd)]
+use std::intrinsics::simd::simd_insert;
+#[repr(simd)]
+#[derive(Copy, Clone)]
+struct U8x2([u8; 2]);
+fn main() { unsafe { simd_insert(U8x2([0, 0]), 2, 0u8); } }
+"#;
+
+const SIMD_EXTRACT_OOB_SRC: &str = r#"
+#![feature(core_intrinsics, repr_simd)]
+use std::intrinsics::simd::simd_extract;
+#[repr(simd)]
+#[derive(Copy, Clone)]
+struct U8x2([u8; 2]);
+fn main() { unsafe { let _x: u8 = simd_extract(U8x2([0, 0]), 5); } }
+"#;
+
+const SIMD_INSERT_EXTRACT_OK_SRC: &str = r#"
+#![feature(core_intrinsics, repr_simd)]
+use std::intrinsics::simd::{simd_extract, simd_insert};
+#[repr(simd)]
+#[derive(Copy, Clone)]
+struct U8x2([u8; 2]);
+fn main() {
+    unsafe {
+        let v = simd_insert(U8x2([0, 0]), 1, 7u8);
+        let _x: u8 = simd_extract(v, 1);
+    }
+}
+"#;
+
+#[test]
+fn convert_mode_simd_insert_with_out_of_bounds_index_is_a_compile_failure() {
+    let dir = temp_dir("mono-simd-insert-oob");
+    let src = fixture(&dir, "insert_oob.rs", SIMD_INSERT_OOB_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an insert index past the vector must fail; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("simd_insert") && stderr.contains("less than"),
+        "the failure must name the intrinsic and the reason; stderr={stderr}"
+    );
+}
+
+#[test]
+fn convert_mode_simd_extract_with_out_of_bounds_index_is_a_compile_failure() {
+    let dir = temp_dir("mono-simd-extract-oob");
+    let src = fixture(&dir, "extract_oob.rs", SIMD_EXTRACT_OOB_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an extract index past the vector must fail; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("simd_extract") && stderr.contains("less than"),
+        "the failure must name the intrinsic and the reason; stderr={stderr}"
+    );
+}
+
+#[test]
+fn convert_mode_simd_insert_extract_with_in_bounds_index_converts() {
+    let dir = temp_dir("mono-simd-insert-extract-ok");
+    let src = fixture(&dir, "insert_extract_ok.rs", SIMD_INSERT_EXTRACT_OK_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "in-bounds insert/extract must convert; stderr={stderr}"
+    );
+}
+
 #[test]
 fn convert_mode_simd_reduce_with_wrong_return_is_a_compile_failure() {
     let dir = temp_dir("mono-simd-reduce-bad");

@@ -57,9 +57,11 @@
 //!   intrinsics (the ordered reductions' initial value included),
 //!   length and element agreement for shuffles,
 //!   selects and comparisons, insert/extract element agreement,
-//!   and the constant index bounds of `simd_shuffle` (the index
-//!   values are read from the call's constant operand, the same
-//!   evidence code generation reads).
+//!   and the constant index bounds of `simd_shuffle`,
+//!   `simd_insert` and `simd_extract` (the index values are read
+//!   from the call's constant operand, the same evidence code
+//!   generation reads; named constants reach this check already
+//!   evaluated by the compiler's own constant conversion).
 //!
 //! Anything not provable from the converted bodies is left alone:
 //! the checks only report a failure when the invalid shape is
@@ -625,6 +627,28 @@ fn const_u32_vector(op: &Operand, lanes: u64) -> Option<Vec<u32>> {
     }
 }
 
+/// The value of a constant scalar index operand (the `u32`
+/// index of `simd_insert` / `simd_extract`), read from the
+/// operand's allocation. `None` when the operand is not a
+/// constant with a readable 4-byte value.
+fn const_u32_scalar(op: &Operand) -> Option<u32> {
+    use rustc_public::ty::ConstantKind as CK;
+    let Operand::Constant(c) = op else {
+        return None;
+    };
+    let read = |alloc: &rustc_public::ty::Allocation| -> Option<u32> {
+        alloc.read_partial_uint(0..4).ok().map(|v| v as u32)
+    };
+    match c.const_.kind() {
+        CK::Allocated(alloc) => read(&alloc),
+        CK::Ty(tc) => match tc.kind() {
+            rustc_public::ty::TyConstKind::Value(_, alloc) => read(&alloc),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// The per-intrinsic argument rules of `generic_simd_intrinsic`
 /// (rustc_codegen_llvm) beyond the entry check in `check_call`:
 /// element-type requirements, length and element agreement
@@ -1026,28 +1050,42 @@ fn check_simd_family(
         }
         "simd_insert" | "simd_insert_dyn" => {
             let in_ty = input(0)?;
-            let (_, elem) = simd_shape(in_ty)?;
+            let (lanes, elem) = simd_shape(in_ty)?;
             let val_ty = input(2)?;
-            if val_ty == elem {
-                None
-            } else {
-                err(format!(
+            if val_ty != elem {
+                return err(format!(
                     "expected inserted type `{elem}` (element of input \
                      `{in_ty}`), found `{val_ty}`"
-                ))
+                ));
             }
+            if let Some(idx) = call_args.get(1).and_then(const_u32_scalar) {
+                if u64::from(idx) >= lanes {
+                    return err(format!(
+                        "expected index to be less than {lanes}, \
+                         found {idx}"
+                    ));
+                }
+            }
+            None
         }
         "simd_extract" | "simd_extract_dyn" => {
             let in_ty = input(0)?;
-            let (_, elem) = simd_shape(in_ty)?;
-            if ret_ty == elem {
-                None
-            } else {
-                err(format!(
+            let (lanes, elem) = simd_shape(in_ty)?;
+            if ret_ty != elem {
+                return err(format!(
                     "expected return type `{elem}` (element of input \
                      `{in_ty}`), found `{ret_ty}`"
-                ))
+                ));
             }
+            if let Some(idx) = call_args.get(1).and_then(const_u32_scalar) {
+                if u64::from(idx) >= lanes {
+                    return err(format!(
+                        "expected index to be less than {lanes}, \
+                         found {idx}"
+                    ));
+                }
+            }
+            None
         }
         _ => None,
     }
