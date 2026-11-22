@@ -1422,6 +1422,9 @@ fn sequence_values(value: &Value) -> Option<Vec<Value>> {
     match value {
         Value::Tuple(items) => Some(items.clone()),
         Value::Enum { fields, .. } => Some(fields.clone()),
+        // A sparse sequence's stored elements (its declared
+        // length runs past them; see `Value::SparseVec`).
+        Value::SparseVec { elems, .. } => Some(elems.clone()),
         Value::Bytes(bytes) => Some(
             bytes
                 .iter()
@@ -1451,6 +1454,66 @@ fn render_gdb_any(
 ) -> Option<String> {
     render_pretty_gdb(interp, frames, value, desc, None, depth)
         .or_else(|| render_gdb(interp, value, desc, false, None, depth))
+}
+
+/// Resolve a printed slice value to the value holding its
+/// elements: follow the fat pointer, and keep following while
+/// the pointee is itself a fat pointer — a slice formed over
+/// another slice value (a vector's `&vec[..]`, whose base is
+/// the vector's own slice value) denotes the same elements
+/// through every layer. The peeling is bounded; a pointee
+/// still fat past the bound is left as it stands (and the
+/// caller's sequence reading then declines it, as it did
+/// before peeling existed).
+fn slice_pointee(
+    interp: &Interpreter,
+    frames: &[Frame],
+    value: &Value,
+) -> Option<Value> {
+    let mut pointee = interp
+        .read_resolved(frames, &interp.deref_value(frames, value).ok()?)
+        .ok()?;
+    for _ in 0..8 {
+        match &pointee {
+            Value::FatRef { base, .. } => match &**base {
+                // The elements are the base aggregate itself:
+                // the fat pointer is self-contained over it.
+                Value::Tuple(_) | Value::SparseVec { .. } => {
+                    return Some((**base).clone());
+                }
+                // A reference base: follow the fat pointer to
+                // what it denotes and judge that value.
+                Value::Ref(_) => {
+                    pointee = interp
+                        .read_resolved(
+                            frames,
+                            &interp.deref_value(frames, &pointee).ok()?,
+                        )
+                        .ok()?;
+                }
+                _ => return Some(pointee),
+            },
+            _ => return Some(pointee),
+        }
+    }
+    Some(pointee)
+}
+
+/// The elements a sequence rendering walks: the stored
+/// elements, extended with uninitialised slots up to the
+/// declared length when the sequence is sparse (see
+/// `Value::SparseVec`) — bounded just past the print-elements
+/// limit, since the renderer truncates there anyway. A fully
+/// stored sequence passes through unchanged.
+fn render_sequence_elems(stored: &[Value], declared: u128) -> Vec<Value> {
+    let mut elems = stored.to_vec();
+    let want = usize::try_from(declared)
+        .unwrap_or(usize::MAX)
+        .min(GDB_PRINT_ELEMENTS + 1);
+    if elems.len() < want {
+        elems.resize(want, Value::Uninit);
+    }
+    elems
 }
 
 /// Render a printer's array-hint children block (`{a, b, c}`),
@@ -1497,19 +1560,33 @@ fn render_pretty_gdb(
     match desc {
         Some(Desc::Ref(inner)) => match inner.as_ref() {
             Desc::Slice(elem) => {
-                let resolved = interp.deref_value(frames, value).ok()?;
-                let pointee = interp.read_resolved(frames, &resolved).ok()?;
-                let elems = sequence_values(&pointee)?;
+                let pointee = slice_pointee(interp, frames, value)?;
+                // A sparse pointee declares its length past its
+                // stored elements (see `Value::SparseVec`): the
+                // size is the declared length, and the children
+                // render from the stored elements plus the
+                // uninitialised tail.
+                let (elems, declared) = match &pointee {
+                    Value::SparseVec { elems, len } => {
+                        (elems.clone(), *len)
+                    }
+                    _ => {
+                        let elems = sequence_values(&pointee)?;
+                        let len = elems.len() as u128;
+                        (elems, len)
+                    }
+                };
                 let ty = match tag_hint {
                     Some(tag) if tag.trim_start().starts_with('&') => {
                         tag.trim().to_string()
                     }
                     _ => return None,
                 };
-                let head = format!("{ty}(size={})", elems.len());
-                if elems.is_empty() {
+                let head = format!("{ty}(size={declared})");
+                if declared == 0 {
                     Some(head)
                 } else {
+                    let elems = render_sequence_elems(&elems, declared);
                     let block = render_printer_children(
                         interp,
                         frames,
@@ -1563,6 +1640,27 @@ fn render_printer_adt(
             let elem =
                 first_generic_arg(tag).map(|t| Desc::from_tag(&t));
             match value {
+                // A sparse vector (see `Value::SparseVec`): the
+                // size is the declared length, and the children
+                // render from the stored elements plus the
+                // uninitialised tail, bounded like any long
+                // vector's.
+                Value::SparseVec { elems, len } => {
+                    let head = format!("Vec(size={len})");
+                    if *len == 0 {
+                        Some(head)
+                    } else {
+                        let elems = render_sequence_elems(elems, *len);
+                        let block = render_printer_children(
+                            interp,
+                            frames,
+                            &elems,
+                            elem.as_ref(),
+                            depth,
+                        )?;
+                        Some(format!("{head} = {block}"))
+                    }
+                }
                 Value::Enum { fields, .. } => {
                     let head = format!("Vec(size={})", fields.len());
                     if fields.is_empty() {
@@ -1679,9 +1777,15 @@ fn render_lldb_provider_line(
     match desc {
         Some(Desc::Ref(inner)) => match inner.as_ref() {
             Desc::Slice(elem) => {
-                let resolved = interp.deref_value(frames, value).ok()?;
-                let pointee = interp.read_resolved(frames, &resolved).ok()?;
+                let pointee = slice_pointee(interp, frames, value)?;
                 let elems = sequence_values(&pointee)?;
+                // A sparse pointee's size is its declared
+                // length, past the stored elements the children
+                // render from (see `Value::SparseVec`).
+                let size = match &pointee {
+                    Value::SparseVec { len, .. } => *len,
+                    _ => elems.len() as u128,
+                };
                 let ty = tag_hint?.trim();
                 let mut parts = Vec::with_capacity(elems.len());
                 for (i, e) in elems.iter().enumerate() {
@@ -1702,7 +1806,7 @@ fn render_lldb_provider_line(
                 };
                 Some(format!(
                     "({ty}) {expr} = size={} {children}",
-                    elems.len()
+                    size
                 ))
             }
             Desc::Str => {

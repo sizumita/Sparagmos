@@ -8130,6 +8130,21 @@ impl<'a> Interpreter<'a> {
                                         .map(|f| self.clone_owned_value(frames, f))
                                         .collect::<InterpResult<Vec<_>>>()?,
                                 },
+                                // A sparse vector's stored
+                                // elements clone the same way;
+                                // its unmaterialised tail has
+                                // nothing to clone.
+                                Value::SparseVec { elems, len } => {
+                                    Value::SparseVec {
+                                        elems: elems
+                                            .iter()
+                                            .map(|f| {
+                                                self.clone_owned_value(frames, f)
+                                            })
+                                            .collect::<InterpResult<Vec<_>>>()?,
+                                        len,
+                                    }
+                                }
                                 other => other,
                             }
                         } else if (self_ty.starts_with('(') || self_ty.starts_with('['))
@@ -8410,6 +8425,12 @@ impl<'a> Interpreter<'a> {
                         fields.extend(elems.iter().cloned());
                         Ok(Value::Unit)
                     }
+                    // The appended elements would land past the
+                    // unmaterialised region, as for `Vec::push`.
+                    Value::SparseVec { .. } => Err(unsupported(
+                        "Vec::extend_from_slice on a vector whose elements are not materialised"
+                            .to_string(),
+                    )),
                     other => Err(InterpError::type_mismatch(
                         "Vec::extend_from_slice",
                         "vector value",
@@ -8428,6 +8449,13 @@ impl<'a> Interpreter<'a> {
                         fields.push(elem);
                         Ok(Value::Unit)
                     }
+                    // The pushed element would land past the
+                    // unmaterialised region, which only
+                    // materialising that region could store.
+                    Value::SparseVec { .. } => Err(unsupported(
+                        "Vec::push on a vector whose elements are not materialised"
+                            .to_string(),
+                    )),
                     other => Err(InterpError::type_mismatch(
                         "Vec::push",
                         "vector value",
@@ -8585,29 +8613,31 @@ impl<'a> Interpreter<'a> {
                         ));
                     }
                 };
-                // The element list is materialised value by
-                // value, so an astronomical length (the
-                // `Vec::with_capacity(1_000_000_000)` +
-                // `set_len` idiom) cannot be represented: it
-                // stays an explicit unsupported error rather
-                // than an allocation failure that takes the
-                // whole process down.
-                if new_len > MAX_VEC_SET_LEN_ELEMENTS {
-                    return Err(unsupported(format!(
-                        "Vec::set_len to {new_len} elements is beyond the value model's materialisation limit"
-                    )));
-                }
                 let target = self.deref_value(frames, &vals[0])?;
-                self.modify_resolved(frames, &target, |slot| match slot {
-                    Value::Enum { fields, .. } => {
-                        fields.resize(new_len, Value::Uninit);
-                        Ok(Value::Unit)
-                    }
-                    other => Err(InterpError::type_mismatch(
-                        "Vec::set_len",
-                        "vector value",
-                        other.kind_name(),
-                    )),
+                self.modify_resolved(frames, &target, |slot| {
+                    // The vector's value at the new length (see
+                    // `vec_with_len`): materialised up to the
+                    // materialisation limit, sparse past it, so
+                    // an astronomical length (the
+                    // `Vec::with_capacity(1_000_000_000)` +
+                    // `set_len` idiom) declares its length
+                    // instead of exhausting the host. Shrinking
+                    // forgets the tail elements without dropping
+                    // them, exactly as the real `set_len`
+                    // contract specifies.
+                    let elems = match std::mem::replace(slot, Value::Uninit) {
+                        Value::Enum { fields, .. } => fields,
+                        Value::SparseVec { elems, .. } => elems,
+                        other => {
+                            return Err(InterpError::type_mismatch(
+                                "Vec::set_len",
+                                "vector value",
+                                other.kind_name(),
+                            ));
+                        }
+                    };
+                    *slot = vec_with_len(elems, new_len);
+                    Ok(Value::Unit)
                 })
             }
             Builtin::VecExtendTrusted => {
@@ -8619,6 +8649,12 @@ impl<'a> Interpreter<'a> {
                 let target = self.deref_value(frames, &vals[0])?;
                 let mut fields = match self.read_resolved(frames, &target)? {
                     Value::Enum { fields, .. } => fields,
+                    Value::SparseVec { .. } => {
+                        return Err(unsupported(
+                            "Vec::extend_trusted on a vector whose elements are not materialised"
+                                .to_string(),
+                        ));
+                    }
                     ref other => {
                         return Err(InterpError::type_mismatch(
                             "Vec::extend_trusted",
@@ -14547,6 +14583,19 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         value: &Value,
     ) -> InterpResult<(Vec<Value>, u128)> {
         let (elems, len) = self.slice_elements_ref(frames, value)?;
+        // An owned copy of a sparse sequence's elements would
+        // materialise its uninitialised tail: past the
+        // materialisation limit that stays an explicit error
+        // rather than an allocation that exhausts the host.
+        // (Borrowing consumers use `slice_elements_ref` and read
+        // the tail as the uninitialised slots they are.)
+        if elems.stored_len() < elems.len()
+            && elems.len() > MAX_VEC_SET_LEN_ELEMENTS
+        {
+            return Err(unsupported(format!(
+                "a slice of {len} elements is beyond the value model's materialisation limit"
+            )));
+        }
         Ok((elems.into_vec(), len))
     }
 
@@ -14593,7 +14642,10 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                 "index out of bounds: the len is {len} but the index is {idx}"
             )));
         }
-        if !matches!(&*base, Value::Tuple(_) | Value::Enum { .. }) {
+        if !matches!(
+            &*base,
+            Value::Tuple(_) | Value::Enum { .. } | Value::SparseVec { .. }
+        ) {
             return Ok(None);
         }
         let refr = match target {
@@ -14692,7 +14744,17 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                 // container (and reads within the element when the
                 // element is itself an aggregate).
                 if let Ok(target) = self.deref_value(frames, base) {
-                    if target_ends_at_element(&target)
+                    // A sparse pointee's elements past its stored
+                    // prefix are read through the ordinary path
+                    // below (which reports them as the
+                    // uninitialised slots they are); the sibling
+                    // walk would materialise them one by one.
+                    let sparse_target = matches!(
+                        self.read_resolved(frames, &target),
+                        Ok(Value::SparseVec { .. })
+                    );
+                    if !sparse_target
+                        && target_ends_at_element(&target)
                         && self.sibling_span_fits(frames, &target, *len)
                     {
                         let mut elems = Vec::with_capacity(*len as usize);
@@ -14721,8 +14783,10 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
     /// reference over a materialised copy of the sub-slice's
     /// elements (a shared slice: reads through it are exact; the
     /// model has no offsettable place to alias the original
-    /// storage). A `str` receiver yields the sub-string, with
-    /// char-boundary checks as in core.
+    /// storage) — or, when the range runs past a sparse
+    /// receiver's stored elements, over the sparse form of the
+    /// range (see `Value::SparseVec`). A `str` receiver yields
+    /// the sub-string, with char-boundary checks as in core.
     fn index_range(
         &self,
         frames: &[Frame],
@@ -14782,14 +14846,12 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                 None => Err(InterpError::panic(str_slice_error(text, start, end))),
             };
         }
-        let (elems, len) = self.slice_elements(frames, receiver)?;
+        let (elems, len) = self.slice_elements_ref(frames, receiver)?;
         let len = usize::try_from(len).unwrap_or(usize::MAX);
         let (start, end) = range_bounds(&kind, &bound, len)?;
-        let sub: Vec<Value> = elems[start..end].to_vec();
-        let sub_len = sub.len() as u128;
         Ok(Value::FatRef {
-            base: Box::new(Value::Tuple(sub)),
-            len: sub_len,
+            base: Box::new(elems.sub_snapshot(start, end)),
+            len: (end - start) as u128,
         })
     }
 
@@ -17254,7 +17316,34 @@ fn is_count_cell(value: &Value) -> bool {
 /// (see the `VecSetLen` builtin): the element list is stored
 /// value by value, so the count is bounded well clear of the
 /// memory a pathological length would need.
-const MAX_VEC_SET_LEN_ELEMENTS: usize = 1 << 22;
+pub(crate) const MAX_VEC_SET_LEN_ELEMENTS: usize = 1 << 22;
+
+/// A vector value holding `elems` at declared length `len`:
+/// the plain element aggregate when the whole length is
+/// materialised — a growth into the materialisation limit pads
+/// with uninitialised slots, as `Vec::set_len` does — and the
+/// sparse form (see `Value::SparseVec`) past it, which declares
+/// the length the stored elements do not cover.
+fn vec_with_len(mut elems: Vec<Value>, len: usize) -> Value {
+    if len <= elems.len() {
+        elems.truncate(len);
+        Value::Enum {
+            variant: 0,
+            fields: elems,
+        }
+    } else if len <= MAX_VEC_SET_LEN_ELEMENTS {
+        elems.resize(len, Value::Uninit);
+        Value::Enum {
+            variant: 0,
+            fields: elems,
+        }
+    } else {
+        Value::SparseVec {
+            elems,
+            len: len as u128,
+        }
+    }
+}
 
 const ERROR_KIND_INVALID_INPUT: u32 = 20;
 /// The `errno` for a missing file or directory.
@@ -17559,6 +17648,10 @@ fn ordering_value(ord: Ordering) -> Value {
 pub(crate) enum SliceElems<'a> {
     Values(Cow<'a, [Value]>),
     Bytes(Cow<'a, [u8]>),
+    /// The stored prefix of a sparse sequence (see
+    /// `Value::SparseVec`) together with its declared length:
+    /// indices past the prefix read as the uninitialised slot.
+    Sparse { stored: Cow<'a, [Value]>, len: usize },
 }
 
 impl<'a> SliceElems<'a> {
@@ -17567,6 +17660,19 @@ impl<'a> SliceElems<'a> {
         match self {
             SliceElems::Values(v) => v.len(),
             SliceElems::Bytes(b) => b.len(),
+            SliceElems::Sparse { len, .. } => *len,
+        }
+    }
+
+    /// The number of elements actually stored: a sparse
+    /// sequence's declared length runs past its stored prefix
+    /// (see `Value::SparseVec`); every other form stores them
+    /// all.
+    pub(crate) fn stored_len(&self) -> usize {
+        match self {
+            SliceElems::Values(v) => v.len(),
+            SliceElems::Bytes(b) => b.len(),
+            SliceElems::Sparse { stored, .. } => stored.len(),
         }
     }
 
@@ -17576,6 +17682,10 @@ impl<'a> SliceElems<'a> {
         match self {
             SliceElems::Values(v) => v[idx].clone(),
             SliceElems::Bytes(b) => Value::Uint(b[idx] as u128),
+            SliceElems::Sparse { stored, .. } => stored
+                .get(idx)
+                .cloned()
+                .unwrap_or(Value::Uninit),
         }
     }
 
@@ -17585,6 +17695,10 @@ impl<'a> SliceElems<'a> {
         match self {
             SliceElems::Values(v) => Cow::Borrowed(&v[idx]),
             SliceElems::Bytes(b) => Cow::Owned(Value::Uint(b[idx] as u128)),
+            SliceElems::Sparse { stored, .. } => match stored.get(idx) {
+                Some(v) => Cow::Borrowed(v),
+                None => Cow::Owned(Value::Uninit),
+            },
         }
     }
 
@@ -17607,6 +17721,18 @@ impl<'a> SliceElems<'a> {
                 v.truncate(len);
                 SliceElems::Bytes(Cow::Owned(v))
             }
+            SliceElems::Sparse { stored, len: declared } => SliceElems::Sparse {
+                stored: match stored {
+                    Cow::Borrowed(s) => {
+                        Cow::Borrowed(&s[..len.min(s.len())])
+                    }
+                    Cow::Owned(mut v) => {
+                        v.truncate(len);
+                        Cow::Owned(v)
+                    }
+                },
+                len: declared.min(len),
+            },
         }
     }
 
@@ -17618,6 +17744,33 @@ impl<'a> SliceElems<'a> {
             SliceElems::Bytes(b) => {
                 b.iter().map(|byte| Value::Uint(*byte as u128)).collect()
             }
+            // Only reached at or under the materialisation
+            // limit (see the guard in `slice_elements`): the
+            // tail materialises as the uninitialised slots it
+            // denotes.
+            SliceElems::Sparse { stored, len } => {
+                let mut v = stored.into_owned();
+                v.resize(len, Value::Uninit);
+                v
+            }
+        }
+    }
+
+    /// The snapshot value a range index over these elements
+    /// denotes (what `index_range` stores as the sub-slice's
+    /// base): the materialised elements of the range — or, when
+    /// the range runs past a sparse sequence's stored elements,
+    /// the sparse form over the stored part of the range, its
+    /// remaining slots uninitialised (see `Value::SparseVec`).
+    pub(crate) fn sub_snapshot(&self, start: usize, end: usize) -> Value {
+        match self {
+            SliceElems::Sparse { stored, .. } if end > stored.len() => {
+                Value::SparseVec {
+                    elems: stored[start.min(stored.len())..].to_vec(),
+                    len: (end - start) as u128,
+                }
+            }
+            _ => Value::Tuple((start..end).map(|i| self.at(i)).collect()),
         }
     }
 }
@@ -18352,6 +18505,10 @@ fn elements_of<'a>(value: Cow<'a, Value>) -> InterpResult<SliceElems<'a>> {
         Cow::Borrowed(v) => Ok(match v {
             Value::Tuple(items) => SliceElems::Values(Cow::Borrowed(items)),
             Value::Enum { fields, .. } => SliceElems::Values(Cow::Borrowed(fields)),
+            Value::SparseVec { elems, len } => SliceElems::Sparse {
+                stored: Cow::Borrowed(elems),
+                len: usize::try_from(*len).unwrap_or(usize::MAX),
+            },
             Value::Bytes(b) => SliceElems::Bytes(Cow::Borrowed(b)),
             Value::Str(text) => SliceElems::Bytes(Cow::Borrowed(text.as_bytes())),
             other => {
@@ -18365,6 +18522,10 @@ fn elements_of<'a>(value: Cow<'a, Value>) -> InterpResult<SliceElems<'a>> {
         Cow::Owned(v) => Ok(match v {
             Value::Tuple(items) => SliceElems::Values(Cow::Owned(items)),
             Value::Enum { fields, .. } => SliceElems::Values(Cow::Owned(fields)),
+            Value::SparseVec { elems, len } => SliceElems::Sparse {
+                stored: Cow::Owned(elems),
+                len: usize::try_from(len).unwrap_or(usize::MAX),
+            },
             Value::Bytes(b) => SliceElems::Bytes(Cow::Owned(b)),
             Value::Str(text) => SliceElems::Bytes(Cow::Owned(text.into_bytes())),
             other => {

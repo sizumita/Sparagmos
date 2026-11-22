@@ -294,6 +294,19 @@ pub enum Value {
     },
     /// An ADT value: variant index + field values.
     Enum { variant: u32, fields: Vec<Value> },
+    /// A `Vec` value whose declared length runs past the element
+    /// list the value model materialises: `elems` holds the
+    /// stored elements and every slot from `elems.len()` up to
+    /// `len` is uninitialised — the shape a `Vec::set_len`
+    /// growth past the materialisation limit produces (the
+    /// element list is stored value by value, so an astronomical
+    /// length is not a value this model can hold element by
+    /// element). The unmaterialised slots behave exactly like
+    /// the uninitialised slots a materialised `set_len` leaves:
+    /// reading one is an uninitialised read, dropping one is a
+    /// no-op, and only the length, the stored elements, and
+    /// bounded prefixes of the whole are observable.
+    SparseVec { elems: Vec<Value>, len: u128 },
     /// A `core::fmt::rt::Argument` formatting a pointee.
     FmtArg {
         /// The reference passed to the `new_*` constructor.
@@ -375,6 +388,7 @@ impl Value {
             Value::FatRef { .. } => "slice reference",
             Value::DynRef { .. } => "dyn reference",
             Value::Enum { .. } => "ADT value",
+            Value::SparseVec { .. } => "vector value",
             Value::FmtArg { .. } => "fmt argument",
             Value::FmtCount(_) => "fmt count",
             Value::FmtArguments(_) => "fmt arguments",
@@ -416,6 +430,7 @@ impl Value {
             Value::Bytes(b) => Some(b.len() as u128),
             Value::Str(s) => Some(s.len() as u128),
             Value::Enum { fields, .. } => Some(fields.len() as u128),
+            Value::SparseVec { len, .. } => Some(*len),
             Value::FatRef { len, .. } => Some(*len),
             _ => None,
         }
@@ -523,6 +538,9 @@ impl fmt::Display for Value {
                     write!(f, "{field}")?;
                 }
                 write!(f, ")")
+            }
+            Value::SparseVec { elems, len } => {
+                write!(f, "vec[{len} ({} stored)]", elems.len())
             }
             Value::FmtArg { ty, trait_, .. } => {
                 write!(f, "<fmt {trait_:?} argument of {ty}>")

@@ -17091,3 +17091,88 @@ fn run_mode_rc_dyn_trait_clone_and_drop_counts() {
         "the count moves with the clone and the destructor runs at the last drop"
     );
 }
+
+const SPARSE_VEC_SRC: &str = r#"
+fn main() {
+    // A length past the value model's materialisation limit is
+    // held sparsely: the length is exact, the stored prefix is
+    // kept, and the tail denotes uninitialised slots.
+    let mut vec: Vec<String> = Vec::with_capacity(5_000_000);
+    unsafe { vec.set_len(5_000_000) }
+    assert_eq!(vec.len(), 5_000_000);
+    drop(vec);
+    println!("sparse string drop ok");
+
+    let mut v2: Vec<String> = Vec::new();
+    v2.push("a".to_string());
+    v2.push("bb".to_string());
+    unsafe { v2.set_len(5_000_000) }
+    assert_eq!(v2.len(), 5_000_000);
+    assert_eq!(v2[0], "a");
+    assert_eq!(v2[1], "bb");
+    drop(v2);
+    println!("sparse prefix drop ok");
+
+    let mut v3: Vec<u8> = Vec::with_capacity(5_000_000);
+    unsafe { v3.set_len(5_000_000) }
+    let s = &v3[..];
+    assert_eq!(s.len(), 5_000_000);
+    assert_eq!(v3.len(), 5_000_000);
+    drop(v3);
+    println!("sparse u8 ok");
+
+    // Shrinking back under the limit materialises the vector.
+    let mut v4: Vec<u8> = Vec::with_capacity(5_000_000);
+    unsafe { v4.set_len(5_000_000) }
+    unsafe { v4.set_len(3) }
+    assert_eq!(v4.len(), 3);
+    v4.push(9);
+    assert_eq!(v4[3], 9);
+    println!("shrink ok");
+
+    // Growing a materialised vector past the limit keeps its
+    // stored elements.
+    let mut v5: Vec<u8> = vec![1, 2, 3];
+    unsafe { v5.set_len(5_000_000) }
+    assert_eq!(v5.len(), 5_000_000);
+    assert_eq!(v5[0], 1);
+    assert_eq!(v5[2], 3);
+    let s5 = &v5[..];
+    assert_eq!(s5.len(), 5_000_000);
+    drop(v5);
+    println!("grow ok");
+}
+"#;
+
+#[test]
+fn run_mode_sparse_vec_set_len() {
+    run_ok(
+        "sparse-vec",
+        SPARSE_VEC_SRC,
+        "sparse string drop ok\nsparse prefix drop ok\nsparse u8 ok\nshrink ok\ngrow ok\n",
+    );
+}
+
+const SPARSE_VEC_UNINIT_READ_SRC: &str = r#"
+fn main() {
+    let mut vec: Vec<u8> = Vec::with_capacity(5_000_000);
+    unsafe { vec.set_len(5_000_000) }
+    // A tail slot was never written: reading it is the same
+    // uninitialised read a materialised `set_len` vector's
+    // padding raises.
+    println!("{}", vec[0]);
+}
+"#;
+
+#[test]
+fn run_mode_sparse_vec_uninit_read() {
+    let dir = temp_dir("sparse-vec-uninit");
+    let src = fixture(&dir, "case.rs", SPARSE_VEC_UNINIT_READ_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr={stderr}");
+    assert!(
+        stderr.contains("uninitialized"),
+        "tail read must be an uninitialised read; stderr={stderr}"
+    );
+}

@@ -4057,7 +4057,9 @@ impl<'a> Interpreter<'a> {
                             // written by an aggregate and never
                             // projected lands here with an untyped plan.
                             Some(Value::Enum { fields, .. }) if fields.is_empty() => {}
-                            Some(Value::Enum { .. }) | Some(Value::Coroutine { .. }) => {
+                            Some(Value::Enum { .. })
+                            | Some(Value::SparseVec { .. })
+                            | Some(Value::Coroutine { .. }) => {
                                     return Err(InterpError::UnsupportedTerminator {
                                     kind: "Drop".to_string(),
                                 });
@@ -4195,6 +4197,31 @@ impl<'a> Interpreter<'a> {
                         let Some(value) = self.read_at(frames, &active.root, &path)? else {
                             continue;
                         };
+                        if let Value::SparseVec { elems, len } = &value {
+                            // The stored elements drop one by one,
+                            // as a materialised vector's do. The
+                            // unmaterialised tail is all
+                            // uninitialised slots, whose glue is a
+                            // no-op under the read rules (a plan
+                            // applied at a never-written slot finds
+                            // nothing to run), so one representative
+                            // tail index judges the plan for the
+                            // whole tail instead of walking it slot
+                            // by slot.
+                            for i in (0..elems.len()).rev() {
+                                let mut sub = path.clone();
+                                sub.push(RefProj::Field(i));
+                                active.work.push((sub, (*elem).clone()));
+                            }
+                            if *len > elems.len() as u128
+                                && !matches!(&*elem, P::Trivial)
+                            {
+                                let mut sub = path.clone();
+                                sub.push(RefProj::Field(elems.len()));
+                                active.work.push((sub, (*elem).clone()));
+                            }
+                            continue;
+                        }
                         let (count, is_enum) = match &value {
                             Value::Tuple(items) => (items.len(), false),
                             Value::Enum { fields, .. } => (fields.len(), true),
@@ -7066,7 +7093,13 @@ impl<'a> Interpreter<'a> {
             // aggregate itself) derefs to the slice value itself, so
             // `Len` and index bounds see the fat pointer's length.
             Value::FatRef { base, .. } => match &**base {
-                Value::Tuple(_) => Ok(Resolved::Value(value.clone(), Vec::new())),
+                // A sparse element aggregate (see
+                // `Value::SparseVec`) is self-contained in the
+                // same way: the fat pointer's own length is the
+                // slice's length.
+                Value::Tuple(_) | Value::SparseVec { .. } => {
+                    Ok(Resolved::Value(value.clone(), Vec::new()))
+                }
                 // An address-only base has no pointee to reach: the
                 // fat pointer is self-contained (a dangling slice
                 // constant, a `from_raw_parts` result), and
@@ -9623,6 +9656,14 @@ impl<'a> Interpreter<'a> {
             // itself, exactly as in a coroutine-typed place.
             (Some(Ty::Adt(name)), Value::Coroutine { .. })
                 if name == "std::future::ResumeTy" =>
+            {
+                Ok(value)
+            }
+            // A vector value in its sparse form (see
+            // `Value::SparseVec`) is a `Vec` value: it stores
+            // into a `Vec` place as it stands.
+            (Some(Ty::Adt(name)), Value::SparseVec { .. })
+                if name == "std::vec::Vec" || name == "alloc::vec::Vec" =>
             {
                 Ok(value)
             }
@@ -12352,6 +12393,29 @@ pub(crate) fn project_value(
                         fields: vec![ptr],
                     }
                 }
+                // A sparse vector value (see `Value::SparseVec`):
+                // a field step addresses an element, as the drop
+                // glue's per-element walk addresses a materialised
+                // vector's elements — the stored elements read as
+                // themselves, the unmaterialised tail as the
+                // uninitialised slots it denotes, and past the
+                // declared length the step finds no slot, as a
+                // materialised aggregate's missing field does not.
+                Value::SparseVec {
+                    ref elems,
+                    len,
+                } => {
+                    if *idx as u128 >= len {
+                        return Err(InterpError::UninitializedRead {
+                            func: func.to_string(),
+                            place: place.to_string(),
+                        });
+                    }
+                    elems
+                        .get(*idx)
+                        .cloned()
+                        .unwrap_or(Value::Uninit)
+                }
                 ref other => {
                     return Err(InterpError::type_mismatch(
                         format!("field projection on {place}"),
@@ -12383,6 +12447,24 @@ pub(crate) fn project_value(
                         return Err(index_oob(len as usize, *idx));
                     }
                     project_value((**base).clone(), &[RefProj::Index(*idx)], func, place)?
+                }
+                // A sparse vector value (see `Value::SparseVec`):
+                // the stored elements read as themselves, the
+                // unmaterialised tail as the uninitialised slots
+                // it denotes, and past the declared length the
+                // index is out of bounds, as for the materialised
+                // aggregate.
+                Value::SparseVec {
+                    ref elems,
+                    len,
+                } => {
+                    if *idx as u128 >= len {
+                        return Err(index_oob(len as usize, *idx));
+                    }
+                    elems
+                        .get(*idx)
+                        .cloned()
+                        .unwrap_or(Value::Uninit)
                 }
                 Value::Tuple(ref items) => items
                     .get(*idx)
@@ -12804,6 +12886,30 @@ pub(crate) fn project_value_ref<'a>(
                             place: place.to_string(),
                         }
                     })?,
+                    // A sparse vector value, as in
+                    // `project_value`: a field step addresses an
+                    // element; the unmaterialised tail has no
+                    // storage to lend, so the walk continues into
+                    // an owned uninitialised slot.
+                    Value::SparseVec { elems, len } => {
+                        if *idx as u128 >= *len {
+                            return Err(InterpError::UninitializedRead {
+                                func: func.to_string(),
+                                place: place.to_string(),
+                            });
+                        }
+                        match elems.get(*idx) {
+                            Some(v) => v,
+                            None => {
+                                return Ok(Cow::Owned(project_value(
+                                    Value::Uninit,
+                                    rest,
+                                    func,
+                                    place,
+                                )?));
+                            }
+                        }
+                    }
                     Value::Coroutine { fields, saved, .. } => {
                         // As in `project_value`: a downcast routes
                         // the field step to that state's saved
@@ -12882,6 +12988,28 @@ pub(crate) fn project_value_ref<'a>(
                         Cow::Borrowed(v) => cur = v,
                         Cow::Owned(v) => {
                             return Ok(Cow::Owned(project_value(v, rest, func, place)?));
+                        }
+                    }
+                }
+                // A sparse vector value, as in `project_value`:
+                // the stored elements lend their storage, the
+                // unmaterialised tail continues into an owned
+                // uninitialised slot.
+                Value::SparseVec { elems, len } => {
+                    if *idx as u128 >= *len {
+                        return Err(index_oob(*len as usize, *idx));
+                    }
+                    match elems.get(*idx) {
+                        Some(v) => {
+                            cur = v;
+                        }
+                        None => {
+                            return Ok(Cow::Owned(project_value(
+                                Value::Uninit,
+                                rest,
+                                func,
+                                place,
+                            )?));
                         }
                     }
                 }
@@ -13270,6 +13398,30 @@ pub(crate) fn navigate_mut<'x>(
                 } else {
                     navigate_mut(&mut fields[*idx], rest, func, place)
                 }
+            }
+            // A sparse vector value (see `Value::SparseVec`):
+            // a write to a stored element navigates into it; a
+            // write into the unmaterialised tail materialises
+            // the gap with uninitialised slots up to the written
+            // index — bounded by the same materialisation limit
+            // as `Vec::set_len`, past which the write stays an
+            // explicit error rather than an allocation that
+            // exhausts the host.
+            Value::SparseVec { elems, len } => {
+                if *idx as u128 >= *len {
+                    return Err(index_oob(*len as usize, *idx));
+                }
+                if *idx >= crate::builtins::MAX_VEC_SET_LEN_ELEMENTS {
+                    return Err(InterpError::UnsupportedProjection {
+                        kind: format!(
+                            "index write at {idx} into a vector whose elements are not materialised"
+                        ),
+                    });
+                }
+                if *idx >= elems.len() {
+                    elems.resize(*idx + 1, Value::Uninit);
+                }
+                navigate_mut(&mut elems[*idx], rest, func, place)
             }
             Value::Bytes(b) => {
                 if *idx >= b.len() {
@@ -14340,7 +14492,10 @@ fn drop_dyn_value(value: &Value) -> InterpResult<()> {
         Value::Tuple(items) => items.iter().try_for_each(drop_dyn_value),
         Value::Closure { env, .. } => env.iter().try_for_each(drop_dyn_value),
         Value::Enum { fields, .. } if fields.is_empty() => Ok(()),
-        Value::Enum { .. } | Value::Coroutine { .. } | Value::PanicPayload(_) => {
+        Value::Enum { .. }
+        | Value::SparseVec { .. }
+        | Value::Coroutine { .. }
+        | Value::PanicPayload(_) => {
             Err(InterpError::UnsupportedTerminator {
                 kind: "Drop".to_string(),
             })
