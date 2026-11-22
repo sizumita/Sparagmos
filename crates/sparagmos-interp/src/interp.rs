@@ -3321,16 +3321,21 @@ impl<'a> Interpreter<'a> {
         Ok(cur)
     }
 
-    /// The (data pointer, drop function) a genuine `RawWaker`
+    /// The (data pointer, drop callable) a genuine `RawWaker`
     /// aggregate value carries: field 0 is the data pointer the
     /// vtable functions act on, field 1 a reference to the
     /// vtable value, whose four function pointers are (clone,
-    /// wake, wake_by_ref, drop). `None` for any other shape.
+    /// wake, wake_by_ref, drop). The drop entry is returned as
+    /// the value it was stored as: a plain function item is a
+    /// `FnPtr`, while a non-capturing closure literal in the
+    /// vtable constant stays a `Closure` value (its coercion to
+    /// a function pointer is a type-level fact the value model
+    /// does not rewrite). `None` for any other shape.
     fn raw_waker_drop_fn(
         &self,
         frames: &[Frame],
         value: &Value,
-    ) -> InterpResult<Option<(Value, String)>> {
+    ) -> InterpResult<Option<(Value, Value)>> {
         let Value::Enum { fields, .. } = value else {
             return Ok(None);
         };
@@ -3348,10 +3353,10 @@ impl<'a> Interpreter<'a> {
         if fields.len() != 4 {
             return Ok(None);
         }
-        let Value::FnPtr(drop_fn) = &fields[3] else {
+        if !matches!(fields[3], Value::FnPtr(_) | Value::Closure { .. }) {
             return Ok(None);
-        };
-        Ok(Some((data.clone(), drop_fn.clone())))
+        }
+        Ok(Some((data.clone(), fields[3].clone())))
     }
 
     /// Execute drop glue: process `work` until it is empty or a
@@ -3648,9 +3653,35 @@ impl<'a> Interpreter<'a> {
                                 // `Waker` drop does. The call
                                 // suspends this session like a
                                 // destructor call does.
-                                if let Some((data, drop_fn)) =
+                                if let Some((data, callable)) =
                                     self.raw_waker_drop_fn(frames, &handle)?
                                 {
+                                    // A function item is called
+                                    // with the data pointer alone; a
+                                    // closure value takes its
+                                    // environment argument first,
+                                    // exactly as an indirect closure
+                                    // call passes it.
+                                    let (drop_fn, call_args) = match &callable {
+                                        Value::FnPtr(name) => {
+                                            (name.clone(), vec![data])
+                                        }
+                                        Value::Closure { def, .. } => {
+                                            let env = if self
+                                                .closure_body_takes_env_by_value(def)
+                                            {
+                                                callable.clone()
+                                            } else {
+                                                Value::Ref(RefTarget::value(
+                                                    callable.clone(),
+                                                ))
+                                            };
+                                            (def.clone(), vec![env, data])
+                                        }
+                                        _ => unreachable!(
+                                            "raw_waker_drop_fn yields callables only"
+                                        ),
+                                    };
                                     let callee = self
                                         .program
                                         .get(&drop_fn)
@@ -3664,15 +3695,19 @@ impl<'a> Interpreter<'a> {
                                     }
                                     let (arg_count, local_count) =
                                         (callee.arg_count, callee.local_count());
-                                    if arg_count != 1 || local_count < 2 {
+                                    if arg_count != call_args.len()
+                                        || local_count < 1 + call_args.len()
+                                    {
                                         return Err(InterpError::type_mismatch(
                                             format!("waker vtable drop `{drop_fn}`"),
-                                            "one argument",
+                                            format!("{} argument(s)", call_args.len()),
                                             format!("{arg_count} argument(s)"),
                                         ));
                                     }
                                     let mut locals = vec![Value::Uninit; local_count];
-                                    locals[1] = data;
+                                    for (i, arg) in call_args.into_iter().enumerate() {
+                                        locals[1 + i] = arg;
+                                    }
                                     let frame_id = self.fresh_frame_id();
                                     self.drop_continuations.push(DropContinuation {
                                         callee_frame: frame_id,

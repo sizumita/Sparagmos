@@ -111,6 +111,13 @@ pub struct MirProgram {
     /// (see [`mir::AdtLayouts`]). Consulted by the `size_of` /
     /// `align_of` / `size_of_val` builtins for ADT type tags.
     pub adt_layouts: mir::AdtLayouts,
+    /// Storage-slot maps of the program's monomorphic coroutine
+    /// instances, as recorded by the driver (see
+    /// `mir::CoroutineLayouts`). Consulted when a place projects
+    /// a state field of a coroutine value: the flat positional
+    /// field vector does not by itself model the state-machine
+    /// layout's sharing of one field across suspension states.
+    pub coroutine_layouts: mir::CoroutineLayouts,
     /// Declared shapes of the program's ADTs, as recorded by the
     /// driver (see `mir::AdtShape`). Used to decide which locals
     /// are provably zero-sized.
@@ -1620,6 +1627,8 @@ struct Converter<'a> {
     /// Instance ADT shape tables of the program (see `MirProgram`).
     adt_instance_shapes: &'a mir::AdtInstanceShapes,
     adt_niches: &'a mir::AdtNiches,
+    /// Coroutine storage-slot tables of the program (see `MirProgram`).
+    coroutine_layouts: &'a mir::CoroutineLayouts,
     /// Operand counts of ADT aggregate constructions (see
     /// [`AdtAggregateCounts`]).
     adt_aggregates: AdtAggregateCounts,
@@ -1688,6 +1697,7 @@ impl<'a> Converter<'a> {
             adt_shapes: &program.adt_shapes,
             adt_instance_shapes: &program.adt_instance_shapes,
             adt_niches: &program.adt_niches,
+            coroutine_layouts: &program.coroutine_layouts,
             adt_aggregates,
             local_crate,
             impl_targets: None,
@@ -2504,9 +2514,35 @@ impl<'a> Converter<'a> {
             .local_decls
             .get(place.local.index())
             .map(|decl| decl.ty.clone());
+        // A coroutine place's `Downcast(v)` step followed by a
+        // `Field(i)` step names state field `i` of state `v` in
+        // the compiler's state-machine layout. When the driver
+        // recorded the instance's slot map, the pair converts to
+        // the single layout slot of that field (see
+        // `mir::CoroutineSlots`): a state field keeps one storage
+        // cell in every state that contains it, which the
+        // positional field index does not express. A downcast not
+        // followed by a field step, and every projection of an
+        // instance with no recorded map, converts exactly as
+        // before.
+        let mut coroutine_downcast: Option<(u32, &mir::CoroutineSlots)> = None;
         for elem in &place.projection {
             while let Some(mir::Ty::Pat(inner, _)) = &ty {
                 ty = Some(inner.as_ref().clone());
+            }
+            if let Some((variant, slots)) = coroutine_downcast.take() {
+                if let mir::PlaceElem::Field(idx, field_ty) = elem {
+                    if let Some(slot) = slots
+                        .variants
+                        .get(variant as usize)
+                        .and_then(|v| v.get(*idx as usize))
+                    {
+                        out.projection.push(ir::ProjectionElem::Field(*slot as usize));
+                        ty = Some(field_ty.clone());
+                        continue;
+                    }
+                }
+                out.projection.push(ir::ProjectionElem::Downcast(variant));
             }
             out.projection.push(match elem {
                 mir::PlaceElem::Field(idx, field_ty) => {
@@ -2558,6 +2594,20 @@ impl<'a> Converter<'a> {
                     }
                 }
                 mir::PlaceElem::Downcast(_, variant) => {
+                    if let Some(mir::Ty::Coroutine(def, args)) = &ty {
+                        let key = crate::builtins::ty_tag(
+                            &mir::Ty::Coroutine(*def, args.clone()),
+                            self.names,
+                        );
+                        if let Some(slots) = self.coroutine_layouts.get(&key) {
+                            coroutine_downcast = Some((*variant, slots));
+                            // The downcast step is emitted (or
+                            // folded into the following field step)
+                            // at the top of the next iteration, so
+                            // this arm never pushes.
+                            continue;
+                        }
+                    }
                     ir::ProjectionElem::Downcast(*variant)
                 }
                 mir::PlaceElem::Subslice { from, to, from_end } => {
@@ -2576,6 +2626,9 @@ impl<'a> Converter<'a> {
                     })
                 }
             });
+        }
+        if let Some((variant, _)) = coroutine_downcast.take() {
+            out.projection.push(ir::ProjectionElem::Downcast(variant));
         }
         Ok(out)
     }
@@ -2609,6 +2662,17 @@ impl<'a> Converter<'a> {
             };
         }
         Some(ty)
+    }
+
+    /// Whether a place's declared type is the coroutine
+    /// transform's context cell type, `std::future::ResumeTy`.
+    fn is_resume_ty_place(&self, body: &mir::Body, place: &mir::Place) -> bool {
+        match self.place_ty(body, place) {
+            Some(mir::Ty::Adt(def, _)) => {
+                self.def_display_name(&def) == "std::future::ResumeTy"
+            }
+            _ => false,
+        }
     }
 
     /// The discriminant table of the `Self` type of a comparison
@@ -3253,7 +3317,23 @@ impl<'a> Converter<'a> {
     ) -> Result<ir::Operand, ConvertError> {
         Ok(match op {
             mir::Operand::Copy(p) => ir::Operand::Copy(self.convert_place(body, p)?),
-            mir::Operand::Move(p) => ir::Operand::Move(self.convert_place(body, p)?),
+            mir::Operand::Move(p) => {
+                // The coroutine transform moves the `ResumeTy`
+                // out of the state object's context cell at every
+                // opaque-future poll site, then reads the cell
+                // again for the next poll of the same activation:
+                // the cell is state-machine storage (rewritten at
+                // every state entry), not an owned value the move
+                // vacates. `ResumeTy` is a pointer wrapper with no
+                // drop glue of its own, so reading it without
+                // vacating the cell is exact, and no other move in
+                // the program has this shape.
+                if self.is_resume_ty_place(body, p) {
+                    ir::Operand::Copy(self.convert_place(body, p)?)
+                } else {
+                    ir::Operand::Move(self.convert_place(body, p)?)
+                }
+            }
             mir::Operand::Constant(c) => {
                 // With no context from the operation, a constant is
                 // read under its own recorded type when it has one:
@@ -8058,6 +8138,39 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                 continue;
             }
             plans.push(self.one_variant_fields(def, args, v)?);
+        }
+        // When the driver recorded the instance's storage-slot
+        // map, the value's state fields live at layout slots, not
+        // at variant-relative positions: re-index each state's
+        // field plans by slot, so the glue reads the cell the
+        // body wrote. Variant 0 is the unresumed state, whose
+        // fields are the upvars themselves and already
+        // slot-positional. Plans are padded to the instance's
+        // full slot count with trivial entries, so the plan
+        // covers every cell the value can hold.
+        let key = crate::builtins::ty_tag(&mir::Ty::Coroutine(def, args.to_vec()), conv.names);
+        if let Some(slots) = conv.coroutine_layouts.get(&key) {
+            let total = slots
+                .variants
+                .iter()
+                .flatten()
+                .max()
+                .map(|m| *m as usize + 1)
+                .unwrap_or(0);
+            for (v, plan) in plans.iter_mut().enumerate().skip(1) {
+                let Some(variant_slots) = slots.variants.get(v) else {
+                    continue;
+                };
+                if let P::Fields { fields, .. } = plan {
+                    let mut by_slot = vec![P::Trivial; total];
+                    for (f, field_plan) in fields.drain(..).enumerate() {
+                        if let Some(slot) = variant_slots.get(f) {
+                            by_slot[*slot as usize] = field_plan;
+                        }
+                    }
+                    *fields = by_slot;
+                }
+            }
         }
         Some(P::Variants { variants: plans })
     }

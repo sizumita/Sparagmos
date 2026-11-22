@@ -64,6 +64,17 @@ pub struct Converter {
     /// compiler cannot give (generic parameters, unsized types) get
     /// no entry.
     pub adt_layouts: sm::AdtLayouts,
+    /// Storage-slot maps of the monomorphic coroutine instances
+    /// converted so far, keyed like `adt_layouts` (see
+    /// `sm::CoroutineLayouts`). Handed to the interpreter with the
+    /// converted program: its place conversion resolves coroutine
+    /// state-field projections through these maps.
+    pub coroutine_layouts: sm::CoroutineLayouts,
+    /// Compiler types whose coroutine slot-map recording was
+    /// already attempted, keyed by the type handle itself (the
+    /// rendered key is the expensive part, as in
+    /// `layout_attempted_tys`).
+    coroutine_slots_attempted: std::collections::HashSet<rustc_public::ty::Ty>,
     /// Rendered instance keys whose layout query was already
     /// attempted (successfully or not), so a type whose query
     /// cannot be answered is not re-queried at every conversion.
@@ -695,6 +706,8 @@ impl Converter {
             def_names: Vec::new(),
             adt_discriminants: sm::AdtDiscriminants::new(),
             adt_layouts: sm::AdtLayouts::new(),
+            coroutine_layouts: sm::CoroutineLayouts::new(),
+            coroutine_slots_attempted: std::collections::HashSet::new(),
             layout_attempted: std::collections::HashSet::new(),
             layout_attempted_tys: std::collections::HashSet::new(),
             layout_names: std::collections::HashMap::new(),
@@ -3286,6 +3299,9 @@ impl Converter {
             }
             _ => {}
         }
+        if let TyKind::RigidTy(RigidTy::Coroutine(..)) = &kind {
+            self.record_coroutine_slots(ty, &converted);
+        }
         converted
     }
 
@@ -3754,6 +3770,80 @@ impl Converter {
             key,
             (shape.size.bytes() as u64, shape.abi_align),
         );
+    }
+
+    /// Record the storage-slot map of one monomorphic coroutine
+    /// instance (see `sm::CoroutineSlots`) from the compiler's
+    /// layout of the instance. The layout's per-variant field
+    /// offsets are absolute, and a state field keeps one offset
+    /// in every variant that contains it, so slots are assigned
+    /// per distinct offset across all variants, after the upvar
+    /// slots. Instances whose layout the query cannot answer,
+    /// and shapes that do not match the state-machine form (the
+    /// outer fields are the upvars followed by the discriminant
+    /// tag), get no entry; their projections keep the positional
+    /// conversion.
+    fn record_coroutine_slots(
+        &mut self,
+        ty: &rustc_public::ty::Ty,
+        converted: &sm::Ty,
+    ) {
+        use rustc_public::abi::{FieldsShape, VariantsShape};
+        if !self.coroutine_slots_attempted.insert(*ty) {
+            return;
+        }
+        let sm::Ty::Coroutine(..) = converted else {
+            return;
+        };
+        let layout = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ty.layout()));
+        let Ok(Ok(layout)) = layout else {
+            return;
+        };
+        let shape = layout.shape();
+        let FieldsShape::Arbitrary { offsets } = &shape.fields else {
+            return;
+        };
+        let VariantsShape::Multiple { tag_field, variants, .. } = &shape.variants
+        else {
+            return;
+        };
+        // The outer fields of a coroutine layout are the upvars
+        // followed by the discriminant tag, whose field index the
+        // layout itself reports: the upvar count is the tag's
+        // index. (The converted generic arguments do not reliably
+        // start with the upvars tuple - a generic coroutine's
+        // arguments begin with the definition's own parameters.)
+        let n_upvars = *tag_field;
+        if offsets.len() != n_upvars + 1 {
+            return;
+        }
+        let mut state_offsets: Vec<u64> = Vec::new();
+        for variant in variants {
+            for offset in &variant.offsets {
+                let offset = offset.bytes() as u64;
+                if !state_offsets.contains(&offset) {
+                    state_offsets.push(offset);
+                }
+            }
+        }
+        let variants: Vec<Vec<u32>> = variants
+            .iter()
+            .map(|variant| {
+                variant
+                    .offsets
+                    .iter()
+                    .map(|offset| {
+                        let pos = state_offsets
+                            .iter()
+                            .position(|o| *o == offset.bytes() as u64)
+                            .expect("offset was collected above");
+                        (n_upvars + pos) as u32
+                    })
+                    .collect()
+            })
+            .collect();
+        let key = self.layout_key(converted);
+        self.coroutine_layouts.insert(key, sm::CoroutineSlots { variants });
     }
 
     fn rigid_ty(&mut self, r: &RigidTy) -> sm::Ty {

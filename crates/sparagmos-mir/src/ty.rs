@@ -73,6 +73,37 @@ pub type ThreadLocals = std::collections::HashMap<DefId, ThreadLocalDef>;
 /// interpreter.
 pub type AdtLayouts = std::collections::HashMap<String, (u64, u64)>;
 
+/// The storage-slot map of one monomorphic coroutine instance:
+/// which slot of the interpreter's flat coroutine field vector
+/// each state field of the compiler's state-machine layout lives
+/// in. Keyed like [`AdtLayouts`] by the rendered instance name.
+///
+/// A coroutine value's fields are stored positionally: slots
+/// `0..n_upvars` hold the upvars in creation order (the creation
+/// aggregate fills them in that order, and bare `Field`
+/// projections - how transformed bodies read upvars - stay
+/// positional), and the state fields take the following slots.
+/// The compiler's layout gives every state field one absolute
+/// offset, the same in every variant that contains it, so slots
+/// are assigned per distinct offset across all variants: two
+/// variant fields at one offset (above all the `ResumeTy` slot,
+/// present at the head of every suspension state) are one storage
+/// cell, and fields at distinct offsets never alias even when
+/// their variant-relative field indices coincide. The driver
+/// fills one entry per coroutine instance whose layout the
+/// compiler can give; an instance with no entry keeps the
+/// positional projection conversion.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CoroutineSlots {
+    /// `variants[v][f]` is the storage slot of variant `v`'s
+    /// field `f`, in the variant's own field order.
+    pub variants: Vec<Vec<u32>>,
+}
+
+/// Storage-slot maps of a program's coroutine instances (see
+/// [`CoroutineSlots`]).
+pub type CoroutineLayouts = std::collections::HashMap<String, CoroutineSlots>;
+
 /// The derived-`Debug` shape of one monomorphic ADT instance: the
 /// names and field structure a `#[derive(Debug)]` expansion prints,
 /// recorded without any function body. Keyed like [`AdtLayouts`]
