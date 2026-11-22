@@ -372,6 +372,22 @@ fn convert_body_isolated(
     result
 }
 
+/// Fetch one demanded instance's body through the Stable MIR
+/// containment (see [`guard_stable_mir_query`]): materializing a
+/// body can hit one of rustc_public's known unimplemented
+/// conversions (a tail-call terminator is the known case), and in
+/// the demand passes that panic must become the definition's
+/// named demand failure. An uncontained fetch would unwind to
+/// the per-body scan guard, which abandons the scan silently and
+/// leaves a demanded definition looking undemanded. `Ok(None)`
+/// is an instance with no body available; `Err` is the named
+/// reason.
+fn fetch_instance_body(
+    inst: &Instance,
+) -> Result<Option<rustc_public::mir::Body>, String> {
+    guard_stable_mir_query(|| inst.body())
+}
+
 /// Whether a conversion error is one of the contained Stable
 /// MIR panics' named reasons (see `stable_mir_panic_reason`).
 fn is_contained_reason(reason: &str) -> bool {
@@ -933,9 +949,16 @@ fn collect_local_instances(
                 fail_all(&mut *demands, &owners, reason.to_string());
                 continue;
             }
-            let Some(ibody) = inst.body() else {
-                fail_all(&mut *demands, &owners, "no MIR body available".to_string());
-                continue;
+            let ibody = match fetch_instance_body(&inst) {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    fail_all(&mut *demands, &owners, "no MIR body available".to_string());
+                    continue;
+                }
+                Err(reason) => {
+                    fail_all(&mut *demands, &owners, reason);
+                    continue;
+                }
             };
             match convert_body_isolated(&mut *conv, &ibody) {
                 Ok(converted) => {
@@ -1112,9 +1135,20 @@ fn collect_closure_instances(
                     fail_all(&mut *demands, &owners, "no MIR body available".to_string());
                     continue;
                 }
-                let Some(ibody) = inst.body() else {
-                    fail_all(&mut *demands, &owners, "no MIR body available".to_string());
-                    continue;
+                let ibody = match fetch_instance_body(&inst) {
+                    Ok(Some(b)) => b,
+                    Ok(None) => {
+                        fail_all(
+                            &mut *demands,
+                            &owners,
+                            "no MIR body available".to_string(),
+                        );
+                        continue;
+                    }
+                    Err(reason) => {
+                        fail_all(&mut *demands, &owners, reason);
+                        continue;
+                    }
                 };
                 match convert_body_isolated(&mut *conv, &ibody) {
                     Ok(converted) => {
@@ -1258,22 +1292,29 @@ fn collect_coroutine_instances(
                             );
                             continue;
                         }
-                        inst.body()
+                        fetch_instance_body(&inst)
                     }
                     Err(_) => {
                         if !unresolved_seen.insert((referenced, format!("{args:?}"))) {
                             continue;
                         }
-                        def.body()
+                        guard_stable_mir_query(|| def.body())
                     }
                 };
-                let Some(ibody) = ibody else {
-                    fail_all(
-                        &mut *demands,
-                        &owners,
-                        "no MIR body available".to_string(),
-                    );
-                    continue;
+                let ibody = match ibody {
+                    Ok(Some(b)) => b,
+                    Ok(None) => {
+                        fail_all(
+                            &mut *demands,
+                            &owners,
+                            "no MIR body available".to_string(),
+                        );
+                        continue;
+                    }
+                    Err(reason) => {
+                        fail_all(&mut *demands, &owners, reason);
+                        continue;
+                    }
                 };
                 if *taken >= MAX_LOCAL_INSTANCES {
                     fail_all(

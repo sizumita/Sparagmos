@@ -1708,6 +1708,40 @@ fn summary_mode_demanded_generic_instances_are_converted() {
     );
 }
 
+const TAIL_CALL_GENERIC_SRC: &str = r#"
+#![allow(incomplete_features)]
+#![feature(explicit_tail_calls)]
+fn countdown<T: Copy>(n: u32, m: T) -> u32 {
+    if n == 0 { 0 } else { become countdown(n - 1, m) }
+}
+fn main() { let _ = countdown::<u32>(3, 0); }
+"#;
+
+#[test]
+fn summary_mode_demanded_generic_with_unconvertible_body_stays_skipped() {
+    // Demand does not excuse a body that cannot be converted: the
+    // generic definition is demanded concretely from `main`, its
+    // instance fails conversion with the named tail-call reason,
+    // and the definition stays skipped — the target crate stays
+    // incomplete for that named reason alone.
+    let dir = temp_dir("generic-tailcall");
+    let src = fixture(&dir, "generic_tailcall.rs", TAIL_CALL_GENERIC_SRC);
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.starts_with("fn generic_tailcall::countdown:"))
+        .expect("summary lists the generic definition");
+    assert!(
+        line.contains("SKIPPED") && line.contains("tail call"),
+        "the demanded-but-unconvertible definition stays skipped with its reason: {line}"
+    );
+    assert!(
+        stdout.contains("target-crate converted: 1, skipped: 1"),
+        "the target crate stays incomplete for the demanded failure: {stdout}"
+    );
+}
+
 const GENERIC_DROP_CREDIT_SRC: &str = r#"
 struct Guard<T> { _v: T }
 impl<T> Drop for Guard<T> { fn drop(&mut self) {} }
