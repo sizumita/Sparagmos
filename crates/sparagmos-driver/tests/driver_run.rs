@@ -13494,3 +13494,119 @@ fn run_mode_io_error_from_error_kind() {
         "error-from-kind-ok\n"
     );
 }
+
+// ----- uninitialized array constants under optimized MIR (Lane JS) ---------
+// At opt-level 2 `[MaybeUninit::uninit(); N]` const-propagates into a
+// single `<uninit>` constant of the array type, and an element written
+// with `MaybeUninit::new(..)` arrives as a decoded union constant
+// carrying both union slots. The converted values must carry the
+// array's and the union's shapes, so a dynamic-index write followed by
+// a read of the written element observes the payload -- while a
+// never-written element's payload stays an error, exactly as in the
+// unoptimized form. Verification is by exit code: under -O a plain
+// `println!` reaches unrelated fmt machinery gaps on this tree.
+
+const UNINIT_ARRAY_O2_SRC: &str = r#"
+use std::mem::MaybeUninit;
+fn idx() -> usize { 2 }
+fn main() {
+    let mut arr: [MaybeUninit<u32>; 4] = [MaybeUninit::uninit(); 4];
+    let i = idx();
+    arr[i] = MaybeUninit::new(42);
+    unsafe {
+        let v = arr[i].assume_init();
+        std::process::exit(v as i32);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_uninit_array_o2_dynamic_index_write_then_read() {
+    let dir = temp_dir("uninit-array-o2");
+    let src = fixture(&dir, "uninit_array_o2.rs", UNINIT_ARRAY_O2_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "-Copt-level=2"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(42),
+        "the written element's payload must read back; stderr={stderr}"
+    );
+}
+
+const UNINIT_ARRAY_O2_LOOP_SRC: &str = r#"
+use std::mem::MaybeUninit;
+fn main() {
+    let mut arr: [MaybeUninit<u32>; 4] = [MaybeUninit::uninit(); 4];
+    for i in 0..4 {
+        arr[i].write(i as u32 * 10);
+    }
+    unsafe {
+        let sum = arr[0].assume_init() + arr[1].assume_init()
+            + arr[2].assume_init() + arr[3].assume_init();
+        std::process::exit(sum as i32);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_uninit_array_o2_loop_write_then_read_all() {
+    let dir = temp_dir("uninit-array-o2-loop");
+    let src = fixture(&dir, "uninit_array_o2_loop.rs", UNINIT_ARRAY_O2_LOOP_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "-Copt-level=2"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(60),
+        "every written element must read back; stderr={stderr}"
+    );
+}
+
+const UNINIT_SCALAR_CONST_O2_SRC: &str = r#"
+use std::mem::MaybeUninit;
+#[inline(never)]
+fn read(x: MaybeUninit<u32>) -> u32 { unsafe { x.assume_init() } }
+fn main() {
+    let x: MaybeUninit<u32> = MaybeUninit::new(42);
+    std::process::exit(read(x) as i32);
+}
+"#;
+
+#[test]
+fn run_mode_maybeuninit_scalar_const_o2_reads_payload() {
+    let dir = temp_dir("uninit-scalar-o2");
+    let src = fixture(&dir, "uninit_scalar_o2.rs", UNINIT_SCALAR_CONST_O2_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "-Copt-level=2"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(42),
+        "a decoded MaybeUninit constant must hold its payload at field 0; stderr={stderr}"
+    );
+}
+
+const UNINIT_ARRAY_O2_UNWRITTEN_SRC: &str = r#"
+use std::mem::MaybeUninit;
+fn idx() -> usize { 2 }
+fn main() {
+    let mut arr: [MaybeUninit<u32>; 4] = [MaybeUninit::uninit(); 4];
+    let i = idx();
+    arr[i] = MaybeUninit::new(42);
+    unsafe {
+        let v = arr[1].assume_init();
+        std::process::exit(v as i32);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_uninit_array_o2_unwritten_element_stays_an_error() {
+    let dir = temp_dir("uninit-array-o2-unwritten");
+    let src = fixture(&dir, "uninit_array_o2_unwritten.rs", UNINIT_ARRAY_O2_UNWRITTEN_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "-Copt-level=2"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "reading a never-written element's payload must stay a named error; stderr={stderr}"
+    );
+}
