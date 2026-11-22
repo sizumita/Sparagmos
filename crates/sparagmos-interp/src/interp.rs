@@ -7093,6 +7093,28 @@ impl<'a> Interpreter<'a> {
 
     // ----- rvalues -----------------------------------------------------------
 
+    /// The wrapper ADT value holding the address-only pointer
+    /// for `addr` in its payload field, with the unique values
+    /// in its zero-sized fields: the result of the
+    /// integer/enum-to-pointer-wrapper transmutes.
+    fn ptr_wrapped_value(
+        &self,
+        addr: u64,
+        payload_index: u32,
+        field_count: usize,
+        fill: &[(u32, Constant)],
+    ) -> InterpResult<Value> {
+        let mut fields = vec![Value::Uninit; field_count];
+        fields[payload_index as usize] = Value::Ref(RefTarget::Address(addr));
+        for (index, constant) in fill {
+            fields[*index as usize] = self.eval_constant(constant)?;
+        }
+        Ok(Value::Enum {
+            variant: 0,
+            fields,
+        })
+    }
+
     pub(crate) fn eval_rvalue(
         &self,
         frames: &mut Vec<Frame>,
@@ -7285,6 +7307,61 @@ impl<'a> Interpreter<'a> {
                         other.kind_name(),
                     )),
                 }
+            }
+            Rvalue::IntToPtrWrapped {
+                operand,
+                payload_index,
+                field_count,
+                fill,
+            } => {
+                let value = self.eval_operand(frames, body, operand)?;
+                let addr = match value {
+                    Value::Int(i) => i as u64,
+                    Value::Uint(u) => u as u64,
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            "integer-to-pointer-wrapper transmute",
+                            "an integer value",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                self.ptr_wrapped_value(addr, *payload_index, *field_count, fill)
+            }
+            Rvalue::EnumToPtrWrapped {
+                operand,
+                discriminants,
+                payload_index,
+                field_count,
+                fill,
+            } => {
+                let value = self.eval_operand(frames, body, operand)?;
+                let addr = match value {
+                    Value::Enum { variant, .. } => {
+                        let discr = if discriminants.is_empty() {
+                            variant as i128
+                        } else {
+                            *discriminants.get(variant as usize).ok_or_else(
+                                || {
+                                    InterpError::type_mismatch(
+                                        "enum-to-pointer-wrapper transmute",
+                                        "variant covered by the discriminant table",
+                                        format!("variant {variant}"),
+                                    )
+                                },
+                            )?
+                        };
+                        discr as u64
+                    }
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            "enum-to-pointer-wrapper transmute",
+                            "an enum value",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                self.ptr_wrapped_value(addr, *payload_index, *field_count, fill)
             }
             Rvalue::EnumToInt(operand, discriminants, ty) => {
                 let value = self.eval_operand(frames, body, operand)?;

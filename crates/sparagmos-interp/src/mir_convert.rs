@@ -3069,6 +3069,15 @@ impl<'a> Converter<'a> {
     ///   zero-sized with unique values): `NonNull`, `Pin` and the
     ///   coroutine machinery's `ResumeTy` chain transmute through
     ///   these;
+    /// * thin-pointer transparent wrapper <-> integer: the
+    ///   payload pointer's synthetic address, wrapped back up
+    ///   on the way back (`NonNull<u8>` -> `usize` is the
+    ///   transmute `fmt`'s statically-known-string check
+    ///   performs);
+    /// * fieldless enum (or a one-field wrapper around one,
+    ///   `mem::Alignment`) -> thin-pointer transparent wrapper:
+    ///   the discriminant as the payload pointer's address
+    ///   (`NonNull::dangling`);
     /// * zero-sized type -> zero-sized type whose value is
     ///   uniquely determined by its type;
     /// * scalar-shaped -> scalar-shaped of the same total width
@@ -3255,6 +3264,22 @@ impl<'a> Converter<'a> {
                         Ok(t) => ir::Rvalue::EnumToInt(v.clone(), table, t),
                         Err(_) => unsupported(),
                     }
+                } else if let Some(shape) = self.wrapper_shape(def, args) {
+                    // A transparent wrapper around a thin pointer
+                    // (`NonNull`, `Unique`): transmuting it to an
+                    // integer is the payload pointer's address —
+                    // the transmute `fmt`'s statically-known-string
+                    // check performs on its `NonNull<u8>`.
+                    match self.field_operand(
+                        body,
+                        operand,
+                        v,
+                        shape.payload_index as u32,
+                        &shape.payload_ty,
+                    ) {
+                        Some(op) => ir::Rvalue::PtrToInt(op),
+                        None => unsupported(),
+                    }
                 } else if let Some(field_ty) = self.single_field_ty(def, args)
                 {
                     if field_ty == *target {
@@ -3314,6 +3339,22 @@ impl<'a> Converter<'a> {
                         }
                     } else {
                         unsupported()
+                    }
+                } else if let Some(shape) = self.wrapper_shape(def, args) {
+                    // A transparent wrapper around a thin pointer
+                    // (`NonNull`, `Unique`): the integer is the
+                    // payload pointer's address, wrapped back up —
+                    // the reverse of the wrapper-to-integer
+                    // transmute above.
+                    ir::Rvalue::IntToPtrWrapped {
+                        operand: v.clone(),
+                        payload_index: shape.payload_index as u32,
+                        field_count: shape.field_count,
+                        fill: shape
+                            .fill
+                            .iter()
+                            .map(|(i, c)| (*i as u32, c.clone()))
+                            .collect(),
                     }
                 } else {
                     unsupported()
@@ -3383,7 +3424,7 @@ impl<'a> Converter<'a> {
             // fieldless enum: the field is the discriminant (the
             // `Bar { a }` -> `Foo` shape). Any other ADT -> ADT
             // pair falls through to the zero-sized rule below.
-            (Some(mir::Ty::Adt(def, args)), mir::Ty::Adt(tdef, _)) => {
+            (Some(mir::Ty::Adt(def, args)), mir::Ty::Adt(tdef, targs)) => {
                 match (
                     self.single_field_ty(def, args),
                     self.fieldless_enum_discriminants(tdef),
@@ -3397,6 +3438,69 @@ impl<'a> Converter<'a> {
                         match self.field_operand(body, operand, v, 0, &field_ty) {
                             Some(op) => ir::Rvalue::IntToEnum(op, table),
                             None => unsupported(),
+                        }
+                    }
+                    // A one-field wrapper around a fieldless enum
+                    // (`mem::Alignment`) transmuted to a
+                    // transparent pointer wrapper (`NonNull`):
+                    // the discriminant is the payload pointer's
+                    // address — the transmute `NonNull::dangling`
+                    // performs.
+                    (Some(field_ty), None)
+                        if self.wrapper_shape(tdef, targs).is_some() =>
+                    {
+                        let table = match &field_ty {
+                            mir::Ty::Adt(fdef, _) => {
+                                self.fieldless_enum_discriminants(fdef)
+                            }
+                            _ => None,
+                        };
+                        let shape = self
+                            .wrapper_shape(tdef, targs)
+                            .expect("guard checked");
+                        match (
+                            table,
+                            self.field_operand(body, operand, v, 0, &field_ty),
+                        ) {
+                            (Some(table), Some(op)) => {
+                                ir::Rvalue::EnumToPtrWrapped {
+                                    operand: op,
+                                    discriminants: table,
+                                    payload_index: shape.payload_index as u32,
+                                    field_count: shape.field_count,
+                                    fill: shape
+                                        .fill
+                                        .iter()
+                                        .map(|(i, c)| (*i as u32, c.clone()))
+                                        .collect(),
+                                }
+                            }
+                            _ => unsupported(),
+                        }
+                    }
+                    // A fieldless enum itself transmuted to a
+                    // transparent pointer wrapper: the same
+                    // discriminant-as-address reading.
+                    (None, None)
+                        if self.fieldless_enum_discriminants(def).is_some()
+                            && self.wrapper_shape(tdef, targs).is_some() =>
+                    {
+                        let table = self
+                            .fieldless_enum_discriminants(def)
+                            .expect("guard checked");
+                        let shape = self
+                            .wrapper_shape(tdef, targs)
+                            .expect("guard checked");
+                        ir::Rvalue::EnumToPtrWrapped {
+                            operand: v.clone(),
+                            discriminants: table,
+                            payload_index: shape.payload_index as u32,
+                            field_count: shape.field_count,
+                            fill: shape
+                                .fill
+                                .iter()
+                                .map(|(i, c)| (*i as u32, c.clone()))
+                                .collect(),
                         }
                     }
                     _ => match (self.zst_value(src.as_ref().unwrap(), 0), self.zst_value(target, 0)) {

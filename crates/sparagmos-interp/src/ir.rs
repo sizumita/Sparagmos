@@ -636,6 +636,37 @@ pub enum Rvalue {
     /// address names no place), exactly like a pointer constant
     /// with no provenance.
     IntToPtr(Operand),
+    /// A `Transmute` cast from an integer to a transparent
+    /// single-payload wrapper around a thin pointer (`NonNull`,
+    /// `Unique`): the reverse of transmuting the wrapper to an
+    /// integer. The integer is an address in the model's
+    /// synthetic address space (see [`Rvalue::IntToPtr`]), held
+    /// in the wrapper's payload field; the remaining fields are
+    /// zero-sized and take their unique values.
+    IntToPtrWrapped {
+        operand: Operand,
+        payload_index: u32,
+        field_count: usize,
+        fill: Vec<(u32, Constant)>,
+    },
+    /// A `Transmute` cast from a fieldless-enum value (or a
+    /// transparent one-field wrapper around one, such as
+    /// `mem::Alignment`) to a transparent pointer wrapper
+    /// (`NonNull`, `Unique`): the variant's discriminant is the
+    /// payload pointer's address — the transmute
+    /// `NonNull::dangling` performs to turn an alignment into a
+    /// dangling pointer. The operand is the enum value itself
+    /// (conversion extracts the field for the wrapped form);
+    /// `discriminants` is the same baked table
+    /// [`Rvalue::EnumToInt`] carries (an empty table means the
+    /// discriminants are the variant indices).
+    EnumToPtrWrapped {
+        operand: Operand,
+        discriminants: Vec<i128>,
+        payload_index: u32,
+        field_count: usize,
+        fill: Vec<(u32, Constant)>,
+    },
     /// A `Transmute` cast from a fieldless enum value to an
     /// integer: yields the discriminant value of the operand's
     /// variant, taken from the table baked in at conversion time
