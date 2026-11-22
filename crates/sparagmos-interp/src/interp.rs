@@ -6336,7 +6336,35 @@ impl<'a> Interpreter<'a> {
                     .map(|f| f.func.clone())
                     .unwrap_or_else(|| "<allocation>".to_string());
                 let place_desc = format!("allocation #{id}");
-                let value = self.project_value_t(base, projection, &func, &place_desc)?;
+                // An elem block's stored tuple holds only the
+                // elements written so far (it grows on write; see
+                // the allocation arm of `write_resolved`): a read
+                // whose first index step lands past the tuple's
+                // current end addresses a slot that was never
+                // written. That is an uninitialized read, not a
+                // guest bounds violation -- the block's extent is
+                // its byte size, which the tuple's length does
+                // not measure, so the projector's bounds panic
+                // does not apply to it.
+                let past_unwritten = self.is_elem_block(*id)
+                    && match (&base, projection.first()) {
+                        (Value::Tuple(items), Some(RefProj::Index(i))) => {
+                            *i >= items.len()
+                        }
+                        _ => false,
+                    };
+                let value = match self.project_value_t(base, projection, &func, &place_desc) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if past_unwritten {
+                            return Err(InterpError::UninitializedRead {
+                                func,
+                                place: place_desc,
+                            });
+                        }
+                        return Err(e);
+                    }
+                };
                 if value == Value::Uninit {
                     return Err(InterpError::UninitializedRead {
                         func,
