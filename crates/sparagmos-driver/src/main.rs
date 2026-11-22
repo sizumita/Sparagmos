@@ -4615,6 +4615,39 @@ fn collect() -> ControlFlow<()> {
             .failures
             .remove("dynamic dispatch target (virtual instance)");
     }
+    // A deferred trait method with a default body whose only
+    // demand failure is the virtual-instance one was never
+    // demanded as a monomorphic body: the demand came from
+    // dynamic-dispatch sites in generic bodies, and no vtable
+    // formation anywhere in the program names a concrete `Self`
+    // for it (a formed vtable would have credited the definition
+    // above). The default body is demandable in principle, so
+    // nothing convertible was left unconverted; drop the demand
+    // entry and the definition is accounted like an un-demanded
+    // one. A definition with any other failure, one an instance
+    // of which did convert, or a trait method without a default
+    // body (no body of its own exists to demand) keeps its
+    // accounting.
+    for dfn in &deferred {
+        let Some(demand) = demand_state.demands.get(&dfn.def) else {
+            continue;
+        };
+        if demand.converted > 0
+            || demand.failures.len() != 1
+            || !demand
+                .failures
+                .contains_key("dynamic dispatch target (virtual instance)")
+        {
+            continue;
+        }
+        let has_default_body = guard_stable_mir_query(|| {
+            rustc_public::ty::FnDef(dfn.def).has_body()
+        })
+        .unwrap_or(false);
+        if has_default_body {
+            demand_state.demands.remove(&dfn.def);
+        }
+    }
     // Credit the destructor instances the drop demand converted
     // to their impl definitions (and record its failures) the
     // same way: drop glue is not a call edge, so without this the
