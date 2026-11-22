@@ -7933,6 +7933,44 @@ fn assert_message_text(msg: &mir::AssertMessage) -> String {
         A::RemainderByZero(_) => {
             "attempt to calculate the remainder with a divisor of zero".to_string()
         }
+        // The coroutine resume guards: rustc lowers these
+        // asserts to the `panic_const_*` entry points whose
+        // payloads are the exact strings below (the wording a
+        // `catch_unwind` observer downcasts and compares), not
+        // to a generic assertion failure.
+        A::ResumedAfterReturn(kind) => match kind {
+            mir::CoroutineKind::Async => {
+                "`async fn` resumed after completion".to_string()
+            }
+            mir::CoroutineKind::Gen => {
+                "`gen fn` should just keep returning `None` after completion".to_string()
+            }
+            mir::CoroutineKind::Coroutine => {
+                "coroutine resumed after completion".to_string()
+            }
+        },
+        A::ResumedAfterPanic(kind) => match kind {
+            mir::CoroutineKind::Async => {
+                "`async fn` resumed after panicking".to_string()
+            }
+            mir::CoroutineKind::Gen => {
+                "`gen fn` should just keep returning `None` after panicking".to_string()
+            }
+            mir::CoroutineKind::Coroutine => {
+                "coroutine resumed after panicking".to_string()
+            }
+        },
+        A::ResumedAfterDrop(kind) => match kind {
+            mir::CoroutineKind::Async => {
+                "`async fn` resumed after async drop".to_string()
+            }
+            mir::CoroutineKind::Gen => {
+                "`gen fn` resumed after async drop".to_string()
+            }
+            mir::CoroutineKind::Coroutine => {
+                "coroutine resumed after async drop".to_string()
+            }
+        },
         other => format!("assertion failed: {}", other.kind_name()),
     }
 }

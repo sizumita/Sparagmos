@@ -15950,3 +15950,47 @@ fn run_mode_pin_drop_runs_as_the_destructor() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "pin drop ok\n");
 }
+
+const GEN_BLOCK_PANIC_SRC: &str = r#"
+#![feature(gen_blocks)]
+
+fn main() {
+    let mut iter = gen {
+        yield 42;
+        panic!("foo");
+    };
+    assert_eq!(iter.next(), Some(42));
+    let mut tmp = std::panic::AssertUnwindSafe(&mut iter);
+    match std::panic::catch_unwind(move || tmp.next()) {
+        Ok(_) => unreachable!(),
+        Err(err) => assert_eq!(*err.downcast::<&'static str>().unwrap(), "foo"),
+    }
+    match std::panic::catch_unwind(move || iter.next()) {
+        Ok(_) => unreachable!(),
+        Err(err) => assert_eq!(
+            *err.downcast::<&'static str>().unwrap(),
+            "`gen fn` should just keep returning `None` after panicking",
+        ),
+    }
+    println!("gen block panic ok");
+}
+"#;
+
+#[test]
+fn run_mode_gen_block_resume_after_panic_payload() {
+    // Resuming a panicked `gen` coroutine panics with the
+    // `panic_const_gen_fn_none_panic` payload, not with a
+    // generic assertion-failure message: the resume guard's
+    // assert carries a `ResumedAfterPanic` message whose text
+    // is that exact string.
+    let dir = temp_dir("gen-block-panic");
+    let src = fixture(&dir, "gen_block_panic.rs", GEN_BLOCK_PANIC_SRC);
+    let out = run_driver_extra(&src, &["--edition", "2024"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "resume after panic must carry the gen panic payload; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "gen block panic ok\n");
+}
