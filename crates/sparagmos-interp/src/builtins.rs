@@ -922,6 +922,7 @@ pub enum Builtin {
     /// new_size) -> *mut u8`: a fresh block holding the old
     /// block's contents; the old block is freed.
     RustRealloc,
+
 }
 
 /// A relational operator selected by a `PartialOrd` method.
@@ -1903,6 +1904,10 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::intrinsics::simd::simd_with_exposed_provenance"
         | "core::intrinsics::simd::simd_with_exposed_provenance" => {
             Builtin::SimdOp(SimdOp::WithExposedProvenance)
+        }
+        "core::num::imp::overflow_panic::pow" => Builtin::IntPow,
+        "std::str::FromStr::from_str" | "core::str::FromStr::from_str" => {
+            Builtin::FromStrParse
         }
         "alloc::alloc::__rust_alloc" => Builtin::RustAlloc { zeroed: false },
         "alloc::alloc::__rust_alloc_zeroed" => Builtin::RustAlloc { zeroed: true },
@@ -5663,6 +5668,89 @@ impl<'a> Interpreter<'a> {
                 arity(1)?;
                 Ok(vals.into_iter().next().expect("arity checked"))
             }
+            Builtin::IntPow => {
+                // One call form in core's own `pow` bodies names
+                // this function with no arguments and no return
+                // target: it is the cold overflow exit of the
+                // checked path, reached only when the
+                // exponentiation has already overflowed.
+                if vals.is_empty() {
+                    return Err(InterpError::panic(
+                        "attempt to exponentiate with overflow",
+                    ));
+                }
+                arity(2)?;
+                let tag = generic_args.first().map(String::as_str).unwrap_or("");
+                let (bits, signed) = int_tag(tag).ok_or_else(|| {
+                    unsupported(format!("pow for type {tag} is not runtime-supported"))
+                })?;
+                let elem = if signed {
+                    SimdElem::Signed(bits)
+                } else {
+                    SimdElem::Unsigned(bits)
+                };
+                let mask = bit_mask(bits);
+                let base = lane_pattern(&vals[0]) & mask;
+                let mut exp = match &vals[1] {
+                    Value::Uint(u) => *u,
+                    Value::Int(i) if *i >= 0 => *i as u128,
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            "pow exponent",
+                            "unsigned integer",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                // Checked multiplication at the type's width;
+                // the wrapped product is kept for the
+                // overflow-checks-off path.
+                let mul = |x: u128, y: u128| -> (u128, bool) {
+                    if signed {
+                        let xi = sign_extend(x, bits);
+                        let yi = sign_extend(y, bits);
+                        let wrapped = (xi.wrapping_mul(yi) as u128) & mask;
+                        let in_range = if bits == 128 {
+                            xi.checked_mul(yi).is_some()
+                        } else {
+                            let max = (1i128 << (bits - 1)) - 1;
+                            let min = -(1i128 << (bits - 1));
+                            xi.checked_mul(yi)
+                                .is_some_and(|v| (min..=max).contains(&v))
+                        };
+                        (wrapped, !in_range)
+                    } else {
+                        let wrapped = x.wrapping_mul(y) & mask;
+                        let over = match x.checked_mul(y) {
+                            Some(v) => v > mask,
+                            None => true,
+                        };
+                        (wrapped, over)
+                    }
+                };
+                let mut result: u128 = 1;
+                let mut b = base;
+                let mut overflowed = false;
+                while exp > 0 {
+                    if exp & 1 == 1 {
+                        let (v, over) = mul(result, b);
+                        result = v;
+                        overflowed |= over;
+                    }
+                    exp >>= 1;
+                    if exp > 0 {
+                        let (v, over) = mul(b, b);
+                        b = v;
+                        overflowed |= over;
+                    }
+                }
+                if overflowed && self.overflow_checks() {
+                    return Err(InterpError::panic(
+                        "attempt to exponentiate with overflow",
+                    ));
+                }
+                Ok(make_int_lane(result, elem))
+            }
             Builtin::PtrNull => {
                 arity(0)?;
                 // The null pointer: a dedicated reference target
@@ -6188,6 +6276,711 @@ impl<'a> Interpreter<'a> {
     /// whole-place reads of the cell would see the wrong shape.
     /// When the current contents cannot be read (an uninitialised
     /// cell), the value is written as-is.
+    /// Evaluate `FromStr::from_str` for a primitive `Self`
+    /// type. The result is the `Result` aggregate: variant 0
+    /// (`Ok`) with the parsed value, variant 1 (`Err`) with
+    /// the error value core constructs — a one-field struct
+    /// holding the error-kind enum.
+    fn exec_from_str(
+        &self,
+        tag: &str,
+        text: &str,
+        name: &str,
+    ) -> InterpResult<Value> {
+        fn ok(v: Value) -> Value {
+            Value::Enum {
+                variant: 0,
+                fields: vec![v],
+            }
+        }
+        fn err(kind: u32) -> Value {
+            Value::Enum {
+                variant: 1,
+                fields: vec![Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Enum {
+                        variant: kind,
+                        fields: vec![],
+                    }],
+                }],
+            }
+        }
+        if let Some((bits, signed)) = int_tag(tag) {
+            use std::num::IntErrorKind as K;
+            let parsed: Result<u128, u32> = if signed {
+                macro_rules! go {
+                    ($t:ty) => {
+                        match text.parse::<$t>() {
+                            Ok(v) => Ok(v as i128 as u128),
+                            Err(e) => Err(match e.kind() {
+                                K::Empty => 0,
+                                K::InvalidDigit => 1,
+                                K::PosOverflow => 2,
+                                K::NegOverflow => 3,
+                                K::Zero => 4,
+                                _ => 1,
+                            }),
+                        }
+                    };
+                }
+                match bits {
+                    8 => go!(i8),
+                    16 => go!(i16),
+                    32 => go!(i32),
+                    64 => go!(i64),
+                    _ => go!(i128),
+                }
+            } else {
+                macro_rules! go {
+                    ($t:ty) => {
+                        match text.parse::<$t>() {
+                            Ok(v) => Ok(v as u128),
+                            Err(e) => Err(match e.kind() {
+                                K::Empty => 0,
+                                K::InvalidDigit => 1,
+                                K::PosOverflow => 2,
+                                K::NegOverflow => 3,
+                                K::Zero => 4,
+                                _ => 1,
+                            }),
+                        }
+                    };
+                }
+                match bits {
+                    8 => go!(u8),
+                    16 => go!(u16),
+                    32 => go!(u32),
+                    64 => go!(u64),
+                    _ => go!(u128),
+                }
+            };
+            return Ok(match parsed {
+                Ok(p) => ok(make_int_lane(
+                    p,
+                    if signed {
+                        SimdElem::Signed(bits)
+                    } else {
+                        SimdElem::Unsigned(bits)
+                    },
+                )),
+                Err(kind) => err(kind),
+            });
+        }
+        match tag {
+            "f32" | "f64" => {
+                let parsed = if tag == "f32" {
+                    text.parse::<f32>().map(|v| Value::Float(f64::from(v)))
+                } else {
+                    text.parse::<f64>().map(Value::Float)
+                };
+                Ok(match parsed {
+                    Ok(v) => ok(v),
+                    // `ParseFloatError` distinguishes only the
+                    // empty input from everything else.
+                    Err(_) => err(if text.is_empty() { 0 } else { 1 }),
+                })
+            }
+            "bool" => Ok(match text.parse::<bool>() {
+                Ok(v) => ok(Value::Bool(v)),
+                // `ParseBoolError` is a fieldless struct.
+                Err(_) => Value::Enum {
+                    variant: 1,
+                    fields: vec![Value::Enum {
+                        variant: 0,
+                        fields: vec![],
+                    }],
+                },
+            }),
+            "char" => Ok(match text.parse::<char>() {
+                Ok(v) => ok(Value::Uint(u128::from(v as u32))),
+                // `ParseCharError` distinguishes only the empty
+                // input from too-many-chars.
+                Err(_) => err(if text.is_empty() { 0 } else { 1 }),
+            }),
+            _ => Err(unsupported(format!(
+                "{name}: from_str for {tag} is not runtime-supported"
+            ))),
+        }
+    }
+
+    /// Read one gather/masked-load lane through its pointer.
+    /// A pointer formed by casting an array pointer to an
+    /// element pointer (an array's `as_ptr`) carries no
+    /// projection: the plain read yields the whole array, and
+    /// the pointer denotes its first element, so the read
+    /// steps into index 0.
+    fn simd_pointee_read(
+        &self,
+        frames: &[Frame],
+        ptr: &Value,
+    ) -> InterpResult<Value> {
+        let target = self.deref_value(frames, ptr)?;
+        let value = self.read_resolved(frames, &target)?;
+        let empty_projection = match &target {
+            Resolved::Place { projection, .. }
+            | Resolved::Static { projection, .. }
+            | Resolved::Alloc { projection, .. } => projection.is_empty(),
+            Resolved::Value(_) => false,
+        };
+        if empty_projection {
+            if let Value::Tuple(items) = &value {
+                if !items.is_empty() {
+                    return self.read_resolved_at(frames, &target, 0);
+                }
+            }
+        }
+        Ok(value)
+    }
+
+    /// Write one scatter/masked-store lane through its
+    /// pointer, with the same array-start treatment as
+    /// `simd_pointee_read`.
+    fn simd_pointee_write(
+        &self,
+        frames: &mut Vec<Frame>,
+        ptr: &Value,
+        value: Value,
+    ) -> InterpResult<()> {
+        let target = self.deref_value(frames, ptr)?;
+        let empty_projection = match &target {
+            Resolved::Place { projection, .. }
+            | Resolved::Static { projection, .. }
+            | Resolved::Alloc { projection, .. } => projection.is_empty(),
+            Resolved::Value(_) => false,
+        };
+        if empty_projection {
+            let cur = self.read_resolved(frames, &target)?;
+            if matches!(cur, Value::Tuple(_)) {
+                return self.write_resolved_at(frames, &target, 0, value);
+            }
+        }
+        self.write_resolved(frames, &target, value)
+    }
+
+    /// Evaluate one `std::intrinsics::simd` operation over the
+    /// lanes of its vector arguments. The element kind and lane
+    /// count come from the vector type named in the generic
+    /// arguments (`Simd<elem, N>` / `Mask<elem, N>` renderings);
+    /// the lane values come from the arguments themselves, and
+    /// the result mirrors the shape of the vector argument it
+    /// derives from (see `simd_lanes` / `simd_wrap`).
+    fn exec_simd(
+        &self,
+        frames: &mut Vec<Frame>,
+        op: SimdOp,
+        name: &str,
+        generic_args: &[String],
+        vals: Vec<Value>,
+    ) -> InterpResult<Value> {
+        use SimdOp as S;
+        let unsupported_here =
+            |what: &str| unsupported(format!("{name}: {what}"));
+        let vec_info = generic_args.first().and_then(|t| simd_vector_info(t));
+        let lanes_of = |v: &Value| -> InterpResult<Vec<Value>> {
+            simd_lanes(v)
+                .ok_or_else(|| unsupported_here("argument is not a vector value"))
+        };
+        match op {
+            S::Splat => {
+                let (_, count) = match vec_info {
+                    Some((e, Some(n))) => (e, n),
+                    _ => {
+                        return Err(unsupported_here(
+                            "vector type does not name its lane count",
+                        ))
+                    }
+                };
+                if vals.len() != 1 {
+                    return Err(unsupported_here("splat takes one argument"));
+                }
+                let lanes = vec![vals.into_iter().next().unwrap(); count];
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Tuple(lanes)],
+                })
+            }
+            S::Add
+            | S::Sub
+            | S::Mul
+            | S::Div
+            | S::Rem
+            | S::And
+            | S::Or
+            | S::Xor
+            | S::Shl
+            | S::Shr
+            | S::SaturatingAdd
+            | S::SaturatingSub => {
+                if vals.len() != 2 {
+                    return Err(unsupported_here("binary operation arity"));
+                }
+                let (elem, _) = vec_info.ok_or_else(|| {
+                    unsupported_here("vector element type is not modelled")
+                })?;
+                let a = lanes_of(&vals[0])?;
+                let b = lanes_of(&vals[1])?;
+                if a.len() != b.len() {
+                    return Err(unsupported_here("lane count mismatch"));
+                }
+                let out = simd_binary(op, elem, &a, &b, name)?;
+                simd_wrap(&vals[0], out)
+                    .ok_or_else(|| unsupported_here("cannot rebuild the vector"))
+            }
+            S::FunnelShl | S::FunnelShr => {
+                if vals.len() != 3 {
+                    return Err(unsupported_here("funnel shift arity"));
+                }
+                let (elem, _) = vec_info.ok_or_else(|| {
+                    unsupported_here("vector element type is not modelled")
+                })?;
+                let bits = match elem {
+                    SimdElem::Signed(b) | SimdElem::Unsigned(b) => b,
+                    SimdElem::Float(_) => {
+                        return Err(unsupported_here(
+                            "funnel shift on floating-point lanes",
+                        ))
+                    }
+                };
+                let mask = bit_mask(bits);
+                let a = lanes_of(&vals[0])?;
+                let b = lanes_of(&vals[1])?;
+                let s = lanes_of(&vals[2])?;
+                let mut out = Vec::with_capacity(a.len());
+                for i in 0..a.len() {
+                    let x = lane_pattern(&a[i]) & mask;
+                    let y = lane_pattern(&b[i]) & mask;
+                    let sh = (lane_pattern(&s[i]) % u128::from(bits)) as u32;
+                    let r = if sh == 0 {
+                        // A funnel shift by zero yields the
+                        // first operand for shl and the second
+                        // for shr (the pair reads as one wide
+                        // register, shifted through).
+                        if op == S::FunnelShl { x } else { y }
+                    } else if op == S::FunnelShl {
+                        ((x << sh) | (y >> (bits - sh))) & mask
+                    } else {
+                        ((x << (bits - sh)) | (y >> sh)) & mask
+                    };
+                    out.push(make_int_lane(r, elem));
+                }
+                simd_wrap(&vals[0], out)
+                    .ok_or_else(|| unsupported_here("cannot rebuild the vector"))
+            }
+            S::Neg
+            | S::Not
+            | S::CtPop
+            | S::Ctlz
+            | S::Cttz
+            | S::BitReverse
+            | S::Bswap
+            | S::Fabs
+            | S::Fsqrt
+            | S::Fceil
+            | S::Ffloor
+            | S::Fround
+            | S::FroundTiesEven
+            | S::Ftrunc
+            | S::Fsin
+            | S::Fcos
+            | S::Fexp
+            | S::Fexp2
+            | S::Flog
+            | S::Flog2
+            | S::Flog10 => {
+                if vals.len() != 1 {
+                    return Err(unsupported_here("unary operation arity"));
+                }
+                let (elem, _) = vec_info.ok_or_else(|| {
+                    unsupported_here("vector element type is not modelled")
+                })?;
+                let a = lanes_of(&vals[0])?;
+                let out = simd_unary(op, elem, &a, name)?;
+                simd_wrap(&vals[0], out)
+                    .ok_or_else(|| unsupported_here("cannot rebuild the vector"))
+            }
+            S::Fma => {
+                if vals.len() != 3 {
+                    return Err(unsupported_here("fma arity"));
+                }
+                let (elem, _) = vec_info.ok_or_else(|| {
+                    unsupported_here("vector element type is not modelled")
+                })?;
+                let bits = match elem {
+                    SimdElem::Float(b) => b,
+                    _ => return Err(unsupported_here("fma on integer lanes")),
+                };
+                let a = lanes_of(&vals[0])?;
+                let b = lanes_of(&vals[1])?;
+                let c = lanes_of(&vals[2])?;
+                let mut out = Vec::with_capacity(a.len());
+                for i in 0..a.len() {
+                    let x = lane_float(&a[i], name)?;
+                    let y = lane_float(&b[i], name)?;
+                    let z = lane_float(&c[i], name)?;
+                    out.push(make_float_lane(x.mul_add(y, z), bits));
+                }
+                simd_wrap(&vals[0], out)
+                    .ok_or_else(|| unsupported_here("cannot rebuild the vector"))
+            }
+            S::MinimumNumber | S::MaximumNumber => {
+                if vals.len() != 2 {
+                    return Err(unsupported_here("min/max arity"));
+                }
+                let (elem, _) = vec_info.ok_or_else(|| {
+                    unsupported_here("vector element type is not modelled")
+                })?;
+                let bits = match elem {
+                    SimdElem::Float(b) => b,
+                    _ => {
+                        return Err(unsupported_here(
+                            "minimum/maximum_number on integer lanes",
+                        ))
+                    }
+                };
+                let a = lanes_of(&vals[0])?;
+                let b = lanes_of(&vals[1])?;
+                let mut out = Vec::with_capacity(a.len());
+                for i in 0..a.len() {
+                    let x = lane_float(&a[i], name)?;
+                    let y = lane_float(&b[i], name)?;
+                    let r = if x.is_nan() {
+                        y
+                    } else if y.is_nan() {
+                        x
+                    } else if op == S::MinimumNumber {
+                        if x < y {
+                            x
+                        } else if y < x {
+                            y
+                        } else {
+                            x
+                        }
+                    } else if x > y {
+                        x
+                    } else if y > x {
+                        y
+                    } else {
+                        x
+                    };
+                    out.push(make_float_lane(r, bits));
+                }
+                simd_wrap(&vals[0], out)
+                    .ok_or_else(|| unsupported_here("cannot rebuild the vector"))
+            }
+            S::Cast => {
+                if vals.len() != 1 {
+                    return Err(unsupported_here("cast arity"));
+                }
+                let src_info = generic_args.first().and_then(|t| simd_vector_info(t));
+                let dst_info = generic_args.get(1).and_then(|t| simd_vector_info(t));
+                let (src_elem, _) = src_info.ok_or_else(|| {
+                    unsupported_here("cast source element type is not modelled")
+                })?;
+                let (dst_elem, dst_lanes) = dst_info.ok_or_else(|| {
+                    unsupported_here("cast destination element type is not modelled")
+                })?;
+                let a = lanes_of(&vals[0])?;
+                if let Some(n) = dst_lanes {
+                    if n != a.len() {
+                        return Err(unsupported_here("cast lane count mismatch"));
+                    }
+                }
+                let mut out = Vec::with_capacity(a.len());
+                for lane in &a {
+                    out.push(simd_cast_lane(lane, src_elem, dst_elem, name)?);
+                }
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Tuple(out)],
+                })
+            }
+            S::CastPtr => {
+                if vals.len() != 1 {
+                    return Err(unsupported_here("cast_ptr arity"));
+                }
+                Ok(vals.into_iter().next().unwrap())
+            }
+            S::Bitmask => {
+                if vals.len() != 1 {
+                    return Err(unsupported_here("bitmask arity"));
+                }
+                let (elem, _) = vec_info.ok_or_else(|| {
+                    unsupported_here("vector element type is not modelled")
+                })?;
+                let a = lanes_of(&vals[0])?;
+                let mut bits_out: u128 = 0;
+                for (i, lane) in a.iter().enumerate() {
+                    let msb = match elem {
+                        SimdElem::Signed(_) => match lane {
+                            Value::Int(v) => *v < 0,
+                            _ => false,
+                        },
+                        SimdElem::Unsigned(b) => {
+                            (lane_pattern(lane) >> (b - 1)) & 1 == 1
+                        }
+                        SimdElem::Float(_) => {
+                            matches!(lane, Value::Float(f) if f.is_sign_negative())
+                        }
+                    };
+                    if msb {
+                        bits_out |= 1u128 << i;
+                    }
+                }
+                Ok(Value::Uint(bits_out))
+            }
+            S::Eq | S::Ne | S::Lt | S::Le | S::Gt | S::Ge => {
+                if vals.len() != 2 {
+                    return Err(unsupported_here("comparison arity"));
+                }
+                let (elem, _) = vec_info.ok_or_else(|| {
+                    unsupported_here("vector element type is not modelled")
+                })?;
+                let a = lanes_of(&vals[0])?;
+                let b = lanes_of(&vals[1])?;
+                let mut out = Vec::with_capacity(a.len());
+                for i in 0..a.len() {
+                    let t = simd_compare(op, elem, &a[i], &b[i], name)?;
+                    out.push(Value::Int(if t { -1 } else { 0 }));
+                }
+                simd_wrap(&vals[0], out)
+                    .ok_or_else(|| unsupported_here("cannot rebuild the vector"))
+            }
+            S::Select => {
+                if vals.len() != 3 {
+                    return Err(unsupported_here("select arity"));
+                }
+                let mask = lanes_of(&vals[0])?;
+                let a = lanes_of(&vals[1])?;
+                let b = lanes_of(&vals[2])?;
+                let mut out = Vec::with_capacity(a.len());
+                for i in 0..a.len() {
+                    out.push(if lane_nonzero(&mask[i]) {
+                        a[i].clone()
+                    } else {
+                        b[i].clone()
+                    });
+                }
+                simd_wrap(&vals[1], out)
+                    .ok_or_else(|| unsupported_here("cannot rebuild the vector"))
+            }
+            S::SelectBitmask => {
+                if vals.len() != 3 {
+                    return Err(unsupported_here("select_bitmask arity"));
+                }
+                let bits = lane_pattern(&vals[0]);
+                let a = lanes_of(&vals[1])?;
+                let b = lanes_of(&vals[2])?;
+                let mut out = Vec::with_capacity(a.len());
+                for i in 0..a.len() {
+                    out.push(if (bits >> i) & 1 == 1 {
+                        a[i].clone()
+                    } else {
+                        b[i].clone()
+                    });
+                }
+                simd_wrap(&vals[1], out)
+                    .ok_or_else(|| unsupported_here("cannot rebuild the vector"))
+            }
+            S::Insert | S::InsertDyn | S::Extract | S::ExtractDyn => {
+                let is_insert = matches!(op, S::Insert | S::InsertDyn);
+                let idx = if matches!(op, S::InsertDyn | S::ExtractDyn) {
+                    if vals.len() < 2 {
+                        return Err(unsupported_here("dynamic index arity"));
+                    }
+                    lane_pattern(&vals[1])
+                } else if vals.len() >= 3 || (vals.len() == 2 && !is_insert) {
+                    lane_pattern(&vals[1])
+                } else {
+                    // The constant-index spellings carry the index
+                    // as a generic argument.
+                    match generic_args
+                        .iter()
+                        .rev()
+                        .find_map(|g| g.trim().parse::<u128>().ok())
+                    {
+                        Some(i) => i,
+                        None => {
+                            return Err(unsupported_here(
+                                "constant lane index is not visible",
+                            ))
+                        }
+                    }
+                };
+                let mut lanes = lanes_of(&vals[0])?;
+                let idx = idx as usize;
+                if idx >= lanes.len() {
+                    return Err(InterpError::panic(format!(
+                        "index out of bounds: the len is {} but the index is {idx}",
+                        lanes.len()
+                    )));
+                }
+                if is_insert {
+                    let value = if vals.len() >= 3 {
+                        vals[2].clone()
+                    } else {
+                        vals[1].clone()
+                    };
+                    lanes[idx] = value;
+                    simd_wrap(&vals[0], lanes)
+                        .ok_or_else(|| unsupported_here("cannot rebuild the vector"))
+                } else {
+                    Ok(lanes[idx].clone())
+                }
+            }
+            S::Shuffle => {
+                if vals.len() != 3 {
+                    return Err(unsupported_here("shuffle arity"));
+                }
+                let a = lanes_of(&vals[0])?;
+                let b = lanes_of(&vals[1])?;
+                let idx = lanes_of(&vals[2])?;
+                let mut out = Vec::with_capacity(idx.len());
+                for j in &idx {
+                    let j = lane_pattern(j) as usize;
+                    if j < a.len() {
+                        out.push(a[j].clone());
+                    } else if j - a.len() < b.len() {
+                        out.push(b[j - a.len()].clone());
+                    } else {
+                        return Err(unsupported_here("shuffle index out of range"));
+                    }
+                }
+                simd_wrap(&vals[0], out)
+                    .ok_or_else(|| unsupported_here("cannot rebuild the vector"))
+            }
+            S::ReduceAdd
+            | S::ReduceAddOrdered
+            | S::ReduceMul
+            | S::ReduceMulOrdered
+            | S::ReduceAnd
+            | S::ReduceOr
+            | S::ReduceXor
+            | S::ReduceMax
+            | S::ReduceMin => {
+                // The ordered reductions take the fold's initial
+                // value as a second, scalar operand; the rest
+                // start from the operation's identity (or the
+                // first lane).
+                let ordered =
+                    matches!(op, S::ReduceAddOrdered | S::ReduceMulOrdered);
+                if vals.len() != if ordered { 2 } else { 1 } {
+                    return Err(unsupported_here("reduction arity"));
+                }
+                let (elem, _) = vec_info.ok_or_else(|| {
+                    unsupported_here("vector element type is not modelled")
+                })?;
+                let a = lanes_of(&vals[0])?;
+                let init = if ordered { Some(&vals[1]) } else { None };
+                simd_reduce(op, elem, &a, init, name)
+            }
+            S::ReduceAny | S::ReduceAll => {
+                if vals.len() != 1 {
+                    return Err(unsupported_here("reduction arity"));
+                }
+                let a = lanes_of(&vals[0])?;
+                let r = if op == S::ReduceAny {
+                    a.iter().any(lane_nonzero)
+                } else {
+                    a.iter().all(lane_nonzero)
+                };
+                Ok(Value::Bool(r))
+            }
+            S::Gather => {
+                if vals.len() != 3 {
+                    return Err(unsupported_here("gather arity"));
+                }
+                let defaults = lanes_of(&vals[0])?;
+                let ptrs = lanes_of(&vals[1])?;
+                let mask = lanes_of(&vals[2])?;
+                let mut out = Vec::with_capacity(defaults.len());
+                for i in 0..defaults.len() {
+                    if lane_nonzero(&mask[i]) {
+                        out.push(self.simd_pointee_read(frames, &ptrs[i])?);
+                    } else {
+                        out.push(defaults[i].clone());
+                    }
+                }
+                simd_wrap(&vals[0], out)
+                    .ok_or_else(|| unsupported_here("cannot rebuild the vector"))
+            }
+            S::Scatter => {
+                if vals.len() != 3 {
+                    return Err(unsupported_here("scatter arity"));
+                }
+                let values = lanes_of(&vals[0])?;
+                let ptrs = lanes_of(&vals[1])?;
+                let mask = lanes_of(&vals[2])?;
+                for i in 0..values.len() {
+                    if lane_nonzero(&mask[i]) {
+                        self.simd_pointee_write(
+                            frames,
+                            &ptrs[i],
+                            values[i].clone(),
+                        )?;
+                    }
+                }
+                Ok(Value::Unit)
+            }
+            S::MaskedLoad => {
+                if vals.len() != 3 {
+                    return Err(unsupported_here("masked_load arity"));
+                }
+                let mask = lanes_of(&vals[0])?;
+                let passthrough = lanes_of(&vals[2])?;
+                let (elem, _) = generic_args
+                    .get(2)
+                    .and_then(|t| simd_vector_info(t))
+                    .ok_or_else(|| {
+                        unsupported_here("masked_load element type is not modelled")
+                    })?;
+                let mut out = Vec::with_capacity(passthrough.len());
+                for i in 0..passthrough.len() {
+                    if lane_nonzero(&mask[i]) {
+                        let p = self.ptr_offset_value(
+                            frames,
+                            vals[1].clone(),
+                            i as i128,
+                            Some(u64::from(elem_bits(elem) / 8)),
+                            true,
+                        )?;
+                        out.push(self.simd_pointee_read(frames, &p)?);
+                    } else {
+                        out.push(passthrough[i].clone());
+                    }
+                }
+                simd_wrap(&vals[2], out)
+                    .ok_or_else(|| unsupported_here("cannot rebuild the vector"))
+            }
+            S::MaskedStore => {
+                if vals.len() != 3 {
+                    return Err(unsupported_here("masked_store arity"));
+                }
+                let mask = lanes_of(&vals[0])?;
+                let values = lanes_of(&vals[2])?;
+                let (elem, _) = generic_args
+                    .get(2)
+                    .and_then(|t| simd_vector_info(t))
+                    .ok_or_else(|| {
+                        unsupported_here("masked_store element type is not modelled")
+                    })?;
+                for i in 0..values.len() {
+                    if lane_nonzero(&mask[i]) {
+                        let p = self.ptr_offset_value(
+                            frames,
+                            vals[1].clone(),
+                            i as i128,
+                            Some(u64::from(elem_bits(elem) / 8)),
+                            true,
+                        )?;
+                        let target = self.deref_value(frames, &p)?;
+                        self.write_resolved(frames, &target, values[i].clone())?;
+                    }
+                }
+                Ok(Value::Unit)
+            }
+        }
+    }
+
     fn atomic_write(
         &self,
         frames: &mut Vec<Frame>,

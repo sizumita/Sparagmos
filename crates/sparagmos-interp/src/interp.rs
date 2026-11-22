@@ -449,6 +449,12 @@ impl<'a> Interpreter<'a> {
         &self.config.program_path
     }
 
+    /// Whether the guest was compiled with overflow checks
+    /// (see the `overflow_checks` field of `InterpConfig`).
+    pub fn overflow_checks(&self) -> bool {
+        self.config.overflow_checks
+    }
+
     pub fn with_config(program: &'a Program, config: InterpConfig) -> Self {
         Interpreter {
             program,
