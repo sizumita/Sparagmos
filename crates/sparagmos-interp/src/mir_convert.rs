@@ -3755,6 +3755,50 @@ impl<'a> Converter<'a> {
         self.ptr_chain_operand(body, &next_operand, &field_v, fdef, fargs)
     }
 
+    /// Whether both types are pointers (a reference or a raw
+    /// pointer) to byte-string DSTs: `str`, a `[u8]` slice,
+    /// `std::ffi::OsStr` (or its sys representation type
+    /// `std::sys::os_str::bytes::Slice`, the pointee the
+    /// `OsStr` constructors actually transmute to) or
+    /// `std::path::Path`. All of them are a
+    /// byte string with a length metadata half, and in this
+    /// value model a reference to any of them is the byte
+    /// string itself (see the projection pun for the wrapper
+    /// chain in `interp`), so a transmute between any two of
+    /// these pointer types reinterprets nothing.
+    fn is_byte_string_ptr_pair(&self, s: &mir::Ty, t: &mir::Ty) -> bool {
+        fn pointee(ty: &mir::Ty) -> Option<&mir::Ty> {
+            match ty {
+                mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _) => Some(inner),
+                _ => None,
+            }
+        }
+        let byte_string = |ty: &mir::Ty| -> bool {
+            match ty {
+                mir::Ty::Str => true,
+                mir::Ty::Slice(elem) => {
+                    matches!(**elem, mir::Ty::Uint(mir::UintTy::U8))
+                }
+                mir::Ty::Adt(def, _) => matches!(
+                    self.names
+                        .get(def)
+                        .or_else(|| self.def_names.get(def))
+                        .map(String::as_str),
+                    Some(
+                        "std::ffi::OsStr"
+                            | "std::sys::os_str::bytes::Slice"
+                            | "std::path::Path"
+                    )
+                ),
+                _ => false,
+            }
+        };
+        match (pointee(s), pointee(t)) {
+            (Some(a), Some(b)) => byte_string(a) && byte_string(b),
+            _ => false,
+        }
+    }
+
     /// Convert a `CastKind::Transmute` rvalue: `operand` is the
     /// MIR operand, `v` its converted IR form, `target` the cast's
     /// target type. Only the shapes this value model can
@@ -3791,6 +3835,8 @@ impl<'a> Converter<'a> {
     ///   enums over a scalar or thin-pointer payload
     ///   (`Option<NonNull<T>>`) — the bit-level
     ///   reinterpretation `transmute` means there;
+    /// * pointer <-> pointer over byte-string DST pointees
+    ///   (`str`, `[u8]`, `OsStr`, `Path` in any combination);
     /// * fat pointer <-> fat pointer, and fat pointer <->
 ///   transparent wrapper struct (one fat-pointer payload
     ///   field, the remaining fields zero-sized with unique
@@ -4105,6 +4151,19 @@ let inner = match (&src, target) {
                     && is_fat_ptr_ty(t)
                     && !self.pointee_crosses_cell_wrapper(s, t) =>
             {
+                ir::Rvalue::Use(v.clone())
+            }
+            // Pointer <-> pointer where both pointees are
+            // byte-string DSTs (`str`, `[u8]`, `OsStr`, `Path`):
+            // all four are a byte string with a length metadata
+            // half, and their values in this model are the byte
+            // string itself (the projection pun reads an `OsStr`
+            // / `Path` as its bytes), so the cast reinterprets
+            // nothing — the `&[u8]` -> `&OsStr` step inside
+            // `Component::as_os_str` is the shape that reaches
+            // here, `is_fat_ptr_ty` not counting the DST structs
+            // as fat pointees.
+            (Some(s), t) if self.is_byte_string_ptr_pair(s, t) => {
                 ir::Rvalue::Use(v.clone())
             }
             // Fat pointer between a `str` and a `[u8]` view of the
@@ -8487,6 +8546,31 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
             | "std::str::Chars" | "core::str::Chars"
             | "std::str::Bytes" | "core::str::Bytes"
             | "std::iter::Empty" | "core::iter::Empty" => return Some(P::Trivial),
+            "std::path::Components" => {
+                // The modelled state is the path's byte string
+                // plus the two consumed counts (see
+                // `Builtin::PathComponents` in `builtins`):
+                // plain data with no glue of its own. The real
+                // type owns nothing either (a borrowed path
+                // slice plus parse state), so the plans agree.
+                return Some(P::Trivial)
+            }
+            "std::path::Component" | "std::path::PrefixComponent"
+            | "std::path::Prefix" => {
+                // The component types hold only string slices
+                // (`&OsStr` / `&str`) and plain discriminants,
+                // and none of them has a `Drop` impl, so their
+                // glue is empty. Naming them here matters
+                // because library bodies are not drop-elaborated
+                // the way entry-crate bodies are: a generic
+                // library body (the closure inside
+                // `Iterator::count`, say) still carries `Drop`
+                // terminators for the items it consumes, and
+                // the generic fallthrough below refuses a
+                // non-local type it has no destructor record
+                // for.
+                return Some(P::Trivial)
+            }
             "std::iter::Map" | "core::iter::Map" => {
                 // State fields: the inner iterator's state and the
                 // closure value; glue is the two fields' glue.
