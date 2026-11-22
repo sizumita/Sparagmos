@@ -4014,7 +4014,10 @@ impl Converter {
     /// offsets are absolute, and a state field keeps one offset
     /// in every variant that contains it, so slots are assigned
     /// per distinct offset across all variants, after the upvar
-    /// slots. Instances whose layout the query cannot answer,
+    /// slots — except the zero-sized fields that share an offset
+    /// with the field after them inside one variant, which are
+    /// distinct cells and get private slots (see below).
+    /// Instances whose layout the query cannot answer,
     /// and shapes that do not match the state-machine form (the
     /// outer fields are the upvars followed by the discriminant
     /// tag), get no entry; their projections keep the positional
@@ -4053,6 +4056,19 @@ impl Converter {
         if offsets.len() != n_upvars + 1 {
             return;
         }
+        // One slot per distinct offset, shared by every variant
+        // that has a field there — with one exception. Inside a
+        // single variant, several fields can sit at one offset:
+        // a zero-sized field consumes no bytes, so the field
+        // after it starts at the same offset. Those fields are
+        // distinct storage cells (the zero-sized value and the
+        // value after it are both live in that state), and
+        // merging them would let each overwrite the other. In
+        // offset order, every field of such a group but the last
+        // is zero-sized (the next field starts at its offset, so
+        // it spans no bytes), so the last field owns the offset's
+        // shared slot and each earlier field gets a private slot
+        // of its own, used by no other variant.
         let mut state_offsets: Vec<u64> = Vec::new();
         for variant in variants {
             for offset in &variant.offsets {
@@ -4062,18 +4078,37 @@ impl Converter {
                 }
             }
         }
+        let mut next_slot = n_upvars + state_offsets.len();
         let variants: Vec<Vec<u32>> = variants
             .iter()
             .map(|variant| {
-                variant
-                    .offsets
+                let offsets: Vec<u64> =
+                    variant.offsets.iter().map(|o| o.bytes() as u64).collect();
+                // The owner of each offset in this variant: the
+                // last field, in (offset, field index) order,
+                // among the fields at that offset.
+                let mut owner: std::collections::HashMap<u64, usize> =
+                    std::collections::HashMap::new();
+                let mut order: Vec<usize> = (0..offsets.len()).collect();
+                order.sort_by_key(|&i| (offsets[i], i));
+                for &i in &order {
+                    owner.insert(offsets[i], i);
+                }
+                offsets
                     .iter()
-                    .map(|offset| {
-                        let pos = state_offsets
-                            .iter()
-                            .position(|o| *o == offset.bytes() as u64)
-                            .expect("offset was collected above");
-                        (n_upvars + pos) as u32
+                    .enumerate()
+                    .map(|(i, offset)| {
+                        if owner[&offset] == i {
+                            let pos = state_offsets
+                                .iter()
+                                .position(|o| o == offset)
+                                .expect("offset was collected above");
+                            (n_upvars + pos) as u32
+                        } else {
+                            let slot = next_slot as u32;
+                            next_slot += 1;
+                            slot
+                        }
                     })
                     .collect()
             })

@@ -89,7 +89,11 @@ pub type AdtLayouts = std::collections::HashMap<String, (u64, u64)>;
 /// variant fields at one offset (above all the `ResumeTy` slot,
 /// present at the head of every suspension state) are one storage
 /// cell, and fields at distinct offsets never alias even when
-/// their variant-relative field indices coincide. The driver
+/// their variant-relative field indices coincide. Within one
+/// variant, though, a zero-sized field shares its offset with
+/// the field after it, and those two are distinct cells: the
+/// offset's slot belongs to the later field, and the zero-sized
+/// field gets a private slot no other variant uses. The driver
 /// fills one entry per coroutine instance whose layout the
 /// compiler can give; an instance with no entry keeps the
 /// positional projection conversion.
