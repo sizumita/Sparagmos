@@ -5119,7 +5119,7 @@ impl<'a> Interpreter<'a> {
                             ))),
                         }
                     }
-                    Resolved::Value(_) => Err(unsupported(
+                    Resolved::Value(..) => Err(unsupported(
                         "IndexMut::index_mut on a constant aggregate is not runtime-supported",
                     )),
                 }
@@ -6037,7 +6037,9 @@ impl<'a> Interpreter<'a> {
                     | Resolved::Alloc { projection, .. } => {
                         matches!(projection.last(), Some(RefProj::Index(_)))
                     }
-                    Resolved::Value(_) => false,
+                    Resolved::Value(_, projection) => {
+                        matches!(projection.last(), Some(RefProj::Index(_)))
+                    }
                 };
                 if matches!(
                     self.read_resolved(frames, &target),
@@ -6147,7 +6149,7 @@ impl<'a> Interpreter<'a> {
                 } => (format!("place:{frame_pos}:{local}"), projection),
                 Resolved::Static { name, projection } => (format!("static:{name}"), projection),
                 Resolved::Alloc { id, projection } => (format!("alloc:{id}"), projection),
-                Resolved::Value(_) => return None,
+                Resolved::Value(..) => return None,
             };
             let key = |steps: &[RefProj]| {
                 steps
@@ -7105,7 +7107,8 @@ impl<'a> Interpreter<'a> {
                             projection,
                         })
                     }
-                    Resolved::Value(v) => {
+                    Resolved::Value(base, projection) => {
+                        let v = self.value_target_value(base, projection)?;
                         if mutable {
                             return Err(unsupported(
                                 "IntoIterator::into_iter for &mut Option over a constant aggregate is not runtime-supported",
@@ -7326,7 +7329,7 @@ impl<'a> Interpreter<'a> {
                 id: *id,
                 projection: projection.clone(),
             }),
-            Resolved::Value(_) => unreachable!("closure target is a place"),
+            Resolved::Value(..) => unreachable!("closure target is a place"),
         };
         let mapped = self.call_callable_sync(frames, &callable, Some(env_ref), vec![item])?;
         Ok(Some(some_value(mapped)))
@@ -7351,7 +7354,7 @@ impl<'a> Interpreter<'a> {
                 id: *id,
                 projection: projection.clone(),
             })),
-            Resolved::Value(_) => Err(unsupported(
+            Resolved::Value(..) => Err(unsupported(
                 "a closure environment reference for a value with no storage".to_string(),
             )),
         }
@@ -8628,7 +8631,7 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
             return Ok(None);
         }
         let target = self.deref_value(frames, receiver)?;
-        if matches!(target, Resolved::Value(_)) {
+        if matches!(target, Resolved::Value(..)) {
             return Ok(None);
         }
         let base = self.read_resolved(frames, &target)?;
@@ -8671,7 +8674,7 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                 projection.push(RefProj::Index(idx));
                 Value::Ref(RefTarget::Alloc { id, projection })
             }
-            Resolved::Value(_) => unreachable!("returned above"),
+            Resolved::Value(..) => unreachable!("returned above"),
         };
         Ok(Some(refr))
     }
@@ -9137,7 +9140,8 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                 projection.push(RefProj::Field(0));
                 Value::Ref(RefTarget::Alloc { id, projection })
             }
-            Resolved::Value(value) => {
+            Resolved::Value(base, projection) => {
+                let value = self.value_target_value(&base, &projection)?;
                 Value::Ref(RefTarget::value(one_field_value(value, what)?))
             }
         })
@@ -10133,7 +10137,7 @@ fn extend_target(target: &Resolved, step: RefProj) -> Option<Resolved> {
                 projection,
             })
         }
-        Resolved::Value(_) => None,
+        Resolved::Value(..) => None,
     }
 }
 

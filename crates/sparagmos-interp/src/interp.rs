@@ -152,7 +152,16 @@ pub(crate) enum Resolved {
         local: usize,
         projection: Vec<RefProj>,
     },
-    Value(Value),
+    /// A constant aggregate value and the projection into it
+    /// the resolution accumulated, mirroring [`RefTarget::Value`]:
+    /// the projection applies when the target is read, so an
+    /// empty projection denotes the value itself and a projection
+    /// ending in an index step denotes that one element — the
+    /// shape an array-to-element pointer cast through a constant
+    /// produces, whose sibling elements the sequence access
+    /// (`seq_element_target`) reaches by adjusting the trailing
+    /// step, as for the other targets.
+    Value(Value, Vec<RefProj>),
     /// A place inside a `static` item's storage in the
     /// interpreter's statics store.
     Static {
@@ -1227,7 +1236,7 @@ impl<'a> Interpreter<'a> {
                                     Resolved::Alloc { id, projection } => {
                                         RefTarget::Alloc { id, projection }
                                     }
-                                    Resolved::Value(_) => {
+                                    Resolved::Value(..) => {
                                         return Err(InterpError::type_mismatch(
                                             "std::mem::drop",
                                             "a storage place",
@@ -1299,13 +1308,13 @@ impl<'a> Interpreter<'a> {
                             id,
                             projection,
                         },
-                        Resolved::Value(value) => {
+                        Resolved::Value(base, projection) => {
                             // The place is the deref of a value
                             // reference (a `Box` / `ManuallyDrop`
                             // deref in this model): the glue runs
                             // against that value itself, as it does
                             // for a `mem::drop` constant argument.
-                            RefTarget::value(value)
+                            RefTarget::Value(Box::new(base), projection)
                         }
                     };
                     let work = vec![(Vec::new(), glue.root.clone())];
@@ -2331,7 +2340,7 @@ impl<'a> Interpreter<'a> {
                         local,
                         projection,
                     ))),
-                    Resolved::Value(_) => {
+                    Resolved::Value(..) => {
                         Ok(Value::Ref(RefTarget::value(value.clone())))
                     }
                     Resolved::Static { name, projection } => {
@@ -3728,7 +3737,7 @@ impl<'a> Interpreter<'a> {
                             navigate_mut(slot, &projection, "<allocation>", &place_desc)?;
                         Self::set_discriminant_value(value, *variant, place)
                     }
-                    Resolved::Value(_) => Err(InterpError::type_mismatch(
+                    Resolved::Value(..) => Err(InterpError::type_mismatch(
                         format!("SetDiscriminant on {place}"),
                         "mutable place",
                         "constant aggregate",
@@ -3963,8 +3972,11 @@ impl<'a> Interpreter<'a> {
                 *local,
                 projection.clone(),
             )),
-            Resolved::Value(value) => {
-                Value::Ref(RefTarget::value(value.clone()))
+            Resolved::Value(base, projection) => {
+                Value::Ref(RefTarget::Value(
+                    Box::new(base.clone()),
+                    projection.clone(),
+                ))
             }
             Resolved::Static { name, projection } => Value::Ref(RefTarget::Static {
                 name: name.clone(),
@@ -4145,13 +4157,16 @@ impl<'a> Interpreter<'a> {
                     projection,
                 })
             }
-            Resolved::Value(value) => {
+            Resolved::Value(base, projection) => {
                 let func = frames
                     .last()
                     .map(|f| f.func.clone())
                     .unwrap_or_else(|| body.name.clone());
-                let projected = self.project_value_t(value, &[step], &func, &place.to_string())?;
-                Ok(Resolved::Value(projected))
+                let mut projection = projection.clone();
+                projection.push(step);
+                let projected =
+                    self.project_value_t(base, &projection, &func, &place.to_string())?;
+                Ok(Resolved::Value(projected, Vec::new()))
             }
             Resolved::Static {
                 name,
@@ -4225,9 +4240,9 @@ impl<'a> Interpreter<'a> {
                 local: *local,
                 projection: projection.clone(),
             }),
-            Value::Ref(RefTarget::Value(v, projection)) => Ok(Resolved::Value(
-                self.project_value_t((**v).clone(), projection, "<deref>", "constant aggregate")?,
-            )),
+            Value::Ref(RefTarget::Value(v, projection)) => {
+                Ok(Resolved::Value((**v).clone(), projection.clone()))
+            }
             Value::Ref(RefTarget::Static { name, projection }) => Ok(Resolved::Static {
                 name: name.clone(),
                 projection: projection.clone(),
@@ -4250,21 +4265,23 @@ impl<'a> Interpreter<'a> {
             // itself (see `normalize_for_ty`), and a `&str` value
             // that was materialised as bare string data likewise:
             // dereferencing yields the data value.
-            Value::Bytes(_) | Value::Str(_) => Ok(Resolved::Value(value.clone())),
+            Value::Bytes(_) | Value::Str(_) => {
+                Ok(Resolved::Value(value.clone(), Vec::new()))
+            }
             // Dereferencing a fat pointer whose base is a reference
             // reaches through to the base place. A self-contained
             // fat pointer (a slice constant: the base is the element
             // aggregate itself) derefs to the slice value itself, so
             // `Len` and index bounds see the fat pointer's length.
             Value::FatRef { base, .. } => match &**base {
-                Value::Tuple(_) => Ok(Resolved::Value(value.clone())),
+                Value::Tuple(_) => Ok(Resolved::Value(value.clone(), Vec::new())),
                 // An address-only base has no pointee to reach: the
                 // fat pointer is self-contained (a dangling slice
                 // constant, a `from_raw_parts` result), and
                 // dereferencing it yields the slice value itself —
                 // the same treatment as the aggregate-base case.
                 Value::Ref(RefTarget::Address(_)) => {
-                    Ok(Resolved::Value(value.clone()))
+                    Ok(Resolved::Value(value.clone(), Vec::new()))
                 }
                 _ => self.deref_value(frames, base),
             },
@@ -4293,7 +4310,7 @@ impl<'a> Interpreter<'a> {
                         self.deref_value(frames, &fields[0])
                     }
                     Value::Enum { fields, .. } if fields.len() == 1 => {
-                        Ok(Resolved::Value(fields[0].clone()))
+                        Ok(Resolved::Value(fields[0].clone(), Vec::new()))
                     }
                     _ => self.deref_value(frames, base),
                 }
@@ -4524,14 +4541,15 @@ impl<'a> Interpreter<'a> {
         target: &Resolved,
     ) -> InterpResult<Cow<'x, Value>> {
         match target {
-            Resolved::Value(value) => {
-                if *value == Value::Uninit {
+            Resolved::Value(base, projection) => {
+                let value = self.value_target_value(base, projection)?;
+                if value == Value::Uninit {
                     return Err(InterpError::UninitializedRead {
                         func: "<constant>".to_string(),
                         place: "constant aggregate".to_string(),
                     });
                 }
-                Ok(Cow::Owned(value.clone()))
+                Ok(Cow::Owned(value))
             }
             Resolved::Static { .. } | Resolved::Alloc { .. } => {
                 Ok(Cow::Owned(self.read_resolved(frames, target)?))
@@ -5012,20 +5030,36 @@ impl<'a> Interpreter<'a> {
         Some((cur, i128::from(elem)))
     }
 
+    /// The value a `Resolved::Value` target denotes: its base
+    /// projected by the target's pending projection (the base
+    /// itself when the projection is empty).
+    pub(crate) fn value_target_value(
+        &self,
+        base: &Value,
+        projection: &[RefProj],
+    ) -> InterpResult<Value> {
+        if projection.is_empty() {
+            Ok(base.clone())
+        } else {
+            self.project_value_t(base.clone(), projection, "<constant>", "constant aggregate")
+        }
+    }
+
     pub(crate) fn read_resolved(
         &self,
         frames: &[Frame],
         target: &Resolved,
     ) -> InterpResult<Value> {
         match target {
-            Resolved::Value(value) => {
-                if *value == Value::Uninit {
+            Resolved::Value(base, projection) => {
+                let value = self.value_target_value(base, projection)?;
+                if value == Value::Uninit {
                     return Err(InterpError::UninitializedRead {
                         func: "<constant>".to_string(),
                         place: "constant aggregate".to_string(),
                     });
                 }
-                Ok(value.clone())
+                Ok(value)
             }
             Resolved::Static { name, projection } => {
                 let base = self.static_base(name)?;
@@ -5219,7 +5253,7 @@ impl<'a> Interpreter<'a> {
         value: Value,
     ) -> InterpResult<()> {
         match target {
-            Resolved::Value(_) => Err(InterpError::type_mismatch(
+            Resolved::Value(..) => Err(InterpError::type_mismatch(
                 "assignment",
                 "mutable place",
                 "constant aggregate",
@@ -5306,7 +5340,7 @@ impl<'a> Interpreter<'a> {
         f: impl FnOnce(&mut Value) -> InterpResult<R>,
     ) -> InterpResult<R> {
         match target {
-            Resolved::Value(_) => Err(InterpError::type_mismatch(
+            Resolved::Value(..) => Err(InterpError::type_mismatch(
                 "assignment",
                 "mutable place",
                 "constant aggregate",
@@ -5396,12 +5430,11 @@ impl<'a> Interpreter<'a> {
                     },
                 )
             }
-            Resolved::Value(value) => project_value(
-                value.clone(),
-                &[RefProj::Index(index)],
-                "<constant>",
-                "copy_nonoverlapping source",
-            ),
+            Resolved::Value(base, projection) => {
+                let mut projection = projection.clone();
+                projection.push(RefProj::Index(index));
+                project_value(base.clone(), &projection, "<constant>", "copy_nonoverlapping source")
+            }
         }
     }
 
@@ -5457,7 +5490,7 @@ impl<'a> Interpreter<'a> {
                     value,
                 )
             }
-            Resolved::Value(_) => self.write_resolved(frames, target, value),
+            Resolved::Value(..) => self.write_resolved(frames, target, value),
         }
     }
 
@@ -5509,9 +5542,11 @@ impl<'a> Interpreter<'a> {
     /// element (a buffer being filled element by element) still
     /// denotes its position, so the adjustment applies to it as
     /// well; any other read failure is the failure the plain
-    /// access would report, so it propagates unchanged. A
-    /// constant target's projection was already applied when it
-    /// resolved, so it always takes the plain access.
+    /// access would report, so it propagates unchanged. A value
+    /// target carries its projection like the other targets, so
+    /// an element pointer into a constant aggregate adjusts the
+    /// same way; a target whose projection has no trailing index
+    /// step takes the plain access.
     fn seq_element_target(
         &self,
         frames: &[Frame],
@@ -5521,8 +5556,8 @@ impl<'a> Interpreter<'a> {
         let projection = match target {
             Resolved::Place { projection, .. }
             | Resolved::Static { projection, .. }
-            | Resolved::Alloc { projection, .. } => projection,
-            Resolved::Value(_) => return Ok(None),
+            | Resolved::Alloc { projection, .. }
+            | Resolved::Value(_, projection) => projection,
         };
         let Some((&RefProj::Index(start), head)) = projection.split_last() else {
             return Ok(None);
@@ -5560,7 +5595,7 @@ impl<'a> Interpreter<'a> {
                 id: *id,
                 projection,
             },
-            Resolved::Value(_) => unreachable!("value targets returned above"),
+            Resolved::Value(base, _) => Resolved::Value(base.clone(), projection),
         }))
     }
 
@@ -6844,9 +6879,10 @@ impl<'a> Interpreter<'a> {
                                             projection,
                                         )));
                                     }
-                                    Resolved::Value(value) => {
-                                        break Ok(Value::Ref(RefTarget::value(
-                                            value,
+                                    Resolved::Value(base, projection) => {
+                                        break Ok(Value::Ref(RefTarget::Value(
+                                            Box::new(base),
+                                            projection,
                                         )));
                                     }
                                     Resolved::Static { name, projection }
@@ -6931,7 +6967,9 @@ impl<'a> Interpreter<'a> {
                         local,
                         projection,
                     )),
-                    Resolved::Value(value) => Value::Ref(RefTarget::value(value)),
+                    Resolved::Value(base, projection) => {
+                        Value::Ref(RefTarget::Value(Box::new(base), projection))
+                    }
                     Resolved::Static { name, projection } => {
                         Value::Ref(RefTarget::Static { name, projection })
                     }
