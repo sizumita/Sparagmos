@@ -465,7 +465,15 @@ fn ty_sizedness(
     if depth >= 8 {
         return Sizedness::Unknown;
     }
-    match ty.kind() {
+    // The composed arguments can resolve a parameter to any
+    // concrete type in the program, including one whose kind
+    // the bridge cannot hand over (a coroutine-closure type):
+    // the question goes through the guarded form, and an
+    // unaskable type is `Unknown`, like an alias.
+    let Some(kind) = guarded_ty_kind(ty) else {
+        return Sizedness::Unknown;
+    };
+    match kind {
         TyKind::RigidTy(r) => match r {
             RigidTy::Slice(_) | RigidTy::Str | RigidTy::Dynamic(..) => {
                 Sizedness::Unsized
@@ -503,7 +511,14 @@ fn ty_may_be_unsized(
     if depth >= 8 {
         return true;
     }
-    match ty.kind() {
+    // See `ty_sizedness`: the composed arguments can carry a
+    // type whose kind cannot be asked for; it counts as
+    // possibly unsized, like every shape this walk cannot
+    // resolve.
+    let Some(kind) = guarded_ty_kind(ty) else {
+        return true;
+    };
+    match kind {
         TyKind::RigidTy(r) => match r {
             RigidTy::Slice(_) | RigidTy::Str | RigidTy::Dynamic(..) => true,
             RigidTy::Adt(def, a2) => {
