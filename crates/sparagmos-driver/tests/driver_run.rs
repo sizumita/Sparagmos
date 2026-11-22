@@ -9641,3 +9641,116 @@ fn run_mode_ptr_offset_through_slice_pointer() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
 }
+
+// ----- Lane HG: the ported intrinsic families, executed ------------
+
+const SIMD_INTRINSICS_SRC: &str = r#"
+#![feature(core_intrinsics, repr_simd)]
+use std::intrinsics::simd::{simd_add, simd_eq, simd_extract, simd_reduce_add_unordered, simd_select, simd_splat};
+#[repr(simd)]
+#[derive(Copy, Clone)]
+struct I32x4([i32; 4]);
+fn main() {
+    unsafe {
+        let a = I32x4([1, 2, 3, 4]);
+        let b = I32x4([10, 20, 30, 40]);
+        let c = simd_add(a, b);
+        let v: i32 = simd_extract(c, 2);
+        assert_eq!(v, 33);
+        let total: i32 = simd_reduce_add_unordered(c);
+        assert_eq!(total, 110);
+        let seven: I32x4 = simd_splat(7);
+        let t2: i32 = simd_reduce_add_unordered(seven);
+        assert_eq!(t2, 28);
+        let mask: I32x4 = simd_eq(a, b);
+        let picked = simd_select(mask, a, b);
+        let p0: i32 = simd_extract(picked, 0);
+        let p1: i32 = simd_extract(picked, 1);
+        assert_eq!(p0, 10);
+        assert_eq!(p1, 20);
+    }
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_simd_intrinsics_execute() {
+    let dir = temp_dir("simd-intrinsics");
+    let src = fixture(&dir, "simd_intrinsics.rs", SIMD_INTRINSICS_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the simd intrinsic family must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+const INTRINSIC_LEFTOVERS_SRC: &str = r#"
+#![feature(core_intrinsics)]
+use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
+fn main() {
+    let x = AtomicI32::new(-5);
+    assert_eq!(x.fetch_max(3, Ordering::SeqCst), -5);
+    assert_eq!(x.load(Ordering::SeqCst), 3);
+    let y = AtomicU8::new(200);
+    assert_eq!(y.fetch_add(100, Ordering::SeqCst), 200);
+    assert_eq!(y.load(Ordering::SeqCst), 44);
+    unsafe {
+        let f = core::intrinsics::fadd_fast(1.5f64, 2.25f64);
+        assert_eq!(f, 3.75);
+        let z: i32 = core::intrinsics::float_to_int_unchecked(3.75f64);
+        assert_eq!(z, 3);
+        let n: u32 = core::intrinsics::ctlz_nonzero(16u32);
+        assert_eq!(n, 27);
+    }
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_atomic_fetch_fast_float_and_nonzero_bit_intrinsics_execute() {
+    let dir = temp_dir("intrinsic-leftovers");
+    let src = fixture(&dir, "intrinsic_leftovers.rs", INTRINSIC_LEFTOVERS_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the fetch family, fast float and nonzero bit intrinsics must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+const MEMORY_INTRINSICS_SRC: &str = r#"
+fn main() {
+    let mut buf = [0u8; 4];
+    unsafe {
+        std::ptr::write_bytes(buf.as_mut_ptr(), 0xABu8, 4);
+        assert_eq!(buf, [0xAB; 4]);
+        let mut v: u32 = 0;
+        std::ptr::write_volatile(&mut v, 0x0101_0101);
+        assert_eq!(std::ptr::read_volatile(&v), 0x0101_0101);
+        let arr = [10u32, 20, 30, 40, 50];
+        let base = arr.as_ptr();
+        let third = base.add(2);
+        assert_eq!(third.offset_from(base), 2);
+    }
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_write_bytes_volatile_and_offset_from_execute() {
+    let dir = temp_dir("memory-intrinsics");
+    let src = fixture(&dir, "memory_intrinsics.rs", MEMORY_INTRINSICS_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "write_bytes, volatile accesses and ptr_offset_from must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
