@@ -683,3 +683,48 @@ fn single_valued_field_path_read_from_unwritten_local() {
     let value = interpret_mir(&gd_program(main, &shapes), "main", Vec::new()).expect("main runs");
     assert_eq!(value, Value::Enum { variant: 0, fields: vec![] });
 }
+
+/// `struct ZHost { z: ZLeaf, x: u32 }`
+/// `fn main() -> ZLeaf { let h: ZHost = <uninit>; h.x = 7; h.z }` —
+/// the same single-valued field as
+/// `single_valued_field_path_read_from_unwritten_local`, but the
+/// base local is initialized (materialized by the field write)
+/// with only the zero-sized field slot unwritten. A statement
+/// level read of the field runs through the decoded fast path
+/// (`read_local_proj`), which must rescue the read with the
+/// recorded single value exactly as the general path does,
+/// instead of reporting an uninitialized read.
+#[test]
+fn single_valued_field_read_from_materialized_local() {
+    const ZHOST: mir::DefId = mir::DefId::new(0, 64);
+    let shapes = [
+        (
+            ZHOST,
+            shape(
+                mir::AdtShapeKind::Struct,
+                vec![vec![adt_ty(ZLEAF), u32_ty()]],
+            ),
+        ),
+        (ZLEAF, shape(mir::AdtShapeKind::Struct, vec![vec![]])),
+    ];
+    let main = mir::Body::new(
+        decls(&[adt_ty(ZLEAF), adt_ty(ZHOST)]),
+        0,
+        vec![block(
+            vec![
+                assign(place(1), mir::Rvalue::Use(const_uninit())),
+                assign(
+                    place(1).field(1, u32_ty()),
+                    mir::Rvalue::Use(const_u32(7)),
+                ),
+                assign(
+                    place(0),
+                    mir::Rvalue::Use(mir::Operand::Copy(place(1).field(0, adt_ty(ZLEAF)))),
+                ),
+            ],
+            ret(),
+        )],
+    );
+    let value = interpret_mir(&gd_program(main, &shapes), "main", Vec::new()).expect("main runs");
+    assert_eq!(value, Value::Enum { variant: 0, fields: vec![] });
+}
