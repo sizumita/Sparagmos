@@ -3917,16 +3917,16 @@ fn registry_covers_validity_asserts_volatile_and_fill() {
             "std::intrinsics::assert_mem_uninitialized_valid",
             Builtin::AssertValidity,
         ),
-        ("std::intrinsics::volatile_load", Builtin::AtomicLoad),
+        ("std::intrinsics::volatile_load", Builtin::VolatileLoad),
         ("core::intrinsics::unaligned_volatile_load", Builtin::AtomicLoad),
-        ("std::intrinsics::volatile_store", Builtin::AtomicStore),
+        ("std::intrinsics::volatile_store", Builtin::VolatileStore),
         ("core::intrinsics::unaligned_volatile_store", Builtin::AtomicStore),
-        ("std::intrinsics::volatile_copy_memory", Builtin::PtrCopy),
-        ("core::intrinsics::volatile_copy_nonoverlapping_memory", Builtin::PtrCopy),
+        ("std::intrinsics::volatile_copy_memory", Builtin::VolatileCopy),
+        ("core::intrinsics::volatile_copy_nonoverlapping_memory", Builtin::VolatileCopy),
         ("std::intrinsics::copy", Builtin::PtrCopy),
         ("core::intrinsics::copy_nonoverlapping", Builtin::PtrCopy),
         ("std::intrinsics::write_bytes", Builtin::WriteBytes),
-        ("core::intrinsics::volatile_set_memory", Builtin::WriteBytes),
+        ("core::intrinsics::volatile_set_memory", Builtin::VolatileSet),
     ];
     for (name, expected) in cases {
         assert_eq!(
