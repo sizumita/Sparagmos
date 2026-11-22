@@ -10832,3 +10832,137 @@ fn run_mode_box_asref_identity_view_is_a_reference() {
     assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
     assert_eq!(stdout, "box asref ok\n");
 }
+
+// ---- Lane HU: body-less call models (issue #130) ----
+// A trait method named by its plain trait path reaches the
+// interpreter with no body under the name when it arrives as a
+// function value or inside a body the converter kept in generic
+// form; the value-semantics builtins serve those calls at run
+// time. `HashMap::new` draws its `RandomState` keys from the
+// modelled `hashmap_random_keys`.
+
+const CLONED_SUM_SRC: &str = r#"
+fn main() {
+    let v = vec![1i64, 2, 3];
+    let s: i64 = v.iter().cloned().sum();
+    assert_eq!(s, 6);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_cloned_sum_serves_trait_path_clone() {
+    let dir = temp_dir("cloned-sum");
+    let src = fixture(&dir, "cloned_sum.rs", CLONED_SUM_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+const MAP_CLONE_SRC: &str = r#"
+fn main() {
+    let v = vec![1i32, 2, 3];
+    let w: Vec<i32> = v.iter().map(Clone::clone).collect();
+    assert_eq!(w.len(), 3);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_map_fn_item_clone() {
+    let dir = temp_dir("map-clone");
+    let src = fixture(&dir, "map_clone.rs", MAP_CLONE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+// The map is held behind a trait-object box, the shape of
+// rustc's issue-6128 test: a plain local `HashMap` value's drop
+// glue is a separate, still-unmodelled conversion gap.
+const HASHMAP_NEW_SRC: &str = r#"
+use std::collections::HashMap;
+trait G { fn g(&self); }
+impl G for HashMap<i32, i32> { fn g(&self) {} }
+fn main() {
+    let g: Box<HashMap<i32, i32>> = Box::new(HashMap::new());
+    let _g2: Box<dyn G> = g as Box<dyn G>;
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_hashmap_new_uses_modelled_random_keys() {
+    let dir = temp_dir("hashmap-new");
+    let src = fixture(&dir, "hashmap_new.rs", HASHMAP_NEW_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+const RANDOM_STATE_DEFAULT_SRC: &str = r#"
+use std::collections::HashMap;
+use std::hash::RandomState;
+trait G { fn g(&self); }
+impl G for HashMap<i32, i32> { fn g(&self) {} }
+fn main() {
+    let h: Box<HashMap<i32, i32>> = Box::new(HashMap::with_hasher(RandomState::default()));
+    let _h2: Box<dyn G> = h as Box<dyn G>;
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_random_state_default_builds_hasher() {
+    let dir = temp_dir("random-state-default");
+    let src = fixture(&dir, "random_state_default.rs", RANDOM_STATE_DEFAULT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+const GENERIC_PATHS_SRC: &str = r#"
+fn make<T>() -> Vec<T> { Vec::<T>::new() }
+fn main() {
+    let v: Vec<i32> = make();
+    assert!(v.is_empty());
+    let d = <i32 as std::default::Default>::default();
+    assert_eq!(d, 0);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_generic_context_vec_new_and_qualified_default() {
+    let dir = temp_dir("generic-paths");
+    let src = fixture(&dir, "generic_paths.rs", GENERIC_PATHS_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+const PHANTOM_DEFAULT_SRC: &str = r#"
+use std::marker::PhantomData;
+#[derive(Default)]
+struct Wrap<T> { _p: PhantomData<T>, x: i32 }
+fn main() {
+    let w: Wrap<String> = Wrap::default();
+    assert_eq!(w.x, 0);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_phantom_data_default() {
+    let dir = temp_dir("phantom-default");
+    let src = fixture(&dir, "phantom_default.rs", PHANTOM_DEFAULT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}

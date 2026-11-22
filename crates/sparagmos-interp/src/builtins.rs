@@ -518,6 +518,12 @@ pub enum Builtin {
     InstantNow,
     /// `std::time::SystemTime::now()`: the host wall clock.
     SystemTimeNow,
+    /// `std::sys::random::linux::hashmap_random_keys()`: the two
+    /// SipHash keys a fresh `std::hash::RandomState` is seeded
+    /// with. Std draws them from OS entropy; the model draws them
+    /// from the host clock and a per-process counter (see
+    /// `fresh_hash_keys`).
+    HashmapRandomKeys,
     /// `Instant::checked_add` / `SystemTime::checked_add`
     /// (payload: true for `SystemTime`).
     TimeCheckedAdd(bool),
@@ -1143,6 +1149,42 @@ pub fn consumes_caller_location(kind: Builtin) -> bool {
     )
 }
 
+/// Whether a body-less call that names this builtin only by its
+/// plain trait path may be served by the builtin at run time.
+/// Such a call reaches the interpreter as a name with no body
+/// under it (a function value like `.map(Clone::clone)`, or a
+/// call inside a body the converter kept in generic form): the
+/// driver collects no body for a builtin-owned definition, and
+/// conversion had no impl instance to resolve the name to, so
+/// the direct-call conversion to `CallBuiltin` never saw it.
+/// Only the value-semantics models qualify — they compute from
+/// the argument values alone and need nothing conversion bakes
+/// into a `CallBuiltin` (no drop glue, no caller-location stamp,
+/// no generic tags: `Clone::clone`'s tag-keyed handle cases do
+/// not arise for the plain-data values these calls carry, and
+/// enum comparisons order structurally, as they do for a
+/// `CallBuiltin` whose discriminant table conversion could not
+/// bake either). Anything else keeps the missing-body error.
+pub(crate) fn runtime_name_fallback(kind: Builtin) -> bool {
+    matches!(
+        kind,
+        Builtin::PartialEqEq
+            | Builtin::PartialEqNe
+            | Builtin::PartialCmp
+            | Builtin::OrdCmp
+            | Builtin::PartialOrdRel(_)
+            | Builtin::CloneClone
+            | Builtin::VecNew
+            | Builtin::VecWithCapacity
+            // Only ever invoked with the Self type recovered
+            // from an impl-qualified name (`<i32 as
+            // std::default::Default>::default`); the plain trait
+            // path carries no type for the model to default, and
+            // the interpreter's fallback rejects it there.
+            | Builtin::DefaultDefault
+    )
+}
+
 pub fn lookup(canonical: &str) -> Option<Builtin> {
     use FmtTrait as F;
     Some(match canonical {
@@ -1239,6 +1281,7 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::panic::take_hook" => Builtin::PanicTakeHook,
         "std::time::Instant::now" => Builtin::InstantNow,
         "std::time::SystemTime::now" => Builtin::SystemTimeNow,
+        "std::sys::random::linux::hashmap_random_keys" => Builtin::HashmapRandomKeys,
         "std::time::Instant::checked_add" => Builtin::TimeCheckedAdd(false),
         "std::time::SystemTime::checked_add" => Builtin::TimeCheckedAdd(true),
         "std::time::Instant::checked_sub" => Builtin::TimeCheckedSub(false),
@@ -2722,6 +2765,23 @@ impl<'a> Interpreter<'a> {
             let stamp = vals.pop().expect("two arguments");
             self.note_panic_stamp(stamp);
         }
+        self.exec_builtin_values(frames, body, kind, name, generic_args, vals, cmp_discriminants)
+    }
+
+    /// Execute a builtin whose arguments are already evaluated
+    /// values: the dispatch half of [`Self::exec_builtin`], split
+    /// out for the interpreter's run-time name fallback, whose
+    /// call sites hold evaluated values, not operands.
+    pub(crate) fn exec_builtin_values(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        body: &Body,
+        kind: Builtin,
+        name: &str,
+        generic_args: &[String],
+        vals: Vec<Value>,
+        cmp_discriminants: Option<&[i128]>,
+    ) -> InterpResult<Value> {
         let arity = |n: usize| -> InterpResult<()> {
             if vals.len() == n {
                 Ok(())
@@ -3331,6 +3391,14 @@ impl<'a> Interpreter<'a> {
             Builtin::SystemTimeNow => {
                 arity(0)?;
                 Ok(instant_value(wall_now()))
+            }
+            Builtin::HashmapRandomKeys => {
+                arity(0)?;
+                let (k0, k1) = fresh_hash_keys();
+                Ok(Value::Tuple(vec![
+                    Value::Uint(u128::from(k0)),
+                    Value::Uint(u128::from(k1)),
+                ]))
             }
             Builtin::TimeCheckedAdd(system) => {
                 arity(2)?;
@@ -12445,6 +12513,32 @@ fn generic_first_arg<'a>(tag: &'a str, prefix: &str) -> Option<&'a str> {
     split_top_level(inner).into_iter().next()
 }
 
+/// Two fresh SipHash keys for a new `std::hash::RandomState`,
+/// drawn the way the modelled time builtins draw from the host:
+/// the wall clock's nanoseconds, a per-process counter and the
+/// process id, mixed through splitmix64. Successive calls in a
+/// run differ, as successive `RandomState`s do natively.
+fn fresh_hash_keys() -> (u64, u64) {
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut state = nanos
+        ^ n.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ u64::from(std::process::id()).rotate_left(32);
+    let mut next = move || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    (next(), next())
+}
+
 fn default_value_for_tag(tag: &str) -> Option<Value> {
     let tag = tag.trim();
     Some(match tag {
@@ -12475,6 +12569,10 @@ fn default_value_for_tag(tag: &str) -> Option<Value> {
             let inner = generic_first_arg(tag, "std::cell::Cell<").expect("guard checked");
             cell_value(default_value_for_tag(inner)?)
         }
+        _ if tag.starts_with("std::marker::PhantomData<") => Value::Enum {
+            variant: 0,
+            fields: Vec::new(),
+        },
         _ if tag.contains("option::Option<") => Value::Enum {
             variant: 0,
             fields: Vec::new(),
@@ -12536,6 +12634,16 @@ impl<'a> Interpreter<'a> {
         {
             let pointee = self.default_value(inner)?;
             return Some(self.rc_new_handle(pointee));
+        }
+        if tag == "std::hash::RandomState" {
+            // `RandomState::default()` is `RandomState::new()`:
+            // the struct value holding two fresh hash keys, the
+            // shape the collected `new` body builds.
+            let (k0, k1) = fresh_hash_keys();
+            return Some(Value::Enum {
+                variant: 0,
+                fields: vec![Value::Uint(u128::from(k0)), Value::Uint(u128::from(k1))],
+            });
         }
         default_value_for_tag(tag)
     }

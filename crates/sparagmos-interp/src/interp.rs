@@ -441,6 +441,65 @@ pub(crate) fn synthetic_address(value: &Value) -> Option<u128> {
     Some(0x1_0000_0000u128 + u128::from(h % 0x10_0000) * 0x1000)
 }
 
+/// The Self type of an impl-qualified method name
+/// (`<i32 as std::default::Default>::default` gives `i32`):
+/// the text between the leading `<` and the ` as ` separator at
+/// the same bracket depth. `None` for any other name shape.
+fn impl_qualified_self_type(name: &str) -> Option<String> {
+    let inner = name.strip_prefix('<')?;
+    let bytes = inner.as_bytes();
+    let mut depth = 1usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'<' => depth += 1,
+            b'>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return None;
+                }
+            }
+            b' ' if depth == 1 && inner[i..].starts_with(" as ") => {
+                return Some(inner[..i].trim().to_string());
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The value-semantics trait method an impl-path spelling of
+/// a call denotes: the name ends in `>::METHOD` and names the
+/// trait either qualified (`... as std::clone::Clone>::clone`)
+/// or in an impl header (`<impl std::clone::Clone for i32>`).
+/// `None` for any other shape.
+fn impl_path_trait_method(name: &str) -> Option<crate::builtins::Builtin> {
+    use crate::builtins::Builtin;
+    const METHODS: &[(&str, &str, Builtin)] = &[
+        ("PartialEq", "eq", Builtin::PartialEqEq),
+        ("PartialEq", "ne", Builtin::PartialEqNe),
+        ("PartialOrd", "partial_cmp", Builtin::PartialCmp),
+        ("PartialOrd", "lt", Builtin::PartialOrdRel(crate::builtins::RelOp::Lt)),
+        ("PartialOrd", "le", Builtin::PartialOrdRel(crate::builtins::RelOp::Le)),
+        ("PartialOrd", "gt", Builtin::PartialOrdRel(crate::builtins::RelOp::Gt)),
+        ("PartialOrd", "ge", Builtin::PartialOrdRel(crate::builtins::RelOp::Ge)),
+        ("Ord", "cmp", Builtin::OrdCmp),
+        ("Clone", "clone", Builtin::CloneClone),
+    ];
+    for (trait_seg, method, kind) in METHODS {
+        if !name.ends_with(&format!(">::{method}")) {
+            continue;
+        }
+        let qualified = format!("::{trait_seg}>::{method}");
+        let impl_header = format!("::{trait_seg} for ");
+        if name.contains(&qualified) || name.contains(&impl_header) {
+            return Some(*kind);
+        }
+    }
+    None
+}
+
 impl<'a> Interpreter<'a> {
     pub fn new(program: &'a Program) -> Self {
         Interpreter::with_config(program, InterpConfig::default())
@@ -884,7 +943,33 @@ impl<'a> Interpreter<'a> {
                     for arg in args {
                         arg_values.push(self.eval_operand(frames, body, arg)?);
                     }
-                    self.start_call(frames, func, arg_values, destination, *target)?;
+                    // A call naming a trait method by its plain
+                    // trait path, in a body the converter kept in
+                    // generic form, has no body under that name:
+                    // when it is not a vtable dispatch, the
+                    // builtin of the same name may serve it (see
+                    // `builtin_name_fallback`). The vtable check
+                    // comes first, exactly as in `start_call`.
+                    let fallback = if self.virtual_call_target(func, &arg_values).is_none() {
+                        self.builtin_name_fallback(func)
+                    } else {
+                        None
+                    };
+                    if let Some((canonical, kind, generic_args)) = fallback {
+                        self.complete_builtin_name_fallback(
+                            frames,
+                            body,
+                            &canonical,
+                            kind,
+                            &generic_args,
+                            func,
+                            arg_values,
+                            destination,
+                            *target,
+                        )?;
+                    } else {
+                        self.start_call(frames, func, arg_values, destination, *target)?;
+                    }
                 }
                 TerminatorKind::CallIndirect {
                     func,
@@ -909,13 +994,38 @@ impl<'a> Interpreter<'a> {
                     }
                     match callee {
                         Value::FnPtr(name) => {
-                            self.start_call(
-                                frames,
-                                &name,
-                                arg_values,
-                                destination,
-                                *target,
-                            )?;
+                            // A function value naming a trait
+                            // method by its plain trait path has
+                            // no body under that name; the builtin
+                            // of the same name may serve it (see
+                            // `builtin_name_fallback`).
+                            let fallback =
+                                if self.virtual_call_target(&name, &arg_values).is_none() {
+                                    self.builtin_name_fallback(&name)
+                                } else {
+                                    None
+                                };
+                            if let Some((canonical, kind, generic_args)) = fallback {
+                                self.complete_builtin_name_fallback(
+                                    frames,
+                                    body,
+                                    &canonical,
+                                    kind,
+                                    &generic_args,
+                                    &name,
+                                    arg_values,
+                                    destination,
+                                    *target,
+                                )?;
+                            } else {
+                                self.start_call(
+                                    frames,
+                                    &name,
+                                    arg_values,
+                                    destination,
+                                    *target,
+                                )?;
+                            }
                         }
                         Value::Closure { def, .. } => {
                             let mut full = vec![env_ref];
@@ -1151,15 +1261,39 @@ impl<'a> Interpreter<'a> {
                             )?;
                         }
                         Value::FnPtr(name) => {
-                            self.start_call_stamped(
-                                frames,
-                                &name,
-                                arg_values,
-                                edge_stamp,
-                                shim_stamp,
-                                &destination,
-                                *target,
-                            )?;
+                            // As in the indirect-call arm: a
+                            // trait method named by its plain
+                            // trait path may be served by the
+                            // builtin of the same name.
+                            let fallback =
+                                if self.virtual_call_target(&name, &arg_values).is_none() {
+                                    self.builtin_name_fallback(&name)
+                                } else {
+                                    None
+                                };
+                            if let Some((canonical, kind, generic_args)) = fallback {
+                                self.complete_builtin_name_fallback(
+                                    frames,
+                                    body,
+                                    &canonical,
+                                    kind,
+                                    &generic_args,
+                                    &name,
+                                    arg_values,
+                                    destination,
+                                    *target,
+                                )?;
+                            } else {
+                                self.start_call_stamped(
+                                    frames,
+                                    &name,
+                                    arg_values,
+                                    edge_stamp,
+                                    shim_stamp,
+                                    &destination,
+                                    *target,
+                                )?;
+                            }
                         }
                         other => {
                             // A dyn receiver whose concrete value
@@ -1550,6 +1684,132 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// The builtin a body-less call to `func` may be served by
+    /// at run time, with the name's canonical form: `func` names
+    /// a trait method by its plain trait path (a function value
+    /// such as `.map(Clone::clone)`, or a call inside a body the
+    /// converter kept in generic form), the program holds no body
+    /// under that name — the driver collects none for a
+    /// builtin-owned definition, and conversion had no impl
+    /// instance to resolve the name to — and the builtin of the
+    /// same name is one of the value-semantics models (see
+    /// `builtins::runtime_name_fallback`). `None` when a body
+    /// exists (a collected body wins, as everywhere) or no such
+    /// model applies.
+    fn builtin_name_fallback(
+        &self,
+        func: &str,
+    ) -> Option<(String, crate::builtins::Builtin, Vec<String>)> {
+        if self.program.get(func).is_some() {
+            return None;
+        }
+        let canonical = crate::builtins::canonical_name(func);
+        if let Some(kind) = crate::builtins::lookup(&canonical) {
+            if crate::builtins::runtime_name_fallback(kind) {
+                return self.fallback_generic_args(kind, &canonical)
+                    .map(|args| (canonical, kind, args));
+            }
+            return None;
+        }
+        // A name the converter kept in generic form carries the
+        // turbofish spelling of its type arguments
+        // (`std::vec::Vec::<T>::new`); the lookup's impl-path
+        // rules are written against the instantiated spelling
+        // (`std::vec::Vec<T>::new`). Retry with the turbofish
+        // markers folded away.
+        if canonical.contains("::<") {
+            let folded = canonical.replace("::<", "<");
+            if let Some(kind) = crate::builtins::lookup(&folded) {
+                if crate::builtins::runtime_name_fallback(kind) {
+                    return self
+                        .fallback_generic_args(kind, &folded)
+                        .map(|args| (folded, kind, args));
+                }
+            }
+        }
+        // The same trait methods spelled by an impl path: a
+        // qualified name (`<i32 as std::clone::Clone>::clone`)
+        // or an impl-block path (`std::clone::impls::<impl
+        // std::clone::Clone for i32>::clone`). The lookup's
+        // suffix rules are written against the trait-path
+        // spelling only; the value-semantics models answer for
+        // every spelling alike.
+        if let Some(kind) = impl_path_trait_method(&canonical) {
+            return Some((canonical, kind, Vec::new()));
+        }
+        // An impl-qualified `Default::default` name (`<i32 as
+        // std::default::Default>::default`). The global lookup
+        // deliberately has no suffix rule for this shape —
+        // conversion must keep collecting real impl bodies where
+        // it can — but when no body was collected, the Self type
+        // the name itself carries is everything the model needs.
+        if canonical.ends_with(">::default")
+            && canonical.contains("::Default>::default")
+        {
+            if let Some(self_ty) = impl_qualified_self_type(&canonical) {
+                return Some((
+                    canonical,
+                    crate::builtins::Builtin::DefaultDefault,
+                    vec![self_ty],
+                ));
+            }
+        }
+        None
+    }
+
+    /// The generic arguments a run-time name fallback executes
+    /// with. The allowlisted models ignore them — all but
+    /// `Default::default`, whose model needs the Self type: an
+    /// impl-qualified name (`<i32 as std::default::Default>::
+    /// default`) carries it, the plain trait path does not, and
+    /// there the fallback does not apply (`None`).
+    fn fallback_generic_args(
+        &self,
+        kind: crate::builtins::Builtin,
+        canonical: &str,
+    ) -> Option<Vec<String>> {
+        if kind != crate::builtins::Builtin::DefaultDefault {
+            return Some(Vec::new());
+        }
+        impl_qualified_self_type(canonical).map(|t| vec![t])
+    }
+
+    /// Complete a call served by the run-time name fallback:
+    /// execute the builtin on the evaluated arguments and write
+    /// its result to the call's destination, exactly as a
+    /// `CallBuiltin` terminator completes.
+    fn complete_builtin_name_fallback(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        body: &Body,
+        canonical: &str,
+        kind: crate::builtins::Builtin,
+        generic_args: &[String],
+        func: &str,
+        arg_values: Vec<Value>,
+        destination: &Place,
+        target: Option<BasicBlock>,
+    ) -> InterpResult<()> {
+        let result = self.exec_builtin_values(
+            frames,
+            body,
+            kind,
+            canonical,
+            generic_args,
+            arg_values,
+            None,
+        )?;
+        match target {
+            Some(bb) => {
+                self.write_place(frames, body, destination, result)?;
+                Self::jump(frames, body, bb)
+            }
+            None => Err(InterpError::MissingContinuation {
+                func: func.to_string(),
+            }),
+        }
+    }
+
     /// Resolve a call that has no body under its own name against
     /// a `dyn` receiver: the vtable lookup, with the fat pointer's
     /// (concrete type, trait) pair standing in for the vtable.
@@ -1912,6 +2172,28 @@ impl<'a> Interpreter<'a> {
         func: &str,
         arg_values: Vec<Value>,
     ) -> InterpResult<Value> {
+        // A callable value naming a trait method by its plain
+        // trait path — `.map(Clone::clone)` handed to an adapter
+        // the builtins drive — has no body under that name; the
+        // builtin of the same name serves it (see
+        // `builtin_name_fallback`). The body handed to the
+        // dispatch is the caller's: the allowlisted models never
+        // read it (only the caller-location model does, and it is
+        // not allowlisted).
+        if let Some((canonical, kind, generic_args)) = self.builtin_name_fallback(func) {
+            let program: &Program = self.program;
+            if let Some(body) = frames.last().and_then(|f| program.get(&f.func)) {
+                return self.exec_builtin_values(
+                    frames,
+                    body,
+                    kind,
+                    &canonical,
+                    &generic_args,
+                    arg_values,
+                    None,
+                );
+            }
+        }
         self.call_to_completion(frames, func, arg_values)
     }
 
