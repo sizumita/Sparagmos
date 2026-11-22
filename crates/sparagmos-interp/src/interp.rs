@@ -2150,10 +2150,11 @@ impl<'a> Interpreter<'a> {
         // impl from the coroutine transform, so the vtable's
         // method instance *is* the coroutine definition, and its
         // body is in the program under the coroutine's own name
-        // - which is exactly the concrete tag the value carries
+        // - the name the concrete tag the value carries denotes
         // (a tag only a coroutine definition produces: it ends
         // in a `{closure#N}` segment no user type can be named
-        // with).
+        // with), though the tag's spelling and the body key's
+        // differ; see `coroutine_body_key`.
         if concrete.contains("::{closure#")
             && ((method == "poll"
                 && matches!(trait_path, "std::future::Future" | "core::future::Future"))
@@ -2168,9 +2169,10 @@ impl<'a> Interpreter<'a> {
                         "std::async_iter::AsyncIterator"
                             | "core::async_iter::AsyncIterator"
                     )))
-            && self.program.get(concrete).is_some()
         {
-            return Some(Ok((concrete.to_string(), receiver)));
+            if let Some(key) = self.coroutine_body_key(concrete) {
+                return Some(Ok((key, receiver)));
+            }
         }
         if traits.iter().any(|t| t == trait_path) {
             return Some(Err(InterpError::UnsupportedDynamicDispatch {
@@ -2179,6 +2181,49 @@ impl<'a> Interpreter<'a> {
             }));
         }
         None
+    }
+
+    /// The program key of the coroutine body a `dyn` value's
+    /// concrete tag denotes. The tag renders the coroutine
+    /// *type*: the definition path with the `{closure#N}` segment
+    /// last and the full generic-argument list appended - the
+    /// enclosing definition's arguments first, then the coroutine
+    /// signature's own (resume) arguments. A body key instead
+    /// spells an *instance*: the enclosing definition's arguments
+    /// ride on the definition's own segments
+    /// (`gen::<i32>::{closure#0}`), and a definition with no
+    /// arguments keeps the plain path (`me::{closure#0}`). The
+    /// matching key is therefore the one whose plain parent path
+    /// and closure segment are the tag's and whose argument list
+    /// is a prefix of the tag's; the longest such list wins (an
+    /// argument-carrying instance beats the uninstantiated
+    /// spelling), and a tie is ambiguous. `None` when no
+    /// converted body matches.
+    fn coroutine_body_key(&self, concrete: &str) -> Option<String> {
+        if self.program.get(concrete).is_some() {
+            return Some(concrete.to_string());
+        }
+        let (tag_parent, tag_seg, tag_args) = parse_coroutine_tag(concrete)?;
+        let mut best: Option<(usize, String)> = None;
+        for key in self.program.functions.keys() {
+            let Some((key_parent, key_seg, key_args)) = parse_coroutine_key(key) else {
+                continue;
+            };
+            if key_seg != tag_seg || key_parent != tag_parent {
+                continue;
+            }
+            if key_args.len() > tag_args.len()
+                || !key_args.iter().zip(tag_args.iter()).all(|(k, t)| k == t)
+            {
+                continue;
+            }
+            match &best {
+                Some((len, _)) if *len > key_args.len() => {}
+                Some((len, _)) if *len == key_args.len() => return None,
+                _ => best = Some((key_args.len(), key.clone())),
+            }
+        }
+        best.map(|(_, key)| key)
     }
 
     /// Push a call frame for `func` with already-evaluated argument
@@ -11224,6 +11269,120 @@ fn drop_dyn_value(value: &Value) -> InterpResult<()> {
 /// Parse an impl-instance key `<Self as Trait>::method` into
 /// `(Self section, trait path without generic arguments, method)`,
 /// mirroring `mir_convert`'s key parsing. `None` for other shapes.
+/// Split a rendered generic-argument list's contents at its
+/// top-level commas (commas inside nested `<...>`, `(...)`,
+/// `[...]`, `{...}` groups do not split). Empty input yields an
+/// empty list.
+fn split_generic_args(inner: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let bytes = inner.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'-' if bytes.get(i + 1) == Some(&b'>') => {
+                i += 1;
+            }
+            b'<' | b'(' | b'[' | b'{' => depth += 1,
+            b'>' | b')' | b']' | b'}' => depth -= 1,
+            b',' if depth == 0 => {
+                parts.push(inner[start..i].trim().to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let tail = inner[start..].trim();
+    if !tail.is_empty() {
+        parts.push(tail.to_string());
+    }
+    parts
+}
+
+/// The `(plain path, arguments)` of a rendered instance path:
+/// every top-level `::<...>` group is removed from the path and
+/// its arguments collected in order. A path with no group yields
+/// itself and an empty list; an unbalanced group yields `None`.
+fn strip_generic_groups(path: &str) -> Option<(String, Vec<String>)> {
+    let mut plain = String::new();
+    let mut args = Vec::new();
+    let bytes = path.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b':' && path[i..].starts_with("::<") {
+            let mut depth = 0i32;
+            let mut j = i + 2;
+            let inner_start = j + 1;
+            let mut inner_end = None;
+            while j < bytes.len() {
+                match bytes[j] {
+                    b'-' if bytes.get(j + 1) == Some(&b'>') => {
+                        j += 1;
+                    }
+                    b'<' => depth += 1,
+                    b'>' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            inner_end = Some(j);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            let inner_end = inner_end?;
+            args.extend(split_generic_args(&path[inner_start..inner_end]));
+            i = inner_end + 1;
+        } else {
+            let ch_len = path[i..].chars().next()?.len_utf8();
+            plain.push_str(&path[i..i + ch_len]);
+            i += ch_len;
+        }
+    }
+    Some((plain, args))
+}
+
+/// The parts of a coroutine *type* tag as a `dyn` value carries
+/// it: the enclosing definition's plain path, the closing
+/// `{closure#N}` segment, and the tag's generic arguments (the
+/// enclosing definition's arguments first, then the coroutine
+/// signature's own). `None` when the tag is not of this shape.
+fn parse_coroutine_tag(tag: &str) -> Option<(String, String, Vec<String>)> {
+    let idx = tag.rfind("::{closure#")?;
+    let parent = &tag[..idx];
+    let rest = &tag[idx + 2..];
+    let seg_end = rest.find('}')?;
+    let seg = &rest[..=seg_end];
+    let tail = &rest[seg_end + 1..];
+    let args = if tail.is_empty() {
+        Vec::new()
+    } else {
+        let inner = tail.strip_prefix('<')?.strip_suffix('>')?;
+        split_generic_args(inner)
+    };
+    Some((parent.to_string(), seg.to_string(), args))
+}
+
+/// The parts of a coroutine body *key*: the enclosing
+/// definition's plain path and its instance arguments (see
+/// [`strip_generic_groups`]), plus the `{closure#N}` segment.
+/// `None` when the key is not a coroutine body key of this
+/// shape.
+fn parse_coroutine_key(key: &str) -> Option<(String, String, Vec<String>)> {
+    let idx = key.rfind("::{closure#")?;
+    let rest = &key[idx + 2..];
+    let seg_end = rest.find('}')?;
+    if seg_end + 1 != rest.len() {
+        return None;
+    }
+    let seg = &rest[..=seg_end];
+    let (parent, args) = strip_generic_groups(&key[..idx])?;
+    Some((parent, seg.to_string(), args))
+}
+
 fn parse_impl_key(base: &str) -> Option<(String, String, String)> {
     let (head, method) = base.rsplit_once(">::")?;
     if method.is_empty() || method.contains("::") {
