@@ -4183,6 +4183,15 @@ impl<'a> Interpreter<'a> {
                 } else if target.starts_with("std::boxed::Box<") {
                     // `Box::from(value)` is `Box::new` by definition.
                     Ok(self.new_box(value))
+                } else if target.starts_with("std::cell::Cell<") {
+                    // `From<T> for Cell<T>` is `Cell::new` by
+                    // definition (core::cell), so the result is the
+                    // natural cell shape.
+                    Ok(cell_value(value))
+                } else if target.starts_with("std::cell::RefCell<") {
+                    // `From<T> for RefCell<T>` is `RefCell::new` by
+                    // definition (core::cell).
+                    Ok(refcell_value(value))
                 } else if (target == "std::task::Waker"
                     && (source.starts_with("std::sync::Arc<")
                         || source.starts_with("alloc::sync::Arc<")))
