@@ -1157,9 +1157,12 @@ fn main() { println!("hi"); }
 "#;
 
 #[test]
-fn summary_mode_undemanded_generic_context_closure_stays_skipped() {
-    // The same closure with no monomorphic caller anywhere stays
-    // skipped, with the reason naming the generic context.
+fn summary_mode_undemanded_generic_context_closure_is_not_demanded() {
+    // The same closure with no monomorphic caller anywhere is
+    // accounted not demanded, with the reason naming the generic
+    // context: nothing reaches it, so it is not part of the
+    // program, but the record stays (it is not counted converted,
+    // and it does not count as a conversion failure either).
     let dir = temp_dir("closure-generic-undemanded");
     let src = fixture(
         &dir,
@@ -1173,8 +1176,8 @@ fn summary_mode_undemanded_generic_context_closure_stays_skipped() {
         .find(|l| l.contains("{closure#0}"))
         .expect("summary lists the closure item");
     assert!(
-        line.contains("SKIPPED") && line.contains("generic context"),
-        "the undemanded closure stays skipped with the generic-context reason: {line}"
+        line.contains("NOT DEMANDED") && line.contains("generic context"),
+        "the undemanded closure is not demanded, with the generic-context reason: {line}"
     );
 }
 
@@ -1216,10 +1219,12 @@ fn main() { println!("hi"); }
 "#;
 
 #[test]
-fn summary_mode_undemanded_coroutine_stays_skipped() {
+fn summary_mode_undemanded_coroutine_is_not_demanded() {
     // A coroutine inside a generic function that is never
-    // instantiated has no concrete demand anywhere and stays
-    // skipped: an undemanded generic is never counted converted.
+    // instantiated has no concrete demand anywhere and is
+    // accounted not demanded: an undemanded generic is never
+    // counted converted, and its absence is not a conversion
+    // failure either.
     let dir = temp_dir("coroutine-undemanded");
     let src = fixture(&dir, "coroutine_undemanded.rs", COROUTINE_UNDEMANDED_SRC);
     let out = summarize_driver(&src);
@@ -1229,8 +1234,8 @@ fn summary_mode_undemanded_coroutine_stays_skipped() {
         .find(|l| l.contains("{closure#0}"))
         .expect("summary lists the coroutine item");
     assert!(
-        line.contains("SKIPPED") && line.contains("no monomorphic instance"),
-        "the undemanded coroutine stays skipped: {line}"
+        line.contains("NOT DEMANDED") && line.contains("no monomorphic instance"),
+        "the undemanded coroutine is not demanded: {line}"
     );
 }
 
@@ -1670,8 +1675,9 @@ fn main() {
 #[test]
 fn summary_mode_demanded_generic_instances_are_converted() {
     // The demanded definition is reported converted; a definition
-    // nothing demands keeps its no-instance record (it is not
-    // silently counted as converted).
+    // nothing demands keeps its no-instance record as not
+    // demanded: it is not silently counted as converted, and it
+    // does not make the target crate's conversion incomplete.
     let dir = temp_dir("generic-unused");
     let src = fixture(&dir, "generic_unused.rs", GENERIC_UNUSED_SRC);
     let out = summarize_driver(&src);
@@ -1689,8 +1695,50 @@ fn summary_mode_demanded_generic_instances_are_converted() {
         .find(|l| l.starts_with("fn generic_unused::unused:"))
         .expect("summary lists the unused generic definition");
     assert!(
-        unused.contains("SKIPPED (no monomorphic instance available (kind=Fn)"),
-        "the undemanded generic definition stays explicitly skipped: {unused}"
+        unused.contains("NOT DEMANDED (no monomorphic instance available (kind=Fn)"),
+        "the undemanded generic definition is explicitly not demanded: {unused}"
+    );
+    assert!(
+        stdout.contains("target-crate converted: 2, skipped: 0"),
+        "the target crate is complete with the undemanded definition aside: {stdout}"
+    );
+    assert!(
+        stdout.contains("target-crate not demanded: 1"),
+        "the undemanded definition is counted separately: {stdout}"
+    );
+}
+
+const GENERIC_DROP_CREDIT_SRC: &str = r#"
+struct Guard<T> { _v: T }
+impl<T> Drop for Guard<T> { fn drop(&mut self) {} }
+struct Holder { _g: Guard<u32> }
+fn main() { let _h = Holder { _g: Guard { _v: 1 } }; }
+"#;
+
+#[test]
+fn summary_mode_generic_drop_impl_is_credited_from_drop_demand() {
+    // A generic `Drop` impl is demanded only through drop glue
+    // (never a call edge): the drop demand converts the concrete
+    // instance, and that conversion is credited to the impl
+    // definition, whose own entry is reported converted instead
+    // of standing as an unmet no-instance record. (That the
+    // demanded destructor body actually runs is pinned by the
+    // Lane BS run-mode tests below.)
+    let dir = temp_dir("generic-drop-credit");
+    let src = fixture(&dir, "generic_drop_credit.rs", GENERIC_DROP_CREDIT_SRC);
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.starts_with("fn <generic_drop_credit::Guard<T> as std::ops::Drop>::drop:"))
+        .expect("summary lists the generic Drop impl");
+    assert!(
+        line.contains("[converted]"),
+        "the drop-demanded generic Drop impl is converted: {line}"
+    );
+    assert!(
+        stdout.contains("target-crate converted: 2, skipped: 0"),
+        "no target-crate function stays skipped: {stdout}"
     );
 }
 
@@ -2614,8 +2662,8 @@ fn summary_mode_externally_demanded_instances_are_converted() {
         .find(|l| l.starts_with("fn external_demand::unused:"))
         .expect("summary lists the unused generic definition");
     assert!(
-        unused.contains("SKIPPED (no monomorphic instance available (kind=Fn)"),
-        "the undemanded generic definition stays explicitly skipped: {unused}"
+        unused.contains("NOT DEMANDED (no monomorphic instance available (kind=Fn)"),
+        "the undemanded generic definition is explicitly not demanded: {unused}"
     );
 }
 
