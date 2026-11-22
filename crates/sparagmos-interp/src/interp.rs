@@ -787,6 +787,12 @@ pub struct Interpreter<'a> {
 /// target always yields the same address within a run, so equality,
 /// null and alignment checks on transmuted pointers behave as they
 /// do natively; distinct targets collide only on a hash collision.
+/// The hash contributes 44 bits (2^44 aligned slots): truncating
+/// it further makes collisions observable at realistic allocation
+/// counts (a 20-bit truncation collided 4 times among 3,000
+/// allocations), while the range still fits a guest `usize` with
+/// headroom, so a pointer -> integer -> pointer round trip keeps
+/// the address.
 pub(crate) fn synthetic_address(value: &Value) -> Option<u128> {
     // An address-only pointer's address is the stored integer
     // itself (address 0 is the null address).
@@ -821,7 +827,25 @@ pub(crate) fn synthetic_address(value: &Value) -> Option<u128> {
         _ => return None,
     };
     let h = fnv1a(key.as_bytes());
-    Some(0x1_0000_0000u128 + u128::from(h % 0x10_0000) * 0x1000)
+    Some(0x1_0000_0000u128 + u128::from(h & 0xFF_FFFF_FFFF_F000))
+}
+
+#[test]
+fn synthetic_addresses_do_not_collide_at_scale() {
+    // A few thousand distinct allocation targets (a realistic
+    // live-allocation count for one program) must all receive
+    // distinct synthetic addresses: a guest that keys a map by
+    // pointer address or asserts address distinctness observes
+    // any collision as two live objects sharing an address.
+    let mut seen = std::collections::HashSet::new();
+    for id in 0..3000u64 {
+        let v = Value::Ref(RefTarget::Alloc {
+            id,
+            projection: Vec::new(),
+        });
+        let addr = synthetic_address(&v).expect("address");
+        assert!(seen.insert(addr), "collision at allocation {id}");
+    }
 }
 
 /// The Self type of an impl-qualified method name
