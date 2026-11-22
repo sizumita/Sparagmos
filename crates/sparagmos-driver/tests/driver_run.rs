@@ -8282,6 +8282,168 @@ fn run_mode_libtest_harness_output_fidelity() {
 
 }
 
+const LIBTEST_JSON_SRC: &str = r#"
+#[test]
+fn a() {
+    println!("print from successful test");
+}
+#[test]
+fn b() {
+    assert!(false);
+}
+#[test]
+#[should_panic]
+fn c() {
+    assert!(false);
+}
+#[test]
+#[ignore = "msg"]
+fn d() {
+    assert!(false);
+}
+"#;
+
+#[test]
+fn run_mode_libtest_json_format_output() {
+    // Lane IH: `--format json` together with `-Z
+    // unstable-options` is the JSON Lines event stream (the
+    // shape tests/run-make/libtest-json snapshots), for both
+    // runs and `--list` discovery.
+    let dir = temp_dir("libtest-json");
+    let src = fixture(&dir, "f.rs", LIBTEST_JSON_SRC);
+    let out = run_driver_extra(
+        &src,
+        &[
+            "--rustc-arg",
+            "--test",
+            "--guest-arg",
+            "-Zunstable-options",
+            "--guest-arg",
+            "--format=json",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(101), "stdout={stdout}");
+    assert!(
+        stdout.contains("{ \"type\": \"suite\", \"event\": \"started\", \"test_count\": 4 }"),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("{ \"type\": \"test\", \"name\": \"a\", \"event\": \"ok\" }"),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("\"event\": \"failed\", \"stdout\": \"\\nthread 'b'"),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "{ \"type\": \"test\", \"name\": \"d\", \"event\": \"ignored\", \"message\": \"msg\" }"
+        ),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "{ \"type\": \"suite\", \"event\": \"failed\", \"passed\": 2, \"failed\": 1, \
+             \"ignored\": 1, \"measured\": 0, \"filtered_out\": 0"
+        ),
+        "stdout={stdout}"
+    );
+    // `--show-output` adds the captured output to passing
+    // tests, including the report of an expected panic.
+    let out = run_driver_extra(
+        &src,
+        &[
+            "--rustc-arg",
+            "--test",
+            "--guest-arg",
+            "-Zunstable-options",
+            "--guest-arg",
+            "--format=json",
+            "--guest-arg",
+            "--show-output",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(101), "stdout={stdout}");
+    assert!(
+        stdout.contains(
+            "\"name\": \"a\", \"event\": \"ok\", \"stdout\": \"print from successful test\\n\""
+        ),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("\"name\": \"c\", \"event\": \"ok\", \"stdout\": \"\\nthread 'c'"),
+        "stdout={stdout}"
+    );
+    // The discovery listing: descriptor spans ride along.
+    let out = run_driver_extra(
+        &src,
+        &[
+            "--rustc-arg",
+            "--test",
+            "--guest-arg",
+            "--list",
+            "--guest-arg",
+            "--format=json",
+            "--guest-arg",
+            "-Zunstable-options",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "stdout={stdout}");
+    assert!(
+        stdout.contains("{ \"type\": \"suite\", \"event\": \"discovery\" }"),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "\"event\": \"discovered\", \"name\": \"d\", \"ignore\": true, \
+             \"ignore_message\": \"msg\""
+        ),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "{ \"type\": \"suite\", \"event\": \"completed\", \"tests\": 4, \
+             \"benchmarks\": 0, \"total\": 4, \"ignored\": 1 }"
+        ),
+        "stdout={stdout}"
+    );
+}
+
+#[test]
+fn run_mode_libtest_ignored_modes() {
+    // Lane IH: `--ignored` runs only the ignored tests (the
+    // rest count as filtered out); `--include-ignored` runs
+    // them with the rest.
+    let dir = temp_dir("libtest-ignored");
+    let src = fixture(&dir, "f.rs", LIBTEST_JSON_SRC);
+    let out = run_driver_extra(
+        &src,
+        &["--rustc-arg", "--test", "--guest-arg", "--ignored"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(101), "stdout={stdout}");
+    assert!(stdout.contains("running 1 test"), "stdout={stdout}");
+    assert!(
+        stdout.contains("0 passed; 1 failed; 0 ignored"),
+        "stdout={stdout}"
+    );
+    assert!(stdout.contains("3 filtered out"), "stdout={stdout}");
+    let out = run_driver_extra(
+        &src,
+        &["--rustc-arg", "--test", "--guest-arg", "--include-ignored"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(101), "stdout={stdout}");
+    assert!(stdout.contains("running 4 tests"), "stdout={stdout}");
+    assert!(
+        stdout.contains("2 passed; 2 failed; 0 ignored"),
+        "stdout={stdout}"
+    );
+}
+
 #[test]
 fn run_mode_libtest_invalid_rust_test_threads() {
     let dir = temp_dir("libtest-threads");
