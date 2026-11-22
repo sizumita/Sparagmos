@@ -35,6 +35,36 @@ use rustc_public::{CrateDef, CrateDefType};
 
 use sparagmos_mir as sm;
 
+thread_local! {
+    /// The running compilation's compiler context, handed to
+    /// the library by the binary's compiler callback (which
+    /// receives it from `rustc_public`'s `run_with_tcx` entry).
+    /// [`Converter::collapsed_filename_lines`] consults it to
+    /// resolve statement spans the way the compiler's own
+    /// debuginfo does. The context is valid only for the length
+    /// of the callback; the binary clears the slot when the
+    /// callback returns. The lifetime is erased to 'static for
+    /// storage: the stored value is the callback's own context,
+    /// which outlives every conversion performed inside it, and
+    /// it is never read outside the callback.
+    static COMPILER_TCX: std::cell::Cell<Option<rustc_middle::ty::TyCtxt<'static>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Install (or clear, with `None`) the compiler context the
+/// span resolution consults. Called by the binary's compiler
+/// callback around the conversion entry.
+pub fn set_compiler_tcx(tcx: Option<rustc_middle::ty::TyCtxt<'_>>) {
+    let erased = tcx.map(|t| unsafe {
+        std::mem::transmute::<rustc_middle::ty::TyCtxt<'_>, rustc_middle::ty::TyCtxt<'static>>(t)
+    });
+    COMPILER_TCX.with(|slot| slot.set(erased));
+}
+
+fn compiler_tcx() -> Option<rustc_middle::ty::TyCtxt<'static>> {
+    COMPILER_TCX.with(|slot| slot.get())
+}
+
 /// Per-run converter state (DefId assignment) plus per-function error bag.
 pub struct Converter {
     def_ids: HashMap<rustc_public::DefId, u32>,
@@ -1048,10 +1078,38 @@ impl Converter {
                 block
             })
             .collect();
+        // The line extent of each source scope in this body,
+        // from the resolved lines of the statements and
+        // terminators stated directly in it (same-file positions
+        // only: the extent is a line range in the body's own
+        // file). A debug entry's visibility is its scope, so the
+        // entry's recorded extent is its scope's extent, which
+        // is what the debugger's name resolution needs to tell a
+        // live declaration from a shadowed one whose scope has
+        // ended (see var_debug_info).
+        let body_file = self.source_line(body.span, body.span).file;
+        let mut scope_lines: HashMap<u32, (u32, u32)> = HashMap::new();
+        let mut note_scope = |scope_lines: &mut HashMap<u32, (u32, u32)>,
+                              scope: u32,
+                              pos: sm::SourceLine| {
+            if pos.is_known() && pos.file == body_file {
+                let entry = scope_lines.entry(scope).or_insert((pos.line, pos.line));
+                entry.0 = entry.0.min(pos.line);
+                entry.1 = entry.1.max(pos.line);
+            }
+        };
+        for bb in &body.blocks {
+            for stmt in &bb.statements {
+                let pos = self.source_line(stmt.source_info.span, body.span);
+                note_scope(&mut scope_lines, stmt.source_info.scope, pos);
+            }
+            let pos = self.source_line(bb.terminator.source_info.span, body.span);
+            note_scope(&mut scope_lines, bb.terminator.source_info.scope, pos);
+        }
         let debug_info: Vec<sm::VarDebugInfo> = body
             .var_debug_info
             .iter()
-            .map(|info| self.var_debug_info(info))
+            .map(|info| self.var_debug_info(info, &scope_lines))
             .collect();
         if self.errors.is_empty() {
             Self::initialize_const_bound_locals(body, &mut blocks, &debug_info);
@@ -1064,7 +1122,11 @@ impl Converter {
         }
     }
 
-    fn var_debug_info(&mut self, info: &mir::VarDebugInfo) -> sm::VarDebugInfo {
+    fn var_debug_info(
+        &mut self,
+        info: &mir::VarDebugInfo,
+        scope_lines: &HashMap<u32, (u32, u32)>,
+    ) -> sm::VarDebugInfo {
         let value = match &info.value {
             mir::VarDebugInfoContents::Place(p) => {
                 sm::VarDebugInfoContents::Place(self.place(p))
@@ -1073,17 +1135,29 @@ impl Converter {
                 sm::VarDebugInfoContents::Constant(Box::new(self.constant(c)))
             }
         };
-        // The entry's span, resolved to its (start, end) lines:
-        // the span is the extent of the lexical scope the
-        // variable is visible in, which the debugger interface
-        // uses to pick the right entry when one name is declared
-        // in several scopes. (This model's spans are otherwise
-        // dummy; the debug-info span is the one place a resolved
-        // extent is carried, as lines, not byte offsets.)
+        // The entry's recorded (start, end) lines: the extent
+        // of the lexical scope the variable is visible in,
+        // which the debugger interface uses to pick the right
+        // entry when one name is declared in several scopes.
+        // The entry's own span is only the declaration point;
+        // the extent is the line range of the entry's source
+        // scope as stated in the body (computed by the caller),
+        // widened to cover the declaration. A scope that states
+        // nothing leaves the declaration point standing alone.
+        // (This model's spans are otherwise dummy; the
+        // debug-info span is the one place a resolved extent is
+        // carried, as lines, not byte offsets.)
         let (lo, hi) = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             info.source_info.span.get_lines()
         })) {
-            Ok(lines) => (lines.start_line as u32, lines.end_line as u32),
+            Ok(lines) => {
+                let (mut lo, mut hi) = (lines.start_line as u32, lines.end_line as u32);
+                if let Some(&(smin, smax)) = scope_lines.get(&info.source_info.scope) {
+                    lo = lo.min(smin);
+                    hi = hi.max(smax);
+                }
+                (lo, hi)
+            }
             Err(_) => (0, 0),
         };
         sm::VarDebugInfo {
@@ -1237,9 +1311,9 @@ impl Converter {
             statements: bb
                 .statements
                 .iter()
-                .map(|s| self.source_line(s.source_info.span))
+                .map(|s| self.source_line(s.source_info.span, body.span))
                 .collect(),
-            terminator: self.source_line(bb.terminator.source_info.span),
+            terminator: self.source_line(bb.terminator.source_info.span, body.span),
         };
         let terminator = self.terminator_kind(body, &bb.terminator);
         let mut data = sm::BasicBlockData::new(sm::Terminator::new(terminator));
@@ -1257,9 +1331,14 @@ impl Converter {
     /// foreign-macro span) yields [`sm::SourceLine::UNKNOWN`]
     /// instead of failing the conversion — line information is an
     /// overlay on the body, never a conversion requirement.
-    fn source_line(&mut self, span: rustc_public::ty::Span) -> sm::SourceLine {
+    fn source_line(
+        &mut self,
+        span: rustc_public::ty::Span,
+        body_span: rustc_public::ty::Span,
+    ) -> sm::SourceLine {
         let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            (span.get_filename(), span.get_lines())
+            self.collapsed_filename_lines(span, body_span)
+                .unwrap_or_else(|| (span.get_filename(), span.get_lines()))
         }));
         let Ok((file, lines)) = resolved else {
             return sm::SourceLine::UNKNOWN;
@@ -1280,6 +1359,34 @@ impl Converter {
             file: file_id,
             line: lines.start_line as u32,
         }
+    }
+
+    /// The (filename, lines) of a statement span as the
+    /// compiler's own debuginfo reports them: the span is first
+    /// walked outward through its macro expansion chain to the
+    /// outermost call site whose expansion collapses debuginfo
+    /// (`rustc_span::hygiene::walk_chain_collapsed` -- the exact
+    /// resolution codegen applies to every statement's debug
+    /// location in `adjusted_span_and_dbg_scope`), bounded by
+    /// the function body's span. A statement written inside a
+    /// collapsing macro (a `#[collapse_debuginfo]` macro, an
+    /// external macro under the default flag, a builtin macro)
+    /// is therefore attributed to the macro's invocation line,
+    /// which is the line a debugger stops on. Without a compiler
+    /// context (a conversion driven outside the callback) the
+    /// span stands unresolved and the caller uses its raw
+    /// position.
+    fn collapsed_filename_lines(
+        &self,
+        span: rustc_public::ty::Span,
+        body_span: rustc_public::ty::Span,
+    ) -> Option<(rustc_public::Filename, rustc_public::ty::LineInfo)> {
+        let tcx = compiler_tcx()?;
+        let internal_span = rustc_public::rustc_internal::internal(tcx, span);
+        let internal_bound = rustc_public::rustc_internal::internal(tcx, body_span);
+        let collapsed = rustc_span::hygiene::walk_chain_collapsed(internal_span, internal_bound);
+        let public: rustc_public::ty::Span = rustc_public::rustc_internal::stable(collapsed);
+        Some((public.get_filename(), public.get_lines()))
     }
 
     fn statement_kind(&mut self, kind: &mir::StatementKind) -> sm::StatementKind {

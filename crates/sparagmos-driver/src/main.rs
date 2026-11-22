@@ -3603,6 +3603,22 @@ fn account_trivial_const(report: &mut ConversionReport, name: String) {
     });
 }
 
+/// The compiler callback, in the `run_with_tcx` form: the
+/// context is installed for the conversion's span resolution
+/// (see `sparagmos_driver::convert::set_compiler_tcx`) and
+/// cleared on the way out, including on a panic.
+fn collect_with_tcx(tcx: rustc_middle::ty::TyCtxt) -> ControlFlow<()> {
+    struct ClearTcx;
+    impl Drop for ClearTcx {
+        fn drop(&mut self) {
+            sparagmos_driver::convert::set_compiler_tcx(None);
+        }
+    }
+    sparagmos_driver::convert::set_compiler_tcx(Some(tcx));
+    let _clear = ClearTcx;
+    collect()
+}
+
 fn collect() -> ControlFlow<()> {
     let mut conv = Converter::new();
     let mut report = ConversionReport::default();
@@ -5728,8 +5744,15 @@ fn execute_debug(
         session.set_breakpoint(input, *line);
     }
     session.set_pretty_printers(pretty_printers);
-    if let Ok(text) = std::fs::read_to_string(input) {
-        session.set_source_text(input, &text);
+    // Register the source text of every file the converted
+    // program references, not just the main input: a session
+    // can stop in an included file or an auxiliary crate, and
+    // a stop line renders only from registered text.
+    let files: Vec<String> = session.source_files().to_vec();
+    for file in &files {
+        if let Ok(text) = std::fs::read_to_string(file) {
+            session.set_source_text(file, &text);
+        }
     }
     let run = session.run_script(commands, dialect);
     print!("{}", run.stdout);
@@ -6899,7 +6922,7 @@ fn main() {
     let previous_hook = begin_panic_capture();
     let mut stdout_guard = StdoutToStderr::new();
     let run_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        rustc_public::run!(args.as_slice(), collect)
+        rustc_public::run_with_tcx!(args.as_slice(), collect_with_tcx)
     }));
     stdout_guard.restore();
     end_panic_capture(previous_hook);

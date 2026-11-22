@@ -17,10 +17,15 @@
 //! 1.100.0 sysroot regardless of the caller's `PATH`.
 //!
 //! Direct `rustc_private` usage is intentionally minimal: everything goes
-//! through `rustc_public` (Stable MIR). The only internal crates touched
-//! are the ones the `rustc_public::run!` macro expansion itself requires
-//! to be declared (`rustc_driver`, `rustc_interface`, `rustc_middle`,
-//! `rustc_span`); no internal compiler types are used directly.
+//! through `rustc_public` (Stable MIR). The internal crates declared are
+//! the ones the `rustc_public::run_with_tcx!` macro expansion itself
+//! requires (`rustc_driver`, `rustc_interface`, `rustc_middle`,
+//! `rustc_span`). One internal facility is used directly, by design:
+//! the debugger's statement lines are resolved through
+//! `rustc_span::hygiene::walk_chain_collapsed` (via the
+//! `rustc_public::rustc_internal` span conversions), because that
+//! collapsed attribution is what the compiler's own debuginfo
+//! records and the public span API cannot express it.
 
 #![feature(rustc_private)]
 
