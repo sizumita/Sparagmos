@@ -4775,6 +4775,24 @@ impl<'a> Converter<'a> {
             return self.resolve_impl_callee(func);
         };
         let Some(plain) = self.unconverted.get(&name) else {
+            // A name that is not itself a collected body denotes
+            // a trait item the call names directly (the func
+            // operand's `FnDef` is the trait method, with the
+            // concrete `Self` among its generic arguments). A
+            // clean collected impl body for that `Self` is the
+            // faithful target — the same resolution
+            // `resolve_impl_callee` performs for operand shapes
+            // `resolve_callee` cannot name — and wins over the
+            // name-based builtin model the run time would
+            // otherwise serve the trait name with (a structural
+            // `PartialEq` in place of a hand-written `eq`, say).
+            // When no such body is clean, the name stands and
+            // the existing fallbacks apply unchanged.
+            if !self.bodies.contains_key(&name) {
+                if let Some(key) = self.resolve_impl_callee(func) {
+                    return Some(key);
+                }
+            }
             return Some(name);
         };
         if self
@@ -4976,7 +4994,9 @@ impl<'a> Converter<'a> {
         let mut found: Option<&String> = None;
         for key in self.bodies.keys() {
             let base = key.split('#').next().unwrap_or(key.as_str());
-            let Some((self_part, trait_base, key_method)) = parse_impl_key(base) else {
+            let Some((self_part, trait_base, key_method)) =
+                parse_impl_key(base).or_else(|| parse_impl_block_key(base))
+            else {
                 continue;
             };
             if key_method != method || trait_base != trait_path {
@@ -6244,6 +6264,33 @@ fn parse_impl_key(base: &str) -> Option<(String, String, String)> {
     }
     let inner = head.strip_prefix('<')?;
     let (self_part, trait_part) = inner.split_once(" as ")?;
+    if self_part.is_empty() || trait_part.is_empty() {
+        return None;
+    }
+    let trait_base = trait_part.split('<').next().unwrap_or(trait_part);
+    Some((
+        self_part.to_string(),
+        trait_base.to_string(),
+        method.to_string(),
+    ))
+}
+
+/// Parse an impl body key in the impl-block path form the
+/// driver records for impls inside a module (foreign crates in
+/// particular): `some::module::<impl Trait<..> for Self>::method`.
+/// Returns the `Self` section, the trait path without generic
+/// arguments, and the method name, as [`parse_impl_key`] does
+/// for the `<Self as Trait>::method` form.
+fn parse_impl_block_key(base: &str) -> Option<(String, String, String)> {
+    let (head, method) = base.rsplit_once(">::")?;
+    if method.is_empty() || method.contains("::") {
+        return None;
+    }
+    // The `>::` separator consumed the impl's closing `>`, so
+    // `head` ends with the `Self` section itself.
+    let marker = head.rfind("::<impl ")?;
+    let inner = &head[marker + "::<impl ".len()..];
+    let (trait_part, self_part) = inner.split_once(" for ")?;
     if self_part.is_empty() || trait_part.is_empty() {
         return None;
     }
