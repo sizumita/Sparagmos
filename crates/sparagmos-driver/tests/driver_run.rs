@@ -9741,6 +9741,38 @@ fn main() {
 }
 "#;
 
+const ELEM_PTR_BULK_SRC: &str = r#"
+fn main() {
+    let mut dst = [0u8; 6];
+    let src = [9u8, 8, 7];
+    unsafe {
+        core::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr().add(2), 3);
+        std::ptr::write_bytes(dst.as_mut_ptr().add(5), 0xEEu8, 1);
+        std::ptr::write_bytes(dst.as_mut_ptr(), 0xAAu8, 2);
+    }
+    println!("{:?}", dst);
+}
+"#;
+
+#[test]
+fn run_mode_bulk_ops_through_element_pointers() {
+    // Bulk memory operations take a pointer to the sequence's
+    // first element: through an element pointer (the shape an
+    // array-to-element cast produces) the copy / fill must land on
+    // that element and its siblings, not index into the element
+    // itself.
+    let dir = temp_dir("elem-ptr-bulk");
+    let src = fixture(&dir, "elem_ptr_bulk.rs", ELEM_PTR_BULK_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "bulk ops through element pointers must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "[170, 170, 9, 8, 7, 238]\n");
+}
+
 #[test]
 fn run_mode_write_bytes_volatile_and_offset_from_execute() {
     let dir = temp_dir("memory-intrinsics");
