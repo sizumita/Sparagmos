@@ -2099,13 +2099,28 @@ impl<'a> Converter<'a> {
     /// The name of a concrete type as it appears in the `Self`
     /// position of its impl method names in the program
     /// (`<{name} as Trait>::method`): the definition's display name
-    /// for a named type, the surface-syntax rendering otherwise.
+    /// with its generic arguments rendered the way a call's generic
+    /// arguments render them, for a named type; the surface-syntax
+    /// rendering otherwise. The generic arguments are part of the
+    /// name: a `dyn` value's concrete tag is compared against the
+    /// rendered generic argument of a downcast, which carries them.
     fn concrete_ty_name(&self, ty: &mir::Ty) -> String {
         match ty {
-            mir::Ty::Adt(def, _)
-            | mir::Ty::Closure(def, _)
-            | mir::Ty::FnDef(def, _)
-            | mir::Ty::Coroutine(def, _) => self.def_display_name(def),
+            mir::Ty::Adt(def, args)
+            | mir::Ty::Closure(def, args)
+            | mir::Ty::Coroutine(def, args) => {
+                let base = self.def_display_name(def);
+                if args.is_empty() {
+                    base
+                } else {
+                    let parts: Vec<String> = args
+                        .iter()
+                        .map(|t| crate::builtins::ty_tag(t, self.names))
+                        .collect();
+                    format!("{base}<{}>", parts.join(", "))
+                }
+            }
+            mir::Ty::FnDef(def, _) => self.def_display_name(def),
             other => crate::builtins::ty_tag(other, self.names),
         }
     }
@@ -6463,6 +6478,10 @@ fn parse_impl_block_key(base: &str) -> Option<(String, String, String)> {
 /// present on either side or on neither.
 fn impl_self_matches(self_part: &str, self_name: &str) -> bool {
     let self_base = self_part.split('<').next().unwrap_or(self_part);
+    // The queried name may itself carry a generic argument list
+    // (a fully rendered concrete type); only its base takes part
+    // in the comparison, as the key side's list is stripped above.
+    let self_name = self_name.split('<').next().unwrap_or(self_name);
     // A generic Self section must be exactly `name<...>` (the
     // argument list runs to the end of the section).
     if self_part != self_base && !self_part.ends_with('>') {
