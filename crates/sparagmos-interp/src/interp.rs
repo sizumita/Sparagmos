@@ -4655,9 +4655,24 @@ impl<'a> Interpreter<'a> {
                 let projection = self.offset_projection(frames, None, projection, disp)?;
                 Ok(RefTarget::Alloc { id, projection })
             }
-            RefTarget::Value(v) => Ok(RefTarget::Value(Box::new(
-                self.offset_value_target(*v, count, elem_size)?,
-            ))),
+            RefTarget::Value(v, projection) => {
+                if projection.is_empty() {
+                    // An unprojected value target denotes the
+                    // aggregate itself: the offset is applied
+                    // eagerly to the constant value.
+                    Ok(RefTarget::value(
+                        self.offset_value_target(*v, count, elem_size)?,
+                    ))
+                } else {
+                    // A projected value target denotes a position
+                    // inside the value: carry the displacement on
+                    // the projection, as for statics and
+                    // allocations, whose pointees are likewise not
+                    // declared locals.
+                    let projection = self.offset_projection(frames, None, projection, disp)?;
+                    Ok(RefTarget::Value(v, projection))
+                }
+            }
             RefTarget::Null => {
                 if wrapping {
                     let d = disp.ok_or_else(|| InterpError::UnsupportedRvalue {
