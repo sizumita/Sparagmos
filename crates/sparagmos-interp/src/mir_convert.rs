@@ -2530,7 +2530,19 @@ impl<'a> Converter<'a> {
         ctx: Option<&mir::Ty>,
     ) -> Result<ir::Constant, ConvertError> {
         match &constant.literal {
-            mir::ConstKind::Value(v) => self.convert_const_value(v, ctx),
+            mir::ConstKind::Value(v) => {
+                let k = self.convert_const_value(v, ctx)?;
+                // A constant whose bytes are (partly) uninitialized
+                // decodes to a bare `Uninit` whatever its type; give
+                // it the aggregate skeleton of its declared type so
+                // element/field writes and reads see the structure
+                // (see `expand_uninit_constant`). Without a context
+                // type there is no skeleton to rebuild.
+                Ok(match ctx {
+                    Some(ty) => self.expand_uninit_constant(&k, ty, 0),
+                    None => k,
+                })
+            }
             // A function item in operand position is a value (the
             // zero-sized fn item, reifiable to a function pointer):
             // it becomes a callable constant naming the function.
@@ -2600,8 +2612,13 @@ impl<'a> Converter<'a> {
     /// aggregate skeleton of their declared type.
     ///
     /// The constant decoder collapses every all-uninitialized byte
-    /// range into a bare `Uninit`, whatever its type. For a
-    /// thread-local storage that loses the storage's shape: the
+    /// range into a bare `Uninit`, whatever its type. That loses
+    /// the value's shape wherever the constant is used: a
+    /// thread-local storage's `data` field, or — under optimized
+    /// MIR, where `[MaybeUninit::uninit(); N]` const-propagates
+    /// into a single `<uninit>` constant of the array type — an
+    /// ordinary local whose elements are then written and read
+    /// through dynamic indices. For a thread-local storage: the
     /// `data` field is an `UnsafeCell<MaybeUninit<T>>`, a real value
     /// of an aggregate type, and std's lazy initialization copies
     /// the `MaybeUninit` out by value (`ptr::replace` in
@@ -2610,7 +2627,8 @@ impl<'a> Converter<'a> {
     /// memory. Guest code materializes that same value as the union
     /// aggregate with its `()` field active (`MaybeUninit::uninit()`),
     /// so the expansion rebuilds exactly that form: structs and
-    /// tuples get one slot per field, a union gets its unit-typed
+    /// tuples get one slot per field, arrays get one slot per
+    /// element, a union gets its unit-typed
     /// field (the `uninit: ()` pattern) with `Uninit` padding before
     /// it, and scalar leaves stay `Uninit`. Unions without a unit
     /// field have no canonical uninitialized form and keep the bare
@@ -2719,6 +2737,25 @@ impl<'a> Converter<'a> {
                     .map(|f| self.expand_uninit_constant(f, elem, depth + 1))
                     .collect(),
             ),
+            (ir::Constant::Uninit, mir::Ty::Array(elem, len)) => {
+                // An uninitialized array constant is an array of
+                // uninitialized elements: expand it element by
+                // element so the value carries the array's shape
+                // and element writes/reads through dynamic indices
+                // see the same structure the unoptimized `Repeat`
+                // form materializes. Lengths that are not known
+                // constants, and arrays past the repeat
+                // materialization limit, keep the bare `Uninit`.
+                let mir::ArrayLen::Known(n) = len else {
+                    return value.clone();
+                };
+                if *n > MAX_REPEAT_ELEMENTS {
+                    return value.clone();
+                }
+                let elem =
+                    self.expand_uninit_constant(&ir::Constant::Uninit, elem, depth + 1);
+                ir::Constant::Tuple(vec![elem; *n as usize])
+            }
             _ => value.clone(),
         }
     }
@@ -2841,19 +2878,52 @@ impl<'a> Converter<'a> {
                     }
                     _ => None,
                 };
+                let mut fields: Vec<ir::Constant> = fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| {
+                        let fctx = field_ctxs
+                            .as_ref()
+                            .and_then(|ts| ts.get(i))
+                            .map(|t| t as &mir::Ty);
+                        self.convert_const_value(f, fctx)
+                    })
+                    .collect::<Result<_, _>>()?;
+                // A decoded `MaybeUninit<T>` constant carries one
+                // slot per union field -- the `uninit: ()` slot
+                // beside the `value: ManuallyDrop<T>` slot, both
+                // decoded from the same bytes -- but the value
+                // model holds a `MaybeUninit` as a single field-0
+                // payload: the shape `MaybeUninit::new`
+                // constructions store (see the aggregate
+                // evaluation in the interpreter) and the shape its
+                // pointer accesses read. Normalize the two-slot
+                // decoded form to that shape: the payload is the
+                // `value` slot's constant with the `ManuallyDrop`
+                // wrapper unwrapped.
+                if fields.len() == 2 {
+                    if let Some(mir::Ty::Adt(def, _)) = ctx {
+                        let name = self.def_display_name(def);
+                        if matches!(
+                            name.as_str(),
+                            "std::mem::MaybeUninit" | "core::mem::MaybeUninit"
+                        ) {
+                            let value_slot = fields.pop().expect("two slots");
+                            let payload = match value_slot {
+                                ir::Constant::Adt { fields: inner, .. }
+                                    if inner.len() == 1 =>
+                                {
+                                    inner.into_iter().next().expect("one field")
+                                }
+                                other => other,
+                            };
+                            fields = vec![payload];
+                        }
+                    }
+                }
                 ir::Constant::Adt {
                     variant: *variant,
-                    fields: fields
-                        .iter()
-                        .enumerate()
-                        .map(|(i, f)| {
-                            let fctx = field_ctxs
-                                .as_ref()
-                                .and_then(|ts| ts.get(i))
-                                .map(|t| t as &mir::Ty);
-                            self.convert_const_value(f, fctx)
-                        })
-                        .collect::<Result<_, _>>()?,
+                    fields,
                 }
             }
             mir::ConstValue::Ref(inner) => {
