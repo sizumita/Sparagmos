@@ -237,6 +237,29 @@ pub enum Builtin {
     /// over `OsString` values, which are the string values
     /// themselves in this model (guest arguments are text).
     EnvArgsOs,
+    /// `std::env::current_exe() -> io::Result<PathBuf>`: the
+    /// host executable's path (the driver binary's own path —
+    /// the guest observes a real, existing path, as it would
+    /// from the OS).
+    EnvCurrentExe,
+    /// `std::fs::OpenOptions::_open(&options, path)`: the fs
+    /// sys layer's entry point. A path containing a NUL byte is
+    /// rejected with `InvalidInput`, exactly as std's own
+    /// CString conversion rejects it; opening a real file needs
+    /// the File value model (the sys File layout and its method
+    /// bodies), which is the recorded next stage, so a
+    /// NUL-free open is an explicit unsupported error.
+    FsOpen,
+    /// `std::fs::DirBuilder::_create(&builder, path)`: create
+    /// one directory on the host filesystem (std's
+    /// `create_dir_all` body iterates this per component).
+    FsDirCreate,
+    /// A `std::sys::fs` leaf operation, performed on the host
+    /// filesystem: the arguments and results are plain values
+    /// (paths as byte strings, `io::Error` in std's own shape),
+    /// so the converted public `std::fs` bodies above them run
+    /// unchanged.
+    FsSys(FsSysOp),
     /// `std::process::exit(code)`: end the run with the given
     /// exit code (see `InterpError::ProcessExit`).
     ProcessExit,
@@ -1153,6 +1176,25 @@ pub enum Builtin {
 
 }
 
+/// The `std::sys::fs` leaf operations the interpreter performs
+/// on the host filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FsSysOp {
+    Metadata,
+    SymlinkMetadata,
+    Canonicalize,
+    Copy,
+    HardLink,
+    ReadDir,
+    ReadLink,
+    RemoveDir,
+    RemoveDirAll,
+    RemoveFile,
+    Rename,
+    SetPermissions,
+    Symlink,
+}
+
 /// A relational operator selected by a `PartialOrd` method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelOp {
@@ -1473,6 +1515,22 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::io::_eprint" => Builtin::Eprint,
         "std::env::args" => Builtin::EnvArgs,
         "std::env::args_os" => Builtin::EnvArgsOs,
+        "std::env::current_exe" => Builtin::EnvCurrentExe,
+        "std::fs::OpenOptions::_open" => Builtin::FsOpen,
+        "std::fs::DirBuilder::_create" => Builtin::FsDirCreate,
+        "std::sys::fs::metadata" => Builtin::FsSys(FsSysOp::Metadata),
+        "std::sys::fs::symlink_metadata" => Builtin::FsSys(FsSysOp::SymlinkMetadata),
+        "std::sys::fs::canonicalize" => Builtin::FsSys(FsSysOp::Canonicalize),
+        "std::sys::fs::copy" => Builtin::FsSys(FsSysOp::Copy),
+        "std::sys::fs::hard_link" => Builtin::FsSys(FsSysOp::HardLink),
+        "std::sys::fs::read_dir" => Builtin::FsSys(FsSysOp::ReadDir),
+        "std::sys::fs::read_link" => Builtin::FsSys(FsSysOp::ReadLink),
+        "std::sys::fs::remove_dir" => Builtin::FsSys(FsSysOp::RemoveDir),
+        "std::sys::fs::remove_dir_all" => Builtin::FsSys(FsSysOp::RemoveDirAll),
+        "std::sys::fs::remove_file" => Builtin::FsSys(FsSysOp::RemoveFile),
+        "std::sys::fs::rename" => Builtin::FsSys(FsSysOp::Rename),
+        "std::sys::fs::set_permissions" => Builtin::FsSys(FsSysOp::SetPermissions),
+        "std::sys::fs::symlink" => Builtin::FsSys(FsSysOp::Symlink),
         "std::process::exit" => Builtin::ProcessExit,
         "std::io::stdout" => Builtin::Stdout,
         "std::io::Write::write_fmt" => Builtin::WriteFmt,
@@ -5015,6 +5073,39 @@ impl<'a> Interpreter<'a> {
                 let value = vals.into_iter().next().expect("arity checked");
                 self.exec_primitive_unop(name, op, &value)
             }
+            Builtin::EnvCurrentExe => {
+                arity(0)?;
+                Ok(match std::env::current_exe() {
+                    Ok(path) => io_result_ok(pathbuf_value(&host_path_bytes(&path))),
+                    Err(e) => io_result_err(host_io_error(&e)),
+                })
+            }
+            Builtin::FsOpen => {
+                arity(2)?;
+                let mut vals = vals.into_iter();
+                let _options = vals.next().expect("arity checked");
+                let path = vals.next().expect("arity checked");
+                let bytes = self.path_bytes(frames, &path)?;
+                if bytes.contains(&0) {
+                    return Ok(io_result_err(io_error_simple(20)));
+                }
+                Err(unsupported(
+                    "opening a real file: the File value model is not built yet"
+                        .to_string(),
+                ))
+            }
+            Builtin::FsDirCreate => {
+                arity(2)?;
+                let path = vals.into_iter().nth(1).expect("arity checked");
+                let bytes = self.path_bytes(frames, &path)?;
+                if bytes.contains(&0) {
+                    return Ok(io_result_err(io_error_simple(20)));
+                }
+                Ok(io_result_from_host(
+                    std::fs::create_dir(host_path(&bytes)).map(|()| Value::Unit),
+                ))
+            }
+            Builtin::FsSys(op) => self.exec_fs_sys(frames, op, vals),
             Builtin::FromFrom | Builtin::IntoInto => {
                 arity(1)?;
                 // `From::from` renders the callee's generic
@@ -10414,6 +10505,149 @@ impl<'a> Interpreter<'a> {
         eval_unary(op, value, Some(&ty))
     }
 
+    /// The bytes of a path argument: a path value is a fat
+    /// pointer over the path's bytes (or a reference to one).
+    fn path_bytes(&self, frames: &[Frame], value: &Value) -> InterpResult<Vec<u8>> {
+        match value {
+            Value::Str(text) => Ok(text.clone().into_bytes()),
+            Value::FatRef { .. } => {
+                let (items, _) = self.slice_elements(frames, value)?;
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        Value::Uint(b) => out.push(b as u8),
+                        other => {
+                            return Err(InterpError::type_mismatch(
+                                "path bytes",
+                                "byte elements",
+                                other.kind_name(),
+                            ))
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            Value::Ref(_) => {
+                let target = self.deref_value(frames, value)?;
+                let stored = self.read_resolved(frames, &target)?;
+                self.path_bytes(frames, &stored)
+            }
+            other => Err(InterpError::type_mismatch(
+                "path argument",
+                "path (fat pointer) value",
+                other.kind_name(),
+            )),
+        }
+    }
+
+    /// Execute a `std::sys::fs` leaf operation on the host
+    /// filesystem. Every operation first rejects a path
+    /// containing a NUL byte with `InvalidInput`, exactly as
+    /// std's own CString conversion does before any syscall;
+    /// the rest are the host operations themselves, with the
+    /// host's errno returned in std's `Os` error shape (the
+    /// guest's own `Error::kind` body maps it from there).
+    fn exec_fs_sys(
+        &self,
+        frames: &[Frame],
+        op: FsSysOp,
+        vals: Vec<Value>,
+    ) -> InterpResult<Value> {
+        let mut vals = vals.into_iter();
+        let mut next_path = |vals: &mut std::vec::IntoIter<Value>| -> InterpResult<Vec<u8>> {
+            let value = vals.next().ok_or_else(|| {
+                InterpError::type_mismatch("fs operation", "path argument", "missing")
+            })?;
+            self.path_bytes(frames, &value)
+        };
+        let first = next_path(&mut vals)?;
+        if first.contains(&0) {
+            return Ok(io_result_err(io_error_simple(20)));
+        }
+        let second = if matches!(
+            op,
+            FsSysOp::Copy | FsSysOp::HardLink | FsSysOp::Rename | FsSysOp::Symlink
+        ) {
+            let bytes = next_path(&mut vals)?;
+            if bytes.contains(&0) {
+                return Ok(io_result_err(io_error_simple(20)));
+            }
+            Some(bytes)
+        } else {
+            None
+        };
+        let first = host_path(&first);
+        Ok(match op {
+            FsSysOp::Metadata => {
+                io_result_from_host(std::fs::metadata(&first).map(|md| metadata_value(&md)))
+            }
+            FsSysOp::SymlinkMetadata => io_result_from_host(
+                std::fs::symlink_metadata(&first).map(|md| metadata_value(&md)),
+            ),
+            FsSysOp::Canonicalize => io_result_from_host(
+                std::fs::canonicalize(&first)
+                    .map(|p| pathbuf_value(&host_path_bytes(&p))),
+            ),
+            FsSysOp::Copy => {
+                let to = host_path(second.as_ref().expect("two-path operation"));
+                io_result_from_host(std::fs::copy(&first, &to).map(|n| Value::Uint(n as u128)))
+            }
+            FsSysOp::HardLink => {
+                let to = host_path(second.as_ref().expect("two-path operation"));
+                io_result_from_host(std::fs::hard_link(&first, &to).map(|()| Value::Unit))
+            }
+            FsSysOp::ReadDir => {
+                return Err(unsupported(
+                    "read_dir: the ReadDir value model is not built yet".to_string(),
+                ))
+            }
+            FsSysOp::ReadLink => io_result_from_host(
+                std::fs::read_link(&first).map(|p| pathbuf_value(&host_path_bytes(&p))),
+            ),
+            FsSysOp::RemoveDir => {
+                io_result_from_host(std::fs::remove_dir(&first).map(|()| Value::Unit))
+            }
+            FsSysOp::RemoveDirAll => {
+                io_result_from_host(std::fs::remove_dir_all(&first).map(|()| Value::Unit))
+            }
+            FsSysOp::RemoveFile => {
+                io_result_from_host(std::fs::remove_file(&first).map(|()| Value::Unit))
+            }
+            FsSysOp::Rename => {
+                let to = host_path(second.as_ref().expect("two-path operation"));
+                io_result_from_host(std::fs::rename(&first, &to).map(|()| Value::Unit))
+            }
+            FsSysOp::SetPermissions => {
+                // The second argument is the `Permissions`
+                // value, not a path: { inner: { mode } } in
+                // std's shape.
+                let perms = vals.next().ok_or_else(|| {
+                    InterpError::type_mismatch(
+                        "set_permissions",
+                        "permissions argument",
+                        "missing",
+                    )
+                })?;
+                let mode = permissions_mode(&perms).ok_or_else(|| {
+                    unsupported("set_permissions: unrecognised Permissions shape".to_string())
+                })?;
+                io_result_from_host(
+                    std::fs::set_permissions(
+                        &first,
+                        std::os::unix::fs::PermissionsExt::from_mode(mode),
+                    )
+                    .map(|()| Value::Unit),
+                )
+            }
+            FsSysOp::Symlink => {
+                let to = host_path(second.as_ref().expect("two-path operation"));
+                io_result_from_host(
+                    std::os::unix::fs::symlink(&first, &to).map(|()| Value::Unit),
+                )
+            }
+        })
+    }
+
     /// Execute `Iterator::collect` / `FromIterator::from_iter`:
     /// drain the modelled `next` state transition into the
     /// collection the call's target generic names. The value
@@ -13226,6 +13460,148 @@ impl<'a> SliceElems<'a> {
                 b.iter().map(|byte| Value::Uint(*byte as u128)).collect()
             }
         }
+    }
+}
+
+/// An `io::Error` value in std's own shape: `Error { repr }`
+/// with the `Simple` representation carrying an `ErrorKind`
+/// discriminant (the discriminants are the compiler's own:
+/// NotFound is 0, InvalidInput is 20, Other is 42).
+fn io_error_simple(kind: u128) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![Value::Enum {
+            variant: 1,
+            fields: vec![Value::Uint(kind)],
+        }],
+    }
+}
+
+/// An `io::Error` value in the `Os` representation: the raw
+/// errno, which the guest's own `Error::kind` body maps to an
+/// `ErrorKind` through std's table.
+fn io_error_os(code: i32) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![Value::Enum {
+            variant: 0,
+            fields: vec![Value::Int(code as i128)],
+        }],
+    }
+}
+
+/// A host `io::Error` as a guest `io::Error` value: the errno
+/// form when the host error carries one (the faithful case for
+/// filesystem operations), otherwise the kind-only form.
+fn host_io_error(error: &std::io::Error) -> Value {
+    match error.raw_os_error() {
+        Some(code) => io_error_os(code),
+        None => io_error_simple(42),
+    }
+}
+
+fn io_result_ok(value: Value) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![value],
+    }
+}
+
+fn io_result_err(error: Value) -> Value {
+    Value::Enum {
+        variant: 1,
+        fields: vec![error],
+    }
+}
+
+fn io_result_from_host(result: Result<Value, std::io::Error>) -> Value {
+    match result {
+        Ok(value) => io_result_ok(value),
+        Err(error) => io_result_err(host_io_error(&error)),
+    }
+}
+
+/// A host path from raw path bytes (guest paths are byte
+/// strings, not necessarily UTF-8).
+fn host_path(bytes: &[u8]) -> std::path::PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::OsStr::from_bytes(bytes).to_os_string().into()
+}
+
+fn host_path_bytes(path: &std::path::Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().to_vec()
+}
+
+/// A `PathBuf` value in std's shape: `PathBuf { inner:
+/// OsString { inner: Buf { inner: Vec<u8> } } }`, the Vec being
+/// the element-list value.
+fn pathbuf_value(bytes: &[u8]) -> Value {
+    let vec = Value::Enum {
+        variant: 0,
+        fields: bytes.iter().map(|b| Value::Uint(*b as u128)).collect(),
+    };
+    let buf = Value::Enum {
+        variant: 0,
+        fields: vec![vec],
+    };
+    let os_string = Value::Enum {
+        variant: 0,
+        fields: vec![buf],
+    };
+    Value::Enum {
+        variant: 0,
+        fields: vec![os_string],
+    }
+}
+
+/// A `std::sys::fs::Metadata` value in std's shape: `{ stat }`
+/// with the stat fields in libc's order (the mode is the
+/// fourth field, which is what `permissions()` reads).
+fn metadata_value(md: &std::fs::Metadata) -> Value {
+    use std::os::unix::fs::MetadataExt;
+    let stat = Value::Enum {
+        variant: 0,
+        fields: vec![
+            Value::Uint(md.dev() as u128),
+            Value::Uint(md.ino() as u128),
+            Value::Uint(md.nlink() as u128),
+            Value::Uint(md.mode() as u128),
+            Value::Uint(md.uid() as u128),
+            Value::Uint(md.gid() as u128),
+            Value::Uint(0),
+            Value::Uint(md.rdev() as u128),
+            Value::Int(md.size() as i128),
+            Value::Int(md.blksize() as i128),
+            Value::Int(md.blocks() as i128),
+            Value::Int(md.atime() as i128),
+            Value::Int(md.atime_nsec() as i128),
+            Value::Int(md.mtime() as i128),
+            Value::Int(md.mtime_nsec() as i128),
+            Value::Int(md.ctime() as i128),
+            Value::Int(md.ctime_nsec() as i128),
+            Value::Tuple(vec![Value::Int(0), Value::Int(0), Value::Int(0)]),
+        ],
+    };
+    Value::Enum {
+        variant: 0,
+        fields: vec![stat],
+    }
+}
+
+/// The mode of a `std::fs::Permissions` value: `{ inner:
+/// { mode } }` in std's shape.
+fn permissions_mode(value: &Value) -> Option<u32> {
+    let Value::Enum { fields, .. } = value else {
+        return None;
+    };
+    let Value::Enum { fields, .. } = fields.first()? else {
+        return None;
+    };
+    match fields.first()? {
+        Value::Uint(mode) => Some(*mode as u32),
+        Value::Int(mode) => Some(*mode as u32),
+        _ => None,
     }
 }
 
