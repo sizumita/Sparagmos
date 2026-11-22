@@ -307,6 +307,20 @@ pub enum Value {
     FmtCount(u16),
     /// A built `std::fmt::Arguments`.
     FmtArguments(FmtArguments),
+    /// A `core::fmt::Formatter` that captures what guest code
+    /// writes: the id of its state in the interpreter's formatter
+    /// table. A guest `Debug`/`Display` implementation body
+    /// receives this value behind its `&mut Formatter` parameter
+    /// when the fmt engine runs the body (see `builtins`); the
+    /// `Formatter` methods are builtins that append to the
+    /// captured buffer.
+    Formatter(u64),
+    /// A `core::fmt` builder under construction (`DebugList`,
+    /// `DebugSet`, `DebugMap`, `DebugStruct`, `DebugTuple`): the
+    /// id of its state in the interpreter's builder table. The
+    /// builder methods are builtins over this handle, so no
+    /// builder aggregate ever materializes.
+    FmtBuilder(u64),
     /// A function item or function pointer value: the name of the
     /// target function in the program.
     FnPtr(String),
@@ -355,6 +369,8 @@ impl Value {
             Value::FmtArg { .. } => "fmt argument",
             Value::FmtCount(_) => "fmt count",
             Value::FmtArguments(_) => "fmt arguments",
+            Value::Formatter(_) => "fmt formatter",
+            Value::FmtBuilder(_) => "fmt builder",
             Value::FnPtr(_) => "function pointer",
             Value::Closure { .. } => "closure",
             Value::Coroutine { .. } => "coroutine",
@@ -503,6 +519,8 @@ impl fmt::Display for Value {
             }
             Value::FmtCount(n) => write!(f, "<fmt count {n}>"),
             Value::FmtArguments(_) => write!(f, "<fmt::Arguments>"),
+            Value::Formatter(_) => write!(f, "<fmt::Formatter>"),
+            Value::FmtBuilder(_) => write!(f, "<fmt builder>"),
             Value::FnPtr(name) => write!(f, "<fn {name}>"),
             Value::Closure { def, env } => {
                 write!(f, "<closure {def} ({} captures)>", env.len())

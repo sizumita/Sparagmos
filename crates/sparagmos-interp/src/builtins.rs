@@ -35,7 +35,8 @@ use crate::error::{InterpError, InterpResult};
 use crate::interp::{
     box_alloc_pointer, channel_handle_id, eval_binary, eval_unary, float_to_int,
     float_to_uint, impl_qualified_self_type, rc_handle_id, round_to_f16,
-    synthetic_address, Frame, Interpreter, Resolved,
+    synthetic_address, FmtBuilderKind, FmtBuilderState, FmtCapture, Frame,
+    Interpreter, Resolved,
 };
 use crate::ir::{BinOp, Body, FloatTy, IntTy, Operand, Ty, UintTy, UnOp};
 use crate::value::{FmtArguments, FmtTrait, PanicPayload, RefProj, RefTarget, Value};
@@ -285,6 +286,58 @@ pub enum Builtin {
     ArgumentNew(FmtTrait),
     /// `core::fmt::rt::Argument::from_usize(&usize)`.
     ArgumentFromUsize,
+    /// `std::fmt::Formatter::write_str(&mut self, &str)`: append
+    /// the string to the captured formatter's buffer.
+    FormatterWriteStr,
+    /// `std::fmt::Formatter::write_char(&mut self, char)`.
+    FormatterWriteChar,
+    /// `std::fmt::Formatter::pad(&mut self, &str)`: core's
+    /// padding write into the capture (precision truncates to
+    /// that many chars, width pads with the fill).
+    FormatterPad,
+    /// `std::fmt::Formatter::write_fmt(&mut self, Arguments)`:
+    /// format the arguments into the captured buffer.
+    FormatterWriteFmt,
+    /// `std::fmt::Formatter::alternate(&self) -> bool`.
+    FormatterAlternate,
+    /// `std::fmt::Formatter::width(&self) -> Option<usize>`.
+    FormatterWidth,
+    /// `std::fmt::Formatter::precision(&self) -> Option<usize>`.
+    FormatterPrecision,
+    /// `std::fmt::Formatter::fill(&self) -> char`.
+    FormatterFill,
+    /// `std::fmt::Formatter::sign_plus(&self) -> bool`.
+    FormatterSignPlus,
+    /// `std::fmt::Formatter::sign_aware_zero_pad(&self) -> bool`.
+    FormatterSignAwareZeroPad,
+    /// `Formatter::debug_struct_fieldN_finish` (derive's fast
+    /// path for structs of at most five fields): render the
+    /// whole struct value from the name and the interleaved
+    /// field-name / `&dyn Debug` arguments into the capture.
+    DebugStructFinish { fields: usize },
+    /// `Formatter::debug_struct_fields_finish` (the same for
+    /// larger structs, with parallel name/value slices).
+    DebugStructFieldsFinish,
+    DebugTupleFieldsFinish,
+    /// `Formatter::debug_tuple_fieldN_finish`: the tuple-struct
+    /// counterpart of [`Builtin::DebugStructFinish`].
+    DebugTupleFinish { fields: usize },
+    /// `Formatter::debug_list` / `debug_set` / `debug_map` /
+    /// `debug_struct` / `debug_tuple`: open a builder over the
+    /// captured formatter.
+    FmtBuilderNew(FmtBuilderKind),
+    /// `DebugList::entry` / `DebugSet::entry`: append one entry
+    /// to the builder.
+    FmtBuilderEntry,
+    /// `DebugMap::entry`: append one key/value entry.
+    FmtBuilderMapEntry,
+    /// `DebugStruct::field`: append one named field.
+    FmtBuilderStructField,
+    /// `DebugTuple::field`: append one field.
+    FmtBuilderTupleField,
+    /// A builder's `finish` (and `DebugStruct`'s
+    /// `finish_non_exhaustive`): close the rendered value.
+    FmtBuilderFinish { exhaustive: bool },
     /// `std::ops::RangeInclusive::new(start, end)`.
     RangeInclusiveNew,
     /// `std::iter::IntoIterator::into_iter(value)`.
@@ -1589,6 +1642,14 @@ pub fn foreign_helper_lookup(canonical: &str) -> Option<Builtin> {
     })
 }
 
+/// A successful `core::fmt::Result` value (`Ok(())`).
+fn fmt_result_ok() -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![Value::Unit],
+    }
+}
+
 /// Look a canonical callee name up in the registry, spelled
 /// exactly as given; `None` when the interpreter has no model
 /// for it.
@@ -1635,6 +1696,126 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "core::fmt::rt::Argument::new_lower_exp" => Builtin::ArgumentNew(F::LowerExp),
         "core::fmt::rt::Argument::new_upper_exp" => Builtin::ArgumentNew(F::UpperExp),
         "core::fmt::rt::Argument::from_usize" => Builtin::ArgumentFromUsize,
+        // The captured-`Formatter` surface (see the fmt engine):
+        // guest `fmt` implementation bodies write through these
+        // methods, and derive's fast-path finishers render
+        // through them. The finishers and the builder
+        // constructors/methods have no MIR bodies; `write_fmt`
+        // has one, displaced by the builtin so a guest body's
+        // `write!` lands in the same capture as its `write_str`
+        // calls.
+        "std::fmt::Formatter::write_str" | "core::fmt::Formatter::write_str" => {
+            Builtin::FormatterWriteStr
+        }
+        "std::fmt::Formatter::write_char" | "core::fmt::Formatter::write_char" => {
+            Builtin::FormatterWriteChar
+        }
+        "std::fmt::Formatter::pad" | "core::fmt::Formatter::pad" => Builtin::FormatterPad,
+        "std::fmt::Formatter::write_fmt" | "core::fmt::Formatter::write_fmt" => {
+            Builtin::FormatterWriteFmt
+        }
+        "std::fmt::Formatter::alternate" | "core::fmt::Formatter::alternate" => {
+            Builtin::FormatterAlternate
+        }
+        "std::fmt::Formatter::width" | "core::fmt::Formatter::width" => {
+            Builtin::FormatterWidth
+        }
+        "std::fmt::Formatter::precision" | "core::fmt::Formatter::precision" => {
+            Builtin::FormatterPrecision
+        }
+        "std::fmt::Formatter::fill" | "core::fmt::Formatter::fill" => Builtin::FormatterFill,
+        "std::fmt::Formatter::sign_plus" | "core::fmt::Formatter::sign_plus" => {
+            Builtin::FormatterSignPlus
+        }
+        "std::fmt::Formatter::sign_aware_zero_pad"
+        | "core::fmt::Formatter::sign_aware_zero_pad" => Builtin::FormatterSignAwareZeroPad,
+        "std::fmt::Formatter::debug_struct_field1_finish"
+        | "core::fmt::Formatter::debug_struct_field1_finish" => {
+            Builtin::DebugStructFinish { fields: 1 }
+        }
+        "std::fmt::Formatter::debug_tuple_field1_finish"
+        | "core::fmt::Formatter::debug_tuple_field1_finish" => {
+            Builtin::DebugTupleFinish { fields: 1 }
+        }
+        "std::fmt::Formatter::debug_struct_field2_finish"
+        | "core::fmt::Formatter::debug_struct_field2_finish" => {
+            Builtin::DebugStructFinish { fields: 2 }
+        }
+        "std::fmt::Formatter::debug_tuple_field2_finish"
+        | "core::fmt::Formatter::debug_tuple_field2_finish" => {
+            Builtin::DebugTupleFinish { fields: 2 }
+        }
+        "std::fmt::Formatter::debug_struct_field3_finish"
+        | "core::fmt::Formatter::debug_struct_field3_finish" => {
+            Builtin::DebugStructFinish { fields: 3 }
+        }
+        "std::fmt::Formatter::debug_tuple_field3_finish"
+        | "core::fmt::Formatter::debug_tuple_field3_finish" => {
+            Builtin::DebugTupleFinish { fields: 3 }
+        }
+        "std::fmt::Formatter::debug_struct_field4_finish"
+        | "core::fmt::Formatter::debug_struct_field4_finish" => {
+            Builtin::DebugStructFinish { fields: 4 }
+        }
+        "std::fmt::Formatter::debug_tuple_field4_finish"
+        | "core::fmt::Formatter::debug_tuple_field4_finish" => {
+            Builtin::DebugTupleFinish { fields: 4 }
+        }
+        "std::fmt::Formatter::debug_struct_field5_finish"
+        | "core::fmt::Formatter::debug_struct_field5_finish" => {
+            Builtin::DebugStructFinish { fields: 5 }
+        }
+        "std::fmt::Formatter::debug_tuple_field5_finish"
+        | "core::fmt::Formatter::debug_tuple_field5_finish" => {
+            Builtin::DebugTupleFinish { fields: 5 }
+        }
+        "std::fmt::Formatter::debug_struct_fields_finish"
+        | "core::fmt::Formatter::debug_struct_fields_finish" => {
+            Builtin::DebugStructFieldsFinish
+        }
+        "std::fmt::Formatter::debug_tuple_fields_finish"
+        | "core::fmt::Formatter::debug_tuple_fields_finish" => {
+            Builtin::DebugTupleFieldsFinish
+        }
+        "std::fmt::Formatter::debug_list" | "core::fmt::Formatter::debug_list" => {
+            Builtin::FmtBuilderNew(FmtBuilderKind::List)
+        }
+        "std::fmt::Formatter::debug_set" | "core::fmt::Formatter::debug_set" => {
+            Builtin::FmtBuilderNew(FmtBuilderKind::Set)
+        }
+        "std::fmt::Formatter::debug_map" | "core::fmt::Formatter::debug_map" => {
+            Builtin::FmtBuilderNew(FmtBuilderKind::Map)
+        }
+        "std::fmt::Formatter::debug_struct" | "core::fmt::Formatter::debug_struct" => {
+            Builtin::FmtBuilderNew(FmtBuilderKind::Struct)
+        }
+        "std::fmt::Formatter::debug_tuple" | "core::fmt::Formatter::debug_tuple" => {
+            Builtin::FmtBuilderNew(FmtBuilderKind::Tuple)
+        }
+        "std::fmt::DebugList::entry" | "core::fmt::DebugList::entry"
+        | "std::fmt::DebugSet::entry" | "core::fmt::DebugSet::entry" => {
+            Builtin::FmtBuilderEntry
+        }
+        "std::fmt::DebugMap::entry" | "core::fmt::DebugMap::entry" => {
+            Builtin::FmtBuilderMapEntry
+        }
+        "std::fmt::DebugStruct::field" | "core::fmt::DebugStruct::field" => {
+            Builtin::FmtBuilderStructField
+        }
+        "std::fmt::DebugTuple::field" | "core::fmt::DebugTuple::field" => {
+            Builtin::FmtBuilderTupleField
+        }
+        "std::fmt::DebugList::finish" | "core::fmt::DebugList::finish"
+        | "std::fmt::DebugSet::finish" | "core::fmt::DebugSet::finish"
+        | "std::fmt::DebugMap::finish" | "core::fmt::DebugMap::finish"
+        | "std::fmt::DebugStruct::finish" | "core::fmt::DebugStruct::finish"
+        | "std::fmt::DebugTuple::finish" | "core::fmt::DebugTuple::finish" => {
+            Builtin::FmtBuilderFinish { exhaustive: true }
+        }
+        "std::fmt::DebugStruct::finish_non_exhaustive"
+        | "core::fmt::DebugStruct::finish_non_exhaustive" => {
+            Builtin::FmtBuilderFinish { exhaustive: false }
+        }
         "std::iter::IntoIterator::into_iter" => Builtin::IntoIter,
         "std::iter::Iterator::next" => Builtin::IteratorNext,
         "std::iter::DoubleEndedIterator::next_back"
@@ -3409,13 +3590,13 @@ impl<'a> Interpreter<'a> {
         match kind {
             Builtin::Print => {
                 arity(1)?;
-                let text = self.format_arguments(frames, expect_arguments(&vals[0], name)?)?;
+                let text = self.format_arguments(frames, expect_arguments(&vals[0], name)?, 0)?;
                 self.push_output(&text);
                 Ok(Value::Unit)
             }
             Builtin::Eprint => {
                 arity(1)?;
-                let text = self.format_arguments(frames, expect_arguments(&vals[0], name)?)?;
+                let text = self.format_arguments(frames, expect_arguments(&vals[0], name)?, 0)?;
                 self.push_error_output(&text);
                 Ok(Value::Unit)
             }
@@ -3777,7 +3958,7 @@ impl<'a> Interpreter<'a> {
                     .or_else(|| self_ty.strip_prefix("&"))
                     .unwrap_or(self_ty);
                 let text =
-                    self.format_arguments(frames, expect_arguments(&vals[1], name)?)?;
+                    self.format_arguments(frames, expect_arguments(&vals[1], name)?, 0)?;
                 match self_ty {
                     "std::io::Stdout" | "std::io::StdoutLock" => {
                         self.push_output(&text);
@@ -3827,7 +4008,7 @@ impl<'a> Interpreter<'a> {
             Builtin::FmtWrite => {
                 arity(2)?;
                 let text =
-                    self.format_arguments(frames, expect_arguments(&vals[1], name)?)?;
+                    self.format_arguments(frames, expect_arguments(&vals[1], name)?, 0)?;
                 // The output is a `&mut dyn Write`: resolve it to
                 // the dyn value, then deliver the formatted text
                 // through the concrete type's own `write_str`. The
@@ -3883,7 +4064,7 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::Format => {
                 arity(1)?;
-                let text = self.format_arguments(frames, expect_arguments(&vals[0], name)?)?;
+                let text = self.format_arguments(frames, expect_arguments(&vals[0], name)?, 0)?;
                 Ok(Value::Str(text))
             }
             Builtin::ArgumentsFromStr => {
@@ -3908,6 +4089,167 @@ impl<'a> Interpreter<'a> {
                     trait_,
                     ty,
                 })
+            }
+            Builtin::FormatterWriteStr => {
+                arity(2)?;
+                let id = self.formatter_id_of(frames, &vals[0])?;
+                let s = self.resolve_string(frames, &vals[1])?;
+                self.formatter_push(id, &s);
+                Ok(fmt_result_ok())
+            }
+            Builtin::FormatterWriteChar => {
+                arity(2)?;
+                let id = self.formatter_id_of(frames, &vals[0])?;
+                let c = match self.resolve_value(frames, &vals[1])? {
+                    Value::Uint(v) => as_char(v)?,
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            "Formatter::write_char",
+                            "char value",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                self.formatter_push(id, &c.to_string());
+                Ok(fmt_result_ok())
+            }
+            Builtin::FormatterPad => {
+                arity(2)?;
+                let id = self.formatter_id_of(frames, &vals[0])?;
+                let s = self.resolve_string(frames, &vals[1])?;
+                let options = self.capture_of(id)?.options();
+                let text = pad_str(&s, &options);
+                self.formatter_push(id, &text);
+                Ok(fmt_result_ok())
+            }
+            Builtin::FormatterWriteFmt => {
+                arity(2)?;
+                let id = self.formatter_id_of(frames, &vals[0])?;
+                let indent = self.capture_of(id)?.indent;
+                let text = self.format_arguments(
+                    frames,
+                    expect_arguments(&vals[1], name)?,
+                    indent,
+                )?;
+                self.formatter_push(id, &text);
+                Ok(fmt_result_ok())
+            }
+            Builtin::FormatterAlternate => {
+                arity(1)?;
+                let id = self.formatter_id_of(frames, &vals[0])?;
+                Ok(Value::Bool(self.capture_of(id)?.options().alternate()))
+            }
+            Builtin::FormatterWidth => {
+                arity(1)?;
+                let id = self.formatter_id_of(frames, &vals[0])?;
+                Ok(match self.capture_of(id)?.options().width() {
+                    Some(w) => Value::Enum {
+                        variant: 1,
+                        fields: vec![Value::Uint(w as u128)],
+                    },
+                    None => Value::Enum {
+                        variant: 0,
+                        fields: vec![],
+                    },
+                })
+            }
+            Builtin::FormatterPrecision => {
+                arity(1)?;
+                let id = self.formatter_id_of(frames, &vals[0])?;
+                Ok(match self.capture_of(id)?.options().precision() {
+                    Some(p) => Value::Enum {
+                        variant: 1,
+                        fields: vec![Value::Uint(p as u128)],
+                    },
+                    None => Value::Enum {
+                        variant: 0,
+                        fields: vec![],
+                    },
+                })
+            }
+            Builtin::FormatterFill => {
+                arity(1)?;
+                let id = self.formatter_id_of(frames, &vals[0])?;
+                Ok(Value::Uint(self.capture_of(id)?.options().fill() as u32 as u128))
+            }
+            Builtin::FormatterSignPlus => {
+                arity(1)?;
+                let id = self.formatter_id_of(frames, &vals[0])?;
+                Ok(Value::Bool(self.capture_of(id)?.options().sign_plus()))
+            }
+            Builtin::FormatterSignAwareZeroPad => {
+                arity(1)?;
+                let id = self.formatter_id_of(frames, &vals[0])?;
+                Ok(Value::Bool(self.capture_of(id)?.options().zero_pad()))
+            }
+            Builtin::DebugStructFinish { fields } => {
+                arity(2 + 2 * fields)?;
+                self.exec_debug_struct_finish(frames, &vals, fields)
+            }
+            Builtin::DebugStructFieldsFinish => {
+                arity(4)?;
+                self.exec_debug_struct_fields_finish(frames, &vals)
+            }
+            Builtin::DebugTupleFieldsFinish => {
+                arity(3)?;
+                self.exec_debug_tuple_fields_finish(frames, &vals)
+            }
+            Builtin::DebugTupleFinish { fields } => {
+                arity(2 + fields)?;
+                self.exec_debug_tuple_finish(frames, &vals, fields)
+            }
+            Builtin::FmtBuilderNew(kind) => {
+                let (fmt_arg, builder_name) = match kind {
+                    FmtBuilderKind::Struct | FmtBuilderKind::Tuple => {
+                        arity(2)?;
+                        let name = self.resolve_string(frames, &vals[1])?;
+                        (vals[0].clone(), Some(name))
+                    }
+                    _ => {
+                        arity(1)?;
+                        (vals[0].clone(), None)
+                    }
+                };
+                let formatter = self.formatter_id_of(frames, &fmt_arg)?;
+                let id = self.new_fmt_builder(FmtBuilderState {
+                    formatter,
+                    kind,
+                    name: builder_name,
+                    has_fields: false,
+                    result_ok: true,
+                });
+                Ok(Value::FmtBuilder(id))
+            }
+            Builtin::FmtBuilderEntry => {
+                arity(2)?;
+                let id = self.builder_id_of(frames, &vals[0])?;
+                self.builder_entry(frames, id, &vals[1])?;
+                Ok(Value::Ref(RefTarget::value(Value::FmtBuilder(id))))
+            }
+            Builtin::FmtBuilderMapEntry => {
+                arity(3)?;
+                let id = self.builder_id_of(frames, &vals[0])?;
+                self.builder_map_entry(frames, id, &vals[1], &vals[2])?;
+                Ok(Value::Ref(RefTarget::value(Value::FmtBuilder(id))))
+            }
+            Builtin::FmtBuilderStructField => {
+                arity(3)?;
+                let id = self.builder_id_of(frames, &vals[0])?;
+                let field_name = self.resolve_string(frames, &vals[1])?;
+                self.builder_struct_field(frames, id, &field_name, &vals[2])?;
+                Ok(Value::Ref(RefTarget::value(Value::FmtBuilder(id))))
+            }
+            Builtin::FmtBuilderTupleField => {
+                arity(2)?;
+                let id = self.builder_id_of(frames, &vals[0])?;
+                self.builder_tuple_field(frames, id, &vals[1])?;
+                Ok(Value::Ref(RefTarget::value(Value::FmtBuilder(id))))
+            }
+            Builtin::FmtBuilderFinish { exhaustive } => {
+                arity(1)?;
+                let id = self.builder_id_of(frames, &vals[0])?;
+                self.builder_finish(id, exhaustive)?;
+                Ok(fmt_result_ok())
             }
             Builtin::ArgumentFromUsize => {
                 arity(1)?;
@@ -5990,6 +6332,7 @@ impl<'a> Interpreter<'a> {
                         let message = self.format_arguments(
                             frames,
                             expect_arguments(&vals[0], name)?,
+                            0,
                         )?;
                         Err(InterpError::panic_string_payload(message))
                     }
@@ -6011,6 +6354,7 @@ impl<'a> Interpreter<'a> {
                         let message = self.format_arguments(
                             frames,
                             expect_arguments(&vals[0], name)?,
+                            0,
                         )?;
                         Err(InterpError::panic_string_payload(message))
                     }
@@ -6038,7 +6382,7 @@ impl<'a> Interpreter<'a> {
                 {
                     if let Some(arg) = fields.into_iter().next() {
                         if let Ok(text) =
-                            self.format_arguments(frames, expect_arguments(&arg, name)?)
+                            self.format_arguments(frames, expect_arguments(&arg, name)?, 0)
                         {
                             message = format!("{message}: {text}");
                         }
@@ -6070,6 +6414,7 @@ impl<'a> Interpreter<'a> {
                         let message = self.format_arguments(
                             frames,
                             expect_arguments(&vals[0], name)?,
+                            0,
                         )?;
                         Err(InterpError::panic_string_payload(message))
                     }
@@ -6520,7 +6865,7 @@ impl<'a> Interpreter<'a> {
                     // `ToString`) by formatting itself — exactly
                     // the `format_arguments` model.
                     Value::FmtArguments(ref args) => {
-                        Ok(Value::Str(self.format_arguments(frames, args)?))
+                        Ok(Value::Str(self.format_arguments(frames, args, 0)?))
                     }
                     ref other => Err(unsupported(format!(
                         "ToString::to_string for {self_ty} (a {}) is not runtime-supported",
@@ -16255,6 +16600,18 @@ impl FmtOptions {
     }
 }
 
+impl FmtCapture {
+    /// The placeholder options this capture was seeded with,
+    /// in the fmt engine's terms.
+    fn options(&self) -> FmtOptions {
+        FmtOptions {
+            flags: self.flags,
+            width: self.width,
+            precision: self.precision,
+        }
+    }
+}
+
 fn template_error(what: &str) -> InterpError {
     InterpError::type_mismatch("fmt pieces template", "well-formed template", what)
 }
@@ -16262,23 +16619,25 @@ fn template_error(what: &str) -> InterpError {
 impl<'a> Interpreter<'a> {
     /// Format a built `fmt::Arguments` value to a string.
     pub(crate) fn format_arguments(
-        &self,
-        frames: &[Frame],
+        &mut self,
+        frames: &mut Vec<Frame>,
         args: &FmtArguments,
+        indent: usize,
     ) -> InterpResult<String> {
         match args {
             FmtArguments::Plain(s) => Ok(s.clone()),
             FmtArguments::Template { template, args } => {
-                self.format_template(frames, template, args)
+                self.format_template(frames, template, args, indent)
             }
         }
     }
 
     fn format_template(
-        &self,
-        frames: &[Frame],
+        &mut self,
+        frames: &mut Vec<Frame>,
         template: &[u8],
         args: &[Value],
+        indent: usize,
     ) -> InterpResult<String> {
         let mut out = String::new();
         let mut arg_index = 0usize;
@@ -16301,7 +16660,7 @@ impl<'a> Interpreter<'a> {
             } else if b == 0xC0 {
                 // Placeholder with entirely default options.
                 let arg = template_arg(args, arg_index)?;
-                out.push_str(&self.format_arg(frames, arg, &FmtOptions::new())?);
+                out.push_str(&self.format_arg(frames, arg, &FmtOptions::new(), indent)?);
                 arg_index += 1;
                 i += 1;
             } else if b & 0xC0 == 0xC0 {
@@ -16340,7 +16699,7 @@ impl<'a> Interpreter<'a> {
                     j += 2;
                 }
                 let arg = template_arg(args, this_arg)?;
-                out.push_str(&self.format_arg(frames, arg, &options)?);
+                out.push_str(&self.format_arg(frames, arg, &options, indent)?);
                 arg_index += 1;
                 i = j;
             } else {
@@ -16362,10 +16721,11 @@ impl<'a> Interpreter<'a> {
     }
 
     fn format_arg(
-        &self,
-        frames: &[Frame],
+        &mut self,
+        frames: &mut Vec<Frame>,
         arg: &Value,
         options: &FmtOptions,
+        indent: usize,
     ) -> InterpResult<String> {
         match arg {
             Value::FmtArg {
@@ -16406,20 +16766,658 @@ impl<'a> Interpreter<'a> {
                     }
                 }
                 let pointee = self.resolve_value(frames, target)?;
-                self.format_value(frames, &pointee, *trait_, ty, options, 0)
+                self.format_value(frames, &pointee, *trait_, ty, options, indent)
             }
             Value::FmtCount(_) => Err(template_error(
                 "count argument used as a formatting argument",
             )),
-            other => self.format_value(frames, other, FmtTrait::Display, "", options, 0),
+            other => self.format_value(frames, other, FmtTrait::Display, "", options, indent),
         }
+    }
+
+    /// The captured formatter a `Formatter` argument value
+    /// names: the handle itself, or the handle behind the
+    /// reference a guest body passes.
+    fn formatter_id_of(&self, frames: &[Frame], value: &Value) -> InterpResult<u64> {
+        match self.resolve_value(frames, value)? {
+            Value::Formatter(id) => Ok(id),
+            other => Err(InterpError::type_mismatch(
+                "Formatter method",
+                "a captured Formatter",
+                other.kind_name(),
+            )),
+        }
+    }
+
+    /// The builder a builder-method argument value names: the
+    /// handle itself, or the handle behind the reference.
+    fn builder_id_of(&self, frames: &[Frame], value: &Value) -> InterpResult<u64> {
+        match self.resolve_value(frames, value)? {
+            Value::FmtBuilder(id) => Ok(id),
+            other => Err(InterpError::type_mismatch(
+                "fmt builder method",
+                "a fmt builder",
+                other.kind_name(),
+            )),
+        }
+    }
+
+    /// The current state of a captured formatter.
+    fn capture_of(&self, id: u64) -> InterpResult<FmtCapture> {
+        self.formatter_snapshot(id).ok_or_else(|| {
+            unsupported("a Formatter method on a capture that already finished".to_string())
+        })
+    }
+
+    /// Append text to a captured formatter's buffer.
+    fn formatter_push(&self, id: u64, text: &str) {
+        self.with_formatter(id, |capture| capture.buffer.push_str(text));
+    }
+
+    /// Run a guest `fmt` implementation body for `value`, if
+    /// the program collected one: the body executes against a
+    /// captured `Formatter` seeded with the placeholder's
+    /// options, and the captured text is the formatted output.
+    /// Returns `None` when no collected body serves this type:
+    /// core/std/alloc types and the shapes the structural
+    /// engine models keep their structural formatting (their
+    /// impls are core's, written against a real `Formatter`
+    /// value layout the value model does not reproduce).
+    fn format_with_body(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        value: &Value,
+        trait_: FmtTrait,
+        ty: &str,
+        options: &FmtOptions,
+        indent: usize,
+    ) -> InterpResult<Option<String>> {
+        if matches!(trait_, FmtTrait::DebugNoop | FmtTrait::Pointer) {
+            return Ok(None);
+        }
+        if !matches!(value, Value::Enum { .. }) {
+            return Ok(None);
+        }
+        let Some(call) = self.fmt_body_call(ty, trait_) else {
+            return Ok(None);
+        };
+        let id = self.new_formatter(FmtCapture {
+            buffer: String::new(),
+            flags: options.flags,
+            width: options.width,
+            precision: options.precision,
+            indent,
+            self_tag: pointee_tag(ty).to_string(),
+        });
+        let formatter = Value::Ref(RefTarget::value(Value::Formatter(id)));
+        let receiver = Value::Ref(RefTarget::value(value.clone()));
+        let result = self.call_sync(frames, &call, vec![receiver, formatter]);
+        let capture = self.take_formatter(id);
+        let result = result?;
+        match result {
+            Value::Enum { variant: 0, .. } => {}
+            _ => {
+                return Err(unsupported(format!(
+                    "the {trait_:?} implementation for {ty} returned an error"
+                )))
+            }
+        }
+        Ok(Some(capture.map(|c| c.buffer).unwrap_or_default()))
+    }
+
+    /// The program name of the `fmt` method serving `ty`
+    /// through `trait_`, when a body for it was collected. The
+    /// recorded instance name is tried first (the impl-def
+    /// spelling, for bodies the item loop and the reachability
+    /// collection recorded), then the trait-name spelling the
+    /// instance-demand pass records (`Trait::fmt [<impl>::fmt]`
+    /// for instances it converted).
+    fn fmt_body_call(&self, ty: &str, trait_: FmtTrait) -> Option<String> {
+        let trait_name = match trait_ {
+            FmtTrait::Display => "Display",
+            FmtTrait::Debug => "Debug",
+            FmtTrait::Octal => "Octal",
+            FmtTrait::LowerHex => "LowerHex",
+            FmtTrait::UpperHex => "UpperHex",
+            FmtTrait::Binary => "Binary",
+            FmtTrait::LowerExp => "LowerExp",
+            FmtTrait::UpperExp => "UpperExp",
+            FmtTrait::DebugNoop | FmtTrait::Pointer => return None,
+        };
+        // The value the dispatch runs on is the pointee value
+        // (references are unwrapped before this point), so the
+        // only `Self` whose body can execute on it is the
+        // pointee type's -- a reference type's own impl (core's
+        // `&T` forwarding impls included) takes the reference
+        // itself as its value and must not be selected here.
+        let plain = ty.trim();
+        let selves: Vec<&str> = vec![pointee_tag(plain)];
+        for self_ty in selves.iter().copied() {
+            if !guest_fmt_tag(self_ty) {
+                continue;
+            }
+            for spelling in ["std", "core"] {
+                let direct =
+                    format!("<{self_ty} as {spelling}::fmt::{trait_name}>::fmt");
+                if self.program().get(&direct).is_some() {
+                    return Some(direct);
+                }
+                for inner in ["std", "core"] {
+                    let suffixed = format!(
+                        "{spelling}::fmt::{trait_name}::fmt [<{self_ty} as {inner}::fmt::{trait_name}>::fmt]"
+                    );
+                    if self.program().get(&suffixed).is_some() {
+                        return Some(suffixed);
+                    }
+                }
+            }
+        }
+        // The compiler's instance name and the converter's
+        // type-tag rendering differ in const generic
+        // arguments (the tag rendering carries type arguments
+        // only), so an exact candidate can miss an instance
+        // the driver recorded under its instance name. Scan
+        // the program's instance names for one whose Self
+        // type is this tag modulo const generic arguments.
+        let normalized: Vec<String> = selves
+            .iter()
+            .filter(|s| guest_fmt_tag(s))
+            .map(|s| normalize_fmt_tag(s))
+            .collect();
+        if !normalized.is_empty() {
+            for key in self.program().functions.keys() {
+                let Some(rest) = key.strip_prefix('<') else {
+                    continue;
+                };
+                let Some(rest) = rest.strip_suffix(">::fmt") else {
+                    continue;
+                };
+                for spelling in ["std", "core"] {
+                    let suffix = format!(" as {spelling}::fmt::{trait_name}");
+                    if let Some(self_part) = rest.strip_suffix(&suffix) {
+                        if normalized.iter().any(|n| *n == normalize_fmt_tag(self_part)) {
+                            return Some(key.clone());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The recorded field type tags of the variant of the
+    /// capture's `self_tag` type that the finisher name
+    /// identifies (a struct's type name, an enum variant's
+    /// name), in declaration order; `None` when no recorded
+    /// shape fits, in which case the caller formats fields
+    /// with no tag, as a `dyn` dispatch would. The shape is
+    /// the only place the full field types survive: the
+    /// finisher's `&dyn Debug` field values carry their type
+    /// by definition name only.
+    fn capture_field_tags(&self, id: u64, name: &str) -> Option<Vec<String>> {
+        let capture = self.capture_of(id).ok()?;
+        let shape = self
+            .program()
+            .adt_debug_shapes
+            .get(pointee_tag(&capture.self_tag))?;
+        let variant = shape
+            .variants
+            .iter()
+            .find(|v| v.name == name)
+            .or_else(|| shape.variants.iter().next().filter(|_| shape.variants.len() == 1))?;
+        Some(variant.fields.iter().map(|f| f.ty.clone()).collect())
+    }
+
+    /// Format one finisher/builder field: a `&dyn Debug`
+    /// value whose full type tag `tag` comes from the
+    /// containing type's recorded shape. The dyn value is
+    /// unwrapped here (with the same receiver shaping the
+    /// `dyn` formatting path applies) rather than left to
+    /// that path, because the recorded concrete type names
+    /// an ADT by its definition name only -- the element
+    /// types the structural forms parse out of the tag
+    /// (`Vec<T>`'s `T`, a box's pointee) would be lost.
+    /// A `Box` / `Rc` / `Arc` field formats its pointee
+    /// with the element tag, as the structural `Box` form
+    /// does.
+    fn format_finisher_field(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        value: &Value,
+        tag: &str,
+        options: &FmtOptions,
+        indent: usize,
+    ) -> InterpResult<String> {
+        if let Value::DynRef { base, .. } = value {
+            let resolved = self.resolve_value(frames, base)?;
+            let shaped = if let Some(id) = rc_handle_id(&resolved) {
+                Value::Ref(RefTarget::Alloc {
+                    id,
+                    projection: vec![RefProj::Field(2)],
+                })
+            } else if let Value::Enum { fields, .. } = &resolved {
+                if fields.len() == 1
+                    && matches!(
+                        fields[0],
+                        Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. }
+                    )
+                {
+                    fields[0].clone()
+                } else {
+                    resolved
+                }
+            } else {
+                resolved
+            };
+            let tag = match tag_base_name(pointee_tag(tag)) {
+                "Box" | "Rc" | "Arc" => {
+                    first_generic_arg(pointee_tag(tag)).unwrap_or(tag)
+                }
+                _ => tag,
+            };
+            return self.format_value(frames, &shaped, FmtTrait::Debug, tag, options, indent);
+        }
+        self.format_value(frames, value, FmtTrait::Debug, tag, options, indent)
+    }
+
+    /// `Formatter::debug_struct_fieldN_finish`: render the
+    /// struct from its name and the interleaved field-name /
+    /// `&dyn Debug` arguments into the capture.
+    fn exec_debug_struct_finish(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        vals: &[Value],
+        count: usize,
+    ) -> InterpResult<Value> {
+        let id = self.formatter_id_of(frames, &vals[0])?;
+        let capture = self.capture_of(id)?;
+        let options = capture.options();
+        let name = self.resolve_string(frames, &vals[1])?;
+        let field_indent = if options.alternate() {
+            capture.indent + 4
+        } else {
+            capture.indent
+        };
+        let tags = self.capture_field_tags(id, &name);
+        let mut fields = Vec::with_capacity(count);
+        for i in 0..count {
+            let field_name = self.resolve_string(frames, &vals[2 + 2 * i])?;
+            let tag = tags
+                .as_ref()
+                .and_then(|tags| tags.get(i))
+                .map(String::as_str)
+                .unwrap_or("");
+            let text = self.format_finisher_field(
+                frames,
+                &vals[3 + 2 * i],
+                tag,
+                &options,
+                field_indent,
+            )?;
+            fields.push((field_name, text));
+        }
+        let text = render_debug_struct(&name, &fields, &options, capture.indent);
+        self.formatter_push(id, &text);
+        Ok(fmt_result_ok())
+    }
+
+    /// `Formatter::debug_struct_fields_finish`: the same
+    /// rendering with parallel field-name / value slices.
+    fn exec_debug_struct_fields_finish(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        vals: &[Value],
+    ) -> InterpResult<Value> {
+        let id = self.formatter_id_of(frames, &vals[0])?;
+        let capture = self.capture_of(id)?;
+        let options = capture.options();
+        let name = self.resolve_string(frames, &vals[1])?;
+        let (names, _) = self.slice_elements(frames, &vals[2])?;
+        let (values, _) = self.slice_elements(frames, &vals[3])?;
+        if names.len() != values.len() {
+            return Err(InterpError::type_mismatch(
+                "debug_struct_fields_finish",
+                "field-name and value slices of equal length",
+                "slices of different lengths",
+            ));
+        }
+        let field_indent = if options.alternate() {
+            capture.indent + 4
+        } else {
+            capture.indent
+        };
+        let tags = self.capture_field_tags(id, &name);
+        let mut fields = Vec::with_capacity(names.len());
+        for (i, (name_value, field_value)) in names.iter().zip(values.iter()).enumerate() {
+            let field_name = self.resolve_string(frames, name_value)?;
+            let tag = tags
+                .as_ref()
+                .and_then(|tags| tags.get(i))
+                .map(String::as_str)
+                .unwrap_or("");
+            let text = self.format_finisher_field(
+                frames,
+                field_value,
+                tag,
+                &options,
+                field_indent,
+            )?;
+            fields.push((field_name, text));
+        }
+        let text = render_debug_struct(&name, &fields, &options, capture.indent);
+        self.formatter_push(id, &text);
+        Ok(fmt_result_ok())
+    }
+
+    /// `Formatter::debug_tuple_fieldN_finish`: render the
+    /// tuple struct from its name and `&dyn Debug` fields.
+    fn exec_debug_tuple_finish(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        vals: &[Value],
+        count: usize,
+    ) -> InterpResult<Value> {
+        let id = self.formatter_id_of(frames, &vals[0])?;
+        let capture = self.capture_of(id)?;
+        let options = capture.options();
+        let name = self.resolve_string(frames, &vals[1])?;
+        let field_indent = if options.alternate() {
+            capture.indent + 4
+        } else {
+            capture.indent
+        };
+        let tags = self.capture_field_tags(id, &name);
+        let mut fields = Vec::with_capacity(count);
+        for i in 0..count {
+            let tag = tags
+                .as_ref()
+                .and_then(|tags| tags.get(i))
+                .map(String::as_str)
+                .unwrap_or("");
+            let text = self.format_finisher_field(
+                frames,
+                &vals[2 + i],
+                tag,
+                &options,
+                field_indent,
+            )?;
+            fields.push(text);
+        }
+        let text = render_debug_tuple(&name, &fields, &options, capture.indent);
+        self.formatter_push(id, &text);
+        Ok(fmt_result_ok())
+    }
+
+    /// `Formatter::debug_tuple_fields_finish`: the tuple
+    /// rendering with the fields as one `&[&dyn Debug]` slice
+    /// (the form derived tuple structs with more than five
+    /// fields use).
+    fn exec_debug_tuple_fields_finish(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        vals: &[Value],
+    ) -> InterpResult<Value> {
+        let id = self.formatter_id_of(frames, &vals[0])?;
+        let capture = self.capture_of(id)?;
+        let options = capture.options();
+        let name = self.resolve_string(frames, &vals[1])?;
+        let (values, _) = self.slice_elements(frames, &vals[2])?;
+        let field_indent = if options.alternate() {
+            capture.indent + 4
+        } else {
+            capture.indent
+        };
+        let tags = self.capture_field_tags(id, &name);
+        let mut fields = Vec::with_capacity(values.len());
+        for (i, field_value) in values.iter().enumerate() {
+            let tag = tags
+                .as_ref()
+                .and_then(|tags| tags.get(i))
+                .map(String::as_str)
+                .unwrap_or("");
+            let text = self.format_finisher_field(
+                frames,
+                field_value,
+                tag,
+                &options,
+                field_indent,
+            )?;
+            fields.push(text);
+        }
+        let text = render_debug_tuple(&name, &fields, &options, capture.indent);
+        self.formatter_push(id, &text);
+        Ok(fmt_result_ok())
+    }
+
+    /// Append one entry's rendered text to a builder, with
+    /// the separator and pretty indentation core's builders
+    /// produce, and mark the builder non-empty. A builder
+    /// whose writes already failed writes nothing (core's
+    /// `result` short-circuit).
+    fn builder_write_entry(&mut self, builder: u64, text: &str) -> InterpResult<()> {
+        let state = self
+            .fmt_builder_snapshot(builder)
+            .ok_or_else(|| unsupported("a fmt builder on a finished capture".to_string()))?;
+        if !state.result_ok {
+            return Ok(());
+        }
+        let capture = self.capture_of(state.formatter)?;
+        let options = capture.options();
+        let indent = capture.indent;
+        let mut out = String::new();
+        match state.kind {
+            FmtBuilderKind::Struct => {
+                if state.has_fields {
+                    if !options.alternate() {
+                        out.push_str(", ");
+                    }
+                } else {
+                    out.push_str(state.name.as_deref().unwrap_or(""));
+                    out.push_str(if options.alternate() { " {\n" } else { " { " });
+                }
+                if options.alternate() {
+                    out.push_str(&" ".repeat(indent + 4));
+                }
+            }
+            kind => {
+                let (open, _) = builder_brackets(kind, state.name.as_deref());
+                if state.has_fields {
+                    if !options.alternate() {
+                        out.push_str(", ");
+                    }
+                } else {
+                    out.push_str(&open);
+                    if options.alternate() {
+                        out.push('\n');
+                    }
+                }
+                if options.alternate() {
+                    out.push_str(&" ".repeat(indent + 4));
+                }
+            }
+        }
+        out.push_str(text);
+        if options.alternate() {
+            out.push_str(",\n");
+        }
+        self.formatter_push(state.formatter, &out);
+        self.with_fmt_builder(builder, |st| st.has_fields = true);
+        Ok(())
+    }
+
+    /// The entry text's formatting shared by the builder
+    /// entry/field builtins: the value's own `Debug` under
+    /// the builder formatter's options.
+    fn builder_entry_text(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        builder: u64,
+        entry: &Value,
+    ) -> InterpResult<String> {
+        let state = self
+            .fmt_builder_snapshot(builder)
+            .ok_or_else(|| unsupported("a fmt builder on a finished capture".to_string()))?;
+        let capture = self.capture_of(state.formatter)?;
+        let options = capture.options();
+        let field_indent = if options.alternate() {
+            capture.indent + 4
+        } else {
+            capture.indent
+        };
+        self.format_value(frames, entry, FmtTrait::Debug, "", &options, field_indent)
+    }
+
+    /// `DebugList::entry` / `DebugSet::entry` /
+    /// `DebugTuple::field`: append one entry.
+    fn builder_entry(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        builder: u64,
+        entry: &Value,
+    ) -> InterpResult<()> {
+        let text = self.builder_entry_text(frames, builder, entry)?;
+        self.builder_write_entry(builder, &text)
+    }
+
+    /// `DebugTuple::field` is the tuple builder's `entry`.
+    fn builder_tuple_field(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        builder: u64,
+        entry: &Value,
+    ) -> InterpResult<()> {
+        self.builder_entry(frames, builder, entry)
+    }
+
+    /// `DebugMap::entry`: append one `key: value` entry.
+    fn builder_map_entry(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        builder: u64,
+        key: &Value,
+        value: &Value,
+    ) -> InterpResult<()> {
+        let key_text = self.builder_entry_text(frames, builder, key)?;
+        let value_text = self.builder_entry_text(frames, builder, value)?;
+        self.builder_write_entry(builder, &format!("{key_text}: {value_text}"))
+    }
+
+    /// `DebugStruct::field`: append one `name: value` field.
+    fn builder_struct_field(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        builder: u64,
+        field_name: &str,
+        value: &Value,
+    ) -> InterpResult<()> {
+        // The field's type tag comes from the recorded shape
+        // of the type whose body is running, matched by field
+        // name, when the builder is for that type (the usual
+        // `debug_struct` in a handwritten impl).
+        let tag = self
+            .fmt_builder_snapshot(builder)
+            .and_then(|state| {
+                let variant_name = state.name.clone()?;
+                self.capture_field_tags(state.formatter, &variant_name)
+                    .and_then(|tags| {
+                        let shape = self
+                            .program()
+                            .adt_debug_shapes
+                            .get(pointee_tag(
+                                &self.capture_of(state.formatter).ok()?.self_tag,
+                            ))?
+                            .clone();
+                        let variant = shape
+                            .variants
+                            .iter()
+                            .find(|v| v.name == variant_name)?;
+                        let idx = variant
+                            .fields
+                            .iter()
+                            .position(|f| f.name.as_deref() == Some(field_name))?;
+                        tags.get(idx).cloned()
+                    })
+            })
+            .unwrap_or_default();
+        let state = self
+            .fmt_builder_snapshot(builder)
+            .ok_or_else(|| unsupported("a fmt builder on a finished capture".to_string()))?;
+        let capture = self.capture_of(state.formatter)?;
+        let options = capture.options();
+        let field_indent = if options.alternate() {
+            capture.indent + 4
+        } else {
+            capture.indent
+        };
+        let value_text = self.format_finisher_field(
+            frames,
+            value,
+            &tag,
+            &options,
+            field_indent,
+        )?;
+        self.builder_write_entry(builder, &format!("{field_name}: {value_text}"))
+    }
+
+    /// A builder's `finish`: write the closing delimiter (or
+    /// the whole empty form) to the builder's formatter.
+    fn builder_finish(&mut self, builder: u64, exhaustive: bool) -> InterpResult<()> {
+        let state = self
+            .fmt_builder_snapshot(builder)
+            .ok_or_else(|| unsupported("a fmt builder on a finished capture".to_string()))?;
+        let capture = self.capture_of(state.formatter)?;
+        let options = capture.options();
+        let indent = capture.indent;
+        let name = state.name.as_deref().unwrap_or("");
+        let text = if !state.has_fields {
+            match state.kind {
+                FmtBuilderKind::List => "[]".to_string(),
+                FmtBuilderKind::Set | FmtBuilderKind::Map => "{}".to_string(),
+                FmtBuilderKind::Struct => {
+                    if exhaustive {
+                        name.to_string()
+                    } else {
+                        format!("{name} {{ .. }}")
+                    }
+                }
+                FmtBuilderKind::Tuple => format!("{name}()"),
+            }
+        } else if options.alternate() {
+            let mut out = String::new();
+            if state.kind == FmtBuilderKind::Struct && !exhaustive {
+                out.push_str(&" ".repeat(indent + 4));
+                out.push_str("..,\n");
+            }
+            out.push_str(&" ".repeat(indent));
+            out.push(match state.kind {
+                FmtBuilderKind::List => ']',
+                FmtBuilderKind::Set | FmtBuilderKind::Map | FmtBuilderKind::Struct => '}',
+                FmtBuilderKind::Tuple => ')',
+            });
+            out
+        } else {
+            match state.kind {
+                FmtBuilderKind::List => "]".to_string(),
+                FmtBuilderKind::Set | FmtBuilderKind::Map => "}".to_string(),
+                FmtBuilderKind::Struct => {
+                    if exhaustive {
+                        " }".to_string()
+                    } else {
+                        ", .. }".to_string()
+                    }
+                }
+                FmtBuilderKind::Tuple => ")".to_string(),
+            }
+        };
+        self.formatter_push(state.formatter, &text);
+        Ok(())
     }
 
     /// Format one argument value through a formatting trait.
     /// `indent` is the current pretty-print (`{:#?}`) indent level.
     fn format_value(
-        &self,
-        frames: &[Frame],
+        &mut self,
+        frames: &mut Vec<Frame>,
         value: &Value,
         trait_: FmtTrait,
         ty: &str,
@@ -16523,6 +17521,15 @@ impl<'a> Interpreter<'a> {
                 return self.format_value(frames, &pointee, trait_, concrete, options, indent);
             }
         }
+        // A guest `fmt` implementation body, when the program
+        // collected one for this type, is the faithful
+        // formatting: run it against a captured `Formatter`
+        // instead of reconstructing the output structurally.
+        if let Some(text) =
+            self.format_with_body(frames, value, trait_, ty, options, indent)?
+        {
+            return Ok(text);
+        }
         match trait_ {
             FmtTrait::DebugNoop => Ok(String::new()),
             FmtTrait::Pointer => Err(unsupported(
@@ -16540,8 +17547,8 @@ impl<'a> Interpreter<'a> {
     }
 
     fn format_display(
-        &self,
-        frames: &[Frame],
+        &mut self,
+        frames: &mut Vec<Frame>,
         value: &Value,
         ty: &str,
         options: &FmtOptions,
@@ -16563,7 +17570,7 @@ impl<'a> Interpreter<'a> {
             )),
             Value::Str(s) => Ok(pad_str(s, options)),
             Value::FmtArguments(inner) => {
-                let text = self.format_arguments(frames, inner)?;
+                let text = self.format_arguments(frames, inner, 0)?;
                 Ok(pad_width(&text, options))
             }
             Value::Tuple(_) => Err(unsupported(
@@ -16581,8 +17588,8 @@ impl<'a> Interpreter<'a> {
     }
 
     fn format_debug(
-        &self,
-        frames: &[Frame],
+        &mut self,
+        frames: &mut Vec<Frame>,
         value: &Value,
         ty: &str,
         options: &FmtOptions,
@@ -16640,7 +17647,7 @@ impl<'a> Interpreter<'a> {
                 self.format_debug_seq_items(frames, items, options, indent, '(', ')', &tys)
             }
             Value::FmtArguments(inner) => {
-                let text = self.format_arguments(frames, inner)?;
+                let text = self.format_arguments(frames, inner, indent)?;
                 Ok(pad_width(&text, options))
             }
             Value::Enum { variant, fields } => {
@@ -16724,8 +17731,8 @@ impl<'a> Interpreter<'a> {
     /// Format one operand of an `ops::Range`-family value with
     /// the field's recorded type tag.
     fn format_range_operand(
-        &self,
-        frames: &[Frame],
+        &mut self,
+        frames: &mut Vec<Frame>,
         variant_shape: &sparagmos_mir::AdtDebugVariant,
         index: usize,
         fields: &[Value],
@@ -16759,8 +17766,8 @@ impl<'a> Interpreter<'a> {
     /// forwards to the pointee). An ADT with no recorded shape
     /// stays an explicit unsupported error.
     fn format_debug_adt(
-        &self,
-        frames: &[Frame],
+        &mut self,
+        frames: &mut Vec<Frame>,
         variant: u32,
         fields: &[Value],
         ty: &str,
@@ -16789,7 +17796,11 @@ impl<'a> Interpreter<'a> {
             }
             _ => {}
         }
-        let Some(shape) = self.program().adt_debug_shapes.get(tag) else {
+        // The shape is cloned out of the program: formatting
+        // the fields runs guest `fmt` bodies, which needs
+        // `&mut self`, so no program borrow may live across
+        // the field formatting below.
+        let Some(shape) = self.program().adt_debug_shapes.get(tag).cloned() else {
             return Err(unsupported(
                 "Debug formatting for an ADT value (no derived-Debug shape was recorded for its type)",
             ));
@@ -17040,8 +18051,8 @@ impl<'a> Interpreter<'a> {
     /// Debug formatting of a tuple or slice value: `(a, b)` / `[a, b]`,
     /// or the multi-line form under `{:#?}`.
     fn format_debug_seq(
-        &self,
-        frames: &[Frame],
+        &mut self,
+        frames: &mut Vec<Frame>,
         value: &Value,
         options: &FmtOptions,
         indent: usize,
@@ -17086,8 +18097,8 @@ impl<'a> Interpreter<'a> {
     }
 
     fn format_debug_seq_items(
-        &self,
-        frames: &[Frame],
+        &mut self,
+        frames: &mut Vec<Frame>,
         items: &[Value],
         options: &FmtOptions,
         indent: usize,
@@ -17215,6 +18226,187 @@ fn pad_str(s: &str, options: &FmtOptions) -> String {
 }
 
 /// Width padding only (no precision truncation).
+/// Whether a rendered type tag names a guest-crate type —
+/// the only types whose `fmt` implementation bodies the fmt
+/// engine runs. Crate-qualified, and not a core/std/alloc
+/// path (those impls are core's; the structural engine
+/// models them).
+fn guest_fmt_tag(tag: &str) -> bool {
+    let head = tag.trim().trim_start_matches('&').trim_start();
+    (head.starts_with(|c: char| c.is_alphabetic() || c == '_'))
+        && head.contains("::")
+        && !head.starts_with("core::")
+        && !head.starts_with("std::")
+        && !head.starts_with("alloc::")
+}
+
+/// Split a rendered type at its top-level commas (commas
+/// not nested inside `<>`, `()` or `[]`).
+fn split_top_commas(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+/// Whether a rendered generic argument is a const literal
+/// (an integer, a boolean or a char) rather than a type.
+fn is_const_literal(arg: &str) -> bool {
+    let a = arg.trim();
+    !a.is_empty()
+        && (a == "true"
+            || a == "false"
+            || a.chars().all(|c| c.is_ascii_digit())
+            || (a.len() > 1
+                && a.starts_with('-')
+                && a[1..].chars().all(|c| c.is_ascii_digit()))
+            || (a.starts_with('\'') && a.ends_with('\'') && a.chars().count() <= 4))
+}
+
+/// Normalize a rendered type for instance-name matching:
+/// drop const generic arguments (see [`is_const_literal`])
+/// at every nesting level and remove whitespace, so the
+/// converter's tag rendering (type arguments only) and the
+/// compiler's instance name (all arguments) compare equal
+/// for the same type.
+fn normalize_fmt_tag(tag: &str) -> String {
+    fn norm(s: &str, out: &mut String) {
+        let bytes = s.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] == b'<' {
+                let mut depth = 0i32;
+                let mut j = i;
+                while j < bytes.len() {
+                    match bytes[j] {
+                        b'<' => depth += 1,
+                        b'>' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                if j >= bytes.len() {
+                    out.push_str(&s[i..]);
+                    return;
+                }
+                let inner = &s[i + 1..j];
+                let kept: Vec<String> = split_top_commas(inner)
+                    .iter()
+                    .filter(|a| !is_const_literal(a))
+                    .map(|a| {
+                        let mut t = String::new();
+                        norm(a, &mut t);
+                        t
+                    })
+                    .collect();
+                if !kept.is_empty() {
+                    out.push('<');
+                    out.push_str(&kept.join(","));
+                    out.push('>');
+                }
+                i = j + 1;
+            } else {
+                let ch_len = s[i..].chars().next().map_or(1, |c| c.len_utf8());
+                out.push_str(&s[i..i + ch_len]);
+                i += ch_len;
+            }
+        }
+    }
+    let mut out = String::new();
+    norm(tag, &mut out);
+    out.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// The `(open, close)` delimiters of a builder kind; the
+/// struct kind is rendered by its own entry/finish arms and
+/// does not use this.
+fn builder_brackets(kind: FmtBuilderKind, name: Option<&str>) -> (String, String) {
+    match kind {
+        FmtBuilderKind::List => ("[".to_string(), "]".to_string()),
+        FmtBuilderKind::Set | FmtBuilderKind::Map => ("{".to_string(), "}".to_string()),
+        FmtBuilderKind::Tuple => (format!("{}(", name.unwrap_or("")), ")".to_string()),
+        FmtBuilderKind::Struct => (format!("{} {{", name.unwrap_or("")), "}".to_string()),
+    }
+}
+
+/// Render a derived-`Debug` struct value the way core's
+/// `debug_struct_fieldN_finish` does: `Name { a: 1, b: 2 }`,
+/// or the multi-line form under `{:#}` with the fields at
+/// `indent + 4` and the closing brace at `indent`.
+fn render_debug_struct(
+    name: &str,
+    fields: &[(String, String)],
+    options: &FmtOptions,
+    indent: usize,
+) -> String {
+    if options.alternate() {
+        let pad = " ".repeat(indent + 4);
+        let mut out = String::new();
+        out.push_str(name);
+        out.push_str(" {\n");
+        for (field_name, text) in fields {
+            out.push_str(&pad);
+            out.push_str(field_name);
+            out.push_str(": ");
+            out.push_str(text);
+            out.push_str(",\n");
+        }
+        out.push_str(&" ".repeat(indent));
+        out.push('}');
+        out
+    } else {
+        let parts: Vec<String> = fields
+            .iter()
+            .map(|(field_name, text)| format!("{field_name}: {text}"))
+            .collect();
+        format!("{name} {{ {} }}", parts.join(", "))
+    }
+}
+
+/// Render a derived-`Debug` tuple-struct value the way
+/// core's `debug_tuple_fieldN_finish` does: `Name(1, 2)`, or
+/// the multi-line form under `{:#}`.
+fn render_debug_tuple(
+    name: &str,
+    fields: &[String],
+    options: &FmtOptions,
+    indent: usize,
+) -> String {
+    if options.alternate() {
+        let pad = " ".repeat(indent + 4);
+        let mut out = String::new();
+        out.push_str(name);
+        out.push_str("(\n");
+        for text in fields {
+            out.push_str(&pad);
+            out.push_str(text);
+            out.push_str(",\n");
+        }
+        out.push_str(&" ".repeat(indent));
+        out.push(')');
+        out
+    } else {
+        format!("{name}({})", fields.join(", "))
+    }
+}
+
 fn pad_width(s: &str, options: &FmtOptions) -> String {
     let width = options.width().unwrap_or(0) as usize;
     let len = s.chars().count();

@@ -212,6 +212,53 @@ pub(crate) struct ChannelState {
 /// deterministically and the outcome is either the `io::Error`
 /// the resolution failure produces natively or a named
 /// unsupported error (see `process_spawn_error` in `builtins.rs`).
+/// One captured `core::fmt::Formatter` (see [`Value::Formatter`]):
+/// the text a guest `fmt` implementation body has written through
+/// the `Formatter` builtins, and the options of the placeholder
+/// that dispatched to the body — the flag word, width and
+/// precision mirror `core::fmt::FormattingOptions`, and `indent`
+/// is the pretty-print (`{:#}`) indentation level the value sits
+/// at, which the builder and finisher builtins align to.
+#[derive(Clone, Debug)]
+pub(crate) struct FmtCapture {
+    pub buffer: String,
+    pub flags: u32,
+    pub width: u16,
+    pub precision: u16,
+    pub indent: usize,
+    /// The rendered type whose `fmt` body this capture serves
+    /// (the pointee tag the dispatch was invoked with). The
+    /// finisher and builder builtins read the type's recorded
+    /// Debug shape for the field type tags their `&dyn Debug`
+    /// arguments have already lost.
+    pub self_tag: String,
+}
+
+/// Which of core's `fmt` builders a [`FmtBuilderState`] models.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FmtBuilderKind {
+    List,
+    Set,
+    Map,
+    Struct,
+    Tuple,
+}
+
+/// One `core::fmt` builder under construction (see
+/// [`Value::FmtBuilder`]): the formatter it writes into, its
+/// struct/tuple name, and the two pieces of progress core's
+/// builders track — whether any field was written, and whether
+/// the writes so far succeeded (a failed write short-circuits the
+/// rest, as core's `result` field does).
+#[derive(Clone, Debug)]
+pub(crate) struct FmtBuilderState {
+    pub formatter: u64,
+    pub kind: FmtBuilderKind,
+    pub name: Option<String>,
+    pub has_fields: bool,
+    pub result_ok: bool,
+}
+
 #[derive(Clone)]
 pub(crate) struct CommandState {
     /// The program path as passed to `Command::new` (raw bytes:
@@ -495,6 +542,17 @@ pub struct Interpreter<'a> {
     commands: std::cell::RefCell<HashMap<u64, CommandState>>,
     /// The id the next created command gets.
     next_command: std::cell::RefCell<u64>,
+    /// Captured `core::fmt::Formatter` states (see
+    /// [`FmtCapture`]), keyed by the id inside the formatter
+    /// handle values.
+    formatters: std::cell::RefCell<HashMap<u64, FmtCapture>>,
+    /// The id the next captured formatter gets.
+    next_formatter: std::cell::RefCell<u64>,
+    /// `core::fmt` builder states (see [`FmtBuilderState`]),
+    /// keyed by the id inside the builder handle values.
+    fmt_builders: std::cell::RefCell<HashMap<u64, FmtBuilderState>>,
+    /// The id the next created builder gets.
+    next_fmt_builder: std::cell::RefCell<u64>,
     /// The program-level heap allocation store: one storage per
     /// live `Box` allocation, keyed by the allocation id the box
     /// value carries as its single field (see
@@ -726,6 +784,10 @@ impl<'a> Interpreter<'a> {
             next_channel: std::cell::RefCell::new(1),
             commands: std::cell::RefCell::new(HashMap::new()),
             next_command: std::cell::RefCell::new(1),
+            formatters: std::cell::RefCell::new(HashMap::new()),
+            next_formatter: std::cell::RefCell::new(1),
+            fmt_builders: std::cell::RefCell::new(HashMap::new()),
+            next_fmt_builder: std::cell::RefCell::new(1),
             allocs: std::cell::RefCell::new(HashMap::new()),
             elem_blocks: std::cell::RefCell::new(std::collections::HashSet::new()),
             next_alloc: std::cell::Cell::new(1),
@@ -4427,6 +4489,67 @@ impl<'a> Interpreter<'a> {
         id
     }
 
+    /// Register a captured formatter state and return the id
+    /// its handle value carries.
+    pub(crate) fn new_formatter(&self, state: FmtCapture) -> u64 {
+        let mut next = self.next_formatter.borrow_mut();
+        let id = *next;
+        *next += 1;
+        drop(next);
+        self.formatters.borrow_mut().insert(id, state);
+        id
+    }
+
+    /// Run `f` against the captured formatter with the given
+    /// id; `None` if the id names no live formatter.
+    pub(crate) fn with_formatter<R>(
+        &self,
+        id: u64,
+        f: impl FnOnce(&mut FmtCapture) -> R,
+    ) -> Option<R> {
+        let mut formatters = self.formatters.borrow_mut();
+        formatters.get_mut(&id).map(f)
+    }
+
+    /// A snapshot of the captured formatter with the given id.
+    pub(crate) fn formatter_snapshot(&self, id: u64) -> Option<FmtCapture> {
+        self.formatters.borrow().get(&id).cloned()
+    }
+
+    /// Remove the captured formatter with the given id and
+    /// return its final state (the dispatch that created it
+    /// reads the captured text out this way).
+    pub(crate) fn take_formatter(&self, id: u64) -> Option<FmtCapture> {
+        self.formatters.borrow_mut().remove(&id)
+    }
+
+    /// Register a builder state and return the id its handle
+    /// value carries.
+    pub(crate) fn new_fmt_builder(&self, state: FmtBuilderState) -> u64 {
+        let mut next = self.next_fmt_builder.borrow_mut();
+        let id = *next;
+        *next += 1;
+        drop(next);
+        self.fmt_builders.borrow_mut().insert(id, state);
+        id
+    }
+
+    /// Run `f` against the builder with the given id; `None`
+    /// if the id names no live builder.
+    pub(crate) fn with_fmt_builder<R>(
+        &self,
+        id: u64,
+        f: impl FnOnce(&mut FmtBuilderState) -> R,
+    ) -> Option<R> {
+        let mut builders = self.fmt_builders.borrow_mut();
+        builders.get_mut(&id).map(f)
+    }
+
+    /// A snapshot of the builder with the given id.
+    pub(crate) fn fmt_builder_snapshot(&self, id: u64) -> Option<FmtBuilderState> {
+        self.fmt_builders.borrow().get(&id).cloned()
+    }
+
     /// Run `f` against the state of the command with the given
     /// id; `None` if the id names no live command.
     pub(crate) fn with_command<R>(
@@ -7571,7 +7694,13 @@ impl<'a> Interpreter<'a> {
             | (Some(Ty::Adt(_)), Value::DynRef { .. })
             | (Some(Ty::Adt(_)), Value::FmtArg { .. })
             | (Some(Ty::Adt(_)), Value::FmtCount(_))
-            | (Some(Ty::Adt(_)), Value::FmtArguments(_)) => Ok(value),
+            | (Some(Ty::Adt(_)), Value::FmtArguments(_))
+            // The captured-`Formatter` and builder handles stand
+            // for `core::fmt` ADT values (`Formatter` itself when
+            // a body moves it, and the `DebugList` family the
+            // builder constructors return by value).
+            | (Some(Ty::Adt(_)), Value::Formatter(_))
+            | (Some(Ty::Adt(_)), Value::FmtBuilder(_)) => Ok(value),
             // Reference locals hold resolved references, fat pointers,
             // and — for `&str` and byte-array references — the string
             // or byte data itself (a string constant *is* its value;
@@ -11575,7 +11704,9 @@ fn drop_dyn_value(value: &Value) -> InterpResult<()> {
         | Value::FnPtr(_)
         | Value::FmtArg { .. }
         | Value::FmtCount(_)
-        | Value::FmtArguments(_) => Ok(()),
+        | Value::FmtArguments(_)
+        | Value::Formatter(_)
+        | Value::FmtBuilder(_) => Ok(()),
         Value::DynRef { base, .. } => drop_dyn_value(base),
         Value::Tuple(items) => items.iter().try_for_each(drop_dyn_value),
         Value::Closure { env, .. } => env.iter().try_for_each(drop_dyn_value),

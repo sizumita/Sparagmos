@@ -2310,12 +2310,48 @@ impl<'a> Converter<'a> {
     }
 
     /// The field-entry depth of a pointer cast from `source` to
-    /// `target` that crosses transparent single-field wrappers
-    /// (`UnsafeCell<T>` / `MaybeUninit<T>`) to reach the wrapped
-    /// type itself, or `None` when the cast is not of that shape.
+    /// `target` that crosses single-field wrappers to reach the
+    /// wrapped type itself, or `None` when the cast is not of
+    /// that shape. The wrappers are the transparent cell types
+    /// (`UnsafeCell<T>` / `MaybeUninit<T>`, recognized by name
+    /// because their field convention is definitional) and any
+    /// other struct with exactly one field whose type is the
+    /// next layer (the `as_array` newtype idiom).
     /// Decided from the cast's two types, both known at conversion
     /// time: the source pointee is peeled wrapper by wrapper until
     /// it is exactly the target pointee.
+    /// Whether two types are the same for cast classification:
+    /// structural equality, except that an array length that is
+    /// a generic parameter (or otherwise unevaluated) on either
+    /// side matches any length -- the recorded field type of a
+    /// generic definition carries the parameter, the cast's
+    /// target in an instantiated caller carries the value, and
+    /// the field-entry decision does not depend on the length.
+    fn cast_ty_matches(a: &mir::Ty, b: &mir::Ty) -> bool {
+        use mir::Ty as T;
+        match (a, b) {
+            (T::Array(ea, la), T::Array(eb, lb)) => {
+                Self::cast_ty_matches(ea, eb)
+                    && (la == lb
+                        || matches!(la, mir::ArrayLen::Param(_) | mir::ArrayLen::Unevaluated(_))
+                        || matches!(lb, mir::ArrayLen::Param(_) | mir::ArrayLen::Unevaluated(_)))
+            }
+            (T::Adt(da, aa), T::Adt(db, ab)) => {
+                da == db
+                    && aa.len() == ab.len()
+                    && aa.iter().zip(ab.iter()).all(|(x, y)| Self::cast_ty_matches(x, y))
+            }
+            (T::Tuple(ta), T::Tuple(tb)) => {
+                ta.len() == tb.len()
+                    && ta.iter().zip(tb.iter()).all(|(x, y)| Self::cast_ty_matches(x, y))
+            }
+            (T::Ref(_, ta, ma), T::Ref(_, tb, mb)) => ma == mb && Self::cast_ty_matches(ta, tb),
+            (T::RawPtr(ta, ma), T::RawPtr(tb, mb)) => ma == mb && Self::cast_ty_matches(ta, tb),
+            (T::Slice(ea), T::Slice(eb)) => Self::cast_ty_matches(ea, eb),
+            _ => a == b,
+        }
+    }
+
     fn cast_wrapper_entry_depth(
         &self,
         source: &mir::Ty,
@@ -2327,11 +2363,11 @@ impl<'a> Converter<'a> {
                 _ => None,
             }
         }
-        let mut current = pointee(source)?;
+        let mut current = pointee(source)?.clone();
         let target = pointee(target)?;
         let mut depth = 0u32;
         loop {
-            let mir::Ty::Adt(def, args) = current else {
+            let mir::Ty::Adt(def, args) = &current else {
                 return None;
             };
             // Both wrapper kinds are one-field aggregates in the
@@ -2350,14 +2386,31 @@ impl<'a> Converter<'a> {
                     | "std::mem::MaybeUninit"
                     | "core::mem::MaybeUninit"
             );
-            if !is_wrapper || args.len() != 1 {
+            let next = if is_wrapper && args.len() == 1 {
+                args[0].clone()
+            } else if let Some(field) = self.single_field_ty(def, args)
+                .filter(|field| matches!(field, mir::Ty::Array(..)))
+            {
+                // A single-field struct whose only field is an
+                // array is entered the same way when the cast's
+                // target is exactly the field's type: the
+                // `as_array` idiom (`&*p.cast::<[T; N]>()` on a
+                // `Simd([T; N])` or an array newtype) denotes the
+                // field, not the aggregate. The restriction to
+                // array fields is load-bearing: scalar-field
+                // wrappers include representation wrappers over
+                // values this model stores bare (the atomics'
+                // alignment wrappers), where a field projection
+                // would address storage that is not there.
+                field
+            } else {
                 return None;
-            }
+            };
             depth += 1;
-            if args[0] == *target {
+            if Self::cast_ty_matches(&next, target) {
                 return Some(depth);
             }
-            current = &args[0];
+            current = next;
         }
     }
 
