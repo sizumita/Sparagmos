@@ -4956,17 +4956,30 @@ impl<'a> Interpreter<'a> {
                     return self.index_range(frames, name, &vals[0], &vals[1], idx_tag);
                 }
                 let idx = expect_index(&vals[1], name)?;
+                // A receiver backed by a live place yields a live
+                // element reference, exactly as `IndexMut` does:
+                // interior-mutability writes through the shared
+                // reference (`v[i].set(..)` on a `Vec<Cell<_>>`)
+                // must land in the container's storage, which a
+                // snapshot of the element cannot do.
+                let fat_len = match &vals[0] {
+                    Value::FatRef { len, .. } => Some(*len),
+                    _ => None,
+                };
+                if let Some(r) = self.index_place_ref(frames, &vals[0], idx, fat_len)? {
+                    return Ok(r);
+                }
                 let (elems, len) = self.slice_elements_ref(frames, &vals[0])?;
                 if idx as u128 >= len {
                     return Err(InterpError::panic(format!(
                         "index out of bounds: the len is {len} but the index is {idx}"
                     )));
                 }
-                // A shared element reference: reads resolve against
-                // the element value itself (the model has no separate
-                // heap place for it), as for constant aggregates.
-                // Only the one element is cloned out of the borrowed
-                // element storage.
+                // A receiver with no live place behind it (a
+                // constant aggregate, a detached value): reads
+                // resolve against the element value itself, as for
+                // constant aggregates. Only the one element is
+                // cloned out of the borrowed element storage.
                 let elem = elems.at(idx);
                 Ok(Value::Ref(RefTarget::value(elem)))
             }
@@ -8596,6 +8609,73 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
     /// resolved value wherever it is already materialised, so a
     /// consumer that needs one element (or a comparison that stops
     /// early) does not pay for a snapshot of all of them.
+    /// The live element reference for an index into a
+    /// place-backed receiver (the shared-`Index` counterpart of
+    /// the resolution `IndexMut::index_mut` performs): the
+    /// receiver's own place with an `Index` step appended, so
+    /// reads and interior-mutability writes reach the container's
+    /// storage. `Ok(None)` when the receiver is not backed by a
+    /// live place holding an indexable aggregate — the caller
+    /// falls back to a snapshot of the element.
+    fn index_place_ref(
+        &self,
+        frames: &[Frame],
+        receiver: &Value,
+        idx: usize,
+        fat_len: Option<u128>,
+    ) -> InterpResult<Option<Value>> {
+        if !matches!(receiver, Value::Ref(_) | Value::FatRef { .. }) {
+            return Ok(None);
+        }
+        let target = self.deref_value(frames, receiver)?;
+        if matches!(target, Resolved::Value(_)) {
+            return Ok(None);
+        }
+        let base = self.read_resolved(frames, &target)?;
+        let len = match fat_len {
+            Some(len) => len,
+            None => match base.len() {
+                Some(len) => len,
+                None => return Ok(None),
+            },
+        };
+        if idx as u128 >= len {
+            return Err(InterpError::panic(format!(
+                "index out of bounds: the len is {len} but the index is {idx}"
+            )));
+        }
+        if !matches!(base, Value::Tuple(_) | Value::Enum { .. }) {
+            return Ok(None);
+        }
+        let refr = match target {
+            Resolved::Place {
+                frame_pos,
+                local,
+                mut projection,
+            } => {
+                projection.push(RefProj::Index(idx));
+                Value::Ref(RefTarget::Place {
+                    frame: frames[frame_pos].id,
+                    local,
+                    projection,
+                })
+            }
+            Resolved::Static {
+                name,
+                mut projection,
+            } => {
+                projection.push(RefProj::Index(idx));
+                Value::Ref(RefTarget::Static { name, projection })
+            }
+            Resolved::Alloc { id, mut projection } => {
+                projection.push(RefProj::Index(idx));
+                Value::Ref(RefTarget::Alloc { id, projection })
+            }
+            Resolved::Value(_) => unreachable!("returned above"),
+        };
+        Ok(Some(refr))
+    }
+
     fn slice_elements_ref<'x>(
         &self,
         frames: &'x [Frame],
