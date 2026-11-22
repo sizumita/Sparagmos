@@ -2449,8 +2449,30 @@ impl<'a> Converter<'a> {
                 _ => None,
             }
         }
-        let mut current = pointee(source)?.clone();
+        let current = pointee(source)?.clone();
         let target = pointee(target)?;
+        // A cast between slice pointers whose element types are
+        // related by wrapper entry (`*mut [MaybeUninit<T>]` to
+        // `*mut [T]`, the cast the array clone guard's drop
+        // performs on the erased buffer): the fat pointer's base
+        // denotes the first element's wrapper, so the entry depth
+        // of the element types is a field-0 entry on the base.
+        if let (mir::Ty::Slice(src_elem), mir::Ty::Slice(tgt_elem)) = (&current, target) {
+            return self.wrapper_peel_depth((**src_elem).clone(), tgt_elem);
+        }
+        self.wrapper_peel_depth(current, target)
+    }
+
+    /// Peel wrapper layers (`UnsafeCell` / `MaybeUninit`, and
+    /// single-field array structs) off `current` until it matches
+    /// `target`, returning the number of field-0 entries the peel
+    /// denotes, or `None` when the peel does not land exactly on
+    /// `target`.
+    fn wrapper_peel_depth(
+        &self,
+        mut current: mir::Ty,
+        target: &mir::Ty,
+    ) -> Option<u32> {
         let mut depth = 0u32;
         loop {
             let mir::Ty::Adt(def, args) = &current else {
