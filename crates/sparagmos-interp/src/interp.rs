@@ -1495,14 +1495,14 @@ impl<'a> Interpreter<'a> {
             .expect("non-entry frame has a destination");
         let resume = frame.return_block;
         let caller_name = frames.last().expect("caller").func.clone();
-        let caller_body = self.program.get(&caller_name).cloned().ok_or_else(|| {
+        let caller_body = self.program.get(&caller_name).ok_or_else(|| {
             InterpError::UnknownFunction {
                 name: caller_name.clone(),
             }
         })?;
-        self.write_place(frames, &caller_body, &dest, value)?;
+        self.write_place(frames, caller_body, &dest, value)?;
         match resume {
-            Some(bb) => Self::jump(frames, &caller_body, bb)?,
+            Some(bb) => Self::jump(frames, caller_body, bb)?,
             None => {
                 return Err(InterpError::MissingContinuation { func: caller_name });
             }
@@ -1720,7 +1720,7 @@ impl<'a> Interpreter<'a> {
                 Err(e) => return Err(e),
             },
             None => match self.program.get(func) {
-                Some(c) => c.clone(),
+                Some(c) => c,
                 None => return Err(self.missing_body_error(func)),
             },
         };
@@ -1821,7 +1821,7 @@ impl<'a> Interpreter<'a> {
                 Err(e) => return Err(e),
             },
             None => match self.program.get(func) {
-                Some(b) => b.clone(),
+                Some(b) => b,
                 None => return Err(self.missing_body_error(func)),
             },
         };
