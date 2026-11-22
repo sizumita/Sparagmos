@@ -1147,12 +1147,22 @@ fn collect_closure_instances(
                 // The expanded-size cap, as in the function
                 // demand pass: a closure demanded with
                 // size-increasing arguments is the same
-                // recursion-limit situation.
+                // recursion-limit situation. A foreign closure
+                // is the exception: its arguments come from a
+                // body the compiler already monomorphized, so
+                // the instance is finite by construction (the
+                // foreign demand graph of a deeply nested but
+                // legitimate program measures far past the cap;
+                // see the reachability collection, which exempts
+                // foreign demand for the same reason). Tripping
+                // the cap there fails only that demand, recorded
+                // under the same reason; it must not fail the
+                // whole compilation as a recursion-limit error.
                 if !sparagmos_driver::reach::generic_args_within_expanded_size(
                     &args,
                     sparagmos_driver::reach::MAX_INSTANTIATION_EXPANDED_SIZE,
                 ) {
-                    if recursion_limit.is_none() {
+                    if !foreign && recursion_limit.is_none() {
                         *recursion_limit = Some(format!(
                             "reached the recursion limit while instantiating `{}` (instantiation size limit)",
                             base_name
@@ -1381,12 +1391,17 @@ fn collect_const_closure_instances(
                 // The expanded-size cap, as in the closure
                 // demand pass: a closure demanded with
                 // size-increasing arguments is the same
-                // recursion-limit situation.
+                // recursion-limit situation. As there, a
+                // foreign closure's oversized arguments fail
+                // only its own demand: the instance comes from
+                // a constant the compiler already monomorphized,
+                // so its size is finite by construction and is
+                // not a recursion-limit violation.
                 if !sparagmos_driver::reach::generic_args_within_expanded_size(
                     args,
                     sparagmos_driver::reach::MAX_INSTANTIATION_EXPANDED_SIZE,
                 ) {
-                    if recursion_limit.is_none() {
+                    if !foreign && recursion_limit.is_none() {
                         *recursion_limit = Some(format!(
                             "reached the recursion limit while instantiating `{}` (instantiation size limit)",
                             base_name

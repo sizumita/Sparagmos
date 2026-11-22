@@ -153,6 +153,15 @@ pub fn generic_args_within_expanded_size(args: &GenericArgs, limit: usize) -> bo
             }
         }
         fn ty(&mut self, ty: &Ty) -> bool {
+            if let Some(size) = EXPANDED_SIZE_CACHE.with(|cache| cache.borrow().get(ty).copied())
+            {
+                if size > self.budget {
+                    return false;
+                }
+                self.budget -= size;
+                return true;
+            }
+            let budget_before = self.budget;
             if !self.node() {
                 return false;
             }
@@ -160,9 +169,12 @@ pub fn generic_args_within_expanded_size(args: &GenericArgs, limit: usize) -> bo
             // cannot be asked its kind (see `guarded_ty_kind`);
             // it counts as one node, like any other leaf.
             let Some(kind) = guarded_ty_kind(ty) else {
+                EXPANDED_SIZE_CACHE.with(|cache| {
+                    cache.borrow_mut().insert(*ty, 1);
+                });
                 return true;
             };
-            match kind {
+            let within = match kind {
                 TyKind::RigidTy(RigidTy::Tuple(elems)) => {
                     elems.iter().all(|elem| self.ty(elem))
                 }
@@ -193,10 +205,47 @@ pub fn generic_args_within_expanded_size(args: &GenericArgs, limit: usize) -> bo
                 }),
                 TyKind::Alias(_, alias) => self.args(&alias.args),
                 _ => true,
+            };
+            if within {
+                let size = budget_before - self.budget;
+                EXPANDED_SIZE_CACHE.with(|cache| {
+                    cache.borrow_mut().insert(*ty, size);
+                });
             }
+            within
         }
     }
     Walk { budget: limit }.args(args)
+}
+
+thread_local! {
+    /// Exact expanded sizes of types already measured by
+    /// [`generic_args_within_expanded_size`], keyed by the
+    /// type handle and shared by every check of one
+    /// compilation. The argument graph is a DAG (an interned
+    /// type cannot be a proper subterm of itself), and a
+    /// deeply nested instance shares its subterms across
+    /// every occurrence and every demand pass: re-expanding
+    /// them per check makes the guard cost the full expanded
+    /// size per demanded instance, which dwarfs the
+    /// conversion it guards. Only exact sizes are stored: a
+    /// type whose measurement ran out of budget is not
+    /// memoized (its size is only known to exceed the budget
+    /// it was measured against). Cleared whenever a fresh
+    /// `Converter` starts a compilation (see
+    /// [`clear_expanded_size_cache`]), so handles from an
+    /// earlier compilation in the same process are never
+    /// read back.
+    static EXPANDED_SIZE_CACHE: std::cell::RefCell<std::collections::HashMap<Ty, usize>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Drop every memoized expanded size (see
+/// [`EXPANDED_SIZE_CACHE`]). Called when a new compilation
+/// starts, because type handles are only meaningful within
+/// the compilation that interned them.
+pub fn clear_expanded_size_cache() {
+    EXPANDED_SIZE_CACHE.with(|cache| cache.borrow_mut().clear());
 }
 
 

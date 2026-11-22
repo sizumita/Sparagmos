@@ -68,6 +68,13 @@ pub struct Converter {
     /// attempted (successfully or not), so a type whose query
     /// cannot be answered is not re-queried at every conversion.
     layout_attempted: std::collections::HashSet<String>,
+    /// Compiler types whose closure/coroutine layout recording
+    /// was already attempted, keyed by the type handle itself:
+    /// the rendered key is the whole instance rendering, so
+    /// computing it for an already-attempted type is the
+    /// expensive part (a deeply nested instance renders its
+    /// entire type tree), and the handle check must come first.
+    layout_attempted_tys: std::collections::HashSet<rustc_public::ty::Ty>,
     /// Name table for rendering ADT instance keys, kept in sync
     /// with `def_names` (which is indexed by the converted `DefId`).
     layout_names: std::collections::HashMap<sm::DefId, String>,
@@ -613,8 +620,25 @@ pub fn stable_mir_panic_reason(
     }
 }
 
+thread_local! {
+    /// Memoized results of [`ty_mentions_param`], keyed by the
+    /// compiler's type handle. The walk is a pure function of
+    /// the interned type, and the demand passes re-walk the
+    /// same shared subtrees for every candidate instance:
+    /// without the memo, a deeply nested type is re-expanded
+    /// once per occurrence (and every node pays the guarded
+    /// kind query). Cleared whenever a fresh [`Converter`]
+    /// starts a compilation, so handles from an earlier
+    /// compilation in the same process are never read back.
+    static TY_MENTIONS_PARAM_CACHE: std::cell::RefCell<
+        std::collections::HashMap<rustc_public::ty::Ty, bool>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 impl Converter {
     pub fn new() -> Self {
+        TY_MENTIONS_PARAM_CACHE.with(|cache| cache.borrow_mut().clear());
+        crate::reach::clear_expanded_size_cache();
         Self {
             def_ids: HashMap::new(),
             instance_ids: HashMap::new(),
@@ -622,6 +646,7 @@ impl Converter {
             adt_discriminants: sm::AdtDiscriminants::new(),
             adt_layouts: sm::AdtLayouts::new(),
             layout_attempted: std::collections::HashSet::new(),
+            layout_attempted_tys: std::collections::HashSet::new(),
             layout_names: std::collections::HashMap::new(),
             adt_shapes: sm::AdtShapes::new(),
             adt_debug_shapes: sm::AdtDebugShapes::new(),
@@ -3144,6 +3169,9 @@ impl Converter {
         args: &rustc_public::ty::GenericArgs,
         converted: &sm::Ty,
     ) {
+        if !self.layout_attempted_tys.insert(*ty) {
+            return;
+        }
         let key = self.layout_key(converted);
         if !self.layout_attempted.insert(key.clone()) {
             return;
@@ -3397,6 +3425,9 @@ impl Converter {
     /// the ADT path: the query is caught, and the instance stays
     /// explicitly unsupported.
     fn record_coroutine_layout(&mut self, ty: &rustc_public::ty::Ty, converted: &sm::Ty) {
+        if !self.layout_attempted_tys.insert(*ty) {
+            return;
+        }
         let key = self.layout_key(converted);
         if !self.layout_attempted.insert(key.clone()) {
             return;
@@ -4140,6 +4171,19 @@ fn const_mentions_param(konst: &rustc_public::ty::TyConst) -> bool {
 }
 
 fn ty_mentions_param(ty: &Ty) -> bool {
+    if let Some(cached) =
+        TY_MENTIONS_PARAM_CACHE.with(|cache| cache.borrow().get(ty).copied())
+    {
+        return cached;
+    }
+    let result = ty_mentions_param_walk(ty);
+    TY_MENTIONS_PARAM_CACHE.with(|cache| {
+        cache.borrow_mut().insert(*ty, result);
+    });
+    result
+}
+
+fn ty_mentions_param_walk(ty: &Ty) -> bool {
     // A type passing through a coroutine-closure type cannot
     // be asked its kind (see `guarded_ty_kind`); counting it
     // as mentioning a parameter is the conservative answer
