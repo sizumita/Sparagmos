@@ -16119,3 +16119,181 @@ fn run_mode_boxed_suspended_future_drops_parameters_once() {
         "boxed future param drop ok\n"
     );
 }
+
+const TOOL_GUEST_SRC: &str = r#"
+use std::process::Command;
+
+fn main() {
+    // The harness passes the tool program's path as the first
+    // guest argument; every compile request below is answered
+    // by the driver's own conversion machinery (the tool
+    // interception), never by a real child process.
+    let rustc = std::env::args().nth(1).unwrap();
+    let src0 = std::env::args().next().unwrap();
+    let dir = std::path::Path::new(&src0).parent().unwrap().to_path_buf();
+    std::env::set_current_dir(&dir).unwrap();
+
+    std::fs::write("t.rs", "pub fn f() -> u32 { 7 }\n").unwrap();
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--crate-type=rlib")
+        .arg("--out-dir")
+        .arg(".")
+        .arg("t.rs")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "good compile failed");
+    assert!(std::path::Path::new("libt.rlib").exists(), "rlib artifact missing");
+
+    // dep-info is real text naming the input.
+    let out = Command::new(&rustc)
+        .arg("--crate-type=rlib")
+        .arg("--emit=dep-info")
+        .arg("--out-dir")
+        .arg(".")
+        .arg("t.rs")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "dep-info compile failed");
+    let dep = std::fs::read("t.d").unwrap();
+    assert!(!dep.is_empty(), "dep-info is empty");
+
+    // A failing source: exit code 1 and diagnostics on stderr.
+    std::fs::write("bad.rs", "fn main() { let _x: i32 = \"s\"; }\n").unwrap();
+    let out = Command::new(&rustc).arg("bad.rs").output().unwrap();
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!out.stderr.is_empty(), "diagnostics missing");
+
+    // `status()` reports the code without an Output value.
+    let st = Command::new(&rustc)
+        .arg("--crate-type=rlib")
+        .arg("--out-dir")
+        .arg(".")
+        .arg("t.rs")
+        .status()
+        .unwrap();
+    assert!(st.success());
+
+    // A consumer bound through `--extern` resolves the
+    // artifact back to its source.
+    std::fs::write("u.rs", "extern crate t; fn main() { assert_eq!(t::f(), 7); }\n").unwrap();
+    let out = Command::new(&rustc)
+        .arg("--extern")
+        .arg("t=libt.rlib")
+        .arg("--out-dir")
+        .arg(".")
+        .arg("u.rs")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "extern consumer failed");
+
+    // `--print` rides the informational path.
+    let out = Command::new(&rustc)
+        .arg("--print")
+        .arg("target-list")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(!out.stdout.is_empty(), "print output missing");
+
+    println!("tool guest ok");
+}
+"#;
+
+#[test]
+fn run_mode_tool_interception_answers_compiler_calls() {
+    let dir = temp_dir("tool-intercept");
+    let src = fixture(&dir, "tool_guest.rs", TOOL_GUEST_SRC);
+    // The tool program is this very driver binary: the string
+    // only has to name a program that would start (so the
+    // process model lets the call through to the interception),
+    // and the handler answers with the driver's own conversion.
+    let driver = env!("CARGO_BIN_EXE_sparagmos-driver");
+    let out = run_driver_extra(
+        &src,
+        &["--tool-program", driver, "--guest-arg", driver],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "tool guest ok\n", "stderr={stderr}");
+}
+
+const ENV_GUEST_SRC: &str = r#"
+fn main() {
+    assert!(std::env::var_os("SPARAGMOS_NO_SUCH_VAR").is_none());
+    match std::env::var("SPARAGMOS_NO_SUCH_VAR") {
+        Err(std::env::VarError::NotPresent) => {}
+        other => panic!("expected NotPresent, got {other:?}"),
+    }
+    std::env::set_var("SPARAGMOS_GUEST_VAR", "hello");
+    assert_eq!(std::env::var("SPARAGMOS_GUEST_VAR").unwrap(), "hello");
+    assert_eq!(
+        std::env::var_os("SPARAGMOS_GUEST_VAR").unwrap().to_str().unwrap(),
+        "hello"
+    );
+    std::env::remove_var("SPARAGMOS_GUEST_VAR");
+    assert!(std::env::var_os("SPARAGMOS_GUEST_VAR").is_none());
+    let cwd = std::env::current_dir().unwrap();
+    assert!(cwd.is_absolute());
+    assert!(std::env::temp_dir().is_absolute());
+    println!("env guest ok");
+}
+"#;
+
+#[test]
+fn run_mode_env_builtins_roundtrip() {
+    let dir = temp_dir("env-guest");
+    let src = fixture(&dir, "env_guest.rs", ENV_GUEST_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "env guest ok\n", "stderr={stderr}");
+}
+
+const FS_GUEST_SRC: &str = r#"
+fn main() {
+    let src0 = std::env::args().next().unwrap();
+    let dir = std::path::Path::new(&src0).parent().unwrap().join("work");
+    std::fs::create_dir_all(dir.join("a/b")).unwrap();
+    std::fs::write(dir.join("a/b/f.txt"), b"abc").unwrap();
+    assert_eq!(
+        std::fs::read(dir.join("a/b/f.txt")).unwrap(),
+        vec![b'a', b'b', b'c']
+    );
+    let md = std::fs::metadata(dir.join("a/b/f.txt")).unwrap();
+    assert!(md.is_file());
+    assert_eq!(md.len(), 3);
+    let mut names = Vec::new();
+    for e in std::fs::read_dir(dir.join("a")).unwrap() {
+        let e = e.unwrap();
+        names.push(e.file_name().to_str().unwrap().to_string());
+    }
+    assert_eq!(names.len(), 1);
+    assert_eq!(names[0], "b");
+    match std::fs::read(dir.join("missing")) {
+        Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
+        Ok(_) => panic!("missing file read succeeded"),
+    }
+    match std::fs::create_dir(dir.join("a")) {
+        Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists),
+        Ok(_) => panic!("second create_dir succeeded"),
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(!dir.exists());
+    println!("fs guest ok");
+}
+"#;
+
+#[test]
+fn run_mode_fs_builtins_roundtrip() {
+    let dir = temp_dir("fs-guest");
+    let src = fixture(&dir, "fs_guest.rs", FS_GUEST_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "fs guest ok\n", "stderr={stderr}");
+}

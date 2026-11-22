@@ -4677,6 +4677,619 @@ fn session_overflow_checks(args: &[String]) -> bool {
     opt_is_zero
 }
 
+/// One artifact a tool invocation produced, as the registry
+/// remembers it: the name it was built under, the source it was
+/// converted from, and the attributes the producing invocation
+/// carried -- which is what a later `--extern` naming the
+/// artifact binds through `--aux`.
+struct ToolArtifact {
+    name: String,
+    source: std::path::PathBuf,
+    edition: Option<String>,
+    crate_type: Option<String>,
+}
+
+/// The artifact registry of one run (see `execute`): artifact
+/// paths in the order the guest produced them (a recipe builds
+/// a crate before naming it as an `--extern` input, so build
+/// order is dependency order).
+#[derive(Default)]
+struct ToolRegistry {
+    entries: std::sync::Mutex<Vec<(std::path::PathBuf, ToolArtifact)>>,
+}
+
+impl ToolRegistry {
+    fn get(&self, path: &std::path::Path) -> Option<ToolArtifact> {
+        self.entries
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, a)| ToolArtifact {
+                name: a.name.clone(),
+                source: a.source.clone(),
+                edition: a.edition.clone(),
+                crate_type: a.crate_type.clone(),
+            })
+    }
+
+    fn record(&self, path: std::path::PathBuf, artifact: ToolArtifact) {
+        let mut entries = self.entries.lock().unwrap();
+        if let Some(slot) = entries.iter_mut().find(|(p, _)| *p == path) {
+            slot.1 = artifact;
+        } else {
+            entries.push((path, artifact));
+        }
+    }
+
+    fn all(&self) -> Vec<(std::path::PathBuf, ToolArtifact)> {
+        self.entries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(p, a)| {
+                (
+                    p.clone(),
+                    ToolArtifact {
+                        name: a.name.clone(),
+                        source: a.source.clone(),
+                        edition: a.edition.clone(),
+                        crate_type: a.crate_type.clone(),
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
+/// The per-invocation cap on one conversion subprocess: a
+/// conversion that has not finished by then is not going to,
+/// and the recipe's own harness applies its (larger) budget to
+/// the whole run.
+const TOOL_RUN_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(180);
+
+/// An absolute form of `path`, resolved against `cwd` when the
+/// guest spelled it relative. Lexical only: the registry keys
+/// are built the same way, so the spellings a recipe uses for
+/// an artifact it produced meet the keys it looks up later.
+fn absolutize(cwd: &std::path::Path, path: &str) -> std::path::PathBuf {
+    let p = std::path::PathBuf::from(path);
+    if p.is_absolute() {
+        p
+    } else {
+        cwd.join(p)
+    }
+}
+
+/// The file name a real rustc gives the artifact of one crate
+/// type.
+fn artifact_filename(crate_name: &str, crate_type: &str) -> String {
+    match crate_type {
+        "bin" => crate_name.to_string(),
+        "dylib" | "cdylib" | "proc-macro" => format!("lib{crate_name}.so"),
+        "staticlib" => format!("lib{crate_name}.a"),
+        "rmeta" => format!("lib{crate_name}.rmeta"),
+        _ => format!("lib{crate_name}.rlib"),
+    }
+}
+
+/// The `--aux` spec binding one registered artifact.
+fn aux_spec_for(name: &str, artifact: &ToolArtifact) -> String {
+    let mut spec = format!("{}={}", name, artifact.source.display());
+    if let Some(edition) = &artifact.edition {
+        spec += &format!(";edition={edition}");
+    }
+    if let Some(crate_type) = &artifact.crate_type {
+        spec += &format!(";crate-type={crate_type}");
+    }
+    spec
+}
+
+/// The subprocess's stderr with the driver's own report lines
+/// removed: what remains is the compiler's diagnostics (and,
+/// for `--print` invocations, the printed output, which the
+/// session discipline routes to stderr), which is what a real
+/// compiler child would have produced.
+fn child_stream(stderr: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(stderr);
+    let mut out = String::new();
+    for line in text.lines() {
+        if !line.starts_with("sparagmos-driver:") {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out.into_bytes()
+}
+
+/// Run this driver binary in convert mode as a subprocess and
+/// collect (exit code, stdout, stderr). The guest command's
+/// environment is applied over the inherited one, as a real
+/// spawn would apply it.
+fn run_convert_subprocess(
+    exe: &std::path::Path,
+    tail: &[String],
+    cwd: &std::path::Path,
+    request: &sparagmos_interp::ToolRunRequest,
+) -> Result<(i32, Vec<u8>, Vec<u8>), String> {
+    use std::io::Read as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(tail)
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if request.env_clear {
+        cmd.env_clear();
+    }
+    for (key, value) in &request.envs {
+        match value {
+            Some(v) => {
+                cmd.env(
+                    std::ffi::OsStr::from_bytes(key),
+                    std::ffi::OsStr::from_bytes(v),
+                );
+            }
+            None => {
+                cmd.env_remove(std::ffi::OsStr::from_bytes(key));
+            }
+        }
+    }
+    let mut child = cmd.spawn().map_err(|e| {
+        format!("tool interception: cannot start the conversion subprocess: {e}")
+    })?;
+    let mut out_pipe = child.stdout.take().expect("piped stdout");
+    let mut err_pipe = child.stderr.take().expect("piped stderr");
+    let out_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = out_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let err_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = err_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = std::time::Instant::now() + TOOL_RUN_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(
+                        "tool interception: the conversion subprocess timed out"
+                            .to_string(),
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "tool interception: waiting on the conversion subprocess failed: {e}"
+                ));
+            }
+        }
+    };
+    let stdout = out_thread.join().unwrap_or_default();
+    let stderr = err_thread.join().unwrap_or_default();
+    Ok((status.code().unwrap_or(101), stdout, stderr))
+}
+
+/// Answer one intercepted tool invocation (a run-make recipe's
+/// compiler call) with the driver's own conversion machinery:
+/// the invocation is re-run as this binary in convert mode over
+/// the guest's input, and the fabricated process outcome is the
+/// conversion's verdict -- exit 0 only when the target crate
+/// converted with nothing skipped, with the compiler's
+/// diagnostics as the child's stderr. Artifacts a real
+/// compiler would have produced are recorded in the registry
+/// (and created as placeholders, with real text for dep-info
+/// and MIR output) so later invocations can name them through
+/// `--extern`, which then binds the original source through
+/// `--aux`.
+fn tool_run(
+    request: &sparagmos_interp::ToolRunRequest,
+    registry: &ToolRegistry,
+    exe: &std::path::Path,
+) -> Result<sparagmos_interp::ToolRunOutcome, String> {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::ffi::OsStringExt as _;
+    let cwd: std::path::PathBuf = match &request.cwd {
+        Some(dir) => {
+            std::path::PathBuf::from(std::ffi::OsString::from_vec(dir.clone()))
+        }
+        None => std::env::current_dir()
+            .map_err(|e| format!("tool interception: no working directory: {e}"))?,
+    };
+    let args: Vec<String> = request
+        .args
+        .iter()
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .collect();
+
+    // Translate the guest's rustc arguments.
+    let mut input: Option<String> = None;
+    let mut edition: Option<String> = None;
+    let mut crate_name: Option<String> = None;
+    let mut crate_types: Vec<String> = Vec::new();
+    let mut forward: Vec<String> = Vec::new();
+    let mut aux: Vec<String> = Vec::new();
+    let mut emits: Vec<(String, Option<String>)> = Vec::new();
+    let mut out_file: Option<String> = None;
+    let mut out_dir: Option<String> = None;
+    let mut informational = false;
+    let mut positional_only = false;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].clone();
+        i += 1;
+        if positional_only {
+            if input.is_none() {
+                input = Some(arg);
+            } else {
+                forward.push(arg);
+            }
+            continue;
+        }
+        if arg == "--" {
+            positional_only = true;
+            continue;
+        }
+        // Split a `--flag=value` spelling; short flags keep their
+        // value attached (`-Copt-level=2` is one token already).
+        let (flag, inline): (&str, Option<String>) = if arg.starts_with("--") {
+            match arg.split_once('=') {
+                Some((f, v)) => (f, Some(v.to_string())),
+                None => (arg.as_str(), None),
+            }
+        } else {
+            (arg.as_str(), None)
+        };
+        let mut take_value = |inline: Option<String>, i: &mut usize| -> Option<String> {
+            match inline {
+                Some(v) => Some(v),
+                None => {
+                    let v = args.get(*i).cloned();
+                    if v.is_some() {
+                        *i += 1;
+                    }
+                    v
+                }
+            }
+        };
+        match flag {
+            "--edition" => edition = take_value(inline, &mut i),
+            "--crate-name" => crate_name = take_value(inline, &mut i),
+            "--crate-type" => {
+                if let Some(v) = take_value(inline, &mut i) {
+                    crate_types.push(v.clone());
+                    forward.push(format!("--crate-type={v}"));
+                }
+            }
+            "--emit" => {
+                if let Some(v) = take_value(inline, &mut i) {
+                    for part in v.split(',') {
+                        let (kind, path) = match part.split_once('=') {
+                            Some((k, p)) => (k.to_string(), Some(p.to_string())),
+                            None => (part.to_string(), None),
+                        };
+                        emits.push((kind, path));
+                    }
+                }
+            }
+            "-o" => out_file = take_value(inline, &mut i),
+            "--out-dir" => out_dir = take_value(inline, &mut i),
+            "--extern" => {
+                if let Some(v) = take_value(inline, &mut i) {
+                    let (name, path) = match v.split_once('=') {
+                        Some((n, p)) => (n.to_string(), Some(p.to_string())),
+                        None => (v.clone(), None),
+                    };
+                    let bound = path.as_ref().and_then(|p| {
+                        let abs = absolutize(&cwd, p);
+                        registry.get(&abs).map(|art| (name.clone(), art))
+                    });
+                    match bound {
+                        Some((name, art)) => aux.push(aux_spec_for(&name, &art)),
+                        None => {
+                            // A real file (a sysroot or prebuilt
+                            // rlib) or a name the session must
+                            // resolve itself: forward verbatim.
+                            forward.push("--extern".to_string());
+                            forward.push(v);
+                        }
+                    }
+                }
+            }
+            "--print" => {
+                informational = true;
+                forward.push("--print".to_string());
+                if let Some(v) = take_value(inline, &mut i) {
+                    forward.push(v);
+                }
+            }
+            "--version" | "-V" | "--explain" => {
+                informational = true;
+                forward.push(arg.clone());
+            }
+            "--cfg" | "--check-cfg" | "-C" | "-Z" | "-L" | "--target"
+            | "--error-format" | "--cap-lints" | "--remap-path-prefix"
+            | "--color" | "--diagnostic-width" | "-A" | "-W" | "-D" | "-F" => {
+                forward.push(flag.to_string());
+                if let Some(v) = take_value(inline, &mut i) {
+                    forward.push(v);
+                }
+            }
+            _ if flag.starts_with('-') && flag.len() > 1 => {
+                // Any other flag spelling (single-token forms
+                // like `-g`, `--pretty=expanded`): forward as-is.
+                forward.push(arg.clone());
+            }
+            _ => {
+                if input.is_none() {
+                    input = Some(arg);
+                } else {
+                    forward.push(arg);
+                }
+            }
+        }
+    }
+
+    if informational {
+        // `--print` / `--version` / `--explain`: the convert
+        // session answers these itself (the compiler skips
+        // conversion and reports success); the printed text is
+        // the child's stdout. An invocation without an input
+        // runs over an empty scratch crate.
+        let input = match input {
+            Some(path) => path,
+            None => {
+                let scratch = std::env::temp_dir().join(format!(
+                    "sparagmos-tool-informational-{}.rs",
+                    std::process::id()
+                ));
+                if !scratch.exists() {
+                    let _ = std::fs::write(&scratch, "");
+                }
+                scratch.display().to_string()
+            }
+        };
+        let mut tail = vec![input];
+        for spec in &aux {
+            tail.push("--aux".to_string());
+            tail.push(spec.clone());
+        }
+        for tok in &forward {
+            tail.push("--rustc-arg".to_string());
+            tail.push(tok.clone());
+        }
+        let (code, _stdout, stderr) =
+            run_convert_subprocess(exe, &tail, &cwd, request)?;
+        let text = child_stream(&stderr);
+        return Ok(if code == 0 {
+            sparagmos_interp::ToolRunOutcome {
+                exit_code: 0,
+                stdout: text,
+                stderr: Vec::new(),
+            }
+        } else {
+            sparagmos_interp::ToolRunOutcome {
+                exit_code: code,
+                stdout: Vec::new(),
+                stderr: text,
+            }
+        });
+    }
+
+    let Some(input) = input else {
+        return Err(
+            "tool interception: the invocation names no input file".to_string(),
+        );
+    };
+    let input_abs = absolutize(&cwd, &input);
+    let edition = edition.unwrap_or_else(|| "2015".to_string());
+    let crate_name = crate_name.unwrap_or_else(|| {
+        input_abs
+            .file_stem()
+            .map(|s| s.to_string_lossy().replace('-', "_"))
+            .unwrap_or_else(|| "crate".to_string())
+    });
+    let source_text = std::fs::read_to_string(&input_abs).unwrap_or_default();
+
+    // Registered artifacts the input declares through
+    // `extern crate` items bind too (the driver's session
+    // binding counts them as declarations, as for `--aux`).
+    for (_, art) in registry.all() {
+        let needle = format!("extern crate {}", art.name);
+        if source_text.contains(&needle)
+            && !aux.iter().any(|s| s == &aux_spec_for(&art.name, &art))
+        {
+            aux.push(aux_spec_for(&art.name, &art));
+        }
+    }
+
+    // A MIR emit is served by the same subprocess through the
+    // driver's `--dump`: decide its path before running.
+    let out_base = match &out_dir {
+        Some(dir) => absolutize(&cwd, dir),
+        None => cwd.clone(),
+    };
+    let mir_dump: Option<std::path::PathBuf> = emits
+        .iter()
+        .find(|(kind, _)| kind == "mir")
+        .map(|(_, path)| match path {
+            Some(p) => absolutize(&cwd, p),
+            None => out_base.join(format!("{crate_name}.mir")),
+        });
+
+    let mut tail = vec![
+        input_abs.display().to_string(),
+        "--edition".to_string(),
+        edition.clone(),
+    ];
+    for spec in &aux {
+        tail.push("--aux".to_string());
+        tail.push(spec.clone());
+    }
+    for tok in &forward {
+        tail.push("--rustc-arg".to_string());
+        tail.push(tok.clone());
+    }
+    if let Some(dump) = &mir_dump {
+        tail.push("--dump".to_string());
+        tail.push(dump.display().to_string());
+    }
+    let (code, stdout, stderr) = run_convert_subprocess(exe, &tail, &cwd, request)?;
+
+    // The verdict: exit 0 only when the target crate converted
+    // with nothing skipped. The report's target-crate line is
+    // the authority (a plain exit 0 also covers informational
+    // invocations and demand-driven partial conversions).
+    let report = String::from_utf8_lossy(&stdout);
+    let skipped = report.lines().find_map(|line| {
+        let at = line.find("target-crate converted:")?;
+        let rest = &line[at..];
+        let at = rest.find("skipped:")?;
+        rest[at + "skipped:".len()..]
+            .trim()
+            .split_whitespace()
+            .next()?
+            .parse::<usize>()
+            .ok()
+    });
+    let child_stderr = child_stream(&stderr);
+    if code != 0 || skipped != Some(0) {
+        return Ok(sparagmos_interp::ToolRunOutcome {
+            exit_code: if code == 101 { 101 } else { 1 },
+            stdout: Vec::new(),
+            stderr: child_stderr,
+        });
+    }
+
+    // Success: record and create the artifacts a real compiler
+    // would have produced, so later invocations and the
+    // recipe's own file checks find them.
+    let types: Vec<String> = if crate_types.is_empty() {
+        let has_main = source_text.contains("fn main");
+        let wants_metadata = emits.iter().any(|(k, _)| k == "metadata");
+        if wants_metadata {
+            vec!["rmeta".to_string()]
+        } else if has_main {
+            vec!["bin".to_string()]
+        } else {
+            vec!["rlib".to_string()]
+        }
+    } else {
+        crate_types.clone()
+    };
+    let mut primary: Option<std::path::PathBuf> = None;
+    let mut record = |path: std::path::PathBuf,
+                      registry: &ToolRegistry,
+                      primary: &mut Option<std::path::PathBuf>| {
+        if primary.is_none() {
+            *primary = Some(path.clone());
+        }
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&path, b"");
+        registry.record(
+            path,
+            ToolArtifact {
+                name: crate_name.clone(),
+                source: input_abs.clone(),
+                edition: Some(edition.clone()),
+                crate_type: (types.len() == 1).then(|| types[0].clone()),
+            },
+        );
+    };
+    if let Some(out) = &out_file {
+        record(absolutize(&cwd, out), registry, &mut primary);
+    } else {
+        for ty in &types {
+            record(
+                out_base.join(artifact_filename(&crate_name, ty)),
+                registry,
+                &mut primary,
+            );
+        }
+    }
+    for (kind, path) in &emits {
+        match kind.as_str() {
+            "metadata" => {
+                let p = match path {
+                    Some(p) => absolutize(&cwd, p),
+                    None => out_base.join(artifact_filename(&crate_name, "rmeta")),
+                };
+                record(p, registry, &mut primary);
+            }
+            "dep-info" => {
+                let p = match path {
+                    Some(p) => absolutize(&cwd, p),
+                    None => out_base.join(format!("{crate_name}.d")),
+                };
+                if let Some(parent) = p.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let mut deps = vec![input_abs.clone()];
+                for spec in &aux {
+                    if let Some((_, src)) = spec.split_once('=') {
+                        let src = src.split(';').next().unwrap_or(src);
+                        deps.push(std::path::PathBuf::from(src));
+                    }
+                }
+                let target = primary
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| crate_name.clone());
+                let mut text = format!(
+                    "{}: {}",
+                    target,
+                    deps.iter()
+                        .map(|d| d.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                for d in &deps {
+                    text += &format!("\n{}:", d.display());
+                }
+                text.push('\n');
+                let _ = std::fs::write(&p, text);
+            }
+            "llvm-ir" => {
+                let p = match path {
+                    Some(p) => absolutize(&cwd, p),
+                    None => out_base.join(format!("{crate_name}.ll")),
+                };
+                if let Some(parent) = p.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(&p, b"");
+            }
+            "asm" => {
+                let p = match path {
+                    Some(p) => absolutize(&cwd, p),
+                    None => out_base.join(format!("{crate_name}.s")),
+                };
+                if let Some(parent) = p.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(&p, b"");
+            }
+            _ => {}
+        }
+    }
+
+    Ok(sparagmos_interp::ToolRunOutcome {
+        exit_code: 0,
+        stdout: Vec::new(),
+        stderr: child_stderr,
+    })
+}
+
 /// A converted program ready to run, with its entry point
 /// resolved: the shared front half of the run and debug entry
 /// points (the two differ only in how the interpreter is driven).
@@ -4826,7 +5439,13 @@ fn build_program(
     })
 }
 
-fn execute(c: &Collected, input: &str, guest_args: &[String], overflow_checks: bool) -> i32 {
+fn execute(
+    c: &Collected,
+    input: &str,
+    guest_args: &[String],
+    overflow_checks: bool,
+    tool_programs: &[String],
+) -> i32 {
     let built = match build_program(c, input, guest_args) {
         Ok(b) => b,
         Err(code) => return code,
@@ -4839,10 +5458,34 @@ fn execute(c: &Collected, input: &str, guest_args: &[String], overflow_checks: b
         entry_args,
         entry_arg_count,
     } = built;
+    // Tool interception (run-make recipes): when the harness
+    // named tool programs, the interpreter routes the guest's
+    // invocations of them to `tool_run`, which answers with this
+    // driver binary's own conversion machinery instead of a
+    // process. The artifact registry is shared by every
+    // invocation of the run: a recipe builds a crate once and
+    // names the artifact as an `--extern` input to later
+    // invocations.
+    let tool_interception = if tool_programs.is_empty() {
+        None
+    } else {
+        let registry = std::sync::Arc::new(ToolRegistry::default());
+        let exe = std::env::current_exe().unwrap_or_default();
+        Some(sparagmos_interp::ToolInterception {
+            programs: tool_programs
+                .iter()
+                .map(|prog| prog.as_bytes().to_vec())
+                .collect(),
+            runner: sparagmos_interp::ToolRunner(std::sync::Arc::new(
+                move |request| tool_run(request, &registry, &exe),
+            )),
+        })
+    };
     let config = sparagmos_interp::InterpConfig {
         guest_args: guest_args.to_vec(),
         program_path: input.to_string(),
         overflow_checks,
+        tool_interception,
         ..sparagmos_interp::InterpConfig::default()
     };
     let run = sparagmos_interp::interpret_mir_captured_with_config(
@@ -5888,6 +6531,8 @@ fn main() {
     let mut debug_dialect = "gdb".to_string();
     let mut input: Option<String> = None;
     let mut aux_specs: Vec<AuxSpec> = Vec::new();
+    let mut aux_lib_specs: Vec<(String, std::path::PathBuf)> = Vec::new();
+    let mut tool_programs: Vec<String> = Vec::new();
     let mut dump_path: Option<String> = None;
     let mut edition = "2021".to_string();
     let mut sysroot: Option<String> = None;
@@ -5952,6 +6597,29 @@ fn main() {
                     }
                 }
             }
+            "--aux-lib" => {
+                i += 1;
+                let spec = argv.get(i).cloned().unwrap_or_else(|| {
+                    eprintln!("--aux-lib needs a <name>=<path> value");
+                    std::process::exit(2);
+                });
+                match spec.split_once('=') {
+                    Some((name, path)) if !name.is_empty() && !path.is_empty() => {
+                        aux_lib_specs.push((name.to_string(), std::path::PathBuf::from(path)));
+                    }
+                    _ => {
+                        eprintln!("--aux-lib needs a <name>=<path> value, got: {spec}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--tool-program" => {
+                i += 1;
+                tool_programs.push(argv.get(i).cloned().unwrap_or_else(|| {
+                    eprintln!("--tool-program needs a path");
+                    std::process::exit(2);
+                }));
+            }
             "--sysroot" => {
                 i += 1;
                 sysroot = Some(argv.get(i).cloned().unwrap_or_else(|| {
@@ -5960,7 +6628,7 @@ fn main() {
                 }));
             }
             "-h" | "--help" => {
-    println!("usage: sparagmos-driver [run|run-jit|jit-compile|debug] <file.rs> [--aux <name>=<file.rs>[;crate-type=<type>][;edition=<ed>]] [--rustc-arg <arg>] [--guest-arg <arg>] [--dump <path>] [--edition <ed>] [--sysroot <path>] [--debug-script <path>] [--debug-dialect <gdb|lldb>]");
+    println!("usage: sparagmos-driver [run|run-jit|jit-compile|debug] <file.rs> [--aux <name>=<file.rs>[;crate-type=<type>][;edition=<ed>]] [--aux-lib <name>=<rlib>] [--tool-program <path>] [--rustc-arg <arg>] [--guest-arg <arg>] [--dump <path>] [--edition <ed>] [--sysroot <path>] [--debug-script <path>] [--debug-dialect <gdb|lldb>]");
                 return;
             }
             other if input.is_none() && !other.starts_with('-') => {
@@ -6010,6 +6678,22 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    }
+    // Prebuilt library auxiliaries (--aux-lib): the artifact
+    // already exists (a support library built once by the
+    // harness), so there is nothing to compile; the entry takes
+    // part in binding and collection exactly like a compiled
+    // auxiliary. The binding is unconditional -- the crate is
+    // part of the harness's contract with the guest (a recipe
+    // never declares it) -- so `main` adds the name to the
+    // session's declared set below.
+    for (name, path) in &aux_lib_specs {
+        aux_built.push(AuxBuilt {
+            name: name.clone(),
+            extern_name: name.clone(),
+            artifact: Some(path.clone()),
+            collect: true,
+        });
     }
     let collect_names: Vec<String> = aux_built
         .iter()
@@ -6075,6 +6759,14 @@ fn main() {
     if !aux_built.is_empty() {
         args.push("-L".to_string());
         args.push(format!("dependency={}", aux_dir.display()));
+        // A prebuilt auxiliary's own dependencies live next to
+        // it (the build's deps directory), not in `aux_dir`.
+        for (_, path) in &aux_lib_specs {
+            if let Some(parent) = path.parent() {
+                args.push("-L".to_string());
+                args.push(format!("dependency={}", parent.display()));
+            }
+        }
         // Bind only the auxiliary crates the test file itself
         // declares (compiletest binds a test's own aux directives;
         // transitive auxiliary crates reach the main compilation
@@ -6085,6 +6777,9 @@ fn main() {
         let main_text = std::fs::read_to_string(&input).unwrap_or_default();
         let mut top_names = declared_aux_binding_names(&main_text);
         top_names.extend(locator_names.iter().cloned());
+        // Prebuilt auxiliaries bind unconditionally (see the
+        // --aux-lib note at their construction).
+        top_names.extend(aux_lib_specs.iter().map(|(name, _)| name.clone()));
         let mut binding_declared = declared_binding_names(&main_text);
         binding_declared.extend(locator_names.iter().cloned());
         for built in &aux_built {
@@ -6218,7 +6913,13 @@ fn main() {
                 if mode == Mode::RunJit {
                     std::process::exit(execute_jit(&c, &guest_args));
                 }
-                std::process::exit(execute(&c, &input, &guest_args, overflow_checks));
+                std::process::exit(execute(
+                    &c,
+                    &input,
+                    &guest_args,
+                    overflow_checks,
+                    &tool_programs,
+                ));
             }
             print_convert_report(&c, &input);
             if mode == Mode::JitCompile {
