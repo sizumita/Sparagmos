@@ -6285,40 +6285,6 @@ impl<'a> Interpreter<'a> {
                     items.push(self.eval_operand(frames, body, op)?);
                 }
                 Ok(Value::Tuple(items))            }
-            Rvalue::AggregateRawPtr(data_op, meta_op) => {
-                let data = self.eval_operand(frames, body, data_op)?;
-                match meta_op {
-                    None => Ok(data),
-                    Some(meta_op) => {
-                        let len: Option<u128> =
-                            match self.eval_operand(frames, body, meta_op)? {
-                                Value::Unit => None,
-                                Value::Int(v) if v >= 0 => Some(v as u128),
-                                Value::Uint(v) => Some(v),
-                                other => {
-                                    return Err(InterpError::UnsupportedRvalue {
-                                        kind: format!(
-                                            "raw pointer aggregate with {} metadata",
-                                            other.kind_name()
-                                        ),
-                                    })
-                                }
-                            };
-                        Ok(match len {
-                            None => data,
-                            Some(len) => match data {
-                                Value::FatRef { base, .. } => {
-                                    Value::FatRef { base, len }
-                                }
-                                data => Value::FatRef {
-                                    base: Box::new(data),
-                                    len,
-                                },
-                            },
-                        })
-                    }
-                }
-            }
             Rvalue::AggregateAdt {
                 variant,
                 operands,

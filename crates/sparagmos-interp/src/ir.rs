@@ -532,14 +532,6 @@ pub enum Rvalue {
     /// Build a tuple value from operands. Array aggregates ride as
     /// tuples too (the length lives in the declared type).
     AggregateTuple(Vec<Operand>),
-    /// A raw-pointer aggregate: a pointer rebuilt from its data
-    /// pointer operand and, for fat pointers, its metadata operand
-    /// (absent for thin pointers in some MIR shapes). A unit
-    /// metadata operand yields the data pointer itself; an integer
-    /// metadata operand yields the fat pointer of that length; a
-    /// vtable metadata operand has no standalone value in this
-    /// model and is an explicit unsupported.
-    AggregateRawPtr(Operand, Option<Operand>),
     /// Build an ADT value: a variant index plus field values.
     AggregateAdt {
         variant: u32,
