@@ -2080,9 +2080,13 @@ enum LenSrc {
 }
 
 /// How to compute the runtime address of a place in memory: a base
-/// pointer source, a constant leaf offset from it, and at most one
-/// dynamic index term (the index's value slot and the leaves per
-/// element). Every leaf is one 8-byte slot, in memory exactly as in
+/// pointer source, a constant leaf offset from it, and any number
+/// of dynamic index terms (each the index's value slot and the
+/// leaves per element of that index step). Nested indices compose
+/// additively: an element of a nested array lies at the sum of the
+/// steps' displacements, because each array's elements are laid
+/// out contiguously at the leaves-per-element stride. Every leaf
+/// is one 8-byte slot, in memory exactly as in
 /// a frame: a pointer in this model is always the address of a
 /// place's first leaf, and leaf `k` lies `8 * k` bytes *below* it,
 /// because the backend lays value slots out at descending addresses
@@ -2092,7 +2096,7 @@ enum LenSrc {
 struct AddrExpr {
     source: PtrSrc,
     const_off: usize,
-    dyn_idx: Option<(IndexSrc, usize)>,
+    dyn_terms: Vec<(IndexSrc, usize)>,
 }
 
 /// An index value for a dynamic index term or a bounds check:
@@ -2612,7 +2616,7 @@ impl<'a> FnLower<'a> {
                     let addr = AddrExpr {
                         source: PtrSrc::Slot(ptr_slot),
                         const_off: 0,
-                        dyn_idx: None,
+                        dyn_terms: Vec::new(),
                     };
                     return self.classify_mem(place, i + 1, addr, pointee, len, Vec::new());
                 }
@@ -2635,7 +2639,7 @@ impl<'a> FnLower<'a> {
                     let addr = AddrExpr {
                         source: PtrSrc::SlotAddr(local_first + offset as u32),
                         const_off: 0,
-                        dyn_idx: Some((IndexSrc::Slot(idx_slot), per)),
+                        dyn_terms: vec![(IndexSrc::Slot(idx_slot), per)],
                     };
                     let checks = vec![PlaceCheck::Index(IndexCheck {
                         index: IndexSrc::Slot(idx_slot),
@@ -2670,7 +2674,7 @@ impl<'a> FnLower<'a> {
                     let addr = AddrExpr {
                         source: PtrSrc::SlotAddr(local_first + offset as u32),
                         const_off: subslice_offset(*from, per),
-                        dyn_idx: None,
+                        dyn_terms: Vec::new(),
                     };
                     return self.classify_mem(
                         place,
@@ -2761,10 +2765,7 @@ impl<'a> FnLower<'a> {
                         let len_src = len.clone().ok_or_else(|| {
                             self.err("index into a slice whose length is not available")
                         })?;
-                        if addr.dyn_idx.is_some() {
-                            return Err(self.err("second dynamic index in one place"));
-                        }
-                        addr.dyn_idx = Some((IndexSrc::Const(*idx), per));
+                        addr.dyn_terms.push((IndexSrc::Const(*idx), per));
                         checks.push(PlaceCheck::Index(IndexCheck {
                             index: IndexSrc::Const(*idx),
                             len: len_src,
@@ -2833,12 +2834,9 @@ impl<'a> FnLower<'a> {
                             )));
                         }
                     };
-                    if addr.dyn_idx.is_some() {
-                        return Err(self.err("second dynamic index in one place"));
-                    }
                     let (idx_slot, signed) = self.index_slot(*local)?;
                     let per = flatten(&elem_ty, &self.func.name, self.layouts)?;
-                    addr.dyn_idx = Some((IndexSrc::Slot(idx_slot), per));
+                    addr.dyn_terms.push((IndexSrc::Slot(idx_slot), per));
                     checks.push(PlaceCheck::Index(IndexCheck {
                         index: IndexSrc::Slot(idx_slot),
                         len: len_src,
@@ -2869,7 +2867,7 @@ impl<'a> FnLower<'a> {
                             addr = AddrExpr {
                                 source: PtrSrc::Loaded(Box::new(pair_addr)),
                                 const_off: 0,
-                                dyn_idx: None,
+                                dyn_terms: Vec::new(),
                             };
                             len = Some(LenSrc::Mem(Box::new(len_addr)));
                         }
@@ -2877,7 +2875,7 @@ impl<'a> FnLower<'a> {
                             addr = AddrExpr {
                                 source: PtrSrc::Loaded(Box::new(pair_addr)),
                                 const_off: 0,
-                                dyn_idx: None,
+                                dyn_terms: Vec::new(),
                             };
                             len = None;
                         }
@@ -3172,7 +3170,7 @@ impl<'a> FnLower<'a> {
                 d
             }
         };
-        if let Some((idx, per)) = &addr.dyn_idx {
+        for (idx, per) in &addr.dyn_terms {
             let idx = match idx {
                 IndexSrc::Slot(s) => *s,
                 IndexSrc::Const(n) => {

@@ -191,6 +191,10 @@ pub struct Converter {
     /// Declared types of the target crate's statics, recorded by
     /// the item scan before conversion (`note_static_ty`).
     static_tys: HashMap<sm::DefId, rustc_public::ty::Ty>,
+    /// The same declared types converted to Sparagmos MIR types,
+    /// handed to the interpreter with the program (see
+    /// `sparagmos_mir::StaticTys`).
+    pub static_tys_mir: sm::StaticTys,
     /// Definition-location stamps of the `#[track_caller]`
     /// instances registered so far, keyed by the instance's
     /// Sparagmos `DefId` (see `note_track_caller_instance`).
@@ -905,6 +909,7 @@ impl Converter {
             source_file_ids: HashMap::new(),
             instance_shape_attempted: std::collections::HashSet::new(),
             static_tys: HashMap::new(),
+            static_tys_mir: sm::StaticTys::new(),
             track_caller_defs: HashMap::new(),
             fn_shim_locations: [None, None, None],
             noting_track_caller: false,
@@ -947,6 +952,8 @@ impl Converter {
     /// decoder.
     pub fn note_static_ty<D: CrateDef>(&mut self, def: &D, ty: rustc_public::ty::Ty) {
         let id = self.crate_def_id(def);
+        let mir_ty = self.ty(&ty);
+        self.static_tys_mir.insert(id, mir_ty);
         self.static_tys.insert(id, ty);
     }
 

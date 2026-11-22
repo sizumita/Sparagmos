@@ -6942,6 +6942,15 @@ impl<'a> Interpreter<'a> {
                         }
                     };
                     Ok(io_simple_error_value(disc))
+                } else if target.starts_with("std::collections::VecDeque<") {
+                    // `VecDeque: From<Vec<T>> / From<[T; N]> /
+                    // From<&[T]>`: the deque has no modelled shape
+                    // of its own in this value model (its value is
+                    // the real aggregate, built and consumed by
+                    // the converted std bodies), so the conversion
+                    // assembles that aggregate from the source's
+                    // elements (see `vec_deque_from_value`).
+                    Ok(self.vec_deque_from_value(frames, value)?)
                 } else if (target.starts_with("std::rc::Rc<")
                     || target.starts_with("std::sync::Arc<"))
                     && (source.starts_with("std::vec::Vec<")
@@ -10231,7 +10240,7 @@ impl<'a> Interpreter<'a> {
                 arity(3)?;
                 let ptr = unwrap_wrapper(&vals[0]);
                 if let Value::Ref(RefTarget::Alloc { id, projection }) = ptr {
-                    if projection.is_empty() {
+                    if crate::interp::projection_is_base(projection) {
                         self.free_alloc(*id);
                     }
                 }
@@ -10253,7 +10262,7 @@ impl<'a> Interpreter<'a> {
                 let ptr = unwrap_wrapper(&vals[0]).clone();
                 let content = match &ptr {
                     Value::Ref(RefTarget::Alloc { id, projection })
-                        if projection.is_empty() =>
+                        if crate::interp::projection_is_base(projection) =>
                     {
                         let old = self.alloc_base(*id)?;
                         self.free_alloc(*id);
@@ -10300,7 +10309,7 @@ impl<'a> Interpreter<'a> {
                 arity(1)?;
                 let ptr = unwrap_wrapper(&vals[0]);
                 if let Value::Ref(RefTarget::Alloc { id, projection }) = ptr {
-                    if projection.is_empty() {
+                    if crate::interp::projection_is_base(projection) {
                         self.free_alloc(*id);
                     }
                 }
@@ -10312,7 +10321,7 @@ impl<'a> Interpreter<'a> {
                 let ptr = unwrap_wrapper(&vals[0]).clone();
                 let content = match &ptr {
                     Value::Ref(RefTarget::Alloc { id, projection })
-                        if projection.is_empty() =>
+                        if crate::interp::projection_is_base(projection) =>
                     {
                         let old = self.alloc_base(*id)?;
                         self.free_alloc(*id);
@@ -14321,6 +14330,105 @@ fn value_fingerprint(value: &Value) -> u64 {
     /// compare element-wise. This is the equality of the *data*, not
     /// of the representation — exactly what the derived `PartialEq`
     /// impls of the modelled types compute.
+    /// The logical element sequence of a `VecDeque` value (the
+    /// real aggregate: wrapped head index, length, and the ring
+    /// buffer), in iteration order, when the value has exactly
+    /// that shape; `None` for any other value, and for a deque
+    /// whose buffer slots cannot be read back (a physical slot
+    /// of the logical range was never written -- not a state a
+    /// well-formed deque reaches). The buffer's physical layout
+    /// is not part of the sequence.
+    fn vec_deque_elements(
+        &self,
+        value: &Value,
+    ) -> InterpResult<Option<Vec<Value>>> {
+        let Value::Enum { fields, .. } = value else {
+            return Ok(None);
+        };
+        if fields.len() != 3 {
+            return Ok(None);
+        }
+        let Value::Enum {
+            fields: head_fields, ..
+        } = &fields[0]
+        else {
+            return Ok(None);
+        };
+        let [Value::Uint(head)] = head_fields.as_slice() else {
+            return Ok(None);
+        };
+        let Value::Uint(len) = fields[1] else {
+            return Ok(None);
+        };
+        let Value::Enum {
+            fields: buf_fields, ..
+        } = &fields[2]
+        else {
+            return Ok(None);
+        };
+        if buf_fields.len() != 2 {
+            return Ok(None);
+        }
+        let Value::Enum {
+            fields: inner_fields, ..
+        } = &buf_fields[0]
+        else {
+            return Ok(None);
+        };
+        if inner_fields.len() != 3 {
+            return Ok(None);
+        }
+        let Value::Enum {
+            fields: ptr_fields, ..
+        } = &inner_fields[0]
+        else {
+            return Ok(None);
+        };
+        let [ptr] = ptr_fields.as_slice() else {
+            return Ok(None);
+        };
+        let Value::Enum {
+            fields: cap_fields, ..
+        } = &inner_fields[1]
+        else {
+            return Ok(None);
+        };
+        let [Value::Uint(cap)] = cap_fields.as_slice() else {
+            return Ok(None);
+        };
+        let (head, len, cap) = (*head as usize, len as usize, *cap as usize);
+        if len == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        if cap == 0 {
+            return Ok(None);
+        }
+        // The buffer's element block: the allocation the
+        // `RawVec` pointer denotes, whose stored value is the
+        // element tuple.
+        let Value::Ref(RefTarget::Alloc { id, .. }) = ptr else {
+            return Ok(None);
+        };
+        let Ok(buffer) = self.alloc_base(*id) else {
+            return Ok(None);
+        };
+        let Value::Tuple(slots) = buffer else {
+            return Ok(None);
+        };
+        let mut out = Vec::with_capacity(len);
+        for i in 0..len {
+            let physical = (head + i) % cap;
+            let Some(elem) = slots.get(physical) else {
+                return Ok(None);
+            };
+            if *elem == Value::Uninit {
+                return Ok(None);
+            }
+            out.push(elem.clone());
+        }
+        Ok(Some(out))
+    }
+
     pub(crate) fn values_equal(
         &self,
         frames: &[Frame],
@@ -14351,6 +14459,20 @@ fn value_fingerprint(value: &Value) -> u64 {
         }
         let a = self.resolve_ref(frames, a)?;
         let b = self.resolve_ref(frames, b)?;
+        // A `VecDeque` value (the real aggregate: wrapped head,
+        // length, ring buffer) compares by its logical element
+        // sequence, as the type's own `PartialEq` does: the
+        // physical buffer layout -- where the head sits, the
+        // capacity, the buffer pointer's projection form -- is
+        // not part of the value's identity, so two deques with
+        // the same elements in the same order are equal however
+        // their buffers happen to be arranged.
+        if let (Some(ea), Some(eb)) = (
+            self.vec_deque_elements(a.as_ref())?,
+            self.vec_deque_elements(b.as_ref())?,
+        ) {
+            return Ok(ea.len() == eb.len() && self.seq_equal(frames, &ea, &eb)?);
+        }
         // A `dyn Trait` value denotes its concrete pointee: two
         // trait objects compare equal when their concrete types
         // agree and the pointees compare equal, and unequal when
@@ -15660,6 +15782,58 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
     /// the field projection pun in `project_value`), held as a
     /// `Str` for text data or a `Bytes` for arbitrary bytes, or
     /// as a fat pointer over the bytes.
+    /// Assemble a `VecDeque` value from a `From` / `Into`
+    /// source: a `Vec` (modelled, or in its real aggregate
+    /// form), an array, or a slice. The deque's value is the
+    /// real aggregate the converted std bodies build and
+    /// consume (see `vec_deque_value`): a source `Vec` in its
+    /// real aggregate form hands its buffer over unchanged, as
+    /// the std conversion does; every other source's elements
+    /// are copied into a fresh element block at exact-fit
+    /// capacity, with the head at index zero.
+    fn vec_deque_from_value(
+        &self,
+        frames: &[Frame],
+        value: Value,
+    ) -> InterpResult<Value> {
+        let resolved = self.resolve_value(frames, &value)?;
+        if let Some((buf, len)) = vec_real_aggregate_parts(&resolved) {
+            return Ok(vec_deque_value(buf, len));
+        }
+        let elements = match resolved {
+            Value::Enum { fields, .. } => fields,
+            Value::Tuple(items) => items,
+            Value::FatRef { base, .. } => match *base {
+                Value::Tuple(items) => items,
+                other => {
+                    return Err(InterpError::type_mismatch(
+                        "From::from to VecDeque",
+                        "slice value over an element tuple",
+                        other.kind_name(),
+                    ));
+                }
+            },
+            other => {
+                return Err(InterpError::type_mismatch(
+                    "From::from to VecDeque",
+                    "vector, array or slice value",
+                    other.kind_name(),
+                ));
+            }
+        };
+        let len = elements.len();
+        let id = self.alloc_insert(Value::Tuple(elements));
+        self.mark_elem_block(id);
+        let buf = raw_vec_value(
+            Value::Ref(RefTarget::Alloc {
+                id,
+                projection: Vec::new(),
+            }),
+            len,
+        );
+        Ok(vec_deque_value(buf, len))
+    }
+
     fn path_bytes_of(
         &self,
         frames: &[Frame],
@@ -15972,6 +16146,93 @@ fn unwrap_newtype(value: Value) -> Value {
 /// } }`: the shape a collected `Cell` aggregate and a decoded
 /// constant produce, which the `Cell` builtins and the
 /// `UnsafeCell::get` pointer path must agree on.
+/// The parts of a `Vec` value in its real aggregate form
+/// (`[buf, len]`): the buffer value and the length, when the
+/// value has exactly that shape. A modelled vector (its elements
+/// as the fields) does not qualify: its second field is an
+/// element, never a bare length beside a `RawVec`-shaped first
+/// field.
+fn vec_real_aggregate_parts(value: &Value) -> Option<(Value, usize)> {
+    let Value::Enum { fields, .. } = value else {
+        return None;
+    };
+    if fields.len() != 2 {
+        return None;
+    }
+    let Value::Uint(len) = fields[1] else {
+        return None;
+    };
+    let Value::Enum {
+        fields: buf_fields, ..
+    } = &fields[0]
+    else {
+        return None;
+    };
+    if buf_fields.len() != 2 {
+        return None;
+    }
+    let Value::Enum {
+        fields: inner_fields, ..
+    } = &buf_fields[0]
+    else {
+        return None;
+    };
+    if inner_fields.len() != 3 {
+        return None;
+    }
+    Some((fields[0].clone(), len as usize))
+}
+
+/// A `RawVec` buffer value over the element block pointer
+/// `ptr`, with capacity `cap`: the `RawVecInner` triple
+/// (`NonNull` pointer, `UsizeNoHighBit` capacity, the global
+/// allocator marker) plus the trailing `PhantomData`.
+fn raw_vec_value(ptr: Value, cap: usize) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![
+            Value::Enum {
+                variant: 0,
+                fields: vec![
+                    Value::Enum {
+                        variant: 0,
+                        fields: vec![ptr],
+                    },
+                    Value::Enum {
+                        variant: 0,
+                        fields: vec![Value::Uint(cap as u128)],
+                    },
+                    Value::Enum {
+                        variant: 0,
+                        fields: Vec::new(),
+                    },
+                ],
+            },
+            Value::Enum {
+                variant: 0,
+                fields: Vec::new(),
+            },
+        ],
+    }
+}
+
+/// A `VecDeque` value in its real aggregate form over buffer
+/// `buf` holding `len` elements from index zero: the wrapped
+/// head index, the length, and the buffer.
+fn vec_deque_value(buf: Value, len: usize) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![
+            Value::Enum {
+                variant: 0,
+                fields: vec![Value::Uint(0)],
+            },
+            Value::Uint(len as u128),
+            buf,
+        ],
+    }
+}
+
 fn cell_value(value: Value) -> Value {
     Value::Enum {
         variant: 0,

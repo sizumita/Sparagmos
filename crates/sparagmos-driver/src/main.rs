@@ -188,6 +188,9 @@ struct Collected {
     /// Thread-local statics of the converted program, for the
     /// interpreter (see `Converter::thread_locals`).
     thread_locals: sparagmos_mir::ThreadLocals,
+    /// Declared types of the converted program's statics, for
+    /// the interpreter (see `Converter::static_tys_mir`).
+    static_tys: sparagmos_mir::StaticTys,
     /// Field types of monomorphic ADT instances whose generic
     /// shape mentions a type alias, for the interpreter
     /// (see `Converter::adt_instance_shapes`).
@@ -4790,6 +4793,7 @@ fn collect() -> ControlFlow<()> {
         adt_debug_shapes: conv.adt_debug_shapes.clone(),
         env_debug_shapes: conv.env_debug_shapes.clone(),
         thread_locals: conv.thread_locals.clone(),
+        static_tys: conv.static_tys_mir.clone(),
         adt_instance_shapes: conv.adt_instance_shapes.clone(),
         adt_niches: conv.adt_niches.clone(),
         drop_trivial_adts,
@@ -5637,6 +5641,7 @@ fn build_program(
     program.adt_debug_shapes = c.adt_debug_shapes.clone();
     program.env_debug_shapes = c.env_debug_shapes.clone();
     program.thread_locals = c.thread_locals.clone();
+    program.static_tys = c.static_tys.clone();
     program.adt_instance_shapes = c.adt_instance_shapes.clone();
     program.adt_niches = c.adt_niches.clone();
     program.drop_trivial_adts = c.drop_trivial_adts.clone();

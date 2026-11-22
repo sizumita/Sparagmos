@@ -4905,6 +4905,26 @@ impl<'a> Interpreter<'a> {
             // as in real memory, where `drop_in_place` leaves the
             // bytes in place.
             self.note_string_buffer_free(frames, &active.root);
+            // A session that dropped a whole allocation's value
+            // through a pointer (a `drop_in_place` on a raw
+            // pointer into a heap allocation -- the pointee drop
+            // inside a compiler `drop_glue` shim, say) leaves the
+            // storage uninitialised, as a native drop leaves the
+            // bytes dead: a later step reaching the same
+            // allocation (the shim's destructor step, converted
+            // to the box's glue plan, reaching the pointee
+            // through the box) must find nothing left to drop a
+            // second time. Sessions nested inside another (a
+            // reference-counted pointee's glue, rooted at the
+            // allocation's value field) keep the storage: their
+            // enclosing session still owns it.
+            if matches!(active.completion, GlueCompletion::Jump(_)) {
+                if let RefTarget::Alloc { id, projection } = &active.root {
+                    if projection.is_empty() {
+                        self.allocs.borrow_mut().insert(*id, Value::Uninit);
+                    }
+                }
+            }
             if let RefTarget::Place {
                 frame,
                 local,
@@ -7792,6 +7812,7 @@ impl<'a> Interpreter<'a> {
                 let projection = self.offset_projection(
                     frames,
                     Some((frame, local)),
+                    None,
                     projection,
                     disp,
                     elem_size,
@@ -7804,14 +7825,18 @@ impl<'a> Interpreter<'a> {
                 })
             }
             RefTarget::Static { name, projection } => {
-                // A static's declared type is not part of the IR
-                // program, so no array absorption is attempted for
-                // statics: the displacement is carried unless the
-                // static value's own shape absorbs it.
+                // The driver records the declared types of the
+                // target crate's statics in the program, so an
+                // offset over a static array is denominated by
+                // that type, exactly as for a local; a static
+                // without a recorded type (a foreign item) carries
+                // the displacement unless the static value's own
+                // shape absorbs it.
                 let base = self.static_base(&name).ok();
                 let projection = self.offset_projection(
                     frames,
                     None,
+                    Some(&name),
                     projection,
                     disp,
                     elem_size,
@@ -7837,6 +7862,7 @@ impl<'a> Interpreter<'a> {
                 let base = self.alloc_base(id).ok();
                 let projection = self.offset_projection(
                     frames,
+                    None,
                     None,
                     projection,
                     disp,
@@ -7885,6 +7911,7 @@ impl<'a> Interpreter<'a> {
                     // declared locals.
                     let projection = self.offset_projection(
                         frames,
+                        None,
                         None,
                         projection,
                         disp,
@@ -7993,6 +8020,7 @@ impl<'a> Interpreter<'a> {
         &self,
         frames: &[Frame],
         place: Option<(u64, usize)>,
+        static_name: Option<&str>,
         mut projection: Vec<RefProj>,
         disp: Option<i128>,
         elem_size: Option<u64>,
@@ -8019,7 +8047,10 @@ impl<'a> Interpreter<'a> {
         if total == 0 {
             return Ok(projection);
         }
-        let array_pos = self.array_position(frames, place, &projection);
+        let array_pos = match static_name {
+            Some(name) => self.static_array_position(name, &projection),
+            None => self.array_position(frames, place, &projection),
+        };
         if let Some((cur, elem)) = array_pos {
             if elem > 0 {
                 if let Some(byte_pos) = cur.checked_mul(elem).and_then(|b| b.checked_add(total)) {
@@ -8328,6 +8359,30 @@ impl<'a> Interpreter<'a> {
         let frame = &frames[self.frame_pos(frames, frame_id).ok()?];
         let body = self.program().functions.get(&frame.func)?;
         let elem = match body.local_tys.get(local)? {
+            Ty::Array(elem, _) => self.ty_size(elem)?,
+            _ => return None,
+        };
+        let cur = match projection {
+            [] => 0,
+            [RefProj::Index(i)] => i128::try_from(*i).ok()?,
+            _ => return None,
+        };
+        Some((cur, i128::from(elem)))
+    }
+
+    /// The array position a projection over the static `name`
+    /// denotes, from the static's declared type as the driver
+    /// recorded it in the program: the current element index
+    /// and the element size in bytes, in the same form
+    /// [`Self::array_position`] answers for a local. `None` when
+    /// the static has no recorded type (a foreign item) or its
+    /// declared type is not an array.
+    fn static_array_position(
+        &self,
+        name: &str,
+        projection: &[RefProj],
+    ) -> Option<(i128, i128)> {
+        let elem = match self.program().static_tys.get(name)? {
             Ty::Array(elem, _) => self.ty_size(elem)?,
             _ => return None,
         };
@@ -11634,6 +11689,18 @@ fn check_subslice(value_len: usize, offset: usize, count: usize) -> InterpResult
 /// step is an index step, or an index step followed only by
 /// whole-value entry steps (field and downcast steps) -- the
 /// entered-element shape (see [`entered_element_container`]).
+/// Whether an allocation projection denotes the allocation's
+/// base: no steps at all, or only zero steps -- an `Index(0)` or
+/// a `ByteOffset(0)`, the forms pointer arithmetic and the
+/// element-block denominations leave on a pointer that still
+/// denotes the start of its block (a byte-denominated buffer
+/// pointer carries `[Index(0)]`, for instance).
+pub(crate) fn projection_is_base(projection: &[RefProj]) -> bool {
+    projection
+        .iter()
+        .all(|s| matches!(s, RefProj::Index(0) | RefProj::ByteOffset(0)))
+}
+
 fn projection_ends_at_element(projection: &[RefProj]) -> bool {
     let mut pos = projection.len();
     while pos > 0 {
@@ -12303,6 +12370,16 @@ pub(crate) fn project_value(
                 // value projection begins, so a `Ref` here is a
                 // pointer value extracted from a wrapper.)
                 Value::Ref(_) if *idx == 0 => value,
+                // The wrapper's one remaining field is its
+                // zero-sized `PhantomData` marker (a `Unique` /
+                // `NonNull` holds the pointer at field 0 and the
+                // marker at field 1): the model keeps no storage
+                // for it, so the step yields the marker value
+                // itself.
+                Value::Ref(_) => Value::Enum {
+                    variant: 0,
+                    fields: Vec::new(),
+                },
                 // The same wrapper chain for a byte string: a
                 // `Path`'s field 0 is its `OsStr`, whose field 0
                 // is the byte slice, and in this model the value
@@ -12946,6 +13023,49 @@ pub(crate) fn project_value_ref<'a>(
                         return project_value_ref(base, &sub, func, place);
                     }
                     Value::DynRef { .. } if *idx == 0 => cur,
+                    // The thin-pointer wrapper chain, as in
+                    // `project_value`: a `Box`'s field 0 is its
+                    // `Unique`, whose field 0 is the `NonNull`,
+                    // whose field 0 is the raw pointer -- and in
+                    // this model the box's one field is the
+                    // pointer value itself, so each of those steps
+                    // yields it unchanged. (A reference to a place
+                    // never sits at a field step of a value
+                    // projection: place references are resolved
+                    // before value projection begins, so a `Ref`
+                    // here is a pointer value extracted from a
+                    // wrapper -- the box stored inside another
+                    // aggregate is the case that reaches it.)
+                    Value::Ref(_) if *idx == 0 => cur,
+                    // The wrapper's zero-sized `PhantomData`
+                    // marker field, as in `project_value`: the
+                    // model keeps no storage for it, so the step
+                    // materializes the marker value as an owned
+                    // value, like the synthesized `fmt::Arguments`
+                    // fields below.
+                    Value::Ref(_) => {
+                        let owned = Value::Enum {
+                            variant: 0,
+                            fields: Vec::new(),
+                        };
+                        if tail.is_empty() {
+                            return Ok(Cow::Owned(owned));
+                        }
+                        return Ok(Cow::Owned(
+                            project_value_ref(&owned, tail, func, place)?
+                                .into_owned(),
+                        ));
+                    }
+                    // A one-field wrapper over a scalar whose
+                    // storage the model holds as the bare scalar,
+                    // as in `project_value`: field 0 of the
+                    // wrapper is the scalar it wraps.
+                    Value::Int(_) | Value::Uint(_) | Value::Float(_)
+                    | Value::Bool(_)
+                        if *idx == 0 =>
+                    {
+                        cur
+                    }
                     // The byte-string wrapper chain, as in
                     // `project_value`: field 0 of the transparent
                     // `Path`/`OsStr`/`CStr` wrappers over a string
@@ -13323,6 +13443,24 @@ pub(crate) fn navigate_mut<'x>(
                 // `project_value`: a write to field 0 of the
                 // transparent `Path`/`OsStr` wrappers over a
                 // string value lands on the string itself.
+                return navigate_mut(slot, rest, func, place);
+            }
+            if *idx == 0
+                && matches!(
+                    slot,
+                    Value::Ref(_)
+                        | Value::Int(_)
+                        | Value::Uint(_)
+                        | Value::Float(_)
+                        | Value::Bool(_)
+                )
+            {
+                // The one-field wrapper chains `project_value`
+                // reads through: a write to field 0 of a thin
+                // pointer value (a `Box`'s `Unique`/`NonNull`
+                // chain, whose one field is the pointer itself)
+                // or of a wrapper over a bare scalar lands on
+                // the held value, which is the slot itself.
                 return navigate_mut(slot, rest, func, place);
             }
             if let Value::Coroutine { fields, .. } = slot {

@@ -1571,6 +1571,11 @@ pub struct Program {
     /// constant each thread's storage for that static is seeded
     /// from on first access.
     pub thread_locals: std::collections::HashMap<String, Constant>,
+    /// Declared types of the program's statics, keyed by the
+    /// static key a `StaticRef` value carries, as recorded by
+    /// the driver. Consulted when a pointer offset over a static
+    /// must be denominated in the declared type's element size.
+    pub static_tys: std::collections::HashMap<String, Ty>,
     /// The guest allocation shims of a program that defines a
     /// `#[global_allocator]`: symbol (`__rust_alloc`,
     /// `__rust_dealloc`, `__rust_realloc`, `__rust_alloc_zeroed`)

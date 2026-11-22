@@ -136,6 +136,9 @@ pub struct MirProgram {
     /// driver (see `mir::ThreadLocalDef`): each entry's initializer
     /// seeds one thread's storage for that static.
     pub thread_locals: mir::ThreadLocals,
+    /// Declared types of the program's statics, as recorded by
+    /// the driver (see `mir::StaticTys`).
+    pub static_tys: mir::StaticTys,
     /// Field types of monomorphic ADT instances whose generic
     /// shape mentions a type alias, as recorded by the driver
     /// (see `mir::AdtInstanceShapes`). Consulted for an ADT
@@ -637,6 +640,17 @@ fn convert_all(
             Some((conv.static_key(def), seed))
         })
         .collect();
+    // The statics' declared types, keyed by the same static key
+    // the `StaticRef` values carry, for the interpreter's
+    // pointer-offset denomination over statics.
+    out.static_tys = program
+        .static_tys
+        .iter()
+        .filter_map(|(def, ty)| {
+            let ty = conv.convert_ty(ty, "a static's declared type").ok()?;
+            Some((conv.static_key(def), ty))
+        })
+        .collect();
     // The definition-location stamps, keyed by the program key
     // of the body each belongs to (the `DefId` a function's
     // calls and constants resolve through), in the same
@@ -856,6 +870,43 @@ fn clean_targets(program: &ir::Program) -> HashSet<String> {
         .filter(|k| !unclean.contains(k.as_str()))
         .cloned()
         .collect()
+}
+
+/// Whether a drop glue's plans call the destructor body `key`
+/// anywhere: through `Seq` / `At` / `Each` / `Fields` /
+/// `Variants` / reference-count steps and the glue's ADT table.
+fn glue_calls_dtor(glue: &ir::DropGlue, key: &str) -> bool {
+    fn walk(
+        plan: &ir::DropPlan,
+        glue: &ir::DropGlue,
+        key: &str,
+        seen: &mut std::collections::HashSet<usize>,
+    ) -> bool {
+        use ir::DropPlan as P;
+        match plan {
+            P::CallDtor { func } => func == key,
+            P::Seq(plans) => plans.iter().any(|p| walk(p, glue, key, seen)),
+            P::At { plan, .. } => walk(plan, glue, key, seen),
+            P::Each { elem } => walk(elem, glue, key, seen),
+            P::Fields { fields, .. } => {
+                fields.iter().any(|p| walk(p, glue, key, seen))
+            }
+            P::Variants { variants } => {
+                variants.iter().any(|p| walk(p, glue, key, seen))
+            }
+            P::RcHandleDrop { value } => walk(value, glue, key, seen),
+            P::Adt { index } => {
+                seen.insert(*index)
+                    && glue
+                        .adts
+                        .get(*index)
+                        .is_some_and(|p| walk(p, glue, key, seen))
+            }
+            _ => false,
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    walk(&glue.root, glue, key, &mut seen)
 }
 
 /// Walk one terminator's drop glue, pushing the destructor bodies
@@ -7097,10 +7148,13 @@ let inner = match (&src, target) {
     /// `Drop` terminator for the same place reads it as
     /// uninitialised and runs no glue a second time.
     ///
-    /// An impl-item call whose own converted body exists keeps
-    /// that body: the inherent-body priority rule — a collected
-    /// impl body is the faithful semantics of the call — wins over
-    /// the glue conversion. A call whose glue cannot be built
+    /// One exception: when the dropped type's own glue routes
+    /// its destructor step through the very body this call
+    /// resolves to, the collected body IS that step and the call
+    /// keeps it — the surrounding body runs the fields' glue
+    /// itself (a compiler `drop_glue` shim does, through its own
+    /// `Drop` terminators), which the full-glue conversion would
+    /// run a second time. A call whose glue cannot be built
     /// falls through to the ordinary call conversion.
     fn drop_call_terminator(
         &self,
@@ -7124,9 +7178,6 @@ let inner = match (&src, target) {
         if !is_trait_item && !is_impl_item {
             return None;
         }
-        if is_impl_item && self.resolve_body_callee(func).is_some() {
-            return None;
-        }
         // Self type: the receiver argument's pointee type (the
         // argument is `&mut Self`), falling back to the call's
         // first generic argument.
@@ -7138,6 +7189,37 @@ let inner = match (&src, target) {
             })
             .or_else(|| raw_generic_args.first().cloned())?;
         let glue = self.drop_glue(&self_ty)?;
+        // When the dropped type's own glue routes its destructor
+        // step through a collected destructor body for this very
+        // type, that body IS the step this call names (reached
+        // directly, or through the trait item's dispatch body):
+        // keep the ordinary call, whose execution runs the
+        // destructor and nothing else. The surrounding body runs
+        // the fields' glue itself (a compiler `drop_glue` shim
+        // does, through its own `Drop` terminators), which the
+        // full-glue conversion would run a second time. A type
+        // whose glue the value model accounts for structurally
+        // (a modelled container, a reference-counted handle)
+        // names no such step, and the conversion below is its
+        // faithful route.
+        let dtor_key = match &self_ty {
+            mir::Ty::Adt(def, args) => self
+                .dtor_bodies
+                .get(&format!("{self_ty:?}"))
+                .cloned()
+                .or_else(|| {
+                    self.names
+                        .get(def)
+                        .or_else(|| self.def_names.get(def))
+                        .and_then(|n| self.dtor_body(n, args))
+                }),
+            _ => None,
+        };
+        if let Some(key) = dtor_key {
+            if glue_calls_dtor(&glue, &key) {
+                return None;
+            }
+        }
         let arg_place = match &args[0] {
             mir::Operand::Copy(place) | mir::Operand::Move(place) => place.clone(),
             _ => return None,

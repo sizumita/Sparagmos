@@ -59,6 +59,16 @@ pub struct ThreadLocalDef {
 /// `DefId` of the static item.
 pub type ThreadLocals = std::collections::HashMap<DefId, ThreadLocalDef>;
 
+/// Declared types of a program's statics, keyed by the `DefId`
+/// of the static item. The interpreter consults a static's
+/// declared type when a pointer offset over the static must be
+/// denominated in the type's element size (a byte displacement
+/// into a static array, say): the static's seed value alone
+/// does not carry the element width. Statics the driver could
+/// not record (foreign items) have no entry and keep the
+/// value-shape behaviour.
+pub type StaticTys = std::collections::HashMap<DefId, Ty>;
+
 /// Layout of one monomorphic ADT instance: `(size, align)` in bytes,
 /// as computed by the compiler's own layout query (so `repr(C)`,
 /// `repr(packed)`, `repr(align)` and enum tag placement are already

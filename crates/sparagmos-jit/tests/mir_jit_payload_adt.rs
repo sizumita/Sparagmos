@@ -143,6 +143,7 @@ fn build_with_table(
         adt_debug_shapes: Default::default(),
         env_debug_shapes: Default::default(),
         thread_locals: Default::default(),
+        static_tys: Default::default(),
         adt_instance_shapes: Default::default(),
         adt_niches: Default::default(),
         source_files: Default::default(),
