@@ -964,7 +964,7 @@ impl Converter {
                 mutability: mutability(d.mutability),
             })
             .collect();
-        let blocks: Vec<sm::BasicBlockData> = body
+        let mut blocks: Vec<sm::BasicBlockData> = body
             .blocks
             .iter()
             .map(|b| self.basic_block(body, b))
@@ -975,6 +975,7 @@ impl Converter {
             .map(|info| self.var_debug_info(info))
             .collect();
         if self.errors.is_empty() {
+            Self::initialize_const_bound_locals(body, &mut blocks, &debug_info);
             let mut b = sm::Body::new(locals, body.arg_locals().len(), blocks);
             b.var_debug_info = debug_info;
             Ok(b)
@@ -997,6 +998,133 @@ impl Converter {
             source_info: sm::SourceInfo::DUMMY,
             value,
         }
+    }
+
+    /// Optimized MIR can hold a local whose only definition was
+    /// const-propagated away: the binding's value survives only as
+    /// a `VarDebugInfoContents::Const` entry, while the local
+    /// itself is still borrowed, dropped and otherwise used as a
+    /// place (a match binding moved out of a constant scrutinee is
+    /// the canonical shape). Such a local has no assignment
+    /// anywhere in the body, so an executor meets it uninitialized.
+    /// When a constant debug entry and a never-written local are
+    /// the unique pair of their type, restore the definition as an
+    /// assignment at the head of the entry block: the value is a
+    /// constant, so it is the same at every point of the body.
+    /// Ambiguous shapes (several never-written locals, or several
+    /// constants, of one type) are left as they are: a wrong
+    /// pairing would silently invent a value, which is worse than
+    /// the explicit uninitialized failure.
+    fn initialize_const_bound_locals(
+        body: &mir::Body,
+        blocks: &mut [sm::BasicBlockData],
+        debug_info: &[sm::VarDebugInfo],
+    ) {
+        fn mark(written: &mut [bool], place: &sm::Place) {
+            // Any write rooted at the local disqualifies it, not
+            // just a whole-local assignment: a local the body
+            // builds or mutates through projections (a union
+            // overwritten field by field, say) is defined by the
+            // body, whatever its debug info claims.
+            written[place.local.0 as usize] = true;
+        }
+        let mut written = vec![false; body.locals().len()];
+        for i in 1..=body.arg_locals().len() {
+            written[i] = true;
+        }
+        for block in blocks.iter() {
+            for stmt in &block.statements {
+                match &stmt.kind {
+                    sm::StatementKind::Assign(pair) => mark(&mut written, &pair.0),
+                    sm::StatementKind::SetDiscriminant { place, .. } => {
+                        mark(&mut written, place)
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(term) = &block.terminator {
+                match &term.kind {
+                    sm::TerminatorKind::Call { destination, .. } => {
+                        mark(&mut written, destination)
+                    }
+                    sm::TerminatorKind::Yield { resume_arg, .. } => {
+                        mark(&mut written, resume_arg)
+                    }
+                    sm::TerminatorKind::Drop {
+                        place, replace, ..
+                    } if *replace => mark(&mut written, place),
+                    sm::TerminatorKind::InlineAsm { operands, .. } => {
+                        for op in operands {
+                            if matches!(
+                                op.kind,
+                                sm::AsmOperandKind::Out | sm::AsmOperandKind::InOut
+                            ) {
+                                if let Some(place) = &op.out_place {
+                                    mark(&mut written, place);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Constant debug entries with their source types; the
+        // converted debug info preserves the source order, so the
+        // index names the same entry in both.
+        let consts: Vec<(usize, Ty)> = body
+            .var_debug_info
+            .iter()
+            .enumerate()
+            .filter_map(|(i, info)| match &info.value {
+                mir::VarDebugInfoContents::Const(c) => Some((i, c.const_.ty())),
+                _ => None,
+            })
+            .collect();
+        if consts.is_empty() || blocks.is_empty() {
+            return;
+        }
+        let decl_tys: Vec<Ty> = body.locals().iter().map(|d| d.ty).collect();
+        let mut init: Vec<sm::Statement> = Vec::new();
+        for (local, ty) in decl_tys.iter().enumerate() {
+            if written[local] {
+                continue;
+            }
+            // The local pairs only when it is the sole never-written
+            // local of its type and the constant is the sole
+            // constant debug entry of that type.
+            if decl_tys.iter().enumerate().any(|(other, t)| {
+                other != local && t == ty && !written[other]
+            }) {
+                continue;
+            }
+            let mut matching = consts.iter().filter(|(_, t)| t == ty);
+            let Some((info_idx, _)) = matching.next() else {
+                continue;
+            };
+            if matching.next().is_some() {
+                continue;
+            }
+            if let sm::VarDebugInfoContents::Constant(k) = &debug_info[*info_idx].value {
+                // A zero-sized literal carries no value shape: the
+                // definition it would restore cannot be rebuilt
+                // from it (a union constant decodes to one, and
+                // assigning the resulting unit to the union's local
+                // is a type error, not a restoration).
+                if matches!(k.literal, sm::ConstKind::Value(sm::ConstValue::ZeroSized)) {
+                    continue;
+                }
+                init.push(sm::Statement::new(sm::StatementKind::Assign(Box::new((
+                    sm::Place::from_local(sm::Local(local as u32)),
+                    sm::Rvalue::Use(sm::Operand::Constant(k.clone())),
+                )))));
+            }
+        }
+        if init.is_empty() {
+            return;
+        }
+        init.extend(blocks[0].statements.drain(..));
+        blocks[0].statements = init;
     }
 
     fn basic_block(&mut self, body: &mir::Body, bb: &mir::BasicBlock) -> sm::BasicBlockData {
