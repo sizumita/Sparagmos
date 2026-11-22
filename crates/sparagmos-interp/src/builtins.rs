@@ -4930,6 +4930,8 @@ impl<'a> Interpreter<'a> {
                     || self_ty.starts_with("std::iter::Enumerate<")
                     || self_ty.starts_with("std::iter::Copied<")
                     || self_ty.starts_with("std::iter::Take<")
+                    || self_ty.starts_with("std::iter::Skip<")
+                    || self_ty.starts_with("std::iter::Chain<")
                     || self_ty.starts_with("std::iter::SkipWhile<")
                     || self_ty.starts_with("std::iter::Once<")
                     || self_ty.starts_with("std::iter::Empty<")
@@ -10258,6 +10260,125 @@ impl<'a> Interpreter<'a> {
                     )
                 }
             }
+        } else if self_ty.starts_with("std::iter::Skip<") {
+            // `Skip` is (inner iterator, remaining skip count):
+            // the first step discards up to `count` items and
+            // yields the one after them, and the count is spent
+            // by that step whether or not the inner iterator had
+            // enough items -- core's `next` delegates the first
+            // step to `nth`, which has exactly this contract --
+            // so every later step is a plain inner step.
+            if fields.len() != 2 {
+                return Err(InterpError::type_mismatch(
+                    "Skip state",
+                    "[iterator, remaining]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let remaining = match fields[1] {
+                Value::Uint(v) => v,
+                ref other => {
+                    return Err(InterpError::type_mismatch(
+                        "Skip remaining count",
+                        "unsigned integer",
+                        other.kind_name(),
+                    ))
+                }
+            };
+            let inner_ty = first_generic_arg(self_ty).unwrap_or("");
+            let mut inner = fields[0].clone();
+            let mut to_skip = remaining;
+            let mut result = none_value();
+            loop {
+                let (new_inner, item) =
+                    self.iterator_next_state(frames, inner_ty, inner)?;
+                inner = new_inner;
+                let Some(x) = option_payload_opt(item) else {
+                    break;
+                };
+                if to_skip > 0 {
+                    to_skip -= 1;
+                    continue;
+                }
+                result = some_value(x);
+                break;
+            }
+            (vec![inner, Value::Uint(0)], result)
+        } else if self_ty.starts_with("std::iter::Chain<") {
+            // `Chain` is (first as an `Option`, second as an
+            // `Option`): the first iterator is stepped while it
+            // is present; the step that exhausts it drops it to
+            // `None` and pulls from the second in the same call.
+            // An exhausted second stays in place -- its own
+            // state keeps answering `None` -- exactly as core
+            // leaves it.
+            if fields.len() != 2 {
+                return Err(InterpError::type_mismatch(
+                    "Chain state",
+                    "[Option<iterator>, Option<iterator>]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let type_args = generic_args_of(self_ty);
+            let first_ty = type_args.first().map(String::as_str).unwrap_or("");
+            let second_ty = type_args.get(1).map(String::as_str).unwrap_or("");
+            let mut first = fields[0].clone();
+            let mut second = fields[1].clone();
+            let mut result = none_value();
+            let mut yielded = false;
+            match first.clone() {
+                Value::Enum {
+                    variant: 1,
+                    fields: payload,
+                } if payload.len() == 1 => {
+                    let (new_first, item) = self.iterator_next_state(
+                        frames,
+                        first_ty,
+                        payload.into_iter().next().expect("length checked"),
+                    )?;
+                    match option_payload_opt(item) {
+                        Some(x) => {
+                            first = some_value(new_first);
+                            result = some_value(x);
+                            yielded = true;
+                        }
+                        None => first = none_value(),
+                    }
+                }
+                Value::Enum { variant: 0, .. } => {}
+                ref other => {
+                    return Err(InterpError::type_mismatch(
+                        "Chain first state",
+                        "an Option holding the first iterator",
+                        other.kind_name(),
+                    ))
+                }
+            }
+            if !yielded {
+                match second.clone() {
+                    Value::Enum {
+                        variant: 1,
+                        fields: payload,
+                    } if payload.len() == 1 => {
+                        let (new_second, item) = self.iterator_next_state(
+                            frames,
+                            second_ty,
+                            payload.into_iter().next().expect("length checked"),
+                        )?;
+                        second = some_value(new_second);
+                        result = item;
+                    }
+                    Value::Enum { variant: 0, .. } => {}
+                    ref other => {
+                        return Err(InterpError::type_mismatch(
+                            "Chain second state",
+                            "an Option holding the second iterator",
+                            other.kind_name(),
+                        ))
+                    }
+                }
+            }
+            (vec![first, second], result)
         } else {
             return Err(unsupported(format!(
                 "Iterator::next for {self_ty} is not runtime-supported"
@@ -10304,6 +10425,51 @@ impl<'a> Interpreter<'a> {
             }
         }
         Ok(items)
+    }
+
+    /// The `(lower, upper)` bounds of an inner iterator
+    /// state's `size_hint`, for the adapter arms of
+    /// [`Self::iterator_size_hint`]: the state is parked as a
+    /// value reference and the hint the modelled step reports
+    /// for it is taken apart.
+    fn size_hint_parts(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        self_ty: &str,
+        state: Value,
+    ) -> InterpResult<(u128, Option<u128>)> {
+        let inner_ref = Value::Ref(RefTarget::value(state));
+        match self.iterator_size_hint(frames, self_ty, &inner_ref)? {
+            Value::Tuple(pair) if pair.len() == 2 => {
+                let lower = match pair[0] {
+                    Value::Uint(v) => v,
+                    ref other => {
+                        return Err(InterpError::type_mismatch(
+                            format!("size_hint lower bound of {self_ty}"),
+                            "unsigned integer",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                let upper = match option_payload_opt(pair[1].clone()) {
+                    Some(Value::Uint(v)) => Some(v),
+                    Some(ref other) => {
+                        return Err(InterpError::type_mismatch(
+                            format!("size_hint upper bound of {self_ty}"),
+                            "unsigned integer",
+                            other.kind_name(),
+                        ))
+                    }
+                    None => None,
+                };
+                Ok((lower, upper))
+            }
+            other => Err(InterpError::type_mismatch(
+                format!("size_hint of {self_ty}"),
+                "(usize, Option<usize>)",
+                other.kind_name(),
+            )),
+        }
     }
 
     /// `Iterator::size_hint` for the modelled iterators: the
@@ -10389,6 +10555,77 @@ impl<'a> Interpreter<'a> {
             }
             let inner_ref = Value::Ref(RefTarget::value(fields[0].clone()));
             return self.iterator_size_hint(frames, inner_ty, &inner_ref);
+        }
+        if self_ty.starts_with("std::iter::Skip<") {
+            // `Skip::size_hint` is the inner hint with the
+            // remaining skip count saturated off both bounds.
+            let fields = iterator_fields(&state, self_ty)?;
+            if fields.len() != 2 {
+                return Err(InterpError::type_mismatch(
+                    "Skip state",
+                    "[iterator, remaining]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let remaining = match fields[1] {
+                Value::Uint(v) => v,
+                ref other => {
+                    return Err(InterpError::type_mismatch(
+                        "Skip remaining count",
+                        "unsigned integer",
+                        other.kind_name(),
+                    ))
+                }
+            };
+            let inner_ty = first_generic_arg(self_ty).unwrap_or("");
+            let (lower, upper) =
+                self.size_hint_parts(frames, inner_ty, fields[0].clone())?;
+            return Ok(hint(
+                lower.saturating_sub(remaining),
+                upper.map(|u| u.saturating_sub(remaining)),
+            ));
+        }
+        if self_ty.starts_with("std::iter::Chain<") {
+            // `Chain::size_hint` adds the two sides' hints; a
+            // side already dropped to `None` counts as the
+            // exact `(0, Some(0))`, and the upper bound is
+            // known only when both sides' are.
+            let fields = iterator_fields(&state, self_ty)?;
+            if fields.len() != 2 {
+                return Err(InterpError::type_mismatch(
+                    "Chain state",
+                    "[Option<iterator>, Option<iterator>]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let type_args = generic_args_of(self_ty);
+            let mut lower = 0u128;
+            let mut upper = Some(0u128);
+            for (i, side) in fields.iter().enumerate() {
+                let side_ty = type_args.get(i).map(String::as_str).unwrap_or("");
+                let (l, u) = match side {
+                    Value::Enum {
+                        variant: 1,
+                        fields: payload,
+                    } if payload.len() == 1 => {
+                        self.size_hint_parts(frames, side_ty, payload[0].clone())?
+                    }
+                    Value::Enum { variant: 0, .. } => (0, Some(0)),
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            "Chain state",
+                            "an Option holding an iterator",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                lower = lower.saturating_add(l);
+                upper = match (upper, u) {
+                    (Some(a), Some(b)) => a.checked_add(b),
+                    _ => None,
+                };
+            }
+            return Ok(hint(lower, upper));
         }
         let fields = iterator_fields(&state, self_ty)?;
         if self_ty.starts_with("std::ops::RangeInclusive<") {
@@ -11927,14 +12164,27 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
     /// program, argument, environment entry or directory): in
     /// this model an `OsStr` is its byte string.
     fn os_str_bytes(&self, frames: &[Frame], value: &Value) -> InterpResult<Vec<u8>> {
-        match self.resolve_value(frames, value)? {
-            Value::Str(s) => Ok(s.into_bytes()),
-            Value::Bytes(b) => Ok(b),
-            other => Err(InterpError::type_mismatch(
-                "OsStr argument",
-                "string or byte data",
-                other.kind_name(),
-            )),
+        let mut resolved = self.resolve_value(frames, value)?;
+        // The path and OS-string values of this model wrap the
+        // string data in one-field aggregates (`PathBuf`
+        // around `OsString` around the string itself, an owned
+        // `Cow<OsStr>` around its `OsString`): unwrap those
+        // layers to the data they hold.
+        loop {
+            match resolved {
+                Value::Str(s) => return Ok(s.into_bytes()),
+                Value::Bytes(b) => return Ok(b),
+                Value::Enum { fields, .. } if fields.len() == 1 => {
+                    resolved = fields.into_iter().next().expect("length checked");
+                }
+                other => {
+                    return Err(InterpError::type_mismatch(
+                        "OsStr argument",
+                        "string or byte data",
+                        other.kind_name(),
+                    ))
+                }
+            }
         }
     }
 
