@@ -828,6 +828,13 @@ pub enum Builtin {
     /// differ only in the null-base case (see
     /// `Interpreter::ptr_offset_value`).
     ArithOffset { wrapping: bool },
+    /// `std::intrinsics::ptr_offset_from(x, y)` /
+    /// `ptr_offset_from_unsigned(x, y)`: the number of elements
+    /// between two pointers into the same allocation. The
+    /// unsigned form requires `x >= y` in the guest (a negative
+    /// distance is undefined behaviour), so the model keeps it a
+    /// named unsupported there.
+    PtrOffsetFrom { unsigned: bool },
     /// `std::mem::zeroed()`: the all-zero-bits value of a scalar
     /// type, or of a tuple/array of scalar types.
     MemZeroed,
@@ -1478,6 +1485,13 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         }
         "std::intrinsics::offset" | "core::intrinsics::offset" => {
             Builtin::ArithOffset { wrapping: false }
+        }
+        "std::intrinsics::ptr_offset_from" | "core::intrinsics::ptr_offset_from" => {
+            Builtin::PtrOffsetFrom { unsigned: false }
+        }
+        "std::intrinsics::ptr_offset_from_unsigned"
+        | "core::intrinsics::ptr_offset_from_unsigned" => {
+            Builtin::PtrOffsetFrom { unsigned: true }
         }
         "std::mem::zeroed" => Builtin::MemZeroed,
         "std::ptr::null" | "std::ptr::null_mut" => Builtin::PtrNull,
@@ -5173,6 +5187,54 @@ impl<'a> Interpreter<'a> {
                 // no meaning in the value model.
                 Ok(Value::Ref(RefTarget::Null))
             }
+            Builtin::PtrOffsetFrom { unsigned } => {
+                arity(2)?;
+                // Two address-only pointers have no pointee to
+                // dereference in this model; their distance is a
+                // byte distance over the synthetic addresses.
+                let d = match (synthetic_address(&vals[0]), synthetic_address(&vals[1])) {
+                    (Some(a), Some(b)) => {
+                        let tag = generic_args.first().map(String::as_str).unwrap_or("");
+                        let size = self
+                            .layout_of(tag)
+                            .map(|(size, _)| size)
+                            .filter(|size| *size > 0)
+                            .ok_or_else(|| {
+                                unsupported(format!(
+                                    "ptr_offset_from with element type `{tag}` is not \
+                                     runtime-supported"
+                                ))
+                            })? as i128;
+                        let bytes = (a as i128).wrapping_sub(b as i128);
+                        if bytes % size != 0 {
+                            None
+                        } else {
+                            Some(bytes / size)
+                        }
+                    }
+                    _ => {
+                        let x = self.deref_value(frames, &vals[0])?;
+                        let y = self.deref_value(frames, &vals[1])?;
+                        self.pointer_distance(&x, &y, generic_args)?
+                    }
+                };
+                match d {
+                    Some(d) if unsigned && d < 0 => Err(unsupported(
+                        "ptr_offset_from_unsigned with a negative distance is not \
+                         runtime-supported"
+                            .to_string(),
+                    )),
+                    Some(d) => Ok(if unsigned {
+                        Value::Uint(d as u128)
+                    } else {
+                        Value::Int(d)
+                    }),
+                    None => Err(unsupported(
+                        "ptr_offset_from between unrelated pointers is not runtime-supported"
+                            .to_string(),
+                    )),
+                }
+            }
             Builtin::MemZeroed => {
                 arity(0)?;
                 let tag = generic_args.first().map(String::as_str).unwrap_or("");
@@ -5574,6 +5636,64 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// The signed distance, in elements of the pointee type the
+    /// generic arguments name, between two resolved pointer
+    /// targets, when both denote positions in the same place,
+    /// static or allocation. Positions are compared through their
+    /// projections: the interpreter's offset machinery leaves an
+    /// element-aligned position as a trailing `Index` step, or —
+    /// when the position cannot be resolved structurally — as a
+    /// trailing byte displacement, so a trailing step of either
+    /// shape is read back as the position's element index.
+    /// `None` when the two targets are unrelated (their distance
+    /// is then meaningless in the guest too).
+    fn pointer_distance(
+        &self,
+        x: &Resolved,
+        y: &Resolved,
+        generic_args: &[String],
+    ) -> InterpResult<Option<i128>> {
+        let tag = generic_args.first().map(String::as_str).unwrap_or("");
+        let elem_size = self.layout_of(tag).map(|(size, _)| size);
+        // Split a target into its base identity and the element
+        // index its trailing projection step denotes, if any.
+        let split = |target: &Resolved| -> Option<(String, i128)> {
+            let (base, projection): (String, &[RefProj]) = match target {
+                Resolved::Place {
+                    frame_pos,
+                    local,
+                    projection,
+                } => (format!("place:{frame_pos}:{local}"), projection),
+                Resolved::Static { name, projection } => (format!("static:{name}"), projection),
+                Resolved::Alloc { id, projection } => (format!("alloc:{id}"), projection),
+                Resolved::Value(_) => return None,
+            };
+            let key = |steps: &[RefProj]| {
+                steps
+                    .iter()
+                    .map(|p| format!("{p:?}"))
+                    .collect::<Vec<_>>()
+                    .join("/")
+            };
+            match projection.split_last() {
+                Some((RefProj::Index(i), rest)) => {
+                    Some((format!("{base}|{}", key(rest)), *i as i128))
+                }
+                Some((RefProj::ByteOffset(d), rest)) => {
+                    let size = elem_size.filter(|sz| *sz > 0)? as i128;
+                    if d % size != 0 {
+                        return None;
+                    }
+                    Some((format!("{base}|{}", key(rest)), d / size))
+                }
+                _ => Some((format!("{base}|{}", key(projection)), 0)),
+            }
+        };
+        Ok(match (split(x), split(y)) {
+            (Some((bx, ix)), Some((by, iy))) if bx == by => Some(ix - iy),
+            _ => None,
+        })
+    }
     /// `Iterator::next`: mutate the iterator in place through the
     /// `&mut` argument and return the `Option` value.
     /// A `Duration` value in the real field shape (`secs`,
