@@ -91,7 +91,7 @@ fn check_body(
 ) -> Option<String> {
     for local in body.locals() {
         let ty = local.ty;
-        if is_simd(ty) && !simd_layout_exists(ty) {
+        if is_simd(ty) && simd_layout_invalid(ty) {
             return Some(format!(
                 "the SIMD type `{ty}` has an invalid number of lanes \
                  (zero, or more than the monomorphization lane limit)"
@@ -359,12 +359,26 @@ fn is_mem_measure_fn(name: &str) -> bool {
 /// panic inside the compiler for shapes it cannot represent; a
 /// panic means the layout could not be determined here, not that
 /// it is invalid, so it is treated as "no finding".
-fn simd_layout_exists(ty: Ty) -> bool {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ty.layout())) {
-        Ok(Ok(_)) => true,
-        Ok(Err(_)) => false,
-        Err(_) => true,
-    }
+/// Whether the layout query positively reports `ty`'s lane
+/// count as invalid -- the failure rustc's own wording names
+/// ("has zero elements", "has more elements than the limit").
+/// Any other layout outcome is no finding: a layout can be
+/// uncomputable here for reasons rustc accepts (a lane count
+/// named by a constant the layout query cannot evaluate in
+/// this context reports "unknown layout", and rustc's own
+/// code generation evaluates it fine), and a panic means the
+/// layout could not be determined, not that it is invalid --
+/// the same discipline as the too-big check.
+fn simd_layout_invalid(ty: Ty) -> bool {
+    let layout = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ty.layout()));
+    let Err(err) = (match layout {
+        Ok(r) => r,
+        Err(_) => return false,
+    }) else {
+        return false;
+    };
+    let text = err.to_string();
+    text.contains("has zero elements") || text.contains("has more elements than the limit")
 }
 
 /// Whether a type is a SIMD vector type (a `#[repr(simd)]` ADT or
