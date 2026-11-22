@@ -15994,3 +15994,49 @@ fn run_mode_gen_block_resume_after_panic_payload() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "gen block panic ok\n");
 }
+
+const TUPLE_CLONE_UNWIND_SRC: &str = r#"
+use std::rc::Rc;
+
+struct S(Rc<()>);
+
+impl Clone for S {
+    fn clone(&self) -> Self {
+        if Rc::strong_count(&self.0) == 7 {
+            panic!("oops");
+        }
+        S(self.0.clone())
+    }
+}
+
+fn main() {
+    let counter = Rc::new(());
+    let ccounter = counter.clone();
+    let result = std::panic::catch_unwind(move || {
+        let _ =
+            (S(ccounter.clone()), S(ccounter.clone()), S(ccounter.clone()), S(ccounter)).clone();
+    });
+    assert!(result.is_err());
+    assert_eq!(1, Rc::strong_count(&counter));
+    println!("tuple clone unwind ok");
+}
+"#;
+
+#[test]
+fn run_mode_tuple_clone_runs_element_impls_and_cleans_up() {
+    // A tuple's `Clone` impl is a compiler shim: with its body
+    // demanded, cloning a tuple runs each element's own `Clone`
+    // impl in order, and a panic mid-clone drops the elements
+    // already cloned (the shim's unwind cleanup), which the
+    // reference count observes.
+    let dir = temp_dir("tuple-clone-unwind");
+    let src = fixture(&dir, "tuple_clone_unwind.rs", TUPLE_CLONE_UNWIND_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "tuple clone must run element impls and clean up on panic; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "tuple clone unwind ok\n");
+}

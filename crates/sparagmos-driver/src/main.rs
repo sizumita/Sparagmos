@@ -2956,6 +2956,117 @@ fn demand_drop_instances(
     (credited, failures, dtor_bodies)
 }
 
+/// Cap on tuple/array `Clone` bodies demanded per program,
+/// mirroring the drop demand's cap.
+const MAX_DEMANDED_CLONE_BODIES: usize = 256;
+
+/// Demand a converted body for the `Clone` impl of every tuple
+/// and array type the converted bodies clone. Those impls are
+/// macro-generated inside `core`, so the call-graph collection
+/// never reaches them (the trait method's name is served by an
+/// interpreter builtin, which ends the demand there), and the
+/// builtin's structural clone bypasses the elements' own
+/// `Clone` impls — wrong for any element whose impl is manual,
+/// and unable to reproduce the cleanup a panicking element
+/// clone triggers. With the body collected, the call dispatches
+/// to it like any other trait call, element impls and unwind
+/// cleanup included. Other `Self` shapes keep the builtin:
+/// their impls are local items or modelled types.
+fn demand_clone_instances(
+    conv: &mut Converter,
+    report: &mut ConversionReport,
+    bodies: &mut Vec<(String, Body)>,
+    body_def_ids: &mut Vec<sparagmos_mir::DefId>,
+    body_def_names: &mut Vec<String>,
+    seed_bodies: &mut Vec<rustc_public::mir::Body>,
+) {
+    let mut seen: std::collections::HashSet<String> = Default::default();
+    let mut demanded = 0usize;
+    let mut scan_from = 0usize;
+    while scan_from < seed_bodies.len() {
+        let batch: Vec<rustc_public::mir::Body> = seed_bodies[scan_from..].to_vec();
+        scan_from = seed_bodies.len();
+        let mut targets: Vec<(rustc_public::ty::FnDef, GenericArgs)> = Vec::new();
+        for body in &batch {
+            for (def, args) in sparagmos_driver::reach::call_targets(body) {
+                let name = def.name();
+                if name != "std::clone::Clone::clone"
+                    && name != "core::clone::Clone::clone"
+                {
+                    continue;
+                }
+                let Some(self_ty) = args.0.iter().find_map(|a| match a {
+                    GenericArgKind::Type(t) => Some(*t),
+                    _ => None,
+                }) else {
+                    continue;
+                };
+                if !matches!(
+                    self_ty.kind(),
+                    TyKind::RigidTy(RigidTy::Tuple(_))
+                        | TyKind::RigidTy(RigidTy::Array(..))
+                ) {
+                    continue;
+                }
+                if args_mention_params(&args) {
+                    continue;
+                }
+                let key = format!("{:?} {:?}", def.def_id(), args);
+                if seen.insert(key) {
+                    targets.push((def, args));
+                }
+            }
+        }
+        let mut added = false;
+        for (def, args) in targets {
+            if demanded >= MAX_DEMANDED_CLONE_BODIES {
+                break;
+            }
+            // A tuple/array `Clone` resolves to a compiler
+            // shim instance: `has_body` reports false for
+            // shims, but `body()` still hands over the
+            // synthesized body, which is all conversion needs.
+            let resolved = std::panic::catch_unwind(
+                std::panic::AssertUnwindSafe(|| {
+                    Instance::resolve(def, &args)
+                        .ok()
+                        .and_then(|inst| inst.body().map(|body| (inst, body)))
+                }),
+            );
+            let Ok(Some((inst, sm_body))) = resolved else {
+                continue;
+            };
+            let def_id = conv.instance_def_id(inst.def.def_id(), &inst);
+            if body_def_ids.contains(&def_id) {
+                continue;
+            }
+            let name = inst.name().to_string();
+            if bodies.iter().any(|(n, _)| n == &name) {
+                continue;
+            }
+            let before = bodies.len();
+            convert_item(
+                conv,
+                report,
+                bodies,
+                body_def_ids,
+                body_def_names,
+                name,
+                def_id,
+                Ok(Some(sm_body.clone())),
+            );
+            if bodies.len() > before {
+                seed_bodies.push(sm_body);
+                demanded += 1;
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+}
+
 /// The ADT instantiations among the types the collected bodies
 /// drop that have no `Drop` impl at all, keyed like
 /// `certify_drop_trivial`'s result. A `Drop` impl for a type can
@@ -3787,6 +3898,19 @@ fn collect() -> ControlFlow<()> {
     // pass the interpreter's glue builder finds the impl recorded
     // but bodiless and refuses the drop.
     let (mut drop_credited, mut drop_failures, mut dtor_bodies) = demand_drop_instances(
+        &mut conv,
+        &mut report,
+        &mut bodies,
+        &mut body_def_ids,
+        &mut body_def_names,
+        &mut seed_bodies,
+    );
+
+    // Demand the `core`-generated `Clone` bodies for tuple and
+    // array types, for the same reason: the trait method's name
+    // is builtin-served, so the call-graph collection stops
+    // there and the elements' own `Clone` impls would never run.
+    demand_clone_instances(
         &mut conv,
         &mut report,
         &mut bodies,
