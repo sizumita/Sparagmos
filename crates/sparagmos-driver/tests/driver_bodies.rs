@@ -171,3 +171,112 @@ fn async_closure_in_uncalled_helper_does_not_block_main() {
     assert!(status.success(), "run failed: {stdout}");
     assert_eq!(stdout, "main only\n");
 }
+
+const BINARY_SEARCH_RS: &str = "\
+fn main() {
+    let v: &[i32] = &[1, 2, 3, 4, 5, 6, 9];
+    match v.binary_search(&5) {
+        Ok(i) => println!(\"found at {i}\"),
+        Err(i) => println!(\"insert at {i}\"),
+    }
+}
+";
+
+#[test]
+fn foreign_closure_inside_generic_std_function_is_collected() {
+    // `slice::binary_search` is a generic core function whose body
+    // creates a closure (`|p| p.cmp(x)`) and hands it to
+    // `binary_search_by`. The closure is defined in core, so no
+    // item loop ever defers it and the reachability collection
+    // (which follows FnDef targets only) never demands it; the
+    // closure demand pass collects it from the mention in the
+    // collected `binary_search` body.
+    let fixture = write_fixture("binary_search", BINARY_SEARCH_RS);
+    let (stdout, status) = run_driver(&[], &fixture);
+    assert!(status.success(), "driver failed: {stdout}");
+    assert!(
+        stdout.contains(
+            "fn core::slice::<impl [T]>::binary_search::{closure#0}: blocks="
+        ),
+        "foreign closure not reported as converted:\n{stdout}"
+    );
+    let dump_path = fixture.with_extension("dump.txt");
+    let dump_arg = dump_path.to_string_lossy().into_owned();
+    let (stdout, status) = run_driver(&["--dump", &dump_arg], &fixture);
+    assert!(status.success(), "driver failed: {stdout}");
+    let dump = std::fs::read_to_string(&dump_path).expect("read dump file");
+    assert!(
+        dump.contains("=== fn core::slice::<impl [T]>::binary_search::{closure#0}"),
+        "foreign closure body missing from dump:\n{dump}"
+    );
+}
+
+const HASHMAP_RS: &str = "\
+use std::collections::HashMap;
+fn main() {
+    let mut m = HashMap::new();
+    m.insert(1, 2);
+    println!(\"{:?}\", m.get(&1));
+}
+";
+
+#[test]
+fn foreign_closures_inside_hashbrown_and_random_state_are_collected() {
+    // The closures hashbrown's table code and
+    // `RandomState::new`'s `KEYS.with(...)` create are defined in
+    // their own crates; before foreign closure collection they
+    // were demanded by no pass and calls to them failed as
+    // unknown functions.
+    let fixture = write_fixture("hashmap", HASHMAP_RS);
+    let (stdout, status) = run_driver(&[], &fixture);
+    assert!(status.success(), "driver failed: {stdout}");
+    for name in [
+        "fn std::hash::RandomState::new::{closure#0}: blocks=",
+        "fn hashbrown::map::make_hasher::{closure#0}: blocks=",
+        "fn hashbrown::raw::RawTableInner::rehash_in_place::{closure#0}: blocks=",
+    ] {
+        assert!(
+            stdout.contains(name),
+            "foreign closure {name} not reported as converted:\n{stdout}"
+        );
+    }
+}
+
+const HASHMAP_INDEX_RS: &str = "\
+use std::collections::HashMap;
+fn main() {
+    let mut m: HashMap<u32, u32> = HashMap::new();
+    m.insert(1, 2);
+    println!(\"{}\", m[&1]);
+}
+";
+
+#[test]
+fn closure_mentioned_only_in_a_constant_is_collected() {
+    // `RandomState::new`'s thread-local keys live in the `KEYS`
+    // constant, whose stored function pointer names the
+    // initializer closure. No converted body's types mention
+    // that closure — the decoded constant value is the only
+    // mention — so only the constant-content demand collects its
+    // body; without it, programs using `HashMap` failed at run
+    // time with an unknown function when `LocalKey` invoked the
+    // stored pointer.
+    let fixture = write_fixture("hashmap_const_closure", HASHMAP_INDEX_RS);
+    let dump_path = fixture.with_extension("dump.txt");
+    let dump_arg = dump_path.to_string_lossy().into_owned();
+    let (stdout, status) = run_driver(&["--dump", &dump_arg], &fixture);
+    assert!(status.success(), "driver failed: {stdout}");
+    assert!(
+        stdout.contains(
+            "fn std::hash::RandomState::new::KEYS::{constant#0}::{closure#1}: blocks="
+        ),
+        "constant-mentioned closure not reported converted:\n{stdout}"
+    );
+    let dump = std::fs::read_to_string(&dump_path).expect("read dump file");
+    assert!(
+        dump.contains(
+            "=== fn std::hash::RandomState::new::KEYS::{constant#0}::{closure#1}"
+        ),
+        "constant-mentioned closure body missing from dump:\n{dump}"
+    );
+}
