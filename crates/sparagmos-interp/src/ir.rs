@@ -1193,6 +1193,17 @@ pub enum TerminatorKind {
         /// shim: the shim's own location is bound instead (see
         /// `Program::fn_shim_locations`).
         stamp: Option<Operand>,
+        /// Drop glue of the receiver's `Self` type for a
+        /// `call_once` edge: the real `FnOnce::call_once` shim owns
+        /// the receiver value and drops it after the call (and
+        /// during unwinding out of the call) whenever the closure
+        /// body takes its environment by reference and does not
+        /// drop the environment itself; conversion builds the glue
+        /// and the interpreter runs it as the shim's drop (see
+        /// `Frame::call_once_env_drop` in the interpreter). `None`
+        /// for `call` / `call_mut`, and for a `call_once` whose
+        /// glue cannot be accounted for.
+        receiver_glue: Option<DropGlue>,
         destination: Place,
         target: Option<BasicBlock>,
     },

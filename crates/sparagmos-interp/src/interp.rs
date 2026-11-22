@@ -172,6 +172,17 @@ pub(crate) struct Frame {
     /// jumped it there): a fresh panic raised directly in this
     /// frame is a panic in a cleanup and aborts the run.
     in_cleanup: bool,
+    /// The `FnOnce::call_once` shim's environment drop owed for
+    /// this frame's call: set on a closure-body frame when the
+    /// caller started a `call_once` whose body takes its
+    /// environment by reference and does not drop the environment
+    /// itself — the real shim owns the receiver value and drops
+    /// it when the call returns, and during unwinding out of the
+    /// call. The root names the receiver place (or value) in the
+    /// caller and the glue is the receiver `Self` type's, built
+    /// by conversion onto the `CallTrait` terminator. `None` for
+    /// every other frame.
+    call_once_env_drop: Option<(RefTarget, crate::ir::DropGlue)>,
 }
 
 /// Drop glue suspended while a destructor body runs. A `Drop`
@@ -1146,6 +1157,7 @@ impl<'a> Interpreter<'a> {
             return_block: None,
             unwind_payload: None,
             in_cleanup: false,
+            call_once_env_drop: None,
         }];
         let result = self.drive_frames(&mut frames, 0);
         // Program exit runs the entry thread's registered TLS
@@ -1255,6 +1267,11 @@ impl<'a> Interpreter<'a> {
                                 let frame = frames.last_mut().expect("frame");
                                 frame.unwind_payload = Some((message, payload));
                                 frame.in_cleanup = true;
+                                // The frame's own cleanup blocks own
+                                // its drops now: a `call_once` shim
+                                // environment drop recorded for this
+                                // frame must not run as well.
+                                frame.call_once_env_drop = None;
                                 Self::jump(frames, body, target)?;
                                 break;
                             }
@@ -1273,7 +1290,42 @@ impl<'a> Interpreter<'a> {
                                         .iter()
                                         .rposition(|c| c.callee_frame == top.id)
                                 });
-                                if let Some(pos) = cont_pos {
+                                let env_drop = frames
+                                    .last()
+                                    .and_then(|top| top.call_once_env_drop.clone());
+                                if let Some((root, glue)) = env_drop {
+                                    // A `call_once` shim environment
+                                    // drop owed for the frame being
+                                    // unwound out of: the shim drops
+                                    // the receiver value as the panic
+                                    // passes through the call, before
+                                    // the caller's call-site action
+                                    // decides (see
+                                    // `Frame::call_once_env_drop`).
+                                    let callee_id =
+                                        frames.last().expect("frame").id;
+                                    self.pop_unwind_frame(frames);
+                                    let cont = DropContinuation {
+                                        callee_frame: callee_id,
+                                        session: GlueSession {
+                                            root,
+                                            work: vec![(
+                                                Vec::new(),
+                                                glue.root.clone(),
+                                            )],
+                                            adts: glue.adts.clone(),
+                                            completion:
+                                                GlueCompletion::UnwindCleanup,
+                                        },
+                                        sessions: Vec::new(),
+                                    };
+                                    match self.run_glue_cleanup(frames, cont, panic)? {
+                                        GlueCleanupFlow::Completed(p) => {
+                                            panic = p;
+                                        }
+                                        GlueCleanupFlow::Suspended => break,
+                                    }
+                                } else if let Some(pos) = cont_pos {
                                     let cont = self.drop_continuations.remove(pos);
                                     self.pop_unwind_frame(frames);
                                     match self.run_glue_cleanup(frames, cont, panic)? {
@@ -1557,6 +1609,7 @@ impl<'a> Interpreter<'a> {
                     receiver,
                     args,
                     stamp,
+                    receiver_glue,
                     destination,
                     target,
                 } => {
@@ -1602,6 +1655,8 @@ impl<'a> Interpreter<'a> {
                     // concrete value (a hand-written Fn impl) keys
                     // on it, and `dyn_callable` erases it.
                     let mut dyn_concrete: Option<String> = None;
+                    let mut env_consumed = false;
+                    let mut env_unwrapped = false;
                     let (callable, env_ref) = match kind {
                         FnCallKind::CallOnce => {
                             let (value, env_ref) = self.eval_callable(&frames, body, receiver)?;
@@ -1620,6 +1675,7 @@ impl<'a> Interpreter<'a> {
                             // struct): unwrap it, but only when the
                             // wrapped value is itself callable.
                             let (value, unwrapped) = unwrap_callable_wrapper(value);
+                            env_unwrapped = unwrapped;
                             let env_ref = if unwrapped {
                                 Value::Ref(RefTarget::value(value.clone()))
                             } else {
@@ -1631,7 +1687,10 @@ impl<'a> Interpreter<'a> {
                                 receiver,
                                 &value,
                             )? {
-                                Some(by_value) => by_value,
+                                Some(by_value) => {
+                                    env_consumed = true;
+                                    by_value
+                                }
                                 None => env_ref,
                             };
                             (value, env_ref)
@@ -1736,6 +1795,33 @@ impl<'a> Interpreter<'a> {
                             }
                         }
                     };
+                    // The `call_once` shim's environment drop (see
+                    // `Frame::call_once_env_drop`): owed when the
+                    // closure body took its environment by
+                    // reference — the environment was not consumed
+                    // into the body, the receiver was not a `dyn`
+                    // dispatch or an unwrapped wrapper — and the
+                    // body does not drop the environment itself.
+                    let shim_drop = if matches!(kind, FnCallKind::CallOnce)
+                        && !env_consumed
+                        && !env_unwrapped
+                        && dyn_concrete.is_none()
+                    {
+                        match (&callable, receiver_glue) {
+                            (Value::Closure { def, .. }, Some(glue))
+                                if !self.closure_body_drops_env(def) =>
+                            {
+                                self.call_once_receiver_root(
+                                    frames, body, receiver, &callable,
+                                )
+                                .ok()
+                                .map(|root| (root, glue.clone()))
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
                     // A `dyn` receiver's call passes through
                     // the `Fn` vtable shim, which presents its
                     // own location (the trait method's definition
@@ -1770,6 +1856,11 @@ impl<'a> Interpreter<'a> {
                                 &destination,
                                 *target,
                             )?;
+                            if let Some(drop) = shim_drop {
+                                if let Some(frame) = frames.last_mut() {
+                                    frame.call_once_env_drop = Some(drop);
+                                }
+                            }
                         }
                         Value::FnPtr(name) => {
                             // As in the indirect-call arm: a
@@ -2232,6 +2323,7 @@ impl<'a> Interpreter<'a> {
             .clone()
             .expect("non-entry frame has a destination");
         let resume = frame.return_block;
+        let env_drop = frame.call_once_env_drop;
         let caller_name = frames.last().expect("caller").func.clone();
         let caller_body = self.program.get(&caller_name).ok_or_else(|| {
             InterpError::UnknownFunction {
@@ -2240,7 +2332,20 @@ impl<'a> Interpreter<'a> {
         })?;
         self.write_place(frames, caller_body, &dest, value)?;
         match resume {
-            Some(bb) => Self::jump(frames, caller_body, bb)?,
+            Some(bb) => {
+                // A `call_once` shim environment drop owed for
+                // this call (see `Frame::call_once_env_drop`) runs
+                // now that the body has returned, as the shim's
+                // own drop of the receiver value: the glue session
+                // ends by jumping to the resume block, exactly
+                // like a `Drop` terminator at the call site.
+                if let Some((root, glue)) = env_drop {
+                    let work = vec![(Vec::new(), glue.root.clone())];
+                    self.run_drop_glue(frames, root, work, &glue.adts, bb)?;
+                } else {
+                    Self::jump(frames, caller_body, bb)?;
+                }
+            }
             None => {
                 return Err(InterpError::MissingContinuation { func: caller_name });
             }
@@ -2855,6 +2960,7 @@ impl<'a> Interpreter<'a> {
             return_block: target,
             unwind_payload: None,
             in_cleanup: false,
+            call_once_env_drop: None,
         });
         Ok(())
     }
@@ -2926,6 +3032,7 @@ impl<'a> Interpreter<'a> {
             return_block: None,
             unwind_payload: None,
             in_cleanup: false,
+            call_once_env_drop: None,
         });
         Ok(())
     }
@@ -2992,6 +3099,62 @@ impl<'a> Interpreter<'a> {
     /// argument: a caller that knows where the closure value lives
     /// (an iterator adapter's state field, say) passes a reference
     /// to that storage so `FnMut` capture writes persist in place;
+    /// Whether the closure body `def` itself drops its
+    /// environment (a `Drop` terminator rooted at the environment
+    /// parameter, local 1): some pipeline shapes inline the
+    /// environment's drop into the body — the captures are dropped
+    /// through the environment reference at the end of the body —
+    /// and then the `call_once` shim drop (see
+    /// [`Frame::call_once_env_drop`]) must not run as well.
+    fn closure_body_drops_env(&self, def: &str) -> bool {
+        let Some(body) = self.program.get(def) else {
+            return false;
+        };
+        body.blocks.iter().any(|block| {
+            matches!(
+                &block.terminator,
+                TerminatorKind::Drop { place, .. } if place.local.0 == 1
+            )
+        })
+    }
+
+    /// The drop root for a `call_once` receiver: the receiver
+    /// place resolved in the caller (the glue session then also
+    /// clears the place, as MIR's drop flags do after the shim
+    /// consumes the value), or the evaluated value itself when
+    /// the receiver is not a place.
+    fn call_once_receiver_root(
+        &self,
+        frames: &[Frame],
+        body: &Body,
+        receiver: &Operand,
+        value: &Value,
+    ) -> InterpResult<RefTarget> {
+        if let Operand::Copy(place) | Operand::Move(place) = receiver {
+            if let Ok(resolved) = self.resolve_place(frames, body, place) {
+                return Ok(match resolved {
+                    Resolved::Place {
+                        frame_pos,
+                        local,
+                        projection,
+                    } => RefTarget::place(frames[frame_pos].id, local, projection),
+                    Resolved::Static { name, projection } => RefTarget::Static {
+                        name,
+                        projection,
+                    },
+                    Resolved::Alloc { id, projection } => RefTarget::Alloc {
+                        id,
+                        projection,
+                    },
+                    Resolved::Value(base, projection) => {
+                        RefTarget::Value(Box::new(base), projection)
+                    }
+                });
+            }
+        }
+        Ok(RefTarget::value(value.clone()))
+    }
+
     /// with `None` the environment is a reference to the value
     /// itself, through which capture reads resolve and capture
     /// writes are the explicit constant-aggregate error. A body
@@ -4214,6 +4377,7 @@ impl<'a> Interpreter<'a> {
                                         return_block: None,
                                         unwind_payload: None,
                                         in_cleanup: false,
+            call_once_env_drop: None,
                                     });
                                     return Ok(());
                                 }
@@ -4377,6 +4541,7 @@ impl<'a> Interpreter<'a> {
                             return_block: None,
                             unwind_payload: None,
                             in_cleanup: false,
+            call_once_env_drop: None,
                         });
                         return Ok(());
                     }
@@ -4572,6 +4737,7 @@ impl<'a> Interpreter<'a> {
                             return_block: None,
                             unwind_payload: None,
                             in_cleanup: false,
+            call_once_env_drop: None,
                         });
                         return Ok(());
                     }

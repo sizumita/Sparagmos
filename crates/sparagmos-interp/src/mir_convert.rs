@@ -7582,6 +7582,16 @@ let inner = match (&src, target) {
                                 receiver,
                                 args: tuple,
                                 stamp,
+                                receiver_glue: if matches!(
+                                    kind,
+                                    ir::FnCallKind::CallOnce
+                                ) {
+                                    raw_generic_args
+                                        .first()
+                                        .and_then(|t| self.drop_glue(t))
+                                } else {
+                                    None
+                                },
                                 destination: self.convert_place(body, destination)?,
                                 target: target.map(|b| ir::BasicBlock(b.index())),
                             }
