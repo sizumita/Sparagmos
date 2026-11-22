@@ -255,7 +255,7 @@ pub enum Builtin {
     ArgumentsNew,
     /// `core::fmt::rt::Argument::new_*(ref)`.
     ArgumentNew(FmtTrait),
-    /// `core::fmt::rt::Argument::from_usize(usize)`.
+    /// `core::fmt::rt::Argument::from_usize(&usize)`.
     ArgumentFromUsize,
     /// `std::ops::RangeInclusive::new(start, end)`.
     RangeInclusiveNew,
@@ -3029,8 +3029,14 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::ArgumentFromUsize => {
                 arity(1)?;
-                // core truncates the count to u16.
-                let n = match vals[0] {
+                // Current core passes the count by reference
+                // (`from_usize(&usize)`: the format-args capture
+                // tuple holds a reference to the count), so read
+                // through one reference level; a bare integer is
+                // accepted as well. core truncates the count to
+                // u16.
+                let arg = self.read_ref_once(frames, &vals[0])?;
+                let n = match arg {
                     Value::Uint(v) => v as u16,
                     Value::Int(v) => v as u16,
                     ref other => {
