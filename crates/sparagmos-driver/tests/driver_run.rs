@@ -7635,6 +7635,39 @@ fn main() {
 }
 "#;
 
+const NESTED_BOX_MOVE_SRC: &str = r#"struct A {
+    x: Box<isize>,
+    y: isize,
+}
+struct C {
+    x: Box<A>,
+    y: isize,
+}
+fn main() {
+    let a: Box<C> = Box::new(C { x: Box::new(A { x: Box::new(0), y: 1 }), y: 2 });
+    let _x = a.x.x;
+    let _y = a.y;
+    println!("nested ok");
+}
+"#;
+
+#[test]
+fn run_mode_nested_box_partial_move_and_drop() {
+    // Moving `a.x.x` out of nested boxes and dropping the
+    // remainder runs the drop shims, whose places walk the
+    // `Box` -> `Unique` -> `NonNull` -> pointer field chain:
+    // in the value model the box's one field is the pointer
+    // itself, so each field-0 step of that chain yields it
+    // unchanged.
+    let dir = temp_dir("nested-box-move");
+    let src = fixture(&dir, "nested_box.rs", NESTED_BOX_MOVE_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "nested ok\n");
+}
+
 #[test]
 fn run_mode_shared_index_write_through_cell() {
     // `v[i].set(..)` mutates through the *shared* element
