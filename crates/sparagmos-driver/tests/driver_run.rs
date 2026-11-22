@@ -1743,6 +1743,47 @@ fn summary_mode_demanded_generic_instances_are_converted() {
     );
 }
 
+const GENERIC_CONST_SRC: &str = r#"
+struct Foo<const N: usize>;
+trait Bar { const VAL: usize; }
+impl<const N: usize> Bar for Foo<N> { const VAL: usize = N; }
+fn arr<const N: usize>() -> [u8; N] { [0; N] }
+fn main() { let _ = <Foo<3> as Bar>::VAL; let _ = arr::<2>(); }
+"#;
+
+#[test]
+fn summary_mode_generic_const_definition_is_not_demanded() {
+    // A generic constant definition (here an associated constant
+    // of a generic impl) has no instance as an item, and its own
+    // body still mentions its const parameter, so converting the
+    // definition body fails on `ConstantKind::Param`. That is the
+    // generic definition itself, not a monomorphic body: the
+    // monomorphized bodies that use the constant carry its
+    // evaluated value, so the definition is accounted not
+    // demanded — it does not make the target crate's conversion
+    // incomplete, and it is not silently counted as converted.
+    let dir = temp_dir("generic-const");
+    let src = fixture(&dir, "generic_const.rs", GENERIC_CONST_SRC);
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let val = stdout
+        .lines()
+        .find(|l| l.starts_with("fn <generic_const::Foo<N> as generic_const::Bar>::VAL:"))
+        .expect("summary lists the generic associated constant");
+    assert!(
+        val.contains("NOT DEMANDED") && val.contains("generic constant definition"),
+        "the generic constant definition is explicitly not demanded: {val}"
+    );
+    assert!(
+        stdout.contains("target-crate converted: 4, skipped: 0"),
+        "the target crate is complete with the generic constant aside: {stdout}"
+    );
+    assert!(
+        stdout.contains("target-crate not demanded: 1"),
+        "the generic constant is counted separately: {stdout}"
+    );
+}
+
 const TAIL_CALL_GENERIC_SRC: &str = r#"
 #![allow(incomplete_features)]
 #![feature(explicit_tail_calls)]

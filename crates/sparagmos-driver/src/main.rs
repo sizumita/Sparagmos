@@ -2754,17 +2754,76 @@ fn collect() -> ControlFlow<()> {
                         // unavailable too is a trivial constant
                         // (see `account_trivial_const`).
                         match guard_stable_mir_query(|| item.body()) {
-                            Ok(Some(body)) => convert_local_body(
-                                &mut conv,
-                                &mut report,
-                                &mut bodies,
-                                &mut body_def_ids,
-                                &mut body_def_names,
-                                &mut seed_bodies,
-                                name,
-                                def_id,
-                                body,
-                            ),
+                            Ok(Some(body)) => {
+                                let report_idx = report.functions.len();
+                                convert_local_body(
+                                    &mut conv,
+                                    &mut report,
+                                    &mut bodies,
+                                    &mut body_def_ids,
+                                    &mut body_def_names,
+                                    &mut seed_bodies,
+                                    name,
+                                    def_id,
+                                    body,
+                                );
+                                // A conversion that fails only on
+                                // the constant's own parameters has
+                                // met the generic definition itself,
+                                // not a monomorphic body: a
+                                // `ConstantKind::Param` in the body
+                                // means the body's constants still
+                                // mention the parameters of the
+                                // definition (or of its enclosing
+                                // item), which only substitution by
+                                // monomorphization removes — and this
+                                // constant has no instance as an item
+                                // (that is why it reached this arm).
+                                // Monomorphized bodies that use the
+                                // constant carry its evaluated value,
+                                // so no converted body needs this
+                                // definition body, the way a generic
+                                // function definition nothing demands
+                                // is not part of the program either.
+                                // Account it `NotDemanded`, keeping
+                                // the parameter record; a failure
+                                // with any other reason mixed in
+                                // stays skipped, as a genuine gap.
+                                if let Some(entry) =
+                                    report.functions.get_mut(report_idx)
+                                {
+                                    let param_reasons = match &entry.outcome {
+                                        FnOutcome::Skipped { reasons }
+                                            if !reasons.is_empty()
+                                                && reasons.keys().all(|r| {
+                                                    r.starts_with(
+                                                        "ConstantKind::Param(",
+                                                    ) || r
+                                                        == "ConstantKind::Bound"
+                                                }) =>
+                                        {
+                                            Some(
+                                                reasons
+                                                    .iter()
+                                                    .map(|(k, v)| {
+                                                        format!("{k} x{v}")
+                                                    })
+                                                    .collect::<Vec<_>>()
+                                                    .join(", "),
+                                            )
+                                        }
+                                        _ => None,
+                                    };
+                                    if let Some(param_reasons) = param_reasons {
+                                        entry.outcome =
+                                            FnOutcome::NotDemanded {
+                                                reason: format!(
+                                                    "generic constant definition                                                      ({param_reasons}); only                                                      monomorphic instances are                                                      converted, and                                                      monomorphized bodies that                                                      use the constant carry                                                      its evaluated value"
+                                                ),
+                                            };
+                                    }
+                                }
+                            }
                             Ok(None) => account_trivial_const(&mut report, name),
                             Err(reason) => skip_fn(&mut report, &name, reason),
                         }
