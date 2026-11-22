@@ -381,6 +381,14 @@ pub struct Interpreter<'a> {
     /// outlives the call, as a leaked allocation does). Interior-
     /// mutable because most execution paths hold only `&self`.
     allocs: std::cell::RefCell<HashMap<u64, Value>>,
+    /// Allocations created by the raw allocator builtins
+    /// (`__rust_alloc` and friends): their content is an
+    /// element tuple (or a zeroed byte block), and a pointer
+    /// to the block denotes its first element. Every other
+    /// allocation holds one whole pointee value (a box's
+    /// contents, a materialised constant), where the same
+    /// pointer denotes the value itself.
+    elem_blocks: std::cell::RefCell<std::collections::HashSet<u64>>,
     /// The id the next created allocation gets.
     next_alloc: std::cell::Cell<u64>,
     /// Pre-decoded bodies for the run loop (see [`crate::decode`]),
@@ -477,6 +485,7 @@ impl<'a> Interpreter<'a> {
             channels: std::cell::RefCell::new(HashMap::new()),
             next_channel: std::cell::RefCell::new(1),
             allocs: std::cell::RefCell::new(HashMap::new()),
+            elem_blocks: std::cell::RefCell::new(std::collections::HashSet::new()),
             next_alloc: std::cell::Cell::new(1),
             decoded: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
@@ -3641,8 +3650,20 @@ impl<'a> Interpreter<'a> {
     /// drop glue has completed). Removing an id that is not
     /// present is not an error: glue also runs for places whose
     /// box was fabricated rather than allocated.
+    /// Mark an allocation as a raw element block (see
+    /// `elem_blocks`).
+    pub(crate) fn mark_elem_block(&self, id: u64) {
+        self.elem_blocks.borrow_mut().insert(id);
+    }
+
+    /// Whether an allocation is a raw element block.
+    pub(crate) fn is_elem_block(&self, id: u64) -> bool {
+        self.elem_blocks.borrow().contains(&id)
+    }
+
     pub(crate) fn free_alloc(&self, id: u64) {
         self.allocs.borrow_mut().remove(&id);
+        self.elem_blocks.borrow_mut().remove(&id);
     }
 
     /// Set the discriminant of the ADT value `value` to `variant`,
@@ -4001,6 +4022,16 @@ impl<'a> Interpreter<'a> {
         body: &Body,
         place: &Place,
     ) -> InterpResult<Resolved> {
+        self.resolve_place_mode(frames, body, place, true)
+    }
+
+    fn resolve_place_mode(
+        &self,
+        frames: &[Frame],
+        body: &Body,
+        place: &Place,
+        deref_elem0: bool,
+    ) -> InterpResult<Resolved> {
         let mut cur = Resolved::Place {
             frame_pos: frames.len() - 1,
             local: place.local.0,
@@ -4121,10 +4152,13 @@ impl<'a> Interpreter<'a> {
                     // continues past the dereference (or by a
                     // write of a tuple value, which replaces
                     // it) — the read and write sides agree on
-                    // this.
-                    if is_last {
+                    // this. Fat pointers are exempt: dereferencing
+                    // one denotes the whole slice, whose length
+                    // the caller pairs with the base.
+                    if deref_elem0 && is_last && matches!(value, Value::Ref(_)) {
                         if let Resolved::Alloc { id, projection } = &resolved {
                             if projection.is_empty()
+                                && self.is_elem_block(*id)
                                 && matches!(
                                     self.alloc_base(*id).ok().as_ref(),
                                     Some(Value::Tuple(_) | Value::Bytes(_))
@@ -4726,6 +4760,9 @@ impl<'a> Interpreter<'a> {
     ) -> Option<InterpResult<Vec<RefProj>>> {
         let size = elem_size?;
         if size == 0 {
+            return None;
+        }
+        if !self.is_elem_block(id) {
             return None;
         }
         let content = self.alloc_base(id).ok()?;
@@ -5388,7 +5425,8 @@ impl<'a> Interpreter<'a> {
                     // through it writes element 0, not the
                     // block as a whole. A tuple value is the
                     // block's own array value and replaces it.
-                    if matches!(&*slot, Value::Tuple(_))
+                    if self.is_elem_block(*id)
+                        && matches!(&*slot, Value::Tuple(_))
                         && !matches!(value, Value::Tuple(_))
                     {
                         let place_desc = format!("allocation #{id}");
@@ -5415,11 +5453,13 @@ impl<'a> Interpreter<'a> {
                 // elements materialize as uninitialized slots
                 // (reading one stays an uninitialized-read
                 // error, never a fabricated value).
-                if let (Value::Tuple(items), Some(RefProj::Index(i))) =
-                    (&mut *slot, projection.first())
-                {
-                    if *i >= items.len() {
-                        items.resize(i + 1, Value::Uninit);
+                if self.is_elem_block(*id) {
+                    if let (Value::Tuple(items), Some(RefProj::Index(i))) =
+                        (&mut *slot, projection.first())
+                    {
+                        if *i >= items.len() {
+                            items.resize(i + 1, Value::Uninit);
+                        }
                     }
                 }
                 let place_desc = format!("allocation #{id}");
@@ -5877,7 +5917,7 @@ impl<'a> Interpreter<'a> {
         place: &Place,
         value: Value,
     ) -> InterpResult<()> {
-        let target = self.resolve_place(frames, body, place)?;
+        let target = self.resolve_place_mode(frames, body, place, false)?;
         self.write_resolved(frames, &target, value)
     }
 

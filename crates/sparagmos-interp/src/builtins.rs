@@ -6120,6 +6120,7 @@ impl<'a> Interpreter<'a> {
                     Value::Tuple(Vec::new())
                 };
                 let id = self.alloc_insert(content);
+                self.mark_elem_block(id);
                 Ok(Value::Ref(RefTarget::Alloc {
                     id,
                     projection: Vec::new(),
@@ -6163,6 +6164,7 @@ impl<'a> Interpreter<'a> {
                     }
                 };
                 let id = self.alloc_insert(content);
+                self.mark_elem_block(id);
                 Ok(Value::Ref(RefTarget::Alloc {
                     id,
                     projection: Vec::new(),
