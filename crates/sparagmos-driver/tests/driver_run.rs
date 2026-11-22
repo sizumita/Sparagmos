@@ -14195,3 +14195,149 @@ fn run_mode_async_block_state_storage() {
         "async-block-state-ok\n",
     );
 }
+
+// ----- Constant pointer `as usize` (Lane KC) -----
+
+const CONST_NULL_PTR_AS_USIZE_SRC: &str = r#"
+const P: *mut u8 = core::ptr::null_mut();
+fn main() {
+    let a = P as usize;
+    assert_eq!(a, 0);
+}
+"#;
+
+/// A null pointer constant cast to an integer: the operand is a
+/// constant, so it carries no place type; the constant's own form
+/// is the evidence for the `PtrToInt` reading, and the null
+/// pointer's address is 0.
+#[test]
+fn run_mode_const_null_ptr_as_usize() {
+    let dir = temp_dir("const-null-ptr-usize");
+    let src = fixture(&dir, "case.rs", CONST_NULL_PTR_AS_USIZE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a null pointer constant must cast to 0; stderr={stderr}"
+    );
+}
+
+const CONST_ADDR_PTR_AS_USIZE_SRC: &str = r#"
+const P: *const u8 = 0x1000 as *const u8;
+fn main() {
+    let a = P as usize;
+    assert_eq!(a, 0x1000);
+}
+"#;
+
+/// An address-only pointer constant cast to an integer reads back
+/// the address it was made from, exactly.
+#[test]
+fn run_mode_const_addr_ptr_as_usize() {
+    let dir = temp_dir("const-addr-ptr-usize");
+    let src = fixture(&dir, "case.rs", CONST_ADDR_PTR_AS_USIZE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an address pointer constant must cast to its address; stderr={stderr}"
+    );
+}
+
+/// The same reading under optimization, where the constant is
+/// folded into the cast's operand position.
+#[test]
+fn run_mode_const_addr_ptr_as_usize_o2() {
+    let dir = temp_dir("const-addr-ptr-usize-o2");
+    let src = fixture(&dir, "case.rs", CONST_ADDR_PTR_AS_USIZE_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "-Copt-level=2"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an address pointer constant must cast to its address under -O; stderr={stderr}"
+    );
+}
+
+const CONST_STATIC_PTR_AS_USIZE_SRC: &str = r#"
+static X: u32 = 42;
+const P: *const u32 = &X;
+fn main() {
+    let a = P as usize;
+    assert!(a != 0);
+    let b = &X as *const u32 as usize;
+    assert_eq!(a, b);
+    assert_eq!(unsafe { *P }, 42);
+}
+"#;
+
+/// A static-reference pointer constant cast to an integer yields
+/// the same synthetic address as the place cast of the same
+/// static, and the pointer still reads the static's value.
+#[test]
+fn run_mode_const_static_ptr_as_usize() {
+    let dir = temp_dir("const-static-ptr-usize");
+    let src = fixture(&dir, "case.rs", CONST_STATIC_PTR_AS_USIZE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a static pointer constant must cast to the static's address; stderr={stderr}"
+    );
+}
+
+const CONST_FN_PTR_AS_USIZE_SRC: &str = r#"
+fn f() {}
+const P: fn() = f;
+fn main() {
+    let a = P as usize;
+    assert!(a != 0);
+    P();
+}
+"#;
+
+/// A function-item pointer constant cast to an integer yields the
+/// callable's synthetic address (nonzero), and the constant still
+/// calls.
+#[test]
+fn run_mode_const_fn_ptr_as_usize() {
+    let dir = temp_dir("const-fn-ptr-usize");
+    let src = fixture(&dir, "case.rs", CONST_FN_PTR_AS_USIZE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a fn pointer constant must cast to its address; stderr={stderr}"
+    );
+}
+
+const CONST_REF_AS_USIZE_SRC: &str = r#"
+const R: &u32 = &42;
+fn main() {
+    let a = R as *const u32 as usize;
+    assert!(a != 0);
+    let b = &*R as *const u32 as usize;
+    assert_eq!(a, b);
+    assert_eq!(*R, 42);
+}
+"#;
+
+/// A reference constant cast through a raw pointer to an integer
+/// yields the same synthetic address as the place-derived pointer
+/// to the same value.
+#[test]
+fn run_mode_const_ref_as_usize() {
+    let dir = temp_dir("const-ref-usize");
+    let src = fixture(&dir, "case.rs", CONST_REF_AS_USIZE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a reference constant must cast to its value's address; stderr={stderr}"
+    );
+}
