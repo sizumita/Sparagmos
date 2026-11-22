@@ -1751,6 +1751,14 @@ impl<'a> Interpreter<'a> {
             }
             return None;
         }
+        // A body-less foreign callee named by a function value
+        // (an extern declaration reified as a function pointer)
+        // is served by the foreign-helper models: they compute
+        // from the argument values alone, like the
+        // value-semantics models above.
+        if let Some(kind) = crate::builtins::foreign_helper_lookup(&canonical) {
+            return Some((canonical, kind, Vec::new()));
+        }
         // A name the converter kept in generic form carries the
         // turbofish spelling of its type arguments
         // (`std::vec::Vec::<T>::new`); the lookup's impl-path

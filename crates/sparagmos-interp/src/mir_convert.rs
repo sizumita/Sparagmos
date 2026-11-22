@@ -4798,7 +4798,9 @@ impl<'a> Converter<'a> {
     /// external path would really produce.
     fn external_builtin(&self, func: &mir::Operand) -> bool {
         self.resolve_external_callee(func).is_some_and(|(name, _, _)| {
-            crate::builtins::lookup(&crate::builtins::canonical_name(&name)).is_some()
+            let canonical = crate::builtins::canonical_name(&name);
+            crate::builtins::lookup(&canonical).is_some()
+                || crate::builtins::foreign_helper_lookup(&canonical).is_some()
         })
     }
 
@@ -5636,9 +5638,16 @@ impl<'a> Converter<'a> {
                     self.resolve_external_callee(func)
                 {
                     let canonical = crate::builtins::canonical_name(&name);
-                    let kind = crate::builtins::lookup(&canonical).filter(|kind| {
-                        !self.consumer_prefers_body(*kind, func, &raw_generic_args)
-                    });
+                    let kind = crate::builtins::lookup(&canonical)
+                        .filter(|kind| {
+                            !self.consumer_prefers_body(*kind, func, &raw_generic_args)
+                        })
+                        // A body-less foreign callee (an extern
+                        // declaration) may be served by the
+                        // foreign-helper models; they are not in
+                        // `lookup`, so no collected body is ever
+                        // displaced by them.
+                        .or_else(|| crate::builtins::foreign_helper_lookup(&canonical));
                     if let Some(kind) = kind {
                         let mut ir_args = Vec::with_capacity(args.len());
                         for (i, arg) in args.iter().enumerate() {

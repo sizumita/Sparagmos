@@ -1064,6 +1064,82 @@ pub enum Builtin {
     /// `std::intrinsics::volatile_set_memory(dst, val, count)`:
     /// store `val` at each of `count` consecutive elements.
     VolatileSet,
+    /// A `rust_test_helpers` identity function
+    /// (`rust_dbg_extern_identity_*`, `rust_int8_to_int32`, the
+    /// i128 helper `identity`): return the single argument
+    /// unchanged. The value model stores integers sign-extended
+    /// and floats widened, so the C function's own widening is
+    /// already the stored shape. Served only for callees with
+    /// no converted body (see [`foreign_helper_lookup`]).
+    FfiIdentity,
+    /// `rust_dbg_extern_return_Two{U8s,U16s,U32s,U64s}`: the
+    /// fixed two-field struct `{10, 20}`.
+    FfiReturnTwo,
+    /// `rust_dbg_extern_return_FiveU16s`: the fixed struct
+    /// `{10, 20, 30, 40, 50}`.
+    FfiReturnFive,
+    /// `rust_dbg_call(cb, data) -> cb(data)`: invoke the guest
+    /// callback with the data argument and return its result.
+    FfiDbgCall,
+    /// `rust_dbg_extern_empty_struct(v1, e, v2)`: the C body
+    /// asserts each field of `v1` equals the matching field of
+    /// `v2` plus one; modelled as the same checks (a failed
+    /// check is the C `assert` failure: a guest abort).
+    FfiEmptyStruct,
+    /// `rust_get_test_int() -> 1`.
+    FfiGetTestInt,
+    /// `rust_get_null_ptr() -> NULL`.
+    FfiGetNullPtr,
+    /// `rust_dbg_abi_1(quad) -> {c + 1, d - 1, a + 1, b - 1}`
+    /// (u64 wrapping).
+    FfiDbgAbi1,
+    /// `rust_dbg_abi_2(floats) -> {c + 1.0, 0xff, a - 1.0}`.
+    FfiDbgAbi2,
+    /// `rust_dbg_abi_3(char_char_double) -> {a + 1, b - 1,
+    /// c + 1.0}` (u8 wrapping).
+    FfiDbgAbi3,
+    /// `rust_dbg_abi_4(char_char_float) -> {a + 1, b - 1,
+    /// c + 1.0f}` (u8 wrapping, f32 arithmetic).
+    FfiDbgAbi4,
+    /// A helper returning one field of one argument: `get_x` /
+    /// `get_y` / `get_z` (field 0/1/2 of argument 0),
+    /// `get_c_many_params` (field 2 of argument 4),
+    /// `get_c_exhaust_sysv64_ints` (field 2 of argument 7).
+    FfiArgField { arg: usize, field: usize },
+    /// `rust_interesting_average(n, ...)`: the variadic tail
+    /// is `n` pairs of `(i64, f64)`; the result is the pair
+    /// sum divided by `n` (NaN for `n == 0`, as in C).
+    FfiInterestingAverage,
+    /// The i128 helper `square(x) -> x * x` (wrapping).
+    FfiSquare128,
+    /// The i128 helper `sub(a, b) -> a - b` (wrapping).
+    FfiSub128,
+    /// `increment_all_parts(LARGE_INTEGER)`: each 32-bit part
+    /// is incremented twice (once per struct view of the
+    /// union) and the whole 64-bit value once more.
+    FfiIncrementAllParts,
+    /// `issue_97463_leak_uninit_data(a, b, c) -> (b & 0xFFFF)
+    /// as u16`.
+    FfiLeakUninitData,
+    /// `rust_dbg_new_some_u64(x)` /
+    /// `rust_dbg_new_some_u64u64(a, b)`: the `Some` variant
+    /// (index 1) of the `#[repr(C, u8)]` tagged-option enums,
+    /// holding the arguments as its payload fields.
+    FfiNewSome,
+    /// `rust_dbg_new_none_u64()` /
+    /// `rust_dbg_new_none_u64u64()`: the `None` variant
+    /// (index 0, no payload).
+    FfiNewNone,
+    /// `rust_dbg_unpack_option_u64(o, into)` /
+    /// `rust_dbg_unpack_option_u64u64(o, a, b)`: for a `Some`
+    /// value, write the payload fields through the pointer
+    /// arguments and return 1; for `None`, return 0. The C
+    /// body asserts the pointers are non-null.
+    FfiUnpackOption,
+    /// `proc_macro::is_available()`: false for code running
+    /// as an ordinary program; the true answer exists only
+    /// inside a proc-macro expansion, which is compile-time.
+    ProcMacroIsAvailable,
 
 }
 
@@ -1298,6 +1374,86 @@ pub(crate) fn runtime_name_fallback(kind: Builtin) -> bool {
             | Builtin::IoFormatOsError
             | Builtin::IoIsInterrupted
     )
+}
+
+/// Models for body-less foreign callees whose semantics are
+/// fixed outside the guest program: the C helpers of
+/// `rust_test_helpers` (the static library the rustc UI tests
+/// link for ABI checks; its source ships in the tree at
+/// `tests/auxiliary/rust_test_helpers.c`) and
+/// `proc_macro::is_available`.
+///
+/// These names are deliberately absent from [`lookup`]: the
+/// registry gates driver collection (a registered name's body
+/// is not collected), and a guest function that merely shares
+/// a helper's last path segment must keep its own body. This
+/// lookup is consulted only where a callee is already known
+/// to have no converted body — conversion's external-callee
+/// path and the interpreter's run-time name fallback — so a
+/// collected body always wins. The C symbols match on the
+/// last path segment because the declaration site (the guest
+/// crate's own module path) is part of the callee's name;
+/// names under `std::` / `core::` / `alloc::` never match, so
+/// a library function can never be mistaken for a helper.
+/// Each model validates the argument values it is handed and
+/// fails with an explicit error on a shape it does not know,
+/// never a silently different result.
+pub fn foreign_helper_lookup(canonical: &str) -> Option<Builtin> {
+    if canonical == "proc_macro::is_available"
+        || canonical.ends_with("::proc_macro::is_available")
+    {
+        return Some(Builtin::ProcMacroIsAvailable);
+    }
+    if canonical.starts_with("std::")
+        || canonical.starts_with("core::")
+        || canonical.starts_with("alloc::")
+    {
+        return None;
+    }
+    let last = canonical.rsplit("::").next().unwrap_or(canonical);
+    Some(match last {
+        "rust_dbg_extern_identity_u8"
+        | "rust_dbg_extern_identity_u32"
+        | "rust_dbg_extern_identity_u64"
+        | "rust_dbg_extern_identity_double"
+        | "rust_dbg_extern_identity_TwoU8s"
+        | "rust_dbg_extern_identity_TwoU16s"
+        | "rust_dbg_extern_identity_TwoU32s"
+        | "rust_dbg_extern_identity_TwoU64s"
+        | "rust_dbg_extern_identity_TwoDoubles"
+        | "rust_dbg_extern_identity_FiveU16s"
+        | "rust_int8_to_int32"
+        | "identity" => Builtin::FfiIdentity,
+        "rust_dbg_extern_return_TwoU8s"
+        | "rust_dbg_extern_return_TwoU16s"
+        | "rust_dbg_extern_return_TwoU32s"
+        | "rust_dbg_extern_return_TwoU64s" => Builtin::FfiReturnTwo,
+        "rust_dbg_extern_return_FiveU16s" => Builtin::FfiReturnFive,
+        "rust_dbg_call" => Builtin::FfiDbgCall,
+        "rust_dbg_extern_empty_struct" => Builtin::FfiEmptyStruct,
+        "rust_get_test_int" => Builtin::FfiGetTestInt,
+        "rust_get_null_ptr" => Builtin::FfiGetNullPtr,
+        "rust_dbg_abi_1" => Builtin::FfiDbgAbi1,
+        "rust_dbg_abi_2" => Builtin::FfiDbgAbi2,
+        "rust_dbg_abi_3" => Builtin::FfiDbgAbi3,
+        "rust_dbg_abi_4" => Builtin::FfiDbgAbi4,
+        "get_x" => Builtin::FfiArgField { arg: 0, field: 0 },
+        "get_y" => Builtin::FfiArgField { arg: 0, field: 1 },
+        "get_z" => Builtin::FfiArgField { arg: 0, field: 2 },
+        "get_c_many_params" => Builtin::FfiArgField { arg: 4, field: 2 },
+        "get_c_exhaust_sysv64_ints" => Builtin::FfiArgField { arg: 7, field: 2 },
+        "rust_dbg_new_some_u64" | "rust_dbg_new_some_u64u64" => Builtin::FfiNewSome,
+        "rust_dbg_new_none_u64" | "rust_dbg_new_none_u64u64" => Builtin::FfiNewNone,
+        "rust_dbg_unpack_option_u64" | "rust_dbg_unpack_option_u64u64" => {
+            Builtin::FfiUnpackOption
+        }
+        "rust_interesting_average" => Builtin::FfiInterestingAverage,
+        "square" => Builtin::FfiSquare128,
+        "sub" => Builtin::FfiSub128,
+        "increment_all_parts" => Builtin::FfiIncrementAllParts,
+        "issue_97463_leak_uninit_data" => Builtin::FfiLeakUninitData,
+        _ => return None,
+    })
 }
 
 pub fn lookup(canonical: &str) -> Option<Builtin> {
@@ -2974,6 +3130,7 @@ impl<'a> Interpreter<'a> {
             return self.time_add_sub(name, self_ty, name.ends_with("Sub::sub"), &vals);
         }
         let kind = lookup(name)
+            .or_else(|| foreign_helper_lookup(name))
             .ok_or_else(|| unsupported(format!("call to {name} is not runtime-supported")))?;
         // The closure-taking consumers evaluate their callable
         // operand themselves: the generic evaluation below moves
@@ -3040,6 +3197,304 @@ impl<'a> Interpreter<'a> {
                 let text = self.format_arguments(frames, expect_arguments(&vals[0], name)?)?;
                 self.push_error_output(&text);
                 Ok(Value::Unit)
+            }
+            Builtin::FfiIdentity => {
+                arity(1)?;
+                Ok(vals[0].clone())
+            }
+            Builtin::FfiReturnTwo => {
+                arity(0)?;
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Uint(10), Value::Uint(20)],
+                })
+            }
+            Builtin::FfiReturnFive => {
+                arity(0)?;
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields: vec![
+                        Value::Uint(10),
+                        Value::Uint(20),
+                        Value::Uint(30),
+                        Value::Uint(40),
+                        Value::Uint(50),
+                    ],
+                })
+            }
+            Builtin::FfiDbgCall => {
+                arity(2)?;
+                match &vals[0] {
+                    Value::FnPtr(target) => {
+                        let target = target.clone();
+                        let data = vals[1].clone();
+                        self.call_sync(frames, &target, vec![data])
+                    }
+                    other => Err(InterpError::type_mismatch(
+                        format!("builtin {name}"),
+                        "function pointer callback",
+                        other.kind_name(),
+                    )),
+                }
+            }
+            Builtin::FfiEmptyStruct => {
+                arity(3)?;
+                let v1 = aggregate_fields(&vals[0]).ok_or_else(|| {
+                    unsupported(format!("call to {name}: first argument is not a struct value"))
+                })?;
+                let v2 = aggregate_fields(&vals[2]).ok_or_else(|| {
+                    unsupported(format!("call to {name}: third argument is not a struct value"))
+                })?;
+                if v1.len() != 6 || v2.len() != 6 {
+                    return Err(unsupported(format!(
+                        "call to {name}: ManyInts shape not recognised"
+                    )));
+                }
+                // The C asserts: each scalar field of v1 is the
+                // matching field of v2 plus one, and likewise
+                // for the nested TwoU8s (field 5).
+                let mut holds = true;
+                for i in 0..5 {
+                    holds &= as_i128(&v1[i], name)? == as_i128(&v2[i], name)? + 1;
+                }
+                let n1 = aggregate_fields(&v1[5]).ok_or_else(|| {
+                    unsupported(format!("call to {name}: nested struct shape not recognised"))
+                })?;
+                let n2 = aggregate_fields(&v2[5]).ok_or_else(|| {
+                    unsupported(format!("call to {name}: nested struct shape not recognised"))
+                })?;
+                if n1.len() != 2 || n2.len() != 2 {
+                    return Err(unsupported(format!(
+                        "call to {name}: nested struct shape not recognised"
+                    )));
+                }
+                for i in 0..2 {
+                    holds &= as_u128(&n1[i], name)? == as_u128(&n2[i], name)? + 1;
+                }
+                if !holds {
+                    return Err(InterpError::Abort {
+                        message: format!(
+                            "{name}: assertion `v1 == v2 + 1` failed (C assert in rust_test_helpers)"
+                        ),
+                    });
+                }
+                Ok(Value::Unit)
+            }
+            Builtin::FfiGetTestInt => {
+                arity(0)?;
+                Ok(Value::Int(1))
+            }
+            Builtin::FfiGetNullPtr => {
+                arity(0)?;
+                Ok(Value::Ref(RefTarget::Null))
+            }
+            Builtin::FfiDbgAbi1 => {
+                arity(1)?;
+                let f = aggregate_fields(&vals[0]).ok_or_else(|| {
+                    unsupported(format!("call to {name}: argument is not a struct value"))
+                })?;
+                if f.len() != 4 {
+                    return Err(unsupported(format!(
+                        "call to {name}: quad shape not recognised"
+                    )));
+                }
+                let a = as_u128(&f[0], name)? as u64;
+                let b = as_u128(&f[1], name)? as u64;
+                let c = as_u128(&f[2], name)? as u64;
+                let d = as_u128(&f[3], name)? as u64;
+                Ok(aggregate_like(
+                    &vals[0],
+                    vec![
+                        Value::Uint(c.wrapping_add(1) as u128),
+                        Value::Uint(d.wrapping_sub(1) as u128),
+                        Value::Uint(a.wrapping_add(1) as u128),
+                        Value::Uint(b.wrapping_sub(1) as u128),
+                    ],
+                ))
+            }
+            Builtin::FfiDbgAbi2 => {
+                arity(1)?;
+                let f = aggregate_fields(&vals[0]).ok_or_else(|| {
+                    unsupported(format!("call to {name}: argument is not a struct value"))
+                })?;
+                if f.len() != 3 {
+                    return Err(unsupported(format!(
+                        "call to {name}: floats shape not recognised"
+                    )));
+                }
+                let a = as_f64(&f[0], name)?;
+                let c = as_f64(&f[2], name)?;
+                Ok(aggregate_like(
+                    &vals[0],
+                    vec![
+                        Value::Float(c + 1.0),
+                        Value::Uint(0xff),
+                        Value::Float(a - 1.0),
+                    ],
+                ))
+            }
+            Builtin::FfiDbgAbi3 | Builtin::FfiDbgAbi4 => {
+                arity(1)?;
+                let f = aggregate_fields(&vals[0]).ok_or_else(|| {
+                    unsupported(format!("call to {name}: argument is not a struct value"))
+                })?;
+                if f.len() != 3 {
+                    return Err(unsupported(format!(
+                        "call to {name}: char_char shape not recognised"
+                    )));
+                }
+                let a = as_u128(&f[0], name)? as u8;
+                let b = as_u128(&f[1], name)? as u8;
+                let c = as_f64(&f[2], name)?;
+                // abi_4's third field is an f32: the C adds in
+                // float precision; abi_3's is an f64.
+                let c = if kind == Builtin::FfiDbgAbi4 {
+                    (c as f32 + 1.0f32) as f64
+                } else {
+                    c + 1.0
+                };
+                Ok(aggregate_like(
+                    &vals[0],
+                    vec![
+                        Value::Uint(a.wrapping_add(1) as u128),
+                        Value::Uint(b.wrapping_sub(1) as u128),
+                        Value::Float(c),
+                    ],
+                ))
+            }
+            Builtin::FfiArgField { arg, field } => {
+                let Some(target) = vals.get(arg) else {
+                    return Err(InterpError::type_mismatch(
+                        format!("builtin {name}"),
+                        format!("at least {} argument(s)", arg + 1),
+                        format!("{} argument(s)", vals.len()),
+                    ));
+                };
+                let f = aggregate_fields(target).ok_or_else(|| {
+                    unsupported(format!(
+                        "call to {name}: argument {arg} is not a struct value"
+                    ))
+                })?;
+                let Some(value) = f.get(field) else {
+                    return Err(unsupported(format!(
+                        "call to {name}: argument {arg} has no field {field}"
+                    )));
+                };
+                Ok(value.clone())
+            }
+            Builtin::FfiInterestingAverage => {
+                if vals.is_empty() {
+                    return Err(InterpError::type_mismatch(
+                        format!("builtin {name}"),
+                        "at least 1 argument(s)",
+                        "0 argument(s)",
+                    ));
+                }
+                let n = as_u128(&vals[0], name)?;
+                let rest = &vals[1..];
+                if rest.len() as u128 != 2 * n {
+                    return Err(unsupported(format!(
+                        "call to {name}: expected {n} (i64, f64) pairs, got {} values",
+                        rest.len()
+                    )));
+                }
+                let mut sum = 0.0f64;
+                for pair in rest.chunks(2) {
+                    sum += as_i128(&pair[0], name)? as f64;
+                    sum += as_f64(&pair[1], name)?;
+                }
+                Ok(Value::Float(sum / n as f64))
+            }
+            Builtin::FfiSquare128 => {
+                arity(1)?;
+                let v = as_i128(&vals[0], name)?;
+                Ok(Value::Int(v.wrapping_mul(v)))
+            }
+            Builtin::FfiSub128 => {
+                arity(2)?;
+                let a = as_i128(&vals[0], name)?;
+                let b = as_i128(&vals[1], name)?;
+                Ok(Value::Int(a.wrapping_sub(b)))
+            }
+            Builtin::FfiIncrementAllParts => {
+                arity(1)?;
+                let Some(bits) = union_u64_bits(&vals[0]) else {
+                    return Err(unsupported(format!(
+                        "call to {name}: argument is not a 64-bit union value"
+                    )));
+                };
+                let lo = (bits as u32).wrapping_add(2) as u64;
+                let hi = ((bits >> 32) as u32).wrapping_add(2) as u64;
+                let combined = (hi << 32) | lo;
+                Ok(union_with_u64_bits(&vals[0], combined.wrapping_add(1)))
+            }
+            Builtin::FfiLeakUninitData => {
+                arity(3)?;
+                let b = as_u128(&vals[1], name)?;
+                Ok(Value::Uint(b & 0xFFFF))
+            }
+            Builtin::FfiNewSome => {
+                if vals.is_empty() || vals.len() > 2 {
+                    return Err(InterpError::type_mismatch(
+                        format!("builtin {name}"),
+                        "1 or 2 argument(s)",
+                        format!("{} argument(s)", vals.len()),
+                    ));
+                }
+                Ok(Value::Enum {
+                    variant: 1,
+                    fields: vals.clone(),
+                })
+            }
+            Builtin::FfiNewNone => {
+                arity(0)?;
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields: Vec::new(),
+                })
+            }
+            Builtin::FfiUnpackOption => {
+                if vals.len() < 2 || vals.len() > 3 {
+                    return Err(InterpError::type_mismatch(
+                        format!("builtin {name}"),
+                        "2 or 3 argument(s)",
+                        format!("{} argument(s)", vals.len()),
+                    ));
+                }
+                let (variant, fields) = match &vals[0] {
+                    Value::Enum { variant, fields } => (*variant, fields.clone()),
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            format!("builtin {name}"),
+                            "tagged option enum value",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                if variant == 0 {
+                    return Ok(Value::Int(0));
+                }
+                if variant != 1 || fields.len() != vals.len() - 1 {
+                    return Err(unsupported(format!(
+                        "call to {name}: option shape not recognised"
+                    )));
+                }
+                for (ptr, value) in vals[1..].iter().zip(fields) {
+                    if matches!(ptr, Value::Ref(RefTarget::Null)) {
+                        return Err(InterpError::Abort {
+                            message: format!(
+                                "{name}: assertion `into` failed (C assert in rust_test_helpers)"
+                            ),
+                        });
+                    }
+                    let target = self.deref_value(frames, ptr)?;
+                    self.write_resolved(frames, &target, value)?;
+                }
+                Ok(Value::Int(1))
+            }
+            Builtin::ProcMacroIsAvailable => {
+                arity(0)?;
+                Ok(Value::Bool(false))
             }
             Builtin::EnvArgs | Builtin::EnvArgsOs => {
                 arity(0)?;
@@ -13498,6 +13953,119 @@ fn sign_extend(pattern: u128, bits: u32) -> i128 {
     } else {
         let shift = 128 - bits;
         ((pattern << shift) as i128) >> shift
+    }
+}
+
+/// The field values of an aggregate value: a struct rides
+/// as a `Value::Enum` (variant 0), a plain aggregate as a
+/// `Value::Tuple`.
+fn aggregate_fields(value: &Value) -> Option<&[Value]> {
+    match value {
+        Value::Enum { fields, .. } => Some(fields),
+        Value::Tuple(items) => Some(items),
+        _ => None,
+    }
+}
+
+/// Rebuild an aggregate with the shape of `template` and new
+/// field values.
+fn aggregate_like(template: &Value, fields: Vec<Value>) -> Value {
+    match template {
+        Value::Enum { variant, .. } => Value::Enum {
+            variant: *variant,
+            fields,
+        },
+        _ => Value::Tuple(fields),
+    }
+}
+
+fn as_f64(value: &Value, name: &str) -> InterpResult<f64> {
+    match value {
+        Value::Float(f) => Ok(*f),
+        other => Err(InterpError::type_mismatch(
+            format!("builtin {name}"),
+            "float",
+            other.kind_name(),
+        )),
+    }
+}
+
+/// The 64-bit pattern a `LARGE_INTEGER` union value holds.
+/// A union value is an `Enum` holding one live field (the
+/// last written; the other slots are `Uninit`): here either
+/// the `QuadPart` scalar or the two-`u32` struct view, whose
+/// parts combine low-then-high. A bare scalar (the shape a
+/// constant aggregate can arrive in) reads as itself.
+fn union_u64_bits(value: &Value) -> Option<u64> {
+    match value {
+        Value::Uint(v) => Some(*v as u64),
+        Value::Int(v) => Some(*v as u64),
+        Value::Enum { fields, .. } => {
+            let live: Vec<&Value> = fields
+                .iter()
+                .filter(|f| **f != Value::Uninit)
+                .collect();
+            match live.as_slice() {
+                [only] => match only {
+                    Value::Enum { fields: parts, .. } if parts.len() == 2 => {
+                        let lo = match &parts[0] {
+                            Value::Uint(v) => *v as u64,
+                            _ => return None,
+                        };
+                        let hi = match &parts[1] {
+                            Value::Uint(v) => *v as u64,
+                            _ => return None,
+                        };
+                        Some(lo | (hi << 32))
+                    }
+                    other => union_u64_bits(other),
+                },
+                _ => None,
+            }
+        }
+        Value::Tuple(items) if items.len() == 1 => union_u64_bits(&items[0]),
+        _ => None,
+    }
+}
+
+/// A union value with `template`'s shape holding `bits` as
+/// its 64-bit pattern: the live slot of the template (the
+/// scalar, or the struct view as its two 32-bit parts) is
+/// rewritten, every other slot stays `Uninit`, so the guest's
+/// union field reads reinterpret the new pattern exactly as
+/// they did the old one.
+fn union_with_u64_bits(template: &Value, bits: u64) -> Value {
+    match template {
+        Value::Enum { variant, fields } => {
+            let live_idx = fields.iter().position(|f| *f != Value::Uninit);
+            match live_idx {
+                Some(idx) => {
+                    let mut out: Vec<Value> =
+                        fields.iter().map(|_| Value::Uninit).collect();
+                    out[idx] = match &fields[idx] {
+                        Value::Enum { variant: v2, fields: parts } if parts.len() == 2 => {
+                            Value::Enum {
+                                variant: *v2,
+                                fields: vec![
+                                    Value::Uint((bits & 0xFFFF_FFFF) as u128),
+                                    Value::Uint((bits >> 32) as u128),
+                                ],
+                            }
+                        }
+                        _ => Value::Uint(bits as u128),
+                    };
+                    Value::Enum {
+                        variant: *variant,
+                        fields: out,
+                    }
+                }
+                None => Value::Uint(bits as u128),
+            }
+        }
+        Value::Tuple(items) if items.len() == 1 => {
+            Value::Tuple(vec![union_with_u64_bits(&items[0], bits)])
+        }
+        _ => Value::Uint(bits as u128),
     }
 }
 
