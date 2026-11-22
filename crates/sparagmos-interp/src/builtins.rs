@@ -1060,6 +1060,14 @@ pub enum Builtin {
     /// paths, and a path value is its byte string, see
     /// `path_bytes_of`).
     PathPart(PathPart),
+    /// `std::str::from_utf8(&[u8]) -> Result<&str, Utf8Error>`:
+    /// a non-inline library method, so no MIR body is available;
+    /// the validation is a pure function of the bytes, answered
+    /// with the host's own `std::str::from_utf8` (the same
+    /// rules). The error value is std's shape: the
+    /// `Utf8Error` struct's `valid_up_to` and `error_len`
+    /// fields.
+    FromUtf8,
     /// `alloc::alloc::__rust_alloc(size, align) -> *mut u8` and
     /// `__rust_alloc_zeroed`: a fresh block in the allocation
     /// store, named by a new allocation id. The uninitialised
@@ -1758,6 +1766,7 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::path::Path::file_name" => Builtin::PathPart(PathPart::FileName),
         "std::path::Path::file_stem" => Builtin::PathPart(PathPart::FileStem),
         "std::path::Path::extension" => Builtin::PathPart(PathPart::Extension),
+        "std::str::from_utf8" | "core::str::from_utf8" => Builtin::FromUtf8,
         _ if canonical.contains("RangeInclusive") && canonical.ends_with("::new") => {
             Builtin::RangeInclusiveNew
         }
@@ -5609,6 +5618,35 @@ impl<'a> Interpreter<'a> {
                         Value::Bytes(bytes)
                     }),
                     None => none_value(),
+                })
+            }
+            Builtin::FromUtf8 => {
+                arity(1)?;
+                let (bytes, _) = self.path_bytes_of(frames, &vals[0])?;
+                Ok(match std::str::from_utf8(&bytes) {
+                    Ok(_) => Value::Enum {
+                        variant: 0,
+                        fields: vec![Value::Str(
+                            // The bytes are valid UTF-8 (just
+                            // checked) and the model's string is
+                            // the same data.
+                            String::from_utf8(bytes)
+                                .expect("validity checked above"),
+                        )],
+                    },
+                    Err(e) => Value::Enum {
+                        variant: 1,
+                        fields: vec![Value::Enum {
+                            variant: 0,
+                            fields: vec![
+                                Value::Uint(e.valid_up_to() as u128),
+                                match e.error_len() {
+                                    Some(n) => some_value(Value::Uint(n as u128)),
+                                    None => none_value(),
+                                },
+                            ],
+                        }],
+                    },
                 })
             }
             Builtin::ToUppercase => {

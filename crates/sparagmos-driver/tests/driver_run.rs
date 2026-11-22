@@ -13065,3 +13065,41 @@ fn run_mode_dyn_any_debug_is_opaque() {
         "Any { .. }\nNamed { x: 2 }\n",
     );
 }
+
+const PATH_TO_STR_SRC: &str = r#"
+use std::path::Path;
+
+fn main() {
+    // `Path::to_str` goes through `str::from_utf8` on the
+    // path's bytes.
+    let p = Path::new("abc");
+    assert_eq!(p.to_str().unwrap(), "abc");
+    let ok = std::str::from_utf8(b"abc").unwrap();
+    assert_eq!(ok, "abc");
+    let bad = std::str::from_utf8(&[0x61, 0xFF, 0x62]).unwrap_err();
+    assert_eq!(bad.valid_up_to(), 1);
+    assert_eq!(bad.error_len(), Some(1));
+    let incomplete = std::str::from_utf8(&[0x61, 0xE3, 0x81]).unwrap_err();
+    assert_eq!(incomplete.valid_up_to(), 1);
+    assert_eq!(incomplete.error_len(), None);
+    println!("path-to-str-ok");
+}
+"#;
+
+#[test]
+fn run_mode_path_to_str_and_from_utf8() {
+    let dir = temp_dir("path-to-str");
+    let src = fixture(&dir, "path_to_str.rs", PATH_TO_STR_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Path::to_str and str::from_utf8 run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "path-to-str-ok\n",
+        "utf8 validation results and error fields match std"
+    );
+}
