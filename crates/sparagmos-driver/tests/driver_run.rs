@@ -16691,3 +16691,133 @@ fn run_mode_valist_forwarding() {
 fn run_mode_valist_fixed_and_tail() {
     run_ok_edition("valist-fixed-tail", VALIST_FIXED_AND_TAIL_SRC, "scaled=45\n");
 }
+const ARRAY_CLONE_UNWIND_MULTIFIELD_SRC: &str = r#"
+use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+static N: AtomicUsize = AtomicUsize::new(0);
+struct S {
+    id: u32,
+    rc: Rc<()>,
+}
+impl Clone for S {
+    fn clone(&self) -> Self {
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        if n == 2 {
+            panic!("oops on third clone");
+        }
+        S { id: self.id, rc: self.rc.clone() }
+    }
+}
+fn main() {
+    let counter = Rc::new(());
+    let arr = [
+        S { id: 0, rc: counter.clone() },
+        S { id: 1, rc: counter.clone() },
+        S { id: 2, rc: counter.clone() },
+        S { id: 3, rc: counter.clone() },
+    ];
+    println!("built: {}", Rc::strong_count(&counter));
+    let child = std::panic::catch_unwind(move || {
+        let _ = arr.clone();
+    });
+    println!("is_err: {}", child.is_err());
+    println!("count after: {}", Rc::strong_count(&counter));
+}
+"#;
+#[test]
+fn run_mode_array_clone_unwind_drops_cloned_prefix() {
+    // Cloning an array of multi-field elements through the
+    // spec-clone guard: when an element's `Clone` panics, the
+    // guard drops exactly the already-cloned prefix. The guard's
+    // erased buffer pointer denotes element 0 entered through
+    // its `MaybeUninit` wrapper; the drop's slice length is the
+    // cloned count, which for a two-field element coincides with
+    // the element's own field count -- the two must not be
+    // confused when the drop's base place is composed.
+    let dir = temp_dir("array-clone-unwind-multifield");
+    let src = fixture(&dir, "array_clone_unwind.rs", ARRAY_CLONE_UNWIND_MULTIFIELD_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "built: 5\nis_err: true\ncount after: 1\n"
+    );
+}
+const MAYBE_UNINIT_ARRAY_BUFFER_SRC: &str = r#"
+use std::mem::MaybeUninit;
+use std::rc::Rc;
+struct S {
+    id: u32,
+    rc: Rc<()>,
+}
+impl Clone for S {
+    fn clone(&self) -> Self {
+        S { id: self.id, rc: self.rc.clone() }
+    }
+}
+fn main() {
+    let counter = Rc::new(());
+    let mut buf: MaybeUninit<[S; 4]> = MaybeUninit::uninit();
+    let ptr = buf.as_mut_ptr() as *mut S;
+    unsafe {
+        for i in 0..4 {
+            ptr.add(i).write(S { id: i as u32, rc: counter.clone() });
+        }
+        let arr = buf.assume_init();
+        println!("after assume_init: {}", Rc::strong_count(&counter));
+        println!("ids: {} {} {} {}", arr[0].id, arr[1].id, arr[2].id, arr[3].id);
+        let arr2 = arr.clone();
+        println!("after clone: {}", Rc::strong_count(&counter));
+        drop(arr2);
+        drop(arr);
+    }
+    println!("final: {}", Rc::strong_count(&counter));
+}
+"#;
+#[test]
+fn run_mode_maybe_uninit_array_buffer_element_access() {
+    // A whole-buffer `MaybeUninit<[S; 4]>`: the `uninit()`
+    // construction must materialize the payload slot as the
+    // array's uninitialized skeleton (the model's field-0
+    // payload convention), so element writes through
+    // `as_mut_ptr` land in array slots and `assume_init` reads
+    // the filled array back.
+    let dir = temp_dir("maybe-uninit-array-buffer");
+    let src = fixture(&dir, "maybe_uninit_buffer.rs", MAYBE_UNINIT_ARRAY_BUFFER_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "after assume_init: 5\nids: 0 1 2 3\nafter clone: 9\nfinal: 1\n"
+    );
+}
+const NESTED_MAYBE_UNINIT_BUFFER_SRC: &str = r#"
+use std::mem::MaybeUninit;
+fn main() {
+    let mut buf: MaybeUninit<MaybeUninit<[u32; 2]>> = MaybeUninit::uninit();
+    let ptr = buf.as_mut_ptr() as *mut u32;
+    unsafe {
+        ptr.write(11);
+        ptr.add(1).write(22);
+        let inner = buf.assume_init();
+        let arr = inner.assume_init();
+        println!("nested: {} {}", arr[0], arr[1]);
+    }
+}
+"#;
+#[test]
+fn run_mode_nested_maybe_uninit_buffer_cast() {
+    // `buf.as_mut_ptr() as *mut u32` over a nested
+    // `MaybeUninit<MaybeUninit<[u32; 2]>>` crosses both wrapper
+    // layers and the array layer in a single cast; the resulting
+    // pointer denotes the first array element, so element writes
+    // through it fill the array's slots in order.
+    let dir = temp_dir("nested-maybe-uninit-buffer");
+    let src = fixture(&dir, "nested_maybe_uninit.rs", NESTED_MAYBE_UNINIT_BUFFER_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "nested: 11 22\n");
+}

@@ -6546,6 +6546,27 @@ impl<'a> Interpreter<'a> {
         cur: &Resolved,
         fat_len: u128,
     ) -> bool {
+        // A position that ends at one element of a container,
+        // entered through whole-value entry steps (the shape a
+        // transparent-wrapper entry leaves, as in the elements of
+        // a `[MaybeUninit<T>]` buffer), denotes that element as a
+        // whole: the slice's elements are the container's elements
+        // entered the same way, so when the slice fits inside the
+        // container at the base index, the position is an element
+        // position, never the slice's own storage -- whatever the
+        // entered element's own field count happens to be. Judging
+        // by the count alone mistook a two-field element of a
+        // two-element slice (the array clone guard's partial drop)
+        // for the slice's storage.
+        if let Some((container, base)) = entered_element_container(cur) {
+            if let Ok(value) = self.read_resolved(frames, &container) {
+                if let Some(count) = value.len() {
+                    if base as u128 + fat_len <= count {
+                        return false;
+                    }
+                }
+            }
+        }
         match self.read_resolved(frames, cur) {
             Ok(value) => value.len() == Some(fat_len),
             Err(_) => false,
@@ -6860,8 +6881,10 @@ impl<'a> Interpreter<'a> {
     /// pointer, and appending index 0 there would denote the
     /// element's own first element instead. A base position is the
     /// element case exactly when its projection already ends at
-    /// an element index and the value there is not the slice's
-    /// storage (see [`Self::deref_denotes_storage`]); a position
+    /// an element position (an index step, possibly followed by
+    /// whole-value entry steps into that element) and the value
+    /// there is not the slice's storage (see
+    /// [`Self::deref_denotes_storage`]); a position
     /// denoting a whole scalar or aggregate (a one-element slice
     /// over a lone scalar, say) is storage whatever its shape. The projection is carried
     /// on the target like every other retargeting in this model
@@ -6915,7 +6938,7 @@ impl<'a> Interpreter<'a> {
                         | Resolved::Static { projection, .. }
                         | Resolved::Alloc { projection, .. }
                         | Resolved::Value(_, projection) => {
-                            matches!(projection.last(), Some(RefProj::Index(_)))
+                            projection_ends_at_element(projection)
                         }
                     };
                     if ends_at_element
@@ -10574,6 +10597,11 @@ impl<'a> Interpreter<'a> {
                 let value = self.eval_operand(frames, body, operand)?;
                 self.ptr_field_value(frames, body, value, *depth)
             }
+            Rvalue::PtrFieldFirstElem(operand, depth) => {
+                let value = self.eval_operand(frames, body, operand)?;
+                let value = self.ptr_field_value(frames, body, value, *depth)?;
+                self.ptr_first_elem_value(frames, body, value)
+            }
             Rvalue::PtrFirstElem(operand) => {
                 let value = self.eval_operand(frames, body, operand)?;
                 self.ptr_first_elem_value(frames, body, value)
@@ -11200,6 +11228,77 @@ fn check_subslice(value_len: usize, offset: usize, count: usize) -> InterpResult
 /// before the entry steps is advanced and the entry steps are
 /// kept. Any other target shape answers `None` and the caller
 /// appends the step as usual.
+/// Whether a projection ends at an element position: its last
+/// step is an index step, or an index step followed only by
+/// whole-value entry steps (field and downcast steps) -- the
+/// entered-element shape (see [`entered_element_container`]).
+fn projection_ends_at_element(projection: &[RefProj]) -> bool {
+    let mut pos = projection.len();
+    while pos > 0 {
+        match projection[pos - 1] {
+            RefProj::Field(_) | RefProj::Downcast(_) => pos -= 1,
+            RefProj::Index(_) => return true,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// The container position and base index of a resolved position
+/// that ends at one element of a container, entered through
+/// whole-value entry steps (field and downcast steps -- the shape
+/// a transparent-wrapper entry leaves, as in the elements of a
+/// `[MaybeUninit<T>]` buffer): the position
+/// `[.., Index(k), entry...]`, with at least one entry step,
+/// denotes element `k` of the container the index step ranges
+/// over, entered the way every element of that container is.
+/// Any other shape answers `None`.
+fn entered_element_container(cur: &Resolved) -> Option<(Resolved, usize)> {
+    let projection: &[RefProj] = match cur {
+        Resolved::Place { projection, .. }
+        | Resolved::Static { projection, .. }
+        | Resolved::Alloc { projection, .. } => projection,
+        Resolved::Value(..) => return None,
+    };
+    let mut pos = projection.len();
+    let mut entered = false;
+    while pos > 0 {
+        match projection[pos - 1] {
+            RefProj::Field(_) | RefProj::Downcast(_) => {
+                entered = true;
+                pos -= 1;
+            }
+            RefProj::Index(k) => {
+                if !entered {
+                    return None;
+                }
+                let container_projection = projection[..pos - 1].to_vec();
+                let container = match cur {
+                    Resolved::Place {
+                        frame_pos, local, ..
+                    } => Resolved::Place {
+                        frame_pos: *frame_pos,
+                        local: *local,
+                        projection: container_projection,
+                    },
+                    Resolved::Static { name, .. } => Resolved::Static {
+                        name: name.clone(),
+                        projection: container_projection,
+                    },
+                    Resolved::Alloc { id, .. } => Resolved::Alloc {
+                        id: *id,
+                        projection: container_projection,
+                    },
+                    Resolved::Value(..) => unreachable!(),
+                };
+                return Some((container, k));
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 fn compose_fat_index(cur: &Resolved, idx: usize) -> Option<Resolved> {
     fn advanced(projection: &[RefProj], idx: usize) -> Option<Vec<RefProj>> {
         // The element index the composition advances: the

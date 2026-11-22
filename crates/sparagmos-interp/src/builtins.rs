@@ -18199,10 +18199,14 @@ fn tag_leaf_count(tag: &str) -> Option<usize> {
 
 /// The number of scalar leaves in a materialised `value`,
 /// mirroring [`tag_leaf_count`]: aggregates sum their parts,
-/// anything else is one leaf. Byte blocks and strings keep the
-/// sequence path (their fills are byte-wise), a fat reference's
-/// pointee count is not a fact of the value alone, and an
-/// uninitialised leaf has no count: all are `None` here.
+/// anything else is one leaf -- including an uninitialised leaf,
+/// which still occupies its slot in the aggregate's shape (a
+/// materialised-but-uninitialised array has the same leaf count
+/// as the filled value `write_bytes` would write into it, and
+/// the caller compares exactly those two counts). Byte blocks
+/// and strings keep the sequence path (their fills are
+/// byte-wise), and a fat reference's pointee count is not a fact
+/// of the value alone: those are `None` here.
 fn value_leaf_count(value: &Value) -> Option<usize> {
     match value {
         Value::Tuple(items) => items.iter().map(value_leaf_count).sum(),
@@ -18218,8 +18222,7 @@ fn value_leaf_count(value: &Value) -> Option<usize> {
         Value::Bytes(_)
         | Value::Str(_)
         | Value::FatRef { .. }
-        | Value::DynRef { .. }
-        | Value::Uninit => None,
+        | Value::DynRef { .. } => None,
         _ => Some(1),
     }
 }

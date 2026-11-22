@@ -2460,6 +2460,26 @@ impl<'a> Converter<'a> {
         source: &mir::Ty,
         target: &mir::Ty,
     ) -> Option<u32> {
+        match self.cast_entry_depth(source, target) {
+            Some((depth, false)) => Some(depth),
+            _ => None,
+        }
+    }
+
+    /// The retargeting a pointer cast from `source` to `target`
+    /// denotes when it crosses transparent wrappers (and possibly
+    /// one array layer) to reach the target pointee: the number
+    /// of field-0 entries the wrapper peel denotes, and whether
+    /// the peel then continues into the first element of the
+    /// array the innermost peeled layer holds (the cast's target
+    /// is that array's element type, as in
+    /// `buf.as_mut_ptr() as *mut T` over a nested `MaybeUninit`
+    /// buffer). `None` when the cast is not of that shape.
+    fn cast_entry_depth(
+        &self,
+        source: &mir::Ty,
+        target: &mir::Ty,
+    ) -> Option<(u32, bool)> {
         fn pointee(ty: &mir::Ty) -> Option<&mir::Ty> {
             match ty {
                 mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _) => Some(inner),
@@ -2474,22 +2494,30 @@ impl<'a> Converter<'a> {
         // performs on the erased buffer): the fat pointer's base
         // denotes the first element's wrapper, so the entry depth
         // of the element types is a field-0 entry on the base.
+        // The target is a slice here, so the peel must land
+        // exactly on the target element type, never inside it.
         if let (mir::Ty::Slice(src_elem), mir::Ty::Slice(tgt_elem)) = (&current, target) {
-            return self.wrapper_peel_depth((**src_elem).clone(), tgt_elem);
+            return match self.wrapper_peel((**src_elem).clone(), tgt_elem) {
+                Some((depth, false)) => Some((depth, false)),
+                _ => None,
+            };
         }
-        self.wrapper_peel_depth(current, target)
+        self.wrapper_peel(current, target)
     }
 
     /// Peel wrapper layers (`UnsafeCell` / `MaybeUninit`, and
     /// single-field array structs) off `current` until it matches
     /// `target`, returning the number of field-0 entries the peel
-    /// denotes, or `None` when the peel does not land exactly on
-    /// `target`.
-    fn wrapper_peel_depth(
+    /// denotes -- and, when the innermost peeled layer is an
+    /// array (or slice) whose element type is exactly `target`,
+    /// reporting that the peel continues into that array's first
+    /// element. `None` when the peel lands nowhere the target
+    /// names.
+    fn wrapper_peel(
         &self,
         mut current: mir::Ty,
         target: &mir::Ty,
-    ) -> Option<u32> {
+    ) -> Option<(u32, bool)> {
         let mut depth = 0u32;
         loop {
             let mir::Ty::Adt(def, args) = &current else {
@@ -2533,7 +2561,16 @@ impl<'a> Converter<'a> {
             };
             depth += 1;
             if Self::cast_ty_matches(&next, target) {
-                return Some(depth);
+                return Some((depth, false));
+            }
+            // The peel crossed the wrappers and reached an array
+            // whose element type is the target: the cast denotes
+            // the array's first element, one index-0 step past
+            // the field entries the peel denotes.
+            if let mir::Ty::Array(elem, _) | mir::Ty::Slice(elem) = &next {
+                if Self::cast_ty_matches(elem, target) {
+                    return Some((depth, true));
+                }
             }
             current = next;
         }
@@ -3183,9 +3220,12 @@ impl<'a> Converter<'a> {
     /// the `MaybeUninit` out by value (`ptr::replace` in
     /// `get_or_init_slow`) -- a read that must yield the uninitialized
     /// `MaybeUninit` itself, not fail for touching uninitialized
-    /// memory. Guest code materializes that same value as the union
-    /// aggregate with its `()` field active (`MaybeUninit::uninit()`),
-    /// so the expansion rebuilds exactly that form: structs and
+    /// memory. Guest code materializes that same value through the
+    /// `MaybeUninit::uninit()` construction, whose conversion the
+    /// aggregate arm of `convert_rvalue` rewrites to the model's
+    /// field-0 payload form, so the expansion rebuilds exactly that
+    /// form for a `MaybeUninit`: the payload slot carrying the
+    /// payload type's own expansion. For the rest: structs and
     /// tuples get one slot per field, arrays get one slot per
     /// element, a union gets its unit-typed
     /// field (the `uninit: ()` pattern) with `Uninit` padding before
@@ -3203,6 +3243,30 @@ impl<'a> Converter<'a> {
         }
         match (value, ty) {
             (ir::Constant::Uninit, mir::Ty::Adt(def, args)) => {
+                // A `MaybeUninit<T>` is held as a single field-0
+                // payload (see the aggregate conversion in
+                // `convert_rvalue`): an uninitialized one carries
+                // the uninitialized skeleton of `T` in that slot,
+                // not the union's unit-typed `uninit` field value,
+                // so a constant of this type expands to the same
+                // value the `MaybeUninit::uninit()` construction
+                // materializes. (Bulk consumers are unaffected by
+                // the shape: `write_bytes` counts uninitialised
+                // leaves as occupying their slots when it decides
+                // a fill is the target's whole value.)
+                if self.is_maybe_uninit(def) {
+                    if let Some(payload_ty) = args.first() {
+                        let payload = self.expand_uninit_constant(
+                            &ir::Constant::Uninit,
+                            payload_ty,
+                            depth + 1,
+                        );
+                        return ir::Constant::Adt {
+                            variant: 0,
+                            fields: vec![payload],
+                        };
+                    }
+                }
                 let Some(shape) = self.adt_shapes.get(def) else {
                     return value.clone();
                 };
@@ -5914,11 +5978,15 @@ let inner = match (&src, target) {
                         // pointer denotes: the wrapper's only field.
                         // Every other pointer-to-pointer cast leaves
                         // the denoted place unchanged in this model.
-                        let entry_depth = ctx
+                        let entry = ctx
                             .as_ref()
-                            .and_then(|src| self.cast_wrapper_entry_depth(src, target));
-                        if let Some(depth) = entry_depth {
-                            ir::Rvalue::PtrField(v, depth)
+                            .and_then(|src| self.cast_entry_depth(src, target));
+                        if let Some((depth, first_elem)) = entry {
+                            if first_elem {
+                                ir::Rvalue::PtrFieldFirstElem(v, depth)
+                            } else {
+                                ir::Rvalue::PtrField(v, depth)
+                            }
                         } else if ctx.as_ref().is_some_and(|src| {
                             self.cast_enters_first_element(src, target)
                         }) {
@@ -6105,6 +6173,58 @@ let inner = match (&src, target) {
                     field_index,
                     ..
                 } => {
+                    // A `MaybeUninit::uninit()` construction: the
+                    // union aggregate activates the `uninit: ()`
+                    // field, but in this value model a
+                    // `MaybeUninit<T>` holds its payload at field
+                    // 0 -- the slot its pointer accesses enter --
+                    // and the payload of an uninitialized
+                    // `MaybeUninit` is uninitialized memory of
+                    // type `T`, not the unit value the field's
+                    // declaration suggests. Storing the unit value
+                    // there left every access that navigates
+                    // inside the payload (an element write through
+                    // `as_mut_ptr` into a `MaybeUninit<[T; N]>`,
+                    // say) facing a unit where the payload's own
+                    // shape belongs. Emit the value the model
+                    // holds for an uninitialized `MaybeUninit`:
+                    // the payload slot carrying the uninitialized
+                    // skeleton of `T`, the same expansion an
+                    // uninitialized constant of this type receives
+                    // (see `expand_uninit_constant`).
+                    if let Some(active) = field_index {
+                        if self.is_maybe_uninit(def) {
+                            // The active field's declared type, from
+                            // the ADT's shape (the field table is
+                            // recovered from projections, and the
+                            // `uninit` field is never projected).
+                            let active_ty = self
+                                .adt_shapes
+                                .get(def)
+                                .and_then(|shape| {
+                                    shape.variants.get(*variant_index as usize)
+                                })
+                                .and_then(|fields| fields.get(*active as usize))
+                                .map(|fty| subst_ty(fty, generic_args));
+                            if let (Some(payload_ty), Some(field_ty)) =
+                                (generic_args.first(), active_ty)
+                            {
+                                if field_ty.is_unit() {
+                                    let payload = self.expand_uninit_constant(
+                                        &ir::Constant::Uninit,
+                                        payload_ty,
+                                        0,
+                                    );
+                                    return Ok(ir::Rvalue::Use(ir::Operand::Constant(
+                                        ir::Constant::Adt {
+                                            variant: 0,
+                                            fields: vec![payload],
+                                        },
+                                    )));
+                                }
+                            }
+                        }
+                    }
                     // For `Range` / `RangeInclusive` the two bound
                     // fields are the ADT's single generic parameter;
                     // typing literal bounds by it keeps them from

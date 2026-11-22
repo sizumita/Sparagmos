@@ -639,6 +639,18 @@ pub enum Rvalue {
     /// `UnsafeCell::get` and `cast` are inlined together) appends
     /// one field-0 projection per layer.
     PtrField(Operand, u32),
+    /// A wrapper-entering cast (see [`Rvalue::PtrField`]) whose
+    /// target pointee is the element type of the array the
+    /// innermost peeled wrapper holds: the cast crosses the
+    /// wrapper layers and then the array layer in one step
+    /// (`*mut MaybeUninit<MaybeUninit<[T; N]>>` cast straight to
+    /// `*mut T`, the shape of `buf.as_mut_ptr() as *mut T` over a
+    /// nested `MaybeUninit` buffer). The result is the operand
+    /// pointer field-entered `u32` times and then retargeted at
+    /// the array's first element -- the composition of
+    /// [`Rvalue::PtrField`] and [`Rvalue::PtrFirstElem`], which a
+    /// single cast statement cannot express as two rvalues.
+    PtrFieldFirstElem(Operand, u32),
     /// A pointer cast from an array / slice / `str` pointee to the
     /// element type itself - what `<[T]>::as_ptr`, `<[T; N]>::as_ptr`
     /// and `str::as_ptr` return, and what `&arr as *const T` writes.

@@ -449,7 +449,8 @@ impl<'a> Interpreter<'a> {
                 Rc::from(fill.as_slice()),
             ),
             // DataPtr, RawPtrAggregate, Unsize, BoxDerefTransmute,
-            // PtrField, PtrFirstElem, PtrArrayBase, Reinterpret,
+            // PtrField, PtrFieldFirstElem, PtrFirstElem,
+            // PtrArrayBase, Reinterpret,
             // ShapedLoad,
             // PtrOffset, Ref, CopyForDeref,
             // ThreadLocalRef, Unsupported: their evaluation is
