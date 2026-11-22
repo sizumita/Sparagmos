@@ -20816,10 +20816,11 @@ impl<'a> Interpreter<'a> {
                 })
             } else if let Value::Enum { fields, .. } = &resolved {
                 if fields.len() == 1
-                    && matches!(
-                        fields[0],
-                        Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. }
-                    )
+                    && (matches!(base.as_ref(), Value::Enum { .. })
+                        || matches!(
+                            tag_base_name(pointee_tag(tag)),
+                            "Box" | "Rc" | "Arc"
+                        ))
                 {
                     fields[0].clone()
                 } else {
@@ -21278,29 +21279,31 @@ impl<'a> Interpreter<'a> {
             ..
         } = value
         {
-            // A trait object's `Debug` is its concrete type's
-            // `Debug` (that is the vtable entry), so format the
-            // pointee with the concrete type as the tag. The other
-            // traits keep their existing behaviour: their impls
-            // are handwritten bodies, not the derived shape this
-            // formatter models.
-            if trait_ == FmtTrait::Debug {
+            // A trait object's fmt traits are its concrete
+            // type's (that is the vtable entry, for the principal
+            // trait and its supertraits alike), so format the
+            // pointee with the concrete type as the tag.
+            // `Pointer` keeps the existing behaviour: the value
+            // model has no address to print for the data pointer.
+            if !matches!(trait_, FmtTrait::Pointer | FmtTrait::DebugNoop) {
                 // Core's `Debug` impls for the `dyn Any` family
                 // ignore the concrete value and print `Any { .. }`:
                 // the vtable entry for such an object is that impl,
                 // not the concrete type's `Debug`.
-                let is_any = traits.iter().any(|t| t.trim().ends_with("::any::Any"));
-                let only_auto = traits.iter().all(|t| {
-                    let t = t.trim();
-                    t.ends_with("::any::Any")
-                        || t.ends_with("::marker::Send")
-                        || t.ends_with("::marker::Sync")
-                        || t.ends_with("::marker::Unpin")
-                        || t.ends_with("::panic::UnwindSafe")
-                        || t.ends_with("::panic::RefUnwindSafe")
-                });
-                if is_any && only_auto {
-                    return Ok(pad_width("Any { .. }", options));
+                if trait_ == FmtTrait::Debug {
+                    let is_any = traits.iter().any(|t| t.trim().ends_with("::any::Any"));
+                    let only_auto = traits.iter().all(|t| {
+                        let t = t.trim();
+                        t.ends_with("::any::Any")
+                            || t.ends_with("::marker::Send")
+                            || t.ends_with("::marker::Sync")
+                            || t.ends_with("::marker::Unpin")
+                            || t.ends_with("::panic::UnwindSafe")
+                            || t.ends_with("::panic::RefUnwindSafe")
+                    });
+                    if is_any && only_auto {
+                        return Ok(pad_width("Any { .. }", options));
+                    }
                 }
                 let pointee = self.resolve_value(frames, base)?;
                 // The base is the data pointer in the shape the
@@ -21316,13 +21319,9 @@ impl<'a> Interpreter<'a> {
                         projection: vec![RefProj::Field(2)],
                     })
                 } else if let Value::Enum { fields, .. } = &pointee {
-                    if fields.len() == 1
-                        && (matches!(
-                            fields[0],
-                            Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. }
-                        ) || matches!(base.as_ref(), Value::Enum { .. }))
-                    {
-                        // A box's single field denotes the
+                    if fields.len() == 1 && matches!(base.as_ref(), Value::Enum { .. }) {
+                        // The data pointer is the box aggregate
+                        // itself, whose single field denotes the
                         // pointee: the pointee reference of an
                         // allocation-backed box (which the `Ref`
                         // arm above then resolves), or the pointee
@@ -22293,6 +22292,17 @@ fn split_top_commas(s: &str) -> Vec<&str> {
     parts
 }
 
+/// Whether a rendered generic argument is a lifetime
+/// (`'a`, `'_`, `'static`): char literals also start with a
+/// quote but close it, lifetimes never do.
+fn is_lifetime_arg(arg: &str) -> bool {
+    let a = arg.trim();
+    a.len() > 1
+        && a.starts_with('\'')
+        && !a.ends_with('\'')
+        && a[1..].chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
 /// Whether a rendered generic argument is a const literal
 /// (an integer, a boolean or a char) rather than a type.
 fn is_const_literal(arg: &str) -> bool {
@@ -22309,10 +22319,11 @@ fn is_const_literal(arg: &str) -> bool {
 
 /// Normalize a rendered type for instance-name matching:
 /// drop const generic arguments (see [`is_const_literal`])
-/// at every nesting level and remove whitespace, so the
-/// converter's tag rendering (type arguments only) and the
-/// compiler's instance name (all arguments) compare equal
-/// for the same type.
+/// and lifetime arguments (see [`is_lifetime_arg`]) at every
+/// nesting level and remove whitespace, so the converter's
+/// tag rendering (type arguments only) and the compiler's
+/// instance name (all arguments) compare equal for the
+/// same type.
 fn normalize_fmt_tag(tag: &str) -> String {
     fn norm(s: &str, out: &mut String) {
         let bytes = s.as_bytes();
@@ -22341,7 +22352,7 @@ fn normalize_fmt_tag(tag: &str) -> String {
                 let inner = &s[i + 1..j];
                 let kept: Vec<String> = split_top_commas(inner)
                     .iter()
-                    .filter(|a| !is_const_literal(a))
+                    .filter(|a| !is_const_literal(a) && !is_lifetime_arg(a))
                     .map(|a| {
                         let mut t = String::new();
                         norm(a, &mut t);
@@ -22543,6 +22554,15 @@ fn format_uint_radix(v: u128, ty: Option<&str>, radix: u32, prefix: &str, option
 /// Precision (minimum digits, zero-extended) then `pad_integral`;
 /// a specified precision suppresses sign-aware zero-padding.
 fn finish_int(negative: bool, mut digits: String, prefix: &str, options: &FmtOptions) -> String {
+    // A `0X` prefix marks the upper-case hex form: core prints
+    // its digits upper-cased and the alternate prefix itself
+    // stays `0x`.
+    let prefix = if prefix == "0X" {
+        digits = digits.to_ascii_uppercase();
+        "0x"
+    } else {
+        prefix
+    };
     let mut options = *options;
     if let Some(p) = options.precision() {
         if digits.len() < p as usize {

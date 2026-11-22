@@ -17176,3 +17176,174 @@ fn run_mode_sparse_vec_uninit_read() {
         "tail read must be an uninitialised read; stderr={stderr}"
     );
 }
+
+const DYN_DISPLAY_SRC: &str = r#"
+use std::fmt::{Debug, Display, LowerHex};
+
+trait Greeter: Display + Debug {}
+
+#[derive(Debug)]
+struct Bot {
+    id: u32,
+}
+impl Display for Bot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "bot#{}", self.id)
+    }
+}
+impl Greeter for Bot {}
+
+#[derive(Debug)]
+struct MyErr;
+impl Display for MyErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "my error")
+    }
+}
+impl std::error::Error for MyErr {}
+
+fn show(d: &dyn Display) {
+    println!("{:>6}", d);
+}
+
+fn main() {
+    let b: Box<dyn Display> = Box::new(42i32);
+    println!("{}", b);
+    println!("{:>8}", b);
+    let s: Box<dyn Display> = Box::new(String::from("hello"));
+    println!("{:.3}", s);
+    let r: std::rc::Rc<dyn Display> = std::rc::Rc::new(String::from("rc-text"));
+    println!("{}", r);
+    let a: std::sync::Arc<dyn Display> = std::sync::Arc::new(123i32);
+    println!("{}", a);
+    show(&77i32);
+    let g: Box<dyn Greeter> = Box::new(Bot { id: 5 });
+    println!("{}", g);
+    println!("{:?}", g);
+    let e: Box<dyn std::error::Error> = Box::new(MyErr);
+    println!("{}", e);
+    println!("{:?}", e);
+    let h: Box<dyn LowerHex> = Box::new(255u32);
+    println!("{:x}", &*h);
+    println!("{:X}", 255u32);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_display_formats_concrete() {
+    // A trait object's fmt traits are the concrete type's (the
+    // vtable entries, for the principal trait and its
+    // supertraits alike): `Box` / `Rc` / `Arc` / `&dyn` Display
+    // with format specifiers, a supertrait object's Display and
+    // Debug, a `dyn Error`, and a radix trait through `&dyn`.
+    let dir = temp_dir("dyn-display");
+    let src = fixture(&dir, "dyn_display.rs", DYN_DISPLAY_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "dyn Display formatting must execute; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "42\n      42\nhel\nrc-text\n123\n    77\nbot#5\nBot { id: 5 }\nmy error\nMyErr\nff\nFF\n"
+    );
+}
+
+const FMT_WRAPPER_LIFETIME_SRC: &str = r#"
+use std::fmt::{Display, Formatter, Result};
+
+struct Wrap<'a>(&'a dyn Display);
+impl<'a> Display for Wrap<'a> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        Display::fmt(self.0, f)
+    }
+}
+
+struct Named<'a>(&'a i32);
+impl<'a> Display for Named<'a> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        write!(f, "named:{}", self.0)
+    }
+}
+
+fn main() {
+    let boxed: Box<dyn Display> = Box::new(13i32);
+    println!("{}", Wrap(&*boxed));
+    let n = 21i32;
+    println!("{}", Named(&n));
+}
+"#;
+
+#[test]
+fn run_mode_fmt_wrapper_with_lifetime_formats() {
+    // A guest `fmt` body whose `Self` carries a lifetime: the
+    // instance name spells the lifetime (`<'_>` / `<'a>`) while
+    // the argument's type tag drops it, so the body lookup must
+    // normalise lifetime arguments away. The wrapper's UFCS
+    // `Display::fmt` call on its `&dyn Display` field is served
+    // by the same dyn dispatch.
+    let dir = temp_dir("fmt-wrapper-lifetime");
+    let src = fixture(&dir, "fmt_wrapper.rs", FMT_WRAPPER_LIFETIME_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "lifetime-carrying fmt wrappers must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "13\nnamed:21\n");
+}
+
+const DYN_ONE_FIELD_REF_SRC: &str = r#"
+#[derive(Debug)]
+struct A {}
+
+#[derive(Debug)]
+struct B<'a> {
+    ed: &'a mut A,
+}
+
+#[derive(Debug)]
+struct C<'a> {
+    pd: &'a mut B<'a>,
+}
+
+fn main() {
+    let mut a = A {};
+    let mut b = B { ed: &mut a };
+    let c = C { pd: &mut b };
+    println!("{:?}", c);
+    let mut a2 = A {};
+    let b2 = B { ed: &mut a2 };
+    let d: &dyn std::fmt::Debug = &b2;
+    println!("{:?}", d);
+    let mut a3 = A {};
+    let b3 = B { ed: &mut a3 };
+    let v: Vec<Box<dyn std::fmt::Debug>> = vec![Box::new(b3)];
+    println!("{:?}", v);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_one_field_ref_struct_debug() {
+    // A one-field struct whose field is a reference is the
+    // payload itself, not a box aggregate: the derived `Debug`
+    // bodies of the nested `B` / `C` shapes must run on the
+    // struct values, and a `dyn Debug` over such a struct must
+    // dispatch to the struct's own `Debug`.
+    let dir = temp_dir("dyn-one-field-ref");
+    let src = fixture(&dir, "dyn_one_field.rs", DYN_ONE_FIELD_REF_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "one-field ref struct Debug must execute; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "C { pd: B { ed: A } }\nB { ed: A }\n[B { ed: A }]\n"
+    );
+}
