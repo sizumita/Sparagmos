@@ -8072,7 +8072,7 @@ fn eval_shift(
 /// `f16` place's value. Computing in `f64` first is exact for
 /// `f16` operands by the same double-rounding argument as `f32`
 /// (53 mantissa bits >= 2*11 + 2).
-fn round_to_f16(v: f64) -> f64 {
+pub(crate) fn round_to_f16(v: f64) -> f64 {
     crate::mir_convert::f16_to_f64(f64_to_f16_bits(v))
 }
 
@@ -8167,7 +8167,7 @@ pub(crate) fn eval_unary(op: UnOp, v: &Value, dest_ty: Option<&Ty>) -> InterpRes
 /// Rust float-to-int cast semantics: saturate at the target type's
 /// range, NaN becomes 0. The host `as` cast saturates at `i128`;
 /// clamping to the declared width finishes the job.
-fn float_to_int(v: f64, bits: u32) -> i128 {
+pub(crate) fn float_to_int(v: f64, bits: u32) -> i128 {
     let wide = v as i128;
     if bits >= 128 {
         wide
@@ -8180,7 +8180,7 @@ fn float_to_int(v: f64, bits: u32) -> i128 {
 
 /// Rust float-to-uint cast semantics: saturate at the target type's
 /// range (negative values become 0), NaN becomes 0.
-fn float_to_uint(v: f64, bits: u32) -> u128 {
+pub(crate) fn float_to_uint(v: f64, bits: u32) -> u128 {
     let wide = v as u128;
     if bits >= 128 {
         wide

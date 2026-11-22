@@ -33,8 +33,8 @@ use sparagmos_mir as mir;
 
 use crate::error::{InterpError, InterpResult};
 use crate::interp::{
-    box_alloc_pointer, channel_handle_id, rc_handle_id, synthetic_address, Frame, Interpreter,
-    Resolved,
+    box_alloc_pointer, channel_handle_id, float_to_int, float_to_uint, rc_handle_id,
+    round_to_f16, synthetic_address, Frame, Interpreter, Resolved,
 };
 use crate::ir::{Body, Operand};
 use crate::value::{FmtArguments, FmtTrait, PanicPayload, RefProj, RefTarget, Value};
@@ -709,6 +709,20 @@ pub enum Builtin {
     MemSizeOfVal,
     /// `std::mem::align_of_val(&value)`.
     MemAlignOfVal,
+    /// A `*_fast` float intrinsic (`fadd_fast`, `fsub_fast`,
+    /// `fmul_fast`, `fdiv_fast`, `frem_fast`): the ordinary
+    /// floating-point operation. The `fast` contract only
+    /// licenses the compiler to reassociate operations and to
+    /// assume the guest has no NaNs or infinities; neither
+    /// changes the value of a single operation computed here.
+    FastFloat(FastFloatOp),
+    /// `std::intrinsics::float_to_int_unchecked(value)`: a
+    /// truncating float-to-integer conversion. Out-of-range and
+    /// NaN inputs are undefined behaviour in the guest; the model
+    /// produces the saturating result the `as` cast defines,
+    /// which agrees on every input where the intrinsic is
+    /// defined.
+    FloatToIntUnchecked,
     /// `std::mem::needs_drop::<T>()` (types with a known answer only).
     MemNeedsDrop,
     /// `ManuallyDrop::new(value)`: an ADT aggregate of one field.
@@ -909,6 +923,17 @@ pub enum FetchOp {
     Min,
     UMax,
     UMin,
+}
+
+/// One `*_fast` float operation, selected by the intrinsic's
+/// name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FastFloatOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
 }
 
 /// A saturating arithmetic operation, selected by the
@@ -1321,6 +1346,24 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         }
         "std::intrinsics::align_of_val" | "core::intrinsics::align_of_val" => {
             Builtin::MemAlignOfVal
+        }
+        "std::intrinsics::fadd_fast" | "core::intrinsics::fadd_fast" => {
+            Builtin::FastFloat(FastFloatOp::Add)
+        }
+        "std::intrinsics::fsub_fast" | "core::intrinsics::fsub_fast" => {
+            Builtin::FastFloat(FastFloatOp::Sub)
+        }
+        "std::intrinsics::fmul_fast" | "core::intrinsics::fmul_fast" => {
+            Builtin::FastFloat(FastFloatOp::Mul)
+        }
+        "std::intrinsics::fdiv_fast" | "core::intrinsics::fdiv_fast" => {
+            Builtin::FastFloat(FastFloatOp::Div)
+        }
+        "std::intrinsics::frem_fast" | "core::intrinsics::frem_fast" => {
+            Builtin::FastFloat(FastFloatOp::Rem)
+        }
+        "std::intrinsics::float_to_int_unchecked" | "core::intrinsics::float_to_int_unchecked" => {
+            Builtin::FloatToIntUnchecked
         }
         "std::mem::needs_drop" => Builtin::MemNeedsDrop,
         _ if canonical.starts_with("std::mem::ManuallyDrop") && canonical.ends_with(">::new") => {
@@ -5026,6 +5069,60 @@ impl<'a> Interpreter<'a> {
                             "align_of_val for {tag} is not runtime-supported"
                         ))),
                     }
+                }
+            }
+            Builtin::FastFloat(op) => {
+                arity(2)?;
+                let tag = generic_args.first().map(String::as_str).unwrap_or("");
+                let (a, b) = match (&vals[0], &vals[1]) {
+                    (Value::Float(a), Value::Float(b)) => (*a, *b),
+                    _ => {
+                        return Err(InterpError::type_mismatch(
+                            format!("builtin {name}"),
+                            "two float operands",
+                            format!(
+                                "{} and {}",
+                                vals[0].kind_name(),
+                                vals[1].kind_name()
+                            ),
+                        ));
+                    }
+                };
+                let r = match op {
+                    FastFloatOp::Add => a + b,
+                    FastFloatOp::Sub => a - b,
+                    FastFloatOp::Mul => a * b,
+                    FastFloatOp::Div => a / b,
+                    FastFloatOp::Rem => a % b,
+                };
+                // A narrower float operation's result rounds to
+                // the operation's width, as in the interpreter's
+                // own float arithmetic.
+                Ok(Value::Float(match tag {
+                    "f16" => round_to_f16(r),
+                    "f32" => (r as f32) as f64,
+                    _ => r,
+                }))
+            }
+            Builtin::FloatToIntUnchecked => {
+                arity(1)?;
+                let tag = generic_args.get(1).map(String::as_str).unwrap_or("");
+                let (bits, signed) = int_tag(tag).ok_or_else(|| {
+                    unsupported(format!(
+                        "float_to_int_unchecked to {tag} is not runtime-supported"
+                    ))
+                })?;
+                match vals[0] {
+                    Value::Float(x) => Ok(if signed {
+                        Value::Int(float_to_int(x, bits))
+                    } else {
+                        Value::Uint(float_to_uint(x, bits))
+                    }),
+                    ref other => Err(InterpError::type_mismatch(
+                        format!("builtin {name}"),
+                        "float operand",
+                        other.kind_name(),
+                    )),
                 }
             }
             Builtin::MemNeedsDrop => {
