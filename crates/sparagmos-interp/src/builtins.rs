@@ -1051,6 +1051,15 @@ pub enum Builtin {
     /// interpreter models as lane tuples (possibly inside the
     /// one-field wrapper a SIMD type is).
     SimdOp(SimdOp),
+    /// `std::path::Path::parent` / `file_name` / `file_stem` /
+    /// `extension`: the path-parsing accessors. These are
+    /// non-inline library methods, so no MIR body is available
+    /// for them; the parsing is a pure function of the path's
+    /// byte string and is answered with the host's own
+    /// `std::path` (the same rules — the model's paths are unix
+    /// paths, and a path value is its byte string, see
+    /// `path_bytes_of`).
+    PathPart(PathPart),
     /// `alloc::alloc::__rust_alloc(size, align) -> *mut u8` and
     /// `__rust_alloc_zeroed`: a fresh block in the allocation
     /// store, named by a new allocation id. The uninitialised
@@ -1279,6 +1288,15 @@ pub enum FastFloatOp {
     Mul,
     Div,
     Rem,
+}
+
+/// Which part of a path a `Builtin::PathPart` extracts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathPart {
+    Parent,
+    FileName,
+    FileStem,
+    Extension,
 }
 
 /// A saturating arithmetic operation, selected by the
@@ -1736,6 +1754,10 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::convert::From::from" => Builtin::FromFrom,
         "std::hint::must_use" => Builtin::MustUse,
         "std::ops::Deref::deref" => Builtin::Deref,
+        "std::path::Path::parent" => Builtin::PathPart(PathPart::Parent),
+        "std::path::Path::file_name" => Builtin::PathPart(PathPart::FileName),
+        "std::path::Path::file_stem" => Builtin::PathPart(PathPart::FileStem),
+        "std::path::Path::extension" => Builtin::PathPart(PathPart::Extension),
         _ if canonical.contains("RangeInclusive") && canonical.ends_with("::new") => {
             Builtin::RangeInclusiveNew
         }
@@ -5550,6 +5572,44 @@ impl<'a> Interpreter<'a> {
                         "Deref::deref for {self_ty} is not runtime-supported"
                     )))
                 }
+            }
+            Builtin::PathPart(part) => {
+                arity(1)?;
+                let (bytes, was_str) = self.path_bytes_of(frames, &vals[0])?;
+                let part = {
+                    use std::os::unix::ffi::OsStrExt;
+                    let path = std::path::Path::new(
+                        std::ffi::OsStr::from_bytes(&bytes),
+                    );
+                    let part: Option<&[u8]> = match part {
+                        PathPart::Parent => {
+                            path.parent().map(|p| p.as_os_str().as_bytes())
+                        }
+                        PathPart::FileName => {
+                            path.file_name().map(|s| s.as_bytes())
+                        }
+                        PathPart::FileStem => {
+                            path.file_stem().map(|s| s.as_bytes())
+                        }
+                        PathPart::Extension => {
+                            path.extension().map(|s| s.as_bytes())
+                        }
+                    };
+                    part.map(<[u8]>::to_vec)
+                };
+                Ok(match part {
+                    Some(bytes) => some_value(if was_str {
+                        // The parts of a text path are text: the
+                        // parse only cuts at ASCII separators.
+                        match String::from_utf8(bytes) {
+                            Ok(s) => Value::Str(s),
+                            Err(e) => Value::Bytes(e.into_bytes()),
+                        }
+                    } else {
+                        Value::Bytes(bytes)
+                    }),
+                    None => none_value(),
+                })
             }
             Builtin::ToUppercase => {
                 arity(1)?;
@@ -12324,6 +12384,50 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                 resolved.kind_name(),
             )
         })
+    }
+
+    /// The byte string a path argument denotes, and whether it
+    /// arrived as text: a `Path` / `OsStr` value in this model
+    /// is the byte string itself under its wrapper chain (see
+    /// the field projection pun in `project_value`), held as a
+    /// `Str` for text data or a `Bytes` for arbitrary bytes, or
+    /// as a fat pointer over the bytes.
+    fn path_bytes_of(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+    ) -> InterpResult<(Vec<u8>, bool)> {
+        match value {
+            Value::Str(text) => Ok((text.clone().into_bytes(), true)),
+            Value::Bytes(b) => Ok((b.clone(), false)),
+            Value::FatRef { .. } => {
+                let (items, _) = self.slice_elements(frames, value)?;
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        Value::Uint(b) => out.push(b as u8),
+                        other => {
+                            return Err(InterpError::type_mismatch(
+                                "path argument",
+                                "byte elements",
+                                other.kind_name(),
+                            ))
+                        }
+                    }
+                }
+                Ok((out, false))
+            }
+            Value::Ref(_) => {
+                let target = self.deref_value(frames, value)?;
+                let stored = self.read_resolved(frames, &target)?;
+                self.path_bytes_of(frames, &stored)
+            }
+            other => Err(InterpError::type_mismatch(
+                "path argument",
+                "path byte string",
+                other.kind_name(),
+            )),
+        }
     }
 
     fn resolve_string(&self, frames: &[Frame], value: &Value) -> InterpResult<String> {
