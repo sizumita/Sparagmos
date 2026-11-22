@@ -2481,6 +2481,44 @@ fn drop_place_ty(body: &rustc_public::mir::Body, place: &rustc_public::mir::Plac
     Some(ty)
 }
 
+/// Whether the type tree of `ty` contains an alias type (an
+/// associated-type projection, an inherent alias or an opaque
+/// type) anywhere the substitution in `drop_candidates` would
+/// carry it: ADT and closure arguments, tuple elements, array
+/// and slice elements, and reference / raw-pointer pointees.
+/// Kinds are asked through the guarded question, and a type
+/// whose kind cannot be asked for — or a tree deeper than the
+/// cap — counts as containing one: the screen exists to keep
+/// the compiler's normalization out of shapes it can fail on,
+/// so doubt resolves to not substituting.
+fn type_tree_has_alias(ty: &Ty, depth: usize) -> bool {
+    if depth >= 8 {
+        return true;
+    }
+    let Some(kind) = sparagmos_driver::convert::guarded_ty_kind(ty) else {
+        return true;
+    };
+    match kind {
+        TyKind::Alias(..) => true,
+        TyKind::RigidTy(RigidTy::Adt(_, args)) | TyKind::RigidTy(RigidTy::Closure(_, args)) => {
+            args.0.iter().any(|a| match a {
+                GenericArgKind::Type(t) => type_tree_has_alias(t, depth + 1),
+                _ => false,
+            })
+        }
+        TyKind::RigidTy(RigidTy::Tuple(ts)) => {
+            ts.iter().any(|t| type_tree_has_alias(t, depth + 1))
+        }
+        TyKind::RigidTy(RigidTy::Array(elem, _) | RigidTy::Slice(elem)) => {
+            type_tree_has_alias(&elem, depth + 1)
+        }
+        TyKind::RigidTy(RigidTy::Ref(_, inner, _) | RigidTy::RawPtr(inner, _)) => {
+            type_tree_has_alias(&inner, depth + 1)
+        }
+        _ => false,
+    }
+}
+
 /// Collect every ADT instantiation in the type tree of `ty` —
 /// the type itself, its generic arguments, its variants' field
 /// types (with the arguments substituted), tuple elements, array
@@ -2491,7 +2529,7 @@ fn drop_place_ty(body: &rustc_public::mir::Body, place: &rustc_public::mir::Plac
 fn drop_candidates(
     ty: &Ty,
     out: &mut Vec<(Ty, rustc_public::ty::AdtDef, GenericArgs)>,
-    seen: &mut std::collections::HashSet<String>,
+    seen: &mut std::collections::HashSet<Ty>,
 ) {
     // The walk reaches every type in the dropped places' trees,
     // including types whose kind rustc_public cannot answer for
@@ -2505,8 +2543,12 @@ fn drop_candidates(
     };
     match kind {
         TyKind::RigidTy(RigidTy::Adt(def, args)) => {
-            let key = format!("{:?} {:?}", def.def_id(), args);
-            if !seen.insert(key) {
+            // The dedup key is the type value itself, never a
+            // debug rendering: rendering a `Ty` asks its kind,
+            // which panics for the types this walk must tolerate
+            // (a coroutine-closure type nested in the arguments).
+            // The interned identity is exact for this purpose.
+            if !seen.insert(*ty) {
                 return;
             }
             out.push((*ty, def, args.clone()));
@@ -2517,16 +2559,37 @@ fn drop_candidates(
             }
             for variant in def.variants() {
                 for field in variant.fields() {
-                    // Substituting the instance's arguments into a
-                    // field type normalizes inside the compiler,
-                    // and some argument shapes (associated-type
-                    // projections the erasing-regions folder
-                    // cannot normalize) panic there instead of
-                    // answering. The demand pass is auxiliary: a
-                    // field whose substituted type cannot be asked
-                    // for contributes no candidates, the same
-                    // containment the layout recorder uses for its
-                    // queries.
+                    let declared = field.ty();
+                    // Substituting the instance's arguments into
+                    // a field type makes the compiler fold the
+                    // result back to Stable MIR, which normalizes
+                    // every alias the substituted type contains —
+                    // and an associated-type projection whose
+                    // arguments the erasing-regions folder cannot
+                    // normalize fails there. The failure is not
+                    // containable after the fact: alongside the
+                    // panic, the compiler records a delayed bug,
+                    // which the end of the run flushes as an
+                    // abort of the whole compilation. So the
+                    // substitution is only attempted when neither
+                    // the field's declared tree nor the instance's
+                    // arguments contain an alias at all (the
+                    // substitution cannot create one). With an
+                    // alias present, the declared type is walked
+                    // instead: its concrete members still yield
+                    // their candidates, and the alias itself is
+                    // left alone, as aliases are everywhere in
+                    // this walk. The containment stays as a
+                    // backstop for shapes the screen cannot see.
+                    if type_tree_has_alias(&declared, 0)
+                        || args.0.iter().any(|a| match a {
+                            GenericArgKind::Type(t) => type_tree_has_alias(t, 0),
+                            _ => false,
+                        })
+                    {
+                        drop_candidates(&declared, out, seen);
+                        continue;
+                    }
                     let Ok(field_ty) = std::panic::catch_unwind(
                         std::panic::AssertUnwindSafe(|| field.ty_with_args(&args)),
                     ) else {
@@ -2776,7 +2839,7 @@ fn demand_drop_instances(
     if impl_methods.is_empty() && seed_bodies.is_empty() {
         return (credited, failures, dtor_bodies);
     }
-    let mut seen_candidates: std::collections::HashSet<String> = Default::default();
+    let mut seen_candidates: std::collections::HashSet<Ty> = Default::default();
     let mut demanded = 0usize;
     let mut scan_from = 0usize;
     while scan_from < seed_bodies.len() {
@@ -2881,8 +2944,7 @@ fn demand_drop_instances(
             if demanded >= MAX_DEMANDED_DTOR_BODIES {
                 break;
             }
-            let key = format!("{:?} {:?}", def.def_id(), args);
-            if !seen_candidates.insert(key) {
+            if !seen_candidates.insert(cand_ty) {
                 continue;
             }
             if args_mention_params(&args) {
@@ -3029,7 +3091,8 @@ fn demand_clone_instances(
     body_def_names: &mut Vec<String>,
     seed_bodies: &mut Vec<rustc_public::mir::Body>,
 ) {
-    let mut seen: std::collections::HashSet<String> = Default::default();
+    let mut seen: std::collections::HashSet<(rustc_public::DefId, GenericArgs)> =
+        Default::default();
     let mut demanded = 0usize;
     let mut scan_from = 0usize;
     while scan_from < seed_bodies.len() {
@@ -3062,8 +3125,11 @@ fn demand_clone_instances(
                 if args_mention_params(&args) {
                     continue;
                 }
-                let key = format!("{:?} {:?}", def.def_id(), args);
-                if seen.insert(key) {
+                // The dedup key is the identity pair itself,
+                // never a debug rendering (rendering an argument
+                // type asks its kind, which panics for types the
+                // demand walks must tolerate).
+                if seen.insert((def.def_id(), args.clone())) {
                     targets.push((def, args));
                 }
             }
