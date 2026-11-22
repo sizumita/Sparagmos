@@ -12152,3 +12152,154 @@ fn run_mode_panic_box_string_push_through_deref_mut() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "az\n");
 }
+
+// ----- monomorphization validity checks, deep rules (Lane HZ) ---------------
+
+const SIMD_SHUFFLE_ELEM_MISMATCH_SRC: &str = r#"
+#![feature(core_intrinsics, repr_simd)]
+use std::intrinsics::simd::simd_shuffle;
+#[repr(simd)]
+#[derive(Copy, Clone)]
+struct U32x4([u32; 4]);
+#[repr(simd)]
+#[derive(Copy, Clone)]
+struct Idx2([u32; 2]);
+const IDX: Idx2 = Idx2([0, 1]);
+fn main() {
+    let v = U32x4([0; 4]);
+    unsafe { let _: U32x4 = simd_shuffle(v, v, IDX); }
+}
+"#;
+
+const SIMD_SHUFFLE_VALID_SRC: &str = r#"
+#![feature(core_intrinsics, repr_simd)]
+use std::intrinsics::simd::simd_shuffle;
+#[repr(simd)]
+#[derive(Copy, Clone)]
+struct U32x4([u32; 4]);
+#[repr(simd)]
+#[derive(Copy, Clone)]
+struct Idx4([u32; 4]);
+const IDX: Idx4 = Idx4([0, 1, 2, 3]);
+fn main() {
+    let v = U32x4([0; 4]);
+    unsafe { let _: U32x4 = simd_shuffle(v, v, IDX); }
+}
+"#;
+
+const SIMD_BITMASK_WIDTH_SRC: &str = r#"
+#![feature(core_intrinsics, repr_simd)]
+use std::intrinsics::simd::simd_bitmask;
+#[repr(simd)]
+#[derive(Copy, Clone)]
+struct I8x2([i8; 2]);
+fn main() {
+    let m = I8x2([-1, 0]);
+    unsafe { let _: u16 = simd_bitmask(m); }
+}
+"#;
+
+const MASKED_STORE_CONST_PTR_SRC: &str = r#"
+#![feature(portable_simd, core_intrinsics)]
+use std::intrinsics::simd::SimdAlign;
+use std::{ptr::null, simd::Simd};
+const _: () = {
+    let c = Simd::from_array([0; 3]);
+    unsafe {
+        core::intrinsics::simd::simd_masked_store::<_, _, _, { SimdAlign::Element }>(
+            c,
+            null::<i32>(),
+            c,
+        )
+    };
+};
+fn main() {}
+"#;
+
+#[test]
+fn convert_mode_simd_shuffle_with_mismatched_index_length_is_a_compile_failure() {
+    let dir = temp_dir("mono-shuffle-len");
+    let src = fixture(&dir, "shuffle_len.rs", SIMD_SHUFFLE_ELEM_MISMATCH_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a shuffle whose index length differs from the return length must fail; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("invalid monomorphization of `simd_shuffle` intrinsic"),
+        "the failure must be the monomorphization check, not a front-end error; stderr={stderr}"
+    );
+}
+
+#[test]
+fn convert_mode_simd_shuffle_with_matching_index_converts() {
+    let dir = temp_dir("mono-shuffle-ok");
+    let src = fixture(&dir, "shuffle_ok.rs", SIMD_SHUFFLE_VALID_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a valid shuffle must convert; stderr={stderr}"
+    );
+}
+
+#[test]
+fn convert_mode_simd_bitmask_with_wrong_width_is_a_compile_failure() {
+    let dir = temp_dir("mono-bitmask-width");
+    let src = fixture(&dir, "bitmask_width.rs", SIMD_BITMASK_WIDTH_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a bitmask result wider than the lane count requires must fail; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("simd_bitmask"),
+        "the failure must name the intrinsic; stderr={stderr}"
+    );
+}
+
+#[test]
+fn convert_mode_masked_store_with_const_pointer_in_const_converts() {
+    let dir = temp_dir("mono-masked-const");
+    let src = fixture(&dir, "masked_const.rs", MASKED_STORE_CONST_PTR_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a const-evaluated masked store through a *const pointer must convert; stderr={stderr}"
+    );
+}
+
+
+const SIMD_REDUCE_BAD_INITIAL_SRC: &str = r#"
+#![feature(core_intrinsics, repr_simd)]
+use std::intrinsics::simd::simd_reduce_add_ordered;
+#[repr(simd)]
+#[derive(Copy, Clone)]
+struct F32x4([f32; 4]);
+fn reduce<U>(v: F32x4, init: U) -> U { unsafe { simd_reduce_add_ordered(v, init) } }
+fn main() { let _ = reduce(F32x4([0.0; 4]), 0i32); }
+"#;
+
+#[test]
+fn convert_mode_simd_reduce_ordered_with_mismatched_initial_is_a_compile_failure() {
+    let dir = temp_dir("mono-simd-reduce-initial");
+    let src = fixture(&dir, "reduce_initial.rs", SIMD_REDUCE_BAD_INITIAL_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an ordered reduction whose initial value is not the element type must fail; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("simd_reduce_add_ordered") && stderr.contains("initial value"),
+        "the failure must name the intrinsic and the initial value; stderr={stderr}"
+    );
+}
