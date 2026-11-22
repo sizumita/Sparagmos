@@ -2530,6 +2530,22 @@ impl Converter {
         offset: usize,
         depth: usize,
     ) -> Option<sm::ConstValue> {
+        if matches!(def.name().as_str(), "core::ffi::CStr" | "std::ffi::CStr") {
+            // The one field is a `[c_char]` byte string. `c_char`
+            // is signed on this platform, so the generic decode
+            // would produce signed-char elements, but a `CStr`'s
+            // contents are bytes by definition — every public
+            // view of it is a byte view (`to_bytes`, `to_str`,
+            // the `&[u8]` casts its own methods perform) — so
+            // decode them as the byte string they are, like the
+            // `[u8]` trailing-slice decode below.
+            let raw = alloc.raw_bytes().ok()?;
+            let bytes = raw.get(offset..)?.to_vec();
+            return Some(sm::ConstValue::Adt {
+                variant: 0,
+                fields: vec![sm::ConstValue::Bytes(bytes)],
+            });
+        }
         let shape = ty.layout().ok()?.shape();
         let (variant_idx, offsets): (usize, Vec<usize>) = match def.kind() {
             AdtKind::Struct => {

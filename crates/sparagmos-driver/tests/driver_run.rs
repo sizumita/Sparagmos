@@ -15820,3 +15820,33 @@ fn run_mode_default_field_value_empty_vec_is_empty() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "default field values ok\n");
 }
+
+const CSTR_NONASCII_SRC: &str = r#"
+fn main() {
+    assert_eq!(
+        c"\xEF\x80\u{1F980}\u{1F980}".to_bytes_with_nul(),
+        &[0xEF, 0x80, 0xF0, 0x9F, 0xA6, 0x80, 0xF0, 0x9F, 0xA6, 0x80, 0x00],
+    );
+    println!("cstr non-ascii ok");
+}
+"#;
+
+#[test]
+fn run_mode_cstr_literal_non_ascii_bytes() {
+    // A `CStr`'s field is a `[c_char]` slice and `c_char` is
+    // signed on this platform: decoding the constant as
+    // signed-char elements would leak the sign into every byte
+    // view of the string (indexing would read -17 for 0xEF and
+    // byte equality against `u8` data would fail). The constant
+    // decodes as the byte string it is.
+    let dir = temp_dir("cstr-nonascii");
+    let src = fixture(&dir, "cstr_nonascii.rs", CSTR_NONASCII_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "non-ASCII CStr literal bytes must compare as u8 data; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "cstr non-ascii ok\n");
+}
