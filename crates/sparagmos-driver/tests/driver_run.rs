@@ -14927,3 +14927,241 @@ fn run_mode_simd_cast_sign_extends_signed_lanes() {
         "simd_cast from a signed element type sign-extends its lanes"
     );
 }
+
+// ----- HashMap / hashbrown raw-table execution (Lane HX) -----
+
+const HASHMAP_BASIC_SRC: &str = r#"
+use std::collections::HashMap;
+fn main() {
+    let mut m: HashMap<i32, i32> = HashMap::new();
+    m.insert(1, 2);
+    println!("{}", m[&1]);
+}
+"#;
+
+#[test]
+fn run_mode_hashmap_insert_and_index() {
+    let dir = temp_dir("hashmap-basic");
+    let src = fixture(&dir, "hashmap_basic.rs", HASHMAP_BASIC_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n");
+}
+
+const HASHMAP_RESIZE_SRC: &str = r#"
+use std::collections::HashMap;
+fn main() {
+    let mut m: HashMap<i32, i32> = HashMap::new();
+    for i in 0..10 {
+        m.insert(i, i * 10);
+    }
+    println!("len {}", m.len());
+    for i in 0..10 {
+        assert_eq!(m[&i], i * 10);
+    }
+    println!("resize ok");
+}
+"#;
+
+#[test]
+fn run_mode_hashmap_resize_rehashes_entries() {
+    let dir = temp_dir("hashmap-resize");
+    let src = fixture(&dir, "hashmap_resize.rs", HASHMAP_RESIZE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "len 10\nresize ok\n");
+}
+
+const HASHMAP_STRING_KEYS_SRC: &str = r#"
+use std::collections::HashMap;
+fn main() {
+    let mut m: HashMap<String, String> = HashMap::new();
+    for (k, v) in [("a", "1"), ("b", "2"), ("c", "3"), ("d", "4")] {
+        m.insert(k.to_string(), v.to_string());
+    }
+    println!("len {}", m.len());
+    println!("got {}", &m["c"]);
+}
+"#;
+
+#[test]
+fn run_mode_hashmap_string_keys_across_resize() {
+    let dir = temp_dir("hashmap-string-keys");
+    let src = fixture(&dir, "hashmap_string_keys.rs", HASHMAP_STRING_KEYS_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "len 4\ngot 3\n");
+}
+
+const HASHMAP_COW_KEYS_SRC: &str = r#"
+use std::borrow::Cow;
+use std::collections::HashMap;
+fn main() {
+    let mut m: HashMap<Cow<str>, i32> = HashMap::new();
+    m.insert(Cow::Borrowed("foo"), 42);
+    assert_eq!(m.get(&Cow::Owned("foo".to_string())), Some(&42));
+    assert_eq!(m.insert(Cow::Owned("foo".to_string()), 43), Some(42));
+    println!("cow ok {}", m.len());
+}
+"#;
+
+#[test]
+fn run_mode_hashmap_cow_keys_borrowed_owned_agree() {
+    let dir = temp_dir("hashmap-cow-keys");
+    let src = fixture(&dir, "hashmap_cow_keys.rs", HASHMAP_COW_KEYS_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "cow ok 1\n");
+}
+
+const HASHMAP_ITER_SRC: &str = r#"
+use std::collections::HashMap;
+fn main() {
+    let mut m: HashMap<i32, i32> = HashMap::new();
+    m.insert(1, 10);
+    m.insert(2, 20);
+    m.insert(3, 30);
+    let mut sum = 0;
+    for (k, v) in &m {
+        sum += k + v;
+    }
+    assert_eq!(sum, 66);
+    let mut it = m.iter();
+    let mut seen = 0;
+    for _ in it.by_ref() {
+        seen += 1;
+        break;
+    }
+    for _ in it {
+        seen += 1;
+    }
+    assert_eq!(seen, 3);
+    println!("iter ok");
+}
+"#;
+
+#[test]
+fn run_mode_hashmap_iter_and_by_ref_restart() {
+    let dir = temp_dir("hashmap-iter");
+    let src = fixture(&dir, "hashmap_iter.rs", HASHMAP_ITER_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "iter ok\n");
+}
+
+const HASHSET_ITER_SRC: &str = r#"
+use std::collections::HashSet;
+fn main() {
+    let mut s: HashSet<i32> = HashSet::new();
+    s.insert(1);
+    s.insert(2);
+    let mut n = 0;
+    for x in &s {
+        n += x;
+    }
+    assert_eq!(n, 3);
+    println!("set ok");
+}
+"#;
+
+#[test]
+fn run_mode_hashset_iter() {
+    let dir = temp_dir("hashset-iter");
+    let src = fixture(&dir, "hashset_iter.rs", HASHSET_ITER_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "set ok\n");
+}
+
+const HASHMAP_WITH_CAPACITY_SRC: &str = r#"
+use std::collections::HashMap;
+fn main() {
+    let mut m: HashMap<u8, u8> = HashMap::with_capacity(100);
+    m.insert(7, 9);
+    println!("{}", m[&7]);
+}
+"#;
+
+#[test]
+fn run_mode_hashmap_with_capacity() {
+    let dir = temp_dir("hashmap-capacity");
+    let src = fixture(&dir, "hashmap_capacity.rs", HASHMAP_WITH_CAPACITY_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "9\n");
+}
+
+const NONNULL_CAST_DENOMINATION_SRC: &str = r#"
+use std::ptr::NonNull;
+struct Inner { ctrl: NonNull<u8>, mask: usize }
+struct Bucket<T> { ptr: NonNull<T> }
+impl Inner {
+    fn data_end<T>(&self) -> NonNull<T> { self.ctrl.cast() }
+    unsafe fn bucket<T>(&self, index: usize) -> Bucket<T> {
+        unsafe { Bucket::from_base_index(self.data_end(), index) }
+    }
+}
+impl<T> Bucket<T> {
+    unsafe fn from_base_index(base: NonNull<T>, index: usize) -> Self {
+        let ptr = unsafe { base.as_ptr().sub(index) };
+        Bucket { ptr: unsafe { NonNull::new_unchecked(ptr) } }
+    }
+    unsafe fn write(&self, value: T) {
+        unsafe { self.ptr.as_ptr().sub(1).write(value) }
+    }
+}
+fn main() {
+    unsafe {
+        let layout = std::alloc::Layout::from_size_align(64, 8).unwrap();
+        let base = std::alloc::alloc(layout);
+        let inner = Inner { ctrl: NonNull::new_unchecked(base.add(32)), mask: 3 };
+        let b: Bucket<(i32, i32)> = inner.bucket(0);
+        b.write((7i32, 8i32));
+        let back = base.add(24) as *const (i32, i32);
+        let v = back.read();
+        assert_eq!(v, (7, 8));
+        std::alloc::dealloc(base, layout);
+    }
+    println!("denomination ok");
+}
+"#;
+
+#[test]
+fn run_mode_nonnull_cast_denominates_pointer_units() {
+    let dir = temp_dir("nonnull-cast-units");
+    let src = fixture(&dir, "nonnull_cast_units.rs", NONNULL_CAST_DENOMINATION_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "denomination ok\n");
+}
+
+const SWAP_STRUCT_SRC: &str = r#"
+#[derive(Debug, PartialEq)]
+struct TableLike { mask: usize, ctrl: u64, growth: usize, items: usize }
+fn main() {
+    let mut a = TableLike { mask: 3, ctrl: 11, growth: 5, items: 2 };
+    let mut b = TableLike { mask: 7, ctrl: 22, growth: 1, items: 6 };
+    std::mem::swap(&mut a, &mut b);
+    assert_eq!(a, TableLike { mask: 7, ctrl: 22, growth: 1, items: 6 });
+    assert_eq!(b, TableLike { mask: 3, ctrl: 11, growth: 5, items: 2 });
+    println!("swap ok");
+}
+"#;
+
+#[test]
+fn run_mode_swap_nonoverlapping_whole_struct() {
+    let dir = temp_dir("swap-struct");
+    let src = fixture(&dir, "swap_struct.rs", SWAP_STRUCT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "swap ok\n");
+}
