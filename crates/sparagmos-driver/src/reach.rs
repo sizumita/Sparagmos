@@ -982,6 +982,20 @@ fn consumer_instance_needs_body(canonical: &str, args: &GenericArgs) -> bool {
         | "std::iter::Iterator::for_each"
         | "std::iter::Iterator::collect" => 0,
         "std::iter::FromIterator::from_iter" => 2,
+        "std::iter::DoubleEndedIterator::next_back" => {
+            // `next_back` differs from the consumers above: the
+            // builtin serves the call directly, so a collected
+            // body is needed exactly for the iterator types the
+            // builtin's back step does not model — every other
+            // type (adapters whose bodies compose modelled
+            // steps, and user-defined iterators) keeps its body
+            // as the primary execution, with the builtin as the
+            // fallback when no clean body is available.
+            let Some(GenericArgKind::Type(ty)) = args.0.first() else {
+                return false;
+            };
+            return !iterator_back_modelled(ty);
+        }
         _ => return false,
     };
     let Some(GenericArgKind::Type(ty)) = args.0.get(iter_arg) else {
@@ -1017,6 +1031,62 @@ fn iterator_self_modelled(ty: &Ty) -> bool {
             | "std::str::Bytes"
             | "core::str::Bytes"
     )
+}
+
+/// The Stable MIR counterpart of the interpreter's modelled
+/// `next_back` shapes (see `iterator_next_back_modelled` in
+/// sparagmos-interp): the leaf iterators whose states the
+/// builtin's back step transitions directly. Adapter types
+/// (`Rev`, `Enumerate`, `Map`, ...) are deliberately absent:
+/// their bodies compose the modelled steps and stay the
+/// primary execution.
+fn iterator_back_modelled(ty: &Ty) -> bool {
+    let TyKind::RigidTy(RigidTy::Adt(def, args)) = ty.kind() else {
+        return false;
+    };
+    match def.name().as_str() {
+        "std::ops::Range"
+        | "std::ops::RangeInclusive"
+        | "std::slice::Iter"
+        | "std::slice::IterMut"
+        | "std::vec::IntoIter"
+        | "alloc::vec::IntoIter"
+        | "std::array::IntoIter"
+        | "std::option::IntoIter"
+        | "std::option::Iter"
+        | "std::option::IterMut"
+        | "std::iter::Empty"
+        | "std::iter::Once"
+        | "std::env::Args"
+        | "std::env::ArgsOs"
+        | "std::str::Chars"
+        | "core::str::Chars"
+        | "std::str::Bytes"
+        | "core::str::Bytes" => true,
+        // A `Rev`'s back step is its inner iterator's front
+        // step, so it is modelled exactly when the inner
+        // iterator's `next` is.
+        "std::iter::Rev" => first_type_arg(&args).is_some_and(iterator_self_modelled),
+        // These adapters' back steps compose the inner back
+        // step, so they are modelled exactly when it is. (An
+        // `Enumerate` body would also work when collected, but
+        // it computes the index through the inner iterator's
+        // `len` body, which for a pointer-pair state such as
+        // `slice::Iter`'s is not executable; the builtin
+        // computes it from the modelled size hint instead.)
+        "std::iter::Enumerate" | "std::iter::Copied" | "std::iter::Map" => {
+            first_type_arg(&args).is_some_and(iterator_back_modelled)
+        }
+        _ => false,
+    }
+}
+
+/// The first type among a set of generic arguments.
+fn first_type_arg(args: &GenericArgs) -> Option<&Ty> {
+    args.0.iter().find_map(|arg| match arg {
+        GenericArgKind::Type(ty) => Some(ty),
+        _ => None,
+    })
 }
 
 /// The closure types among one set of generic arguments.
