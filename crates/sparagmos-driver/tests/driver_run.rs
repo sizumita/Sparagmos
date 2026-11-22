@@ -10633,6 +10633,39 @@ fn run_mode_bulk_ops_through_element_pointers() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "[170, 170, 9, 8, 7, 238]\n");
 }
 
+const RAW_BLOCK_FILL_SRC: &str = r#"
+fn main() {
+    let s = String::from("ok");
+    assert_eq!(s.len(), 2);
+}
+"#;
+
+#[test]
+fn run_mode_raw_block_bulk_fill_under_optimized_mir() {
+    // Under optimized MIR, `String::from` / `to_vec` allocate a
+    // raw block through `__rust_alloc` and fill it with
+    // `copy_nonoverlapping` before any element exists. The fill's
+    // destination probe reads element 0 of the still-empty block:
+    // an unwritten slot of a raw block must read as uninitialized
+    // (the write side then grows the block), never as a guest
+    // "index out of bounds" panic -- the guest indexed nothing.
+    let dir = temp_dir("raw-block-fill");
+    let src = fixture(&dir, "raw_block_fill.rs", RAW_BLOCK_FILL_SRC);
+    let out = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("run")
+        .arg(&src)
+        .arg("--rustc-arg")
+        .arg("-Copt-level=3")
+        .output()
+        .expect("failed to run sparagmos-driver");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "bulk fill of a fresh raw block must execute; stderr={stderr}"
+    );
+}
+
 #[test]
 fn run_mode_write_bytes_volatile_and_offset_from_execute() {
     let dir = temp_dir("memory-intrinsics");
