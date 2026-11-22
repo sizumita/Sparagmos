@@ -7532,6 +7532,17 @@ impl<'a> Interpreter<'a> {
         if matches!(projection.last(), Some(RefProj::Index(_))) {
             return Ok(None);
         }
+        // A byte-displaced target denotes a byte inside the
+        // scalar's storage, not the scalar as a whole: the
+        // indexed byte view (read / write _resolved_at) owns
+        // those reads, and the whole-value read of a displaced
+        // position is an unsupported projection, not a scalar.
+        if projection
+            .iter()
+            .any(|s| matches!(s, RefProj::ByteOffset(d) if *d != 0))
+        {
+            return Ok(None);
+        }
         match self.read_resolved(frames, target) {
             Ok(v @ (Value::Int(_) | Value::Uint(_))) => Ok(Some(v)),
             Ok(_) => Ok(None),
@@ -10440,25 +10451,6 @@ pub(crate) fn project_value(
         let step_state = downcast_state.take();
         value = match step {
             RefProj::Field(idx) => match value {
-                // A byte string is the storage of a value the
-                // model never materialised (a byte-pointer view
-                // of a constant allocation): field 0 of the
-                // wrapper stored there — a control byte's tag —
-                // is the byte at offset 0. Wider first fields
-                // have no honest read here (their width is not
-                // recorded in the string); the shaped loads
-                // cover the vector-storage case in rvalue
-                // position, and any other shape keeps failing
-                // downstream on the byte it did not expect.
-                Value::Bytes(ref bytes) if *idx == 0 => match bytes.first() {
-                    Some(b) => Value::Uint(u128::from(*b)),
-                    None => {
-                        return Err(InterpError::UninitializedRead {
-                            func: func.to_string(),
-                            place: place.to_string(),
-                        })
-                    }
-                },
                 Value::Tuple(ref items) => items.get(*idx).cloned().ok_or_else(|| {
                     InterpError::UninitializedRead {
                         func: func.to_string(),
@@ -10546,23 +10538,16 @@ pub(crate) fn project_value(
                 // `RawVec` / `Unique` / `NonNull` structure, yet
                 // converted code (the inlined `Borrow::borrow`
                 // for `Cow`, `String::as_ptr`, ...) walks exactly
-                // that one-field chain to the data pointer, and
-                // the sibling `Field(1)` for the length. The
-                // chain's steps before the last are the wrappers
-                // themselves, for which the string data is the
-                // only honest stand-in; the last `Field(0)` is
-                // the data pointer, a reference to the string
-                // value; `Field(1)` at any step is the vector's
+                // that one-field chain to the data. Field 0 of
+                // the chain is the string data itself, yielded
+                // unchanged like the byte-string wrapper chain
+                // above: the consumers that need a pointer form
+                // the reference at their own site (reference
+                // formation reads the target's value to recover
+                // the fat length, so the read must stay the
+                // data). `Field(1)` at any step is the vector's
                 // length slot, the string's length.
-                Value::Str(ref text) if *idx == 0 => {
-                    if pos + 1 == projection.len() {
-                        Value::Ref(crate::value::RefTarget::value(
-                            Value::Str(text.clone()),
-                        ))
-                    } else {
-                        value
-                    }
-                }
+                Value::Str(_) if *idx == 0 => value,
                 Value::Str(ref text) if *idx == 1 => {
                     Value::Uint(text.len() as u128)
                 }
