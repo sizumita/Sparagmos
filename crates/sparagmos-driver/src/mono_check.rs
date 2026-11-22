@@ -58,7 +58,8 @@ use crate::convert::guarded_ty_kind;
 /// and return the first monomorphization failure rustc would have
 /// reported, if any.
 pub fn check_bodies(bodies: &[Body]) -> Option<String> {
-    let mut layout_memo = std::collections::HashMap::new();
+    let mut layout_memo: std::collections::HashMap<(Ty, bool), Option<String>> =
+        std::collections::HashMap::new();
     for body in bodies {
         if let Some(err) = check_body(body, &mut layout_memo) {
             return Some(err);
@@ -69,7 +70,7 @@ pub fn check_bodies(bodies: &[Body]) -> Option<String> {
 
 fn check_body(
     body: &Body,
-    layout_memo: &mut std::collections::HashMap<Ty, Option<String>>,
+    layout_memo: &mut std::collections::HashMap<(Ty, bool), Option<String>>,
 ) -> Option<String> {
     for local in body.locals() {
         let ty = local.ty;
@@ -79,7 +80,7 @@ fn check_body(
                  (zero, or more than the monomorphization lane limit)"
             ));
         }
-        if let Some(err) = layout_too_big(ty, layout_memo) {
+        if let Some(err) = layout_too_big(ty, layout_memo, false) {
             return Some(err);
         }
     }
@@ -108,18 +109,19 @@ fn check_body(
 /// bodies repeat the same types heavily.
 fn layout_too_big(
     ty: Ty,
-    memo: &mut std::collections::HashMap<Ty, Option<String>>,
+    memo: &mut std::collections::HashMap<(Ty, bool), Option<String>>,
+    bypass_screen: bool,
 ) -> Option<String> {
-    if let Some(hit) = memo.get(&ty) {
+    if let Some(hit) = memo.get(&(ty, bypass_screen)) {
         return hit.clone();
     }
-    let found = raw_layout_too_big(ty);
-    memo.insert(ty, found.clone());
+    let found = raw_layout_too_big(ty, bypass_screen);
+    memo.insert((ty, bypass_screen), found.clone());
     found
 }
 
-fn raw_layout_too_big(ty: Ty) -> Option<String> {
-    if !layout_query_safe(ty) {
+fn raw_layout_too_big(ty: Ty, bypass_screen: bool) -> Option<String> {
+    if !bypass_screen && !layout_query_safe(ty) {
         return None;
     }
     let layout = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ty.layout()));
@@ -130,18 +132,18 @@ fn raw_layout_too_big(ty: Ty) -> Option<String> {
         return None;
     };
     // Stable MIR exposes the layout failure only as the
-    // compiler's diagnostic text; the too-big failure is the one
-    // whose text carries rustc's own wording for this error.
+    // compiler's diagnostic text; the failures this scan reports
+    // are the ones whose text carries rustc's own wording for
+    // the error — a type too big for the target architecture, or
+    // a layout cycle (E0391), which monomorphization surfaces
+    // for the same materialized types.
     let text = err.to_string();
-    if !text.contains("too big for the target architecture") {
-        return None;
+    for needle in ["values of the type", "cycle detected when computing layout"] {
+        if let Some(at) = text.find(needle) {
+            return Some(text[at..].to_string());
+        }
     }
-    // Report rustc's own diagnostic (the part after the failed
-    // query's preamble) rather than a paraphrase.
-    match text.find("values of the type") {
-        Some(at) => Some(text[at..].to_string()),
-        None => Some(text),
-    }
+    None
 }
 
 /// Whether asking the compiler for `ty`'s layout is safe for
@@ -275,14 +277,18 @@ fn walk_layout_type(
 /// too big for the target architecture. Instantiating such a
 /// call evaluates the measured type's layout in rustc, so a
 /// too-big argument is the same monomorphization failure as a
-/// too-big local. Type arguments of ordinary calls are *not*
+/// too-big local. The layout query is asked without the
+/// structural pre-screen here: rustc itself performs exactly
+/// this query when it instantiates the call, so the query
+/// cannot fail in a way rustc's own compilation of the same
+/// program avoids. Type arguments of ordinary calls are *not*
 /// checked: an ordinary generic function may never materialize
 /// a type it merely names (a `PhantomData` parameter is the
 /// standard shape), and rustc instantiates it without asking
 /// for the type's layout.
 fn check_measured_call(
     func: &Operand,
-    layout_memo: &mut std::collections::HashMap<Ty, Option<String>>,
+    layout_memo: &mut std::collections::HashMap<(Ty, bool), Option<String>>,
 ) -> Option<String> {
     let Operand::Constant(c) = func else {
         return None;
@@ -302,7 +308,7 @@ fn check_measured_call(
     }
     for arg in &args.0 {
         if let rustc_public::ty::GenericArgKind::Type(ty) = arg {
-            if let Some(err) = layout_too_big(*ty, layout_memo) {
+            if let Some(err) = layout_too_big(*ty, layout_memo, true) {
                 return Some(err);
             }
         }
