@@ -3937,13 +3937,13 @@ impl<'a> Interpreter<'a> {
             Builtin::Print => {
                 arity(1)?;
         self.note_stdout_use(frames)?;
-        let text = self.format_arguments(frames, expect_arguments(&vals[0], name)?, 0)?;
+        let text = self.format_arguments(frames, &self.coerce_arguments(frames, &vals[0], name)?, 0)?;
                 self.push_output(&text);
                 Ok(Value::Unit)
             }
             Builtin::Eprint => {
                 arity(1)?;
-                let text = self.format_arguments(frames, expect_arguments(&vals[0], name)?, 0)?;
+                let text = self.format_arguments(frames, &self.coerce_arguments(frames, &vals[0], name)?, 0)?;
                 self.push_error_output(&text);
                 Ok(Value::Unit)
             }
@@ -4329,7 +4329,7 @@ impl<'a> Interpreter<'a> {
                     .or_else(|| self_ty.strip_prefix("&"))
                     .unwrap_or(self_ty);
                 let text =
-                    self.format_arguments(frames, expect_arguments(&vals[1], name)?, 0)?;
+                    self.format_arguments(frames, &self.coerce_arguments(frames, &vals[1], name)?, 0)?;
                 match self_ty {
                     "std::io::Stdout" | "std::io::StdoutLock" => {
                         self.push_output(&text);
@@ -4379,7 +4379,7 @@ impl<'a> Interpreter<'a> {
             Builtin::FmtWrite => {
                 arity(2)?;
                 let text =
-                    self.format_arguments(frames, expect_arguments(&vals[1], name)?, 0)?;
+                    self.format_arguments(frames, &self.coerce_arguments(frames, &vals[1], name)?, 0)?;
                 // The output is a `&mut dyn Write`: resolve it to
                 // the dyn value, then deliver the formatted text
                 // through the concrete type's own `write_str`. The
@@ -4435,7 +4435,7 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::Format => {
                 arity(1)?;
-                let text = self.format_arguments(frames, expect_arguments(&vals[0], name)?, 0)?;
+                let text = self.format_arguments(frames, &self.coerce_arguments(frames, &vals[0], name)?, 0)?;
                 Ok(Value::Str(text))
             }
             Builtin::ArgumentsFromStr => {
@@ -4499,7 +4499,7 @@ impl<'a> Interpreter<'a> {
                 let indent = self.capture_of(id)?.indent;
                 let text = self.format_arguments(
                     frames,
-                    expect_arguments(&vals[1], name)?,
+                    &self.coerce_arguments(frames, &vals[1], name)?,
                     indent,
                 )?;
                 self.formatter_push(id, &text);
@@ -7447,7 +7447,7 @@ impl<'a> Interpreter<'a> {
                     Value::FmtArguments(_) => {
                         let message = self.format_arguments(
                             frames,
-                            expect_arguments(&vals[0], name)?,
+                            &self.coerce_arguments(frames, &vals[0], name)?,
                             0,
                         )?;
                         Err(InterpError::panic_string_payload(message))
@@ -7462,16 +7462,12 @@ impl<'a> Interpreter<'a> {
                 arity(1)?;
                 // A verbatim `Arguments` (a literal message) is a
                 // `&str` payload; a formatted one is a `String`.
-                match expect_arguments(&vals[0], name)? {
+                match self.coerce_arguments(frames, &vals[0], name)? {
                     FmtArguments::Plain(text) => {
-                        Err(InterpError::panic_str_payload(text.clone()))
+                        Err(InterpError::panic_str_payload(text))
                     }
-                    _ => {
-                        let message = self.format_arguments(
-                            frames,
-                            expect_arguments(&vals[0], name)?,
-                            0,
-                        )?;
+                    args => {
+                        let message = self.format_arguments(frames, &args, 0)?;
                         Err(InterpError::panic_string_payload(message))
                     }
                 }
@@ -7497,10 +7493,11 @@ impl<'a> Interpreter<'a> {
                 } = self.resolve_value(frames, &vals[3])?
                 {
                     if let Some(arg) = fields.into_iter().next() {
-                        if let Ok(text) =
-                            self.format_arguments(frames, expect_arguments(&arg, name)?, 0)
-                        {
-                            message = format!("{message}: {text}");
+                        if let Ok(coerced) = self.coerce_arguments(frames, &arg, name) {
+                            if let Ok(text) = self.format_arguments(frames, &coerced, 0)
+                            {
+                                message = format!("{message}: {text}");
+                            }
                         }
                     }
                 }
@@ -7522,16 +7519,12 @@ impl<'a> Interpreter<'a> {
                         format!("{} argument(s)", vals.len()),
                     ));
                 }
-                match expect_arguments(&vals[0], name)? {
+                match self.coerce_arguments(frames, &vals[0], name)? {
                     FmtArguments::Plain(text) => {
-                        Err(InterpError::panic_str_payload(text.clone()))
+                        Err(InterpError::panic_str_payload(text))
                     }
-                    _ => {
-                        let message = self.format_arguments(
-                            frames,
-                            expect_arguments(&vals[0], name)?,
-                            0,
-                        )?;
+                    args => {
+                        let message = self.format_arguments(frames, &args, 0)?;
                         Err(InterpError::panic_string_payload(message))
                     }
                 }
@@ -15181,6 +15174,42 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
     }
 
     /// The byte data a value denotes (an fmt pieces template).
+    /// The `fmt::Arguments` a builtin argument denotes. The
+    /// modelled value comes from the `Arguments` constructor
+    /// builtins; a body that builds the struct itself (an
+    /// inlined `format_args!` expansion inside a library body —
+    /// the shape edition-2015 `unreachable!` reaches through
+    /// `core::panicking::unreachable_display`) hands over the
+    /// raw aggregate instead: two wrapper fields holding the
+    /// encoded template bytes and a reference to the argument
+    /// array. Both forms denote the same value.
+    fn coerce_arguments(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+        name: &str,
+    ) -> InterpResult<FmtArguments> {
+        let resolved = self.resolve_value(frames, value)?;
+        match resolved {
+            Value::FmtArguments(args) => Ok(args),
+            Value::Enum { fields, .. } if fields.len() == 2 => {
+                let mut fields = fields.into_iter();
+                let template_field = fields.next().expect("two fields");
+                let args_field = fields.next().expect("two fields");
+                let template =
+                    self.resolve_bytes(frames, &unwrap_newtype(template_field))?;
+                let args =
+                    self.resolve_arg_array(frames, &unwrap_newtype(args_field))?;
+                Ok(FmtArguments::Template { template, args })
+            }
+            other => Err(InterpError::type_mismatch(
+                format!("builtin {name}"),
+                "fmt::Arguments value",
+                other.kind_name(),
+            )),
+        }
+    }
+
     fn resolve_bytes(&self, frames: &[Frame], value: &Value) -> InterpResult<Vec<u8>> {
         match self.resolve_value(frames, value)? {
             Value::Bytes(b) => Ok(b),
@@ -15328,14 +15357,68 @@ fn dyn_box_pointee(
     }
 }
 
-fn expect_arguments<'v>(value: &'v Value, name: &str) -> InterpResult<&'v FmtArguments> {
+/// The modelled fmt argument a raw `core::fmt::rt::Argument`
+/// aggregate denotes, when `value` has that shape: single-field
+/// wrappers around the triple of the erased value reference,
+/// the formatter function (whose name states the trait and the
+/// Self type), and a unit-shaped marker field. Any other shape
+/// is not a raw argument.
+fn coerce_fmt_arg(value: &Value) -> Option<Value> {
+    let mut current = value.clone();
+    loop {
+        match current {
+            Value::Enum { fields, .. } if fields.len() == 1 => {
+                current = fields.into_iter().next().expect("one field");
+            }
+            Value::Enum { fields, .. } => {
+                let formatter = fields.iter().find_map(|f| match f {
+                    Value::FnPtr(name) => Some(name.clone()),
+                    _ => None,
+                })?;
+                let target = fields.iter().find_map(|f| match f {
+                    Value::FnPtr(_) => None,
+                    Value::Enum { fields, .. } if fields.is_empty() => None,
+                    other => Some(unwrap_newtype(other.clone())),
+                })?;
+                let trait_ = [
+                    ("Display", FmtTrait::Display),
+                    ("Debug", FmtTrait::Debug),
+                    ("Octal", FmtTrait::Octal),
+                    ("LowerHex", FmtTrait::LowerHex),
+                    ("UpperHex", FmtTrait::UpperHex),
+                    ("Pointer", FmtTrait::Pointer),
+                    ("Binary", FmtTrait::Binary),
+                    ("LowerExp", FmtTrait::LowerExp),
+                    ("UpperExp", FmtTrait::UpperExp),
+                ]
+                .iter()
+                .find(|(name, _)| formatter.contains(&format!("{name}>::fmt")))
+                .map(|(_, t)| *t)?;
+                let ty = formatter
+                    .strip_prefix('<')
+                    .and_then(|rest| rest.split(" as ").next())
+                    .unwrap_or("")
+                    .to_string();
+                return Some(Value::FmtArg {
+                    target: Box::new(target),
+                    trait_,
+                    ty,
+                });
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Unwrap one newtype layer: a single-field aggregate denotes
+/// its field (the wrappers core puts around the two halves of a
+/// built `fmt::Arguments`).
+fn unwrap_newtype(value: Value) -> Value {
     match value {
-        Value::FmtArguments(args) => Ok(args),
-        other => Err(InterpError::type_mismatch(
-            format!("builtin {name}"),
-            "fmt::Arguments value",
-            other.kind_name(),
-        )),
+        Value::Enum { fields, .. } if fields.len() == 1 => {
+            fields.into_iter().next().expect("one field")
+        }
+        other => other,
     }
 }
 
@@ -19369,6 +19452,16 @@ impl<'a> Interpreter<'a> {
         options: &FmtOptions,
         indent: usize,
     ) -> InterpResult<String> {
+        // A body that builds `core::fmt::rt::Argument` itself
+        // (an inlined `format_args!` expansion inside a library
+        // body) hands over the raw aggregate instead of the
+        // modelled value the `Argument::new_*` builtins produce;
+        // both denote the same argument.
+        if !matches!(arg, Value::FmtArg { .. }) {
+            if let Some(coerced) = coerce_fmt_arg(arg) {
+                return self.format_arg(frames, &coerced, options, indent);
+            }
+        }
         match arg {
             Value::FmtArg {
                 target,
