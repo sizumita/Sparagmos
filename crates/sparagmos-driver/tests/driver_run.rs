@@ -10365,3 +10365,28 @@ fn run_mode_closure_demanded_by_two_collectors_converts_once() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
 }
+
+const ASSERT_INHABITED_SRC: &str = r#"
+#![feature(core_intrinsics)]
+fn main() {
+    unsafe {
+        std::intrinsics::assert_inhabited::<u32>();
+        std::intrinsics::assert_inhabited::<[u8; 3]>();
+    }
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_assert_inhabited_is_a_no_op() {
+    let dir = temp_dir("assert-inhabited");
+    let src = fixture(&dir, "assert_inhabited.rs", ASSERT_INHABITED_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "assert_inhabited must run as a no-op; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
