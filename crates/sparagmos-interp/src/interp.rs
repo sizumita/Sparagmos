@@ -969,6 +969,9 @@ impl<'a> Interpreter<'a> {
         loop {
             match self.drive_loop(frames, stop_depth) {
                 Ok(value) => return Ok(value),
+                Err(e) if !matches!(e, InterpError::Panic { .. }) => {
+                    return Err(e);
+                }
                 Err(InterpError::Panic { message, payload }) => {
                     let resumed = std::mem::take(&mut self.resume_signaled);
                     if !resumed {
@@ -4843,6 +4846,32 @@ impl<'a> Interpreter<'a> {
     }
 
     /// Whether an allocation is a raw element block.
+    /// The projection a raw element block's access uses: a
+    /// lone byte offset (the denomination a differently sized
+    /// pointer cast left on the pointer, see `PtrCastUnits`)
+    /// denotes the block's byte slot of that offset — the
+    /// block's slots are byte positions for a byte-denominated
+    /// pointer exactly as they are element positions for an
+    /// element-denominated one, and the two denominations are
+    /// kept apart by the projection form itself. Any other
+    /// projection passes through unchanged.
+    pub(crate) fn elem_block_projection(
+        &self,
+        id: u64,
+        projection: &[RefProj],
+    ) -> Vec<RefProj> {
+        if self.is_elem_block(id) {
+            if let Some(RefProj::ByteOffset(d)) = projection.first() {
+                if let Ok(i) = usize::try_from(*d) {
+                    let mut out = vec![RefProj::Index(i)];
+                    out.extend_from_slice(&projection[1..]);
+                    return out;
+                }
+            }
+        }
+        projection.to_vec()
+    }
+
     pub(crate) fn is_elem_block(&self, id: u64) -> bool {
         self.elem_blocks.borrow().contains(&id)
     }
@@ -4911,6 +4940,11 @@ impl<'a> Interpreter<'a> {
             StatementKind::Assign(place, rvalue) => {
                 let value = self.eval_rvalue(frames, body, rvalue, body.local_ty(place.local))?;
                 self.write_place(frames, body, place, value)
+            }
+            StatementKind::ShapedStore { place, value, shape } => {
+                let value = self.eval_operand(frames, body, value)?;
+                let target = self.resolve_place(frames, body, place)?;
+                self.shaped_store(frames, &target, value, shape)
             }
             StatementKind::SetDiscriminant { place, variant } => {
                 let target = self.resolve_place(frames, body, place)?;
@@ -5137,6 +5171,98 @@ impl<'a> Interpreter<'a> {
                 // a single element, which a count of 1 copies directly
                 // and larger counts continue at its siblings (the
                 // sequence access in `read_seq_at` / `write_seq_at`).
+                // A byte-granular copy whose other end is one
+                // structured scalar value — the byte copy an
+                // unaligned vector load/store lowers to, filling
+                // or draining a vector local — moves the bytes
+                // through the value's leaf structure: the
+                // indexed access cannot address a vector value's
+                // bytes (it would walk the storage array's lanes
+                // as elements). Only whole structured values are
+                // rerouted; every other shape keeps the element
+                // path below.
+                if n > 1 {
+                    let dst_tree = self
+                        .read_resolved(frames, &dst_target)
+                        .ok()
+                        .filter(|v| is_scalar_tree(v));
+                    let src_tree = if dst_tree.is_none() {
+                        self.read_resolved(frames, &src_target)
+                            .ok()
+                            .filter(|v| is_scalar_tree(v))
+                    } else {
+                        None
+                    };
+                    if dst_tree.is_some() || src_tree.is_some() {
+                        let bytes = match &src_tree {
+                            Some(tree) => tree_to_bytes(tree, n),
+                            None => {
+                                // The source's units as bytes: a
+                                // unit can be a one-field wrapper
+                                // over the byte (a control byte's
+                                // tag in a raw block), which the
+                                // byte view unwraps.
+                                fn seq_byte(value: &Value) -> Option<u8> {
+                                    match value {
+                                        Value::Uint(b) if *b <= 0xFF => Some(*b as u8),
+                                        Value::Int(b) if (0..=255).contains(b) => {
+                                            Some(*b as u8)
+                                        }
+                                        Value::Enum { fields, .. } if fields.len() == 1 => {
+                                            seq_byte(&fields[0])
+                                        }
+                                        _ => None,
+                                    }
+                                }
+                                let mut bytes = Vec::with_capacity(n);
+                                let mut all_bytes = true;
+                                for i in 0..n {
+                                    match self.read_seq_at(frames, &src_target, i) {
+                                        Ok(v) => match seq_byte(&v) {
+                                            Some(b) => bytes.push(b),
+                                            None => {
+                                                all_bytes = false;
+                                                break;
+                                            }
+                                        },
+                                        _ => {
+                                            all_bytes = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if all_bytes {
+                                    Some(bytes)
+                                } else {
+                                    None
+                                }
+                            }
+                        };
+                        if let Some(bytes) = bytes {
+                            if let Some(tree) = &dst_tree {
+                                if let Some(patched) = byte_patch_tree(tree, &bytes) {
+                                    self.write_resolved(frames, &dst_target, patched)?;
+                                    return Ok(());
+                                }
+                            }
+                            if let Some(tree) = &src_tree {
+                                // The copy moves exactly the source
+                                // value's bytes (`tree_to_bytes`
+                                // only succeeds at the value's own
+                                // length): write the value itself as
+                                // one slot. Writing its bytes one by
+                                // one would shred the structured
+                                // value into byte slots that a later
+                                // whole-value read cannot reassemble
+                                // (a hash table's resize copying its
+                                // buckets byte-granularly).
+                                let tree = tree.clone();
+                                self.write_resolved(frames, &dst_target, tree)?;
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
                 let aggregate = |v: &Value| {
                     matches!(
                         v,
@@ -5172,7 +5298,18 @@ impl<'a> Interpreter<'a> {
                 } else {
                     let mut elems = Vec::with_capacity(n);
                     for i in 0..n {
-                        elems.push(self.read_seq_at(frames, &src_target, i)?);
+                        // A unit of the source range that was
+                        // never written copies as uninit: a
+                        // byte-granular copy over a raw block
+                        // spans model slots that carry no value
+                        // (the block's element occupies one slot;
+                        // its byte size counts the rest).
+                        let unit = match self.read_seq_at(frames, &src_target, i) {
+                            Ok(v) => v,
+                            Err(InterpError::UninitializedRead { .. }) => Value::Uninit,
+                            Err(e) => return Err(e),
+                        };
+                        elems.push(unit);
                     }
                     elems
                 };
@@ -6205,6 +6342,18 @@ impl<'a> Interpreter<'a> {
             _ => (projection, 0),
         };
         let total = carried.checked_add(disp)?;
+        // A pointer already denominated in bytes (its index was
+        // rewritten by a differently sized pointer cast, see
+        // `PtrCastUnits`) with nothing before the byte offset
+        // stays in bytes: converting the total back into the
+        // current element size's index would silently change
+        // the position whenever the two denominations meet —
+        // the byte-denominated bucket pointers of a raw table
+        // versus its element-denominated ones. Byte offsets
+        // resolve against the block's byte slots directly.
+        if base.is_empty() && matches!(projection.last(), Some(RefProj::ByteOffset(_))) {
+            return Some(Ok(vec![RefProj::ByteOffset(total)]));
+        }
         let size_i = i128::from(size);
         if total % size_i != 0 {
             return None;
@@ -6812,6 +6961,7 @@ impl<'a> Interpreter<'a> {
                 Ok(value)
             }
             Resolved::Alloc { id, projection } => {
+                let projection = &self.elem_block_projection(*id, projection);
                 let base = self.alloc_base(*id)?;
                 let func = frames
                     .last()
@@ -7033,6 +7183,7 @@ impl<'a> Interpreter<'a> {
                 assign_projected(slot, projection, value, "<static>", &place_desc)
             }
             Resolved::Alloc { id, projection } => {
+                let projection = &self.elem_block_projection(*id, projection);
                 let mut store = self.allocs.borrow_mut();
                 let slot = store
                     .get_mut(id)
@@ -7072,11 +7223,21 @@ impl<'a> Interpreter<'a> {
                 // (reading one stays an uninitialized-read
                 // error, never a fabricated value).
                 if self.is_elem_block(*id) {
-                    if let (Value::Tuple(items), Some(RefProj::Index(i))) =
-                        (&mut *slot, projection.first())
-                    {
-                        if *i >= items.len() {
-                            items.resize(i + 1, Value::Uninit);
+                    if let Some(RefProj::Index(i)) = projection.first() {
+                        let i = *i;
+                        // A block no write has materialized yet
+                        // holds no value at all: the first element
+                        // write materializes the element tuple,
+                        // with the slots it skips over
+                        // uninitialized, exactly as the grow
+                        // below treats a short tuple.
+                        if *slot == Value::Uninit {
+                            *slot = Value::Tuple(vec![Value::Uninit; i + 1]);
+                        }
+                        if let Value::Tuple(items) = &mut *slot {
+                            if i >= items.len() {
+                                items.resize(i + 1, Value::Uninit);
+                            }
                         }
                     }
                 }
@@ -7310,7 +7471,12 @@ impl<'a> Interpreter<'a> {
     ) -> InterpResult<Value> {
         match self.seq_element_target(frames, target, index)? {
             Some(target) => self.read_resolved(frames, &target),
-            None => self.read_resolved_at(frames, target, index),
+            None => {
+                if let Some(scalar) = self.seq_scalar(frames, target)? {
+                    return Ok(Value::Uint(scalar_byte(&scalar, index)? as u128));
+                }
+                self.read_resolved_at(frames, target, index)
+            }
         }
     }
 
@@ -7326,7 +7492,51 @@ impl<'a> Interpreter<'a> {
     ) -> InterpResult<()> {
         match self.seq_element_target(frames, target, index)? {
             Some(target) => self.write_resolved(frames, &target, value),
-            None => self.write_resolved_at(frames, target, index, value),
+            None => {
+                if let Some(scalar) = self.seq_scalar(frames, target)? {
+                    let byte = match &value {
+                        Value::Uint(v) if *v <= 0xFF => *v as u8,
+                        Value::Int(v) if (-128..=255).contains(v) => *v as u8,
+                        _ => {
+                            return self.write_resolved_at(frames, target, index, value);
+                        }
+                    };
+                    let patched = scalar_with_byte(&scalar, index, byte)?;
+                    return self.write_resolved(frames, target, patched);
+                }
+                self.write_resolved_at(frames, target, index, value)
+            }
+        }
+    }
+
+    /// The integer a sequence target denotes as a whole, when a
+    /// bulk-memory operation's pointer names a scalar place: the
+    /// address of an integer local cast to a byte pointer (the
+    /// shape `ptr::copy_nonoverlapping` into a `u32` in
+    /// `core::hash::sip`'s integer loads takes) makes the
+    /// operation's sequence the scalar's own bytes, which the
+    /// indexed access cannot express. A target ending in an index
+    /// step denotes one element of an aggregate instead and keeps
+    /// the element treatment, as does any non-integer value.
+    fn seq_scalar(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+    ) -> InterpResult<Option<Value>> {
+        let projection = match target {
+            Resolved::Place { projection, .. }
+            | Resolved::Static { projection, .. }
+            | Resolved::Alloc { projection, .. }
+            | Resolved::Value(_, projection) => projection,
+        };
+        if matches!(projection.last(), Some(RefProj::Index(_))) {
+            return Ok(None);
+        }
+        match self.read_resolved(frames, target) {
+            Ok(v @ (Value::Int(_) | Value::Uint(_))) => Ok(Some(v)),
+            Ok(_) => Ok(None),
+            Err(InterpError::UninitializedRead { .. }) => Ok(None),
+            Err(e) => Err(e),
         }
     }
 
@@ -7348,6 +7558,111 @@ impl<'a> Interpreter<'a> {
         target: &Resolved,
         index: usize,
     ) -> InterpResult<Option<Resolved>> {
+        // A byte-denominated allocation target (see
+        // `elem_block_projection`) reads its elements at the
+        // byte slot, as the plain read/write paths do.
+        let byte_translated = match target {
+            Resolved::Alloc { id, projection } => Some(Resolved::Alloc {
+                id: *id,
+                projection: self.elem_block_projection(*id, projection),
+            }),
+            _ => None,
+        };
+        let target = byte_translated.as_ref().unwrap_or(target);
+        // A raw element block target carrying a single index
+        // step denotes a position in the block's flat sequence:
+        // the sequence continues at the following slots, never
+        // inside the value stored at this slot (which may be a
+        // structured element a byte-granular copy moves whole).
+        if let Resolved::Alloc { id, projection } = target {
+            if self.is_elem_block(*id) {
+                if let [RefProj::Index(a)] = projection.as_slice() {
+                    return Ok(Some(Resolved::Alloc {
+                        id: *id,
+                        projection: vec![RefProj::Index(a + index)],
+                    }));
+                }
+            }
+        }
+        // A raw element block target carrying two index steps —
+        // an offset absorbed into an element index, followed by
+        // the first-element step of an array-to-element cast —
+        // denotes the flat sequence starting at the sum of the
+        // two indices, unless the value stored at the first
+        // index is itself an aggregate the second index ranges
+        // over (a nested array value in the block, including
+        // the single-array-field pun `project_value` reads
+        // through): that shape keeps the trailing-index
+        // reading below.
+        if let Resolved::Alloc { id, projection } = target {
+            if self.is_elem_block(*id) {
+                if let [RefProj::Index(a), RefProj::Index(b)] = projection.as_slice() {
+                    let (a, b) = (*a, *b);
+                    let head = Resolved::Alloc {
+                        id: *id,
+                        projection: vec![RefProj::Index(a)],
+                    };
+                    match self.read_resolved(frames, &head) {
+                        Ok(v) => {
+                            // The nested reading is only
+                            // available while the trailing index
+                            // ranges inside the stored value: a
+                            // byte-granular sequence running past
+                            // the value's own length is the flat
+                            // continuation (a raw table's resize
+                            // copying a structured bucket value
+                            // byte by byte reads past the bucket's
+                            // field count immediately).
+                            let inner_len = match &v {
+                                Value::Tuple(items) => Some(items.len()),
+                                Value::Bytes(bytes) => Some(bytes.len()),
+                                Value::Str(text) => Some(text.len()),
+                                Value::Enum { fields, .. }
+                                    if fields.len() == 1 =>
+                                {
+                                    match &fields[0] {
+                                        Value::Tuple(items) => Some(items.len()),
+                                        Value::Bytes(bytes) => Some(bytes.len()),
+                                        _ => None,
+                                    }
+                                }
+                                _ => None,
+                            };
+                            let nested = match &v {
+                                Value::Tuple(_)
+                                | Value::Bytes(_)
+                                | Value::Str(_)
+                                | Value::FatRef { .. } => {
+                                    inner_len.is_none_or(|l| b + index < l)
+                                }
+                                Value::Enum { fields, .. } => {
+                                    fields.len() == 1
+                                        && matches!(
+                                            fields[0],
+                                            Value::Tuple(_) | Value::Bytes(_)
+                                        )
+                                        && inner_len.is_none_or(|l| b + index < l)
+                                }
+                                _ => false,
+                            };
+                            if !nested {
+                                return Ok(Some(Resolved::Alloc {
+                                    id: *id,
+                                    projection: vec![RefProj::Index(a + b + index)],
+                                }));
+                            }
+                        }
+                        Err(InterpError::UninitializedRead { .. }) => {
+                            return Ok(Some(Resolved::Alloc {
+                                id: *id,
+                                projection: vec![RefProj::Index(a + b + index)],
+                            }));
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+        }
         let projection = match target {
             Resolved::Place { projection, .. }
             | Resolved::Static { projection, .. }
@@ -7686,8 +8001,11 @@ impl<'a> Interpreter<'a> {
             // these wrapper locals verbatim (a box's field 0 read
             // into a `Unique` local is the first step of every
             // `Box::into_raw`), and the pointer is the value each
-            // of them denotes in this model.
-            | (Some(Ty::Adt(_)), Value::Ref(RefTarget::Alloc { .. }))
+            // of them denotes in this model. The target may be a
+            // detached value as well as an allocation — the data
+            // pointer read out of a string the model holds as
+            // bare data names the string value itself.
+            | (Some(Ty::Adt(_)), Value::Ref(_))
             | (Some(Ty::Adt(_)), Value::Str(_))
             // A smart-pointer ADT over a `dyn` pointee (`Box<dyn
             // Trait>`, `Rc<dyn Trait>`) holds the fat pointer.
@@ -8335,6 +8653,199 @@ impl<'a> Interpreter<'a> {
     /// operand value to its bit pattern through the source
     /// shape, then construct the target shape's value from the
     /// same bits.
+    /// The lane decomposition of a vector shape: the shape of
+    /// one lane and the lane count, unwrapping one-payload-field
+    /// ADTs to the array they store. A shape that is not (an ADT
+    /// over) an array decomposes to itself as a single lane.
+    fn shape_lanes(shape: &ScalarShape) -> (ScalarShape, u64) {
+        match shape {
+            ScalarShape::AdtField { inner, .. } => Self::shape_lanes(inner),
+            ScalarShape::Array(elem, n) => ((**elem).clone(), *n),
+            other => (other.clone(), 1),
+        }
+    }
+
+    /// Flatten a stored element to a lane's bit pattern: the
+    /// plain scalar flattening, seeing through one-field wrapper
+    /// aggregates (a raw block's elements are the lane types'
+    /// own values — a control byte is the wrapper struct around
+    /// the byte, not the bare integer).
+    fn flatten_lane(&self, value: &Value, lane: &ScalarShape) -> InterpResult<u128> {
+        if let Ok(bits) = self.flatten_scalar(value, lane) {
+            return Ok(bits);
+        }
+        if let Value::Enum { fields, .. } = value {
+            if fields.len() == 1 {
+                return self.flatten_lane(&fields[0], lane);
+            }
+        }
+        self.flatten_scalar(value, lane)
+    }
+
+    /// The bit pattern of the vector value a raw element block
+    /// holds at `target`: lane `i` is the element at sequence
+    /// offset `i`, flattened through the lane shape.
+    fn shaped_bits_from_elements(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        shape: &ScalarShape,
+    ) -> InterpResult<u128> {
+        let (lane, count) = Self::shape_lanes(shape);
+        let lane_bits = lane.bits();
+        // A target whose stored units are bytes (a byte string,
+        // a raw block of control bytes) holds the vector as a
+        // byte stream: the lanes are packed from consecutive
+        // bytes, not read one byte per lane. The first unit
+        // decides: a byte-sized scalar (or a one-field wrapper
+        // over one, like a control-byte tag) means byte units.
+        let first = self.read_seq_at(frames, target, 0)?;
+        let byte_like = |v: &Value| -> bool {
+            match v {
+                Value::Uint(b) => *b <= 0xFF,
+                Value::Int(b) => (-128..=255).contains(b),
+                Value::Enum { fields, .. } if fields.len() == 1 => {
+                    matches!(&fields[0], Value::Uint(b) if *b <= 0xFF)
+                        || matches!(&fields[0], Value::Int(b) if (-128..=255).contains(b))
+                }
+                _ => false,
+            }
+        };
+        if lane_bits > 8 && byte_like(&first) {
+            let byte_lane = ScalarShape::Int {
+                bits: 8,
+                signed: false,
+            };
+            let nbytes = (shape.bits() / 8) as usize;
+            let mut out = 0u128;
+            for k in 0..nbytes {
+                let unit = if k == 0 {
+                    first.clone()
+                } else {
+                    self.read_seq_at(frames, target, k)?
+                };
+                let b = self.flatten_lane(&unit, &byte_lane)?;
+                out |= (b & 0xFF) << (8 * (k as u32));
+            }
+            return Ok(out);
+        }
+        let mut out = 0u128;
+        for i in 0..count {
+            let element = if i == 0 {
+                first.clone()
+            } else {
+                self.read_seq_at(frames, target, i as usize)?
+            };
+            let bits = self.flatten_lane(&element, &lane)?;
+            out |= bits << ((i as u32) * lane_bits);
+        }
+        Ok(out)
+    }
+
+    /// A shaped whole-pointee load (see [`Rvalue::ShapedLoad`]):
+    /// a pointee stored whole loads as itself, canonicalised
+    /// through its shape; a pointee in a raw element block whose
+    /// stored elements are not the value (a byte buffer read as
+    /// a vector) is assembled from the consecutive elements.
+    fn shaped_load(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        shape: &ScalarShape,
+    ) -> InterpResult<Value> {
+        let elem_block = matches!(target, Resolved::Alloc { id, .. } if self.is_elem_block(*id));
+        match self.read_resolved(frames, target) {
+            Ok(v) => {
+                if let Ok(bits) = self.flatten_scalar(&v, shape) {
+                    return self.construct_scalar(bits, shape);
+                }
+                // A sequence-like value base (a byte string or an
+                // element tuple behind a constant pointer) holds
+                // the vector as its consecutive elements, like a
+                // raw block does.
+                let seq_base = matches!(
+                    target,
+                    Resolved::Value(base, _)
+                        if matches!(base, Value::Bytes(_) | Value::Tuple(_))
+                );
+                if elem_block || seq_base {
+                    let bits = self.shaped_bits_from_elements(frames, target, shape)?;
+                    return self.construct_scalar(bits, shape);
+                }
+                Ok(v)
+            }
+            Err(e) => {
+                if elem_block && matches!(e, InterpError::UninitializedRead { .. }) {
+                    let bits = self.shaped_bits_from_elements(frames, target, shape)?;
+                    return self.construct_scalar(bits, shape);
+                }
+                // A byte string behind field steps: the steps
+                // below the dereference select the payload field
+                // of a wrapper (a vector type's storage field is
+                // field 0 at offset 0), so a chain of field-0
+                // steps over a byte-string base denotes the
+                // shape's bits at the start of the string — the
+                // plain projection cannot enter a byte string,
+                // but the shaped load names exactly those bits.
+                if let Resolved::Value(base, projection) = target {
+                    if let Value::Bytes(bytes) = base {
+                        if projection
+                            .iter()
+                            .all(|p| matches!(p, RefProj::Field(0)))
+                            && !projection.is_empty()
+                        {
+                            let nbytes = (shape.bits() / 8) as usize;
+                            if bytes.len() >= nbytes {
+                                let mut bits = 0u128;
+                                for (k, b) in bytes[..nbytes].iter().enumerate() {
+                                    bits |= u128::from(*b) << (8 * (k as u32));
+                                }
+                                return self.construct_scalar(bits, shape);
+                            }
+                        }
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// A shaped whole-pointee store (see
+    /// [`StatementKind::ShapedStore`]): into a raw element block
+    /// the value goes lane by lane over the consecutive elements
+    /// at the target, each new lane keeping the wrapper shape of
+    /// the element it replaces; anywhere else the store is the
+    /// plain whole-value one.
+    fn shaped_store(
+        &self,
+        frames: &mut Vec<Frame>,
+        target: &Resolved,
+        value: Value,
+        shape: &ScalarShape,
+    ) -> InterpResult<()> {
+        let elem_block = matches!(target, Resolved::Alloc { id, .. } if self.is_elem_block(*id));
+        if elem_block {
+            if let Ok(bits) = self.flatten_scalar(&value, shape) {
+                let (lane, count) = Self::shape_lanes(shape);
+                let lane_bits = lane.bits();
+                let mask = bit_mask(lane_bits);
+                for i in 0..count {
+                    let lane_value = self.construct_scalar(
+                        (bits >> ((i as u32) * lane_bits)) & mask,
+                        &lane,
+                    )?;
+                    let stored = match self.read_seq_at(frames, target, i as usize) {
+                        Ok(current) => crate::builtins::rewrap_like(&current, lane_value),
+                        Err(_) => lane_value,
+                    };
+                    self.write_seq_at(frames, target, i as usize, stored)?;
+                }
+                return Ok(());
+            }
+        }
+        self.write_resolved(frames, target, value)
+    }
+
     fn reinterpret_value(
         &self,
         value: &Value,
@@ -8775,6 +9286,7 @@ impl<'a> Interpreter<'a> {
                 variant,
                 operands,
                 field_index,
+                units_from,
             } => {
                 // A union aggregate's single operand initializes the
                 // active field; the slots before it stay
@@ -8790,6 +9302,12 @@ impl<'a> Interpreter<'a> {
                 };
                 for op in operands {
                     fields.push(self.eval_operand(frames, body, op)?);
+                }
+                if let Some((from_size, payload_pos)) = units_from {
+                    if let Some(field) = fields.get_mut(*payload_pos) {
+                        let taken = std::mem::replace(field, Value::Unit);
+                        *field = ptr_cast_units_value(taken, *from_size);
+                    }
                 }
                 // A `MaybeUninit::new(v)` construction (the union's
                 // `value` field, index 1): in this model a
@@ -8878,6 +9396,10 @@ impl<'a> Interpreter<'a> {
             Rvalue::PtrFirstElem(operand) => {
                 let value = self.eval_operand(frames, body, operand)?;
                 self.ptr_first_elem_value(frames, body, value)
+            }
+            Rvalue::PtrCastUnits(operand, from_size) => {
+                let value = self.eval_operand(frames, body, operand)?;
+                Ok(ptr_cast_units_value(value, *from_size))
             }
             Rvalue::PtrArrayBase(operand) => {
                 let value = self.eval_operand(frames, body, operand)?;
@@ -9063,6 +9585,10 @@ impl<'a> Interpreter<'a> {
             Rvalue::Reinterpret(operand, src, dst) => {
                 let value = self.eval_operand(frames, body, operand)?;
                 self.reinterpret_value(&value, src, dst)
+            }
+            Rvalue::ShapedLoad(place, shape) => {
+                let target = self.resolve_place(frames, body, place)?;
+                self.shaped_load(frames, &target, shape)
             }
             Rvalue::PtrOffset(ptr_op, count_op, baked_size, count_width) => {
                 let base = self.eval_operand(frames, body, ptr_op)?;
@@ -9480,6 +10006,232 @@ fn index_oob(len: usize, index: usize) -> InterpError {
     ))
 }
 
+/// Byte `index` of an integer value's little-endian
+/// representation (see `Interpreter::seq_scalar`). The model's
+/// word is 128 bits; a byte past it is outside every integer
+/// type the model holds, so it is an explicit error rather
+/// than a fabricated byte.
+/// The scalar leaves of a structured scalar value (a vector
+/// value's tree of integer/float/bool leaves inside its
+/// aggregate wrappers), in storage order; `None` when any part
+/// of the tree is not a scalar leaf or a plain aggregate over
+/// them. Byte-granular bulk operations (the byte copy an
+/// unaligned vector load lowers to) address such a value's
+/// bytes, which the indexed access cannot express: the leaves'
+/// widths are not recorded in the values themselves.
+fn scalar_tree_leaves(value: &Value) -> Option<Vec<&Value>> {
+    fn walk<'v>(value: &'v Value, out: &mut Vec<&'v Value>) -> Option<()> {
+        match value {
+            Value::Int(_) | Value::Uint(_) | Value::Float(_) | Value::Bool(_) => {
+                out.push(value);
+            }
+            Value::Tuple(items) => {
+                for item in items {
+                    walk(item, out)?;
+                }
+            }
+            Value::Enum { fields, .. } => {
+                for field in fields {
+                    walk(field, out)?;
+                }
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+    let mut out = Vec::new();
+    walk(value, &mut out)?;
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Whether `value` is a structured scalar tree (an aggregate
+/// over scalar leaves) rather than a plain scalar or a
+/// sequence value the indexed access already handles.
+fn is_scalar_tree(value: &Value) -> bool {
+    matches!(value, Value::Tuple(_) | Value::Enum { .. })
+        && scalar_tree_leaves(value).is_some()
+}
+
+/// The leaf width a byte view of a scalar tree uses: every
+/// leaf must share one kind, and the total bit count must
+/// divide evenly into a width the model can store. Vector
+/// values — the trees this serves — are uniform by
+/// construction (a `Simd<T, N>` storage array, a wrapper over
+/// one scalar); a mixed tree has no honest byte view here and
+/// keeps the plain access's outcome.
+fn scalar_tree_leaf_width(leaves: &[&Value], total_bits: u32) -> Option<u32> {
+    let count = leaves.len() as u32;
+    if count == 0 || total_bits % count != 0 {
+        return None;
+    }
+    let width = total_bits / count;
+    let kind = leaves[0];
+    if !leaves.iter().all(|leaf| {
+        matches!(
+            (kind, leaf),
+            (Value::Int(_), Value::Int(_))
+                | (Value::Uint(_), Value::Uint(_))
+                | (Value::Float(_), Value::Float(_))
+                | (Value::Bool(_), Value::Bool(_))
+        )
+    }) {
+        return None;
+    }
+    match kind {
+        Value::Int(_) | Value::Uint(_) if matches!(width, 8 | 16 | 32 | 64 | 128) => Some(width),
+        Value::Float(_) if matches!(width, 32 | 64) => Some(width),
+        Value::Bool(_) if width == 8 => Some(width),
+        _ => None,
+    }
+}
+
+/// Rebuild a scalar tree with its leaf bits taken from
+/// `bytes` (little-endian, in storage order), preserving the
+/// tree's shape and leaf kinds. `None` when the tree has no
+/// uniform byte view (see [`scalar_tree_leaf_width`]).
+fn byte_patch_tree(current: &Value, bytes: &[u8]) -> Option<Value> {
+    let leaves = scalar_tree_leaves(current)?;
+    let width = scalar_tree_leaf_width(&leaves, (bytes.len() as u32).checked_mul(8)?)?;
+    let mut pos = 0usize;
+    fn build(template: &Value, bytes: &[u8], width: u32, pos: &mut usize) -> Option<Value> {
+        let nbytes = (width / 8) as usize;
+        let take = |pos: &mut usize| -> Option<u128> {
+            let mut bits = 0u128;
+            for i in 0..nbytes {
+                bits |= u128::from(*bytes.get(*pos + i)?) << (8 * i);
+            }
+            *pos += nbytes;
+            Some(bits)
+        };
+        match template {
+            Value::Int(_) => {
+                let bits = take(pos)?;
+                Some(Value::Int(wrap_signed(bits as i128, width)))
+            }
+            Value::Uint(_) => {
+                let bits = take(pos)?;
+                Some(Value::Uint(wrap_unsigned(bits, width)))
+            }
+            Value::Float(_) => {
+                let bits = take(pos)?;
+                Some(Value::Float(match width {
+                    32 => f64::from(f32::from_bits(bits as u32)),
+                    _ => f64::from_bits(bits as u64),
+                }))
+            }
+            Value::Bool(_) => {
+                let bits = take(pos)?;
+                Some(Value::Bool(bits != 0))
+            }
+            Value::Tuple(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    out.push(build(item, bytes, width, pos)?);
+                }
+                Some(Value::Tuple(out))
+            }
+            Value::Enum { variant, fields } => {
+                let mut out = Vec::with_capacity(fields.len());
+                for field in fields {
+                    out.push(build(field, bytes, width, pos)?);
+                }
+                Some(Value::Enum {
+                    variant: *variant,
+                    fields: out,
+                })
+            }
+            _ => None,
+        }
+    }
+    build(current, bytes, width, &mut pos)
+}
+
+/// Serialize a scalar tree to its little-endian bytes when it
+/// has a uniform byte view of exactly `total` bytes (the
+/// mirror of [`byte_patch_tree`], for a vector store's source).
+fn tree_to_bytes(value: &Value, total: usize) -> Option<Vec<u8>> {
+    let leaves = scalar_tree_leaves(value)?;
+    let width = scalar_tree_leaf_width(&leaves, (total as u32).checked_mul(8)?)?;
+    let nbytes = (width / 8) as usize;
+    let mut out = Vec::with_capacity(total);
+    for leaf in leaves {
+        let bits: u128 = match leaf {
+            Value::Int(i) => (*i as u128) & bit_mask(width),
+            Value::Uint(u) => *u & bit_mask(width),
+            Value::Float(f) => match width {
+                32 => u128::from((*f as f32).to_bits()),
+                _ => u128::from(f.to_bits()),
+            },
+            Value::Bool(b) => u128::from(*b),
+            _ => return None,
+        };
+        for i in 0..nbytes {
+            out.push((bits >> (8 * i)) as u8);
+        }
+    }
+    if out.len() == total {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+fn scalar_byte(value: &Value, index: usize) -> InterpResult<u8> {
+    if index >= 16 {
+        return Err(InterpError::UnsupportedProjection {
+            kind: format!(
+                "byte {index} of a scalar value is outside the model's word"
+            ),
+        });
+    }
+    let bits = match value {
+        Value::Int(v) => *v as u128,
+        Value::Uint(v) => *v,
+        other => {
+            return Err(InterpError::type_mismatch(
+                "scalar byte access",
+                "integer value",
+                other.kind_name(),
+            ));
+        }
+    };
+    Ok((bits >> (index * 8)) as u8)
+}
+
+/// The integer value with byte `index` of its little-endian
+/// representation replaced by `byte` (see
+/// [`scalar_byte`]). The signed form keeps its two's-complement
+/// word: patching a byte of a negative value patches the
+/// representation the native write would touch.
+fn scalar_with_byte(value: &Value, index: usize, byte: u8) -> InterpResult<Value> {
+    if index >= 16 {
+        return Err(InterpError::UnsupportedProjection {
+            kind: format!(
+                "byte {index} of a scalar value is outside the model's word"
+            ),
+        });
+    }
+    let shift = index * 8;
+    let mask = !(0xFFu128 << shift);
+    Ok(match value {
+        Value::Int(v) => {
+            Value::Int(((*v as u128 & mask) | ((byte as u128) << shift)) as i128)
+        }
+        Value::Uint(v) => Value::Uint((*v & mask) | ((byte as u128) << shift)),
+        other => {
+            return Err(InterpError::type_mismatch(
+                "scalar byte access",
+                "integer value",
+                other.kind_name(),
+            ));
+        }
+    })
+}
+
 /// Apply constant projection steps to a value (read direction).
 /// The canonical value of a type that is zero-sized by its IR
 /// shape alone (see `Interpreter::zst_local_value`): unit, tuples
@@ -9605,6 +10357,58 @@ fn compose_projection(
     out
 }
 
+/// The run-time half of [`Rvalue::PtrCastUnits`]: rewrite a
+/// trailing element index in the pointer's projection as the
+/// byte offset it denotes in the source pointee's units
+/// (`index * from_size`). Every other shape — no trailing
+/// index, a byte offset already, a zero index (the same
+/// position in any unit), an index whose byte position does
+/// not fit — passes through unchanged: the position is the
+/// same, only its denomination was ambiguous.
+pub(crate) fn ptr_cast_units_value(value: Value, from_size: u64) -> Value {
+    fn rescale(projection: &mut Vec<RefProj>, from_size: u64) {
+        if let Some(RefProj::Index(k)) = projection.last() {
+            let k = *k;
+            if k > 0 {
+                if let Some(bytes) = (k as u128).checked_mul(u128::from(from_size)) {
+                    if let Ok(d) = i128::try_from(bytes) {
+                        *projection.last_mut().expect("last checked") =
+                            RefProj::ByteOffset(d);
+                    }
+                }
+            }
+        }
+    }
+    match value {
+        Value::Ref(target) => Value::Ref(match target {
+            // Only an allocation target's index is denominated
+            // in the pointer's own pointee units: a raw block
+            // has no declared element type, so the projection
+            // the pointer carries is the only denomination in
+            // play. A place, static or value target's index
+            // belongs to the declared aggregate it projects
+            // into (an array local's element index), which a
+            // pointer cast does not redenominate.
+            RefTarget::Alloc { id, mut projection } => {
+                rescale(&mut projection, from_size);
+                RefTarget::Alloc { id, projection }
+            }
+            other => other,
+        }),
+        Value::FatRef { base, len } => Value::FatRef {
+            base: Box::new(ptr_cast_units_value(*base, from_size)),
+            len,
+        },
+        Value::DynRef { base, concrete, traits, drop_glue } => Value::DynRef {
+            base: Box::new(ptr_cast_units_value(*base, from_size)),
+            concrete,
+            traits,
+            drop_glue,
+        },
+        other => other,
+    }
+}
+
 pub(crate) fn project_value(
     value: Value,
     projection: &[RefProj],
@@ -9626,6 +10430,7 @@ pub(crate) fn project_value(
     while step_idx < projection.len() {
         let step = &projection[step_idx];
         step_idx += 1;
+        let pos = step_idx - 1;
         if value == Value::Uninit {
             return Err(InterpError::UninitializedRead {
                 func: func.to_string(),
@@ -9635,6 +10440,25 @@ pub(crate) fn project_value(
         let step_state = downcast_state.take();
         value = match step {
             RefProj::Field(idx) => match value {
+                // A byte string is the storage of a value the
+                // model never materialised (a byte-pointer view
+                // of a constant allocation): field 0 of the
+                // wrapper stored there — a control byte's tag —
+                // is the byte at offset 0. Wider first fields
+                // have no honest read here (their width is not
+                // recorded in the string); the shaped loads
+                // cover the vector-storage case in rvalue
+                // position, and any other shape keeps failing
+                // downstream on the byte it did not expect.
+                Value::Bytes(ref bytes) if *idx == 0 => match bytes.first() {
+                    Some(b) => Value::Uint(u128::from(*b)),
+                    None => {
+                        return Err(InterpError::UninitializedRead {
+                            func: func.to_string(),
+                            place: place.to_string(),
+                        })
+                    }
+                },
                 Value::Tuple(ref items) => items.get(*idx).cloned().ok_or_else(|| {
                     InterpError::UninitializedRead {
                         func: func.to_string(),
@@ -9705,7 +10529,43 @@ pub(crate) fn project_value(
                 // Each wrapper's only field sits at offset 0 with
                 // exactly the string's representation, so the
                 // step yields the value unchanged.
-                Value::Str(_) | Value::Bytes(_) if *idx == 0 => value,
+                Value::Bytes(_) if *idx == 0 => value,
+                // A one-field wrapper over a scalar whose storage
+                // the model holds as the bare scalar (a control
+                // byte reached through a byte-string constant:
+                // the tag's storage is the byte itself): field 0
+                // of the wrapper is the scalar it wraps.
+                Value::Int(_) | Value::Uint(_) | Value::Float(_) | Value::Bool(_)
+                    if *idx == 0 =>
+                {
+                    value
+                }
+                // String data reached through its own wrapper
+                // descent: a `String` the model holds as bare
+                // string data has no materialised `Vec` /
+                // `RawVec` / `Unique` / `NonNull` structure, yet
+                // converted code (the inlined `Borrow::borrow`
+                // for `Cow`, `String::as_ptr`, ...) walks exactly
+                // that one-field chain to the data pointer, and
+                // the sibling `Field(1)` for the length. The
+                // chain's steps before the last are the wrappers
+                // themselves, for which the string data is the
+                // only honest stand-in; the last `Field(0)` is
+                // the data pointer, a reference to the string
+                // value; `Field(1)` at any step is the vector's
+                // length slot, the string's length.
+                Value::Str(ref text) if *idx == 0 => {
+                    if pos + 1 == projection.len() {
+                        Value::Ref(crate::value::RefTarget::value(
+                            Value::Str(text.clone()),
+                        ))
+                    } else {
+                        value
+                    }
+                }
+                Value::Str(ref text) if *idx == 1 => {
+                    Value::Uint(text.len() as u128)
+                }
                 // The two fields of a modelled `fmt::Arguments`
                 // (see the struct's encoding in core::fmt): field
                 // 0 is the `template: NonNull<u8>`, field 1 the

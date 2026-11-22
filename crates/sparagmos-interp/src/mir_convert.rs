@@ -147,6 +147,36 @@ pub struct MirProgram {
     /// Handed to the interpreter program for the debugger
     /// interface.
     pub source_files: Vec<String>,
+    /// ADT instantiations whose drop glue the compiler certifies
+    /// empty, as recorded by the driver (it resolves each dropped
+    /// type's drop-in-place shim through Stable MIR and keeps the
+    /// ones the compiler reports as empty shims). Keyed by the
+    /// `Debug` rendering of the instantiation's type, the same
+    /// rendering the drop-glue builder keys its ADT table with.
+    /// Consulted for an ADT with no converted destructor body:
+    /// certification covers the whole tree, fields included, so
+    /// the trivial plan is exact for these types.
+    pub drop_trivial_adts: std::collections::HashSet<String>,
+    /// ADT instantiations the driver certifies have no `Drop`
+    /// impl at all (its crate — the only one the orphan rule
+    /// allows an impl in — defines none for the type). Keyed
+    /// like `drop_trivial_adts`. A certified type's glue is
+    /// exactly its fields' glue, so the glue builder may use
+    /// its field-evidence plan for a foreign type it would
+    /// otherwise have to refuse (an unrecorded impl cannot be
+    /// ruled out for an uncertified foreign type).
+    pub drop_no_impl_adts: std::collections::HashSet<String>,
+    /// Destructor bodies the driver demanded for specific ADT
+    /// instantiations, keyed by the `Debug` rendering of the
+    /// instantiation's type (the certification tables' key) with
+    /// the program name of the converted `Drop::drop` body as
+    /// the value. The glue builder's own key construction
+    /// renders generic arguments its way, which cannot reproduce
+    /// the compiler's instance names for every argument shape
+    /// (a closure argument is the case that forced this table);
+    /// the driver knows the exact name it demanded.
+    pub dtor_bodies: std::collections::HashMap<String, String>,
+
     /// Definition-location stamps of the program's
     /// `#[track_caller]` instances, keyed by the instance's
     /// `DefId`, as recorded by the driver (see
@@ -1629,6 +1659,17 @@ struct Converter<'a> {
     adt_niches: &'a mir::AdtNiches,
     /// Coroutine storage-slot tables of the program (see `MirProgram`).
     coroutine_layouts: &'a mir::CoroutineLayouts,
+    /// ADT instance layouts of the program (see `MirProgram`).
+    adt_layouts: &'a mir::AdtLayouts,
+    /// ADT instantiations with compiler-certified empty drop
+    /// glue (see `MirProgram::drop_trivial_adts`).
+    drop_trivial_adts: &'a std::collections::HashSet<String>,
+    /// ADT instantiations certified to have no `Drop` impl
+    /// (see `MirProgram::drop_no_impl_adts`).
+    drop_no_impl_adts: &'a std::collections::HashSet<String>,
+    /// Demanded destructor bodies by instantiation
+    /// (see `MirProgram::dtor_bodies`).
+    dtor_bodies: &'a std::collections::HashMap<String, String>,
     /// Operand counts of ADT aggregate constructions (see
     /// [`AdtAggregateCounts`]).
     adt_aggregates: AdtAggregateCounts,
@@ -1698,6 +1739,10 @@ impl<'a> Converter<'a> {
             adt_instance_shapes: &program.adt_instance_shapes,
             adt_niches: &program.adt_niches,
             coroutine_layouts: &program.coroutine_layouts,
+            adt_layouts: &program.adt_layouts,
+            drop_trivial_adts: &program.drop_trivial_adts,
+            drop_no_impl_adts: &program.drop_no_impl_adts,
+            dtor_bodies: &program.dtor_bodies,
             adt_aggregates,
             local_crate,
             impl_targets: None,
@@ -2686,6 +2731,43 @@ impl<'a> Converter<'a> {
         Ok(out)
     }
 
+    /// The scalar shape of a dereference through `place`:
+    /// the shape a shaped load / store of the place runs
+    /// through. The dereference may sit below field steps (a
+    /// vector stored in a wrapper struct behind a pointer:
+    /// `(*p).0` where the field is the vector or its storage
+    /// array; the byte inside a tag wrapper: `(*p).0` over a
+    /// control byte), because the pointee behind such a
+    /// pointer can be stored as raw bytes the plain projection
+    /// cannot enter. `None` for any other place: no
+    /// dereference, or a place type with no scalar shape (its
+    /// loads and stores are plain whole-value ones).
+    fn deref_vector_shape(
+        &self,
+        body: &mir::Body,
+        place: &mir::Place,
+    ) -> Option<ir::ScalarShape> {
+        if !place
+            .projection
+            .iter()
+            .any(|e| matches!(e, mir::PlaceElem::Deref))
+        {
+            return None;
+        }
+        let ty = self.place_ty(body, place)?;
+        let shape = self.scalar_shape(&ty, 0)?;
+        // Any scalar shape qualifies, not only vector (array)
+        // ones: a pointee stored as raw bytes — a control byte
+        // in the static empty group is the case at hand — can
+        // sit below a dereference under a field step of any
+        // scalar-shaped type (the byte inside its tag wrapper),
+        // and the plain projection cannot enter a byte string.
+        // For a pointee stored whole the shaped load/store is
+        // the canonicalising round trip, so the broader gate
+        // changes nothing there.
+        Some(shape)
+    }
+
     /// Best-effort type of a place (used only to type constants in
     /// operand position; `None` when it cannot be derived).
     fn place_ty(&self, body: &mir::Body, place: &mir::Place) -> Option<mir::Ty> {
@@ -2788,7 +2870,107 @@ impl<'a> Converter<'a> {
             mir::Ty::Ref(_, inner, _) => *inner,
             _ => return None,
         };
-        mir_ty_size(&pointee)
+        if let Some(size) = mir_ty_size(&pointee) {
+            return Some(size);
+        }
+        // A composite pointee's size is its recorded layout: an
+        // ADT's size lives in the layout table (the
+        // `MaybeUninit<Chunk>` pointees of the byte-swap
+        // machinery are the canonical case), and a tuple's size
+        // is its fields' layouts composed — a hashbrown bucket
+        // pointer's pointee is a `(K, V)` tuple whose fields may
+        // themselves be ADTs.
+        self.ty_layout(&pointee).map(|(size, _)| size)
+    }
+
+    /// The source pointee size for a pointer-to-pointer cast
+    /// that needs its projection index rewritten in byte units
+    /// (`Rvalue::PtrCastUnits`): both pointees' layouts are
+    /// known, they differ, and the source is thin. `None` for
+    /// every other cast, which keeps its existing form.
+    fn cast_units_from_size(
+        &self,
+        ctx: &Option<mir::Ty>,
+        target: &mir::Ty,
+    ) -> Option<u64> {
+        let src = ptr_pointee(ctx.as_ref()?)?;
+        let dst = ptr_pointee(target)?;
+        if matches!(
+            src,
+            mir::Ty::Slice(_) | mir::Ty::Str | mir::Ty::Dynamic(..)
+        ) {
+            return None;
+        }
+        let from = self.ty_layout(src).map(|(size, _)| size)?;
+        let to = self.ty_layout(dst).map(|(size, _)| size)?;
+        if from != to && from > 0 {
+            Some(from)
+        } else {
+            None
+        }
+    }
+
+    /// The native `(size, align)` of a type whose layout is
+    /// structurally known or recorded in the layout table:
+    /// scalars by their width, arrays and tuples by composing
+    /// their elements' layouts (declaration order, each field
+    /// aligned to its own alignment, the total rounded up to
+    /// the widest), ADTs by their recorded layout. `None` when
+    /// any component's layout is unknown.
+    fn ty_layout(&self, ty: &mir::Ty) -> Option<(u64, u64)> {
+        use mir::Ty as T;
+        Some(match ty {
+            T::Bool => (1, 1),
+            T::Char => (4, 4),
+            T::Int(t) => {
+                let b = u64::from(t.bits() / 8);
+                (b, b)
+            }
+            T::Uint(t) => {
+                let b = u64::from(t.bits() / 8);
+                (b, b)
+            }
+            T::Float(t) => {
+                let b = u64::from(t.bits() / 8);
+                (b, b)
+            }
+            T::Array(elem, mir::ArrayLen::Known(n)) => {
+                let (es, ea) = self.ty_layout(elem)?;
+                (es.checked_mul(*n)?, ea)
+            }
+            T::RawPtr(pointee, _) | T::Ref(_, pointee, _) => {
+                if matches!(
+                    &**pointee,
+                    T::Slice(_) | T::Str | T::Dynamic(..)
+                ) {
+                    (16, 8)
+                } else {
+                    (8, 8)
+                }
+            }
+            T::FnPtr(_) => (8, 8),
+            T::Tuple(ts) => {
+                let mut size = 0u64;
+                let mut align = 1u64;
+                for f in ts {
+                    let (fs, fa) = self.ty_layout(f)?;
+                    align = align.max(fa);
+                    size = size.checked_add(fa - 1)? / fa * fa;
+                    size = size.checked_add(fs)?;
+                }
+                (size.checked_add(align - 1)? / align * align, align)
+            }
+            T::Adt(def, args) => {
+                let tag = crate::builtins::ty_tag(
+                    &mir::Ty::Adt(*def, args.clone()),
+                    self.names,
+                );
+                *self.adt_layouts.get(&tag)?
+            }
+            T::Pat(inner, _) => self.ty_layout(inner)?,
+            T::Never => (0, 1),
+            _ => return None,
+        })
     }
 
     // ----- constants & operands ---------------------------------------------
@@ -3587,7 +3769,7 @@ impl<'a> Converter<'a> {
 ///   transparent wrapper struct (one fat-pointer payload
     ///   field, the remaining fields zero-sized with unique
     ///   values): `NonNull<str>` and its kin;
-    /// * one-field struct over a fieldless enum -> integer:
+    /// * one-field struct over a fieldless enum <-> integer:
     ///   the discriminant of the field's value (`mem::Alignment`
     ///   -> `usize`), and the reverse (integer -> the wrapper:
     ///   the integer is the wrapped enum's discriminant);
@@ -3843,7 +4025,7 @@ impl<'a> Converter<'a> {
                 }
             }
         }
-        match (&src, target) {
+let inner = match (&src, target) {
             // Pointer -> integer: the synthetic address (what the
             // compiler's UB precondition checks use to test a
             // pointer for null / alignment).
@@ -4050,6 +4232,7 @@ impl<'a> Converter<'a> {
                             variant: 0,
                             operands: vec![v.clone()],
                             field_index: None,
+                            units_from: None,
                         }
                     } else {
                         unsupported()
@@ -4130,6 +4313,7 @@ impl<'a> Converter<'a> {
                             variant: 0,
                             operands,
                             field_index: None,
+                            units_from: None,
                         }
                     }
                     None => unsupported(),
@@ -4150,6 +4334,80 @@ impl<'a> Converter<'a> {
                 };
                 match shape {
                     Some(shape) => self.unwrap_wrapper(body, operand, v, &shape),
+                    None => unsupported(),
+                }
+            }
+            // Pointer wrapper -> pointer wrapper of another
+            // pointee (`NonNull::cast` and its kin): the payload
+            // pointer carries over, rewrapped in the target
+            // wrapper's shape.
+            (Some(mir::Ty::Adt(def, args)), mir::Ty::Adt(tdef, targs))
+                if (self.wrapper_shape(def, args).is_some()
+                    || self.fat_wrapper_shape(def, args).is_some())
+                    && (self.wrapper_shape(tdef, targs).is_some()
+                        || self.fat_wrapper_shape(tdef, targs).is_some()) =>
+            {
+                let src_shape = self
+                    .wrapper_shape(def, args)
+                    .or_else(|| self.fat_wrapper_shape(def, args))
+                    .expect("guard checked");
+                let dst_shape = self
+                    .wrapper_shape(tdef, targs)
+                    .or_else(|| self.fat_wrapper_shape(tdef, targs))
+                    .expect("guard checked");
+                match self.field_operand(
+                    body,
+                    operand,
+                    v,
+                    src_shape.payload_index as u32,
+                    &src_shape.payload_ty,
+                ) {
+                    Some(op) => {
+                        let mut operands =
+                            Vec::with_capacity(dst_shape.field_count);
+                        for i in 0..dst_shape.field_count {
+                            if i == dst_shape.payload_index {
+                                operands.push(op.clone());
+                            } else {
+                                let c = dst_shape
+                                    .fill
+                                    .iter()
+                                    .find(|(j, _)| *j == i)
+                                    .map(|(_, c)| c.clone());
+                                match c {
+                                    Some(c) => {
+                                        operands.push(ir::Operand::Constant(c))
+                                    }
+                                    None => return unsupported(),
+                                }
+                            }
+                        }
+                        // A retarget at a differently sized
+                        // pointee denominates the payload
+                        // pointer's index in the source
+                        // pointee's elements; rewrite it in
+                        // byte units as the wrapper is built
+                        // (see `Rvalue::PtrCastUnits`).
+                        let units_from = match (
+                            ptr_pointee(&src_shape.payload_ty)
+                                .and_then(|t| self.ty_layout(t))
+                                .map(|(size, _)| size),
+                            ptr_pointee(&dst_shape.payload_ty)
+                                .and_then(|t| self.ty_layout(t))
+                                .map(|(size, _)| size),
+                        ) {
+                            (Some(f), Some(t)) if f != t && f > 0 => {
+                                Some((f, dst_shape.payload_index))
+                            }
+                            _ => None,
+                        };
+                        ir::Rvalue::AggregateAdt {
+                            variant: 0,
+                            operands,
+                            field_index: None,
+                            units_from,
+                        }
+                    }
                     None => unsupported(),
                 }
             }
@@ -4251,6 +4509,7 @@ impl<'a> Converter<'a> {
                             variant: 0,
                             operands: vec![v.clone()],
                             field_index: None,
+                            units_from: None,
                         }
                     }
                     // The reverse direction: the one-field
@@ -4303,8 +4562,79 @@ impl<'a> Converter<'a> {
                 }
             }
             _ => unsupported(),
+        };
+        // A transmute whose result the optimiser scalarised to a
+        // bare pointer local (a `NonNull::cast` whose wrapper was
+        // SROA'd away) reaches here as a plain `Use` of the
+        // unwrapped pointer; the denomination rewrite the
+        // wrapper-to-wrapper arm records on its aggregate applies
+        // to this shape as well.
+        if let ir::Rvalue::Use(op) = &inner {
+            if let Some(from) = self.transmute_units_from(src.as_ref(), target) {
+                return ir::Rvalue::PtrCastUnits(op.clone(), from);
+            }
         }
+        inner
     }
+
+    /// The source element size for a pointer-valued transmute
+    /// whose source and target pointees differ in size, when the
+    /// source pointer is carried directly or inside a one-field
+    /// pointer wrapper. Fat pointees keep their metadata path and
+    /// never take part.
+    fn transmute_units_from(
+        &self,
+        source: Option<&mir::Ty>,
+        target: &mir::Ty,
+    ) -> Option<u64> {
+        let target_pointee = ptr_pointee(target)?;
+        if matches!(
+            target_pointee,
+            mir::Ty::Slice(_) | mir::Ty::Str | mir::Ty::Dynamic(..)
+        ) {
+            return None;
+        }
+        let source_pointee = match source? {
+            mir::Ty::RawPtr(p, _) | mir::Ty::Ref(_, p, _) => &**p,
+            mir::Ty::Adt(def, args) => {
+                let shape = self
+                    .wrapper_shape(def, args)
+                    .or_else(|| self.fat_wrapper_shape(def, args))?;
+                match shape.payload_ty.clone() {
+                    mir::Ty::RawPtr(p, _) | mir::Ty::Ref(_, p, _) => {
+                        return self.transmute_units_from_pointees(&p, target);
+                    }
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        if matches!(
+            source_pointee,
+            mir::Ty::Slice(_) | mir::Ty::Str | mir::Ty::Dynamic(..)
+        ) {
+            return None;
+        }
+        self.transmute_units_from_pointees(source_pointee, target)
+    }
+
+    fn transmute_units_from_pointees(
+        &self,
+        source_pointee: &mir::Ty,
+        target: &mir::Ty,
+    ) -> Option<u64> {
+        let target_pointee = ptr_pointee(target)?;
+        if matches!(
+            source_pointee,
+            mir::Ty::Slice(_) | mir::Ty::Str | mir::Ty::Dynamic(..)
+        ) {
+            return None;
+        }
+        let (from, _) = self.ty_layout(source_pointee)?;
+        let (to, _) = self.ty_layout(target_pointee)?;
+        (from > 0 && from != to).then_some(from)
+    }
+
 
     /// Whether `def` is `MaybeUninit` (std or core).
     fn is_maybe_uninit(&self, def: &mir::AdtDefId) -> bool {
@@ -4378,6 +4708,7 @@ impl<'a> Converter<'a> {
             variant: 0,
             operands: vec![v.clone()],
             field_index,
+            units_from: None,
         })
     }
 
@@ -4684,6 +5015,47 @@ impl<'a> Converter<'a> {
                     return self.fieldless_enum_shape(def);
                 }
                 let fields = self.instantiated_field_tys(def, args, 0)?;
+                // A single array field whose length is a const
+                // parameter the type representation does not
+                // carry (the `Simd<T, N>` storage field): the
+                // instance's recorded layout size is the array's
+                // byte size — a one-field struct's size is its
+                // field's size, the field size already being a
+                // multiple of the struct's alignment — so the
+                // element count is the size over the element
+                // width.
+                if fields.len() == 1 {
+                    if let mir::Ty::Array(elem, len) = &fields[0] {
+                        if !matches!(len, mir::ArrayLen::Known(_)) {
+                            if let Some(elem_shape) = self.scalar_shape(elem, depth + 1) {
+                                let elem_bits = elem_shape.bits();
+                                if elem_bits > 0 {
+                                    let tag = crate::builtins::ty_tag(
+                                        &mir::Ty::Adt(*def, args.to_vec()),
+                                        self.names,
+                                    );
+                                    if let Some((size, _)) = self.adt_layouts.get(&tag) {
+                                        let total = u128::from(*size) * 8;
+                                        if total > 0
+                                            && total <= 128
+                                            && total % u128::from(elem_bits) == 0
+                                        {
+                                            return Some(S::AdtField {
+                                                index: 0,
+                                                count: 1,
+                                                fill: Vec::new(),
+                                                inner: Box::new(S::Array(
+                                                    Box::new(elem_shape),
+                                                    (total / u128::from(elem_bits)) as u64,
+                                                )),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 let mut payload: Option<(u32, ir::ScalarShape)> = None;
                 let mut fill = Vec::new();
                 for (i, fty) in fields.iter().enumerate() {
@@ -5060,7 +5432,21 @@ impl<'a> Converter<'a> {
     ) -> Result<ir::Rvalue, ConvertError> {
         use mir::Rvalue as R;
         Ok(match rv {
-            R::Use(op) => ir::Rvalue::Use(self.convert_operand(body, op, dest_ty)?),
+            R::Use(op) => {
+                // A whole-pointee load of a vector-shaped value
+                // through a dereference: the shaped load, which
+                // assembles the value from a raw block's elements
+                // when the pointee is not stored whole.
+                if let mir::Operand::Copy(place) | mir::Operand::Move(place) = op {
+                    if let Some(shape) = self.deref_vector_shape(body, place) {
+                        return Ok(ir::Rvalue::ShapedLoad(
+                            self.convert_place(body, place)?,
+                            shape,
+                        ));
+                    }
+                }
+                ir::Rvalue::Use(self.convert_operand(body, op, dest_ty)?)
+            }
             R::BinaryOp(op, pair) if *op == mir::BinOp::Offset => {
                 // `BinaryOp::Offset` is, like a shift, a binary
                 // operation whose operands do not share a type: a
@@ -5260,6 +5646,20 @@ impl<'a> Converter<'a> {
                             // cast back to a pointer to the whole
                             // array denotes the array as a whole.
                             ir::Rvalue::PtrArrayBase(v)
+                        } else if let Some(f) = self.cast_units_from_size(&ctx, target) {
+                            // A cast between differently sized
+                            // pointees (see `cast_units_from_size`):
+                            // the denoted position is unchanged,
+                            // but its projection index is
+                            // denominated in the source pointee's
+                            // elements while later offsets use the
+                            // target's, so the cast rewrites the
+                            // index as a byte offset. For a thin
+                            // source this is the cast's only
+                            // effect; fat sources never reach
+                            // here (the `DataPtr` path below owns
+                            // them).
+                            ir::Rvalue::PtrCastUnits(v, f)
                         } else if ptr_pointee(target).is_some_and(|p| {
                             // A pointer cast to a thin target drops
                             // the metadata word when the source value
@@ -5458,6 +5858,7 @@ impl<'a> Converter<'a> {
                         variant: *variant_index,
                         operands: fields,
                         field_index: *field_index,
+                        units_from: None,
                     }
                 }
                 mir::AggregateKind::Closure { def, generic_args } => {
@@ -5629,6 +6030,21 @@ impl<'a> Converter<'a> {
             S::Assign(pair) => {
                 let (place, rv) = &**pair;
                 let dest_ty = self.place_ty(body, place);
+                // A whole-pointee store of a vector-shaped value
+                // through a dereference: the shaped store, which
+                // writes the value lane by lane when the pointee
+                // lives in a raw element block.
+                if let mir::Rvalue::Use(op) = rv {
+                    if let Some(shape) = self.deref_vector_shape(body, place) {
+                        return Ok(ir::Statement {
+                            kind: ir::StatementKind::ShapedStore {
+                                place: self.convert_place(body, place)?,
+                                value: self.convert_operand(body, op, dest_ty.as_ref())?,
+                                shape,
+                            },
+                        });
+                    }
+                }
                 let ir_place = self.convert_place(body, place)?;
                 let ir_rv = self.convert_rvalue(body, rv, dest_ty.as_ref())?;
                 ir::Statement::assign(ir_place, ir_rv)
@@ -5815,12 +6231,29 @@ impl<'a> Converter<'a> {
             | crate::builtins::Builtin::IteratorCollect => raw_generic_args.first(),
             crate::builtins::Builtin::FromIteratorFromIter => raw_generic_args.get(2),
             crate::builtins::Builtin::IteratorNextBack => raw_generic_args.first(),
+            crate::builtins::Builtin::IteratorNext => raw_generic_args.first(),
+            crate::builtins::Builtin::IntoIter => raw_generic_args.first(),
             _ => return false,
         };
         let Some(iter_ty) = iter_ty else {
             return false;
         };
         let tag = crate::builtins::ty_tag(iter_ty, self.names);
+        // Hash-collection iteration is the inverse of the
+        // consumer rule below: the builtin models many iterator
+        // types, but a raw table's walk is not one of them, so
+        // the body is preferred exactly for the hash shapes.
+        match kind {
+            crate::builtins::Builtin::IteratorNext => {
+                return crate::builtins::hash_iterator_tag(&tag)
+                    && self.resolve_body_callee(func).is_some();
+            }
+            crate::builtins::Builtin::IntoIter => {
+                return crate::builtins::hash_collection_tag(&tag)
+                    && self.resolve_body_callee(func).is_some();
+            }
+            _ => {}
+        }
         let modelled = match kind {
             crate::builtins::Builtin::IteratorNextBack => {
                 crate::builtins::iterator_next_back_modelled(&tag)
@@ -6793,7 +7226,9 @@ impl<'a> Converter<'a> {
                 }
             }
             T::Drop { place, target, .. } => {
-                let glue = self.place_ty(body, place).and_then(|t| self.drop_glue(&t));
+                let glue = self
+                    .place_ty(body, place)
+                    .and_then(|t| self.drop_glue(&t));
                 match glue {
                     Some(glue) => ir::TerminatorKind::Drop {
                         place: self.convert_place(body, place)?,
@@ -7231,6 +7666,66 @@ fn mir_ty_size(ty: &mir::Ty) -> Option<u64> {
             Some(t) => mir_ty_size(t)?,
             None => 0,
         },
+        // A multi-field tuple's size is its native layout:
+        // fields in declaration order, each aligned to its own
+        // alignment, the total rounded up to the widest field
+        // alignment — the layout the compiler's `size_of` and
+        // the allocation layouts the driver records both use,
+        // and the stride pointer arithmetic over a tuple-typed
+        // pointee (a hashbrown bucket pointer) is computed in.
+        // A field whose layout is not structurally known (an
+        // ADT, whose layout lives in the layout table the free
+        // function cannot see) leaves the size unknown.
+        T::Tuple(_) => {
+            fn layout(ty: &mir::Ty) -> Option<(u64, u64)> {
+                Some(match ty {
+                    T::Bool => (1, 1),
+                    T::Char => (4, 4),
+                    T::Int(t) => {
+                        let b = u64::from(t.bits() / 8);
+                        (b, b)
+                    }
+                    T::Uint(t) => {
+                        let b = u64::from(t.bits() / 8);
+                        (b, b)
+                    }
+                    T::Float(t) => {
+                        let b = u64::from(t.bits() / 8);
+                        (b, b)
+                    }
+                    T::Array(elem, mir::ArrayLen::Known(n)) => {
+                        let (es, ea) = layout(elem)?;
+                        (es.checked_mul(*n)?, ea)
+                    }
+                    T::RawPtr(pointee, _) | T::Ref(_, pointee, _) => {
+                        if matches!(
+                            &**pointee,
+                            T::Slice(_) | T::Str | T::Dynamic(..)
+                        ) {
+                            (16, 8)
+                        } else {
+                            (8, 8)
+                        }
+                    }
+                    T::FnPtr(_) => (8, 8),
+                    T::Tuple(ts) => {
+                        let mut size = 0u64;
+                        let mut align = 1u64;
+                        for f in ts {
+                            let (fs, fa) = layout(f)?;
+                            align = align.max(fa);
+                            size = size.checked_add(fa - 1)? / fa * fa;
+                            size = size.checked_add(fs)?;
+                        }
+                        (size.checked_add(align - 1)? / align * align, align)
+                    }
+                    T::Pat(inner, _) => layout(inner)?,
+                    T::Never => (0, 1),
+                    _ => return None,
+                })
+            }
+            layout(ty)?.0
+        }
         T::Pat(inner, _) => mir_ty_size(inner)?,
         T::Never => 0,
         _ => return None,
@@ -8098,16 +8593,31 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
         // Any other ADT: its glue is its `Drop` impl (called first,
         // as in rustc's drop glue) followed by its fields' glue.
         let mut steps = Vec::new();
-        if let Some(func) = conv.dtor_body(&name, args) {
+        let ty_key = format!("{:?}", mir::Ty::Adt(def, args.to_vec()));
+        let dtor = conv
+            .dtor_bodies
+            .get(&ty_key)
+            .cloned()
+            .or_else(|| conv.dtor_body(&name, args));
+        if let Some(func) = dtor {
             steps.push(P::CallDtor { func });
+        } else if conv.drop_trivial_adts.contains(&ty_key) {
+            // The compiler certifies this instantiation's drop
+            // glue empty: no destructor and no field glue exists
+            // anywhere in its tree, so the trivial plan is exact
+            // rather than an assumption about an unrecorded impl.
+            return Some(P::Trivial);
         } else if conv.dtor_impl_known(&name) {
             // The impl exists but has no converted body (a generic
             // impl gets no monomorphic instance in the program):
             // its effects can neither be executed nor ruled out.
             return None;
-        } else if !conv.is_local_type(&name) {
+        } else if !conv.is_local_type(&name) && !conv.drop_no_impl_adts.contains(&ty_key) {
             // Not the entry crate's type: an impl could exist that
-            // the name table never recorded.
+            // the name table never recorded. (A type the driver
+            // certifies has no `Drop` impl in its own crate — the
+            // only crate the orphan rule allows one in — falls
+            // through to its fields' glue below.)
             return None;
         }
         steps.push(self.variant_fields_plan(def, args)?);

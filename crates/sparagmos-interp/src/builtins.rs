@@ -961,6 +961,15 @@ pub enum Builtin {
     MemDrop,
     /// `std::mem::swap(&mut a, &mut b)`.
     MemSwap,
+    /// `std::ptr::swap_nonoverlapping(x, y, count)` and its
+    /// intrinsic form `typed_swap_nonoverlapping`: the two
+    /// ranges' elements exchanged pairwise. The collected body
+    /// swaps large values byte by byte through chunk buffers,
+    /// which the value model cannot follow (a byte-displaced
+    /// read of a structured value is not a value); the swap
+    /// itself is a whole-value operation, so it is served
+    /// directly over the elements the pointers denote.
+    SwapNonoverlapping,
     /// `std::mem::size_of::<T>()` (types with a known layout only).
     MemSizeOf,
     /// `std::mem::align_of::<T>()` (types with a known layout only).
@@ -2239,6 +2248,9 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         }
         "std::mem::drop" => Builtin::MemDrop,
         "std::mem::swap" => Builtin::MemSwap,
+        "std::ptr::swap_nonoverlapping" | "core::ptr::swap_nonoverlapping"
+        | "std::intrinsics::typed_swap_nonoverlapping"
+        | "core::intrinsics::typed_swap_nonoverlapping" => Builtin::SwapNonoverlapping,
         "std::mem::size_of" => Builtin::MemSizeOf,
         "std::mem::align_of" => Builtin::MemAlignOf,
         "std::mem::size_of_val" => Builtin::MemSizeOfVal,
@@ -5807,6 +5819,35 @@ impl<'a> Interpreter<'a> {
                     // `String::deref -> &str`: the string data itself.
                     let s = self.resolve_string(frames, &vals[0])?;
                     Ok(Value::Str(s))
+                } else if self_ty.starts_with("std::borrow::Cow<") {
+                    // `Cow<B>::deref -> &B::Target`: the borrowed
+                    // variant's field already IS the target value
+                    // (a `&str` / `&[u8]` reference value); the
+                    // owned variant's field is the owned value
+                    // (`String` / `Vec<_>`), whose deref is the
+                    // same data read as the target — for a string
+                    // target that is the string data itself.
+                    let cow = self.resolve_value(frames, &vals[0])?;
+                    match cow {
+                        Value::Enum { variant, mut fields, .. }
+                            if fields.len() == 1 =>
+                        {
+                            let field = fields.pop().expect("len checked");
+                            if variant == 0 {
+                                Ok(field)
+                            } else if self_ty.contains("str") {
+                                let s = self.resolve_string(frames, &field)?;
+                                Ok(Value::Str(s))
+                            } else {
+                                Ok(field)
+                            }
+                        }
+                        ref other => Err(InterpError::type_mismatch(
+                            "Deref::deref for Cow",
+                            "cow aggregate",
+                            other.kind_name(),
+                        )),
+                    }
                 } else if self_ty.starts_with("std::vec::Vec<") {
                     let pointee = self.resolve_value(frames, &vals[0])?;
                     let len = pointee.len().ok_or_else(|| {
@@ -7787,6 +7828,74 @@ impl<'a> Interpreter<'a> {
                 self.write_resolved(frames, &b, va)?;
                 Ok(Value::Unit)
             }
+            Builtin::SwapNonoverlapping => {
+                // `typed_swap_nonoverlapping` swaps a single pair
+                // (two arguments); `swap_nonoverlapping` carries
+                // the element count as a third.
+                let n = match vals.len() {
+                    2 => 1,
+                    3 => match vals[2] {
+                        Value::Uint(n) => usize::try_from(n).map_err(|_| {
+                            InterpError::type_mismatch(
+                                "swap_nonoverlapping count",
+                                "count that fits in usize",
+                                format!("{n}"),
+                            )
+                        })?,
+                        Value::Int(n) if n >= 0 => n as usize,
+                        ref other => {
+                            return Err(InterpError::type_mismatch(
+                                "swap_nonoverlapping count",
+                                "unsigned integer",
+                                other.kind_name(),
+                            ))
+                        }
+                    },
+                    _ => {
+                        return Err(InterpError::type_mismatch(
+                            "swap_nonoverlapping",
+                            "two or three arguments",
+                            format!("{} arguments", vals.len()),
+                        ))
+                    }
+                };
+                if n == 0 {
+                    // A zero-count swap touches no memory: the
+                    // pointers are never dereferenced.
+                    return Ok(Value::Unit);
+                }
+                let a = self.deref_value(frames, &vals[0])?;
+                let b = self.deref_value(frames, &vals[1])?;
+                if n == 1 {
+                    // A single element is the whole value each
+                    // target denotes: the sequence access would
+                    // index INTO a structured value (an index
+                    // step descends into an aggregate's fields)
+                    // instead of naming the element, so the
+                    // exchange goes through the whole-value
+                    // access, exactly like the one-element copy.
+                    let va = self.read_resolved(frames, &a)?;
+                    let vb = self.read_resolved(frames, &b)?;
+                    self.write_resolved(frames, &a, vb)?;
+                    self.write_resolved(frames, &b, va)?;
+                    return Ok(Value::Unit);
+                }
+                // Snapshot both ranges before writing: the
+                // ranges are promised non-overlapping, but the
+                // snapshot keeps the exchange exact regardless
+                // (the same discipline as the element copy).
+                let mut va = Vec::with_capacity(n);
+                let mut vb = Vec::with_capacity(n);
+                for i in 0..n {
+                    va.push(self.read_seq_at(frames, &a, i)?);
+                    vb.push(self.read_seq_at(frames, &b, i)?);
+                }
+                for i in 0..n {
+                    self.write_seq_at(frames, &a, i, vb[i].clone())?;
+                    self.write_seq_at(frames, &b, i, va[i].clone())?;
+                }
+                Ok(Value::Unit)
+            }
             Builtin::MemSizeOf | Builtin::MemAlignOf => {
                 arity(0)?;
                 let tag = generic_args.first().map(String::as_str).unwrap_or("");
@@ -8577,9 +8686,13 @@ impl<'a> Interpreter<'a> {
                         ));
                     }
                 };
-                let fill = byte_fill_value(tag, byte).ok_or_else(|| {
-                    unsupported(format!("write_bytes for {tag} is not runtime-supported"))
-                })?;
+                let fill = byte_fill_value(tag, byte)
+                    .or_else(|| self.wrapped_byte_fill(tag, byte, 0))
+                    .ok_or_else(|| {
+                        unsupported(format!(
+                            "write_bytes for {tag} is not runtime-supported"
+                        ))
+                    })?;
                 let n = element_count(&vals[2], name)?;
                 if n == 0 {
                     // A zero-count fill touches no memory, so the
@@ -8665,6 +8778,49 @@ impl<'a> Interpreter<'a> {
             Builtin::Float128Method { op } => exec_float128_method(name, op, &vals),
             Builtin::Float16Method { op } => exec_float16_method(name, op, &vals),
         }
+    }
+
+    /// The fill value of a `write_bytes` over a pointee type
+    /// [`byte_fill_value`] does not cover, resolved through the
+    /// wrappers the byte pattern passes through unchanged:
+    ///
+    /// * `MaybeUninit<T>`: a byte fill over the union view writes
+    ///   `T`'s bytes; the region's canonical value is `T`'s fill
+    ///   (the readers of such a region read it as `T` — a raw
+    ///   table's control bytes are allocated as
+    ///   `MaybeUninit<Tag>` and read as `Tag`).
+    /// * a one-field struct (per the program's recorded shape of
+    ///   the instance): the struct value holding the field's
+    ///   fill — the shape an aggregate construction of the
+    ///   wrapper produces (`Tag` over its `u8`).
+    ///
+    /// Anything else stays unsupported at the call site.
+    fn wrapped_byte_fill(&self, tag: &str, byte: u8, depth: u32) -> Option<Value> {
+        if depth > 4 {
+            return None;
+        }
+        let tag = tag.trim();
+        if let Some(inner) = generic_first_arg(tag, "std::mem::MaybeUninit<")
+            .or_else(|| generic_first_arg(tag, "core::mem::MaybeUninit<"))
+        {
+            return byte_fill_value(inner, byte)
+                .or_else(|| self.wrapped_byte_fill(inner, byte, depth + 1));
+        }
+        let shape = self.program().adt_debug_shapes.get(tag)?;
+        if shape.kind != mir::AdtShapeKind::Struct || shape.variants.len() != 1 {
+            return None;
+        }
+        let variant = &shape.variants[0];
+        if variant.fields.len() != 1 {
+            return None;
+        }
+        let field_ty = variant.fields[0].ty.as_str();
+        let field_fill = byte_fill_value(field_ty, byte)
+            .or_else(|| self.wrapped_byte_fill(field_ty, byte, depth + 1))?;
+        Some(Value::Enum {
+            variant: 0,
+            fields: vec![field_fill],
+        })
     }
 
     /// Write an atomic cell's new scalar, preserving the wrapper
@@ -13568,6 +13724,45 @@ fn refcell_guard(cell: &RefTarget) -> Value {
 /// machinery itself produces — ranges, the `[items, index]`
 /// states of `slice::Iter` / `array::IntoIter` / `Chars` /
 /// `Bytes`, `Empty`, and the mpsc channel iterators.
+/// Whether this type tag names a hash-collection iterator
+/// (`hash_map` / `hash_set` view types, or hashbrown's raw
+/// iterators): their `next` walks a raw table's control bytes,
+/// which the modelled state machines do not reproduce — the
+/// collected impl body is the faithful execution.
+pub fn hash_iterator_tag(self_ty: &str) -> bool {
+    // `Iterator` is also implemented for `&mut I`, whose
+    // blanket body forwards to the inner iterator: the tag
+    // may carry the reference.
+    let self_ty = self_ty
+        .strip_prefix("&mut ")
+        .or_else(|| self_ty.strip_prefix('&'))
+        .unwrap_or(self_ty);
+    self_ty.starts_with("std::collections::hash_map::")
+        || self_ty.starts_with("std::collections::hash_set::")
+        || self_ty.starts_with("hashbrown::map::")
+        || self_ty.starts_with("hashbrown::set::")
+        || self_ty.starts_with("hashbrown::raw::RawIter")
+        || self_ty.starts_with("hashbrown::raw::RawIntoIter")
+        || self_ty.starts_with("hashbrown::raw::RawDrain")
+        || self_ty.starts_with("hashbrown::raw::RawExtractIf")
+}
+
+/// Whether this `IntoIterator::into_iter` `Self` tag names a
+/// hash collection (by value or by reference) or a reference
+/// to a hash-collection iterator (the `&mut I` blanket impl):
+/// the real body assembles the raw-table iterator state,
+/// which the builtin's modelled constructions do not cover.
+pub fn hash_collection_tag(self_ty: &str) -> bool {
+    let inner = self_ty
+        .strip_prefix("&mut ")
+        .or_else(|| self_ty.strip_prefix('&'))
+        .unwrap_or(self_ty);
+    inner.starts_with("std::collections::HashMap<")
+        || inner.starts_with("std::collections::HashSet<")
+        || hash_iterator_tag(inner)
+        || hash_iterator_tag(self_ty)
+}
+
 pub fn iterator_next_modelled(self_ty: &str) -> bool {
     self_ty.starts_with("std::ops::Range<")
         || self_ty.starts_with("std::ops::RangeInclusive<")

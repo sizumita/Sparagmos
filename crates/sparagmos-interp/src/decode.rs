@@ -183,6 +183,7 @@ pub(crate) enum DRvalue {
         variant: u32,
         operands: Box<[DSrc]>,
         field_index: Option<u32>,
+        units_from: Option<(u64, usize)>,
     },
     ClosureAggregate {
         def: String,
@@ -197,6 +198,7 @@ pub(crate) enum DRvalue {
     IntToPtr(DSrc),
     EnumToInt(DSrc, Rc<[i128]>, Ty),
     IntToEnum(DSrc, Rc<[i128]>),
+    IntToEnumWrapped(DSrc, Rc<[i128]>, u32, usize, Rc<[(u32, Constant)]>),
     Orig(Box<Rvalue>),
 }
 
@@ -396,10 +398,12 @@ impl<'a> Interpreter<'a> {
                 variant,
                 operands,
                 field_index,
+                units_from,
             } => DRvalue::AggregateAdt {
                 variant: *variant,
                 operands: operands.iter().map(|o| self.decode_src(o)).collect(),
                 field_index: *field_index,
+                units_from: *units_from,
             },
             Rvalue::ClosureAggregate { def, operands } => DRvalue::ClosureAggregate {
                 def: def.clone(),
@@ -431,8 +435,22 @@ impl<'a> Interpreter<'a> {
                 self.decode_src(operand),
                 Rc::from(discriminants.as_slice()),
             ),
+            Rvalue::IntToEnumWrapped {
+                operand,
+                discriminants,
+                payload_index,
+                field_count,
+                fill,
+            } => DRvalue::IntToEnumWrapped(
+                self.decode_src(operand),
+                Rc::from(discriminants.as_slice()),
+                *payload_index,
+                *field_count,
+                Rc::from(fill.as_slice()),
+            ),
             // DataPtr, RawPtrAggregate, Unsize, BoxDerefTransmute,
             // PtrField, PtrFirstElem, PtrArrayBase, Reinterpret,
+            // ShapedLoad,
             // PtrOffset, Ref, CopyForDeref,
             // ThreadLocalRef, Unsupported: their evaluation is
             // entangled with place resolution or is an explicit
@@ -684,6 +702,7 @@ impl<'a> Interpreter<'a> {
                 variant,
                 operands,
                 field_index,
+                units_from,
             } => {
                 let mut fields = match field_index {
                     Some(active) => vec![Value::Uninit; *active as usize],
@@ -691,6 +710,12 @@ impl<'a> Interpreter<'a> {
                 };
                 for src in operands {
                     fields.push(self.eval_src(frames, body, src)?);
+                }
+                if let Some((from_size, payload_pos)) = units_from {
+                    if let Some(field) = fields.get_mut(*payload_pos) {
+                        let taken = std::mem::replace(field, Value::Unit);
+                        *field = crate::interp::ptr_cast_units_value(taken, *from_size);
+                    }
                 }
                 // The `MaybeUninit::new(v)` normalization the
                 // original evaluator performs (see `eval_rvalue`'s
@@ -862,6 +887,42 @@ impl<'a> Interpreter<'a> {
                         format!("integer {bits}"),
                     )),
                 }
+            }
+            DRvalue::IntToEnumWrapped(src, discriminants, payload_index, field_count, fill) => {
+                let value = self.eval_src(frames, body, src)?;
+                let bits = match value {
+                    Value::Int(i) => i as u128,
+                    Value::Uint(u) => u,
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            "integer-to-enum-wrapper transmute",
+                            "an integer value",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                let variant = discriminants
+                    .iter()
+                    .position(|d| *d as u128 == bits)
+                    .ok_or_else(|| {
+                        InterpError::type_mismatch(
+                            "integer-to-enum-wrapper transmute",
+                            "a discriminant value of the wrapped enum",
+                            format!("integer {bits}"),
+                        )
+                    })?;
+                let mut fields = vec![Value::Uninit; *field_count];
+                fields[*payload_index as usize] = Value::Enum {
+                    variant: variant as u32,
+                    fields: Vec::new(),
+                };
+                for (index, constant) in fill.iter() {
+                    fields[*index as usize] = self.eval_constant(constant)?;
+                }
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields,
+                })
             }
             DRvalue::Orig(rv) => self.eval_rvalue(frames, body, rv, dest_ty),
         }

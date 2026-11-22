@@ -567,6 +567,15 @@ pub enum Rvalue {
         /// rather than field 0. `None` for struct/enum aggregates,
         /// whose operands fill the variant's fields from index 0.
         field_index: Option<u32>,
+        /// A pointer-payload denomination rewrite (see
+        /// [`Rvalue::PtrCastUnits`]): when a wrapper-to-wrapper
+        /// transmute retargets the payload pointer at a
+        /// differently sized pointee, the payload field (the
+        /// operand index in the second element) has its trailing
+        /// projection index rewritten in byte units at the
+        /// source pointee size (the first element) as the
+        /// aggregate is built. `None` for every other aggregate.
+        units_from: Option<(u64, usize)>,
     },
     /// Build a closure value: the closure body's name plus the
     /// captured environment values (the aggregate's operands, in
@@ -636,6 +645,18 @@ pub enum Rvalue {
     /// at conversion time from the cast's source and target types.
     /// Any other pointer-to-pointer cast leaves the denoted place
     /// unchanged and stays a plain `Use`.
+    /// A pointer-to-pointer cast whose source and target
+    /// pointee sizes differ (decided at conversion time): the
+    /// denoted position does not change, but its projection
+    /// index is denominated in the SOURCE pointee's elements,
+    /// while every later offset on the result is denominated
+    /// in the target's. The operand is evaluated and a trailing
+    /// element index is rewritten as the equivalent byte
+    /// offset (`index * source size`, the second field), the
+    /// unit-free form later offsets accumulate onto in bytes.
+    /// A pointer without a trailing element index denotes the
+    /// same position in any unit and passes through unchanged.
+    PtrCastUnits(Operand, u64),
     PtrFirstElem(Operand),
     /// The reverse cast: an element pointer cast back to a pointer
     /// to the whole array (`as_ptr().cast::<[T; N]>()`). The result
@@ -759,6 +780,15 @@ pub enum Rvalue {
     /// field stays unsupported: there is no flat byte memory to
     /// reinterpret through.
     Reinterpret(Operand, ScalarShape, ScalarShape),
+    /// A whole-pointee load of a vector-shaped value (an ADT or
+    /// array whose scalar shape is an array of lanes, e.g. an
+    /// x86 vector type) through the place's dereference. Where
+    /// the pointee is stored whole, the load is that value,
+    /// canonicalised through its shape; where the pointee lives
+    /// in a raw element block whose elements are the lanes'
+    /// storage (a byte buffer read as a vector), the value is
+    /// assembled from the consecutive elements at the place.
+    ShapedLoad(Place, ScalarShape),
     /// A pointer offset (`BinaryOp::Offset`: `ptr.offset` /
     /// `ptr.add` / `ptr.sub` and the `byte_add` family after their
     /// cast to an element pointer): the first operand's pointer
@@ -863,6 +893,18 @@ pub enum UnsizeMeta {
 #[derive(Debug, Clone, PartialEq)]
 pub enum StatementKind {
     Assign(Place, Rvalue),
+    /// A whole-pointee store of a vector-shaped value through
+    /// the place's dereference (the store half of
+    /// [`Rvalue::ShapedLoad`]): where the pointee lives in a raw
+    /// element block, the value is written lane by lane over the
+    /// consecutive elements at the place, preserving each
+    /// element's wrapper shape; anywhere else it is the plain
+    /// whole-value store.
+    ShapedStore {
+        place: Place,
+        value: Operand,
+        shape: ScalarShape,
+    },
     /// Set the discriminant of the enum value at a place, clearing
     /// its fields (as in rustc MIR).
     SetDiscriminant { place: Place, variant: u32 },

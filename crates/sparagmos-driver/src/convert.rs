@@ -341,8 +341,41 @@ fn ty_mentions_alias(ty: &sm::Ty) -> bool {
 /// computation itself ICEs on them (rustc never computes their
 /// layouts). Screened instances get no layout entry and stay
 /// explicitly unsupported. Parameter resolution goes one frame
-/// deep: a parameter that resolves to another parameter counts as
-/// suspect, which only ever skips a query, never enables one.
+/// deep at each ADT boundary, composing the instance arguments
+/// with the ambient frame's (see `compose_args`): a parameter
+/// the ambient frame leaves unresolved counts as suspect, which
+/// only ever skips a query, never enables one.
+/// Compose an ADT's instance arguments with the ambient
+/// frame's arguments: an argument that is directly a parameter
+/// of the ambient frame is replaced by the ambient frame's
+/// argument for it. The walkers below resolve parameters one
+/// frame deep; composing at every ADT boundary keeps a
+/// parameter chain resolvable across nested generic ADTs (the
+/// `ManuallyDrop<T>` field inside `MaybeUninit<T>` is the
+/// canonical case) without ever enabling a query the one-frame
+/// rule would skip: an argument the ambient frame itself leaves
+/// a parameter stays a parameter, and stays suspect.
+fn compose_args(
+    args: &rustc_public::ty::GenericArgs,
+    ambient: Option<&rustc_public::ty::GenericArgs>,
+) -> rustc_public::ty::GenericArgs {
+    rustc_public::ty::GenericArgs(
+        args.0
+            .iter()
+            .map(|a| match a {
+                rustc_public::ty::GenericArgKind::Type(t) => match t.kind() {
+                    TyKind::Param(p) => ambient
+                        .and_then(|amb| amb.0.get(p.index as usize))
+                        .cloned()
+                        .unwrap_or_else(|| a.clone()),
+                    _ => a.clone(),
+                },
+                _ => a.clone(),
+            })
+            .collect(),
+    )
+}
+
 fn adt_may_be_unsized(
     def: &AdtDef,
     args: &rustc_public::ty::GenericArgs,
@@ -407,7 +440,7 @@ fn ty_sizedness(
             RigidTy::Slice(_) | RigidTy::Str | RigidTy::Dynamic(..) => {
                 Sizedness::Unsized
             }
-            RigidTy::Adt(def, a2) => adt_sizedness(&def, &a2, depth),
+            RigidTy::Adt(def, a2) => adt_sizedness(&def, &compose_args(&a2, args), depth),
             RigidTy::Array(elem, _) => ty_sizedness(&elem, args, depth),
             RigidTy::Tuple(ts) => {
                 let mut result = Sizedness::Sized;
@@ -443,7 +476,9 @@ fn ty_may_be_unsized(
     match ty.kind() {
         TyKind::RigidTy(r) => match r {
             RigidTy::Slice(_) | RigidTy::Str | RigidTy::Dynamic(..) => true,
-            RigidTy::Adt(def, a2) => adt_may_be_unsized(&def, &a2, depth),
+            RigidTy::Adt(def, a2) => {
+                adt_may_be_unsized(&def, &compose_args(&a2, args), depth)
+            }
             RigidTy::Array(elem, _) => ty_may_be_unsized(&elem, args, depth),
             RigidTy::Tuple(ts) => ts.iter().any(|t| ty_may_be_unsized(t, args, depth)),
             _ => false,
@@ -3001,6 +3036,32 @@ impl Converter {
                         return Some(c);
                     }
                 }
+                // A byte-sized pointee whose target allocation
+                // extends past it: the pointer was cast in a
+                // const context from a wider pointer into the
+                // same allocation (a byte pointer into a static
+                // byte table is the canonical case), so it
+                // denotes the allocation from the offset on, not
+                // the single byte — the same snapshot the byte
+                // array arm above takes. A pointer whose
+                // allocation is exactly the pointee keeps the
+                // scalar decode.
+                if matches!(
+                    inner.kind(),
+                    TyKind::RigidTy(
+                        RigidTy::Uint(SmirUintTy::U8)
+                            | RigidTy::Int(SmirIntTy::I8)
+                            | RigidTy::Bool
+                    )
+                ) {
+                    if let Ok(raw) = target.raw_bytes() {
+                        if raw.len() > target_off + 1 {
+                            return Some(sm::ConstValue::Ref(Box::new(
+                                sm::ConstValue::Bytes(raw[target_off..].to_vec()),
+                            )));
+                        }
+                    }
+                }
                 let pointee = self.decode_const(inner, &target, target_off, depth + 1)?;
                 Some(sm::ConstValue::Ref(Box::new(pointee)))
             }
@@ -3492,9 +3553,22 @@ impl Converter {
             return;
         }
         self.record_niche(ty, def, args, &key);
-        if adt_may_be_unsized(def, args, 0) {
-            return;
-        }
+        // The maybe-unsized screen was this query's only guard,
+        // but it answers conservatively for ADTs whose fields
+        // mention a type alias — `Cow<str>`'s `Owned` field is
+        // `<str as ToOwned>::Owned` — screening out instances
+        // the compiler lays out without doubt (the niche
+        // recorder above already relies on exactly that). The
+        // query below is contained, so attempting it for a
+        // screened instance costs at most the contained failure
+        // the unscreened path already tolerates: the instance
+        // simply gets no entry and stays unsupported. One
+        // exception: a screened instance with a directly
+        // unsized field (a `str` in a non-final position) is
+        // ill-formed for layout, and asking can surface as a
+        // compiler crash rather than a contained failure, so
+        // the guard under this comment keeps the screen's
+        // verdict for it without a query.
         // The layout query is not total: for some types that can
         // appear in converted bodies (ill-formed bounds, types the
         // layout computation itself rejects) it panics inside the
@@ -3503,6 +3577,30 @@ impl Converter {
         // the instance simply gets no entry and stays unsupported.
         // (The panic is silent under the driver's panic-capture
         // hook, which is installed while the compiler runs.)
+        // The field inspection judges the declared field
+        // types (no substitution): `ty_with_args` normalizes,
+        // and a normalization panic poisons the compiler query
+        // it runs in, surfacing later as an ICE in the guest
+        // compilation itself — the failure this guard exists
+        // to avoid. A generic parameter field is not directly
+        // unsized by declaration, so such an instance still
+        // reaches the contained query below.
+        if adt_may_be_unsized(def, args, 0)
+            && def.variants().iter().any(|variant| {
+                variant.fields().iter().any(|field| {
+                    matches!(
+                        field.ty().kind(),
+                        rustc_public::ty::TyKind::RigidTy(
+                            rustc_public::ty::RigidTy::Str
+                                | rustc_public::ty::RigidTy::Slice(_)
+                                | rustc_public::ty::RigidTy::Dynamic(..)
+                        )
+                    )
+                })
+            })
+        {
+            return;
+        }
         let layout = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ty.layout()));
         let Ok(Ok(layout)) = layout else {
             return;

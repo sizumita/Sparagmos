@@ -1080,6 +1080,76 @@ fn walk_closure_ty(ty: &Ty, out: &mut Vec<(ClosureDef, GenericArgs)>) {
 /// The iterator type is the call's first generic argument, or
 /// the third for `from_iter` (whose first is the collection).
 fn consumer_instance_needs_body(canonical: &str, args: &GenericArgs) -> bool {
+    // `Index` / `IndexMut`: the builtins read the receiver as a
+    // sequence (slices, arrays, `Vec`, `String`), which is the
+    // faithful semantics only for those receivers. Any other
+    // `Self` type — a map's key lookup above all — has an impl
+    // body that means something else entirely, and the
+    // interpreter's impl-call resolution prefers a collected
+    // body over the builtin, so the instance must be collected.
+    // The `Self` type is the call's first generic argument.
+    if matches!(
+        canonical,
+        "std::ops::Index::index" | "std::ops::IndexMut::index_mut"
+    ) {
+        let Some(GenericArgKind::Type(ty)) = args.0.first() else {
+            return false;
+        };
+        return !index_self_modelled(ty);
+    }
+    // The comparison builtins (`PartialEq::eq` and family)
+    // compare values structurally — the derived semantics.
+    // A manual impl that compares something else is silently
+    // wrong under the builtin, but demanding every unmodelled
+    // type's body is not safe either: a derived body may
+    // lower its comparison to shapes the conversion leaves
+    // unsupported (a whole-value transmute, a discriminant
+    // `BinaryOp Cmp`), and a collected body then replaces a
+    // working builtin with a runtime failure. The demand is
+    // therefore limited to the measured case: `Cow`, whose
+    // manual impl compares the borrowed and owned contents
+    // across variants — a comparison the structural builtin
+    // gets wrong (different variants are never structurally
+    // equal), and the common manual-equality hash key. The
+    // `Self` type is the call's first generic argument.
+    if matches!(
+        canonical,
+        "std::cmp::PartialEq::eq"
+            | "std::cmp::PartialEq::ne"
+            | "std::cmp::PartialOrd::partial_cmp"
+            | "std::cmp::PartialOrd::lt"
+            | "std::cmp::PartialOrd::le"
+            | "std::cmp::PartialOrd::gt"
+            | "std::cmp::PartialOrd::ge"
+            | "std::cmp::Ord::cmp"
+    ) {
+        let Some(GenericArgKind::Type(ty)) = args.0.first() else {
+            return false;
+        };
+        return matches!(
+            guarded_ty_kind(ty),
+            Some(TyKind::RigidTy(RigidTy::Adt(def, _)))
+                if def.name() == "std::borrow::Cow"
+        );
+    }
+    // Hash-collection iteration: the `next` / `into_iter`
+    // builtins model iterator states for sequences, not a raw
+    // table's control-byte walk, so hash iterator and hash
+    // collection instances keep their bodies (the interpreter's
+    // conversion prefers a collected body for these shapes).
+    if matches!(
+        canonical,
+        "std::iter::Iterator::next" | "std::iter::IntoIterator::into_iter"
+    ) {
+        let Some(GenericArgKind::Type(ty)) = args.0.first() else {
+            return false;
+        };
+        return if canonical.ends_with("next") {
+            hash_iterator_ty(ty)
+        } else {
+            hash_collection_ty(ty)
+        };
+    }
     let iter_arg = match canonical {
         "std::iter::Iterator::count"
         | "std::iter::Iterator::fold"
@@ -1137,6 +1207,68 @@ fn partial_eq_ref_instance_needs_body(canonical: &str, args: &GenericArgs) -> bo
         guarded_ty_kind(ty),
         Some(TyKind::RigidTy(RigidTy::Ref(..)))
     )
+}
+/// The receiver types the `Index` builtins serve directly:
+/// the sequence types whose elements the builtin reads —
+/// arrays, slices, `str`, references to them, `Vec` and
+/// `String`. Judged on the `Self` type of the indexing impl.
+fn index_self_modelled(ty: &Ty) -> bool {
+    match guarded_ty_kind(ty) {
+        Some(
+            TyKind::RigidTy(RigidTy::Array(..))
+            | TyKind::RigidTy(RigidTy::Slice(..))
+            | TyKind::RigidTy(RigidTy::Str)
+            | TyKind::RigidTy(RigidTy::Ref(..))
+            | TyKind::RigidTy(RigidTy::RawPtr(..)),
+        ) => true,
+        Some(TyKind::RigidTy(RigidTy::Adt(def, _))) => matches!(
+            def.name().as_str(),
+            "std::vec::Vec" | "alloc::vec::Vec" | "std::string::String"
+        ),
+        _ => false,
+    }
+}
+
+/// Whether this type is a hash-collection iterator (the
+/// `hash_map` / `hash_set` view types or hashbrown's raw
+/// iterators), judged by the ADT definition name.
+fn hash_iterator_ty(ty: &Ty) -> bool {
+    // The `&mut I` blanket `Iterator` impl names the reference
+    // as its `Self` type.
+    if let Some(TyKind::RigidTy(RigidTy::Ref(_, inner, _))) = guarded_ty_kind(ty) {
+        return hash_iterator_ty(&inner);
+    }
+    let Some(TyKind::RigidTy(RigidTy::Adt(def, _))) = guarded_ty_kind(ty) else {
+        return false;
+    };
+    let name = def.name();
+    name.starts_with("std::collections::hash_map::")
+        || name.starts_with("std::collections::hash_set::")
+        || name.starts_with("hashbrown::map::")
+        || name.starts_with("hashbrown::set::")
+        || name.starts_with("hashbrown::raw::RawIter")
+        || name.starts_with("hashbrown::raw::RawIntoIter")
+        || name.starts_with("hashbrown::raw::RawDrain")
+        || name.starts_with("hashbrown::raw::RawExtractIf")
+}
+
+/// Whether this `IntoIterator` `Self` type is a hash
+/// collection, or a reference to one, or a reference to a
+/// hash-collection iterator (the `&mut I` blanket impl).
+fn hash_collection_ty(ty: &Ty) -> bool {
+    if hash_iterator_ty(ty) {
+        return true;
+    }
+    match guarded_ty_kind(ty) {
+        Some(TyKind::RigidTy(RigidTy::Adt(def, _))) => matches!(
+            def.name().as_str(),
+            "std::collections::HashMap" | "std::collections::HashSet"
+        ),
+        Some(TyKind::RigidTy(RigidTy::Ref(_, inner, _))) => {
+            hash_collection_ty(&inner) || hash_iterator_ty(&inner)
+        }
+        _ => false,
+    }
 }
 
 /// Whether `canonical` (a builtin lookup name) is one of

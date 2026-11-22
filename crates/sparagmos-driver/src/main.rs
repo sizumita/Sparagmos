@@ -162,6 +162,11 @@ struct Collected {
     /// (see `Converter::adt_instance_shapes`).
     adt_instance_shapes: sparagmos_mir::AdtInstanceShapes,
     adt_niches: sparagmos_mir::AdtNiches,
+    /// ADT instantiations whose drop glue the compiler certifies
+    /// empty, for the interpreter (see `certify_drop_trivial`).
+    drop_trivial_adts: std::collections::HashSet<String>,
+    drop_no_impl_adts: std::collections::HashSet<String>,
+    dtor_bodies: std::collections::HashMap<String, String>,
     /// Number of leading entries of `bodies` that come from the main
     /// crate itself (the rest are auxiliary-crate functions). The
     /// entry point is only ever searched among these: an auxiliary
@@ -2349,8 +2354,17 @@ fn convert_local_body(
 /// an impl method with the self type's generic arguments yields
 /// the monomorphic destructor instance directly.
 fn local_drop_impl_methods() -> std::collections::HashMap<String, rustc_public::ty::FnDef> {
+    drop_impl_methods(rustc_public::local_crate().fn_defs())
+}
+
+/// The `Drop::drop` methods of one crate's function definitions,
+/// keyed by the self type's path without its parameter list
+/// (see `local_drop_impl_methods`).
+fn drop_impl_methods(
+    fn_defs: Vec<rustc_public::ty::FnDef>,
+) -> std::collections::HashMap<String, rustc_public::ty::FnDef> {
     let mut out = std::collections::HashMap::new();
-    for f in rustc_public::local_crate().fn_defs() {
+    for f in fn_defs {
         let name = f.name();
         if !(name.ends_with(" as std::ops::Drop>::drop")
             || name.ends_with(" as core::ops::Drop>::drop"))
@@ -2489,10 +2503,19 @@ fn demand_drop_instances(
 ) -> (
     std::collections::HashMap<rustc_public::DefId, (usize, (usize, usize, usize))>,
     std::collections::HashMap<rustc_public::DefId, BTreeMap<String, usize>>,
+    std::collections::HashMap<String, String>,
 ) {
     let local_crate = rustc_public::local_crate();
     let local_crate_name = local_crate.name.as_str();
     let impl_methods = local_drop_impl_methods();
+    // Drop impls of foreign crates, built per crate on first
+    // use: an impl lives in its self type's crate (the orphan
+    // rule leaves no other home for a `Drop` impl), so the type
+    // name's first segment names the crate to scan.
+    let mut foreign_impl_methods: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, rustc_public::ty::FnDef>,
+    > = std::collections::HashMap::new();
     let mut credited: std::collections::HashMap<
         rustc_public::DefId,
         (usize, (usize, usize, usize)),
@@ -2501,8 +2524,10 @@ fn demand_drop_instances(
         rustc_public::DefId,
         BTreeMap<String, usize>,
     > = std::collections::HashMap::new();
-    if impl_methods.is_empty() {
-        return (credited, failures);
+    let mut dtor_bodies: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    if impl_methods.is_empty() && seed_bodies.is_empty() {
+        return (credited, failures, dtor_bodies);
     }
     let mut seen_candidates: std::collections::HashSet<String> = Default::default();
     let mut demanded = 0usize;
@@ -2539,19 +2564,16 @@ fn demand_drop_instances(
                 }
             }
         }
+        // Local types first: the shared cap must not let a
+        // foreign destructor crowd out the entry crate's own.
+        let mut candidates = candidates;
+        candidates.sort_by_key(|(_, def, _)| {
+            def.name().split("::").next() != Some(local_crate_name)
+        });
         let mut added = false;
-        for (_, def, args) in candidates {
+        for (cand_ty, def, args) in candidates {
             if demanded >= MAX_DEMANDED_DTOR_BODIES {
                 break;
-            }
-            // Only local types: for any other crate's type the
-            // interpreter cannot assume the collected body is the
-            // whole story (its value model owns the std types whose
-            // glue it can run at all). Type definitions are not
-            // items, so locality is judged by the name's crate
-            // segment, the same test the glue builder applies.
-            if def.name().split("::").next() != Some(local_crate_name) {
-                continue;
             }
             let key = format!("{:?} {:?}", def.def_id(), args);
             if !seen_candidates.insert(key) {
@@ -2560,7 +2582,34 @@ fn demand_drop_instances(
             if args_mention_params(&args) {
                 continue;
             }
-            let Some(impl_fn) = impl_methods.get(&def.name()) else {
+            // The destructor body to demand: the entry crate's
+            // impls come from the local scan; a foreign type's
+            // impl comes from its own crate's scan. Types the
+            // interpreter's value model owns (the modelled std
+            // containers) are matched by name in the glue builder
+            // before it ever consults a collected body, so
+            // collecting their destructors is inert for them; for
+            // every other type the collected body is the glue the
+            // builder runs.
+            let def_name = def.name();
+            let type_crate = def_name.split("::").next().unwrap_or("");
+            let impl_fn = if type_crate == local_crate_name {
+                impl_methods.get(&def_name)
+            } else {
+                let methods = foreign_impl_methods
+                    .entry(type_crate.to_string())
+                    .or_insert_with(|| {
+                        let mut defs = Vec::new();
+                        for krate in rustc_public::find_crates(type_crate) {
+                            if !krate.is_local {
+                                defs.extend(krate.fn_defs());
+                            }
+                        }
+                        drop_impl_methods(defs)
+                    });
+                methods.get(&def_name)
+            };
+            let Some(impl_fn) = impl_fn else {
                 continue;
             };
             // The impl's generic parameters are the self type's, in
@@ -2613,6 +2662,18 @@ fn demand_drop_instances(
                 seed_bodies.push(sm_body);
                 demanded += 1;
                 added = true;
+                // Record the demanded body under the converted
+                // type's key: the interpreter's glue builder
+                // cannot reconstruct the compiler's instance
+                // name for every generic-argument shape (a
+                // closure argument renders differently), so the
+                // exact name is handed over directly.
+                let key = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    format!("{:?}", conv.ty(&cand_ty))
+                }));
+                if let Ok(key) = key {
+                    dtor_bodies.insert(key, inst.name().to_string());
+                }
                 if let Some(entry) = report.functions.last() {
                     let counts = (entry.blocks, entry.locals, entry.arg_count);
                     let slot = credited
@@ -2638,7 +2699,162 @@ fn demand_drop_instances(
             break;
         }
     }
-    (credited, failures)
+    (credited, failures, dtor_bodies)
+}
+
+/// The ADT instantiations among the types the collected bodies
+/// drop that have no `Drop` impl at all, keyed like
+/// `certify_drop_trivial`'s result. A `Drop` impl for a type can
+/// only live in the type's own crate (the orphan rule: the trait
+/// is `core`'s, so no other crate may implement it for the type),
+/// so scanning that crate's function definitions for an impl of
+/// the type is complete — absence there is absence everywhere.
+/// A crate that cannot be found by name certifies nothing, and
+/// an impl under any generic spelling blocks certification:
+/// both keep the interpreter's refusal for the type.
+fn certify_drop_no_impl(
+    conv: &mut Converter,
+    bodies: &[rustc_public::mir::Body],
+) -> std::collections::HashSet<String> {
+    let mut candidates = Vec::new();
+    let mut seen = Default::default();
+    for body in bodies {
+        for bb in &body.blocks {
+            let rustc_public::mir::TerminatorKind::Drop { place, .. } = &bb.terminator.kind
+            else {
+                continue;
+            };
+            if let Some(ty) = drop_place_ty(body, place) {
+                drop_candidates(&ty, &mut candidates, &mut seen);
+            }
+        }
+        for (def, args) in sparagmos_driver::reach::call_targets(body) {
+            if def.name() != "std::mem::drop" {
+                continue;
+            }
+            if let Some(ty) = args.0.iter().find_map(|a| match a {
+                GenericArgKind::Type(t) => Some(*t),
+                _ => None,
+            }) {
+                drop_candidates(&ty, &mut candidates, &mut seen);
+            }
+        }
+    }
+    let local_crate_name = rustc_public::local_crate().name;
+    let mut scans: std::collections::HashMap<String, Option<std::collections::HashSet<String>>> =
+        std::collections::HashMap::new();
+    let mut out = std::collections::HashSet::new();
+    let mut queried = 0usize;
+    for (ty, def, args) in candidates {
+        if queried >= MAX_DROP_CERTIFICATIONS {
+            break;
+        }
+        if args_mention_params(&args) {
+            continue;
+        }
+        queried += 1;
+        let def_name = def.name();
+        let type_crate = def_name.split("::").next().unwrap_or("");
+        let scan = scans.entry(type_crate.to_string()).or_insert_with(|| {
+            if type_crate == local_crate_name.as_str() {
+                Some(local_drop_impl_methods().into_keys().collect())
+            } else {
+                let mut defs = Vec::new();
+                let mut found = false;
+                for krate in rustc_public::find_crates(type_crate) {
+                    if !krate.is_local {
+                        found = true;
+                        defs.extend(krate.fn_defs());
+                    }
+                }
+                found.then(|| drop_impl_methods(defs).into_keys().collect())
+            }
+        });
+        let Some(impl_names) = scan else {
+            continue;
+        };
+        if impl_names.contains(&def_name) {
+            continue;
+        }
+        let key = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            format!("{:?}", conv.ty(&ty))
+        }));
+        if let Ok(key) = key {
+            out.insert(key);
+        }
+    }
+    out
+}
+
+/// Cap on drop-glue certifications per program: certification
+/// is one compiler query per distinct instantiation, and a
+/// program dropping more distinct types than this keeps the
+/// uncertified (refused) treatment for the tail.
+const MAX_DROP_CERTIFICATIONS: usize = 1024;
+
+/// The ADT instantiations among the types the collected bodies
+/// drop whose drop glue the compiler certifies empty, keyed by
+/// the `Debug` rendering of the converted type (the key the
+/// interpreter's glue builder consults). A foreign type's
+/// destructor cannot be ruled out from the name table — an impl
+/// the collection never demanded leaves no trace there — but
+/// the compiler's own drop-in-place resolution is complete: an
+/// empty shim means no destructor and no field glue anywhere in
+/// the type's tree. A query that panics (an unaskable type, an
+/// odd instantiation) certifies nothing.
+fn certify_drop_trivial(
+    conv: &mut Converter,
+    bodies: &[rustc_public::mir::Body],
+) -> std::collections::HashSet<String> {
+    let mut candidates = Vec::new();
+    let mut seen = Default::default();
+    for body in bodies {
+        for bb in &body.blocks {
+            let rustc_public::mir::TerminatorKind::Drop { place, .. } = &bb.terminator.kind
+            else {
+                continue;
+            };
+            if let Some(ty) = drop_place_ty(body, place) {
+                drop_candidates(&ty, &mut candidates, &mut seen);
+            }
+        }
+        // A `std::mem::drop` call runs the dropped type's glue
+        // without a `Drop` terminator; its argument type is a
+        // certification candidate for the same reason.
+        for (def, args) in sparagmos_driver::reach::call_targets(body) {
+            if def.name() != "std::mem::drop" {
+                continue;
+            }
+            if let Some(ty) = args.0.iter().find_map(|a| match a {
+                GenericArgKind::Type(t) => Some(*t),
+                _ => None,
+            }) {
+                drop_candidates(&ty, &mut candidates, &mut seen);
+            }
+        }
+    }
+    let mut out = std::collections::HashSet::new();
+    let mut queried = 0usize;
+    for (ty, _def, args) in candidates {
+        if queried >= MAX_DROP_CERTIFICATIONS {
+            break;
+        }
+        if args_mention_params(&args) {
+            continue;
+        }
+        queried += 1;
+        let certified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let inst = Instance::resolve_drop_in_place(ty);
+            if !inst.is_empty_shim() {
+                return None;
+            }
+            Some(format!("{:?}", conv.ty(&ty)))
+        }));
+        if let Ok(Some(key)) = certified {
+            out.insert(key);
+        }
+    }
+    out
 }
 
 /// The `dyn` trait references one Stable MIR body forms: every
@@ -3316,7 +3532,7 @@ fn collect() -> ControlFlow<()> {
     // collection (drop glue is not a call edge), so without this
     // pass the interpreter's glue builder finds the impl recorded
     // but bodiless and refuses the drop.
-    let (drop_credited, drop_failures) = demand_drop_instances(
+    let (mut drop_credited, mut drop_failures, mut dtor_bodies) = demand_drop_instances(
         &mut conv,
         &mut report,
         &mut bodies,
@@ -3713,6 +3929,37 @@ fn collect() -> ControlFlow<()> {
             }
         }
     }
+    // Second drop-demand round over the full collected body
+    // set: the first round ran before the reachability
+    // collection, so it only saw the entry crate's bodies and
+    // the type trees of the types they drop. Foreign bodies
+    // collected by reachability drop foreign machinery of
+    // their own (hashbrown's allocation guards are the
+    // motivating case), and those drops need the same
+    // destructor bodies. Instances the first round already
+    // converted are skipped by identity inside the pass.
+    {
+        let mut all_bodies = alias_sources.clone();
+        let (credited2, failures2, dtor_bodies2) = demand_drop_instances(
+            &mut conv,
+            &mut report,
+            &mut bodies,
+            &mut body_def_ids,
+            &mut body_def_names,
+            &mut all_bodies,
+        );
+        for (def, (count, counts)) in credited2 {
+            let slot = drop_credited.entry(def).or_insert((0, counts));
+            slot.0 += count;
+        }
+        for (def, reasons) in failures2 {
+            let slot = drop_failures.entry(def).or_default();
+            for (k, v) in reasons {
+                *slot.entry(k).or_default() += v;
+            }
+        }
+        dtor_bodies.extend(dtor_bodies2);
+    }
     // Credit the vtable instances the dyn demand converted for
     // deferred definitions (a trait default method is the common
     // case): the "dynamic dispatch target (virtual instance)"
@@ -3844,6 +4091,14 @@ fn collect() -> ControlFlow<()> {
 
     let entry_def_id = entry_point_def_id(&mut conv, &items);
 
+    // Certify the dropped types whose drop glue the compiler
+    // knows is empty, over the same body set the monomorphization
+    // checks scan: the interpreter's glue builder consults the
+    // set for the foreign types its name table cannot rule a
+    // destructor out for.
+    let drop_trivial_adts = certify_drop_trivial(&mut conv, &alias_sources);
+    let drop_no_impl_adts = certify_drop_no_impl(&mut conv, &alias_sources);
+
     stash(Collected {
         report,
         bodies,
@@ -3862,6 +4117,9 @@ fn collect() -> ControlFlow<()> {
         thread_locals: conv.thread_locals.clone(),
         adt_instance_shapes: conv.adt_instance_shapes.clone(),
         adt_niches: conv.adt_niches.clone(),
+        drop_trivial_adts,
+        drop_no_impl_adts,
+        dtor_bodies,
         track_caller_defs: conv.track_caller_defs.clone(),
         fn_shim_locations: conv.fn_shim_locations.clone(),
         source_files: conv.source_files.clone(),
@@ -4092,6 +4350,9 @@ fn build_program(
     program.thread_locals = c.thread_locals.clone();
     program.adt_instance_shapes = c.adt_instance_shapes.clone();
     program.adt_niches = c.adt_niches.clone();
+    program.drop_trivial_adts = c.drop_trivial_adts.clone();
+    program.drop_no_impl_adts = c.drop_no_impl_adts.clone();
+    program.dtor_bodies = c.dtor_bodies.clone();
     program.track_caller_defs = c.track_caller_defs.clone();
     program.fn_shim_locations = c.fn_shim_locations.clone();
     program.source_files = c.source_files.clone();

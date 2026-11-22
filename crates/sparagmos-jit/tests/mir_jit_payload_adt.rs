@@ -145,6 +145,10 @@ fn build_with_table(
         adt_instance_shapes: Default::default(),
         adt_niches: Default::default(),
         source_files: Default::default(),
+        drop_trivial_adts: Default::default(),
+        drop_no_impl_adts: Default::default(),
+        dtor_bodies: Default::default(),
+
         track_caller_defs: Default::default(),
         fn_shim_locations: Default::default(),
     };
