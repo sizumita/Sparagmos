@@ -3263,6 +3263,52 @@ impl<'a> Converter<'a> {
         }
     }
 
+    /// The modelled-contents form of an empty `Vec` / `String`
+    /// constant, when `value` is one's raw-layout constant tree
+    /// (see the `Adt` arm of `convert_const_value`). The raw
+    /// length is the second field of the raw `Vec` tree (the
+    /// first is the buffer); a `String` wraps that tree in its
+    /// single field.
+    fn empty_modelled_container(
+        &self,
+        value: &mir::ConstValue,
+        ctx: Option<&mir::Ty>,
+    ) -> Option<ir::Constant> {
+        let Some(mir::Ty::Adt(def, _)) = ctx else {
+            return None;
+        };
+        let name = self.names.get(def).or_else(|| self.def_names.get(def))?;
+        let mir::ConstValue::Adt { fields, .. } = value else {
+            return None;
+        };
+        let raw_vec_len = |fields: &[mir::ConstValue]| -> Option<u128> {
+            match fields.get(1) {
+                Some(mir::ConstValue::Scalar(mir::Scalar::Int { data, .. })) => {
+                    Some(*data)
+                }
+                _ => None,
+            }
+        };
+        match name.as_str() {
+            "std::vec::Vec" => (raw_vec_len(fields)? == 0).then_some(ir::Constant::Adt {
+                variant: 0,
+                fields: Vec::new(),
+            }),
+            "std::string::String" => {
+                let mir::ConstValue::Adt {
+                    fields: inner_fields,
+                    ..
+                } = fields.first()?
+                else {
+                    return None;
+                };
+                (raw_vec_len(inner_fields)? == 0)
+                    .then_some(ir::Constant::Str(String::new()))
+            }
+            _ => None,
+        }
+    }
+
     fn convert_const_value(
         &self,
         value: &mir::ConstValue,
@@ -3368,6 +3414,22 @@ impl<'a> Converter<'a> {
                     .collect::<Result<_, _>>()?,
             ),
             mir::ConstValue::Adt { variant, fields } => {
+                // A constant of a modelled container type arrives
+                // in the type's raw layout (a `Vec` constant is
+                // the nested RawVec tree const evaluation
+                // produced), but the value model represents the
+                // container by its contents: a `Vec::new()`
+                // default field value would otherwise materialise
+                // as a raw-layout aggregate whose two fields the
+                // `Vec::len` builtin reads as a length of 2. An
+                // empty container's contents are empty in both
+                // layouts, so it translates exactly; a non-empty
+                // one's elements live in the buffer allocation the
+                // raw tree points into, which this layer does not
+                // decode, so it keeps the raw form.
+                if let Some(k) = self.empty_modelled_container(value, ctx) {
+                    return Ok(k);
+                }
                 // The fields take the ADT's instantiated field
                 // types as their context, exactly as the tuple arm
                 // takes its element types: a scalar field's bits

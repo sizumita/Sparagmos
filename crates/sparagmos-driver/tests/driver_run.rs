@@ -15785,3 +15785,38 @@ fn run_mode_box_dyn_drop_runs_concrete_dtor() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "dyn drop ok\n");
 }
+
+const DEFAULT_FIELD_VEC_SRC: &str = r#"
+#![feature(default_field_values)]
+
+pub struct Foo {
+    pub baz: i32 = 42 + 3,
+    pub bak: Vec<i32> = Vec::new(),
+}
+
+fn main() {
+    let x = Foo { .. };
+    assert_eq!(x.baz, 45);
+    assert!(x.bak.is_empty());
+    println!("default field values ok");
+}
+"#;
+
+#[test]
+fn run_mode_default_field_value_empty_vec_is_empty() {
+    // A field default is materialised as a constant in the
+    // type's raw layout; for a modelled container (`Vec`) the
+    // constant must be translated into the model's
+    // contents representation, or the raw tree's field count
+    // reads back as the vector's length.
+    let dir = temp_dir("default-field-vec");
+    let src = fixture(&dir, "default_field_vec.rs", DEFAULT_FIELD_VEC_SRC);
+    let out = run_driver_extra(&src, &["--edition", "2024"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a Vec::new() field default must be an empty vector; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "default field values ok\n");
+}
