@@ -13741,3 +13741,78 @@ fn run_mode_uninit_array_o2_unwritten_element_stays_an_error() {
         "reading a never-written element's payload must stay a named error; stderr={stderr}"
     );
 }
+
+const TRANSMUTE_OPTION_FIELDLESS_SRC: &str = r#"
+#[repr(u8)]
+pub enum Size { One = 1, Two = 2, Three = 3 }
+fn main() {
+    let n: u8 = unsafe { std::mem::transmute::<Option<Size>, u8>(None) };
+    let s: u8 = unsafe { std::mem::transmute::<Option<Size>, u8>(Some(Size::Two)) };
+    let back: Option<Size> = unsafe { std::mem::transmute::<u8, Option<Size>>(3) };
+    println!("{} {} {}", n, s, matches!(back, Some(Size::Three)));
+}
+"#;
+
+#[test]
+fn run_mode_transmute_option_fieldless_enum_niche() {
+    run_ok(
+        "transmute-option-fieldless",
+        TRANSMUTE_OPTION_FIELDLESS_SRC,
+        "0 2 true\n",
+    );
+}
+
+const TRANSMUTE_FN_PTR_RETURN_SRC: &str = r#"
+use std::mem;
+#[inline(never)]
+extern "C" fn foo(x: &isize) -> Option<&isize> { Some(x) }
+static FOO: isize = 0xDEADBEE;
+pub fn main() {
+    unsafe {
+        let f: extern "C" fn(&isize) -> &isize =
+            mem::transmute(foo as extern "C" fn(&isize) -> Option<&isize>);
+        println!("{}", *f(&FOO));
+    }
+}
+"#;
+
+#[test]
+fn run_mode_transmute_fn_ptr_return_niche_to_ref() {
+    run_ok(
+        "transmute-fn-ptr-return",
+        TRANSMUTE_FN_PTR_RETURN_SRC,
+        "233495534\n",
+    );
+}
+
+const UNIQUE_DANGLING_SRC: &str = r#"
+#![feature(ptr_internals)]
+use std::ptr::Unique;
+const PTR: *mut u32 = Unique::dangling().as_ptr();
+fn main() {
+    let p = Unique::<u32>::dangling().as_ptr();
+    println!("{}", PTR == p);
+}
+"#;
+
+#[test]
+fn run_mode_unique_dangling_const_and_runtime() {
+    run_ok("unique-dangling", UNIQUE_DANGLING_SRC, "true\n");
+}
+
+const NONNULL_DANGLING_SRC: &str = r#"
+use std::ptr::NonNull;
+use std::num::NonZero;
+#[inline(never)]
+fn dangling() -> NonNull<u32> { NonNull::dangling() }
+fn main() {
+    let a = dangling();
+    let b = NonNull::<u32>::without_provenance(NonZero::new(4usize).unwrap());
+    println!("{} {}", a.as_ptr() as usize, b.as_ptr() as usize);
+}
+"#;
+
+#[test]
+fn run_mode_nonnull_dangling_without_provenance() {
+    run_ok("nonnull-dangling", NONNULL_DANGLING_SRC, "4 4\n");
+}
