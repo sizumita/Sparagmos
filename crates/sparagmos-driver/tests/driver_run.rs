@@ -10553,3 +10553,60 @@ fn run_mode_pow_overflow_panics() {
         "overflow message goes to stderr: {stderr}"
     );
 }
+
+// ----- composite layouts and remaining Default shapes (Lane HQ) -----
+
+const COMPOSITE_LAYOUT_SRC: &str = r#"
+fn main() {
+    let a: [u16; 3] = [1, 2, 3];
+    println!("arr {} {}", std::mem::size_of_val(&a), std::mem::align_of_val(&a));
+    let t: (u8, u32) = (1, 2);
+    println!("tup {} {}", std::mem::size_of_val(&t), std::mem::align_of_val(&t));
+    let n: [[u8; 3]; 2] = [[1, 2, 3], [4, 5, 6]];
+    println!("nest {} {}", std::mem::size_of_val(&n), std::mem::align_of_val(&n));
+    let m: (u16, [u8; 5]) = (7, [1, 2, 3, 4, 5]);
+    println!("mix {} {}", std::mem::size_of_val(&m), std::mem::align_of_val(&m));
+}
+"#;
+
+#[test]
+fn run_mode_size_of_val_composite_layouts() {
+    // The layouts are computed from the element / field layouts
+    // (verified against a native 1.100.0 build of the same source).
+    run_ok(
+        "composite-layout",
+        COMPOSITE_LAYOUT_SRC,
+        "arr 6 2\ntup 8 4\nnest 6 1\nmix 8 2\n",
+    );
+}
+
+const WRAPPER_DEFAULT_SRC: &str = r#"
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+use std::sync::Arc;
+
+fn main() {
+    assert_eq!(<f64 as Default>::default(), 0.0);
+    assert_eq!(<f32 as Default>::default(), 0.0);
+    assert_eq!(<&str as Default>::default(), "");
+    let c: Cell<u32> = Default::default();
+    assert_eq!(c.get(), 0);
+    let r: RefCell<Vec<u32>> = Default::default();
+    assert!(r.borrow().is_empty());
+    let b: Box<u32> = Default::default();
+    assert_eq!(*b, 0);
+    let bs: Box<[u32]> = Default::default();
+    assert_eq!(bs.len(), 0);
+    let rc: Rc<u32> = Default::default();
+    assert_eq!(*rc, 0);
+    assert_eq!(Rc::strong_count(&rc), 1);
+    let arc: Arc<String> = Default::default();
+    assert!(arc.is_empty());
+    println!("defaults ok");
+}
+"#;
+
+#[test]
+fn run_mode_default_for_float_str_and_wrappers() {
+    run_ok("wrapper-default", WRAPPER_DEFAULT_SRC, "defaults ok\n");
+}
