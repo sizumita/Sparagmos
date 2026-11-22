@@ -7361,6 +7361,18 @@ pub(crate) fn project_value_ref<'a>(
                     "the untyped value projector",
                 ));
             }
+            RefProj::ByteOffset(disp) => {
+                if *disp != 0 {
+                    // The position does not coincide with a value
+                    // boundary, and the model has no byte-level
+                    // view of a value's storage to reinterpret.
+                    return Err(InterpError::UnsupportedProjection {
+                        kind: format!(
+                            "read through a pointer displaced {disp} bytes from a value boundary"
+                        ),
+                    });
+                }
+            }
         }
     }
     Ok(Cow::Borrowed(cur))
@@ -8268,6 +8280,7 @@ fn synthetic_addr(v: &Value) -> u128 {
                     RefProj::Subslice { offset, len } => {
                         (4u128, ((*offset as u128) << 64) | (*len as u128))
                     }
+                    RefProj::ByteOffset(d) => (6u128, *d as u128),
                 };
                 mix(&mut h, tag);
                 mix(&mut h, n);
