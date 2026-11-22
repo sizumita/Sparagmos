@@ -13582,6 +13582,162 @@ fn run_mode_pathbuf_deref_to_path() {
     );
 }
 
+const PATH_COMPONENTS_SRC: &str = r#"
+use std::path::{Component, Path};
+
+fn main() {
+    // The component kinds and the `as_os_str` view of each:
+    // `Component::as_os_str`'s body transmutes a string
+    // constant through a byte slice to the `OsStr` sys type,
+    // and the consumers below run through library bodies.
+    let kinds: Vec<u8> = Path::new("/a/../c")
+        .components()
+        .map(|c| match c {
+            Component::Prefix(_) => 0,
+            Component::RootDir => 1,
+            Component::CurDir => 2,
+            Component::ParentDir => 3,
+            Component::Normal(_) => 4,
+        })
+        .collect();
+    assert_eq!(kinds, vec![1, 4, 3, 4]);
+    let lens: Vec<usize> = Path::new("/../x")
+        .components()
+        .map(|c| c.as_os_str().len())
+        .collect();
+    assert_eq!(lens, vec![1, 2, 1]);
+    assert_eq!(Path::new("").components().count(), 0);
+    assert_eq!(Path::new("./a").components().count(), 2);
+    let mut sum = 0usize;
+    for c in Path::new("a//b/").components() {
+        sum += c.as_os_str().len();
+    }
+    assert_eq!(sum, 2);
+    println!("path-components-ok");
+}
+"#;
+
+#[test]
+fn run_mode_path_components_iteration() {
+    let dir = temp_dir("path-components");
+    let src = fixture(&dir, "path_components.rs", PATH_COMPONENTS_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Path::components iteration runs; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "path-components-ok\n",
+        "component kinds and os_str views match std"
+    );
+}
+
+const PATH_COMPONENTS_CONSUMERS_SRC: &str = r#"
+use std::path::Path;
+
+fn main() {
+    // `count` is a library body whose closure drops each
+    // component it consumes; the drop glue of the component
+    // types is empty (they hold only string slices).
+    assert_eq!(Path::new("a/b/c/d").components().count(), 4);
+    // Front and back steps interleave over one state.
+    let mut it = Path::new("a/b/c/d").components();
+    assert_eq!(it.next().unwrap().as_os_str().len(), 1);
+    assert_eq!(it.next_back().unwrap().as_os_str().len(), 1);
+    assert_eq!(it.count(), 2);
+    let mut it = Path::new("a").components();
+    assert!(it.next().is_some());
+    assert!(it.next_back().is_none());
+    assert!(it.next().is_none());
+    // `rev` composes the back step; an explicit `drop` of a
+    // component accounts its (empty) glue as well.
+    let names: Vec<String> = Path::new("a/bb")
+        .components()
+        .rev()
+        .map(|c| c.as_os_str().to_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, vec!["bb".to_string(), "a".to_string()]);
+    let c = Path::new("/x").components().next().unwrap();
+    drop(c);
+    println!("path-components-consumers-ok");
+}
+"#;
+
+#[test]
+fn run_mode_path_components_consumers() {
+    let dir = temp_dir("path-components-consumers");
+    let src = fixture(
+        &dir,
+        "path_components_consumers.rs",
+        PATH_COMPONENTS_CONSUMERS_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Components consumers (count/next_back/rev/drop) run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "path-components-consumers-ok\n",
+        "front/back steps and consumer drops match std"
+    );
+}
+
+const PATHBUF_BUILD_SRC: &str = r#"
+use std::path::{Path, PathBuf};
+
+fn main() {
+    let mut pb = PathBuf::from("/tmp");
+    pb.push("a");
+    pb.push("b/c");
+    assert_eq!(pb.to_str().unwrap(), "/tmp/a/b/c");
+    assert!(pb.pop());
+    assert_eq!(pb.to_str().unwrap(), "/tmp/a/b");
+    // An absolute addition replaces the whole buffer.
+    pb.push("/abs");
+    assert_eq!(pb.to_str().unwrap(), "/abs");
+    // The root and the empty buffer have nothing to pop.
+    let mut root = PathBuf::from("/");
+    assert!(!root.pop());
+    assert_eq!(root.to_str().unwrap(), "/");
+    let mut empty = PathBuf::new();
+    assert!(!empty.pop());
+    empty.push("x");
+    assert_eq!(empty.to_str().unwrap(), "x");
+    // One-byte buffers dereference to their path as well.
+    let one = PathBuf::from(String::from("s"));
+    assert_eq!(one.to_str().unwrap(), "s");
+    assert_eq!(one.components().count(), 1);
+    // `to_path_buf` copies a borrowed path into a buffer.
+    let copied: PathBuf = Path::new("q/r").to_path_buf();
+    assert_eq!(copied.to_str().unwrap(), "q/r");
+    println!("pathbuf-build-ok");
+}
+"#;
+
+#[test]
+fn run_mode_pathbuf_construction_and_mutation() {
+    let dir = temp_dir("pathbuf-build");
+    let src = fixture(&dir, "pathbuf_build.rs", PATHBUF_BUILD_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "PathBuf construction and mutation run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "pathbuf-build-ok\n",
+        "from/push/pop/new/to_path_buf match std"
+    );
+}
+
 // ---- Lane JL: one io::Error representation (issue #173) ----
 // Every io::Error producer (the fs layer, the process model,
 // From<ErrorKind>) builds the bitpacked `Repr` layout std's own
