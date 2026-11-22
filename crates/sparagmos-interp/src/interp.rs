@@ -9335,6 +9335,25 @@ pub(crate) fn project_value_ref<'a>(
                     // `Path`/`OsStr`/`CStr` wrappers over a string
                     // value is the string itself.
                     Value::Str(_) | Value::Bytes(_) if *idx == 0 => cur,
+                    Value::FmtArguments(_) => {
+                        // The modelled `fmt::Arguments` fields are
+                        // synthesized values, not storage (see the
+                        // matching arm in `project_value`), so the
+                        // projection materializes an owned field and
+                        // any remaining steps project into it.
+                        let owned = project_value(
+                            cur.clone(),
+                            std::slice::from_ref(step),
+                            func,
+                            place,
+                        )?;
+                        if tail.is_empty() {
+                            return Ok(Cow::Owned(owned));
+                        }
+                        return Ok(Cow::Owned(
+                            project_value_ref(&owned, tail, func, place)?.into_owned(),
+                        ));
+                    }
                     other => {
                         return Err(InterpError::type_mismatch(
                             format!("field projection on {place}"),
