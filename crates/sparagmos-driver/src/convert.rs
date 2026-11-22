@@ -2454,6 +2454,7 @@ impl Converter {
             }
             TyKind::RigidTy(RigidTy::Array(elem, len)) => {
                 let count = len.eval_target_usize().ok()?;
+                if count > MAX_CONST_ARRAY_ELEMS { return None; }
                 let shape = ty.layout().ok()?.shape();
                 let FieldsShape::Array { stride, count: layout_count } = shape.fields else {
                     return None;
@@ -4131,6 +4132,15 @@ fn region_of(r: &rustc_public::ty::Region) -> sm::Region {
 /// pointer hops share it, so cyclic statics exhaust it and stay
 /// unsupported instead of recursing forever.
 const MAX_CONST_DEPTH: usize = 32;
+
+/// Resource bound on array constants materialised element by
+/// element in `decode_const`, mirroring `unique_const_value`'s
+/// bound: an array length is guest-controlled input (`[(); usize::MAX]`
+/// is a legal constant whose allocation is empty), and past this
+/// many elements the value is not materialised — the decode fails
+/// and reference constants keep their `ByRef` identity instead of
+/// the host process aborting on allocation.
+const MAX_CONST_ARRAY_ELEMS: u64 = 4096;
 
 /// Pointer width in bytes on the target this driver runs for
 /// (x86_64); Stable MIR provenance entries are pointer-sized.
