@@ -524,6 +524,7 @@ fn step_limit_stops_infinite_loop() {
             guest_args: Vec::new(),
             program_path: String::new(),
             overflow_checks: true,
+            tool_interception: None,
         },
     );
     let err = interp.run("forever", vec![]).unwrap_err();
@@ -562,6 +563,7 @@ fn call_depth_limit_stops_unbounded_recursion() {
             guest_args: Vec::new(),
             program_path: String::new(),
             overflow_checks: true,
+            tool_interception: None,
         },
     );
     let err = interp.run("f", vec![]).unwrap_err();

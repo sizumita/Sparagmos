@@ -442,6 +442,9 @@ pub enum BinOp {
     Le,
     Gt,
     Ge,
+    /// Three-way comparison (`BinOp::Cmp`): the result is a
+    /// `core::cmp::Ordering` value, not a boolean.
+    Cmp,
 }
 
 /// Unary operators (rustc MIR `UnOp`).

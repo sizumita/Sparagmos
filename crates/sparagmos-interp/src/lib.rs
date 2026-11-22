@@ -61,7 +61,10 @@ pub mod mir_convert;
 pub mod value;
 
 pub use error::{InterpError, InterpResult};
-pub use interp::{interpret, InterpConfig, Interpreter};
+pub use interp::{
+    interpret, InterpConfig, Interpreter, ToolInterception, ToolRunOutcome,
+    ToolRunRequest, ToolRunner,
+};
 pub use ir::{
     BasicBlock, BasicBlockData, BinOp, Body, Constant, DropGlue, DropPlan, Local, Operand,
     Place, Program,

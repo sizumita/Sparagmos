@@ -62,6 +62,10 @@ pub struct InterpConfig {
     /// wrap either way, exactly as in MIR. Defaults to `true`
     /// (the debug-profile default).
     pub overflow_checks: bool,
+    /// Tool interception for this run (see [`ToolInterception`]);
+    /// `None` keeps the process model's standing behaviour, under
+    /// which no child process ever starts.
+    pub tool_interception: Option<ToolInterception>,
 }
 
 impl Default for InterpConfig {
@@ -72,8 +76,77 @@ impl Default for InterpConfig {
             guest_args: Vec::new(),
             program_path: String::new(),
             overflow_checks: true,
+            tool_interception: None,
         }
     }
+}
+
+/// A request to run a configured tool program, handed from the
+/// interpreter to the host-side tool runner (see
+/// [`InterpConfig::tool_interception`]). The fields mirror the
+/// interpreter's command-table entry for the invocation: the
+/// program and its arguments as raw byte strings, the environment
+/// entries the guest set on the command (a `None` value is a
+/// removal), whether the inherited environment was cleared, and
+/// the child's working directory if the guest set one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolRunRequest {
+    pub program: Vec<u8>,
+    pub args: Vec<Vec<u8>>,
+    pub argv0: Option<Vec<u8>>,
+    pub envs: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    pub env_clear: bool,
+    pub cwd: Option<Vec<u8>>,
+}
+
+/// The outcome of one tool invocation, from which the fabricated
+/// `std::process::Output` / `ExitStatus` values are built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolRunOutcome {
+    /// The child's exit code; negative when the child ended on a
+    /// signal (the fabricated wait status encodes it as such).
+    pub exit_code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// The host-side tool runner: invoked by the interpreter when the
+/// guest runs one of the configured tool programs through
+/// `Command::output` / `Command::status`. An `Err` return becomes
+/// the run's unsupported error, with the returned text as the
+/// reason.
+#[derive(Clone)]
+pub struct ToolRunner(
+    pub std::sync::Arc<
+        dyn Fn(&ToolRunRequest) -> Result<ToolRunOutcome, String> + Send + Sync,
+    >,
+);
+
+impl std::fmt::Debug for ToolRunner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ToolRunner(..)")
+    }
+}
+
+impl PartialEq for ToolRunner {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ToolRunner {}
+
+/// Tool interception configured for a run: the exact program byte
+/// strings the interpreter routes to `runner` instead of answering
+/// with the process model's named unsupported error. This is how a
+/// test recipe's compiler invocations reach the driver's own
+/// conversion machinery: the program named here is the compiler,
+/// and running it means converting the guest's input with the
+/// driver, not starting a process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolInterception {
+    pub programs: Vec<Vec<u8>>,
+    pub runner: ToolRunner,
 }
 
 /// One call frame: a function's locals plus where to resume.
@@ -856,6 +929,12 @@ impl<'a> Interpreter<'a> {
     /// (see the `overflow_checks` field of `InterpConfig`).
     pub fn overflow_checks(&self) -> bool {
         self.config.overflow_checks
+    }
+
+    /// The tool interception configured for this run, if any
+    /// (see [`InterpConfig::tool_interception`]).
+    pub fn tool_interception(&self) -> Option<&ToolInterception> {
+        self.config.tool_interception.as_ref()
     }
 
     pub fn with_config(program: &'a Program, config: InterpConfig) -> Self {
@@ -8625,6 +8704,26 @@ impl<'a> Interpreter<'a> {
         ) {
             return Ok(value);
         }
+        // `core::ptr::Unaligned<T>` is a one-field `repr(C,
+        // packed)` wrapper whose only field IS the value it
+        // wraps: `ptr::read_unaligned` moves the pointee through
+        // locals of this type, and a pointee read in this model
+        // yields the field value itself (the allocation holds
+        // the inner value; the wrapper has no address of its
+        // own). Storing the bare value into an `Unaligned` place
+        // therefore wraps it in the one-field aggregate, the
+        // exact inverse of the wrapper-unwrap for scalar targets
+        // below.
+        if let Some(Ty::Adt(name)) = ty {
+            if (name == "std::ptr::Unaligned" || name == "core::ptr::Unaligned")
+                && !matches!(value, Value::Enum { .. })
+            {
+                return Ok(Value::Enum {
+                    variant: 0,
+                    fields: vec![value],
+                });
+            }
+        }
         // A scalar place whose value arrives as a one-field wrapper
         // aggregate: reading through a raw pointer into a transparent
         // wrapper (`UnsafeCell<T>`, the `AtomicUsize`-family structs,
@@ -11322,6 +11421,20 @@ pub(crate) fn project_value(
                         }
                     })?
                 }
+                // Field 0 of a string value is the string
+                // itself: the byte-string wrappers std layers
+                // over the same bytes (`String` over its buffer,
+                // `OsString` over its `Buf`, `PathBuf` over its
+                // `OsString`, `Path` over its `OsStr`, `OsStr`
+                // over its byte slice) are all one-field chains
+                // whose every layer denotes the same byte string
+                // in this model, and the `AsRef` / `Deref` glue
+                // that walks them (e.g. the projections inside
+                // `env::split_paths`) reads the same value at
+                // every step. Consumers that need the buffer in
+                // vector form reach it through the modelled
+                // `Vec` API, not through these projections.
+                Value::Str(_) if *idx == 0 => value,
                 // Field 0 of a fat pointer value is the pointer
                 // field of its smart-pointer wrapper (a `Box`'s
                 // `Unique`): in this model the `DynRef` *is* that
@@ -12557,6 +12670,20 @@ fn unsigned_bits(dest_ty: Option<&Ty>) -> u32 {
 /// by zero panics in both forms — the operation itself requires it,
 /// independent of overflow checks. Comparison and bitwise-on-bool
 /// operations never overflow.
+/// The `core::cmp::Ordering` value of a three-way comparison:
+/// the enum in declaration order (Less, Equal, Greater), the
+/// shape `Builtin::OrdCmp`'s `ordering_value` also produces.
+fn ordering_of(ord: std::cmp::Ordering) -> Value {
+    Value::Enum {
+        variant: match ord {
+            std::cmp::Ordering::Less => 0,
+            std::cmp::Ordering::Equal => 1,
+            std::cmp::Ordering::Greater => 2,
+        },
+        fields: Vec::new(),
+    }
+}
+
 pub(crate) fn eval_binary(
     op: BinOp,
     lhs: &Value,
@@ -12573,6 +12700,7 @@ pub(crate) fn eval_binary(
             BitXor => Value::Bool(*a ^ *b),
             Eq => Value::Bool(a == b),
             Ne => Value::Bool(a != b),
+            Cmp => ordering_of(a.cmp(b)),
             _ => {
                 return Err(InterpError::type_mismatch(
                     format!("binary operation {op:?}"),
@@ -12634,6 +12762,7 @@ pub(crate) fn eval_binary(
         };
         let cmp = |f: &dyn Fn() -> bool| Ok((Value::Bool(f()), false));
         let wide: Option<i128> = match op {
+            Cmp => return Ok((ordering_of(a.cmp(&b)), false)),
             Eq => return cmp(&|| a == b),
             Ne => return cmp(&|| a != b),
             Lt => return cmp(&|| a < b),
@@ -12702,6 +12831,7 @@ pub(crate) fn eval_binary(
         };
         let cmp = |f: &dyn Fn() -> bool| Ok((Value::Bool(f()), false));
         match op {
+            Cmp => return Ok((ordering_of(a.cmp(&b)), false)),
             Eq => return cmp(&|| a == b),
             Ne => return cmp(&|| a != b),
             Lt => return cmp(&|| a < b),
@@ -12813,7 +12943,7 @@ pub(crate) fn eval_binary(
     // exposes); a fat pointer's equality also compares the
     // metadata word (its length). Ordering is defined on the
     // synthetic addresses, which is deterministic within a run.
-    if matches!(op, Eq | Ne | Lt | Le | Gt | Ge) {
+    if matches!(op, Eq | Ne | Lt | Le | Gt | Ge | Cmp) {
         let key = |v: &Value| -> Option<(u128, Option<u128>)> {
             match v {
                 // The null pointer's address is 0, matching an
@@ -12836,6 +12966,9 @@ pub(crate) fn eval_binary(
         };
         if let (Some(a), Some(b)) = (key(lhs), key(rhs)) {
             let ord = a.cmp(&b);
+            if op == Cmp {
+                return Ok((ordering_of(ord), false));
+            }
             let v = match op {
                 Eq => a == b,
                 Ne => a != b,

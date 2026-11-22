@@ -8000,8 +8000,8 @@ fn is_shift(op: mir::BinOp) -> bool {
 /// The IR operator for a plain (non-checked) `mir` binary operator.
 /// `Offset` (pointer arithmetic) is converted separately into
 /// `ir::Rvalue::PtrOffset` (a `CheckedBinaryOp` with `Offset`, the
-/// only way this function could still see it, is never emitted) and
-/// `Cmp` (three-way) has no IR equivalent; both yield `None`.
+/// only way this function could still see it, is never emitted), so
+/// it yields `None` here.
 fn plain_binop(op: mir::BinOp) -> Option<ir::BinOp> {
     use mir::BinOp as M;
     Some(match op {
@@ -8021,7 +8021,8 @@ fn plain_binop(op: mir::BinOp) -> Option<ir::BinOp> {
         M::Ne => ir::BinOp::Ne,
         M::Ge => ir::BinOp::Ge,
         M::Gt => ir::BinOp::Gt,
-        M::Offset | M::Cmp => return None,
+        M::Cmp => ir::BinOp::Cmp,
+        M::Offset => return None,
         // *WithOverflow in a plain position is handled by `overflow_base`
         // before this function is consulted.
         M::AddWithOverflow | M::SubWithOverflow | M::MulWithOverflow => return None,
@@ -9008,6 +9009,126 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                 // elements are the argument strings themselves:
                 // dropping the iterator drops the not-yet-yielded
                 // strings, which is unobservable for string values.
+                return Some(P::Trivial);
+            }
+            "std::env::SplitPaths" => {
+                // The modelled value is the `split_paths`
+                // builtin's snapshot ([part snapshot, next
+                // index]) whose elements are `PathBuf` values:
+                // dropping the iterator drops the not-yet-yielded
+                // parts, which is unobservable for path values
+                // (the same reasoning as the `Args` entry above).
+                // The type is opaque (`define_opaque`), so the
+                // evidence-based planner cannot see its shape.
+                return Some(P::Trivial);
+            }
+            "std::env::VarError" => {
+                // A plain enum with no `Drop` impl. Its only
+                // payload is the `NotUnicode` variant's
+                // `OsString`, which is the string value itself in
+                // this model (see the `OsString` entry above), so
+                // the whole glue is trivial.
+                return Some(P::Trivial);
+            }
+            "std::fs::Metadata" => {
+                // A plain snapshot of the host `stat` data: no
+                // `Drop` impl, and every field (the stat struct,
+                // the file type, the times) is plain data, so the
+                // whole glue is trivial.
+                return Some(P::Trivial);
+            }
+            "std::fs::DirEntry" => {
+                // No `Drop` impl; the modelled value is the
+                // entry's path and name, both string data in this
+                // model, so the whole glue is trivial.
+                return Some(P::Trivial);
+            }
+            "std::fs::ReadDir" => {
+                // The modelled value is the snapshot of the
+                // directory's entries plus the read index:
+                // dropping it drops the not-yet-yielded entries,
+                // which are plain data in this model (the same
+                // accounting as `std::env::Args` above).
+                return Some(P::Trivial);
+            }
+            "build_helper::drop_bomb::DropBomb" => {
+                // The bomb's own `Drop` impl panics when the
+                // bomb is still armed. That check is a
+                // recipe-authoring guard, not recipe semantics:
+                // the harness's native oracle runs the recipe
+                // first, so a recipe whose commands are dropped
+                // unexecuted has already failed natively, and
+                // the defuse itself is ordinary field data the
+                // converted support code maintains. Its fields
+                // (an `OsString`, a flag and a `Location`) are
+                // all glue-free in this model, so the glue is
+                // trivial.
+                return Some(P::Trivial);
+            }
+            "run_make_support::command::Command"
+            | "run_make_support::CompletedProcess"
+            | "run_make_support::Rustc"
+            | "run_make_support::Cargo"
+            | "run_make_support::Rustdoc"
+            | "run_make_support::Cc"
+            | "run_make_support::LlvmAr"
+            | "run_make_support::LlvmReadobj" => {
+                // The run-make support library's own value
+                // types: builders wrapping the modelled
+                // `std::process::Command` (a handle whose glue
+                // is trivial, above) plus option/string/path
+                // data and the `DropBomb` accounted for above,
+                // and the completed-process wrapper around the
+                // modelled `Output`. None of them has a `Drop`
+                // impl, and every field is glue-free in this
+                // model, so the glue is trivial. (Their shapes
+                // are not in the evidence tables -- the types
+                // live in an auxiliary crate whose construction
+                // sites are not converted -- so the generic
+                // fields plan cannot be derived for them.)
+                return Some(P::Trivial);
+            }
+            "run_make_support::similar::TextDiff"
+            | "run_make_support::similar::udiff::UnifiedDiff" => {
+                // Diff values are borrowed line data and owned
+                // vectors of it: no `Drop` impl, and every
+                // field is glue-free in this model.
+                return Some(P::Trivial);
+            }
+            "std::process::Stdio" => {
+                // Stdio configuration is not observed by the
+                // process model (see the `ProcessCommandStdio`
+                // builtin): a modelled `Stdio` value holds no
+                // host resource, so its glue is trivial.
+                return Some(P::Trivial);
+            }
+            "std::process::ChildStdin"
+            | "std::process::ChildStdout"
+            | "std::process::ChildStderr" => {
+                // Child pipe handles exist only for a spawned
+                // child, which the process model never produces
+                // (spawn stays unsupported at its call site);
+                // the values are unreachable in a running
+                // program, and their glue is trivial.
+                return Some(P::Trivial);
+            }
+            "std::string::FromUtf8Error" => {
+                // A byte vector plus a plain validation error:
+                // no `Drop` impl, nothing owned beyond the
+                // buffer value itself.
+                return Some(P::Trivial);
+            }
+            "std::process::Output" => {
+                // No `Drop` impl; the fields are an exit status
+                // (a plain wait-status integer) and two byte
+                // vectors, whose buffers are values in this
+                // model (as for `OsString` above), so the whole
+                // glue is trivial.
+                return Some(P::Trivial);
+            }
+            "std::process::ExitStatus" => {
+                // A plain wait-status integer in a two-level
+                // wrapper: no `Drop` impl, nothing owned.
                 return Some(P::Trivial);
             }
             _ => {}

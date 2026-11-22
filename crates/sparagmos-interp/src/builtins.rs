@@ -253,6 +253,94 @@ pub enum Builtin {
     /// the guest observes a real, existing path, as it would
     /// from the OS).
     EnvCurrentExe,
+    /// `std::env::var::inner(&key) -> Result<String, VarError>`:
+    /// the non-generic leaf under `std::env::var`, over the host
+    /// environment (see `EnvGetenv`).
+    EnvVarInner,
+    /// `std::env::split_paths(&OsStr) -> SplitPaths`: the
+    /// parts split on the platform path separator (`:` on
+    /// unix, `slice::Split` semantics -- empty segments are
+    /// kept, including a trailing one), snapshotted as an
+    /// owned-iterator state of `PathBuf` values.
+    EnvSplitPaths,
+    /// `std::env::join_paths(iterable) -> Result<OsString,
+    /// JoinPathsError>`: concatenates the items' bytes with
+    /// the platform path separator (`:` on unix), failing if
+    /// any item contains the separator. The native body
+    /// composes iterator adapters whose inlined slice-iterator
+    /// machinery reconstructs slices from raw pointers, which
+    /// this value model cannot dereference; the builtin steps
+    /// the modelled iterator state directly (the pattern
+    /// `Iterator::count` uses) and extracts each item's bytes
+    /// through the `OsStr` argument funnel.
+    EnvJoinPaths,
+    /// `std::sys::env::unix::getenv(&key) -> Option<OsString>`:
+    /// the host process environment, read live (a run-make
+    /// recipe's tool invocations are configured through it).
+    EnvGetenv,
+    /// `std::sys::env::unix::setenv(&key, &value) ->
+    /// io::Result<()>`: mutate the host process environment, as
+    /// the real call does.
+    EnvSetenv,
+    /// `std::sys::env::unix::unsetenv(&key) -> io::Result<()>`:
+    /// remove a variable from the host process environment.
+    EnvUnsetenv,
+    /// `std::env::current_dir()` (and the
+    /// `std::sys::paths::unix::getcwd` leaf under it): the host
+    /// process's working directory. A recipe runs in a real host
+    /// directory, so the host value is the faithful one.
+    EnvCurrentDir,
+    /// `std::env::temp_dir()` (and its `std::sys::paths` leaf):
+    /// the host's temporary directory.
+    EnvTempDir,
+    /// `std::env::home_dir()` (and its `std::sys::paths` leaf):
+    /// the host's home directory, when it has one.
+    EnvHomeDir,
+    /// `std::sys::paths::unix::chdir(&path) -> io::Result<()>`:
+    /// change the host process's working directory (what
+    /// `std::env::set_current_dir` bottoms out in).
+    SysChdir,
+    /// `std::fs::read::inner(&path) -> io::Result<Vec<u8>>`: the
+    /// non-generic leaf under `std::fs::read`, performed on the
+    /// host filesystem (the fs sys layer's model).
+    FsReadInner,
+    /// `std::fs::read_to_string::inner(&Path) ->
+    /// io::Result<String>`: the host read plus the UTF-8
+    /// validation (an invalid file is `InvalidData`, exactly
+    /// the error the native `read_to_string` reports).
+    FsReadToStringInner,
+    /// `String::from_utf8(Vec<u8>) -> Result<String,
+    /// FromUtf8Error>`: the host validation over the vector's
+    /// elements. (The native body's construction path walks
+    /// the `String`/`Vec` field layout, which the element-list
+    /// value model does not have.)
+    StringFromUtf8,
+    /// `std::fs::write::inner(&path, &[u8]) -> io::Result<()>`:
+    /// the non-generic leaf under `std::fs::write`.
+    FsWriteInner,
+    /// `std::path::Path::parent(&self) -> Option<&Path>`: the
+    /// lexical parent, a prefix of the path's own bytes.
+    PathParent,
+    /// `std::path::Path::file_name(&self) -> Option<&OsStr>`:
+    /// the final component when it is a normal one.
+    PathFileName,
+    /// `std::path::Path::file_stem(&self) -> Option<&OsStr>`.
+    PathFileStem,
+    /// `std::path::Path::extension(&self) -> Option<&OsStr>`.
+    PathExtension,
+    /// `std::path::Path::_starts_with(&self, &Path) -> bool`:
+    /// the component-wise prefix test under `Path::starts_with`.
+    PathStartsWith,
+    /// `std::path::Path::_ends_with(&self, &Path) -> bool`:
+    /// the component-wise suffix test under `Path::ends_with`.
+    PathEndsWith,
+    /// `std::path::Path::is_absolute(&self) -> bool`: the path
+    /// has a root component.
+    PathIsAbsolute,
+    /// `std::path::Path::_join(&self, &Path) -> PathBuf`: the
+    /// owned path with the argument pushed onto it (the leaf
+    /// under `Path::join`).
+    PathJoin,
     /// `std::fs::OpenOptions::_open(&options, path)`: the fs
     /// sys layer's entry point. A path containing a NUL byte is
     /// rejected with `InvalidInput`, exactly as std's own
@@ -265,6 +353,32 @@ pub enum Builtin {
     /// one directory on the host filesystem (std's
     /// `create_dir_all` body iterates this per component).
     FsDirCreate,
+    /// `std::string::String::from_utf8_lossy(&[u8]) ->
+    /// Cow<str>`: the host conversion, verbatim (borrowed when
+    /// the bytes are valid UTF-8, owned with replacement
+    /// characters otherwise; in this model both sides carry the
+    /// string data itself).
+    StringFromUtf8Lossy,
+    /// `std::str::from_utf8(&[u8]) -> Result<&str, Utf8Error>`:
+    /// the host validation, verbatim; the error is the plain
+    /// struct value (valid-up-to count, optional error length).
+    StrFromUtf8,
+    /// `to_string_lossy` on an `OsString`, `OsStr` or `Path`
+    /// receiver: the lossy conversion of the receiver's bytes
+    /// as a `Cow<str>` (the same conversion
+    /// `StringFromUtf8Lossy` performs, over bytes read from the
+    /// receiver instead of a byte slice).
+    ToStringLossy,
+    /// `std::fs::DirEntry::path(&entry) -> PathBuf`: the full
+    /// path the modelled entry was snapshotted with.
+    DirEntryPath,
+    /// `std::fs::DirEntry::file_name(&entry) -> OsString`: the
+    /// entry's final component.
+    DirEntryFileName,
+    /// `std::fs::DirEntry::metadata(&entry) ->
+    /// io::Result<Metadata>`: the host metadata of the entry's
+    /// path, following symlinks as std's does.
+    DirEntryMetadata,
     /// A `std::sys::fs` leaf operation, performed on the host
     /// filesystem: the arguments and results are plain values
     /// (paths as byte strings, `io::Error` in std's own shape),
@@ -524,6 +638,14 @@ pub enum Builtin {
     /// raise a guest panic with the message core's branch order
     /// selects for the failing range.
     SliceIndexFail,
+    /// `core::slice::memchr::memchr(needle, haystack) ->
+    /// Option<usize>` (and `memrchr`, searching from the
+    /// back): a linear scan over the haystack's elements.
+    /// The native word-at-a-time implementation walks raw
+    /// pointers whose distances this value model cannot
+    /// express for value-held slices; the scan computes the
+    /// same result.
+    Memchr { reverse: bool },
     /// `core::slice::index::RangeError::report(self, len)`: core
     /// forwards to `slice_index_fail`; the same builtin shape.
     RangeErrorReport,
@@ -819,6 +941,14 @@ pub enum Builtin {
     VecNew,
     /// `Vec::push(&mut vec, value)`.
     VecPush,
+    /// `Vec::extend_from_slice(&mut self, &[T])`: appends a
+    /// clone of the slice's elements. The native body walks
+    /// raw buffer pointers through `ptr::copy_nonoverlapping`,
+    /// whose unsafe-precondition checks order pointers within
+    /// one allocation -- an order the synthetic-address model
+    /// does not define -- so the append is computed directly
+    /// on the element list, exactly as `Vec::push` is.
+    VecExtendFromSlice,
     /// `Vec::len(&vec)`.
     VecLen,
     /// `Vec::is_empty(&vec)`.
@@ -910,6 +1040,28 @@ pub enum Builtin {
     /// (element snapshot + next index), the shape `Iterator::next`
     /// consumes for `std::slice::Iter`.
     SliceIter,
+    /// `core::slice::<impl [T]>::windows(size) ->
+    /// Windows<'_, T>`: the sliding-window iterator's state
+    /// in this model is [slice, window size, next index];
+    /// `Iterator::next` for it is modelled in
+    /// `iterator_next_state`. (The native struct stores the
+    /// shrinking tail slice instead; no converted body reads
+    /// its fields -- `next` is the only operation the string
+    /// search machinery needs.)
+    SliceWindows,
+    /// `str::contains(&str) -> bool` (and `starts_with` /
+    /// `ends_with`): the pattern search. The native
+    /// `TwoWaySearcher` execution produces wrong answers in
+    /// this interpreter for multi-byte needles (it reports
+    /// no match even for a needle at position 0), so the
+    /// search is computed on the resolved strings directly,
+    /// with the host's own `str` semantics -- the same
+    /// semantics the guest's `str` operations denote.
+    StrContains,
+    /// See `StrContains`.
+    StrStartsWith,
+    /// See `StrContains`.
+    StrEndsWith,
     /// `std::iter::empty()`: an empty iterator.
     IterEmpty,
     /// `Index::index(&container, idx) -> &elem`.
@@ -1736,8 +1888,43 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::env::args" => Builtin::EnvArgs,
         "std::env::args_os" => Builtin::EnvArgsOs,
         "std::env::current_exe" => Builtin::EnvCurrentExe,
+        "std::env::var::inner" => Builtin::EnvVarInner,
+        "std::env::split_paths" => Builtin::EnvSplitPaths,
+        "std::env::join_paths" => Builtin::EnvJoinPaths,
+        "std::sys::env::unix::getenv" => Builtin::EnvGetenv,
+        "std::sys::env::unix::setenv" => Builtin::EnvSetenv,
+        "std::sys::env::unix::unsetenv" => Builtin::EnvUnsetenv,
+        "std::env::current_dir" => Builtin::EnvCurrentDir,
+        "std::sys::paths::unix::getcwd" => Builtin::EnvCurrentDir,
+        "std::env::temp_dir" => Builtin::EnvTempDir,
+        "std::sys::paths::unix::temp_dir" => Builtin::EnvTempDir,
+        "std::env::home_dir" => Builtin::EnvHomeDir,
+        "std::sys::paths::unix::home_dir" => Builtin::EnvHomeDir,
+        "std::sys::paths::unix::chdir" => Builtin::SysChdir,
+        "std::fs::read::inner" => Builtin::FsReadInner,
+        "std::fs::read_to_string::inner" => Builtin::FsReadToStringInner,
+        "std::string::String::from_utf8" => Builtin::StringFromUtf8,
+        "std::fs::write::inner" => Builtin::FsWriteInner,
+        "std::path::Path::is_absolute" => Builtin::PathIsAbsolute,
+        "std::path::Path::to_path_buf" => Builtin::PathToPathBuf,
+        "std::path::Path::_join" => Builtin::PathJoin,
+        "std::path::Path::parent" => Builtin::PathParent,
+        "std::path::Path::file_name" => Builtin::PathFileName,
+        "std::path::Path::file_stem" => Builtin::PathFileStem,
+        "std::path::Path::extension" => Builtin::PathExtension,
+        "std::path::Path::_starts_with" => Builtin::PathStartsWith,
+        "std::path::Path::_ends_with" => Builtin::PathEndsWith,
         "std::fs::OpenOptions::_open" => Builtin::FsOpen,
         "std::fs::DirBuilder::_create" => Builtin::FsDirCreate,
+        "std::string::String::from_utf8_lossy" => Builtin::StringFromUtf8Lossy,
+        "std::str::from_utf8" => Builtin::StrFromUtf8,
+        "core::str::from_utf8" => Builtin::StrFromUtf8,
+        "std::ffi::OsString::to_string_lossy" => Builtin::ToStringLossy,
+        "std::ffi::OsStr::to_string_lossy" => Builtin::ToStringLossy,
+        "std::path::Path::to_string_lossy" => Builtin::ToStringLossy,
+        "std::fs::DirEntry::path" => Builtin::DirEntryPath,
+        "std::fs::DirEntry::file_name" => Builtin::DirEntryFileName,
+        "std::fs::DirEntry::metadata" => Builtin::DirEntryMetadata,
         "std::sys::fs::metadata" => Builtin::FsSys(FsSysOp::Metadata),
         "std::sys::fs::symlink_metadata" => Builtin::FsSys(FsSysOp::SymlinkMetadata),
         "std::sys::fs::canonicalize" => Builtin::FsSys(FsSysOp::Canonicalize),
@@ -2079,6 +2266,8 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::result::unwrap_failed" | "core::result::unwrap_failed" => Builtin::ResultUnwrapFailed,
         "core::num::from_ascii_bytes_radix_panic" => Builtin::FromAsciiRadixPanic,
         "core::slice::index::slice_index_fail" => Builtin::SliceIndexFail,
+        "core::slice::memchr::memchr" => Builtin::Memchr { reverse: false },
+        "core::slice::memchr::memrchr" => Builtin::Memchr { reverse: true },
         "core::slice::index::RangeError::report" => Builtin::RangeErrorReport,
         // The panic-catching path: the `catch_unwind` intrinsic
         // itself (its std wrapper's body is collected and runs;
@@ -2196,6 +2385,11 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         _ if canonical.starts_with("std::vec::Vec") && canonical.ends_with(">::push") => {
             Builtin::VecPush
         }
+        _ if canonical.starts_with("std::vec::Vec")
+            && canonical.ends_with(">::extend_from_slice") =>
+        {
+            Builtin::VecExtendFromSlice
+        }
         _ if canonical.starts_with("std::vec::Vec") && canonical.ends_with(">::len") => {
             Builtin::VecLen
         }
@@ -2247,6 +2441,22 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
             && (canonical.ends_with(">::to_vec") || canonical.ends_with(">::to_vec_in")) =>
         {
             Builtin::SliceToVec
+        }
+        _ if canonical.starts_with("core::slice::<impl")
+            && canonical.ends_with(">::windows") =>
+        {
+            Builtin::SliceWindows
+        }
+        _ if canonical.starts_with("core::str::<impl") && canonical.ends_with(">::contains") => {
+            Builtin::StrContains
+        }
+        _ if canonical.starts_with("core::str::<impl")
+            && canonical.ends_with(">::starts_with") =>
+        {
+            Builtin::StrStartsWith
+        }
+        _ if canonical.starts_with("core::str::<impl") && canonical.ends_with(">::ends_with") => {
+            Builtin::StrEndsWith
         }
         "std::iter::empty" => Builtin::IterEmpty,
         "std::ops::Index::index" => Builtin::IndexIndex,
@@ -5097,10 +5307,26 @@ impl<'a> Interpreter<'a> {
                     .ok_or_else(|| unsupported(format!("call to {name} on a stale command handle")))?;
                 match process_spawn_error(&state) {
                     Some(error) => Ok(err_result(error)),
-                    None => Err(unsupported(format!(
-                        "spawning program `{}` is not runtime-supported (the process model does not start child processes)",
-                        String::from_utf8_lossy(&state.program)
-                    ))),
+                    None => {
+                        // `Command::status` on a configured tool
+                        // program runs the tool and reports its
+                        // exit status. A `Child` handle for a
+                        // spawned tool cannot be fabricated, so
+                        // `spawn` itself stays unsupported.
+                        if name == "std::process::Command::status" {
+                            if let Some(outcome) =
+                                tool_outcome(self.tool_interception(), &state)?
+                            {
+                                return Ok(ok_result(exit_status_value(
+                                    outcome.exit_code,
+                                )));
+                            }
+                        }
+                        Err(unsupported(format!(
+                            "spawning program `{}` is not runtime-supported (the process model does not start child processes)",
+                            String::from_utf8_lossy(&state.program)
+                        )))
+                    }
                 }
             }
             Builtin::ProcessCommandNewPublic => {
@@ -5178,10 +5404,15 @@ impl<'a> Interpreter<'a> {
                     .ok_or_else(|| unsupported(format!("call to {name} on a stale command handle")))?;
                 match process_spawn_error(&state) {
                     Some(error) => Ok(err_result(error)),
-                    None => Err(unsupported(format!(
-                        "running program `{}` to collect its output is not runtime-supported (the process model does not start child processes)",
-                        String::from_utf8_lossy(&state.program)
-                    ))),
+                    None => match tool_outcome(self.tool_interception(), &state)? {
+                        Some(outcome) => {
+                            Ok(ok_result(process_output_value(&outcome)))
+                        }
+                        None => Err(unsupported(format!(
+                            "running program `{}` to collect its output is not runtime-supported (the process model does not start child processes)",
+                            String::from_utf8_lossy(&state.program)
+                        ))),
+                    },
                 }
             }
             Builtin::CurrentExe => {
@@ -5507,6 +5738,7 @@ impl<'a> Interpreter<'a> {
                     || self_ty.starts_with("std::iter::SkipWhile<")
                     || self_ty.starts_with("std::iter::Once<")
                     || self_ty.starts_with("std::path::Components")
+                    || self_ty_is(self_ty, "std::fs::ReadDir")
                     || self_ty.starts_with("std::iter::Empty<")
                     || self_ty.starts_with("std::iter::Repeat<")
                     || self_ty_is(self_ty, "std::str::Chars")
@@ -5552,6 +5784,8 @@ impl<'a> Interpreter<'a> {
                     Ok(slice_iter_value(elems))
                 } else if self_ty_is(self_ty, "std::env::Args")
                     || self_ty_is(self_ty, "std::env::ArgsOs")
+                    || self_ty_is(self_ty, "std::env::SplitPaths")
+                    || self_ty.starts_with("std::slice::Windows<")
                 {
                     // The env argument iterators are their own
                     // `IntoIterator` (the state `env::args` built).
@@ -5728,14 +5962,456 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::FsDirCreate => {
                 arity(2)?;
-                let path = vals.into_iter().nth(1).expect("arity checked");
+                let mut vals = vals.into_iter();
+                let builder = vals.next().expect("arity checked");
+                let path = vals.next().expect("arity checked");
                 let bytes = self.path_bytes(frames, &path)?;
                 if bytes.contains(&0) {
                     return Ok(io_result_err(io_simple_error_value(ERROR_KIND_INVALID_INPUT)));
                 }
+                // The builder's `recursive` flag (its second
+                // field) selects between std's two operations:
+                // with it, `_create` builds the whole ancestor
+                // chain; without it, one directory. The chain is
+                // built on the host like the rest of the fs layer:
+                // the converted `create_dir_all` body is never
+                // reached (this builtin serves the `_create`
+                // call), and its `Ancestors` iteration does not
+                // carry its state faithfully in this model.
+                let recursive = match self.resolve_value(frames, &builder) {
+                    Ok(Value::Enum { fields, .. }) if fields.len() >= 2 => {
+                        matches!(fields[1], Value::Bool(true))
+                    }
+                    _ => false,
+                };
+                Ok(io_result_from_host(if recursive {
+                    std::fs::create_dir_all(host_path(&bytes))
+                        .map(|()| Value::Unit)
+                } else {
+                    std::fs::create_dir(host_path(&bytes)).map(|()| Value::Unit)
+                }))
+            }
+            Builtin::EnvJoinPaths => {
+                arity(1)?;
+                let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
+                let value = vals.into_iter().next().expect("arity checked");
+                // The argument is an `IntoIterator`; the forms
+                // whose conversion is not the identity are the
+                // by-value and by-reference containers, converted
+                // here to their iterator states (the same states
+                // the `IntoIterator::into_iter` builtin builds).
+                let (state, iter_ty): (Value, String) = if iterator_next_modelled(self_ty) {
+                    (value, self_ty.to_string())
+                } else if self_ty.starts_with("std::vec::Vec<")
+                    || self_ty.starts_with("alloc::vec::Vec<")
+                {
+                    match value {
+                        Value::Enum { fields, .. } => (
+                            owned_iter_state(fields),
+                            self_ty.replacen("Vec<", "IntoIter<", 1),
+                        ),
+                        other => {
+                            return Err(InterpError::type_mismatch(
+                                "join_paths argument",
+                                "vector value",
+                                other.kind_name(),
+                            ))
+                        }
+                    }
+                } else if self_ty.starts_with("&std::vec::Vec<")
+                    || self_ty.starts_with("&alloc::vec::Vec<")
+                    || self_ty.starts_with("&[")
+                {
+                    let (elems, _) = self.slice_elements(frames, &value)?;
+                    (slice_iter_value(elems), "std::slice::Iter<>".to_string())
+                } else {
+                    return Err(unsupported(format!(
+                        "join_paths over {self_ty} is not runtime-supported"
+                    )));
+                };
+                let mut state = state;
+                let mut joined: Vec<u8> = Vec::new();
+                let mut first = true;
+                loop {
+                    self.tick_step()?;
+                    let (next_state, item) =
+                        self.iterator_next_state(frames, &iter_ty, state)?;
+                    state = next_state;
+                    let Some(item) = option_payload(item)? else {
+                        break;
+                    };
+                    let bytes = self.os_str_bytes(frames, &item)?;
+                    if bytes.contains(&b':') {
+                        // `JoinPathsError` is a zero-sized
+                        // struct: the empty tuple shape.
+                        return Ok(err_result(Value::Tuple(Vec::new())));
+                    }
+                    if !first {
+                        joined.push(b':');
+                    }
+                    first = false;
+                    joined.extend_from_slice(&bytes);
+                }
+                Ok(ok_result(os_string_value(&joined)))
+            }
+            Builtin::EnvSplitPaths => {
+                arity(1)?;
+                let bytes = self.os_str_bytes(frames, &vals[0])?;
+                let parts: Vec<Value> = bytes
+                    .split(|b| *b == b':')
+                    .map(pathbuf_value)
+                    .collect();
+                Ok(owned_iter_state(parts))
+            }
+            Builtin::EnvVarInner => {
+                arity(1)?;
+                let key = self.os_str_bytes(frames, &vals[0])?;
+                use std::os::unix::ffi::OsStrExt as _;
+                let value = if key.contains(&0) {
+                    None
+                } else {
+                    std::env::var_os(std::ffi::OsStr::from_bytes(&key))
+                };
+                Ok(match value {
+                    None => err_result(Value::Enum {
+                        variant: 0,
+                        fields: Vec::new(),
+                    }),
+                    Some(v) => {
+                        let bytes = v.as_bytes();
+                        match std::str::from_utf8(bytes) {
+                            Ok(s) => ok_result(Value::Str(s.to_string())),
+                            Err(_) => err_result(Value::Enum {
+                                variant: 1,
+                                fields: vec![os_string_value(bytes)],
+                            }),
+                        }
+                    }
+                })
+            }
+            Builtin::EnvGetenv => {
+                arity(1)?;
+                let key = self.os_str_bytes(frames, &vals[0])?;
+                if key.contains(&0) {
+                    return Ok(none_value());
+                }
+                use std::os::unix::ffi::OsStrExt as _;
+                let value = std::env::var_os(std::ffi::OsStr::from_bytes(&key));
+                Ok(match value {
+                    Some(v) => some_value(os_string_value(v.as_bytes())),
+                    None => none_value(),
+                })
+            }
+            Builtin::EnvSetenv => {
+                arity(2)?;
+                let key = self.os_str_bytes(frames, &vals[0])?;
+                let value = self.os_str_bytes(frames, &vals[1])?;
+                if key.is_empty()
+                    || key.contains(&b'=')
+                    || key.contains(&0)
+                    || value.contains(&0)
+                {
+                    return Ok(io_result_err(io_simple_error_value(20)));
+                }
+                use std::os::unix::ffi::OsStrExt as _;
+                std::env::set_var(
+                    std::ffi::OsStr::from_bytes(&key),
+                    std::ffi::OsStr::from_bytes(&value),
+                );
+                Ok(io_result_ok(Value::Unit))
+            }
+            Builtin::EnvUnsetenv => {
+                arity(1)?;
+                let key = self.os_str_bytes(frames, &vals[0])?;
+                if key.is_empty() || key.contains(&b'=') || key.contains(&0) {
+                    return Ok(io_result_err(io_simple_error_value(20)));
+                }
+                use std::os::unix::ffi::OsStrExt as _;
+                std::env::remove_var(std::ffi::OsStr::from_bytes(&key));
+                Ok(io_result_ok(Value::Unit))
+            }
+            Builtin::EnvCurrentDir => {
+                arity(0)?;
                 Ok(io_result_from_host(
-                    std::fs::create_dir(host_path(&bytes)).map(|()| Value::Unit),
+                    std::env::current_dir()
+                        .map(|dir| path_buf_value(&dir)),
                 ))
+            }
+            Builtin::EnvTempDir => {
+                arity(0)?;
+                Ok(path_buf_value(&std::env::temp_dir()))
+            }
+            Builtin::EnvHomeDir => {
+                arity(0)?;
+                Ok(match std::env::home_dir() {
+                    Some(dir) => {
+                        some_value(path_buf_value(&dir))
+                    }
+                    None => none_value(),
+                })
+            }
+            Builtin::SysChdir => {
+                arity(1)?;
+                let bytes = self.path_bytes(frames, &vals[0])?;
+                if bytes.contains(&0) {
+                    return Ok(io_result_err(io_simple_error_value(20)));
+                }
+                Ok(io_result_from_host(
+                    std::env::set_current_dir(host_path(&bytes))
+                        .map(|()| Value::Unit),
+                ))
+            }
+            Builtin::StringFromUtf8 => {
+                arity(1)?;
+                let resolved = self.resolve_value(frames, &vals[0])?;
+                let bytes = match &resolved {
+                    Value::Enum { fields, .. } => fields
+                        .iter()
+                        .map(|f| match f {
+                            Value::Uint(v) => Ok(*v as u8),
+                            Value::Int(v) => Ok(*v as u8),
+                            other => Err(InterpError::type_mismatch(
+                                "String::from_utf8 argument",
+                                "byte elements",
+                                other.kind_name(),
+                            )),
+                        })
+                        .collect::<InterpResult<Vec<u8>>>()?,
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            "String::from_utf8 argument",
+                            "byte vector value",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                Ok(match String::from_utf8(bytes.clone()) {
+                    Ok(text) => ok_result(Value::Str(text)),
+                    Err(e) => {
+                        let ue = e.utf8_error();
+                        let error_len = match ue.error_len() {
+                            Some(n) => Value::Enum {
+                                variant: 1,
+                                fields: vec![Value::Uint(n as u128)],
+                            },
+                            None => Value::Enum {
+                                variant: 0,
+                                fields: Vec::new(),
+                            },
+                        };
+                        let utf8_error = Value::Tuple(vec![
+                            Value::Uint(ue.valid_up_to() as u128),
+                            error_len,
+                        ]);
+                        err_result(Value::Enum {
+                            variant: 0,
+                            fields: vec![byte_vec_value(&bytes), utf8_error],
+                        })
+                    }
+                })
+            }
+            Builtin::FsReadToStringInner => {
+                arity(1)?;
+                let bytes = self.path_bytes(frames, &vals[0])?;
+                if bytes.contains(&0) {
+                    return Ok(io_result_err(io_simple_error_value(20)));
+                }
+                Ok(match std::fs::read(host_path(&bytes)) {
+                    Ok(data) => match String::from_utf8(data) {
+                        Ok(text) => io_result_ok(Value::Str(text)),
+                        Err(_) => io_result_err(io_simple_error_value(std::io::ErrorKind::InvalidData as u32)),
+                    },
+                    Err(e) => io_result_from_host(Err::<Value, _>(e)),
+                })
+            }
+            Builtin::FsReadInner => {
+                arity(1)?;
+                let bytes = self.path_bytes(frames, &vals[0])?;
+                if bytes.contains(&0) {
+                    return Ok(io_result_err(io_simple_error_value(20)));
+                }
+                Ok(io_result_from_host(
+                    std::fs::read(host_path(&bytes)).map(|data| byte_vec_value(&data)),
+                ))
+            }
+            Builtin::FsWriteInner => {
+                arity(2)?;
+                let bytes = self.path_bytes(frames, &vals[0])?;
+                if bytes.contains(&0) {
+                    return Ok(io_result_err(io_simple_error_value(20)));
+                }
+                let contents = self.arg_bytes(frames, &vals[1])?;
+                Ok(io_result_from_host(
+                    std::fs::write(host_path(&bytes), &contents)
+                        .map(|()| Value::Unit),
+                ))
+            }
+            Builtin::PathToPathBuf => {
+                arity(1)?;
+                let bytes = self.path_bytes(frames, &vals[0])?;
+                Ok(pathbuf_value(&bytes))
+            }
+            Builtin::PathIsAbsolute => {
+                arity(1)?;
+                let bytes = self.path_bytes(frames, &vals[0])?;
+                Ok(Value::Bool(bytes.first() == Some(&b'/')))
+            }
+            Builtin::PathJoin => {
+                arity(2)?;
+                let base = self.path_bytes(frames, &vals[0])?;
+                let path = self.path_bytes(frames, &vals[1])?;
+                Ok(pathbuf_value(&path_push_bytes(&base, &path)))
+            }
+            Builtin::PathParent => {
+                arity(1)?;
+                let bytes = self.path_bytes(frames, &vals[0])?;
+                Ok(match path_parent_len(&bytes) {
+                    Some(end) => some_value(sub_path_value(&bytes[..end])),
+                    None => none_value(),
+                })
+            }
+            Builtin::PathFileName => {
+                arity(1)?;
+                let bytes = self.path_bytes(frames, &vals[0])?;
+                Ok(match path_file_name_range(&bytes) {
+                    Some((start, end)) => {
+                        some_value(sub_path_value(&bytes[start..end]))
+                    }
+                    None => none_value(),
+                })
+            }
+            Builtin::PathFileStem => {
+                arity(1)?;
+                let bytes = self.path_bytes(frames, &vals[0])?;
+                Ok(match path_file_name_range(&bytes) {
+                    Some((start, end)) => {
+                        let (before, after) =
+                            rsplit_file_at_dot(&bytes[start..end]);
+                        let stem = before
+                            .or(after)
+                            .expect("a file name always has a stem side");
+                        some_value(sub_path_value(stem))
+                    }
+                    None => none_value(),
+                })
+            }
+            Builtin::PathExtension => {
+                arity(1)?;
+                let bytes = self.path_bytes(frames, &vals[0])?;
+                Ok(match path_file_name_range(&bytes) {
+                    Some((start, end)) => {
+                        let (before, after) =
+                            rsplit_file_at_dot(&bytes[start..end]);
+                        match before.and(after) {
+                            Some(ext) => some_value(sub_path_value(ext)),
+                            None => none_value(),
+                        }
+                    }
+                    None => none_value(),
+                })
+            }
+            Builtin::StringFromUtf8Lossy => {
+                arity(1)?;
+                let bytes = self.arg_bytes(frames, &vals[0])?;
+                Ok(cow_str_value(&bytes))
+            }
+            Builtin::StrFromUtf8 => {
+                arity(1)?;
+                let bytes = self.arg_bytes(frames, &vals[0])?;
+                Ok(match std::str::from_utf8(&bytes) {
+                    Ok(s) => ok_result(Value::Str(s.to_string())),
+                    Err(e) => err_result(Value::Enum {
+                        variant: 0,
+                        fields: vec![
+                            Value::Uint(u128::from(e.valid_up_to() as u64)),
+                            match e.error_len() {
+                                Some(n) => Value::Enum {
+                                    variant: 1,
+                                    fields: vec![Value::Uint(n as u128)],
+                                },
+                                None => Value::Enum {
+                                    variant: 0,
+                                    fields: Vec::new(),
+                                },
+                            },
+                        ],
+                    }),
+                })
+            }
+            Builtin::ToStringLossy => {
+                arity(1)?;
+                let bytes = if name == "std::ffi::OsString::to_string_lossy" {
+                    let pointee = self.resolve_value(frames, &vals[0])?;
+                    os_string_bytes(&pointee).ok_or_else(|| {
+                        InterpError::type_mismatch(
+                            format!("builtin {name}"),
+                            "an OS string value",
+                            pointee.kind_name(),
+                        )
+                    })?
+                } else {
+                    self.path_bytes(frames, &vals[0])?
+                };
+                Ok(cow_str_value(&bytes))
+            }
+            Builtin::DirEntryPath | Builtin::DirEntryFileName => {
+                arity(1)?;
+                let entry = self.resolve_value(frames, &vals[0])?;
+                let (path, name) = dir_entry_parts(&entry).ok_or_else(|| {
+                    InterpError::type_mismatch(
+                        format!("builtin {name}"),
+                        "a directory entry value",
+                        entry.kind_name(),
+                    )
+                })?;
+                Ok(if matches!(kind, Builtin::DirEntryPath) {
+                    path
+                } else {
+                    name
+                })
+            }
+            Builtin::DirEntryMetadata => {
+                arity(1)?;
+                let entry = self.resolve_value(frames, &vals[0])?;
+                let (path, _) = dir_entry_parts(&entry).ok_or_else(|| {
+                    InterpError::type_mismatch(
+                        format!("builtin {name}"),
+                        "a directory entry value",
+                        entry.kind_name(),
+                    )
+                })?;
+                let bytes = path_buf_bytes(&path).ok_or_else(|| {
+                    InterpError::type_mismatch(
+                        format!("builtin {name}"),
+                        "a directory entry holding a path buffer",
+                        path.kind_name(),
+                    )
+                })?;
+                if bytes.contains(&0) {
+                    return Ok(io_result_err(io_simple_error_value(20)));
+                }
+                Ok(io_result_from_host(
+                    std::fs::metadata(host_path(&bytes)).map(|md| {
+                        // The public `Metadata` wraps the sys
+                        // value `metadata_value` builds.
+                        Value::Enum {
+                            variant: 0,
+                            fields: vec![metadata_value(&md)],
+                        }
+                    }),
+                ))
+            }
+            Builtin::PathStartsWith => {
+                arity(2)?;
+                let path = self.path_bytes(frames, &vals[0])?;
+                let child = self.path_bytes(frames, &vals[1])?;
+                Ok(Value::Bool(path_starts_with(&path, &child)))
+            }
+            Builtin::PathEndsWith => {
+                arity(2)?;
+                let path = self.path_bytes(frames, &vals[0])?;
+                let child = self.path_bytes(frames, &vals[1])?;
+                Ok(Value::Bool(path_ends_with(&path, &child)))
             }
             Builtin::FsSys(op) => self.exec_fs_sys(frames, op, vals),
             Builtin::FromFrom | Builtin::IntoInto => {
@@ -5791,6 +6467,75 @@ impl<'a> Interpreter<'a> {
                             fields: vec![Value::Uint(byte)],
                         }],
                     })
+                } else if target == "run_make_support::CompletedProcess"
+                    && source == "std::process::Output"
+                {
+                    // run-make-support's `CompletedProcess` is a
+                    // one-field wrapper around the process
+                    // `Output`; the conversion moves it in.
+                    Ok(Value::Enum {
+                        variant: 0,
+                        fields: vec![value],
+                    })
+                } else if target == "std::path::PathBuf"
+                    && (source == "&str" || source == "str")
+                {
+                    // `PathBuf: From<&str>` copies the text into
+                    // the path's buffer.
+                    match self.resolve_value(frames, &value)? {
+                        Value::Str(s) => Ok(pathbuf_value(s.as_bytes())),
+                        other => Err(InterpError::type_mismatch(
+                            "From::from to PathBuf",
+                            "string value",
+                            other.kind_name(),
+                        )),
+                    }
+                } else if target == "std::ffi::OsString"
+                    && (source == "&str" || source == "str")
+                {
+                    // `OsString: From<&str>` likewise.
+                    match self.resolve_value(frames, &value)? {
+                        Value::Str(s) => Ok(os_string_value(s.as_bytes())),
+                        other => Err(InterpError::type_mismatch(
+                            "From::from to OsString",
+                            "string value",
+                            other.kind_name(),
+                        )),
+                    }
+                } else if target == "std::path::PathBuf" && source == "std::string::String" {
+                    // `PathBuf: From<String>` moves the string's
+                    // bytes into the path.
+                    match &value {
+                        Value::Str(s) => Ok(pathbuf_value(s.as_bytes())),
+                        other => Err(InterpError::type_mismatch(
+                            "From::from to PathBuf",
+                            "string value",
+                            other.kind_name(),
+                        )),
+                    }
+                } else if target == "std::ffi::OsString" && source == "std::string::String" {
+                    // `OsString: From<String>` likewise.
+                    match &value {
+                        Value::Str(s) => Ok(os_string_value(s.as_bytes())),
+                        other => Err(InterpError::type_mismatch(
+                            "From::from to OsString",
+                            "string value",
+                            other.kind_name(),
+                        )),
+                    }
+                } else if target == "std::ffi::OsString"
+                    && (source == "&std::ffi::OsStr" || source == "std::ffi::OsStr")
+                {
+                    // `OsString: From<&OsStr>` clones the byte
+                    // string into an owned buffer.
+                    let bytes = self.os_str_bytes(frames, &value)?;
+                    Ok(os_string_value(&bytes))
+                } else if target == "std::path::PathBuf"
+                    && (source == "&std::path::Path" || source == "std::path::Path")
+                {
+                    // `PathBuf: From<&Path>` clones the path.
+                    let bytes = self.path_bytes(frames, &value)?;
+                    Ok(pathbuf_value(&bytes))
                 } else if target.starts_with("std::vec::Vec<") {
                     // `Vec::from([T; N])`: the array's elements become
                     // the vector's.
@@ -5912,6 +6657,32 @@ impl<'a> Interpreter<'a> {
                     // `String::deref -> &str`: the string data itself.
                     let s = self.resolve_string(frames, &vals[0])?;
                     Ok(Value::Str(s))
+                } else if self_ty == "std::path::PathBuf" {
+                    // `PathBuf::deref -> &Path`: the path the
+                    // buffer holds, in the shape a path over the
+                    // same bytes denotes (see `sub_path_value`).
+                    let pointee = self.resolve_value(frames, &vals[0])?;
+                    let bytes = path_buf_bytes(&pointee).ok_or_else(|| {
+                        InterpError::type_mismatch(
+                            "Deref::deref for PathBuf",
+                            "a path buffer value",
+                            pointee.kind_name(),
+                        )
+                    })?;
+                    Ok(sub_path_value(&bytes))
+                } else if self_ty == "std::ffi::OsString" {
+                    // `OsString::deref -> &OsStr`: the string's
+                    // bytes as the slice value, the same shape
+                    // `PathBuf`'s deref produces.
+                    let pointee = self.resolve_value(frames, &vals[0])?;
+                    let bytes = os_string_bytes(&pointee).ok_or_else(|| {
+                        InterpError::type_mismatch(
+                            "Deref::deref for OsString",
+                            "an OS string value",
+                            pointee.kind_name(),
+                        )
+                    })?;
+                    Ok(sub_path_value(&bytes))
                 } else if self_ty.starts_with("std::borrow::Cow<") {
                     // `Cow<B>::deref -> &B::Target`: the borrowed
                     // variant's field already IS the target value
@@ -6665,6 +7436,42 @@ impl<'a> Interpreter<'a> {
                     "from_ascii_bytes_radix: radix must lie in the range `[2, 36]` - found {radix}"
                 )))
             }
+            Builtin::Memchr { reverse } => {
+                arity(2)?;
+                let needle = match self.resolve_value(frames, &vals[0])? {
+                    Value::Uint(v) => v as u8,
+                    Value::Int(v) => v as u8,
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            "memchr needle",
+                            "byte value",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                let (elems, _) = self.slice_elements(frames, &vals[1])?;
+                let bytes: Vec<u8> = elems
+                    .iter()
+                    .map(|e| match e {
+                        Value::Uint(v) => Ok(*v as u8),
+                        Value::Int(v) => Ok(*v as u8),
+                        other => Err(InterpError::type_mismatch(
+                            "memchr haystack",
+                            "byte elements",
+                            other.kind_name(),
+                        )),
+                    })
+                    .collect::<InterpResult<Vec<u8>>>()?;
+                let found = if reverse {
+                    bytes.iter().rposition(|b| *b == needle)
+                } else {
+                    bytes.iter().position(|b| *b == needle)
+                };
+                Ok(match found {
+                    Some(i) => some_value(Value::Uint(i as u128)),
+                    None => none_value(),
+                })
+            }
             Builtin::SliceIndexFail => {
                 arity(3)?;
                 let start = as_u128(&vals[0], name)? as usize;
@@ -7265,6 +8072,22 @@ impl<'a> Interpreter<'a> {
                     fields: Vec::new(),
                 })
             }
+            Builtin::VecExtendFromSlice => {
+                arity(2)?;
+                let target = self.deref_value(frames, &vals[0])?;
+                let (elems, _) = self.slice_elements(frames, &vals[1])?;
+                self.modify_resolved(frames, &target, |slot| match slot {
+                    Value::Enum { fields, .. } => {
+                        fields.extend(elems.iter().cloned());
+                        Ok(Value::Unit)
+                    }
+                    other => Err(InterpError::type_mismatch(
+                        "Vec::extend_from_slice",
+                        "vector value",
+                        other.kind_name(),
+                    )),
+                })
+            }
             Builtin::VecPush => {
                 arity(2)?;
                 let target = self.deref_value(frames, &vals[0])?;
@@ -7498,6 +8321,54 @@ impl<'a> Interpreter<'a> {
                 arity(1)?;
                 let (elems, _) = self.slice_elements(frames, &vals[0])?;
                 Ok(slice_iter_value(elems))
+            }
+            Builtin::StrContains | Builtin::StrStartsWith | Builtin::StrEndsWith => {
+                arity(2)?;
+                let text_of = |v: &Value| -> InterpResult<String> {
+                    match self.resolve_value(frames, v)? {
+                        Value::Str(s) => Ok(s),
+                        Value::Bytes(b) => Ok(String::from_utf8_lossy(&b).into_owned()),
+                        other => Err(InterpError::type_mismatch(
+                            "str pattern argument",
+                            "string value",
+                            other.kind_name(),
+                        )),
+                    }
+                };
+                let haystack = text_of(&vals[0])?;
+                let needle = text_of(&vals[1])?;
+                Ok(Value::Bool(match kind {
+                    Builtin::StrContains => haystack.contains(&needle),
+                    Builtin::StrStartsWith => haystack.starts_with(&needle),
+                    _ => haystack.ends_with(&needle),
+                }))
+            }
+            Builtin::SliceWindows => {
+                arity(2)?;
+                let size = match self.resolve_value(frames, &vals[1])? {
+                    Value::Uint(v) => v,
+                    Value::Enum { fields, .. } if fields.len() == 1 => match fields[0] {
+                        Value::Uint(v) => v,
+                        ref other => {
+                            return Err(InterpError::type_mismatch(
+                                "windows size",
+                                "non-zero integer",
+                                other.kind_name(),
+                            ))
+                        }
+                    },
+                    ref other => {
+                        return Err(InterpError::type_mismatch(
+                            "windows size",
+                            "non-zero integer",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields: vec![vals[0].clone(), Value::Uint(size), Value::Uint(0)],
+                })
             }
             Builtin::IterEmpty => {
                 arity(0)?;
@@ -9351,6 +10222,102 @@ impl<'a> Interpreter<'a> {
     /// shape is read back as the position's element index.
     /// `None` when the two targets are unrelated (their distance
     /// is then meaningless in the guest too).
+/// A structural fingerprint of a value (an FNV-1a walk over
+/// its shape and scalar leaves), used only as an identity key
+/// for pointer-distance purposes: two pointers whose base
+/// values share a fingerprint are treated as pointing into the
+/// same allocation.
+fn value_fingerprint(value: &Value) -> u64 {
+    fn mix(h: &mut u64, x: u64) {
+        *h ^= x;
+        *h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    fn walk(h: &mut u64, value: &Value) {
+        match value {
+            Value::Unit => mix(h, 1),
+            Value::Bool(b) => {
+                mix(h, 2);
+                mix(h, *b as u64);
+            }
+            Value::Int(v) => {
+                mix(h, 3);
+                mix(h, *v as u64);
+            }
+            Value::Uint(v) => {
+                mix(h, 4);
+                mix(h, *v as u64);
+            }
+            Value::Float(v) => {
+                mix(h, 5);
+                mix(h, v.to_bits());
+            }
+            Value::Str(s) => {
+                mix(h, 6);
+                mix(h, s.len() as u64);
+                for b in s.as_bytes() {
+                    mix(h, *b as u64);
+                }
+            }
+            Value::Bytes(b) => {
+                mix(h, 7);
+                mix(h, b.len() as u64);
+                for byte in b {
+                    mix(h, *byte as u64);
+                }
+            }
+            Value::Tuple(items) => {
+                mix(h, 8);
+                mix(h, items.len() as u64);
+                for item in items {
+                    walk(h, item);
+                }
+            }
+            Value::Enum { variant, fields } => {
+                mix(h, 9);
+                mix(h, *variant as u64);
+                mix(h, fields.len() as u64);
+                for field in fields {
+                    walk(h, field);
+                }
+            }
+            Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. } => {
+                mix(h, 11);
+                if let Some(addr) = crate::interp::synthetic_address(value) {
+                    mix(h, addr as u64);
+                    mix(h, (addr >> 64) as u64);
+                }
+            }
+            Value::FnPtr(name) => {
+                mix(h, 12);
+                for b in name.as_bytes() {
+                    mix(h, *b as u64);
+                }
+            }
+            Value::Closure { def, .. } => {
+                mix(h, 13);
+                for b in def.as_bytes() {
+                    mix(h, *b as u64);
+                }
+            }
+            other => {
+                // The remaining shapes (uninitialized slots,
+                // formatting arguments, SIMD vectors, ...) do
+                // not underlie slice pointers in practice; a
+                // Debug-shape hash keeps the key deterministic.
+                mix(h, 14);
+                let text = format!("{other:?}");
+                mix(h, text.len() as u64);
+                for b in text.as_bytes() {
+                    mix(h, *b as u64);
+                }
+            }
+        }
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    walk(&mut h, value);
+    h
+}
+
     fn pointer_distance(
         &self,
         x: &Resolved,
@@ -9370,7 +10337,20 @@ impl<'a> Interpreter<'a> {
                 } => (format!("place:{frame_pos}:{local}"), projection),
                 Resolved::Static { name, projection } => (format!("static:{name}"), projection),
                 Resolved::Alloc { id, projection } => (format!("alloc:{id}"), projection),
-                Resolved::Value(..) => return None,
+                // Two pointers into the same value tree (a
+                // cloned copy of one base value -- the shape a
+                // slice iterator's start/end pair takes, both
+                // derived from one fat reference) are the same
+                // allocation for distance purposes: the base
+                // value's structural fingerprint is the identity.
+                // Pointers into different allocations that happen
+                // to hold equal values would be conflated, but a
+                // cross-allocation `offset_from` is undefined
+                // behaviour in the guest, so no defined program
+                // can observe the difference.
+                Resolved::Value(base, projection) => {
+                    (format!("value:{:016x}", Self::value_fingerprint(base)), projection)
+                }
             };
             let key = |steps: &[RefProj]| {
                 steps
@@ -10964,6 +11944,136 @@ impl<'a> Interpreter<'a> {
             // host's own parsing from it.
             return self.components_step(state, false);
         }
+        if self_ty.starts_with("std::slice::Windows<") {
+            // Two state shapes reach here: the native struct
+            // {tail slice, window size} (built by a struct
+            // literal in core's search machinery), stepped by
+            // shrinking the tail exactly as the native `next`
+            // does, and the `windows` builtin's [slice, size,
+            // next index] snapshot.
+            let fields = iterator_fields(&state, self_ty)?;
+            let tail_slice = |elems: &[Value]| {
+                Value::FatRef {
+                    base: Box::new(Value::Ref(RefTarget::Value(
+                        Box::new(Value::Tuple(elems.to_vec())),
+                        vec![RefProj::Index(0)],
+                    ))),
+                    len: elems.len() as u128,
+                }
+            };
+            let size_of = |f: &Value| -> InterpResult<usize> {
+                // `NonZero<usize>` arrives as nested one-field
+                // wrappers around the integer.
+                let mut cur = f;
+                loop {
+                    match cur {
+                        Value::Uint(v) => return Ok(*v as usize),
+                        Value::Enum { fields, .. } if fields.len() == 1 => {
+                            cur = &fields[0];
+                        }
+                        Value::Tuple(fields) if fields.len() == 1 => {
+                            cur = &fields[0];
+                        }
+                        other => {
+                            return Err(InterpError::type_mismatch(
+                                "Windows size",
+                                "non-zero integer",
+                                other.kind_name(),
+                            ))
+                        }
+                    }
+                }
+            };
+            if fields.len() == 2 {
+                let (elems, _) = self.slice_elements(frames, &fields[0])?;
+                let size = size_of(&fields[1])?;
+                if size == 0 || elems.len() < size {
+                    return Ok((state, none_value()));
+                }
+                let item = tail_slice(&elems[..size]);
+                let new_state = Value::Enum {
+                    variant: 0,
+                    fields: vec![tail_slice(&elems[1..]), fields[1].clone()],
+                };
+                return Ok((new_state, some_value(item)));
+            }
+            if fields.len() != 3 {
+                return Err(InterpError::type_mismatch(
+                    "Windows state",
+                    "[slice, window size] or [slice, window size, next index]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let (elems, _) = self.slice_elements(frames, &fields[0])?;
+            let size = size_of(&fields[1])?;
+            let index = match fields[2] {
+                Value::Uint(v) => v as usize,
+                ref other => {
+                    return Err(InterpError::type_mismatch(
+                        "Windows index",
+                        "integer",
+                        other.kind_name(),
+                    ))
+                }
+            };
+            if size == 0 || index + size > elems.len() {
+                return Ok((state, none_value()));
+            }
+            let item = tail_slice(&elems[index..index + size]);
+            let new_state = Value::Enum {
+                variant: 0,
+                fields: vec![
+                    fields[0].clone(),
+                    fields[1].clone(),
+                    Value::Uint((index + 1) as u128),
+                ],
+            };
+            return Ok((new_state, some_value(item)));
+        }
+        if self_ty_is(self_ty, "std::env::SplitPaths") {
+            // The state is the owned-iterator state the
+            // `split_paths` builtin snapshots ([parts, next
+            // index]); the items are the parts' `PathBuf`
+            // values themselves.
+            let (new_state, item) = step_owned_iter(&state, self_ty)?;
+            return Ok((
+                new_state,
+                match item {
+                    Some(part) => some_value(part),
+                    None => none_value(),
+                },
+            ));
+        }
+        if self_ty_is(self_ty, "std::fs::ReadDir") {
+            // The state is the one-field wrapper around the
+            // owned-iterator state ([entries, next index]) the
+            // fs sys layer's snapshot builds; the items are the
+            // entries' `io::Result<DirEntry>` values themselves.
+            let inner = match &state {
+                Value::Enum { fields, .. } if fields.len() == 1 => {
+                    fields[0].clone()
+                }
+                other => {
+                    return Err(InterpError::type_mismatch(
+                        "ReadDir state",
+                        "a wrapper around [entries, next index]",
+                        other.kind_name(),
+                    ))
+                }
+            };
+            let (new_inner, item) = step_owned_iter(&inner, self_ty)?;
+            let rebuilt = Value::Enum {
+                variant: 0,
+                fields: vec![new_inner],
+            };
+            return Ok((
+                rebuilt,
+                match item {
+                    Some(result) => some_value(result),
+                    None => none_value(),
+                },
+            ));
+        }
         let (new_state, result) = self.next_on_state(frames, self_ty, &state)?;
         Ok((new_state, result))
     }
@@ -12191,6 +13301,25 @@ impl<'a> Interpreter<'a> {
         eval_unary(op, value, Some(&ty))
     }
 
+    /// The bytes of a `&[u8]` argument.
+    fn arg_bytes(&self, frames: &[Frame], value: &Value) -> InterpResult<Vec<u8>> {
+        let (items, _) = self.slice_elements(frames, value)?;
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            match item {
+                Value::Uint(b) => out.push(b as u8),
+                other => {
+                    return Err(InterpError::type_mismatch(
+                        "byte slice argument",
+                        "byte elements",
+                        other.kind_name(),
+                    ))
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// The bytes of a path argument: a path value is a fat
     /// pointer over the path's bytes (or a reference to one).
     /// The byte string a `PartialEq` operand for a path type
@@ -12305,9 +13434,26 @@ impl<'a> Interpreter<'a> {
                 io_result_from_host(std::fs::hard_link(&first, &to).map(|()| Value::Unit))
             }
             FsSysOp::ReadDir => {
-                return Err(unsupported(
-                    "read_dir: the ReadDir value model is not built yet".to_string(),
-                ))
+                // The entries are snapshotted eagerly: the
+                // modelled `ReadDir` value is the entry list
+                // plus the read index (the owned-iterator
+                // state), each entry already its
+                // `io::Result<DirEntry>` value, so a per-entry
+                // host error surfaces at its own position
+                // exactly as the native iterator yields it.
+                match std::fs::read_dir(&first) {
+                    Ok(entries) => {
+                        let mut items = Vec::new();
+                        for entry in entries {
+                            items.push(match entry {
+                                Ok(ent) => io_result_ok(dir_entry_value(&ent)),
+                                Err(e) => io_result_err(host_io_error(&e)),
+                            });
+                        }
+                        io_result_ok(read_dir_value(items))
+                    }
+                    Err(e) => io_result_err(host_io_error(&e)),
+                }
             }
             FsSysOp::ReadLink => io_result_from_host(
                 std::fs::read_link(&first).map(|p| pathbuf_value(&host_path_bytes(&p))),
@@ -14151,6 +15297,9 @@ pub fn iterator_next_modelled(self_ty: &str) -> bool {
         || self_ty.starts_with("alloc::vec::IntoIter<")
         || self_ty_is(self_ty, "std::env::Args")
         || self_ty_is(self_ty, "std::env::ArgsOs")
+        || self_ty_is(self_ty, "std::fs::ReadDir")
+        || self_ty_is(self_ty, "std::env::SplitPaths")
+        || self_ty.starts_with("std::slice::Windows<")
         || self_ty.starts_with("std::iter::Empty<")
         || self_ty.starts_with("std::sync::mpsc::Iter<")
         || self_ty.starts_with("std::sync::mpsc::IntoIter<")
@@ -15482,6 +16631,378 @@ fn io_result_from_host(result: Result<Value, std::io::Error>) -> Value {
         Ok(value) => io_result_ok(value),
         Err(error) => io_result_err(host_io_error(&error)),
     }
+}
+
+/// Run the configured tool runner for this command, when the
+/// command's program is one of the intercepted tool programs;
+/// `None` when no interception applies, in which case the
+/// caller keeps the process model's standing answer. A runner
+/// error becomes the run's unsupported error: the tool ran the
+/// invocation and reported it cannot be carried out.
+fn tool_outcome(
+    interception: Option<&crate::interp::ToolInterception>,
+    state: &crate::interp::CommandState,
+) -> InterpResult<Option<crate::interp::ToolRunOutcome>> {
+    let Some(interception) = interception else {
+        return Ok(None);
+    };
+    if !interception.programs.iter().any(|p| p == &state.program) {
+        return Ok(None);
+    }
+    let request = crate::interp::ToolRunRequest {
+        program: state.program.clone(),
+        args: state.args.clone(),
+        argv0: state.argv0.clone(),
+        envs: state.envs.clone(),
+        env_clear: state.env_clear,
+        cwd: state.cwd.clone(),
+    };
+    match (interception.runner.0)(&request) {
+        Ok(outcome) => Ok(Some(outcome)),
+        Err(reason) => Err(unsupported(reason)),
+    }
+}
+
+/// A `Cow<str>` value over the given bytes: borrowed when
+/// they are valid UTF-8, owned with replacement characters
+/// otherwise (the host `from_utf8_lossy` semantics); in this
+/// model both variants carry the string data itself.
+fn cow_str_value(bytes: &[u8]) -> Value {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Value::Enum {
+            variant: 0,
+            fields: vec![Value::Str(text.to_string())],
+        },
+        Err(_) => Value::Enum {
+            variant: 1,
+            fields: vec![Value::Str(
+                String::from_utf8_lossy(bytes).into_owned(),
+            )],
+        },
+    }
+}
+
+/// A `Vec<u8>` value: the element-list aggregate the
+/// interpreter uses for vectors.
+fn byte_vec_value(bytes: &[u8]) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: bytes.iter().map(|b| Value::Uint(u128::from(*b))).collect(),
+    }
+}
+
+/// An `OsString` value in std's shape: `OsString { inner: Buf {
+/// inner: Vec<u8> } }`, the same nesting `pathbuf_value` builds
+/// for the `OsString` inside a `PathBuf`.
+fn os_string_value(bytes: &[u8]) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![Value::Enum {
+            variant: 0,
+            fields: vec![byte_vec_value(bytes)],
+        }],
+    }
+}
+
+/// A `std::process::ExitStatus` value: the platform wait
+/// status in std's own layout (the outer struct wraps the sys
+/// status struct, which wraps the raw `c_int`). An exited
+/// process's raw status carries its code in the high byte; a
+/// process ended by a signal carries the signal number in the
+/// low byte, as `waitpid` reports it. The guest's own
+/// `ExitStatus::code` body decodes it from there.
+fn exit_status_value(exit_code: i32) -> Value {
+    let raw: i32 = if exit_code >= 0 {
+        exit_code << 8
+    } else {
+        -exit_code
+    };
+    Value::Enum {
+        variant: 0,
+        fields: vec![Value::Enum {
+            variant: 0,
+            fields: vec![Value::Int(i128::from(raw))],
+        }],
+    }
+}
+
+/// A `std::process::Output` value: the exit status and the two
+/// captured byte vectors, in declaration order.
+fn process_output_value(outcome: &crate::interp::ToolRunOutcome) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![
+            exit_status_value(outcome.exit_code),
+            byte_vec_value(&outcome.stdout),
+            byte_vec_value(&outcome.stderr),
+        ],
+    }
+}
+
+/// A `&Path` / `&OsStr` value over the given bytes. When the
+/// bytes are UTF-8 the value is the string data itself, which
+/// is what a path over string data denotes everywhere else in
+/// this model (a `Path::new` over a `&str` keeps the string
+/// value); non-UTF-8 bytes become a fat pointer to a fresh
+/// aggregate of the byte elements, the shape the interpreter's
+/// own slice operations produce for a materialised sub-slice.
+fn sub_path_value(bytes: &[u8]) -> Value {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Value::Str(text.to_string()),
+        Err(_) => Value::FatRef {
+            base: Box::new(Value::Tuple(
+                bytes.iter().map(|b| Value::Uint(u128::from(*b))).collect(),
+            )),
+            len: bytes.len() as u128,
+        },
+    }
+}
+
+/// The byte length of a path's parent, following std's
+/// components-based `Path::parent` on unix separators: trailing
+/// separators and trailing `.` components take no part (as
+/// `Components` normalizes them away), the last remaining
+/// component is removed, and a root or empty path has no
+/// parent. The parent is always a prefix of the path's bytes.
+fn path_parent_len(bytes: &[u8]) -> Option<usize> {
+    let mut end = bytes.len();
+    loop {
+        if end > 1 && bytes[end - 1] == b'/' {
+            end -= 1;
+        } else if end >= 2 && bytes[end - 2] == b'/' && bytes[end - 1] == b'.' {
+            end -= 2;
+        } else {
+            break;
+        }
+    }
+    if end == 0 || bytes[..end].iter().all(|b| *b == b'/') {
+        return None;
+    }
+    match bytes[..end].iter().rposition(|b| *b == b'/') {
+        None => Some(0),
+        Some(0) => Some(1),
+        Some(mut i) => {
+            while i > 1 && bytes[i - 1] == b'/' {
+                i -= 1;
+            }
+            Some(i)
+        }
+    }
+}
+
+/// The byte range of a path's file name, following std's
+/// `Path::file_name`: the final component when it is a normal
+/// one (a trailing `.` component names the previous one, as
+/// `Components` drops it; `..` and the root have no file name).
+fn path_file_name_range(bytes: &[u8]) -> Option<(usize, usize)> {
+    let mut end = bytes.len();
+    while end > 1 && bytes[end - 1] == b'/' {
+        end -= 1;
+    }
+    if end == 0 || bytes[..end].iter().all(|b| *b == b'/') {
+        return None;
+    }
+    let start = bytes[..end]
+        .iter()
+        .rposition(|b| *b == b'/')
+        .map_or(0, |i| i + 1);
+    let seg = &bytes[start..end];
+    if seg == b".." {
+        return None;
+    }
+    if seg == b"." {
+        if start == 0 {
+            return None;
+        }
+        return path_file_name_range(&bytes[..start - 1]);
+    }
+    Some((start, end))
+}
+
+/// One path component in std's `Components` normalization
+/// (unix separators): a leading `.` is its own component, `.`
+/// elsewhere and empty segments are dropped, and a leading
+/// run of separators is the root.
+/// A path's components, in `Components` order.
+#[derive(PartialEq, Eq)]
+enum PathComp<'a> {
+    Root,
+    Cur,
+    Parent,
+    Normal(&'a [u8]),
+}
+
+/// `PathBuf::push` on raw bytes (unix): an absolute argument
+/// replaces the base; otherwise the argument is appended, with
+/// a separator inserted unless the base is empty or already
+/// ends with one.
+fn path_push_bytes(base: &[u8], path: &[u8]) -> Vec<u8> {
+    if path.first() == Some(&b'/') {
+        return path.to_vec();
+    }
+    if base.is_empty() || path.is_empty() {
+        let mut out = base.to_vec();
+        out.extend_from_slice(path);
+        return out;
+    }
+    let mut out = base.to_vec();
+    if !out.ends_with(b"/") {
+        out.push(b'/');
+    }
+    out.extend_from_slice(path);
+    out
+}
+
+fn path_comps(bytes: &[u8]) -> Vec<PathComp<'_>> {
+    let mut comps = Vec::new();
+    let mut rest = bytes;
+    if rest.first() == Some(&b'/') {
+        comps.push(PathComp::Root);
+        while rest.first() == Some(&b'/') {
+            rest = &rest[1..];
+        }
+    } else if rest == b"." || rest.starts_with(b"./") {
+        comps.push(PathComp::Cur);
+        rest = if rest.len() > 1 { &rest[2..] } else { &rest[1..] };
+        while rest.first() == Some(&b'/') {
+            rest = &rest[1..];
+        }
+    }
+    for seg in rest.split(|b| *b == b'/') {
+        match seg {
+            b"" | b"." => {}
+            b".." => comps.push(PathComp::Parent),
+            s => comps.push(PathComp::Normal(s)),
+        }
+    }
+    comps
+}
+
+/// std's `Path::starts_with`: the child's components are a
+/// prefix of the path's components.
+fn path_starts_with(path: &[u8], child: &[u8]) -> bool {
+    let comps = path_comps(path);
+    let child = path_comps(child);
+    comps.len() >= child.len() && comps[..child.len()] == child[..]
+}
+
+/// std's `Path::ends_with`: the child's components are a
+/// suffix of the path's components.
+fn path_ends_with(path: &[u8], child: &[u8]) -> bool {
+    let comps = path_comps(path);
+    let child = path_comps(child);
+    comps.len() >= child.len() && comps[comps.len() - child.len()..] == child[..]
+}
+
+/// std's `rsplit_file_at_dot` on a file name's bytes: the
+/// split at the last dot, as a (before, after) pair, with std's
+/// special cases (a `..` name splits as itself with no
+/// extension side; a dot in the first position does not start
+/// an extension).
+fn rsplit_file_at_dot(name: &[u8]) -> (Option<&[u8]>, Option<&[u8]>) {
+    if name == b".." {
+        return (Some(name), None);
+    }
+    match name.iter().rposition(|b| *b == b'.') {
+        None => (None, Some(name)),
+        Some(0) => (Some(name), None),
+        Some(i) => (Some(&name[..i]), Some(&name[i + 1..])),
+    }
+}
+
+/// The bytes of an `OsString` value, in either of the model's
+/// two shapes: the string form (the inner data is the string
+/// itself) and the buffer form (an `OsString` wrapping a `Buf`
+/// wrapping the byte vector).
+fn os_string_bytes(value: &Value) -> Option<Vec<u8>> {
+    let Value::Enum { fields, .. } = value else {
+        return None;
+    };
+    match fields.as_slice() {
+        [Value::Str(text)] => Some(text.clone().into_bytes()),
+        [buf] => {
+            let Value::Enum { fields, .. } = buf else {
+                return None;
+            };
+            let [vec] = fields.as_slice() else {
+                return None;
+            };
+            byte_list_value(vec)
+        }
+        _ => None,
+    }
+}
+
+/// The bytes of a byte-vector value (the element-list
+/// aggregate): `None` when any element is not a byte.
+fn byte_list_value(value: &Value) -> Option<Vec<u8>> {
+    let Value::Enum { fields, .. } = value else {
+        return None;
+    };
+    let mut out = Vec::with_capacity(fields.len());
+    for field in fields {
+        match field {
+            Value::Uint(b) => out.push(*b as u8),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// The bytes of a `PathBuf` value: its one field is the
+/// buffer's `OsString`.
+fn path_buf_bytes(value: &Value) -> Option<Vec<u8>> {
+    let Value::Enum { fields, .. } = value else {
+        return None;
+    };
+    let [os_string] = fields.as_slice() else {
+        return None;
+    };
+    os_string_bytes(os_string)
+}
+
+/// The sys-level `std::fs::ReadDir` value: the struct whose
+/// fields are the owned-iterator state ([entry results, next
+/// index]) the fs sys layer's snapshot builds. The public
+/// `std::fs::read_dir` body wraps it in the public one-field
+/// `ReadDir` aggregate itself.
+fn read_dir_value(items: Vec<Value>) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![Value::Tuple(items), Value::Uint(0)],
+    }
+}
+
+/// A `std::fs::DirEntry` value: the public one-field wrapper
+/// around the pair of the entry's full path (as a `PathBuf`)
+/// and its file name (as an `OsString`) — the two facts the
+/// entry's modelled methods read.
+fn dir_entry_value(entry: &std::fs::DirEntry) -> Value {
+    use std::os::unix::ffi::OsStrExt as _;
+    Value::Enum {
+        variant: 0,
+        fields: vec![Value::Tuple(vec![
+            pathbuf_value(&host_path_bytes(&entry.path())),
+            os_string_value(entry.file_name().as_bytes()),
+        ])],
+    }
+}
+
+/// The (full path, file name) values of a modelled `DirEntry`.
+fn dir_entry_parts(value: &Value) -> Option<(Value, Value)> {
+    let Value::Enum { fields, .. } = value else {
+        return None;
+    };
+    let [inner] = fields.as_slice() else {
+        return None;
+    };
+    let Value::Tuple(pair) = inner else {
+        return None;
+    };
+    let [path, name] = pair.as_slice() else {
+        return None;
+    };
+    Some((path.clone(), name.clone()))
 }
 
 /// A host path from raw path bytes (guest paths are byte
