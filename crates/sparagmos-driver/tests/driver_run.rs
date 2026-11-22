@@ -15547,3 +15547,47 @@ fn run_mode_constant_cast_operand_keeps_source_type() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
 }
+
+const INDEX_LOCATION_SRC: &str = r#"
+#[track_caller]
+fn caller_line() -> u32 {
+    std::panic::Location::caller().line()
+}
+
+struct A {
+    prev_line: u32,
+}
+
+impl std::ops::Index<usize> for A {
+    type Output = ();
+    fn index(&self, _idx: usize) -> &() {
+        assert_eq!(caller_line(), self.prev_line + 1);
+        &()
+    }
+}
+
+fn main() {
+    let prev_line = caller_line();
+    (A { prev_line })[0];
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_track_caller_location_forwards_through_index() {
+    // `Index::index` is `#[track_caller]` through the trait:
+    // a location taken inside an index impl names the indexing
+    // expression in the caller, not the call inside the impl.
+    // The call names the trait method, so the stamp must reach
+    // the impl body the dispatch lands on.
+    let dir = temp_dir("index-location");
+    let src = fixture(&dir, "index_location.rs", INDEX_LOCATION_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "caller location must forward through Index::index; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}

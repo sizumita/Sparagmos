@@ -678,6 +678,33 @@ pub(crate) fn impl_qualified_self_type(name: &str) -> Option<String> {
 /// trait either qualified (`... as std::clone::Clone>::clone`)
 /// or in an impl header (`<impl std::clone::Clone for i32>`).
 /// `None` for any other shape.
+/// Whether a value is a caller-location stamp: the `Location`
+/// aggregate — (file, line, column) — or a reference to it, as
+/// the driver-appended stamp of a `#[track_caller]` call
+/// evaluates.
+fn is_caller_location_value(v: &Value) -> bool {
+    let inner = match v {
+        Value::Ref(RefTarget::Value(inner, _)) => &**inner,
+        other => other,
+    };
+    let Value::Enum { fields, .. } = inner else {
+        return false;
+    };
+    if fields.len() < 3 {
+        return false;
+    }
+    let file_is_str = match &fields[0] {
+        Value::Str(_) => true,
+        Value::Enum { fields: inner, .. } => {
+            matches!(inner.first(), Some(Value::Str(_)))
+        }
+        _ => false,
+    };
+    file_is_str
+        && matches!(fields[1], Value::Int(_) | Value::Uint(_))
+        && matches!(fields[2], Value::Int(_) | Value::Uint(_))
+}
+
 fn impl_path_trait_method(name: &str) -> Option<crate::builtins::Builtin> {
     use crate::builtins::Builtin;
     const METHODS: &[(&str, &str, Builtin)] = &[
@@ -2205,6 +2232,18 @@ impl<'a> Interpreter<'a> {
         destination: &Place,
         target: Option<BasicBlock>,
     ) -> InterpResult<()> {
+        // A call the conversion kept as a plain call can still
+        // carry the driver-appended caller-location stamp (a
+        // `#[track_caller]` trait method's call); a builtin that
+        // does not consume the location is served the declared
+        // arguments only, as in the `CallBuiltin` conversion.
+        let mut arg_values = arg_values;
+        if !crate::builtins::consumes_caller_location(kind)
+            && arg_values.len() > 1
+            && arg_values.last().is_some_and(is_caller_location_value)
+        {
+            arg_values.pop();
+        }
         let result = self.exec_builtin_values(
             frames,
             body,

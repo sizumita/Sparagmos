@@ -1387,9 +1387,18 @@ impl Converter {
             // stamp to; only the builtins that consume the
             // location (the intrinsic, the panic entry points)
             // are stamped, so the other builtins keep their
-            // declared argument lists.
+            // declared argument lists. A call the compiler
+            // resolved to a DIFFERENT definition than the one it
+            // names — a trait method call, which names the trait
+            // but dispatches to the impl — is the exception: the
+            // interpreter runs the resolved impl's body when one
+            // was collected (registered under the trait name),
+            // and that body binds the stamp like any direct
+            // callee.
             if let Some(kind) = builtin {
-                if !sparagmos_interp::builtins::consumes_caller_location(kind) {
+                if !sparagmos_interp::builtins::consumes_caller_location(kind)
+                    && inst.def.def_id() == def.def_id()
+                {
                     return None;
                 }
             }

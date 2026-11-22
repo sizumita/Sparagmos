@@ -7172,6 +7172,22 @@ let inner = match (&src, target) {
                             let ctx = builtin_arg_ctx(kind, &raw_generic_args, i);
                             ir_args.push(self.convert_operand(body, arg, ctx.as_ref())?);
                         }
+                        // The driver appends the caller-location
+                        // stamp to a call of a `#[track_caller]`
+                        // callee (a trait method like
+                        // `Index::index`, whose resolved impl is
+                        // track-caller through the trait). A body
+                        // serving the call binds the stamp to its
+                        // synthetic local; a builtin that does not
+                        // consume the location keeps its declared
+                        // argument list, so the stamp is dropped
+                        // here.
+                        if !crate::builtins::consumes_caller_location(kind)
+                            && ir_args.len() > 1
+                            && args.last().is_some_and(is_caller_location_stamp)
+                        {
+                            ir_args.pop();
+                        }
                         // An explicit `std::mem::drop` runs the
                         // dropped value's glue, exactly like a `Drop`
                         // terminator for the same type: build the
@@ -7528,6 +7544,26 @@ fn callable_param_tys(ty: Option<&mir::Ty>) -> Vec<mir::Ty> {
         },
         _ => Vec::new(),
     }
+}
+
+/// Whether an operand is the caller-location stamp the driver
+/// appends to a `#[track_caller]` call: a constant reference to
+/// the `Location` aggregate — its (file, line, column) fields,
+/// with line and column 4-byte integers.
+fn is_caller_location_stamp(op: &mir::Operand) -> bool {
+    let mir::Operand::Constant(c) = op else {
+        return false;
+    };
+    let mir::ConstKind::Value(mir::ConstValue::Ref(inner)) = &c.literal else {
+        return false;
+    };
+    let mir::ConstValue::Adt { fields, .. } = &**inner else {
+        return false;
+    };
+    let is_u32 = |v: &mir::ConstValue| {
+        matches!(v, mir::ConstValue::Scalar(mir::Scalar::Int { size: 4, .. }))
+    };
+    fields.len() >= 3 && is_u32(&fields[1]) && is_u32(&fields[2])
 }
 
 fn builtin_arg_ctx(
