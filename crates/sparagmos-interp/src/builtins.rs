@@ -5629,8 +5629,7 @@ impl<'a> Interpreter<'a> {
             ));
         }
         let (new_state, result) = self.next_on_state(frames, self_ty, &state)?;
-        self.write_resolved(frames, target, new_state)?;
-        Ok(result)
+        Ok((new_state, result))
     }
 
     fn map_next(
@@ -5647,7 +5646,7 @@ impl<'a> Interpreter<'a> {
         };
         let inner_ty = first_generic_arg(self_ty).unwrap_or("");
         let item = self.iterator_next_at(frames, inner_ty, &inner_target)?;
-        let Some(item) = option_payload(item) else {
+        let Some(item) = option_payload_opt(item) else {
             return Ok(Some(none_value()));
         };
         let callable = self.read_resolved(frames, &closure_target)?;
@@ -5721,7 +5720,7 @@ impl<'a> Interpreter<'a> {
             let fields = iterator_fields(&state, self_ty)?;
             let done = matches!(fields.get(1), Some(Value::Bool(true)));
             let item = self.iterator_next_at(frames, inner_ty, &inner_target)?;
-            let Some(item) = option_payload(item) else {
+            let Some(item) = option_payload_opt(item) else {
                 return Ok(Some(none_value()));
             };
             if done {
@@ -6109,7 +6108,7 @@ impl<'a> Interpreter<'a> {
             };
             let inner_ty = first_generic_arg(self_ty).unwrap_or("");
             let (new_inner, item) = self.next_on_state(frames, inner_ty, &fields[0])?;
-            match option_payload(item) {
+            match option_payload_opt(item) {
                 None => (vec![new_inner, Value::Uint(count)], none_value()),
                 Some(x) => (
                     vec![new_inner, Value::Uint(count + 1)],
@@ -6129,7 +6128,7 @@ impl<'a> Interpreter<'a> {
             }
             let inner_ty = first_generic_arg(self_ty).unwrap_or("");
             let (new_inner, item) = self.next_on_state(frames, inner_ty, &fields[0])?;
-            match option_payload(item) {
+            match option_payload_opt(item) {
                 None => (vec![new_inner], none_value()),
                 Some(x) => {
                     let copied = self.resolve_value(frames, &x)?;
@@ -6158,7 +6157,7 @@ impl<'a> Interpreter<'a> {
             loop {
                 let (new_inner, item) = self.next_on_state(frames, inner_ty, &inner)?;
                 inner = new_inner;
-                let Some(x) = option_payload(item) else {
+                let Some(x) = option_payload_opt(item) else {
                     break;
                 };
                 if done {
@@ -6210,7 +6209,7 @@ impl<'a> Interpreter<'a> {
             } else {
                 let inner_ty = first_generic_arg(self_ty).unwrap_or("");
                 let (new_inner, item) = self.next_on_state(frames, inner_ty, &fields[0])?;
-                match option_payload(item) {
+                match option_payload_opt(item) {
                     None => (vec![new_inner, Value::Uint(remaining)], none_value()),
                     Some(x) => (
                         vec![new_inner, Value::Uint(remaining - 1)],
@@ -6236,7 +6235,7 @@ impl<'a> Interpreter<'a> {
             }
             let inner_ty = first_generic_arg(self_ty).unwrap_or("");
             let (new_inner, item) = self.next_on_state(frames, inner_ty, &fields[0])?;
-            match option_payload(item) {
+            match option_payload_opt(item) {
                 None => (vec![new_inner, fields[1].clone()], none_value()),
                 Some(x) => {
                     let mapped =
@@ -7870,7 +7869,7 @@ fn rebuild_state(state: &Value, new_fields: Vec<Value>) -> Value {
     }
 }
 
-fn option_payload(value: Value) -> Option<Value> {
+fn option_payload_opt(value: Value) -> Option<Value> {
     match value {
         Value::Enum {
             variant: 1,
