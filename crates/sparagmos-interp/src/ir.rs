@@ -1282,6 +1282,72 @@ impl BasicBlockData {
     }
 }
 
+/// The source position of one statement or terminator: an index
+/// into [`Program::source_files`] plus a 1-based line number,
+/// resolved by the driver from the Stable MIR span at conversion
+/// time. The debugger interface ([`crate::debug`]) is the consumer:
+/// breakpoints and stepping are line-based.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct SourceLine {
+    /// Index into the program's source-file table; `u32::MAX` when
+    /// the position is unknown.
+    pub file: u32,
+    /// 1-based line number; 0 when unknown.
+    pub line: u32,
+}
+
+impl SourceLine {
+    pub const UNKNOWN: SourceLine = SourceLine { file: u32::MAX, line: 0 };
+
+    pub fn is_known(&self) -> bool {
+        self.line != 0 && self.file != u32::MAX
+    }
+}
+
+/// Source lines of one basic block, parallel to [`Body::blocks`]:
+/// one entry per statement, plus the terminator's. Empty in bodies
+/// built by hand.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BlockSourceLines {
+    pub statements: Vec<SourceLine>,
+    pub terminator: SourceLine,
+}
+
+/// One debugger-visible variable of a body.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DebugVarEntry {
+    /// The variable's source-level name.
+    pub name: String,
+    /// Where its value comes from.
+    pub source: DebugVar,
+    /// Whether the variable's source-level type is `char` or a
+    /// reference to one (see [`Body::debug_vars`]).
+    pub is_char: bool,
+    /// The (start, end) source lines of the span the compiler
+    /// recorded for the entry: usually a point span at the
+    /// declaration. `(0, 0)` when unknown. When several entries
+    /// share a name, the debugger interface resolves the name to
+    /// the declaration in effect at the current line (a
+    /// containing span first, then the latest declaration at or
+    /// before it).
+    pub lines: (u32, u32),
+}
+
+/// Where one debugger-visible variable's value comes from.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DebugVar {
+    /// A place in the executing frame: the local, plus a
+    /// field/downcast projection into it (empty for the local
+    /// itself; only field/downcast projections are carried).
+    Place(usize, Vec<crate::RefProj>),
+    /// A constant the compiler's debug info records directly for
+    /// the variable: a constant-valued variable whose storage the
+    /// optimizer eliminated carries its value in its debug info
+    /// instead, and a real debugger reads that same constant out
+    /// of the DWARF location description.
+    Constant(Constant),
+}
+
 /// A function body: argument count, local types, and basic blocks.
 /// `local_tys[0]` is the return type; `local_tys.len()` is the frame size.
 #[derive(Debug, Clone, PartialEq)]
@@ -1321,6 +1387,13 @@ pub struct Body {
     /// `mark_caller_location_bodies` in mir_convert). `None` for
     /// ordinary functions.
     pub caller_location_local: Option<usize>,
+    /// Source lines of every block, parallel to `blocks` (see
+    /// [`BlockSourceLines`]). Carried from the MIR body's recorded
+    /// lines; empty for hand-built bodies.
+    pub source_lines: Vec<BlockSourceLines>,
+    /// The body's named variables, for the debugger interface
+    /// (see [`DebugVarEntry`]), in declaration order.
+    pub debug_vars: Vec<DebugVarEntry>,
 }
 
 impl Body {
@@ -1339,6 +1412,8 @@ impl Body {
             zst_fields: Vec::new(),
             unwind: Vec::new(),
             caller_location_local: None,
+            source_lines: Vec::new(),
+            debug_vars: Vec::new(),
         }
     }
     pub fn local_count(&self) -> usize {
@@ -1362,6 +1437,11 @@ impl Body {
 /// A whole program: a set of named function bodies in one module.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Program {
+    /// The program's source-file table: the file names the
+    /// bodies' source lines ([`Body::source_lines`]) index into.
+    /// Carried from the driver's table; empty for hand-built
+    /// programs.
+    pub source_files: Vec<String>,
     /// Per-field scalar shapes of the program's union instances,
     /// indexed by the `table` of [`ProjectionElem::UnionField`]:
     /// entry `t` is one union instance's field list, in field

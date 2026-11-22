@@ -135,6 +135,11 @@ pub struct MirProgram {
     /// `mir::AdtNiches`). Consulted when a transmute involves
     /// a niche-encoded enum such as `Option<NonZero<T>>`.
     pub adt_niches: mir::AdtNiches,
+    /// The source-file table the bodies' source lines index into
+    /// (see `mir::Body::source_lines`), as recorded by the driver.
+    /// Handed to the interpreter program for the debugger
+    /// interface.
+    pub source_files: Vec<String>,
     /// Definition-location stamps of the program's
     /// `#[track_caller]` instances, keyed by the instance's
     /// `DefId`, as recorded by the driver (see
@@ -871,6 +876,7 @@ fn convert_each(
     keys: &[String],
 ) -> (ir::Program, HashMap<String, ConvertError>) {
     let mut out = ir::Program::new();
+    out.source_files = program.source_files.clone();
     let mut failures: HashMap<String, ConvertError> = HashMap::new();
     for (func, key) in program.functions.iter().zip(keys) {
         match conv.convert_body(func, key) {
@@ -966,6 +972,31 @@ pub fn interpret_mir_captured_with_config(
             stderr: String::new(),
         },
     }
+}
+
+/// Convert `program` and open a debugger session on `entry`
+/// (see [`crate::debug::DebugSession`]): the caller sets its
+/// breakpoints and source text, then runs a command script; the
+/// session drives the interpreter itself, so nothing executes
+/// until the script runs. Conversion failures are reported the
+/// same way as for a run: a helper's failure is isolated, the
+/// entry's own failure is returned here.
+pub fn debug_mir(
+    program: &MirProgram,
+    entry: &str,
+    args: Vec<Value>,
+    config: crate::InterpConfig,
+) -> Result<crate::debug::DebugSession, MirRunError> {
+    let (ir_program, failures) = convert_all(program).map_err(MirRunError::from)?;
+    if let Some(e) = failures.get(entry) {
+        return Err(MirRunError::from(e.clone()));
+    }
+    Ok(crate::debug::DebugSession::new(
+        ir_program,
+        entry.to_string(),
+        args,
+        config,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1829,6 +1860,87 @@ impl<'a> Converter<'a> {
             blocks.push(self.convert_block(body, bb)?);
         }
         let mut out = ir::Body::new(key.to_string(), body.arg_count, local_tys, blocks);
+        out.source_lines = body
+            .source_lines
+            .iter()
+            .map(|b| ir::BlockSourceLines {
+                statements: b
+                    .statements
+                    .iter()
+                    .map(|s| ir::SourceLine { file: s.file, line: s.line })
+                    .collect(),
+                terminator: ir::SourceLine {
+                    file: b.terminator.file,
+                    line: b.terminator.line,
+                },
+            })
+            .collect();
+        // The debugger interface's variable table, from the
+        // body's var-debug-info entries (see `ir::DebugVar`).
+        out.debug_vars = body
+            .var_debug_info
+            .iter()
+            .filter_map(|info| {
+                // Whether the variable is a `char` or a reference
+                // to one at the source level, from the type its
+                // debug info was recorded against.
+                let ty_is_char = |ty: &mir::Ty| match ty {
+                    mir::Ty::Char => true,
+                    mir::Ty::Ref(_, inner, _) => matches!(&**inner, mir::Ty::Char),
+                    _ => false,
+                };
+                let lines = (info.source_info.span.lo, info.source_info.span.hi);
+                match &info.value {
+                    mir::VarDebugInfoContents::Local(local) => Some(ir::DebugVarEntry {
+                        name: info.name.clone(),
+                        source: ir::DebugVar::Place(local.0 as usize, Vec::new()),
+                        is_char: ty_is_char(&body.local_decls.get(local.0 as usize)?.ty),
+                        lines,
+                    }),
+                    mir::VarDebugInfoContents::Place(place) => {
+                        // The projection, in the interpreter's
+                        // resolved form: only field/downcast steps
+                        // carry over (the same restriction the
+                        // decoder's local-projection reader works
+                        // under); a variable reached through
+                        // anything else is not carried.
+                        let mut proj: Vec<crate::RefProj> = Vec::new();
+                        for elem in &place.projection {
+                            match elem {
+                                mir::PlaceElem::Field(i, _) => {
+                                    proj.push(crate::RefProj::Field(*i as usize))
+                                }
+                                mir::PlaceElem::Downcast(_, v) => {
+                                    proj.push(crate::RefProj::Downcast(*v))
+                                }
+                                _ => return None,
+                            }
+                        }
+                        // Only plain locals carry the char fact; a
+                        // projected variable's element type is not
+                        // tracked here.
+                        let is_char = place.projection.is_empty()
+                            && ty_is_char(&body.local_decls.get(place.local.0 as usize)?.ty);
+                        Some(ir::DebugVarEntry {
+                            name: info.name.clone(),
+                            source: ir::DebugVar::Place(place.local.0 as usize, proj),
+                            is_char,
+                            lines,
+                        })
+                    }
+                    mir::VarDebugInfoContents::Constant(c) => {
+                        let constant = self.convert_constant(c, c.ty.as_ref()).ok()?;
+                        let is_char = c.ty.as_ref().map(|t| ty_is_char(t)).unwrap_or(false);
+                        Some(ir::DebugVarEntry {
+                            name: info.name.clone(),
+                            source: ir::DebugVar::Constant(constant),
+                            is_char,
+                            lines,
+                        })
+                    }
+                }
+            })
+            .collect();
         out.unwind = body
             .basic_blocks
             .iter()

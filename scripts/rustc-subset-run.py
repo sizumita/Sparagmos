@@ -2410,6 +2410,494 @@ def bucket_reason(reason):
 # Per-test driver
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Debuginfo tests (nature "exec-debugger")
+#
+# compiletest runs these by compiling the test file unoptimized,
+# setting a breakpoint on every line containing `#break`, feeding
+# the file's `//@ <debugger>-command:` sections to a real
+# debugger, and matching the `//@ <debugger>-check:` lines against
+# its output in order. A real debugger reads DWARF out of the
+# compiled binary; this runtime produces no binary, so the subset
+# interprets the sections itself and drives the interpreter's
+# debugger interface (the driver's `debug` entry point) instead:
+# the same breakpoints, the same command flow, and the same check
+# matching, with the session served by the execution engine.
+#
+# Only the scalar scope is attempted (the reachability census's
+# D0/D1 categories): files whose applicable variants carry no
+# session at all are judged by the conversion probe the
+# compile-check category uses, and sessions are attempted only
+# when every command and print expression stays within line
+# stops and scalar prints. Anything beyond that (aggregate
+# rendering, type queries, call expressions, pretty-printer
+# forms, the `repr` pseudo-command's custom inspection) keeps a
+# not-attempted bucket.
+# ---------------------------------------------------------------------------
+
+DEBUGGER_VARIANT_DIRECTIVES = frozenset({
+    "ignore-gdb", "ignore-lldb", "ignore-cdb",
+    "only-gdb", "only-lldb", "only-cdb",
+})
+
+
+class _DebuggerFilteredView:
+    """A revision's directive view with the per-debugger variant
+    directives removed. compiletest decides `ignore-gdb` /
+    `only-lldb` and their kin per debugger variant, not per host,
+    so the host applicability evaluation must not see them (the
+    bare names would otherwise read as host conditions that do
+    not hold); the variant decision itself is
+    debugger_variant_skipped's."""
+
+    def __init__(self, view):
+        self._view = view
+        self.names = view.names - DEBUGGER_VARIANT_DIRECTIVES
+
+    def has(self, name):
+        return (name not in DEBUGGER_VARIANT_DIRECTIVES
+                and self._view.has(name))
+
+    def values(self, name):
+        return self._view.values(name)
+
+
+def debugger_variant_skipped(view, debugger):
+    """Whether compiletest would not run `debugger`'s variant of a
+    test with these directives: an `ignore-<debugger>`, or an
+    `only-<other>` naming another debugger."""
+    if view.has(f"ignore-{debugger}"):
+        return True
+    return any(view.has(f"only-{other}")
+               for other in ("gdb", "lldb", "cdb") if other != debugger)
+
+
+def parse_debugger_sections(text, debugger, revision):
+    """One debugger's sections of a debuginfo test file: a port of
+    compiletest's DebuggerCommands::parse_from. Returns
+    (breakpoint_lines, commands, check_lines): the 1-based lines
+    containing `#break`, the debugger's commands in file order,
+    and its (source line, pattern) check lines. The `-repr`
+    pseudo-directive becomes a `repr <var>` command plus its
+    artificial `<var>: Ok` check line, as in compiletest."""
+    breakpoint_lines = []
+    commands = []
+    check_lines = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        if "#break" in line:
+            breakpoint_lines.append(lineno)
+            continue
+        m = DIRECTIVE_RE.match(line)
+        if not m:
+            continue
+        rev, name, value = m.group(1), m.group(2), m.group(3)
+        if rev is not None and rev != revision:
+            continue
+        if not name.startswith(debugger):
+            continue
+        kind = name[len(debugger):]
+        if value is None:
+            continue
+        if kind == "-command":
+            commands.append(value)
+        elif kind == "-check":
+            check_lines.append((lineno, value))
+        elif kind == "-repr":
+            commands.append(f"repr {value.strip()}")
+            check_lines.append((lineno, f"{value.strip()}: Ok"))
+    return breakpoint_lines, commands, check_lines
+
+
+def debugger_check_single_line(line, check_line):
+    """Whether one output line matches one check pattern: a port
+    of compiletest's check_single_line. The pattern's `[...]`
+    spans are wildcards; the fragments must appear in order, and
+    unless the pattern ends with `[...]`, the line must end
+    exactly at the last fragment."""
+    line = line.strip()
+    check_line = check_line.strip()
+    can_start_anywhere = check_line.startswith("[...]")
+    can_end_anywhere = check_line.endswith("[...]")
+    fragments = [f for f in check_line.split("[...]") if f]
+    if not fragments:
+        return True
+    if can_start_anywhere:
+        pos = line.find(fragments[0])
+        if pos < 0:
+            return False
+        rest = line[pos + len(fragments[0]):]
+        fragments = fragments[1:]
+    else:
+        rest = line
+    for fragment in fragments:
+        pos = rest.find(fragment)
+        if pos < 0:
+            return False
+        rest = rest[pos + len(fragment):]
+    return can_end_anywhere or rest == ""
+
+
+def debugger_check_output(check_lines, output_lines):
+    """Match every check line in order against the session's
+    output lines (extra lines may intervene; a matched line may
+    match again for the next check, as in compiletest's
+    check_output). Returns (ok, missing): the (source line,
+    pattern) pairs that were not found."""
+    missing = []
+    last_idx = 0
+    for src_lineno, pattern in check_lines:
+        hit = None
+        for idx in range(last_idx, len(output_lines)):
+            if debugger_check_single_line(output_lines[idx], pattern):
+                hit = idx
+                break
+        if hit is None:
+            missing.append((src_lineno, pattern))
+        else:
+            last_idx = hit
+    return (not missing), missing
+
+
+# A print expression within the attempted scope: dereferences, a
+# variable name, and numeric field/index steps — the grammar the
+# debugger interface's expression evaluator speaks.
+_DEBUGGER_EXPR_RE = re.compile(
+    r"^\s*\**\s*[A-Za-z_][A-Za-z0-9_]*(\s*\.\d+|\s*\[\d+\])*\s*$")
+
+
+def _translate_gdb_command(cmd):
+    """One gdb command of a test file, as a line of the session
+    script the driver's debug entry point speaks (see
+    parse_debug_script there), or None when the command is
+    outside the attempted scope. Session-shaping `set` commands
+    that cannot change scalar output become script comments."""
+    if cmd in ("run", "r"):
+        return "run"
+    if cmd in ("continue", "c"):
+        return "continue"
+    if cmd in ("next", "n"):
+        return "next"
+    if cmd in ("step", "s"):
+        return "step"
+    if cmd == "finish":
+        return "finish"
+    if cmd.startswith(("set print ", "set language ", "set pagination ",
+                       "set confirm ", "set charset ")):
+        return f"# inert: {cmd}"
+    if cmd in ("frame", "f"):
+        return "show-line"
+    m = re.match(r"^(?:frame|f)\s+(\d+)$", cmd)
+    if m:
+        return f"frame {m.group(1)}"
+    m = re.match(r"^(?:print|p)(?:/([a-z]))?\s+(.+)$", cmd)
+    if m:
+        fmt, expr = m.group(1), m.group(2).strip()
+        if fmt is not None and fmt not in "dxtcu":
+            return None
+        if not _DEBUGGER_EXPR_RE.match(expr):
+            return None
+        return f"print/{fmt} {expr}" if fmt else f"print {expr}"
+    return None
+
+
+def _translate_lldb_command(cmd):
+    """One lldb command of a test file, as a session script line,
+    or None when outside the attempted scope."""
+    if cmd in ("run", "r"):
+        return "run"
+    if cmd in ("continue", "c"):
+        return "continue"
+    if cmd in ("next", "n"):
+        return "next"
+    if cmd in ("step", "s"):
+        return "step"
+    if cmd == "finish":
+        return "finish"
+    if cmd.startswith("settings set "):
+        return f"# inert: {cmd}"
+    if cmd == "frame select":
+        return "show-line"
+    m = re.match(r"^frame\s+select\s+(\d+)$", cmd)
+    if m:
+        return f"frame {m.group(1)}"
+    m = re.match(r"^(?:v|print|p|expr|expression)\s+(.+)$", cmd)
+    if m:
+        expr = m.group(1).strip()
+        if expr.startswith("-"):
+            return None
+        if not _DEBUGGER_EXPR_RE.match(expr):
+            return None
+        return f"v {expr}"
+    return None
+
+
+def translate_debugger_command(debugger, command):
+    """Translate one command of a test file's debugger section
+    into the session script's vocabulary, or None when the
+    command is outside the attempted scope."""
+    cmd = command.strip()
+    if debugger == "gdb":
+        return _translate_gdb_command(cmd)
+    return _translate_lldb_command(cmd)
+
+
+def sparagmos_debug_side(path, edition, driver_bin, dialect, script_text,
+                         rustc_args=(), aux_specs=(), env_extra=None,
+                         env_remove=()):
+    """Run one debugger session through the driver's `debug`
+    entry point. Returns (result, kind, reason) in
+    sparagmos_side's convention: kind "result" carries the
+    session transcript in the result's stdout."""
+    rustc_args = list(rustc_args) + sysroot_extern_args(path, rustc_args)
+    script_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                "w", suffix=".script", delete=False) as f:
+            f.write(script_text)
+            script_path = f.name
+        argv = [str(driver_bin), "debug", str(path), "--edition", edition]
+        for a in rustc_args:
+            argv += ["--rustc-arg", a]
+        for spec in aux_specs:
+            argv += ["--aux", aux_spec_arg(spec)]
+        argv += ["--debug-script", script_path, "--debug-dialect", dialect]
+        env = dict(BOOTSTRAP_ENV)
+        if env_extra:
+            env.update(env_extra)
+        res = run_cmd(argv, timeout=DRIVER_TIMEOUT, env_extra=env,
+                      env_remove=env_remove)
+    finally:
+        if script_path is not None:
+            os.unlink(script_path)
+    if res["timeout"]:
+        return None, "timeout", f"driver timed out after {DRIVER_TIMEOUT}s"
+    if res["exit_code"] == 0:
+        return res, "result", ""
+    if res["exit_code"] == 2:
+        return None, "unsupported", driver_reason(res["stderr"])
+    return None, "driver-error", \
+        f"driver exit {res['exit_code']}: {res['stderr'].strip()[:300]}"
+
+
+def fill_result_debugger(rec, rust_dir, driver_bin, out):
+    """Wrapper: the judgment runs under one scratch build
+    directory (compiletest's build-base stand-in for flag and
+    env expansion), removed when the record is judged. A
+    `should-fail` test (one that exists to prove the checks are
+    really compared: its expected output deliberately does not
+    match) inverts the judgment, as compiletest's does."""
+    path = rust_dir / rec["path"]
+    try:
+        header = Header(path.read_text(errors="ignore"))
+    except OSError:
+        header = None
+    if header is not None and header.has("should-fail"):
+        scratch = {"status": "not-attempted", "reason": "", "bucket": ""}
+        with tempfile.TemporaryDirectory(prefix="subset-dbg-") as td:
+            _fill_result_debugger(rec, rust_dir, driver_bin, scratch, td)
+        if scratch["status"] == "pass":
+            out["reason"] = ("should-fail test's session unexpectedly "
+                              "matched all its check lines")
+            out["bucket"] = "debugger output mismatch"
+        else:
+            out["status"] = "pass"
+        return
+    with tempfile.TemporaryDirectory(prefix="subset-dbg-") as td:
+        _fill_result_debugger(rec, rust_dir, driver_bin, out, td)
+
+
+def _fill_result_debugger(rec, rust_dir, driver_bin, out, td):
+    """Judge one debuginfo (exec-debugger) record: run each
+    applicable debugger variant's session through the
+    interpreter's debugger interface and match its check lines
+    against the transcript. A record whose applicable variants
+    carry no session at all (compile-only files; cdb-only files,
+    cdb having no session on this host) is judged by the
+    conversion probe the compile-check category uses."""
+    if rec["suite"] != "debuginfo":
+        out["reason"] = (f"suite={rec['suite']} (the exec-debugger "
+                         "harness serves the debuginfo suite)")
+        out["bucket"] = "out of stage-1 scope (suite)"
+        return
+    path = rust_dir / rec["path"]
+    text = path.read_text(errors="ignore")
+    header = Header(text)
+    if header.has("ignore-test"):
+        out["reason"] = "ignore-test (compiletest itself never runs this test)"
+        out["bucket"] = "not attempted (ignore-test)"
+        return
+    revisions = header.revisions() or [None]
+    src_base = suite_root(path)
+    # Per applicable revision: its compile assembly and its
+    # debugger variants (debugger, breakpoints, commands, checks).
+    applicable = []
+    skip_reasons = []
+    unevaluatable = False
+    for revision in revisions:
+        view = header.view(revision)
+        status, why = applicability(_DebuggerFilteredView(view))
+        if status == "out-of-environment":
+            skip_reasons.append(why)
+            continue
+        if status == "unevaluatable":
+            unevaluatable = True
+            skip_reasons.append(why)
+            continue
+        variants = []
+        for debugger in ("gdb", "lldb"):
+            if debugger_variant_skipped(view, debugger):
+                continue
+            variants.append((debugger,)
+                            + parse_debugger_sections(text, debugger,
+                                                      revision))
+        applicable.append((revision, view, variants))
+    if not applicable:
+        if unevaluatable:
+            out["reason"] = "; ".join(skip_reasons)
+            out["bucket"] = "not attempted (unevaluatable condition)"
+        else:
+            out["reason"] = "; ".join(skip_reasons)
+            out["bucket"] = "out of environment"
+        return
+
+    def assembly(view, revision):
+        """The revision's driver-invocation assembly, put
+        together the way stage 2 assembles a view's conversion:
+        (edition, args, aux_specs, compile_env, compile_unset,
+        exec_env, exec_unset), or a (reason, bucket) refusal."""
+        aux_specs = []
+        if not rec["single_file"]:
+            aux_specs, aux_err = resolve_aux_specs(path, revision)
+            if aux_err:
+                return None, (aux_err, "out of stage-1 scope (multi-file)")
+        edition = attempt_edition(view)
+        flags = compile_flags(view, src_base, td)
+        screened = screen_flags(flags, targets={HOST_TARGET})
+        if screened:
+            return None, (screened, "not attempted (compile-flags)")
+        rev_args = (revision_args(view, revision, revisions)
+                    if revision is not None else [])
+        args = (rev_args
+                + compiletest_mode_args(rec["suite"], flags) + flags)
+        env_pairs, env_unset = view_env(view, "exec-env",
+                                        "unset-exec-env",
+                                        src_base, td)
+        cenv, cunset = view_env(view, "rustc-env", "unset-rustc-env",
+                                src_base, td)
+        return (edition, args, aux_specs, cenv, tuple(cunset),
+                env_pairs, tuple(env_unset)), None
+
+    has_session = any(
+        commands or checks
+        for (_rev, _view, variants) in applicable
+        for (_dbg, _bps, commands, checks) in variants)
+
+    if not has_session:
+        # Compile-only: the conversion probe, judged as a
+        # success-expecting compile-check.
+        for revision, view, _variants in applicable:
+            asm, refusal = assembly(view, revision)
+            if refusal:
+                out["reason"], out["bucket"] = refusal
+                return
+            edition, args, aux_specs, cenv, cunset, _ep, _eu = asm
+            conv = convert_side(path, edition, driver_bin,
+                                rustc_args=args, aux_specs=aux_specs,
+                                env_extra=cenv, env_remove=cunset)
+            if conv["timeout"]:
+                out["reason"] = "driver timed out"
+                out["bucket"] = "timeout"
+                return
+            if conv["compilation_failed"]:
+                out["reason"] = ("compilation failed: "
+                                  + first_error_line(conv["stderr"]))
+                out["bucket"] = "compilation failed"
+                return
+            if conv["exit_code"] != 0 or conv.get("target_skipped"):
+                totals = conv.get("target_skip_totals") or []
+                detail = (": " + ", ".join(f"{k} x{v}" for k, v in totals)
+                          if totals else "")
+                out["reason"] = ("conversion incomplete (debugger "
+                                  f"compile-only probe){detail}")
+                out["bucket"] = "conversion incomplete"
+                return
+        out["status"] = "pass"
+        return
+
+    # Sessions: translate every variant's commands first; one
+    # command outside the attempted scope holds the whole record
+    # back (the file is not fully judged without it).
+    sessions = []
+    for revision, view, variants in applicable:
+        for debugger, breakpoints, commands, checks in variants:
+            if not commands and not checks:
+                continue
+            script_lines = [f"break {line}" for line in breakpoints]
+            for command in commands:
+                line = translate_debugger_command(debugger, command)
+                if line is None:
+                    out["reason"] = (f"{debugger} command outside the "
+                                      f"attempted scope: {command}")
+                    out["bucket"] = "not attempted (debugger feature)"
+                    return
+                script_lines.append(line)
+            sessions.append((revision, view, debugger, commands, checks,
+                             "\n".join(script_lines) + "\n"))
+    for revision, view, debugger, commands, checks, script in sessions:
+        if not commands:
+            # compiletest would feed the debugger no commands at
+            # all: the program never starts, no output is produced,
+            # and every check line misses.
+            detail = "; ".join(f"(line {ln}) `{pat}`"
+                                for ln, pat in checks[:4])
+            out["reason"] = (f"{debugger} check line(s) not found in the "
+                              f"session output: {detail}")
+            out["bucket"] = "debugger output mismatch"
+            return
+        asm, refusal = assembly(view, revision)
+        if refusal:
+            out["reason"], out["bucket"] = refusal
+            return
+        edition, args, aux_specs, cenv, cunset, env_pairs, env_unset = asm
+        env = dict(cenv)
+        env.update(env_pairs)
+        env_remove = cunset + env_unset
+        # compiletest compiles debuginfo tests unoptimized
+        # ("debuginfo tests must be unoptimized", runtest.rs);
+        # the MIR the session executes takes the same shape --
+        # the optimizer's statement spans and constant-folded
+        # debug info are not what the checks were written
+        # against. (Measured both ways on the exec-debugger
+        # population: the default pipeline passes strictly
+        # fewer records.)
+        args = args + ["-Zmir-opt-level=0"]
+        res, kind, reason = sparagmos_debug_side(
+            path, edition, driver_bin, debugger, script,
+            rustc_args=args, aux_specs=aux_specs,
+            env_extra=env, env_remove=env_remove)
+        if kind == "timeout":
+            out["reason"] = reason
+            out["bucket"] = "timeout"
+            return
+        if kind == "unsupported":
+            out["reason"] = reason
+            out["bucket"] = "conversion incomplete (debugger session)"
+            return
+        if kind != "result":
+            out["reason"] = reason
+            out["bucket"] = "driver error"
+            return
+        ok, missing = debugger_check_output(
+            checks, res["stdout"].splitlines())
+        if not ok:
+            detail = "; ".join(f"(line {ln}) `{pat}`" for ln, pat in missing[:4])
+            out["reason"] = (f"{debugger} check line(s) not found in the "
+                              f"session output: {detail}")
+            out["bucket"] = "debugger output mismatch"
+            return
+    out["status"] = "pass"
+
+
 def process_test(rec, rust_dir, driver_bin, stage2=False):
     """Produce the result record for one survey record."""
     out = {
@@ -2427,7 +2915,9 @@ def process_test(rec, rust_dir, driver_bin, stage2=False):
     }
     t0 = time.time()
     try:
-        if stage2 and rec["nature"] == "compile-check":
+        if rec["nature"] == "exec-debugger":
+            fill_result_debugger(rec, rust_dir, driver_bin, out)
+        elif stage2 and rec["nature"] == "compile-check":
             fill_result_stage2(rec, rust_dir, driver_bin, out)
         else:
             fill_result(rec, rust_dir, driver_bin, out)
@@ -3975,6 +4465,11 @@ def main():
         return (r["nature"] == "compile-check"
                 and not r["env_excluded"])
 
+    def is_candidate_debugger(r):
+        return (r["nature"] == "exec-debugger"
+                and r["suite"] == "debuginfo"
+                and not r["env_excluded"])
+
     all_candidates = ([r for r in records if is_candidate(r)]
                       if stage1_on else [])
     candidates = (all_candidates[:args.limit] if args.limit
@@ -3985,12 +4480,19 @@ def main():
     candidates2 = (all_candidates2[:args.stage2_limit]
                    if args.stage2_limit else all_candidates2)
     limited_out2 = all_candidates2[len(candidates2):]
+    # The debugger harness runs with stage 2 (stage 1 is the
+    # exec-only stage by definition); its records dispatch by
+    # nature inside process_test.
+    candidates_dbg = ([r for r in records if is_candidate_debugger(r)]
+                      if stage2_on else [])
     others = [r for r in records
               if not is_candidate(r) and not r["env_excluded"]
-              and not (stage2_on and is_candidate2(r))]
+              and not (stage2_on and is_candidate2(r))
+              and not (stage2_on and is_candidate_debugger(r))]
 
     print(f"denominator: {denominator}; stage-1 candidates: "
           f"{len(candidates)}; stage-2 candidates: {len(candidates2)}; "
+          f"debugger candidates: {len(candidates_dbg)}; "
           f"other records carried as not-attempted: {len(others)}",
           flush=True)
 
@@ -4003,7 +4505,11 @@ def main():
         futs += [pool.submit(process_test, r, args.rust_dir,
                              args.driver_bin, True)
                  for r in candidates2]
-        total_jobs = len(candidates) + len(candidates2)
+        futs += [pool.submit(process_test, r, args.rust_dir,
+                             args.driver_bin, True)
+                 for r in candidates_dbg]
+        total_jobs = (len(candidates) + len(candidates2)
+                      + len(candidates_dbg))
         done = 0
         for fut in concurrent.futures.as_completed(futs):
             results.append(fut.result())

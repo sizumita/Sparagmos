@@ -143,6 +143,7 @@ fn build_with_table(
         thread_locals: Default::default(),
         adt_instance_shapes: Default::default(),
         adt_niches: Default::default(),
+        source_files: Default::default(),
         track_caller_defs: Default::default(),
         fn_shim_locations: Default::default(),
     };

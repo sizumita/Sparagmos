@@ -51,6 +51,7 @@
 //! limits) is unchanged by that layer.
 
 pub mod builtins;
+pub mod debug;
 mod decode;
 pub mod error;
 pub mod f128;
@@ -66,8 +67,9 @@ pub use ir::{
     Place, Program,
     ProjectionElem, Rvalue, Statement, StatementKind, TerminatorKind, Ty, UnOp, UnwindAction,
 };
+pub use debug::{DebugCommand, DebugDialect, DebugPrint, DebugRun, DebugSession, PrintFormat};
 pub use mir_convert::{
-    convert_program, interpret_mir, interpret_mir_captured,
+    convert_program, debug_mir, interpret_mir, interpret_mir_captured,
     interpret_mir_captured_with_config, program_key_of, CapturedRun, ConvertError, MirFunction,
     MirProgram, MirRunError,
 };

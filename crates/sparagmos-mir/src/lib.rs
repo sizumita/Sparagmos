@@ -18,7 +18,9 @@ pub mod statement;
 pub mod terminator;
 pub mod ty;
 
-pub use body::{BasicBlockData, Body, VarDebugInfo, VarDebugInfoContents};
+pub use body::{
+    BasicBlockData, BlockSourceLines, Body, SourceLine, VarDebugInfo, VarDebugInfoContents,
+};
 pub use operand::{ConstKind, ConstValue, Constant, Operand, Scalar};
 pub use place::{Local, LocalDecl, Place, PlaceElem, ProjectionElem, RETURN_PLACE};
 pub use rvalue::{

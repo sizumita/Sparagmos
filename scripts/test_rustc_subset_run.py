@@ -2840,3 +2840,142 @@ class ProcessStage2RunModeTests(unittest.TestCase):
             conv())
         self.assertEqual(res["status"], "pass")
         self.assertEqual(res["expectation"], "run-pass")
+
+
+class DebuggerHarnessTests(unittest.TestCase):
+    """The exec-debugger harness: section parsing, the check
+    matchers (ports of compiletest's debugger.rs), command
+    translation, and per-variant skipping."""
+
+    SAMPLE = (
+        "//@ compile-flags:-g\n"
+        "//@ gdb-command:run\n"
+        "//@ gdb-command:print x\n"
+        "//@ gdb-check:$1 = 5\n"
+        "//@ lldb-command:run\n"
+        "//@ lldb-command:v x\n"
+        "//@ lldb-check:[...] 5\n"
+        "fn main() {\n"
+        "    let x = 5;\n"
+        "    zzz(); // #break\n"
+        "}\n"
+        "fn zzz() {()}\n")
+
+    def test_sections_parse_commands_checks_and_breaks(self):
+        bp, cmds, checks = run.parse_debugger_sections(
+            self.SAMPLE, "gdb", None)
+        self.assertEqual(bp, [10])
+        self.assertEqual(cmds, ["run", "print x"])
+        self.assertEqual(checks, [(4, "$1 = 5")])
+        bp, cmds, checks = run.parse_debugger_sections(
+            self.SAMPLE, "lldb", None)
+        self.assertEqual(bp, [10])
+        self.assertEqual(cmds, ["run", "v x"])
+        self.assertEqual(checks, [(7, "[...] 5")])
+
+    def test_break_marker_wins_over_directive_shape(self):
+        # A line containing #break is a breakpoint line even
+        # when the rest of the line looks like a directive.
+        text = "//@ gdb-command:run\nfn f() {} // #break\n"
+        bp, cmds, _ = run.parse_debugger_sections(text, "gdb", None)
+        self.assertEqual(bp, [2])
+        self.assertEqual(cmds, ["run"])
+
+    def test_repr_becomes_command_and_check(self):
+        text = ("//@ gdb-command:run\n"
+                "//@ gdb-repr:thing\n"
+                "fn main() {}\n")
+        _, cmds, checks = run.parse_debugger_sections(text, "gdb", None)
+        self.assertEqual(cmds, ["run", "repr thing"])
+        self.assertEqual(checks, [(2, "thing: Ok")])
+
+    def test_revision_scoping(self):
+        text = ("//@ revisions: a b\n"
+                "//@ [a] gdb-command:run\n"
+                "//@ [b] gdb-command:print y\n"
+                "fn main() {}\n")
+        _, a_cmds, _ = run.parse_debugger_sections(text, "gdb", "a")
+        _, b_cmds, _ = run.parse_debugger_sections(text, "gdb", "b")
+        self.assertEqual(a_cmds, ["run"])
+        self.assertEqual(b_cmds, ["print y"])
+
+    def test_check_single_line_fragment_order(self):
+        self.assertTrue(run.debugger_check_single_line(
+            "noise $1 = 5", "$1 = 5"))
+        self.assertFalse(run.debugger_check_single_line(
+            "$1 = 5 trailing", "$1 = 5"))
+
+    def test_check_single_line_trailing_wildcard(self):
+        self.assertTrue(run.debugger_check_single_line(
+            "(f64) $0 = 4.5", "[...] 4.5"))
+        self.assertFalse(run.debugger_check_single_line(
+            "(f64) $0 = 4.5 trailing", "[...] 4.5"))
+        self.assertTrue(run.debugger_check_single_line(
+            "xx a yy b", "a [...] b"))
+        self.assertFalse(run.debugger_check_single_line(
+            "xx a yy", "a [...] b"))
+
+    def test_check_output_reuses_the_matched_line(self):
+        # compiletest's check_output does not advance past a
+        # matched line: two checks may match the same output
+        # line.
+        ok, missing = run.debugger_check_output(
+            [(1, "$1 = 5"), (2, "$1 = 5")], ["$1 = 5"])
+        self.assertTrue(ok)
+        self.assertEqual(missing, [])
+
+    def test_check_output_reports_missing_in_order(self):
+        ok, missing = run.debugger_check_output(
+            [(1, "beta"), (2, "gamma")], ["alpha", "beta"])
+        self.assertFalse(ok)
+        self.assertEqual(missing, [(2, "gamma")])
+
+    def test_translate_gdb(self):
+        self.assertEqual(
+            run.translate_debugger_command("gdb", "print/d x"),
+            "print/d x")
+        self.assertEqual(
+            run.translate_debugger_command("gdb", "print x"), "print x")
+        self.assertEqual(
+            run.translate_debugger_command("gdb", "continue"), "continue")
+        self.assertEqual(
+            run.translate_debugger_command("gdb", "frame"), "show-line")
+        self.assertEqual(
+            run.translate_debugger_command("gdb", "frame 2"), "frame 2")
+        self.assertEqual(
+            run.translate_debugger_command("gdb", "set print pretty"),
+            "# inert: set print pretty")
+        self.assertIsNone(run.translate_debugger_command("gdb", "quit"))
+        self.assertIsNone(
+            run.translate_debugger_command("gdb", "ptype x"))
+
+    def test_translate_lldb(self):
+        self.assertEqual(
+            run.translate_debugger_command("lldb", "v x"), "v x")
+        self.assertEqual(
+            run.translate_debugger_command("lldb", "expr x"), "v x")
+        self.assertEqual(
+            run.translate_debugger_command("lldb", "settings set a b"),
+            "# inert: settings set a b")
+        self.assertEqual(
+            run.translate_debugger_command("lldb", "frame select"),
+            "show-line")
+        self.assertIsNone(
+            run.translate_debugger_command("lldb", "breakpoint set -l 3"))
+
+    def test_variant_skipping(self):
+        h = run.Header("//@ ignore-gdb\nfn main() {}\n")
+        view = h.view(None)
+        self.assertTrue(run.debugger_variant_skipped(view, "gdb"))
+        self.assertFalse(run.debugger_variant_skipped(view, "lldb"))
+        h2 = run.Header("//@ only-lldb\nfn main() {}\n")
+        self.assertTrue(run.debugger_variant_skipped(h2.view(None), "gdb"))
+        self.assertFalse(run.debugger_variant_skipped(h2.view(None), "lldb"))
+
+    def test_filtered_view_hides_variant_directives(self):
+        h = run.Header("//@ only-lldb\n//@ run-pass\n")
+        view = h.view(None)
+        self.assertTrue(view.has("only-lldb"))
+        filtered = run._DebuggerFilteredView(view)
+        self.assertFalse(filtered.has("only-lldb"))
+        self.assertTrue(filtered.has("run-pass"))

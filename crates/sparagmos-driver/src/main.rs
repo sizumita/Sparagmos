@@ -193,6 +193,10 @@ struct Collected {
     /// stamps (see `Converter::fn_shim_locations`), for the
     /// interpreter.
     fn_shim_locations: [Option<sparagmos_mir::ConstValue>; 3],
+    /// The source-file table the bodies' source lines index into
+    /// (see `Converter::source_files`), for the interpreter's
+    /// debugger interface.
+    source_files: Vec<String>,
 }
 
 static COLLECTED: OnceLock<Mutex<Option<Collected>>> = OnceLock::new();
@@ -3691,6 +3695,7 @@ fn collect() -> ControlFlow<()> {
         adt_niches: conv.adt_niches.clone(),
         track_caller_defs: conv.track_caller_defs.clone(),
         fn_shim_locations: conv.fn_shim_locations.clone(),
+        source_files: conv.source_files.clone(),
     });
     ControlFlow::Continue(())
 }
@@ -3867,7 +3872,31 @@ fn session_overflow_checks(args: &[String]) -> bool {
     opt_is_zero
 }
 
-fn execute(c: &Collected, input: &str, guest_args: &[String], overflow_checks: bool) -> i32 {
+/// A converted program ready to run, with its entry point
+/// resolved: the shared front half of the run and debug entry
+/// points (the two differ only in how the interpreter is driven).
+struct BuiltProgram {
+    program: sparagmos_interp::MirProgram,
+    /// The program key of the entry body (see `execute`).
+    entry: String,
+    /// The display name of the entry body.
+    entry_name: String,
+    /// Index of the entry body in `Collected::bodies`.
+    entry_index: usize,
+    /// The arguments the entry invocation supplies.
+    entry_args: Vec<sparagmos_interp::Value>,
+    /// The entry body's declared argument count.
+    entry_arg_count: usize,
+}
+
+/// Build the interpreter program from a collection and resolve
+/// its entry point. On failure the run-mode error has already
+/// been reported and the `Err` carries the process exit code.
+fn build_program(
+    c: &Collected,
+    input: &str,
+    guest_args: &[String],
+) -> Result<BuiltProgram, i32> {
     let mut program = sparagmos_interp::MirProgram::new();
     for ((name, body), def_id) in c.bodies.iter().zip(c.body_def_ids.iter()) {
         program.functions.push(sparagmos_interp::MirFunction {
@@ -3895,6 +3924,7 @@ fn execute(c: &Collected, input: &str, guest_args: &[String], overflow_checks: b
     program.adt_niches = c.adt_niches.clone();
     program.track_caller_defs = c.track_caller_defs.clone();
     program.fn_shim_locations = c.fn_shim_locations.clone();
+    program.source_files = c.source_files.clone();
     // The entry body: the one rustc designated (see
     // `Collected::entry_def_id`) when collection recorded it, and
     // otherwise the first local body named `main`. A `--test`
@@ -3924,14 +3954,14 @@ fn execute(c: &Collected, input: &str, guest_args: &[String], overflow_checks: b
                         "sparagmos-driver run: unsupported: `main` was not converted ({})",
                         rs.join(", ")
                     );
-                    return 2;
+                    return Err(2);
                 }
             }
         }
         eprintln!(
             "sparagmos-driver run: unsupported: no `main` function among the converted functions"
         );
-        return 2;
+        return Err(2);
     };
     // The interpreter keys a body whose name another body shares
     // under a `DefId`-disambiguated key; hand it the key
@@ -3977,6 +4007,29 @@ fn execute(c: &Collected, input: &str, guest_args: &[String], overflow_checks: b
     } else {
         Vec::new()
     };
+    Ok(BuiltProgram {
+        program,
+        entry,
+        entry_name,
+        entry_index,
+        entry_args,
+        entry_arg_count,
+    })
+}
+
+fn execute(c: &Collected, input: &str, guest_args: &[String], overflow_checks: bool) -> i32 {
+    let built = match build_program(c, input, guest_args) {
+        Ok(b) => b,
+        Err(code) => return code,
+    };
+    let BuiltProgram {
+        program,
+        entry,
+        entry_name,
+        entry_index,
+        entry_args,
+        entry_arg_count,
+    } = built;
     let config = sparagmos_interp::InterpConfig {
         guest_args: guest_args.to_vec(),
         program_path: input.to_string(),
@@ -4067,6 +4120,169 @@ fn execute(c: &Collected, input: &str, guest_args: &[String], overflow_checks: b
             2
         }
     }
+}
+
+/// The `debug` entry point: run a debugger session over the
+/// converted program (see [`sparagmos_interp::debug`]), driven by
+/// a session script the harness produced from the test file's
+/// debugger sections (`--debug-script <path>`). The script is one
+/// command per line:
+///
+/// ```text
+/// break <line>     a breakpoint in the input file (repeatable)
+/// run              start (the session start; at most one, first)
+/// continue         resume to the next breakpoint
+/// next             step over
+/// step             step into
+/// finish           step out
+/// print <expr>     gdb-form print (also `print/d`, `print/x`,
+///                  `print/t`, `print/c` for the value format)
+/// v <expr>         lldb-form print
+/// frame <n>        select frame n (0 = innermost)
+/// show-line        emit the current stop line again
+/// ```
+///
+/// The session transcript is printed to stdout (the guest's own
+/// stdout first, then one line per stop or print). The exit
+/// contract is run mode's, adapted to a session: 0 when the
+/// session ran (the program's own end, normal or not, is part of
+/// the session — the harness judges the transcript), 2 when a
+/// conversion-side failure kept the session from starting.
+fn execute_debug(
+    c: &Collected,
+    input: &str,
+    guest_args: &[String],
+    overflow_checks: bool,
+    script_path: Option<&str>,
+    dialect_name: &str,
+) -> i32 {
+    let Some(script_path) = script_path else {
+        eprintln!("sparagmos-driver debug: --debug-script is required");
+        return 2;
+    };
+    let dialect = match dialect_name {
+        "gdb" => sparagmos_interp::DebugDialect::Gdb,
+        "lldb" => sparagmos_interp::DebugDialect::Lldb,
+        other => {
+            eprintln!("sparagmos-driver debug: unknown dialect `{other}` (gdb|lldb)");
+            return 2;
+        }
+    };
+    let script_text = match std::fs::read_to_string(script_path) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("sparagmos-driver debug: cannot read script {script_path}: {e}");
+            return 2;
+        }
+    };
+    let (breakpoints, commands) = match parse_debug_script(&script_text) {
+        Ok(parsed) => parsed,
+        Err(reason) => {
+            eprintln!("sparagmos-driver debug: bad script: {reason}");
+            return 2;
+        }
+    };
+    let built = match build_program(c, input, guest_args) {
+        Ok(b) => b,
+        Err(code) => return code,
+    };
+    let config = sparagmos_interp::InterpConfig {
+        guest_args: guest_args.to_vec(),
+        program_path: input.to_string(),
+        overflow_checks,
+        ..sparagmos_interp::InterpConfig::default()
+    };
+    let mut session = match sparagmos_interp::debug_mir(
+        &built.program,
+        &built.entry,
+        built.entry_args,
+        config,
+    ) {
+        Ok(session) => session,
+        Err(e) => {
+            eprintln!("sparagmos-driver run: unsupported: {e}");
+            return 2;
+        }
+    };
+    for line in &breakpoints {
+        session.set_breakpoint(input, *line);
+    }
+    if let Ok(text) = std::fs::read_to_string(input) {
+        session.set_source_text(input, &text);
+    }
+    let run = session.run_script(commands, dialect);
+    print!("{}", run.stdout);
+    for line in &run.transcript {
+        println!("{line}");
+    }
+    if let Err(msg) = &run.outcome {
+        eprintln!("sparagmos-driver debug: program ended: {msg}");
+    }
+    0
+}
+
+/// Parse a debugger session script (see [`execute_debug`]) into
+/// its breakpoint lines and its command list.
+fn parse_debug_script(
+    text: &str,
+) -> Result<(Vec<u32>, Vec<sparagmos_interp::DebugCommand>), String> {
+    use sparagmos_interp::{DebugCommand, DebugPrint, PrintFormat};
+    let mut breakpoints = Vec::new();
+    let mut commands = Vec::new();
+    for (lineno, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let bad = |what: &str| format!("line {}: {what}", lineno + 1);
+        let (head, rest) = match line.split_once(char::is_whitespace) {
+            Some((h, r)) => (h, r.trim()),
+            None => (line, ""),
+        };
+        match head {
+            "break" => {
+                let n: u32 = rest
+                    .parse()
+                    .map_err(|_| bad(&format!("bad breakpoint line `{rest}`")))?;
+                breakpoints.push(n);
+            }
+            "run" => commands.push(DebugCommand::Run),
+            "continue" => commands.push(DebugCommand::Continue),
+            "next" => commands.push(DebugCommand::Next),
+            "step" => commands.push(DebugCommand::Step),
+            "finish" => commands.push(DebugCommand::Finish),
+            "show-line" => commands.push(DebugCommand::ShowLine),
+            "frame" => {
+                let n: usize = rest
+                    .parse()
+                    .map_err(|_| bad(&format!("bad frame index `{rest}`")))?;
+                commands.push(DebugCommand::FrameSelect(n));
+            }
+            "v" => commands.push(DebugCommand::Print(DebugPrint {
+                expr: rest.to_string(),
+                format: None,
+            })),
+            "print" => commands.push(DebugCommand::Print(DebugPrint {
+                expr: rest.to_string(),
+                format: None,
+            })),
+            _ if head.starts_with("print/") => {
+                let format = match &head["print/".len()..] {
+                    "d" => Some(PrintFormat::Decimal),
+                    "x" => Some(PrintFormat::Hex),
+                    "t" => Some(PrintFormat::Binary),
+                    "c" => Some(PrintFormat::Char),
+                    other => return Err(bad(&format!("unknown print format `{other}`"))),
+                };
+                commands.push(DebugCommand::Print(DebugPrint {
+                    expr: rest.to_string(),
+                    format,
+                }));
+            }
+            _ => return Err(bad(&format!("unknown command `{head}`"))),
+        }
+    }
+    Ok((breakpoints, commands))
 }
 
 /// The crate type an auxiliary source declares for itself
@@ -4601,6 +4817,14 @@ fn compile_aux(
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     let run_mode = argv.get(1).map(|a| a == "run").unwrap_or(false);
+    let debug_mode = argv.get(1).map(|a| a == "debug").unwrap_or(false);
+    // The debug entry point compiles and collects exactly like
+    // run mode (it executes the same program, under a debugger
+    // session), so every compilation-shaping and error-contract
+    // decision below keys on the two together.
+    let exec_mode = run_mode || debug_mode;
+    let mut debug_script: Option<String> = None;
+    let mut debug_dialect = "gdb".to_string();
     let mut input: Option<String> = None;
     let mut aux_specs: Vec<AuxSpec> = Vec::new();
     let mut dump_path: Option<String> = None;
@@ -4608,7 +4832,7 @@ fn main() {
     let mut sysroot: Option<String> = None;
     let mut rustc_args: Vec<String> = Vec::new();
     let mut guest_args: Vec<String> = Vec::new();
-    let mut i = if run_mode { 2 } else { 1 };
+    let mut i = if exec_mode { 2 } else { 1 };
     while i < argv.len() {
         match argv[i].as_str() {
             "--dump" => {
@@ -4639,6 +4863,20 @@ fn main() {
                     std::process::exit(2);
                 }));
             }
+            "--debug-script" => {
+                i += 1;
+                debug_script = Some(argv.get(i).cloned().unwrap_or_else(|| {
+                    eprintln!("--debug-script needs a path");
+                    std::process::exit(2);
+                }));
+            }
+            "--debug-dialect" => {
+                i += 1;
+                debug_dialect = argv.get(i).cloned().unwrap_or_else(|| {
+                    eprintln!("--debug-dialect needs a value (gdb|lldb)");
+                    std::process::exit(2);
+                });
+            }
             "--aux" => {
                 i += 1;
                 let spec = argv.get(i).cloned().unwrap_or_else(|| {
@@ -4661,7 +4899,7 @@ fn main() {
                 }));
             }
             "-h" | "--help" => {
-    println!("usage: sparagmos-driver [run] <file.rs> [--aux <name>=<file.rs>[;crate-type=<type>][;edition=<ed>]] [--rustc-arg <arg>] [--guest-arg <arg>] [--dump <path>] [--edition <ed>] [--sysroot <path>]");
+    println!("usage: sparagmos-driver [run|debug] <file.rs> [--aux <name>=<file.rs>[;crate-type=<type>][;edition=<ed>]] [--rustc-arg <arg>] [--guest-arg <arg>] [--dump <path>] [--edition <ed>] [--sysroot <path>] [--debug-script <path>] [--debug-dialect <gdb|lldb>]");
                 return;
             }
             other if input.is_none() && !other.starts_with('-') => {
@@ -4699,7 +4937,7 @@ fn main() {
         match compile_aux(&sysroot, &edition, &aux_dir, spec, &aux_built) {
             Ok(built) => aux_built.push(built),
             Err(reason) => {
-                if run_mode {
+                if exec_mode {
                     eprintln!("sparagmos-driver run: unsupported: {reason}");
                     std::process::exit(2);
                 }
@@ -4744,7 +4982,7 @@ fn main() {
     let caller_sets_crate_type = rustc_args
         .iter()
         .any(|a| a == "--crate-type" || a.starts_with("--crate-type="));
-    if run_mode && !caller_sets_crate_type {
+    if exec_mode && !caller_sets_crate_type {
         args.push("--crate-type=lib".to_string());
     }
     // Lint levels are not part of an execution verdict, and the
@@ -4760,7 +4998,7 @@ fn main() {
     // admits nothing the reference rejected. Convert mode caps
     // nothing: its front end mirrors compiletest's, lint errors
     // included.
-    if run_mode {
+    if exec_mode {
         args.push("--cap-lints=allow".to_string());
     }
     // Caller-supplied rustc arguments (a test's `//@ compile-flags`,
@@ -4844,7 +5082,7 @@ fn main() {
                 // single unsupported code, and the
                 // compilation-failure report, for every
                 // conversion-side failure.
-                if run_mode {
+                if exec_mode {
                     eprintln!("sparagmos-driver: compilation failed: {DELAYED_BUG_ABORT}");
                     std::process::exit(2);
                 }
@@ -4860,9 +5098,9 @@ fn main() {
                 // exactly like a front-end rejection recorded by
                 // the callbacks.
                 eprintln!("sparagmos-driver: compilation failed: {abort}");
-                std::process::exit(if run_mode { 2 } else { 1 });
+                std::process::exit(if exec_mode { 2 } else { 1 });
             }
-            if run_mode {
+            if exec_mode {
                 eprintln!(
                     "sparagmos-driver run: unsupported: Stable MIR conversion panicked: {reason}"
                 );
@@ -4885,7 +5123,17 @@ fn main() {
                 eprintln!("sparagmos-driver: compilation failed: {e}");
                 // Same contract as a front-end failure: exit 1 in
                 // convert mode, exit 2 (unsupported) in run mode.
-                std::process::exit(if run_mode { 2 } else { 1 });
+                std::process::exit(if exec_mode { 2 } else { 1 });
+            }
+            if debug_mode {
+                std::process::exit(execute_debug(
+                    &c,
+                    &input,
+                    &guest_args,
+                    overflow_checks,
+                    debug_script.as_deref(),
+                    &debug_dialect,
+                ));
             }
             if run_mode {
                 if let Some(path) = &dump_path {
@@ -4979,7 +5227,7 @@ fn main() {
             eprintln!("sparagmos-driver: internal error: no results collected");
             std::process::exit(1);
         }
-        (Err(rustc_public::CompilerError::Skipped), _) if !run_mode => {
+        (Err(rustc_public::CompilerError::Skipped), _) if !exec_mode => {
             // The compiler finished without ever handing the
             // callbacks a crate: it was asked for information
             // (--version, --print, --explain) or told to stop after
@@ -5003,7 +5251,7 @@ fn main() {
             eprintln!("sparagmos-driver: compilation failed: {e:?}");
             // In run mode a failed compilation is a conversion failure,
             // which the run contract reports as exit 2.
-            std::process::exit(if run_mode { 2 } else { 1 });
+            std::process::exit(if exec_mode { 2 } else { 1 });
         }
     }
 }

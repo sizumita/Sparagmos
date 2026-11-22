@@ -18,6 +18,38 @@ pub struct VarDebugInfo {
     pub value: VarDebugInfoContents,
 }
 
+/// The source position of one statement or terminator, resolved by
+/// the driver from the Stable MIR span at conversion time (the span
+/// itself is opaque outside the compiler, so the resolution happens
+/// there): an index into the program-wide source-file table plus a
+/// 1-based line number. The interpreter's debugger interface is the
+/// consumer: breakpoints and stepping are line-based.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct SourceLine {
+    /// Index into the program's source-file table; `u32::MAX` when
+    /// the position is unknown.
+    pub file: u32,
+    /// 1-based line number; 0 when unknown.
+    pub line: u32,
+}
+
+impl SourceLine {
+    pub const UNKNOWN: SourceLine = SourceLine { file: u32::MAX, line: 0 };
+
+    pub fn is_known(&self) -> bool {
+        self.line != 0 && self.file != u32::MAX
+    }
+}
+
+/// Source lines of one basic block, parallel to
+/// [`BasicBlockData`]: one entry per statement, plus the
+/// terminator's. Empty in bodies built by hand.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BlockSourceLines {
+    pub statements: Vec<SourceLine>,
+    pub terminator: SourceLine,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct BasicBlockData {
     pub statements: Vec<Statement>,
@@ -58,6 +90,10 @@ pub struct Body {
     pub var_debug_info: Vec<VarDebugInfo>,
     pub span: Span,
     pub required_consts: Vec<Constant>,
+    /// Source lines of every block, parallel to `basic_blocks`
+    /// (see [`BlockSourceLines`]). Filled by the driver from the
+    /// Stable MIR spans; empty for hand-built bodies.
+    pub source_lines: Vec<BlockSourceLines>,
 }
 impl Body {
     pub fn new(
@@ -72,6 +108,7 @@ impl Body {
             var_debug_info: Vec::new(),
             span: Span::DUMMY,
             required_consts: Vec::new(),
+            source_lines: Vec::new(),
         }
     }
     pub fn return_ty(&self) -> Option<&Ty> {

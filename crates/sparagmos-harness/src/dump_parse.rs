@@ -515,6 +515,7 @@ impl Conv {
             local_decls,
             arg_count: atom_parse(field(f, "arg_count")?, "arg_count")?,
             var_debug_info: Vec::new(),
+            source_lines: Vec::new(),
             span: mir::Span::DUMMY,
             required_consts: Vec::new(),
         })

@@ -106,6 +106,13 @@ pub struct Converter {
     /// interpreter with the converted program.
     pub adt_instance_shapes: sm::AdtInstanceShapes,
     pub adt_niches: sm::AdtNiches,
+    /// Source-file table of the converted program: the file names
+    /// the per-body source lines (see `sm::Body::source_lines`)
+    /// index into, in first-use order. Handed to the interpreter
+    /// with the converted program, for the debugger interface.
+    pub source_files: Vec<String>,
+    /// Interning map for `source_files`.
+    source_file_ids: HashMap<String, u32>,
     /// Rendered instance keys whose instance-shape recording was
     /// already attempted (successfully or not), so an instance
     /// whose fields cannot be normalized is not retried at every
@@ -697,6 +704,8 @@ impl Converter {
             thread_locals: sm::ThreadLocals::new(),
             adt_instance_shapes: sm::AdtInstanceShapes::new(),
             adt_niches: sm::AdtNiches::new(),
+            source_files: Vec::new(),
+            source_file_ids: HashMap::new(),
             instance_shape_attempted: std::collections::HashSet::new(),
             static_tys: HashMap::new(),
             track_caller_defs: HashMap::new(),
@@ -980,10 +989,16 @@ impl Converter {
                 mutability: mutability(d.mutability),
             })
             .collect();
+        let mut source_lines: Vec<sm::BlockSourceLines> =
+            Vec::with_capacity(body.blocks.len());
         let mut blocks: Vec<sm::BasicBlockData> = body
             .blocks
             .iter()
-            .map(|b| self.basic_block(body, b))
+            .map(|b| {
+                let (block, lines) = self.basic_block(body, b);
+                source_lines.push(lines);
+                block
+            })
             .collect();
         let debug_info: Vec<sm::VarDebugInfo> = body
             .var_debug_info
@@ -994,6 +1009,7 @@ impl Converter {
             Self::initialize_const_bound_locals(body, &mut blocks, &debug_info);
             let mut b = sm::Body::new(locals, body.arg_locals().len(), blocks);
             b.var_debug_info = debug_info;
+            b.source_lines = source_lines;
             Ok(b)
         } else {
             Err(std::mem::take(&mut self.errors))
@@ -1009,9 +1025,25 @@ impl Converter {
                 sm::VarDebugInfoContents::Constant(Box::new(self.constant(c)))
             }
         };
+        // The entry's span, resolved to its (start, end) lines:
+        // the span is the extent of the lexical scope the
+        // variable is visible in, which the debugger interface
+        // uses to pick the right entry when one name is declared
+        // in several scopes. (This model's spans are otherwise
+        // dummy; the debug-info span is the one place a resolved
+        // extent is carried, as lines, not byte offsets.)
+        let (lo, hi) = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            info.source_info.span.get_lines()
+        })) {
+            Ok(lines) => (lines.start_line as u32, lines.end_line as u32),
+            Err(_) => (0, 0),
+        };
         sm::VarDebugInfo {
             name: info.name.clone(),
-            source_info: sm::SourceInfo::DUMMY,
+            source_info: sm::SourceInfo {
+                span: sm::Span { lo, hi },
+                scope: 0,
+            },
             value,
         }
     }
@@ -1143,18 +1175,63 @@ impl Converter {
         blocks[0].statements = init;
     }
 
-    fn basic_block(&mut self, body: &mir::Body, bb: &mir::BasicBlock) -> sm::BasicBlockData {
+    fn basic_block(
+        &mut self,
+        body: &mir::Body,
+        bb: &mir::BasicBlock,
+    ) -> (sm::BasicBlockData, sm::BlockSourceLines) {
         let statements = bb
             .statements
             .iter()
             .map(|s| sm::Statement::new(self.statement_kind(&s.kind)))
             .collect();
+        let lines = sm::BlockSourceLines {
+            statements: bb
+                .statements
+                .iter()
+                .map(|s| self.source_line(s.source_info.span))
+                .collect(),
+            terminator: self.source_line(bb.terminator.source_info.span),
+        };
         let terminator = self.terminator_kind(body, &bb.terminator);
         let mut data = sm::BasicBlockData::new(sm::Terminator::new(terminator));
         data.statements = statements;
         // Stable MIR (1.100.0) does not expose `is_cleanup`; see module docs.
         data.is_cleanup = false;
-        data
+        (data, lines)
+    }
+
+    /// Resolve one Stable MIR span to the (file, line) the debugger
+    /// interface works in, interning the file name into
+    /// `source_files`. The span is opaque outside the compiler, so
+    /// the resolution must happen here, through the span's own
+    /// stable queries; a span the compiler cannot place (a dummy or
+    /// foreign-macro span) yields [`sm::SourceLine::UNKNOWN`]
+    /// instead of failing the conversion — line information is an
+    /// overlay on the body, never a conversion requirement.
+    fn source_line(&mut self, span: rustc_public::ty::Span) -> sm::SourceLine {
+        let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (span.get_filename(), span.get_lines())
+        }));
+        let Ok((file, lines)) = resolved else {
+            return sm::SourceLine::UNKNOWN;
+        };
+        if lines.start_line == 0 {
+            return sm::SourceLine::UNKNOWN;
+        }
+        let file_id = match self.source_file_ids.get(&file) {
+            Some(&id) => id,
+            None => {
+                let id = self.source_files.len() as u32;
+                self.source_files.push(file.clone());
+                self.source_file_ids.insert(file, id);
+                id
+            }
+        };
+        sm::SourceLine {
+            file: file_id,
+            line: lines.start_line as u32,
+        }
     }
 
     fn statement_kind(&mut self, kind: &mir::StatementKind) -> sm::StatementKind {

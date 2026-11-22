@@ -448,6 +448,12 @@ pub struct Interpreter<'a> {
     /// continues in the caller) from a fresh panic raised directly
     /// in a cleanup frame (which aborts).
     resume_signaled: bool,
+    /// The debugger session's control state, when this run is
+    /// driven by the debugger interface ([`crate::debug`]): the
+    /// drive loop consults it at every source-line change. `None`
+    /// for every ordinary run, which then never pays for it beyond
+    /// the one check.
+    pub(crate) debug_ctl: Option<crate::debug::DebugControl>,
     /// The program-level statics store: one storage per `static`
     /// item, keyed by the static's program key (see
     /// [`crate::ir::Constant::StaticRef`]). A static's storage is
@@ -724,6 +730,7 @@ impl<'a> Interpreter<'a> {
             elem_blocks: std::cell::RefCell::new(std::collections::HashSet::new()),
             next_alloc: std::cell::Cell::new(1),
             decoded: std::cell::RefCell::new(std::collections::HashMap::new()),
+            debug_ctl: None,
         }
     }
 
@@ -1064,6 +1071,9 @@ impl<'a> Interpreter<'a> {
                 .2
                 .blocks[block_idx];
 
+            if self.debug_ctl.is_some() {
+                crate::debug::drive_hook(self, frames, body, block_idx, stmt_idx);
+            }
             if stmt_idx < block.statements.len() {
                 let dstmt = &dblock.stmts[stmt_idx];
                 // Advance the program counter before executing, so a call
