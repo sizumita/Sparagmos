@@ -2442,6 +2442,51 @@ fn unsupported(what: impl Into<String>) -> InterpError {
 // Execution
 // ---------------------------------------------------------------------------
 
+/// Escape a string for the harness's JSON output formats:
+/// the quote, the backslash, and the control characters (the
+/// short escapes for newline, carriage return, and tab, the
+/// `\uXXXX` form for the rest), as libtest's own JSON writer
+/// emits them.
+fn json_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// A panic report as it appears in a passing should-panic
+/// test's captured output: the `thread '...' panicked at ...`
+/// head and the message, without the backtrace note the
+/// failure account adds.
+fn panic_report_head(
+    test: &TestDesc,
+    thread_id: u64,
+    location: Option<(String, u64, u64)>,
+    message: &str,
+) -> String {
+    match location {
+        Some((file, line, col)) => format!(
+            "\nthread '{}' ({}) panicked at {}:{}:{}:\n{}\n",
+            test.name, thread_id, file, line, col, message
+        ),
+        None => format!(
+            "\nthread '{}' ({}) panicked:\n{}\n",
+            test.name, thread_id, message
+        ),
+    }
+}
+
 /// The `ExitCode` value the harness main returns: the byte
 /// wrapped in the two single-field enums of its model shape.
 fn test_exit_code(byte: u128) -> Value {
@@ -2457,13 +2502,28 @@ fn test_exit_code(byte: u128) -> Value {
 /// The libtest command line, read from the guest's arguments:
 /// positional filters (a test is selected when it matches ANY
 /// of them, as a substring, or by equality with `--exact`),
-/// `--skip` exclusions, `--list`, `--nocapture`,
-/// `--include-ignored`, and the output format (`--quiet` is
-/// libtest's terse format). Flags the model does not act on
-/// (thread counts, colors, log files) are accepted and
-/// ignored: they cannot change a sequential run's output.
-/// `--ignored` (run only the ignored tests) is not modeled,
-/// and the terse run format is only honored for `--list`.
+/// `--skip` exclusions, `--list`, `--nocapture`, the
+/// ignored-test mode (`--ignored` / `--include-ignored`), and
+/// the output format (`--quiet` is libtest's terse format;
+/// `--format json` is the JSON Lines event stream, accepted
+/// only together with `-Z unstable-options`). Flags the model
+/// does not act on (thread counts, colors, log files) are
+/// accepted and ignored: they cannot change a sequential
+/// run's output. The terse run format is only honored for
+/// `--list`.
+/// How a run treats `#[ignore]`d tests (libtest's
+/// `RunIgnored`): by default they are skipped and reported as
+/// ignored; `--include-ignored` runs them with the rest;
+/// `--ignored` runs only them, the rest counting as filtered
+/// out. When both flags are given the later one wins, as in
+/// libtest's own parser.
+#[derive(Clone, Copy, PartialEq)]
+enum RunIgnored {
+    No,
+    Yes,
+    Only,
+}
+
 struct HarnessOpts {
     filters: Vec<String>,
     exact: bool,
@@ -2471,7 +2531,9 @@ struct HarnessOpts {
     list: bool,
     nocapture: bool,
     terse: bool,
-    include_ignored: bool,
+    json: bool,
+    show_output: bool,
+    run_ignored: RunIgnored,
 }
 
 impl HarnessOpts {
@@ -2483,7 +2545,9 @@ impl HarnessOpts {
             list: false,
             nocapture: false,
             terse: false,
-            include_ignored: false,
+            json: false,
+            show_output: false,
+            run_ignored: RunIgnored::No,
         };
         let mut i = 0;
         while i < args.len() {
@@ -2493,11 +2557,19 @@ impl HarnessOpts {
                 "--nocapture" => opts.nocapture = true,
                 "--exact" => opts.exact = true,
                 "--quiet" => opts.terse = true,
-                "--include-ignored" => opts.include_ignored = true,
+                // A `-Z` flag's value is an unstable option
+                // (the gating in the harness arm judges it),
+                // never a positional filter.
+                "-Z" => i += 1,
+                "--include-ignored" => opts.run_ignored = RunIgnored::Yes,
+                "--ignored" => opts.run_ignored = RunIgnored::Only,
+                "--show-output" => opts.show_output = true,
                 "--format" => {
                     i += 1;
-                    if args.get(i).map(String::as_str) == Some("terse") {
-                        opts.terse = true;
+                    match args.get(i).map(String::as_str) {
+                        Some("terse") => opts.terse = true,
+                        Some("json") => opts.json = true,
+                        _ => {}
                     }
                 }
                 "--skip" => {
@@ -2510,6 +2582,8 @@ impl HarnessOpts {
                     if let Some(v) = arg.strip_prefix("--format=") {
                         if v == "terse" {
                             opts.terse = true;
+                        } else if v == "json" {
+                            opts.json = true;
                         }
                     } else if let Some(v) = arg.strip_prefix("--skip=") {
                         opts.skips.push(v.to_string());
@@ -2523,7 +2597,16 @@ impl HarnessOpts {
         opts
     }
 
+    /// Whether ignored tests run in this run (with the rest,
+    /// or as the only tests).
+    fn runs_ignored(&self) -> bool {
+        self.run_ignored != RunIgnored::No
+    }
+
     fn selected(&self, test: &TestDesc) -> bool {
+        if self.run_ignored == RunIgnored::Only && !test.ignore {
+            return false;
+        }
         if self.skips.iter().any(|s| test.name.contains(s.as_str())) {
             return false;
         }
@@ -2553,6 +2636,8 @@ struct TestDesc {
     source_file: String,
     start_line: u64,
     start_col: u64,
+    end_line: u64,
+    end_col: u64,
     callable: Value,
 }
 
@@ -3114,28 +3199,51 @@ impl<'a> Interpreter<'a> {
                 // happens: the harness this models is a
                 // stable-channel one (the toolchain's own harness
                 // refuses `-Z` without a nightly channel). The
-                // json format is likewise an unstable option and
-                // is refused before listing or running.
+                // one exception is `-Z unstable-options` unlocking
+                // the json format, the pair libtest's own JSON
+                // consumers pass; any other `-Z` use, and
+                // unstable-options without a json request, is
+                // refused as before. The json format without the
+                // unlocking option is likewise refused before
+                // listing or running.
                 let raw_args: Vec<String> = self.guest_args().to_vec();
-                if raw_args.iter().any(|a| a == "-Z" || a.starts_with("-Z")) {
+                let opts = HarnessOpts::parse(&raw_args);
+                let mut unstable_options = false;
+                let mut other_z = false;
+                {
+                    let mut j = 0;
+                    while j < raw_args.len() {
+                        let a = &raw_args[j];
+                        if a == "-Zunstable-options" {
+                            unstable_options = true;
+                        } else if a == "-Z" {
+                            if raw_args.get(j + 1).map(String::as_str)
+                                == Some("unstable-options")
+                            {
+                                unstable_options = true;
+                                j += 1;
+                            } else {
+                                other_z = true;
+                            }
+                        } else if a.starts_with("-Z") {
+                            other_z = true;
+                        }
+                        j += 1;
+                    }
+                }
+                if other_z || (unstable_options && !opts.json) {
                     self.push_error_output(
                         "error: the option `Z` is only accepted on the nightly compiler\n",
                     );
                     return Ok(test_exit_code(101));
                 }
-                let format_json = raw_args.iter().enumerate().any(|(j, a)| {
-                    a == "--format=json"
-                        || (a == "--format"
-                            && raw_args.get(j + 1).map(String::as_str) == Some("json"))
-                });
-                if format_json {
+                if opts.json && !unstable_options {
                     self.push_error_output(
                         "error: The \"json\" format is only accepted on the nightly \
                          compiler with -Z unstable-options\n",
                     );
                     return Ok(test_exit_code(101));
                 }
-                let opts = HarnessOpts::parse(self.guest_args());
                 let mut selected: Vec<&TestDesc> = Vec::new();
                 let mut filtered_out = 0usize;
                 for test in &tests {
@@ -3146,6 +3254,49 @@ impl<'a> Interpreter<'a> {
                     }
                 }
                 if opts.list {
+                    if opts.json {
+                        // `--list` in the json format is the
+                        // discovery event stream: a suite event,
+                        // one `discovered` event per selected
+                        // test carrying its descriptor's span,
+                        // and the closing suite event with the
+                        // counts.
+                        self.push_output(
+                            "{ \"type\": \"suite\", \"event\": \"discovery\" }\n",
+                        );
+                        let mut discovered_ignored = 0usize;
+                        for test in &selected {
+                            if test.ignore {
+                                discovered_ignored += 1;
+                            }
+                            self.push_output(&format!(
+                                "{{ \"type\": \"test\", \"event\": \"discovered\", \
+                                 \"name\": \"{}\", \"ignore\": {}, \
+                                 \"ignore_message\": \"{}\", \"source_path\": \"{}\", \
+                                 \"start_line\": {}, \"start_col\": {}, \
+                                 \"end_line\": {}, \"end_col\": {} }}\n",
+                                json_escape(&test.name),
+                                test.ignore,
+                                json_escape(
+                                    test.ignore_message.as_deref().unwrap_or("")
+                                ),
+                                json_escape(&test.source_file),
+                                test.start_line,
+                                test.start_col,
+                                test.end_line,
+                                test.end_col
+                            ));
+                        }
+                        self.push_output(&format!(
+                            "{{ \"type\": \"suite\", \"event\": \"completed\", \
+                             \"tests\": {}, \"benchmarks\": 0, \"total\": {}, \
+                             \"ignored\": {} }}\n",
+                            selected.len(),
+                            selected.len(),
+                            discovered_ignored
+                        ));
+                        return Ok(test_exit_code(0));
+                    }
                     // `--list`: one `{name}: test` line per
                     // selected test; the default format adds the
                     // count footer, the terse format does not.
@@ -3176,29 +3327,64 @@ impl<'a> Interpreter<'a> {
                 }
                 let mut failure_names: Vec<String> = Vec::new();
                 let mut failure_sections: Vec<String> = Vec::new();
-                self.push_output(&format!(
-                    "\nrunning {} {}\n",
-                    selected.len(),
-                    if selected.len() == 1 { "test" } else { "tests" }
-                ));
+                if opts.json {
+                    self.push_output(&format!(
+                        "{{ \"type\": \"suite\", \"event\": \"started\", \
+                         \"test_count\": {} }}\n",
+                        selected.len()
+                    ));
+                } else {
+                    self.push_output(&format!(
+                        "\nrunning {} {}\n",
+                        selected.len(),
+                        if selected.len() == 1 { "test" } else { "tests" }
+                    ));
+                }
                 for test in selected {
                     let annotation = match test.should_panic {
                         ShouldPanic::No => "",
                         _ => " - should panic",
                     };
-                    if test.ignore && !opts.include_ignored {
+                    if test.ignore && !opts.runs_ignored() {
                         ignored += 1;
-                        let note = match &test.ignore_message {
-                            Some(msg) => format!(", {msg}"),
-                            None => String::new(),
-                        };
-                        self.push_output(&format!(
-                            "test {}{} ... ignored{}\n",
-                            test.name, annotation, note
-                        ));
+                        if opts.json {
+                            self.push_output(&format!(
+                                "{{ \"type\": \"test\", \"event\": \"started\", \
+                                 \"name\": \"{}\" }}\n",
+                                json_escape(&test.name)
+                            ));
+                            let message = match &test.ignore_message {
+                                Some(msg) => format!(
+                                    ", \"message\": \"{}\"",
+                                    json_escape(msg)
+                                ),
+                                None => String::new(),
+                            };
+                            self.push_output(&format!(
+                                "{{ \"type\": \"test\", \"name\": \"{}\", \
+                                 \"event\": \"ignored\"{} }}\n",
+                                json_escape(&test.name),
+                                message
+                            ));
+                        } else {
+                            let note = match &test.ignore_message {
+                                Some(msg) => format!(", {msg}"),
+                                None => String::new(),
+                            };
+                            self.push_output(&format!(
+                                "test {}{} ... ignored{}\n",
+                                test.name, annotation, note
+                            ));
+                        }
                         continue;
                     }
-                    if opts.nocapture {
+                    if opts.json {
+                        self.push_output(&format!(
+                            "{{ \"type\": \"test\", \"event\": \"started\", \
+                             \"name\": \"{}\" }}\n",
+                            json_escape(&test.name)
+                        ));
+                    } else if opts.nocapture {
                         self.push_output(&format!(
                             "test {}{} ... ",
                             test.name, annotation
@@ -3229,6 +3415,12 @@ impl<'a> Interpreter<'a> {
                     // failure's account. A bare panic in
                     // nocapture mode has no section (its report
                     // went to the guest's stderr as it ran).
+                    // For a test that panics as it was expected
+                    // to, the panic report without the backtrace
+                    // note: the json format's `--show-output`
+                    // account of a passing should-panic test is
+                    // its captured output plus this report.
+                    let mut pass_note: Option<String> = None;
                     let failure_body: Option<Option<String>> = match result {
                         Ok(_) => match test.should_panic {
                             ShouldPanic::No => None,
@@ -3266,7 +3458,15 @@ impl<'a> Interpreter<'a> {
                                         )))
                                     }
                                 }
-                                ShouldPanic::Yes => None,
+                                ShouldPanic::Yes => {
+                                    pass_note = Some(panic_report_head(
+                                        test,
+                                        self.current_thread_id(),
+                                        self.panic_location(),
+                                        &message,
+                                    ));
+                                    None
+                                }
                                 ShouldPanic::YesWithMessage(expected) => {
                                     let text = payload
                                         .as_ref()
@@ -3293,6 +3493,12 @@ impl<'a> Interpreter<'a> {
                                             "{cap_out}{cap_err}note: expected panic with string value,\n found non-string value: `{ty}`\n     expected substring: \"{expected}\""
                                         )))
                                     } else if text.contains(expected.as_str()) {
+                                        pass_note = Some(panic_report_head(
+                                            test,
+                                            self.current_thread_id(),
+                                            self.panic_location(),
+                                            &message,
+                                        ));
                                         None
                                     } else {
                                         Some(Some(format!(
@@ -3307,7 +3513,36 @@ impl<'a> Interpreter<'a> {
                     match failure_body {
                         None => {
                             passed += 1;
-                            if opts.nocapture {
+                            if opts.json {
+                                // With `--show-output`, a passing
+                                // test's event carries its
+                                // captured output (plus the report
+                                // of a panic it was expected to
+                                // raise); without it, or under
+                                // `--nocapture`, the field is
+                                // omitted.
+                                let captured = format!(
+                                    "{cap_out}{cap_err}{}",
+                                    pass_note.as_deref().unwrap_or("")
+                                );
+                                let stdout = if opts.show_output
+                                    && !opts.nocapture
+                                    && !captured.is_empty()
+                                {
+                                    format!(
+                                        ", \"stdout\": \"{}\"",
+                                        json_escape(&captured)
+                                    )
+                                } else {
+                                    String::new()
+                                };
+                                self.push_output(&format!(
+                                    "{{ \"type\": \"test\", \"name\": \"{}\", \
+                                     \"event\": \"ok\"{} }}\n",
+                                    json_escape(&test.name),
+                                    stdout
+                                ));
+                            } else if opts.nocapture {
                                 self.push_output("ok\n");
                             } else {
                                 self.push_output(&format!(
@@ -3319,13 +3554,36 @@ impl<'a> Interpreter<'a> {
                         Some(body) => {
                             failed += 1;
                             failure_names.push(test.name.clone());
-                            if let Some(body) = body {
+                            if let Some(body) = &body {
                                 failure_sections.push(format!(
                                     "\n---- {} stdout ----\n{}",
                                     test.name, body
                                 ));
                             }
-                            if opts.nocapture {
+                            if opts.json {
+                                // A failed test's event carries
+                                // its failure account as `stdout`
+                                // (the captured output followed by
+                                // the account itself); under
+                                // `--nocapture` nothing was
+                                // captured, so the field is omitted.
+                                let stdout = if opts.nocapture {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        ", \"stdout\": \"{}\"",
+                                        json_escape(
+                                            body.as_deref().unwrap_or("")
+                                        )
+                                    )
+                                };
+                                self.push_output(&format!(
+                                    "{{ \"type\": \"test\", \"name\": \"{}\", \
+                                     \"event\": \"failed\"{} }}\n",
+                                    json_escape(&test.name),
+                                    stdout
+                                ));
+                            } else if opts.nocapture {
                                 self.push_output("FAILED\n");
                             } else {
                                 self.push_output(&format!(
@@ -3336,25 +3594,36 @@ impl<'a> Interpreter<'a> {
                         }
                     }
                 }
-                if !failure_names.is_empty() {
-                    self.push_output("\nfailures:\n");
-                    for section in &failure_sections {
-                        self.push_output(section);
+                if opts.json {
+                    let event = if failed == 0 { "ok" } else { "failed" };
+                    self.push_output(&format!(
+                        "{{ \"type\": \"suite\", \"event\": \"{}\", \
+                         \"passed\": {}, \"failed\": {}, \"ignored\": {}, \
+                         \"measured\": 0, \"filtered_out\": {}, \
+                         \"exec_time\": \"0.00\" }}\n",
+                        event, passed, failed, ignored, filtered_out
+                    ));
+                } else {
+                    if !failure_names.is_empty() {
+                        self.push_output("\nfailures:\n");
+                        for section in &failure_sections {
+                            self.push_output(section);
+                        }
+                        if !failure_sections.is_empty() {
+                            self.push_output("\n");
+                        }
+                        self.push_output("\nfailures:\n");
+                        for name in &failure_names {
+                            self.push_output(&format!("    {name}\n"));
+                        }
                     }
-                    if !failure_sections.is_empty() {
-                        self.push_output("\n");
-                    }
-                    self.push_output("\nfailures:\n");
-                    for name in &failure_names {
-                        self.push_output(&format!("    {name}\n"));
-                    }
+                    let verdict = if failed == 0 { "ok" } else { "FAILED" };
+                    self.push_output(&format!(
+                        "\ntest result: {verdict}. {passed} passed; {failed} failed; \
+                         {ignored} ignored; 0 measured; {filtered_out} filtered out; \
+                         finished in 0.00s\n\n"
+                    ));
                 }
-                let verdict = if failed == 0 { "ok" } else { "FAILED" };
-                self.push_output(&format!(
-                    "\ntest result: {verdict}. {passed} passed; {failed} failed; \
-                     {ignored} ignored; 0 measured; {filtered_out} filtered out; \
-                     finished in 0.00s\n\n"
-                ));
                 // `ExitCode`: success is 0, any failure is 101,
                 // as in libtest.
                 let byte = if failed == 0 { 0 } else { 101 };
@@ -7322,6 +7591,8 @@ impl<'a> Interpreter<'a> {
                 source_file,
                 start_line: desc_uint(4),
                 start_col: desc_uint(5),
+                end_line: desc_uint(6),
+                end_col: desc_uint(7),
                 callable,
             });
         }
