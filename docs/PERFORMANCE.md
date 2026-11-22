@@ -308,3 +308,35 @@ Bench-helper medians against the pre-pass tree:
 
 Call- and builtin-heavy kernels are unchanged (about 1.0x),
 as expected: their cost sits below the statement layer.
+
+## Update 2026-11-22 (fleur): no body clones on call and return
+
+Re-measured all bench kernels on the current main and profiled
+with a sampling profiler (perf is blocked on this host, so an
+LD_PRELOAD SIGPROF sampler was used). On the call-heavy kernel
+the largest single cost was not dispatch or operand evaluation:
+`Body::clone` took 39% inclusive of fib_rec_s and dropping those
+clones another 21%. `start_call_stamped`, `start_detached_call`
+and `exec_return` cloned the callee/caller body (every block,
+statement and type) on every call and every return, only to read
+fields and pass `&Body` to the write/jump paths. The interpreter
+borrows the program (`&'a Program`), so the bodies are available
+by reference; the three clones are gone.
+
+Bench-helper medians against the pre-pass tree:
+
+| kernel | speedup |
+|---|---|
+| fib_rec | 2.50x |
+| fib_rec_s | 2.37x |
+| vec_push_sum_s | 1.08x |
+| loop_sum / vec_push_sum / matmul / string kernels | about 1.0x |
+
+Semantics are unchanged: the full test suites pass (workspace
+580, driver 321, corpus 47/47, pytest 349). The profile also
+named the next two costs for later passes, both unchanged by
+this one: terminator operand evaluation in the run loop goes
+through the general `eval_operand` path (59.6% inclusive on
+loop_sum, with place-description formatting at 21.2%), and the
+`Vec` builtins' `resolve_value` clones the whole vector
+(about 50% inclusive on vec_push_sum_s).
