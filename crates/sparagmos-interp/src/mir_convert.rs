@@ -4643,13 +4643,20 @@ impl<'a> Converter<'a> {
             | crate::builtins::Builtin::IteratorForEach
             | crate::builtins::Builtin::IteratorCollect => raw_generic_args.first(),
             crate::builtins::Builtin::FromIteratorFromIter => raw_generic_args.get(2),
+            crate::builtins::Builtin::IteratorNextBack => raw_generic_args.first(),
             _ => return false,
         };
         let Some(iter_ty) = iter_ty else {
             return false;
         };
         let tag = crate::builtins::ty_tag(iter_ty, self.names);
-        if crate::builtins::iterator_next_modelled(&tag) {
+        let modelled = match kind {
+            crate::builtins::Builtin::IteratorNextBack => {
+                crate::builtins::iterator_next_back_modelled(&tag)
+            }
+            _ => crate::builtins::iterator_next_modelled(&tag),
+        };
+        if modelled {
             return false;
         }
         self.resolve_body_callee(func).is_some()

@@ -263,6 +263,8 @@ pub enum Builtin {
     IntoIter,
     /// `std::iter::Iterator::next(&mut iter)`.
     IteratorNext,
+    /// `std::iter::DoubleEndedIterator::next_back(&mut iter)`.
+    IteratorNextBack,
     /// `std::iter::Iterator::size_hint(&iter)`.
     IteratorSizeHint,
     /// `std::iter::Iterator::count(iter)`: drive the modelled
@@ -1169,6 +1171,8 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "core::fmt::rt::Argument::from_usize" => Builtin::ArgumentFromUsize,
         "std::iter::IntoIterator::into_iter" => Builtin::IntoIter,
         "std::iter::Iterator::next" => Builtin::IteratorNext,
+        "std::iter::DoubleEndedIterator::next_back"
+        | "core::iter::DoubleEndedIterator::next_back" => Builtin::IteratorNextBack,
         "std::iter::Iterator::size_hint" => Builtin::IteratorSizeHint,
         "std::iter::Iterator::count" => Builtin::IteratorCount,
         "std::iter::Iterator::fold" => Builtin::IteratorFold,
@@ -3726,6 +3730,11 @@ impl<'a> Interpreter<'a> {
                 arity(1)?;
                 let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
                 self.iterator_next(frames, self_ty, &vals[0])
+            }
+            Builtin::IteratorNextBack => {
+                arity(1)?;
+                let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
+                self.iterator_next_back(frames, self_ty, &vals[0])
             }
             Builtin::IteratorSizeHint => {
                 arity(1)?;
@@ -7662,6 +7671,321 @@ impl<'a> Interpreter<'a> {
         Ok(result)
     }
 
+    /// `DoubleEndedIterator::next_back`: mutate the iterator in
+    /// place through the `&mut` argument and return the `Option`
+    /// value — the mirror of [`Self::iterator_next`].
+    fn iterator_next_back(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        self_ty: &str,
+        ref_arg: &Value,
+    ) -> InterpResult<Value> {
+        let target = self.deref_value(frames, ref_arg)?;
+        self.iterator_next_back_at(frames, self_ty, &target)
+    }
+
+    /// `DoubleEndedIterator::next_back` on the iterator stored
+    /// at `target`: mutate it in place and return the `Option`
+    /// value.
+    fn iterator_next_back_at(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        self_ty: &str,
+        target: &Resolved,
+    ) -> InterpResult<Value> {
+        // A `Map` on a place-based state is stepped in place,
+        // exactly as for `next` (see `iterator_next_at`): its
+        // closure's environment reference must name the closure
+        // field's own storage.
+        if self_ty.starts_with("std::iter::Map<") {
+            if let Some(result) = self.map_next_back(frames, self_ty, target)? {
+                return Ok(result);
+            }
+        }
+        let state = self.read_resolved(frames, target)?;
+        let (new_state, result) = self.next_back_on_state(frames, self_ty, state)?;
+        self.write_resolved(frames, target, new_state)?;
+        Ok(result)
+    }
+
+    /// The place-based back step of a `Map` (see `map_next`):
+    /// step the inner iterator in place from the back, then apply
+    /// the closure to the yielded item. Declines a state that
+    /// does not live in a place, like `map_next` does.
+    fn map_next_back(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        self_ty: &str,
+        target: &Resolved,
+    ) -> InterpResult<Option<Value>> {
+        let Some(inner_target) = extend_target(target, RefProj::Field(0)) else {
+            return Ok(None);
+        };
+        let Some(closure_target) = extend_target(target, RefProj::Field(1)) else {
+            return Ok(None);
+        };
+        let inner_ty = first_generic_arg(self_ty).unwrap_or("");
+        let item = self.iterator_next_back_at(frames, inner_ty, &inner_target)?;
+        let Some(item) = option_payload_opt(item) else {
+            return Ok(Some(none_value()));
+        };
+        let callable = self.read_resolved(frames, &closure_target)?;
+        let env_ref = self.target_ref_value(frames, &closure_target)?;
+        let mapped = self.call_callable_sync(frames, &callable, Some(env_ref), vec![item])?;
+        Ok(Some(some_value(mapped)))
+    }
+
+    /// One `DoubleEndedIterator::next_back` step on an iterator
+    /// state value: the new state and the step's `Option` value.
+    /// The leaf shapes are the pure state transition
+    /// (`iterator_next_back_state`) that `Rev::next` already
+    /// runs; the arms here are the wrappers whose back step is a
+    /// composition of other steps: a `Rev`'s back step is its
+    /// inner iterator's front step, an `Enumerate`'s is the
+    /// inner back step indexed from the end, a `Copied`'s is the
+    /// inner back step with the yielded reference followed, a
+    /// `Map`'s is the inner back step with the closure applied,
+    /// and an `IterMut`'s hands out the last remaining element
+    /// of the container.
+    fn next_back_on_state(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        self_ty: &str,
+        state: Value,
+    ) -> InterpResult<(Value, Value)> {
+        if self_ty.starts_with("std::iter::Rev<") {
+            let fields = iterator_fields(&state, self_ty)?;
+            if fields.len() != 1 {
+                return Err(InterpError::type_mismatch(
+                    "Rev state",
+                    "[inner iterator]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let inner_ty = self_ty
+                .strip_prefix("std::iter::Rev<")
+                .and_then(|rest| rest.strip_suffix('>'))
+                .unwrap_or("");
+            let (new_inner, result) =
+                self.iterator_next_state(frames, inner_ty, fields[0].clone())?;
+            return Ok((rebuild_state(&state, vec![new_inner]), result));
+        }
+        if self_ty.starts_with("std::iter::Enumerate<") {
+            let fields = iterator_fields(&state, self_ty)?;
+            if fields.len() != 2 {
+                return Err(InterpError::type_mismatch(
+                    "Enumerate state",
+                    "[iterator, count]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let count = match fields[1] {
+                Value::Uint(v) => v,
+                ref other => {
+                    return Err(InterpError::type_mismatch(
+                        "Enumerate count",
+                        "unsigned integer",
+                        other.kind_name(),
+                    ))
+                }
+            };
+            let inner_ty = first_generic_arg(self_ty).unwrap_or("");
+            let (new_inner, item) =
+                self.next_back_on_state(frames, inner_ty, fields[0].clone())?;
+            let Some(x) = option_payload_opt(item) else {
+                return Ok((
+                    rebuild_state(&state, vec![new_inner, Value::Uint(count)]),
+                    none_value(),
+                ));
+            };
+            // The back item's index is the front count plus the
+            // items that remain after it; std computes it from
+            // the inner iterator's exact length, so an inexact
+            // size hint is an explicit unsupported error here
+            // (the step itself already happened on the state
+            // value, but the run fails before anything observes
+            // the stepped state).
+            let inner_ref = Value::Ref(RefTarget::value(fields[0].clone()));
+            let hint = self.iterator_size_hint(frames, inner_ty, &inner_ref)?;
+            let remaining = match &hint {
+                Value::Tuple(parts) if parts.len() == 2 => match &parts[0] {
+                    Value::Uint(lower) => match option_payload_opt(parts[1].clone()) {
+                        Some(Value::Uint(upper)) if upper == *lower => Some(*lower),
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                _ => None,
+            };
+            let Some(remaining) = remaining else {
+                return Err(unsupported(format!(
+                    "DoubleEndedIterator::next_back for {self_ty} needs the inner \
+                     iterator's exact length, which its size hint does not give"
+                )));
+            };
+            if remaining == 0 {
+                return Err(unsupported(format!(
+                    "DoubleEndedIterator::next_back for {self_ty} yielded an item \
+                     from an inner iterator reporting zero remaining items"
+                )));
+            }
+            let index = count + remaining - 1;
+            return Ok((
+                rebuild_state(&state, vec![new_inner, Value::Uint(count)]),
+                some_value(Value::Tuple(vec![Value::Uint(index), x])),
+            ));
+        }
+        if self_ty.starts_with("std::iter::Copied<") {
+            let fields = iterator_fields(&state, self_ty)?;
+            if fields.len() != 1 {
+                return Err(InterpError::type_mismatch(
+                    "Copied state",
+                    "[iterator]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let inner_ty = first_generic_arg(self_ty).unwrap_or("");
+            let (new_inner, item) =
+                self.next_back_on_state(frames, inner_ty, fields[0].clone())?;
+            return match option_payload_opt(item) {
+                None => Ok((rebuild_state(&state, vec![new_inner]), none_value())),
+                Some(x) => {
+                    let copied = self.resolve_value(frames, &x)?;
+                    Ok((rebuild_state(&state, vec![new_inner]), some_value(copied)))
+                }
+            };
+        }
+        if self_ty.starts_with("std::iter::Map<") {
+            // The value-level step, used when the Map does not
+            // live in a place (see `map_next_back`): the closure
+            // is applied with a reference to the value itself,
+            // exactly as in the front step's fallback.
+            let fields = iterator_fields(&state, self_ty)?;
+            if fields.len() != 2 {
+                return Err(InterpError::type_mismatch(
+                    "Map state",
+                    "[iterator, closure]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let inner_ty = first_generic_arg(self_ty).unwrap_or("");
+            let (new_inner, item) =
+                self.next_back_on_state(frames, inner_ty, fields[0].clone())?;
+            return match option_payload_opt(item) {
+                None => Ok((
+                    rebuild_state(&state, vec![new_inner, fields[1].clone()]),
+                    none_value(),
+                )),
+                Some(x) => {
+                    let mapped =
+                        self.call_callable_sync(frames, &fields[1], None, vec![x])?;
+                    Ok((
+                        rebuild_state(&state, vec![new_inner, fields[1].clone()]),
+                        some_value(mapped),
+                    ))
+                }
+            };
+        }
+        if self_ty.starts_with("std::option::Iter<")
+            || self_ty.starts_with("std::option::IterMut<")
+        {
+            // The two state shapes of the front step (see
+            // `next_on_state`): the [elements, index] state, whose
+            // back step drops the last remaining element, and the
+            // nested one-payload shape, whose only element is
+            // taken exactly as the front step takes it.
+            let fields = iterator_fields(&state, self_ty)?;
+            if fields.len() == 2 {
+                if let (Value::Tuple(items), Value::Uint(idx)) = (&fields[0], &fields[1]) {
+                    let idx = *idx as usize;
+                    if idx < items.len() {
+                        let item = items[items.len() - 1].clone();
+                        let kept = items[..items.len() - 1].to_vec();
+                        let new_state = rebuild_state(
+                            &state,
+                            vec![Value::Tuple(kept), Value::Uint(idx as u128)],
+                        );
+                        return Ok((new_state, some_value(item)));
+                    }
+                    return Ok((state, none_value()));
+                }
+            }
+            return match take_option_payload(&state) {
+                Ok(Some((new_state, item))) => Ok((new_state, some_value(item))),
+                Ok(None) => Ok((state, none_value())),
+                Err(()) => Err(InterpError::type_mismatch(
+                    format!("iterator state of {self_ty}"),
+                    "an Option value in one-field wrappers",
+                    state.kind_name(),
+                )),
+            };
+        }
+        if self_ty.starts_with("std::iter::Once<") {
+            // `Once`'s single payload is taken on the first step
+            // from either end; the step is the front step's.
+            let fields = iterator_fields(&state, self_ty)?;
+            if fields.len() != 1 {
+                return Err(InterpError::type_mismatch(
+                    "Once state",
+                    "[option]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            return match take_option_payload(&fields[0]) {
+                Ok(Some((new_inner, item))) => {
+                    Ok((rebuild_state(&state, vec![new_inner]), some_value(item)))
+                }
+                Ok(None) => Ok((state, none_value())),
+                Err(()) => Err(InterpError::type_mismatch(
+                    "Once state",
+                    "an Option value in one-field wrappers",
+                    fields[0].kind_name(),
+                )),
+            };
+        }
+        if self_ty.starts_with("std::slice::IterMut<") {
+            // The state `IntoIterator` builds for `&mut Vec` /
+            // `&mut [T; N]` / `&mut [T]` (see the front step in
+            // `next_on_state`): the back step hands out a
+            // reference to the last remaining element in the
+            // container's own storage and shrinks the length.
+            // Any other state shape — the pointer-pair layout
+            // the real `iter_mut` body builds, which the front
+            // step does not serve either — falls through to the
+            // pure transition below and is reported unsupported.
+            let fields = iterator_fields(&state, self_ty)?;
+            if fields.len() == 3 {
+                if let (Value::Uint(idx), Value::Uint(len)) = (&fields[1], &fields[2]) {
+                    let (idx, len) = (*idx, *len);
+                    if idx < len {
+                        let elem =
+                            self.iter_mut_element_ref(frames, &fields[0], (len - 1) as usize)?;
+                        return Ok((
+                            rebuild_state(
+                                &state,
+                                vec![
+                                    fields[0].clone(),
+                                    Value::Uint(idx),
+                                    Value::Uint(len - 1),
+                                ],
+                            ),
+                            some_value(elem),
+                        ));
+                    }
+                    return Ok((state, none_value()));
+                }
+            }
+        }
+        let (new_state, item) = iterator_next_back_state(&state, self_ty)?;
+        Ok((
+            new_state,
+            match item {
+                Some(value) => some_value(value),
+                None => none_value(),
+            },
+        ))
+    }
+
     /// The state transition of `Iterator::next` for the modelled
     /// iterator shapes, as a function of the iterator state value
     /// alone: returns the successor state and the `Option` result.
@@ -10119,6 +10443,49 @@ pub fn iterator_next_modelled(self_ty: &str) -> bool {
         || self_ty_is(self_ty, "core::str::Bytes")
 }
 
+/// Whether the modelled `DoubleEndedIterator::next_back` step
+/// transitions this iterator type's state directly: the leaf
+/// shapes of `iterator_next_back_state` plus the `IterMut`
+/// state the back step serves in `next_back_on_state`. Adapter
+/// types are absent on purpose — their collected bodies
+/// compose the modelled steps and stay the primary execution
+/// (see `consumer_instance_needs_body` in the driver).
+pub fn iterator_next_back_modelled(self_ty: &str) -> bool {
+    if self_ty.starts_with("std::ops::Range<")
+        || self_ty.starts_with("std::ops::RangeInclusive<")
+        || self_ty.starts_with("std::slice::Iter<")
+        || self_ty.starts_with("std::slice::IterMut<")
+        || self_ty.starts_with("std::array::IntoIter<")
+        || self_ty.starts_with("std::vec::IntoIter<")
+        || self_ty.starts_with("alloc::vec::IntoIter<")
+        || self_ty.starts_with("std::option::IntoIter<")
+        || self_ty.starts_with("std::option::Iter<")
+        || self_ty.starts_with("std::option::IterMut<")
+        || self_ty_is(self_ty, "std::env::Args")
+        || self_ty_is(self_ty, "std::env::ArgsOs")
+        || self_ty.starts_with("std::iter::Empty<")
+        || self_ty.starts_with("std::iter::Once<")
+        || self_ty_is(self_ty, "std::str::Chars")
+        || self_ty_is(self_ty, "core::str::Chars")
+        || self_ty_is(self_ty, "std::str::Bytes")
+        || self_ty_is(self_ty, "core::str::Bytes")
+    {
+        return true;
+    }
+    // A `Rev`'s back step is its inner iterator's front step.
+    if self_ty.starts_with("std::iter::Rev<") {
+        return first_generic_arg(self_ty).is_some_and(iterator_next_modelled);
+    }
+    // These adapters' back steps compose the inner back step.
+    if self_ty.starts_with("std::iter::Enumerate<")
+        || self_ty.starts_with("std::iter::Copied<")
+        || self_ty.starts_with("std::iter::Map<")
+    {
+        return first_generic_arg(self_ty).is_some_and(iterator_next_back_modelled);
+    }
+    false
+}
+
 fn self_ty_is(self_ty: &str, name: &str) -> bool {
     self_ty == name
         || self_ty
@@ -10349,12 +10716,16 @@ fn iterator_next_back_state(
     if self_ty.starts_with("std::array::IntoIter<")
         || self_ty.starts_with("std::vec::IntoIter<")
         || self_ty.starts_with("alloc::vec::IntoIter<")
+        || self_ty.starts_with("std::option::IntoIter<")
         || self_ty_is(self_ty, "std::str::Chars")
         || self_ty_is(self_ty, "core::str::Chars")
         || self_ty_is(self_ty, "std::str::Bytes")
         || self_ty_is(self_ty, "core::str::Bytes")
     {
         return step_owned_iter_back(state, self_ty);
+    }
+    if self_ty.starts_with("std::iter::Empty<") {
+        return Ok((state.clone(), None));
     }
     Err(unsupported(format!(
         "DoubleEndedIterator::next_back for {self_ty} is not runtime-supported"
