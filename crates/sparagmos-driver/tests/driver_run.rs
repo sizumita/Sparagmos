@@ -13816,3 +13816,83 @@ fn main() {
 fn run_mode_nonnull_dangling_without_provenance() {
     run_ok("nonnull-dangling", NONNULL_DANGLING_SRC, "4 4\n");
 }
+
+
+const SLICE_TO_VEC_SRC: &str = r#"
+fn bar(v: &mut [usize]) -> Vec<usize> {
+    v.to_vec()
+}
+
+fn bip(v: &[usize]) -> Vec<usize> {
+    v.to_vec()
+}
+
+fn main() {
+    // A slice over an array literal.
+    let s: &[usize] = &[1, 2, 3, 100];
+    let r = s.to_vec();
+    assert_eq!(r.len(), 4);
+    assert_eq!(r[0], 1);
+    assert_eq!(r[3], 100);
+    assert_eq!(r, vec![1, 2, 3, 100]);
+    // A slice reached by deref coercion of a Vec reference at a
+    // call argument, in both the shared and mutable forms.
+    let mut the_vec = vec![1, 2, 3, 100];
+    assert_eq!(the_vec.clone(), bar(&mut the_vec));
+    assert_eq!(the_vec.clone(), bip(&the_vec));
+    // Elements are cloned: a slice of owned strings copies.
+    let words: &[String] = &[String::from("a"), String::from("bc")];
+    let owned = words.to_vec();
+    assert_eq!(owned.len(), 2);
+    assert_eq!(owned[1], "bc");
+    println!("slice-to-vec-ok");
+}
+"#;
+
+#[test]
+fn run_mode_slice_to_vec() {
+    let dir = temp_dir("slice-to-vec");
+    let src = fixture(&dir, "slice_to_vec.rs", SLICE_TO_VEC_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "slice-to-vec-ok\n");
+}
+
+const DEREF_COPY_INTO_ALLOC_SRC: &str = r#"
+use std::alloc::{alloc, dealloc, Layout};
+
+fn main() {
+    let layout = Layout::array::<usize>(4).unwrap();
+    let p = unsafe { alloc(layout) as *mut usize };
+    assert!(!p.is_null());
+    // The destination pointer reaches the copy through a
+    // dereference of the fresh block's base pointer, so it
+    // denotes the block's first element position while the
+    // block still holds no written elements.
+    let r: &mut usize = unsafe { &mut *p };
+    let q = r as *mut usize;
+    unsafe {
+        std::ptr::copy_nonoverlapping([10usize, 20, 30].as_ptr(), q, 3);
+        assert_eq!(*q, 10);
+        assert_eq!(*q.add(1), 20);
+        assert_eq!(*q.add(2), 30);
+        dealloc(p as *mut u8, layout);
+    }
+    println!("deref-copy-ok");
+}
+"#;
+
+#[test]
+fn run_mode_copy_nonoverlapping_through_deref_into_fresh_alloc() {
+    let dir = temp_dir("deref-copy-alloc");
+    let src = fixture(
+        &dir,
+        "deref_copy_alloc.rs",
+        DEREF_COPY_INTO_ALLOC_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "deref-copy-ok\n");
+}
