@@ -5242,7 +5242,7 @@ impl<'a> Interpreter<'a> {
                 let path = vals.next().expect("arity checked");
                 let bytes = self.path_bytes(frames, &path)?;
                 if bytes.contains(&0) {
-                    return Ok(io_result_err(io_error_simple(20)));
+                    return Ok(io_result_err(io_simple_error_value(ERROR_KIND_INVALID_INPUT)));
                 }
                 Err(unsupported(
                     "opening a real file: the File value model is not built yet"
@@ -5254,7 +5254,7 @@ impl<'a> Interpreter<'a> {
                 let path = vals.into_iter().nth(1).expect("arity checked");
                 let bytes = self.path_bytes(frames, &path)?;
                 if bytes.contains(&0) {
-                    return Ok(io_result_err(io_error_simple(20)));
+                    return Ok(io_result_err(io_simple_error_value(ERROR_KIND_INVALID_INPUT)));
                 }
                 Ok(io_result_from_host(
                     std::fs::create_dir(host_path(&bytes)).map(|()| Value::Unit),
@@ -5369,6 +5369,24 @@ impl<'a> Interpreter<'a> {
                         variant: 0,
                         fields: vec![value],
                     })
+                } else if target == "std::io::Error" && source == "std::io::ErrorKind" {
+                    // `Error::from(kind)` is std's `const_error!`:
+                    // the bare kind in the bitpacked error
+                    // representation (the same shape the fs layer
+                    // and the process model produce).
+                    let disc = match value {
+                        Value::Enum { variant, .. } => variant,
+                        Value::Uint(v) => v as u32,
+                        Value::Int(v) => v as u32,
+                        ref other => {
+                            return Err(InterpError::type_mismatch(
+                                "From::from to io::Error",
+                                "an ErrorKind value",
+                                other.kind_name(),
+                            ));
+                        }
+                    };
+                    Ok(io_simple_error_value(disc))
                 } else {
                     Err(unsupported(format!(
                         "From::from from {source} to {target} is not runtime-supported"
@@ -11081,6 +11099,7 @@ impl<'a> Interpreter<'a> {
     fn path_bytes(&self, frames: &[Frame], value: &Value) -> InterpResult<Vec<u8>> {
         match value {
             Value::Str(text) => Ok(text.clone().into_bytes()),
+            Value::Bytes(bytes) => Ok(bytes.clone()),
             Value::FatRef { .. } => {
                 let (items, _) = self.slice_elements(frames, value)?;
                 let mut out = Vec::with_capacity(items.len());
@@ -11133,7 +11152,7 @@ impl<'a> Interpreter<'a> {
         };
         let first = next_path(&mut vals)?;
         if first.contains(&0) {
-            return Ok(io_result_err(io_error_simple(20)));
+            return Ok(io_result_err(io_simple_error_value(ERROR_KIND_INVALID_INPUT)));
         }
         let second = if matches!(
             op,
@@ -11141,7 +11160,7 @@ impl<'a> Interpreter<'a> {
         ) {
             let bytes = next_path(&mut vals)?;
             if bytes.contains(&0) {
-                return Ok(io_result_err(io_error_simple(20)));
+                return Ok(io_result_err(io_simple_error_value(ERROR_KIND_INVALID_INPUT)));
             }
             Some(bytes)
         } else {
@@ -12120,7 +12139,23 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                 || target_ty == base_ty
             {
                 return match value {
-                    Value::Str(s) => Ok(Value::Str(s)),
+                    Value::Str(_) | Value::Bytes(_) => Ok(value),
+                    Value::Enum { .. } => {
+                        // An owned string-like value in aggregate
+                        // form (a `PathBuf` around an `OsString`
+                        // around the buffer around the byte
+                        // vector, the shape `pathbuf_value`
+                        // builds): the view is the byte string at
+                        // the bottom of the wrapper chain.
+                        match string_aggregate_bytes(&value) {
+                            Some(bytes) => Ok(Value::Bytes(bytes)),
+                            None => Err(InterpError::type_mismatch(
+                                what,
+                                "string data",
+                                value.kind_name(),
+                            )),
+                        }
+                    }
                     other => Err(InterpError::type_mismatch(
                         what,
                         "string data",
@@ -13798,6 +13833,43 @@ fn command_handle_id(value: &Value) -> Option<u64> {
     }
 }
 
+/// The byte string at the bottom of an owned string-like
+/// aggregate: one-field wrappers (a `PathBuf` around an
+/// `OsString` around its buffer) peel to their field, and the
+/// innermost element list (a `Vec<u8>` value) is the byte
+/// string itself. `None` for any other shape.
+fn string_aggregate_bytes(value: &Value) -> Option<Vec<u8>> {
+    match value {
+        Value::Str(s) => Some(s.clone().into_bytes()),
+        Value::Bytes(b) => Some(b.clone()),
+        Value::Enum { fields, .. } => {
+            if fields
+                .iter()
+                .all(|f| matches!(f, Value::Uint(_) | Value::Int(_)))
+            {
+                // The element list of the byte vector (an empty
+                // list is the empty string).
+                let mut out = Vec::with_capacity(fields.len());
+                for f in fields {
+                    match f {
+                        Value::Uint(b) => out.push(*b as u8),
+                        Value::Int(b) if (0..=255).contains(b) => {
+                            out.push(*b as u8)
+                        }
+                        _ => return None,
+                    }
+                }
+                Some(out)
+            } else if fields.len() == 1 {
+                string_aggregate_bytes(&fields[0])
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 /// An `std::io::Error` value in the bitpacked `Repr` layout the
 /// platform's `core::io::error` uses: the error is a one-field
 /// struct whose field is the tagged word (a `NonNull<()>`),
@@ -14173,40 +14245,20 @@ impl<'a> SliceElems<'a> {
     }
 }
 
-/// An `io::Error` value in std's own shape: `Error { repr }`
-/// with the `Simple` representation carrying an `ErrorKind`
-/// discriminant (the discriminants are the compiler's own:
-/// NotFound is 0, InvalidInput is 20, Other is 42).
-fn io_error_simple(kind: u128) -> Value {
-    Value::Enum {
-        variant: 0,
-        fields: vec![Value::Enum {
-            variant: 1,
-            fields: vec![Value::Uint(kind)],
-        }],
-    }
-}
-
-/// An `io::Error` value in the `Os` representation: the raw
-/// errno, which the guest's own `Error::kind` body maps to an
-/// `ErrorKind` through std's table.
-fn io_error_os(code: i32) -> Value {
-    Value::Enum {
-        variant: 0,
-        fields: vec![Value::Enum {
-            variant: 0,
-            fields: vec![Value::Int(code as i128)],
-        }],
-    }
-}
+// `io::Error` values are built only in the bitpacked `Repr`
+// layout (`io_error_value` / `io_os_error_value` /
+// `io_simple_error_value` above): that is the representation
+// the guest's own converted `Error::kind` / `raw_os_error`
+// bodies read, so every producer - the fs layer here and the
+// process model alike - goes through those constructors.
 
 /// A host `io::Error` as a guest `io::Error` value: the errno
 /// form when the host error carries one (the faithful case for
 /// filesystem operations), otherwise the kind-only form.
 fn host_io_error(error: &std::io::Error) -> Value {
     match error.raw_os_error() {
-        Some(code) => io_error_os(code),
-        None => io_error_simple(42),
+        Some(code) => io_os_error_value(code),
+        None => io_simple_error_value(42),
     }
 }
 
