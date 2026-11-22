@@ -482,6 +482,14 @@ pub enum ScalarShape {
     /// pattern that is not a valid code point rather than
     /// fabricating a `char`.
     Char,
+    /// A thin pointer: flattened as its synthetic address (the
+    /// identity [`crate::interp::synthetic_address`] assigns the
+    /// pointer value), constructed as an address-only reference
+    /// holding the pattern — the same reading the pointer <->
+    /// integer transmutes give a bare pointer, extended to the
+    /// pointer payloads of wrapper and niche-encoded shapes
+    /// (`NonNull<T>`, `Option<NonNull<T>>`).
+    Ptr,
     /// An array of a scalar element shape: element `i` occupies
     /// bits `[i * elem_bits, (i + 1) * elem_bits)`.
     Array(Box<ScalarShape>, u64),
@@ -519,6 +527,7 @@ impl ScalarShape {
             ScalarShape::Int { bits, .. } | ScalarShape::Float { bits } => *bits,
             ScalarShape::Bool => 8,
             ScalarShape::Char => 32,
+            ScalarShape::Ptr => 64,
             ScalarShape::Array(elem, n) => elem.bits() * (*n as u32),
             ScalarShape::AdtField { inner, .. } => inner.bits(),
             ScalarShape::NicheEnum { inner, .. } => inner.bits(),

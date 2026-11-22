@@ -3166,7 +3166,8 @@ impl<'a> Converter<'a> {
     ///   ([`ir::Rvalue::Reinterpret`]): integers, floats, `bool`
     ///   and `char` in any combination, arrays of scalars, and
     ///   one-payload-field ADTs over those, and niche-encoded
-    ///   enums over a scalar payload — the bit-level
+    ///   enums over a scalar or thin-pointer payload
+    ///   (`Option<NonNull<T>>`) — the bit-level
     ///   reinterpretation `transmute` means there;
     /// * fat pointer <-> fat pointer, and fat pointer <->
 ///   transparent wrapper struct (one fat-pointer payload
@@ -3237,9 +3238,9 @@ impl<'a> Converter<'a> {
         // two types alone: when both sides flatten to the same
         // nonzero bit width, the cast is a `Reinterpret`. The
         // specialised arms below still take the shapes whose
-        // result this does not reproduce (pointers and fieldless
-        // enums carry no scalar shape, so those pairs never
-        // produce a `generic`).
+        // result this does not reproduce (fieldless enums carry
+        // no scalar shape, and the bare pointer pairs are claimed
+        // by their own arms before this one is reached).
         let generic = {
             let to = self.scalar_shape(target, 0);
             let from = match &src {
@@ -3255,7 +3256,40 @@ impl<'a> Converter<'a> {
                 (Some(from), Some(to))
                     if from.bits() == to.bits() && from.bits() > 0 =>
                 {
-                    Some(ir::Rvalue::Reinterpret(v.clone(), from, to))
+                    // A bare pointer on one side and a wrapper
+                    // ADT on the other stays with the specialised
+                    // arms below: they carry the pointer value
+                    // itself (its place identity) across, where a
+                    // bit reinterpretation would reduce it to an
+                    // address-only reference that no longer reads
+                    // the pointee. A niche-encoded ADT is the
+                    // exception: no specialised arm reads a
+                    // variant-dependent payload, so its pointer
+                    // pairs go through the reinterpretation.
+                    let src_bare_ptr = matches!(
+                        src,
+                        Some(mir::Ty::RawPtr(..) | mir::Ty::Ref(..))
+                    );
+                    let target_bare_ptr =
+                        is_thin_ptr_ty(target) || is_fat_ptr_ty(target);
+                    // Both sides bare pointers stay with the
+                    // specialised arms too: they carry the value
+                    // itself across (or refuse the wrapper-exiting
+                    // crossing), where a bit reinterpretation
+                    // would silently change what the pointer
+                    // denotes.
+                    let identity_pair = (src_bare_ptr && target_bare_ptr)
+                        || (src_bare_ptr
+                            && matches!(target, mir::Ty::Adt(..))
+                            && !matches!(to, ir::ScalarShape::NicheEnum { .. }))
+                        || (target_bare_ptr
+                            && matches!(src, Some(mir::Ty::Adt(..)))
+                            && !matches!(from, ir::ScalarShape::NicheEnum { .. }));
+                    if identity_pair {
+                        None
+                    } else {
+                        Some(ir::Rvalue::Reinterpret(v.clone(), from, to))
+                    }
                 }
                 _ => None,
             }
@@ -3944,6 +3978,18 @@ impl<'a> Converter<'a> {
                 16 | 32 | 64 => Some(S::Float { bits: ft.bits() }),
                 _ => None,
             },
+            // A thin pointer flattens to its synthetic address.
+            // This is what gives the pointer-carrying shapes a
+            // scalar reading: a transparent wrapper over a thin
+            // pointer (the `NonNull` chain) through the ADT arm
+            // below, and a niche-encoded enum over one (the
+            // `Option<NonNull<T>>` family) through
+            // `niche_enum_shape`. Fat pointers carry a metadata
+            // half this single-word shape cannot account for and
+            // stay shapeless.
+            mir::Ty::RawPtr(..) | mir::Ty::Ref(..) if is_thin_ptr_ty(ty) => {
+                Some(S::Ptr)
+            }
             mir::Ty::Array(elem, mir::ArrayLen::Known(n)) => {
                 let elem = self.scalar_shape(elem, depth + 1)?;
                 let total = elem.bits().checked_mul(*n as u32)?;

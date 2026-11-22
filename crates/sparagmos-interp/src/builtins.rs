@@ -271,6 +271,10 @@ pub enum Builtin {
     /// `std::io::Write::write_fmt(&mut self, Arguments)` for the
     /// modelled receivers (the std handles and `Vec<u8>`).
     WriteFmt,
+    /// `core::fmt::write(&mut dyn Write, Arguments)`: format the
+    /// arguments (the same model `format_arguments` implements)
+    /// and deliver the text through the output's own `write_str`.
+    FmtWrite,
     /// `std::fmt::format(Arguments) -> String`.
     Format,
     /// `std::fmt::Arguments::from_str(&str)`.
@@ -1588,6 +1592,7 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::process::exit" => Builtin::ProcessExit,
         "std::io::stdout" => Builtin::Stdout,
         "std::io::Write::write_fmt" => Builtin::WriteFmt,
+        "std::fmt::write" | "core::fmt::write" => Builtin::FmtWrite,
         "std::fmt::format" => Builtin::Format,
         "std::fmt::Arguments::from_str" | "std::fmt::Arguments::from_str_nonconst" => {
             Builtin::ArgumentsFromStr
@@ -3774,6 +3779,63 @@ impl<'a> Interpreter<'a> {
                     variant: 0,
                     fields: vec![Value::Unit],
                 })
+            }
+            Builtin::FmtWrite => {
+                arity(2)?;
+                let text =
+                    self.format_arguments(frames, expect_arguments(&vals[1], name)?)?;
+                // The output is a `&mut dyn Write`: resolve it to
+                // the dyn value, then deliver the formatted text
+                // through the concrete type's own `write_str`. The
+                // real `fmt::write` body walks the template and
+                // calls `write_str` piece by piece; one `write_str`
+                // of the whole formatted text is the same
+                // observable output, and matches the fast path the
+                // body itself takes for a plain string.
+                let dyn_value = match &vals[0] {
+                    Value::DynRef { .. } => vals[0].clone(),
+                    Value::Ref(_) => {
+                        let target = self.deref_value(frames, &vals[0])?;
+                        self.read_resolved(frames, &target)?
+                    }
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            format!("builtin {name}"),
+                            "&mut dyn Write value",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                let Value::DynRef {
+                    base, concrete, ..
+                } = dyn_value
+                else {
+                    return Err(InterpError::type_mismatch(
+                        format!("builtin {name}"),
+                        "&mut dyn Write value",
+                        dyn_value.kind_name(),
+                    ));
+                };
+                let Some(impl_name) = self.scan_virtual_impl(
+                    &concrete,
+                    "core::fmt::Write",
+                    "write_str",
+                ) else {
+                    return Err(unsupported(format!(
+                        "fmt::write output type {concrete} has no collected write_str impl"
+                    )));
+                };
+                let receiver = match &*base {
+                    Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. } => {
+                        (*base).clone()
+                    }
+                    _ => {
+                        return Err(unsupported(format!(
+                            "fmt::write output type {concrete} is not held behind a reference"
+                        )))
+                    }
+                };
+                self.call_sync(frames, &impl_name, vec![receiver, Value::Str(text)])
             }
             Builtin::Format => {
                 arity(1)?;
@@ -6358,6 +6420,12 @@ impl<'a> Interpreter<'a> {
                         }
                     }
                     Value::Uint(v) => Ok(Value::Str(v.to_string())),
+                    // `Arguments` implements `Display` (and so
+                    // `ToString`) by formatting itself — exactly
+                    // the `format_arguments` model.
+                    Value::FmtArguments(ref args) => {
+                        Ok(Value::Str(self.format_arguments(frames, args)?))
+                    }
                     ref other => Err(unsupported(format!(
                         "ToString::to_string for {self_ty} (a {}) is not runtime-supported",
                         other.kind_name()

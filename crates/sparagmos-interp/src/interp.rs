@@ -2736,7 +2736,7 @@ impl<'a> Interpreter<'a> {
     /// under either the `std::` or the `core::` spelling of the
     /// trait path. `None` when there is not exactly one candidate
     /// among the converted and unconverted bodies.
-    fn scan_virtual_impl(
+    pub(crate) fn scan_virtual_impl(
         &self,
         concrete: &str,
         trait_path: &str,
@@ -7748,6 +7748,15 @@ impl<'a> Interpreter<'a> {
                 }
                 Ok(out)
             }
+            // A pointer payload stored bare (the model keeps a
+            // wrapper's payload pointer as the value itself in
+            // some slots — the same convention `project_value`
+            // encodes for field 0 of a pointer value): flatten
+            // the pointer through the payload shape directly.
+            (
+                ScalarShape::AdtField { index, inner, .. },
+                Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. },
+            ) if *index == 0 => self.flatten_scalar(value, inner),
             (
                 ScalarShape::AdtField { index, inner, .. },
                 Value::Enum { fields, .. },
@@ -7787,6 +7796,14 @@ impl<'a> Interpreter<'a> {
                     ))
                 }
             }
+            (ScalarShape::Ptr, _) => match synthetic_address(value) {
+                Some(addr) => Ok(addr & bit_mask(64)),
+                None => Err(InterpError::type_mismatch(
+                    "transmute",
+                    "a pointer value",
+                    value.kind_name(),
+                )),
+            },
             (_, other) => Err(InterpError::type_mismatch(
                 "transmute",
                 "a value of the source shape",
@@ -7815,6 +7832,9 @@ impl<'a> Interpreter<'a> {
                 32 => f64::from(f32::from_bits(bits as u32)),
                 _ => f64::from_bits(bits as u64),
             })),
+            ScalarShape::Ptr => {
+                Ok(Value::Ref(RefTarget::Address(bits as u64)))
+            }
             ScalarShape::Bool => Ok(Value::Bool(bits != 0)),
             ScalarShape::Char => match char::from_u32(bits as u32) {
                 Some(c) => Ok(Value::Uint(u128::from(c as u32))),
@@ -8822,6 +8842,57 @@ pub(crate) fn project_value(
                 // exactly the string's representation, so the
                 // step yields the value unchanged.
                 Value::Str(_) | Value::Bytes(_) if *idx == 0 => value,
+                // The two fields of a modelled `fmt::Arguments`
+                // (see the struct's encoding in core::fmt): field
+                // 0 is the `template: NonNull<u8>`, field 1 the
+                // `args: NonNull<rt::Argument>`. The model keeps
+                // neither as storage, so the projection answers
+                // with the field's own value: a one-field `NonNull`
+                // wrapper around a pointer to the modelled bytes
+                // / argument array, or — for the `from_str` form,
+                // whose `args` field is not a pointer at all — the
+                // tagged length word `(len << 1) | 1` as an
+                // address-only pointer, which is exactly what
+                // `Arguments::as_str` transmutes it back to.
+                Value::FmtArguments(ref args) => {
+                    use crate::value::FmtArguments;
+                    let ptr = match (idx, args) {
+                        (0, FmtArguments::Plain(text)) => {
+                            Value::Ref(RefTarget::Value(
+                                Box::new(Value::Str(text.clone())),
+                                Vec::new(),
+                            ))
+                        }
+                        (0, FmtArguments::Template { template, .. }) => {
+                            Value::Ref(RefTarget::Value(
+                                Box::new(Value::Bytes(template.clone())),
+                                Vec::new(),
+                            ))
+                        }
+                        (1, FmtArguments::Plain(text)) => {
+                            Value::Ref(RefTarget::Address(
+                                ((text.len() as u64) << 1) | 1,
+                            ))
+                        }
+                        (1, FmtArguments::Template { args, .. }) => {
+                            Value::Ref(RefTarget::Value(
+                                Box::new(Value::Tuple(args.clone())),
+                                Vec::new(),
+                            ))
+                        }
+                        _ => {
+                            return Err(InterpError::type_mismatch(
+                                format!("field projection on {place}"),
+                                "field 0 or 1 of fmt::Arguments",
+                                format!("field {idx}"),
+                            ));
+                        }
+                    };
+                    Value::Enum {
+                        variant: 0,
+                        fields: vec![ptr],
+                    }
+                }
                 ref other => {
                     return Err(InterpError::type_mismatch(
                         format!("field projection on {place}"),

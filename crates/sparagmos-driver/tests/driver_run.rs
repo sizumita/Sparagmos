@@ -7882,6 +7882,86 @@ fn run_mode_transmute_nonnull_integer_roundtrip() {
     assert_eq!(stdout, "nonnull roundtrip ok\n");
 }
 
+const OPTION_NONNULL_NICHE_SRC: &str = r#"use std::ptr::NonNull;
+fn main() {
+    let x = 7u8;
+    let some: Option<NonNull<u8>> = NonNull::new(&x as *const u8 as *mut u8);
+    // The niche encoding: the option *is* the pointer word,
+    // zero for `None`. (The roundtrip is checked on the bits:
+    // comparing an address-only pointer against a place
+    // pointer is a separate, older gap.)
+    let bits: usize = unsafe { std::mem::transmute(some) };
+    assert!(bits != 0);
+    let back: Option<NonNull<u8>> = unsafe { std::mem::transmute(bits) };
+    assert!(back.is_some());
+    let bits2: usize = unsafe { std::mem::transmute(back) };
+    assert_eq!(bits2, bits);
+    assert_eq!(unsafe { *some.unwrap().as_ptr() }, 7);
+    let none: Option<NonNull<u8>> = None;
+    let zero: usize = unsafe { std::mem::transmute(none) };
+    assert_eq!(zero, 0);
+    let back_none: Option<NonNull<u8>> = unsafe { std::mem::transmute(0usize) };
+    assert!(back_none.is_none());
+    // The same encoding through a raw pointer target type.
+    let p: *const u32 = unsafe { std::mem::transmute(some) };
+    assert!(!p.is_null());
+    println!("option nonnull niche ok");
+}
+"#;
+
+#[test]
+fn run_mode_option_nonnull_niche_transmute() {
+    // `Option<NonNull<T>>` uses the pointer's null niche as
+    // its encoding, so a transmute between the option and an
+    // integer (or a raw pointer) is the identity on the
+    // address word, with zero reading back as `None`.
+    let dir = temp_dir("option-nonnull-niche");
+    let src = fixture(&dir, "option_nonnull_niche.rs", OPTION_NONNULL_NICHE_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "option nonnull niche ok\n");
+}
+
+const WRITE_FMT_STRING_SRC: &str = r#"use std::fmt::Write as _;
+fn main() {
+    let mut s = String::new();
+    // Literal-only arguments take the `Arguments::as_str`
+    // fast path inside `fmt::write`.
+    write!(s, "hello").unwrap();
+    assert_eq!(s, "hello");
+    // A template with placeholders goes through the general
+    // path: the modelled `Arguments` value's fields are
+    // projected by the `Write::write_fmt` default body.
+    write!(s, " x={} y={:.3}", 42, 1.23456).unwrap();
+    assert_eq!(s, "hello x=42 y=1.235");
+    writeln!(s, " [{:>4}]", 7).unwrap();
+    assert_eq!(s, "hello x=42 y=1.235 [   7]\n");
+    // `format_args!` converts to a string through its
+    // `Display` / `ToString` impl.
+    let t = format_args!("n={}", 3).to_string();
+    assert_eq!(t, "n=3");
+    println!("write fmt string ok");
+}
+"#;
+
+#[test]
+fn run_mode_write_fmt_to_string() {
+    // `write!` on a `String` runs the `fmt::Write::write_fmt`
+    // default body over a modelled `fmt::Arguments` value:
+    // its fields are projected from the model, and the text is
+    // delivered through `core::fmt::write` to the string's own
+    // `write_str`.
+    let dir = temp_dir("write-fmt-string");
+    let src = fixture(&dir, "write_fmt_string.rs", WRITE_FMT_STRING_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "write fmt string ok\n");
+}
+
 #[test]
 fn run_mode_thread_join_at_optimized_mir() {
     // Optimizing MIR inlines `JoinHandle::join`: field 0 (the
