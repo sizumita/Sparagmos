@@ -14341,3 +14341,139 @@ fn run_mode_const_ref_as_usize() {
         "a reference constant must cast to its value's address; stderr={stderr}"
     );
 }
+
+const DROP_IN_PLACE_VEC_FORGET_SRC: &str = r#"
+struct D(u32);
+impl Drop for D { fn drop(&mut self) { println!("drop D({})", self.0); } }
+fn main() {
+    let mut v = vec![D(1), D(2)];
+    unsafe { std::ptr::drop_in_place(&mut v) };
+    std::mem::forget(v);
+    println!("after");
+}
+"#;
+
+/// `ptr::drop_in_place` on a `Vec` runs through the compiler's
+/// drop-glue shim, whose field drops name the `RawVec` buffer:
+/// the glue conversion must account for it (the buffer's own
+/// glue is deallocation only), and the shim's drop must not
+/// kill the caller's place -- `forget` still moves it after.
+#[test]
+fn run_mode_drop_in_place_vec_then_forget() {
+    let dir = temp_dir("drop-in-place-vec-forget");
+    let src = fixture(&dir, "case.rs", DROP_IN_PLACE_VEC_FORGET_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "drop D(1)\ndrop D(2)\nafter\n");
+}
+
+const DROP_IN_PLACE_NESTED_VEC_SRC: &str = r#"
+struct D(u32);
+impl Drop for D { fn drop(&mut self) { println!("drop D({})", self.0); } }
+fn main() {
+    let mut v = vec![vec![D(1)], vec![D(2), D(3)]];
+    unsafe { std::ptr::drop_in_place(&mut v) };
+    std::mem::forget(v);
+    println!("after");
+}
+"#;
+
+/// The nested-`Vec` form of the drop-glue shim path: the outer
+/// buffer's field drop and the inner vectors' element glue.
+#[test]
+fn run_mode_drop_in_place_nested_vec() {
+    let dir = temp_dir("drop-in-place-nested-vec");
+    let src = fixture(&dir, "case.rs", DROP_IN_PLACE_NESTED_VEC_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "drop D(1)\ndrop D(2)\ndrop D(3)\nafter\n");
+}
+
+const DROP_IN_PLACE_RC_FORGET_SRC: &str = r#"
+struct D(u32);
+impl Drop for D { fn drop(&mut self) { println!("drop D({})", self.0); } }
+fn main() {
+    let mut r = std::rc::Rc::new(D(9));
+    unsafe { std::ptr::drop_in_place(&mut r) };
+    std::mem::forget(r);
+    println!("after");
+}
+"#;
+
+/// An `Rc` dropped in place through the shim: the pointee's
+/// destructor runs once, and the caller's handle stays
+/// movable (the drop through the pointer does not clear the
+/// owner's slot).
+#[test]
+fn run_mode_drop_in_place_rc_then_forget() {
+    let dir = temp_dir("drop-in-place-rc-forget");
+    let src = fixture(&dir, "case.rs", DROP_IN_PLACE_RC_FORGET_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "drop D(9)\nafter\n");
+}
+
+const DROP_IN_PLACE_VEC_SCOPE_DROP_SRC: &str = r#"
+struct D(u32);
+impl Drop for D { fn drop(&mut self) { println!("drop D({})", self.0); } }
+fn main() {
+    let mut v = vec![D(1), D(2)];
+    unsafe { std::ptr::drop_in_place(&mut v) };
+    println!("after");
+}
+"#;
+
+/// After `drop_in_place`, the scope-end `Drop` terminator for
+/// the same local is unconditional in MIR (drop elaboration
+/// cannot see through the raw pointer), so the glue runs on
+/// the value as it stands -- the same behaviour arrays and
+/// struct fields already had through this path.
+#[test]
+fn run_mode_drop_in_place_vec_scope_drop_after() {
+    let dir = temp_dir("drop-in-place-vec-scope");
+    let src = fixture(&dir, "case.rs", DROP_IN_PLACE_VEC_SCOPE_DROP_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "drop D(1)\ndrop D(2)\nafter\ndrop D(1)\ndrop D(2)\n");
+}
+
+const ADAPTERS_DROP_BY_VALUE_SRC: &str = r#"
+fn sink<T>(_: T) {}
+fn main() {
+    let a = [1, 2, 3];
+    sink(a.iter().cloned());
+    sink(a.iter().cycle());
+    sink(a.iter().zip([4, 5].iter()));
+    sink(a.iter().peekable());
+    sink(a.iter().filter(|_| true));
+    sink(a.iter().rev());
+    sink((1..10).step_by(2));
+    sink("x".escape_debug());
+    sink("x".escape_default());
+    sink("x".escape_unicode());
+    println!("done");
+}
+"#;
+
+/// The field-only iterator adapters and the `str` escape
+/// adapters have no `Drop` impl of their own: dropping one by
+/// value (here, inside the generic `sink`) plans the glue
+/// from the fields' evidence instead of refusing the drop.
+#[test]
+fn run_mode_iterator_adapters_drop_by_value() {
+    let dir = temp_dir("adapters-drop-by-value");
+    let src = fixture(&dir, "case.rs", ADAPTERS_DROP_BY_VALUE_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "done\n");
+}
