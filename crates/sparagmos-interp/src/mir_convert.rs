@@ -3160,6 +3160,13 @@ impl<'a> Converter<'a> {
     /// * one-field struct over a fieldless enum -> integer:
     ///   the discriminant of the field's value (`mem::Alignment`
     ///   -> `usize`).
+    /// * one-payload wrapper <-> its payload, for a payload of
+    ///   any type: a one-field struct whose only field has
+    ///   exactly the other side's type, and `MaybeUninit<T>`
+    ///   <-> `T` (the payload sits at field 0 of the union
+    ///   value in this model) -- the `assume_init` transmute
+    ///   an inlined `mem::zeroed` performs under optimization,
+    ///   and its reverse.
     ///
     /// Every other shape — aggregate <-> aggregate byte
     /// reinterpretation beyond one payload field, fat pointers,
@@ -3238,6 +3245,32 @@ impl<'a> Converter<'a> {
                 _ => None,
             }
         };
+        // One-payload wrapper crossings, decided ahead of the
+        // shape arms below: a one-field struct (or a
+        // `MaybeUninit`) transmuted to exactly its payload type
+        // reads the payload field out, and the reverse
+        // transmute wraps the value into the wrapper. The arms
+        // below keep the shapes whose payload is not the whole
+        // other side -- pointer payloads behind newtype chains
+        // and fieldless-enum payloads -- which these checks
+        // cannot mistake for this one: they require the field
+        // type to be exactly the other side's type.
+        if let Some(mir::Ty::Adt(def, args)) = &src {
+            if let Some(op) =
+                self.payload_field_operand(body, operand, v, def, args, target)
+            {
+                return ir::Rvalue::Use(op);
+            }
+        }
+        if let mir::Ty::Adt(tdef, targs) = target {
+            if let Some(src_ty) = &src {
+                if let Some(r) =
+                    self.wrap_payload_rvalue(v, src_ty, tdef, targs)
+                {
+                    return r;
+                }
+            }
+        }
         match (&src, target) {
             // Pointer -> integer: the synthetic address (what the
             // compiler's UB precondition checks use to test a
@@ -3626,6 +3659,81 @@ impl<'a> Converter<'a> {
             }
             _ => unsupported(),
         }
+    }
+
+    /// Whether `def` is `MaybeUninit` (std or core).
+    fn is_maybe_uninit(&self, def: &mir::AdtDefId) -> bool {
+        matches!(
+            self.def_display_name(def).as_str(),
+            "std::mem::MaybeUninit" | "core::mem::MaybeUninit"
+        )
+    }
+
+    /// The operand denoting the payload of a one-payload
+    /// wrapper value, when the wrapper's payload type is
+    /// exactly `target`: a one-field struct whose only field
+    /// has the target type, or a `MaybeUninit` of the target
+    /// type. In this value model a `MaybeUninit<T>` holds its
+    /// payload at field 0 of the union value -- the slot every
+    /// pointer access to the union denotes -- so field 0 is
+    /// the payload's slot for both shapes. `None` when the
+    /// source is not such a wrapper, or when the operand
+    /// carries no addressable payload field.
+    fn payload_field_operand(
+        &self,
+        body: &mir::Body,
+        operand: &mir::Operand,
+        v: &ir::Operand,
+        def: &mir::AdtDefId,
+        args: &[mir::Ty],
+        target: &mir::Ty,
+    ) -> Option<ir::Operand> {
+        let payload_ty = if let Some(field_ty) = self.single_field_ty(def, args) {
+            if field_ty != *target {
+                return None;
+            }
+            field_ty
+        } else if self.is_maybe_uninit(def) && args.len() == 1 && args[0] == *target
+        {
+            args[0].clone()
+        } else {
+            return None;
+        };
+        self.field_operand(body, operand, v, 0, &payload_ty)
+    }
+
+    /// The aggregate rvalue wrapping `v` into a one-payload
+    /// wrapper of exactly its type: a one-field struct whose
+    /// only field has the source type (the payload is the
+    /// struct's only field), or a `MaybeUninit` of the source
+    /// type (the payload goes to field 0 of the union value,
+    /// the slot this model reads it back from). `None` when
+    /// the target is not such a wrapper.
+    fn wrap_payload_rvalue(
+        &self,
+        v: &ir::Operand,
+        src: &mir::Ty,
+        tdef: &mir::AdtDefId,
+        targs: &[mir::Ty],
+    ) -> Option<ir::Rvalue> {
+        let field_index = if let Some(field_ty) = self.single_field_ty(tdef, targs) {
+            if field_ty != *src {
+                return None;
+            }
+            None
+        } else if self.is_maybe_uninit(tdef)
+            && targs.len() == 1
+            && targs[0] == *src
+        {
+            Some(0)
+        } else {
+            return None;
+        };
+        Some(ir::Rvalue::AggregateAdt {
+            variant: 0,
+            operands: vec![v.clone()],
+            field_index,
+        })
     }
 
     /// Read the payload field out of a transparent wrapper value
@@ -7030,6 +7138,30 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
             "std::iter::Take" | "core::iter::Take" => {
                 let inner = self.plan(args.first()?)?;
                 return Some(collapse_fields(vec![inner, P::Trivial], true));
+            }
+            "std::iter::Skip" | "core::iter::Skip" => {
+                // Fields are the inner iterator and the
+                // remaining skip count (a `usize`: no glue).
+                let inner = self.plan(args.first()?)?;
+                return Some(collapse_fields(vec![inner, P::Trivial], true));
+            }
+            "std::iter::Chain" | "core::iter::Chain" => {
+                // Fields are the two iterators, each held
+                // behind an `Option`: dropping the chain drops
+                // whichever iterators are still present, each
+                // through the `Option` plan for its type.
+                let first = self.plan(args.first()?)?;
+                let second = self.plan(args.get(1)?)?;
+                let option_plan = |inner: P| match inner {
+                    P::Trivial => P::Trivial,
+                    e => P::Variants {
+                        variants: vec![P::Trivial, at_field0(e)],
+                    },
+                };
+                return Some(collapse_fields(
+                    vec![option_plan(first), option_plan(second)],
+                    true,
+                ));
             }
             "std::iter::Once" | "core::iter::Once" => {
                 // The state's only field is the wrapped
