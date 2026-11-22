@@ -16821,3 +16821,77 @@ fn run_mode_nested_maybe_uninit_buffer_cast() {
     assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "nested: 11 22\n");
 }
+
+const IO_ERROR_FMT_SRC: &str = r#"
+use std::io;
+fn main() {
+    for code in [2, 13, 22] {
+        let e = io::Error::from_raw_os_error(code);
+        println!("{} | {:?} | {:?} | {:?}", e, e, e.kind(), e.raw_os_error());
+    }
+    let simple: io::Error = io::ErrorKind::NotFound.into();
+    println!("{} | {:?}", simple, simple);
+    println!("{}", io::ErrorKind::PermissionDenied);
+    let fs_err = std::fs::read("/definitely/not/here-lh-test.xyz").unwrap_err();
+    println!("{} | {:?}", fs_err, fs_err);
+}
+"#;
+
+#[test]
+fn run_mode_io_error_display_and_debug() {
+    // `io::Error` in the bitpacked representation formats the
+    // way core's own impls do: an OS error's text carries the
+    // platform's message for the code, its `Debug` is the `Os`
+    // struct form, a kind-only error displays as the kind's
+    // message and debugs as `Kind(..)`, and an `ErrorKind`
+    // displays as its message.
+    let dir = temp_dir("io-error-fmt");
+    let src = fixture(&dir, "io_error_fmt.rs", IO_ERROR_FMT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "No such file or directory (os error 2) | Os { code: 2, kind: NotFound, message: \"No such file or directory\" } | NotFound | Some(2)\n\
+         Permission denied (os error 13) | Os { code: 13, kind: PermissionDenied, message: \"Permission denied\" } | PermissionDenied | Some(13)\n\
+         Invalid argument (os error 22) | Os { code: 22, kind: InvalidInput, message: \"Invalid argument\" } | InvalidInput | Some(22)\n\
+         entity not found | Kind(NotFound)\n\
+         permission denied\n\
+         No such file or directory (os error 2) | Os { code: 2, kind: NotFound, message: \"No such file or directory\" }\n"
+    );
+}
+
+const POINTER_WRAPPER_FMT_SRC: &str = r#"
+use std::fmt;
+use std::rc::Rc;
+use std::sync::Arc;
+struct Wrap(u32);
+impl fmt::Display for Wrap {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "wrap<{}>", self.0) }
+}
+fn main() {
+    println!("{} {:?}", Box::new(10isize), Box::new(String::from("bs")));
+    println!("{}", Box::new(Wrap(5)));
+    println!("{} {:?}", Rc::new(11), Rc::new(vec![1, 2]));
+    println!("{} {:?}", Arc::new(3.25f32), Arc::new(String::from("arcstr")));
+    println!("{}", Box::new(Box::new(9)));
+}
+"#;
+
+#[test]
+fn run_mode_pointer_wrapper_display_and_debug() {
+    // The standard pointer wrappers forward `Display` and
+    // `Debug` to the pointee: a `Box` prints as its contents
+    // (through a guest `Display` body when the pointee has
+    // one), and `Rc` / `Arc` print as the value behind the
+    // handle rather than as the handle's own fields.
+    let dir = temp_dir("pointer-wrapper-fmt");
+    let src = fixture(&dir, "pointer_wrapper_fmt.rs", POINTER_WRAPPER_FMT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "10 \"bs\"\nwrap<5>\n11 [1, 2]\n3.25 \"arcstr\"\n9\n"
+    );
+}

@@ -845,10 +845,10 @@ pub enum Builtin {
     /// error function table names).
     IoDecodeErrorKind,
     /// `std::sys::io::error::unix::format_error(errno, fmt)`:
-    /// write the OS error message. The model writes nothing:
-    /// the message text of an OS error is the one part of its
-    /// observable surface the value model does not reproduce
-    /// (its kind, raw code and interrupted-ness are exact).
+    /// write the OS error message into the formatter. The text
+    /// is the platform's own message for the code (see
+    /// `os_error_message`), exactly what std's native
+    /// implementation writes through `strerror_r`.
     IoFormatOsError,
     /// `std::sys::io::error::unix::is_interrupted(errno)`:
     /// the error is `EINTR`.
@@ -5608,14 +5608,20 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::IoFormatOsError => {
                 arity(2)?;
-                // `fmt::Result` is the unit-like `Result<(), Error>`
-                // aggregate: Ok is variant 0 with no payload in
-                // this model (the formatter error type is the
-                // fieldless `core::fmt::Error`).
-                Ok(Value::Enum {
-                    variant: 0,
-                    fields: vec![Value::Unit],
-                })
+                let code = match vals[0] {
+                    Value::Int(v) => v as i32,
+                    Value::Uint(v) => v as i32,
+                    ref other => {
+                        return Err(InterpError::type_mismatch(
+                            format!("builtin {name}"),
+                            "an errno integer",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                let id = self.formatter_id_of(frames, &vals[1])?;
+                self.formatter_push(id, &os_error_message(code));
+                Ok(fmt_result_ok())
             }
             Builtin::IoIsInterrupted => {
                 arity(1)?;
@@ -17079,6 +17085,170 @@ fn io_simple_error_value(kind_discriminant: u32) -> Value {
     io_error_value(((kind_discriminant as u128) << 32) | 0b11)
 }
 
+/// The tagged word an `std::io::Error` value in the bitpacked
+/// representation carries: the address-only reference at the
+/// bottom of the `Error { repr: Repr(NonNull) }` nesting. The
+/// nesting's other leaves are zero-sized markers (the
+/// `PhantomData` field a guest-built value carries), so the
+/// word is the value tree's unique address leaf; a tree with
+/// zero or several address leaves is not this representation.
+fn io_error_tagged_word(value: &Value) -> Option<u64> {
+    match value {
+        Value::Ref(RefTarget::Address(word)) => Some(*word),
+        Value::Enum { fields, .. } | Value::Tuple(fields) => {
+            let mut found = None;
+            for field in fields {
+                if let Some(word) = io_error_tagged_word(field) {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some(word);
+                }
+            }
+            found
+        }
+        _ => None,
+    }
+}
+
+/// The platform's message text for an OS error code: the text
+/// the C library's `strerror` gives for it, which is exactly
+/// what std's native `format_os_error` writes. Read through the
+/// host's own `io::Error` (whose `Display` is built from that
+/// text), with the ` (os error {code})` suffix std's `Display`
+/// adds removed.
+fn os_error_message(code: i32) -> String {
+    let full = std::io::Error::from_raw_os_error(code).to_string();
+    let suffix = format!(" (os error {code})");
+    match full.strip_suffix(&suffix) {
+        Some(message) => message.to_string(),
+        None => full,
+    }
+}
+
+/// The variant name of the `ErrorKind` with the given
+/// discriminant (the declaration order `from_prim` decodes in
+/// `core::io::error`); `None` for a discriminant no variant
+/// carries.
+fn error_kind_name(discriminant: u32) -> Option<&'static str> {
+    Some(match discriminant {
+        0 => "NotFound",
+        1 => "PermissionDenied",
+        2 => "ConnectionRefused",
+        3 => "ConnectionReset",
+        4 => "HostUnreachable",
+        5 => "NetworkUnreachable",
+        6 => "ConnectionAborted",
+        7 => "NotConnected",
+        8 => "AddrInUse",
+        9 => "AddrNotAvailable",
+        10 => "NetworkDown",
+        11 => "BrokenPipe",
+        12 => "AlreadyExists",
+        13 => "WouldBlock",
+        14 => "NotADirectory",
+        15 => "IsADirectory",
+        16 => "DirectoryNotEmpty",
+        17 => "ReadOnlyFilesystem",
+        18 => "FilesystemLoop",
+        19 => "StaleNetworkFileHandle",
+        20 => "InvalidInput",
+        21 => "InvalidData",
+        22 => "TimedOut",
+        23 => "WriteZero",
+        24 => "StorageFull",
+        25 => "NotSeekable",
+        26 => "QuotaExceeded",
+        27 => "FileTooLarge",
+        28 => "ResourceBusy",
+        29 => "ExecutableFileBusy",
+        30 => "Deadlock",
+        31 => "CrossesDevices",
+        32 => "TooManyLinks",
+        33 => "InvalidFilename",
+        34 => "ArgumentListTooLong",
+        35 => "Interrupted",
+        36 => "Other",
+        37 => "UnexpectedEof",
+        38 => "Unsupported",
+        39 => "OutOfMemory",
+        40 => "InProgress",
+        41 => "TooManyOpenFiles",
+        42 => "InputOutputError",
+        43 => "Uncategorized",
+        _ => return None,
+    })
+}
+
+/// The message text of the `ErrorKind` with the given
+/// discriminant: core's `ErrorKind::as_str` table (the text its
+/// `Display` writes), entry for entry.
+fn error_kind_message(discriminant: u32) -> Option<&'static str> {
+    Some(match discriminant {
+        0 => "entity not found",
+        1 => "permission denied",
+        2 => "connection refused",
+        3 => "connection reset",
+        4 => "host unreachable",
+        5 => "network unreachable",
+        6 => "connection aborted",
+        7 => "not connected",
+        8 => "address in use",
+        9 => "address not available",
+        10 => "network down",
+        11 => "broken pipe",
+        12 => "entity already exists",
+        13 => "operation would block",
+        14 => "not a directory",
+        15 => "is a directory",
+        16 => "directory not empty",
+        17 => "read-only filesystem or storage medium",
+        18 => "filesystem loop or indirection limit (e.g. symlink loop)",
+        19 => "stale network file handle",
+        20 => "invalid input parameter",
+        21 => "invalid data",
+        22 => "timed out",
+        23 => "write zero",
+        24 => "no storage space",
+        25 => "seek on unseekable file",
+        26 => "quota exceeded",
+        27 => "file too large",
+        28 => "resource busy",
+        29 => "executable file busy",
+        30 => "deadlock",
+        31 => "cross-device link or rename",
+        32 => "too many links",
+        33 => "invalid filename",
+        34 => "argument list too long",
+        35 => "operation interrupted",
+        36 => "other error",
+        37 => "unexpected end of file",
+        38 => "unsupported",
+        39 => "out of memory",
+        40 => "in progress",
+        41 => "too many open files",
+        42 => "input/output error",
+        43 => "uncategorized error",
+        _ => return None,
+    })
+}
+
+/// One reference count of an `RcInner` / `ArcInner` aggregate
+/// as the handle constructor builds it: a one-field wrapper
+/// (the `Cell` / `AtomicUsize`) around a one-field wrapper
+/// (the `UnsafeCell`) around the count itself.
+fn is_count_cell(value: &Value) -> bool {
+    match value {
+        Value::Enum { fields, .. } if fields.len() == 1 => match &fields[0] {
+            Value::Enum { fields, .. } if fields.len() == 1 => {
+                matches!(fields[0], Value::Uint(_) | Value::Int(_))
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// The `ErrorKind::InvalidInput` discriminant.
 /// The largest element count `Vec::set_len` will materialise
 /// (see the `VecSetLen` builtin): the element list is stored
@@ -17198,9 +17368,8 @@ fn path_buf_value(path: &std::path::Path) -> Value {
 }
 
 /// The OS error function table the model answers for
-/// `get_os_functions`: std's unix entries, by name (the
-/// `decode_error_kind` and `is_interrupted` entries are the
-/// builtins above; `format_error` writes no message text).
+/// `get_os_functions`: std's unix entries, by name (all three
+/// entries are the builtins above).
 fn os_functions_table() -> Value {
     Value::Enum {
         variant: 0,
@@ -20663,6 +20832,25 @@ impl<'a> Interpreter<'a> {
                 return self.format_value(frames, &pointee, trait_, concrete, options, indent);
             }
         }
+        // `std::io::Error` values in the bitpacked representation
+        // the value model owns, and `ErrorKind` values: their
+        // `Display` / `Debug` text is a fixed function of the
+        // decoded representation (and, for OS errors, of the
+        // platform's message text), produced here like the other
+        // std shapes the structural engine models.
+        if let Some(text) = self.format_io_error(value, trait_, ty, options) {
+            return Ok(text);
+        }
+        // The standard pointer wrappers (`Box`, `Rc`, `Arc`)
+        // forward their `Display` and `Debug` to the pointee:
+        // format the pointee with the element type as the tag.
+        if matches!(trait_, FmtTrait::Display | FmtTrait::Debug) {
+            if let Some(text) = self.format_pointer_wrapper(
+                frames, value, trait_, ty, options, indent,
+            )? {
+                return Ok(text);
+            }
+        }
         // A guest `fmt` implementation body, when the program
         // collected one for this type, is the faithful
         // formatting: run it against a captured `Formatter`
@@ -20686,6 +20874,143 @@ impl<'a> Interpreter<'a> {
             FmtTrait::LowerExp => self.format_exp(value, ty, false, options),
             FmtTrait::UpperExp => self.format_exp(value, ty, true, options),
         }
+    }
+
+    /// Structural `Display` / `Debug` for `std::io::Error` and
+    /// `ErrorKind` values, mirroring core's own implementations
+    /// (`core::io::error`): an OS error displays as
+    /// `{message} (os error {code})` and debugs as
+    /// `Os { code, kind, message }`; a kind-only (simple) error
+    /// displays as the kind's message and debugs as
+    /// `Kind({kind})`; a kind displays as its message. The
+    /// `Custom` and `SimpleMessage` representations hold a
+    /// pointer the value model does not resolve here, so those
+    /// keep the existing behaviour (`None`).
+    fn format_io_error(
+        &self,
+        value: &Value,
+        trait_: FmtTrait,
+        ty: &str,
+        options: &FmtOptions,
+    ) -> Option<String> {
+        let plain = pointee_tag(ty);
+        if plain == "std::io::ErrorKind" || plain == "core::io::ErrorKind" {
+            if trait_ != FmtTrait::Display {
+                return None;
+            }
+            let Value::Enum { variant, .. } = value else {
+                return None;
+            };
+            return error_kind_message(*variant).map(|m| pad_str(m, options));
+        }
+        if plain != "std::io::Error" && plain != "core::io::Error" {
+            return None;
+        }
+        let word = io_error_tagged_word(value)?;
+        let payload = (word >> 32) as u32;
+        match (trait_, word & 0b11) {
+            (FmtTrait::Display, 0b10) => {
+                let code = payload as i32;
+                Some(pad_width(
+                    &format!("{} (os error {code})", os_error_message(code)),
+                    options,
+                ))
+            }
+            (FmtTrait::Debug, 0b10) => {
+                let code = payload as i32;
+                let kind = error_kind_name(decode_error_kind_unix(code))?;
+                Some(pad_width(
+                    &format!(
+                        "Os {{ code: {code}, kind: {kind}, message: \"{}\" }}",
+                        os_error_message(code)
+                    ),
+                    options,
+                ))
+            }
+            (FmtTrait::Display, 0b11) => {
+                error_kind_message(payload).map(|m| pad_str(m, options))
+            }
+            (FmtTrait::Debug, 0b11) => error_kind_name(payload)
+                .map(|name| pad_width(&format!("Kind({name})"), options)),
+            _ => None,
+        }
+    }
+
+    /// `Display` / `Debug` for the standard pointer wrappers
+    /// (`Box`, `Rc`, `Arc`), which std defines as forwarding to
+    /// the pointee: shape the pointee value the way the `dyn`
+    /// formatting path shapes its base, then format it with the
+    /// element type as the tag. `None` when the type is not one
+    /// of the wrappers or the value does not have the wrapper's
+    /// shape, in which case the existing behaviour stands.
+    fn format_pointer_wrapper(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        value: &Value,
+        trait_: FmtTrait,
+        ty: &str,
+        options: &FmtOptions,
+        indent: usize,
+    ) -> InterpResult<Option<String>> {
+        let tag = pointee_tag(ty);
+        let head = tag.split('<').next().unwrap_or(tag).trim();
+        if !matches!(
+            head,
+            "std::boxed::Box"
+                | "alloc::boxed::Box"
+                | "std::rc::Rc"
+                | "alloc::rc::Rc"
+                | "std::sync::Arc"
+                | "alloc::sync::Arc"
+        ) {
+            return Ok(None);
+        }
+        let Some(elem) = first_generic_arg(tag) else {
+            return Ok(None);
+        };
+        let pointee: Value = match tag_base_name(tag) {
+            "Box" => {
+                // A box value is the one-field wrapper around the
+                // pointee reference (or, for an aggregate-shaped
+                // box, around the pointee value itself) -- the
+                // same shaping `format_debug_adt`'s `Box` arm and
+                // the `dyn` path apply.
+                let Value::Enum { fields, .. } = value else {
+                    return Ok(None);
+                };
+                if fields.len() != 1 {
+                    return Ok(None);
+                }
+                fields[0].clone()
+            }
+            _ => {
+                // `Rc` / `Arc`: the handle names the inner
+                // allocation, whose field 2 is the value. A bare
+                // inner aggregate (the handle already resolved
+                // through its allocation) carries the value as
+                // its own field 2, behind the two count cells.
+                if let Some(id) = rc_handle_id(value) {
+                    Value::Ref(RefTarget::Alloc {
+                        id,
+                        projection: vec![RefProj::Field(2)],
+                    })
+                } else if let Value::Enum { fields, .. } = value {
+                    if fields.len() == 3
+                        && is_count_cell(&fields[0])
+                        && is_count_cell(&fields[1])
+                    {
+                        fields[2].clone()
+                    } else {
+                        return Ok(None);
+                    }
+                } else {
+                    return Ok(None);
+                }
+            }
+        };
+        Ok(Some(self.format_value(
+            frames, &pointee, trait_, elem, options, indent,
+        )?))
     }
 
     fn format_display(
