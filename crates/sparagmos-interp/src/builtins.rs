@@ -5192,8 +5192,15 @@ impl<'a> Interpreter<'a> {
                 // Two address-only pointers have no pointee to
                 // dereference in this model; their distance is a
                 // byte distance over the synthetic addresses.
-                let d = match (synthetic_address(&vals[0]), synthetic_address(&vals[1])) {
-                    (Some(a), Some(b)) => {
+                let addr_pair = match (&vals[0], &vals[1]) {
+                    (
+                        Value::Ref(RefTarget::Address(a)),
+                        Value::Ref(RefTarget::Address(b)),
+                    ) => Some((*a, *b)),
+                    _ => None,
+                };
+                let d = match addr_pair {
+                    Some((a, b)) => {
                         let tag = generic_args.first().map(String::as_str).unwrap_or("");
                         let size = self
                             .layout_of(tag)
