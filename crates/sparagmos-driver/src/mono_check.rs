@@ -43,6 +43,23 @@
 //!   failure (unsized, parametric, uncomputable here) is left
 //!   alone, exactly as for the SIMD layout check.
 //!
+//! - Invalid atomic intrinsic monomorphizations (also E0511,
+//!   from `codegen_intrinsic_call` in rustc_codegen_ssa): the
+//!   `atomic_*` intrinsics require the type of the value at the
+//!   memory operand to be a basic integer or raw pointer type;
+//!   the read-modify-write arithmetic group additionally
+//!   requires the operand value to have that same type (or
+//!   `usize` when the memory type is a raw pointer).
+//! - The per-intrinsic SIMD argument rules of
+//!   `generic_simd_intrinsic` beyond the entry check above:
+//!   element-type requirements for the saturating arithmetic,
+//!   bitmask, gather/scatter, masked load/store and reduction
+//!   intrinsics, length and element agreement for shuffles,
+//!   selects and comparisons, insert/extract element agreement,
+//!   and the constant index bounds of `simd_shuffle` (the index
+//!   values are read from the call's constant operand, the same
+//!   evidence code generation reads).
+//!
 //! Anything not provable from the converted bodies is left alone:
 //! the checks only report a failure when the invalid shape is
 //! positively present, mirroring the corresponding rustc error.
@@ -85,10 +102,10 @@ fn check_body(
         }
     }
     for bb in &body.blocks {
-        let TerminatorKind::Call { func, .. } = &bb.terminator.kind else {
+        let TerminatorKind::Call { func, args, .. } = &bb.terminator.kind else {
             continue;
         };
-        if let Some(err) = check_call(func) {
+        if let Some(err) = check_call(func, args) {
             return Some(err);
         }
         if let Some(err) = check_measured_call(func, layout_memo) {
@@ -359,7 +376,7 @@ fn is_simd(ty: Ty) -> bool {
     guarded_ty_kind(&ty).is_some_and(|kind| kind.is_simd())
 }
 
-fn check_call(func: &Operand) -> Option<String> {
+fn check_call(func: &Operand, call_args: &[Operand]) -> Option<String> {
     let Operand::Constant(c) = func else {
         return None;
     };
@@ -370,20 +387,24 @@ fn check_call(func: &Operand) -> Option<String> {
         return None;
     };
     let (def, args) = (*def, args.clone());
-    // Only compiler intrinsics are checked, and among them only the
-    // `simd_*` family has monomorphization rules of this shape.
+    // Only compiler intrinsics are checked: among them the
+    // `simd_*` and `atomic_*` families carry monomorphization
+    // rules of this shape.
     let inst = Instance::resolve(def, &args).ok()?;
     if !matches!(inst.kind, InstanceKind::Intrinsic) {
         return None;
     }
     let full_name = def.name();
     let name = full_name.rsplit("::").next().unwrap_or(&full_name);
-    if !name.starts_with("simd_") {
-        return None;
-    }
     let sig = kind.fn_sig()?;
     let sig = &sig.value;
     let inputs = sig.inputs();
+    if name.starts_with("atomic_") {
+        return check_atomic(name, inputs);
+    }
+    if !name.starts_with("simd_") {
+        return None;
+    }
     // Mirror `generic_simd_intrinsic`'s entry checks: the vector
     // argument whose type must be a SIMD type differs for the two
     // intrinsics handled before the general case.
@@ -393,12 +414,598 @@ fn check_call(func: &Operand) -> Option<String> {
         _ => (inputs.first().copied(), "input"),
     };
     let vector_ty = vector_ty?;
-    if is_simd(vector_ty) {
-        return None;
+    if !is_simd(vector_ty) {
+        return Some(format!(
+            "invalid monomorphization of `{name}` intrinsic: \
+             expected SIMD {what} type, found non-SIMD `{vector_ty}`"
+        ));
     }
-    Some(format!(
-        "invalid monomorphization of `{name}` intrinsic: \
-         expected SIMD {what} type, found non-SIMD `{vector_ty}`"
-    ))
+    check_simd_family(name, inputs, sig.output(), call_args)
 }
 
+/// Mirror the E0511 checks rustc_codegen_ssa performs for the
+/// `atomic_*` intrinsics (`codegen_intrinsic_call`): the type of
+/// the value at the memory operand — the pointee of the first
+/// argument, which is `*const T` for loads and `*mut T` for the
+/// rest — must be a basic integer type (an integer of any width,
+/// pointer-sized included; `bool` and `char` do not qualify) or
+/// a raw pointer type. The read-modify-write arithmetic group
+/// (`atomic_xadd` and its siblings, whose second argument is the
+/// operand value) additionally requires the operand's type to
+/// equal the memory type, or to be `usize` when the memory type
+/// is a raw pointer. `atomic_fence` and
+/// `atomic_singlethreadfence` carry no type rule and are left
+/// alone, as is any shape not positively present.
+fn check_atomic(name: &str, inputs: &[Ty]) -> Option<String> {
+    let dst = inputs.first().copied()?;
+    let Some(dst_kind) = guarded_ty_kind(&dst) else {
+        return None;
+    };
+    let TyKind::RigidTy(RigidTy::RawPtr(pointee, _)) = dst_kind else {
+        return None;
+    };
+    let invalid = || {
+        Some(format!(
+            "invalid monomorphization of `{name}` intrinsic: \
+             expected basic integer or pointer type, found `{pointee}`"
+        ))
+    };
+    match name {
+        "atomic_load" | "atomic_store" | "atomic_xchg" | "atomic_cxchg"
+        | "atomic_cxchgweak" | "atomic_max" | "atomic_min" | "atomic_umax"
+        | "atomic_umin" => {
+            if is_int_or_uint(pointee)
+                || guarded_ty_kind(&pointee)
+                    .is_some_and(|k| matches!(k, TyKind::RigidTy(RigidTy::RawPtr(..))))
+            {
+                None
+            } else {
+                invalid()
+            }
+        }
+        "atomic_xadd" | "atomic_xsub" | "atomic_and" | "atomic_or" | "atomic_xor"
+        | "atomic_nand" => {
+            let val = inputs.get(1).copied()?;
+            let ok = (is_int_or_uint(pointee) && val == pointee)
+                || (guarded_ty_kind(&pointee)
+                    .is_some_and(|k| matches!(k, TyKind::RigidTy(RigidTy::RawPtr(..))))
+                    && guarded_ty_kind(&val).is_some_and(|k| {
+                        matches!(
+                            k,
+                            TyKind::RigidTy(RigidTy::Uint(rustc_public::ty::UintTy::Usize))
+                        )
+                    }));
+            if ok { None } else { invalid() }
+        }
+        _ => None,
+    }
+}
+
+/// Whether a type is an integer type (signed or unsigned, any
+/// width, pointer-sized included).
+fn is_int_or_uint(ty: Ty) -> bool {
+    guarded_ty_kind(&ty).is_some_and(|k| {
+        matches!(k, TyKind::RigidTy(RigidTy::Int(_) | RigidTy::Uint(_)))
+    })
+}
+
+/// The shape of a SIMD vector type as `(lane count, element
+/// type)`, read from the single array field every `#[repr(simd)]`
+/// type is built on; `None` when the type is not a SIMD type or
+/// its lane count is not a concrete value here.
+fn simd_shape(ty: Ty) -> Option<(u64, Ty)> {
+    if !is_simd(ty) {
+        return None;
+    }
+    let Some(ty_kind) = guarded_ty_kind(&ty) else {
+        return None;
+    };
+    let TyKind::RigidTy(RigidTy::Adt(def, args)) = ty_kind else {
+        return None;
+    };
+    let variants = def.variants();
+    let [variant] = variants.as_slice() else {
+        return None;
+    };
+    let fields = variant.fields();
+    let [field] = fields.as_slice() else {
+        return None;
+    };
+    // The field's declared type is written in terms of the
+    // ADT's own generic parameters (`Simd<T, N>`'s field is
+    // `[T; N]`); substitute the instance's arguments, the same
+    // substitution code generation works with.
+    let Some(field_kind) = guarded_ty_kind(&field.ty()) else {
+        return None;
+    };
+    let TyKind::RigidTy(RigidTy::Array(elem, len)) = field_kind else {
+        return None;
+    };
+    let elem = subst_param(elem, &args);
+    // The lane count, resolving a count written as the ADT's
+    // own const parameter through the instance's arguments.
+    let lanes = match len.eval_target_usize() {
+        Ok(n) => n,
+        Err(_) => {
+            let rustc_public::ty::TyConstKind::Param(p) = len.kind() else {
+                return None;
+            };
+            match args.0.get(p.index as usize) {
+                Some(rustc_public::ty::GenericArgKind::Const(inner)) => {
+                    inner.eval_target_usize().ok()?
+                }
+                _ => return None,
+            }
+        }
+    };
+    Some((lanes, elem))
+}
+
+/// Resolve a type written as one of the enclosing ADT's type
+/// parameters through the instance's generic arguments; any
+/// other type is returned unchanged.
+fn subst_param(ty: Ty, args: &rustc_public::ty::GenericArgs) -> Ty {
+    match guarded_ty_kind(&ty) {
+        Some(TyKind::Param(p)) => match args.0.get(p.index as usize) {
+            Some(rustc_public::ty::GenericArgKind::Type(t)) => *t,
+            _ => ty,
+        },
+        _ => ty,
+    }
+}
+
+/// The bit width of an integer type, from its layout (the layout
+/// of a primitive integer always exists); `None` when it cannot
+/// be determined here.
+fn int_bit_width(ty: Ty) -> Option<u64> {
+    if !is_int_or_uint(ty) {
+        return None;
+    }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ty.layout())) {
+        Ok(Ok(layout)) => Some(layout.shape().size.bytes() as u64 * 8),
+        _ => None,
+    }
+}
+
+/// The `u32` elements of a constant index operand, read from the
+/// operand's allocation — the same values code generation reads
+/// when it checks `simd_shuffle` indices. `None` when the
+/// operand is not a constant whose allocation is exactly the
+/// index vector's bytes.
+fn const_u32_vector(op: &Operand, lanes: u64) -> Option<Vec<u32>> {
+    use rustc_public::ty::ConstantKind as CK;
+    let Operand::Constant(c) = op else {
+        return None;
+    };
+    let read = |alloc: &rustc_public::ty::Allocation| -> Option<Vec<u32>> {
+        if alloc.bytes.len() as u64 != 4 * lanes {
+            return None;
+        }
+        (0..lanes)
+            .map(|i| {
+                let at = (4 * i) as usize;
+                alloc.read_partial_uint(at..at + 4).ok().map(|v| v as u32)
+            })
+            .collect()
+    };
+    match c.const_.kind() {
+        CK::Allocated(alloc) => read(&alloc),
+        CK::Ty(tc) => match tc.kind() {
+            rustc_public::ty::TyConstKind::Value(_, alloc) => read(&alloc),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The per-intrinsic argument rules of `generic_simd_intrinsic`
+/// (rustc_codegen_llvm) beyond the entry check in `check_call`:
+/// element-type requirements, length and element agreement
+/// between arguments and the return type, and the constant
+/// index bounds of `simd_shuffle`. Each rule fires only when
+/// the invalid shape is positively present in the call's
+/// substituted signature (or, for the shuffle bounds, in the
+/// call's constant index operand).
+fn check_simd_family(
+    name: &str,
+    inputs: &[Ty],
+    ret_ty: Ty,
+    call_args: &[Operand],
+) -> Option<String> {
+    let input = |i: usize| inputs.get(i).copied();
+    let err = |msg: String| {
+        Some(format!(
+            "invalid monomorphization of `{name}` intrinsic: {msg}"
+        ))
+    };
+    let mask_elem_err = |elem: Ty| {
+        err(format!(
+            "expected mask element type to be an integer, found `{elem}`"
+        ))
+    };
+    match name {
+        "simd_saturating_add" | "simd_saturating_sub" => {
+            let in_ty = input(0)?;
+            let (_, elem) = simd_shape(in_ty)?;
+            if is_int_or_uint(elem) {
+                None
+            } else {
+                err(format!(
+                    "expected element type `{elem}` of vector type `{in_ty}` \
+                     to be a signed or unsigned integer type"
+                ))
+            }
+        }
+        "simd_bitmask" => {
+            let in_ty = input(0)?;
+            let (len, elem) = simd_shape(in_ty)?;
+            if !is_int_or_uint(elem) {
+                return mask_elem_err(elem);
+            }
+            // The return must be an unsigned integer with
+            // `max(len, 8).next_power_of_two()` bits, or a byte
+            // array with `ceil(len / 8)` elements.
+            let expected_bits = len.max(8).next_power_of_two();
+            let ok = match guarded_ty_kind(&ret_ty) {
+                Some(TyKind::RigidTy(RigidTy::Uint(_))) => {
+                    int_bit_width(ret_ty) == Some(expected_bits)
+                }
+                Some(TyKind::RigidTy(RigidTy::Array(e, n))) => {
+                    guarded_ty_kind(&e).is_some_and(|k| {
+                        matches!(
+                            k,
+                            TyKind::RigidTy(RigidTy::Uint(rustc_public::ty::UintTy::U8))
+                        )
+                    }) && n.eval_target_usize().ok() == Some(len.div_ceil(8))
+                }
+                _ => false,
+            };
+            if ok {
+                None
+            } else {
+                err(format!(
+                    "cannot return `{ret_ty}`, expected `u{expected_bits}` \
+                     or `[u8; {}]`",
+                    len.div_ceil(8)
+                ))
+            }
+        }
+        "simd_shuffle" => {
+            let in_ty = input(0)?;
+            let (in_len, in_elem) = simd_shape(in_ty)?;
+            let idx_ty = input(2)?;
+            let Some((n, idx_elem)) = simd_shape(idx_ty) else {
+                return err(
+                    "simd_shuffle index must be a SIMD vector of `u32` elements"
+                        .to_string(),
+                );
+            };
+            if !guarded_ty_kind(&idx_elem).is_some_and(|k| {
+                matches!(
+                    k,
+                    TyKind::RigidTy(RigidTy::Uint(rustc_public::ty::UintTy::U32))
+                )
+            }) {
+                return err(
+                    "simd_shuffle index must be a SIMD vector of `u32` elements"
+                        .to_string(),
+                );
+            }
+            if !is_simd(ret_ty) {
+                return err(format!(
+                    "expected SIMD return type, found non-SIMD `{ret_ty}`"
+                ));
+            }
+            let (out_len, out_elem) = simd_shape(ret_ty)?;
+            if out_len != n {
+                return err(format!(
+                    "expected return type with length {n} (same as the \
+                     index type `{idx_ty}`), found `{ret_ty}` with \
+                     length {out_len}"
+                ));
+            }
+            if out_elem != in_elem {
+                return err(format!(
+                    "expected return element type `{in_elem}` (element of \
+                     input `{in_ty}`), found `{out_elem}`"
+                ));
+            }
+            if let Some(indices) = const_u32_vector(call_args.get(2)?, n) {
+                let total = in_len * 2;
+                for (i, v) in indices.iter().enumerate() {
+                    if u64::from(*v) >= total {
+                        return err(format!(
+                            "expected index {i} to be less than {total}, \
+                             found {v}"
+                        ));
+                    }
+                }
+            }
+            None
+        }
+        "simd_gather" | "simd_scatter" => {
+            let in_ty = input(0)?;
+            let (in_len, in_elem) = simd_shape(in_ty)?;
+            let ptr_ty = input(1)?;
+            if !is_simd(ptr_ty) {
+                return err(format!(
+                    "expected SIMD second argument type, found \
+                     non-SIMD `{ptr_ty}`"
+                ));
+            }
+            let (ptr_len, ptr_elem) = simd_shape(ptr_ty)?;
+            if ptr_len != in_len {
+                return err(format!(
+                    "expected second argument with length {in_len} (same \
+                     as input type `{in_ty}`), found `{ptr_ty}` with \
+                     length {ptr_len}"
+                ));
+            }
+            let mask_ty = input(2)?;
+            if !is_simd(mask_ty) {
+                return err(format!(
+                    "expected SIMD third argument type, found \
+                     non-SIMD `{mask_ty}`"
+                ));
+            }
+            let (mask_len, mask_elem) = simd_shape(mask_ty)?;
+            if mask_len != in_len {
+                return err(format!(
+                    "expected third argument with length {in_len} (same \
+                     as input type `{in_ty}`), found `{mask_ty}` with \
+                     length {mask_len}"
+                ));
+            }
+            if name == "simd_gather" {
+                if !is_simd(ret_ty) {
+                    return err(format!(
+                        "expected SIMD return type, found non-SIMD `{ret_ty}`"
+                    ));
+                }
+                if ret_ty != in_ty {
+                    return err(format!(
+                        "expected return type `{in_ty}`, found `{ret_ty}`"
+                    ));
+                }
+            }
+            // The pointer vector's elements must be pointers to
+            // the input's element type. Code generation also
+            // requires mutable pointers for scatter, but that
+            // requirement is enforced only when a call is
+            // lowered, and this scan also covers constant bodies
+            // code generation never lowers (a masked store
+            // through a `*const` in an unevaluated constant is
+            // accepted by rustc), so mutability is not checked
+            // here.
+            let ptr_ok = match guarded_ty_kind(&ptr_elem) {
+                Some(TyKind::RigidTy(RigidTy::RawPtr(p, _))) => p == in_elem,
+                _ => false,
+            };
+            if !ptr_ok {
+                return err(format!(
+                    "expected element type of second argument `{ptr_ty}` \
+                     to be a pointer to the element type `{in_elem}`"
+                ));
+            }
+            if !is_int_or_uint(mask_elem) {
+                return mask_elem_err(mask_elem);
+            }
+            None
+        }
+        "simd_masked_load" | "simd_masked_store" => {
+            let mask_ty = input(0)?;
+            let (mask_len, mask_elem) = simd_shape(mask_ty)?;
+            let values_ty = input(2)?;
+            if !is_simd(values_ty) {
+                return err(format!(
+                    "expected SIMD third argument type, found \
+                     non-SIMD `{values_ty}`"
+                ));
+            }
+            let (values_len, values_elem) = simd_shape(values_ty)?;
+            if values_len != mask_len {
+                return err(format!(
+                    "expected third argument with length {mask_len} \
+                     (same as input type `{mask_ty}`), found \
+                     `{values_ty}` with length {values_len}"
+                ));
+            }
+            if name == "simd_masked_load" && ret_ty != values_ty {
+                return err(format!(
+                    "expected return type `{values_ty}`, found `{ret_ty}`"
+                ));
+            }
+            // The pointer must point at the values' element
+            // type. (Pointer mutability is not checked, for the
+            // reason given at the gather/scatter check above.)
+            let pointer_ty = input(1)?;
+            let ptr_ok = match guarded_ty_kind(&pointer_ty) {
+                Some(TyKind::RigidTy(RigidTy::RawPtr(p, _))) => p == values_elem,
+                _ => false,
+            };
+            if !ptr_ok {
+                return err(format!(
+                    "expected element type of second argument \
+                     `{pointer_ty}` to be a pointer to the element \
+                     type `{values_elem}`"
+                ));
+            }
+            if !is_int_or_uint(mask_elem) {
+                return mask_elem_err(mask_elem);
+            }
+            None
+        }
+        "simd_reduce_add_ordered" | "simd_reduce_mul_ordered"
+        | "simd_reduce_add_unordered" | "simd_reduce_mul_unordered" => {
+            let in_ty = input(0)?;
+            let (_, elem) = simd_shape(in_ty)?;
+            if ret_ty != elem {
+                return err(format!(
+                    "expected return type `{elem}` (element of input \
+                     `{in_ty}`), found `{ret_ty}`"
+                ));
+            }
+            if is_int_or_uint(elem)
+                || guarded_ty_kind(&elem)
+                    .is_some_and(|k| matches!(k, TyKind::RigidTy(RigidTy::Float(_))))
+            {
+                None
+            } else {
+                err(format!(
+                    "unsupported {name} from `{in_ty}` with element \
+                     `{elem}` to `{ret_ty}`"
+                ))
+            }
+        }
+        "simd_reduce_min" | "simd_reduce_max" | "simd_reduce_and"
+        | "simd_reduce_or" | "simd_reduce_xor" => {
+            let in_ty = input(0)?;
+            let (_, elem) = simd_shape(in_ty)?;
+            if ret_ty != elem {
+                return err(format!(
+                    "expected return type `{elem}` (element of input \
+                     `{in_ty}`), found `{ret_ty}`"
+                ));
+            }
+            if is_int_or_uint(elem) {
+                None
+            } else {
+                err(format!(
+                    "unsupported {name} from `{in_ty}` with element \
+                     `{elem}` to `{ret_ty}`"
+                ))
+            }
+        }
+        "simd_reduce_all" | "simd_reduce_any" => {
+            let in_ty = input(0)?;
+            let (_, elem) = simd_shape(in_ty)?;
+            if is_int_or_uint(elem) {
+                None
+            } else {
+                err(format!(
+                    "unsupported {name} from `{in_ty}` with element \
+                     `{elem}` to `{ret_ty}`"
+                ))
+            }
+        }
+        "simd_eq" | "simd_ne" | "simd_lt" | "simd_le" | "simd_gt" | "simd_ge" => {
+            let in_ty = input(0)?;
+            let (in_len, _) = simd_shape(in_ty)?;
+            if !is_simd(ret_ty) {
+                return err(format!(
+                    "expected SIMD return type, found non-SIMD `{ret_ty}`"
+                ));
+            }
+            let (out_len, out_elem) = simd_shape(ret_ty)?;
+            if out_len != in_len {
+                return err(format!(
+                    "expected return type with length {in_len} (same as \
+                     input type `{in_ty}`), found `{ret_ty}` with \
+                     length {out_len}"
+                ));
+            }
+            if !is_int_or_uint(out_elem) {
+                return err(format!(
+                    "expected return element type to be an integer, \
+                     found `{out_elem}`"
+                ));
+            }
+            None
+        }
+        "simd_select" => {
+            let mask_ty = input(0)?;
+            let (m_len, m_elem) = simd_shape(mask_ty)?;
+            let v_ty = input(1)?;
+            if !is_simd(v_ty) {
+                return err(format!(
+                    "expected SIMD second argument type, found \
+                     non-SIMD `{v_ty}`"
+                ));
+            }
+            let (v_len, _) = simd_shape(v_ty)?;
+            if m_len != v_len {
+                return err(format!(
+                    "expected mask length {m_len} to match the vector \
+                     length {v_len} of `{v_ty}`"
+                ));
+            }
+            if !is_int_or_uint(m_elem) {
+                return mask_elem_err(m_elem);
+            }
+            None
+        }
+        "simd_splat" => {
+            let (_, out_elem) = simd_shape(ret_ty)?;
+            let val_ty = input(0)?;
+            if val_ty == out_elem {
+                None
+            } else {
+                err(format!(
+                    "expected element type `{out_elem}` of vector type \
+                     `{ret_ty}`, found the splatted value's type \
+                     `{val_ty}`"
+                ))
+            }
+        }
+        "simd_select_bitmask" => {
+            let vec_ty = input(1)?;
+            let (len, _) = simd_shape(vec_ty)?;
+            let mask_ty = input(0)?;
+            // Same accepted mask shapes as `simd_bitmask`'s
+            // return: an unsigned integer with
+            // `max(len, 8).next_power_of_two()` bits, or a byte
+            // array with `ceil(len / 8)` elements.
+            let expected_bits = len.max(8).next_power_of_two();
+            let ok = match guarded_ty_kind(&mask_ty) {
+                Some(TyKind::RigidTy(RigidTy::Int(_)))
+                | Some(TyKind::RigidTy(RigidTy::Uint(_))) => {
+                    int_bit_width(mask_ty) == Some(expected_bits)
+                }
+                Some(TyKind::RigidTy(RigidTy::Array(e, n))) => {
+                    guarded_ty_kind(&e).is_some_and(|k| {
+                        matches!(
+                            k,
+                            TyKind::RigidTy(RigidTy::Uint(rustc_public::ty::UintTy::U8))
+                        )
+                    }) && n.eval_target_usize().ok() == Some(len.div_ceil(8))
+                }
+                _ => false,
+            };
+            if ok {
+                None
+            } else {
+                err(format!(
+                    "invalid bitmask `{mask_ty}`, expected `u{expected_bits}` \
+                     or `[u8; {}]`",
+                    len.div_ceil(8)
+                ))
+            }
+        }
+        "simd_insert" | "simd_insert_dyn" => {
+            let in_ty = input(0)?;
+            let (_, elem) = simd_shape(in_ty)?;
+            let val_ty = input(2)?;
+            if val_ty == elem {
+                None
+            } else {
+                err(format!(
+                    "expected inserted type `{elem}` (element of input \
+                     `{in_ty}`), found `{val_ty}`"
+                ))
+            }
+        }
+        "simd_extract" | "simd_extract_dyn" => {
+            let in_ty = input(0)?;
+            let (_, elem) = simd_shape(in_ty)?;
+            if ret_ty == elem {
+                None
+            } else {
+                err(format!(
+                    "expected return type `{elem}` (element of input \
+                     `{in_ty}`), found `{ret_ty}`"
+                ))
+            }
+        }
+        _ => None,
+    }
+}

@@ -11203,3 +11203,284 @@ fn run_mode_from_into_cell_and_refcell() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n5\n7\n9\n");
 }
+
+// ----- monomorphization validity checks (Lane DX) ---------------------------
+
+const ATOMIC_BOOL_SRC: &str = r#"
+#![feature(core_intrinsics)]
+use std::intrinsics::{self, AtomicOrdering::*};
+fn main() {
+    let mut b = true;
+    unsafe { let _ = intrinsics::atomic_load::<_, { SeqCst }, false>(&mut b); }
+}
+"#;
+
+const ATOMIC_VALID_SRC: &str = r#"
+#![feature(core_intrinsics)]
+use std::intrinsics::{self, AtomicOrdering::*};
+fn main() {
+    let v = 41u32;
+    unsafe {
+        let _ = intrinsics::atomic_load::<_, { SeqCst }, false>(&v);
+        let mut n = 1u64;
+        let _ = intrinsics::atomic_xadd::<_, _, { SeqCst }>(&mut n, 2u64);
+        let mut p = &v as *const u32;
+        let _ = intrinsics::atomic_xadd::<_, _, { SeqCst }>(&mut p, 1usize);
+    }
+}
+"#;
+
+const SIMD_SATURATING_FLOAT_SRC: &str = r#"
+#![feature(core_intrinsics, repr_simd)]
+use std::intrinsics::simd::simd_saturating_add;
+#[repr(simd)]
+#[derive(Copy, Clone)]
+struct F32x4([f32; 4]);
+fn main() { unsafe { let _ = simd_saturating_add(F32x4([0.0; 4]), F32x4([0.0; 4])); } }
+"#;
+
+const SIMD_BITMASK_BAD_RET_SRC: &str = r#"
+#![feature(core_intrinsics, repr_simd)]
+use std::intrinsics::simd::simd_bitmask;
+#[repr(simd)]
+#[derive(Copy, Clone)]
+struct M2([i32; 2]);
+fn main() { unsafe { let _: u16 = simd_bitmask(M2([0, 0])); } }
+"#;
+
+const SIMD_BITMASK_OK_SRC: &str = r#"
+#![feature(core_intrinsics, repr_simd)]
+use std::intrinsics::simd::simd_bitmask;
+#[repr(simd)]
+#[derive(Copy, Clone)]
+struct M16([i32; 16]);
+fn main() { unsafe { let _: u16 = simd_bitmask(M16([0; 16])); } }
+"#;
+
+const SIMD_SHUFFLE_OOB_SRC: &str = r#"
+#![feature(core_intrinsics, repr_simd)]
+use std::intrinsics::simd::simd_shuffle;
+#[repr(simd)]
+#[derive(Copy, Clone)]
+struct F32x2([f32; 2]);
+#[repr(simd)]
+#[derive(Copy, Clone)]
+struct Idx2([u32; 2]);
+const IDX: Idx2 = Idx2([4, 0]);
+fn main() { unsafe { let _: F32x2 = simd_shuffle(F32x2([0.0, 0.0]), F32x2([1.0, 1.0]), IDX); } }
+"#;
+
+const SIMD_SHUFFLE_OK_SRC: &str = r#"
+#![feature(core_intrinsics, repr_simd)]
+use std::intrinsics::simd::simd_shuffle;
+#[repr(simd)]
+#[derive(Copy, Clone)]
+struct F32x2([f32; 2]);
+#[repr(simd)]
+#[derive(Copy, Clone)]
+struct Idx2([u32; 2]);
+const IDX: Idx2 = Idx2([3, 0]);
+fn main() { unsafe { let _: F32x2 = simd_shuffle(F32x2([0.0, 0.0]), F32x2([1.0, 1.0]), IDX); } }
+"#;
+
+const SIMD_REDUCE_BAD_RET_SRC: &str = r#"
+#![feature(core_intrinsics, repr_simd)]
+use std::intrinsics::simd::simd_reduce_and;
+#[repr(simd)]
+#[derive(Copy, Clone)]
+struct U32x4([u32; 4]);
+fn main() { unsafe { let _: f32 = simd_reduce_and(U32x4([0; 4])); } }
+"#;
+
+const SIMD_MASKED_LOAD_BAD_SRC: &str = r#"
+#![feature(core_intrinsics, repr_simd)]
+use std::intrinsics::simd::{SimdAlign, simd_masked_load};
+#[repr(simd)]
+#[derive(Copy, Clone)]
+struct Simd<T, const N: usize>([T; N]);
+fn main() {
+    let arr = [4u8, 5, 6, 7];
+    let default = Simd::<u8, 4>([9; 4]);
+    unsafe {
+        let _ = simd_masked_load::<_, _, _, { SimdAlign::Element }>(
+            Simd::<i8, 8>([-1, 0, -1, -1, 0, 0, 0, 0]),
+            arr.as_ptr(),
+            default,
+        );
+    }
+}
+"#;
+
+const SIMD_GATHER_BAD_PTR_SRC: &str = r#"
+#![feature(core_intrinsics, repr_simd)]
+use std::intrinsics::simd::simd_gather;
+#[repr(simd)]
+#[derive(Copy, Clone)]
+struct Simd<T, const N: usize>([T; N]);
+fn main() {
+    let default = Simd::<f32, 4>([0.0; 4]);
+    let mask = Simd::<i32, 4>([-1, -1, -1, -1]);
+    unsafe { let _ = simd_gather(default, mask, mask); }
+}
+"#;
+
+#[test]
+fn convert_mode_atomic_intrinsic_with_bool_value_is_a_compile_failure() {
+    let dir = temp_dir("mono-atomic-bool");
+    let src = fixture(&dir, "atomic_bool.rs", ATOMIC_BOOL_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an atomic load of a bool must fail compilation; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("sparagmos-driver: compilation failed")
+            && stderr.contains("atomic_load")
+            && stderr.contains("basic integer or pointer"),
+        "the failure must name the intrinsic and the reason; stderr={stderr}"
+    );
+}
+
+#[test]
+fn convert_mode_atomic_intrinsics_with_valid_types_convert() {
+    let dir = temp_dir("mono-atomic-valid");
+    let src = fixture(&dir, "atomic_valid.rs", ATOMIC_VALID_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "valid atomic monomorphizations must convert; stderr={stderr}"
+    );
+}
+
+#[test]
+fn convert_mode_simd_saturating_add_on_floats_is_a_compile_failure() {
+    let dir = temp_dir("mono-simd-saturating");
+    let src = fixture(&dir, "saturating.rs", SIMD_SATURATING_FLOAT_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "saturating arithmetic on a float vector must fail; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("simd_saturating_add") && stderr.contains("integer type"),
+        "the failure must name the intrinsic and the reason; stderr={stderr}"
+    );
+}
+
+#[test]
+fn convert_mode_simd_bitmask_with_wrong_return_is_a_compile_failure() {
+    let dir = temp_dir("mono-simd-bitmask-bad");
+    let src = fixture(&dir, "bitmask_bad.rs", SIMD_BITMASK_BAD_RET_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a bitmask returned as the wrong integer width must fail; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("simd_bitmask") && stderr.contains("cannot return"),
+        "the failure must name the intrinsic and the reason; stderr={stderr}"
+    );
+}
+
+#[test]
+fn convert_mode_simd_bitmask_with_matching_return_converts() {
+    let dir = temp_dir("mono-simd-bitmask-ok");
+    let src = fixture(&dir, "bitmask_ok.rs", SIMD_BITMASK_OK_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a bitmask with the matching return width must convert; stderr={stderr}"
+    );
+}
+
+#[test]
+fn convert_mode_simd_shuffle_with_out_of_bounds_index_is_a_compile_failure() {
+    let dir = temp_dir("mono-simd-shuffle-oob");
+    let src = fixture(&dir, "shuffle_oob.rs", SIMD_SHUFFLE_OOB_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a shuffle index past both inputs must fail; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("simd_shuffle") && stderr.contains("less than"),
+        "the failure must name the intrinsic and the reason; stderr={stderr}"
+    );
+}
+
+#[test]
+fn convert_mode_simd_shuffle_with_in_bounds_index_converts() {
+    let dir = temp_dir("mono-simd-shuffle-ok");
+    let src = fixture(&dir, "shuffle_ok.rs", SIMD_SHUFFLE_OK_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an in-bounds shuffle must convert; stderr={stderr}"
+    );
+}
+
+#[test]
+fn convert_mode_simd_reduce_with_wrong_return_is_a_compile_failure() {
+    let dir = temp_dir("mono-simd-reduce-bad");
+    let src = fixture(&dir, "reduce_bad.rs", SIMD_REDUCE_BAD_RET_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a reduction returned as a non-element type must fail; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("simd_reduce_and") && stderr.contains("expected return type"),
+        "the failure must name the intrinsic and the reason; stderr={stderr}"
+    );
+}
+
+#[test]
+fn convert_mode_simd_masked_load_with_wrong_length_is_a_compile_failure() {
+    let dir = temp_dir("mono-simd-masked-bad");
+    let src = fixture(&dir, "masked_bad.rs", SIMD_MASKED_LOAD_BAD_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a masked load whose values length differs from the mask must fail; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("simd_masked_load") && stderr.contains("third argument"),
+        "the failure must name the intrinsic and the reason; stderr={stderr}"
+    );
+}
+
+#[test]
+fn convert_mode_simd_gather_with_non_pointer_vector_is_a_compile_failure() {
+    let dir = temp_dir("mono-simd-gather-bad");
+    let src = fixture(&dir, "gather_bad.rs", SIMD_GATHER_BAD_PTR_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a gather whose second argument is not a pointer vector must fail; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("simd_gather") && stderr.contains("pointer"),
+        "the failure must name the intrinsic and the reason; stderr={stderr}"
+    );
+}
+
