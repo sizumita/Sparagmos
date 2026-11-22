@@ -207,6 +207,39 @@ extern "C" fn format_slice_index_message(from: u64, end: u64, buf: *mut u8) -> u
     write_formatted(&text, buf)
 }
 
+/// One static blob: storage the compiled program owns for its
+/// whole lifetime, holding the pointee of a pointer-shaped
+/// constant (a string constant's bytes, a reference constant's
+/// pointee). Generated code takes a blob's address with
+/// [`crate::ir::Instr::StaticAddr`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum StaticBlob {
+    /// Raw bytes (a string / byte-string constant's contents).
+    Bytes(Vec<u8>),
+    /// A constant value's leaf words, in leaf order. A word is
+    /// either a plain value or the address of another blob — the
+    /// address words are resolved when the program is laid out,
+    /// once every blob's address is known.
+    Words(Vec<StaticWord>),
+}
+
+/// One word of a [`StaticBlob::Words`] image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StaticWord {
+    /// A plain 64-bit value.
+    Imm(i64),
+    /// The address of the blob with this index.
+    AddrOf(u32),
+}
+
+/// The byte length of a blob's storage.
+fn blob_len(b: &StaticBlob) -> usize {
+    match b {
+        StaticBlob::Bytes(bytes) => bytes.len(),
+        StaticBlob::Words(words) => words.len() * 8,
+    }
+}
+
 /// A whole compiled program: executable image plus the state its
 /// generated code refers to by absolute address.
 pub struct CompiledProgram {
@@ -228,6 +261,10 @@ pub struct CompiledProgram {
     /// Scratch buffer for run-time-formatted panic messages
     /// (address-stable; see [`format_index_message`]).
     scratch_buf: Box<[u8; 128]>,
+    /// The static blobs pointer-shaped constants point at
+    /// (address-stable; see [`StaticBlob`]).
+    #[allow(dead_code)]
+    statics: Vec<Box<[u8]>>,
 }
 
 impl CompiledProgram {
@@ -303,6 +340,7 @@ pub fn compile_program(
     funcs: &[Function],
     messages: Vec<String>,
     places: Vec<String>,
+    statics: Vec<StaticBlob>,
 ) -> Result<CompiledProgram, CompileError> {
     // Everything the generated code refers to by absolute address is
     // created first and kept in the returned program: the panic
@@ -314,6 +352,31 @@ pub fn compile_program(
     let messages: Vec<Box<str>> = messages.into_iter().map(|s| s.into_boxed_str()).collect();
     let places: Vec<Box<str>> = places.into_iter().map(|s| s.into_boxed_str()).collect();
     let scratch_buf: Box<[u8; 128]> = Box::new([0; 128]);
+    // The static blobs: allocate every blob's storage first (each
+    // boxed, so its address is stable), then fill the contents —
+    // a word blob may hold the address of another blob, which is
+    // only known once all the storage exists.
+    let mut storages: Vec<Box<[u8]>> = statics
+        .iter()
+        .map(|b| vec![0u8; blob_len(b)].into_boxed_slice())
+        .collect();
+    let static_addrs: Vec<usize> = storages.iter().map(|b| b.as_ptr() as usize).collect();
+    for (blob, storage) in statics.iter().zip(storages.iter_mut()) {
+        match blob {
+            StaticBlob::Bytes(bytes) => storage.copy_from_slice(bytes),
+            StaticBlob::Words(words) => {
+                for (i, w) in words.iter().enumerate() {
+                    let value = match w {
+                        StaticWord::Imm(v) => *v,
+                        StaticWord::AddrOf(idx) => {
+                            static_addrs[*idx as usize] as i64
+                        }
+                    };
+                    storage[i * 8..i * 8 + 8].copy_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+    }
     let ctx = ProgramCtx {
         flag_addr: panic_ctx.as_ref() as *const PanicCtx as usize,
         panic_fn: sparagmos_runtime::ffi::sparagmos_panic as usize,
@@ -330,6 +393,7 @@ pub fn compile_program(
             .map(|s| (s.as_ptr() as usize, s.len()))
             .collect(),
         scratch_buf: scratch_buf.as_ptr() as usize,
+        statics: static_addrs,
     };
 
     // Compile each function separately, then lay the bodies out in
@@ -374,6 +438,7 @@ pub fn compile_program(
         messages,
         places,
         scratch_buf,
+        statics: storages,
     })
 }
 
@@ -416,7 +481,7 @@ mod tests {
     #[test]
     fn call_between_functions() {
         let (funcs, msgs) = caller_and_callee();
-        let prog = compile_program(&funcs, msgs, vec![]).unwrap();
+        let prog = compile_program(&funcs, msgs, vec![], vec![]).unwrap();
         // caller(4) = callee(5) + callee(10) = 15 + 30
         assert_eq!(prog.call(1, &[4]), Ok(45));
         assert_eq!(prog.call(0, &[7]), Ok(21));
@@ -450,7 +515,7 @@ mod tests {
             value: sum.into(),
             second: None,
         });
-        let prog = compile_program(&[callee, caller], vec![], vec![]).unwrap();
+        let prog = compile_program(&[callee, caller], vec![], vec![], vec![]).unwrap();
         // The pair travels in RAX/RDX; `call` reads the first word.
         assert_eq!(prog.call_pair(0, &[10]), Ok((11, 20)));
         assert_eq!(prog.call(0, &[10]), Ok(11));
@@ -478,7 +543,7 @@ mod tests {
         let mid = mk_caller("mid", 0);
         let top = mk_caller("top", 1);
         let prog =
-            compile_program(&[boom, mid, top], vec!["kaboom".to_string()], vec![]).unwrap();
+            compile_program(&[boom, mid, top], vec!["kaboom".to_string()], vec![], vec![]).unwrap();
         let err = prog.call(2, &[]).expect_err("panic must surface");
         assert_eq!(err.message, "kaboom");
         // The runtime's shared panic record was written too.
@@ -533,7 +598,7 @@ mod tests {
             value: d.into(),
             second: None,
         });
-        let prog = compile_program(&[callee, caller], vec![], vec![]).unwrap();
+        let prog = compile_program(&[callee, caller], vec![], vec![], vec![]).unwrap();
         // callee(1..=7) = 1 + 4 + 9 + 16 + 25 + 36 + 49
         assert_eq!(prog.call(1, &[6]), Ok(140));
         // Direct entry with seven words (through the trampoline).
@@ -570,7 +635,7 @@ mod tests {
             value: sum.into(),
             second: None,
         });
-        let prog = compile_program(&[c8, c10, caller], vec![], vec![]).unwrap();
+        let prog = compile_program(&[c8, c10, caller], vec![], vec![], vec![]).unwrap();
         // c8(1..=8) = 204; c10(1 x9, 2) = 45 + 20 = 65.
         assert_eq!(prog.call(2, &[2]), Ok(269));
         assert_eq!(prog.call(0, &[1; 8]), Ok(36));
@@ -598,7 +663,7 @@ mod tests {
             value: r.into(),
             second: None,
         });
-        let prog = compile_program(&[inner, outer], vec![], vec![]).unwrap();
+        let prog = compile_program(&[inner, outer], vec![], vec![], vec![]).unwrap();
         // inner(8, 7, 6, 5, 4, 3, 2, 1) = 8+14+18+20+20+18+14+8 = 120; + a = 1.
         assert_eq!(prog.call(1, &[1, 2, 3, 4, 5, 6, 7, 8]), Ok(121));
     }
@@ -635,7 +700,7 @@ mod tests {
             value: r.into(),
             second: None,
         });
-        let prog = compile_program(&[callee, caller], vec![], vec![]).unwrap();
+        let prog = compile_program(&[callee, caller], vec![], vec![], vec![]).unwrap();
         assert_eq!(prog.call(1, &[]), Ok(23));
         assert_eq!(prog.call_pair(0, &[1, 2, 3, 4, 5, 6, 7, 8]), Ok((9, 14)));
     }

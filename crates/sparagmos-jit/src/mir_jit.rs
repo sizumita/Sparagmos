@@ -136,22 +136,22 @@
 //! (including `PtrMetadata`), `IntToInt` / `FloatToInt` /
 //! `IntToFloat` / `FloatToFloat` casts, the address-preserving
 //! pointer casts and the array-to-slice `Unsize` coercion, `Len`,
-//! tuple aggregates, ADT aggregates (structs and enums,
+//! tuple aggregates, array aggregates, ADT aggregates (structs and enums,
 //! including payloads), `Repeat`,
 //! `Discriminant`, `SetDiscriminant`; `Goto`, `SwitchInt`, `Call`
 //! (within the program, any number of argument words — the first
 //! six in the System V registers, the rest on the stack; see
 //! [`arg_word_layout`] for the exact contract — and results of up
 //! to two words — a fat pointer or a pair — returned in RAX/RDX,
-//! the System V pair-return convention),
+//! the System V pair-return convention; wider results are stored
+//! through a hidden leading sret argument word),
 //! `Assert`, `Drop`, `Return`, `Unreachable` (as a guest panic).
 //! Anything else — `f16` / `f128`, 128-bit integers, references
 //! to trait objects, unions, ADT values wider than the layout
 //! bound or with a field type the program never reveals, a second dynamic
 //! index within one place,
-//! a literal index from the end of a slice, return values of
-//! more than two words, arguments of more than two words,
-//! aggregates other than tuples and ADTs, calls to functions
+//! a literal index from the end of a slice,
+//! aggregates other than tuples, ADTs and arrays, calls to functions
 //! outside the program, and
 //! so on — fails the whole function's compilation with
 //! [`JitError::Unsupported`] naming the construct. There is
@@ -170,7 +170,7 @@ use crate::ir::{
     FloatKind as IrFloatKind, Function as IrFunction, Instr, IntKind as IrIntKind,
     Operand as IrOperand, Terminator as IrTerminator, UnOp as IrUnOp,
 };
-use crate::program::{compile_program, CompiledProgram};
+use crate::program::{compile_program, CompiledProgram, StaticBlob, StaticWord};
 
 // ---------------------------------------------------------------------------
 // Public input / output types
@@ -259,6 +259,10 @@ pub struct JitProgram {
     /// Parameter word count (IR parameters) per function: one
     /// word per scalar leaf of each MIR argument.
     param_counts: Vec<usize>,
+    /// Return leaf count per function. A count above two means
+    /// the function takes the hidden sret argument word (see
+    /// `FnLower::run`); the call API supplies it itself.
+    ret_counts: Vec<usize>,
     names: Vec<String>,
 }
 
@@ -295,6 +299,7 @@ impl JitProgram {
         let layouts = AdtLayouts::build(&input.functions, &input.adt_discriminants);
         let mut messages = MsgTable::default();
         let mut places = MsgTable::default();
+        let mut statics = StaticsTable::default();
         let mut ir_funcs: Vec<IrFunction> = Vec::with_capacity(input.functions.len());
         for f in &input.functions {
             let lower = FnLower::new(
@@ -306,11 +311,25 @@ impl JitProgram {
                 &layouts,
                 &mut messages,
                 &mut places,
+                &mut statics,
             );
             ir_funcs.push(lower.run()?);
         }
         let param_counts: Vec<usize> = ir_funcs.iter().map(|f| f.param_count).collect();
-        let inner = compile_program(&ir_funcs, messages.into_vec(), places.into_vec())?;
+        let mut ret_counts: Vec<usize> = Vec::with_capacity(input.functions.len());
+        for f in &input.functions {
+            ret_counts.push(flatten(
+                &f.body.local_decls[0].ty,
+                &f.name,
+                &layouts,
+            )?);
+        }
+        let inner = compile_program(
+            &ir_funcs,
+            messages.into_vec(),
+            places.into_vec(),
+            statics.into_vec(),
+        )?;
         Ok(JitProgram {
             inner,
             index_by_name: input
@@ -320,6 +339,7 @@ impl JitProgram {
                 .map(|(i, f)| (f.name.clone(), i))
                 .collect(),
             param_counts,
+            ret_counts,
             names: input.functions.iter().map(|f| f.name.clone()).collect(),
         })
     }
@@ -341,6 +361,10 @@ impl JitProgram {
     /// Arguments are the parameters' canonical 64-bit representations
     /// (sign-extended for signed types). The result is the return
     /// value's canonical representation (0 for a unit return).
+    /// A function returning more than two words stores them
+    /// through a hidden sret argument this API supplies itself;
+    /// `call` then yields the result's first word (and
+    /// [`JitProgram::call_pair`] its first two).
     pub fn call(&self, name: &str, args: &[i64]) -> Result<i64, JitCallError> {
         let idx = self
             .index_by_name
@@ -353,7 +377,33 @@ impl JitProgram {
     /// Call the function at index `idx` (input order); see
     /// [`JitProgram::call`] for the argument contract.
     pub fn call_index(&self, idx: usize, args: &[i64]) -> Result<i64, JitCallError> {
-        let expected = self.param_counts[idx];
+        let (full, buf) = self.prepare_call(idx, args)?;
+        let r = self
+            .inner
+            .call(idx, &full)
+            .map_err(JitCallError::Panic)?;
+        Ok(match &buf {
+            // A wide result's first word is in the sret buffer
+            // (its last cell: the leaves lie at descending
+            // addresses from the base the callee was given).
+            Some(b) => b[b.len() - 1],
+            None => r,
+        })
+    }
+
+    /// Validate the public argument words of a call to `idx` and
+    /// build the full IR argument sequence: for a function with a
+    /// wide (sret) result, the hidden leading word — the address
+    /// of a fresh result buffer, its last cell — is prepended, and
+    /// the buffer is returned alongside so the caller can read the
+    /// result words back (leaf `k` at cell `len - 1 - k`).
+    fn prepare_call(
+        &self,
+        idx: usize,
+        args: &[i64],
+    ) -> Result<(Vec<i64>, Option<Vec<i64>>), JitCallError> {
+        let wide = self.ret_counts[idx] > 2;
+        let expected = self.param_counts[idx] - usize::from(wide);
         if args.len() != expected {
             return Err(JitCallError::WrongArgCount {
                 name: self.names[idx].clone(),
@@ -361,7 +411,15 @@ impl JitProgram {
                 got: args.len(),
             });
         }
-        self.inner.call(idx, args).map_err(JitCallError::Panic)
+        if !wide {
+            return Ok((args.to_vec(), None));
+        }
+        let mut buf = vec![0i64; self.ret_counts[idx]];
+        let base = buf.as_mut_ptr() as i64 + ((buf.len() - 1) * 8) as i64;
+        let mut full = Vec::with_capacity(args.len() + 1);
+        full.push(base);
+        full.extend_from_slice(args);
+        Ok((full, Some(buf)))
     }
 
     /// Call the function called `name`; see [`JitProgram::call`]
@@ -386,15 +444,15 @@ impl JitProgram {
         idx: usize,
         args: &[i64],
     ) -> Result<(i64, i64), JitCallError> {
-        let expected = self.param_counts[idx];
-        if args.len() != expected {
-            return Err(JitCallError::WrongArgCount {
-                name: self.names[idx].clone(),
-                expected,
-                got: args.len(),
-            });
-        }
-        self.inner.call_pair(idx, args).map_err(JitCallError::Panic)
+        let (full, buf) = self.prepare_call(idx, args)?;
+        let r = self
+            .inner
+            .call_pair(idx, &full)
+            .map_err(JitCallError::Panic)?;
+        Ok(match &buf {
+            Some(b) => (b[b.len() - 1], b[b.len() - 2]),
+            None => r,
+        })
     }
 }
 
@@ -423,6 +481,38 @@ impl MsgTable {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Statics table
+// ---------------------------------------------------------------------------
+
+/// The program's static blobs: the pointees of pointer-shaped
+/// constants, interned by content like the message tables. A blob
+/// is either raw bytes (a string / byte-string constant's contents)
+/// or a constant value's leaf words (a reference constant's
+/// pointee), with address words left symbolic
+/// ([`StaticWord::AddrOf`]) for the program layer to resolve once
+/// every blob's address is known.
+#[derive(Default)]
+struct StaticsTable {
+    blobs: Vec<StaticBlob>,
+    map: HashMap<StaticBlob, u32>,
+}
+
+impl StaticsTable {
+    fn intern(&mut self, b: StaticBlob) -> u32 {
+        if let Some(i) = self.map.get(&b) {
+            return *i;
+        }
+        let i = self.blobs.len() as u32;
+        self.map.insert(b.clone(), i);
+        self.blobs.push(b);
+        i
+    }
+    fn into_vec(self) -> Vec<StaticBlob> {
+        self.blobs
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ADT layouts
@@ -1111,10 +1201,10 @@ fn build_leaf_count(
 /// * Arguments are laid out in order, one flat word per scalar leaf.
 /// * A zero-word argument (unit, never) still occupies one dummy
 ///   word, whose value nobody reads.
-/// * A two-word argument (a fat reference, a two-scalar pair) is
-///   never split across the register/stack boundary: if it would
-///   start at word 5 — the last register word — one pad word is
-///   inserted before it, so the pair lies entirely on the stack.
+/// * A multi-word argument is never split across the
+///   register/stack boundary: if it would start among the
+///   register words but end past them, pad words are inserted
+///   before it, so the argument lies entirely on the stack.
 /// * Words 0..6 travel in the System V argument registers, words
 ///   6.. on the stack in order (word 6 at the lowest address).
 ///
@@ -1126,8 +1216,8 @@ fn arg_word_layout(counts: &[usize]) -> (Vec<usize>, usize) {
     let mut word = 0usize;
     for &count in counts {
         let width = count.max(1);
-        if width == 2 && word == 5 {
-            word += 1; // pad: keep the pair off the register/stack seam
+        if width > 1 && word < 6 && word + width > 6 {
+            word = 6; // pad: keep the argument off the register/stack seam
         }
         starts.push(word);
         word += width;
@@ -1603,6 +1693,23 @@ enum PlaceLoc {
     },
 }
 
+/// Whether a constant's value is pointer-shaped: materializing it
+/// yields the address of a static blob holding its contents, plus
+/// metadata words for the fat shapes. A reference constant delegates
+/// to its pointee's shape when the pointee is itself pointer-shaped
+/// (a `&str` constant *is* the fat pointer); otherwise it is a thin
+/// pointer to a value-shaped pointee.
+fn is_pointer_shaped(v: &mir::ConstValue) -> bool {
+    matches!(
+        v,
+        mir::ConstValue::Str(_)
+            | mir::ConstValue::Bytes(_)
+            | mir::ConstValue::Slice { .. }
+            | mir::ConstValue::SliceVal(_)
+            | mir::ConstValue::Ref(_)
+    )
+}
+
 struct FnLower<'a> {
     func: &'a MirFunctionInput,
     body: &'a mir::Body,
@@ -1615,6 +1722,12 @@ struct FnLower<'a> {
     /// Place strings for the negative-index panic, interned like
     /// `messages`.
     places: &'a mut MsgTable,
+    /// The program's static blobs, interned like `messages`.
+    statics: &'a mut StaticsTable,
+    /// The slot holding the hidden sret argument (the address of
+    /// the caller's destination storage), for a function whose
+    /// return value is wider than two words. `None` otherwise.
+    sret_slot: Option<u32>,
     /// Per local: (first leaf slot, leaf count).
     local_slots: Vec<(u32, usize)>,
     next_value: u32,
@@ -1636,6 +1749,7 @@ impl<'a> FnLower<'a> {
         layouts: &'a AdtLayouts,
         messages: &'a mut MsgTable,
         places: &'a mut MsgTable,
+        statics: &'a mut StaticsTable,
     ) -> Self {
         Self {
             func,
@@ -1647,6 +1761,8 @@ impl<'a> FnLower<'a> {
             layouts,
             messages,
             places,
+            statics,
+            sret_slot: None,
             local_slots: Vec::new(),
             next_value: 0,
             blocks: Vec::new(),
@@ -1733,30 +1849,40 @@ impl<'a> FnLower<'a> {
     fn run(mut self) -> Result<IrFunction, JitError> {
         let body = self.body;
         // Lay out the locals. Argument locals are laid out first:
-        // each one is one IR parameter, and IR parameters are by
-        // definition the values 0..param_count (a unit argument gets
-        // a parameter slot whose value is never read; a multi-leaf
-        // argument is outside the baseline's register-argument
-        // model). The return place and the remaining locals follow.
+        // each one spans its leaves in the IR parameter sequence,
+        // and IR parameters are by definition the values
+        // 0..param_count (a unit argument gets a parameter slot
+        // whose value is never read). The return place and the
+        // remaining locals follow.
         let arg_count = body.arg_count;
         self.local_slots = vec![(0, 0); body.local_decls.len()];
+        // A function whose return place flattens to more than two
+        // words cannot return them in registers: it takes a hidden
+        // leading argument word — the address of the caller's
+        // destination storage — and stores the return words there
+        // at `Return` (the System V sret convention, in the slot
+        // model's terms). `lower_call` derives the same layout from
+        // the destination's leaf count, so the two sides agree.
+        let ret_count = flatten(&body.local_decls[0].ty, &self.func.name, self.layouts)?;
+        let sret = ret_count > 2;
         // The IR parameter layout: one word per leaf of each
-        // argument, laid out by `arg_word_layout` (a unit argument
-        // still occupies a dummy word; a fat argument occupies two;
-        // a pair that would straddle the register/stack boundary is
-        // preceded by a pad word, which gets a slot nobody reads).
-        let mut counts = Vec::with_capacity(arg_count);
+        // argument (the hidden sret word first, when present), laid
+        // out by `arg_word_layout` (a unit argument still occupies
+        // a dummy word; a fat argument occupies two; a pair that
+        // would straddle the register/stack boundary is preceded by
+        // a pad word, which gets a slot nobody reads).
+        let mut counts = Vec::with_capacity(arg_count + 1);
+        if sret {
+            counts.push(1);
+        }
         for idx in 1..=arg_count {
             let decl = &body.local_decls[idx];
-            let count = flatten(&decl.ty, &self.func.name, self.layouts)?;
-            if count > 2 {
-                return Err(self.err("function argument with more than two words"));
-            }
-            counts.push(count);
+            counts.push(flatten(&decl.ty, &self.func.name, self.layouts)?);
         }
         let (starts, ir_param_count) = arg_word_layout(&counts);
-        for (idx, &count) in (1..=arg_count).zip(counts.iter()) {
-            let start = starts[idx - 1];
+        let offset = usize::from(sret);
+        for (i, &count) in counts.iter().enumerate() {
+            let start = starts[i];
             while (self.next_value as usize) < start {
                 self.fresh(); // the pad word's slot
             }
@@ -1764,7 +1890,11 @@ impl<'a> FnLower<'a> {
             for _ in 1..count.max(1) {
                 self.fresh();
             }
-            self.local_slots[idx] = (slot, count);
+            if sret && i == 0 {
+                self.sret_slot = Some(slot);
+            } else {
+                self.local_slots[i + 1 - offset] = (slot, count);
+            }
         }
         for idx in std::iter::once(0).chain(arg_count + 1..body.local_decls.len()) {
             let decl = &body.local_decls[idx];
@@ -2741,6 +2871,23 @@ impl<'a> FnLower<'a> {
                 }
             }
             mir::Operand::Constant(c) => {
+                if let mir::ConstKind::Value(v) = &c.literal {
+                    if is_pointer_shaped(v) {
+                        // A pointer-shaped constant in a single-word
+                        // position is a thin pointer (a reference to
+                        // a scalar constant, a byte string used as a
+                        // raw pointer): materialize its words and
+                        // take the first — the address.
+                        let pointee = match ctx {
+                            mir::Ty::Ref(_, p, _) | mir::Ty::RawPtr(p, _) => Some(&**p),
+                            _ => None,
+                        };
+                        let words = self.pointer_const_words(v, pointee, 1)?;
+                        let dst = self.fresh();
+                        self.emit_static_words(&words, dst);
+                        return Ok(dst);
+                    }
+                }
                 let v = self.const_i64(c, ctx)?;
                 let dst = self.fresh();
                 self.emit(Instr::Const { dst, imm: v });
@@ -2778,7 +2925,19 @@ impl<'a> FnLower<'a> {
                     }
                 }
             }
-            mir::Operand::Constant(_) => Err(self.err("fat pointer constant")),
+            mir::Operand::Constant(c) => match &c.literal {
+                mir::ConstKind::Value(v) if is_pointer_shaped(v) => {
+                    // A fat pointer constant: the address of its
+                    // pointee blob and its metadata word.
+                    let words = self.pointer_const_words(v, None, 2)?;
+                    let a = self.fresh();
+                    let b = self.fresh();
+                    debug_assert_eq!(b, a + 1);
+                    self.emit_static_words(&words, a);
+                    Ok((a, b))
+                }
+                _ => Err(self.err("fat pointer constant")),
+            },
         }
     }
 
@@ -2913,6 +3072,20 @@ impl<'a> FnLower<'a> {
                 }
                 Ok(())
             }
+            _ if is_pointer_shaped(v) => {
+                // A pointer-shaped constant (a string, a slice, a
+                // reference to another constant): its leaves are
+                // the address of its pointee blob plus its metadata
+                // words.
+                let width = flatten(ctx, &self.func.name, self.layouts)?;
+                let pointee = match ctx {
+                    mir::Ty::Ref(_, p, _) | mir::Ty::RawPtr(p, _) => Some(&**p),
+                    _ => None,
+                };
+                let words = self.pointer_const_words(v, pointee, width)?;
+                self.emit_static_words(&words, dst);
+                Ok(())
+            }
             _ => {
                 if flatten(ctx, &self.func.name, self.layouts)? == 0 {
                     // A zero-leaf value (unit / never) stores nothing.
@@ -2923,6 +3096,197 @@ impl<'a> FnLower<'a> {
                 Ok(())
             }
         }
+    }
+
+    /// Emit static words into consecutive slots starting at `dst`:
+    /// an immediate word is a constant, an address word is the
+    /// address of the interned static blob.
+    fn emit_static_words(&mut self, words: &[StaticWord], dst: u32) {
+        for (k, w) in words.iter().enumerate() {
+            match w {
+                StaticWord::Imm(x) => self.emit(Instr::Const {
+                    dst: dst + k as u32,
+                    imm: *x,
+                }),
+                StaticWord::AddrOf(idx) => self.emit(Instr::StaticAddr {
+                    dst: dst + k as u32,
+                    index: *idx,
+                }),
+            }
+        }
+    }
+
+    /// The leaf words of a pointer-shaped constant, as static
+    /// words: the address of the constant's pointee blob plus the
+    /// metadata word(s) of the value's shape. `pointee` is the
+    /// pointee type when the caller knows it (a slice-value
+    /// constant needs its element type, a reference constant its
+    /// pointee's layout); `width` is the constant value's leaf
+    /// count in its position.
+    fn pointer_const_words(
+        &mut self,
+        v: &mir::ConstValue,
+        pointee: Option<&mir::Ty>,
+        width: usize,
+    ) -> Result<Vec<StaticWord>, JitError> {
+        use mir::ConstValue as V;
+        match v {
+            V::Str(s) => {
+                if width != 2 {
+                    return Err(self.err("string constant in a non-pointer position"));
+                }
+                let idx = self
+                    .statics
+                    .intern(StaticBlob::Bytes(s.as_bytes().to_vec()));
+                Ok(vec![
+                    StaticWord::AddrOf(idx),
+                    StaticWord::Imm(s.len() as i64),
+                ])
+            }
+            V::Bytes(b) => {
+                let idx = self.statics.intern(StaticBlob::Bytes(b.clone()));
+                match width {
+                    1 => Ok(vec![StaticWord::AddrOf(idx)]),
+                    2 => Ok(vec![
+                        StaticWord::AddrOf(idx),
+                        StaticWord::Imm(b.len() as i64),
+                    ]),
+                    _ => Err(self.err("byte-string constant in an unexpected position")),
+                }
+            }
+            V::Slice { data, meta } => {
+                if width != 2 {
+                    return Err(self.err("slice constant in a non-pointer position"));
+                }
+                let idx = self.statics.intern(StaticBlob::Bytes(data.clone()));
+                Ok(vec![
+                    StaticWord::AddrOf(idx),
+                    StaticWord::Imm(*meta as i64),
+                ])
+            }
+            V::SliceVal(elems) => {
+                if width != 2 {
+                    return Err(self.err("slice-value constant in a non-pointer position"));
+                }
+                let Some(mir::Ty::Slice(elem)) = pointee else {
+                    return Err(self.err("slice-value constant without a slice type"));
+                };
+                let elem = (**elem).clone();
+                let words = self.const_blob_words(elems, &elem)?;
+                let idx = self.statics.intern(StaticBlob::Words(words));
+                Ok(vec![
+                    StaticWord::AddrOf(idx),
+                    StaticWord::Imm(elems.len() as i64),
+                ])
+            }
+            V::Ref(inner) => {
+                if is_pointer_shaped(inner) {
+                    // A reference to a pointer-shaped constant is
+                    // the constant's own pointer value.
+                    return self.pointer_const_words(inner, pointee, width);
+                }
+                let Some(pty) = pointee else {
+                    return Err(self.err("reference constant without a pointee type"));
+                };
+                if width != 1 {
+                    return Err(self.err("fat reference constant to a value"));
+                }
+                let pty = pty.clone();
+                let words = self.const_static_words(inner, &pty)?;
+                let idx = self.statics.intern(StaticBlob::Words(words));
+                Ok(vec![StaticWord::AddrOf(idx)])
+            }
+            _ => Err(self.err("unsupported pointer constant")),
+        }
+    }
+
+    /// The static words of a constant value laid out in a blob: a
+    /// scalar is one immediate word, a tuple / array / ADT is its
+    /// leaves in order (an ADT prefixed by its discriminant word),
+    /// a pointer-shaped value is its pointer words.
+    fn const_static_words(
+        &mut self,
+        v: &mir::ConstValue,
+        ty: &mir::Ty,
+    ) -> Result<Vec<StaticWord>, JitError> {
+        use mir::ConstValue as V;
+        match v {
+            V::Tuple(fields) => {
+                let mut out = Vec::new();
+                match ty {
+                    mir::Ty::Tuple(tys) => {
+                        if fields.len() != tys.len() {
+                            return Err(self.err("tuple constant arity mismatch"));
+                        }
+                        for (f, t) in fields.iter().zip(tys.iter()) {
+                            out.extend(self.const_static_words(f, t)?);
+                        }
+                    }
+                    // A promoted array constant is a tuple of its
+                    // elements.
+                    mir::Ty::Array(elem, mir::ArrayLen::Known(n)) => {
+                        if fields.len() != *n as usize {
+                            return Err(self.err("array constant arity mismatch"));
+                        }
+                        let elem = (**elem).clone();
+                        for f in fields {
+                            out.extend(self.const_static_words(f, &elem)?);
+                        }
+                    }
+                    _ => return Err(self.err("tuple constant without a tuple type")),
+                }
+                Ok(out)
+            }
+            V::Adt { variant, fields } => {
+                let mir::Ty::Adt(def, _) = ty else {
+                    return Err(self.err("ADT constant without an ADT type"));
+                };
+                let layout = self.adt_layout(ty)?;
+                let slots = layout
+                    .variants
+                    .get(*variant as usize)
+                    .ok_or_else(|| self.err("ADT constant variant outside the layout"))?
+                    .clone();
+                if slots.len() != fields.len() {
+                    return Err(self.err("ADT constant field count mismatch"));
+                }
+                let mut out = vec![StaticWord::Imm(0); layout.total];
+                if layout.tag {
+                    out[0] = StaticWord::Imm(self.discriminant_value(*def, *variant)?);
+                }
+                for (field, slot) in fields.iter().zip(slots.iter()) {
+                    let fty = slot.ty.clone();
+                    let words = self.const_static_words(field, &fty)?;
+                    for (k, w) in words.into_iter().enumerate() {
+                        out[slot.offset + k] = w;
+                    }
+                }
+                Ok(out)
+            }
+            _ if is_pointer_shaped(v) => {
+                let width = flatten(ty, &self.func.name, self.layouts)?;
+                let pointee = match ty {
+                    mir::Ty::Ref(_, p, _) | mir::Ty::RawPtr(p, _) => Some(&**p),
+                    _ => None,
+                };
+                self.pointer_const_words(v, pointee, width)
+            }
+            _ => Ok(vec![StaticWord::Imm(self.const_value_i64(v, ty)?)]),
+        }
+    }
+
+    /// The static words of a sequence of same-typed constant
+    /// values (a slice-value constant's elements).
+    fn const_blob_words(
+        &mut self,
+        elems: &[mir::ConstValue],
+        elem_ty: &mir::Ty,
+    ) -> Result<Vec<StaticWord>, JitError> {
+        let mut out = Vec::new();
+        for e in elems {
+            out.extend(self.const_static_words(e, elem_ty)?);
+        }
+        Ok(out)
     }
 
     /// Interpret a constant under the type context it is used in.
@@ -3376,6 +3740,27 @@ impl<'a> FnLower<'a> {
                             )?;
                         }
                     }
+                    mir::AggregateKind::Array(_) => {
+                        let (elem, n) = match dst_ty {
+                            mir::Ty::Array(elem, mir::ArrayLen::Known(n)) => {
+                                (elem, *n as usize)
+                            }
+                            _ => {
+                                return Err(self.err(
+                                    "array aggregate with a non-array place type",
+                                ))
+                            }
+                        };
+                        if ops.len() != n {
+                            return Err(self.err("array aggregate arity mismatch"));
+                        }
+                        let per = flatten(elem, &self.func.name, self.layouts)?;
+                        let mut off = 0usize;
+                        for op in ops {
+                            self.store_operand_leaves(op, elem, base + off as u32)?;
+                            off += per;
+                        }
+                    }
                     other => {
                         return Err(self.err(&format!(
                             "{} aggregate assigned through a dereference",
@@ -3538,8 +3923,19 @@ impl<'a> FnLower<'a> {
                     }
                     mir::Operand::Constant(c) => {
                         if dst_count == 1 {
-                            let v = self.const_i64(c, &dst_ty)?;
-                            self.emit(Instr::Const { dst, imm: v });
+                            match &c.literal {
+                                // A pointer-shaped constant (a
+                                // reference to a scalar constant, a
+                                // byte string) materialises through
+                                // the leaf path like a wide one.
+                                mir::ConstKind::Value(v) if is_pointer_shaped(v) => {
+                                    self.const_value_leaves(v, &dst_ty, dst)?;
+                                }
+                                _ => {
+                                    let v = self.const_i64(c, &dst_ty)?;
+                                    self.emit(Instr::Const { dst, imm: v });
+                                }
+                            }
                         } else if dst_count > 1 {
                             // A multi-leaf constant (a tuple or an
                             // ADT with payload fields) materialises
@@ -4465,26 +4861,47 @@ impl<'a> FnLower<'a> {
                 }
                 return Ok(());
             }
+            mir::AggregateKind::Array(_) => {
+                let (dst, _count, dst_ty) = self.place_leaves(place)?;
+                let (elem, n) = match &dst_ty {
+                    mir::Ty::Array(elem, mir::ArrayLen::Known(n)) => {
+                        ((**elem).clone(), *n as usize)
+                    }
+                    _ => {
+                        return Err(
+                            self.err("array aggregate with a non-array place type")
+                        )
+                    }
+                };
+                if ops.len() != n {
+                    return Err(self.err("array aggregate arity mismatch"));
+                }
+                let per = flatten(&elem, &self.func.name, self.layouts)?;
+                for (i, op) in ops.iter().enumerate() {
+                    self.store_operand_leaves(op, &elem, dst + (i * per) as u32)?;
+                }
+                return Ok(());
+            }
             other => {
                 return Err(self.err(&format!("aggregate {}", other.kind_name())));
             }
         }
-        let (dst, count, _) = self.place_leaves(place)?;
-        if count != ops.len() {
-            return Err(self.err("tuple aggregate with non-scalar fields"));
+        // Only the Tuple kind reaches here (the other kinds
+        // return from the match above): each field is stored at
+        // its leaf offset under the destination tuple's shape —
+        // a field may itself be multi-leaf (a nested tuple, a
+        // fat pointer, a wide call result).
+        let (dst, _count, dst_ty) = self.place_leaves(place)?;
+        let mir::Ty::Tuple(tys) = dst_ty else {
+            return Err(self.err("tuple aggregate destination is not a tuple"));
+        };
+        if tys.len() != ops.len() {
+            return Err(self.err("tuple aggregate arity mismatch"));
         }
-        for (k, op) in ops.iter().enumerate() {
-            // Field types come from the destination tuple's shape;
-            // each field here is a single leaf.
-            let field_ty = match self.place_leaves(place) {
-                Ok((_, _, mir::Ty::Tuple(fields))) => fields[k].clone(),
-                _ => return Err(self.err("tuple aggregate destination is not a tuple")),
-            };
-            let v = self.operand_value(op, &field_ty)?;
-            self.emit(Instr::Copy {
-                dst: dst + k as u32,
-                src: IrOperand::Value(v),
-            });
+        let mut off = 0usize;
+        for (op, ty) in ops.iter().zip(tys.iter()) {
+            self.store_operand_leaves(op, ty, dst + off as u32)?;
+            off += flatten(ty, &self.func.name, self.layouts)?;
         }
         Ok(())
     }
@@ -4516,7 +4933,41 @@ impl<'a> FnLower<'a> {
                         value: IrOperand::Value(slot),
                         second: Some(IrOperand::Value(slot + 1)),
                     },
-                    _ => return Err(self.err("return value of more than two words")),
+                    // A wider result travels through the hidden
+                    // sret argument: store each return word into
+                    // the caller's destination storage (leaf `k`
+                    // lies `8 * k` bytes below the base address, the
+                    // slot model's addressing), then return a dummy
+                    // word. The stores happen only here, at the
+                    // return itself, so a panicking function leaves
+                    // the caller's destination untouched.
+                    _ => {
+                        let base = self
+                            .sret_slot
+                            .expect("a wide return implies the sret layout");
+                        for k in 0..count as u32 {
+                            let a = if k == 0 {
+                                base
+                            } else {
+                                let d = self.fresh();
+                                self.emit(Instr::BinOp {
+                                    dst: d,
+                                    op: IrBinOp::Sub,
+                                    lhs: IrOperand::Value(base),
+                                    rhs: IrOperand::Const((k * 8) as i64),
+                                });
+                                d
+                            };
+                            self.emit(Instr::StorePtr {
+                                ptr: IrOperand::Value(a),
+                                src: IrOperand::Value(slot + k),
+                            });
+                        }
+                        IrTerminator::Return {
+                            value: IrOperand::Const(0),
+                            second: None,
+                        }
+                    }
                 };
                 self.seal_terminator(term);
                 Ok(())
@@ -4697,23 +5148,71 @@ impl<'a> FnLower<'a> {
         if args.len() != callee_tys.len() {
             return Err(self.err("call argument count does not match the callee"));
         }
+        // The destination first: its leaf count is the callee's
+        // return leaf count, which decides the call's shape. A
+        // result of more than two words does not travel in
+        // registers: the callee takes a hidden leading argument
+        // word holding the address of the storage it stores the
+        // result into (see `FnLower::run`) — the destination's own
+        // slots for a frame destination, a scratch run for a memory
+        // one.
+        //
+        // A call whose destination is in memory (`*p = f()`)
+        // receives into the scratch run and stores through the
+        // address after the panic check, so a panicking callee
+        // leaves the pointee untouched (and the destination's
+        // index is read after the call, as the interpreter reads
+        // it when the call returns).
+        let dst_loc = self.classify_place(destination)?;
+        let (dst, count) = match &dst_loc {
+            PlaceLoc::Mem { count, .. } => {
+                let count = match count {
+                    Some(c) => *c,
+                    None => return Err(self.err("call destination is an unsized place")),
+                };
+                // The result lands in a consecutive scratch run;
+                // `store_mem_from` stores it through the address
+                // after the panic check.
+                let first = self.fresh();
+                let mut prev = first;
+                for _ in 1..count.max(1) {
+                    let next = self.fresh();
+                    debug_assert_eq!(next, prev + 1);
+                    prev = next;
+                }
+                (first, count)
+            }
+            PlaceLoc::Slots { .. } => {
+                let (dst, count, _) = self.place_leaves(destination)?;
+                (dst, count)
+            }
+        };
+        let sret = count > 2;
         // Lay the argument words out by the shared contract
-        // (`arg_word_layout`): a unit argument contributes a dummy
+        // (`arg_word_layout`), the hidden sret word first when the
+        // callee takes one: a unit argument contributes a dummy
         // zero word, and a pad zero word precedes a pair that would
         // straddle the register/stack boundary. Words past the
         // sixth travel on the stack; the backend call handles them.
         let mut counts = Vec::with_capacity(callee_tys.len());
         for pty in callee_tys.iter() {
-            let count = flatten(pty, &self.func.name, self.layouts)?;
-            if count > 2 {
-                return Err(self.err("call with an argument of more than two words"));
-            }
-            counts.push(count);
+            counts.push(flatten(pty, &self.func.name, self.layouts)?);
         }
-        let (starts, _) = arg_word_layout(&counts);
+        let mut layout_counts = Vec::with_capacity(counts.len() + 1);
+        if sret {
+            layout_counts.push(1);
+        }
+        layout_counts.extend_from_slice(&counts);
+        let (starts, _) = arg_word_layout(&layout_counts);
+        let offset = usize::from(sret);
         let mut ir_args: Vec<IrOperand> = Vec::new();
+        if sret {
+            let addr = self.fresh();
+            self.emit(Instr::SlotAddr { dst: addr, slot: dst });
+            ir_args.push(IrOperand::Value(addr));
+        }
         for (i, (arg, pty)) in args.iter().zip(callee_tys.iter()).enumerate() {
-            while ir_args.len() < starts[i] {
+            while ir_args.len() < starts[i + offset] {
                 ir_args.push(IrOperand::Const(0)); // the pad word
             }
             match counts[i] {
@@ -4727,49 +5226,24 @@ impl<'a> FnLower<'a> {
                     ir_args.push(IrOperand::Value(a));
                     ir_args.push(IrOperand::Value(b));
                 }
-                _ => unreachable!("argument word count checked above"),
-            }
-        }
-        // A call whose destination is in memory (`*p = f()`)
-        // receives into a scratch slot and stores through the
-        // address after the panic check, so a panicking callee
-        // leaves the pointee untouched (and the destination's
-        // index is read after the call, as the interpreter reads
-        // it when the call returns).
-        let dst_loc = self.classify_place(destination)?;
-        let (dst, count) = match &dst_loc {
-            PlaceLoc::Mem { count, .. } => {
-                let count = match count {
-                    Some(c @ (0 | 1 | 2)) => *c,
-                    Some(_) => {
-                        return Err(
-                            self.err("call returning a value of more than two words")
-                        )
+                n => {
+                    let leaves = self.operand_leaves(arg, pty, n)?;
+                    for leaf in leaves {
+                        ir_args.push(IrOperand::Value(leaf));
                     }
-                    None => return Err(self.err("call destination is an unsized place")),
-                };
-                // The result lands in a consecutive scratch pair;
-                // `store_mem_from` stores it through the address
-                // after the panic check.
-                let first = self.fresh();
-                if count == 2 {
-                    let second = self.fresh();
-                    debug_assert_eq!(second, first + 1);
                 }
-                (first, count)
             }
-            PlaceLoc::Slots { .. } => {
-                let (dst, count, _) = self.place_leaves(destination)?;
-                (dst, count)
-            }
-        };
-        if count > 2 {
-            return Err(self.err("call returning a value of more than two words"));
         }
-        let (dst, dst2) = match count {
-            0 => (self.fresh(), None),
-            1 => (dst, None),
-            _ => (dst, Some(dst + 1)),
+        let (dst, dst2) = if sret {
+            // The result is already in the sret storage; the call's
+            // nominal result word is a dummy.
+            (self.fresh(), None)
+        } else {
+            match count {
+                0 => (self.fresh(), None),
+                1 => (dst, None),
+                _ => (dst, Some(dst + 1)),
+            }
         };
         self.emit(Instr::Call {
             dst,

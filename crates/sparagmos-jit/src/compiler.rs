@@ -63,6 +63,9 @@ pub enum CompileError {
     /// A panic instruction referenced a place string outside the
     /// table.
     BadPlaceIndex(u32),
+    /// A static-address instruction referenced a static blob
+    /// outside the table.
+    BadStaticIndex(u32),
     Memory(std::io::Error),
 }
 
@@ -77,6 +80,7 @@ impl std::fmt::Display for CompileError {
             }
             CompileError::BadMessageIndex(i) => write!(f, "panic message index {i} out of range"),
             CompileError::BadPlaceIndex(i) => write!(f, "panic place index {i} out of range"),
+            CompileError::BadStaticIndex(i) => write!(f, "static index {i} out of range"),
             CompileError::Memory(e) => write!(f, "jit memory error: {e}"),
         }
     }
@@ -127,6 +131,12 @@ pub struct ProgramCtx {
     /// Address of the scratch buffer the formatter writes into:
     /// 8 length bytes (little-endian u64) followed by message bytes.
     pub scratch_buf: usize,
+    /// Addresses of the program's static blobs (the storage
+    /// pointer-shaped constants point at; see
+    /// [`crate::program::StaticBlob`]). The blobs are owned by the
+    /// compiled program, so the addresses stay valid for its whole
+    /// lifetime.
+    pub statics: Vec<usize>,
 }
 
 /// Call fixups produced when compiling one function of a program:
@@ -351,6 +361,16 @@ impl<'a> Compiler<'a> {
         match instr {
             Instr::Const { dst, imm } => {
                 self.e.mov_imm(Reg::Rax, *imm);
+                self.store_result(*dst)?;
+            }
+            Instr::StaticAddr { dst, index } => {
+                let ctx = self.ctx.ok_or(CompileError::ProgramOnly("StaticAddr"))?;
+                let addr = ctx
+                    .statics
+                    .get(*index as usize)
+                    .copied()
+                    .ok_or(CompileError::BadStaticIndex(*index))?;
+                self.e.mov_ri64(Reg::Rax, addr as i64);
                 self.store_result(*dst)?;
             }
             Instr::Copy { dst, src } => {

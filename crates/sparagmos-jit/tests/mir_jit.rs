@@ -1089,34 +1089,6 @@ fn unsupported_constructs_report_reasons() {
         other => panic!("expected Unsupported, got {other}"),
     }
 
-    // An argument of more than two words (a three-element tuple;
-    // two-word arguments — a fat pointer, a pair — are supported).
-    let tuple_arg = MirFunctionInput {
-        name: "tup".to_string(),
-        def_id: Some(def(0)),
-        body: mir::Body::new(
-            locals(&[
-                i(mir::IntTy::I32),
-                mir::Ty::Tuple(vec![
-                    i(mir::IntTy::I32),
-                    i(mir::IntTy::I32),
-                    i(mir::IntTy::I32),
-                ]),
-            ]),
-            1,
-            vec![bb(vec![], mir::TerminatorKind::Return)],
-        ),
-    };
-    let err = JitProgram::compile(&MirProgramInput {
-        functions: vec![tuple_arg],
-        names: HashMap::new(),
-        adt_discriminants: Default::default(),
-    })
-    .expect_err("three-word argument must be unsupported");
-    match err {
-        JitError::Unsupported(what) => assert!(what.contains("more than two words"), "{what}"),
-        other => panic!("expected Unsupported, got {other}"),
-    }
 }
 
 #[test]
@@ -3339,33 +3311,339 @@ fn pair_return_into_a_memory_destination() {
 }
 
 #[test]
-fn three_word_return_is_unsupported() {
+fn three_word_return_via_sret() {
     let i32t = i(mir::IntTy::I32);
     let triple = mir::Ty::Tuple(vec![i32t.clone(), i32t.clone(), i32t.clone()]);
-    // fn f() -> (i32, i32, i32) { (1, 2, 3) }
+    // fn triple() -> (i32, i32, i32) { (10, 20, 30) }
     let f = spec(
         "triple",
         0,
         0,
-        &[triple],
+        &[triple.clone()],
         vec![bb(
             vec![assign(
                 pl(0),
                 mir::Rvalue::Aggregate(
                     Box::new(mir::AggregateKind::Tuple),
-                    vec![i32c(1), i32c(2), i32c(3)],
+                    vec![i32c(10), i32c(20), i32c(30)],
                 ),
             )],
             mir::TerminatorKind::Return,
         )],
     );
-    match jit_compile(&[f]) {
-        Err(JitError::Unsupported(msg)) => {
-            assert!(msg.contains("more than two words"), "{msg}")
-        }
-        Err(other) => panic!("expected Unsupported, got {other}"),
-        Ok(_) => panic!("expected Unsupported, but the program compiled"),
+    // fn main_sret() -> i32 { let t = triple(); t.0 + t.1 + t.2 }
+    let main = spec(
+        "main_sret",
+        1,
+        0,
+        &[i32t.clone(), triple, i32t.clone()],
+        vec![
+            bb(vec![], call_term(fndef(def(0)), vec![], 1, 1)),
+            bb(
+                vec![
+                    assign(
+                        pl(2),
+                        mir::Rvalue::BinaryOp(
+                            mir::BinOp::Add,
+                            Box::new((cpf(1, 0, i32t.clone()), cpf(1, 1, i32t.clone()))),
+                        ),
+                    ),
+                    assign(
+                        pl(0),
+                        mir::Rvalue::BinaryOp(
+                            mir::BinOp::Add,
+                            Box::new((cp(2), cpf(1, 2, i32t.clone()))),
+                        ),
+                    ),
+                ],
+                mir::TerminatorKind::Return,
+            ),
+        ],
+    );
+    let (jit, prog) = build(&[f, main]);
+    check(&jit, &prog, "main_sret", &[], vec![], Ok(60));
+    // The public call API supplies the sret word itself: `call`
+    // yields the result's first word, `call_pair` its first two.
+    match jit.call("triple", &[]) {
+        Ok(v) => assert_eq!(v, 10),
+        other => panic!("expected Ok(10), got {other:?}"),
     }
+    match jit.call_pair("triple", &[]) {
+        Ok(v) => assert_eq!(v, (10, 20)),
+        other => panic!("expected Ok((10, 20)), got {other:?}"),
+    }
+}
+
+#[test]
+fn three_word_argument_and_seam_layout() {
+    let i32t = i(mir::IntTy::I32);
+    let triple = mir::Ty::Tuple(vec![i32t.clone(), i32t.clone(), i32t.clone()]);
+    // fn sum3(t: (i32, i32, i32)) -> i32 { t.0 + t.1 + t.2 }
+    let sum3 = spec(
+        "sum3",
+        0,
+        1,
+        &[i32t.clone(), triple.clone(), i32t.clone()],
+        vec![bb(
+            vec![
+                assign(
+                    pl(2),
+                    mir::Rvalue::BinaryOp(
+                        mir::BinOp::Add,
+                        Box::new((cpf(1, 0, i32t.clone()), cpf(1, 1, i32t.clone()))),
+                    ),
+                ),
+                assign(
+                    pl(0),
+                    mir::Rvalue::BinaryOp(
+                        mir::BinOp::Add,
+                        Box::new((cp(2), cpf(1, 2, i32t.clone()))),
+                    ),
+                ),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    // fn seam3(a, b, c, d: i32, t: (i32, i32, i32)) -> i32
+    //   { a + b + c + d + t.0 + t.1 + t.2 }
+    // The triple starts at word 4 and would straddle the
+    // register/stack boundary, so both sides pad it to word 6.
+    let mut stmts = vec![assign(
+        pl(6),
+        mir::Rvalue::BinaryOp(mir::BinOp::Add, Box::new((cp(1), cp(2)))),
+    )];
+    for k in 3..=4u32 {
+        stmts.push(assign(
+            pl(6),
+            mir::Rvalue::BinaryOp(mir::BinOp::Add, Box::new((cp(6), cp(k)))),
+        ));
+    }
+    for f in 0..2u32 {
+        stmts.push(assign(
+            pl(6),
+            mir::Rvalue::BinaryOp(
+                mir::BinOp::Add,
+                Box::new((cp(6), cpf(5, f, i32t.clone()))),
+            ),
+        ));
+    }
+    stmts.push(assign(
+        pl(0),
+        mir::Rvalue::BinaryOp(
+            mir::BinOp::Add,
+            Box::new((cp(6), cpf(5, 2, i32t.clone()))),
+        ),
+    ));
+    let seam3 = spec(
+        "seam3",
+        1,
+        5,
+        &[
+            i32t.clone(),
+            i32t.clone(),
+            i32t.clone(),
+            i32t.clone(),
+            i32t.clone(),
+            triple.clone(),
+            i32t.clone(),
+        ],
+        vec![bb(stmts, mir::TerminatorKind::Return)],
+    );
+    // fn main_sum3() -> i32 { sum3((7, 8, 9)) }
+    let main_sum3 = spec(
+        "main_sum3",
+        2,
+        0,
+        &[i32t.clone(), triple.clone()],
+        vec![
+            bb(
+                vec![assign(
+                    pl(1),
+                    mir::Rvalue::Aggregate(
+                        Box::new(mir::AggregateKind::Tuple),
+                        vec![i32c(7), i32c(8), i32c(9)],
+                    ),
+                )],
+                call_term(fndef(def(0)), vec![cp(1)], 0, 1),
+            ),
+            bb(vec![], mir::TerminatorKind::Return),
+        ],
+    );
+    // fn main_seam3() -> i32 { seam3(1, 2, 3, 4, (5, 6, 7)) }
+    let main_seam3 = spec(
+        "main_seam3",
+        3,
+        0,
+        &[i32t.clone(), triple],
+        vec![
+            bb(
+                vec![assign(
+                    pl(1),
+                    mir::Rvalue::Aggregate(
+                        Box::new(mir::AggregateKind::Tuple),
+                        vec![i32c(5), i32c(6), i32c(7)],
+                    ),
+                )],
+                call_term(
+                    fndef(def(1)),
+                    vec![i32c(1), i32c(2), i32c(3), i32c(4), cp(1)],
+                    0,
+                    1,
+                ),
+            ),
+            bb(vec![], mir::TerminatorKind::Return),
+        ],
+    );
+    let (jit, prog) = build(&[sum3, seam3, main_sum3, main_seam3]);
+    check(&jit, &prog, "main_sum3", &[], vec![], Ok(24));
+    check(&jit, &prog, "main_seam3", &[], vec![], Ok(28));
+}
+
+#[test]
+fn array_aggregate_and_index() {
+    let i32t = i(mir::IntTy::I32);
+    let arr3 = mir::Ty::Array(Box::new(i32t.clone()), mir::ArrayLen::Known(3));
+    let idx = |k: u64| mir::Place {
+        local: mir::Local(1),
+        projection: vec![mir::PlaceElem::ConstantIndex {
+            offset: k,
+            min_length: 3,
+            from_end: false,
+        }],
+    };
+    // fn main_arr() -> i32 { let a = [5, 6, 7]; a[0] + a[1] + a[2] }
+    let main = spec(
+        "main_arr",
+        0,
+        0,
+        &[i32t.clone(), arr3, i32t.clone()],
+        vec![bb(
+            vec![
+                assign(
+                    pl(1),
+                    mir::Rvalue::Aggregate(
+                        Box::new(mir::AggregateKind::Array(i32t.clone())),
+                        vec![i32c(5), i32c(6), i32c(7)],
+                    ),
+                ),
+                assign(
+                    pl(2),
+                    mir::Rvalue::BinaryOp(
+                        mir::BinOp::Add,
+                        Box::new((
+                            mir::Operand::Copy(idx(0)),
+                            mir::Operand::Copy(idx(1)),
+                        )),
+                    ),
+                ),
+                assign(
+                    pl(0),
+                    mir::Rvalue::BinaryOp(
+                        mir::BinOp::Add,
+                        Box::new((cp(2), mir::Operand::Copy(idx(2)))),
+                    ),
+                ),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    let (jit, prog) = build(&[main]);
+    check(&jit, &prog, "main_arr", &[], vec![], Ok(18));
+}
+
+#[test]
+fn string_constant_as_str_argument() {
+    let usizet = u(mir::UintTy::Usize);
+    let strref = mir::Ty::Ref(
+        mir::Region::Erased,
+        Box::new(mir::Ty::Str),
+        mir::Mutability::Not,
+    );
+    // fn slen_const(s: &str) -> usize { return PtrMetadata(_1) }
+    let slen = spec(
+        "slen_const",
+        0,
+        1,
+        &[usizet.clone(), strref],
+        vec![bb(
+            vec![assign(
+                pl(0),
+                mir::Rvalue::UnaryOp(mir::UnOp::PtrMetadata, cp(1)),
+            )],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    // fn main_strc() -> usize { slen_const("hello") }
+    let hello = mir::Operand::constant(mir::Constant::from_value(mir::ConstValue::Str(
+        "hello".to_string(),
+    )));
+    let main = spec(
+        "main_strc",
+        1,
+        0,
+        &[usizet],
+        vec![
+            bb(vec![], call_term(fndef(def(0)), vec![hello], 0, 1)),
+            bb(vec![], mir::TerminatorKind::Return),
+        ],
+    );
+    let (jit, prog) = build(&[slen, main]);
+    check(&jit, &prog, "main_strc", &[], vec![], Ok(5));
+}
+
+#[test]
+fn reference_constants_deref() {
+    let i32t = i(mir::IntTy::I32);
+    // fn main_refc() -> i32 { let r = &42; *r }
+    let rc = mir::Operand::constant(mir::Constant::from_value(mir::ConstValue::Ref(
+        Box::new(mir::ConstValue::Scalar(mir::Scalar::Int {
+            data: 42,
+            size: 4,
+        })),
+    )));
+    let main = spec(
+        "main_refc",
+        0,
+        0,
+        &[i32t.clone(), refty(i32t.clone())],
+        vec![bb(
+            vec![
+                assign(pl(1), mir::Rvalue::Use(rc)),
+                assign(pl(0), mir::Rvalue::Use(cpd(1))),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    let (jit, prog) = build(&[main]);
+    check(&jit, &prog, "main_refc", &[], vec![], Ok(42));
+
+    // fn main_fref() -> i32 { let r = &1.5f64; *r as i32 }
+    let f64t = mir::Ty::Float(mir::FloatTy::F64);
+    let fc = mir::Operand::constant(mir::Constant::from_value(mir::ConstValue::Ref(
+        Box::new(mir::ConstValue::Scalar(mir::Scalar::Float {
+            bits: 1.5f64.to_bits() as u128,
+            ty: mir::FloatTy::F64,
+        })),
+    )));
+    let main_f = spec(
+        "main_fref",
+        0,
+        0,
+        &[i32t.clone(), refty(f64t.clone()), f64t],
+        vec![bb(
+            vec![
+                assign(pl(1), mir::Rvalue::Use(fc)),
+                assign(pl(2), mir::Rvalue::Use(cpd(1))),
+                assign(
+                    pl(0),
+                    mir::Rvalue::Cast(mir::CastKind::FloatToInt, cp(2), i32t.clone()),
+                ),
+            ],
+            mir::TerminatorKind::Return,
+        )],
+    );
+    let (jit, prog) = build(&[main_f]);
+    check(&jit, &prog, "main_fref", &[], vec![], Ok(1));
 }
 
 // ----- Calls with more than six argument words (Lane CM) ---------------------

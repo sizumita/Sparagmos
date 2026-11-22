@@ -287,6 +287,16 @@ pub enum Instr {
     /// the current frame (or an ancestor frame, for a pointer passed
     /// down as a call argument) is live.
     SlotAddr { dst: Value, slot: Value },
+    /// `dst = &static[index]`: the machine address of the program's
+    /// static blob `index` (a byte string or a constant value's word
+    /// image, owned by the compiled program for its whole lifetime —
+    /// see [`crate::program::StaticBlob`]). This is how the MIR front
+    /// end materialises pointer-shaped constants (string constants,
+    /// reference constants): the pointee lives in program storage,
+    /// not in any frame, so the pointer stays valid after the
+    /// current function returns, exactly like a native `&'static`.
+    /// Program compiles only, like [`Instr::Call`].
+    StaticAddr { dst: Value, index: u32 },
     /// `dst = *ptr`: load the full 64-bit word at the address held
     /// in `ptr`. A scalar leaf's slot always holds the value's
     /// canonical 64-bit form, so a whole-word load through a pointer
