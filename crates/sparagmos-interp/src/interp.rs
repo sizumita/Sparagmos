@@ -7494,16 +7494,18 @@ impl<'a> Interpreter<'a> {
     /// element aggregate `base` that `projection` denotes a
     /// position in (see the call in
     /// [`Self::offset_projection`]). The projection must navigate
-    /// structurally (fields, downcasts, sub-slices) to an element
-    /// container — a tuple, a byte string, or an ADT value whose
-    /// fields are its elements — and end either at the container
-    /// itself (element 0) or at one index step into it. The
-    /// displacement must move the position by a whole number of
-    /// the offset's element size and land within the container
-    /// (one past the end included: such a pointer may be formed,
-    /// and reading through it stays an explicit out-of-bounds
-    /// error). Anything else answers `None`, and the caller
-    /// carries the displacement as before.
+    /// structurally (fields, downcasts, sub-slices, and index
+    /// steps into aggregate elements — a position inside a
+    /// nested aggregate, such as one row of a matrix) to an
+    /// element container — a tuple, a byte string, or an ADT
+    /// value whose fields are its elements — and end either at
+    /// the container itself (element 0) or at one index step
+    /// into it. The displacement must move the position by a
+    /// whole number of the offset's element size and land within
+    /// the container (one past the end included: such a pointer
+    /// may be formed, and reading through it stays an explicit
+    /// out-of-bounds error). Anything else answers `None`, and
+    /// the caller carries the displacement as before.
     fn absorb_displacement(
         &self,
         base: &Value,
@@ -7521,11 +7523,24 @@ impl<'a> Interpreter<'a> {
         // shapes and counts from it), so a position inside a
         // sub-slice of an element container — the back half of a
         // `split_at_mut` on a range slice, say — absorbs exactly
-        // like a position in the container itself.
+        // like a position in the container itself. An index step
+        // that is not the last step descends into the element it
+        // selects (which must be an aggregate the remaining
+        // steps can navigate), so a position inside a nested
+        // aggregate — an element of one row of a matrix, a field
+        // of one element of an array — is judged at the
+        // innermost container it sits in, the one the offset's
+        // element size denominates.
         let mut temps: Vec<Box<Value>> = Vec::new();
         let mut cur: &Value = base;
         let mut prefix = projection.len();
         let mut index: i128 = 0;
+        // The container the pending index ranges over, once an
+        // index step has set the position (an owned snapshot: the
+        // walk may materialise further sub-values into `temps`
+        // after the step); `None` while the walk denotes the
+        // container it has navigated to itself.
+        let mut pending_container: Option<Value> = None;
         for (j, step) in projection.iter().enumerate() {
             match step {
                 RefProj::Field(idx) => {
@@ -7548,11 +7563,26 @@ impl<'a> Interpreter<'a> {
                     cur = temps.last().expect("just pushed");
                 }
                 RefProj::Index(idx) => {
-                    if j + 1 != projection.len() {
-                        return None;
+                    if j + 1 == projection.len() {
+                        prefix = j;
+                        index = i128::try_from(*idx).ok()?;
+                        pending_container = Some(cur.clone());
+                    } else {
+                        // Descend into the selected element: the
+                        // remaining steps navigate inside it, and
+                        // a later index step sets the position
+                        // afresh at that depth.
+                        cur = match cur {
+                            Value::Tuple(items) => items.get(*idx)?,
+                            Value::Enum { fields, .. } => fields.get(*idx)?,
+                            Value::Coroutine { fields, .. } => fields.get(*idx)?,
+                            Value::Closure { env, .. } => env.get(*idx)?,
+                            _ => return None,
+                        };
+                        prefix = projection.len();
+                        index = 0;
+                        pending_container = None;
                     }
-                    prefix = j;
-                    index = i128::try_from(*idx).ok()?;
                 }
                 _ => return None,
             }
@@ -7563,7 +7593,7 @@ impl<'a> Interpreter<'a> {
         // single-field ADT whose only field is an element
         // aggregate is indexed through that field (the
         // `#[repr(simd)]` pun `project_value` also honours).
-        let mut container: &Value = cur;
+        let mut container: &Value = pending_container.as_ref().unwrap_or(cur);
         loop {
             match container {
                 Value::FatRef { base, .. } => container = base,
