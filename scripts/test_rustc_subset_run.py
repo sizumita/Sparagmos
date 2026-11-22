@@ -1971,7 +1971,10 @@ class ResolveAuxSpecsTests(unittest.TestCase):
         self.assertIsNone(err)
         by_name = {spec.name: spec for spec in specs}
         self.assertEqual(by_name["old"].edition, "2015")
-        self.assertIsNone(by_name["plain"].edition)
+        # No directive of its own: the auxiliary is built with no
+        # requested edition (rustc's default 2015), not the main
+        # test's edition 2024.
+        self.assertEqual(by_name["plain"].edition, "2015")
 
 
 class ViewBlockerTests(unittest.TestCase):
@@ -2193,7 +2196,7 @@ class ProcessStage1RevisionTests(unittest.TestCase):
         res = self.run_with_fakes(rec)
         self.assertEqual(res["status"], "pass")
         editions = {s["rev"]: s["edition"] for s in self.native_seen}
-        self.assertEqual(editions, {"a": "2021", "b": "2018"})
+        self.assertEqual(editions, {"a": "2015", "b": "2018"})
 
     def test_scoped_aux_resolves_for_its_revision(self):
         (self.tmp / "tests" / "ui" / "auxiliary").mkdir()
@@ -2558,9 +2561,9 @@ class AttemptEditionTests(unittest.TestCase):
         h = header("//@ edition:2015\n")
         self.assertEqual(run.attempt_edition(h.view(None)), "2015")
 
-    def test_no_directive_defaults_to_2021(self):
+    def test_no_directive_defaults_to_2015(self):
         h = header("fn main() {}\n")
-        self.assertEqual(run.attempt_edition(h.view(None)), "2021")
+        self.assertEqual(run.attempt_edition(h.view(None)), "2015")
 
     def test_last_directive_wins(self):
         h = header("//@ edition:2015\n//@ edition:2018..2024\n")

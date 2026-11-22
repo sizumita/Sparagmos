@@ -85,7 +85,9 @@ Both sides are compiled/run with RUSTC_BOOTSTRAP=1 so that tests
 using unstable features behave the same way they do under
 compiletest (which runs against a development compiler). The native
 compile uses `--edition` from the test's `//@ edition:` directive,
-defaulting to 2021 (compiletest's default for the ui suite), and
+defaulting to 2015 (compiletest passes no requested edition and
+bootstrap passes it none, so a test without a directive is compiled
+with no `--edition` flag and rustc's own default applies), and
 opt-level 0, matching the harness's corpus oracle.
 
 Usage:
@@ -1235,12 +1237,18 @@ def applicability(header, facts=None):
     onlys = [n[len("only-"):] for n in header.names if n.startswith("only-")]
     if onlys:
         vals = [eval_condition(c) for c in onlys]
+        # compiletest decides each only-* directive on its own
+        # (handle_only): one non-matching condition already ignores
+        # the test, so several only-* directives are conjunctive --
+        # only-aarch64 + only-linux runs nowhere but aarch64-linux.
+        if any(v is False for v in vals):
+            failing = [c for c, v in zip(onlys, vals) if v is False]
+            return ("out-of-environment",
+                    "only-* condition does not match this host: "
+                    + ", ".join(failing))
         if any(v is None for v in vals):
             return ("unevaluatable",
                     "only-* condition cannot be evaluated: " + ", ".join(onlys))
-        if not any(vals):
-            return ("out-of-environment",
-                    "no only-* condition matches this host: " + ", ".join(onlys))
     for name in sorted(header.names):
         if name.startswith("needs-"):
             v = eval_needs(name, header, facts)
@@ -1445,10 +1453,16 @@ class AuxSpec(NamedTuple):
 
     `crate_type` is "proc-macro" for the crates a `//@ proc-macro:`
     directive names (compiletest builds those as proc-macro crates)
-    and None otherwise. `edition` is the auxiliary file's own
-    `//@ edition:` directive when it declares one (compiletest
-    builds each auxiliary crate with its own edition) and None
-    otherwise, meaning the main test's edition.
+    and None otherwise. `edition` is the edition the auxiliary
+    crate is built with: the auxiliary file's own `//@ edition:`
+    directive when it declares one, and 2015 when it does not --
+    compiletest builds each auxiliary crate from its own file's
+    properties (TestProps::from_aux_file) with no requested
+    edition, so a directive-less auxiliary reaches rustc with no
+    `--edition` flag, never with the main test's edition. The
+    distinction is observable: a proc-macro crate built under the
+    test's edition 2024 gives its generated macro_rules that
+    edition's token matching (macro_rules_edition_from_pm).
     """
 
     name: str
@@ -1616,7 +1630,7 @@ def resolve_aux_specs(test_path, revision=None, top=None,
         visiting.discard(name)
         editions = header.values("edition")
         edition = _concrete_edition(editions[-1].strip()) \
-            if editions else None
+            if editions else "2015"
         specs.append(AuxSpec(name, path, crate_type, edition,
                              modifiers))
         return None
@@ -1730,14 +1744,17 @@ def attempt_edition(view):
 
     The view's last `//@ edition:` directive, collapsed to the
     concrete edition the single attempt uses (see
-    _concrete_edition); the subset's default 2021 when the test
-    declares none. Every attempt path (stage-1 flat, stage-1 per
-    revision, stage 2) selects the edition through this one
-    helper, so a range directive reaches rustc only in its
-    collapsed form.
+    _concrete_edition); 2015 when the test declares none --
+    compiletest's `--edition` is an unset option in the reference
+    run (bootstrap passes it no value), so a directive-less test
+    reaches rustc with no `--edition` flag at all and compiles
+    under rustc's own default edition, 2015. Every attempt path
+    (stage-1 flat, stage-1 per revision, stage 2) selects the
+    edition through this one helper, so a range directive reaches
+    rustc only in its collapsed form.
     """
     editions = view.values("edition")
-    return _concrete_edition(editions[-1].strip()) if editions else "2021"
+    return _concrete_edition(editions[-1].strip()) if editions else "2015"
 
 
 def _build_proc_macro_chain(chain, edition, outdir, extra_externs=()):
@@ -1746,8 +1763,9 @@ def _build_proc_macro_chain(chain, edition, outdir, extra_externs=()):
 
     Mirrors native_side's auxiliary-crate builds: dependency
     order, each crate linked to the previous ones with --extern,
-    the crate's own compile-flags honoured, its own edition
-    directive winning over the test's. Returns (crate_name,
+    the crate's own compile-flags honoured, each crate built
+    with its own edition directive or 2015 when it declares none
+    (never the test's edition). Returns (crate_name,
     artifact, error) for the chain's last crate, the proc-macro
     crate itself.
     """
@@ -1759,7 +1777,7 @@ def _build_proc_macro_chain(chain, edition, outdir, extra_externs=()):
         aux_view = Header(text).view(None)
         editions = aux_view.values("edition")
         ced = _concrete_edition(editions[-1].strip()) if editions \
-            else edition
+            else "2015"
         declared = declared_crate_type(text)
         cmd = rustc_cmd() + ["--edition", ced, "--out-dir", str(outdir)]
         lib = sysroot_lib()
@@ -1853,7 +1871,7 @@ def build_proc_macro(test_path, fname, edition, extra_externs=(),
     # Recipe version: bump when the build recipe changes (crate
     # metadata disambiguation, the bare proc_macro extern, ...),
     # so artifacts built by an older recipe are never reused.
-    h.update(b"sparagmos-pm-recipe-3")
+    h.update(b"sparagmos-pm-recipe-4")  # 4: chain crates fall back to edition 2015, not the test edition
     h.update(edition.encode())
     for prev_name, prev_artifact in extra_externs:
         h.update(prev_name.encode())
@@ -2575,6 +2593,52 @@ def compiletest_mode_args(suite, flags):
     return []
 
 
+def check_mode_lint_args(expectation):
+    """Lint levels mirroring compiletest's check compilation.
+
+    compiletest compiles a success-expecting compile-check test
+    in check mode (--emit=metadata), which never builds runtime
+    MIR, so the two lints the runtime-MIR KnownPanicsLint pass
+    evaluates (unconditional_panic, arithmetic_overflow -- both
+    deny by default) never fire for it. Conversion demands
+    runtime-MIR bodies, so without an adjustment they would
+    fail compilations the reference accepts (a literal
+    out-of-bounds index in code the check compilation never
+    evaluates). A failure-expecting test gets no adjustment:
+    compiletest's build-fail compilations are full builds, in
+    which the pass runs and the lint is often the very failure
+    asserted. The test's own compile-flags are appended after
+    these, so an explicit level for either lint still wins.
+    """
+    if expectation != "success":
+        return []
+    return ["-A", "unconditional_panic", "-A", "arithmetic_overflow"]
+
+
+def pretty_unpretty_args(suite, view):
+    """The -Zunpretty argument compiletest runs a pretty test with.
+
+    A pretty test is never compiled past printing: compiletest
+    invokes rustc with `-Zunpretty=<mode>` (the view's pretty-mode
+    directive, defaulting to "normal" -- TestProps' own default)
+    and judges the print run. Supplying the same argument makes
+    the subset judge the compilation compiletest performs: the
+    compiler prints and stops, the driver reports the run as an
+    empty successful conversion, and sources that are fragments
+    for printing (an undefined name, a delegation whose attribute
+    validation only runs in later passes) are not held to a
+    whole-program conversion compiletest never asks of them. The
+    printed-output comparison itself, and the typecheck of the
+    printed source for tests without pretty-compare-only, remain
+    outside what a conversion outcome can judge.
+    """
+    if suite != "pretty":
+        return []
+    modes = view.values("pretty-mode")
+    mode = modes[-1].strip() if modes else "normal"
+    return [f"-Zunpretty={mode}"]
+
+
 def stage1_compile_check(rec, view, path, driver_bin, revision, res,
                          edition, rev_args, flags, aux_specs,
                          rust_dir):
@@ -2611,6 +2675,8 @@ def stage1_compile_check(rec, view, path, driver_bin, revision, res,
             return res
         args += mc_args
     args += compiletest_mode_args(rec["suite"], flags)
+    args += pretty_unpretty_args(rec["suite"], view)
+    args += check_mode_lint_args(expectation)
     args += flags
     pm_args, pm_err = proc_macro_extern_args(path, view, edition)
     if pm_err:
@@ -3426,6 +3492,8 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
                 path.read_text(errors="ignore")):
             args += ["--crate-type", "lib"]
     args += compiletest_mode_args(rec["suite"], flags)
+    args += pretty_unpretty_args(rec["suite"], view)
+    args += check_mode_lint_args(expectation)
     args += flags
     specs = aux_specs
     if aux_per_revision:
