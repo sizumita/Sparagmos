@@ -11699,3 +11699,104 @@ fn run_mode_large_array_zeroed_and_write_bytes_execute() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
 }
+
+// ---- Lane II: process model (issue #144) ----
+// The process model never starts a child process. Spawning a
+// program that cannot be resolved answers the io::Error the OS
+// would produce (shape and kind included, through the guest
+// bitpacked representation and the modelled OS error table); a
+// program that does resolve is a named unsupported error, never
+// a silent success.
+
+const SPAWN_NONEXISTENT_SRC: &str = r#"
+use std::io::ErrorKind;
+use std::process::Command;
+fn main() {
+    let e = Command::new("definitely-not-a-real-program-xyz").spawn().unwrap_err();
+    println!("kind={:?}", e.kind());
+    println!("raw={:?}", e.raw_os_error());
+    assert_eq!(e.kind(), ErrorKind::NotFound);
+    println!("spawn-nonexistent-ok");
+}
+"#;
+
+#[test]
+fn run_mode_process_spawn_nonexistent_error_kind() {
+    let dir = temp_dir("proc-spawn-nonexistent");
+    let src = fixture(&dir, "spawn_nonexistent.rs", SPAWN_NONEXISTENT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "kind=NotFound\nraw=Some(2)\nspawn-nonexistent-ok\n"
+    );
+}
+
+const SPAWN_ERROR_SHAPES_SRC: &str = r#"
+use std::io::ErrorKind;
+use std::process::Command;
+fn main() {
+    let dir = Command::new("/tmp").spawn().unwrap_err().kind();
+    assert_eq!(dir, ErrorKind::PermissionDenied);
+    let nul = Command::new("whatever").arg("a\0b").spawn().unwrap_err().kind();
+    assert_eq!(nul, ErrorKind::InvalidInput);
+    let cwd = Command::new("whatever")
+        .current_dir("/no/such/dir-xyz")
+        .spawn()
+        .unwrap_err()
+        .kind();
+    assert_eq!(cwd, ErrorKind::NotFound);
+    println!("error-shapes-ok");
+}
+"#;
+
+#[test]
+fn run_mode_process_spawn_error_shapes() {
+    let dir = temp_dir("proc-spawn-shapes");
+    let src = fixture(&dir, "spawn_shapes.rs", SPAWN_ERROR_SHAPES_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "error-shapes-ok\n");
+}
+
+const CURRENT_EXE_SRC: &str = r#"
+fn main() {
+    let p = std::env::current_exe().unwrap();
+    let q = std::env::current_exe().unwrap();
+    assert!(p == q);
+    assert!(std::process::id() > 0);
+    println!("current-exe-ok");
+}
+"#;
+
+#[test]
+fn run_mode_process_current_exe_and_id() {
+    let dir = temp_dir("proc-current-exe");
+    let src = fixture(&dir, "current_exe.rs", CURRENT_EXE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "current-exe-ok\n");
+}
+
+const SPAWN_RESOLVABLE_SRC: &str = r#"
+fn main() {
+    let _ = std::process::Command::new("ls").spawn();
+    println!("must not reach here");
+}
+"#;
+
+#[test]
+fn run_mode_process_spawn_resolvable_is_named_error() {
+    let dir = temp_dir("proc-spawn-resolvable");
+    let src = fixture(&dir, "spawn_resolvable.rs", SPAWN_RESOLVABLE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr={stderr}");
+    assert!(
+        stderr.contains("does not start child processes"),
+        "stderr={stderr}"
+    );
+}
