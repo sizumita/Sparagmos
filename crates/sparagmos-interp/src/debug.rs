@@ -713,36 +713,43 @@ fn evaluate_print(
     }
     // lldb's summary for a reference to a path is the path text
     // itself, not the address: render the pointee.
-    let mut lldb = match &desc {
-        Some(Desc::Ref(inner))
-            if expr.steps.is_empty()
-                && matches!(
-                    inner.as_ref(),
-                    Desc::Adt(tag)
-                        if matches!(tag_base_name(tag), "Path" | "OsStr")
-                ) =>
-        {
-            let pointee = interp
-                .deref_value(frames, &value)
-                .and_then(|resolved| interp.read_resolved(frames, &resolved));
-            match pointee {
-                Ok(target) => render_lldb_lines(
-                    interp,
-                    &target,
-                    Some(inner.as_ref()),
-                    char,
-                    &print.expr,
-                ),
-                Err(_) => render_lldb_lines(
-                    interp,
-                    &value,
-                    desc.as_ref(),
-                    char,
-                    &print.expr,
-                ),
+    let mut lldb = if matches!(value, Value::Closure { .. } | Value::Coroutine { .. }) {
+        // A closure or coroutine value renders through its
+        // recorded environment shape; the lldb form needs the
+        // frames to read through a captured reference field.
+        render_env_lldb_lines(interp, frames, &value, desc.as_ref(), &print.expr)
+    } else {
+        match &desc {
+            Some(Desc::Ref(inner))
+                if expr.steps.is_empty()
+                    && matches!(
+                        inner.as_ref(),
+                        Desc::Adt(tag)
+                            if matches!(tag_base_name(tag), "Path" | "OsStr")
+                    ) =>
+            {
+                let pointee = interp
+                    .deref_value(frames, &value)
+                    .and_then(|resolved| interp.read_resolved(frames, &resolved));
+                match pointee {
+                    Ok(target) => render_lldb_lines(
+                        interp,
+                        &target,
+                        Some(inner.as_ref()),
+                        char,
+                        &print.expr,
+                    ),
+                    Err(_) => render_lldb_lines(
+                        interp,
+                        &value,
+                        desc.as_ref(),
+                        char,
+                        &print.expr,
+                    ),
+                }
             }
+            _ => render_lldb_lines(interp, &value, desc.as_ref(), char, &print.expr),
         }
-        _ => render_lldb_lines(interp, &value, desc.as_ref(), char, &print.expr),
     };
     lldb.extend(lldb_lines_extra);
     Ok(EvaluatedPrint {
@@ -1243,6 +1250,9 @@ fn render_gdb(
         | Value::FnPtr(_) => {
             let addr = crate::interp::synthetic_address(value)?;
             Some(format!("0x{addr:x}"))
+        }
+        Value::Closure { .. } | Value::Coroutine { .. } => {
+            render_env_gdb(interp, value, desc, depth)
         }
         Value::Uninit => match desc {
             Some(Desc::Int(_)) | Some(Desc::Float) => Some("0".to_string()),
@@ -1831,6 +1841,9 @@ fn render_lldb_compact(
             let addr = crate::interp::synthetic_address(value)?;
             Some(format!("0x{addr:x}"))
         }
+        Value::Closure { .. } | Value::Coroutine { .. } => {
+            render_env_lldb_compact(interp, None, value, desc, depth)
+        }
         Value::Str(s) => Some(format!("\"{}\"", escape_str(s))),
         Value::Uninit => match desc {
             Some(Desc::Int(_)) | Some(Desc::Float) => Some("0".to_string()),
@@ -2044,6 +2057,180 @@ fn named_field_values(
         pairs.push((vshape.fields[i].name.clone()?, gdb, compact));
     }
     Some((head, pairs))
+}
+
+/// The (field, value) pairs a closure or coroutine value
+/// renders with, in printed order, with the instance's recorded
+/// environment shape: for a closure, its captures in environment
+/// order; for a coroutine, the current state's saved fields
+/// followed by its captures (the order the compiler's debuginfo
+/// lays a state out in). `None` when the value's instance has no
+/// recorded shape or a field's storage is absent.
+fn env_render_fields<'i, 'v>(
+    interp: &'i Interpreter,
+    value: &'v Value,
+    desc: Option<&Desc>,
+) -> Option<(
+    &'i sparagmos_mir::EnvDebugShape,
+    Vec<(&'i sparagmos_mir::AdtDebugField, &'v Value)>,
+)> {
+    let Some(Desc::Adt(tag)) = desc else {
+        return None;
+    };
+    let shape: &'i sparagmos_mir::EnvDebugShape =
+        interp.program().env_debug_shapes.get(tag)?;
+    let mut pairs = Vec::new();
+    match value {
+        Value::Closure { env, .. } => {
+            if env.len() != shape.upvars.len() {
+                return None;
+            }
+            pairs.extend(shape.upvars.iter().zip(env.iter()));
+        }
+        Value::Coroutine {
+            variant,
+            fields,
+            saved,
+        } => {
+            let vshape = shape.variants.get(*variant as usize)?;
+            if vshape.fields.len() != vshape.slots.len() {
+                return None;
+            }
+            for (field, slot) in vshape.fields.iter().zip(vshape.slots.iter()) {
+                let stored = if shape.slotted {
+                    fields.get(*slot as usize)?
+                } else {
+                    saved.get(*variant as usize)?.get(*slot as usize)?
+                };
+                pairs.push((field, stored));
+            }
+            if fields.len() < shape.upvars.len() {
+                return None;
+            }
+            pairs.extend(shape.upvars.iter().zip(fields.iter()));
+        }
+        _ => return None,
+    }
+    Some((shape, pairs))
+}
+
+/// Render one closure or coroutine value in gdb form:
+/// `path::{closure_env#0} {name: value, ...}` for a closure,
+/// `path::{coroutine_env#0}::State{name: value, ...}` for a
+/// coroutine (see [`env_render_fields`] for the field order).
+fn render_env_gdb(
+    interp: &Interpreter,
+    value: &Value,
+    desc: Option<&Desc>,
+    depth: usize,
+) -> Option<String> {
+    let (shape, pairs) = env_render_fields(interp, value, desc)?;
+    let mut parts = Vec::with_capacity(pairs.len());
+    for (field, stored) in &pairs {
+        let name = field.name.as_deref()?;
+        let d = Desc::from_tag(&field.ty);
+        let rendered = render_gdb(interp, stored, Some(&d), false, None, depth + 1)?;
+        parts.push(format!("{name}: {rendered}"));
+    }
+    match value {
+        Value::Closure { .. } => {
+            if parts.is_empty() {
+                Some(shape.dwarf_name.clone())
+            } else {
+                Some(format!("{} {{{}}}", shape.dwarf_name, parts.join(", ")))
+            }
+        }
+        Value::Coroutine { variant, .. } => {
+            let vname = &shape.variants.get(*variant as usize)?.name;
+            let prefix = format!("{}::{vname}", shape.dwarf_name);
+            if parts.is_empty() {
+                Some(prefix)
+            } else {
+                Some(format!("{prefix}{{{}}}", parts.join(", ")))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Render one closure or coroutine value in lldb's compact
+/// form: `{name:value, ...}` over the same fields as
+/// [`render_env_gdb`]. At the top level of a print (`frames`
+/// given), a captured field that is a reference to an aggregate
+/// renders as its pointee - the form lldb's own display gives a
+/// reference member - while a reference to a scalar or to
+/// another reference stays the address; nested renders
+/// (`frames` absent) keep the address form throughout.
+fn render_env_lldb_compact(
+    interp: &Interpreter,
+    frames: Option<&[Frame]>,
+    value: &Value,
+    desc: Option<&Desc>,
+    depth: usize,
+) -> Option<String> {
+    let (_shape, pairs) = env_render_fields(interp, value, desc)?;
+    let mut parts = Vec::with_capacity(pairs.len());
+    for (field, stored) in &pairs {
+        let name = field.name.as_deref()?;
+        let d = Desc::from_tag(&field.ty);
+        let rendered = render_env_lldb_field(interp, frames, stored, &d, depth + 1)?;
+        parts.push(format!("{name}:{rendered}"));
+    }
+    Some(format!("{{{}}}", parts.join(", ")))
+}
+
+/// Render one environment field's value in lldb's compact form
+/// (see [`render_env_lldb_compact`] for the reference rule).
+fn render_env_lldb_field(
+    interp: &Interpreter,
+    frames: Option<&[Frame]>,
+    value: &Value,
+    desc: &Desc,
+    depth: usize,
+) -> Option<String> {
+    if let (Some(frames), Value::Ref(_), Desc::Ref(inner)) = (frames, value, desc) {
+        if matches!(inner.as_ref(), Desc::Adt(_)) {
+            if let Ok(resolved) = interp.deref_value(frames, value) {
+                if let Ok(pointee) = interp.read_resolved(frames, &resolved) {
+                    return render_lldb_compact(
+                        interp,
+                        &pointee,
+                        Some(inner.as_ref()),
+                        false,
+                        true,
+                        depth,
+                    );
+                }
+            }
+        }
+    }
+    render_lldb_compact(interp, value, Some(desc), false, true, depth)
+}
+
+/// The transcript lines of one lldb print of a closure or
+/// coroutine value: the single `(Type) name = <compact>` line,
+/// with the environment type's DWARF name.
+fn render_env_lldb_lines(
+    interp: &Interpreter,
+    frames: &[Frame],
+    value: &Value,
+    desc: Option<&Desc>,
+    expr: &str,
+) -> Vec<String> {
+    let Some(compact) = render_env_lldb_compact(interp, Some(frames), value, desc, 0)
+    else {
+        return Vec::new();
+    };
+    let Some(Desc::Adt(tag)) = desc else {
+        return vec![format!("= {compact}")];
+    };
+    let Some(shape) = interp.program().env_debug_shapes.get(tag) else {
+        return vec![format!("= {compact}")];
+    };
+    vec![format!(
+        "({}) {expr} = {compact}",
+        lldb_type_name(&shape.dwarf_name)
+    )]
 }
 
 /// The transcript lines of one lldb print. A scalar keeps the
