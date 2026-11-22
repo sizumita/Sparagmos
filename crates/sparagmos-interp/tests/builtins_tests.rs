@@ -1952,6 +1952,7 @@ fn registry_round2_covers_the_new_callees() {
         ("std::intrinsics::black_box", Builtin::BlackBox),
         ("std::string::String::new", Builtin::StringNew),
         ("std::string::String::with_capacity", Builtin::StringWithCapacity),
+        ("std::intrinsics::va_arg", Builtin::VaArg),
         ("std::intrinsics::ctpop", Builtin::IntBitOp(BitOp::CtPop)),
         ("std::intrinsics::ctlz", Builtin::IntBitOp(BitOp::Ctlz)),
         ("std::intrinsics::cttz", Builtin::IntBitOp(BitOp::Cttz)),
@@ -2005,7 +2006,6 @@ fn registry_round2_covers_the_new_callees() {
         "std::option::Option::<T>::map",
         "std::sync::mpmc::channel",
         "std::thread::LocalKey::<T>::with",
-        "std::intrinsics::va_arg",
     ] {
         assert_eq!(lookup(&canonical_name(name)), None, "{name} stays unsupported");
     }

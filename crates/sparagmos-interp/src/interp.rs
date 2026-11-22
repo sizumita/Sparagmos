@@ -302,6 +302,19 @@ pub(crate) struct ChannelState {
 /// deterministically and the outcome is either the `io::Error`
 /// the resolution failure produces natively or a named
 /// unsupported error (see `process_spawn_error` in `builtins.rs`).
+/// One C variable argument list's state (see [`Value::VaList`]):
+/// the tail arguments of one variadic call, in order, and the
+/// cursor the next `va_arg` reads. The arguments are the values
+/// the caller evaluated, stored in the interpreter's usual shapes
+/// (integers sign-extended / zero-extended to 128 bits, `f32`
+/// widened to `f64`), which is exactly the promoted shape C's
+/// default argument promotions hand to the callee.
+#[derive(Clone, Debug)]
+pub(crate) struct VaListState {
+    pub args: Vec<Value>,
+    pub cursor: usize,
+}
+
 /// One captured `core::fmt::Formatter` (see [`Value::Formatter`]):
 /// the text a guest `fmt` implementation body has written through
 /// the `Formatter` builtins, and the options of the placeholder
@@ -715,6 +728,11 @@ pub struct Interpreter<'a> {
     fmt_builders: std::cell::RefCell<HashMap<u64, FmtBuilderState>>,
     /// The id the next created builder gets.
     next_fmt_builder: std::cell::RefCell<u64>,
+    /// Live C variable argument lists (see [`VaListState`]),
+    /// keyed by the id inside the va-list handle values.
+    va_lists: std::cell::RefCell<HashMap<u64, VaListState>>,
+    /// The id the next created va list gets.
+    next_va_list: std::cell::RefCell<u64>,
     /// The program-level heap allocation store: one storage per
     /// live `Box` allocation, keyed by the allocation id the box
     /// value carries as its single field (see
@@ -990,6 +1008,8 @@ impl<'a> Interpreter<'a> {
             next_formatter: std::cell::RefCell::new(1),
             fmt_builders: std::cell::RefCell::new(HashMap::new()),
             next_fmt_builder: std::cell::RefCell::new(1),
+            va_lists: std::cell::RefCell::new(HashMap::new()),
+            next_va_list: std::cell::RefCell::new(1),
             allocs: std::cell::RefCell::new(HashMap::new()),
             elem_blocks: std::cell::RefCell::new(std::collections::HashSet::new()),
             next_alloc: std::cell::Cell::new(1),
@@ -1103,6 +1123,7 @@ impl<'a> Interpreter<'a> {
             .program
             .get(entry)
             .ok_or_else(|| self.missing_body_error(entry))?;
+        let args = self.pack_variadic_args(entry, body, args);
         if args.len() != body.arg_count {
             return Err(InterpError::type_mismatch(
                 format!("call to `{entry}`"),
@@ -2710,6 +2731,14 @@ impl<'a> Interpreter<'a> {
                 stamp = Some(f);
             }
         }
+        // A C-variadic callee receives its tail arguments packed
+        // as one va list (see `pack_variadic_args`); the vtable
+        // dispatch below re-enters this function with the impl
+        // body, where the packed shape is already the declared
+        // one and passes through unchanged.
+        if let Some(callee) = self.program.get(func) {
+            arg_values = self.pack_variadic_args(func, callee, arg_values);
+        }
         // A call whose receiver is a `dyn` fat pointer is a vtable
         // dispatch even when a body exists under the callee's own
         // name: that body is one monomorphic instance of the trait
@@ -2866,6 +2895,7 @@ impl<'a> Interpreter<'a> {
                 None => return Err(self.missing_body_error(func)),
             },
         };
+        let arg_values = self.pack_variadic_args(func, body, arg_values);
         if arg_values.len() != body.arg_count {
             return Err(InterpError::type_mismatch(
                 format!("call to {func}"),
@@ -5109,6 +5139,142 @@ impl<'a> Interpreter<'a> {
         drop(next);
         self.commands.borrow_mut().insert(id, state);
         id
+    }
+
+    /// Register a C variable argument list holding `args` (the
+    /// evaluated tail arguments of one variadic call, in order)
+    /// and return the handle value that names it.
+    pub(crate) fn new_va_list(&self, args: Vec<Value>) -> Value {
+        let mut next = self.next_va_list.borrow_mut();
+        let id = *next;
+        *next += 1;
+        drop(next);
+        self.va_lists
+            .borrow_mut()
+            .insert(id, VaListState { args, cursor: 0 });
+        Value::VaList(id)
+    }
+
+    /// Duplicate the va list with the given id (C `va_copy`):
+    /// a new list over the same arguments, starting at the
+    /// source's current cursor and advancing independently.
+    pub(crate) fn va_list_duplicate(&self, id: u64) -> InterpResult<Value> {
+        let state = self
+            .va_lists
+            .borrow()
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| InterpError::UnsupportedTerminator {
+                kind: format!("va list handle {id} is not live"),
+            })?;
+        Ok(self.new_va_list_at(state.args, state.cursor))
+    }
+
+    /// Register a va list over `args` with its cursor already at
+    /// `cursor` (the [`Self::va_list_duplicate`] back end).
+    fn new_va_list_at(&self, args: Vec<Value>, cursor: usize) -> Value {
+        let mut next = self.next_va_list.borrow_mut();
+        let id = *next;
+        *next += 1;
+        drop(next);
+        self.va_lists
+            .borrow_mut()
+            .insert(id, VaListState { args, cursor });
+        Value::VaList(id)
+    }
+
+    /// Read the next argument of the va list with the given id
+    /// (`va_arg`): the argument at the cursor, which advances by
+    /// one. Reading past the last argument is undefined behaviour
+    /// in C; here it is a named failure.
+    pub(crate) fn va_list_next(&self, id: u64) -> InterpResult<Value> {
+        let mut lists = self.va_lists.borrow_mut();
+        let state = lists
+            .get_mut(&id)
+            .ok_or_else(|| InterpError::UnsupportedTerminator {
+                kind: format!("va list handle {id} is not live"),
+            })?;
+        let value = state.args.get(state.cursor).cloned().ok_or_else(|| {
+            InterpError::UnsupportedTerminator {
+                kind: "va_arg read past the end of the argument list".to_string(),
+            }
+        })?;
+        state.cursor += 1;
+        Ok(value)
+    }
+
+    /// Resolve a value denoting a va list — the handle itself,
+    /// or a reference to a place holding one — to the list's
+    /// table id.
+    pub(crate) fn va_list_handle(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+    ) -> InterpResult<u64> {
+        match value {
+            Value::VaList(id) => Ok(*id),
+            Value::Ref(_) => {
+                let target = self.deref_value(frames, value)?;
+                match self.read_resolved(frames, &target)? {
+                    Value::VaList(id) => Ok(id),
+                    other => Err(InterpError::type_mismatch(
+                        "va list argument",
+                        "a va list value",
+                        other.kind_name(),
+                    )),
+                }
+            }
+            other => Err(InterpError::type_mismatch(
+                "va list argument",
+                "a va list value",
+                other.kind_name(),
+            )),
+        }
+    }
+
+    /// Whether `ty` is the C variable argument list type
+    /// (`std::ffi::VaList`, spelled through `core` inside core's
+    /// own bodies).
+    fn is_va_list_ty(ty: &Ty) -> bool {
+        matches!(ty, Ty::Adt(name) if name == "std::ffi::VaList" || name == "core::ffi::VaList")
+    }
+
+    /// Pack the argument values of a call to the C-variadic body
+    /// `callee` (registered under `func`) into the shape the body
+    /// declares: a variadic body's last parameter is its
+    /// `VaList`, and the caller supplies the fixed arguments
+    /// followed by every tail argument as a separate value, so
+    /// the tail becomes one va-list value. A call that already
+    /// passes exactly the declared arguments with a va list in
+    /// the last slot forwards that list unchanged (the
+    /// `vprintf`-style idiom), as does any call to a body whose
+    /// last parameter is not a va list; anything else is left
+    /// for the caller's arity check to judge.
+    fn pack_variadic_args(
+        &self,
+        func: &str,
+        callee: &Body,
+        args: Vec<Value>,
+    ) -> Vec<Value> {
+        let _ = func;
+        if callee.arg_count == 0 || args.len() < callee.arg_count - 1 {
+            return args;
+        }
+        let Some(last_ty) = callee.local_tys.get(callee.arg_count) else {
+            return args;
+        };
+        if !Self::is_va_list_ty(last_ty) {
+            return args;
+        }
+        if args.len() == callee.arg_count {
+            if matches!(args.last(), Some(Value::VaList(_))) {
+                return args;
+            }
+        }
+        let fixed = callee.arg_count - 1;
+        let mut packed: Vec<Value> = args[..fixed].to_vec();
+        packed.push(self.new_va_list(args[fixed..].to_vec()));
+        packed
     }
 
     /// Register a captured formatter state and return the id
@@ -9014,6 +9180,9 @@ impl<'a> Interpreter<'a> {
             // a body moves it, and the `DebugList` family the
             // builder constructors return by value).
             | (Some(Ty::Adt(_)), Value::Formatter(_))
+            // The va-list handle stands for the `std::ffi::VaList`
+            // ADT value a variadic body moves and clones.
+            | (Some(Ty::Adt(_)), Value::VaList(_))
             | (Some(Ty::Adt(_)), Value::FmtBuilder(_)) => Ok(value),
             // Reference locals hold resolved references, fat pointers,
             // and — for `&str` and byte-array references — the string
@@ -13705,6 +13874,7 @@ fn drop_dyn_value(value: &Value) -> InterpResult<()> {
         | Value::FmtCount(_)
         | Value::FmtArguments(_)
         | Value::Formatter(_)
+        | Value::VaList(_)
         | Value::FmtBuilder(_) => Ok(()),
         Value::DynRef { base, .. } => drop_dyn_value(base),
         Value::Tuple(items) => items.iter().try_for_each(drop_dyn_value),

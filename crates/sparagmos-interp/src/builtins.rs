@@ -1494,6 +1494,21 @@ pub enum Builtin {
     /// is `n` pairs of `(i64, f64)`; the result is the pair
     /// sum divided by `n` (NaN for `n == 0`, as in C).
     FfiInterestingAverage,
+    /// `rust_valist_interesting_average(n, ap)`: the same pair
+    /// sum as [`Builtin::FfiInterestingAverage`], read from the
+    /// va list `ap` at its current cursor, which advances past
+    /// the `n` pairs read.
+    FfiValistInterestingAverage,
+    /// `rust_va_list_next_i32(ap)`: `va_arg(*ap, int32_t)` —
+    /// the next `i32` of the va list behind the pointer, whose
+    /// cursor advances.
+    FfiVaListNextI32,
+    /// `std::intrinsics::va_arg(ap) -> T`: the next argument of
+    /// the va list `ap` points to, whose cursor advances. The
+    /// argument was stored in the promoted shape the caller
+    /// passed it in (see [`crate::interp::VaListState`]), which
+    /// is the shape `T` reads back.
+    VaArg,
     /// The i128 helper `square(x) -> x * x` (wrapping).
     FfiSquare128,
     /// The i128 helper `sub(a, b) -> a - b` (wrapping).
@@ -1885,6 +1900,8 @@ pub fn foreign_helper_lookup(canonical: &str) -> Option<Builtin> {
             Builtin::FfiUnpackOption
         }
         "rust_interesting_average" => Builtin::FfiInterestingAverage,
+        "rust_valist_interesting_average" => Builtin::FfiValistInterestingAverage,
+        "rust_va_list_next_i32" => Builtin::FfiVaListNextI32,
         "square" => Builtin::FfiSquare128,
         "sub" => Builtin::FfiSub128,
         "increment_all_parts" => Builtin::FfiIncrementAllParts,
@@ -2160,6 +2177,7 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::time::Duration::from_micros" => Builtin::DurationFromMicros,
         "std::time::Duration::from_nanos" => Builtin::DurationFromNanos,
         "std::intrinsics::caller_location" => Builtin::CallerLocation,
+        "std::intrinsics::va_arg" | "core::intrinsics::va_arg" => Builtin::VaArg,
         // The harness calls either a crate-local wrapper
         // (`<crate>::test::test_main_env_args`) or, for an empty
         // test list, the `test` crate's function directly.
@@ -4135,6 +4153,30 @@ impl<'a> Interpreter<'a> {
                     sum += as_f64(&pair[1], name)?;
                 }
                 Ok(Value::Float(sum / n as f64))
+            }
+            Builtin::FfiValistInterestingAverage => {
+                arity(2)?;
+                let n = as_u128(&vals[0], name)?;
+                let id = self.va_list_handle(frames, &vals[1])?;
+                let mut sum = 0.0f64;
+                for _ in 0..n {
+                    let int = self.va_list_next(id)?;
+                    sum += as_i128(&int, name)? as f64;
+                    let float = self.va_list_next(id)?;
+                    sum += as_f64(&float, name)?;
+                }
+                Ok(Value::Float(sum / n as f64))
+            }
+            Builtin::FfiVaListNextI32 => {
+                arity(1)?;
+                let id = self.va_list_handle(frames, &vals[0])?;
+                let value = self.va_list_next(id)?;
+                Ok(Value::Int(as_i128(&value, name)? as i32 as i128))
+            }
+            Builtin::VaArg => {
+                arity(1)?;
+                let id = self.va_list_handle(frames, &vals[0])?;
+                self.va_list_next(id)
             }
             Builtin::FfiSquare128 => {
                 arity(1)?;
@@ -7859,6 +7901,13 @@ impl<'a> Interpreter<'a> {
                     Value::Ref(_) => {
                         let target = self.deref_value(frames, &vals[0])?;
                         let value = self.read_resolved(frames, &target)?;
+                        // A `VaList` clone is C `va_copy`: a second
+                        // list over the same arguments with its own
+                        // cursor, not another handle on the same
+                        // cursor.
+                        if let Value::VaList(id) = value {
+                            return self.va_list_duplicate(id);
+                        }
                         // A `Waker` / `LocalWaker` clone is not
                         // a value copy: a waker built by
                         // `from_raw` clones through its

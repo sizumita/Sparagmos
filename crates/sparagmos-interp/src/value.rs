@@ -321,6 +321,15 @@ pub enum Value {
     /// builder methods are builtins over this handle, so no
     /// builder aggregate ever materializes.
     FmtBuilder(u64),
+    /// A C variable argument list (`std::ffi::VaList`): the id of
+    /// its state in the interpreter's va-list table. The state is
+    /// the ordered tail arguments of one variadic call plus the
+    /// cursor `va_arg` reads from; the platform `va_list` struct
+    /// (register save areas and offsets) is not modelled, only
+    /// the argument sequence it walks. Cloning a list (C
+    /// `va_copy`) registers a second state with the same cursor,
+    /// so the two advance independently.
+    VaList(u64),
     /// A function item or function pointer value: the name of the
     /// target function in the program.
     FnPtr(String),
@@ -371,6 +380,7 @@ impl Value {
             Value::FmtArguments(_) => "fmt arguments",
             Value::Formatter(_) => "fmt formatter",
             Value::FmtBuilder(_) => "fmt builder",
+            Value::VaList(_) => "va list",
             Value::FnPtr(_) => "function pointer",
             Value::Closure { .. } => "closure",
             Value::Coroutine { .. } => "coroutine",
@@ -521,6 +531,7 @@ impl fmt::Display for Value {
             Value::FmtArguments(_) => write!(f, "<fmt::Arguments>"),
             Value::Formatter(_) => write!(f, "<fmt::Formatter>"),
             Value::FmtBuilder(_) => write!(f, "<fmt builder>"),
+            Value::VaList(_) => write!(f, "<va list>"),
             Value::FnPtr(name) => write!(f, "<fn {name}>"),
             Value::Closure { def, env } => {
                 write!(f, "<closure {def} ({} captures)>", env.len())

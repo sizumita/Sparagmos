@@ -16589,3 +16589,105 @@ fn run_mode_pathbuf_set_extension() {
         "path-set-extension-ok\n",
     );
 }
+
+// ---------------------------------------------------------------------
+// C-variadic (VaList) value model: a variadic callee's tail
+// arguments are packed into one ordered list at the call boundary;
+// `next_arg` reads them back in order, `clone` forks the cursor,
+// and a `VaList` parameter forwards the same list.
+// ---------------------------------------------------------------------
+
+const VALIST_BASIC_SRC: &str = r#"
+use std::ffi::*;
+unsafe extern "C" fn sum3(mut ap: ...) -> i64 {
+    let mut total: i64 = 0;
+    for _ in 0..3 {
+        total += ap.next_arg::<c_int>() as i64;
+    }
+    total
+}
+fn main() {
+    let s = unsafe { sum3(10 as c_int, 20 as c_int, 30 as c_int) };
+    println!("sum={s}");
+}
+"#;
+
+const VALIST_MIXED_SRC: &str = r#"
+use std::ffi::*;
+unsafe extern "C" fn weighted(mut ap: ...) -> f64 {
+    let w = ap.next_arg::<c_double>();
+    let x = ap.next_arg::<c_int>();
+    let y = ap.next_arg::<c_double>();
+    w * x as f64 + y
+}
+fn main() {
+    let w = unsafe { weighted(2.5 as c_double, 4 as c_int, 0.5 as c_double) };
+    println!("weighted={w}");
+}
+"#;
+
+const VALIST_CLONE_SRC: &str = r#"
+use std::ffi::*;
+unsafe extern "C" fn clone_check(mut ap: ...) -> i64 {
+    let mut ap2 = ap.clone();
+    let a = ap2.next_arg::<c_long>();
+    let b = ap.next_arg::<c_long>();
+    a * 100 + b
+}
+fn main() {
+    let c = unsafe { clone_check(7 as c_long, 9 as c_long) };
+    println!("clone={c}");
+}
+"#;
+
+const VALIST_FORWARD_SRC: &str = r#"
+use std::ffi::*;
+unsafe extern "C" fn helper(mut ap: VaList) -> i64 {
+    ap.next_arg::<c_long>() + ap.next_arg::<c_long>()
+}
+unsafe extern "C" fn outer(ap: ...) -> i64 {
+    unsafe { helper(ap) }
+}
+fn main() {
+    let v = unsafe { outer(40 as c_long, 2 as c_long) };
+    println!("fwd={v}");
+}
+"#;
+
+const VALIST_FIXED_AND_TAIL_SRC: &str = r#"
+use std::ffi::*;
+unsafe extern "C" fn scaled(scale: c_int, mut ap: ...) -> i64 {
+    let a = ap.next_arg::<c_long>();
+    let b = ap.next_arg::<c_long>();
+    scale as i64 * (a + b)
+}
+fn main() {
+    let v = unsafe { scaled(3 as c_int, 10 as c_long, 5 as c_long) };
+    println!("scaled={v}");
+}
+"#;
+
+#[test]
+fn run_mode_valist_basic() {
+    run_ok_edition("valist-basic", VALIST_BASIC_SRC, "sum=60\n");
+}
+
+#[test]
+fn run_mode_valist_mixed_types() {
+    run_ok_edition("valist-mixed", VALIST_MIXED_SRC, "weighted=10.5\n");
+}
+
+#[test]
+fn run_mode_valist_clone_independent_cursor() {
+    run_ok_edition("valist-clone", VALIST_CLONE_SRC, "clone=707\n");
+}
+
+#[test]
+fn run_mode_valist_forwarding() {
+    run_ok_edition("valist-forward", VALIST_FORWARD_SRC, "fwd=42\n");
+}
+
+#[test]
+fn run_mode_valist_fixed_and_tail() {
+    run_ok_edition("valist-fixed-tail", VALIST_FIXED_AND_TAIL_SRC, "scaled=45\n");
+}

@@ -684,6 +684,7 @@ fn mark_caller_location_bodies(program: &mut ir::Program) {
                 if let Some(callee) = program.functions.get(func) {
                     if args.len() == callee.arg_count + 1
                         && callee.caller_location_local.is_none()
+                        && !callee_takes_va_list(callee)
                         && !marked.contains(func)
                     {
                         marked.push(func.clone());
@@ -705,6 +706,22 @@ fn mark_caller_location_bodies(program: &mut ir::Program) {
         }
         body.caller_location_local = Some(idx);
     }
+}
+
+/// Whether the body's last declared parameter is a C variable
+/// argument list (`std::ffi::VaList`, spelled through `core`
+/// inside core's own bodies): the body is a C-variadic function,
+/// so a caller passing `arg_count + 1` values is passing one
+/// tail argument, not a caller-location stamp, and the
+/// track-caller heuristic in [`mark_caller_location_bodies`]
+/// must not claim it.
+fn callee_takes_va_list(body: &ir::Body) -> bool {
+    body.arg_count >= 1
+        && matches!(
+            body.local_tys.get(body.arg_count),
+            Some(ir::Ty::Adt(name))
+                if name == "std::ffi::VaList" || name == "core::ffi::VaList"
+        )
 }
 
 /// The defensive bound on the joint-fixpoint rounds in
@@ -6390,6 +6407,23 @@ let inner = match (&src, target) {
             .collect()
     }
 
+    /// Whether the (unconverted) body's last declared parameter
+    /// is a C variable argument list: the MIR-side form of
+    /// [`callee_takes_va_list`], used while converting call
+    /// arguments, before the callee's converted body exists.
+    fn mir_body_takes_va_list(&self, body: &mir::Body) -> bool {
+        if body.arg_count == 0 {
+            return false;
+        }
+        match body.local_decls.get(body.arg_count).map(|d| &d.ty) {
+            Some(mir::Ty::Adt(def, _)) => {
+                let name = self.def_display_name(def);
+                name == "std::ffi::VaList" || name == "core::ffi::VaList"
+            }
+            _ => false,
+        }
+    }
+
     fn resolve_callee(&self, func: &mir::Operand) -> Option<String> {
         let mir::Operand::Constant(c) = func else {
             return None;
@@ -7420,18 +7454,42 @@ let inner = match (&src, target) {
                                 .and_then(|(_, raw)| raw.first().cloned());
                             let mut ir_args = Vec::with_capacity(args.len());
                             for (i, arg) in args.iter().enumerate() {
-                                let ctx = if i == 0 {
-                                    self_ctx.clone().or_else(|| {
-                                        callee.and_then(|b| {
-                                            b.local_decls
-                                                .get(i + 1)
-                                                .map(|d| d.ty.clone())
-                                        })
-                                    })
-                                } else {
-                                    callee.and_then(|b| {
+                                // Only a declared parameter types a
+                                // call argument. The parameters that
+                                // name call arguments are locals
+                                // 1..=arg_count, except a trailing
+                                // `VaList` parameter of a C-variadic
+                                // callee, which names no single
+                                // argument (the whole tail is packed
+                                // into it at the call boundary); and
+                                // an argument past the last parameter
+                                // (a `#[track_caller]` stamp) names
+                                // none either. Typing such an
+                                // argument by the local at its index
+                                // — an unrelated temporary of the
+                                // callee — corrupts literal arguments
+                                // (an integer literal read under a
+                                // `bool` temporary collapses to
+                                // `true`), so it is typed by its own
+                                // recorded type instead, the fallback
+                                // `convert_operand` applies when no
+                                // context is given.
+                                let param_ctx = |b: &&mir::Body| {
+                                    let named = if self.mir_body_takes_va_list(b) {
+                                        b.arg_count - 1
+                                    } else {
+                                        b.arg_count
+                                    };
+                                    if i < named {
                                         b.local_decls.get(i + 1).map(|d| d.ty.clone())
-                                    })
+                                    } else {
+                                        None
+                                    }
+                                };
+                                let ctx = if i == 0 {
+                                    self_ctx.clone().or_else(|| callee.and_then(param_ctx))
+                                } else {
+                                    callee.and_then(param_ctx)
                                 };
                                 ir_args.push(self.convert_operand(body, arg, ctx.as_ref())?);
                             }
