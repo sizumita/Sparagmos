@@ -69,7 +69,11 @@
 //! likewise observable when it panics).
 //!
 //! Convert-mode exit codes: 0 = the crate converted (per-function
-//! outcomes are in the report), 1 = the compilation failed (a
+//! outcomes are in the report; an informational or parse-only
+//! invocation -- `--version`, `--print`, `--explain`,
+//! `-Z parse-crate-root-only` -- converts nothing and still
+//! succeeds, because the compilation the compiler was asked to
+//! perform did), 1 = the compilation failed (a
 //! front-end rejection, a `-Z treat-err-as-bug` abort on a reported
 //! diagnostic, or a driver-side monomorphization failure),
 //! 101 = the compiler crashed: an internal compiler error (a
@@ -4652,6 +4656,26 @@ fn main() {
         (Ok(()), None) => {
             eprintln!("sparagmos-driver: internal error: no results collected");
             std::process::exit(1);
+        }
+        (Err(rustc_public::CompilerError::Skipped), _) if !run_mode => {
+            // The compiler finished without ever handing the
+            // callbacks a crate: it was asked for information
+            // (--version, --print, --explain) or told to stop after
+            // parsing the crate root (-Z parse-crate-root-only).
+            // The compilation it was asked to perform succeeded --
+            // these paths report no error -- so convert mode
+            // reports an empty, successful conversion instead of a
+            // compilation failure. Run mode has no program to
+            // execute on this path and keeps the failure arm below.
+            println!(
+                "sparagmos-driver: {input} (Stable MIR, {})",
+                env!("SPARAGMOS_BUILD_RUSTC_VERSION")
+            );
+            println!(
+                "compiler skipped conversion: informational or parse-only invocation"
+            );
+            println!("converted: 0, skipped: 0");
+            println!("target-crate converted: 0, skipped: 0");
         }
         (Err(e), _) => {
             eprintln!("sparagmos-driver: compilation failed: {e:?}");

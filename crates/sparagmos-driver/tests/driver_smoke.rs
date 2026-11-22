@@ -308,3 +308,40 @@ fn convert_mode_clean_rejection_is_a_compilation_failure() {
         "a clean rejection is not a crash:\n{stderr}"
     );
 }
+
+#[test]
+fn convert_mode_parse_only_invocation_is_a_successful_empty_conversion() {
+    // -Z parse-crate-root-only stops the compiler after parsing
+    // the crate root: the conversion callback never runs and
+    // rustc_public reports the run as skipped. The compilation the
+    // compiler was asked to perform succeeded, so convert mode
+    // reports an empty conversion and exits 0, not a compilation
+    // failure.
+    let dir = std::env::temp_dir().join(format!(
+        "sparagmos-driver-contract-parseonly-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("parseonly.rs");
+    std::fs::write(&src, "impl <*const u8>::AssocTy {}\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg(&src)
+        .arg("--edition")
+        .arg("2021")
+        .arg("--rustc-arg")
+        .arg("-Zparse-crate-root-only")
+        .env("RUSTC_BOOTSTRAP", "1")
+        .output()
+        .expect("failed to run sparagmos-driver");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(0), "stdout={stdout} stderr={stderr}");
+    assert!(
+        stdout.contains("converted: 0, skipped: 0"),
+        "an empty conversion report is printed:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains("compilation failed"),
+        "a parse-only invocation is not a compilation failure:\n{stderr}"
+    );
+}
