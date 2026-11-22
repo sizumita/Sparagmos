@@ -1406,6 +1406,56 @@ fn main() {
 }
 "#;
 
+const CONST_BOUND_MATCH_SRC: &str = r#"
+struct Conn;
+impl Drop for Conn {
+    fn drop(&mut self) { println!("dropped"); }
+}
+struct Wrap(Conn);
+impl ::std::ops::Deref for Wrap {
+    type Target = Conn;
+    fn deref(&self) -> &Conn { &self.0 }
+}
+fn inner() {
+    let conn = &*match Some(Wrap(Conn)) {
+        Some(val) => val,
+        None => return,
+    };
+    let _ = conn;
+    println!("inner end");
+}
+fn main() {
+    inner();
+    println!("main end");
+}
+"#;
+
+#[test]
+fn run_mode_const_bound_match_binding_is_initialized() {
+    // The scrutinee is a constant aggregate, so optimized MIR
+    // const-propagates the by-value match binding away: the
+    // binding local has no assignment anywhere in the body and
+    // its value survives only as a constant debug-info entry.
+    // The driver restores the definition at conversion; without
+    // it the local is met uninitialized and its scope-end Drop
+    // fails with "unsupported terminator: Drop"
+    // (tests/ui/mir/mir_early_return_scope.rs).
+    let dir = temp_dir("constbound");
+    let src = fixture(&dir, "constbound.rs", CONST_BOUND_MATCH_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "const-bound match binding program must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "inner end\ndropped\nmain end\n",
+        "the binding's destructor runs at scope end, after the body"
+    );
+}
+
 #[test]
 fn run_mode_mem_drop_runs_destructors() {
     // An explicit std::mem::drop runs the same destructor as a
