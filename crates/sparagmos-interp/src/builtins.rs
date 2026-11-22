@@ -14335,6 +14335,57 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         Ok(Some(refr))
     }
 
+    /// Whether the `len` elements a fat pointer denotes can be
+    /// the elements of the container its base target sits in,
+    /// starting at the target's trailing element index. A fat
+    /// pointer formed by dereferencing a container value that
+    /// itself sits at an element position (a `Vec` nested inside
+    /// another container, bound by a deref pattern) denotes that
+    /// value's own elements, whose count the container's
+    /// remaining span can fall short of; such a span cannot be
+    /// the container's elements, so the answer is no and the
+    /// caller reads the pointee's own elements instead. Any
+    /// shape this cannot judge answers yes, keeping the sibling
+    /// reading.
+    fn sibling_span_fits(&self, frames: &[Frame], target: &Resolved, len: u128) -> bool {
+        let projection = match target {
+            Resolved::Place { projection, .. }
+            | Resolved::Static { projection, .. }
+            | Resolved::Alloc { projection, .. }
+            | Resolved::Value(_, projection) => projection,
+        };
+        let Some((&RefProj::Index(start), head)) = projection.split_last() else {
+            return true;
+        };
+        let parent = match target {
+            Resolved::Place {
+                frame_pos,
+                local,
+                ..
+            } => Resolved::Place {
+                frame_pos: *frame_pos,
+                local: *local,
+                projection: head.to_vec(),
+            },
+            Resolved::Static { name, .. } => Resolved::Static {
+                name: name.clone(),
+                projection: head.to_vec(),
+            },
+            Resolved::Alloc { id, .. } => Resolved::Alloc {
+                id: *id,
+                projection: head.to_vec(),
+            },
+            Resolved::Value(value, _) => Resolved::Value(value.clone(), head.to_vec()),
+        };
+        match self.read_resolved(frames, &parent) {
+            Ok(container) => match container.len() {
+                Some(count) => (start as u128) + len <= count,
+                None => true,
+            },
+            Err(_) => true,
+        }
+    }
+
     fn slice_elements_ref<'x>(
         &self,
         frames: &'x [Frame],
@@ -14351,7 +14402,9 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                 // container (and reads within the element when the
                 // element is itself an aggregate).
                 if let Ok(target) = self.deref_value(frames, base) {
-                    if target_ends_at_element(&target) {
+                    if target_ends_at_element(&target)
+                        && self.sibling_span_fits(frames, &target, *len)
+                    {
                         let mut elems = Vec::with_capacity(*len as usize);
                         for i in 0..(*len as usize) {
                             elems.push(self.read_seq_at(frames, &target, i)?);
