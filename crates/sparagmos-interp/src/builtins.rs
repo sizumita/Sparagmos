@@ -332,6 +332,30 @@ pub enum Builtin {
     /// `String::into_bytes(String) -> Vec<u8>`: the string data as
     /// a vector of bytes (the model's element aggregate).
     StringIntoBytes,
+    /// `String::into_boxed_str(String) -> Box<str>`: the string
+    /// data in a fresh box allocation. The collected body moves
+    /// the `vec` field out of the string value and rebuilds the
+    /// box from the vector's raw parts, neither of which the
+    /// string model can serve; the box over the string value
+    /// itself is the same observable value.
+    StringIntoBoxedStr,
+    /// `Vec::into_boxed_slice(Vec<T>) -> Box<[T]>`: the element
+    /// aggregate in a fresh box allocation, for the same reason
+    /// as `String::into_boxed_str`.
+    VecIntoBoxedSlice,
+    /// `AsRef::as_ref(&Self) -> &Target`: a view of the receiver's
+    /// data as the target type. The collected std bodies build
+    /// the view from the receiver's raw parts (the string's
+    /// pointer and length read field by field), which the value
+    /// model cannot serve; the view itself is a direct function
+    /// of the modelled data. Modelled receiver types are served
+    /// here; anything else is an explicit unsupported error.
+    AsRef,
+    /// `AsMut::as_mut(&mut Self) -> &mut Target`: the mutable
+    /// counterpart of `AsRef`; for the modelled receivers the
+    /// receiver place itself is the viewed storage, so the
+    /// argument reference is returned unchanged.
+    AsMut,
     /// `String::push_str(&mut String, &str)`.
     StringPushStr,
     /// `String::push(&mut String, char)`.
@@ -350,6 +374,13 @@ pub enum Builtin {
     /// `str::bytes(&str)`: a byte iterator state, the shape
     /// `Iterator::next` consumes for `std::str::Bytes`.
     StrBytes,
+    /// `str::make_ascii_uppercase(&mut str)` /
+    /// `str::make_ascii_lowercase(&mut str)`: in-place ASCII case
+    /// conversion of the string data. The collected bodies go
+    /// through `as_bytes_mut` and write byte by byte, which the
+    /// string model cannot serve (a string has no byte slots);
+    /// the conversion itself is exact on the model's string.
+    StrMakeAsciiCase(bool),
     /// `str::trim` / `trim_start` / `trim_end` (`&str -> &str`):
     /// strip `char::is_whitespace` from the selected side(s); the
     /// result is the stripped string data.
@@ -1280,6 +1311,16 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::string::String::into_bytes" | "alloc::string::String::into_bytes" => {
             Builtin::StringIntoBytes
         }
+        "std::string::String::into_boxed_str" | "alloc::string::String::into_boxed_str" => {
+            Builtin::StringIntoBoxedStr
+        }
+        "std::convert::AsRef::as_ref" | "core::convert::AsRef::as_ref" => Builtin::AsRef,
+        "std::convert::AsMut::as_mut" | "core::convert::AsMut::as_mut" => Builtin::AsMut,
+        _ if canonical.starts_with("std::vec::Vec")
+            && canonical.ends_with(">::into_boxed_slice") =>
+        {
+            Builtin::VecIntoBoxedSlice
+        }
         "std::string::String::push_str" | "alloc::string::String::push_str" => {
             Builtin::StringPushStr
         }
@@ -1289,6 +1330,12 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "core::str::<impl str>::as_bytes" => Builtin::StrAsBytes,
         "core::str::<impl str>::chars" => Builtin::StrChars,
         "core::str::<impl str>::bytes" => Builtin::StrBytes,
+        "core::str::<impl str>::make_ascii_uppercase" => {
+            Builtin::StrMakeAsciiCase(true)
+        }
+        "core::str::<impl str>::make_ascii_lowercase" => {
+            Builtin::StrMakeAsciiCase(false)
+        }
         "core::str::<impl str>::trim" => Builtin::StrTrim(TrimSide::Both),
         "core::str::<impl str>::trim_start" => Builtin::StrTrim(TrimSide::Start),
         "core::str::<impl str>::trim_end" => Builtin::StrTrim(TrimSide::End),
@@ -3955,6 +4002,33 @@ impl<'a> Interpreter<'a> {
                         .collect(),
                 })
             }
+            Builtin::StringIntoBoxedStr => {
+                arity(1)?;
+                let s = self.resolve_string(frames, &vals[0])?;
+                Ok(self.new_box(Value::Str(s)))
+            }
+            Builtin::AsRef => {
+                arity(1)?;
+                self.as_ref_view(frames, generic_args, &vals[0], false)
+            }
+            Builtin::AsMut => {
+                arity(1)?;
+                self.as_ref_view(frames, generic_args, &vals[0], true)
+            }
+            Builtin::VecIntoBoxedSlice => {
+                arity(1)?;
+                match vals.into_iter().next().expect("arity checked") {
+                    Value::Enum { fields, .. } => {
+                        Ok(self.new_box(Value::Tuple(fields)))
+                    }
+                    Value::Tuple(items) => Ok(self.new_box(Value::Tuple(items))),
+                    other => Err(InterpError::type_mismatch(
+                        "Vec::into_boxed_slice",
+                        "vector value",
+                        other.kind_name(),
+                    )),
+                }
+            }
             Builtin::StringPushStr => {
                 arity(2)?;
                 let suffix = self.resolve_string(frames, &vals[1])?;
@@ -4015,6 +4089,25 @@ impl<'a> Interpreter<'a> {
                 Ok(Value::Enum {
                     variant: 0,
                     fields: vec![Value::Tuple(items), Value::Uint(0)],
+                })
+            }
+            Builtin::StrMakeAsciiCase(upper) => {
+                arity(1)?;
+                let target = self.deref_value(frames, &vals[0])?;
+                self.modify_resolved(frames, &target, |slot| match slot {
+                    Value::Str(s) => {
+                        if upper {
+                            s.make_ascii_uppercase();
+                        } else {
+                            s.make_ascii_lowercase();
+                        }
+                        Ok(Value::Unit)
+                    }
+                    other => Err(InterpError::type_mismatch(
+                        "str::make_ascii_uppercase/lowercase",
+                        "string value",
+                        other.kind_name(),
+                    )),
                 })
             }
             Builtin::StrBytes => {
@@ -8687,6 +8780,226 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         }
     }
 
+    /// `AsRef::as_ref` / `AsMut::as_mut`: the receiver viewed as
+    /// the target type, computed from the modelled data (see the
+    /// `Builtin::AsRef` note). `generic_args` are the trait's
+    /// `[Self, Target]` type arguments. The blanket impls for
+    /// `&T` / `&mut T` forward to `T`'s impl, so leading
+    /// references are stripped from the self type and the value
+    /// resolution below follows them. For the mutable form the
+    /// receiver place itself is the viewed storage for the
+    /// modelled containers, so the argument reference is returned
+    /// unchanged; only `Box` needs its allocation pointer.
+    fn as_ref_view(
+        &self,
+        frames: &[Frame],
+        generic_args: &[String],
+        arg: &Value,
+        mutable: bool,
+    ) -> InterpResult<Value> {
+        let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
+        let target_ty = generic_args.get(1).map(String::as_str).unwrap_or("");
+        let mut base_ty = self_ty;
+        while let Some(rest) = base_ty
+            .strip_prefix("&mut ")
+            .or_else(|| base_ty.strip_prefix('&'))
+        {
+            base_ty = rest.trim();
+        }
+        let what = if mutable { "AsMut::as_mut" } else { "AsRef::as_ref" };
+        if mutable {
+            match base_ty {
+                t if is_string_like_ty(t)
+                    || t.starts_with("std::vec::Vec<")
+                    || t.starts_with("alloc::vec::Vec<")
+                    || t.starts_with('[') =>
+                {
+                    return Ok(arg.clone());
+                }
+                t if t.starts_with("std::boxed::Box<") => {
+                    let pointee = self.resolve_value(frames, arg)?;
+                    if let Value::DynRef { .. } = pointee {
+                        return Ok(pointee);
+                    }
+                    return match pointee {
+                        Value::Enum { fields, .. } if fields.len() == 1 => {
+                            let inner =
+                                fields.into_iter().next().expect("len checked");
+                            Ok(match inner {
+                                Value::Ref(RefTarget::Alloc { .. }) => inner,
+                                other => Value::Ref(RefTarget::value(other)),
+                            })
+                        }
+                        other => Err(InterpError::type_mismatch(
+                            what,
+                            "boxed value",
+                            other.kind_name(),
+                        )),
+                    };
+                }
+                _ => {
+                    return Err(unsupported(format!(
+                        "{what} for {self_ty} is not runtime-supported"
+                    )));
+                }
+            }
+        }
+        let value = self.resolve_value(frames, arg)?;
+        self.view_value_as(frames, value, base_ty, target_ty, what)
+    }
+
+    /// The value-level view behind `as_ref_view`: `value` is the
+    /// receiver's data (references already followed), `base_ty`
+    /// its type, `target_ty` the view's type.
+    fn view_value_as(
+        &self,
+        frames: &[Frame],
+        value: Value,
+        base_ty: &str,
+        target_ty: &str,
+        what: &str,
+    ) -> InterpResult<Value> {
+        // A value still wrapped in a reference (a blanket
+        // `&T` layer the type stripping already accounted for):
+        // follow it and view the pointee.
+        if matches!(
+            value,
+            Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. }
+        ) {
+            let inner = self.resolve_value(frames, &value)?;
+            if inner != value {
+                return self.view_value_as(frames, inner, base_ty, target_ty, what);
+            }
+        }
+        if is_string_like_ty(base_ty) {
+            if target_ty == "[u8]" {
+                return self.string_bytes_ref(frames, &value);
+            }
+            if target_ty == "str"
+                || target_ty == "std::ffi::OsStr"
+                || target_ty == "std::path::Path"
+                || target_ty == base_ty
+            {
+                return match value {
+                    Value::Str(s) => Ok(Value::Str(s)),
+                    other => Err(InterpError::type_mismatch(
+                        what,
+                        "string data",
+                        other.kind_name(),
+                    )),
+                };
+            }
+        }
+        if base_ty.starts_with("std::vec::Vec<")
+            || base_ty.starts_with("alloc::vec::Vec<")
+        {
+            if target_ty.starts_with('[') {
+                let len = value.len().ok_or_else(|| {
+                    InterpError::type_mismatch(
+                        what,
+                        "array value",
+                        value.kind_name(),
+                    )
+                })?;
+                return Ok(Value::FatRef {
+                    base: Box::new(value),
+                    len,
+                });
+            }
+            if target_ty.starts_with("std::vec::Vec<")
+                || target_ty.starts_with("alloc::vec::Vec<")
+            {
+                return Ok(value);
+            }
+        }
+        if base_ty.starts_with('[') && target_ty.starts_with('[') {
+            if base_ty.contains(';') && !target_ty.contains(';') {
+                // An array viewed as a slice.
+                let len = value.len().ok_or_else(|| {
+                    InterpError::type_mismatch(
+                        what,
+                        "array value",
+                        value.kind_name(),
+                    )
+                })?;
+                return Ok(Value::FatRef {
+                    base: Box::new(value),
+                    len,
+                });
+            }
+            return Ok(value);
+        }
+        if base_ty.starts_with("std::boxed::Box<") {
+            if let Value::DynRef { .. } = value {
+                return Ok(value);
+            }
+            let inner_ty = first_generic_param(base_ty).ok_or_else(|| {
+                unsupported(format!("{what} for {base_ty}: no inner type"))
+            })?;
+            return match value {
+                Value::Enum { fields, .. } if fields.len() == 1 => {
+                    let field = fields.into_iter().next().expect("len checked");
+                    let pointee = self.resolve_value(frames, &field)?;
+                    self.view_value_as(frames, pointee, &inner_ty, target_ty, what)
+                }
+                other => Err(InterpError::type_mismatch(
+                    what,
+                    "boxed value",
+                    other.kind_name(),
+                )),
+            };
+        }
+        if base_ty.starts_with("std::rc::Rc<")
+            || base_ty.starts_with("std::sync::Arc<")
+        {
+            if let Value::DynRef { .. } = value {
+                return Ok(value);
+            }
+            let inner_ty = first_generic_param(base_ty).ok_or_else(|| {
+                unsupported(format!("{what} for {base_ty}: no inner type"))
+            })?;
+            return match rc_handle_id(&value) {
+                Some(id) => {
+                    let pointee = self.read_resolved(
+                        frames,
+                        &Resolved::Alloc {
+                            id,
+                            projection: vec![RefProj::Field(2)],
+                        },
+                    )?;
+                    self.view_value_as(frames, pointee, &inner_ty, target_ty, what)
+                }
+                None => Err(InterpError::type_mismatch(
+                    what,
+                    "a reference-counted handle",
+                    value.kind_name(),
+                )),
+            };
+        }
+        if base_ty.starts_with("std::borrow::Cow<") {
+            let inner_ty = last_generic_param(base_ty).ok_or_else(|| {
+                unsupported(format!("{what} for {base_ty}: no inner type"))
+            })?;
+            return match value {
+                Value::Enum { fields, .. } if !fields.is_empty() => {
+                    let data = fields.into_iter().next().expect("checked non-empty");
+                    self.view_value_as(frames, data, &inner_ty, target_ty, what)
+                }
+                other => Err(InterpError::type_mismatch(
+                    what,
+                    "a Cow value",
+                    other.kind_name(),
+                )),
+            };
+        }
+        if base_ty == target_ty {
+            return Ok(value);
+        }
+        Err(unsupported(format!(
+            "{what} for {base_ty} -> {target_ty} is not runtime-supported"
+        )))
+    }
+
     /// A reference to field 0 of the aggregate `arg` points at:
     /// the dereference result of a one-field newtype wrapper
     /// (`AssertUnwindSafe`). A place-backed argument yields a live
@@ -9036,6 +9349,76 @@ fn cell_value(value: Value) -> Value {
 /// The single field of a one-field aggregate value: the shape of
 /// the std newtype wrappers (`Pin`, `ManuallyDrop`,
 /// `AssertUnwindSafe`).
+/// The types whose data the value model stores as a string:
+/// the string, byte-string and path types and `str` itself.
+fn is_string_like_ty(ty: &str) -> bool {
+    matches!(
+        ty,
+        "str"
+            | "std::string::String"
+            | "alloc::string::String"
+            | "std::ffi::OsString"
+            | "std::ffi::OsStr"
+            | "std::path::PathBuf"
+            | "std::path::Path"
+    )
+}
+
+/// The generic arguments of a rendered type, split at top-level
+/// commas: `std::boxed::Box<T, A>` yields `["T", "A"]`.
+fn generic_args_of(ty: &str) -> Vec<String> {
+    let Some(open) = ty.find('<') else {
+        return Vec::new();
+    };
+    let mut depth = 0usize;
+    let mut close = None;
+    for (i, c) in ty[open..].char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(open + i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(close) = close else {
+        return Vec::new();
+    };
+    let inner = &ty[open + 1..close];
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (i, c) in inner.char_indices() {
+        match c {
+            '<' | '[' | '(' => depth += 1,
+            '>' | ']' | ')' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(inner[start..i].trim().to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(inner[start..].trim().to_string());
+    parts.retain(|p| !p.is_empty());
+    parts
+}
+
+/// The first generic argument of a rendered type, if any.
+fn first_generic_param(ty: &str) -> Option<String> {
+    generic_args_of(ty).into_iter().next()
+}
+
+/// The last generic argument of a rendered type, if any (the
+/// borrowed type of a `Cow<'_, B>` is its last parameter).
+fn last_generic_param(ty: &str) -> Option<String> {
+    generic_args_of(ty).into_iter().last()
+}
+
 fn one_field_value(value: Value, what: &str) -> InterpResult<Value> {
     match value {
         Value::Enum { fields, .. } if fields.len() == 1 => {
