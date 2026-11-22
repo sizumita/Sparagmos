@@ -6081,7 +6081,10 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::VecLen | Builtin::VecIsEmpty => {
                 arity(1)?;
-                let value = self.resolve_value(frames, &vals[0])?;
+                // Only the length is read: resolve by borrowing,
+                // so the query does not clone every element of the
+                // vector the way the owned resolution did.
+                let value = self.resolve_ref(frames, &vals[0])?;
                 let len = value.len().ok_or_else(|| {
                     InterpError::type_mismatch(
                         "Vec length",
@@ -6162,7 +6165,9 @@ impl<'a> Interpreter<'a> {
                         ));
                     }
                 };
-                let resolved = self.resolve_value(frames, &vals[0])?;
+                // Only the element count is read: borrow the
+                // receiver instead of cloning every element.
+                let resolved = self.resolve_ref(frames, &vals[0])?;
                 let len = value_elements(&resolved)?.len() as u128;
                 let elem_tag = generic_args.first().map(String::as_str).unwrap_or("");
                 let (elem_size, _) = type_layout(elem_tag).ok_or_else(|| {
@@ -10758,7 +10763,10 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         if matches!(target, Resolved::Value(..)) {
             return Ok(None);
         }
-        let base = self.read_resolved(frames, &target)?;
+        // The base is only inspected (its length and form): read
+        // it by borrowing, so indexing a vector does not clone
+        // every element before returning one element's reference.
+        let base = self.read_resolved_ref(frames, &target)?;
         let len = match fat_len {
             Some(len) => len,
             None => match base.len() {
@@ -10771,7 +10779,7 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                 "index out of bounds: the len is {len} but the index is {idx}"
             )));
         }
-        if !matches!(base, Value::Tuple(_) | Value::Enum { .. }) {
+        if !matches!(&*base, Value::Tuple(_) | Value::Enum { .. }) {
             return Ok(None);
         }
         let refr = match target {
