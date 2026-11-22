@@ -6438,6 +6438,10 @@ impl<'a> Interpreter<'a> {
                         return Err(InterpError::type_mismatch(
                             "integer-to-enum transmute",
                             "an integer value",
+                            other.kind_name(),
+                        ))
+                    }
+                };
                 match discriminants.iter().position(|d| *d as u128 == bits) {
                     Some(variant) => Ok(Value::Enum {
                         variant: variant as u32,
