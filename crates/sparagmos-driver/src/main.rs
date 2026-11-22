@@ -2400,14 +2400,33 @@ fn drop_impl_methods(
         }
         // `<crate::Type<Params> as ...::Drop>::drop`: the key is
         // the self type's path without its parameter list.
+        // Stripping at the first `<` is wrong for a type defined
+        // inside a function (a cleanup helper is the common
+        // shape): its name is
+        // `<Outer<Args>::method::LocalType<Params> as ...>::drop`,
+        // and the first `<` ends the OUTER type's path, so the
+        // local type's destructor would be demanded for the outer
+        // type -- with the outer type's arguments, an
+        // instantiation the compiler itself rejects. Strip every
+        // balanced `<...>` group instead, which leaves the full
+        // path, function segment included.
         let Some(rest) = name.strip_prefix('<') else {
             continue;
         };
         let Some((self_part, _)) = rest.split_once(" as ") else {
             continue;
         };
-        let base = self_part.split('<').next().unwrap_or(self_part);
-        out.entry(base.to_string()).or_insert(f);
+        let mut base = String::with_capacity(self_part.len());
+        let mut depth = 0usize;
+        for ch in self_part.chars() {
+            match ch {
+                '<' => depth += 1,
+                '>' => depth = depth.saturating_sub(1),
+                _ if depth == 0 => base.push(ch),
+                _ => {}
+            }
+        }
+        out.entry(base).or_insert(f);
     }
     out
 }
