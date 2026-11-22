@@ -12870,3 +12870,198 @@ fn run_mode_thread_spawn_zeroed_array_under_optimization() {
     assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "");
 }
+
+const DYN_ANY_GENERIC_PAYLOADS_SRC: &str = r#"
+use std::any::Any;
+use std::cell::{Cell, RefCell};
+fn main() {
+    let b: Box<dyn Any> = Box::new(Cell::new(1u32));
+    println!("cell is: {}", b.is::<Cell<u32>>());
+    match b.downcast::<Cell<u32>>() {
+        Ok(c) => println!("cell: {}", c.get()),
+        Err(_) => println!("cell FAILED"),
+    }
+    let b: Box<dyn Any> = Box::new(vec![1u32, 2, 3]);
+    println!("vec is: {}", b.is::<Vec<u32>>());
+    match b.downcast::<Vec<u32>>() {
+        Ok(v) => println!("vec len: {}", v.len()),
+        Err(_) => println!("vec FAILED"),
+    }
+    let b: Box<dyn Any> = Box::new(RefCell::new(4u32));
+    println!("refcell is: {}", b.is::<RefCell<u32>>());
+    match b.downcast::<RefCell<u32>>() {
+        Ok(c) => println!("refcell: {}", c.into_inner()),
+        Err(_) => println!("refcell FAILED"),
+    }
+}
+"#;
+
+#[test]
+fn run_mode_dyn_any_downcast_generic_payloads() {
+    // The concrete tag a `dyn Any` value carries is the fully
+    // rendered type, generic arguments included — the same
+    // rendering a downcast's generic argument carries. Payloads
+    // whose types have generic arguments (Cell, Vec, RefCell)
+    // therefore answer `is` and `downcast` like argument-free
+    // payloads do.
+    run_ok(
+        "dyn-any-generic",
+        DYN_ANY_GENERIC_PAYLOADS_SRC,
+        "cell is: true\ncell: 1\nvec is: true\nvec len: 3\nrefcell is: true\nrefcell: 4\n",
+    );
+}
+
+const DYN_ANY_DOWNCAST_WRITE_SRC: &str = r#"
+use std::any::Any;
+use std::cell::Cell;
+use std::ops::{Deref, DerefMut};
+fn main() {
+    let b: Box<dyn Any> = Box::new(String::from("a"));
+    let mut b = match b.downcast::<String>() {
+        Ok(x) => x,
+        Err(_) => panic!("downcast failed"),
+    };
+    let s: &mut String = DerefMut::deref_mut(&mut b);
+    s.push_str("z");
+    println!("{}", b.as_str());
+    let b: Box<dyn Any> = Box::new(Cell::new(1u32));
+    let b = match b.downcast::<Cell<u32>>() {
+        Ok(x) => x,
+        Err(_) => panic!("downcast failed"),
+    };
+    let r: &Cell<u32> = Deref::deref(&b);
+    r.set(5);
+    println!("{}", b.get());
+}
+"#;
+
+#[test]
+fn run_mode_dyn_any_downcast_constructed_box_writes_through_deref() {
+    // A by-value downcast of a constructed `Box<dyn Any>` hands
+    // back the box itself (the dyn value's base), not a box
+    // wrapped around it: writes through the result's `Deref` /
+    // `DerefMut` reach the payload, as they do for a box that was
+    // never erased.
+    run_ok("dyn-any-write", DYN_ANY_DOWNCAST_WRITE_SRC, "az\n5\n");
+}
+
+const DYN_ANY_DOWNCAST_REF_SRC: &str = r#"
+use std::any::Any;
+fn main() {
+    let b: Box<dyn Any> = Box::new(vec![10u32, 20, 30]);
+    match b.downcast_ref::<Vec<u32>>() {
+        Some(v) => println!("ref len {} first {}", v.len(), v[0]),
+        None => println!("ref FAILED"),
+    }
+}
+"#;
+
+#[test]
+fn run_mode_dyn_any_downcast_ref_denotes_the_payload() {
+    // `downcast_ref` denotes the payload the box points at, not
+    // the box aggregate itself (which would report the box's own
+    // one-field shape, e.g. a length of 1 for a 3-element Vec).
+    run_ok("dyn-any-ref", DYN_ANY_DOWNCAST_REF_SRC, "ref len 3 first 10\n");
+}
+
+const PANIC_ANY_GENERIC_PAYLOAD_SRC: &str = r#"
+use std::any::Any;
+use std::cell::Cell;
+use std::panic;
+fn main() {
+    let r = panic::catch_unwind(|| {
+        panic::panic_any(Cell::new(7u32));
+    });
+    let err = match r {
+        Ok(()) => panic!("no panic"),
+        Err(e) => e,
+    };
+    println!("is: {}", err.is::<Cell<u32>>());
+    match err.downcast_ref::<Cell<u32>>() {
+        Some(c) => println!("ref: {}", c.get()),
+        None => println!("ref FAILED"),
+    }
+    match err.downcast::<Cell<u32>>() {
+        Ok(c) => println!("downcast: {}", c.get()),
+        Err(_) => println!("downcast FAILED"),
+    }
+}
+"#;
+
+#[test]
+fn run_mode_panic_any_generic_payload_downcast() {
+    // A fabricated payload box (a caught panic's payload) has the
+    // same box shape as a constructed one, so the full
+    // is / downcast_ref / downcast surface works on a payload
+    // whose type carries generic arguments.
+    run_ok(
+        "panic-any-generic",
+        PANIC_ANY_GENERIC_PAYLOAD_SRC,
+        "is: true\nref: 7\ndowncast: 7\n",
+    );
+}
+
+const RESUME_UNWIND_GENERIC_PAYLOAD_SRC: &str = r#"
+use std::any::Any;
+use std::cell::Cell;
+use std::panic;
+fn main() {
+    let r = panic::catch_unwind(|| {
+        panic::panic_any(Cell::new(3u32));
+    });
+    let err = match r {
+        Ok(()) => panic!("no panic"),
+        Err(e) => e,
+    };
+    let r2 = panic::catch_unwind(panic::AssertUnwindSafe(move || {
+        panic::resume_unwind(err);
+    }));
+    let err2 = match r2 {
+        Ok(()) => panic!("no panic"),
+        Err(e) => e,
+    };
+    match err2.downcast::<Cell<u32>>() {
+        Ok(c) => println!("resumed: {}", c.get()),
+        Err(_) => println!("resumed FAILED"),
+    }
+}
+"#;
+
+#[test]
+fn run_mode_resume_unwind_generic_payload_downcast() {
+    // A resumed panic re-raises the payload itself (the dyn box's
+    // pointee), so the payload survives the round trip through
+    // resume_unwind and a second catch with its type and value
+    // intact.
+    run_ok(
+        "resume-generic",
+        RESUME_UNWIND_GENERIC_PAYLOAD_SRC,
+        "resumed: 3\n",
+    );
+}
+
+const DYN_ANY_DEBUG_SRC: &str = r#"
+use std::any::Any;
+use std::fmt::Debug;
+#[derive(Debug)]
+struct Named { x: i32 }
+fn main() {
+    let b: Box<dyn Any> = Box::new(Named { x: 1 });
+    println!("{:?}", b);
+    let d: Box<dyn Debug> = Box::new(Named { x: 2 });
+    println!("{:?}", d);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_any_debug_is_opaque() {
+    // The `Debug` entry of a `dyn Any` vtable is `Any`'s own
+    // impl, which prints the opaque `Any { .. }` whatever the
+    // concrete type; a `dyn Debug` value formats its concrete
+    // type as usual.
+    run_ok(
+        "dyn-any-debug",
+        DYN_ANY_DEBUG_SRC,
+        "Any { .. }\nNamed { x: 2 }\n",
+    );
+}
