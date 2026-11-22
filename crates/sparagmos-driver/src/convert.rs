@@ -1067,7 +1067,7 @@ impl Converter {
             return None;
         };
         let canonical = sparagmos_interp::builtins::canonical_name(&def.def_id().name());
-        let builtin = sparagmos_interp::builtins::lookup(&canonical);
+        let builtin = sparagmos_interp::builtins::lookup_qualified(&canonical);
         // The location intrinsic is not itself `#[track_caller]`
         // (it produces the location rather than receiving one),
         // so the gate below would never stamp its calls. That is

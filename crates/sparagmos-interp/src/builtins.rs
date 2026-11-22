@@ -1367,7 +1367,32 @@ pub enum SimdOp {
     WithExposedProvenance,
 }
 
-/// Look a canonical callee name up in the registry.
+/// The index just past the first top-level `::` of a path, if
+/// it has one: the end of its leading segment. A `<`-qualified
+/// path (an impl path) has no leading segment to remove, and a
+/// `::` inside a generic argument group does not separate
+/// segments.
+fn leading_segment_end(name: &str) -> Option<usize> {
+    if name.starts_with('<') {
+        return None;
+    }
+    let bytes = name.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'<' => depth += 1,
+            b'>' => depth = depth.saturating_sub(1),
+            b':' if depth == 0 && bytes.get(i + 1) == Some(&b':') => {
+                return Some(i + 2);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Whether a builtin consumes the caller-location stamp the
 /// driver appends to `#[track_caller]` calls: the location
 /// intrinsic (the stamp is its result) and the panic entry
@@ -1508,6 +1533,9 @@ pub fn foreign_helper_lookup(canonical: &str) -> Option<Builtin> {
     })
 }
 
+/// Look a canonical callee name up in the registry, spelled
+/// exactly as given; `None` when the interpreter has no model
+/// for it.
 pub fn lookup(canonical: &str) -> Option<Builtin> {
     use FmtTrait as F;
     Some(match canonical {
@@ -2368,6 +2396,35 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         }
         _ => return float_method(canonical),
     })
+}
+
+/// Look a canonical callee name up in the registry, tolerating
+/// a crate-qualified spelling. A callee reached through an
+/// extern crate the referencing crate links (and possibly
+/// renames) itself carries that crate's name in front of the
+/// defining path -- `vec_macro_no_std::alloc::alloc::__rust_alloc`
+/// for a `#![no_std]` crate with `extern crate alloc`, or
+/// `krate::other::alloc::handle_alloc_error` through
+/// `extern crate std as other`. The item is the same one the
+/// unprefixed spelling names, so when the full spelling matches
+/// nothing, retry with leading path segments removed, one at a
+/// time. Names that match as spelled are unaffected, and a
+/// collected body still wins over a builtin wherever the driver
+/// collects one. All builtin-name consumers go through this
+/// entry point; [`lookup`] is the exact-spelling registry
+/// behind it.
+pub fn lookup_qualified(canonical: &str) -> Option<Builtin> {
+    if let Some(kind) = lookup(canonical) {
+        return Some(kind);
+    }
+    let mut rest = canonical;
+    while let Some(pos) = leading_segment_end(rest) {
+        rest = &rest[pos..];
+        if let Some(kind) = lookup(rest) {
+            return Some(kind);
+        }
+    }
+    None
 }
 
 /// Resolve a primitive float method callee

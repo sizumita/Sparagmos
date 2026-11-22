@@ -4817,7 +4817,7 @@ impl<'a> Converter<'a> {
     fn external_builtin(&self, func: &mir::Operand) -> bool {
         self.resolve_external_callee(func).is_some_and(|(name, _, _)| {
             let canonical = crate::builtins::canonical_name(&name);
-            crate::builtins::lookup(&canonical).is_some()
+            crate::builtins::lookup_qualified(&canonical).is_some()
                 || crate::builtins::foreign_helper_lookup(&canonical).is_some()
         })
     }
@@ -5658,7 +5658,7 @@ impl<'a> Converter<'a> {
                     self.resolve_external_callee(func)
                 {
                     let canonical = crate::builtins::canonical_name(&name);
-                    let kind = crate::builtins::lookup(&canonical)
+                    let kind = crate::builtins::lookup_qualified(&canonical)
                         .filter(|kind| {
                             !self.consumer_prefers_body(*kind, func, &raw_generic_args)
                         })

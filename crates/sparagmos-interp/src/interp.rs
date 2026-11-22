@@ -290,6 +290,35 @@ pub(crate) fn rc_handle_id(value: &Value) -> Option<u64> {
     }
 }
 
+/// The allocation a hand-built `RawWaker` aggregate's data
+/// pointer denotes, when the waker was made from an `Rc` / `Arc`
+/// (the shape `ArcWake::into_waker` and its kin produce): the
+/// aggregate's fields are (data, vtable), and the data pointer
+/// is the one `Rc::into_raw` / `Arc::into_raw` returned -- a
+/// reference to the value field (field 2) of the handle's
+/// `RcInner` / `ArcInner` allocation. Releasing such a waker is
+/// releasing that handle, which is what its vtable's drop
+/// function does. `None` for any other shape.
+pub(crate) fn raw_waker_alloc_id(value: &Value) -> Option<u64> {
+    let Value::Enum { fields, .. } = value else {
+        return None;
+    };
+    let [data, vtable] = fields.as_slice() else {
+        return None;
+    };
+    if !matches!(vtable, Value::Ref(_)) {
+        return None;
+    }
+    match data {
+        Value::Ref(RefTarget::Alloc { id, projection })
+            if projection.as_slice() == [RefProj::Field(2)] =>
+        {
+            Some(*id)
+        }
+        _ => None,
+    }
+}
+
 /// The count leaf of one reference count of an `RcInner` /
 /// `ArcInner` aggregate: field `field` (0 = strong, 1 = weak) is
 /// a `Cell<usize>` / `AtomicUsize` wrapper around an
@@ -1807,7 +1836,7 @@ impl<'a> Interpreter<'a> {
             return None;
         }
         let canonical = crate::builtins::canonical_name(func);
-        if let Some(kind) = crate::builtins::lookup(&canonical) {
+        if let Some(kind) = crate::builtins::lookup_qualified(&canonical) {
             if crate::builtins::runtime_name_fallback(kind) {
                 return self.fallback_generic_args(kind, &canonical)
                     .map(|args| (canonical, kind, args));
@@ -1830,7 +1859,7 @@ impl<'a> Interpreter<'a> {
         // markers folded away.
         if canonical.contains("::<") {
             let folded = canonical.replace("::<", "<");
-            if let Some(kind) = crate::builtins::lookup(&folded) {
+            if let Some(kind) = crate::builtins::lookup_qualified(&folded) {
                 if crate::builtins::runtime_name_fallback(kind) {
                     return self
                         .fallback_generic_args(kind, &folded)
@@ -3095,6 +3124,39 @@ impl<'a> Interpreter<'a> {
         Ok(cur)
     }
 
+    /// The (data pointer, drop function) a genuine `RawWaker`
+    /// aggregate value carries: field 0 is the data pointer the
+    /// vtable functions act on, field 1 a reference to the
+    /// vtable value, whose four function pointers are (clone,
+    /// wake, wake_by_ref, drop). `None` for any other shape.
+    fn raw_waker_drop_fn(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+    ) -> InterpResult<Option<(Value, String)>> {
+        let Value::Enum { fields, .. } = value else {
+            return Ok(None);
+        };
+        let [data, vtable] = fields.as_slice() else {
+            return Ok(None);
+        };
+        if !matches!(data, Value::Ref(_)) || !matches!(vtable, Value::Ref(_)) {
+            return Ok(None);
+        }
+        let resolved = self.deref_value(frames, vtable)?;
+        let table = self.read_resolved(frames, &resolved)?;
+        let Value::Enum { fields, .. } = &table else {
+            return Ok(None);
+        };
+        if fields.len() != 4 {
+            return Ok(None);
+        }
+        let Value::FnPtr(drop_fn) = &fields[3] else {
+            return Ok(None);
+        };
+        Ok(Some((data.clone(), drop_fn.clone())))
+    }
+
     /// Execute drop glue: process `work` until it is empty or a
     /// destructor call has to run. A destructor call pushes its
     /// frame plus a [`DropContinuation`] and returns; the `Return`
@@ -3338,12 +3400,71 @@ impl<'a> Interpreter<'a> {
                         let Some(handle) = self.read_at(frames, &active.root, &path)? else {
                             continue;
                         };
-                        let Some(id) = rc_handle_id(&handle) else {
-                            return Err(InterpError::type_mismatch(
-                                "reference-counted handle drop glue",
-                                "an Rc/Arc handle",
-                                handle.kind_name(),
-                            ));
+                        let id = match rc_handle_id(&handle)
+                            .or_else(|| raw_waker_alloc_id(&handle))
+                        {
+                            Some(id) => id,
+                            None => {
+                                // A hand-built waker whose data
+                                // pointer does not denote an
+                                // Rc/Arc allocation field (see
+                                // `raw_waker_alloc_id`): its
+                                // release is the vtable's drop
+                                // function, run on the data
+                                // pointer, exactly as the real
+                                // `Waker` drop does. The call
+                                // suspends this session like a
+                                // destructor call does.
+                                if let Some((data, drop_fn)) =
+                                    self.raw_waker_drop_fn(frames, &handle)?
+                                {
+                                    let callee = self
+                                        .program
+                                        .get(&drop_fn)
+                                        .ok_or_else(|| InterpError::UnknownFunction {
+                                            name: drop_fn.clone(),
+                                        })?;
+                                    if frames.len() >= self.config.max_call_depth {
+                                        return Err(InterpError::CallDepthExceeded {
+                                            limit: self.config.max_call_depth,
+                                        });
+                                    }
+                                    let (arg_count, local_count) =
+                                        (callee.arg_count, callee.local_count());
+                                    if arg_count != 1 || local_count < 2 {
+                                        return Err(InterpError::type_mismatch(
+                                            format!("waker vtable drop `{drop_fn}`"),
+                                            "one argument",
+                                            format!("{arg_count} argument(s)"),
+                                        ));
+                                    }
+                                    let mut locals = vec![Value::Uninit; local_count];
+                                    locals[1] = data;
+                                    let frame_id = self.fresh_frame_id();
+                                    self.drop_continuations.push(DropContinuation {
+                                        callee_frame: frame_id,
+                                        session: active,
+                                        sessions: suspended,
+                                    });
+                                    frames.push(Frame {
+                                        id: frame_id,
+                                        func: drop_fn,
+                                        locals,
+                                        block: 0,
+                                        stmt: 0,
+                                        return_dest: None,
+                                        return_block: None,
+                                        unwind_payload: None,
+                                        in_cleanup: false,
+                                    });
+                                    return Ok(());
+                                }
+                                return Err(InterpError::type_mismatch(
+                                    "reference-counted handle drop glue",
+                                    "an Rc/Arc handle",
+                                    handle.kind_name(),
+                                ));
+                            }
                         };
                         if !self.rc_dec_strong(id)? {
                             continue;
@@ -4361,6 +4482,80 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// The base value a bulk byte operation reads at `target`:
+    /// the resolved value, or -- for a pointer displaced into a
+    /// scalar's storage -- the byte the pointer denotes. The
+    /// operation's element is a byte by construction, so the
+    /// displaced position is a byte position here; a displaced
+    /// read anywhere else (a wider element load) stays the
+    /// explicit projection error `project_value` raises.
+    fn read_bulk_base(&self, frames: &[Frame], target: &Resolved) -> InterpResult<Value> {
+        match self.read_resolved(frames, target) {
+            Ok(v) => Ok(v),
+            Err(e) => match self.displaced_scalar_byte(frames, target) {
+                Ok(Some(byte)) => Ok(byte),
+                _ => Err(e),
+            },
+        }
+    }
+
+    /// The byte at the displacement of a target whose projection
+    /// ends in a byte-offset step into a scalar's storage, when
+    /// the base under the displacement is a scalar; `None` for
+    /// every other shape.
+    fn displaced_scalar_byte(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+    ) -> InterpResult<Option<Value>> {
+        let (base_target, disp) = match target {
+            Resolved::Place {
+                frame_pos,
+                local,
+                projection,
+            } => match projection.split_last() {
+                Some((&RefProj::ByteOffset(d), head)) if d >= 0 => (
+                    Resolved::Place {
+                        frame_pos: *frame_pos,
+                        local: *local,
+                        projection: head.to_vec(),
+                    },
+                    d as usize,
+                ),
+                _ => return Ok(None),
+            },
+            Resolved::Static { name, projection } => match projection.split_last() {
+                Some((&RefProj::ByteOffset(d), head)) if d >= 0 => (
+                    Resolved::Static {
+                        name: name.clone(),
+                        projection: head.to_vec(),
+                    },
+                    d as usize,
+                ),
+                _ => return Ok(None),
+            },
+            Resolved::Alloc { id, projection } => match projection.split_last() {
+                Some((&RefProj::ByteOffset(d), head)) if d >= 0 => (
+                    Resolved::Alloc {
+                        id: *id,
+                        projection: head.to_vec(),
+                    },
+                    d as usize,
+                ),
+                _ => return Ok(None),
+            },
+            Resolved::Value(base, projection) => match projection.split_last() {
+                Some((&RefProj::ByteOffset(d), head)) if d >= 0 => (
+                    Resolved::Value(base.clone(), head.to_vec()),
+                    d as usize,
+                ),
+                _ => return Ok(None),
+            },
+        };
+        let base = self.read_resolved(frames, &base_target)?;
+        Ok(scalar_storage_byte(&base, disp).map(|byte| Value::Uint(u128::from(byte))))
+    }
+
     /// The element copy behind `copy_nonoverlapping`, shared by the
     /// `StatementKind::Intrinsic` form (a direct
     /// `core::intrinsics::copy_nonoverlapping` call in MIR) and the
@@ -4424,7 +4619,7 @@ impl<'a> Interpreter<'a> {
                         Value::Tuple(_) | Value::FatRef { .. } | Value::Bytes(_) | Value::Str(_)
                     )
                 };
-                let src_base = self.read_resolved(frames, &src_target)?;
+                let src_base = self.read_bulk_base(frames, &src_target)?;
                 // The elements are values of the element type. When
                 // that type is known and the value found at the
                 // source IS one element -- possibly inside a
@@ -6217,9 +6412,7 @@ impl<'a> Interpreter<'a> {
                     return Ok(());
                 }
                 let place_desc = format!("static {name}");
-                let slot = navigate_mut(slot, projection, "<static>", &place_desc)?;
-                *slot = value;
-                Ok(())
+                assign_projected(slot, projection, value, "<static>", &place_desc)
             }
             Resolved::Alloc { id, projection } => {
                 let mut store = self.allocs.borrow_mut();
@@ -6270,9 +6463,7 @@ impl<'a> Interpreter<'a> {
                     }
                 }
                 let place_desc = format!("allocation #{id}");
-                let slot = navigate_mut(slot, projection, "<allocation>", &place_desc)?;
-                *slot = value;
-                Ok(())
+                assign_projected(slot, projection, value, "<allocation>", &place_desc)
             }
             Resolved::Place {
                 frame_pos,
@@ -6306,9 +6497,7 @@ impl<'a> Interpreter<'a> {
                         local: *local,
                     }
                 })?;
-                let slot = navigate_mut(slot, projection, &func, &place_desc)?;
-                *slot = value;
-                Ok(())
+                assign_projected(slot, projection, value, &func, &place_desc)
             }
         }
     }
@@ -6874,6 +7063,16 @@ impl<'a> Interpreter<'a> {
             {
                 Ok(value)
             }
+            // A byte read through a `*const u8` / `*const i8`
+            // whose pointee is a byte-string value: the pointer
+            // denotes the storage's first byte (any displacement
+            // has already been projected away by the read).
+            (Some(Ty::Uint(UintTy::U8)), Value::Bytes(b)) if !b.is_empty() => {
+                Ok(Value::Uint(u128::from(b[0])))
+            }
+            (Some(Ty::Int(IntTy::I8)), Value::Bytes(b)) if !b.is_empty() => {
+                Ok(Value::Int(i128::from(b[0] as i8)))
+            }
             (Some(Ty::Slice(_)), Value::FatRef { .. }) => Ok(value),
             // Coroutine locals hold the state object itself. (A
             // coroutine value also reaches places typed as the ADT
@@ -6881,6 +7080,16 @@ impl<'a> Interpreter<'a> {
             // wrapper's aggregate value, which is checked as the
             // wrapper, not here.)
             (Some(Ty::Coroutine(_)), Value::Coroutine { .. }) => Ok(value),
+            // The async-drop transform types a coroutine body's
+            // resume place as the ADT `std::future::ResumeTy`,
+            // the wrapper the coroutine environment travels in;
+            // the value stored there is the coroutine object
+            // itself, exactly as in a coroutine-typed place.
+            (Some(Ty::Adt(name)), Value::Coroutine { .. })
+                if name == "std::future::ResumeTy" =>
+            {
+                Ok(value)
+            }
             (Some(expected), other) => Err(InterpError::type_mismatch(
                 "assignment",
                 format!("{expected:?}"),
@@ -8389,7 +8598,10 @@ pub(crate) fn project_value(
     place: &str,
 ) -> InterpResult<Value> {
     let mut value = value;
-    for step in projection {
+    let mut step_idx = 0;
+    while step_idx < projection.len() {
+        let step = &projection[step_idx];
+        step_idx += 1;
         if value == Value::Uninit {
             return Err(InterpError::UninitializedRead {
                 func: func.to_string(),
@@ -8520,11 +8732,26 @@ pub(crate) fn project_value(
                     .cloned()
                     .ok_or_else(|| index_oob(fields.len(), *idx))?,
                 ref other => {
-                    return Err(InterpError::type_mismatch(
-                        format!("index projection on {place}"),
-                        "array, byte or string value",
-                        other.kind_name(),
-                    ));
+                    // A scalar's storage is byte-addressable
+                    // through a raw byte pointer (see
+                    // `scalar_storage_byte`): the index step
+                    // reads the byte at that offset of the
+                    // storage, the only element it has.
+                    if let Some(len) = scalar_storage_len(other) {
+                        if *idx >= len {
+                            return Err(index_oob(len, *idx));
+                        }
+                        Value::Uint(u128::from(
+                            scalar_storage_byte(other, *idx)
+                                .expect("index inside the storage"),
+                        ))
+                    } else {
+                        return Err(InterpError::type_mismatch(
+                            format!("index projection on {place}"),
+                            "array, byte or string value",
+                            other.kind_name(),
+                        ));
+                    }
                 }
             },
             RefProj::Subslice { offset, len } => {
@@ -8631,6 +8858,32 @@ pub(crate) fn project_value(
             RefProj::ByteOffset(disp) => {
                 if *disp == 0 {
                     value
+                } else if *disp >= 0 {
+                    let Some(len) = scalar_storage_len(&value) else {
+                        return Err(InterpError::UnsupportedProjection {
+                            kind: format!(
+                                "read through a pointer displaced {disp} bytes from a value boundary"
+                            ),
+                        });
+                    };
+                    let Some(&RefProj::Index(k)) = projection.get(step_idx) else {
+                        return Err(InterpError::UnsupportedProjection {
+                            kind: format!(
+                                "read through a pointer displaced {disp} bytes from a value boundary"
+                            ),
+                        });
+                    };
+                    // A byte read through a pointer displaced into
+                    // a scalar's storage: the index step that
+                    // follows selects the byte at the combined
+                    // offset, the read side of the byte view
+                    // `scalar_storage_byte` describes.
+                    let at = *disp as usize + k;
+                    step_idx += 1;
+                    match scalar_storage_byte(&value, at) {
+                        Some(byte) => Value::Uint(u128::from(byte)),
+                        None => return Err(index_oob(len, at)),
+                    }
                 } else {
                     // The position does not coincide with a value
                     // boundary, and the model has no byte-level
@@ -8645,6 +8898,148 @@ pub(crate) fn project_value(
         };
     }
     Ok(value)
+}
+
+/// The number of bytes in a scalar value's storage, for the
+/// byte-level view of that storage a raw byte pointer has (see
+/// [`scalar_storage_byte`]). Integers ride in a 128-bit slot, so
+/// their storage is the full 16 bytes; the guest only ever
+/// addresses the bytes of the value's own declared width, which
+/// are the low ones.
+fn scalar_storage_len(value: &Value) -> Option<usize> {
+    match value {
+        Value::Bool(_) => Some(1),
+        Value::Float(_) => Some(8),
+        Value::Int(_) | Value::Uint(_) | Value::Float128(_) => Some(16),
+        _ => None,
+    }
+}
+
+/// Byte `idx` of a scalar value's storage, little-endian: the
+/// byte a `*const u8` cast of the value's address reads at that
+/// offset. Bulk byte copies move data in and out of scalar
+/// buffers this way (SipHash's `Hasher::write` assembles its
+/// next word in a `u64` local), so an index step applied to a
+/// scalar value denotes this byte, the only element a scalar's
+/// storage has. `None` for a non-scalar value or an index past
+/// the storage.
+fn scalar_storage_byte(value: &Value, idx: usize) -> Option<u8> {
+    let len = scalar_storage_len(value)?;
+    if idx >= len {
+        return None;
+    }
+    let bits: u128 = match value {
+        Value::Bool(b) => u128::from(*b),
+        Value::Int(i) => *i as u128,
+        Value::Uint(u) => *u,
+        Value::Float(f) => u128::from(f.to_bits()),
+        Value::Float128(bits) => *bits,
+        _ => return None,
+    };
+    Some((bits >> (8 * idx)) as u8)
+}
+
+/// The byte a written value carries when it is a byte value: a
+/// `u8` (or an `i8`, or a `bool`) written through a byte pointer.
+fn value_as_storage_byte(value: &Value) -> Option<u8> {
+    match value {
+        Value::Uint(u) if *u <= 0xff => Some(*u as u8),
+        Value::Int(i) if (-128..=127).contains(i) => Some(*i as u8),
+        Value::Bool(b) => Some(*b as u8),
+        _ => None,
+    }
+}
+
+/// Splice `byte` into byte `idx` of a scalar value's storage
+/// (see [`scalar_storage_byte`]), in place. An unwritten slot is
+/// zero storage for this purpose: a buffer being filled byte by
+/// byte is written whole before it is read, so the bytes the
+/// fill has not reached yet are never observed. Returns whether
+/// the splice applied (the slot held a scalar, or no value, and
+/// the index is inside the storage).
+fn splice_scalar_storage_byte(slot: &mut Value, idx: usize, byte: u8) -> bool {
+    let len = match &*slot {
+        Value::Uninit => 16,
+        other => match scalar_storage_len(other) {
+            Some(len) => len,
+            None => return false,
+        },
+    };
+    if idx >= len {
+        return false;
+    }
+    let bits: u128 = match &*slot {
+        Value::Bool(b) => u128::from(*b),
+        Value::Int(i) => *i as u128,
+        Value::Uint(u) => *u,
+        Value::Float(f) => u128::from(f.to_bits()),
+        Value::Float128(bits) => *bits,
+        _ => 0,
+    };
+    let bits = (bits & !(0xffu128 << (8 * idx))) | (u128::from(byte) << (8 * idx));
+    *slot = match &*slot {
+        Value::Bool(_) => Value::Bool(bits != 0),
+        Value::Int(_) => Value::Int(bits as i128),
+        Value::Float(_) => Value::Float(f64::from_bits(bits as u64)),
+        Value::Float128(_) => Value::Float128(bits),
+        _ => Value::Uint(bits),
+    };
+    true
+}
+
+/// Assign `value` to the slot `projection` selects inside the
+/// stored value `slot` (the final step of a `write_resolved`
+/// once the target's base slot is in hand). One shape needs a
+/// read-modify-write instead of a slot assignment: a byte
+/// written through a trailing index step into a scalar's
+/// storage (see [`scalar_storage_byte`]) has no byte slot to
+/// hand out, so it is spliced into the scalar in place. Every
+/// other shape navigates to the selected slot and assigns, with
+/// exactly the errors that navigation produced before.
+fn assign_projected(
+    slot: &mut Value,
+    projection: &[RefProj],
+    value: Value,
+    func: &str,
+    place: &str,
+) -> InterpResult<()> {
+    if let Some((&RefProj::ByteOffset(disp), head)) = projection.split_last() {
+        // A byte written through a pointer displaced into a
+        // scalar's storage, with no index step after the
+        // displacement (a one-byte bulk write, or the direct
+        // write of a single element): the byte value being
+        // written is what makes the position a byte position.
+        if disp >= 0 {
+            if let Some(byte) = value_as_storage_byte(&value) {
+                if let Ok(head_slot) = navigate_mut(slot, head, func, place) {
+                    if splice_scalar_storage_byte(head_slot, disp as usize, byte) {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+    if let Some((&RefProj::Index(idx), head)) = projection.split_last() {
+        // A byte pointer displaced into the storage first
+        // (`p.add(k)`) puts a byte-offset step immediately before
+        // the index step; the byte position is the sum.
+        let (idx, head) = match head.split_last() {
+            Some((&RefProj::ByteOffset(disp), head)) if disp >= 0 => {
+                (idx + disp as usize, head)
+            }
+            _ => (idx, head),
+        };
+        if let Some(byte) = value_as_storage_byte(&value) {
+            if let Ok(head_slot) = navigate_mut(slot, head, func, place) {
+                if splice_scalar_storage_byte(head_slot, idx, byte) {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    let target = navigate_mut(slot, projection, func, place)?;
+    *target = value;
+    Ok(())
 }
 
 /// Project through `projection` by reference: the borrowing form
@@ -8762,6 +9157,22 @@ pub(crate) fn project_value_ref<'a>(
                     let v = Value::Uint(*byte as u128);
                     return Ok(Cow::Owned(project_value(v, rest, func, place)?));
                 }
+                Value::Bool(_)
+                | Value::Int(_)
+                | Value::Uint(_)
+                | Value::Float(_)
+                | Value::Float128(_) => {
+                    // A scalar's storage byte, as in
+                    // `project_value` (see `scalar_storage_byte`).
+                    let len = scalar_storage_len(cur).expect("scalar storage");
+                    if *idx >= len {
+                        return Err(index_oob(len, *idx));
+                    }
+                    let byte =
+                        scalar_storage_byte(cur, *idx).expect("index inside the storage");
+                    let v = Value::Uint(u128::from(byte));
+                    return Ok(Cow::Owned(project_value(v, rest, func, place)?));
+                }
                 other => {
                     return Err(InterpError::type_mismatch(
                         format!("index projection on {place}"),
@@ -8875,6 +9286,21 @@ pub(crate) fn project_value_ref<'a>(
             }
             RefProj::ByteOffset(disp) => {
                 if *disp != 0 {
+                    // A byte read through a pointer displaced into
+                    // a scalar's storage, as in `project_value`:
+                    // the index step that follows selects the byte
+                    // at the combined offset.
+                    if *disp >= 0 {
+                        if let (Some(len), Some(&RefProj::Index(k))) =
+                            (scalar_storage_len(cur), rest.first())
+                        {
+                            let at = *disp as usize + k;
+                            let byte = scalar_storage_byte(cur, at)
+                                .ok_or_else(|| index_oob(len, at))?;
+                            let v = Value::Uint(u128::from(byte));
+                            return Ok(Cow::Owned(project_value(v, &rest[1..], func, place)?));
+                        }
+                    }
                     // The position does not coincide with a value
                     // boundary, and the model has no byte-level
                     // view of a value's storage to reinterpret.

@@ -372,7 +372,7 @@ pub fn collect_reachable(
             // module docs). The registry is keyed by canonical
             // definition name, so this check is per definition.
             let canonical = sparagmos_interp::builtins::canonical_name(&def_name);
-            if sparagmos_interp::builtins::lookup(&canonical).is_some()
+            if sparagmos_interp::builtins::lookup_qualified(&canonical).is_some()
                 && !consumer_instance_needs_body(&canonical, &args)
                 && !partial_eq_ref_instance_needs_body(&canonical, &args)
             {

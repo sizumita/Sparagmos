@@ -3663,6 +3663,43 @@ fn execute(c: &Collected, input: &str, guest_args: &[String], overflow_checks: b
     // user's `main`, and names no stored body at all).
     let entry = sparagmos_interp::program_key_of(&program, &program.functions[entry_index]);
     let entry_name = program.functions[entry_index].name.clone();
+    // A `#[no_main]` entry in the C convention
+    // (`extern "C" fn main(argc, argv)`) declares two parameters;
+    // the interpreter's call machinery checks the argument count,
+    // so the entry invocation supplies the modelled `argc`/`argv`
+    // a native `_start` would pass: the program path followed by
+    // the guest arguments, each a NUL-terminated byte string, and
+    // a null terminator for the array. A standard entry declares
+    // no parameters and receives none, as before.
+    let entry_arg_count = c.bodies[entry_index].1.arg_count;
+    let entry_args: Vec<sparagmos_interp::Value> = if entry_arg_count == 2 {
+        let mut argv: Vec<sparagmos_interp::Value> = Vec::new();
+        let mut all_args = vec![input.to_string()];
+        all_args.extend(guest_args.iter().cloned());
+        for arg in &all_args {
+            let mut bytes = arg.as_bytes().to_vec();
+            bytes.push(0);
+            argv.push(sparagmos_interp::Value::Ref(
+                sparagmos_interp::RefTarget::value(sparagmos_interp::Value::Bytes(bytes)),
+            ));
+        }
+        argv.push(sparagmos_interp::Value::Ref(
+            sparagmos_interp::RefTarget::Null,
+        ));
+        vec![
+            sparagmos_interp::Value::Int(all_args.len() as i128),
+            // The array pointer denotes its first element, as a
+            // native argv does: element reads and pointer
+            // arithmetic over the array go through the index
+            // projection.
+            sparagmos_interp::Value::Ref(sparagmos_interp::RefTarget::Value(
+                Box::new(sparagmos_interp::Value::Tuple(argv)),
+                vec![sparagmos_interp::RefProj::Index(0)],
+            )),
+        ]
+    } else {
+        Vec::new()
+    };
     let config = sparagmos_interp::InterpConfig {
         guest_args: guest_args.to_vec(),
         program_path: input.to_string(),
@@ -3672,7 +3709,7 @@ fn execute(c: &Collected, input: &str, guest_args: &[String], overflow_checks: b
     let run = sparagmos_interp::interpret_mir_captured_with_config(
         &program,
         &entry,
-        Vec::new(),
+        entry_args,
         config,
     );
     // The guest's stdout is this process's stdout, whatever the
@@ -3703,6 +3740,14 @@ fn execute(c: &Collected, input: &str, guest_args: &[String], overflow_checks: b
                     2
                 }
             }
+        }
+        Ok(sparagmos_interp::Value::Int(code)) if entry_arg_count == 2 => {
+            // The C-convention entry's return value is the
+            // process exit status, as `_start` applies it.
+            code as i32
+        }
+        Ok(sparagmos_interp::Value::Uint(code)) if entry_arg_count == 2 => {
+            code as i32
         }
         Ok(other) => {
             eprintln!(
