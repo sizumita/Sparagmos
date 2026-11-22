@@ -54,7 +54,8 @@
 //!   `generic_simd_intrinsic` beyond the entry check above:
 //!   element-type requirements for the saturating arithmetic,
 //!   bitmask, gather/scatter, masked load/store and reduction
-//!   intrinsics, length and element agreement for shuffles,
+//!   intrinsics (the ordered reductions' initial value included),
+//!   length and element agreement for shuffles,
 //!   selects and comparisons, insert/extract element agreement,
 //!   and the constant index bounds of `simd_shuffle` (the index
 //!   values are read from the call's constant operand, the same
@@ -505,8 +506,9 @@ fn is_int_or_uint(ty: Ty) -> bool {
 
 /// The shape of a SIMD vector type as `(lane count, element
 /// type)`, read from the single array field every `#[repr(simd)]`
-/// type is built on; `None` when the type is not a SIMD type or
-/// its lane count is not a concrete value here.
+/// type is built on, or from several fields all of the same type;
+/// `None` when the type is not a SIMD type or its lane count is
+/// not a concrete value here.
 fn simd_shape(ty: Ty) -> Option<(u64, Ty)> {
     if !is_simd(ty) {
         return None;
@@ -523,6 +525,17 @@ fn simd_shape(ty: Ty) -> Option<(u64, Ty)> {
     };
     let fields = variant.fields();
     let [field] = fields.as_slice() else {
+        // A `#[repr(simd)]` type may instead be several fields
+        // all of the same type `T`; its shape is then the field
+        // count and `T`, read with the instance's arguments
+        // substituted.
+        if fields.len() < 2 {
+            return None;
+        }
+        let elem = fields[0].ty_with_args(&args);
+        if fields.iter().all(|f| f.ty_with_args(&args) == elem) {
+            return Some((fields.len() as u64, elem));
+        }
         return None;
     };
     // The field's declared type is written in terms of the
@@ -853,6 +866,22 @@ fn check_simd_family(
         | "simd_reduce_add_unordered" | "simd_reduce_mul_unordered" => {
             let in_ty = input(0)?;
             let (_, elem) = simd_shape(in_ty)?;
+            // The ordered pair takes the initial value as its
+            // second argument, and it must have the element type.
+            if matches!(
+                name,
+                "simd_reduce_add_ordered" | "simd_reduce_mul_ordered"
+            ) {
+                if let Some(initial) = input(1) {
+                    if initial != elem {
+                        return err(format!(
+                            "expected initial value type `{elem}` \
+                             (element of input `{in_ty}`), found \
+                             `{initial}`"
+                        ));
+                    }
+                }
+            }
             if ret_ty != elem {
                 return err(format!(
                     "expected return type `{elem}` (element of input \
