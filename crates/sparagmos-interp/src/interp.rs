@@ -4801,6 +4801,30 @@ impl<'a> Interpreter<'a> {
                     Ok(RefTarget::value(
                         self.offset_value_target(*v, count, elem_size)?,
                     ))
+                } else if let Some((&RefProj::Index(i), head)) = projection.split_last() {
+                    // A value target projected to an element of
+                    // the constant aggregate (the shape a
+                    // first-element cast of a constant array or
+                    // string reference produces): the offset is
+                    // counted in elements of the type the index
+                    // denotes, so it absorbs into the index
+                    // directly, whatever the element size.
+                    let idx = i128::try_from(i).map_err(|_| InterpError::UnsupportedRvalue {
+                        kind: "pointer offset: element index out of range".to_string(),
+                    })? + count;
+                    if idx < 0 {
+                        return Err(InterpError::UnsupportedRvalue {
+                            kind: "pointer offset: negative offset of a constant array"
+                                .to_string(),
+                        });
+                    }
+                    let mut projection = head.to_vec();
+                    projection.push(RefProj::Index(usize::try_from(idx).map_err(|_| {
+                        InterpError::UnsupportedRvalue {
+                            kind: "pointer offset: element index out of range".to_string(),
+                        }
+                    })?));
+                    Ok(RefTarget::Value(v, projection))
                 } else {
                     // A projected value target denotes a position
                     // inside the value: carry the displacement on
