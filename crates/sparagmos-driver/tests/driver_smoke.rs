@@ -148,3 +148,163 @@ fn driver_forwards_rustc_args() {
         "gated fn must be converted with the flag:\n{on_stdout}"
     );
 }
+
+// ---------------------------------------------------------------------
+// Convert-mode exit-code contract (Issue #66): 0 = converted,
+// 1 = the compilation failed, 101 = the compiler crashed. A crash
+// is reported only for a genuine internal failure of the compiler
+// (an internal compiler error, or a panic that escaped the
+// compiler run); a designed abort on a reported diagnostic and a
+// clean rejection stay compilation failures.
+
+fn convert_fixture(name: &str, fixture: &str, rustc_args: &[&str]) -> (Option<i32>, String) {
+    let dir = std::env::temp_dir().join(format!(
+        "sparagmos-driver-contract-{name}-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join(format!("{name}.rs"));
+    std::fs::write(&src, fixture).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"));
+    cmd.arg(&src).arg("--edition").arg("2021");
+    // Mirror the subset runner, whose invocations carry the
+    // bootstrap env the embedded nightly rustc needs for -Z flags
+    // and in-source feature gates.
+    cmd.env("RUSTC_BOOTSTRAP", "1");
+    for a in rustc_args {
+        cmd.arg("--rustc-arg").arg(a);
+    }
+    let out = cmd.output().expect("failed to run sparagmos-driver");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// The rustc test suite's known-bug #100041 shape: the compiler
+/// creates a delayed bug during compilation and flushes it by
+/// panicking at the end of the run, after printing it as an
+/// internal compiler error.
+const DELAYED_BUG_FIXTURE: &str = r#"
+pub trait WellUnformed {
+    type RequestNormalize;
+}
+
+impl<T: ?Sized> WellUnformed for T {
+    type RequestNormalize = ();
+}
+
+pub fn latent(_: &[<[[()]] as WellUnformed>::RequestNormalize; 0]) {}
+
+pub fn bang() {
+    latent(&[]);
+}
+
+fn main() {}
+"#;
+
+#[test]
+fn convert_mode_delayed_bug_is_a_compiler_crash() {
+    let (code, stderr) = convert_fixture("delayed", DELAYED_BUG_FIXTURE, &[]);
+    assert_eq!(code, Some(101), "stderr={stderr}");
+    assert!(
+        stderr.contains("internal compiler error"),
+        "the compiler's own ICE text is printed:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("sparagmos-driver: compiler crashed:")
+            && stderr.contains("delayed bug"),
+        "the crash report names the delayed bug:\n{stderr}"
+    );
+}
+
+/// The known-bug #105238 shape: instantiating the generic const
+/// expression panics inside the compiler and the panic escapes the
+/// compiler run.
+const CONVERSION_PANIC_FIXTURE: &str = r#"
+#![allow(incomplete_features)]
+#![feature(generic_const_exprs)]
+
+trait Ret {
+    type R;
+}
+
+struct Cond<const PRED: bool, U, V>(std::marker::PhantomData<U>, std::marker::PhantomData<V>);
+
+impl<U, V> Ret for Cond<true, U, V> {
+    type R = U;
+}
+
+impl<U, V> Ret for Cond<false, U, V> {
+    type R = V;
+}
+
+struct RobinHashTable<const MAX_LENGTH: usize, CellIdx = Cond<{ MAX_LENGTH < 65535 }, u16, u32>>
+where
+    CellIdx: Ret,
+{
+    _idx: CellIdx::R,
+}
+
+fn main() {
+    use std::mem::size_of;
+    println!("{}", size_of::<RobinHashTable<1024>>());
+    println!("{}", size_of::<RobinHashTable<65536>>());
+}
+"#;
+
+#[test]
+fn convert_mode_escaped_conversion_panic_is_a_compiler_crash() {
+    let (code, stderr) = convert_fixture("panic", CONVERSION_PANIC_FIXTURE, &[]);
+    assert_eq!(code, Some(101), "stderr={stderr}");
+    assert!(
+        stderr.contains("sparagmos-driver: Stable MIR conversion panicked:"),
+        "the escaped panic keeps its report line:\n{stderr}"
+    );
+}
+
+const CONST_EVAL_FIXTURE: &str = r#"
+const FOO: i32 = 1 / 0;
+fn main() { println!("{}", FOO); }
+"#;
+
+#[test]
+fn convert_mode_treat_err_abort_is_a_compilation_failure() {
+    // `-Z treat-err-as-bug` orders the compiler to abort on the
+    // reported diagnostic; that designed abort is a compilation
+    // failure, not a crash, even though the diagnostic is a
+    // const-eval error the flag promotes to a bug.
+    let (code, stderr) = convert_fixture(
+        "treaterr",
+        CONST_EVAL_FIXTURE,
+        &["-Ztreat-err-as-bug=1"],
+    );
+    assert_eq!(code, Some(1), "stderr={stderr}");
+    assert!(
+        stderr.contains("sparagmos-driver: compilation failed:")
+            && stderr.contains("treat-err-as-bug"),
+        "the abort takes the compilation-failure report:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("compiler crashed"),
+        "a designed abort is not a crash:\n{stderr}"
+    );
+}
+
+#[test]
+fn convert_mode_clean_rejection_is_a_compilation_failure() {
+    let (code, stderr) = convert_fixture(
+        "cleanfail",
+        "fn main() { let x: i32 = \"s\"; }\n",
+        &[],
+    );
+    assert_eq!(code, Some(1), "stderr={stderr}");
+    assert!(
+        stderr.contains("sparagmos-driver: compilation failed:"),
+        "a clean rejection takes the compilation-failure report:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("compiler crashed"),
+        "a clean rejection is not a crash:\n{stderr}"
+    );
+}

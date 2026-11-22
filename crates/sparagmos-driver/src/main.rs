@@ -68,12 +68,25 @@
 //! its own stdout (in every outcome — a native program's output is
 //! likewise observable when it panics).
 //!
+//! Convert-mode exit codes: 0 = the crate converted (per-function
+//! outcomes are in the report), 1 = the compilation failed (a
+//! front-end rejection, a `-Z treat-err-as-bug` abort on a reported
+//! diagnostic, or a driver-side monomorphization failure),
+//! 101 = the compiler crashed: an internal compiler error (a
+//! delayed bug flushed at the end of the run) or a panic that
+//! escaped the compiler run. A crash is reported only for a genuine
+//! internal failure of the compiler; conversion limits the driver
+//! contains per body or per query keep their named reasons in the
+//! report and do not change the exit code.
+//!
 //! Conversion can also fail *inside* Stable MIR itself: some MIR
 //! constructs make `rustc_public` panic (`unimplemented!()`). Those
-//! panics are caught at the compiler-run boundary and reported like
-//! any other conversion failure (run mode: exit 2, with the panic
-//! message as the reason). While the compiler runs, its stdout is
-//! redirected to stderr: compile-time output (e.g. `log_syntax!`)
+//! panics are caught at the compiler-run boundary: run mode reports
+//! them like any other conversion failure (exit 2, with the panic
+//! message as the reason), while convert mode reports an escaped
+//! panic as a compiler crash (exit 101, above). While the
+//! compiler runs, its stdout is redirected to stderr: compile-time
+//! output (e.g. `log_syntax!`)
 //! is compiler-side diagnostics, and this process's stdout is
 //! reserved for the driver's report — in run mode, for the guest's
 //! output alone.
@@ -225,26 +238,36 @@ fn panic_reason(info: &std::panic::PanicHookInfo<'_>) -> String {
     }
 }
 
+/// The report text for a delayed bug the compiler created during
+/// compilation and flushed at the end of the run.
+const DELAYED_BUG_ABORT: &str = "the compiler aborted on a delayed bug it created during \
+    compilation (see the internal compiler error above)";
+
+/// Whether a panic that escaped the compiler run is the flush of
+/// a delayed bug the compiler created during compilation: such a
+/// bug is flushed at the end of the run by panicking with the
+/// non-string `DelayedBugPanic` marker (rustc_errors/src/lib.rs:
+/// 1499), and its own text is an internal compiler error the
+/// compiler has already printed. The flush only panics when the
+/// compilation would otherwise have finished, so the compilation
+/// died on the compiler's own internal error: a compiler crash,
+/// which the caller reports as one (Issue #66).
+fn is_delayed_bug_flush(reason: &str) -> bool {
+    reason.contains("rustc_errors/src/lib.rs:1499:")
+}
+
 /// When a panic that escaped the compiler run is the compiler
-/// aborting the compilation itself, the compilation-failure
-/// reason to report for it; `None` for anything else (a
-/// conversion panic, which the caller reports as such). Two
-/// shapes: an error emitted under `-Z treat-err-as-bug` panics
-/// with "aborting due to `-Z treat-err-as-bug=…`" (rustc_errors'
-/// `panic_if_treat_err_as_bug`), and a delayed bug created
-/// during compilation is flushed at the end of the run by
-/// panicking with the non-string `DelayedBugPanic` marker
-/// (rustc_errors/src/lib.rs:1499) — that bug's own text is an
-/// internal compiler error the compiler has already printed.
-fn compiler_abort_reason(reason: &str) -> Option<String> {
+/// aborting the compilation on a diagnostic it had already
+/// reported, the compilation-failure reason to report for it;
+/// `None` for anything else. One shape: an error emitted under
+/// `-Z treat-err-as-bug` panics with "aborting due to
+/// `-Z treat-err-as-bug=…`" (rustc_errors'
+/// `panic_if_treat_err_as_bug`). The flag orders exactly this
+/// abort, so the outcome stays a compilation failure carrying the
+/// reported diagnostic, not a crash.
+fn treat_err_abort_reason(reason: &str) -> Option<String> {
     if reason.contains("treat-err-as-bug") {
         Some(reason.to_string())
-    } else if reason.contains("rustc_errors/src/lib.rs:1499:") {
-        Some(
-            "the compiler aborted on a delayed bug it created during \
-             compilation (see the internal compiler error above)"
-                .to_string(),
-        )
     } else {
         None
     }
@@ -4412,12 +4435,30 @@ fn main() {
             let reason = take_captured_panic()
                 .or_else(|| payload_reason(&*payload))
                 .unwrap_or_else(|| "panic with a non-string payload".to_string());
-            if let Some(abort) = compiler_abort_reason(&reason) {
-                // The compiler itself aborted the compilation:
-                // that is a compilation failure, not a conversion
-                // gap, so it takes the compilation-failure report
-                // (and its exit codes), exactly like a front-end
-                // rejection recorded by the callbacks.
+            if is_delayed_bug_flush(&reason) {
+                // The compiler died on an internal error of its own
+                // (see `is_delayed_bug_flush`): a compiler crash
+                // (Issue #66). Convert mode reports it with the
+                // crash exit code, the code the native compiler
+                // dies with on the same flush; run mode keeps its
+                // single unsupported code, and the
+                // compilation-failure report, for every
+                // conversion-side failure.
+                if run_mode {
+                    eprintln!("sparagmos-driver: compilation failed: {DELAYED_BUG_ABORT}");
+                    std::process::exit(2);
+                }
+                eprintln!("sparagmos-driver: compiler crashed: {DELAYED_BUG_ABORT}");
+                std::process::exit(101);
+            }
+            if let Some(abort) = treat_err_abort_reason(&reason) {
+                // The compiler itself aborted the compilation on a
+                // diagnostic it had already reported, under a flag
+                // ordering exactly that: a compilation failure, not
+                // a conversion gap, so it takes the
+                // compilation-failure report (and its exit codes),
+                // exactly like a front-end rejection recorded by
+                // the callbacks.
                 eprintln!("sparagmos-driver: compilation failed: {abort}");
                 std::process::exit(if run_mode { 2 } else { 1 });
             }
@@ -4427,8 +4468,14 @@ fn main() {
                 );
                 std::process::exit(2);
             }
+            // Any other panic that escapes the compiler run is an
+            // internal failure of the compiler itself (Issue #66):
+            // convert mode reports it as a crash, not as a clean
+            // compilation failure. Panics the conversion contains
+            // per body or per query never reach this point; they
+            // keep their named reasons in the report.
             eprintln!("sparagmos-driver: Stable MIR conversion panicked: {reason}");
-            std::process::exit(1);
+            std::process::exit(101);
         }
     };
     let collected = take();
