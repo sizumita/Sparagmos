@@ -10791,3 +10791,44 @@ fn run_mode_next_back_user_defined_iterator() {
         "back=Some(3)\nfront=Some(1)\nback=Some(1)\nback=None\n",
     );
 }
+const BOX_ASREF_IDENTITY_SRC: &str = r#"
+#[repr(align(16))]
+#[derive(Clone, Copy)]
+struct Align16(i32);
+
+fn main() {
+    // The `AsRef` view of a box pointee is the pointee itself:
+    // the result must be a reference to the box's storage, not
+    // the pointee value.
+    let b = Box::new(Align16(41));
+    let r: &Align16 = b.as_ref();
+    assert_eq!(r.0, 41);
+    assert_eq!(std::mem::align_of_val(r), 16);
+    assert_eq!(std::mem::size_of_val(r), 16);
+    // An identity view of an aggregate receiver is a reference
+    // to the receiver, not the receiver value.
+    let v = vec![3u32, 4];
+    let rv: &Vec<u32> = v.as_ref();
+    assert_eq!(rv.len(), 2);
+    assert_eq!(rv[0], 3);
+    println!("box asref ok");
+}
+"#;
+
+#[test]
+fn run_mode_box_asref_identity_view_is_a_reference() {
+    // Regression: the `AsRef` builtin (Lane HD) resolved a
+    // `Box<T> -> &T` view to the bare pointee value, which the
+    // destination's `Ref` type check rejects ("expected
+    // Ref(Adt(..)), found ADT value") — this broke
+    // tests/ui/structs-enums/align-struct.rs at both19. The
+    // identity views (box pointee, aggregate self view) now
+    // return reference-shaped results.
+    let dir = temp_dir("box-asref");
+    let src = fixture(&dir, "box_asref.rs", BOX_ASREF_IDENTITY_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "box asref ok\n");
+}
