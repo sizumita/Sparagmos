@@ -10,7 +10,9 @@
 
 use std::collections::HashMap;
 
-use sparagmos_interp::builtins::{canonical_name, lookup, BitOp, Builtin, RelOp, SatOp, TrimSide};
+use sparagmos_interp::builtins::{
+    canonical_name, lookup, BitOp, Builtin, FastFloatOp, FetchOp, RelOp, SatOp, SimdOp, TrimSide,
+};
 use sparagmos_interp::mir_convert::{interpret_mir, MirProgram};
 use sparagmos_interp::{InterpError, MirRunError, RefTarget, Value};
 use sparagmos_mir as mir;
@@ -3713,3 +3715,951 @@ fn waker_from_rc_stays_unsupported() {
         other => panic!("expected an explicit unsupported error, got {other:?}"),
     }
 }
+
+// volatile and byte-fill memory intrinsics, fast float ops,
+// pointer arithmetic, SIMD) ---------------------------------------
+
+const ATOMIC_XADD: mir::DefId = mir::DefId::new(0, 500);
+const ATOMIC_XSUB: mir::DefId = mir::DefId::new(0, 501);
+const ATOMIC_UMAX: mir::DefId = mir::DefId::new(0, 502);
+const ATOMIC_MAX: mir::DefId = mir::DefId::new(0, 503);
+const CTLZ_NONZERO: mir::DefId = mir::DefId::new(0, 504);
+const CTTZ_NONZERO: mir::DefId = mir::DefId::new(0, 505);
+
+fn names_ds() -> HashMap<mir::DefId, String> {
+    let mut names = names_bi();
+    names.extend([
+        (ATOMIC_XADD, "std::intrinsics::atomic_xadd".to_string()),
+        (ATOMIC_XSUB, "std::intrinsics::atomic_xsub".to_string()),
+        (ATOMIC_UMAX, "std::intrinsics::atomic_umax".to_string()),
+        (ATOMIC_MAX, "std::intrinsics::atomic_max".to_string()),
+        (CTLZ_NONZERO, "std::intrinsics::ctlz_nonzero".to_string()),
+        (CTTZ_NONZERO, "std::intrinsics::cttz_nonzero".to_string()),
+    ]);
+    names
+}
+
+fn program_ds(body: mir::Body) -> MirProgram {
+    let mut prog = MirProgram::new();
+    prog.add("main", body);
+    prog.fn_names = names_ds();
+    prog
+}
+
+#[test]
+fn registry_covers_the_fetch_family_and_nonzero_bit_ops() {
+    let cases: &[(&str, Builtin)] = &[
+        ("std::intrinsics::atomic_xadd", Builtin::AtomicXadd),
+        ("core::intrinsics::atomic_xadd", Builtin::AtomicXadd),
+        ("std::intrinsics::atomic_xsub", Builtin::AtomicXsub),
+        ("std::intrinsics::atomic_and", Builtin::AtomicFetchOp(FetchOp::And)),
+        ("std::intrinsics::atomic_or", Builtin::AtomicFetchOp(FetchOp::Or)),
+        ("std::intrinsics::atomic_xor", Builtin::AtomicFetchOp(FetchOp::Xor)),
+        ("std::intrinsics::atomic_nand", Builtin::AtomicFetchOp(FetchOp::Nand)),
+        ("std::intrinsics::atomic_max", Builtin::AtomicFetchOp(FetchOp::Max)),
+        ("std::intrinsics::atomic_min", Builtin::AtomicFetchOp(FetchOp::Min)),
+        ("std::intrinsics::atomic_umax", Builtin::AtomicFetchOp(FetchOp::UMax)),
+        ("std::intrinsics::atomic_umin", Builtin::AtomicFetchOp(FetchOp::UMin)),
+        ("std::intrinsics::ctlz_nonzero", Builtin::IntBitOp(BitOp::Ctlz)),
+        ("core::intrinsics::cttz_nonzero", Builtin::IntBitOp(BitOp::Cttz)),
+        ("core::intrinsics::ctpop", Builtin::IntBitOp(BitOp::CtPop)),
+    ];
+    for (name, expected) in cases {
+        assert_eq!(
+            lookup(&canonical_name(name)),
+            Some(*expected),
+            "lookup for {name}"
+        );
+    }
+}
+
+#[test]
+fn atomic_fetch_add_returns_previous_and_wraps_at_the_type_width() {
+    // fn main() -> u8 { let mut x = 200u8; return atomic_xadd(&mut x, 100); }
+    let body = mir::Body::new(
+        decls(&[u8_ty(), u8_ty(), ref_ty(u8_ty(), true)]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(place(1), mir::Rvalue::Use(const_int(200, 1))),
+                    assign(place(2), ref_rvalue(1, true)),
+                ],
+                call(fndef(ATOMIC_XADD, vec![u8_ty()]), vec![move_(2), const_int(100, 1)], 0, 1),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_ds(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Uint(200));
+
+    // fn main() -> u8 { let mut x = 200u8; atomic_xadd(&mut x, 100); return atomic_load(&x); }
+    // The stored value wraps at the u8 width: 300 mod 256 == 44.
+    let body = mir::Body::new(
+        decls(&[
+            u8_ty(),
+            u8_ty(),
+            ref_ty(u8_ty(), true),
+            u8_ty(),
+            ref_ty(u8_ty(), true),
+        ]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(place(1), mir::Rvalue::Use(const_int(200, 1))),
+                    assign(place(2), ref_rvalue(1, true)),
+                ],
+                call(fndef(ATOMIC_XADD, vec![u8_ty()]), vec![move_(2), const_int(100, 1)], 3, 1),
+            ),
+            block(
+                vec![assign(place(4), ref_rvalue(1, true))],
+                call(fndef(ATOMIC_LOAD, vec![u8_ty()]), vec![move_(4)], 0, 2),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_ds(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Uint(44));
+}
+
+#[test]
+fn atomic_fetch_max_compares_in_the_intrinsics_domain() {
+    // fn main() -> i8 { let mut x = -5i8; atomic_max(&mut x, 3); return atomic_load(&x); }
+    // atomic_max is the signed-domain operation: -5 < 3, so 3 is stored.
+    let body = mir::Body::new(
+        decls(&[
+            i8_ty(),
+            i8_ty(),
+            ref_ty(i8_ty(), true),
+            i8_ty(),
+            ref_ty(i8_ty(), true),
+        ]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(place(1), mir::Rvalue::Use(const_int((-5i8) as u8 as u128, 1))),
+                    assign(place(2), ref_rvalue(1, true)),
+                ],
+                call(fndef(ATOMIC_MAX, vec![i8_ty()]), vec![move_(2), const_int(3, 1)], 3, 1),
+            ),
+            block(
+                vec![assign(place(4), ref_rvalue(1, true))],
+                call(fndef(ATOMIC_LOAD, vec![i8_ty()]), vec![move_(4)], 0, 2),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_ds(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Int(3));
+}
+
+#[test]
+fn nonzero_bit_intrinsics_agree_with_the_plain_operations() {
+    // ctlz_nonzero::<u32>(16) == 27
+    let body = mir::Body::new(
+        decls(&[u32_ty()]),
+        0,
+        vec![
+            block(vec![], call(fndef(CTLZ_NONZERO, vec![u32_ty()]), vec![const_int(16, 4)], 0, 1)),
+            block(vec![], ret()),
+        ],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("main", body);
+    prog.fn_names = names_ds();
+    assert_eq!(interpret_mir(&prog, "main", vec![]).expect("run"), Value::Uint(27));
+    // cttz_nonzero::<u32>(0x8000) == 15
+    let body = mir::Body::new(
+        decls(&[u32_ty()]),
+        0,
+        vec![
+            block(vec![], call(fndef(CTTZ_NONZERO, vec![u32_ty()]), vec![const_int(0x8000, 4)], 0, 1)),
+            block(vec![], ret()),
+        ],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("main", body);
+    prog.fn_names = names_ds();
+    assert_eq!(interpret_mir(&prog, "main", vec![]).expect("run"), Value::Uint(15));
+}
+
+const VOLATILE_LOAD: mir::DefId = mir::DefId::new(0, 506);
+const VOLATILE_STORE: mir::DefId = mir::DefId::new(0, 507);
+const WRITE_BYTES: mir::DefId = mir::DefId::new(0, 508);
+const ASSERT_INHABITED: mir::DefId = mir::DefId::new(0, 509);
+
+fn names_ds2() -> HashMap<mir::DefId, String> {
+    let mut names = names_ds();
+    names.extend([
+        (VOLATILE_LOAD, "std::intrinsics::volatile_load".to_string()),
+        (VOLATILE_STORE, "std::intrinsics::volatile_store".to_string()),
+        (WRITE_BYTES, "std::intrinsics::write_bytes".to_string()),
+        (ASSERT_INHABITED, "std::intrinsics::assert_inhabited".to_string()),
+    ]);
+    names
+}
+
+fn program_ds2(body: mir::Body) -> MirProgram {
+    let mut prog = MirProgram::new();
+    prog.add("main", body);
+    prog.fn_names = names_ds2();
+    prog
+}
+
+#[test]
+fn registry_covers_validity_asserts_volatile_and_fill() {
+    let cases: &[(&str, Builtin)] = &[
+        ("std::intrinsics::assert_inhabited", Builtin::AssertValidity),
+        ("core::intrinsics::assert_zero_valid", Builtin::AssertValidity),
+        (
+            "std::intrinsics::assert_mem_uninitialized_valid",
+            Builtin::AssertValidity,
+        ),
+        ("std::intrinsics::volatile_load", Builtin::AtomicLoad),
+        ("core::intrinsics::unaligned_volatile_load", Builtin::AtomicLoad),
+        ("std::intrinsics::volatile_store", Builtin::AtomicStore),
+        ("core::intrinsics::unaligned_volatile_store", Builtin::AtomicStore),
+        ("std::intrinsics::volatile_copy_memory", Builtin::PtrCopy),
+        ("core::intrinsics::volatile_copy_nonoverlapping_memory", Builtin::PtrCopy),
+        ("std::intrinsics::copy", Builtin::PtrCopy),
+        ("core::intrinsics::copy_nonoverlapping", Builtin::PtrCopy),
+        ("std::intrinsics::write_bytes", Builtin::WriteBytes),
+        ("core::intrinsics::volatile_set_memory", Builtin::WriteBytes),
+    ];
+    for (name, expected) in cases {
+        assert_eq!(
+            lookup(&canonical_name(name)),
+            Some(*expected),
+            "lookup for {name}"
+        );
+    }
+}
+
+#[test]
+fn assert_inhabited_is_a_no_op_for_a_converted_program() {
+    // fn main() -> i32 { assert_inhabited::<u32>(); return 5; }
+    let body = mir::Body::new(
+        decls(&[i32_ty(), mir::Ty::unit()]),
+        0,
+        vec![
+            block(vec![], call(fndef(ASSERT_INHABITED, vec![u32_ty()]), vec![], 1, 1)),
+            block(
+                vec![assign(place(0), mir::Rvalue::Use(const_i32(5)))],
+                ret(),
+            ),
+        ],
+    );
+    let value = interpret_mir(&program_ds2(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Int(5));
+}
+
+#[test]
+fn volatile_store_and_load_round_trip() {
+    // fn main() -> u32 {
+    //   let mut x = 7u32;
+    //   volatile_store(&mut x, 99);
+    //   return volatile_load(&x);
+    // }
+    let body = mir::Body::new(
+        decls(&[
+            u32_ty(),
+            u32_ty(),
+            ref_ty(u32_ty(), true),
+            mir::Ty::unit(),
+            ref_ty(u32_ty(), true),
+        ]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(place(1), mir::Rvalue::Use(const_int(7, 4))),
+                    assign(place(2), ref_rvalue(1, true)),
+                ],
+                call(
+                    fndef(VOLATILE_STORE, vec![u32_ty()]),
+                    vec![move_(2), const_int(99, 4)],
+                    3,
+                    1,
+                ),
+            ),
+            block(
+                vec![assign(place(4), ref_rvalue(1, true))],
+                call(fndef(VOLATILE_LOAD, vec![u32_ty()]), vec![move_(4)], 0, 2),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_ds2(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Uint(99));
+}
+
+#[test]
+fn write_bytes_fills_elements_with_the_repeated_byte() {
+    // fn main() -> [u8; 4] {
+    //   let mut buf = [0u8; 4];  (the local starts uninit in MIR;
+    //   write_bytes(buf.as_mut_ptr(), 0xAB, 4);   the fill creates it)
+    //   return buf;
+    // }
+    let arr = mir::Ty::Array(Box::new(u8_ty()), mir::ArrayLen::Known(4));
+    let body = mir::Body::new(
+        decls(&[arr.clone(), arr, ref_ty(u8_ty(), true), mir::Ty::unit()]),
+        0,
+        vec![
+            block(
+                vec![assign(place(2), ref_rvalue(1, true))],
+                call(
+                    fndef(WRITE_BYTES, vec![u8_ty()]),
+                    vec![move_(2), const_int(0xAB, 1), const_int(4, 8)],
+                    3,
+                    1,
+                ),
+            ),
+            block(
+                vec![assign(place(0), mir::Rvalue::Use(mir::Operand::Copy(place(1))))],
+                ret(),
+            ),
+        ],
+    );
+    let value = interpret_mir(&program_ds2(body), "main", vec![]).expect("run");
+    assert_eq!(
+        value,
+        Value::Tuple(vec![Value::Uint(0xAB); 4])
+    );
+}
+
+#[test]
+fn write_bytes_fill_respects_the_element_type() {
+    // fn main() -> u32 {
+    //   let mut x: u32 = 0;
+    //   write_bytes(&mut x, 0x01, 1);
+    //   return x;   // 0x0101_0101, not 1
+    // }
+    let body = mir::Body::new(
+        decls(&[u32_ty(), u32_ty(), ref_ty(u32_ty(), true), mir::Ty::unit()]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(place(1), mir::Rvalue::Use(const_int(0, 4))),
+                    assign(place(2), ref_rvalue(1, true)),
+                ],
+                call(
+                    fndef(WRITE_BYTES, vec![u32_ty()]),
+                    vec![move_(2), const_int(0x01, 1), const_int(1, 8)],
+                    3,
+                    1,
+                ),
+            ),
+            block(
+                vec![assign(place(0), mir::Rvalue::Use(mir::Operand::Copy(place(1))))],
+                ret(),
+            ),
+        ],
+    );
+    let value = interpret_mir(&program_ds2(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Uint(0x0101_0101));
+}
+
+const SIZE_OF_VAL_INTR: mir::DefId = mir::DefId::new(0, 510);
+const ALIGN_OF_VAL_INTR: mir::DefId = mir::DefId::new(0, 511);
+const FADD_FAST: mir::DefId = mir::DefId::new(0, 512);
+const FMUL_FAST: mir::DefId = mir::DefId::new(0, 513);
+const FLOAT_TO_INT_UNCHECKED: mir::DefId = mir::DefId::new(0, 514);
+
+fn names_ds3() -> HashMap<mir::DefId, String> {
+    let mut names = names_ds2();
+    names.extend([
+        (SIZE_OF_VAL_INTR, "std::intrinsics::size_of_val".to_string()),
+        (ALIGN_OF_VAL_INTR, "std::intrinsics::align_of_val".to_string()),
+        (FADD_FAST, "std::intrinsics::fadd_fast".to_string()),
+        (FMUL_FAST, "std::intrinsics::fmul_fast".to_string()),
+        (
+            FLOAT_TO_INT_UNCHECKED,
+            "std::intrinsics::float_to_int_unchecked".to_string(),
+        ),
+    ]);
+    names
+}
+
+fn program_ds3(body: mir::Body) -> MirProgram {
+    let mut prog = MirProgram::new();
+    prog.add("main", body);
+    prog.fn_names = names_ds3();
+    prog
+}
+
+fn f64_ty() -> mir::Ty {
+    mir::Ty::Float(mir::FloatTy::F64)
+}
+
+fn f32_ty() -> mir::Ty {
+    mir::Ty::Float(mir::FloatTy::F32)
+}
+
+fn const_f64(v: f64) -> mir::Operand {
+    mir::Operand::constant(mir::Constant::from_value(mir::ConstValue::Scalar(
+        mir::Scalar::Float {
+            bits: v.to_bits() as u128,
+            ty: mir::FloatTy::F64,
+        },
+    )))
+}
+
+fn const_f32(v: f32) -> mir::Operand {
+    mir::Operand::constant(mir::Constant::from_value(mir::ConstValue::Scalar(
+        mir::Scalar::Float {
+            bits: v.to_bits() as u128,
+            ty: mir::FloatTy::F32,
+        },
+    )))
+}
+
+#[test]
+fn registry_covers_fast_float_and_intrinsic_size_align() {
+    let cases: &[(&str, Builtin)] = &[
+        ("std::intrinsics::size_of_val", Builtin::MemSizeOfVal),
+        ("core::intrinsics::align_of_val", Builtin::MemAlignOfVal),
+        ("std::intrinsics::fadd_fast", Builtin::FastFloat(FastFloatOp::Add)),
+        ("std::intrinsics::fsub_fast", Builtin::FastFloat(FastFloatOp::Sub)),
+        ("core::intrinsics::fmul_fast", Builtin::FastFloat(FastFloatOp::Mul)),
+        ("std::intrinsics::fdiv_fast", Builtin::FastFloat(FastFloatOp::Div)),
+        ("std::intrinsics::frem_fast", Builtin::FastFloat(FastFloatOp::Rem)),
+        ("std::intrinsics::float_to_int_unchecked", Builtin::FloatToIntUnchecked),
+    ];
+    for (name, expected) in cases {
+        assert_eq!(
+            lookup(&canonical_name(name)),
+            Some(*expected),
+            "lookup for {name}"
+        );
+    }
+}
+
+#[test]
+fn fast_float_ops_are_the_plain_operations_at_the_type_width() {
+    // fadd_fast::<f64>(1.5, 2.25) == 3.75
+    let body = mir::Body::new(
+        decls(&[f64_ty()]),
+        0,
+        vec![
+            block(
+                vec![],
+                call(
+                    fndef(FADD_FAST, vec![f64_ty()]),
+                    vec![const_f64(1.5), const_f64(2.25)],
+                    0,
+                    1,
+                ),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_ds3(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Float(3.75));
+    // fmul_fast::<f32>(1.1, 1.1): the result is the f32 product,
+    // not the f64 product of the widened operands.
+    let body = mir::Body::new(
+        decls(&[f32_ty()]),
+        0,
+        vec![
+            block(
+                vec![],
+                call(
+                    fndef(FMUL_FAST, vec![f32_ty()]),
+                    vec![const_f32(1.1), const_f32(1.1)],
+                    0,
+                    1,
+                ),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_ds3(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Float((1.1f32 * 1.1f32) as f64));
+}
+
+#[test]
+fn float_to_int_unchecked_truncates_like_the_defined_domain() {
+    // float_to_int_unchecked::<f64, i32>(3.75) == 3
+    let body = mir::Body::new(
+        decls(&[i32_ty()]),
+        0,
+        vec![
+            block(
+                vec![],
+                call(
+                    fndef(FLOAT_TO_INT_UNCHECKED, vec![f64_ty(), i32_ty()]),
+                    vec![const_f64(3.75)],
+                    0,
+                    1,
+                ),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_ds3(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Int(3));
+    // float_to_int_unchecked::<f64, i32>(-3.75) == -3 (toward zero)
+    let body = mir::Body::new(
+        decls(&[i32_ty()]),
+        0,
+        vec![
+            block(
+                vec![],
+                call(
+                    fndef(FLOAT_TO_INT_UNCHECKED, vec![f64_ty(), i32_ty()]),
+                    vec![const_f64(-3.75)],
+                    0,
+                    1,
+                ),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_ds3(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Int(-3));
+}
+
+#[test]
+fn intrinsic_size_of_val_and_align_of_val_use_the_pointee_layout() {
+    // fn main() -> usize { let x = 7i32; return size_of_val(&x as *const i32); }
+    let body = mir::Body::new(
+        decls(&[usize_ty(), i32_ty(), ref_ty(i32_ty(), false)]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(place(1), mir::Rvalue::Use(const_i32(7))),
+                    assign(place(2), ref_rvalue(1, false)),
+                ],
+                call(fndef(SIZE_OF_VAL_INTR, vec![i32_ty()]), vec![move_(2)], 0, 1),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_ds3(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Uint(4));
+    // align_of_val::<u16> == 2
+    let body = mir::Body::new(
+        decls(&[usize_ty(), u16_ty(), ref_ty(u16_ty(), false)]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(place(1), mir::Rvalue::Use(const_int(7, 2))),
+                    assign(place(2), ref_rvalue(1, false)),
+                ],
+                call(fndef(ALIGN_OF_VAL_INTR, vec![u16_ty()]), vec![move_(2)], 0, 1),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_ds3(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Uint(2));
+}
+
+const ARITH_OFFSET: mir::DefId = mir::DefId::new(0, 515);
+const PTR_OFFSET_FROM_UNSIGNED: mir::DefId = mir::DefId::new(0, 516);
+const COMPARE_BYTES: mir::DefId = mir::DefId::new(0, 517);
+
+fn names_ds4() -> HashMap<mir::DefId, String> {
+    let mut names = names_ds3();
+    names.extend([
+        (ARITH_OFFSET, "std::intrinsics::arith_offset".to_string()),
+        (
+            PTR_OFFSET_FROM_UNSIGNED,
+            "std::intrinsics::ptr_offset_from_unsigned".to_string(),
+        ),
+        (COMPARE_BYTES, "std::intrinsics::compare_bytes".to_string()),
+    ]);
+    names
+}
+
+fn program_ds4(body: mir::Body) -> MirProgram {
+    let mut prog = MirProgram::new();
+    prog.add("main", body);
+    prog.fn_names = names_ds4();
+    prog
+}
+
+fn const_u32_tuple(vals: &[u32]) -> mir::Operand {
+    mir::Operand::constant(mir::Constant::from_value(mir::ConstValue::Tuple(
+        vals.iter()
+            .map(|v| mir::ConstValue::Scalar(mir::Scalar::Int {
+                data: *v as u128,
+                size: 4,
+            }))
+            .collect(),
+    )))
+}
+
+fn const_u8_tuple(vals: &[u8]) -> mir::Operand {
+    mir::Operand::constant(mir::Constant::from_value(mir::ConstValue::Tuple(
+        vals.iter()
+            .map(|v| mir::ConstValue::Scalar(mir::Scalar::Int {
+                data: *v as u128,
+                size: 1,
+            }))
+            .collect(),
+    )))
+}
+
+#[test]
+fn registry_covers_pointer_arithmetic_and_compare_bytes() {
+    let cases: &[(&str, Builtin)] = &[
+        ("std::intrinsics::arith_offset", Builtin::ArithOffset { wrapping: true }),
+        ("core::intrinsics::offset", Builtin::ArithOffset { wrapping: false }),
+        (
+            "std::intrinsics::ptr_offset_from",
+            Builtin::PtrOffsetFrom { unsigned: false },
+        ),
+        (
+            "core::intrinsics::ptr_offset_from_unsigned",
+            Builtin::PtrOffsetFrom { unsigned: true },
+        ),
+        ("std::intrinsics::compare_bytes", Builtin::CompareBytes),
+    ];
+    for (name, expected) in cases {
+        assert_eq!(
+            lookup(&canonical_name(name)),
+            Some(*expected),
+            "lookup for {name}"
+        );
+    }
+}
+
+#[test]
+fn arith_offset_steps_into_the_aggregate_and_reads_back() {
+    // fn main() -> u32 {
+    //   let arr = [10, 20, 30, 40, 50];
+    //   let p = arith_offset(arr.as_ptr(), 2);
+    //   return *p;
+    // }
+    let arr_ty = mir::Ty::Array(Box::new(u32_ty()), mir::ArrayLen::Known(5));
+    let body = mir::Body::new(
+        decls(&[
+            u32_ty(),
+            arr_ty,
+            ref_ty(u32_ty(), false),
+            ref_ty(u32_ty(), false),
+        ]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(place(1), mir::Rvalue::Use(const_u32_tuple(&[10, 20, 30, 40, 50]))),
+                    assign(place(2), ref_rvalue(1, false)),
+                ],
+                call(
+                    fndef(ARITH_OFFSET, vec![u32_ty()]),
+                    vec![mir::Operand::Copy(place(2)), const_int(2, 8)],
+                    3,
+                    1,
+                ),
+            ),
+            block(
+                vec![assign(
+                    place(0),
+                    mir::Rvalue::Use(mir::Operand::Copy(deref_place(3))),
+                )],
+                ret(),
+            ),
+        ],
+    );
+    let value = interpret_mir(&program_ds4(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Uint(30));
+}
+
+#[test]
+fn ptr_offset_from_unsigned_measures_the_element_distance() {
+    // fn main() -> usize {
+    //   let arr = [10, 20, 30, 40, 50];
+    //   let base = arr.as_ptr();
+    //   let third = arith_offset(base, 2);
+    //   return ptr_offset_from_unsigned(third, base);
+    // }
+    let arr_ty = mir::Ty::Array(Box::new(u32_ty()), mir::ArrayLen::Known(5));
+    let body = mir::Body::new(
+        decls(&[
+            usize_ty(),
+            arr_ty,
+            ref_ty(u32_ty(), false),
+            ref_ty(u32_ty(), false),
+        ]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(place(1), mir::Rvalue::Use(const_u32_tuple(&[10, 20, 30, 40, 50]))),
+                    assign(place(2), ref_rvalue(1, false)),
+                ],
+                call(
+                    fndef(ARITH_OFFSET, vec![u32_ty()]),
+                    vec![mir::Operand::Copy(place(2)), const_int(2, 8)],
+                    3,
+                    1,
+                ),
+            ),
+            block(
+                vec![],
+                call(
+                    fndef(PTR_OFFSET_FROM_UNSIGNED, vec![u32_ty()]),
+                    vec![mir::Operand::Copy(place(3)), mir::Operand::Copy(place(2))],
+                    0,
+                    2,
+                ),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_ds4(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Uint(2));
+}
+
+#[test]
+fn compare_bytes_compares_the_pointee_bytes() {
+    // fn main() -> i32 {
+    //   let a = [1u8, 2, 3, 4]; let b = [1u8, 2, 3, 9];
+    //   return compare_bytes(a.as_ptr(), b.as_ptr(), 4);
+    // }
+    let arr_ty = mir::Ty::Array(Box::new(u8_ty()), mir::ArrayLen::Known(4));
+    let body = mir::Body::new(
+        decls(&[
+            i32_ty(),
+            arr_ty.clone(),
+            arr_ty,
+            ref_ty(u8_ty(), false),
+            ref_ty(u8_ty(), false),
+        ]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(place(1), mir::Rvalue::Use(const_u8_tuple(&[1, 2, 3, 4]))),
+                    assign(place(2), mir::Rvalue::Use(const_u8_tuple(&[1, 2, 3, 9]))),
+                    assign(place(3), ref_rvalue(1, false)),
+                    assign(place(4), ref_rvalue(2, false)),
+                ],
+                call(
+                    fndef(COMPARE_BYTES, vec![]),
+                    vec![
+                        mir::Operand::Copy(place(3)),
+                        mir::Operand::Copy(place(4)),
+                        const_int(4, 8),
+                    ],
+                    0,
+                    1,
+                ),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_ds4(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Int(-1));
+}
+
+const SIMD_ADD: mir::DefId = mir::DefId::new(0, 518);
+const SIMD_EXTRACT: mir::DefId = mir::DefId::new(0, 519);
+const SIMD_SPLAT: mir::DefId = mir::DefId::new(0, 520);
+const SIMD_REDUCE_ADD_UNORDERED: mir::DefId = mir::DefId::new(0, 521);
+const SIMD_EQ: mir::DefId = mir::DefId::new(0, 522);
+const SIMD_SELECT: mir::DefId = mir::DefId::new(0, 523);
+
+fn names_ds5() -> HashMap<mir::DefId, String> {
+    let mut names = names_ds4();
+    names.extend([
+        (SIMD_ADD, "std::intrinsics::simd::simd_add".to_string()),
+        (
+            SIMD_EXTRACT,
+            "std::intrinsics::simd::simd_extract".to_string(),
+        ),
+        (SIMD_SPLAT, "std::intrinsics::simd::simd_splat".to_string()),
+        (
+            SIMD_REDUCE_ADD_UNORDERED,
+            "std::intrinsics::simd::simd_reduce_add_unordered".to_string(),
+        ),
+        (SIMD_EQ, "std::intrinsics::simd::simd_eq".to_string()),
+        (SIMD_SELECT, "std::intrinsics::simd::simd_select".to_string()),
+    ]);
+    names
+}
+
+fn program_ds5(body: mir::Body) -> MirProgram {
+    let mut prog = MirProgram::new();
+    prog.add("main", body);
+    prog.fn_names = names_ds5();
+    prog
+}
+
+fn i32x4_ty() -> mir::Ty {
+    mir::Ty::Array(Box::new(i32_ty()), mir::ArrayLen::Known(4))
+}
+
+fn const_i32_tuple(vals: &[i32]) -> mir::Operand {
+    mir::Operand::constant(mir::Constant::from_value(mir::ConstValue::Tuple(
+        vals.iter()
+            .map(|v| mir::ConstValue::Scalar(mir::Scalar::Int {
+                data: (*v as i128) as u128,
+                size: 4,
+            }))
+            .collect(),
+    )))
+}
+
+#[test]
+fn registry_covers_simd_intrinsics() {
+    let cases: &[(&str, Builtin)] = &[
+        ("std::intrinsics::simd::simd_add", Builtin::SimdOp(SimdOp::Add)),
+        (
+            "core::intrinsics::simd::simd_shuffle",
+            Builtin::SimdOp(SimdOp::Shuffle),
+        ),
+        (
+            "std::intrinsics::simd::simd_reduce_max",
+            Builtin::SimdOp(SimdOp::ReduceMax),
+        ),
+        (
+            "core::intrinsics::simd::simd_masked_load",
+            Builtin::SimdOp(SimdOp::MaskedLoad),
+        ),
+        (
+            "std::intrinsics::simd::simd_cast_ptr",
+            Builtin::SimdOp(SimdOp::CastPtr),
+        ),
+    ];
+    for (name, expected) in cases {
+        assert_eq!(
+            lookup(&canonical_name(name)),
+            Some(*expected),
+            "lookup for {name}"
+        );
+    }
+}
+
+#[test]
+fn simd_add_then_extract_lane() {
+    // fn main() -> i32 {
+    //   let a = [1, 2, 3, 4]; let b = [10, 20, 30, 40];
+    //   let c = simd_add(a, b);
+    //   return simd_extract(c, 2);
+    // }
+    let body = mir::Body::new(
+        decls(&[i32_ty(), i32x4_ty(), i32x4_ty(), i32x4_ty()]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(place(1), mir::Rvalue::Use(const_i32_tuple(&[1, 2, 3, 4]))),
+                    assign(place(2), mir::Rvalue::Use(const_i32_tuple(&[10, 20, 30, 40]))),
+                ],
+                call(
+                    fndef(SIMD_ADD, vec![i32x4_ty()]),
+                    vec![mir::Operand::Copy(place(1)), mir::Operand::Copy(place(2))],
+                    3,
+                    1,
+                ),
+            ),
+            block(
+                vec![],
+                call(
+                    fndef(SIMD_EXTRACT, vec![i32x4_ty(), i32_ty()]),
+                    vec![mir::Operand::Copy(place(3)), const_int(2, 4)],
+                    0,
+                    2,
+                ),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_ds5(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Int(33));
+}
+
+#[test]
+fn simd_splat_then_reduce_add_unordered() {
+    // fn main() -> i32 {
+    //   let v = simd_splat(7);
+    //   return simd_reduce_add_unordered(v);
+    // }
+    let body = mir::Body::new(
+        decls(&[i32_ty(), i32x4_ty()]),
+        0,
+        vec![
+            block(
+                vec![],
+                call(
+                    fndef(SIMD_SPLAT, vec![i32x4_ty(), i32_ty()]),
+                    vec![const_i32(7)],
+                    1,
+                    1,
+                ),
+            ),
+            block(
+                vec![],
+                call(
+                    fndef(SIMD_REDUCE_ADD_UNORDERED, vec![i32x4_ty(), i32_ty()]),
+                    vec![mir::Operand::Copy(place(1))],
+                    0,
+                    2,
+                ),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_ds5(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Int(28));
+}
+
+#[test]
+fn simd_eq_mask_drives_select() {
+    // fn main() -> [i32; 4] {
+    //   let a = [1, 2, 3, 4]; let b = [1, 9, 3, 9];
+    //   let m = simd_eq(a, b);
+    //   return simd_select(m, a, b);
+    // }
+    let body = mir::Body::new(
+        decls(&[i32x4_ty(), i32x4_ty(), i32x4_ty(), i32x4_ty(), i32x4_ty()]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(place(1), mir::Rvalue::Use(const_i32_tuple(&[1, 2, 3, 4]))),
+                    assign(place(2), mir::Rvalue::Use(const_i32_tuple(&[1, 9, 3, 9]))),
+                ],
+                call(
+                    fndef(SIMD_EQ, vec![i32x4_ty()]),
+                    vec![mir::Operand::Copy(place(1)), mir::Operand::Copy(place(2))],
+                    3,
+                    1,
+                ),
+            ),
+            block(
+                vec![],
+                call(
+                    fndef(SIMD_SELECT, vec![i32x4_ty(), i32x4_ty()]),
+                    vec![
+                        mir::Operand::Copy(place(3)),
+                        mir::Operand::Copy(place(1)),
+                        mir::Operand::Copy(place(2)),
+                    ],
+                    0,
+                    2,
+                ),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_ds5(body), "main", vec![]).expect("run");
+    assert_eq!(
+        value,
+        Value::Tuple(vec![
+            Value::Int(1),
+            Value::Int(9),
+            Value::Int(3),
+            Value::Int(9)
+        ])
+    );
+}
+
