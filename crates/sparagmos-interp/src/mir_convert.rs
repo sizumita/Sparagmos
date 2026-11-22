@@ -2731,6 +2731,18 @@ impl<'a> Converter<'a> {
         Ok(out)
     }
 
+    /// Whether a scalar shape has a pointer leaf (see the
+    /// pointer exception in [`Self::deref_vector_shape`]).
+    fn shape_contains_ptr(shape: &ir::ScalarShape) -> bool {
+        match shape {
+            ir::ScalarShape::Ptr => true,
+            ir::ScalarShape::Array(elem, _) => Self::shape_contains_ptr(elem),
+            ir::ScalarShape::AdtField { inner, .. } => Self::shape_contains_ptr(inner),
+            ir::ScalarShape::NicheEnum { inner, .. } => Self::shape_contains_ptr(inner),
+            _ => false,
+        }
+    }
+
     /// The scalar shape of a dereference through `place`:
     /// the shape a shaped load / store of the place runs
     /// through. The dereference may sit below field steps (a
@@ -2765,6 +2777,20 @@ impl<'a> Converter<'a> {
         // For a pointee stored whole the shaped load/store is
         // the canonicalising round trip, so the broader gate
         // changes nothing there.
+        //
+        // A shape with a pointer leaf is the exception: the
+        // round trip through a pointer shape flattens a
+        // reference to its synthetic address and constructs an
+        // address-only pointer back, which is not the stored
+        // value's identity (a place or allocation reference
+        // denotes its target; the address-only form denotes
+        // nothing readable). Pointers in this model are stored
+        // whole, never as bytes, so there is nothing for a
+        // shaped load/store to assemble — the plain projection
+        // is the only honest path.
+        if Self::shape_contains_ptr(&shape) {
+            return None;
+        }
         Some(shape)
     }
 
