@@ -144,6 +144,16 @@ pub(crate) enum DSrc {
     Local(u32),
     /// `Move` of a projection-less local.
     MoveLocal(u32),
+    /// `Move` of a place over a local whose projection is only
+    /// `Field` / `Downcast` steps: read through the projected
+    /// fast path, then leave the moved-out part uninitialized,
+    /// exactly as the general `Move` evaluation does.
+    MoveLocalProj {
+        local: u32,
+        proj: Rc<[RefProj]>,
+        desc: Rc<str>,
+        place: Place,
+    },
     /// `Copy` of a place over a local whose projection is only
     /// `Field` / `Downcast` steps, with the resolved projection
     /// and the place description precomputed. The original place
@@ -206,6 +216,18 @@ enum PlaceKind {
 /// once, here. Any other step (`Deref`, `Index`, `ConstantIndex`,
 /// `Subslice`) makes resolution depend on run-time values, and
 /// the place stays on the general path.
+/// The `LocalProj` classification of `place`, for callers
+/// outside this module (terminator operand evaluation in the
+/// run loop): the precomputed resolved projection and place
+/// description of a `Field` / `Downcast`-only place over a
+/// local, or `None` for any other shape.
+pub(crate) fn classify_local_proj(place: &Place) -> Option<(Rc<[RefProj]>, Rc<str>)> {
+    match classify_place(place) {
+        PlaceKind::LocalProj(proj, desc) => Some((proj, desc)),
+        _ => None,
+    }
+}
+
 fn classify_place(place: &Place) -> PlaceKind {
     if place.projection.is_empty() {
         return PlaceKind::Local;
@@ -339,13 +361,16 @@ impl<'a> Interpreter<'a> {
                 },
                 PlaceKind::General => DSrc::Operand(op.clone()),
             },
-            Operand::Move(place) => {
-                if place.projection.is_empty() {
-                    DSrc::MoveLocal(place.local.0 as u32)
-                } else {
-                    DSrc::Operand(op.clone())
-                }
-            }
+            Operand::Move(place) => match classify_place(place) {
+                PlaceKind::Local => DSrc::MoveLocal(place.local.0 as u32),
+                PlaceKind::LocalProj(proj, desc) => DSrc::MoveLocalProj {
+                    local: place.local.0 as u32,
+                    proj,
+                    desc,
+                    place: place.clone(),
+                },
+                PlaceKind::General => DSrc::Operand(op.clone()),
+            },
         }
     }
 
@@ -465,7 +490,7 @@ impl<'a> Interpreter<'a> {
     /// value (`zst_field_value`) or reported as the same
     /// `UninitializedRead` the general path reports after
     /// projection.
-    fn read_local_proj(
+    pub(crate) fn read_local_proj(
         &self,
         frames: &[Frame],
         body: &Body,
@@ -559,6 +584,21 @@ impl<'a> Interpreter<'a> {
                 desc,
                 place,
             } => self.read_local_proj(frames, body, *local, proj, desc, place),
+            DSrc::MoveLocalProj {
+                local,
+                proj,
+                desc,
+                place,
+            } => {
+                let value = self.read_local_proj(frames, body, *local, proj, desc, place)?;
+                // The clearing `eval_operand` performs for a
+                // move out of a projected place, through the
+                // shared helper: the moved-out part is left
+                // uninitialized, so a later `Drop` of the whole
+                // value does not run its glue a second time.
+                self.clear_local_proj(frames, *local as usize, proj, desc)?;
+                Ok(value)
+            }
         }
     }
 

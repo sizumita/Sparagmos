@@ -6433,7 +6433,14 @@ impl<'a> Interpreter<'a> {
         place: &Place,
     ) -> InterpResult<Value> {
         let target = self.resolve_place(frames, body, place)?;
-        self.read_resolved(frames, &target)
+        // Read through the borrowing form: a projected read lends
+        // the denoted value out of the frame's storage, so only
+        // the projected part is cloned into the owned result,
+        // where the owned read cloned the whole base aggregate
+        // (every element of a vector, for a single indexed read).
+        // Results and errors are identical (see
+        // `read_resolved_ref`).
+        Ok(self.read_resolved_ref(frames, &target)?.into_owned())
     }
 
     pub(crate) fn write_place(
@@ -6727,6 +6734,33 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// Leave the value at a `Field` / `Downcast`-only projected
+    /// place over a local of the executing frame uninitialized:
+    /// the clearing a `Move` out of that place performs. The
+    /// resolved target of such a place is the executing frame's
+    /// local under the same projection (the classification's
+    /// steps are purely syntactic), so the write goes straight
+    /// through `navigate_mut` — the same write
+    /// `write_resolved`'s projected `Place` arm performs, minus
+    /// the resolve round trip.
+    pub(crate) fn clear_local_proj(
+        &self,
+        frames: &mut Vec<Frame>,
+        local: usize,
+        proj: &[RefProj],
+        desc: &str,
+    ) -> InterpResult<()> {
+        let frame = frames.last_mut().expect("frame");
+        let func = frame.func.clone();
+        let slot = frame.locals.get_mut(local).ok_or_else(|| InterpError::UnknownLocal {
+            func: func.clone(),
+            local,
+        })?;
+        let slot = navigate_mut(slot, proj, &func, desc)?;
+        *slot = Value::Uninit;
+        Ok(())
+    }
+
     pub(crate) fn eval_operand(
         &self,
         frames: &mut Vec<Frame>,
@@ -6734,14 +6768,73 @@ impl<'a> Interpreter<'a> {
         operand: &Operand,
     ) -> InterpResult<Value> {
         match operand {
-            Operand::Copy(place) => self.read_place(frames, body, place),
+            Operand::Copy(place) => {
+                // Fast path, mirroring `read_local` in the decode
+                // layer: a projection-less local holding a value is
+                // cloned straight out of the frame's slot, skipping
+                // place resolution and the resolved read. Anything
+                // else — a projected place, an out-of-range index,
+                // an uninitialized slot (whose zero-sized fallback
+                // and exact error the general read produces) —
+                // delegates to the general read unchanged.
+                if place.is_direct_local() {
+                    let frame = frames.last().expect("frame");
+                    if let Some(value) = frame.locals.get(place.local.0) {
+                        if *value != Value::Uninit {
+                            return Ok(value.clone());
+                        }
+                    }
+                }
+                // A `Field` / `Downcast`-only place over a local
+                // takes the decode layer's projected fast read,
+                // which mirrors the general read step for step;
+                // any other shape keeps the general read.
+                if let Some((proj, desc)) = crate::decode::classify_local_proj(place) {
+                    return self.read_local_proj(
+                        frames,
+                        body,
+                        place.local.0 as u32,
+                        &proj,
+                        &desc,
+                        place,
+                    );
+                }
+                self.read_place(frames, body, place)
+            }
             Operand::Move(place) => {
-                let value = self.read_place(frames, body, place)?;
+                // The `Copy` fast path, plus the clearing of the
+                // vacated slot the general path performs below for
+                // a direct local.
+                if place.is_direct_local() {
+                    let idx = place.local.0;
+                    let frame = frames.last().expect("frame");
+                    if let Some(value) = frame.locals.get(idx) {
+                        if *value != Value::Uninit {
+                            let value = value.clone();
+                            frames.last_mut().expect("frame").locals[idx] = Value::Uninit;
+                            return Ok(value);
+                        }
+                    }
+                }
+                let fast = crate::decode::classify_local_proj(place);
+                let value = match &fast {
+                    Some((proj, desc)) => self.read_local_proj(
+                        frames,
+                        body,
+                        place.local.0 as u32,
+                        proj,
+                        desc,
+                        place,
+                    )?,
+                    None => self.read_place(frames, body, place)?,
+                };
                 if place.is_direct_local() {
                     let frame = frames.last_mut().expect("frame");
                     if let Some(slot) = frame.locals.get_mut(place.local.0) {
                         *slot = Value::Uninit;
                     }
+                } else if let Some((proj, desc)) = &fast {
+                    self.clear_local_proj(frames, place.local.0, proj, desc)?;
                 } else if let Ok(target) = self.resolve_place(frames, body, place) {
                     // A move out of a projected place leaves that
                     // part uninitialized too, so a later `Drop` of
