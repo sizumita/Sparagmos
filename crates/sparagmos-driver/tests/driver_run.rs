@@ -15321,3 +15321,57 @@ fn run_mode_swap_nonoverlapping_whole_struct() {
     assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "swap ok\n");
 }
+
+// ----- Lane KE: reborrowed &mut Vec slice positions ---------------
+
+const MUT_VEC_REBORROW_REVERSE_SRC: &str = r#"
+fn reverse_arg(v: &mut [usize]) {
+    v.reverse();
+}
+fn bar(v: &mut [usize]) {
+    v.reverse();
+    reverse_arg(v);
+    v.reverse();
+}
+fn main() {
+    let mut the_vec = vec![0x0102usize, 0x0304, 0x0506, 0x0708];
+    bar(&mut the_vec);
+    assert_eq!(the_vec, [0x0708, 0x0506, 0x0304, 0x0102]);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_mut_vec_reborrow_reverse() {
+    // A `&mut Vec` reborrowed as `&mut [usize]` and reversed
+    // through the receiver and through a helper argument: the
+    // slice machinery (`split_at_mut`, `revswap`, `mem::swap` over
+    // byte-chunk pointers) must address whole elements of the
+    // backing Vec, in both directions. Multi-byte element values
+    // pin the semantics: a byte-wise swap would corrupt them.
+    run_ok("mut-vec-reborrow", MUT_VEC_REBORROW_REVERSE_SRC, "ok\n");
+}
+
+const SUBSLICE_SPLIT_AT_MUT_SRC: &str = r#"
+fn main() {
+    let mut v = vec![10usize, 20, 30, 40, 50, 60];
+    let sub = &mut v[1..5];
+    let (a, b) = sub.split_at_mut(2);
+    a[1] = 99;
+    b[0] = 77;
+    a.reverse();
+    assert_eq!(v, [10, 99, 20, 77, 50, 60]);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_subslice_split_at_mut_positions() {
+    // `split_at_mut` on a range sub-slice: the front half's data
+    // pointer is the sub-slice's first element (not that
+    // element's own first element), indexing either half composes with the
+    // sub-slice offset in the backing Vec, and the back half's data
+    // pointer absorbs its displacement through the sub-slice step
+    // instead of degrading to a displaced pointer.
+    run_ok("subslice-split", SUBSLICE_SPLIT_AT_MUT_SRC, "ok\n");
+}
