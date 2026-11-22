@@ -4461,6 +4461,10 @@ impl<'a> Interpreter<'a> {
                     Err(e) => return Err(e),
                 };
                 Ok(value)
+            }
+        }
+    }
+
     /// The size in bytes of an IR type whose layout is fixed by
     /// the type alone or by the program's ADT layout table:
     /// scalars, arrays of such types, pointers (fat when the
