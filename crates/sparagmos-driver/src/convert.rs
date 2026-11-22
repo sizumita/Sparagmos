@@ -2760,7 +2760,8 @@ impl Converter {
                 self.record_debug_shape(&def, &converted);
                 self.record_instance_shape(ty, &def, &args, &converted);
             }
-            TyKind::RigidTy(RigidTy::Coroutine(..))
+            TyKind::RigidTy(RigidTy::Closure(..))
+            | TyKind::RigidTy(RigidTy::Coroutine(..))
             | TyKind::RigidTy(RigidTy::CoroutineClosure(..)) => {
                 self.record_coroutine_layout(ty, &converted);
             }
@@ -3188,12 +3189,13 @@ impl Converter {
     }
 
     /// Record the compiler-computed layout of one monomorphic
-    /// coroutine instance under its type tag, once per distinct
-    /// instance. A coroutine's layout is the compiler's own
-    /// state-machine layout (which captures live across each
-    /// suspension point); it cannot be derived from the converted
-    /// MIR, so it comes from the same layout query the ADT path
-    /// uses. The entry lands in `adt_layouts`, the table the
+    /// closure or coroutine instance under its type tag, once per
+    /// distinct instance. A coroutine's layout is the compiler's
+    /// own state-machine layout (which captures live across each
+    /// suspension point), and a closure's is its capture aggregate;
+    /// neither can be derived from the converted MIR, so both come
+    /// from the same layout query the ADT path uses. The entry
+    /// lands in `adt_layouts`, the table the
     /// `size_of_val` / `align_of_val` builtins consult by tag.
     /// Instances the query cannot answer (generic parameters among
     /// the arguments) are skipped under the same containment as

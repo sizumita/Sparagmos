@@ -138,7 +138,13 @@ pub fn ty_tag(ty: &mir::Ty, names: &HashMap<mir::DefId, String>) -> String {
             format!("&{m}{}", ty_tag(inner, names))
         }
         T::RawPtr(inner, _) => format!("*const {}", ty_tag(inner, names)),
-        T::Adt(def, args) => {
+        T::Adt(def, args) | T::Closure(def, args) => {
+            // A closure type is identified by its definition's
+            // name plus its generic arguments (the upvars tuple
+            // among them), the same rendering as an ADT instance:
+            // two distinct closure types must not share a tag,
+            // because the layout table is keyed by it (`size_of` /
+            // `size_of_val` of a closure value is a per-type fact).
             let base = names
                 .get(def)
                 .cloned()
