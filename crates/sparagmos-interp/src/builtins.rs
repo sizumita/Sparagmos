@@ -6726,16 +6726,31 @@ impl<'a> Interpreter<'a> {
                 // As in the element copy: an unreadable destination
                 // is a buffer being filled, which the indexed path
                 // can create elements in.
-                let dst_aggregate = self
-                    .read_resolved(frames, &target)
-                    .map(|v| {
-                        matches!(
-                            v,
-                            Value::Tuple(_) | Value::FatRef { .. } | Value::Bytes(_) | Value::Str(_)
-                        )
-                    })
-                    .unwrap_or(true);
-                if n == 1 && !dst_aggregate {
+                let dst = self.read_resolved(frames, &target);
+                // A one-element fill denotes the target whole when
+                // the target is not a sequence (a scalar or wrapper
+                // place: the fill is its new value), and also when
+                // the target is an array whose scalar-leaf count
+                // the fill's type exactly matches — the intrinsic's
+                // type is then the target's own type (an array
+                // filled in one operation, the shape `mem::zeroed`
+                // takes under optimisation), and writing the fill
+                // as element 0 of a sequence would nest it inside
+                // its own first element. Any other fill denotes one
+                // element of the target sequence.
+                let whole = n == 1
+                    && match &dst {
+                        Ok(v @ Value::Tuple(_)) => {
+                            value_leaf_count(v).is_some()
+                                && value_leaf_count(v) == tag_leaf_count(tag)
+                        }
+                        Ok(Value::FatRef { .. } | Value::Bytes(_) | Value::Str(_)) => {
+                            false
+                        }
+                        Ok(_) => true,
+                        Err(_) => false,
+                    };
+                if whole {
                     self.write_resolved(frames, &target, fill)?;
                 } else {
                     for i in 0..n {
@@ -12148,11 +12163,76 @@ fn element_count(value: &Value, name: &str) -> InterpResult<usize> {
     }
 }
 
+/// The most scalar leaves a materialised fill value (a
+/// `mem::zeroed` result, a `write_bytes` fill) may hold. The
+/// interpreter's values are trees, so a fill of a large array
+/// type is a tree with one value per element: the bound admits
+/// a `mem::zeroed::<[u8; 1 << 20]>()` — the big-buffer shape
+/// real programs use, the same order as the conversion bound
+/// on `Rvalue::Repeat` aggregates — while keeping an absurd
+/// type from exhausting memory.
+const MAX_FILL_LEAVES: usize = 1 << 21;
+
+/// The number of scalar leaves in the value of the type `tag`
+/// names, for the fill functions' materialisation budget: a
+/// scalar is one leaf, a tuple sums its parts, an array
+/// multiplies. `None` for a tag outside the fill grammar.
+fn tag_leaf_count(tag: &str) -> Option<usize> {
+    let tag = tag.trim();
+    match tag {
+        "bool" | "char" | "f16" | "f32" | "f64" | "f128" | "()" => Some(1),
+        _ if int_tag(tag).is_some() => Some(1),
+        _ if tag.starts_with('(') && tag.ends_with(')') => {
+            let inner = &tag[1..tag.len() - 1];
+            let mut total: usize = 0;
+            if !inner.trim().is_empty() {
+                for part in split_top_level(inner) {
+                    total = total.checked_add(tag_leaf_count(part)?)?;
+                }
+            }
+            Some(total)
+        }
+        _ if tag.starts_with('[') && tag.ends_with(']') => {
+            let inner = &tag[1..tag.len() - 1];
+            let (elem, n) = inner.rsplit_once(';')?;
+            let n: usize = n.trim().parse().ok()?;
+            n.checked_mul(tag_leaf_count(elem)?)
+        }
+        _ => None,
+    }
+}
+
+/// The number of scalar leaves in a materialised `value`,
+/// mirroring [`tag_leaf_count`]: aggregates sum their parts,
+/// anything else is one leaf. Byte blocks and strings keep the
+/// sequence path (their fills are byte-wise), a fat reference's
+/// pointee count is not a fact of the value alone, and an
+/// uninitialised leaf has no count: all are `None` here.
+fn value_leaf_count(value: &Value) -> Option<usize> {
+    match value {
+        Value::Tuple(items) => items.iter().map(value_leaf_count).sum(),
+        Value::Enum { fields, .. } | Value::Coroutine { fields, .. } => {
+            fields.iter().map(value_leaf_count).sum()
+        }
+        Value::Closure { env, .. } => env.iter().map(value_leaf_count).sum(),
+        Value::Bytes(_)
+        | Value::Str(_)
+        | Value::FatRef { .. }
+        | Value::DynRef { .. }
+        | Value::Uninit => None,
+        _ => Some(1),
+    }
+}
+
 /// The value whose byte pattern is `byte` repeated, for the
 /// element type `tag` names — the value `write_bytes` fills with.
 /// Only types with a fixed byte interpretation are filled: for
 /// any other type an arbitrary byte pattern need not be a valid
-/// value, so the fill stays unsupported there.
+/// value, so the fill stays unsupported there. An array of a
+/// fillable element type is filled element by element (the
+/// shape `mem::zeroed` takes under optimisation, where the
+/// intrinsic's type is the whole array), within the
+/// materialisation budget.
 fn byte_fill_value(tag: &str, byte: u8) -> Option<Value> {
     let tag = tag.trim();
     if let Some((bits, signed)) = int_tag(tag) {
@@ -12181,6 +12261,16 @@ fn byte_fill_value(tag: &str, byte: u8) -> Option<Value> {
         )),
         "f32" => Value::Float(f64::from(f32::from_bits(u32::from(byte) * 0x0101_0101))),
         "f64" => Value::Float(f64::from_bits(u64::from(byte) * 0x0101_0101_0101_0101)),
+        _ if tag.starts_with('[') && tag.ends_with(']') => {
+            let inner = &tag[1..tag.len() - 1];
+            let (elem, n) = inner.rsplit_once(';')?;
+            let n: usize = n.trim().parse().ok()?;
+            if tag_leaf_count(tag)? > MAX_FILL_LEAVES {
+                return None;
+            }
+            let elem = byte_fill_value(elem, byte)?;
+            Value::Tuple(vec![elem; n])
+        }
         _ => return None,
     })
 }
@@ -12769,10 +12859,16 @@ fn as_u128(value: &Value, name: &str) -> InterpResult<u128> {
 }
 
 /// The all-zero-bits value of the type `tag` names, for
-/// `mem::zeroed`: scalars, and tuples/arrays built from scalars.
-/// Anything else (an ADT whose zero bit pattern need not be a
-/// valid value, a reference, ...) stays unsupported.
+/// `mem::zeroed`: scalars, and tuples/arrays built from scalars,
+/// within the materialisation budget (see [`MAX_FILL_LEAVES`]):
+/// a large array of scalars is a big tree of zero leaves, which
+/// the budget admits up to millions of elements. Anything else
+/// (an ADT whose zero bit pattern need not be a valid value, a
+/// reference, ...) stays unsupported.
 fn zeroed_value_for_tag(tag: &str) -> Option<Value> {
+    if tag_leaf_count(tag)? > MAX_FILL_LEAVES {
+        return None;
+    }
     let tag = tag.trim();
     Some(match tag {
         "bool" => Value::Bool(false),
@@ -12795,9 +12891,6 @@ fn zeroed_value_for_tag(tag: &str) -> Option<Value> {
             let inner = &tag[1..tag.len() - 1];
             let (elem, n) = inner.rsplit_once(';')?;
             let n: usize = n.trim().parse().ok()?;
-            if n > 4096 {
-                return None;
-            }
             let elem = zeroed_value_for_tag(elem)?;
             Value::Tuple(vec![elem; n])
         }

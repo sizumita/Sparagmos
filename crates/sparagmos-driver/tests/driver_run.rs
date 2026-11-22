@@ -11484,3 +11484,122 @@ fn convert_mode_simd_gather_with_non_pointer_vector_is_a_compile_failure() {
     );
 }
 
+
+// ----- statics holding slice references (Issue #140) ---------------------------
+
+const STATIC_MUT_SLICE_SRC: &str = r#"
+#![allow(static_mut_refs)]
+
+static mut TEST: &'static mut [isize] = &mut [1];
+static mut EMPTY: &'static mut [isize] = &mut [];
+static mut INT: &'static mut isize = &mut 1;
+static mut TEST_RAW: *mut [isize] = &mut [1isize] as *mut _;
+static mut INT_RAW: *mut isize = &mut 1isize as *mut _;
+
+pub fn main() {
+    unsafe {
+        TEST[0] += 1;
+        assert_eq!(TEST[0], 2);
+        assert_eq!(EMPTY.len(), 0);
+        *INT += 1;
+        assert_eq!(*INT, 2);
+        (*TEST_RAW)[0] += 1;
+        assert_eq!((*TEST_RAW)[0], 2);
+        *INT_RAW += 1;
+        assert_eq!(*INT_RAW, 2);
+    }
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_static_mut_slice_references_write_through() {
+    // A mutable slice reference stored in a static denotes the
+    // promoted array's own storage (a fat reference over the
+    // static reference), so a write through it is observed by
+    // later reads of the static instead of landing in a detached
+    // snapshot of the elements.
+    let dir = temp_dir("static-mut-slice");
+    let src = fixture(&dir, "static_mut_slice.rs", STATIC_MUT_SLICE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "writes through a static's slice reference must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+const STATIC_SLICE_ALIAS_SRC: &str = r#"
+use std::sync::atomic::{AtomicIsize, Ordering};
+
+static A: [AtomicIsize; 1] = [AtomicIsize::new(7)];
+static TEST: &[AtomicIsize] = &A;
+
+pub fn main() {
+    TEST[0].store(9, Ordering::SeqCst);
+    assert_eq!(A[0].load(Ordering::SeqCst), 9);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_static_slice_alias_observes_the_named_static() {
+    // A slice reference to a whole named array static is the
+    // same storage as the static itself: an interior write
+    // through the alias is read back through the static.
+    let dir = temp_dir("static-slice-alias");
+    let src = fixture(&dir, "static_slice_alias.rs", STATIC_SLICE_ALIAS_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a slice alias of an array static must share its storage; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+// ----- large array fills (Issue #140) ------------------------------------------
+
+const LARGE_FILL_SRC: &str = r#"
+use std::mem::MaybeUninit;
+
+fn main() {
+    // `mem::zeroed` of a large scalar array materialises the
+    // whole zero tree.
+    let z: [u64; 5000] = unsafe { std::mem::zeroed() };
+    assert_eq!(z[4999], 0);
+    let nested: [[u16; 300]; 300] = unsafe { std::mem::zeroed() };
+    assert_eq!(nested[299][299], 0);
+    // `write_bytes` whose element type is the whole array (the
+    // shape `mem::zeroed` takes under optimisation) fills it in
+    // one operation.
+    let mut un: MaybeUninit<[u8; 1048576]> = MaybeUninit::uninit();
+    unsafe {
+        std::ptr::write_bytes(un.as_mut_ptr(), 0u8, 1);
+        let arr = un.assume_init_read();
+        assert_eq!(arr[0], 0);
+        assert_eq!(arr[1048575], 0);
+        std::ptr::write_bytes(un.as_mut_ptr(), 0x5Au8, 1);
+        let arr = un.assume_init_read();
+        assert_eq!(arr[524288], 0x5A);
+    }
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_large_array_zeroed_and_write_bytes_execute() {
+    let dir = temp_dir("large-fill");
+    let src = fixture(&dir, "large_fill.rs", LARGE_FILL_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "large array zeroed / write_bytes fills must execute; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
