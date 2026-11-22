@@ -3623,7 +3623,7 @@ impl<'a> Interpreter<'a> {
     /// The current contents of allocation `id` (a clone; the
     /// store is the shared storage, so writes go through
     /// `write_resolved`, never through this copy).
-    fn alloc_base(&self, id: u64) -> InterpResult<Value> {
+    pub(crate) fn alloc_base(&self, id: u64) -> InterpResult<Value> {
         self.allocs
             .borrow()
             .get(&id)
@@ -3635,7 +3635,7 @@ impl<'a> Interpreter<'a> {
     /// drop glue has completed). Removing an id that is not
     /// present is not an error: glue also runs for places whose
     /// box was fabricated rather than allocated.
-    fn free_alloc(&self, id: u64) {
+    pub(crate) fn free_alloc(&self, id: u64) {
         self.allocs.borrow_mut().remove(&id);
     }
 

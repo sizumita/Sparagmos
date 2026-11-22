@@ -903,6 +903,25 @@ pub enum Builtin {
     /// interpreter models as lane tuples (possibly inside the
     /// one-field wrapper a SIMD type is).
     SimdOp(SimdOp),
+    /// `alloc::alloc::__rust_alloc(size, align) -> *mut u8` and
+    /// `__rust_alloc_zeroed`: a fresh block in the allocation
+    /// store, named by a new allocation id. The uninitialised
+    /// form's storage is `Value::Uninit` (the buffer-fill write
+    /// paths materialise its elements, exactly as for a
+    /// `Box::new_uninit` pointee); the zeroed form's storage is
+    /// zero bytes. A request too large to materialise answers
+    /// the null pointer, which is the shim's own failure signal
+    /// (the caller then runs the allocation-error path).
+    RustAlloc { zeroed: bool },
+    /// `alloc::alloc::__rust_dealloc(ptr, size, align)`: removes
+    /// the pointer's block from the allocation store. A pointer
+    /// that names no live block (a fabricated or dangling one)
+    /// frees nothing.
+    RustDealloc,
+    /// `alloc::alloc::__rust_realloc(ptr, old_size, align,
+    /// new_size) -> *mut u8`: a fresh block holding the old
+    /// block's contents; the old block is freed.
+    RustRealloc,
 }
 
 /// A relational operator selected by a `PartialOrd` method.
@@ -1885,6 +1904,10 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         | "core::intrinsics::simd::simd_with_exposed_provenance" => {
             Builtin::SimdOp(SimdOp::WithExposedProvenance)
         }
+        "alloc::alloc::__rust_alloc" => Builtin::RustAlloc { zeroed: false },
+        "alloc::alloc::__rust_alloc_zeroed" => Builtin::RustAlloc { zeroed: true },
+        "alloc::alloc::__rust_dealloc" => Builtin::RustDealloc,
+        "alloc::alloc::__rust_realloc" => Builtin::RustRealloc,
         _ if canonical.starts_with("std::rc::Rc") && canonical.ends_with(">::new") => {
             Builtin::RcNew
         }
@@ -5956,6 +5979,78 @@ impl<'a> Interpreter<'a> {
                 }))
             }
             Builtin::SimdOp(op) => self.exec_simd(op, frames, generic_args, &vals),
+            Builtin::RustAlloc { zeroed } => {
+                arity(2)?;
+                let size = match &vals[0] {
+                    Value::Uint(n) => *n,
+                    Value::Int(n) if *n >= 0 => *n as u128,
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            name,
+                            "allocation size",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                // The uninitialised form stores nothing per byte,
+                // so only the zeroed form has a materialisation
+                // limit; past it the shim's failure signal (the
+                // null pointer) is the faithful answer.
+                if zeroed && size > (1 << 28) {
+                    return Ok(Value::Ref(RefTarget::Null));
+                }
+                let content = if zeroed {
+                    Value::Bytes(vec![0u8; size as usize])
+                } else {
+                    Value::Uninit
+                };
+                let id = self.alloc_insert(content);
+                Ok(Value::Ref(RefTarget::Alloc {
+                    id,
+                    projection: Vec::new(),
+                }))
+            }
+            Builtin::RustDealloc => {
+                arity(3)?;
+                if let Value::Ref(RefTarget::Alloc { id, projection }) = &vals[0] {
+                    if projection.is_empty() {
+                        self.free_alloc(*id);
+                    }
+                }
+                Ok(Value::Unit)
+            }
+            Builtin::RustRealloc => {
+                arity(4)?;
+                let new_size = match &vals[3] {
+                    Value::Uint(n) => *n,
+                    Value::Int(n) if *n >= 0 => *n as u128,
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            name,
+                            "allocation size",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                let content = match &vals[0] {
+                    Value::Ref(RefTarget::Alloc { id, projection })
+                        if projection.is_empty() =>
+                    {
+                        let old = self.alloc_base(*id)?;
+                        self.free_alloc(*id);
+                        old
+                    }
+                    _ => {
+                        let _ = new_size;
+                        Value::Uninit
+                    }
+                };
+                let id = self.alloc_insert(content);
+                Ok(Value::Ref(RefTarget::Alloc {
+                    id,
+                    projection: Vec::new(),
+                }))
+            }
             Builtin::AtomicCxchg => {
                 arity(3)?;
                 // Single-threaded: nothing can intervene between
