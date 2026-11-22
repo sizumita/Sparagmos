@@ -3195,7 +3195,9 @@ impl<'a> Interpreter<'a> {
             RefTarget::Address(_) => return Ok(None),
         };
         let mut value = base;
-        for step in prefix.iter().chain(path.iter()) {
+        let steps: Vec<RefProj> = prefix.iter().chain(path.iter()).cloned().collect();
+        let mut step_idx = 0;
+        while step_idx < steps.len() {
             if value == Value::Uninit {
                 return Ok(None);
             }
@@ -3206,11 +3208,29 @@ impl<'a> Interpreter<'a> {
                 Some(v) => value = v,
                 None => return Ok(None),
             }
-            match self.project_value_t(value, std::slice::from_ref(step), "<drop>", "drop glue") {
+            // A coroutine downcast only names the state whose saved
+            // storage the following field step addresses, so the two
+            // steps are projected together: projected on its own,
+            // the field step would read the upvar storage instead.
+            let take = if matches!(steps[step_idx], RefProj::Downcast(_))
+                && matches!(value, Value::Coroutine { .. })
+                && matches!(steps.get(step_idx + 1), Some(RefProj::Field(_)))
+            {
+                2
+            } else {
+                1
+            };
+            match self.project_value_t(
+                value,
+                &steps[step_idx..step_idx + take],
+                "<drop>",
+                "drop glue",
+            ) {
                 Ok(v) => value = v,
                 Err(InterpError::UninitializedRead { .. }) => return Ok(None),
                 Err(e) => return Err(e),
             }
+            step_idx += take;
         }
         if value == Value::Uninit {
             Ok(None)
@@ -3425,12 +3445,34 @@ impl<'a> Interpreter<'a> {
                             continue;
                         };
                         let is_coroutine = matches!(value, Value::Coroutine { .. });
+                        // For a coroutine in a saved state, the plan
+                        // (selected by the `Variants` arm for exactly
+                        // this state) covers that state's saved
+                        // storage, and the field paths below must
+                        // route through its downcast; in the
+                        // unresumed state it covers the upvar
+                        // storage the bare field paths address.
+                        let mut coroutine_state: Option<u32> = None;
                         let items = match value {
                             Value::Tuple(items) => items,
                             Value::Enum { fields, .. } => fields,
                             // A closure's fields are its captures.
                             Value::Closure { env, .. } => env,
-                            Value::Coroutine { fields, .. } => fields,
+                            Value::Coroutine {
+                                variant,
+                                fields,
+                                saved,
+                            } => {
+                                coroutine_state = Some(variant);
+                                if variant == 0 {
+                                    fields
+                                } else {
+                                    saved
+                                        .get(variant as usize)
+                                        .cloned()
+                                        .unwrap_or_default()
+                                }
+                            }
                             other => {
                                 return Err(InterpError::type_mismatch(
                                     "drop glue",
@@ -3464,6 +3506,11 @@ impl<'a> Interpreter<'a> {
                             }
                             if field_plan != P::Trivial {
                                 let mut sub = path.clone();
+                                if let Some(state) = coroutine_state {
+                                    if state != 0 {
+                                        sub.push(RefProj::Downcast(state));
+                                    }
+                                }
                                 sub.push(RefProj::Field(i));
                                 active.work.push((sub, field_plan));
                             }
@@ -3501,8 +3548,17 @@ impl<'a> Interpreter<'a> {
                         let (variant, stored_fields) = match &value {
                             Value::Enum { variant, .. } => (*variant, None),
                             Value::Coroutine {
-                                variant, fields, ..
-                            } => (*variant, Some(fields.len())),
+                                variant,
+                                fields,
+                                saved,
+                            } => {
+                                let stored = if *variant == 0 {
+                                    fields.len()
+                                } else {
+                                    saved.get(*variant as usize).map_or(0, Vec::len)
+                                };
+                                (*variant, Some(stored))
+                            }
                             Value::Tuple(_) => (0, None),
                             other => {
                                 return Err(InterpError::type_mismatch(
@@ -4617,10 +4673,11 @@ impl<'a> Interpreter<'a> {
     }
 
     /// Set the discriminant of the ADT value `value` to `variant`,
-    /// as a `SetDiscriminant` statement does: a coroutine keeps its
-    /// state fields (they are the shared storage the transform
-    /// writes before the tag moves), an enum's old payload is
-    /// invalidated.
+    /// as a `SetDiscriminant` statement does: a coroutine keeps both
+    /// of its storages (the transform writes the entered state's
+    /// fields through its downcast before the tag moves, and values
+    /// saved for other states must survive the change), an enum's
+    /// old payload is invalidated.
     fn set_discriminant_value(
         value: &mut Value,
         variant: u32,
@@ -8600,6 +8657,7 @@ impl<'a> Interpreter<'a> {
                 Ok(Value::Coroutine {
                     variant: 0,
                     fields,
+                    saved: Vec::new(),
                 })
             }
             Rvalue::Cast(operand, ty) => {
@@ -9269,6 +9327,9 @@ pub(crate) fn project_value(
 ) -> InterpResult<Value> {
     let mut value = value;
     let mut step_idx = 0;
+    // The state a coroutine downcast named, for the field step
+    // that follows it (see the `Downcast` arm below).
+    let mut downcast_state: Option<u32> = None;
     while step_idx < projection.len() {
         let step = &projection[step_idx];
         step_idx += 1;
@@ -9278,6 +9339,7 @@ pub(crate) fn project_value(
                 place: place.to_string(),
             });
         }
+        let step_state = downcast_state.take();
         value = match step {
             RefProj::Field(idx) => match value {
                 Value::Tuple(ref items) => items.get(*idx).cloned().ok_or_else(|| {
@@ -9294,13 +9356,28 @@ pub(crate) fn project_value(
                         }
                     })?
                 }
-                Value::Coroutine { ref fields, .. } => {
-                    fields.get(*idx).cloned().ok_or_else(|| {
-                        InterpError::UninitializedRead {
+                Value::Coroutine {
+                    ref fields,
+                    ref saved,
+                    ..
+                } => {
+                    // A field step through a downcast reads that
+                    // state's saved storage; without one it reads
+                    // the upvar storage (see `Value::Coroutine`).
+                    // State 0 is the unresumed state, whose fields
+                    // ARE the upvars, so its downcast addresses the
+                    // upvar storage too.
+                    let storage = match step_state {
+                        Some(0) | None => Some(fields),
+                        Some(state) => saved.get(state as usize),
+                    };
+                    storage
+                        .and_then(|fields| fields.get(*idx))
+                        .cloned()
+                        .ok_or_else(|| InterpError::UninitializedRead {
                             func: func.to_string(),
                             place: place.to_string(),
-                        }
-                    })?
+                        })?
                 }
                 Value::Closure { ref env, .. } => {
                     env.get(*idx).cloned().ok_or_else(|| {
@@ -9559,12 +9636,16 @@ pub(crate) fn project_value(
                 }
             }
             RefProj::Downcast(variant) => match value {
-                // A coroutine's downcast names the state whose field
-                // layout the access uses; the storage is shared
-                // between states, so the access is valid whatever
-                // the current tag is (the body writes a state's
-                // fields before setting the tag to that state).
-                Value::Coroutine { .. } => value,
+                // A coroutine's downcast names the state whose saved
+                // storage the following field step uses; the access
+                // is valid whatever the current tag is (the body
+                // writes a state's fields before setting the tag to
+                // that state). The tag itself does not move here:
+                // the state is remembered for the next step only.
+                Value::Coroutine { .. } => {
+                    downcast_state = Some(*variant);
+                    value
+                }
                 Value::Enum {
                     variant: current, ..
                 } => {
@@ -9788,6 +9869,9 @@ pub(crate) fn project_value_ref<'a>(
 ) -> InterpResult<Cow<'a, Value>> {
     let mut cur: &'a Value = value;
     let mut rest = projection;
+    // The state a coroutine downcast named, for the field step
+    // that follows it (see the `Downcast` arm below).
+    let mut downcast_state: Option<u32> = None;
     while let Some((step, tail)) = rest.split_first() {
         if *cur == Value::Uninit {
             return Err(InterpError::UninitializedRead {
@@ -9796,6 +9880,7 @@ pub(crate) fn project_value_ref<'a>(
             });
         }
         rest = tail;
+        let step_state = downcast_state.take();
         match step {
             RefProj::Field(idx) => {
                 cur = match cur {
@@ -9811,12 +9896,22 @@ pub(crate) fn project_value_ref<'a>(
                             place: place.to_string(),
                         }
                     })?,
-                    Value::Coroutine { fields, .. } => fields.get(*idx).ok_or_else(|| {
-                        InterpError::UninitializedRead {
-                            func: func.to_string(),
-                            place: place.to_string(),
-                        }
-                    })?,
+                    Value::Coroutine { fields, saved, .. } => {
+                        // As in `project_value`: a downcast routes
+                        // the field step to that state's saved
+                        // storage, otherwise (and for state 0, the
+                        // unresumed state) the upvar storage.
+                        let storage = match step_state {
+                            Some(0) | None => Some(fields),
+                            Some(state) => saved.get(state as usize),
+                        };
+                        storage
+                            .and_then(|fields| fields.get(*idx))
+                            .ok_or_else(|| InterpError::UninitializedRead {
+                                func: func.to_string(),
+                                place: place.to_string(),
+                            })?
+                    }
                     Value::Closure { env, .. } => env.get(*idx).ok_or_else(|| {
                         InterpError::UninitializedRead {
                             func: func.to_string(),
@@ -10008,7 +10103,9 @@ pub(crate) fn project_value_ref<'a>(
                 return Ok(Cow::Owned(project_value(v, rest, func, place)?));
             }
             RefProj::Downcast(variant) => match cur {
-                Value::Coroutine { .. } => {}
+                Value::Coroutine { .. } => {
+                    downcast_state = Some(*variant);
+                }
                 Value::Enum {
                     variant: current, ..
                 } => {
@@ -10328,9 +10425,43 @@ pub(crate) fn navigate_mut<'x>(
             }
         }
         RefProj::Downcast(variant) => match slot {
-            // See the read direction: a coroutine's field writes go
-            // through the downcast of the state being entered,
-            // whatever the current tag is.
+            Value::Coroutine { .. }
+                if matches!(rest.first(), Some(RefProj::Field(_))) =>
+            {
+                // A coroutine's field writes go through the downcast
+                // of the state being entered, whatever the current
+                // tag is, and land in that state's saved storage -
+                // not in the upvar storage a field step without a
+                // downcast addresses (see `Value::Coroutine`); the
+                // unresumed state's downcast is the one exception,
+                // handled below. The state storage grows to the
+                // written slot, like the upvar storage in the
+                // `Field` arm above.
+                let (idx, tail) = match rest.split_first() {
+                    Some((RefProj::Field(idx), tail)) => (*idx, tail),
+                    _ => unreachable!(),
+                };
+                let Value::Coroutine { fields, saved, .. } = slot else {
+                    unreachable!()
+                };
+                // State 0 is the unresumed state: its fields are
+                // the upvars, so the write lands in the upvar
+                // storage, matching the read paths.
+                let state = if *variant == 0 {
+                    &mut *fields
+                } else {
+                    if saved.len() <= *variant as usize {
+                        saved.resize(*variant as usize + 1, Vec::new());
+                    }
+                    &mut saved[*variant as usize]
+                };
+                if state.len() <= idx {
+                    state.resize(idx + 1, Value::Uninit);
+                }
+                navigate_mut(&mut state[idx], tail, func, place)
+            }
+            // A downcast with no field step after it (a whole-state
+            // place) denotes the coroutine value itself.
             Value::Coroutine { .. } => navigate_mut(slot, rest, func, place),
             Value::Enum {
                 variant: current,

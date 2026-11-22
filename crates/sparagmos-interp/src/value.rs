@@ -54,15 +54,21 @@
 //!   it reads `(*env).<field>` in rustc MIR.
 //!
 //! - [`Value::Coroutine`] is a coroutine state object (the value of
-//!   a future / generator): a state discriminant plus the fields
-//!   live in that state. Unlike [`Value::Enum`], its fields are the
-//!   shared state storage the coroutine transform lays out: the body
-//!   writes one state's fields through downcast projections *before*
-//!   the discriminant is set to that state, and setting the
-//!   discriminant never clears the fields - the transform relies on
-//!   values saved in the storage surviving the tag change, and on
-//!   field slots being addressed per (state, field) through explicit
-//!   copies whenever the layout moves a value between slots.
+//!   a future / generator): a state discriminant plus two storage
+//!   areas the coroutine transform addresses separately. `fields`
+//!   is the upvar storage - the captures the creation aggregate
+//!   stored - addressed by field projections with no preceding
+//!   downcast, in any state. `saved` holds one field vector per
+//!   state, addressed by field projections through a downcast to
+//!   that state: the body writes a state's fields through its
+//!   downcast *before* the discriminant is set to that state, and
+//!   setting the discriminant never clears either storage. State
+//!   0 is the exception: the unresumed state's fields ARE the
+//!   upvars, so a downcast to state 0 addresses `fields` too. The two
+//!   areas are distinct even where their indices coincide (an
+//!   async block's upvar at field 0 and its first saved field at
+//!   (state, 0) are different slots); whenever a value lives in
+//!   both, the transform moves it with an explicit copy.
 //!
 //! - [`Value::PanicPayload`] is a raw panic payload in flight: the
 //!   value the panic runtime hands to `catch_unwind`'s catch
@@ -310,10 +316,18 @@ pub enum Value {
     /// A coroutine state object: the state discriminant (0 =
     /// unresumed, then one per suspension point, then the returned
     /// and panicked states - the exact numbering is the coroutine
-    /// layout's, read back by the body's entry `SwitchInt`) plus
-    /// the state storage fields. See the module docs for how this
-    /// differs from [`Value::Enum`].
-    Coroutine { variant: u32, fields: Vec<Value> },
+    /// layout's, read back by the body's entry `SwitchInt`), the
+    /// upvar storage `fields`, and the per-state saved storage
+    /// `saved` (indexed by state; entry 0 is never used - the
+    /// unresumed state's fields are the upvars in `fields` - and
+    /// states with no saved fields, including the returned and
+    /// panicked states, hold an empty or absent vector). See the
+    /// module docs for how this differs from [`Value::Enum`].
+    Coroutine {
+        variant: u32,
+        fields: Vec<Value>,
+        saved: Vec<Vec<Value>>,
+    },
     /// A raw panic payload in flight between the `catch_unwind`
     /// intrinsic and `std::panicking::catch_unwind::cleanup` (see
     /// the module docs). Anywhere else the value is meaningless;
@@ -493,7 +507,7 @@ impl fmt::Display for Value {
             Value::Closure { def, env } => {
                 write!(f, "<closure {def} ({} captures)>", env.len())
             }
-            Value::Coroutine { variant, fields } => {
+            Value::Coroutine { variant, fields, .. } => {
                 write!(f, "<coroutine state {variant} ({} fields)>", fields.len())
             }
             Value::PanicPayload(payload) => {

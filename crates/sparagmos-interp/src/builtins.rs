@@ -15014,8 +15014,13 @@ fn tag_leaf_count(tag: &str) -> Option<usize> {
 fn value_leaf_count(value: &Value) -> Option<usize> {
     match value {
         Value::Tuple(items) => items.iter().map(value_leaf_count).sum(),
-        Value::Enum { fields, .. } | Value::Coroutine { fields, .. } => {
-            fields.iter().map(value_leaf_count).sum()
+        Value::Enum { fields, .. } => fields.iter().map(value_leaf_count).sum(),
+        Value::Coroutine { fields, saved, .. } => {
+            let mut total = 0usize;
+            for value in fields.iter().chain(saved.iter().flatten()) {
+                total += value_leaf_count(value)?;
+            }
+            Some(total)
         }
         Value::Closure { env, .. } => env.iter().map(value_leaf_count).sum(),
         Value::Bytes(_)

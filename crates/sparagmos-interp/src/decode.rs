@@ -745,6 +745,7 @@ impl<'a> Interpreter<'a> {
                 Ok(Value::Coroutine {
                     variant: 0,
                     fields,
+                    saved: Vec::new(),
                 })
             }
             DRvalue::Cast(src, ty) => {
