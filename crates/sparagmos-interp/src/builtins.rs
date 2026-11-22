@@ -5883,10 +5883,27 @@ impl<'a> Interpreter<'a> {
                 // write. The pointer denotes the start of the
                 // uninitialized region in that shape (a fresh
                 // buffer's base pointer).
+                // A target ending in an index projection denotes
+                // one element of an existing aggregate (the shape
+                // an array-to-element pointer cast produces), not
+                // the start of an unmaterialized region: filling it
+                // goes through the sequence access below, which
+                // writes the elements at their own positions. (A
+                // single-element fill writes the denoted element
+                // itself either way, so it keeps this fast path.)
+                let ends_with_index = match &target {
+                    Resolved::Place { projection, .. }
+                    | Resolved::Static { projection, .. }
+                    | Resolved::Alloc { projection, .. } => {
+                        matches!(projection.last(), Some(RefProj::Index(_)))
+                    }
+                    Resolved::Value(_) => false,
+                };
                 if matches!(
                     self.read_resolved(frames, &target),
                     Err(InterpError::UninitializedRead { .. })
-                ) {
+                ) && (n == 1 || !ends_with_index)
+                {
                     if n == 1 {
                         self.write_resolved(frames, &target, fill)?;
                     } else {
@@ -5910,7 +5927,7 @@ impl<'a> Interpreter<'a> {
                     self.write_resolved(frames, &target, fill)?;
                 } else {
                     for i in 0..n {
-                        self.write_resolved_at(frames, &target, i, fill.clone())?;
+                        self.write_seq_at(frames, &target, i, fill.clone())?;
                     }
                 }
                 Ok(Value::Unit)
@@ -8801,7 +8818,7 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         }
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
-            match self.read_resolved_at(frames, &target, i)? {
+            match self.read_seq_at(frames, &target, i)? {
                 Value::Uint(b) => out.push(b as u8),
                 Value::Int(b) if (0..=255).contains(&b) => out.push(b as u8),
                 other => {

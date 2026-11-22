@@ -3815,7 +3815,9 @@ impl<'a> Interpreter<'a> {
                 // element-for-element either way. A pointer in this
                 // model denotes either an aggregate (an array place,
                 // a fat pointer's base) whose elements are indexed, or
-                // a single element, which only a count of 1 can copy.
+                // a single element, which a count of 1 copies directly
+                // and larger counts continue at its siblings (the
+                // sequence access in `read_seq_at` / `write_seq_at`).
                 let aggregate = |v: &Value| {
                     matches!(
                         v,
@@ -3828,7 +3830,7 @@ impl<'a> Interpreter<'a> {
                 } else {
                     let mut elems = Vec::with_capacity(n);
                     for i in 0..n {
-                        elems.push(self.read_resolved_at(frames, &src_target, i)?);
+                        elems.push(self.read_seq_at(frames, &src_target, i)?);
                     }
                     elems
                 };
@@ -3844,7 +3846,7 @@ impl<'a> Interpreter<'a> {
                     self.write_resolved(frames, &dst_target, value)?;
                 } else {
                     for (i, value) in elems.into_iter().enumerate() {
-                        self.write_resolved_at(frames, &dst_target, i, value)?;
+                        self.write_seq_at(frames, &dst_target, i, value)?;
                     }
                 }
                 Ok(())
@@ -5457,6 +5459,109 @@ impl<'a> Interpreter<'a> {
             }
             Resolved::Value(_) => self.write_resolved(frames, target, value),
         }
+    }
+
+    /// Read element `index` of the sequence a bulk-memory
+    /// operation (copy / fill / compare) starting at `target`
+    /// reads. Such an operation's pointer denotes the sequence's
+    /// first element, which two target shapes express: an
+    /// aggregate (an array place, a fat pointer's base), whose
+    /// elements the plain indexed access
+    /// ([`Self::read_resolved_at`]) walks, or a single element —
+    /// a trailing index projection, the shape an array-to-element
+    /// pointer cast produces — whose siblings continue the
+    /// sequence, so the index adds to the trailing one. Which
+    /// shape a target is follows from the value it denotes: an
+    /// aggregate value (a nested array's row included) takes the
+    /// plain access; anything else is one element of the sequence.
+    pub(crate) fn read_seq_at(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        index: usize,
+    ) -> InterpResult<Value> {
+        match self.seq_element_target(frames, target, index)? {
+            Some(target) => self.read_resolved(frames, &target),
+            None => self.read_resolved_at(frames, target, index),
+        }
+    }
+
+    /// Write element `index` of the sequence a bulk-memory
+    /// operation starting at `target` writes (see
+    /// [`Self::read_seq_at`]).
+    pub(crate) fn write_seq_at(
+        &self,
+        frames: &mut Vec<Frame>,
+        target: &Resolved,
+        index: usize,
+        value: Value,
+    ) -> InterpResult<()> {
+        match self.seq_element_target(frames, target, index)? {
+            Some(target) => self.write_resolved(frames, &target, value),
+            None => self.write_resolved_at(frames, target, index, value),
+        }
+    }
+
+    /// The directly-resolved target of element `index` of the
+    /// sequence starting at `target`, when `target` denotes a
+    /// single element of it (see [`Self::read_seq_at`]); `None`
+    /// when the plain indexed access applies. An unreadable
+    /// element (a buffer being filled element by element) still
+    /// denotes its position, so the adjustment applies to it as
+    /// well; any other read failure is the failure the plain
+    /// access would report, so it propagates unchanged. A
+    /// constant target's projection was already applied when it
+    /// resolved, so it always takes the plain access.
+    fn seq_element_target(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        index: usize,
+    ) -> InterpResult<Option<Resolved>> {
+        let projection = match target {
+            Resolved::Place { projection, .. }
+            | Resolved::Static { projection, .. }
+            | Resolved::Alloc { projection, .. } => projection,
+            Resolved::Value(_) => return Ok(None),
+        };
+        let Some((&RefProj::Index(start), head)) = projection.split_last() else {
+            return Ok(None);
+        };
+        match self.read_resolved(frames, target) {
+            Ok(v)
+                if matches!(
+                    v,
+                    Value::Tuple(_)
+                        | Value::FatRef { .. }
+                        | Value::Bytes(_)
+                        | Value::Str(_)
+                ) =>
+            {
+                return Ok(None);
+            }
+            Ok(_) | Err(InterpError::UninitializedRead { .. }) => {}
+            Err(e) => return Err(e),
+        }
+        let mut projection = head.to_vec();
+        projection.push(RefProj::Index(start + index));
+        Ok(Some(match target {
+            Resolved::Place {
+                frame_pos, local, ..
+            } => Resolved::Place {
+                frame_pos: *frame_pos,
+                local: *local,
+                projection,
+            },
+            Resolved::Static { name, .. } => Resolved::Static {
+                name: name.clone(),
+                projection,
+            },
+            Resolved::Alloc { id, .. } => Resolved::Alloc {
+                id: *id,
+                projection,
+            },
+            Resolved::Value(_) => unreachable!("value targets returned above"),
+        }))
     }
 
     /// The live place a `&RefCell` / `&mut RefCell` argument points
