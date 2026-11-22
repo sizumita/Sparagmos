@@ -14510,3 +14510,140 @@ fn run_mode_iterator_adapters_drop_by_value() {
     assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
     assert_eq!(stdout, "done\n");
 }
+
+// ----- uninitialized statics (Lane JZ) --------------------------------------
+// A static whose initializer is (partly) uninitialized decodes to a
+// bare `Uninit` seed: the storage holds no trace of the declared
+// type's structure, so an element write lands in a shapeless value
+// and every element read fails as an uninitialized-place read. The
+// converted seed carries the declared type's skeleton (the same
+// expansion the thread-local table applies to its seeds), so writes
+// and reads through the static's storage observe the array's shape.
+// Verification is by exit code, the sum of the payloads read back.
+
+const STATIC_UNINIT_ARRAY_SRC: &str = r#"
+use std::mem::MaybeUninit;
+static mut ARR: [MaybeUninit<u32>; 4] = [MaybeUninit::uninit(); 4];
+fn main() {
+    unsafe {
+        ARR[1] = MaybeUninit::new(42);
+        let v = ARR[1].assume_init();
+        std::process::exit(v as i32);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_static_uninit_array_write_then_read() {
+    let dir = temp_dir("static-uninit-array");
+    let src = fixture(&dir, "static_uninit_array.rs", STATIC_UNINIT_ARRAY_SRC);
+    let out = run_driver_extra(&src, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(42),
+        "the written element's payload must read back; stderr={stderr}"
+    );
+}
+
+const STATIC_UNINIT_ARRAY_LOOP_SRC: &str = r#"
+use std::mem::MaybeUninit;
+static mut ARR: [MaybeUninit<u32>; 4] = [MaybeUninit::uninit(); 4];
+fn main() {
+    unsafe {
+        let mut i = 0usize;
+        while i < 4 {
+            ARR[i] = MaybeUninit::new((i * 10) as u32);
+            i += 1;
+        }
+        let mut s = 0u32;
+        let mut j = 0usize;
+        while j < 4 {
+            s += ARR[j].assume_init();
+            j += 1;
+        }
+        std::process::exit(s as i32);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_static_uninit_array_dynamic_index_loop() {
+    let dir = temp_dir("static-uninit-array-loop");
+    let src = fixture(
+        &dir,
+        "static_uninit_array_loop.rs",
+        STATIC_UNINIT_ARRAY_LOOP_SRC,
+    );
+    let out = run_driver_extra(&src, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(60),
+        "every written element must read back; stderr={stderr}"
+    );
+}
+
+const STATIC_UNINIT_SLICE_SRC: &str = r#"
+use std::mem::MaybeUninit;
+static mut S: &mut [MaybeUninit<u32>] = &mut [MaybeUninit::uninit(); 3];
+fn main() {
+    unsafe {
+        S[0] = MaybeUninit::new(5);
+        S[2] = MaybeUninit::new(7);
+        let s = S[0].assume_init() + S[2].assume_init();
+        std::process::exit(s as i32);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_static_uninit_slice_write_then_read() {
+    let dir = temp_dir("static-uninit-slice");
+    let src = fixture(&dir, "static_uninit_slice.rs", STATIC_UNINIT_SLICE_SRC);
+    let out = run_driver_extra(&src, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(12),
+        "elements written through the slice static must read back; stderr={stderr}"
+    );
+}
+
+const STATIC_UNINIT_SCALAR_AND_FIELD_SRC: &str = r#"
+use std::mem::MaybeUninit;
+static mut MU: MaybeUninit<u32> = MaybeUninit::uninit();
+struct Holder {
+    tag: u32,
+    buf: [MaybeUninit<u16>; 2],
+}
+static mut H: Holder = Holder {
+    tag: 9,
+    buf: [MaybeUninit::uninit(); 2],
+};
+fn main() {
+    unsafe {
+        MU.as_mut_ptr().write(77);
+        H.buf[1] = MaybeUninit::new(55u16);
+        let s = MU.assume_init() + H.tag + H.buf[1].assume_init() as u32;
+        std::process::exit(s as i32);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_static_uninit_scalar_and_struct_field() {
+    let dir = temp_dir("static-uninit-scalar-field");
+    let src = fixture(
+        &dir,
+        "static_uninit_scalar_field.rs",
+        STATIC_UNINIT_SCALAR_AND_FIELD_SRC,
+    );
+    let out = run_driver_extra(&src, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(141),
+        "the scalar static and the struct field array must both read back; stderr={stderr}"
+    );
+}
