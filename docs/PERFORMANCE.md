@@ -391,3 +391,61 @@ remaining distance to the 39.5s base is wave 12's added
 collection and recording work, now paid once per distinct
 instance). Suites: workspace 602, driver 376, corpus 47/47,
 pytest 349.
+
+## Update 2026-11-23 (gpu-3070): operand reads stop cloning aggregates
+
+This pass takes the two costs the 2026-11-22 (fleur) update
+named for later work. Both were re-profiled on the current main
+first (LD_PRELOAD SIGPROF sampler over bench-helper `interp`
+runs), because the numbers had moved since: on loop_sum the
+general operand path now showed up mostly through statement
+operands the decode layer could not classify (projected `Move`s
+of checked-operation results), and on vec_push_sum_s the clone
+storm was `Value::clone` at 37% self with `drop_in_place` of the
+clones at 32%.
+
+Three changes, all semantics-preserving:
+
+- `read_place` reads through the borrowing `read_resolved_ref`:
+  a projected read lends the value out of the frame's storage,
+  so only the projected element is cloned into the owned result
+  where the owned read cloned the whole base aggregate (every
+  element of a vector, for one indexed read).
+- `eval_operand` gained the decode layer's fast reads: a
+  projection-less local is cloned straight out of its slot, and
+  a `Field` / `Downcast`-only place goes through the shared
+  `read_local_proj` (the decode layer's own mirror of the
+  general read, reused rather than copied). The decode layer
+  gained the matching `DSrc::MoveLocalProj` for statement
+  operands, and the uninitialized-marking a `Move` out of a
+  projected place performs goes through a shared
+  `clear_local_proj` helper (`navigate_mut` directly) instead
+  of a resolve + `write_resolved` round trip.
+- The `Vec` inspection builtins borrow their receiver:
+  `Vec::len` / `is_empty` and `try_reserve` resolve through
+  `resolve_ref`, and `index_place_ref` inspects the indexed
+  base through `read_resolved_ref`. Reading a vector's length
+  no longer clones every element.
+
+Bench-helper `interp` medians against the pre-pass tree
+(S kernels: median of 5 runs; L kernels: single runs, except
+loop_sum, median of 3):
+
+| kernel | before | after | speedup |
+|---|---|---|---|
+| vec_push_sum | 7958.7 ms | 79.2 ms | 100.5x |
+| vec_push_sum_s | 86.2 ms | 7.8 ms | 11.1x |
+| string_concat | 137.2 ms | 69.8 ms | 2.0x |
+| matmul_kernel | 3994.1 ms | 2235.8 ms | 1.79x |
+| loop_sum | 4630 ms | 2682 ms | 1.73x |
+| fib_rec | 5528.3 ms | 3277.1 ms | 1.69x |
+| loop_sum_s | 89.2 ms | 55.2 ms | 1.62x |
+| string_concat_s | 11.2 ms | 7.3 ms | 1.54x |
+| fib_rec_s | 102.3 ms | 70.4 ms | 1.45x |
+| float_loop | 76995.9 ms | 54643.3 ms | 1.41x |
+
+Semantics are unchanged: the full test suites pass (workspace
+608, driver 397, corpus 47/47, pytest 351). The remaining
+loop_sum profile is diffuse per-step machinery (value clone /
+drop of scalar temporaries, checked-operation tuples), with no
+single dominant cost left.
