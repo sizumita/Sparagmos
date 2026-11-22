@@ -789,6 +789,23 @@ pub enum Builtin {
     /// `std::intrinsics::atomic_fence()`: orders other threads'
     /// accesses; there are none, so it is a no-op.
     AtomicFence,
+    /// `std::intrinsics::assert_inhabited` / `assert_zero_valid` /
+    /// `assert_mem_uninitialized_valid`: validity assertions
+    /// about the generic type — that it is inhabited, that its
+    /// all-zero bit pattern is a valid value, that it may be left
+    /// uninitialized. Code generation keeps each as a no-op for
+    /// exactly the types that satisfy the property, and a
+    /// violation is undefined behaviour in the guest, so a
+    /// converted program that reaches one has nothing observable
+    /// left for the interpreter to check.
+    AssertValidity,
+    /// `std::intrinsics::write_bytes(ptr, val, count)` and
+    /// `volatile_set_memory`: fill `count` elements through the
+    /// pointer with the value whose bytes are all `val`, read at
+    /// the element type's own width. A volatile fill is a plain
+    /// fill here: volatility only constrains concurrent or
+    /// signal-observable access, which cannot occur.
+    WriteBytes,
     /// `std::intrinsics::arith_offset(ptr, count)`: wrapping
     /// pointer arithmetic — what `wrapping_offset` / `wrapping_add`
     /// / `wrapping_sub` lower to — and `std::intrinsics::offset`,
@@ -1372,6 +1389,46 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         }
         "std::intrinsics::atomic_fence" | "core::intrinsics::atomic_fence" => {
             Builtin::AtomicFence
+        }
+        "std::intrinsics::assert_inhabited" | "core::intrinsics::assert_inhabited" => {
+            Builtin::AssertValidity
+        }
+        "std::intrinsics::assert_zero_valid" | "core::intrinsics::assert_zero_valid" => {
+            Builtin::AssertValidity
+        }
+        "std::intrinsics::assert_mem_uninitialized_valid"
+        | "core::intrinsics::assert_mem_uninitialized_valid" => Builtin::AssertValidity,
+        // A volatile access is a plain access in this
+        // single-threaded interpreter: volatility constrains the
+        // compiler's reordering and caching, neither of which the
+        // interpreter performs, and no concurrent observer exists.
+        "std::intrinsics::volatile_load" | "core::intrinsics::volatile_load" => {
+            Builtin::AtomicLoad
+        }
+        "std::intrinsics::unaligned_volatile_load"
+        | "core::intrinsics::unaligned_volatile_load" => Builtin::AtomicLoad,
+        "std::intrinsics::volatile_store" | "core::intrinsics::volatile_store" => {
+            Builtin::AtomicStore
+        }
+        "std::intrinsics::unaligned_volatile_store"
+        | "core::intrinsics::unaligned_volatile_store" => Builtin::AtomicStore,
+        "std::intrinsics::volatile_copy_memory" | "core::intrinsics::volatile_copy_memory" => {
+            Builtin::PtrCopy
+        }
+        "std::intrinsics::volatile_copy_nonoverlapping_memory"
+        | "core::intrinsics::volatile_copy_nonoverlapping_memory" => Builtin::PtrCopy,
+        // The `copy` intrinsics in their call form (the statement
+        // form of `copy_nonoverlapping` is handled in the
+        // interpreter proper): the same element copy as the
+        // `std::ptr` wrappers, whose snapshot makes it a correct
+        // memmove.
+        "std::intrinsics::copy" | "core::intrinsics::copy" => Builtin::PtrCopy,
+        "std::intrinsics::copy_nonoverlapping" | "core::intrinsics::copy_nonoverlapping" => {
+            Builtin::PtrCopy
+        }
+        "std::intrinsics::write_bytes" | "core::intrinsics::write_bytes" => Builtin::WriteBytes,
+        "std::intrinsics::volatile_set_memory" | "core::intrinsics::volatile_set_memory" => {
+            Builtin::WriteBytes
         }
         "std::intrinsics::arith_offset" | "core::intrinsics::arith_offset" => {
             Builtin::ArithOffset { wrapping: true }
@@ -5302,6 +5359,79 @@ impl<'a> Interpreter<'a> {
                 // are none.
                 Ok(Value::Unit)
             }
+            Builtin::AssertValidity => {
+                arity(0)?;
+                // The asserted property is a fact about the type
+                // the conversion already produced; nothing about
+                // the running program can still violate it.
+                Ok(Value::Unit)
+            }
+            Builtin::WriteBytes => {
+                arity(3)?;
+                let tag = generic_args.first().map(String::as_str).unwrap_or("");
+                // The fill argument is a `u8`; take its low eight
+                // bits, which are the byte either way it is stored.
+                let byte = match &vals[1] {
+                    Value::Uint(v) => *v as u8,
+                    Value::Int(v) => *v as u8,
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            format!("builtin {name}"),
+                            "fill byte (u8)",
+                            other.kind_name(),
+                        ));
+                    }
+                };
+                let fill = byte_fill_value(tag, byte).ok_or_else(|| {
+                    unsupported(format!("write_bytes for {tag} is not runtime-supported"))
+                })?;
+                let n = element_count(&vals[2], name)?;
+                if n == 0 {
+                    // A zero-count fill touches no memory, so the
+                    // pointer is never dereferenced.
+                    return Ok(Value::Unit);
+                }
+                let target = self.deref_value(frames, &vals[0])?;
+                // Filling not-yet-initialized memory is the
+                // intrinsic's canonical use (a `MaybeUninit`
+                // buffer being initialized): the region has no
+                // prior value to patch element by element, so
+                // materialize exactly the filled region in one
+                // write. The pointer denotes the start of the
+                // uninitialized region in that shape (a fresh
+                // buffer's base pointer).
+                if matches!(
+                    self.read_resolved(frames, &target),
+                    Err(InterpError::UninitializedRead { .. })
+                ) {
+                    if n == 1 {
+                        self.write_resolved(frames, &target, fill)?;
+                    } else {
+                        self.write_resolved(frames, &target, Value::Tuple(vec![fill; n]))?;
+                    }
+                    return Ok(Value::Unit);
+                }
+                // As in the element copy: an unreadable destination
+                // is a buffer being filled, which the indexed path
+                // can create elements in.
+                let dst_aggregate = self
+                    .read_resolved(frames, &target)
+                    .map(|v| {
+                        matches!(
+                            v,
+                            Value::Tuple(_) | Value::FatRef { .. } | Value::Bytes(_) | Value::Str(_)
+                        )
+                    })
+                    .unwrap_or(true);
+                if n == 1 && !dst_aggregate {
+                    self.write_resolved(frames, &target, fill)?;
+                } else {
+                    for i in 0..n {
+                        self.write_resolved_at(frames, &target, i, fill.clone())?;
+                    }
+                }
+                Ok(Value::Unit)
+            }
             Builtin::FloatMethod { f32, op } => exec_float_method(name, f32, op, &vals),
             Builtin::Float128Method { op } => exec_float128_method(name, op, &vals),
             Builtin::Float16Method { op } => exec_float16_method(name, op, &vals),
@@ -9222,6 +9352,64 @@ fn assume_init_elements(pointee: Value) -> Option<Vec<Value>> {
 /// The (bit width, signedness) of a primitive integer type tag
 /// as rendered by `ty_tag` (`i32`, `usize`, ...). `isize` /
 /// `usize` are 64-bit on every platform this runs on.
+/// An element count argument (of a memory intrinsic), as a
+/// `usize`. Mirrors the count handling of the interpreter's
+/// element copy.
+fn element_count(value: &Value, name: &str) -> InterpResult<usize> {
+    match value {
+        Value::Uint(n) => usize::try_from(*n).map_err(|_| {
+            InterpError::type_mismatch(
+                format!("builtin {name}"),
+                "count that fits in usize",
+                format!("{n}"),
+            )
+        }),
+        Value::Int(n) if *n >= 0 => Ok(*n as usize),
+        other => Err(InterpError::type_mismatch(
+            format!("builtin {name}"),
+            "unsigned integer count",
+            other.kind_name(),
+        )),
+    }
+}
+
+/// The value whose byte pattern is `byte` repeated, for the
+/// element type `tag` names — the value `write_bytes` fills with.
+/// Only types with a fixed byte interpretation are filled: for
+/// any other type an arbitrary byte pattern need not be a valid
+/// value, so the fill stays unsupported there.
+fn byte_fill_value(tag: &str, byte: u8) -> Option<Value> {
+    let tag = tag.trim();
+    if let Some((bits, signed)) = int_tag(tag) {
+        let mut pattern: u128 = 0;
+        for _ in 0..bits / 8 {
+            pattern = (pattern << 8) | u128::from(byte);
+        }
+        return Some(if signed {
+            Value::Int(sign_extend(pattern, bits))
+        } else {
+            Value::Uint(pattern)
+        });
+    }
+    Some(match tag {
+        "bool" => match byte {
+            0 => Value::Bool(false),
+            1 => Value::Bool(true),
+            _ => return None,
+        },
+        // A `char` is stored as its code point; the filled code
+        // point is the byte repeated four times, valid only when
+        // it names a character.
+        "char" => Value::Uint(u128::from(char::from_u32(u32::from(byte) * 0x0101_0101)? as u32)),
+        "f16" => Value::Float(crate::mir_convert::f16_to_f64(
+            u16::from(byte) * 0x0101,
+        )),
+        "f32" => Value::Float(f64::from(f32::from_bits(u32::from(byte) * 0x0101_0101))),
+        "f64" => Value::Float(f64::from_bits(u64::from(byte) * 0x0101_0101_0101_0101)),
+        _ => return None,
+    })
+}
+
 fn int_tag(tag: &str) -> Option<(u32, bool)> {
     Some(match tag {
         "i8" => (8, true),
