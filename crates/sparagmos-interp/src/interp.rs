@@ -4012,7 +4012,9 @@ impl<'a> Interpreter<'a> {
         // kept alongside and applied to the immediately following
         // index step (the only step it can bound).
         let mut fat_cap: Option<u128> = None;
-        for elem in &place.projection {
+        let projection_len = place.projection.len();
+        for (step_idx, elem) in place.projection.iter().enumerate() {
+            let is_last = step_idx + 1 == projection_len;
             cur = match elem {
                 ProjectionElem::Field(idx) => {
                     fat_cap = None;
@@ -4110,7 +4112,32 @@ impl<'a> Interpreter<'a> {
                         Value::FatRef { len, .. } => Some(*len),
                         _ => None,
                     };
-                    self.deref_value(frames, &value)?
+                    let resolved = self.deref_value(frames, &value)?;
+                    // A raw allocation block holds its elements
+                    // as a tuple: a trailing dereference of its
+                    // base pointer denotes the first element,
+                    // not the block as a whole. The block as a
+                    // whole is only reached by a projection that
+                    // continues past the dereference (or by a
+                    // write of a tuple value, which replaces
+                    // it) — the read and write sides agree on
+                    // this.
+                    if is_last {
+                        if let Resolved::Alloc { id, projection } = &resolved {
+                            if projection.is_empty()
+                                && matches!(
+                                    self.alloc_base(*id).ok().as_ref(),
+                                    Some(Value::Tuple(_) | Value::Bytes(_))
+                                )
+                            {
+                                return Ok(Resolved::Alloc {
+                                    id: *id,
+                                    projection: vec![RefProj::Index(0)],
+                                });
+                            }
+                        }
+                    }
+                    resolved
                 }
             };
         }
@@ -4683,6 +4710,67 @@ impl<'a> Interpreter<'a> {
     /// The value of a pointer offset (see [`Rvalue::PtrOffset`]):
     /// `base` advanced by `count` elements of `elem_size` bytes
     /// each (the size may be unknown, in which case only the
+    /// Absorb a pointer offset into an element index for a
+    /// raw allocation block (see the `Alloc` arm of
+    /// `offset_target`). Answers `None` when the block's
+    /// contents are not element-shaped, the element size is
+    /// unknown, or the resulting position is not
+    /// element-aligned; the caller then carries the byte
+    /// displacement as before.
+    fn alloc_offset_absorb(
+        &self,
+        id: u64,
+        projection: &[RefProj],
+        elem_size: Option<u64>,
+        disp: Option<i128>,
+    ) -> Option<InterpResult<Vec<RefProj>>> {
+        let size = elem_size?;
+        if size == 0 {
+            return None;
+        }
+        let content = self.alloc_base(id).ok()?;
+        match &content {
+            Value::Tuple(_) => {}
+            // A zeroed block holds bytes; only byte elements
+            // index it faithfully.
+            Value::Bytes(_) if size == 1 => {}
+            _ => return None,
+        }
+        let disp = disp?;
+        let (base, carried) = match projection.last() {
+            Some(RefProj::ByteOffset(d)) => {
+                (&projection[..projection.len() - 1], *d)
+            }
+            _ => (projection, 0),
+        };
+        let total = carried.checked_add(disp)?;
+        let size_i = i128::from(size);
+        if total % size_i != 0 {
+            return None;
+        }
+        let steps = total / size_i;
+        let idx = match base {
+            [] => steps,
+            [RefProj::Index(j)] => i128::try_from(*j).ok()?.checked_add(steps)?,
+            _ => return None,
+        };
+        if idx < 0 {
+            return Some(Err(InterpError::UnsupportedRvalue {
+                kind: "pointer offset: negative element index into an allocation"
+                    .to_string(),
+            }));
+        }
+        let idx = match usize::try_from(idx) {
+            Ok(i) => i,
+            Err(_) => {
+                return Some(Err(InterpError::UnsupportedRvalue {
+                    kind: "pointer offset: element index out of range".to_string(),
+                }))
+            }
+        };
+        Some(Ok(vec![RefProj::Index(idx)]))
+    }
+
     /// shapes that need no size — a zero count — evaluate).
     /// `wrapping` selects the `arith_offset` intrinsic's semantics
     /// over `BinaryOp::Offset`'s: the two compute the same denoted
@@ -4813,9 +4901,20 @@ impl<'a> Interpreter<'a> {
                 Ok(RefTarget::Static { name, projection })
             }
             RefTarget::Alloc { id, projection } => {
-                // An allocation's pointee is not a declared local
-                // type either, so no array absorption is attempted:
-                // the displacement is carried, as for a static.
+                // A raw block from the allocator builtins holds
+                // its elements as a tuple (or, for a zeroed byte
+                // block, as bytes): an offset in element units
+                // is absorbed into an element index, the form
+                // the block's contents are read and written
+                // through. Any other pointee shape is not a
+                // declared local type either, so no absorption
+                // is attempted and the displacement is carried,
+                // as for a static.
+                if let Some(absorbed) =
+                    self.alloc_offset_absorb(id, &projection, elem_size, disp)
+                {
+                    return absorbed.map(|projection| RefTarget::Alloc { id, projection });
+                }
                 let projection = self.offset_projection(frames, None, projection, disp)?;
                 Ok(RefTarget::Alloc { id, projection })
             }
@@ -5284,8 +5383,44 @@ impl<'a> Interpreter<'a> {
                     .get_mut(id)
                     .ok_or_else(|| self.missing_alloc(*id))?;
                 if projection.is_empty() {
+                    // A raw block's base pointer denotes its
+                    // first element: writing a non-tuple value
+                    // through it writes element 0, not the
+                    // block as a whole. A tuple value is the
+                    // block's own array value and replaces it.
+                    if matches!(&*slot, Value::Tuple(_))
+                        && !matches!(value, Value::Tuple(_))
+                    {
+                        let place_desc = format!("allocation #{id}");
+                        if let Value::Tuple(items) = &mut *slot {
+                            if items.is_empty() {
+                                items.push(Value::Uninit);
+                            }
+                        }
+                        let slot = navigate_mut(
+                            slot,
+                            &[RefProj::Index(0)],
+                            "<allocation>",
+                            &place_desc,
+                        )?;
+                        *slot = value;
+                        return Ok(());
+                    }
                     *slot = value;
                     return Ok(());
+                }
+                // A raw block's element tuple grows to the
+                // written index: the allocation's byte size is
+                // not a value-level element count, so unwritten
+                // elements materialize as uninitialized slots
+                // (reading one stays an uninitialized-read
+                // error, never a fabricated value).
+                if let (Value::Tuple(items), Some(RefProj::Index(i))) =
+                    (&mut *slot, projection.first())
+                {
+                    if *i >= items.len() {
+                        items.resize(i + 1, Value::Uninit);
+                    }
                 }
                 let place_desc = format!("allocation #{id}");
                 let slot = navigate_mut(slot, projection, "<allocation>", &place_desc)?;

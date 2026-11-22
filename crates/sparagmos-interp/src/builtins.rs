@@ -6090,7 +6090,12 @@ impl<'a> Interpreter<'a> {
                 let content = if zeroed {
                     Value::Bytes(vec![0u8; size as usize])
                 } else {
-                    Value::Uninit
+                    // An element tuple that grows on write (see
+                    // the allocation arm of write_resolved): the
+                    // blocks elements have no value-level count
+                    // until they are written, and unwritten slots
+                    // read back as uninitialized.
+                    Value::Tuple(Vec::new())
                 };
                 let id = self.alloc_insert(content);
                 Ok(Value::Ref(RefTarget::Alloc {
@@ -6100,7 +6105,8 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::RustDealloc => {
                 arity(3)?;
-                if let Value::Ref(RefTarget::Alloc { id, projection }) = &vals[0] {
+                let ptr = unwrap_wrapper(&vals[0]);
+                if let Value::Ref(RefTarget::Alloc { id, projection }) = ptr {
                     if projection.is_empty() {
                         self.free_alloc(*id);
                     }
@@ -6120,7 +6126,8 @@ impl<'a> Interpreter<'a> {
                         ))
                     }
                 };
-                let content = match &vals[0] {
+                let ptr = unwrap_wrapper(&vals[0]).clone();
+                let content = match &ptr {
                     Value::Ref(RefTarget::Alloc { id, projection })
                         if projection.is_empty() =>
                     {
