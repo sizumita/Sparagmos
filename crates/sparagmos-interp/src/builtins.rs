@@ -408,6 +408,14 @@ pub enum Builtin {
     ArgumentsNew,
     /// `core::fmt::rt::Argument::new_*(ref)`.
     ArgumentNew(FmtTrait),
+    /// A `core::fmt` trait method itself (`Display::fmt`,
+    /// `Debug::fmt`, ...) called by name from a guest body
+    /// (a UFCS call) whose `Self` instance has no converted
+    /// body: the structural fmt engine formats the receiver
+    /// into the captured `Formatter` argument. Deliberately
+    /// absent from `lookup` (see [`fmt_trait_method`]): a
+    /// collected impl body always wins over this model.
+    FmtMethod(FmtTrait),
     /// `core::fmt::rt::Argument::from_usize(&usize)`.
     ArgumentFromUsize,
     /// `std::fmt::Formatter::write_str(&mut self, &str)`: append
@@ -1882,6 +1890,54 @@ pub(crate) fn runtime_name_fallback(kind: Builtin) -> bool {
             | Builtin::IoFormatOsError
             | Builtin::IoIsInterrupted
     )
+}
+
+/// The `core::fmt` trait methods themselves, named by their
+/// plain trait path (`std::fmt::Display::fmt`): an explicit
+/// UFCS call in a guest body names the trait item, and for a
+/// foreign `Self` type the impl instance usually has no MIR
+/// body at all (std's impls are not `#[inline]`, so no body
+/// reaches the metadata) — the call can only be served by the
+/// structural fmt engine, which formats the receiver into the
+/// captured `Formatter` argument exactly as it formats an
+/// `Argument` over the same value.
+///
+/// These names are deliberately absent from [`lookup`], for
+/// the same reason as the foreign helpers below: the registry
+/// gates driver collection, and a collected impl body (a user
+/// type's `fmt`, a foreign `#[inline]` instance) is the
+/// faithful execution and must win. This lookup is consulted
+/// only from conversion's external-callee path, where the
+/// callee is already known to have no converted body and the
+/// call's generic arguments (the `Self` type first) are at
+/// hand for the model (conversion's path, and the
+/// `CallBuiltin` dispatch in `exec_builtin`, which carries
+/// the same tags). It is not part of the interpreter's
+/// run-time name fallback: that path holds no type tags, and
+/// the structural engine keys several shapes (a `char`, an
+/// array, an ADT) on the tag.
+pub fn fmt_trait_method(canonical: &str) -> Option<Builtin> {
+    use FmtTrait as F;
+    Some(match canonical {
+        "std::fmt::Display::fmt" | "core::fmt::Display::fmt" => Builtin::FmtMethod(F::Display),
+        "std::fmt::Debug::fmt" | "core::fmt::Debug::fmt" => Builtin::FmtMethod(F::Debug),
+        "std::fmt::Octal::fmt" | "core::fmt::Octal::fmt" => Builtin::FmtMethod(F::Octal),
+        "std::fmt::LowerHex::fmt" | "core::fmt::LowerHex::fmt" => {
+            Builtin::FmtMethod(F::LowerHex)
+        }
+        "std::fmt::UpperHex::fmt" | "core::fmt::UpperHex::fmt" => {
+            Builtin::FmtMethod(F::UpperHex)
+        }
+        "std::fmt::Binary::fmt" | "core::fmt::Binary::fmt" => Builtin::FmtMethod(F::Binary),
+        "std::fmt::LowerExp::fmt" | "core::fmt::LowerExp::fmt" => {
+            Builtin::FmtMethod(F::LowerExp)
+        }
+        "std::fmt::UpperExp::fmt" | "core::fmt::UpperExp::fmt" => {
+            Builtin::FmtMethod(F::UpperExp)
+        }
+        "std::fmt::Pointer::fmt" | "core::fmt::Pointer::fmt" => Builtin::FmtMethod(F::Pointer),
+        _ => return None,
+    })
 }
 
 /// Models for body-less foreign callees whose semantics are
@@ -3955,6 +4011,7 @@ impl<'a> Interpreter<'a> {
         }
         let kind = lookup(name)
             .or_else(|| foreign_helper_lookup(name))
+            .or_else(|| fmt_trait_method(name))
             .ok_or_else(|| unsupported(format!("call to {name} is not runtime-supported")))?;
         // The closure-taking consumers evaluate their callable
         // operand themselves: the generic evaluation below moves
@@ -4536,6 +4593,35 @@ impl<'a> Interpreter<'a> {
                     trait_,
                     ty,
                 })
+            }
+            Builtin::FmtMethod(trait_) => {
+                // A UFCS `fmt` trait call whose `Self` instance
+                // has no converted body: format the receiver
+                // with the structural engine, under the captured
+                // formatter's own options, and append the text
+                // to its buffer — the same output the type's
+                // `Argument` formatting produces for the same
+                // value and options.
+                arity(2)?;
+                let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
+                let pointee = self.resolve_value(frames, &vals[0])?;
+                let id = self.formatter_id_of(frames, &vals[1])?;
+                let capture = self.capture_of(id)?;
+                let options = FmtOptions {
+                    flags: capture.flags,
+                    width: capture.width,
+                    precision: capture.precision,
+                };
+                let text = self.format_value(
+                    frames,
+                    &pointee,
+                    trait_,
+                    self_ty,
+                    &options,
+                    capture.indent,
+                )?;
+                self.formatter_push(id, &text);
+                Ok(fmt_result_ok())
             }
             Builtin::FormatterWriteStr => {
                 arity(2)?;
@@ -21012,6 +21098,13 @@ impl<'a> Interpreter<'a> {
                 return Ok(text);
             }
         }
+        // `Cow<B>` forwards every fmt trait to the value it
+        // holds (std defines the impls as the borrowed type's
+        // own), so format the held value under the borrowed
+        // type's tag.
+        if let Some(text) = self.format_cow(frames, value, trait_, ty, options, indent)? {
+            return Ok(text);
+        }
         // A guest `fmt` implementation body, when the program
         // collected one for this type, is the faithful
         // formatting: run it against a captured `Formatter`
@@ -21171,6 +21264,56 @@ impl<'a> Interpreter<'a> {
         };
         Ok(Some(self.format_value(
             frames, &pointee, trait_, elem, options, indent,
+        )?))
+    }
+
+    /// `Display` / `Debug` (and the remaining fmt traits) for
+    /// a `Cow<'_, B>` value: std's impls forward to the held
+    /// value — the borrowed variant's reference or the owned
+    /// variant's value — formatted as `B` itself. `None` when
+    /// the type is not a `Cow` or the value does not have the
+    /// one-field enum shape, in which case the existing
+    /// behaviour stands.
+    fn format_cow(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        value: &Value,
+        trait_: FmtTrait,
+        ty: &str,
+        options: &FmtOptions,
+        indent: usize,
+    ) -> InterpResult<Option<String>> {
+        let plain = pointee_tag(ty);
+        if !plain.starts_with("std::borrow::Cow<")
+            && !plain.starts_with("alloc::borrow::Cow<")
+        {
+            return Ok(None);
+        }
+        let Some(inner_ty) = last_generic_param(plain) else {
+            return Ok(None);
+        };
+        let Value::Enum { fields, .. } = value else {
+            return Ok(None);
+        };
+        if fields.len() != 1 {
+            return Ok(None);
+        }
+        let field = fields[0].clone();
+        // The borrowed variant's field is a fat reference when
+        // the borrowed type is unsized: a fat reference whose
+        // pointee is string data denotes the `str` itself (the
+        // shape a `&str` field materialises in), while a fat
+        // reference over elements stays the slice it is.
+        let field = if let Value::FatRef { .. } = field {
+            match self.resolve_value(frames, &field) {
+                Ok(resolved @ Value::Str(_)) => resolved,
+                _ => field,
+            }
+        } else {
+            field
+        };
+        Ok(Some(self.format_value(
+            frames, &field, trait_, &inner_ty, options, indent,
         )?))
     }
 
@@ -21859,7 +22002,7 @@ fn pad_str(s: &str, options: &FmtOptions) -> String {
 /// engine runs. Crate-qualified, and not a core/std/alloc
 /// path (those impls are core's; the structural engine
 /// models them).
-fn guest_fmt_tag(tag: &str) -> bool {
+pub(crate) fn guest_fmt_tag(tag: &str) -> bool {
     let head = tag.trim().trim_start_matches('&').trim_start();
     (head.starts_with(|c: char| c.is_alphabetic() || c == '_'))
         && head.contains("::")

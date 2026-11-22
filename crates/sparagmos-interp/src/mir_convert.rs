@@ -6637,6 +6637,17 @@ let inner = match (&src, target) {
             }
             return self.resolve_impl_callee(func);
         };
+        // A `fmt` trait method call on a foreign `Self` type is
+        // not bound to a body, even when one is stored under
+        // the trait item's plain name: that body is a foreign
+        // impl written against the real value layout, which
+        // the value model does not reproduce. The call falls
+        // through to the external/builtin conversion, whose
+        // structural fmt engine is the faithful execution for
+        // those types (see `fmt_call_self`).
+        if self.fmt_foreign_self(&name, func) {
+            return None;
+        }
         let Some(plain) = self.unconverted.get(&name) else {
             // A name that is not itself a collected body denotes
             // a trait item the call names directly (the func
@@ -6811,10 +6822,63 @@ let inner = match (&src, target) {
 
     /// Find the collected impl body for a trait-method call (see
     /// `resolve_impl_callee` for when a found body may be used).
+    /// When a callee name denotes a `fmt` trait method (the
+    /// `Display`/`Debug`/radix family), the `Self` type the
+    /// call is monomorphized at, in rendered form. The name
+    /// comes in two shapes: the trait item
+    /// (`std::fmt::Debug::fmt`, whose `Self` is the call's
+    /// first generic argument) and the resolved impl instance
+    /// (`<std::vec::Vec<i32> as std::fmt::Debug>::fmt`, whose
+    /// `Self` is the key's subject). Foreign impl bodies of
+    /// these methods are written against the real value layout
+    /// (a `Vec`'s `Debug` reads its buffer pointer out of the
+    /// `RawVec`), which the value model does not reproduce, so
+    /// callers use this to keep such a call off any collected
+    /// body: the structural fmt engine — the same engine that
+    /// formats the type as an argument — serves it instead
+    /// (see `builtins::fmt_trait_method`). A guest type's own
+    /// `fmt` body stays the resolution, exactly as before.
+    /// Whether a callee is a `fmt` trait method whose `Self`
+    /// the structural fmt engine must serve: a foreign type,
+    /// or a `dyn` trait object (whose concrete value the
+    /// engine resolves through the fat reference, exactly as
+    /// when the object is formatted as an argument). A guest
+    /// type's own `fmt` body stays the resolution.
+    fn fmt_foreign_self(&self, name: &str, func: &mir::Operand) -> bool {
+        let Some(self_name) = self.fmt_call_self(name, func) else {
+            return false;
+        };
+        let head = self_name.trim().trim_start_matches('&').trim_start();
+        head.starts_with("dyn ") || !crate::builtins::guest_fmt_tag(&self_name)
+    }
+
+    fn fmt_call_self(&self, name: &str, func: &mir::Operand) -> Option<String> {
+        if crate::builtins::fmt_trait_method(name).is_some() {
+            let (_, _, raw_generic_args) = self.resolve_external_callee(func)?;
+            return raw_generic_args
+                .first()
+                .map(|t| self.concrete_ty_name(t));
+        }
+        let rest = name.strip_prefix('<')?;
+        let (self_part, trait_part) = rest.rsplit_once(" as ")?;
+        let trait_path = trait_part.strip_suffix(">::fmt")?;
+        if crate::builtins::fmt_trait_method(&format!("{trait_path}::fmt")).is_none() {
+            return None;
+        }
+        Some(self_part.to_string())
+    }
+
     fn find_impl_callee(&self, func: &mir::Operand) -> Option<String> {
         let (name, _, raw_generic_args) = self.resolve_external_callee(func)?;
         let (trait_path, method) = name.rsplit_once("::")?;
         if trait_path.is_empty() || method.is_empty() {
+            return None;
+        }
+        // A `fmt` trait method on a foreign `Self` type is not
+        // resolved to its collected impl body either, for the
+        // reason `fmt_call_self` documents: the structural fmt
+        // engine serves the call instead.
+        if method == "fmt" && self.fmt_foreign_self(&name, func) {
             return None;
         }
         self.find_impl_key_for(trait_path, method, &raw_generic_args)
@@ -7684,7 +7748,24 @@ let inner = match (&src, target) {
                         // foreign-helper models; they are not in
                         // `lookup`, so no collected body is ever
                         // displaced by them.
-                        .or_else(|| crate::builtins::foreign_helper_lookup(&canonical));
+                        .or_else(|| crate::builtins::foreign_helper_lookup(&canonical))
+                        // A UFCS `fmt` trait call whose `Self`
+                        // instance has no converted body is served
+                        // by the structural fmt engine (see
+                        // `builtins::fmt_trait_method`); a collected
+                        // impl body has already won above, exactly
+                        // as for the foreign helpers. A `dyn`
+                        // `Self` converts here too: the engine
+                        // resolves the trait object to its
+                        // concrete value, exactly as it does for
+                        // a `dyn` argument.
+                        .or_else(|| {
+                            if raw_generic_args.first().is_some() {
+                                crate::builtins::fmt_trait_method(&canonical)
+                            } else {
+                                None
+                            }
+                        });
                     if let Some(kind) = kind {
                         let mut ir_args = Vec::with_capacity(args.len());
                         for (i, arg) in args.iter().enumerate() {
