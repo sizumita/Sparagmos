@@ -782,7 +782,8 @@ impl<'a> Interpreter<'a> {
                 let value = self.read_dplace(frames, body, dplace)?;
                 let len = self
                     .fat_deref_len(frames, body, place)
-                    .or_else(|| value.len());
+                    .or_else(|| value.len())
+                    .or_else(|| self.fat_tail_field_len(frames, body, place));
                 let len = len.ok_or_else(|| {
                     InterpError::type_mismatch(
                         format!("Len of {place}"),

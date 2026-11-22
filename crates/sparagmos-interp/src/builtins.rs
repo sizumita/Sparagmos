@@ -1381,6 +1381,62 @@ pub enum Builtin {
     /// `Utf8Error` struct's `valid_up_to` and `error_len`
     /// fields.
     FromUtf8,
+    /// The C library `strlen`, reached as
+    /// `core::ffi::c_str::strlen::runtime::strlen`: the
+    /// runtime branch of core's `const_eval_select` C-string
+    /// length helper is an `extern "C"` declaration, so no MIR
+    /// body exists for it. The length is a pure function of
+    /// the bytes behind the pointer, scanned through the
+    /// pointer model to the first NUL.
+    LibcStrlen,
+    /// `std::ffi::CStr::from_bytes_with_nul(&[u8]) ->
+    /// Result<&CStr, FromBytesWithNulError>`: a non-inline
+    /// library method, so no MIR body is available; the
+    /// validation is a pure function of the bytes (the first
+    /// NUL must be the slice's last byte). The `Ok` value is
+    /// the argument itself, exactly what the converted
+    /// `from_bytes_with_nul_unchecked` cast produces.
+    CStrFromBytesWithNul,
+    /// `std::ffi::CStr::from_bytes_until_nul(&[u8]) ->
+    /// Result<&CStr, FromBytesUntilNulError>`: a non-inline
+    /// library method, so no MIR body is available; the `Ok`
+    /// value is the argument fat reference shortened to end
+    /// at (and include) its first NUL byte.
+    CStrFromBytesUntilNul,
+    /// `std::ffi::CStr::to_str(&self) -> Result<&str,
+    /// Utf8Error>`: a non-inline library method, so no MIR
+    /// body is available; it is `str::from_utf8` over the
+    /// C string's bytes (without the terminator), answered
+    /// with the host's own validation, like
+    /// [`Builtin::StrFromUtf8`].
+    CStrToStr,
+    /// `CStr::to_string_lossy(&self) -> Cow<'_, str>`: a
+    /// non-inline library method, so no MIR body is
+    /// available; the lossy conversion of the C string's
+    /// bytes (without the terminator), the same model as
+    /// [`Builtin::StringFromUtf8Lossy`] over those bytes.
+    CStrToStringLossy,
+    /// `CString::new`'s specialization dispatch: the
+    /// specialized instances for `&str` / `&[u8]` have no
+    /// MIR body, so the whole entry point is modelled:
+    /// extract the argument's bytes (the `Into<Vec<u8>>`
+    /// the default instance performs), reject an interior
+    /// NUL with `NulError(position, bytes)`, else build the
+    /// owned C string.
+    CStringSpecNewImpl,
+    /// `CString::_from_vec_unchecked` /
+    /// `CString::from_vec_unchecked` (neither has a MIR
+    /// body): append the trailing NUL and box the bytes.
+    CStringFromVecUnchecked,
+    /// `CString::from_raw` (no MIR body): the length is
+    /// recomputed with the runtime `strlen`, and the
+    /// pointer is reconstituted as the owned boxed slice.
+    CStringFromRaw,
+    /// `CString::into_string` (no MIR body): the UTF-8
+    /// validation of the owned bytes; on failure the
+    /// error carries the string back (`IntoStringError {
+    /// inner, error }`).
+    CStringIntoString,
     /// `alloc::alloc::__rust_alloc(size, align) -> *mut u8` and
     /// `__rust_alloc_zeroed`: a fresh block in the allocation
     /// store, named by a new allocation id. The uninitialised
@@ -1960,6 +2016,26 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::string::String::from_utf8_lossy" => Builtin::StringFromUtf8Lossy,
         "std::str::from_utf8" => Builtin::StrFromUtf8,
         "core::str::from_utf8" => Builtin::StrFromUtf8,
+        "core::ffi::c_str::strlen::runtime::strlen" => Builtin::LibcStrlen,
+        "std::ffi::CStr::from_bytes_with_nul" | "core::ffi::CStr::from_bytes_with_nul" => {
+            Builtin::CStrFromBytesWithNul
+        }
+        "std::ffi::CStr::from_bytes_until_nul" | "core::ffi::CStr::from_bytes_until_nul" => {
+            Builtin::CStrFromBytesUntilNul
+        }
+        "std::ffi::CStr::to_str" | "core::ffi::CStr::to_str" => Builtin::CStrToStr,
+        "alloc::ffi::c_str::<impl std::ffi::CStr>::to_string_lossy" => {
+            Builtin::CStrToStringLossy
+        }
+        "std::ffi::CString::new::SpecNewImpl::spec_new_impl" => {
+            Builtin::CStringSpecNewImpl
+        }
+        "std::ffi::CString::_from_vec_unchecked"
+        | "std::ffi::CString::from_vec_unchecked" => {
+            Builtin::CStringFromVecUnchecked
+        }
+        "std::ffi::CString::from_raw" => Builtin::CStringFromRaw,
+        "std::ffi::CString::into_string" => Builtin::CStringIntoString,
         "std::ffi::OsString::to_string_lossy" => Builtin::ToStringLossy,
         "std::ffi::OsStr::to_string_lossy" => Builtin::ToStringLossy,
         "std::path::Path::to_string_lossy" => Builtin::ToStringLossy,
@@ -6392,22 +6468,108 @@ impl<'a> Interpreter<'a> {
                 let bytes = self.arg_bytes(frames, &vals[0])?;
                 Ok(match std::str::from_utf8(&bytes) {
                     Ok(s) => ok_result(Value::Str(s.to_string())),
+                    Err(e) => err_result(utf8_error_value(&e)),
+                })
+            }
+            Builtin::LibcStrlen => {
+                arity(1)?;
+                let bytes = self.read_c_str(frames, &vals[0])?;
+                Ok(Value::Uint(bytes.len() as u128))
+            }
+            Builtin::CStrFromBytesWithNul => {
+                arity(1)?;
+                let bytes = self.arg_bytes(frames, &vals[0])?;
+                Ok(match bytes.iter().position(|b| *b == 0) {
+                    Some(position) if position + 1 == bytes.len() => {
+                        ok_result(vals[0].clone())
+                    }
+                    Some(position) => err_result(Value::Enum {
+                        variant: 0,
+                        fields: vec![Value::Uint(position as u128)],
+                    }),
+                    None => err_result(Value::Enum {
+                        variant: 1,
+                        fields: Vec::new(),
+                    }),
+                })
+            }
+            Builtin::CStrFromBytesUntilNul => {
+                arity(1)?;
+                let bytes = self.arg_bytes(frames, &vals[0])?;
+                Ok(match bytes.iter().position(|b| *b == 0) {
+                    Some(position) => {
+                        ok_result(self.fat_ref_prefix(frames, &vals[0], position + 1)?)
+                    }
+                    None => err_result(Value::Enum {
+                        variant: 0,
+                        fields: vec![Value::Unit],
+                    }),
+                })
+            }
+            Builtin::CStrToStr => {
+                arity(1)?;
+                let bytes = self.c_str_bytes(frames, &vals[0])?;
+                Ok(match std::str::from_utf8(&bytes) {
+                    Ok(s) => ok_result(Value::Str(s.to_string())),
+                    Err(e) => err_result(utf8_error_value(&e)),
+                })
+            }
+            Builtin::CStrToStringLossy => {
+                arity(1)?;
+                let bytes = self.c_str_bytes(frames, &vals[0])?;
+                Ok(cow_str_value(&bytes))
+            }
+            Builtin::CStringSpecNewImpl => {
+                arity(1)?;
+                let bytes = self.arg_bytes(frames, &vals[0])?;
+                Ok(match bytes.iter().position(|b| *b == 0) {
+                    Some(i) => err_result(Value::Enum {
+                        variant: 0,
+                        fields: vec![
+                            Value::Uint(i as u128),
+                            byte_vec_value(&bytes),
+                        ],
+                    }),
+                    None => ok_result(self.c_string_value(bytes)),
+                })
+            }
+            Builtin::CStringFromVecUnchecked => {
+                arity(1)?;
+                let bytes = self.arg_bytes(frames, &vals[0])?;
+                Ok(self.c_string_value(bytes))
+            }
+            Builtin::CStringIntoString => {
+                arity(1)?;
+                let receiver = Value::Ref(RefTarget::Value(
+                    Box::new(vals[0].clone()),
+                    Vec::new(),
+                ));
+                let cstr = self.c_string_deref(frames, &receiver)?;
+                let bytes = self.c_str_bytes(frames, &cstr)?;
+                Ok(match std::str::from_utf8(&bytes) {
+                    Ok(s) => ok_result(Value::Str(s.to_string())),
                     Err(e) => err_result(Value::Enum {
                         variant: 0,
                         fields: vec![
-                            Value::Uint(u128::from(e.valid_up_to() as u64)),
-                            match e.error_len() {
-                                Some(n) => Value::Enum {
-                                    variant: 1,
-                                    fields: vec![Value::Uint(n as u128)],
-                                },
-                                None => Value::Enum {
-                                    variant: 0,
-                                    fields: Vec::new(),
-                                },
-                            },
+                            self.c_string_value(bytes),
+                            utf8_error_value(&e),
                         ],
                     }),
+                })
+            }
+            Builtin::CStringFromRaw => {
+                arity(1)?;
+                // The real body recomputes the length with
+                // the runtime `strlen` before reconstituting
+                // the box; the read itself is the model's
+                // check that the pointer denotes a C string.
+                let _bytes = self.read_c_str(frames, &vals[0])?;
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Enum {
+                        variant: 0,
+                        fields: vec![vals[0].clone()],
+                    }],
                 })
             }
             Builtin::ToStringLossy => {
@@ -6792,6 +6954,10 @@ impl<'a> Interpreter<'a> {
                         )
                     })?;
                     Ok(sub_path_value(&bytes))
+                } else if self_ty == "std::ffi::CString" {
+                    // `CString::deref -> &CStr`: the fat
+                    // reference over the owned buffer.
+                    self.c_string_deref(frames, &vals[0])
                 } else if self_ty.starts_with("std::borrow::Cow<") {
                     // `Cow<B>::deref -> &B::Target`: the borrowed
                     // variant's field already IS the target value
@@ -8763,6 +8929,10 @@ impl<'a> Interpreter<'a> {
                         base: Box::new(vals.into_iter().next().expect("arity checked")),
                         len,
                     })
+                } else if self_ty == "std::ffi::CString" {
+                    // `CString::deref_mut -> &mut CStr`: the
+                    // same fat reference `deref` produces.
+                    self.c_string_deref(frames, &vals[0])
                 } else if self_ty.starts_with("std::boxed::Box<") {
                     let pointee = self.resolve_value(frames, &vals[0])?;
                     // As in `Deref`: a `Box<dyn Trait>` dereferences
@@ -13567,6 +13737,113 @@ fn value_fingerprint(value: &Value) -> u64 {
         Ok(out)
     }
 
+    /// A `CString` value over `bytes` (given without the
+    /// trailing NUL): the struct's single field is the
+    /// owned boxed byte slice, built the way
+    /// `Vec::into_boxed_slice` builds it (an allocation
+    /// holding the byte elements, terminator appended).
+    fn c_string_value(&self, mut bytes: Vec<u8>) -> Value {
+        bytes.push(0);
+        let elems: Vec<Value> = bytes
+            .iter()
+            .map(|b| Value::Uint(u128::from(*b)))
+            .collect();
+        Value::Enum {
+            variant: 0,
+            fields: vec![self.new_box(Value::Tuple(elems))],
+        }
+    }
+
+    /// The `&CStr` a `CString` dereferences to: the fat
+    /// reference over the owned buffer, terminator
+    /// included. The base is the inner box's allocation
+    /// pointer and the length is the buffer's byte count.
+    fn c_string_deref(
+        &self,
+        frames: &[Frame],
+        receiver: &Value,
+    ) -> InterpResult<Value> {
+        let pointee = self.resolve_value(frames, receiver)?;
+        match pointee {
+            Value::Enum { fields, .. } if fields.len() == 1 => match &fields[0] {
+                Value::FatRef { .. } => Ok(fields[0].clone()),
+                Value::Enum {
+                    fields: box_fields,
+                    ..
+                } if box_fields.len() == 1 => {
+                    let base = box_fields[0].clone();
+                    let buf = self.resolve_value(frames, &base)?;
+                    let len = buf.len().ok_or_else(|| {
+                        InterpError::type_mismatch(
+                            "Deref for CString",
+                            "a byte buffer value",
+                            buf.kind_name(),
+                        )
+                    })?;
+                    Ok(Value::FatRef {
+                        base: Box::new(base),
+                        len,
+                    })
+                }
+                other => Err(InterpError::type_mismatch(
+                    "Deref for CString",
+                    "a boxed byte slice",
+                    other.kind_name(),
+                )),
+            },
+            ref other => Err(InterpError::type_mismatch(
+                "Deref for CString",
+                "cstring aggregate",
+                other.kind_name(),
+            )),
+        }
+    }
+
+    /// The bytes a `&CStr` receiver denotes, without the
+    /// terminating NUL: the receiver is the fat byte slice
+    /// the C string was built from, terminator included, so
+    /// the last byte (always a NUL in a well-formed value)
+    /// is dropped.
+    fn c_str_bytes(&self, frames: &[Frame], value: &Value) -> InterpResult<Vec<u8>> {
+        let mut bytes = self.arg_bytes(frames, value)?;
+        if bytes.last() == Some(&0) {
+            bytes.pop();
+        }
+        Ok(bytes)
+    }
+
+    /// The fat reference `value` shortened to its first
+    /// `len` elements, the sub-slice view
+    /// `CStr::from_bytes_until_nul` returns: a snapshot of
+    /// the prefix elements under the shortened length.
+    fn fat_ref_prefix(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+        len: usize,
+    ) -> InterpResult<Value> {
+        // The prefix is materialised as a snapshot of its
+        // elements: a fat reference that keeps the source's
+        // base would have its length re-derived from that
+        // base (the full slice) when the value is written
+        // to a typed place, losing the shortening.
+        let (items, _) = self.slice_elements(frames, value)?;
+        if items.len() < len {
+            return Err(InterpError::type_mismatch(
+                "sub-slice prefix",
+                "a slice of at least the requested length",
+                format!("{} elements", items.len()),
+            ));
+        }
+        Ok(Value::FatRef {
+            base: Box::new(Value::Ref(RefTarget::Value(
+                Box::new(Value::Tuple(items.into_iter().take(len).collect())),
+                Vec::new(),
+            ))),
+            len: len as u128,
+        })
+    }
+
     /// Whether a comparison call compares paths: the
     /// call's generic arguments name a path type
     /// (`path_cmp_subject`), or — for a call the converter
@@ -15034,6 +15311,51 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
             }
             let target = self.deref_value(frames, &cur)?;
             cur = self.read_resolved_ref(frames, &target)?;
+        }
+    }
+
+    /// The bytes behind a raw C string pointer, up to (not
+    /// including) the first NUL byte: the scan the C library
+    /// `strlen` performs. String and byte data are scanned
+    /// directly; any other aggregate is read element by
+    /// element, as [`Self::read_byte_range`] reads a fixed
+    /// range. Storage with no NUL in it is an explicit error,
+    /// never a silently truncated length.
+    fn read_c_str(&self, frames: &[Frame], ptr: &Value) -> InterpResult<Vec<u8>> {
+        let target = self.deref_value(frames, ptr)?;
+        let base = self.read_resolved(frames, &target)?;
+        let direct: Option<&[u8]> = match &base {
+            Value::Str(s) => Some(s.as_bytes()),
+            Value::Bytes(b) => Some(b.as_slice()),
+            _ => None,
+        };
+        if let Some(bytes) = direct {
+            return match bytes.iter().position(|b| *b == 0) {
+                Some(end) => Ok(bytes[..end].to_vec()),
+                None => Err(unsupported(
+                    "strlen of a string whose storage has no NUL terminator",
+                )),
+            };
+        }
+        let mut out = Vec::new();
+        loop {
+            match self.read_seq_at(frames, &target, out.len())? {
+                Value::Uint(0) => return Ok(out),
+                Value::Uint(b) => out.push(b as u8),
+                Value::Int(b) if (0..=255).contains(&b) => {
+                    if b == 0 {
+                        return Ok(out);
+                    }
+                    out.push(b as u8);
+                }
+                other => {
+                    return Err(InterpError::type_mismatch(
+                        "strlen element",
+                        "byte",
+                        other.kind_name(),
+                    ));
+                }
+            }
         }
     }
 
@@ -16945,6 +17267,28 @@ fn err_result(value: Value) -> Value {
     Value::Enum {
         variant: 1,
         fields: vec![value],
+    }
+}
+
+/// The `str::Utf8Error` value for a host validation failure:
+/// the struct's `valid_up_to` and `error_len` fields, in the
+/// model's aggregate shape.
+fn utf8_error_value(error: &std::str::Utf8Error) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![
+            Value::Uint(u128::from(error.valid_up_to() as u64)),
+            match error.error_len() {
+                Some(n) => Value::Enum {
+                    variant: 1,
+                    fields: vec![Value::Uint(n as u128)],
+                },
+                None => Value::Enum {
+                    variant: 0,
+                    fields: Vec::new(),
+                },
+            },
+        ],
     }
 }
 

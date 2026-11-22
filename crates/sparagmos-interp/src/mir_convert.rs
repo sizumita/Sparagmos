@@ -4005,6 +4005,32 @@ impl<'a> Converter<'a> {
         }
     }
 
+    /// Whether a pointee type is one of the byte-string DST
+    /// structs: `std::ffi::CStr`, `std::ffi::OsStr` (or its
+    /// sys representation type), `std::path::Path`. Each is a
+    /// byte string with a length metadata half, and its value
+    /// in this model is the byte string itself (the same
+    /// family `is_byte_string_ptr_pair` recognises), so a
+    /// pointer to one is a fat pointer.
+    fn pointee_is_byte_string_dst(&self, ty: &mir::Ty) -> bool {
+        match ty {
+            mir::Ty::Adt(def, _) => matches!(
+                self.names
+                    .get(def)
+                    .or_else(|| self.def_names.get(def))
+                    .map(String::as_str),
+                Some(
+                    "std::ffi::CStr"
+                        | "core::ffi::CStr"
+                        | "std::ffi::OsStr"
+                        | "std::sys::os_str::bytes::Slice"
+                        | "std::path::Path"
+                )
+            ),
+            _ => false,
+        }
+    }
+
     /// Convert a `CastKind::Transmute` rvalue: `operand` is the
     /// MIR operand, `v` its converted IR form, `target` the cast's
     /// target type. Only the shapes this value model can
@@ -6030,11 +6056,15 @@ let inner = match (&src, target) {
                             // fat, so it is correct for thin sources
                             // too -- including constant operands, whose
                             // source type this MIR form does not
-                            // preserve (`ctx` is None).
+                            // preserve (`ctx` is None). A byte-string
+                            // DST struct target (`CStr` and its kin)
+                            // is a fat target, not a thin one: its
+                            // metadata is the byte length, and the
+                            // cast keeps the value whole.
                             !matches!(
                                 p,
                                 mir::Ty::Slice(_) | mir::Ty::Str | mir::Ty::Dynamic(..)
-                            )
+                            ) && !self.pointee_is_byte_string_dst(p)
                         }) {
                             ir::Rvalue::DataPtr(v)
                         } else {

@@ -6592,6 +6592,61 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// The fat length for a place naming a DST's unsized tail
+    /// field (`(*p).tail`): the field's metadata is the
+    /// enclosing value's metadata, so the length is the one
+    /// [`Self::fat_deref_len`] reports for the place with the
+    /// field step stripped. Consumers try this only after the
+    /// field value's own length: a sized field (an array field
+    /// of a DST struct) reports its own length that way, and
+    /// only a tail field over storage the model cannot read
+    /// as a sequence (byte storage reached through a thin
+    /// base pointer, as a `CStr`'s `[c_char]` field is) needs
+    /// the enclosing pointer's length.
+    pub(crate) fn fat_tail_field_len(
+        &self,
+        frames: &[Frame],
+        body: &Body,
+        place: &Place,
+    ) -> Option<u128> {
+        if !matches!(place.projection.last(), Some(ProjectionElem::Field(_))) {
+            return None;
+        }
+        let stripped = Place {
+            local: place.local,
+            projection: place.projection[..place.projection.len() - 1].to_vec(),
+        };
+        if let Some(len) = self.fat_deref_len(frames, body, &stripped) {
+            return Some(len);
+        }
+        // The pointer at the deref may itself sit behind a
+        // reference (a method receiver passed by autoref
+        // reborrow: the parameter holds a reference to the
+        // caller's fat pointer value). Follow that one level,
+        // as `ptr_metadata`'s reference arm does, and take the
+        // fat length of the pointer it denotes.
+        if !matches!(
+            stripped.projection.last(),
+            Some(ProjectionElem::Deref)
+        ) {
+            return None;
+        }
+        let prefix = Place {
+            local: stripped.local,
+            projection: stripped.projection[..stripped.projection.len() - 1].to_vec(),
+        };
+        let head = self.read_place(frames, body, &prefix).ok()?;
+        if !matches!(head, Value::Ref(_)) {
+            return None;
+        }
+        let target = self.deref_value(frames, &head).ok()?;
+        let pointee = self.read_resolved(frames, &target).ok()?;
+        match pointee {
+            Value::FatRef { len, .. } => Some(len),
+            _ => None,
+        }
+    }
+
     fn project_step(
         &self,
         frames: &[Frame],
@@ -10375,6 +10430,18 @@ impl<'a> Interpreter<'a> {
                     Ok(Value::Unit)
                 }
             }
+            // A byte-string pointee (the storage a byte-slice
+            // or C-string pointer names, e.g. the `[c_char]`
+            // field of a `CStr` value over a byte-string
+            // constant): the same length metadata as an array
+            // value's, under the same destination gate.
+            Value::Bytes(b) => {
+                if matches!(dest_ty, Some(Ty::Uint(_))) {
+                    Ok(Value::Uint(b.len() as u128))
+                } else {
+                    Ok(Value::Unit)
+                }
+            }
             Value::Enum { fields, .. } => {
                 if matches!(dest_ty, Some(Ty::Uint(_))) {
                     match fields.last() {
@@ -10985,12 +11052,23 @@ impl<'a> Interpreter<'a> {
                     Some(Ty::Ref(inner))
                         if matches!(&**inner, Ty::Slice(_) | Ty::Str) =>
                     {
-                        self.fat_deref_len(frames, body, place).or_else(|| {
-                            self.read_resolved(frames, &target)
-                                .ok()
-                                .and_then(|v| v.len())
-                        })
+                        self.fat_deref_len(frames, body, place)
+                            .or_else(|| {
+                                self.read_resolved(frames, &target)
+                                    .ok()
+                                    .and_then(|v| v.len())
+                            })
+                            .or_else(|| self.fat_tail_field_len(frames, body, place))
                     }
+                    // A borrow of a fat pointer's pointee itself
+                    // (`&*p` with `p` fat): the pointee is
+                    // unsized whatever its type — a DST struct
+                    // like `CStr`, whose only field is its
+                    // unsized tail, as much as a slice — so the
+                    // borrow carries the pointer's length as its
+                    // metadata. A thin pointer yields no length
+                    // here and the borrow stays thin, as before.
+                    Some(Ty::Ref(_)) => self.fat_deref_len(frames, body, place),
                     _ => None,
                 };
                 let thin = match target {
@@ -11026,7 +11104,9 @@ impl<'a> Interpreter<'a> {
                 let len = self.fat_deref_len(frames, body, place);
                 let len = match len {
                     Some(len) => Some(len),
-                    None => value.len(),
+                    None => value
+                        .len()
+                        .or_else(|| self.fat_tail_field_len(frames, body, place)),
                 };
                 let len = len.ok_or_else(|| {
                     InterpError::type_mismatch(
