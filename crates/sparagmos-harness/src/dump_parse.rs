@@ -57,7 +57,7 @@ pub fn parse_dump(text: &str) -> Result<ParsedDump, DumpError> {
     // def-names).
     enum Section {
         Header,
-        Fn(String),
+        Fn(String, Option<mir::DefId>),
         Skipped,
     }
 
@@ -96,13 +96,19 @@ pub fn parse_dump(text: &str) -> Result<ParsedDump, DumpError> {
                 }
                 Ok(())
             }
-            Section::Fn(name) => {
+            Section::Fn(name, header_def) => {
                 let mut parser = Parser::new(text)?;
                 let node = parser.parse_node()?;
                 parser.expect_end()?;
                 let body = Conv::convert_body(&node)
                     .map_err(|e| DumpError(format!("in function `{name}`: {}", e.0)))?;
-                let def_id = def_names.iter().find(|(_, n)| *n == name).map(|(d, _)| *d);
+                // The header's own `def=` field is the function's
+                // identity; the name lookup remains only for dumps
+                // written before the field existed (a name is not
+                // an identity - several bodies can share one).
+                let def_id = header_def.or_else(|| {
+                    def_names.iter().find(|(_, n)| *n == name).map(|(d, _)| *d)
+                });
                 functions.push(sparagmos_jit::MirFunctionInput {
                     name: name.clone(),
                     def_id,
@@ -121,8 +127,18 @@ pub fn parse_dump(text: &str) -> Result<ParsedDump, DumpError> {
             text = String::new();
             section = if rest == "skipped" {
                 Section::Skipped
-            } else if let Some(name) = rest.strip_prefix("fn ") {
-                Section::Fn(name.split(" (args=").next().unwrap_or(name).to_string())
+            } else if let Some(header) = rest.strip_prefix("fn ") {
+                let name_end = header
+                    .find(" (def=")
+                    .unwrap_or_else(|| header.len());
+                let name = header[..name_end.min(header.find(" (args=").unwrap_or(name_end))]
+                    .to_string();
+                let header_def = header
+                    .strip_prefix(&format!("{name} (def=DefId(0:"))
+                    .and_then(|rest| rest.split(')').next())
+                    .and_then(|idx| idx.parse::<u32>().ok())
+                    .map(|index| mir::DefId { krate: 0, index });
+                Section::Fn(name, header_def)
             } else {
                 return err(format!("unknown dump section: {rest}"));
             };

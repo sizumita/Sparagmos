@@ -7,9 +7,17 @@
 //! source: <input file>
 //! functions: <count>
 //!
-//! === fn <name> (args=<n>, blocks=<n>, locals=<n>)
+//! === fn <name> (def=DefId(0:<n>), args=<n>, blocks=<n>, locals=<n>)
 //! <Debug representation of sparagmos_mir::Body>
 //! ```
+//!
+//! The `def=` field is the function's own definition id - the
+//! same id the in-process JIT input carries - because a name is
+//! not an identity: several collected bodies can share one name
+//! (instances of one generic item, an impl forwarder collected
+//! under its trait's name), and a reader that guesses the id
+//! from the name can hand the JIT a different function than the
+//! driver collected.
 //!
 //! Only successfully converted functions are dumped; skipped functions are
 //! listed in a trailing `=== skipped` section with their reasons. The
@@ -24,6 +32,7 @@ pub fn render(
     source: &str,
     report: &ConversionReport,
     bodies: &[(String, Body)],
+    body_def_ids: &[sparagmos_mir::DefId],
     def_names: &[String],
 ) -> String {
     let mut out = String::new();
@@ -36,10 +45,12 @@ pub fn render(
             let _ = writeln!(out, "  DefId(0:{i}) = {n}");
         }
     }
-    for (name, body) in bodies {
+    for ((name, body), def_id) in bodies.iter().zip(body_def_ids.iter()) {
         let _ = writeln!(
             out,
-            "\n=== fn {name} (args={}, blocks={}, locals={})",
+            "\n=== fn {name} (def=DefId({}:{}), args={}, blocks={}, locals={})",
+            def_id.krate,
+            def_id.index,
             body.arg_count,
             body.basic_blocks.len(),
             body.local_decls.len()

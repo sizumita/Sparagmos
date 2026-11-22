@@ -6904,7 +6904,7 @@ fn main() {
             if mode == Mode::Run || mode == Mode::RunJit {
                 if let Some(path) = &dump_path {
                     let text =
-                        sparagmos_driver::dump::render(&input, &c.report, &c.bodies, &c.def_names);
+                        sparagmos_driver::dump::render(&input, &c.report, &c.bodies, &c.body_def_ids, &c.def_names);
                     if let Err(e) = std::fs::write(path, text) {
                         eprintln!("failed to write dump {path}: {e}");
                         std::process::exit(1);
@@ -6936,7 +6936,7 @@ fn main() {
             }
             if let Some(path) = &dump_path {
                 let text =
-                    sparagmos_driver::dump::render(&input, &c.report, &c.bodies, &c.def_names);
+                    sparagmos_driver::dump::render(&input, &c.report, &c.bodies, &c.body_def_ids, &c.def_names);
                 if let Err(e) = std::fs::write(path, text) {
                     eprintln!("failed to write dump {path}: {e}");
                     std::process::exit(1);
