@@ -1152,6 +1152,41 @@ pub enum Builtin {
     /// paths, and a path value is its byte string, see
     /// `path_bytes_of`).
     PathPart(PathPart),
+    /// `std::path::Path::components(&self) -> Components`: a
+    /// non-inline library method, so no MIR body is available
+    /// for it. The iterator state the model builds is the
+    /// path's byte string plus the numbers of components
+    /// consumed from the front and from the back; the
+    /// `Iterator::next` / `DoubleEndedIterator::next_back`
+    /// steps for `Components` replay the host's own
+    /// `std::path` parsing from that state (see
+    /// `components_step`).
+    PathComponents,
+    /// `std::path::Path::to_path_buf(&self) -> PathBuf`: a
+    /// non-inline library method, so no MIR body is available
+    /// for it; the result is the path's own byte string in a
+    /// fresh buffer (the shape `pathbuf_value` builds).
+    PathToPathBuf,
+    /// `std::path::PathBuf::_push(&mut self, path: &Path)`:
+    /// the mutation `PathBuf::push` forwards to; no MIR body
+    /// is available for it. Answered with the host's
+    /// `std::path::PathBuf` over the model's byte string (the
+    /// shape `pathbuf_value` builds).
+    PathBufPush,
+    /// `std::path::PathBuf::pop(&mut self) -> bool`: no MIR
+    /// body is available; answered with the host's
+    /// `std::path::PathBuf` over the model's byte string, as
+    /// for `_push`.
+    PathBufPop,
+    /// `std::path::PathBuf::new() -> PathBuf` and
+    /// `PathBuf::with_capacity(n)`: the empty buffer in the
+    /// model's shape (`pathbuf_value` over no bytes; a
+    /// capacity is unobservable in the model). Modelling the
+    /// constructors keeps the values in the model's shape —
+    /// the converted library bodies would build the real
+    /// `Vec` value (a raw pointer / capacity / length triple)
+    /// whose bytes the path readers do not take.
+    PathBufNew,
     /// `std::str::from_utf8(&[u8]) -> Result<&str, Utf8Error>`:
     /// a non-inline library method, so no MIR body is available;
     /// the validation is a pure function of the bytes, answered
@@ -1987,6 +2022,12 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::path::Path::file_name" => Builtin::PathPart(PathPart::FileName),
         "std::path::Path::file_stem" => Builtin::PathPart(PathPart::FileStem),
         "std::path::Path::extension" => Builtin::PathPart(PathPart::Extension),
+        "std::path::Path::components" => Builtin::PathComponents,
+        "std::path::Path::to_path_buf" => Builtin::PathToPathBuf,
+        "std::path::PathBuf::_push" => Builtin::PathBufPush,
+        "std::path::PathBuf::pop" => Builtin::PathBufPop,
+        "std::path::PathBuf::new" => Builtin::PathBufNew,
+        "std::path::PathBuf::with_capacity" => Builtin::PathBufNew,
         "std::str::from_utf8" | "core::str::from_utf8" => Builtin::FromUtf8,
         _ if canonical.contains("RangeInclusive") && canonical.ends_with("::new") => {
             Builtin::RangeInclusiveNew
@@ -5428,6 +5469,7 @@ impl<'a> Interpreter<'a> {
                     || self_ty.starts_with("std::iter::Chain<")
                     || self_ty.starts_with("std::iter::SkipWhile<")
                     || self_ty.starts_with("std::iter::Once<")
+                    || self_ty.starts_with("std::path::Components")
                     || self_ty.starts_with("std::iter::Empty<")
                     || self_ty.starts_with("std::iter::Repeat<")
                     || self_ty_is(self_ty, "std::str::Chars")
@@ -5785,6 +5827,20 @@ impl<'a> Interpreter<'a> {
                         }
                     };
                     Ok(io_simple_error_value(disc))
+                } else if target == "std::path::PathBuf" {
+                    // `PathBuf: From<&str> / From<&Path> /
+                    // From<&OsStr> / From<String> / From<OsString>`:
+                    // every one of them is the source's byte
+                    // string in a fresh buffer (the shape
+                    // `pathbuf_value` builds). An owned
+                    // string-like source arrives as its wrapper
+                    // aggregate; a borrowed one as the byte
+                    // string itself or a reference to it.
+                    let bytes = match string_aggregate_bytes(&value) {
+                        Some(bytes) => bytes,
+                        None => self.path_bytes_of(frames, &value)?.0,
+                    };
+                    Ok(pathbuf_value(&bytes))
                 } else {
                     Err(unsupported(format!(
                         "From::from from {source} to {target} is not runtime-supported"
@@ -6006,6 +6062,18 @@ impl<'a> Interpreter<'a> {
                     let mut depth = 0usize;
                     let mut bottom = &stored;
                     while let Value::Enum { fields, .. } = bottom {
+                        // The byte vector itself is an aggregate
+                        // of `Uint` elements: stop there, even
+                        // when it holds a single byte (a one-byte
+                        // path's vector is a one-field aggregate,
+                        // indistinguishable in shape from a
+                        // wrapper without this check).
+                        if fields
+                            .iter()
+                            .all(|f| matches!(f, Value::Uint(_)))
+                        {
+                            break;
+                        }
                         if fields.len() != 1 {
                             break;
                         }
@@ -6127,6 +6195,52 @@ impl<'a> Interpreter<'a> {
                     None => none_value(),
                 })
             }
+            Builtin::PathComponents => {
+                arity(1)?;
+                let (bytes, _) = self.path_bytes_of(frames, &vals[0])?;
+                Ok(components_state(&bytes, 0, 0))
+            }
+            Builtin::PathToPathBuf => {
+                arity(1)?;
+                let (bytes, _) = self.path_bytes_of(frames, &vals[0])?;
+                Ok(pathbuf_value(&bytes))
+            }
+            Builtin::PathBufPush => {
+                arity(2)?;
+                let (addition, _) = self.path_bytes_of(frames, &vals[1])?;
+                let target = self.deref_value(frames, &vals[0])?;
+                self.modify_resolved(frames, &target, |slot| {
+                    let current = string_aggregate_bytes(slot).ok_or_else(|| {
+                        InterpError::type_mismatch(
+                            "PathBuf::push",
+                            "path buffer holding byte data",
+                            slot.kind_name(),
+                        )
+                    })?;
+                    let mut buf = host_path(&current);
+                    buf.push(host_path(&addition));
+                    *slot = pathbuf_value(&host_path_bytes(&buf));
+                    Ok(Value::Unit)
+                })
+            }
+            Builtin::PathBufPop => {
+                arity(1)?;
+                let target = self.deref_value(frames, &vals[0])?;
+                self.modify_resolved(frames, &target, |slot| {
+                    let current = string_aggregate_bytes(slot).ok_or_else(|| {
+                        InterpError::type_mismatch(
+                            "PathBuf::pop",
+                            "path buffer holding byte data",
+                            slot.kind_name(),
+                        )
+                    })?;
+                    let mut buf = host_path(&current);
+                    let popped = buf.pop();
+                    *slot = pathbuf_value(&host_path_bytes(&buf));
+                    Ok(Value::Bool(popped))
+                })
+            }
+            Builtin::PathBufNew => Ok(pathbuf_value(&[])),
             Builtin::FromUtf8 => {
                 arity(1)?;
                 let (bytes, _) = self.path_bytes_of(frames, &vals[0])?;
@@ -10266,6 +10380,12 @@ impl<'a> Interpreter<'a> {
         self_ty: &str,
         state: Value,
     ) -> InterpResult<(Value, Value)> {
+        if self_ty.starts_with("std::path::Components") {
+            // The back step of the state `Builtin::PathComponents`
+            // builds, replaying the host's parsing (see
+            // `components_step`).
+            return self.components_step(state, true);
+        }
         if self_ty.starts_with("std::iter::Rev<") {
             let fields = iterator_fields(&state, self_ty)?;
             if fields.len() != 1 {
@@ -10602,8 +10722,32 @@ impl<'a> Interpreter<'a> {
                 },
             ));
         }
+        if self_ty.starts_with("std::path::Components") {
+            // The state is the path's byte string and the
+            // numbers of components consumed from each end (see
+            // `Builtin::PathComponents`); the step replays the
+            // host's own parsing from it.
+            return self.components_step(state, false);
+        }
         let (new_state, result) = self.next_on_state(frames, self_ty, &state)?;
         Ok((new_state, result))
+    }
+
+    /// One step of a `std::path::Components` state, wrapping
+    /// the item in its `Option` (see `components_step_state`).
+    fn components_step(
+        &self,
+        state: Value,
+        from_back: bool,
+    ) -> InterpResult<(Value, Value)> {
+        let (new_state, item) = components_step_state(&state, from_back)?;
+        Ok((
+            new_state,
+            match item {
+                Some(value) => some_value(value),
+                None => none_value(),
+            },
+        ))
     }
 
     fn map_next(
@@ -13802,6 +13946,7 @@ pub fn iterator_next_back_modelled(self_ty: &str) -> bool {
         || self_ty_is(self_ty, "std::env::Args")
         || self_ty_is(self_ty, "std::env::ArgsOs")
         || self_ty.starts_with("std::iter::Empty<")
+        || self_ty.starts_with("std::path::Components")
         || self_ty.starts_with("std::iter::Once<")
         || self_ty_is(self_ty, "std::str::Chars")
         || self_ty_is(self_ty, "core::str::Chars")
@@ -13968,6 +14113,9 @@ fn iterator_next_back_state(
     state: &Value,
     self_ty: &str,
 ) -> InterpResult<(Value, Option<Value>)> {
+    if self_ty.starts_with("std::path::Components") {
+        return components_step_state(state, true);
+    }
     if self_ty_is(self_ty, "std::env::Args") || self_ty_is(self_ty, "std::env::ArgsOs") {
         // Step the innermost owned-iterator state from the back
         // and rebuild the wrappers, mirroring the front step in
@@ -15111,6 +15259,164 @@ fn host_path(bytes: &[u8]) -> std::path::PathBuf {
 fn host_path_bytes(path: &std::path::Path) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt;
     path.as_os_str().as_bytes().to_vec()
+}
+
+/// One `Iterator::next` / `DoubleEndedIterator::next_back`
+/// step of a `std::path::Components` state (see
+/// `Builtin::PathComponents`): rebuild the host iterator
+/// over the state's byte string, replay the components
+/// already consumed from each end, and take one more, so
+/// the parsing rules (root, `.` and `..` handling,
+/// repeated separators) are the host's own. The counts in
+/// the returned state advance on the side the step came
+/// from; an exhausted iterator returns its state
+/// unchanged, so it stays exhausted.
+fn components_step_state(
+    state: &Value,
+    from_back: bool,
+) -> InterpResult<(Value, Option<Value>)> {
+    let fields = iterator_fields(state, "std::path::Components")?;
+    if fields.len() != 3 {
+        return Err(InterpError::type_mismatch(
+            "Components state",
+            "[path bytes, front count, back count]",
+            format!("{} field(s)", fields.len()),
+        ));
+    }
+    let bytes = match &fields[0] {
+        Value::Bytes(b) => b.clone(),
+        Value::Str(s) => s.clone().into_bytes(),
+        other => {
+            return Err(InterpError::type_mismatch(
+                "Components state",
+                "path byte string",
+                other.kind_name(),
+            ))
+        }
+    };
+    let (front, back) = match (&fields[1], &fields[2]) {
+        (Value::Uint(f), Value::Uint(b)) => (*f, *b),
+        _ => {
+            return Err(InterpError::type_mismatch(
+                "Components state",
+                "front and back counts",
+                "non-integer count(s)",
+            ))
+        }
+    };
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::path::Path::new(std::ffi::OsStr::from_bytes(&bytes));
+    let mut iter = path.components();
+    for _ in 0..front {
+        let _ = iter.next();
+    }
+    for _ in 0..back {
+        let _ = iter.next_back();
+    }
+    let item = if from_back { iter.next_back() } else { iter.next() };
+    match item {
+        Some(component) => {
+            let (front, back) = if from_back {
+                (front, back + 1)
+            } else {
+                (front + 1, back)
+            };
+            Ok((
+                components_state(&bytes, front, back),
+                Some(component_value(component)),
+            ))
+        }
+        None => Ok((state.clone(), None)),
+    }
+}
+
+/// The `std::path::Components` iterator state in this
+/// model: the path's byte string and the numbers of
+/// components consumed from the front and from the back.
+/// The parse itself is replayed from this state with the
+/// host's `std::path` on every step (see `components_step`),
+/// so no parse state has to be represented here.
+fn components_state(bytes: &[u8], front: u128, back: u128) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![
+            Value::Bytes(bytes.to_vec()),
+            Value::Uint(front),
+            Value::Uint(back),
+        ],
+    }
+}
+
+/// A `std::path::Component` value in std's shape: the
+/// variants in declaration order (`Prefix`, `RootDir`,
+/// `CurDir`, `ParentDir`, `Normal`); the `Normal` payload is
+/// the component's byte string (the model's `&OsStr`, the
+/// same form `Builtin::PathPart` returns for `&Path` /
+/// `&OsStr` results).
+fn component_value(component: std::path::Component) -> Value {
+    use std::os::unix::ffi::OsStrExt;
+    match component {
+        std::path::Component::Prefix(prefix) => Value::Enum {
+            variant: 0,
+            fields: vec![prefix_component_value(prefix)],
+        },
+        std::path::Component::RootDir => Value::Enum {
+            variant: 1,
+            fields: Vec::new(),
+        },
+        std::path::Component::CurDir => Value::Enum {
+            variant: 2,
+            fields: Vec::new(),
+        },
+        std::path::Component::ParentDir => Value::Enum {
+            variant: 3,
+            fields: Vec::new(),
+        },
+        std::path::Component::Normal(part) => Value::Enum {
+            variant: 4,
+            fields: vec![Value::Bytes(part.as_bytes().to_vec())],
+        },
+    }
+}
+
+/// A `std::path::PrefixComponent` value in std's shape,
+/// `{ kind, raw }`: the `Prefix` enum in declaration order
+/// (`Verbatim`, `VerbatimUNC`, `VerbatimDisk`, `DeviceNS`,
+/// `UNC`, `Disk`) and the raw prefix string. Prefixes do
+/// not occur on Unix; the shape is built for completeness.
+fn prefix_component_value(prefix: std::path::PrefixComponent) -> Value {
+    use std::os::unix::ffi::OsStrExt;
+    let os = |s: &std::ffi::OsStr| Value::Bytes(s.as_bytes().to_vec());
+    let kind = match prefix.kind() {
+        std::path::Prefix::Verbatim(s) => Value::Enum {
+            variant: 0,
+            fields: vec![os(s)],
+        },
+        std::path::Prefix::VerbatimUNC(a, b) => Value::Enum {
+            variant: 1,
+            fields: vec![os(a), os(b)],
+        },
+        std::path::Prefix::VerbatimDisk(d) => Value::Enum {
+            variant: 2,
+            fields: vec![Value::Uint(d as u128)],
+        },
+        std::path::Prefix::DeviceNS(s) => Value::Enum {
+            variant: 3,
+            fields: vec![os(s)],
+        },
+        std::path::Prefix::UNC(a, b) => Value::Enum {
+            variant: 4,
+            fields: vec![os(a), os(b)],
+        },
+        std::path::Prefix::Disk(d) => Value::Enum {
+            variant: 5,
+            fields: vec![Value::Uint(d as u128)],
+        },
+    };
+    Value::Enum {
+        variant: 0,
+        fields: vec![kind, os(prefix.as_os_str())],
+    }
 }
 
 /// A `PathBuf` value in std's shape: `PathBuf { inner:
