@@ -11800,3 +11800,175 @@ fn run_mode_process_spawn_resolvable_is_named_error() {
         "stderr={stderr}"
     );
 }
+
+const FFI_HELPERS_SRC: &str = r#"
+#[link(name = "rust_test_helpers", kind = "static")]
+extern "C" {
+    fn rust_dbg_extern_identity_u32(x: u32) -> u32;
+    fn rust_get_test_int() -> isize;
+    fn rust_dbg_extern_return_TwoU16s() -> TwoU16s;
+    fn rust_int8_to_int32(x: i8) -> i32;
+    fn rust_interesting_average(n: u64, ...) -> f64;
+    fn identity(x: u128) -> u128;
+    fn square(x: i128) -> i128;
+    fn sub(a: i128, b: i128) -> i128;
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct TwoU16s { one: u16, two: u16 }
+
+fn main() {
+    unsafe {
+        assert_eq!(rust_dbg_extern_identity_u32(0xDEADBEEF), 0xDEADBEEFu32);
+        assert_eq!(rust_get_test_int(), 1);
+        let t = rust_dbg_extern_return_TwoU16s();
+        assert_eq!(t.one, 10);
+        assert_eq!(t.two, 20);
+        assert_eq!(rust_int8_to_int32(-1), -1);
+        assert_eq!(rust_interesting_average(2, 10i64, 10.0f64, 20i64, 20.0f64) as i64, 30);
+        assert!(rust_interesting_average(0).is_nan());
+        let b: u128 = 0x33EE_0E2A_54E2_59DA_A0E7_8E41;
+        assert_eq!(identity(b), b);
+        assert_eq!(square(0x734C_C2F2_A521i128) as u128, b);
+        assert_eq!(
+            sub(
+                0x2468_ACF1_3579_BDFF_DB97_530E_CA86_420i128,
+                0x1234_5678_9ABC_DEFF_EDCB_A987_6543_210i128
+            ),
+            0x1234_5678_9ABC_DEFF_EDCB_A987_6543_210i128
+        );
+    }
+    println!("ffi helpers ok");
+}
+"#;
+
+#[test]
+fn run_mode_ffi_helpers_execute() {
+    // The `rust_test_helpers` C functions the rustc UI tests
+    // link for ABI checks are body-less extern declarations;
+    // the interpreter serves them from the foreign-helper
+    // models (their semantics are the C source's).
+    let dir = temp_dir("ffi-helpers");
+    let src = fixture(&dir, "ffi_helpers.rs", FFI_HELPERS_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "ffi helper calls must execute; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "ffi helpers ok\n",
+        "the guest's stdout is the driver's stdout"
+    );
+}
+
+const FFI_STRUCT_SRC: &str = r#"
+#[link(name = "rust_test_helpers", kind = "static")]
+extern "C" {
+    fn rust_dbg_call(cb: extern "C" fn(u64) -> u64, data: u64) -> u64;
+    fn get_x(s: S) -> u64;
+    fn get_y(s: S) -> u64;
+    fn get_z(s: S) -> u64;
+    fn rust_dbg_abi_1(q: Quad) -> Quad;
+    fn get_c_many_params(a: *const (), b: *const (), c: *const (), d: *const (), f: Quad) -> u64;
+    fn issue_97463_leak_uninit_data(a: u32, b: u32, c: u32) -> u16;
+    fn increment_all_parts(li: LARGE_INTEGER) -> LARGE_INTEGER;
+    fn rust_dbg_new_some_u64u64(a: u64, b: u64) -> U8TaggedEnumOptionU64U64;
+    fn rust_dbg_new_none_u64u64() -> U8TaggedEnumOptionU64U64;
+    fn rust_dbg_unpack_option_u64u64(o: U8TaggedEnumOptionU64U64, a: *mut u64, b: *mut u64) -> i32;
+}
+
+extern "C" fn cb(data: u64) -> u64 { data + 1 }
+
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct S { x: u64, y: u64, z: u64 }
+
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct Quad { a: u64, b: u64, c: u64, d: u64 }
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct LARGE_INTEGER_U { LowPart: u32, HighPart: u32 }
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+union LARGE_INTEGER {
+    __unnamed__: LARGE_INTEGER_U,
+    u: LARGE_INTEGER_U,
+    QuadPart: u64,
+}
+
+#[repr(C, u8)]
+pub enum U8TaggedEnumOptionU64U64 {
+    None,
+    Some(u64, u64),
+}
+
+fn indirect(func: unsafe extern "C" fn(s: S) -> u64, s: S) -> u64 { unsafe { func(s) } }
+
+fn main() {
+    unsafe {
+        assert_eq!(rust_dbg_call(cb, 41), 42);
+        let s = S { x: 1, y: 2, z: 3 };
+        assert_eq!(indirect(get_x, s), 1);
+        assert_eq!(indirect(get_y, s), 2);
+        assert_eq!(indirect(get_z, s), 3);
+        let q = Quad { a: 10, b: 20, c: 30, d: 40 };
+        let qq = rust_dbg_abi_1(q);
+        assert_eq!(qq.a, 31);
+        assert_eq!(qq.b, 39);
+        assert_eq!(qq.c, 11);
+        assert_eq!(qq.d, 19);
+        let null = std::ptr::null();
+        assert_eq!(get_c_many_params(null, null, null, null, q), 30);
+        assert_eq!(issue_97463_leak_uninit_data(0, 0x327b23c6, 0), 0x23c6u16);
+        let li = LARGE_INTEGER { QuadPart: 0 };
+        let li_c = increment_all_parts(li);
+        assert_eq!(li_c.QuadPart, 0x0000_0002_0000_0003u64);
+        let some = rust_dbg_new_some_u64u64(10, 20);
+        if let U8TaggedEnumOptionU64U64::Some(a, b) = some {
+            assert_eq!(a, 10);
+            assert_eq!(b, 20);
+        } else {
+            panic!("unexpected none");
+        }
+        let mut a: u64 = 0;
+        let mut b: u64 = 0;
+        let r = rust_dbg_unpack_option_u64u64(some, &mut a as *mut _, &mut b as *mut _);
+        assert_eq!(r, 1);
+        assert_eq!(a, 10);
+        assert_eq!(b, 20);
+        let none = rust_dbg_new_none_u64u64();
+        let r = rust_dbg_unpack_option_u64u64(none, &mut a as *mut _, &mut b as *mut _);
+        assert_eq!(r, 0);
+    }
+    println!("ffi struct helpers ok");
+}
+"#;
+
+#[test]
+fn run_mode_ffi_struct_and_callback_helpers_execute() {
+    // Callback invocation, field-returning helpers, the ABI
+    // shuffle, the union increment and the tagged-option
+    // constructor/unpack pair, all body-less extern
+    // declarations served by the foreign-helper models.
+    let dir = temp_dir("ffi-struct");
+    let src = fixture(&dir, "ffi_struct.rs", FFI_STRUCT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "ffi struct helper calls must execute; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "ffi struct helpers ok\n",
+        "the guest's stdout is the driver's stdout"
+    );
+}
