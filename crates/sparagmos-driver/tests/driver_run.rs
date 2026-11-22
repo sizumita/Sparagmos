@@ -8960,3 +8960,132 @@ fn run_mode_manually_drop_in_union_field_deref() {
     assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
     assert_eq!(stdout, "union ok\n", "stdout={stdout}");
 }
+
+const ITER_COUNT_SRC: &str = r#"
+fn main() {
+    let a = [10, 20, 30];
+    println!("range={}", (0..5).count());
+    println!("slice={}", a.iter().count());
+    println!("chars={}", "abcd".chars().count());
+}
+"#;
+
+#[test]
+fn run_mode_iterator_count_over_modelled_iterators() {
+    let dir = temp_dir("iter_count");
+    let src = fixture(&dir, "iter_count.rs", ITER_COUNT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "count runs; stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "range=5\nslice=3\nchars=4\n"
+    );
+}
+
+const ITER_FOLD_SRC: &str = r#"
+fn main() {
+    let summed = (0..5).fold(0, |acc, x| acc + x);
+    let a = [1, 2, 3];
+    let mut weight = 1;
+    let folded = a.iter().fold(0, |acc, x| {
+        weight *= 2;
+        acc + x * weight
+    });
+    println!("summed={} folded={} weight={}", summed, folded, weight);
+}
+"#;
+
+#[test]
+fn run_mode_iterator_fold_threads_accumulator_and_captures() {
+    // The fold closure is FnMut: its captured `weight` must keep
+    // its mutations across items (1*2 + 2*4 + 3*8 = 34, w = 8).
+    let dir = temp_dir("iter_fold");
+    let src = fixture(&dir, "iter_fold.rs", ITER_FOLD_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "fold runs; stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "summed=10 folded=34 weight=8\n"
+    );
+}
+
+const ITER_FOR_EACH_SRC: &str = r#"
+fn main() {
+    let mut total = 0;
+    (0..5).for_each(|x| total += x);
+    let mut seen = String::new();
+    "abc".chars().for_each(|c| seen.push(c));
+    println!("total={} seen={}", total, seen);
+}
+"#;
+
+#[test]
+fn run_mode_iterator_for_each_mutates_captures() {
+    let dir = temp_dir("iter_for_each");
+    let src = fixture(&dir, "iter_for_each.rs", ITER_FOR_EACH_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "for_each runs; stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "total=10 seen=abc\n");
+}
+
+const ITER_COLLECT_SRC: &str = r#"
+fn main() {
+    let v: Vec<i32> = (0..5).collect();
+    let cs: Vec<char> = "xyz".chars().collect();
+    let s: String = "abcd".chars().collect();
+    let direct: Vec<i32> = std::iter::FromIterator::from_iter(0..4);
+    println!(
+        "v={} {} cs={} {} s={} direct={}",
+        v.len(),
+        v[0] + v[4],
+        cs.len(),
+        cs[2],
+        s,
+        direct.len()
+    );
+}
+"#;
+
+#[test]
+fn run_mode_iterator_collect_into_vec_and_string() {
+    let dir = temp_dir("iter_collect");
+    let src = fixture(&dir, "iter_collect.rs", ITER_COLLECT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "collect runs; stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "v=5 4 cs=3 z s=abcd direct=4\n"
+    );
+}
+
+const ITER_COLLECT_UNSUPPORTED_SRC: &str = r#"
+fn main() {
+    let set: std::collections::HashSet<i32> = (0..3).collect();
+    println!("n={}", set.len());
+}
+"#;
+
+#[test]
+fn run_mode_iterator_collect_names_unmodelled_targets() {
+    // Targets without a value-model shape fail with the target
+    // named, not with an approximation or a conversion error
+    // from deep inside the collected FromIterator chain.
+    let dir = temp_dir("iter_collect_unsupported");
+    let src = fixture(&dir, "iter_collect_unsupported.rs", ITER_COLLECT_UNSUPPORTED_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "unmodelled collect target must exit 2; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("collect into std::collections::HashSet")
+            && stderr.contains("is not runtime-supported"),
+        "the target is named in the reason; stderr={stderr}"
+    );
+}
