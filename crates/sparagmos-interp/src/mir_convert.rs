@@ -1072,6 +1072,29 @@ fn is_thin_ptr_ty(ty: &mir::Ty) -> bool {
     }
 }
 
+/// Whether a converted operand is a pointer constant: one of
+/// the constant forms that evaluate to a pointer value (a
+/// reference, an address-only pointer, a null pointer, a static
+/// reference, a vtable pointer, a fat pointer, or a callable).
+/// A cast of such a constant has no place type to judge from --
+/// the constant's own form is the evidence that the source is a
+/// pointer.
+fn is_pointer_constant(v: &ir::Operand) -> bool {
+    matches!(
+        v,
+        ir::Operand::Constant(
+            ir::Constant::Ref(_)
+                | ir::Constant::IntPtr(_)
+                | ir::Constant::NullPtr
+                | ir::Constant::StaticRef { .. }
+                | ir::Constant::VTablePtr(_)
+                | ir::Constant::FatPtr { .. }
+                | ir::Constant::FnDef(_)
+                | ir::Constant::Closure(_)
+        )
+    )
+}
+
 /// Whether `ty` is a fat pointer type: a raw pointer or
 /// reference whose pointee carries a metadata half (a slice,
 /// `str` or `dyn` pointee). A fat pointer's value in this model
@@ -5016,6 +5039,20 @@ impl<'a> Converter<'a> {
                             ),
                             mir::Ty::Int(_) | mir::Ty::Uint(_),
                         ) => ir::Rvalue::PtrToInt(v.clone()),
+                        // A constant operand carries no place type
+                        // (the `ctx` above holds the cast's target
+                        // type for it), so a pointer constant is
+                        // judged from the converted constant itself:
+                        // the constant forms that evaluate to a
+                        // pointer value take the same `PtrToInt`
+                        // reading, which yields the value's
+                        // synthetic address exactly as for a place
+                        // operand.
+                        _ if matches!(target, mir::Ty::Int(_) | mir::Ty::Uint(_))
+                            && is_pointer_constant(&v) =>
+                        {
+                            ir::Rvalue::PtrToInt(v.clone())
+                        }
                         _ => ir::Rvalue::Unsupported(
                             "Cast PointerExposeProvenance".to_string(),
                         ),
