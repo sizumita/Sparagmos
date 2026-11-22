@@ -2648,8 +2648,10 @@ impl<'a> Converter<'a> {
         })
     }
 
-    /// Expand the `Uninit` leaves of a thread-local seed into the
-    /// aggregate skeleton of their declared type.
+    /// Expand the `Uninit` leaves of a seed constant (a
+    /// thread-local's initializer, a static's initializer, an
+    /// operand constant) into the aggregate skeleton of their
+    /// declared type.
     ///
     /// The constant decoder collapses every all-uninitialized byte
     /// range into a bare `Uninit`, whatever its type. That loses
@@ -2999,9 +3001,44 @@ impl<'a> Converter<'a> {
                     }
                     _ => None,
                 };
+                let seed = self.convert_const_value(value, inner_ctx)?;
+                // A static whose initializer is (partly)
+                // uninitialized decodes to a bare `Uninit` seed
+                // with no trace of the declared type's structure:
+                // element writes into the storage then land in a
+                // shapeless value and element reads fail as
+                // uninitialized-place reads. When this reference
+                // denotes the static whole (empty projection), the
+                // pointee context IS the seed's type -- the
+                // declared type for a thin reference, and for a fat
+                // slice reference the array type the slice covers,
+                // rebuilt from the element type and the carried
+                // length -- so give the seed the declared type's
+                // skeleton exactly as the thread-local table does
+                // for its seeds. An interior reference's seed is
+                // still the full initializer, whose type this
+                // conversion does not know, so it keeps the bare
+                // form.
+                let seed = if projection.is_empty() {
+                    let seed_ty = match (inner_ctx, len) {
+                        (Some(ty), None) => Some(ty.clone()),
+                        (Some(mir::Ty::Slice(elem)), Some(n)) => Some(mir::Ty::Array(
+                            elem.clone(),
+                            mir::ArrayLen::Known(*n),
+                        )),
+                        (Some(ty @ mir::Ty::Array(..)), Some(_)) => Some(ty.clone()),
+                        _ => None,
+                    };
+                    match seed_ty {
+                        Some(ty) => self.expand_uninit_constant(&seed, &ty, 0),
+                        None => seed,
+                    }
+                } else {
+                    seed
+                };
                 ir::Constant::StaticRef {
                     name: self.static_key(def),
-                    value: Box::new(self.convert_const_value(value, inner_ctx)?),
+                    value: Box::new(seed),
                     projection: projection
                         .iter()
                         .map(|e| self.convert_ref_proj(e))
