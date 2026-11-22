@@ -15850,3 +15850,55 @@ fn run_mode_cstr_literal_non_ascii_bytes() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "cstr non-ascii ok\n");
 }
+
+const COROUTINE_DROP_ENV_SRC: &str = r#"
+#![feature(coroutines, coroutine_trait, stmt_expr_attributes)]
+#![allow(dropping_copy_types)]
+
+use std::ops::Coroutine;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static A: AtomicUsize = AtomicUsize::new(0);
+
+struct B;
+
+impl Drop for B {
+    fn drop(&mut self) {
+        A.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn main() {
+    let b = B;
+    let mut foo = #[coroutine] || {
+        yield;
+        drop(b);
+    };
+    let n = A.load(Ordering::SeqCst);
+    drop(Pin::new(&mut foo).resume(()));
+    assert_eq!(A.load(Ordering::SeqCst), n);
+    drop(foo);
+    assert_eq!(A.load(Ordering::SeqCst), n + 1);
+    println!("coroutine drop env ok");
+}
+"#;
+
+#[test]
+fn run_mode_suspended_coroutine_drop_runs_capture_dtor() {
+    // Dropping a suspended coroutine drops the captures it
+    // still holds: the coroutine's storage is one field list
+    // shared by every state, so the suspended state's glue is
+    // the unresumed state's fields (plus its own saved locals),
+    // not the empty plan an unevidenced variant would get.
+    let dir = temp_dir("coroutine-drop-env");
+    let src = fixture(&dir, "coroutine_drop_env.rs", COROUTINE_DROP_ENV_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a suspended coroutine's drop must run its captures' destructors; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "coroutine drop env ok\n");
+}

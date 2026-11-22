@@ -3790,12 +3790,24 @@ impl<'a> Interpreter<'a> {
                                 fields,
                                 saved,
                             } => {
-                                coroutine_state = Some(variant);
-                                if variant == 0 {
+                                // A path addressed through a
+                                // downcast to the unresumed state
+                                // names the upvar storage explicitly
+                                // (the drop of a suspended coroutine
+                                // schedules its captures' glue under
+                                // that address; see the `Variants`
+                                // arm); any other path is read in
+                                // the value's own state.
+                                let effective = match path.last() {
+                                    Some(RefProj::Downcast(0)) => 0,
+                                    _ => variant,
+                                };
+                                coroutine_state = Some(effective);
+                                if effective == 0 {
                                     fields
                                 } else {
                                     saved
-                                        .get(variant as usize)
+                                        .get(effective as usize)
                                         .cloned()
                                         .unwrap_or_default()
                                 }
@@ -3913,7 +3925,33 @@ impl<'a> Interpreter<'a> {
                                 None => P::Unknown,
                             },
                         };
-                        active.work.push((path, plan));
+                        active.work.push((path.clone(), plan));
+                        // A suspended coroutine's captures live in
+                        // the upvar storage, which the selected
+                        // state's plan does not cover (it addresses
+                        // the state's saved storage): schedule the
+                        // unresumed state's plan against the upvar
+                        // storage too, addressed through a downcast
+                        // to the unresumed state. The work stack is
+                        // LIFO, so pushing it after the state's own
+                        // plan runs it first: the captures are the
+                        // shared prefix of every state's field list
+                        // and drop before the state's own locals,
+                        // the compiler's layout order. Captures the
+                        // state machine already moved out read back
+                        // as uninitialised, so for a completed or
+                        // panicked coroutine this is inert.
+                        if let Value::Coroutine { variant, .. } = &value {
+                            if *variant != 0 {
+                                if let Some(upvar_plan) = variants.first() {
+                                    if *upvar_plan != P::Trivial {
+                                        let mut upath = path;
+                                        upath.push(RefProj::Downcast(0));
+                                        active.work.push((upath, upvar_plan.clone()));
+                                    }
+                                }
+                            }
+                        }
                     }
                     P::RefCellRelease { mutable } => {
                         // A moved-out / never-written guard has no
