@@ -969,6 +969,35 @@ impl Conv {
                 alloc_id: atom_parse(field(f, "alloc_id")?, "alloc_id")?,
                 offset: atom_parse(field(f, "offset")?, "offset")?,
             },
+            ("Tuple", Payload::Args(a)) if a.len() == 1 => {
+                let mut fields = Vec::new();
+                for e in as_list(&a[0])? {
+                    fields.push(Self::const_value(e)?);
+                }
+                mir::ConstValue::Tuple(fields)
+            }
+            ("Adt", Payload::Fields(f)) => mir::ConstValue::Adt {
+                variant: atom_parse(field(f, "variant")?, "variant")?,
+                fields: {
+                    let mut fields = Vec::new();
+                    for e in as_list(field(f, "fields")?)? {
+                        fields.push(Self::const_value(e)?);
+                    }
+                    fields
+                },
+            },
+            ("Ref", Payload::Args(a)) if a.len() == 1 => {
+                mir::ConstValue::Ref(Box::new(Self::const_value(&a[0])?))
+            }
+            ("SliceVal", Payload::Args(a)) if a.len() == 1 => {
+                let mut elems = Vec::new();
+                for e in as_list(&a[0])? {
+                    elems.push(Self::const_value(e)?);
+                }
+                mir::ConstValue::SliceVal(elems)
+            }
+            ("Uninit", Payload::Unit) => mir::ConstValue::Uninit,
+            ("NullPtr", Payload::Unit) => mir::ConstValue::NullPtr,
             ("StaticRef", Payload::Fields(f)) => mir::ConstValue::StaticRef {
                 def: Self::def_id(field(f, "def")?)?,
                 value: Box::new(Self::const_value(field(f, "value")?)?),
