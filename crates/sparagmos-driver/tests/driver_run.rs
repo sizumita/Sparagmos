@@ -9089,3 +9089,288 @@ fn run_mode_iterator_collect_names_unmodelled_targets() {
         "the target is named in the reason; stderr={stderr}"
     );
 }
+
+// ----- IntoIterator::into_iter runtime support (Lane DT) ---------------------
+
+const VEC_BY_VALUE_SRC: &str = r#"
+fn main() {
+    let v = vec![1, 2, 3];
+    let mut sum = 0;
+    for x in v {
+        sum += x;
+    }
+    println!("sum={sum}");
+    let mut it = vec![10, 20].into_iter();
+    let a = it.next().unwrap_or(-1);
+    let b = it.next().unwrap_or(-1);
+    let c = it.next().unwrap_or(-1);
+    println!("seq={a},{b},{c}");
+    let w = vec![String::from("a"), String::from("bb"), String::from("ccc")];
+    let mut n = 0;
+    for s in w {
+        n += s.len();
+        break;
+    }
+    println!("n={n}");
+}
+"#;
+
+#[test]
+fn run_mode_vec_by_value_iteration() {
+    let dir = temp_dir("vec-by-value");
+    let src = fixture(&dir, "vec_by_value.rs", VEC_BY_VALUE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Vec by-value iteration must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "sum=6\nseq=10,20,-1\nn=1\n",
+        "owned elements are yielded in order, then None"
+    );
+}
+
+const VEC_DROP_ORDER_SRC: &str = r#"
+struct Frag(i32);
+impl Drop for Frag {
+    fn drop(&mut self) { println!("drop {}", self.0); }
+}
+fn main() {
+    let v = vec![Frag(1), Frag(2), Frag(3)];
+    for x in v {
+        println!("got {}", x.0);
+        break;
+    }
+    println!("end");
+    let w = vec![Frag(4), Frag(5)];
+    for x in w {
+        println!("got {}", x.0);
+    }
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_vec_into_iter_drop_order() {
+    // Each element drops exactly once: yielded ones at the end of
+    // their loop-body scope, the rest in order when the iterator
+    // itself is dropped.
+    let dir = temp_dir("vec-drop-order");
+    let src = fixture(&dir, "vec_drop_order.rs", VEC_DROP_ORDER_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "dropping a partially consumed vec::IntoIter must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "got 1\ndrop 1\ndrop 2\ndrop 3\nend\ngot 4\ndrop 4\ngot 5\ndrop 5\ndone\n",
+        "yielded elements drop once, unyielded elements drop once, in order"
+    );
+}
+
+const OPTION_BY_VALUE_SRC: &str = r#"
+fn main() {
+    let mut n = 0;
+    for x in Some(41) {
+        n += x + 1;
+    }
+    for x in None::<i32> {
+        n += 100;
+    }
+    let o = Some(String::from("hi"));
+    for s in o {
+        n += s.len() as i32;
+    }
+    println!("n={n}");
+    let mut m = Some(7);
+    for x in &m {
+        n += x;
+    }
+    for x in &mut m {
+        *x += 1;
+    }
+    println!("m={}", m.unwrap_or(0));
+    let p = Some(9);
+    let mut t = 0;
+    for x in p.iter() {
+        t += x;
+    }
+    println!("t={t} n={n}");
+}
+"#;
+
+#[test]
+fn run_mode_option_iteration() {
+    let dir = temp_dir("option-iteration");
+    let src = fixture(&dir, "option_iteration.rs", OPTION_BY_VALUE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Option iteration (by value, by reference, .iter()) must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "n=44\nm=8\nt=9 n=51\n",
+        "Some yields its payload once, None yields nothing"
+    );
+}
+
+const MAP_SRC: &str = r#"
+fn double(x: i32) -> i32 { x * 2 }
+fn main() {
+    let mut s = 0;
+    for x in (1..4).map(|x| x * 10) {
+        s += x;
+    }
+    println!("s={s}");
+    let mut calls = 0;
+    let v = vec![1, 2, 3];
+    let mut t = 0;
+    for x in v.into_iter().map(|x| { calls += 1; x + calls }) {
+        t += x;
+    }
+    println!("t={t} calls={calls}");
+    let mut u = 0;
+    for x in (5..8).map(double) {
+        u += x;
+    }
+    println!("u={u}");
+}
+"#;
+
+#[test]
+fn run_mode_map_iteration() {
+    // The FnMut case pins that capture writes persist across
+    // steps (the closure is called through its own storage).
+    let dir = temp_dir("map-iteration");
+    let src = fixture(&dir, "map_iteration.rs", MAP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Map over Range and vec::IntoIter must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "s=60\nt=12 calls=3\nu=36\n",
+        "closure, capturing closure and fn pointer all apply per element"
+    );
+}
+
+const ADAPTERS_SRC: &str = r#"
+use std::iter::{empty, once, repeat};
+fn main() {
+    let a = [10, 20, 30];
+    let mut e = 0;
+    for (i, x) in a.iter().enumerate() {
+        e += (i as i32) * x;
+    }
+    println!("e={e}");
+    let mut c = 0;
+    for x in a.iter().copied() {
+        c += x;
+    }
+    println!("c={c}");
+    let mut t = 0;
+    for x in (0..100).take(3) {
+        t += x;
+    }
+    println!("t={t}");
+    let mut o = 0;
+    for x in once(5) {
+        o += x;
+    }
+    for x in empty::<i32>() {
+        o += 100;
+    }
+    println!("o={o}");
+    let mut r = 0;
+    for x in repeat(2).take(3) {
+        r += x;
+    }
+    println!("r={r}");
+    let v = vec![1, 2, 3, 1, 4];
+    let mut s = 0;
+    for x in v.into_iter().skip_while(|x| *x < 3) {
+        s += x;
+    }
+    println!("s={s}");
+    let mut calls = 0;
+    let w = vec![5, 6, 7];
+    let mut u = 0;
+    for x in w.into_iter().skip_while(|x| { calls += 1; *x < 6 }) {
+        u += x;
+    }
+    println!("u={u} calls={calls}");
+}
+"#;
+
+#[test]
+fn run_mode_adapter_iteration() {
+    // The SkipWhile capture count pins that the predicate is not
+    // consulted again after its first failure.
+    let dir = temp_dir("adapter-iteration");
+    let src = fixture(&dir, "adapter_iteration.rs", ADAPTERS_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Enumerate/Copied/Take/Once/Empty/Repeat/SkipWhile must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "e=80\nc=60\nt=3\no=5\nr=6\ns=8\nu=13 calls=2\n",
+        "each adapter yields exactly the elements its semantics prescribe"
+    );
+}
+
+const ITER_MUT_SRC: &str = r#"
+fn bump(xs: &mut [i32]) {
+    for x in xs {
+        *x += 1;
+    }
+}
+fn main() {
+    let mut a = [1, 2, 3];
+    for x in &mut a {
+        *x += 10;
+    }
+    println!("a={} {} {}", a[0], a[1], a[2]);
+    let mut v = vec![1, 2, 3];
+    for x in &mut v {
+        *x *= 2;
+    }
+    println!("v={} {} {}", v[0], v[1], v[2]);
+    let mut s = [5, 6, 7];
+    bump(&mut s);
+    println!("s={} {} {}", s[0], s[1], s[2]);
+}
+"#;
+
+#[test]
+fn run_mode_iter_mut() {
+    let dir = temp_dir("iter-mut");
+    let src = fixture(&dir, "iter_mut.rs", ITER_MUT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "IterMut over array, Vec and slice must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a=11 12 13\nv=2 4 6\ns=6 7 8\n",
+        "writes through the yielded references land in the container"
+    );
+}
