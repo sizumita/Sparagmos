@@ -5698,7 +5698,7 @@ impl<'a> Interpreter<'a> {
                         }
                         match v {
                             Value::Enum { fields, .. } if !fields.is_empty() => {
-                                Value::Ref(RefTarget::Value(Box::new(fields[0].clone())))
+                                Value::Ref(RefTarget::value(fields[0].clone()))
                             }
                             other => {
                                 return Err(InterpError::type_mismatch(
@@ -5970,7 +5970,7 @@ impl<'a> Interpreter<'a> {
             }
             let callable = self.read_resolved(frames, &closure_target)?;
             let env_ref = self.target_ref_value(frames, &closure_target)?;
-            let arg = Value::Ref(RefTarget::Value(Box::new(item.clone())));
+            let arg = Value::Ref(RefTarget::value(item.clone()));
             let keep = self.call_callable_sync(frames, &callable, Some(env_ref), vec![arg])?;
             match keep {
                 Value::Bool(true) => continue,
@@ -6423,7 +6423,7 @@ impl<'a> Interpreter<'a> {
                     result = some_value(x);
                     break;
                 }
-                let arg = Value::Ref(RefTarget::Value(Box::new(x.clone())));
+                let arg = Value::Ref(RefTarget::value(x.clone()));
                 let keep = self.call_callable_sync(frames, &predicate, None, vec![arg])?;
                 match keep {
                     Value::Bool(true) => continue,

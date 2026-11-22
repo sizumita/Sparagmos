@@ -1924,7 +1924,7 @@ impl<'a> Interpreter<'a> {
                     full.push(callable.clone());
                 } else {
                     full.push(env_ref.unwrap_or_else(|| {
-                        Value::Ref(RefTarget::Value(Box::new(callable.clone())))
+                        Value::Ref(RefTarget::value(callable.clone()))
                     }));
                 }
                 full.extend(args);
@@ -2050,7 +2050,9 @@ impl<'a> Interpreter<'a> {
         let stamp = self.last_panic_stamp.borrow().clone()?;
         fn fields_of(v: &Value) -> Option<&Vec<Value>> {
             match v {
-                Value::Ref(RefTarget::Value(inner)) => fields_of(inner),
+                Value::Ref(RefTarget::Value(inner, projection)) if projection.is_empty() => {
+                    fields_of(inner)
+                }
                 Value::Enum { fields, .. } | Value::Tuple(fields) => Some(fields),
                 _ => None,
             }
