@@ -824,6 +824,19 @@ pub enum Builtin {
     /// every `Iterator::collect::<Vec<_>>` reaches (the
     /// `SpecFromIter` instance delegates to it).
     VecFromIterNested,
+    /// `slice::to_vec` / `slice::to_vec_in`: a vector holding a
+    /// clone of every element of the slice, in order. The
+    /// collected bodies (the `ConvertVec` fast path) drive the
+    /// RawVec allocation machinery directly -- with capacity,
+    /// `copy_nonoverlapping`, `set_len` -- and assemble the
+    /// vector in its native struct layout, which is not the
+    /// value model's vector representation (the element
+    /// aggregate every `Vec` consumer here reads), so they are
+    /// modelled here like the other RawVec-driving entry
+    /// points. The elements are cloned with the model's value
+    /// clone (`clone_owned_value`), the same treatment
+    /// `Clone::clone` receives.
+    SliceToVec,
     /// `Vec::capacity(&vec)`: not modelled. Capacity has no
     /// representation in the value model, and returning the length
     /// would be observably wrong, so the call fails with an
@@ -1953,6 +1966,12 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         _ if canonical.starts_with("std::vec::Vec") && canonical.ends_with(">::remove::assert_failed") => Builtin::VecRemoveAssertFailed,
         _ if canonical.starts_with("core::slice::<impl") && canonical.ends_with(">::iter") => {
             Builtin::SliceIter
+        }
+        _ if (canonical.starts_with("std::slice::<impl")
+            || canonical.starts_with("alloc::slice::<impl"))
+            && (canonical.ends_with(">::to_vec") || canonical.ends_with(">::to_vec_in")) =>
+        {
+            Builtin::SliceToVec
         }
         "std::iter::empty" => Builtin::IterEmpty,
         "std::ops::Index::index" => Builtin::IndexIndex,
@@ -6742,6 +6761,27 @@ impl<'a> Interpreter<'a> {
                 "Vec::capacity is not runtime-supported (capacity is not represented in the value model)"
                     .to_string(),
             )),
+            Builtin::SliceToVec => {
+                // `to_vec` takes the slice alone; `to_vec_in`
+                // takes the allocator handle after it (a
+                // zero-sized value in this model).
+                if vals.is_empty() || vals.len() > 2 {
+                    return Err(InterpError::type_mismatch(
+                        format!("builtin {name}"),
+                        "1 or 2 argument(s)",
+                        format!("{} argument(s)", vals.len()),
+                    ));
+                }
+                let (elems, _) = self.slice_elements(frames, &vals[0])?;
+                let fields = elems
+                    .iter()
+                    .map(|e| self.clone_owned_value(frames, e))
+                    .collect::<InterpResult<Vec<_>>>()?;
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields,
+                })
+            }
             Builtin::SliceIter => {
                 arity(1)?;
                 let (elems, _) = self.slice_elements(frames, &vals[0])?;
