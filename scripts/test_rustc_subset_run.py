@@ -93,6 +93,17 @@ class BlockerTests(unittest.TestCase):
         h = header("//@ run-crash\n")
         self.assertIn("run-crash", run.stage1_blocker(h, self.rec()))
 
+    def test_ignore_test_blocks_without_run_directive(self):
+        # compiletest decides ignore-test before mode dispatch, so a
+        # file whose only mode directive is check-pass still reports
+        # ignore-test rather than the missing-run-mode blocker.
+        h = header("//@ check-pass\n//@ ignore-test (broken)\n")
+        self.assertIn("ignore-test", run.stage1_blocker(h, self.rec()))
+
+    def test_ignore_test_blocks_before_revisions(self):
+        h = header("//@ revisions: a b\n//@ ignore-test\n")
+        self.assertIn("ignore-test", run.stage1_blocker(h, self.rec()))
+
 
 class ApplicabilityTests(unittest.TestCase):
     def test_ignore_windows_applicable_here(self):
@@ -147,6 +158,23 @@ class ApplicabilityTests(unittest.TestCase):
             "ignore-[", "ignore-cfg(").replace("]", ")"))
         status, _ = run.applicability(h)
         self.assertEqual(status, "out-of-environment")
+
+    def test_channel_conditions_follow_the_release_channel(self):
+        # The pinned toolchain is the official release build, whose
+        # declared channel is stable, so exactly one channel
+        # condition is true -- as in compiletest, never all false.
+        self.assertTrue(run.eval_condition("stable"))
+        self.assertFalse(run.eval_condition("beta"))
+        self.assertFalse(run.eval_condition("nightly"))
+        status, why = run.applicability(header("//@ ignore-stable\n"))
+        self.assertEqual(status, "out-of-environment")
+        self.assertIn("ignore-stable", why)
+        status, _ = run.applicability(header("//@ only-stable\n"))
+        self.assertEqual(status, "applicable")
+        status, _ = run.applicability(header("//@ only-nightly\n"))
+        self.assertEqual(status, "out-of-environment")
+        status, _ = run.applicability(header("//@ ignore-nightly\n"))
+        self.assertEqual(status, "applicable")
 
     def test_unknown_needs_unevaluatable(self):
         status, why = run.applicability(header("//@ needs-sanitizer-support\n"))
