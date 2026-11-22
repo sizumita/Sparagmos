@@ -16400,3 +16400,192 @@ fn run_mode_nested_vec_index_and_reverse() {
         "the inner vectors reverse and grow independently, exactly as natively"
     );
 }
+
+const PATH_ORDERING_SRC: &str = r#"
+use std::cmp::Ordering;
+use std::path::Path;
+
+fn main() {
+    // std's `Path` ordering compares the parsed component
+    // sequences, not the raw bytes: the first components
+    // here are "a" and "a.b", so "a/c" < "a.b/c" — byte
+    // order would give the opposite ('.' = 0x2e < '/' =
+    // 0x2f).
+    assert_eq!(Path::new("a/c").cmp(Path::new("a.b/c")), Ordering::Less);
+    assert!(Path::new("a/c") < Path::new("a.b/c"));
+    assert!(Path::new("a.b/c") > Path::new("a/c"));
+    assert!(Path::new("a/c") <= Path::new("a.b/c"));
+    // Component kinds order by kind before any name bytes:
+    // root directory, then current directory, then parent
+    // directory, then normal names.
+    assert_eq!(Path::new("/a").cmp(Path::new("./a")), Ordering::Less);
+    assert_eq!(Path::new("./a").cmp(Path::new("../a")), Ordering::Less);
+    assert_eq!(Path::new("../a").cmp(Path::new("a")), Ordering::Less);
+    assert_eq!(Path::new("/a").cmp(Path::new("a")), Ordering::Less);
+    // A strict component prefix is smaller, and paths whose
+    // components parse the same compare equal.
+    assert_eq!(Path::new("a").cmp(Path::new("a/b")), Ordering::Less);
+    assert_eq!(Path::new("a/..").cmp(Path::new("a")), Ordering::Greater);
+    assert_eq!(Path::new("foo").cmp(Path::new("foo")), Ordering::Equal);
+    assert_eq!(Path::new("a//b").cmp(Path::new("a/b")), Ordering::Equal);
+    assert_eq!(
+        Path::new("a/b").partial_cmp(Path::new("a/b")),
+        Some(Ordering::Equal)
+    );
+    println!("path-ordering-ok");
+}
+"#;
+
+#[test]
+fn run_mode_path_component_ordering() {
+    run_ok("path-ordering", PATH_ORDERING_SRC, "path-ordering-ok\n");
+}
+
+const PATH_SORT_SRC: &str = r#"
+use std::ffi::OsString;
+use std::path::PathBuf;
+
+fn main() {
+    // Sorting owned buffers goes through the generic sort
+    // machinery, whose comparisons carry no type tag; the
+    // order must still be the component order.
+    let mut v = vec![
+        PathBuf::from("a.b/c"),
+        PathBuf::from("a/c"),
+        PathBuf::from("/x"),
+    ];
+    v.sort();
+    assert_eq!(v[0], PathBuf::from("/x"));
+    assert_eq!(v[1], PathBuf::from("a/c"));
+    assert_eq!(v[2], PathBuf::from("a.b/c"));
+    let mut w = vec![PathBuf::from("a.b/c"), PathBuf::from("a/c")];
+    w.sort_unstable();
+    assert_eq!(w[0], PathBuf::from("a/c"));
+    assert_eq!(w[1], PathBuf::from("a.b/c"));
+    // Binary search uses the same ordering, and a
+    // component-equal key ("a//c") finds its entry.
+    assert_eq!(v.binary_search(&PathBuf::from("a/c")), Ok(1));
+    assert!(v.binary_search(&PathBuf::from("a//c")).is_ok());
+    // The neighbouring string-like types keep their byte
+    // order in the same generic machinery.
+    let mut oss = vec![OsString::from("a/c"), OsString::from("a.b/c")];
+    oss.sort();
+    assert_eq!(oss[0], OsString::from("a.b/c"));
+    let mut vecs = vec![b"a/c".to_vec(), b"a.b/c".to_vec()];
+    vecs.sort();
+    assert_eq!(vecs[0], b"a.b/c".to_vec());
+    println!("path-sort-ok");
+}
+"#;
+
+#[test]
+fn run_mode_pathbuf_sort_component_order() {
+    run_ok("path-sort", PATH_SORT_SRC, "path-sort-ok\n");
+}
+
+const PATH_ANCESTORS_SRC: &str = r#"
+use std::path::Path;
+
+fn main() {
+    // `ancestors` yields the path itself, then each parent
+    // up to (and including) the root / the empty path.
+    let anc: Vec<&Path> = Path::new("/a/b/c").ancestors().collect();
+    assert_eq!(
+        anc,
+        vec![
+            Path::new("/a/b/c"),
+            Path::new("/a/b"),
+            Path::new("/a"),
+            Path::new("/")
+        ]
+    );
+    let anc2: Vec<String> = Path::new("a/b")
+        .ancestors()
+        .map(|p| p.to_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        anc2,
+        vec!["a/b".to_string(), "a".to_string(), "".to_string()]
+    );
+    assert_eq!(Path::new("").ancestors().count(), 1);
+    assert_eq!(Path::new("/").ancestors().count(), 1);
+    // The parents are lexical: a trailing separator takes
+    // no part, and `..` components are kept as components.
+    let anc3: Vec<String> = Path::new("a/b/")
+        .ancestors()
+        .map(|p| p.to_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        anc3,
+        vec!["a/b/".to_string(), "a".to_string(), "".to_string()]
+    );
+    let anc4: Vec<String> = Path::new("a/../b")
+        .ancestors()
+        .map(|p| p.to_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        anc4,
+        vec![
+            "a/../b".to_string(),
+            "a/..".to_string(),
+            "a".to_string(),
+            "".to_string()
+        ]
+    );
+    // An exhausted iterator stays exhausted.
+    let mut it = Path::new("x/y").ancestors();
+    assert_eq!(it.next().unwrap(), Path::new("x/y"));
+    assert_eq!(it.next().unwrap(), Path::new("x"));
+    assert_eq!(it.next().unwrap(), Path::new(""));
+    assert!(it.next().is_none());
+    assert!(it.next().is_none());
+    println!("path-ancestors-ok");
+}
+"#;
+
+#[test]
+fn run_mode_path_ancestors() {
+    run_ok("path-ancestors", PATH_ANCESTORS_SRC, "path-ancestors-ok\n");
+}
+
+const PATH_SET_EXTENSION_SRC: &str = r#"
+use std::path::PathBuf;
+
+fn main() {
+    let mut pb = PathBuf::from("foo.rs");
+    assert!(pb.set_extension("txt"));
+    assert_eq!(pb.to_str().unwrap(), "foo.txt");
+    // An empty extension removes the old one (and the dot).
+    assert!(pb.set_extension(""));
+    assert_eq!(pb.to_str().unwrap(), "foo");
+    // A path without an extension gains one.
+    let mut bare = PathBuf::from("foo");
+    assert!(bare.set_extension("md"));
+    assert_eq!(bare.to_str().unwrap(), "foo.md");
+    // No file name: the buffer is left alone, result false.
+    let mut dot = PathBuf::from("..");
+    assert!(!dot.set_extension("txt"));
+    assert_eq!(dot.to_str().unwrap(), "..");
+    let mut root = PathBuf::from("/");
+    assert!(!root.set_extension("txt"));
+    assert_eq!(root.to_str().unwrap(), "/");
+    // `with_extension` replaces only the final extension.
+    let w = PathBuf::from("a/b.tar.gz").with_extension("zip");
+    assert_eq!(w.to_str().unwrap(), "a/b.tar.zip");
+    let w2 = PathBuf::from("a/b").with_extension("md");
+    assert_eq!(w2.to_str().unwrap(), "a/b.md");
+    // The extension argument may be an OsStr too.
+    let w3 = PathBuf::from("a/b.rs").with_extension(std::ffi::OsStr::new("toml"));
+    assert_eq!(w3.to_str().unwrap(), "a/b.toml");
+    println!("path-set-extension-ok");
+}
+"#;
+
+#[test]
+fn run_mode_pathbuf_set_extension() {
+    run_ok(
+        "path-set-extension",
+        PATH_SET_EXTENSION_SRC,
+        "path-set-extension-ok\n",
+    );
+}
