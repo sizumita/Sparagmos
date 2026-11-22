@@ -2621,9 +2621,18 @@ impl<'a> Interpreter<'a> {
                 arity(0)?;
                 // argv[0] is the program path the run was invoked
                 // with, then the configured guest arguments, in
-                // order. `Args` wraps `ArgsOs`, which wraps a
-                // `vec::IntoIter` in this model's iteration-state
-                // shape ([element snapshot, next index]).
+                // order. The wrapper shape matches the real std
+                // layout — `Args { inner: ArgsOs }`, `ArgsOs {
+                // inner: sys::args::common::Args }`, and the common
+                // `Args { inner: vec::IntoIter }` — because std
+                // bodies that navigate the wrappers field by field
+                // (the `ExactSizeIterator::len` one-liners) are
+                // collected and run against this value: a shallower
+                // shape makes their second field step land on the
+                // iteration state's element snapshot. The innermost
+                // value is the `vec::IntoIter` in this model's
+                // iteration-state shape ([element snapshot, next
+                // index]).
                 let mut items: Vec<Value> = Vec::new();
                 if !self.program_path().is_empty() {
                     items.push(Value::Str(self.program_path().to_string()));
@@ -2631,9 +2640,13 @@ impl<'a> Interpreter<'a> {
                 for arg in self.guest_args() {
                     items.push(Value::Str(arg.clone()));
                 }
-                let args_os = Value::Enum {
+                let common_args = Value::Enum {
                     variant: 0,
                     fields: vec![owned_iter_state(items)],
+                };
+                let args_os = Value::Enum {
+                    variant: 0,
+                    fields: vec![common_args],
                 };
                 if kind == Builtin::EnvArgsOs {
                     Ok(args_os)
@@ -7108,14 +7121,15 @@ impl<'a> Interpreter<'a> {
         }
         if self_ty_is(self_ty, "std::env::Args") || self_ty_is(self_ty, "std::env::ArgsOs") {
             // `Args { inner: ArgsOs }` / `ArgsOs { inner:
-            // vec::IntoIter }`: step the innermost owned-iterator
+            // sys::args::common::Args }` / the common `Args {
+            // inner: vec::IntoIter }`: step the innermost owned-iterator
             // state and rebuild the wrappers. The yielded
             // `OsString` is the string value itself in this model,
             // so `Args::next`'s OsString-to-String conversion is
             // the identity (the arguments are always valid text
             // here, so the native panic on invalid Unicode cannot
             // arise).
-            let depth = if self_ty_is(self_ty, "std::env::Args") { 2 } else { 1 };
+            let depth = if self_ty_is(self_ty, "std::env::Args") { 3 } else { 2 };
             let mut inner = &state;
             for _ in 0..depth {
                 inner = match inner {
@@ -7877,7 +7891,7 @@ impl<'a> Interpreter<'a> {
         }
         if self_ty_is(self_ty, "std::env::Args") || self_ty_is(self_ty, "std::env::ArgsOs") {
             // Delegates to the inner `vec::IntoIter`'s exact count.
-            let depth = if self_ty_is(self_ty, "std::env::Args") { 2 } else { 1 };
+            let depth = if self_ty_is(self_ty, "std::env::Args") { 3 } else { 2 };
             let mut inner = &state;
             for _ in 0..depth {
                 inner = match inner {
@@ -9289,7 +9303,7 @@ fn iterator_next_back_state(
         // Step the innermost owned-iterator state from the back
         // and rebuild the wrappers, mirroring the front step in
         // `iterator_next`.
-        let depth = if self_ty_is(self_ty, "std::env::Args") { 2 } else { 1 };
+        let depth = if self_ty_is(self_ty, "std::env::Args") { 3 } else { 2 };
         let mut inner = state;
         for _ in 0..depth {
             inner = match inner {
