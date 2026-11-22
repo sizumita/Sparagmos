@@ -14750,3 +14750,180 @@ fn run_mode_path_hash_eq_consistency() {
         "h1 true\nh2 true\nh3 true\nh4 true\nh5 true\nh6 true\nkey true\n",
     );
 }
+
+const FMT_HANDWRITTEN_DEBUG_SRC: &str = r#"
+use std::fmt;
+struct Foo;
+impl fmt::Debug for Foo {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        println!("<Foo as Debug>::fmt()");
+        Ok(())
+    }
+}
+fn main() {
+    println!("{:?}", Foo);
+    println!("{:?}", Foo);
+}
+"#;
+
+#[test]
+fn run_mode_handwritten_debug_body_executes() {
+    let dir = temp_dir("fmt-handwritten-debug");
+    let src = fixture(&dir, "handwritten.rs", FMT_HANDWRITTEN_DEBUG_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "must run; stdout={stdout}");
+    assert_eq!(
+        stdout, "<Foo as Debug>::fmt()\n\n<Foo as Debug>::fmt()\n\n",
+        "the handwritten Debug body itself must produce the output"
+    );
+}
+
+const FMT_DERIVED_AND_BUILDER_SRC: &str = r#"
+use std::fmt;
+#[derive(Debug)]
+struct Point { x: i32, y: i32 }
+#[derive(Debug)]
+struct Six { a: i32, b: i32, c: i32, d: i32, e: i32, f: i32 }
+struct Manual { x: i32 }
+impl fmt::Debug for Manual {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Manual").field("x", &self.x).finish()
+    }
+}
+struct Wrap([i16; 3]);
+impl fmt::Debug for Wrap {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Debug::fmt(&self.0, f)
+    }
+}
+fn main() {
+    println!("{:?}", Point { x: 1, y: 2 });
+    println!("{:#?}", Point { x: 1, y: 2 });
+    println!("{:?}", Six { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6 });
+    println!("{:?}", Manual { x: 42 });
+    println!("{:?}", Wrap([10, -3, -9]));
+}
+"#;
+
+#[test]
+fn run_mode_derived_debug_finishers_and_builders() {
+    let dir = temp_dir("fmt-derived-builder");
+    let src = fixture(&dir, "derived_builder.rs", FMT_DERIVED_AND_BUILDER_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "must run; stdout={stdout}");
+    assert_eq!(
+        stdout,
+        "Point { x: 1, y: 2 }\nPoint {\n    x: 1,\n    y: 2,\n}\nSix { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6 }\nManual { x: 42 }\n[10, -3, -9]\n",
+        "derived bodies run through the capturing Formatter: finisher \
+         builtins for the field-count forms and the fields form, the \
+         debug_struct builder chain, and the array Debug list chain"
+    );
+}
+
+const FMT_HANDWRITTEN_DISPLAY_SRC: &str = r#"
+use std::fmt;
+struct Thingy { x: i32, y: i32 }
+impl fmt::Debug for Thingy {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{{ x: {:?}, y: {:?} }}", self.x, self.y)
+    }
+}
+struct Poly<T> { x: T }
+impl<T: fmt::Debug> fmt::Debug for Poly<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self.x)
+    }
+}
+struct Word;
+impl fmt::Display for Word {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.pad("word")
+    }
+}
+fn main() {
+    println!("{:?}", Thingy { x: 1, y: 2 });
+    println!("{:?}", Poly { x: Thingy { x: 1, y: 2 } });
+    println!("{}", Word);
+}
+"#;
+
+#[test]
+fn run_mode_handwritten_generic_debug_and_display_bodies() {
+    let dir = temp_dir("fmt-handwritten-generic");
+    let src = fixture(&dir, "handwritten_generic.rs", FMT_HANDWRITTEN_DISPLAY_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "must run; stdout={stdout}");
+    assert_eq!(
+        stdout, "{ x: 1, y: 2 }\n{ x: 1, y: 2 }\nword\n",
+        "generic handwritten impls resolve through their instance \
+         names, and a handwritten Display body runs for the plain \
+         placeholder"
+    );
+}
+
+const FMT_GENERIC_AS_ARRAY_SRC: &str = r#"
+use std::fmt;
+struct S<T, const N: usize>(pub [T; N]);
+impl<T, const N: usize> S<T, N> {
+    pub const fn as_array(&self) -> &[T; N] {
+        let p: *const Self = self;
+        unsafe { &*p.cast::<[T; N]>() }
+    }
+}
+impl<T: fmt::Debug, const N: usize> fmt::Debug for S<T, N> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        <[T; N] as fmt::Debug>::fmt(self.as_array(), f)
+    }
+}
+fn main() {
+    println!("{:?}", S::<i16, 3>([10, -3, -9]));
+}
+"#;
+
+#[test]
+fn run_mode_generic_single_field_pointer_cast_enters_the_field() {
+    let dir = temp_dir("fmt-generic-as-array");
+    let src = fixture(&dir, "generic_as_array.rs", FMT_GENERIC_AS_ARRAY_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "must run; stdout={stdout}");
+    assert_eq!(
+        stdout, "[10, -3, -9]\n",
+        "a raw-pointer cast from a single-field struct to its \
+         field type denotes the field, also from generic code"
+    );
+}
+
+const FMT_SIMD_CAST_SIGN_SRC: &str = r#"
+#![feature(repr_simd, core_intrinsics)]
+#[repr(simd)]
+#[derive(Copy, Clone)]
+struct Simd<T, const N: usize>([T; N]);
+impl<T, const N: usize> Simd<T, N> {
+    fn as_array(&self) -> &[T; N] {
+        let p: *const Self = self;
+        unsafe { &*p.cast::<[T; N]>() }
+    }
+}
+fn main() {
+    let a = Simd::<i8, 3>([10, -3, -9]);
+    let b: Simd<i16, 3> = unsafe { std::intrinsics::simd::simd_cast(a) };
+    println!("{:?}", b.as_array());
+}
+"#;
+
+#[test]
+fn run_mode_simd_cast_sign_extends_signed_lanes() {
+    let dir = temp_dir("fmt-simd-cast-sign");
+    let src = fixture(&dir, "simd_cast_sign.rs", FMT_SIMD_CAST_SIGN_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "must run; stdout={stdout}");
+    assert_eq!(
+        stdout, "[10, -3, -9]\n",
+        "simd_cast from a signed element type sign-extends its lanes"
+    );
+}
