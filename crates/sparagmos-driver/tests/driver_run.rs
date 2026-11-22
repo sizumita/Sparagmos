@@ -9378,6 +9378,137 @@ fn run_mode_catch_unwind_o3_data_union() {
     );
 }
 
+// ----- Optimized-build transmutes in inlined std shapes (Lane JJ) -----
+// Expected outputs are the native results of the same sources.
+
+const FN_PTR_ERASED_SIGNATURE_SRC: &str = r#"
+fn f(_x: &u64, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    Ok(())
+}
+fn main() {
+    let p: fn(&u64, &mut std::fmt::Formatter<'_>) -> std::fmt::Result = f;
+    let _q: unsafe fn(
+        std::ptr::NonNull<()>,
+        &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result = unsafe { std::mem::transmute(p) };
+}
+"#;
+
+/// The transmute an inlined `fmt::Argument` construction performs
+/// on the display function pointer: a function pointer viewed
+/// through an erased signature (safe fn -> unsafe fn over an
+/// erased argument). A function pointer's value is the function
+/// identity, so the cast carries the value over.
+#[test]
+fn run_mode_o2_transmute_fn_ptr_erased_signature() {
+    let dir = temp_dir("fnptr-erased");
+    let src = fixture(&dir, "case.rs", FN_PTR_ERASED_SIGNATURE_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "-Copt-level=2"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "fn-pointer erased-signature transmute must run; stderr={stderr}"
+    );
+}
+
+const ARRAY_BY_VALUE_SUM_SRC: &str = r#"
+fn main() {
+    let a = [7u8; 64];
+    let mut s: u64 = 0;
+    for x in a {
+        s += x as u64;
+    }
+    assert_eq!(s, 448);
+}
+"#;
+
+/// At opt-level 2 the by-value array iterator is inlined, and
+/// its construction transmutes the backing array
+/// `[u8; 64]` -> `[MaybeUninit<u8>; 64]`. Each element takes
+/// the wrapper's value representation, and the iterated sum
+/// must come out exact.
+#[test]
+fn run_mode_o2_array_into_iter_sum() {
+    let dir = temp_dir("array-into-iter");
+    let src = fixture(&dir, "case.rs", ARRAY_BY_VALUE_SUM_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "-Copt-level=2"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "by-value array iteration under -O must sum exactly; stderr={stderr}"
+    );
+}
+
+const MAYBE_UNINIT_ARRAY_UNWRAP_SRC: &str = r#"
+use std::mem::{transmute, MaybeUninit};
+fn main() {
+    let a: [MaybeUninit<u8>; 4] = [
+        MaybeUninit::new(3),
+        MaybeUninit::new(4),
+        MaybeUninit::new(5),
+        MaybeUninit::new(6),
+    ];
+    let b: [u8; 4] = unsafe { transmute(a) };
+    let mut s: u32 = 0;
+    let mut j = 0usize;
+    while j < 4 {
+        s += b[j] as u32;
+        j += 1;
+    }
+    assert_eq!(s, 18);
+}
+"#;
+
+/// The reverse element-wrapper crossing: an array of
+/// `MaybeUninit` values transmuted back to the plain element
+/// array unwraps each element to the payload it holds.
+#[test]
+fn run_mode_o2_transmute_maybe_uninit_array_unwrap() {
+    let dir = temp_dir("mu-array-unwrap");
+    let src = fixture(&dir, "case.rs", MAYBE_UNINIT_ARRAY_UNWRAP_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "-Copt-level=2"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "MaybeUninit array unwrap transmute must run; stderr={stderr}"
+    );
+}
+
+const UNSAFE_CELL_ARRAY_ROUND_TRIP_SRC: &str = r#"
+use std::cell::UnsafeCell;
+use std::mem::transmute;
+fn main() {
+    let a: [u8; 4] = [10, 20, 30, 40];
+    let b: [UnsafeCell<u8>; 4] = unsafe { transmute(a) };
+    let c: [u8; 4] = unsafe { transmute(b) };
+    let mut s: u32 = 0;
+    let mut j = 0usize;
+    while j < 4 {
+        s += c[j] as u32;
+        j += 1;
+    }
+    assert_eq!(s, 100);
+}
+"#;
+
+/// The `UnsafeCell` twin of the element-wrapper crossing, in
+/// both directions in one program.
+#[test]
+fn run_mode_o2_transmute_unsafe_cell_array_round_trip() {
+    let dir = temp_dir("uc-array-roundtrip");
+    let src = fixture(&dir, "case.rs", UNSAFE_CELL_ARRAY_ROUND_TRIP_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "-Copt-level=2"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "UnsafeCell array round-trip transmute must run; stderr={stderr}"
+    );
+}
+
 // ----- InlineAsm: the evaluable register class (Lane GI) -----
 // Expected outputs are the native results of the same sources.
 
