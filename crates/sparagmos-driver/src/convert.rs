@@ -148,6 +148,17 @@ pub struct Converter {
     /// converted program: its `Debug` formatter prints ADT values
     /// from these shapes.
     pub adt_debug_shapes: sm::AdtDebugShapes,
+    /// Debugger shapes of the monomorphic closure/coroutine
+    /// instances converted so far, keyed by the rendered
+    /// instance name (see `sm::EnvDebugShapes`). Handed to the
+    /// interpreter with the converted program: its debugger
+    /// interface prints closure and coroutine values from these
+    /// shapes.
+    pub env_debug_shapes: sm::EnvDebugShapes,
+    /// Compiler types whose environment-shape recording was
+    /// already attempted, keyed by the type handle itself (as in
+    /// `layout_attempted_tys`).
+    env_shape_attempted: std::collections::HashSet<rustc_public::ty::Ty>,
     /// Depth of nested `record_debug_shape` calls currently
     /// unfolding field types (see there).
     debug_shape_depth: usize,
@@ -794,6 +805,79 @@ thread_local! {
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
+/// The DWARF name of a closure/coroutine environment type: the
+/// definition path with its `{closure#N}` segment in the
+/// `{<label>_env#N}` form the compiler's debuginfo uses (see
+/// `push_closure_or_coroutine_name` in the compiler's
+/// `debuginfo/type_names.rs`). A definition with no closure
+/// segment (an `async fn` item) takes the environment segment as
+/// a new final segment, with disambiguator 0.
+fn env_dwarf_name(def_name: &str, label: &str) -> String {
+    if let Some(pos) = def_name.find("::{closure#") {
+        let mut out = String::with_capacity(def_name.len() + 8);
+        out.push_str(&def_name[..pos]);
+        out.push_str("::{");
+        out.push_str(label);
+        out.push_str("_env#");
+        out.push_str(&def_name[pos + "::{closure#".len()..]);
+        out
+    } else {
+        format!("{def_name}::{{{label}_env#0}}")
+    }
+}
+
+/// The definition name a local's declared type denotes when it
+/// is (a reference to, or a `Pin` of a reference to) a closure or
+/// coroutine environment: the environment argument of a closure
+/// body and the state local of a coroutine body are declared
+/// that way. Anything else is not an environment base.
+fn env_def_name(ty: &rustc_public::ty::Ty) -> Option<String> {
+    let mut cur = *ty;
+    loop {
+        match guarded_ty_kind(&cur)? {
+            TyKind::RigidTy(RigidTy::Ref(_, inner, _)) => cur = inner,
+            TyKind::RigidTy(RigidTy::Adt(def, args))
+                if def.name().ends_with("pin::Pin") =>
+            {
+                match args.0.first() {
+                    Some(GenericArgKind::Type(t)) => cur = *t,
+                    _ => return None,
+                }
+            }
+            TyKind::RigidTy(RigidTy::Closure(def, _)) => {
+                return Some(def.name());
+            }
+            TyKind::RigidTy(RigidTy::Coroutine(def, _)) => {
+                return Some(def.name());
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// A coroutine state's DWARF variant name, by discriminant
+/// index (the compiler's `CoroutineArgs::variant_name` rule).
+fn coroutine_variant_name(variant: usize) -> String {
+    match variant {
+        0 => "Unresumed".to_string(),
+        1 => "Returned".to_string(),
+        2 => "Panicked".to_string(),
+        n => format!("Suspend{}", n - 3),
+    }
+}
+
+/// The upvar count of a closure/coroutine instance: the length
+/// of the upvars tuple, the last type argument of the instance.
+fn env_upvar_count(args: &GenericArgs) -> Option<usize> {
+    args.0.iter().rev().find_map(|a| match a {
+        GenericArgKind::Type(t) => match guarded_ty_kind(t) {
+            Some(TyKind::RigidTy(RigidTy::Tuple(ts))) => Some(ts.len()),
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
 impl Converter {
     pub fn new() -> Self {
         TY_MENTIONS_PARAM_CACHE.with(|cache| cache.borrow_mut().clear());
@@ -811,6 +895,8 @@ impl Converter {
             layout_names: std::collections::HashMap::new(),
             adt_shapes: sm::AdtShapes::new(),
             adt_debug_shapes: sm::AdtDebugShapes::new(),
+            env_debug_shapes: sm::EnvDebugShapes::new(),
+            env_shape_attempted: std::collections::HashSet::new(),
             debug_shape_depth: 0,
             thread_locals: sm::ThreadLocals::new(),
             adt_instance_shapes: sm::AdtInstanceShapes::new(),
@@ -3529,6 +3615,13 @@ impl Converter {
         if let TyKind::RigidTy(RigidTy::Coroutine(..)) = &kind {
             self.record_coroutine_slots(ty, &converted);
         }
+        if matches!(
+            kind,
+            TyKind::RigidTy(RigidTy::Closure(..))
+                | TyKind::RigidTy(RigidTy::Coroutine(..))
+        ) {
+            self.record_env_shape(ty, &kind, &converted);
+        }
         converted
     }
 
@@ -4133,6 +4226,273 @@ impl Converter {
             .collect();
         let key = self.layout_key(converted);
         self.coroutine_layouts.insert(key, sm::CoroutineSlots { variants });
+    }
+
+    /// Record the debugger shape of one monomorphic closure or
+    /// coroutine instance under its rendered instance name, once
+    /// per distinct instance (see `sm::EnvDebugShapes`).
+    ///
+    /// The shape is read off the instance body's own debug info.
+    /// The compiler records each captured variable there with the
+    /// name the debuginfo gives the environment field - the
+    /// captured place's name, `__`-joined along the place's
+    /// projections - addressed by a projection from the
+    /// environment base local: a `Field` step for a capture, a
+    /// `Downcast` + `Field` pair for one of a coroutine's saved
+    /// locals. A `Deref` step after the field step marks a
+    /// by-reference capture, whose debuginfo name carries the
+    /// `_ref__` prefix. The base local is identified by its
+    /// declared type, which strips (through references and a
+    /// `Pin` wrapper) to this instance's own definition.
+    ///
+    /// Recording is auxiliary to the conversion in progress,
+    /// exactly like `record_debug_shape`: the current body's
+    /// error list is saved and restored around it. An instance
+    /// whose environment fields are not all named by the debug
+    /// info gets no entry - it stays unrenderable in the
+    /// debugger rather than rendering with invented names.
+    fn record_env_shape(
+        &mut self,
+        ty: &rustc_public::ty::Ty,
+        kind: &TyKind,
+        converted: &sm::Ty,
+    ) {
+        if !self.env_shape_attempted.insert(*ty) {
+            return;
+        }
+        if ty_has_param(converted) {
+            return;
+        }
+        let (def_name, label, args, body) = match kind {
+            TyKind::RigidTy(RigidTy::Closure(def, args)) => {
+                let Some(ck) = closure_kind(args) else {
+                    return;
+                };
+                let body = std::panic::catch_unwind(
+                    std::panic::AssertUnwindSafe(|| {
+                        Instance::resolve_closure(*def, args, ck)
+                            .ok()
+                            .and_then(|inst| inst.body())
+                            .or_else(|| def.body())
+                    }),
+                );
+                let Ok(Some(body)) = body else {
+                    return;
+                };
+                (def.name(), "closure", args, body)
+            }
+            TyKind::RigidTy(RigidTy::Coroutine(def, args)) => {
+                let body = std::panic::catch_unwind(
+                    std::panic::AssertUnwindSafe(|| {
+                        Instance::resolve(FnDef(def.def_id()), args)
+                            .ok()
+                            .and_then(|inst| inst.body())
+                            .or_else(|| def.body())
+                    }),
+                );
+                let Ok(Some(body)) = body else {
+                    return;
+                };
+                (def.name(), "coroutine", args, body)
+            }
+            _ => return,
+        };
+        let Some(upvar_count) = env_upvar_count(args) else {
+            return;
+        };
+        let key = self.layout_key(converted);
+        let saved_errors = std::mem::take(&mut self.errors);
+        let shape = self.env_shape_from_body(
+            &body,
+            &def_name,
+            env_dwarf_name(&def_name, label),
+            upvar_count,
+            &key,
+            label == "coroutine",
+        );
+        self.errors = saved_errors;
+        if let Some(shape) = shape {
+            self.env_debug_shapes.insert(key, shape);
+        }
+    }
+
+    /// Assemble one environment shape from an instance body's
+    /// debug info (see `record_env_shape`). `key` is the
+    /// instance's rendered name, under which its coroutine
+    /// storage-slot map (if any) is also recorded.
+    fn env_shape_from_body(
+        &mut self,
+        body: &mir::Body,
+        def_name: &str,
+        dwarf_name: String,
+        upvar_count: usize,
+        key: &str,
+        is_coroutine: bool,
+    ) -> Option<sm::EnvDebugShape> {
+        // Parse the debug entries into capture and saved-local
+        // candidates, grouped by their base local.
+        struct Candidate {
+            base: usize,
+            variant: Option<usize>,
+            field: usize,
+            by_ref: bool,
+            name: String,
+            fty: rustc_public::ty::Ty,
+        }
+        let mut candidates: Vec<Candidate> = Vec::new();
+        for info in &body.var_debug_info {
+            let mir::VarDebugInfoContents::Place(place) = &info.value
+            else {
+                continue;
+            };
+            let proj = &place.projection;
+            let mut i = 0;
+            while matches!(proj.get(i), Some(mir::ProjectionElem::Deref)) {
+                i += 1;
+            }
+            let (variant, field, fty, rest) = match (proj.get(i), proj.get(i + 1)) {
+                (
+                    Some(mir::ProjectionElem::Downcast(v)),
+                    Some(mir::ProjectionElem::Field(f, fty)),
+                ) => (Some(v.to_index()), *f, *fty, i + 2),
+                (Some(mir::ProjectionElem::Field(f, fty)), _) => {
+                    (None, *f, *fty, i + 1)
+                }
+                _ => continue,
+            };
+            // A capture's place ends at the field step or at the
+            // dereference of the reference the capture holds; a
+            // longer tail denotes a sub-place of a variable the
+            // environment does not hold a field for.
+            if variant.is_none()
+                && rest != proj.len()
+                && !(rest + 1 == proj.len()
+                    && matches!(proj.get(rest), Some(mir::ProjectionElem::Deref)))
+            {
+                continue;
+            }
+            let by_ref = variant.is_none()
+                && matches!(proj.get(rest), Some(mir::ProjectionElem::Deref));
+            candidates.push(Candidate {
+                base: place.local,
+                variant,
+                field,
+                by_ref,
+                name: info.name.clone(),
+                fty,
+            });
+        }
+        // The environment base: the one candidate base whose
+        // declared type denotes this instance's definition.
+        let locals = body.locals();
+        let mut base: Option<usize> = None;
+        for cand in &candidates {
+            if base == Some(cand.base) {
+                continue;
+            }
+            let Some(decl) = locals.get(cand.base) else {
+                continue;
+            };
+            if env_def_name(&decl.ty).as_deref() == Some(def_name) {
+                if base.is_some() {
+                    return None;
+                }
+                base = Some(cand.base);
+            }
+        }
+        let base = base?;
+        // Field descriptors, in the shape's own terms: the
+        // debuginfo name (with a by-reference capture's `_ref__`
+        // prefix) and the field type's rendered tag.
+        let mut upvars: HashMap<usize, sm::AdtDebugField> = HashMap::new();
+        let mut saved: HashMap<(usize, usize), sm::AdtDebugField> = HashMap::new();
+        for cand in candidates.into_iter().filter(|c| c.base == base) {
+            let converted_field = self.ty(&cand.fty);
+            let tag = self.layout_key(&converted_field);
+            let name = if cand.by_ref {
+                format!("_ref__{}", cand.name)
+            } else {
+                cand.name
+            };
+            let field = sm::AdtDebugField {
+                name: Some(name),
+                ty: tag,
+            };
+            match cand.variant {
+                None => {
+                    upvars.entry(cand.field).or_insert(field);
+                }
+                Some(v) => {
+                    saved.entry((v, cand.field)).or_insert(field);
+                }
+            }
+        }
+        let upvars: Option<Vec<sm::AdtDebugField>> =
+            (0..upvar_count).map(|i| upvars.get(&i).cloned()).collect();
+        let upvars = upvars?;
+        if !is_coroutine {
+            return Some(sm::EnvDebugShape {
+                dwarf_name,
+                upvars,
+                variants: Vec::new(),
+                slotted: false,
+            });
+        }
+        if let Some(slots) = self.coroutine_layouts.get(key).cloned() {
+            // Name every slot from the saved-local candidates:
+            // a candidate's (variant, field) address names the
+            // slot the layout map assigns to it.
+            let mut by_slot: HashMap<u32, sm::AdtDebugField> = HashMap::new();
+            for ((v, f), field) in &saved {
+                let slot = slots.variants.get(*v)?.get(*f)?;
+                by_slot.insert(*slot, field.clone());
+            }
+            let mut variants = Vec::with_capacity(slots.variants.len());
+            for (v, vslots) in slots.variants.iter().enumerate() {
+                let mut fields = Vec::with_capacity(vslots.len());
+                for slot in vslots {
+                    fields.push(by_slot.get(slot)?.clone());
+                }
+                variants.push(sm::EnvDebugVariant {
+                    name: coroutine_variant_name(v),
+                    fields,
+                    slots: vslots.clone(),
+                });
+            }
+            return Some(sm::EnvDebugShape {
+                dwarf_name,
+                upvars,
+                variants,
+                slotted: true,
+            });
+        }
+        // No storage-slot map: the saved storage is positional,
+        // one vector per state in the body's own variant order.
+        let n_variants = saved
+            .keys()
+            .map(|(v, _)| v + 1)
+            .max()
+            .unwrap_or(0)
+            .max(3);
+        let mut variants = Vec::with_capacity(n_variants);
+        for v in 0..n_variants {
+            let count = saved.keys().filter(|(sv, _)| *sv == v).count();
+            let mut fields = Vec::with_capacity(count);
+            for f in 0..count {
+                fields.push(saved.get(&(v, f))?.clone());
+            }
+            variants.push(sm::EnvDebugVariant {
+                name: coroutine_variant_name(v),
+                fields,
+                slots: (0..count as u32).collect(),
+            });
+        }
+        Some(sm::EnvDebugShape {
+            dwarf_name,
+            upvars,
+            variants,
+            slotted: false,
+        })
     }
 
     fn rigid_ty(&mut self, r: &RigidTy) -> sm::Ty {

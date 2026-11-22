@@ -181,6 +181,10 @@ struct Collected {
     /// instances, for the interpreter (see
     /// `Converter::adt_debug_shapes`).
     adt_debug_shapes: sparagmos_mir::AdtDebugShapes,
+    /// Debugger shapes of the converted monomorphic closure and
+    /// coroutine instances, for the interpreter (see
+    /// `Converter::env_debug_shapes`).
+    env_debug_shapes: sparagmos_mir::EnvDebugShapes,
     /// Thread-local statics of the converted program, for the
     /// interpreter (see `Converter::thread_locals`).
     thread_locals: sparagmos_mir::ThreadLocals,
@@ -4784,6 +4788,7 @@ fn collect() -> ControlFlow<()> {
         coroutine_layouts: conv.coroutine_layouts.clone(),
         adt_shapes: conv.adt_shapes.clone(),
         adt_debug_shapes: conv.adt_debug_shapes.clone(),
+        env_debug_shapes: conv.env_debug_shapes.clone(),
         thread_locals: conv.thread_locals.clone(),
         adt_instance_shapes: conv.adt_instance_shapes.clone(),
         adt_niches: conv.adt_niches.clone(),
@@ -5630,6 +5635,7 @@ fn build_program(
     program.coroutine_layouts = c.coroutine_layouts.clone();
     program.adt_shapes = c.adt_shapes.clone();
     program.adt_debug_shapes = c.adt_debug_shapes.clone();
+    program.env_debug_shapes = c.env_debug_shapes.clone();
     program.thread_locals = c.thread_locals.clone();
     program.adt_instance_shapes = c.adt_instance_shapes.clone();
     program.adt_niches = c.adt_niches.clone();
