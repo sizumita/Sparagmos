@@ -90,13 +90,29 @@ bootstrap passes it none, so a test without a directive is compiled
 with no `--edition` flag and rustc's own default applies), and
 opt-level 0, matching the harness's corpus oracle.
 
+With `--jit`, the same stages judge metric 4 — the same
+denominator (24,937) on the JIT path — instead of metric 2(b):
+stage 1 executes each exec record through the driver's `run-jit`
+mode (the same conversion and collected program, executed by
+`sparagmos-jit` instead of the interpreter) and compares stdout
+and exit code with the native run under exactly the stage-1
+rules; stage 2 runs the driver's `jit-compile` mode and requires,
+in addition to stage 2's conversion verdict, that the JIT
+lowering of the whole converted program succeed on a
+success-expecting test (see judge_jit_compile). A named JIT
+unsupported is a non-pass, never a pass. Records the JIT harness
+has no attempt for at all (nature procedure / exec-debugger /
+rustdoc, and everything else outside the two stages) are carried
+through as not attempted and count against the metric-4 rate,
+exactly as they count against metric 2(b).
+
 Usage:
     python3 scripts/rustc-subset-run.py \
         --survey-json subset-survey.json \
         --rust-dir ~/rust-1.100.0-survey \
         --driver-bin crates/sparagmos-driver/target/debug/sparagmos-driver \
         --out subset-run-results.json [--jobs 48] [--limit N]
-        [--stages 1|2|both] [--stage2-limit N]
+        [--stages 1|2|both] [--stage2-limit N] [--jit]
 """
 
 import argparse
@@ -2296,7 +2312,7 @@ def native_side(path, edition, workdir, extra_flags=(), aux_specs=(),
 
 def sparagmos_side(path, edition, driver_bin, cwd=None, rustc_args=(),
                    aux_specs=(), guest_args=(), env_extra=None,
-                   env_remove=()):
+                   env_remove=(), jit=False):
     """Run through the driver. Returns (result_dict, kind, reason).
 
     kind is "result" (exit 0/101), "unsupported" (driver exit 2),
@@ -2309,10 +2325,14 @@ def sparagmos_side(path, edition, driver_bin, cwd=None, rustc_args=(),
     interpreter's). `env_extra` / `env_remove` are the test's
     exec-env pairs and unsets, applied to the driver process --
     the guest runs in-process, so this is the environment
-    compiletest's exec-env describes for it.
+    compiletest's exec-env describes for it. With `jit=True` the
+    driver's `run-jit` mode replaces `run`: the same conversion
+    and the same collected program, executed by `sparagmos-jit`
+    instead of the interpreter (metric 4).
     """
     rustc_args = list(rustc_args) + sysroot_extern_args(path, rustc_args)
-    argv = [str(driver_bin), "run", str(path), "--edition", edition]
+    argv = [str(driver_bin), "run-jit" if jit else "run",
+            str(path), "--edition", edition]
     for a in rustc_args:
         argv += ["--rustc-arg", a]
     for spec in aux_specs:
@@ -2330,7 +2350,7 @@ def sparagmos_side(path, edition, driver_bin, cwd=None, rustc_args=(),
     if res["exit_code"] in (0, 101):
         return res, "result", ""
     if res["exit_code"] == 2:
-        return None, "unsupported", driver_reason(res["stderr"])
+        return None, "unsupported", driver_reason(res["stderr"], jit=jit)
     return None, "driver-error", \
         f"driver exit {res['exit_code']}: {res['stderr'].strip()[:300]}"
 
@@ -2343,9 +2363,11 @@ def first_error_line(stderr):
     return (stderr.strip().splitlines() or ["<no output>"])[0][:200]
 
 
-def driver_reason(stderr):
+def driver_reason(stderr, jit=False):
+    marker = "sparagmos-driver run-jit:" if jit \
+        else "sparagmos-driver run:"
     lines = [l.strip() for l in stderr.splitlines()
-             if "sparagmos-driver run:" in l]
+             if marker in l]
     if lines:
         return "; ".join(lines)[:400]
     return ("driver reported unsupported (exit 2) without a reason line: "
@@ -2373,8 +2395,15 @@ def bucket_reason(reason):
     segment decides the bucket; the full text is only consulted for
     the patterns that have no primary line of their own.
     """
-    first = reason.split("; sparagmos-driver run:")[0].lower()
+    first = re.split(r"; sparagmos-driver run(?:-jit)?:",
+                     reason)[0].lower()
     r = reason.lower()
+    if "guest arguments are not supported by jit" in first:
+        return "JIT execution: guest arguments unsupported"
+    if "c-convention entry" in first:
+        return "JIT execution: C-convention entry unsupported"
+    if "exitcode` is not supported by jit" in first:
+        return "JIT execution: ExitCode entry unsupported"
     if "by-reference constant" in first:
         return "unsupported constant: by-reference constant"
     if "boxdereftransmute" in first:
@@ -2898,7 +2927,7 @@ def _fill_result_debugger(rec, rust_dir, driver_bin, out, td):
     out["status"] = "pass"
 
 
-def process_test(rec, rust_dir, driver_bin, stage2=False):
+def process_test(rec, rust_dir, driver_bin, stage2=False, jit=False):
     """Produce the result record for one survey record."""
     out = {
         "suite": rec["suite"],
@@ -2913,14 +2942,16 @@ def process_test(rec, rust_dir, driver_bin, stage2=False):
         "stage": 1,
         "seconds": 0.0,
     }
+    if jit:
+        out["jit"] = True
     t0 = time.time()
     try:
-        if rec["nature"] == "exec-debugger":
+        if rec["nature"] == "exec-debugger" and not jit:
             fill_result_debugger(rec, rust_dir, driver_bin, out)
         elif stage2 and rec["nature"] == "compile-check":
-            fill_result_stage2(rec, rust_dir, driver_bin, out)
+            fill_result_stage2(rec, rust_dir, driver_bin, out, jit=jit)
         else:
-            fill_result(rec, rust_dir, driver_bin, out)
+            fill_result(rec, rust_dir, driver_bin, out, jit=jit)
     except Exception as e:  # a runner bug must not lose the whole run
         out["status"] = "not-attempted"
         out["reason"] = f"runner internal error: {e!r}"
@@ -2929,7 +2960,7 @@ def process_test(rec, rust_dir, driver_bin, stage2=False):
     return out
 
 
-def fill_result(rec, rust_dir, driver_bin, out):
+def fill_result(rec, rust_dir, driver_bin, out, jit=False):
     if rec["nature"] != "exec":
         out["reason"] = f"nature={rec['nature']} (not in stage-1 scope)"
         out["bucket"] = "out of stage-1 scope (nature)"
@@ -2949,7 +2980,7 @@ def fill_result(rec, rust_dir, driver_bin, out):
     revs = header.revisions()
     if revs:
         fill_result_revisions(rec, header, revs, path, driver_bin, out,
-                              rust_dir)
+                              rust_dir, jit=jit)
         return
 
     aux_specs = []
@@ -3031,7 +3062,8 @@ def fill_result(rec, rust_dir, driver_bin, out):
                                            aux_specs=aux_specs,
                                            guest_args=run_flags,
                                            env_extra=denv,
-                                           env_remove=dunset)
+                                           env_remove=dunset,
+                                           jit=jit)
         if kind == "unsupported":
             out["status"] = "unsupported"
             out["reason"] = reason
@@ -3166,7 +3198,7 @@ def pretty_unpretty_args(suite, view):
 
 def stage1_compile_check(rec, view, path, driver_bin, revision, res,
                          edition, rev_args, flags, aux_specs,
-                         rust_dir):
+                         rust_dir, jit=False):
     """Judge a stage-1 revision view that carries no run mode.
 
     compiletest gives such a revision a compile-only verdict:
@@ -3213,8 +3245,12 @@ def stage1_compile_check(rec, view, path, driver_bin, revision, res,
                             suite_root(path), os.getcwd())
     conv = convert_side(path, edition, driver_bin, rustc_args=args,
                         aux_specs=aux_specs, env_extra=cenv,
-                        env_remove=cunset)
-    verdict, reason, bucket = judge_compile(expectation, conv)
+                        env_remove=cunset,
+                        **({"jit": True} if jit else {}))
+    if jit:
+        verdict, reason, bucket = judge_jit_compile(expectation, conv)
+    else:
+        verdict, reason, bucket = judge_compile(expectation, conv)
     res["status"] = verdict
     res["reason"] = reason
     res["bucket"] = bucket
@@ -3225,11 +3261,13 @@ def stage1_compile_check(rec, view, path, driver_bin, revision, res,
         "skip_totals": conv["skip_totals"],
         "ice": conv["ice"],
     }
+    if jit:
+        res["driver"]["jit_compiled"] = conv.get("jit_compiled")
     return res
 
 
 def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions,
-                   rust_dir):
+                   rust_dir, jit=False):
     """Judge one revision view of an exec record.
 
     The stage-1 counterpart of stage2_attempt: the revision is
@@ -3290,7 +3328,7 @@ def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions,
             return stage1_compile_check(rec, view, path, driver_bin,
                                         revision, res, edition,
                                         rev_args, flags, aux_specs,
-                                        rust_dir)
+                                        rust_dir, jit=jit)
         pm_args, pm_err = proc_macro_extern_args(path, view, edition)
         if pm_err:
             res["reason"] = pm_err
@@ -3331,7 +3369,8 @@ def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions,
                                            aux_specs=aux_specs,
                                            guest_args=run_flags,
                                            env_extra=denv,
-                                           env_remove=dunset)
+                                           env_remove=dunset,
+                                           jit=jit)
         if kind == "unsupported":
             res["status"] = "unsupported"
             res["reason"] = reason
@@ -3357,7 +3396,7 @@ def stage1_attempt(rec, view, path, driver_bin, revision, all_revisions,
 
 
 def fill_result_revisions(rec, header, revs, path, driver_bin, out,
-                          rust_dir):
+                          rust_dir, jit=False):
     """Stage-1 judging for a test with `//@ revisions:`.
 
     The test is judged once per revision -- with that revision's
@@ -3374,7 +3413,7 @@ def fill_result_revisions(rec, header, revs, path, driver_bin, out,
     for rev in revs:
         per_rev[rev] = stage1_attempt(rec, header.view(rev), path,
                                       driver_bin, rev, revs,
-                                      rust_dir)
+                                      rust_dir, jit=jit)
     out["revisions"] = {
         rev: {k: r[k] for k in ("status", "reason", "bucket", "mode")
               if r.get(k)}
@@ -3608,7 +3647,7 @@ _TARGET_RE = re.compile(r"^target-crate converted: (\d+), skipped: (\d+)$", re.M
 
 
 def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=(),
-                 env_extra=None, env_remove=()):
+                 env_extra=None, env_remove=(), jit=False):
     """Run the driver in convert-only mode and parse its report.
 
     Returns a dict with exit_code (None on timeout), converted and
@@ -3626,9 +3665,21 @@ def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=(),
     `--rustc-arg` option (a test's compile-flags and the
     per-revision arguments). Auxiliary crates are handed to the
     driver with `--aux`, in dependency order, as in run mode.
+
+    With `jit=True` the driver's `jit-compile` mode replaces
+    convert mode: the same conversion and report, plus a JIT
+    lowering attempt over the whole converted program. The result
+    then also carries jit_compiled (True / False / None when the
+    driver printed no JIT line) and jit_reason (the JIT's named
+    unsupported reason, when it printed one). In this mode exit
+    code 2 means the compilation succeeded but JIT lowering is
+    unsupported — it is not a compiler crash.
     """
     rustc_args = list(rustc_args) + sysroot_extern_args(path, rustc_args)
-    argv = [str(driver_bin), str(path), "--edition", edition]
+    argv = [str(driver_bin)]
+    if jit:
+        argv.append("jit-compile")
+    argv += [str(path), "--edition", edition]
     for a in rustc_args:
         argv += ["--rustc-arg", a]
     for spec in aux_specs:
@@ -3654,6 +3705,15 @@ def convert_side(path, edition, driver_bin, rustc_args=(), aux_specs=(),
         "stderr": res["stderr"],
         "stdout": res["stdout"],
     }
+    if "jit-compiled: yes" in res["stdout"]:
+        out["jit_compiled"] = True
+    elif "jit-compiled: no" in res["stdout"]:
+        out["jit_compiled"] = False
+    else:
+        out["jit_compiled"] = None
+    jm = re.search(r"sparagmos-driver jit-compile: unsupported: (.+)",
+                   res["stderr"])
+    out["jit_reason"] = jm.group(1).strip() if jm else ""
     pm = re.search(r"sparagmos-driver: Stable MIR conversion "
                    r"panicked: (.+)", res["stderr"])
     out["conversion_panicked"] = pm is not None
@@ -3811,6 +3871,94 @@ def judge_compile(expectation, conv):
     raise ValueError(f"unknown expectation {expectation!r}")
 
 
+def jit_bucket(reason):
+    """Aggregate bucket for a JIT-lowering unsupported reason."""
+    r = reason.lower()
+    if "not part of the program" in r:
+        return "JIT lowering unsupported (callee not in program)"
+    if "backend error" in r:
+        return "JIT lowering unsupported (backend error)"
+    return "JIT lowering unsupported (other)"
+
+
+def judge_jit_compile(expectation, conv):
+    """Compare a jit-compile result with the expected outcome.
+
+    Metric 4's compile-check verdict: the conversion outcome must
+    match the expectation exactly as in stage 2 (judge_compile),
+    and — on a success-expecting test whose conversion is complete
+    — the JIT lowering of the whole converted program must also
+    succeed. A named JIT unsupported is reported as unsupported
+    (never a pass). On a failure- or crash-expecting test there is
+    no successfully converted program to lower, so the conversion
+    outcome alone decides, exactly as in stage 2. In jit-compile
+    mode exit code 2 is the defined JIT-unsupported outcome, not
+    a compiler crash, so it is intercepted before judge_compile
+    (which reads any non-0/1 exit as a crash) can see it.
+    """
+    if conv["timeout"] or conv["exit_code"] is None:
+        return ("fail",
+                f"driver timed out after {CONVERT_TIMEOUT}s",
+                "timeout")
+    if conv.get("aux_failure"):
+        return ("unsupported",
+                f"auxiliary crate build failed: "
+                f"{conv['aux_failure']}",
+                "auxiliary crate build failure")
+    if conv["exit_code"] == 2:
+        if conv.get("jit_compiled") is not False:
+            return ("fail",
+                    "driver exit 2 without a JIT lowering report",
+                    "driver error")
+        reason = conv.get("jit_reason") or "JIT lowering unsupported"
+        if expectation == "success":
+            skipped = conv.get("target_skipped")
+            if skipped is None:
+                skipped = conv["skipped"]
+            if skipped is None:
+                return ("fail",
+                        "driver exit 2 without a conversion report",
+                        "driver error")
+            if skipped != 0:
+                totals_list = conv.get("target_skip_totals") \
+                    or conv["skip_totals"]
+                totals = ", ".join(f"{short_kind(k)} x{n}"
+                                   for k, n in totals_list[:5])
+                return ("unsupported",
+                        f"conversion incomplete: {skipped} "
+                        f"function(s) skipped ({totals})",
+                        skip_bucket(totals_list))
+            return ("unsupported",
+                    f"JIT lowering unsupported: {reason[:300]}",
+                    jit_bucket(reason))
+        if expectation == "failure":
+            return ("fail",
+                    "expected compile failure, but the driver "
+                    "converted the test successfully (a JIT "
+                    "lowering failure is not a compilation "
+                    "rejection)",
+                    "expected failure but conversion succeeded")
+        if expectation == "crash":
+            return ("fail",
+                    "no longer crashes: the compilation succeeded "
+                    "and only the JIT lowering is unsupported",
+                    "no crash (JIT lowering unsupported)")
+        raise ValueError(f"unknown expectation {expectation!r}")
+    verdict, reason, bucket = judge_compile(expectation, conv)
+    if verdict == "pass" and expectation == "success":
+        if conv.get("jit_compiled") is True:
+            return (verdict, reason, bucket)
+        if conv.get("jit_compiled") is False:
+            jreason = conv.get("jit_reason") or "JIT lowering unsupported"
+            return ("unsupported",
+                    f"JIT lowering unsupported: {jreason[:300]}",
+                    jit_bucket(jreason))
+        return ("fail",
+                "driver exit 0 without a JIT lowering report",
+                "driver error")
+    return (verdict, reason, bucket)
+
+
 MINICORE_BUILD_TIMEOUT = 120
 
 _MINICORE_LOCK = threading.Lock()
@@ -3924,7 +4072,8 @@ def minicore_test_args(view, rust_dir, edition, flags):
 
 
 def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
-                   rust_dir, aux_specs=(), aux_per_revision=False):
+                   rust_dir, aux_specs=(), aux_per_revision=False,
+                   jit=False):
     """Judge one directive view of a compile-check record.
 
     `revision` is the revision name this view belongs to (None for a
@@ -4045,7 +4194,7 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
         # it is the execution, judged under the same arguments
         # this conversion would have used.
         return stage2_run_attempt(rec, view, path, driver_bin, res,
-                                  edition, args, flags, specs)
+                                  edition, args, flags, specs, jit=jit)
     # The view's `//@ rustc-env:` pairs are applied to the driver
     # process: the driver's embedded rustc reads them exactly as
     # compiletest's rustc invocation does (including values a
@@ -4055,8 +4204,12 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
                             suite_root(path), os.getcwd())
     conv = convert_side(path, edition, driver_bin, rustc_args=args,
                         aux_specs=specs, env_extra=cenv,
-                        env_remove=cunset)
-    verdict, reason, bucket = judge_compile(expectation, conv)
+                        env_remove=cunset,
+                        **({"jit": True} if jit else {}))
+    if jit:
+        verdict, reason, bucket = judge_jit_compile(expectation, conv)
+    else:
+        verdict, reason, bucket = judge_compile(expectation, conv)
     res["status"] = verdict
     res["reason"] = reason
     res["bucket"] = bucket
@@ -4067,13 +4220,15 @@ def stage2_attempt(rec, view, path, driver_bin, revision, all_revisions,
         "skip_totals": conv["skip_totals"],
         "ice": conv["ice"],
     }
+    if jit:
+        res["driver"]["jit_compiled"] = conv.get("jit_compiled")
     if verdict == "fail":
         res["driver"]["stderr_first"] = first_error_line(conv["stderr"])
     return res
 
 
 def stage2_run_attempt(rec, view, path, driver_bin, res, edition,
-                       args, flags, aux_specs):
+                       args, flags, aux_specs, jit=False):
     """Judge a stage-2 view whose verdict is a program run.
 
     The view's mode is run-pass / run-fail (a scoped mode
@@ -4138,7 +4293,8 @@ def stage2_run_attempt(rec, view, path, driver_bin, res, edition,
                                            aux_specs=aux_specs,
                                            guest_args=run_flags,
                                            env_extra=denv,
-                                           env_remove=dunset)
+                                           env_remove=dunset,
+                                           jit=jit)
         if kind == "unsupported":
             res["status"] = "unsupported"
             res["reason"] = reason
@@ -4288,7 +4444,7 @@ def incremental_cross_session_blocker(test_path, text):
     return None
 
 
-def fill_result_stage2(rec, rust_dir, driver_bin, out):
+def fill_result_stage2(rec, rust_dir, driver_bin, out, jit=False):
     """Stage-2 counterpart of fill_result for compile-check records.
 
     A test without revisions is judged once, on its unscoped view.
@@ -4352,7 +4508,7 @@ def fill_result_stage2(rec, rust_dir, driver_bin, out):
     if not revs:
         res = stage2_attempt(rec, header.view(None), path, driver_bin,
                              None, [], rust_dir, aux_specs,
-                             aux_per_revision)
+                             aux_per_revision, jit=jit)
         for key in ("status", "reason", "bucket", "expectation",
                     "driver", "native", "sparagmos"):
             if key in res:
@@ -4362,7 +4518,8 @@ def fill_result_stage2(rec, rust_dir, driver_bin, out):
     for rev in revs:
         per_rev[rev] = stage2_attempt(rec, header.view(rev), path,
                                       driver_bin, rev, revs, rust_dir,
-                                      aux_specs, aux_per_revision)
+                                      aux_specs, aux_per_revision,
+                                      jit=jit)
     out["revisions"] = {
         rev: {k: r[k] for k in ("status", "reason", "bucket",
                                 "expectation") if r.get(k)}
@@ -4424,6 +4581,18 @@ def main():
     ap.add_argument("--stage2-limit", type=int, default=0,
                     help="only process the first N stage-2 candidates "
                          "(smoke runs); 0 = all")
+    ap.add_argument("--jit", action="store_true",
+                    help="metric 4: judge through the JIT path "
+                         "instead of the interpreter/convert path "
+                         "(exec records run via the driver's "
+                         "run-jit mode; compile-check records are "
+                         "judged by conversion plus JIT lowering "
+                         "via the driver's jit-compile mode). The "
+                         "denominator and the carried-through "
+                         "records are unchanged, so records the JIT "
+                         "harness cannot attempt (procedure, "
+                         "exec-debugger, rustdoc, ...) count "
+                         "against the rate, as in metric 2(b)")
     args = ap.parse_args()
     args.driver_bin = args.driver_bin.resolve()
     args.rust_dir = args.rust_dir.resolve()
@@ -4501,9 +4670,10 @@ def main():
     with concurrent.futures.ThreadPoolExecutor(
             max_workers=args.jobs) as pool:
         futs = [pool.submit(process_test, r, args.rust_dir,
-                            args.driver_bin) for r in candidates]
+                            args.driver_bin, False, args.jit)
+                for r in candidates]
         futs += [pool.submit(process_test, r, args.rust_dir,
-                             args.driver_bin, True)
+                             args.driver_bin, True, args.jit)
                  for r in candidates2]
         futs += [pool.submit(process_test, r, args.rust_dir,
                              args.driver_bin, True)
@@ -4615,6 +4785,7 @@ def main():
         "failed": failed,
         "unsupported": unsup,
         "not_attempted": notatt,
+        "jit_mode": bool(args.jit),
         "metric_2b_pass_rate_percent":
             round(100.0 * passed / denominator, 3) if denominator else 0.0,
         "stage1_candidates": len(candidates),
@@ -4637,6 +4808,12 @@ def main():
         "buckets": dict(sorted(buckets.items(), key=lambda kv: -kv[1])),
         "top_reasons": top_reasons,
     }
+    if args.jit:
+        # Metric 4 is metric 2(b)'s denominator judged on the JIT
+        # path; the rate is the same arithmetic over the same
+        # denominator, reported under its own key.
+        agg["metric_4_jit_pass_rate_percent"] = \
+            agg["metric_2b_pass_rate_percent"]
     payload = {"aggregates": agg, "results": results}
     args.out.write_text(json.dumps(payload, indent=1, sort_keys=True))
 

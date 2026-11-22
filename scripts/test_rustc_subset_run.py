@@ -2979,3 +2979,257 @@ class DebuggerHarnessTests(unittest.TestCase):
         filtered = run._DebuggerFilteredView(view)
         self.assertFalse(filtered.has("only-lldb"))
         self.assertTrue(filtered.has("run-pass"))
+
+
+class JudgeJitCompileTests(unittest.TestCase):
+    """judge_jit_compile: metric 4's compile-check verdict."""
+
+    def test_success_and_jit_compiled_passes(self):
+        c = conv(jit_compiled=True, jit_reason="")
+        self.assertEqual(run.judge_jit_compile("success", c),
+                         ("pass", "", ""))
+
+    def test_success_but_jit_unsupported_is_unsupported(self):
+        c = conv(exit_code=2, jit_compiled=False,
+                 jit_reason="function `t::main`: unsupported "
+                            "rvalue `InlineAsm`")
+        status, reason, bucket = run.judge_jit_compile("success", c)
+        self.assertEqual(status, "unsupported")
+        self.assertIn("JIT lowering unsupported", reason)
+        self.assertIn("JIT lowering unsupported", bucket)
+
+    def test_success_but_jit_unsupported_callee_bucket(self):
+        c = conv(exit_code=2, jit_compiled=False,
+                 jit_reason="call to function `std::rt::panic_fmt` "
+                            "which is not part of the program")
+        _s, _r, bucket = run.judge_jit_compile("success", c)
+        self.assertEqual(
+            bucket, "JIT lowering unsupported (callee not in program)")
+
+    def test_success_incomplete_conversion_stays_unsupported(self):
+        c = conv(exit_code=2, jit_compiled=False,
+                 jit_reason="unsupported rvalue",
+                 skipped=2, skip_totals=[("Rvalue::BinaryOp", 3)])
+        status, reason, bucket = run.judge_jit_compile("success", c)
+        self.assertEqual(status, "unsupported")
+        self.assertIn("conversion incomplete", reason)
+        self.assertNotIn("JIT", bucket)
+
+    def test_success_exit0_without_jit_report_is_fail(self):
+        # A pass may never be claimed without evidence the JIT
+        # lowering actually happened.
+        c = conv(jit_compiled=None, jit_reason="")
+        status, _r, bucket = run.judge_jit_compile("success", c)
+        self.assertEqual(status, "fail")
+        self.assertEqual(bucket, "driver error")
+
+    def test_success_exit2_without_jit_report_is_fail(self):
+        c = conv(exit_code=2, jit_compiled=None, jit_reason="")
+        status, _r, bucket = run.judge_jit_compile("success", c)
+        self.assertEqual(status, "fail")
+        self.assertEqual(bucket, "driver error")
+
+    def test_failure_clean_rejection_passes_without_jit(self):
+        c = conv(exit_code=1, compilation_failed=True,
+                 converted=None, skipped=None,
+                 jit_compiled=None, jit_reason="")
+        self.assertEqual(run.judge_jit_compile("failure", c)[0],
+                         "pass")
+
+    def test_failure_but_converted_and_jit_unsupported_is_fail(self):
+        # A JIT lowering failure is not a compilation rejection:
+        # it must not fabricate a pass on a failure-expecting test.
+        c = conv(exit_code=2, jit_compiled=False,
+                 jit_reason="unsupported rvalue")
+        status, _r, bucket = run.judge_jit_compile("failure", c)
+        self.assertEqual(status, "fail")
+        self.assertEqual(bucket,
+                         "expected failure but conversion succeeded")
+
+    def test_crash_reproduced_passes(self):
+        c = conv(exit_code=101, jit_compiled=None, jit_reason="")
+        self.assertEqual(run.judge_jit_compile("crash", c)[0], "pass")
+
+    def test_crash_exit2_is_not_a_crash(self):
+        # In jit-compile mode exit 2 is the defined JIT-unsupported
+        # outcome; it must not be read as a compiler crash.
+        c = conv(exit_code=2, jit_compiled=False,
+                 jit_reason="unsupported rvalue")
+        status, _r, _b = run.judge_jit_compile("crash", c)
+        self.assertEqual(status, "fail")
+
+    def test_timeout_is_fail(self):
+        c = conv(exit_code=None, timeout=True,
+                 jit_compiled=None, jit_reason="")
+        self.assertEqual(run.judge_jit_compile("success", c)[0],
+                         "fail")
+
+
+class JitSideTests(unittest.TestCase):
+    """The JIT driver argv shapes (run_cmd stubbed)."""
+
+    def stub_run_cmd(self, result):
+        orig = run.run_cmd
+        seen = []
+
+        def stub(argv, *, timeout, cwd=None, env_extra=None,
+                 env_remove=()):
+            seen.append(argv)
+            return result
+
+        run.run_cmd = stub
+        self.addCleanup(lambda: setattr(run, "run_cmd", orig))
+        return seen
+
+    def test_sparagmos_side_jit_uses_run_jit(self):
+        seen = self.stub_run_cmd(
+            {"exit_code": 0, "timeout": False,
+             "stdout": "x\n", "stderr": ""})
+        got, kind, _ = run.sparagmos_side(
+            Path("t.rs"), "2021", Path("/fake/driver"), jit=True)
+        self.assertEqual(seen[0][1], "run-jit")
+        self.assertEqual(kind, "result")
+        self.assertEqual(got["stdout"], "x\n")
+
+    def test_sparagmos_side_default_uses_run(self):
+        seen = self.stub_run_cmd(
+            {"exit_code": 0, "timeout": False,
+             "stdout": "", "stderr": ""})
+        run.sparagmos_side(Path("t.rs"), "2021", Path("/fake/driver"))
+        self.assertEqual(seen[0][1], "run")
+
+    def test_sparagmos_side_jit_unsupported_reason(self):
+        self.stub_run_cmd(
+            {"exit_code": 2, "timeout": False, "stdout": "",
+             "stderr": "sparagmos-driver run-jit: unsupported: "
+                       "guest arguments are not supported by JIT "
+                       "execution\n"})
+        _got, kind, reason = run.sparagmos_side(
+            Path("t.rs"), "2021", Path("/fake/driver"), jit=True)
+        self.assertEqual(kind, "unsupported")
+        self.assertIn("run-jit", reason)
+        self.assertEqual(
+            run.bucket_reason(reason),
+            "JIT execution: guest arguments unsupported")
+
+    def test_convert_side_jit_uses_jit_compile_and_parses(self):
+        seen = self.stub_run_cmd(
+            {"exit_code": 2, "timeout": False,
+             "stdout": "converted: 3, skipped: 0\njit-compiled: no\n",
+             "stderr": "sparagmos-driver jit-compile: unsupported: "
+                       "unsupported rvalue `InlineAsm`\n"})
+        out = run.convert_side(Path("t.rs"), "2021",
+                               Path("/fake/driver"), jit=True)
+        self.assertEqual(seen[0][1], "jit-compile")
+        self.assertEqual(out["jit_compiled"], False)
+        self.assertIn("InlineAsm", out["jit_reason"])
+        self.assertEqual(out["converted"], 3)
+
+    def test_convert_side_default_has_no_jit_line(self):
+        seen = self.stub_run_cmd(
+            {"exit_code": 0, "timeout": False,
+             "stdout": "converted: 1, skipped: 0\n", "stderr": ""})
+        out = run.convert_side(Path("t.rs"), "2021",
+                               Path("/fake/driver"))
+        self.assertEqual(seen[0][1], "t.rs")
+        self.assertIsNone(out["jit_compiled"])
+
+
+class ProcessJitTests(unittest.TestCase):
+    """process_test(jit=True) with both process sides stubbed."""
+
+    def setUp(self):
+        self.tmp = Path(self.enterContext(__import__("tempfile")
+                                         .TemporaryDirectory()))
+        (self.tmp / "tests" / "ui").mkdir(parents=True)
+        self.rust_dir = self.tmp
+
+    def write_test(self, body, nature="exec"):
+        p = self.rust_dir / "tests" / "ui" / "t.rs"
+        p.write_text(body)
+        return {"suite": "ui", "path": "tests/ui/t.rs",
+                "nature": nature, "single_file": True,
+                "ffi": False, "env_excluded": False}
+
+    def test_exec_pass_forwards_jit_to_driver_side(self):
+        rec = self.write_test("//@ run-pass\nfn main() {}\n")
+        seen = {}
+        orig_n, orig_s = run.native_side, run.sparagmos_side
+        run.native_side = lambda *a, **kw: (
+            {"exit_code": 0, "stdout": "x\n", "stderr": ""}, None)
+
+        def fake_side(*a, **kw):
+            seen["jit"] = kw.get("jit", False)
+            return ({"exit_code": 0, "stdout": "x\n",
+                     "stderr": ""}, "result", "")
+
+        run.sparagmos_side = fake_side
+        try:
+            res = run.process_test(rec, self.rust_dir,
+                                   Path("/fake/driver"), jit=True)
+        finally:
+            run.native_side, run.sparagmos_side = orig_n, orig_s
+        self.assertEqual(res["status"], "pass")
+        self.assertTrue(seen["jit"])
+        self.assertTrue(res["jit"])
+
+    def test_exec_without_jit_does_not_flag_record(self):
+        rec = self.write_test("//@ run-pass\nfn main() {}\n")
+        orig_n, orig_s = run.native_side, run.sparagmos_side
+        run.native_side = lambda *a, **kw: (
+            {"exit_code": 0, "stdout": "", "stderr": ""}, None)
+        run.sparagmos_side = lambda *a, **kw: (
+            {"exit_code": 0, "stdout": "", "stderr": ""},
+            "result", "")
+        try:
+            res = run.process_test(rec, self.rust_dir,
+                                   Path("/fake/driver"))
+        finally:
+            run.native_side, run.sparagmos_side = orig_n, orig_s
+        self.assertEqual(res["status"], "pass")
+        self.assertNotIn("jit", res)
+
+    def test_compile_check_jit_unsupported_is_not_a_pass(self):
+        rec = self.write_test("//@ check-pass\nfn main() {}\n",
+                              nature="compile-check")
+        orig = run.convert_side
+
+        def fake_conv(*a, **kw):
+            self.assertTrue(kw.get("jit", False))
+            return conv(exit_code=2, jit_compiled=False,
+                        jit_reason="unsupported rvalue")
+
+        run.convert_side = fake_conv
+        try:
+            res = run.process_test(rec, self.rust_dir,
+                                   Path("/fake/driver"),
+                                   stage2=True, jit=True)
+        finally:
+            run.convert_side = orig
+        self.assertEqual(res["status"], "unsupported")
+        self.assertIn("JIT lowering unsupported", res["bucket"])
+        self.assertTrue(res["jit"])
+
+    def test_compile_check_jit_compiled_passes(self):
+        rec = self.write_test("//@ check-pass\nfn main() {}\n",
+                              nature="compile-check")
+        orig = run.convert_side
+        run.convert_side = lambda *a, **kw: conv(
+            jit_compiled=True, jit_reason="")
+        try:
+            res = run.process_test(rec, self.rust_dir,
+                                   Path("/fake/driver"),
+                                   stage2=True, jit=True)
+        finally:
+            run.convert_side = orig
+        self.assertEqual(res["status"], "pass")
+
+    def test_unattemptable_nature_counts_as_not_attempted(self):
+        # procedure / exec-debugger / rustdoc records have no JIT
+        # attempt in this harness; under --jit they stay
+        # not-attempted (counted against the metric-4 rate, never
+        # removed from the denominator).
+        rec = self.write_test("fn main() {}\n", nature="procedure")
+        res = run.process_test(rec, self.rust_dir,
+                               Path("/fake/driver"), jit=True)
+        self.assertEqual(res["status"], "not-attempted")

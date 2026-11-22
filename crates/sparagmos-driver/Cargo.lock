@@ -14,6 +14,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "sparagmos-interp",
+ "sparagmos-jit",
  "sparagmos-mir",
 ]
 
@@ -25,5 +26,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sparagmos-jit"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "sparagmos-mir",
+ "sparagmos-runtime",
+]
+
+[[package]]
 name = "sparagmos-mir"
+version = "0.1.0"
+
+[[package]]
+name = "sparagmos-runtime"
 version = "0.1.0"

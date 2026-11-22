@@ -8,6 +8,33 @@
 //!   `[--rustc-arg <arg>]...` — convert and execute the program's
 //!   `main` in the Sparagmos interpreter (`sparagmos-interp`), in
 //!   this process.
+//! - `sparagmos-driver run-jit <file.rs> [--edition <ed>]`
+//!   `[--rustc-arg <arg>]...` — convert and execute the program's
+//!   `main` with the Sparagmos JIT (`sparagmos-jit`), in this
+//!   process. This is the JIT counterpart of `run`, on the same
+//!   main path (same conversion, same collected program); only the
+//!   execution engine differs. Exit codes follow run mode: 0 = the
+//!   guest terminated normally, 101 = the guest panicked, 2 = the
+//!   program could not be converted or JIT-compiled/executed
+//!   (concrete reason on stderr, prefixed
+//!   `sparagmos-driver run-jit:`). The JIT execution entry takes
+//!   no guest arguments and no modelled `argc`/`argv`, and an
+//!   entry returning `std::process::ExitCode` is reported as
+//!   unsupported rather than guessed: those shapes are outside
+//!   the JIT harness's entry contract (see
+//!   `sparagmos-harness`'s `JitRunner`, which this mode mirrors).
+//! - `sparagmos-driver jit-compile <file.rs> [--edition <ed>]`
+//!   `[--rustc-arg <arg>]...` — convert exactly as convert mode
+//!   does, print the same conversion report, and then attempt to
+//!   JIT-compile (lower) the whole converted program with
+//!   `sparagmos-jit`. The report gains one line: `jit-compiled:
+//!   yes` when the lowering succeeded, or `jit-compiled: no`
+//!   plus a `sparagmos-driver jit-compile: unsupported: <reason>`
+//!   line on stderr when it did not. Exit codes: 0 = compilation
+//!   succeeded and JIT lowering succeeded, 2 = compilation
+//!   succeeded but JIT lowering is unsupported, 1 = the
+//!   compilation failed (as convert mode), 101 = the compiler
+//!   crashed (as convert mode).
 //!
 //! Each `--rustc-arg` forwards one argument verbatim to the embedded
 //! rustc invocation, appended after this driver's own flags — the
@@ -5245,14 +5272,266 @@ fn compile_aux(
     })
 }
 
+/// The JIT program input for a collected program: the same
+/// bodies, definition ids and name table the interpreter path
+/// consumes, in the shape `sparagmos-jit` (and the harness's
+/// `JitRunner`, through the dump) takes.
+fn jit_program_input(c: &Collected) -> sparagmos_jit::MirProgramInput {
+    let functions = c
+        .bodies
+        .iter()
+        .zip(c.body_def_ids.iter())
+        .map(|((name, body), def_id)| sparagmos_jit::MirFunctionInput {
+            name: name.clone(),
+            def_id: Some(*def_id),
+            body: body.clone(),
+        })
+        .collect();
+    let names = c
+        .def_names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            (
+                sparagmos_mir::DefId::new(0, index as u32),
+                name.clone(),
+            )
+        })
+        .collect();
+    sparagmos_jit::MirProgramInput {
+        functions,
+        names,
+        adt_discriminants: c.adt_discriminants.clone(),
+    }
+}
+
+/// Attempt to JIT-compile (lower) the whole collected program.
+/// `Err` carries the JIT's named unsupported reason.
+fn jit_compile_program(c: &Collected) -> Result<sparagmos_jit::JitProgram, String> {
+    sparagmos_jit::JitProgram::compile(&jit_program_input(c)).map_err(|e| match e {
+        sparagmos_jit::JitError::Unsupported(what) => what,
+        sparagmos_jit::JitError::Backend(e) => format!("jit backend error: {e}"),
+    })
+}
+
+/// Execute the collected program's `main` with the JIT and return
+/// the run-jit process exit code (see the crate docs). The entry
+/// contract mirrors the harness's `JitRunner`: the entry is called
+/// with no arguments, a normal return is exit 0, and a guest panic
+/// is exit 101 with the panic message on stderr. Shapes the JIT
+/// entry cannot model — guest arguments, a C-convention
+/// `main(argc, argv)`, an entry returning `ExitCode` — are
+/// reported as unsupported (exit 2), never guessed.
+fn execute_jit(c: &Collected, guest_args: &[String]) -> i32 {
+    if !guest_args.is_empty() {
+        eprintln!(
+            "sparagmos-driver run-jit: unsupported: guest arguments are not supported by JIT execution"
+        );
+        return 2;
+    }
+    let entry_index = c
+        .entry_def_id
+        .and_then(|def| {
+            c.body_def_ids[..c.local_body_count]
+                .iter()
+                .position(|id| *id == def)
+        })
+        .or_else(|| {
+            c.bodies[..c.local_body_count]
+                .iter()
+                .position(|(n, _)| is_main(n))
+        });
+    let Some(entry_index) = entry_index else {
+        for f in &c.report.functions {
+            if is_main(&f.name) {
+                if let FnOutcome::Skipped { reasons } = &f.outcome {
+                    let rs: Vec<String> =
+                        reasons.iter().map(|(k, v)| format!("{k} x{v}")).collect();
+                    eprintln!(
+                        "sparagmos-driver run-jit: unsupported: `main` was not converted ({})",
+                        rs.join(", ")
+                    );
+                    return 2;
+                }
+            }
+        }
+        eprintln!(
+            "sparagmos-driver run-jit: unsupported: no `main` function among the converted functions"
+        );
+        return 2;
+    };
+    if c.bodies[entry_index].1.arg_count == 2 {
+        eprintln!(
+            "sparagmos-driver run-jit: unsupported: C-convention entry `main(argc, argv)` is not supported by JIT execution"
+        );
+        return 2;
+    }
+    if entry_returns_exit_code(c, entry_index) {
+        eprintln!(
+            "sparagmos-driver run-jit: unsupported: entry returning `std::process::ExitCode` is not supported by JIT execution"
+        );
+        return 2;
+    }
+    let prog = match jit_compile_program(c) {
+        Ok(p) => p,
+        Err(reason) => {
+            eprintln!("sparagmos-driver run-jit: unsupported: {reason}");
+            let ext = external_callees(c);
+            if !ext.is_empty() {
+                eprintln!(
+                    "sparagmos-driver run-jit: calls to functions with no converted body: {}",
+                    ext.join(", ")
+                );
+            }
+            return 2;
+        }
+    };
+    match prog.call_index(entry_index, &[]) {
+        Ok(_) => {
+            let (stdout, stderr) = prog.guest_output();
+            use std::io::Write;
+            let mut out = std::io::stdout().lock();
+            let _ = out.write_all(stdout.as_bytes());
+            let _ = out.flush();
+            let mut err = std::io::stderr().lock();
+            let _ = err.write_all(stderr.as_bytes());
+            let _ = err.flush();
+            0
+        }
+        Err(sparagmos_jit::JitCallError::Panic(rec)) => {
+            let (stdout, stderr) = prog.guest_output();
+            use std::io::Write;
+            let mut out = std::io::stdout().lock();
+            let _ = out.write_all(stdout.as_bytes());
+            let _ = out.flush();
+            let mut err = std::io::stderr().lock();
+            let _ = err.write_all(stderr.as_bytes());
+            let _ = err.flush();
+            eprintln!("thread 'main' panicked: {}", rec.message);
+            101
+        }
+        Err(other) => {
+            eprintln!("sparagmos-driver run-jit: unsupported: {other}");
+            2
+        }
+    }
+}
+
+/// Print the convert-mode conversion report for a collected
+/// program (the report `jit-compile` prints as well, before its
+/// own `jit-compiled:` line).
+fn print_convert_report(c: &Collected, input: &str) {
+    println!(
+        "sparagmos-driver: {input} (Stable MIR, {})",
+        env!("SPARAGMOS_BUILD_RUSTC_VERSION")
+    );
+    for f in &c.report.functions {
+        match &f.outcome {
+            FnOutcome::Converted => println!(
+                "fn {}: blocks={} locals={} args={} [converted]",
+                f.name, f.blocks, f.locals, f.arg_count
+            ),
+            FnOutcome::Skipped { reasons } => {
+                let rs: Vec<String> =
+                    reasons.iter().map(|(k, v)| format!("{k} x{v}")).collect();
+                println!("fn {}: SKIPPED ({})", f.name, rs.join(", "));
+            }
+            FnOutcome::NotDemanded { reason } => {
+                println!("fn {}: NOT DEMANDED ({})", f.name, reason);
+            }
+        }
+    }
+    println!(
+        "converted: {}, skipped: {}",
+        c.report.converted_count(),
+        c.report.skipped_count()
+    );
+    let not_demanded = c.report.not_demanded_count();
+    if not_demanded > 0 {
+        println!("not demanded: {not_demanded}");
+    }
+    {
+        let target = &c.report.functions[..c.local_report_count];
+        let t_converted = target
+            .iter()
+            .filter(|f| matches!(f.outcome, FnOutcome::Converted))
+            .count();
+        let t_skipped = target.iter().filter(|f| f.is_skipped()).count();
+        println!("target-crate converted: {t_converted}, skipped: {t_skipped}");
+        let t_not_demanded = target
+            .iter()
+            .filter(|f| matches!(f.outcome, FnOutcome::NotDemanded { .. }))
+            .count();
+        if t_not_demanded > 0 {
+            println!("target-crate not demanded: {t_not_demanded}");
+        }
+        if t_skipped > 0 {
+            let mut totals: std::collections::BTreeMap<&str, usize> =
+                std::collections::BTreeMap::new();
+            for f in target {
+                if let FnOutcome::Skipped { reasons } = &f.outcome {
+                    for (k, v) in reasons {
+                        *totals.entry(k.as_str()).or_default() += v;
+                    }
+                }
+            }
+            println!("target-crate unsupported:");
+            for (k, v) in &totals {
+                println!("  {k}: {v}");
+            }
+        }
+    }
+    let totals = c.report.unsupported_totals();
+    if !totals.is_empty() {
+        println!("unsupported:");
+        for (k, v) in &totals {
+            println!("  {k}: {v}");
+        }
+    }
+}
+
+/// The driver's invocation mode, named by the first argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// No subcommand: convert only, print the conversion report.
+    Convert,
+    /// `run`: convert and execute in the interpreter.
+    Run,
+    /// `run-jit`: convert and execute with the JIT.
+    RunJit,
+    /// `jit-compile`: convert, print the report, and attempt JIT
+    /// lowering of the whole converted program.
+    JitCompile,
+    /// `debug`: convert and execute in the interpreter under a
+    /// debugger session.
+    Debug,
+}
+
+impl Mode {
+    /// Run-shaped modes share run mode's front-end discipline
+    /// (the `--crate-type=lib` pin and `--cap-lints=allow`) and
+    /// its failure contract (a failed compilation is reported as
+    /// unsupported, exit 2).
+    fn is_run(self) -> bool {
+        matches!(self, Mode::Run | Mode::RunJit)
+    }
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
-    let run_mode = argv.get(1).map(|a| a == "run").unwrap_or(false);
-    let debug_mode = argv.get(1).map(|a| a == "debug").unwrap_or(false);
+    let mode = match argv.get(1).map(|a| a.as_str()) {
+        Some("run") => Mode::Run,
+        Some("run-jit") => Mode::RunJit,
+        Some("jit-compile") => Mode::JitCompile,
+        Some("debug") => Mode::Debug,
+        _ => Mode::Convert,
+    };
+    let run_mode = mode.is_run();
+    let debug_mode = mode == Mode::Debug;
     // The debug entry point compiles and collects exactly like
     // run mode (it executes the same program, under a debugger
     // session), so every compilation-shaping and error-contract
-    // decision below keys on the two together.
+    // decision below keys on the executing modes together.
     let exec_mode = run_mode || debug_mode;
     let mut debug_script: Option<String> = None;
     let mut debug_dialect = "gdb".to_string();
@@ -5263,7 +5542,7 @@ fn main() {
     let mut sysroot: Option<String> = None;
     let mut rustc_args: Vec<String> = Vec::new();
     let mut guest_args: Vec<String> = Vec::new();
-    let mut i = if exec_mode { 2 } else { 1 };
+    let mut i = if mode == Mode::Convert { 1 } else { 2 };
     while i < argv.len() {
         match argv[i].as_str() {
             "--dump" => {
@@ -5330,7 +5609,7 @@ fn main() {
                 }));
             }
             "-h" | "--help" => {
-    println!("usage: sparagmos-driver [run|debug] <file.rs> [--aux <name>=<file.rs>[;crate-type=<type>][;edition=<ed>]] [--rustc-arg <arg>] [--guest-arg <arg>] [--dump <path>] [--edition <ed>] [--sysroot <path>] [--debug-script <path>] [--debug-dialect <gdb|lldb>]");
+    println!("usage: sparagmos-driver [run|run-jit|jit-compile|debug] <file.rs> [--aux <name>=<file.rs>[;crate-type=<type>][;edition=<ed>]] [--rustc-arg <arg>] [--guest-arg <arg>] [--dump <path>] [--edition <ed>] [--sysroot <path>] [--debug-script <path>] [--debug-dialect <gdb|lldb>]");
                 return;
             }
             other if input.is_none() && !other.starts_with('-') => {
@@ -5344,7 +5623,7 @@ fn main() {
         i += 1;
     }
     let Some(input) = input else {
-        eprintln!("usage: sparagmos-driver [run] <file.rs> [--dump <path>]");
+        eprintln!("usage: sparagmos-driver [run|run-jit|jit-compile|debug] <file.rs> [--dump <path>]");
         std::process::exit(2);
     };
     let sysroot = sysroot
@@ -5368,6 +5647,10 @@ fn main() {
         match compile_aux(&sysroot, &edition, &aux_dir, spec, &aux_built) {
             Ok(built) => aux_built.push(built),
             Err(reason) => {
+                if mode == Mode::RunJit {
+                    eprintln!("sparagmos-driver run-jit: unsupported: {reason}");
+                    std::process::exit(2);
+                }
                 if exec_mode {
                     eprintln!("sparagmos-driver run: unsupported: {reason}");
                     std::process::exit(2);
@@ -5531,6 +5814,12 @@ fn main() {
                 eprintln!("sparagmos-driver: compilation failed: {abort}");
                 std::process::exit(if exec_mode { 2 } else { 1 });
             }
+            if mode == Mode::RunJit {
+                eprintln!(
+                    "sparagmos-driver run-jit: unsupported: Stable MIR conversion panicked: {reason}"
+                );
+                std::process::exit(2);
+            }
             if exec_mode {
                 eprintln!(
                     "sparagmos-driver run: unsupported: Stable MIR conversion panicked: {reason}"
@@ -5566,7 +5855,7 @@ fn main() {
                     &debug_dialect,
                 ));
             }
-            if run_mode {
+            if mode == Mode::Run || mode == Mode::RunJit {
                 if let Some(path) = &dump_path {
                     let text =
                         sparagmos_driver::dump::render(&input, &c.report, &c.bodies, &c.def_names);
@@ -5575,73 +5864,22 @@ fn main() {
                         std::process::exit(1);
                     }
                 }
+                if mode == Mode::RunJit {
+                    std::process::exit(execute_jit(&c, &guest_args));
+                }
                 std::process::exit(execute(&c, &input, &guest_args, overflow_checks));
             }
-            println!(
-                "sparagmos-driver: {input} (Stable MIR, {})",
-                env!("SPARAGMOS_BUILD_RUSTC_VERSION")
-            );
-            for f in &c.report.functions {
-                match &f.outcome {
-                    FnOutcome::Converted => println!(
-                        "fn {}: blocks={} locals={} args={} [converted]",
-                        f.name, f.blocks, f.locals, f.arg_count
-                    ),
-                    FnOutcome::Skipped { reasons } => {
-                        let rs: Vec<String> =
-                            reasons.iter().map(|(k, v)| format!("{k} x{v}")).collect();
-                        println!("fn {}: SKIPPED ({})", f.name, rs.join(", "));
+            print_convert_report(&c, &input);
+            if mode == Mode::JitCompile {
+                match jit_compile_program(&c) {
+                    Ok(_) => println!("jit-compiled: yes"),
+                    Err(reason) => {
+                        println!("jit-compiled: no");
+                        eprintln!(
+                            "sparagmos-driver jit-compile: unsupported: {reason}"
+                        );
+                        std::process::exit(2);
                     }
-                    FnOutcome::NotDemanded { reason } => {
-                        println!("fn {}: NOT DEMANDED ({})", f.name, reason);
-                    }
-                }
-            }
-            println!(
-                "converted: {}, skipped: {}",
-                c.report.converted_count(),
-                c.report.skipped_count()
-            );
-            let not_demanded = c.report.not_demanded_count();
-            if not_demanded > 0 {
-                println!("not demanded: {not_demanded}");
-            }
-            {
-                let target = &c.report.functions[..c.local_report_count];
-                let t_converted = target
-                    .iter()
-                    .filter(|f| matches!(f.outcome, FnOutcome::Converted))
-                    .count();
-                let t_skipped = target.iter().filter(|f| f.is_skipped()).count();
-                println!("target-crate converted: {t_converted}, skipped: {t_skipped}");
-                let t_not_demanded = target
-                    .iter()
-                    .filter(|f| matches!(f.outcome, FnOutcome::NotDemanded { .. }))
-                    .count();
-                if t_not_demanded > 0 {
-                    println!("target-crate not demanded: {t_not_demanded}");
-                }
-                if t_skipped > 0 {
-                    let mut totals: std::collections::BTreeMap<&str, usize> =
-                        std::collections::BTreeMap::new();
-                    for f in target {
-                        if let FnOutcome::Skipped { reasons } = &f.outcome {
-                            for (k, v) in reasons {
-                                *totals.entry(k.as_str()).or_default() += v;
-                            }
-                        }
-                    }
-                    println!("target-crate unsupported:");
-                    for (k, v) in &totals {
-                        println!("  {k}: {v}");
-                    }
-                }
-            }
-            let totals = c.report.unsupported_totals();
-            if !totals.is_empty() {
-                println!("unsupported:");
-                for (k, v) in &totals {
-                    println!("  {k}: {v}");
                 }
             }
             if let Some(path) = &dump_path {
@@ -5677,6 +5915,13 @@ fn main() {
             );
             println!("converted: 0, skipped: 0");
             println!("target-crate converted: 0, skipped: 0");
+            if mode == Mode::JitCompile {
+                // No crate was handed to the callbacks, so there
+                // is no program to lower; the empty conversion the
+                // compiler was asked for succeeded, and JIT
+                // lowering of an empty program succeeds trivially.
+                println!("jit-compiled: yes");
+            }
         }
         (Err(e), _) => {
             eprintln!("sparagmos-driver: compilation failed: {e:?}");
