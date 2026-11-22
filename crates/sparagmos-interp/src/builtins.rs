@@ -288,11 +288,12 @@ pub enum Builtin {
     /// `std::hint::must_use(value)`: identity.
     MustUse,
     /// `std::sys::thread_local::destructors::linux_like::register`:
-    /// thread-local values are never destroyed in this model (the
-    /// per-thread stores live for the whole run), so registering a
-    /// destructor is a no-op -- the same observable behaviour as
-    /// std's documented caveat that TLS destructors do not run for
-    /// the main thread on Unix.
+    /// record the registration (the storage reference and the
+    /// destructor callable); the interpreter runs the recorded
+    /// destructors when the registering thread finishes. The
+    /// entry thread's registrations never run, matching std's
+    /// documented caveat that TLS destructors do not run for the
+    /// main thread on Unix.
     TlsRegisterDtor,
     /// `std::thread::local::panic_access_error(AccessError)`: the
     /// panic raised when a destroyed thread-local is accessed. It
@@ -5085,6 +5086,10 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::TlsRegisterDtor => {
                 arity(2)?;
+                let mut vals = vals.into_iter();
+                let data = vals.next().expect("arity checked");
+                let dtor = vals.next().expect("arity checked");
+                self.register_tls_dtor(data, dtor);
                 Ok(Value::Unit)
             }
             Builtin::PanicAccessError => {

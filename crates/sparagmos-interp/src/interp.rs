@@ -393,6 +393,13 @@ pub struct Interpreter<'a> {
     threads: std::cell::RefCell<HashMap<u64, ThreadSlot>>,
     /// The id the next spawned thread gets.
     next_thread: std::cell::RefCell<u64>,
+    /// Thread-local destructors registered through std's
+    /// destructor-registration entry point (see the
+    /// `TlsRegisterDtor` builtin), per thread id, in registration
+    /// order: the storage reference and the destructor callable
+    /// the registration carried. They run when the thread's code
+    /// finishes (see [`Interpreter::run_thread`]).
+    tls_dtors: std::cell::RefCell<HashMap<u64, Vec<(Value, Value)>>>,
     /// The thread whose code is currently executing (the entry
     /// thread outside any spawned thread's run).
     current_thread: std::cell::Cell<u64>,
@@ -578,6 +585,7 @@ impl<'a> Interpreter<'a> {
             statics_seeding: std::cell::RefCell::new(HashSet::new()),
             threads: std::cell::RefCell::new(HashMap::new()),
             next_thread: std::cell::RefCell::new(2),
+            tls_dtors: std::cell::RefCell::new(HashMap::new()),
             current_thread: std::cell::Cell::new(1),
             channels: std::cell::RefCell::new(HashMap::new()),
             next_channel: std::cell::RefCell::new(1),
@@ -3576,6 +3584,22 @@ impl<'a> Interpreter<'a> {
         let previous = self.current_thread.get();
         self.current_thread.set(id);
         let result = self.call_callable_to_completion(frames, &callable, Vec::new());
+        // The thread's code has finished: run the thread-local
+        // destructors it registered, as the platform does at
+        // thread exit (a panicking thread's storages are still
+        // destroyed; a hard interpreter error aborts the run
+        // before this point's semantics matter). The current
+        // thread stays `id` while they run — a destructor reads
+        // its own thread's storages. A destructor that itself
+        // panics aborts the run, as a panic in a native TLS
+        // destructor aborts the process.
+        let result = match &result {
+            Ok(_) | Err(InterpError::Panic { .. }) => match self.run_tls_dtors(frames, id) {
+                Ok(()) => result,
+                Err(e) => Err(e),
+            },
+            Err(_) => result,
+        };
         self.current_thread.set(previous);
         let outcome = match result {
             Ok(value) => Ok(value),
@@ -3615,6 +3639,52 @@ impl<'a> Interpreter<'a> {
             self.run_thread(frames, id)?;
             ran = true;
         }
+    }
+
+    /// Record a thread-local destructor registration for the
+    /// currently executing thread (see the `TlsRegisterDtor`
+    /// builtin): the storage reference and the destructor
+    /// callable, in registration order.
+    pub(crate) fn register_tls_dtor(&self, data: Value, dtor: Value) {
+        self.tls_dtors
+            .borrow_mut()
+            .entry(self.current_thread_id())
+            .or_default()
+            .push((data, dtor));
+    }
+
+    /// Run thread `id`'s registered thread-local destructors in
+    /// reverse registration order (the platform's order).
+    /// Registrations a destructor itself makes (initialising
+    /// another thread-local on the way out) are run as well, as
+    /// the platform runs them; the round bound keeps a
+    /// pathological registration loop from spinning forever. A
+    /// registration whose destructor body the program does not
+    /// hold is skipped: the registration call sites materialise
+    /// the destructor as a function constant, which the driver's
+    /// demand pass collects, so a missing body means the
+    /// destructor belongs to a part of std the model never
+    /// collected and its storage is one the model never wrote.
+    fn run_tls_dtors(&mut self, frames: &mut Vec<Frame>, id: u64) -> InterpResult<()> {
+        for _ in 0..1024 {
+            let batch: Vec<(Value, Value)> = self
+                .tls_dtors
+                .borrow_mut()
+                .remove(&id)
+                .unwrap_or_default();
+            if batch.is_empty() {
+                return Ok(());
+            }
+            for (data, dtor) in batch.into_iter().rev() {
+                if let Value::FnPtr(name) = &dtor {
+                    if self.program.get(name).is_none() {
+                        continue;
+                    }
+                }
+                self.call_callable_to_completion(frames, &dtor, vec![data])?;
+            }
+        }
+        Ok(())
     }
 
     /// Join a thread: run it if it is still pending, then return
@@ -7788,10 +7858,10 @@ impl<'a> Interpreter<'a> {
                 // storage bodies, which are ordinary collected code)
                 // performs the user-visible initialization; the seed
                 // is only the storage struct's initial value.
-                // Destructors registered for a storage are not run
-                // at thread exit (see the destructor-registration
-                // builtin), so a thread's entries simply stay in
-                // the store under its unique id.
+                // Destructors registered for a storage run when
+                // the owning thread finishes (see `run_thread`);
+                // the entries themselves stay in the store under
+                // the thread's unique id.
                 let Some(seed) = self.program.thread_locals.get(name) else {
                     return Err(InterpError::UnsupportedRvalue {
                         kind: format!(
