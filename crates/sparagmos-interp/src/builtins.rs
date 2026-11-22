@@ -13905,7 +13905,7 @@ fn simd_cast_lane(
     src_info: (u32, bool, Option<u32>),
     dst_elem: &str,
 ) -> InterpResult<Value> {
-    let (src_bits, _, src_float) = src_info;
+    let (src_bits, src_signed, src_float) = src_info;
     if let Some((dst_bits, dst_signed)) = int_tag(dst_elem) {
         return Ok(match lane {
             Value::Float(f) => {
@@ -13923,7 +13923,16 @@ fn simd_cast_lane(
                 }
             }
             _ => {
-                let pattern = as_u128(lane, "simd lane")? & bit_mask(src_bits);
+                let masked = as_u128(lane, "simd lane")? & bit_mask(src_bits);
+                // A signed source sign-extends from its own width
+                // before the value is wrapped to the destination
+                // width (the extension the float destination below
+                // applies to an integer lane).
+                let pattern = if src_signed {
+                    sign_extend(masked, src_bits) as u128
+                } else {
+                    masked
+                };
                 wrap_simd_int(pattern, dst_bits, dst_signed)
             }
         });
