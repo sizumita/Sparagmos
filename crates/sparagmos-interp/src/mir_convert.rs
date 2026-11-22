@@ -5908,7 +5908,8 @@ fn uint_ty_of_bits(bits: u32) -> Option<mir::UintTy> {
 /// conversion does not depend on a context; the exceptions are
 /// literal arguments whose type the callee's signature pins to a
 /// generic parameter (`RangeInclusive::new`'s bounds are its `Idx`)
-/// or to a fixed type (`Argument::from_usize` takes `usize`).
+/// or to a fixed type (`Argument::from_usize`'s count is a
+/// `usize`, passed by reference).
 /// The parameter types of a callable place type, for typing call
 /// arguments whose literals carry no type of their own: a function
 /// pointer's inputs directly; a closure's parameters through its
