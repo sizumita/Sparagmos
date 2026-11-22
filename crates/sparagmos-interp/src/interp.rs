@@ -3820,8 +3820,21 @@ impl<'a> Interpreter<'a> {
                                 ));
                             }
                         };
+                        // A coroutine judged through a downcast to
+                        // the unresumed state is walked by its upvar
+                        // plan, but a slot-mapped coroutine's flat
+                        // field vector also holds the later states'
+                        // cells, written through bare slot fields
+                        // while it ran: those cells belong to the
+                        // current state's plan, not the upvars', so
+                        // a longer vector is not a mismatch — the
+                        // walk below only visits the plan's own
+                        // indices.
+                        let upvar_walk = is_coroutine
+                            && matches!(path.last(), Some(RefProj::Downcast(0)));
                         if items.len() != fields.len()
                             && !(is_coroutine && items.len() < fields.len())
+                            && !(upvar_walk && items.len() > fields.len())
                         {
                             // With `complete`, conversion proved the
                             // field count, so a mismatch means the value
