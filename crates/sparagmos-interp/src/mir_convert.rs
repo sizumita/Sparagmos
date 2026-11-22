@@ -884,6 +884,10 @@ fn drop_glue_edges<'a>(glue: &'a ir::DropGlue, targets: &mut Vec<&'a str>) -> bo
             // value itself carries): no static edges.
             ir::DropPlan::WakerDrop => true,
             ir::DropPlan::RcHandleDrop { value } => walk(value, adts, targets, seen),
+            // The dyn branch is chosen from the value at run time
+            // (no static edges, like `Dyn` itself); the plain
+            // branch's edges are the subplan's.
+            ir::DropPlan::DynOrPlain { plain } => walk(plain, adts, targets, seen),
             // Judged from the value at run time; calls no
             // destructor body.
             ir::DropPlan::Dynamic => true,
@@ -8854,10 +8858,21 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                 // pointee. A `dyn` pointee is the exception: the
                 // pointer value *is* the fat pointer then, with no
                 // field to project, so the plan is the dyn plan
-                // itself.
-                let inner = self.plan(args.first()?)?;
+                // itself. A pointee that merely mentions a trait
+                // object (an ADT or tuple whose unsized tail is a
+                // `dyn` field) may likewise hold the trait-object
+                // form — such a box is formed only by the unsizing
+                // coercion of a concrete box — but the same type
+                // also spells plain boxes (a `Vec<Box<dyn Trait>>`
+                // element type inside the pointee, say), so the
+                // form is judged on the value at run time.
+                let pointee = args.first()?;
+                let inner = self.plan(pointee)?;
                 return Some(match inner {
                     P::Dyn => P::Dyn,
+                    other if ty_mentions_dyn(pointee) => P::DynOrPlain {
+                        plain: Box::new(at_field0(other)),
+                    },
                     other => at_field0(other),
                 });
             }
@@ -8870,9 +8885,15 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                 // pointee keeps the dyn plan: the handle value *is*
                 // the fat pointer then, and its baked glue applies
                 // to the pointee in the allocation.
-                let inner = self.plan(args.first()?)?;
+                let pointee = args.first()?;
+                let inner = self.plan(pointee)?;
                 return Some(match inner {
                     P::Dyn => P::Dyn,
+                    other if ty_mentions_dyn(pointee) => P::DynOrPlain {
+                        plain: Box::new(P::RcHandleDrop {
+                            value: Box::new(other),
+                        }),
+                    },
                     other => P::RcHandleDrop {
                         value: Box::new(other),
                     },

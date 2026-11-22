@@ -1104,6 +1104,19 @@ pub enum DropPlan {
     /// conversion could not account for is an explicit error, never
     /// a silent skip.
     Dyn,
+    /// The glue of a pointer (`Box`, `Rc`, `Arc`) whose pointee
+    /// type mentions a `dyn` type somewhere in its structure, so
+    /// a value of the pointer type may be in either of two forms.
+    /// A value formed by an unsizing coercion — the only way a
+    /// pointer to an ADT or tuple whose unsized tail is a trait
+    /// object comes to exist — is the trait object itself, and
+    /// its glue is the [`DropPlan::Dyn`] plan (the concrete glue
+    /// the value carries). Any other value is the plain pointer
+    /// aggregate, and `plain` — the plan built for that form —
+    /// runs instead. Which form a value takes is a property of
+    /// how it was formed, not of the pointer type alone, so the
+    /// judgment is made on the value at run time.
+    DynOrPlain { plain: Box<DropPlan> },
 }
 
 /// What happens when execution of a basic block panics (the MIR

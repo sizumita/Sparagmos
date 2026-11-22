@@ -478,6 +478,15 @@ pub(crate) fn is_rc_arc_handle(value: &Value) -> bool {
 }
 
 pub(crate) fn rc_handle_id(value: &Value) -> Option<u64> {
+    // A handle in trait-object form denotes the same allocation
+    // as the handle it wraps: the unsizing coercion changed the
+    // pointee's view, not the handle's identity, so the count
+    // machinery (clone, drop, the count readers) must see
+    // through the `DynRef` to the handle aggregate.
+    let mut value = value;
+    while let Value::DynRef { base, .. } = value {
+        value = base;
+    }
     let fields = match value {
         Value::Enum { fields, .. } if !fields.is_empty() => fields,
         _ => return None,
@@ -4629,6 +4638,45 @@ impl<'a> Interpreter<'a> {
                             drop_unaccounted_dyn(&base)?;
                             continue;
                         };
+                        // A reference-counted handle in trait-object
+                        // form: the pointee's glue is the last strong
+                        // handle's business, exactly as for a plain
+                        // handle (see `RcHandleDrop`) — decrement the
+                        // count first, and only the drop that takes
+                        // it to zero runs the glue the value carries,
+                        // against the allocation's value field, with
+                        // the weak bundle released after it.
+                        let rc_base = rc_handle_id(&base);
+                        if let Some(id) = rc_base {
+                            if !self.rc_dec_strong(id)? {
+                                continue;
+                            }
+                            let release = GlueSession {
+                                root: RefTarget::Alloc {
+                                    id,
+                                    projection: Vec::new(),
+                                },
+                                work: vec![(Vec::new(), P::RcWeakRelease)],
+                                adts: active.adts.clone(),
+                                completion: GlueCompletion::Resume,
+                            };
+                            if glue.root == P::Trivial {
+                                suspended.push(std::mem::replace(&mut active, release));
+                                continue 'sessions;
+                            }
+                            let nested = GlueSession {
+                                root: RefTarget::Alloc {
+                                    id,
+                                    projection: vec![RefProj::Field(2)],
+                                },
+                                work: vec![(Vec::new(), glue.root)],
+                                adts: glue.adts,
+                                completion: GlueCompletion::Resume,
+                            };
+                            suspended.push(std::mem::replace(&mut active, release));
+                            suspended.push(std::mem::replace(&mut active, nested));
+                            continue 'sessions;
+                        }
                         if glue.root == P::Trivial {
                             continue;
                         }
@@ -4637,7 +4685,6 @@ impl<'a> Interpreter<'a> {
                         // built by the `new` builtins, or behind the
                         // data pointer itself for a pointer-shaped
                         // base.
-                        let rc_base = rc_handle_id(&base);
                         let pointee_root = match &*base {
                             // A reference-counted handle base:
                             // the pointee is the allocation's
@@ -4679,6 +4726,23 @@ impl<'a> Interpreter<'a> {
                         };
                         suspended.push(std::mem::replace(&mut active, nested));
                         continue 'sessions;
+                    }
+                    P::DynOrPlain { plain } => {
+                        // Judge the value's own form (see
+                        // `DropPlan::DynOrPlain`): a trait-object
+                        // value runs the dyn plan against the glue
+                        // it carries; a plain pointer aggregate
+                        // runs the plan built for that form. The
+                        // raw read keeps the stored form — following
+                        // an allocation pointer here would read the
+                        // pointee and judge it instead of the
+                        // pointer.
+                        let value = self.read_at_raw(frames, &active.root, &path)?;
+                        if matches!(value, Some(Value::DynRef { .. })) {
+                            active.work.push((path, P::Dyn));
+                        } else {
+                            active.work.push((path, *plain));
+                        }
                     }
                     P::CallDtor { func } => {
                         if self.read_at(frames, &active.root, &path)?.is_none() {

@@ -16895,3 +16895,156 @@ fn run_mode_pointer_wrapper_display_and_debug() {
         "10 \"bs\"\nwrap<5>\n11 [1, 2]\n3.25 \"arcstr\"\n9\n"
     );
 }
+
+const BOX_DYN_TAIL_STRUCT_SRC: &str = r#"
+struct Wrapper<'a, T: ?Sized>(&'a mut i32, T);
+impl<'a, T: ?Sized> Drop for Wrapper<'a, T> {
+    fn drop(&mut self) { *self.0 = 432; }
+}
+fn main() {
+    let mut x = 0;
+    {
+        let wrapper = Box::new(Wrapper(&mut x, [1u32, 2, 3]));
+        let _: Box<Wrapper<dyn Send>> = wrapper;
+    }
+    println!("x is {}", x);
+}
+"#;
+
+#[test]
+fn run_mode_box_dyn_tail_struct_drop_runs_dtor() {
+    // A `Box` over a struct whose unsized tail is a trait object:
+    // the box value is the trait-object form the unsizing
+    // coercion produced, and dropping it runs the struct's
+    // destructor against the pointee in the allocation — the
+    // write through the borrowed field reaches the caller's
+    // local, exactly as the sized box's drop does.
+    let dir = temp_dir("box-dyn-tail-struct-drop");
+    let src = fixture(&dir, "box_dyn_tail_struct_drop.rs", BOX_DYN_TAIL_STRUCT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Box<dyn-tail struct> drop program must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "x is 432\n",
+        "the dyn-tail struct's destructor runs at the box drop"
+    );
+}
+
+const RC_DYN_TAIL_STRUCT_SRC: &str = r#"
+use std::rc::Rc;
+struct Wrapper<T: ?Sized>(i32, T);
+impl<T: ?Sized> Drop for Wrapper<T> {
+    fn drop(&mut self) { println!("dtor {}", self.0); }
+}
+fn main() {
+    let r: Rc<Wrapper<dyn Send>> = Rc::new(Wrapper(5, [1u32, 2]));
+    let r2 = r.clone();
+    drop(r);
+    println!("one left");
+    drop(r2);
+    println!("gone");
+}
+"#;
+
+#[test]
+fn run_mode_rc_dyn_tail_struct_drop_runs_dtor() {
+    // The reference-counted form of the dyn-tail shape: the
+    // handle value is the trait-object form, and the pointee's
+    // destructor runs when the last strong handle drops.
+    let dir = temp_dir("rc-dyn-tail-struct-drop");
+    let src = fixture(&dir, "rc_dyn_tail_struct_drop.rs", RC_DYN_TAIL_STRUCT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Rc<dyn-tail struct> drop program must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "one left\ndtor 5\ngone\n",
+        "the dyn-tail struct's destructor runs at the last handle drop"
+    );
+}
+
+const BOX_POINTEE_MENTIONS_DYN_SRC: &str = r#"
+struct M(i32);
+impl Drop for M { fn drop(&mut self) { println!("dtor {}", self.0); } }
+struct Holder(Vec<Box<dyn Fn()>>);
+impl Drop for Holder {
+    fn drop(&mut self) { println!("holder dtor"); }
+}
+fn main() {
+    let m = M(9);
+    let h = Box::new(Holder(vec![Box::new(move || { let _ = &m; })]));
+    drop(h);
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_box_pointee_mentions_dyn_plain_form_drop() {
+    // A pointee that merely mentions a trait object (a `Vec` of
+    // boxed closures in a field) is a plain box value, not the
+    // trait-object form: dropping it runs the pointee's own
+    // destructor and its fields' glue as usual.
+    let dir = temp_dir("box-pointee-mentions-dyn-drop");
+    let src = fixture(&dir, "box_pointee_mentions_dyn.rs", BOX_POINTEE_MENTIONS_DYN_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "plain Box over a dyn-mentioning pointee must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "holder dtor\ndtor 9\ndone\n",
+        "the plain box's pointee destructor and field glue run at the drop"
+    );
+}
+
+const RC_DYN_TRAIT_COUNT_SRC: &str = r#"
+use std::rc::Rc;
+trait Tr { fn hi(&self) -> i32; }
+struct S(i32);
+impl Tr for S { fn hi(&self) -> i32 { self.0 } }
+impl Drop for S { fn drop(&mut self) { println!("dtor {}", self.0); } }
+fn main() {
+    let r: Rc<dyn Tr> = Rc::new(S(5));
+    let r2 = r.clone();
+    println!("strong {}", Rc::strong_count(&r));
+    drop(r);
+    println!("one left");
+    drop(r2);
+    println!("gone");
+}
+"#;
+
+#[test]
+fn run_mode_rc_dyn_trait_clone_and_drop_counts() {
+    // A cloned `Rc<dyn Trait>` handle is a second live handle on
+    // the same allocation: the strong count moves with the clone
+    // (the handle value is in trait-object form, and the count
+    // machinery sees through it), and the pointee's destructor
+    // runs only when the last handle drops.
+    let dir = temp_dir("rc-dyn-trait-count");
+    let src = fixture(&dir, "rc_dyn_trait_count.rs", RC_DYN_TRAIT_COUNT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Rc<dyn Trait> count program must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "strong 2\none left\ndtor 5\ngone\n",
+        "the count moves with the clone and the destructor runs at the last drop"
+    );
+}
