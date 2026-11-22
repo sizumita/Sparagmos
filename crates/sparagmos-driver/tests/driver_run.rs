@@ -12303,3 +12303,115 @@ fn convert_mode_simd_reduce_ordered_with_mismatched_initial_is_a_compile_failure
         "the failure must name the intrinsic and the initial value; stderr={stderr}"
     );
 }
+
+// ----- stdout-mismatch bucket: TLS destructors, Debug wrapper
+// ----- forms, SIMD cast, libtest failure sections (Lane IM) -----
+
+const TLS_DTOR_SRC: &str = r#"
+use std::thread;
+
+struct Foo;
+
+impl Drop for Foo {
+    fn drop(&mut self) {
+        println!("test2");
+    }
+}
+
+thread_local!(static FOO: Foo = Foo);
+
+fn main() {
+    thread::spawn(|| {
+        FOO.with(|_| {});
+        println!("test1");
+    })
+    .join()
+    .unwrap();
+}
+"#;
+
+#[test]
+fn run_mode_tls_destructor_runs_at_spawned_thread_exit() {
+    // The shape of tests/ui/threads-sendsync/issue-29488.rs: a
+    // thread-local's destructor runs when the thread that
+    // registered it finishes, so the spawned thread's `Foo` is
+    // dropped (printing test2) after its own output (test1).
+    run_ok("tls-dtor", TLS_DTOR_SRC, "test1\ntest2\n");
+}
+
+const DEBUG_WRAPPERS_SRC: &str = r#"
+use std::any::Any;
+use std::cell::{Cell, RefCell, UnsafeCell};
+use std::marker::PhantomData;
+
+fn main() {
+    println!("{:?}", Cell::new(0));
+    println!("{:?}", UnsafeCell::new(0));
+    println!("{:?}", RefCell::new(5));
+    println!("{:?}", PhantomData::<&()>);
+    let b: Box<dyn Any> = Box::new(1);
+    println!("{:?}", b);
+}
+"#;
+
+#[test]
+fn run_mode_debug_wrapper_forms_match_core() {
+    // Core's handwritten `Debug` impls for the cell / marker
+    // wrappers and for `dyn Any` are fixed functions of the
+    // stored value: `Cell` and `RefCell` show the inner value
+    // (not the `UnsafeCell` layer), `UnsafeCell` is
+    // non-exhaustive, `PhantomData` prints its type parameter,
+    // and a `dyn Any` object prints `Any { .. }`.
+    run_ok(
+        "debug-wrappers",
+        DEBUG_WRAPPERS_SRC,
+        "Cell { value: 0 }\nUnsafeCell { .. }\nRefCell { value: 5 }\nPhantomData<&()>\nAny { .. }\n",
+    );
+}
+
+const SIMD_CAST_SRC: &str = r#"
+#![feature(repr_simd, core_intrinsics)]
+#[repr(simd)]
+#[derive(Debug, Copy, Clone)]
+struct Simd<T, const N: usize>([T; N]);
+fn main() {
+    let a: Simd<i8, 3> = Simd([10, -3, -9]);
+    let b: Simd<i16, 3> = unsafe { std::intrinsics::simd::simd_cast(a) };
+    println!("{:?}", b);
+}
+"#;
+
+#[test]
+fn run_mode_simd_cast_sign_extends() {
+    // `simd_cast` from a signed element type sign-extends from
+    // the source width (the shape of tests/ui/simd/
+    // issue-39720.rs): -3 and -9 stay negative as i16 lanes.
+    run_ok("simd-cast", SIMD_CAST_SRC, "Simd([10, -3, -9])\n");
+}
+
+const LIBTEST_MISMATCH_SRC: &str = r#"
+#[test]
+#[should_panic(expected = "foo")]
+fn bar_test() { panic!("bar"); }
+"#;
+
+#[test]
+fn run_mode_libtest_should_panic_mismatch_section_has_report() {
+    // A should-panic message mismatch fails with the panic
+    // report ahead of the `did not contain` note in the
+    // failure section, as libtest prints it.
+    let dir = temp_dir("libtest-mismatch");
+    let src = fixture(&dir, "mismatch.rs", LIBTEST_MISMATCH_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "--test"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(101), "stdout={stdout}");
+    let report = stdout.find("panicked at").expect("panic report in section");
+    let note = stdout
+        .find("note: panic did not contain expected string")
+        .expect("mismatch note in section");
+    assert!(report < note, "report precedes the note: stdout={stdout}");
+    assert!(
+        stdout.contains("panic message: \"bar\""),
+        "stdout={stdout}"
+    );
+}
