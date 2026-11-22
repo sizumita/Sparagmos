@@ -5265,17 +5265,21 @@ impl<'a> Interpreter<'a> {
                     self.project_step(frames, cur, RefProj::Index(idx), body, place)?
                 }
                 ProjectionElem::ConstantIndex { offset, from_end } => {
-                    let len = self
-                        .read_resolved(frames, &cur)?
-                        .len()
-                        .ok_or_else(|| {
+                    // The length the index is bounded by: the fat
+                    // length when the place was reached through a
+                    // fat pointer (the value resolved at an
+                    // element position has no length of its own
+                    // to ask), otherwise the resolved value's own.
+                    let len = match fat_cap {
+                        Some(cap) => cap,
+                        None => self.read_resolved(frames, &cur)?.len().ok_or_else(|| {
                             InterpError::type_mismatch(
                                 format!("constant index into {place}"),
                                 "array, slice or string value",
                                 "value without a length",
                             )
-                        })?;
-                    let len = fat_cap.unwrap_or(len);
+                        })?,
+                    };
                     fat_cap = None;
                     let idx = if *from_end {
                         len.checked_sub(*offset as u128).ok_or_else(|| {
@@ -5302,14 +5306,16 @@ impl<'a> Interpreter<'a> {
                     // element count, so later steps (and reference
                     // targets formed from this place) need no
                     // knowledge of the MIR range shape.
-                    let base_len = self.read_resolved(frames, &cur)?.len().ok_or_else(|| {
-                        InterpError::type_mismatch(
-                            format!("subslice of {place}"),
-                            "array, slice or string value",
-                            "value without a length",
-                        )
-                    })?;
-                    let len = fat_cap.unwrap_or(base_len);
+                    let len = match fat_cap {
+                        Some(cap) => cap,
+                        None => self.read_resolved(frames, &cur)?.len().ok_or_else(|| {
+                            InterpError::type_mismatch(
+                                format!("subslice of {place}"),
+                                "array, slice or string value",
+                                "value without a length",
+                            )
+                        })?,
+                    };
                     fat_cap = None;
                     let (offset, sub_len) = subslice_offset_len(*from, *to, *from_end, len)?;
                     self.project_step(
@@ -9331,12 +9337,113 @@ fn zst_value_of_ty(ty: &Ty) -> Option<Value> {
     }
 }
 
+/// Whether a projection contains an index step immediately
+/// followed by a step that indexes further (another index, or
+/// a sub-slice): the only shape [`compose_projection`] rewrites.
+fn projection_needs_composition(projection: &[RefProj]) -> bool {
+    projection.windows(2).any(|w| {
+        matches!(w[0], RefProj::Index(_))
+            && matches!(w[1], RefProj::Index(_) | RefProj::Subslice { .. })
+    })
+}
+
+/// Compose the element-position index runs of a projection.
+///
+/// An index step that lands on one element of a sequence,
+/// followed by steps that index further, denotes a position
+/// in the sequence rather than a read of the element: the
+/// first step came from a data pointer into the sequence (a
+/// raw-parts slice's base, an `as_ptr` result), and the
+/// following steps address the sequence's elements from that
+/// position, so the run composes into a single index (or, with
+/// a trailing sub-slice step, a sub-slice) from the sequence's
+/// start. When the element is itself a sequence value the
+/// steps nest as written (a row of a matrix, one string of a
+/// table) - the same judgment `seq_element_target` makes for
+/// sequence reads through an element pointer. Steps the walk
+/// cannot evaluate pass through unchanged; the caller's own
+/// application then reproduces their result or error.
+fn compose_projection(
+    value: &Value,
+    projection: &[RefProj],
+    func: &str,
+    place: &str,
+) -> Vec<RefProj> {
+    let mut out: Vec<RefProj> = Vec::with_capacity(projection.len());
+    let mut cur = value.clone();
+    let mut i = 0;
+    while i < projection.len() {
+        if let RefProj::Index(a) = projection[i] {
+            let mut total = a;
+            let mut j = i + 1;
+            while let Some(RefProj::Index(b)) = projection.get(j) {
+                total += b;
+                j += 1;
+            }
+            let subslice = match projection.get(j) {
+                Some(RefProj::Subslice { offset, len }) => Some((*offset, *len)),
+                _ => None,
+            };
+            if j > i + 1 || subslice.is_some() {
+                let element = project_value(cur.clone(), &[RefProj::Index(a)], func, place);
+                if let Ok(element) = element {
+                    if !matches!(
+                        element,
+                        Value::Tuple(_)
+                            | Value::FatRef { .. }
+                            | Value::Bytes(_)
+                            | Value::Str(_)
+                    ) {
+                        let merged = match subslice {
+                            Some((offset, len)) => RefProj::Subslice {
+                                offset: total + offset,
+                                len,
+                            },
+                            None => RefProj::Index(total),
+                        };
+                        if let Ok(next) = project_value(
+                            cur.clone(),
+                            std::slice::from_ref(&merged),
+                            func,
+                            place,
+                        ) {
+                            cur = next;
+                            out.push(merged);
+                            i = if subslice.is_some() { j + 1 } else { j };
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        match project_value(cur.clone(), std::slice::from_ref(&projection[i]), func, place) {
+            Ok(next) => {
+                cur = next;
+                out.push(projection[i].clone());
+                i += 1;
+            }
+            Err(_) => {
+                out.extend_from_slice(&projection[i..]);
+                return out;
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn project_value(
     value: Value,
     projection: &[RefProj],
     func: &str,
     place: &str,
 ) -> InterpResult<Value> {
+    let composed;
+    let projection = if projection_needs_composition(projection) {
+        composed = compose_projection(&value, projection, func, place);
+        &composed[..]
+    } else {
+        projection
+    };
     let mut value = value;
     let mut step_idx = 0;
     // The state a coroutine downcast named, for the field step
@@ -9827,6 +9934,19 @@ fn assign_projected(
     func: &str,
     place: &str,
 ) -> InterpResult<()> {
+    // The byte-splice pre-passes below read the projection's
+    // last step as a byte position inside the value the head
+    // denotes; an element-position index run (see
+    // `compose_projection`) must be composed first, or the
+    // splice mistakes the run's last index for a byte offset
+    // into the element at the run's head.
+    let composed;
+    let projection = if projection_needs_composition(projection) {
+        composed = compose_projection(slot, projection, func, place);
+        &composed[..]
+    } else {
+        projection
+    };
     if let Some((&RefProj::ByteOffset(disp), head)) = projection.split_last() {
         // A byte written through a pointer displaced into a
         // scalar's storage, with no index step after the
@@ -9879,6 +9999,13 @@ pub(crate) fn project_value_ref<'a>(
     func: &str,
     place: &str,
 ) -> InterpResult<Cow<'a, Value>> {
+    let composed;
+    let projection = if projection_needs_composition(projection) {
+        composed = compose_projection(value, projection, func, place);
+        &composed[..]
+    } else {
+        projection
+    };
     let mut cur: &'a Value = value;
     let mut rest = projection;
     // The state a coroutine downcast named, for the field step
@@ -10191,6 +10318,13 @@ pub(crate) fn navigate_mut<'x>(
     if projection.is_empty() {
         return Ok(slot);
     }
+    let composed;
+    let projection = if projection_needs_composition(projection) {
+        composed = compose_projection(slot, projection, func, place);
+        &composed[..]
+    } else {
+        projection
+    };
     if *slot == Value::Uninit {
         // Partial initialization: MIR fills an aggregate place
         // field by field — a `catch_unwind` Data union written

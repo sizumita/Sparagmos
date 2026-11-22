@@ -6298,7 +6298,29 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::PartialEqEq | Builtin::PartialEqNe => {
                 arity(2)?;
-                let eq = self.values_equal(frames, &vals[0], &vals[1])?;
+                // std defines `Path` / `PathBuf` equality over
+                // the parsed components (repeated and trailing
+                // separators and interior `.` components are
+                // normalised away), not over the raw bytes the
+                // structural comparison below would use. The
+                // callee name carries no impl subject in this
+                // model, so the path types are recognised by the
+                // call's own generic arguments (the `Self` and
+                // `Rhs` type tags).
+                let path_cmp = generic_args.iter().take(2).any(|tag| {
+                    let tag = tag
+                        .strip_prefix("&mut ")
+                        .or_else(|| tag.strip_prefix('&'))
+                        .unwrap_or(tag);
+                    matches!(tag, "std::path::Path" | "std::path::PathBuf")
+                });
+                let eq = if path_cmp {
+                    let lhs = self.path_cmp_bytes(frames, &vals[0])?;
+                    let rhs = self.path_cmp_bytes(frames, &vals[1])?;
+                    path_components(&lhs) == path_components(&rhs)
+                } else {
+                    self.values_equal(frames, &vals[0], &vals[1])?
+                };
                 Ok(Value::Bool(if kind == Builtin::PartialEqNe {
                     !eq
                 } else {
@@ -11291,6 +11313,27 @@ impl<'a> Interpreter<'a> {
 
     /// The bytes of a path argument: a path value is a fat
     /// pointer over the path's bytes (or a reference to one).
+    /// The byte string a `PartialEq` operand for a path type
+    /// denotes: the fat-pointer form reads through
+    /// [`Self::path_bytes`]; an owned `PathBuf` value (a
+    /// one-field aggregate chain around the string) reads
+    /// through [`Self::os_str_bytes`].
+    fn path_cmp_bytes(&self, frames: &[Frame], value: &Value) -> InterpResult<Vec<u8>> {
+        if let Ok(bytes) = self.path_bytes(frames, value) {
+            return Ok(bytes);
+        }
+        // An owned path value may be stored in the aggregate
+        // shapes `string_aggregate_bytes` recognises (a wrapper
+        // chain around a byte-element aggregate, as the
+        // `current_exe` model's `PathBuf` is stored).
+        if let Ok(resolved) = self.resolve_value(frames, value) {
+            if let Some(bytes) = string_aggregate_bytes(&resolved) {
+                return Ok(bytes);
+            }
+        }
+        self.os_str_bytes(frames, value)
+    }
+
     fn path_bytes(&self, frames: &[Frame], value: &Value) -> InterpResult<Vec<u8>> {
         match value {
             Value::Str(text) => Ok(text.clone().into_bytes()),
@@ -14033,6 +14076,46 @@ fn command_handle_id(value: &Value) -> Option<u64> {
 /// `OsString` around its buffer) peel to their field, and the
 /// innermost element list (a `Vec<u8>` value) is the byte
 /// string itself. `None` for any other shape.
+/// One parsed path component, in std's `components` parsing
+/// on Unix: a root directory, a leading current-directory
+/// marker, a parent reference, or a normal name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PathComponent<'a> {
+    RootDir,
+    CurDir,
+    ParentDir,
+    Normal(&'a [u8]),
+}
+
+/// Parse path bytes into the component sequence std's
+/// `Path::components` yields (and its `PartialEq` compares):
+/// a leading run of separators is one root component,
+/// repeated and trailing separators are dropped, an interior
+/// `.` component is dropped, and a leading `.` component of
+/// a relative path is the current-directory component.
+fn path_components(bytes: &[u8]) -> Vec<PathComponent<'_>> {
+    let mut comps = Vec::new();
+    let mut rest = bytes;
+    if rest.first() == Some(&b'/') {
+        comps.push(PathComponent::RootDir);
+        let run = rest.iter().take_while(|b| **b == b'/').count();
+        rest = &rest[run..];
+    }
+    let has_root = !comps.is_empty();
+    let mut first = true;
+    for piece in rest.split(|b| *b == b'/') {
+        match piece {
+            [] => {}
+            [b'.'] if first && !has_root => comps.push(PathComponent::CurDir),
+            [b'.'] => {}
+            [b'.', b'.'] => comps.push(PathComponent::ParentDir),
+            name => comps.push(PathComponent::Normal(name)),
+        }
+        first = false;
+    }
+    comps
+}
+
 fn string_aggregate_bytes(value: &Value) -> Option<Vec<u8>> {
     match value {
         Value::Str(s) => Some(s.clone().into_bytes()),

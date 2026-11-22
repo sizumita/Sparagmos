@@ -14647,3 +14647,106 @@ fn run_mode_static_uninit_scalar_and_struct_field() {
         "the scalar static and the struct field array must both read back; stderr={stderr}"
     );
 }
+
+const RAW_PARTS_REBUILD_SRC: &str = r#"
+fn main() {
+    let s: &[u8] = &[7, 8, 9];
+    let sp = s.as_ptr();
+    let sr = unsafe { std::slice::from_raw_parts(sp, 3) };
+    println!("rebuild: {} {} {}", sr[0], sr[1], sr[2]);
+    let sr2 = unsafe { std::slice::from_raw_parts(sp.add(1), 2) };
+    println!("rebuild-off: {} {}", sr2[0], sr2[1]);
+    let a: [u8; 4] = [10, 20, 30, 40];
+    let ap = a.as_ptr();
+    let ar = unsafe { std::slice::from_raw_parts(ap, 4) };
+    println!("arr rebuild: {} {} {} {}", ar[0], ar[1], ar[2], ar[3]);
+    let mut b: [u8; 4] = [0, 0, 0, 0];
+    {
+        let p = b.as_mut_ptr();
+        let w = unsafe { std::slice::from_raw_parts_mut(p.add(1), 2) };
+        w[0] = 7;
+        w[1] = 9;
+    }
+    println!("wback {} {} {} {}", b[0], b[1], b[2], b[3]);
+    // A row of a matrix reached through an element pointer is
+    // the element itself, not a window over the outer array.
+    let m: [[u8; 3]; 2] = [[1, 2, 3], [4, 5, 6]];
+    let row: &[u8] = &m[1];
+    println!("row {} {} {} len {}", row[0], row[1], row[2], row.len());
+}
+"#;
+
+#[test]
+fn run_mode_raw_parts_rebuilt_slice_reads() {
+    run_ok(
+        "raw-parts-rebuild",
+        RAW_PARTS_REBUILD_SRC,
+        "rebuild: 7 8 9\nrebuild-off: 8 9\narr rebuild: 10 20 30 40\nwback 0 7 9 0\nrow 4 5 6 len 3\n",
+    );
+}
+
+const PATH_COMPONENT_EQ_SRC: &str = r#"
+use std::path::Path;
+fn e(a: &str, b: &str) -> bool {
+    Path::new(a) == Path::new(b)
+}
+fn main() {
+    println!("eq1 {}", e("a//b", "a/b"));
+    println!("eq2 {}", e("a/", "a"));
+    println!("eq3 {}", e("a/./b", "a/b"));
+    println!("eq4 {}", e("./a", "a"));
+    println!("eq5 {}", e("/a", "a"));
+    println!("eq6 {}", e("", "."));
+    println!("eq7 {}", e("../a", "../a"));
+    println!("eq8 {}", e("//a", "/a"));
+    println!("eq9 {}", e("a/.", "a"));
+    println!("eq10 {}", e("a/../b", "a/b"));
+    println!("eq11 {}", e("/", "//"));
+    println!("eq12 {}", e("a", "a/"));
+    println!("cross {}", Path::new("a/b") == "a//b");
+    println!("cross2 {}", "a//b" == Path::new("a/b"));
+    println!("ne {}", Path::new("a//b") != Path::new("a/b"));
+}
+"#;
+
+#[test]
+fn run_mode_path_component_equality() {
+    run_ok(
+        "path-component-eq",
+        PATH_COMPONENT_EQ_SRC,
+        "eq1 true\neq2 true\neq3 true\neq4 false\neq5 false\neq6 false\neq7 true\neq8 true\neq9 true\neq10 false\neq11 true\neq12 true\ncross true\ncross2 true\nne false\n",
+    );
+}
+
+const PATH_HASH_EQ_SRC: &str = r#"
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::path::Path;
+fn hp(p: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    Path::new(p).hash(&mut h);
+    h.finish()
+}
+fn main() {
+    println!("h1 {}", hp("a//b") == hp("a/b"));
+    println!("h2 {}", hp("a/") == hp("a"));
+    println!("h3 {}", hp("a/./b") == hp("a/b"));
+    println!("h4 {}", hp("a/b") == hp("a/b"));
+    println!("h5 {}", hp("/a/b") == hp("/a/b"));
+    println!("h6 {}", hp("x") != hp("y"));
+    // The key path a hash map exercises: the same key spelled
+    // two ways must hash and compare equal.
+    let stored = Path::new("some/key");
+    let looked_up = Path::new("some//key");
+    println!("key {}", stored == looked_up && hp("some/key") == hp("some//key"));
+}
+"#;
+
+#[test]
+fn run_mode_path_hash_eq_consistency() {
+    run_ok(
+        "path-hash-eq",
+        PATH_HASH_EQ_SRC,
+        "h1 true\nh2 true\nh3 true\nh4 true\nh5 true\nh6 true\nkey true\n",
+    );
+}
