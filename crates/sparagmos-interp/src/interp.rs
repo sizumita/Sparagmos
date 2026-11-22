@@ -2682,7 +2682,7 @@ impl<'a> Interpreter<'a> {
                             // projected lands here with an untyped plan.
                             Some(Value::Enum { fields, .. }) if fields.is_empty() => {}
                             Some(Value::Enum { .. }) | Some(Value::Coroutine { .. }) => {
-                                return Err(InterpError::UnsupportedTerminator {
+                                    return Err(InterpError::UnsupportedTerminator {
                                     kind: "Drop".to_string(),
                                 });
                             }
@@ -2792,10 +2792,12 @@ impl<'a> Interpreter<'a> {
                         let Some(value) = self.read_at(frames, &active.root, &path)? else {
                             continue;
                         };
-                        let variant = match value {
-                            Value::Enum { variant, .. } => variant,
-                            Value::Coroutine { variant, .. } => variant,
-                            Value::Tuple(_) => 0,
+                        let (variant, stored_fields) = match &value {
+                            Value::Enum { variant, .. } => (*variant, None),
+                            Value::Coroutine {
+                                variant, fields, ..
+                            } => (*variant, Some(fields.len())),
+                            Value::Tuple(_) => (0, None),
                             other => {
                                 return Err(InterpError::type_mismatch(
                                     "drop glue",
@@ -2804,10 +2806,24 @@ impl<'a> Interpreter<'a> {
                                 ));
                             }
                         };
-                        let plan = variants
-                            .get(variant as usize)
-                            .cloned()
-                            .unwrap_or(P::Unknown);
+                        let plan = match variants.get(variant as usize) {
+                            Some(plan) => plan.clone(),
+                            None => match stored_fields {
+                                // A coroutine state the conversion
+                                // collected no field evidence for: a
+                                // state whose fields are saved or
+                                // resumed is projected by the body and
+                                // so evidenced, so an unevidenced
+                                // state holds only what the value
+                                // itself shows - judge each stored
+                                // field by its own shape.
+                                Some(count) => P::Fields {
+                                    fields: vec![P::Untyped; count],
+                                    complete: false,
+                                },
+                                None => P::Unknown,
+                            },
+                        };
                         active.work.push((path, plan));
                     }
                     P::RefCellRelease { mutable } => {
@@ -2930,8 +2946,14 @@ impl<'a> Interpreter<'a> {
                     P::Dynamic => {
                         // A moved-out / never-written place holds
                         // nothing to drop, as with rustc's drop flags.
+                        // The value is judged like an unaccounted
+                        // `dyn` payload: the one-field aggregate
+                        // wrappings the interpreter's own models
+                        // build are stripped before the shape
+                        // judgment, whose destructor-hiding shapes
+                        // stay explicit errors.
                         if let Some(value) = self.read_at(frames, &active.root, &path)? {
-                            drop_dyn_value(&value)?;
+                            drop_unaccounted_dyn(&value)?;
                         }
                     }
                     P::Dyn => {
@@ -8480,6 +8502,13 @@ pub(crate) fn eval_cast(v: &Value, ty: &Ty) -> InterpResult<Value> {
 fn drop_unaccounted_dyn(value: &Value) -> InterpResult<()> {
     match value {
         Value::DynRef { base, .. } => drop_unaccounted_dyn(base),
+        // One-field aggregates nest: a modelled smart-pointer or
+        // handle value wraps its payload in one aggregate per
+        // layer (a  around its counted handle around the
+        // wake object, whose own one-field structs wrap theirs).
+        // Strip the chain; the payload itself is still judged by
+        // , whose shapes that can hide a
+        // destructor stay explicit errors.
         Value::Enum { fields, .. } if fields.len() == 1 => {
             drop_unaccounted_dyn(&fields[0])
         }
