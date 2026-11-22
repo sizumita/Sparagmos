@@ -2645,6 +2645,19 @@ impl Converter {
             }
             TyKind::RigidTy(RigidTy::Slice(elem)) => {
                 let count = read_uint_at(alloc, offset + PTR_SIZE, PTR_SIZE)? as usize;
+                // A slice reference into a static's storage keeps
+                // the static's identity, as a thin static reference
+                // does: a detached snapshot of the elements would
+                // make writes through a mutable slice static
+                // (`static mut S: &mut [T] = &mut [..]`) land in a
+                // copy no later read observes.
+                if let Some(def) = &static_def {
+                    if let Some(c) = self.decode_static_slice_ref(
+                        def, &elem, &target, target_off, count, depth,
+                    ) {
+                        return Some(c);
+                    }
+                }
                 if matches!(elem.kind(), TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8))) {
                     let raw = target.raw_bytes().ok()?;
                     let bytes = raw.get(target_off..target_off + count)?;
@@ -2714,6 +2727,7 @@ impl Converter {
                 def: def_id,
                 value: Box::new(seed),
                 projection: Vec::new(),
+                len: None,
             });
         };
         let projection = self.static_offset_path(&static_ty, target_off, inner, depth)?;
@@ -2722,6 +2736,75 @@ impl Converter {
             def: def_id,
             value: Box::new(seed),
             projection,
+            len: None,
+        })
+    }
+
+    /// Decode a fat slice reference whose provenance names the
+    /// static `def`, as a [`sm::ConstValue::StaticRef`] carrying
+    /// the slice length: the evaluated value is a fat reference
+    /// over the static reference, in the shape the runtime
+    /// unsizing cast builds, so writes through it reach the
+    /// static's storage. The pointee must be the static's whole
+    /// array storage — the shape a promoted array in a static
+    /// initializer takes (`static mut S: &mut [T] = &mut [..]`),
+    /// and a reference to a whole array static unsized to a
+    /// slice. Anything else (an interior subslice, an array
+    /// field inside a larger static) returns `None`, and the
+    /// caller falls back to a snapshot of the elements: reads
+    /// stay correct, writes are rejected like any other
+    /// constant-aggregate write.
+    fn decode_static_slice_ref(
+        &mut self,
+        def: &mir::mono::StaticDef,
+        elem: &rustc_public::ty::Ty,
+        alloc: &Allocation,
+        target_off: usize,
+        count: usize,
+        depth: usize,
+    ) -> Option<sm::ConstValue> {
+        if target_off != 0 {
+            return None;
+        }
+        let def_id = self.crate_def_id(def);
+        let seed = match self.static_tys.get(&def_id).cloned() {
+            Some(static_ty) => {
+                // The static's declared type must be the array
+                // the slice covers whole: an unsizing of the
+                // static itself.
+                let TyKind::RigidTy(RigidTy::Array(arr_elem, arr_len)) =
+                    static_ty.kind()
+                else {
+                    return None;
+                };
+                if arr_elem != *elem
+                    || arr_len.eval_target_usize().ok()? != count as u64
+                {
+                    return None;
+                }
+                self.decode_const(&static_ty, alloc, 0, depth + 1)?
+            }
+            None => {
+                // An anonymous promoted static: the target
+                // allocation is the array itself, decoded element
+                // by element exactly as the array arm of
+                // `decode_const` decodes an array value.
+                let stride = elem.layout().ok()?.shape().size.bytes();
+                if stride == 0 && count > 0 {
+                    return None;
+                }
+                let mut elems = Vec::new();
+                for i in 0..count {
+                    elems.push(self.decode_const(elem, alloc, i * stride, depth + 1)?);
+                }
+                sm::ConstValue::Tuple(elems)
+            }
+        };
+        Some(sm::ConstValue::StaticRef {
+            def: def_id,
+            value: Box::new(seed),
+            projection: Vec::new(),
+            len: Some(count as u64),
         })
     }
 

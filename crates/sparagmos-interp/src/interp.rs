@@ -6660,12 +6660,26 @@ impl<'a> Interpreter<'a> {
                 name,
                 value,
                 projection,
+                len,
             } => {
                 self.ensure_static(name, value)?;
-                Value::Ref(RefTarget::Static {
+                let base = Value::Ref(RefTarget::Static {
                     name: name.clone(),
                     projection: projection.clone(),
-                })
+                });
+                // A fat static reference is the static reference
+                // plus its element count, in the same shape the
+                // runtime unsizing cast builds: dereferencing it
+                // reaches the static's storage, so writes through
+                // a mutable slice static land in the one storage
+                // every later read observes.
+                match len {
+                    Some(len) => Value::FatRef {
+                        base: Box::new(base),
+                        len: *len,
+                    },
+                    None => base,
+                }
             }
             Constant::SliceVal(elems) => {
                 let elems = elems

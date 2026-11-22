@@ -2810,7 +2810,12 @@ impl<'a> Converter<'a> {
                 };
                 ir::Constant::Ref(Box::new(self.convert_const_value(inner, inner_ctx)?))
             }
-            mir::ConstValue::StaticRef { def, value, projection } => {
+            mir::ConstValue::StaticRef {
+                def,
+                value,
+                projection,
+                len,
+            } => {
                 // The seed is the static's full initializer, typed
                 // by the pointee context exactly as for a plain
                 // reference constant; the reference itself names the
@@ -2829,6 +2834,7 @@ impl<'a> Converter<'a> {
                         .iter()
                         .map(|e| self.convert_ref_proj(e))
                         .collect::<Result<_, _>>()?,
+                    len: len.map(u128::from),
                 }
             }
             mir::ConstValue::SliceVal(elems) => ir::Constant::SliceVal(

@@ -976,6 +976,10 @@ impl Conv {
                     .iter()
                     .map(Self::place_elem)
                     .collect::<Result<_, _>>()?,
+                len: match as_opt(field(f, "len")?)? {
+                    Some(n) => Some(atom_parse(n, "slice length")?),
+                    None => None,
+                },
             },
             (other, _) => return unsupported("ConstValue", other),
         })

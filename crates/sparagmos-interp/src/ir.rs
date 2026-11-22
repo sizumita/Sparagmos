@@ -363,6 +363,11 @@ pub enum Constant {
         /// The path from the static's base to the pointee (empty
         /// for a reference to the static itself).
         projection: Vec<RefProj>,
+        /// The element count when the reference is a fat slice
+        /// reference over the static's array storage: evaluation
+        /// yields a fat reference over the static reference.
+        /// `None` for a thin reference.
+        len: Option<u128>,
     },
     /// A slice constant with decoded (non-byte) elements.
     SliceVal(Vec<Constant>),

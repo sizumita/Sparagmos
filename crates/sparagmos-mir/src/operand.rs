@@ -58,7 +58,7 @@ pub enum ConstValue {
     /// dereference is an explicit error in the interpreter (the
     /// `RefTarget::Null` value).
     NullPtr,
-    /// A thin reference (or raw pointer) to a `static` item. The
+    /// A reference (or raw pointer) to a `static` item. The
     /// pointee is the static's own storage, identified by the
     /// static's `DefId`; `value` is the decoded initializer — the
     /// value the storage holds before the program runs. Unlike
@@ -78,6 +78,12 @@ pub enum ConstValue {
         /// seeding the store with an interior value would corrupt
         /// every other access to the same static.
         projection: Vec<PlaceElem>,
+        /// The element count when the reference is a fat slice
+        /// reference (`&[T]` over the static's array storage, the
+        /// shape `static mut S: &mut [T] = &mut [...]` produces):
+        /// the evaluated value is a fat reference over the static
+        /// reference. `None` for a thin reference.
+        len: Option<u64>,
     },
     /// A fat reference to decoded elements: a slice constant whose
     /// elements are not plain bytes.
