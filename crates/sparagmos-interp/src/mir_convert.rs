@@ -1042,6 +1042,19 @@ enum UniqueValue {
 /// in this model is exactly its target, so transmutes between
 /// thin pointer types — and between a thin pointer and a
 /// transparent wrapper around one — reinterpret nothing.
+/// Whether a scalar shape's leaf is an integer: the shape
+/// flattens to an integer bit pattern (transparent wrapper
+/// chains over an integer included).
+fn scalar_leaf_is_int(shape: &ir::ScalarShape) -> bool {
+    match shape {
+        ir::ScalarShape::Int { .. } => true,
+        ir::ScalarShape::AdtField { inner, .. } => {
+            scalar_leaf_is_int(inner)
+        }
+        _ => false,
+    }
+}
+
 fn is_thin_ptr_ty(ty: &mir::Ty) -> bool {
     match ty {
         mir::Ty::RawPtr(pointee, _) | mir::Ty::Ref(_, pointee, _) => !matches!(
@@ -3312,7 +3325,25 @@ impl<'a> Converter<'a> {
         fn unsupported() -> ir::Rvalue {
             ir::Rvalue::Unsupported("Cast Transmute".to_string())
         }
-        let src = self.operand_place_ty(body, operand);
+        // A constant operand carries no place type. When the
+        // constant is a decoded ADT value, the type its
+        // producer recorded for it stands in for the place
+        // type: a const-propagated `core` body holds
+        // transmutes of folded constants whose reading
+        // depends on the source type, which the value's
+        // structure alone does not name (see the driver's
+        // `constant_adt_ty`). A scalar constant keeps the
+        // `None` reading: its shape comes from the converted
+        // constant itself (`constant_scalar_shape`), which is
+        // the form the value actually carries -- a `1u8`
+        // transmuted to `bool` arrives as a bool constant,
+        // not as the integer its literal spelled.
+        let src = self
+            .operand_place_ty(body, operand)
+            .or_else(|| match constant_recorded_ty(operand) {
+                Some(t @ mir::Ty::Adt(..)) => Some(t),
+                _ => None,
+            });
         // A byte-string constant in pointer position carries no
         // place type: const propagation replaced the reference to
         // the static byte string with the allocation's bytes
@@ -3463,6 +3494,38 @@ impl<'a> Converter<'a> {
                     self.wrap_payload_rvalue(v, src_ty, tdef, targs)
                 {
                     return r;
+                }
+            }
+        }
+        // An ADT carrying an integer scalar (a
+        // `NonZero<usize>`, or a transparent wrapper chain
+        // over an integer) transmuted into a transparent
+        // pointer wrapper: the flattened integer is the
+        // payload pointer's address -- the transmute
+        // `NonNull::without_provenance` performs. A
+        // fieldless-enum source (or a wrapper around one)
+        // does not take this arm: its shape's leaf is the
+        // enum itself, and the dedicated arms below serve it.
+        if let (Some(mir::Ty::Adt(def, args)), mir::Ty::Adt(tdef, targs)) =
+            (&src, target)
+        {
+            if let Some(shape) = self.wrapper_shape(tdef, targs) {
+                if let Some(from) =
+                    self.scalar_shape(&mir::Ty::Adt(*def, args.clone()), 0)
+                {
+                    if from.bits() == 64 && scalar_leaf_is_int(&from) {
+                        return ir::Rvalue::ScalarToPtrWrapped {
+                            operand: v.clone(),
+                            from,
+                            payload_index: shape.payload_index as u32,
+                            field_count: shape.field_count,
+                            fill: shape
+                                .fill
+                                .iter()
+                                .map(|(i, c)| (*i as u32, c.clone()))
+                                .collect(),
+                        };
+                    }
                 }
             }
         }
@@ -4254,7 +4317,12 @@ impl<'a> Converter<'a> {
                 }
                 let shape = self.adt_shapes.get(def)?;
                 if shape.variants.len() != 1 {
-                    return self.niche_enum_shape(def, args, shape, depth);
+                    if let Some(s) =
+                        self.niche_enum_shape(def, args, shape, depth)
+                    {
+                        return Some(s);
+                    }
+                    return self.fieldless_enum_shape(def);
                 }
                 let fields = self.instantiated_field_tys(def, args, 0)?;
                 let mut payload: Option<(u32, ir::ScalarShape)> = None;
@@ -4339,6 +4407,40 @@ impl<'a> Converter<'a> {
             untagged_variant: niche.untagged_variant,
             niche_variants: niche.niche_variants,
             niche_start: niche.niche_start,
+        })
+    }
+
+    /// The scalar shape of a fieldless enum: the whole
+    /// value is its discriminant, held in a tag whose width
+    /// is the smallest standard integer width covering the
+    /// discriminant range (the width rule the compiler's
+    /// own tag selection follows for an enum without an
+    /// explicit `repr`). An enum carrying an explicit wider
+    /// `repr` is assigned the smaller inferred width, so a
+    /// transmute pair against the wider integer does not
+    /// take the generic path and stays with the dedicated
+    /// discriminant arms.
+    fn fieldless_enum_shape(
+        &self,
+        def: &mir::AdtDefId,
+    ) -> Option<ir::ScalarShape> {
+        let discriminants = self.fieldless_enum_discriminants(def)?;
+        if discriminants.is_empty() {
+            return None;
+        }
+        let lo = *discriminants.iter().min().expect("non-empty");
+        let hi = *discriminants.iter().max().expect("non-empty");
+        let bits = [8u32, 16, 32, 64, 128].into_iter().find(|w| {
+            if *w == 128 {
+                return true;
+            }
+            let w = *w;
+            (lo >= 0 && (hi as u128) < (1u128 << w))
+                || (lo >= -(1i128 << (w - 1)) && hi < (1i128 << (w - 1)))
+        })?;
+        Some(ir::ScalarShape::FieldlessEnum {
+            bits,
+            discriminants,
         })
     }
 

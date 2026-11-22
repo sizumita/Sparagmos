@@ -518,6 +518,17 @@ pub enum ScalarShape {
         niche_variants: (u32, u32),
         niche_start: u128,
     },
+    /// A fieldless enum: the whole bit pattern is the
+    /// variant's discriminant, held in a tag of `bits` width.
+    /// Flattening yields the discriminant's bit pattern in
+    /// that width; construction selects the variant whose
+    /// discriminant's pattern matches and rejects a pattern
+    /// no variant has (the same contract as the
+    /// integer-to-enum transmute).
+    FieldlessEnum {
+        bits: u32,
+        discriminants: Vec<i128>,
+    },
 }
 
 impl ScalarShape {
@@ -531,6 +542,7 @@ impl ScalarShape {
             ScalarShape::Array(elem, n) => elem.bits() * (*n as u32),
             ScalarShape::AdtField { inner, .. } => inner.bits(),
             ScalarShape::NicheEnum { inner, .. } => inner.bits(),
+            ScalarShape::FieldlessEnum { bits, .. } => *bits,
         }
     }
 }
@@ -668,6 +680,22 @@ pub enum Rvalue {
     /// zero-sized and take their unique values.
     IntToPtrWrapped {
         operand: Operand,
+        payload_index: u32,
+        field_count: usize,
+        fill: Vec<(u32, Constant)>,
+    },
+    /// A `Transmute` cast from an ADT value whose scalar
+    /// shape bottoms out at an integer (a `NonZero<usize>`,
+    /// or a transparent wrapper chain over an integer) to a
+    /// transparent pointer wrapper (`NonNull`, `Unique`):
+    /// the flattened integer is the payload pointer's
+    /// address -- the transmute `NonNull::without_provenance`
+    /// performs. `from` is the source value's scalar shape
+    /// (its flattening is the address); the remaining fields
+    /// are as in [`Rvalue::IntToPtrWrapped`].
+    ScalarToPtrWrapped {
+        operand: Operand,
+        from: ScalarShape,
         payload_index: u32,
         field_count: usize,
         fill: Vec<(u32, Constant)>,

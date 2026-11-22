@@ -7203,6 +7203,30 @@ impl<'a> Interpreter<'a> {
             // read site, as the model has no code bytes.
             | (Some(Ty::Ref(_)), Value::FnPtr(_))
             | (Some(Ty::Ref(_)), Value::Closure { .. }) => Ok(value),
+            // A niche-encoded enum over a pointer payload stored
+            // into a pointer place: the enum's representation IS
+            // the payload pointer -- the ABI fact the
+            // transmuted-fn-pointer return relies on (a callee
+            // whose declared return type is `Option<&T>` produces
+            // the payload-variant aggregate, and a caller whose
+            // signature was transmuted to return `&T` stores the
+            // result into a reference place). The one field is
+            // the pointer itself, the same reading a one-field
+            // wrapper's store unwraps to its scalar above. A
+            // fieldless (niche) variant value carries no pointer
+            // to read, so it stays a mismatch rather than
+            // fabricating one.
+            (Some(Ty::Ref(_)), Value::Enum { fields, .. })
+                if fields.len() == 1
+                    && matches!(
+                        fields[0],
+                        Value::Ref(_)
+                            | Value::FatRef { .. }
+                            | Value::DynRef { .. }
+                    ) =>
+            {
+                Ok(fields[0].clone())
+            }
             (Some(Ty::Str), Value::Str(_)) => Ok(value),
             (Some(Ty::Array(_, n)), Value::Tuple(items)) if items.len() as u64 == *n => Ok(value),
             (Some(Ty::Array(elem, n)), Value::Bytes(b))
@@ -7912,6 +7936,20 @@ impl<'a> Interpreter<'a> {
                     value.kind_name(),
                 )),
             },
+            (
+                ScalarShape::FieldlessEnum {
+                    bits,
+                    discriminants,
+                },
+                Value::Enum { variant, .. },
+            ) => match discriminants.get(*variant as usize) {
+                Some(d) => Ok((*d as u128) & bit_mask(*bits)),
+                None => Err(InterpError::type_mismatch(
+                    "transmute",
+                    "a variant of the fieldless enum",
+                    format!("variant {variant}"),
+                )),
+            },
             (_, other) => Err(InterpError::type_mismatch(
                 "transmute",
                 "a value of the source shape",
@@ -7995,6 +8033,26 @@ impl<'a> Interpreter<'a> {
                         variant: *untagged_variant,
                         fields: vec![payload],
                     })
+                }
+            }
+            ScalarShape::FieldlessEnum {
+                bits: width,
+                discriminants,
+            } => {
+                let pattern = bits & bit_mask(*width);
+                match discriminants
+                    .iter()
+                    .position(|d| (*d as u128) & bit_mask(*width) == pattern)
+                {
+                    Some(variant) => Ok(Value::Enum {
+                        variant: variant as u32,
+                        fields: Vec::new(),
+                    }),
+                    None => Err(InterpError::type_mismatch(
+                        "transmute to a fieldless enum",
+                        "a discriminant value of the target enum",
+                        format!("bit pattern {pattern:#x}"),
+                    )),
                 }
             }
         }
@@ -8346,6 +8404,17 @@ impl<'a> Interpreter<'a> {
                         ))
                     }
                 };
+                self.ptr_wrapped_value(addr, *payload_index, *field_count, fill)
+            }
+            Rvalue::ScalarToPtrWrapped {
+                operand,
+                from,
+                payload_index,
+                field_count,
+                fill,
+            } => {
+                let value = self.eval_operand(frames, body, operand)?;
+                let addr = self.flatten_scalar(&value, from)? as u64;
                 self.ptr_wrapped_value(addr, *payload_index, *field_count, fill)
             }
             Rvalue::EnumToPtrWrapped {
