@@ -134,9 +134,16 @@ DRIVER_TIMEOUT = 60
 # which supplied e.g. the `lib` shape a dropped
 # `[lib] compile-flags: --crate-type lib` would have named).
 DIRECTIVE_RE = re.compile(
-    r"^\s*//@\s*(?:\[([^\]]+)\])?\s*([a-zA-Z][a-zA-Z0-9-]*)"
+    r"^\s*//@\s*(?:\[([^\]]+)\])?\s*([a-zA-Z][a-zA-Z0-9_-]*)"
     r"(?:\s*:\s*(.*?)|\s*\((.*)\)|\s+.*)?\s*$")
 
+# The name class includes `_`: a directive name in compiletest
+# includes its only-/ignore- suffix, and suffixes contain underscores
+# (the x86_64 arch name, target triples such as
+# x86_64-unknown-linux-gnu, rustc_abi-* conditions). Without it,
+# `//@ only-x86_64-unknown-linux-gnu` and `//@ ignore-x86_64` lines
+# failed to match and were silently dropped.
+#
 # The last alternative above is a trailing remark: compiletest
 # ends the directive name at the first colon or space and treats
 # the rest of the line as a remark, so a line such as
@@ -609,6 +616,10 @@ HOST_TRUE_CFGS = {
     "target_family=\"unix\"", "target_env=\"gnu\"",
     "target_vendor=\"unknown\"", "target_pointer_width=\"64\"",
     "target_endian=\"little\"", "64bit", "gnu",
+    # compiletest also registers the target's binary format as a
+    # condition (directives/cfg.rs: `elf` when binary_format is
+    # "elf"); x86_64-unknown-linux-gnu binaries are ELF.
+    "elf",
 }
 
 # ---------------------------------------------------------------------------

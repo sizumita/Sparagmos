@@ -112,6 +112,36 @@ class ApplicabilityTests(unittest.TestCase):
         status, _ = run.applicability(header("//@ only-linux\n"))
         self.assertEqual(status, "applicable")
 
+    def test_only_lines_are_conjunctive(self):
+        # compiletest decides each only-* line on its own: one
+        # non-matching line ignores the test even if another matches.
+        h = header("//@ only-linux\n//@ only-windows\n")
+        status, why = run.applicability(h)
+        self.assertEqual(status, "out-of-environment")
+        self.assertIn("windows", why)
+
+    def test_only_elf_applicable(self):
+        # The host target's binary format is ELF, and compiletest
+        # registers an `elf` condition from it.
+        status, _ = run.applicability(header("//@ only-elf\n"))
+        self.assertEqual(status, "applicable")
+
+    def test_only_host_triple_applicable(self):
+        # Directive names include underscores (target triples);
+        # the line must be parsed, not dropped.
+        status, _ = run.applicability(
+            header("//@ only-x86_64-unknown-linux-gnu\n"))
+        self.assertEqual(status, "applicable")
+
+    def test_only_x86_64_applicable(self):
+        status, _ = run.applicability(header("//@ only-x86_64\n"))
+        self.assertEqual(status, "applicable")
+
+    def test_ignore_x86_64_out_of_environment(self):
+        status, why = run.applicability(header("//@ ignore-x86_64\n"))
+        self.assertEqual(status, "out-of-environment")
+        self.assertIn("ignore-x86_64", why)
+
     def test_cfg_expr(self):
         h = header('//@ ignore-[target_os = "linux"]\n'.replace(
             "ignore-[", "ignore-cfg(").replace("]", ")"))
