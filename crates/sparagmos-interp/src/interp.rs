@@ -1793,6 +1793,7 @@ impl<'a> Interpreter<'a> {
         let result = self.exec_builtin_values(
             frames,
             body,
+            &[],
             kind,
             canonical,
             generic_args,
@@ -2186,6 +2187,7 @@ impl<'a> Interpreter<'a> {
                 return self.exec_builtin_values(
                     frames,
                     body,
+                    &[],
                     kind,
                     &canonical,
                     &generic_args,
@@ -4078,7 +4080,22 @@ impl<'a> Interpreter<'a> {
                 let src_value = self.eval_operand(frames, body, src)?;
                 let dst_value = self.eval_operand(frames, body, dst)?;
                 let count_value = self.eval_operand(frames, body, count)?;
-                self.exec_copy_nonoverlapping(frames, src_value, dst_value, count_value)
+                // The copy's element type is the pointee of the
+                // pointer operands, when they are bare locals with a
+                // declared pointer type. The intrinsic is generic
+                // over the element, and the copy needs the type to
+                // tell "one element that is itself an aggregate"
+                // (an array element, a struct element) from "an
+                // aggregate of elements".
+                let elem = operand_pointee_ty(body, src)
+                    .or_else(|| operand_pointee_ty(body, dst));
+                self.exec_copy_nonoverlapping(
+                    frames,
+                    src_value,
+                    dst_value,
+                    count_value,
+                    elem.as_ref(),
+                )
             }
             StatementKind::Unsupported(kind) => Err(InterpError::UnsupportedStatement {
                 kind: kind.clone(),
@@ -4095,12 +4112,19 @@ impl<'a> Interpreter<'a> {
     /// exact even if the ranges overlapped (which the
     /// non-overlapping contract forbids, and which makes the shared
     /// implementation a correct `memmove` for `ptr::copy`).
+    ///
+    /// `elem` is the copy's element type when the call site knows
+    /// it (both call paths take it from the pointer operands'
+    /// declared types); with `None` the copy reads the element
+    /// boundary off the values' shapes alone, as it did before the
+    /// type was threaded through.
     pub(crate) fn exec_copy_nonoverlapping(
         &self,
         frames: &mut Vec<Frame>,
         src_value: Value,
         dst_value: Value,
         count_value: Value,
+        elem: Option<&Ty>,
     ) -> InterpResult<()> {
                 let n = match count_value {
                     Value::Uint(n) => usize::try_from(n).map_err(|_| {
@@ -4143,8 +4167,31 @@ impl<'a> Interpreter<'a> {
                     )
                 };
                 let src_base = self.read_resolved(frames, &src_target)?;
-                let elems: Vec<Value> = if n == 1 && !aggregate(&src_base) {
-                    vec![src_base]
+                // The elements are values of the element type. When
+                // that type is known and the value found at the
+                // source IS one element -- possibly inside a
+                // one-field wrapper, since a pointer into a
+                // transparent wrapper names the wrapper place, whose
+                // only field is the pointee at that address -- the
+                // first element is that value, not the first lane
+                // of it. (This is the shape `Simd::load`'s copy
+                // has: the element is an array, and the source is
+                // the array itself.) Without a known element type
+                // the shape rule applies: a non-aggregate source is
+                // one element, an aggregate source is indexed.
+                let src_single = match elem {
+                    Some(ty) => {
+                        value_fits_ty(crate::builtins::unwrap_wrapper(&src_base), ty)
+                    }
+                    None => n == 1 && !aggregate(&src_base),
+                };
+                let elems: Vec<Value> = if src_single {
+                    let mut elems = Vec::with_capacity(n);
+                    elems.push(crate::builtins::unwrap_wrapper(&src_base).clone());
+                    for i in 1..n {
+                        elems.push(self.read_seq_at(frames, &src_target, i)?);
+                    }
+                    elems
                 } else {
                     let mut elems = Vec::with_capacity(n);
                     for i in 0..n {
@@ -4152,16 +4199,68 @@ impl<'a> Interpreter<'a> {
                     }
                     elems
                 };
-                // An unreadable (not yet written) destination is a
+                // The destination, mirroring the source: with a
+                // known element type it denotes one element when
+                // the value found there is not an aggregate of
+                // elements (a wrapper place being filled, a scalar
+                // place, an element-shaped aggregate itself). An
+                // unreadable (not yet written) destination is a
                 // buffer being filled: the indexed path is the one
                 // that can create its elements.
-                let dst_aggregate = self
-                    .read_resolved(frames, &dst_target)
-                    .map(|v| aggregate(&v))
-                    .unwrap_or(true);
-                if n == 1 && !dst_aggregate {
-                    let value = elems.into_iter().next().expect("one element");
-                    self.write_resolved(frames, &dst_target, value)?;
+                let dst_current = self.read_resolved(frames, &dst_target).ok();
+                let dst_single = match elem {
+                    Some(ty) => match &dst_current {
+                        Some(cur) => {
+                            !aggregate(cur)
+                                || value_fits_ty(
+                                    crate::builtins::unwrap_wrapper(cur),
+                                    ty,
+                                )
+                        }
+                        None => false,
+                    },
+                    None => {
+                        let dst_aggregate = dst_current
+                            .as_ref()
+                            .map(|v| aggregate(v))
+                            .unwrap_or(true);
+                        n == 1 && !dst_aggregate
+                    }
+                };
+                if dst_single {
+                    // The destination place's declared type, when
+                    // the target is a whole local of some frame: a
+                    // place whose declared type IS the element type
+                    // holds the element itself, not a wrapper
+                    // around it, so its value is replaced outright;
+                    // any other whole place the pointer names is a
+                    // wrapper whose payload slot the element fills
+                    // (the write-side mirror of `unwrap_wrapper`,
+                    // as atomic stores do).
+                    let dst_place_ty = match &dst_target {
+                        Resolved::Place {
+                            frame_pos,
+                            local,
+                            projection,
+                        } if projection.is_empty() => frames
+                            .get(*frame_pos)
+                            .and_then(|f| self.program.get(&f.func))
+                            .and_then(|b| b.local_ty(Local(*local)))
+                            .cloned(),
+                        _ => None,
+                    };
+                    let mut elems = elems.into_iter();
+                    let first = elems.next().expect("count is nonzero");
+                    let stored = match &dst_current {
+                        Some(cur) if dst_place_ty.as_ref() != elem => {
+                            crate::builtins::rewrap_like(cur, first)
+                        }
+                        _ => first,
+                    };
+                    self.write_resolved(frames, &dst_target, stored)?;
+                    for (i, value) in elems.enumerate() {
+                        self.write_seq_at(frames, &dst_target, i + 1, value)?;
+                    }
                 } else {
                     for (i, value) in elems.into_iter().enumerate() {
                         self.write_seq_at(frames, &dst_target, i, value)?;
@@ -9726,5 +9825,64 @@ fn exec_asm_step(
             };
             asm_write(slots, written, regs, *dst, *dst_mod, result & mask);
         }
+    }
+}
+
+/// The pointee type of a bare-local pointer operand: a reference
+/// or raw-pointer local with no projection, whose declared type
+/// says what it points at. Anything else (a constant, a projected
+/// place, a non-pointer local) has no statically known pointee
+/// here.
+pub(crate) fn operand_pointee_ty(body: &Body, op: &Operand) -> Option<Ty> {
+    let (Operand::Copy(place) | Operand::Move(place)) = op else {
+        return None;
+    };
+    if !place.projection.is_empty() {
+        return None;
+    }
+    match body.local_ty(place.local) {
+        Some(Ty::Ref(inner)) => Some((**inner).clone()),
+        _ => None,
+    }
+}
+
+/// Whether `value` has the shape of a value of type `ty`, for the
+/// shapes the copy machinery must tell apart: scalars directly,
+/// tuples and arrays element by element, ADT values as variant
+/// aggregates, references as resolved pointers. Anything
+/// unrecognised does not fit, so callers fall back to treating
+/// the value by its own shape.
+fn value_fits_ty(value: &Value, ty: &Ty) -> bool {
+    match (value, ty) {
+        (Value::Unit, Ty::Unit) => true,
+        (Value::Bool(_), Ty::Bool) => true,
+        (Value::Int(_), Ty::Int(_)) => true,
+        (Value::Uint(_), Ty::Uint(_)) => true,
+        (Value::Float(_), Ty::Float(_)) => true,
+        (Value::Float128(_), Ty::Float(_)) => true,
+        (Value::Tuple(items), Ty::Tuple(tys)) => {
+            items.len() == tys.len()
+                && items
+                    .iter()
+                    .zip(tys.iter())
+                    .all(|(v, t)| value_fits_ty(v, t))
+        }
+        (Value::Tuple(items), Ty::Array(elem, n)) => {
+            items.len() as u64 == *n
+                && items.iter().all(|v| value_fits_ty(v, elem))
+        }
+        (Value::Bytes(b), Ty::Array(elem, n)) => {
+            matches!(&**elem, Ty::Uint(UintTy::U8)) && b.len() as u64 == *n
+        }
+        (Value::Enum { .. }, Ty::Adt(_)) => true,
+        (Value::Str(_), Ty::Str) => true,
+        (Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. }, Ty::Ref(_)) => {
+            true
+        }
+        (Value::FnPtr(_), Ty::FnPtr) => true,
+        (Value::FnPtr(_), Ty::FnDef(_)) => true,
+        (Value::Closure { .. }, Ty::Closure(..)) => true,
+        (Value::Coroutine { .. }, Ty::Coroutine(_)) => true,
+        _ => false,
     }
 }

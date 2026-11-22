@@ -2850,7 +2850,7 @@ impl<'a> Interpreter<'a> {
             let stamp = vals.pop().expect("two arguments");
             self.note_panic_stamp(stamp);
         }
-        self.exec_builtin_values(frames, body, kind, name, generic_args, vals, cmp_discriminants)
+        self.exec_builtin_values(frames, body, args, kind, name, generic_args, vals, cmp_discriminants)
     }
 
     /// Execute a builtin whose arguments are already evaluated
@@ -2861,6 +2861,7 @@ impl<'a> Interpreter<'a> {
         &mut self,
         frames: &mut Vec<Frame>,
         body: &Body,
+        args: &[Operand],
         kind: Builtin,
         name: &str,
         generic_args: &[String],
@@ -6190,7 +6191,17 @@ impl<'a> Interpreter<'a> {
                 let dst = vals.next().expect("arity checked");
                 let src_v = vals.next().expect("arity checked");
                 let count = vals.next().expect("arity checked");
-                self.exec_copy_nonoverlapping(frames, src_v, dst, count)?;
+                // The element type, from the caller's declared
+                // pointer types, as on the intrinsic statement
+                // path (this builtin's argument order is dst, src).
+                let elem = args
+                    .get(1)
+                    .and_then(|a| crate::interp::operand_pointee_ty(body, a))
+                    .or_else(|| {
+                        args.first()
+                            .and_then(|a| crate::interp::operand_pointee_ty(body, a))
+                    });
+                self.exec_copy_nonoverlapping(frames, src_v, dst, count, elem.as_ref())?;
                 Ok(Value::Unit)
             }
             Builtin::PtrNull => {
@@ -6477,7 +6488,17 @@ impl<'a> Interpreter<'a> {
                 let src = vals.next().expect("arity checked");
                 let dst = vals.next().expect("arity checked");
                 let count = vals.next().expect("arity checked");
-                self.exec_copy_nonoverlapping(frames, src, dst, count)?;
+                // The element type, from the caller's declared
+                // pointer types, as on the intrinsic statement
+                // path.
+                let elem = args
+                    .first()
+                    .and_then(|a| crate::interp::operand_pointee_ty(body, a))
+                    .or_else(|| {
+                        args.get(1)
+                            .and_then(|a| crate::interp::operand_pointee_ty(body, a))
+                    });
+                self.exec_copy_nonoverlapping(frames, src, dst, count, elem.as_ref())?;
                 Ok(Value::Unit)
             }
             Builtin::CompareBytes => {
@@ -11432,7 +11453,7 @@ pub(crate) fn unwrap_wrapper(value: &Value) -> &Value {
 /// Rebuild the wrapper chain `current` carries around a new core
 /// value: the mirror of [`unwrap_wrapper`] for writes, so a cell
 /// place keeps its aggregate shape with the new scalar inside.
-fn rewrap_like(current: &Value, core: Value) -> Value {
+pub(crate) fn rewrap_like(current: &Value, core: Value) -> Value {
     match current {
         Value::Enum {
             variant: 0,
