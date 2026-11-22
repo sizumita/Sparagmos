@@ -5520,6 +5520,9 @@ impl<'a> Interpreter<'a> {
         self.resolve_place_mode(frames, body, place, true)
     }
 
+
+
+
     fn resolve_place_mode(
         &self,
         frames: &[Frame],
@@ -5561,13 +5564,21 @@ impl<'a> Interpreter<'a> {
                 }
                 ProjectionElem::Index(local) => {
                     let idx = self.read_index_local(frames, body, *local, place)?;
+                    let via_fat = fat_cap.is_some_and(|cap| {
+                        !self.deref_denotes_storage(frames, &cur, cap)
+                    });
                     if let Some(cap) = fat_cap {
                         if idx as u128 >= cap {
                             return Err(index_oob(cap as usize, idx));
                         }
                     }
                     fat_cap = None;
-                    self.project_step(frames, cur, RefProj::Index(idx), body, place)?
+                    match via_fat.then(|| compose_fat_index(&cur, idx)).flatten() {
+                        Some(composed) => composed,
+                        None => {
+                            self.project_step(frames, cur, RefProj::Index(idx), body, place)?
+                        }
+                    }
                 }
                 ProjectionElem::ConstantIndex { offset, from_end } => {
                     // The length the index is bounded by: the fat
@@ -5585,6 +5596,9 @@ impl<'a> Interpreter<'a> {
                             )
                         })?,
                     };
+                    let via_fat = fat_cap.is_some_and(|cap| {
+                        !self.deref_denotes_storage(frames, &cur, cap)
+                    });
                     fat_cap = None;
                     let idx = if *from_end {
                         len.checked_sub(*offset as u128).ok_or_else(|| {
@@ -5600,7 +5614,17 @@ impl<'a> Interpreter<'a> {
                             "index out of bounds: the len is {len} but the index is {idx}"
                         ))
                     })?;
-                    self.project_step(frames, cur, RefProj::Index(idx), body, place)?
+                    match via_fat.then(|| compose_fat_index(&cur, idx)).flatten() {
+                        Some(composed) => composed,
+                        None => {
+                            match via_fat.then(|| compose_fat_index(&cur, idx)).flatten() {
+                        Some(composed) => composed,
+                        None => {
+                            self.project_step(frames, cur, RefProj::Index(idx), body, place)?
+                        }
+                    }
+                        }
+                    }
                 }
                 ProjectionElem::Subslice { from, to, from_end } => {
                     // The range is resolved against the length the
@@ -5685,6 +5709,31 @@ impl<'a> Interpreter<'a> {
     /// the base place and loses the fat length, so consumers that
     /// need the pointee's own length (`Len`, reference formation)
     /// recover it here from the pointer value itself.
+    /// Whether the position a fat-pointer dereference resolved
+    /// to holds the slice's own storage: an aggregate value whose
+    /// element count is the fat length (a `Vec` value's fields are
+    /// its elements; an unsized array value is its element tuple).
+    /// Indexing such a position goes INTO the aggregate, so a
+    /// following index step is appended as usual. When the
+    /// position instead holds one element of the container the
+    /// slice lives in (a raw-pointer-derived subslice base), the
+    /// value there is a single element — a scalar, or an aggregate
+    /// whose own count is the element's, not the slice's — and the
+    /// index step composes with the base position instead (see
+    /// `compose_fat_index`). A position that cannot be read does
+    /// not denote storage.
+    fn deref_denotes_storage(
+        &self,
+        frames: &[Frame],
+        cur: &Resolved,
+        fat_len: u128,
+    ) -> bool {
+        match self.read_resolved(frames, cur) {
+            Ok(value) => value.len() == Some(fat_len),
+            Err(_) => false,
+        }
+    }
+
     pub(crate) fn fat_deref_len(
         &self,
         frames: &[Frame],
@@ -5981,13 +6030,27 @@ impl<'a> Interpreter<'a> {
 
     /// The pointer an array / slice / `str` to element cast
     /// produces (see [`Rvalue::PtrFirstElem`]): the operand pointer
-    /// with an index-0 projection appended, so it denotes the
-    /// aggregate's first element. The projection is carried on the
-    /// target like every other retargeting in this model (a value
-    /// target's projection applies when the reference resolves);
-    /// a fat pointer loses its metadata, as the cast's result is
-    /// a thin pointer; null and address-only pointers denote no
-    /// element and pass through unchanged.
+    /// retargeted at the aggregate's first element. A thin pointer
+    /// denotes the aggregate itself (its type says so), so an
+    /// index-0 projection is appended. A fat pointer's base can
+    /// denote either the slice's own storage (a `Vec` value, an
+    /// unsized array value: the aggregate whose elements are the
+    /// slice's) or its first element's position in the container
+    /// the slice lives in (a raw-pointer-derived subslice base).
+    /// The storage case takes the appended index 0 like the thin
+    /// case; the element case is already the first-element
+    /// pointer, and appending index 0 there would denote the
+    /// element's own first element instead. A base position is the
+    /// element case exactly when its projection already ends at
+    /// an element index and the value there is not the slice's
+    /// storage (see [`Self::deref_denotes_storage`]); a position
+    /// denoting a whole scalar or aggregate (a one-element slice
+    /// over a lone scalar, say) is storage whatever its shape. The projection is carried
+    /// on the target like every other retargeting in this model
+    /// (a value target's projection applies when the reference
+    /// resolves); a fat pointer loses its metadata, as the cast's
+    /// result is a thin pointer; null and address-only pointers
+    /// denote no element and pass through unchanged.
     pub(crate) fn ptr_first_elem_value(
         &self,
         frames: &[Frame],
@@ -6026,8 +6089,25 @@ impl<'a> Interpreter<'a> {
                 Ok(Value::Ref(RefTarget::Value(v, projection)))
             }
             Value::Ref(RefTarget::Null) | Value::Ref(RefTarget::Address(_)) => Ok(value),
-            Value::FatRef { base, .. } => match *base {
-                Value::Ref(_) => self.ptr_first_elem_value(frames, body, *base),
+            Value::FatRef { base, len } => match *base {
+                Value::Ref(_) => {
+                    let resolved = self.deref_value(frames, &base)?;
+                    let ends_at_element = match &resolved {
+                        Resolved::Place { projection, .. }
+                        | Resolved::Static { projection, .. }
+                        | Resolved::Alloc { projection, .. }
+                        | Resolved::Value(_, projection) => {
+                            matches!(projection.last(), Some(RefProj::Index(_)))
+                        }
+                    };
+                    if ends_at_element
+                        && !self.deref_denotes_storage(frames, &resolved, len)
+                    {
+                        Ok(*base)
+                    } else {
+                        self.ptr_first_elem_value(frames, body, *base)
+                    }
+                }
                 Value::Tuple(_) | Value::Bytes(_) | Value::Str(_) => Ok(Value::Ref(
                     RefTarget::Value(base, vec![RefProj::Index(0)]),
                 )),
@@ -6780,16 +6860,16 @@ impl<'a> Interpreter<'a> {
     /// element aggregate `base` that `projection` denotes a
     /// position in (see the call in
     /// [`Self::offset_projection`]). The projection must navigate
-    /// structurally (fields, downcasts) to an element container —
-    /// a tuple, a byte string, or an ADT value whose fields are
-    /// its elements — and end either at the container itself
-    /// (element 0) or at one index step into it. The displacement
-    /// must move the position by a whole number of the offset's
-    /// element size and land within the container (one past the
-    /// end included: such a pointer may be formed, and reading
-    /// through it stays an explicit out-of-bounds error).
-    /// Anything else answers `None`, and the caller carries the
-    /// displacement as before.
+    /// structurally (fields, downcasts, sub-slices) to an element
+    /// container — a tuple, a byte string, or an ADT value whose
+    /// fields are its elements — and end either at the container
+    /// itself (element 0) or at one index step into it. The
+    /// displacement must move the position by a whole number of
+    /// the offset's element size and land within the container
+    /// (one past the end included: such a pointer may be formed,
+    /// and reading through it stays an explicit out-of-bounds
+    /// error). Anything else answers `None`, and the caller
+    /// carries the displacement as before.
     fn absorb_displacement(
         &self,
         base: &Value,
@@ -6801,7 +6881,14 @@ impl<'a> Interpreter<'a> {
         if size <= 0 {
             return None;
         }
-        // Navigate to the container the position sits in.
+        // Navigate to the container the position sits in. A
+        // sub-slice step descends into the sub-aggregate it
+        // denotes (materialised on the side; the walk only reads
+        // shapes and counts from it), so a position inside a
+        // sub-slice of an element container — the back half of a
+        // `split_at_mut` on a range slice, say — absorbs exactly
+        // like a position in the container itself.
+        let mut temps: Vec<Box<Value>> = Vec::new();
         let mut cur: &Value = base;
         let mut prefix = projection.len();
         let mut index: i128 = 0;
@@ -6820,6 +6907,11 @@ impl<'a> Interpreter<'a> {
                     if !matches!(cur, Value::Enum { .. } | Value::Coroutine { .. }) {
                         return None;
                     }
+                }
+                RefProj::Subslice { offset, len } => {
+                    let sub = subslice_value(cur, *offset, *len)?;
+                    temps.push(Box::new(sub));
+                    cur = temps.last().expect("just pushed");
                 }
                 RefProj::Index(idx) => {
                     if j + 1 != projection.len() {
@@ -7879,6 +7971,25 @@ impl<'a> Interpreter<'a> {
         // holds no value yet; any later read of it still raises
         // `UninitializedRead`, so nothing is fabricated here.
         if value == Value::Uninit {
+            return Ok(value);
+        }
+        // A `MaybeUninit` place denotes the payload's own storage:
+        // the union adds no representation of its own, and std's
+        // byte-wise machinery reads and writes the payload through
+        // the wrapper type while the storage is shared with the
+        // payload-typed place (`ptr::swap_chunk` copies a chunk of
+        // one element's storage into a `MaybeUninit<[u8; N]>`
+        // local and back out into the other element). A read of
+        // that storage yields the payload in storage form, so the
+        // store accepts the value as it stands; wrapping it into
+        // the field-0 form here would put a wrapper value where
+        // the payload's own readers look.
+        if matches!(
+            ty,
+            Some(Ty::Adt(name))
+                if name.starts_with("std::mem::MaybeUninit")
+                    || name.starts_with("core::mem::MaybeUninit")
+        ) {
             return Ok(value);
         }
         // A scalar place whose value arrives as a one-field wrapper
@@ -10009,6 +10120,72 @@ fn check_subslice(value_len: usize, offset: usize, count: usize) -> InterpResult
         )));
     }
     Ok(())
+}
+
+/// Compose an index step that immediately follows a fat-pointer
+/// dereference with the resolved target's trailing element index
+/// (the caller has already established that the dereference does
+/// not denote the slice's own storage — see
+/// `Interpreter::deref_denotes_storage`).
+/// A fat pointer's base denotes the slice's first element, so
+/// when that base is itself an element position (the trailing
+/// step is an index into the container the slice lives in), the
+/// slice-relative index denotes the element `base + idx` of that
+/// container, not an element of the first element: the trailing
+/// step is advanced instead of a nested step being appended.
+/// Any other target shape answers `None` and the caller appends
+/// the step as usual.
+fn compose_fat_index(cur: &Resolved, idx: usize) -> Option<Resolved> {
+    fn advanced(projection: &[RefProj], idx: usize) -> Option<Vec<RefProj>> {
+        match projection.last() {
+            Some(RefProj::Index(k)) => {
+                let mut out = projection.to_vec();
+                *out.last_mut().expect("nonempty projection") =
+                    RefProj::Index(k.checked_add(idx)?);
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+    match cur {
+        Resolved::Place {
+            frame_pos,
+            local,
+            projection,
+        } => Some(Resolved::Place {
+            frame_pos: *frame_pos,
+            local: *local,
+            projection: advanced(projection, idx)?,
+        }),
+        Resolved::Static { name, projection } => Some(Resolved::Static {
+            name: name.clone(),
+            projection: advanced(projection, idx)?,
+        }),
+        Resolved::Alloc { id, projection } => Some(Resolved::Alloc {
+            id: *id,
+            projection: advanced(projection, idx)?,
+        }),
+        Resolved::Value(..) => None,
+    }
+}
+
+/// The sub-aggregate a `Subslice` projection step denotes over
+/// an element container value: the elements `offset..offset+len`
+/// of a tuple, an ADT value whose fields are its elements, a byte
+/// string or a string. Anything else (or an out-of-range window)
+/// answers `None`.
+fn subslice_value(value: &Value, offset: usize, len: usize) -> Option<Value> {
+    let end = offset.checked_add(len)?;
+    match value {
+        Value::Tuple(items) => Some(Value::Tuple(items.get(offset..end)?.to_vec())),
+        Value::Enum { variant, fields } => Some(Value::Enum {
+            variant: *variant,
+            fields: fields.get(offset..end)?.to_vec(),
+        }),
+        Value::Bytes(b) => Some(Value::Bytes(b.get(offset..end)?.to_vec())),
+        Value::Str(text) => Some(Value::Str(text.get(offset..end)?.to_string())),
+        _ => None,
+    }
 }
 
 fn index_oob(len: usize, index: usize) -> InterpError {
