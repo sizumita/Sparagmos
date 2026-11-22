@@ -7534,6 +7534,45 @@ fn run_mode_env_args_reach_the_guest() {
     assert_eq!(lines[4], "count 3");
 }
 
+const ENV_ARGS_LEN_SRC: &str = r#"
+fn main() {
+    println!("len {}", std::env::args().len());
+    println!("os-len {}", std::env::args_os().len());
+    let mut it = std::env::args();
+    println!("first {}", it.next().unwrap());
+    println!("len-after {}", it.len());
+    let mut os = std::env::args_os();
+    println!("os-first {}", os.next().is_some());
+    println!("os-len-after {}", os.len());
+}
+"#;
+
+#[test]
+fn run_mode_env_args_len_uses_the_real_wrapper_layout() {
+    // `ExactSizeIterator::len` for `Args` / `ArgsOs` is not a
+    // builtin: the collected std one-liners navigate the real
+    // wrapper layout (`ArgsOs { inner: sys::args::common::Args {
+    // inner: vec::IntoIter } }`) field by field and land in the
+    // `size_hint` builtin on the innermost iterator. The modelled
+    // value must carry all three wrapper layers or the second
+    // field step reads the element snapshot as the state.
+    let dir = temp_dir("env-args-len");
+    let src = fixture(&dir, "args_len.rs", ENV_ARGS_LEN_SRC);
+    let out = run_driver_extra(&src, &["--guest-arg", "one", "--guest-arg", "two"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 6, "stdout={stdout}");
+    assert_eq!(lines[0], "len 3");
+    assert_eq!(lines[1], "os-len 3");
+    assert!(lines[2].starts_with("first "), "stdout={stdout}");
+    assert!(lines[2].contains("args_len.rs"), "stdout={stdout}");
+    assert_eq!(lines[3], "len-after 2");
+    assert_eq!(lines[4], "os-first true");
+    assert_eq!(lines[5], "os-len-after 2");
+}
+
 const CALLER_LOCATION_SRC: &str = r#"
 #[track_caller]
 fn here() -> u32 {
