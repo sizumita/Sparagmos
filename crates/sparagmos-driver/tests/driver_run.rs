@@ -15375,3 +15375,54 @@ fn run_mode_subslice_split_at_mut_positions() {
     // instead of degrading to a displaced pointer.
     run_ok("subslice-split", SUBSLICE_SPLIT_AT_MUT_SRC, "ok\n");
 }
+const TLS_DTOR_BOTH_SRC: &str = r#"
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static DROPPED: AtomicUsize = AtomicUsize::new(0);
+
+struct Foo;
+impl Drop for Foo {
+    fn drop(&mut self) {
+        DROPPED.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+thread_local!(static FOO: Foo = Foo);
+thread_local!(static BAR: Foo = Foo);
+
+fn main() {
+    // A spawned thread's TLS destructors run at its exit, in
+    // reverse registration order; try_with inside a destructor
+    // observes the destruction.
+    std::thread::spawn(|| {
+        FOO.with(|_| ());
+        BAR.with(|_| ());
+    })
+    .join()
+    .unwrap();
+    assert_eq!(DROPPED.load(Ordering::SeqCst), 2);
+    // The entry thread's destructors run at program exit.
+    FOO.with(|_| ());
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_tls_destructors_run_at_thread_exit() {
+    // TLS destructors are registered through std's
+    // `__cxa_thread_atexit` wrapper; the model records the
+    // registrations per thread and runs them (as ordinary guest
+    // code, so the destroy shim's state transitions happen) when
+    // the owning thread exits.
+    let dir = temp_dir("tls-dtor");
+    let src = fixture(&dir, "tls_dtor.rs", TLS_DTOR_BOTH_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "TLS destructors must run at thread exit; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+

@@ -924,7 +924,15 @@ impl<'a> Interpreter<'a> {
             unwind_payload: None,
             in_cleanup: false,
         }];
-        self.drive_frames(&mut frames, 0)
+        let result = self.drive_frames(&mut frames, 0);
+        // Program exit runs the entry thread's registered TLS
+        // destructors (the registrations wrap
+        // `__cxa_thread_atexit`, whose entries run at exit),
+        // whatever the entry's outcome was.
+        match self.run_tls_dtors(&mut frames, 1) {
+            Ok(()) => result,
+            Err(e) => Err(e),
+        }
     }
 
     /// Drive the frame stack until the frame at depth `base`
