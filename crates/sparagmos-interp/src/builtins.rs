@@ -9749,7 +9749,23 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
             }
         }
         let value = self.resolve_value(frames, arg)?;
-        self.view_value_as(frames, value, base_ty, target_ty, what)
+        let view = self.view_value_as(frames, value, base_ty, target_ty, what)?;
+        // `as_ref` returns a reference: a view that came out as the
+        // bare pointee data (an identity view of an aggregate —
+        // `Box<T> -> &T`, `Vec<T> -> &Vec<T>`, a self view) must be
+        // re-wrapped as a reference to that data, or storing the
+        // result fails the destination's `Ref` type check. The fat
+        // and string views are already reference-shaped.
+        Ok(match view {
+            Value::Ref(_)
+            | Value::FatRef { .. }
+            | Value::DynRef { .. }
+            | Value::Str(_)
+            | Value::Bytes(_)
+            | Value::FnPtr(_)
+            | Value::Closure { .. } => view,
+            other => Value::Ref(RefTarget::value(other)),
+        })
     }
 
     /// The value-level view behind `as_ref_view`: `value` is the
@@ -9843,6 +9859,22 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
             return match value {
                 Value::Enum { fields, .. } if fields.len() == 1 => {
                     let field = fields.into_iter().next().expect("len checked");
+                    if target_ty == inner_ty {
+                        // The view is the pointee itself: the
+                        // result is a reference to the box's
+                        // storage, not the pointee value. The box
+                        // field already is that reference (the
+                        // allocation pointer); a non-reference
+                        // field is resolved and re-wrapped as a
+                        // value reference.
+                        return Ok(match field {
+                            Value::Ref(_) | Value::DynRef { .. } => field,
+                            other => {
+                                let pointee = self.resolve_value(frames, &other)?;
+                                Value::Ref(RefTarget::value(pointee))
+                            }
+                        });
+                    }
                     let pointee = self.resolve_value(frames, &field)?;
                     self.view_value_as(frames, pointee, &inner_ty, target_ty, what)
                 }
