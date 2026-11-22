@@ -6356,8 +6356,18 @@ impl<'a> FnLower<'a> {
     }
 
     /// Lower a call the program does not define through the
-    /// builtin layer. A name the layer does not know keeps the
-    /// error the JIT has always produced for it.
+    /// builtin layer. A name the layer does not know is not a
+    /// lowering failure: the interpreter serves such a call
+    /// only if it is ever executed (it raises its
+    /// unknown-function error at the call, at run time), so the
+    /// JIT lowers it to a panic with that same message, reached
+    /// only if control flow ever reaches the call. Whole-program
+    /// lowering must not fail for a body that merely *contains*
+    /// an unservable call - the demand passes collect bodies
+    /// for the interpreter (the fmt impl bodies, say) whose
+    /// inner calls name instances no body was collected for,
+    /// and those bodies are never entered on the fmt path in
+    /// either engine.
     fn lower_builtin_call(
         &mut self,
         generic_args: &[mir::Ty],
@@ -6369,9 +6379,12 @@ impl<'a> FnLower<'a> {
         let name = self.callee_name(def);
         let canonical = builtins::canonical_name(&name);
         let Some(kind) = builtins::lookup(&canonical) else {
-            return Err(self.err(&format!(
+            let msg = self.messages.intern(&format!(
                 "call to function `{name}` which is not part of the program"
-            )));
+            ));
+            let pblk = self.panic_block(msg);
+            self.seal_terminator(IrTerminator::Jump(pblk));
+            return Ok(());
         };
         match kind {
             Builtin::ArgumentNew(trait_) => {

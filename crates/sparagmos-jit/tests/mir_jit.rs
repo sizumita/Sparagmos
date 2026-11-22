@@ -1044,7 +1044,11 @@ fn unsupported_constructs_report_reasons() {
         other => panic!("expected Unsupported, got {other}"),
     }
 
-    // A call to a function that is not part of the program.
+    // A call to a function that is not part of the program is
+    // not a lowering failure: the interpreter raises its
+    // unknown-function error only if the call is ever executed,
+    // so the JIT compiles the program and the call panics with
+    // that message when (and only when) control reaches it.
     let caller = spec(
         "caller",
         0,
@@ -1057,7 +1061,7 @@ fn unsupported_constructs_report_reasons() {
     );
     let mut names = HashMap::new();
     names.insert(def(99), "somewhere::else::missing".to_string());
-    let err = JitProgram::compile(&MirProgramInput {
+    let jit = JitProgram::compile(&MirProgramInput {
         functions: vec![MirFunctionInput {
             name: caller.name.to_string(),
             def_id: Some(def(0)),
@@ -1066,12 +1070,17 @@ fn unsupported_constructs_report_reasons() {
         names,
         adt_discriminants: Default::default(),
     })
-    .expect_err("unknown callee must be unsupported");
-    match err {
-        JitError::Unsupported(what) => {
-            assert!(what.contains("somewhere::else::missing"), "{what}")
+    .expect("a program whose only flaw is an unservable call still compiles");
+    match jit.call("caller", &[]) {
+        Err(JitCallError::Panic(rec)) => {
+            assert!(
+                rec.message.contains("somewhere::else::missing")
+                    && rec.message.contains("not part of the program"),
+                "{}",
+                rec.message
+            );
         }
-        other => panic!("expected Unsupported, got {other}"),
+        other => panic!("expected a panic at the unservable call, got {other:?}"),
     }
 
 }
