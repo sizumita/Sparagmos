@@ -4392,6 +4392,122 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// The pointer an array / slice / `str` to element cast
+    /// produces (see [`Rvalue::PtrFirstElem`]): the operand pointer
+    /// with an index-0 projection appended, so it denotes the
+    /// aggregate's first element. The projection is carried on the
+    /// target like every other retargeting in this model (a value
+    /// target's projection applies when the reference resolves);
+    /// a fat pointer loses its metadata, as the cast's result is
+    /// a thin pointer; null and address-only pointers denote no
+    /// element and pass through unchanged.
+    pub(crate) fn ptr_first_elem_value(
+        &self,
+        frames: &[Frame],
+        body: &Body,
+        value: Value,
+    ) -> InterpResult<Value> {
+        match value {
+            Value::Ref(RefTarget::Place {
+                frame,
+                local,
+                mut projection,
+            }) => {
+                projection.push(RefProj::Index(0));
+                Ok(Value::Ref(RefTarget::Place {
+                    frame,
+                    local,
+                    projection,
+                }))
+            }
+            Value::Ref(RefTarget::Static {
+                name,
+                mut projection,
+            }) => {
+                projection.push(RefProj::Index(0));
+                Ok(Value::Ref(RefTarget::Static { name, projection }))
+            }
+            Value::Ref(RefTarget::Alloc {
+                id,
+                mut projection,
+            }) => {
+                projection.push(RefProj::Index(0));
+                Ok(Value::Ref(RefTarget::Alloc { id, projection }))
+            }
+            Value::Ref(RefTarget::Value(v, mut projection)) => {
+                projection.push(RefProj::Index(0));
+                Ok(Value::Ref(RefTarget::Value(v, projection)))
+            }
+            Value::Ref(RefTarget::Null) | Value::Ref(RefTarget::Address(_)) => Ok(value),
+            Value::FatRef { base, .. } => match *base {
+                Value::Ref(_) => self.ptr_first_elem_value(frames, body, *base),
+                Value::Tuple(_) | Value::Bytes(_) | Value::Str(_) => Ok(Value::Ref(
+                    RefTarget::Value(base, vec![RefProj::Index(0)]),
+                )),
+                ref other => Err(InterpError::type_mismatch(
+                    "first-element pointer cast",
+                    "fat pointer over a reference or an aggregate value",
+                    other.kind_name(),
+                )),
+            },
+            other => Err(InterpError::type_mismatch(
+                "first-element pointer cast",
+                "pointer to an array, slice or string",
+                other.kind_name(),
+            )),
+        }
+    }
+
+    /// The pointer an element-to-array cast produces (see
+    /// [`Rvalue::PtrArrayBase`]): the operand pointer with a
+    /// trailing index-0 projection removed, so it denotes the
+    /// array as a whole again. Any other shape passes through
+    /// unchanged: a pointer to an element past the first has no
+    /// array-base representation in this model.
+    pub(crate) fn ptr_array_base_value(&self, value: Value) -> InterpResult<Value> {
+        match value {
+            Value::Ref(RefTarget::Place {
+                frame,
+                local,
+                mut projection,
+            }) => {
+                if projection.last() == Some(&RefProj::Index(0)) {
+                    projection.pop();
+                }
+                Ok(Value::Ref(RefTarget::Place {
+                    frame,
+                    local,
+                    projection,
+                }))
+            }
+            Value::Ref(RefTarget::Static {
+                name,
+                mut projection,
+            }) => {
+                if projection.last() == Some(&RefProj::Index(0)) {
+                    projection.pop();
+                }
+                Ok(Value::Ref(RefTarget::Static { name, projection }))
+            }
+            Value::Ref(RefTarget::Alloc {
+                id,
+                mut projection,
+            }) => {
+                if projection.last() == Some(&RefProj::Index(0)) {
+                    projection.pop();
+                }
+                Ok(Value::Ref(RefTarget::Alloc { id, projection }))
+            }
+            Value::Ref(RefTarget::Value(v, mut projection)) => {
+                if projection.last() == Some(&RefProj::Index(0)) {
+                    projection.pop();
+                }
+                Ok(Value::Ref(RefTarget::Value(v, projection)))
+            }
+            other => Ok(other),
+        }
+    }
+
     /// The borrowing form of [`read_resolved`]: a place read lends
     /// the projected value out of the frame's storage instead of
     /// cloning it, for consumers that only inspect the value (or
@@ -6409,6 +6525,14 @@ impl<'a> Interpreter<'a> {
             Rvalue::PtrField(operand, depth) => {
                 let value = self.eval_operand(frames, body, operand)?;
                 self.ptr_field_value(frames, body, value, *depth)
+            }
+            Rvalue::PtrFirstElem(operand) => {
+                let value = self.eval_operand(frames, body, operand)?;
+                self.ptr_first_elem_value(frames, body, value)
+            }
+            Rvalue::PtrArrayBase(operand) => {
+                let value = self.eval_operand(frames, body, operand)?;
+                self.ptr_array_base_value(value)
             }
             Rvalue::IntToPtr(operand) => {
                 let value = self.eval_operand(frames, body, operand)?;

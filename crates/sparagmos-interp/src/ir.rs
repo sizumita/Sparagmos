@@ -601,6 +601,27 @@ pub enum Rvalue {
     /// `UnsafeCell::get` and `cast` are inlined together) appends
     /// one field-0 projection per layer.
     PtrField(Operand, u32),
+    /// A pointer cast from an array / slice / `str` pointee to the
+    /// element type itself - what `<[T]>::as_ptr`, `<[T; N]>::as_ptr`
+    /// and `str::as_ptr` return, and what `&arr as *const T` writes.
+    /// Such a pointer denotes the aggregate's first element, not the
+    /// aggregate: in this projection-based model the result is the
+    /// operand pointer with an index-0 projection appended, decided
+    /// at conversion time from the cast's source and target types.
+    /// Any other pointer-to-pointer cast leaves the denoted place
+    /// unchanged and stays a plain `Use`.
+    PtrFirstElem(Operand),
+    /// The reverse cast: an element pointer cast back to a pointer
+    /// to the whole array (`as_ptr().cast::<[T; N]>()`). The result
+    /// denotes the array as a whole, so a trailing index-0
+    /// projection - the marker a first-element cast (or an
+    /// `&arr[0]` borrow) left on the pointer - is removed at run
+    /// time. A pointer whose projection does not end in index 0
+    /// denotes an element past the first; an array starting there
+    /// has no representation in this projection model, so the value
+    /// passes through unchanged and reads through it keep failing
+    /// with a type mismatch, as they did before.
+    PtrArrayBase(Operand),
     /// An integer-to-pointer `Transmute` cast: the mirror image of
     /// [`Rvalue::PtrToInt`]. The integer is an address in the
     /// model's synthetic address space, so the result is an

@@ -407,7 +407,8 @@ impl<'a> Interpreter<'a> {
                 Rc::from(discriminants.as_slice()),
             ),
             // DataPtr, RawPtrAggregate, Unsize, BoxDerefTransmute,
-            // PtrField, Reinterpret, PtrOffset, Ref, CopyForDeref,
+            // PtrField, PtrFirstElem, PtrArrayBase, Reinterpret,
+            // PtrOffset, Ref, CopyForDeref,
             // ThreadLocalRef, Unsupported: their evaluation is
             // entangled with place resolution or is an explicit
             // error; the original evaluator runs them.

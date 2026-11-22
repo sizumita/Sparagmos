@@ -2162,6 +2162,54 @@ impl<'a> Converter<'a> {
         }
     }
 
+    /// Whether a pointer cast from `source` to `target` goes from
+    /// an aggregate pointee (array / slice / `str`) to the element
+    /// type itself. Decided from the cast's two types, both known
+    /// at conversion time: the source pointee is the aggregate and
+    /// the target pointee is exactly its element type (`u8` for
+    /// `str`). Such a cast retargets the pointer at the first
+    /// element: an array or slice value rides as one aggregate in
+    /// this model, so a pointer that denotes the aggregate as a
+    /// whole and a pointer that denotes its first element differ
+    /// by an index-0 projection, and only the cast's types say
+    /// which of the two a given pointer value is.
+    fn cast_enters_first_element(&self, source: &mir::Ty, target: &mir::Ty) -> bool {
+        fn pointee(ty: &mir::Ty) -> Option<&mir::Ty> {
+            match ty {
+                mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _) => Some(inner),
+                _ => None,
+            }
+        }
+        let (Some(src), Some(tgt)) = (pointee(source), pointee(target)) else {
+            return false;
+        };
+        match src {
+            mir::Ty::Array(elem, _) | mir::Ty::Slice(elem) => **elem == *tgt,
+            mir::Ty::Str => matches!(tgt, mir::Ty::Uint(mir::UintTy::U8)),
+            _ => false,
+        }
+    }
+
+    /// Whether a pointer cast from `source` to `target` is the
+    /// reverse of [`Converter::cast_enters_first_element`]: the
+    /// source pointee is an element type and the target pointee is
+    /// an array of exactly that element type.
+    fn cast_returns_to_array_base(&self, source: &mir::Ty, target: &mir::Ty) -> bool {
+        fn pointee(ty: &mir::Ty) -> Option<&mir::Ty> {
+            match ty {
+                mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _) => Some(inner),
+                _ => None,
+            }
+        }
+        let (Some(src), Some(tgt)) = (pointee(source), pointee(target)) else {
+            return false;
+        };
+        match tgt {
+            mir::Ty::Array(elem, _) => **elem == *src,
+            _ => false,
+        }
+    }
+
     fn convert_ty(&self, ty: &mir::Ty, context: &str) -> Result<ir::Ty, ConvertError> {
         let unsupported = || ConvertError::UnsupportedType {
             context: context.to_string(),
@@ -4020,13 +4068,30 @@ impl<'a> Converter<'a> {
                             None => ir::Rvalue::Unsize(v, ir::UnsizeMeta::Slice),
                         }
                     }
-                    // These coercions do not change the reference
+                    // This coercion does not change the reference
                     // value in this model (a reference carries no
                     // mutability or pointee type at run time).
                     mir::CastKind::PointerCoercion(
-                        mir::PointerCoercion::MutToConstPointer
-                        | mir::PointerCoercion::ArrayToPointer,
+                        mir::PointerCoercion::MutToConstPointer,
                     ) => ir::Rvalue::Use(v),
+                    // An array-to-pointer coercion retargets a
+                    // pointer to an array at its first element,
+                    // exactly like the `PtrToPtr` cast below; the
+                    // coercion kind itself guarantees the source is
+                    // an array pointer and the target its element
+                    // pointer, and the type check is a guard.
+                    mir::CastKind::PointerCoercion(
+                        mir::PointerCoercion::ArrayToPointer,
+                    ) => {
+                        if ctx
+                            .as_ref()
+                            .is_some_and(|src| self.cast_enters_first_element(src, target))
+                        {
+                            ir::Rvalue::PtrFirstElem(v)
+                        } else {
+                            ir::Rvalue::Use(v)
+                        }
+                    }
                     mir::CastKind::PtrToPtr => {
                         // A cast from a transparent single-field
                         // wrapper (`UnsafeCell<T>` / `MaybeUninit<T>`)
@@ -4039,6 +4104,25 @@ impl<'a> Converter<'a> {
                             .and_then(|src| self.cast_wrapper_entry_depth(src, target));
                         if let Some(depth) = entry_depth {
                             ir::Rvalue::PtrField(v, depth)
+                        } else if ctx.as_ref().is_some_and(|src| {
+                            self.cast_enters_first_element(src, target)
+                        }) {
+                            // A cast from an array / slice / `str`
+                            // pointer to an element pointer (what
+                            // `as_ptr` returns and `&arr as *const T`
+                            // writes) denotes the first element, not
+                            // the aggregate as a whole. This precedes
+                            // the `DataPtr` extraction below: dropping
+                            // the metadata alone would leave the
+                            // result denoting the whole aggregate.
+                            ir::Rvalue::PtrFirstElem(v)
+                        } else if ctx.as_ref().is_some_and(|src| {
+                            self.cast_returns_to_array_base(src, target)
+                        }) {
+                            // The reverse cast: an element pointer
+                            // cast back to a pointer to the whole
+                            // array denotes the array as a whole.
+                            ir::Rvalue::PtrArrayBase(v)
                         } else if ptr_pointee(target).is_some_and(|p| {
                             // A pointer cast to a thin target drops
                             // the metadata word when the source value
