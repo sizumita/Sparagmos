@@ -319,6 +319,51 @@ pub(crate) fn raw_waker_alloc_id(value: &Value) -> Option<u64> {
     }
 }
 
+/// The slice length an unsizing cast reads from a pointee
+/// value: the element count of the pointee's own array tail. A
+/// custom DST value (an ADT whose trailing field is the unsized
+/// part) carries the tail's length, recursively; an empty array
+/// aggregate is the unit value, of length zero; and a scalar
+/// pointee counts as one element — the one-element array view
+/// of an allocation a reinterpreted pointer denotes
+/// (`Box::into_boxed_slice` reinterprets a `Box<T>` allocation
+/// as a `[T; 1]`). Anything else has no slice length.
+fn unsized_tail_len(pointee: &Value) -> Option<u128> {
+    match pointee {
+        Value::Tuple(items) => Some(items.len() as u128),
+        Value::Bytes(b) => Some(b.len() as u128),
+        Value::Str(s) => Some(s.len() as u128),
+        Value::FatRef { len, .. } => Some(*len),
+        Value::Unit => Some(0),
+        Value::Enum { fields, .. } => fields.last().and_then(unsized_tail_len),
+        Value::Bool(_)
+        | Value::Int(_)
+        | Value::Uint(_)
+        | Value::Float(_)
+        | Value::Float128(_) => Some(1),
+        _ => None,
+    }
+}
+
+/// Whether a pointee's unsized length (see
+/// [`unsized_tail_len`]) rests on the pointee's own array tail
+/// rather than on the one-element view of a scalar: the
+/// distinction the ADT field search in `unsize_to_slice` ranks
+/// candidates by.
+fn unsized_tail_is_array(pointee: &Value) -> bool {
+    match pointee {
+        Value::Tuple(_)
+        | Value::Bytes(_)
+        | Value::Str(_)
+        | Value::FatRef { .. }
+        | Value::Unit => true,
+        Value::Enum { fields, .. } => {
+            fields.last().is_some_and(unsized_tail_is_array)
+        }
+        _ => false,
+    }
+}
+
 /// The count leaf of one reference count of an `RcInner` /
 /// `ArcInner` aggregate: field `field` (0 = strong, 1 = weak) is
 /// a `Cell<usize>` / `AtomicUsize` wrapper around an
@@ -7151,16 +7196,18 @@ impl<'a> Interpreter<'a> {
 
     /// Array-to-slice unsizing of a pointer-shaped value: a
     /// reference to an array becomes a fat reference over it, and
-    /// a one-field wrapper value (a `Box`, or the `Unique` /
-    /// `NonNull` aggregate chain a MIR-built box is made of) is
-    /// rewrapped around the unsized pointee, so `Box<[T; N]>`
-    /// becomes the same shape a directly built `Box<[T]>` has.
+    /// a pointer-carrying ADT value (a `Box`, the `Unique` /
+    /// `NonNull` aggregate chain a MIR-built box is made of, an
+    /// `Rc` / `Arc` / `Weak` handle, or a user wrapper around
+    /// one) is rewrapped around the unsized pointee, so
+    /// `Box<[T; N]>` becomes the same shape a directly built
+    /// `Box<[T]>` has.
     fn unsize_to_slice(&self, frames: &[Frame], v: Value) -> InterpResult<Value> {
         match v {
             Value::Ref(_) => {
                 let target = self.deref_value(frames, &v)?;
                 let pointee = self.read_resolved(frames, &target)?;
-                let len = pointee.len().ok_or_else(|| {
+                let len = unsized_tail_len(&pointee).ok_or_else(|| {
                     InterpError::type_mismatch(
                         "unsizing cast",
                         "array pointee",
@@ -7172,6 +7219,10 @@ impl<'a> Interpreter<'a> {
                     len,
                 })
             }
+            // Unsizing a fat pointer into a slice pointer again
+            // (a slice-typed field reached through the ADT search
+            // below) leaves it as it stands.
+            Value::FatRef { .. } => Ok(v),
             Value::Bytes(b) => {
                 let len = b.len() as u128;
                 Ok(Value::FatRef {
@@ -7192,6 +7243,17 @@ impl<'a> Interpreter<'a> {
                 base: Box::new(Value::Tuple(Vec::new())),
                 len: 0,
             }),
+            // A reference-counted handle is itself the pointer:
+            // its pointee lives in the allocation store, whose
+            // stored aggregate carries the length every consumer
+            // derives (the `Deref` builtin, the drop glue and the
+            // count adjustments all navigate the store through
+            // the handle's allocation id), so unsizing the handle
+            // into a slice handle changes nothing about the
+            // value. Wrapping the handle's inner pointer into a
+            // fat reference instead would leave the handle naming
+            // a view no consumer recognises as a handle.
+            Value::Enum { .. } if rc_handle_id(&v).is_some() => Ok(v),
             Value::Enum { variant, mut fields } if fields.len() == 1 => {
                 let pointee = fields.pop().expect("one field");
                 // A built box's field is its allocation pointer:
@@ -7216,11 +7278,102 @@ impl<'a> Interpreter<'a> {
                     fields: vec![fat],
                 })
             }
+            Value::Enum { variant, fields } => {
+                // A multi-field ADT: the coercion propagates
+                // through the one pointer-shaped field (rustc's
+                // `CoerceUnsized` changes exactly one field's
+                // type); the remaining fields — phantom markers,
+                // counters, plain data — pass through untouched.
+                // Candidates are judged from the values alone: a
+                // candidate whose unsizing rests on the pointee's
+                // own array tail outranks one resting on the
+                // one-element view of a scalar, and among equals
+                // a changed value outranks an unchanged one, with
+                // the later field winning (the position a DST
+                // tail occupies). When no candidate changes its
+                // value — every one is an allocation-backed
+                // handle, whose unsizing is the identity in this
+                // model — the first candidate stands and the ADT
+                // keeps its shape.
+                let mut best: Option<(usize, Value)> = None;
+                let mut best_strong = false;
+                for (i, field) in fields.iter().enumerate() {
+                    let Some(Ok(unsized_field)) =
+                        self.unsize_pointer_shape(frames, field.clone())
+                    else {
+                        continue;
+                    };
+                    let strong = match field {
+                        Value::Ref(_) => {
+                            let target = self.deref_value(frames, field)?;
+                            let pointee = self.read_resolved(frames, &target)?;
+                            unsized_tail_is_array(&pointee)
+                        }
+                        _ => true,
+                    };
+                    let changed = unsized_field != *field;
+                    let replace = match &best {
+                        None => true,
+                        Some(_) if strong && !best_strong => true,
+                        Some(_) if strong == best_strong && changed => true,
+                        _ => false,
+                    };
+                    if replace {
+                        best = Some((i, unsized_field));
+                        best_strong = strong;
+                    }
+                }
+                let Some((idx, replacement)) = best else {
+                    return Err(InterpError::type_mismatch(
+                        "unsizing cast",
+                        "reference to an array",
+                        "ADT value",
+                    ));
+                };
+                let mut fields = fields;
+                fields[idx] = replacement;
+                Ok(Value::Enum {
+                    variant,
+                    fields,
+                })
+            }
             other => Err(InterpError::type_mismatch(
                 "unsizing cast",
                 "reference to an array",
                 other.kind_name(),
             )),
+        }
+    }
+
+    /// Unsizing applied to a value in pointer position inside an
+    /// ADT (the multi-field arm of [`Self::unsize_to_slice`]):
+    /// references and fat pointers directly, wrapper chains and
+    /// nested ADTs through the general unsizing, and
+    /// reference-counted handles as the identity. Returns `None`
+    /// when the value is not a pointer shape an unsizing can
+    /// apply to — plain data, callables, trait-object pointers
+    /// (their unsizing is the `Dyn` metadata's business) — so
+    /// the caller can look at the ADT's other fields. A pointer
+    /// shape whose own unsizing fails is likewise not a
+    /// candidate: the field the coercion targets is the one
+    /// whose unsizing succeeds.
+    fn unsize_pointer_shape(
+        &self,
+        frames: &[Frame],
+        v: Value,
+    ) -> Option<InterpResult<Value>> {
+        match v {
+            Value::Ref(_) | Value::FatRef { .. } => Some(self.unsize_to_slice(frames, v)),
+            Value::Enum { .. } => {
+                if rc_handle_id(&v).is_some() {
+                    return Some(Ok(v));
+                }
+                match self.unsize_to_slice(frames, v) {
+                    Ok(u) => Some(Ok(u)),
+                    Err(_) => None,
+                }
+            }
+            _ => None,
         }
     }
 

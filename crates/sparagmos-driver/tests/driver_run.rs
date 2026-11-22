@@ -12647,3 +12647,109 @@ fn run_mode_hand_built_waker_drop_releases_arc() {
     assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "released=true\n");
 }
+
+// Slice unsizing of pointer-carrying values: a reference-counted
+// handle is itself the pointer (its pointee lives in the
+// allocation store), a custom DST propagates the metadata
+// through its trailing field, and a byte-slice constant in
+// pointer position is the fat pointer, not the pointee data.
+
+const UNSIZE_RC_SLICE_SRC: &str = r#"
+use std::rc::Rc;
+fn main() {
+    let a: Rc<[i32; 3]> = Rc::new([1, 2, 3]);
+    let b: Rc<[i32]> = a;
+    println!("len={} {} {} {}", b.len(), b[0], b[1], b[2]);
+    let c = b.clone();
+    println!("strong={} clen={}", Rc::strong_count(&b), c.len());
+}
+"#;
+
+#[test]
+fn run_mode_unsize_rc_slice_handle() {
+    run_ok("unsize-rc-slice", UNSIZE_RC_SLICE_SRC, "len=3 1 2 3\nstrong=2 clen=3\n");
+}
+
+const UNSIZE_RC_WRAPPERS_SRC: &str = r#"
+use std::cell::RefCell;
+use std::rc::Rc;
+struct Foo<T: ?Sized>(T);
+fn main() {
+    let rc: Rc<Foo<[u8]>> = Rc::new(Foo([7u8, 8, 9]));
+    println!("foo {} {}", rc.0.len(), rc.0[2]);
+    let a: Rc<RefCell<[isize; 3]>> = Rc::new(RefCell::new([10, 20, 30]));
+    let b: Rc<RefCell<[isize]>> = a;
+    println!("cell {} {}", b.borrow().len(), b.borrow()[1]);
+    let s: std::sync::Arc<[i32]> = std::sync::Arc::new([4, 5]);
+    let w = std::sync::Arc::downgrade(&s);
+    println!("arc {} weak {}", s.len(), w.upgrade().map(|x| x.len()).unwrap_or(0));
+}
+"#;
+
+#[test]
+fn run_mode_unsize_rc_wrapped_and_refcell_slices() {
+    run_ok(
+        "unsize-rc-wrappers",
+        UNSIZE_RC_WRAPPERS_SRC,
+        "foo 3 9\ncell 3 20\narc 2 weak 2\n",
+    );
+}
+
+const UNSIZE_CUSTOM_PTR_SRC: &str = r#"
+#![feature(coerce_unsized, unsize)]
+use std::marker::Unsize;
+use std::ops::CoerceUnsized;
+struct MyPtr<T: ?Sized> { p: *mut T, tag: u32 }
+impl<T: ?Sized, U: ?Sized> CoerceUnsized<MyPtr<U>> for MyPtr<T> where T: Unsize<U> {}
+fn main() {
+    let mut arr = [10u8, 20, 30];
+    let a: MyPtr<[u8; 3]> = MyPtr { p: &mut arr, tag: 7 };
+    let b: MyPtr<[u8]> = a;
+    println!("tag={}", b.tag);
+    let s: &[u8] = unsafe { &*b.p };
+    println!("len={} s1={}", s.len(), s[1]);
+}
+"#;
+
+#[test]
+fn run_mode_unsize_custom_pointer_multi_field() {
+    run_ok("unsize-custom-ptr", UNSIZE_CUSTOM_PTR_SRC, "tag=7\nlen=3 s1=20\n");
+}
+
+const UNSIZE_BYTE_STATICS_SRC: &str = r#"
+static BYTES: &[u8] = &[1, 2, 3];
+const CB: &[u8] = b"ab";
+fn take(s: &[u8]) { println!("take {} {}", s.len(), s[2]); }
+fn main() {
+    println!("st {} {}", BYTES.len(), BYTES[1]);
+    take(BYTES);
+    println!("cb {} {}", CB.len(), CB[0]);
+}
+"#;
+
+#[test]
+fn run_mode_unsize_byte_slice_statics_are_fat_pointers() {
+    run_ok(
+        "unsize-byte-statics",
+        UNSIZE_BYTE_STATICS_SRC,
+        "st 3 2\ntake 3 3\ncb 2 97\n",
+    );
+}
+
+const UNSIZE_RAW_ONE_ELEM_SRC: &str = r#"
+fn main() {
+    let b = Box::new([5u8]);
+    let raw = Box::into_raw(b);
+    let raw2 = raw as *mut [u8];
+    let s: &[u8] = unsafe { &*raw2 };
+    println!("len={} v={}", s.len(), s[0]);
+    let b2 = unsafe { Box::from_raw(raw2) };
+    drop(b2);
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_unsize_raw_pointer_slice_view() {
+    run_ok("unsize-raw-view", UNSIZE_RAW_ONE_ELEM_SRC, "len=1 v=5\ndone\n");
+}

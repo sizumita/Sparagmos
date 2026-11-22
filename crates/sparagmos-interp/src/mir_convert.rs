@@ -2730,13 +2730,38 @@ impl<'a> Converter<'a> {
                         });
                     }
                 }
-                ir::Constant::Bytes(b.clone())
+                // In pointer-to-slice position the bytes are not
+                // the value: the value is the fat pointer to them
+                // (a `&[u8]` static's initializer decodes to this
+                // form), and a bare byte value where a slice
+                // pointer belongs loses the length every consumer
+                // of the pointer reads.
+                if ctx_is_u8_slice_ptr(ctx) {
+                    ir::Constant::SliceVal(
+                        b.iter()
+                            .map(|byte| ir::Constant::Uint(u128::from(*byte)))
+                            .collect(),
+                    )
+                } else {
+                    ir::Constant::Bytes(b.clone())
+                }
             }
             mir::ConstValue::Slice { data, meta } => {
                 // A slice constant whose metadata equals its byte
                 // length is a byte slice.
                 if *meta as usize == data.len() {
-                    ir::Constant::Bytes(data.clone())
+                    // As with the byte form above: in
+                    // pointer-to-slice position the constant is
+                    // the fat pointer, not the pointee data.
+                    if ctx_is_u8_slice_ptr(ctx) {
+                        ir::Constant::SliceVal(
+                            data.iter()
+                                .map(|byte| ir::Constant::Uint(u128::from(*byte)))
+                                .collect(),
+                        )
+                    } else {
+                        ir::Constant::Bytes(data.clone())
+                    }
                 } else {
                     return Err(ConvertError::UnsupportedConstant {
                         kind: "slice constant with non-byte elements".to_string(),
@@ -6089,6 +6114,25 @@ fn builtin_arg_ctx(
             }
         }
         _ => None,
+    }
+}
+
+/// Whether the context type is a pointer (a reference or a raw
+/// pointer) to a byte slice: a byte constant in that position
+/// denotes the fat pointer itself, not the pointee data. A bare
+/// slice context (a trailing unsized field inside an ADT
+/// constant, the `CStr` shape) does not qualify — there the
+/// bytes are the field's data.
+fn ctx_is_u8_slice_ptr(ctx: Option<&mir::Ty>) -> bool {
+    match ctx {
+        Some(mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _)) => {
+            matches!(
+                &**inner,
+                mir::Ty::Slice(elem)
+                    if matches!(&**elem, mir::Ty::Uint(mir::UintTy::U8))
+            )
+        }
+        _ => false,
     }
 }
 
