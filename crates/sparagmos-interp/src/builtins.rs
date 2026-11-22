@@ -2775,6 +2775,22 @@ fn json_escape(text: &str) -> String {
 /// test's captured output: the `thread '...' panicked at ...`
 /// head and the message, without the backtrace note the
 /// failure account adds.
+/// The full panic report of a failing test's captured output:
+/// the report head plus the backtrace note line, as libtest
+/// prints it ahead of a failure's own account (for example the
+/// `panic did not contain expected string` note).
+fn panic_report_full(
+    test: &TestDesc,
+    thread_id: u64,
+    location: Option<(String, u64, u64)>,
+    message: &str,
+) -> String {
+    format!(
+        "{}note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+        panic_report_head(test, thread_id, location, message)
+    )
+}
+
 fn panic_report_head(
     test: &TestDesc,
     thread_id: u64,
@@ -4101,8 +4117,14 @@ impl<'a> Interpreter<'a> {
                                             .as_ref()
                                             .map(|p| p.ty.clone())
                                             .unwrap_or_default();
+                                        let report = panic_report_full(
+                                            test,
+                                            self.current_thread_id(),
+                                            self.panic_location(),
+                                            &message,
+                                        );
                                         Some(Some(format!(
-                                            "{cap_out}{cap_err}note: expected panic with string value,\n found non-string value: `{ty}`\n     expected substring: \"{expected}\""
+                                            "{cap_out}{cap_err}{report}note: expected panic with string value,\n found non-string value: `{ty}`\n     expected substring: \"{expected}\""
                                         )))
                                     } else if text.contains(expected.as_str()) {
                                         pass_note = Some(panic_report_head(
@@ -4113,8 +4135,14 @@ impl<'a> Interpreter<'a> {
                                         ));
                                         None
                                     } else {
+                                        let report = panic_report_full(
+                                            test,
+                                            self.current_thread_id(),
+                                            self.panic_location(),
+                                            &message,
+                                        );
                                         Some(Some(format!(
-                                            "{cap_out}{cap_err}note: panic did not contain expected string\n      panic message: \"{text}\"\n expected substring: \"{expected}\""
+                                            "{cap_out}{cap_err}{report}note: panic did not contain expected string\n      panic message: \"{text}\"\n expected substring: \"{expected}\""
                                         )))
                                     }
                                 }
