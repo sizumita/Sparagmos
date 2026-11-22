@@ -2537,7 +2537,10 @@ impl<'a> Interpreter<'a> {
             variant: 0,
             fields: vec![
                 Value::DynRef {
-                    base: Box::new((*payload.value).clone()),
+                    base: Box::new(Value::Enum {
+                        variant: 0,
+                        fields: vec![(*payload.value).clone()],
+                    }),
                     concrete: payload.ty.clone(),
                     traits: vec![
                         "std::any::Any".to_string(),
@@ -10683,6 +10686,10 @@ fn parse_impl_key(base: &str) -> Option<(String, String, String)> {
 /// crate prefix may be omitted on a side that carries none.
 fn impl_self_matches(self_part: &str, name: &str) -> bool {
     let self_base = self_part.split('<').next().unwrap_or(self_part);
+    // The queried name may itself carry a generic argument list
+    // (a fully rendered concrete type); only its base takes part
+    // in the comparison, as the key side's list is stripped above.
+    let name = name.split('<').next().unwrap_or(name);
     if self_part != self_base && !self_part.ends_with('>') {
         return false;
     }

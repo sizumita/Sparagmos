@@ -3842,7 +3842,10 @@ impl<'a> Interpreter<'a> {
                     // downcasts, in the same shape the
                     // `catch_unwind` cleanup produces.
                     Err(payload) => Ok(err_result(Value::DynRef {
-                        base: Box::new((*payload.value).clone()),
+                        base: Box::new(Value::Enum {
+                            variant: 0,
+                            fields: vec![(*payload.value).clone()],
+                        }),
                         concrete: payload.ty.clone(),
                         traits: vec![
                             "std::any::Any".to_string(),
@@ -5849,7 +5852,14 @@ impl<'a> Interpreter<'a> {
                 arity(1)?;
                 match &vals[0] {
                     Value::PanicPayload(payload) => Ok(Value::DynRef {
-                        base: Box::new(payload.value.as_ref().clone()),
+                        // The payload travels in the aggregate
+                        // box shape a sized box value has, so the
+                        // data pointer has the shape `Value::DynRef`
+                        // documents for a `Box` coercion.
+                        base: Box::new(Value::Enum {
+                            variant: 0,
+                            fields: vec![payload.value.as_ref().clone()],
+                        }),
                         concrete: payload.ty.clone(),
                         traits: vec![
                             "std::any::Any".to_string(),
@@ -5899,6 +5909,12 @@ impl<'a> Interpreter<'a> {
                 // records.
                 self.note_resumed_panic();
                 let (concrete, value, _) = resolve_dyn_box(self, frames, &vals[0], name)?;
+                // The re-raised payload is the pointee the dyn
+                // value's base denotes (the box's contents), not
+                // the box itself: the cleanup that later turns a
+                // payload back into a dyn value wraps it in a box
+                // again, so handing it the box would double it.
+                let value = dyn_box_pointee(self, frames, &value)?;
                 let message = match &value {
                     Value::Str(text) => text.clone(),
                     _ => "Box<dyn Any>".to_string(),
@@ -5916,6 +5932,10 @@ impl<'a> Interpreter<'a> {
                 let want = expect_generic_ty(generic_args, name)?;
                 let (concrete, value, _) = resolve_dyn_box(self, frames, &vals[0], name)?;
                 if concrete == want {
+                    // The result denotes the payload the dyn
+                    // value's base points at (the box's pointee),
+                    // not the box itself.
+                    let value = dyn_box_pointee(self, frames, &value)?;
                     Ok(Value::Enum {
                         variant: 1,
                         fields: vec![Value::Ref(RefTarget::value(value))],
@@ -5933,15 +5953,18 @@ impl<'a> Interpreter<'a> {
                 let (concrete, value, original) =
                     resolve_dyn_box(self, frames, &vals[0], name)?;
                 if concrete == want {
-                    // `Ok` holds a `Box<T>`: the box aggregate
-                    // around the payload value (the same shape
-                    // `Box::new` builds), not the bare payload.
+                    // `Ok` holds a `Box<T>`: the dyn value's base
+                    // itself, which is the box in the shape the
+                    // sized value had (see `Value::DynRef`) — an
+                    // allocation-backed box from an unsizing cast,
+                    // or the aggregate box a fabricated payload
+                    // travels in. Wrapping it once more would hand
+                    // back a box whose field is another box, and
+                    // writes through the result's `Deref` could not
+                    // reach the payload.
                     Ok(Value::Enum {
                         variant: 0,
-                        fields: vec![Value::Enum {
-                            variant: 0,
-                            fields: vec![value],
-                        }],
+                        fields: vec![value],
                     })
                 } else {
                     Ok(Value::Enum {
@@ -12336,6 +12359,37 @@ fn resolve_dyn_box(
     }
 }
 
+/// The pointee a box-shaped value denotes: the payload a
+/// `DynRef` base in a box shape carries. An allocation-backed
+/// box (a one-field aggregate chain bottoming out in a pointer)
+/// denotes the value the pointer points at; an aggregate-shaped
+/// box denotes its field value itself. Any other value denotes
+/// itself.
+fn dyn_box_pointee(
+    interp: &mut Interpreter,
+    frames: &mut Vec<Frame>,
+    base: &Value,
+) -> InterpResult<Value> {
+    let mut current = base.clone();
+    let mut first_field: Option<Value> = None;
+    loop {
+        match current {
+            Value::Enum { fields, .. } if fields.len() == 1 => {
+                let field = fields.into_iter().next().expect("one field");
+                if first_field.is_none() {
+                    first_field = Some(field.clone());
+                }
+                current = field;
+            }
+            Value::Ref(_) | Value::FatRef { .. } => {
+                let target = interp.deref_value(frames, &current)?;
+                return interp.read_resolved(frames, &target);
+            }
+            other => return Ok(first_field.unwrap_or(other)),
+        }
+    }
+}
+
 fn expect_arguments<'v>(value: &'v Value, name: &str) -> InterpResult<&'v FmtArguments> {
     match value {
         Value::FmtArguments(args) => Ok(args),
@@ -15762,11 +15816,19 @@ impl<'a> Interpreter<'a> {
                     })
                 } else if let Value::Enum { fields, .. } = &pointee {
                     if fields.len() == 1
-                        && matches!(
+                        && (matches!(
                             fields[0],
                             Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. }
-                        )
+                        ) || matches!(base.as_ref(), Value::Enum { .. }))
                     {
+                        // A box's single field denotes the
+                        // pointee: the pointee reference of an
+                        // allocation-backed box (which the `Ref`
+                        // arm above then resolves), or the pointee
+                        // value itself of an aggregate-shaped box.
+                        // A one-field payload reached through a
+                        // reference is the payload itself, not a
+                        // box, and keeps its shape.
                         fields[0].clone()
                     } else {
                         pointee

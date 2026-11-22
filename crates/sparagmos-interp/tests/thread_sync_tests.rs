@@ -359,14 +359,22 @@ fn spawned_thread_panic_becomes_the_join_error() {
         Value::Enum { variant: 1, fields } => match &fields[0] {
             // The join error is the panic payload as a
             // `Box<dyn Any>`: a `DynRef` whose base is the
-            // payload value (here the `&str` message).
+            // aggregate box holding the payload value (here the
+            // `&str` message), the shape a sized box value has.
             Value::DynRef { base, concrete, .. } => {
                 assert_eq!(concrete, "&str");
                 match &**base {
-                    Value::Str(message) => {
-                        assert!(message.contains("Option::unwrap"), "{message}")
+                    Value::Enum { fields, .. } if fields.len() == 1 => {
+                        match &fields[0] {
+                            Value::Str(message) => {
+                                assert!(message.contains("Option::unwrap"), "{message}")
+                            }
+                            other => {
+                                panic!("expected the panic message string, got {other:?}")
+                            }
+                        }
                     }
-                    other => panic!("expected the panic message string, got {other:?}"),
+                    other => panic!("expected the payload box, got {other:?}"),
                 }
             }
             other => panic!("expected the payload DynRef, got {other:?}"),
