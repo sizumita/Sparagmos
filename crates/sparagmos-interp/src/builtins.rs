@@ -5140,6 +5140,34 @@ impl<'a> Interpreter<'a> {
                             if let Value::Ref(RefTarget::Alloc { .. }) = inner {
                                 return Ok(inner);
                             }
+                            // An aggregate-shaped box holds its
+                            // pointee as the field value itself.
+                            // When the box lives in a place, the
+                            // deref denotes that place's field 0,
+                            // so writes through the result land in
+                            // the box's storage; a box reached
+                            // only as a value keeps the snapshot
+                            // form, as for constant aggregates.
+                            // (A field that is itself a one-field
+                            // wrapper around a reference is another
+                            // pointer layer, not the pointee: its
+                            // snapshot is kept, as for the built
+                            // box's allocation pointer above.)
+                            let wrapped_pointer = matches!(
+                                &inner,
+                                Value::Enum { fields, .. }
+                                    if fields.len() == 1
+                                        && matches!(fields[0], Value::Ref(_))
+                            );
+                            if !wrapped_pointer {
+                                if let Some(place_ref) = self.place_projected_ref(
+                                    frames,
+                                    &vals[0],
+                                    RefProj::Field(0),
+                                )? {
+                                    return Ok(place_ref);
+                                }
+                            }
                             Ok(Value::Ref(RefTarget::value(inner)))
                         }
                         ref other => Err(InterpError::type_mismatch(
@@ -6430,6 +6458,33 @@ impl<'a> Interpreter<'a> {
                             let inner = fields.into_iter().next().expect("len checked");
                             if let Value::Ref(RefTarget::Alloc { .. }) = inner {
                                 return Ok(inner);
+                            }
+                            // As in `Deref`: an aggregate-shaped
+                            // box in a live place yields a
+                            // reference to that place's field 0,
+                            // so mutable writes through the
+                            // result land in the box; a box
+                            // reached only as a value keeps the
+                            // snapshot form.
+                            // (A field that is itself a one-field
+                            // wrapper around a reference is another
+                            // pointer layer, not the pointee: its
+                            // snapshot is kept, as for the built
+                            // box's allocation pointer above.)
+                            let wrapped_pointer = matches!(
+                                &inner,
+                                Value::Enum { fields, .. }
+                                    if fields.len() == 1
+                                        && matches!(fields[0], Value::Ref(_))
+                            );
+                            if !wrapped_pointer {
+                                if let Some(place_ref) = self.place_projected_ref(
+                                    frames,
+                                    &vals[0],
+                                    RefProj::Field(0),
+                                )? {
+                                    return Ok(place_ref);
+                                }
                             }
                             Ok(Value::Ref(RefTarget::value(inner)))
                         }
@@ -11170,6 +11225,57 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         Err(unsupported(format!(
             "{what} for {base_ty} -> {target_ty} is not runtime-supported"
         )))
+    }
+
+    /// The reference `step` inside the place a reference value
+    /// denotes, when the reference denotes a live place: a frame
+    /// place, a static's storage or an allocation, with `step`
+    /// appended to its projection. Returns `None` when the
+    /// reference denotes no place (a value snapshot), where the
+    /// caller falls back to resolving against the value itself.
+    ///
+    /// Builtins that hand out references to a part of a value they
+    /// were given a reference to (the pointee of an
+    /// aggregate-shaped box) use this to keep the result denoting
+    /// the same storage the part lives in, so writes through the
+    /// result \u2014 interior mutation, `SetDiscriminant`, a
+    /// `Cell::set` write-back \u2014 land in that storage instead of
+    /// failing on an immutable snapshot of it.
+    fn place_projected_ref(
+        &self,
+        frames: &[Frame],
+        arg: &Value,
+        step: RefProj,
+    ) -> InterpResult<Option<Value>> {
+        Ok(match self.deref_value(frames, arg)? {
+            Resolved::Place {
+                frame_pos,
+                local,
+                mut projection,
+            } => {
+                projection.push(step);
+                Some(Value::Ref(RefTarget::Place {
+                    frame: frames[frame_pos].id,
+                    local,
+                    projection,
+                }))
+            }
+            Resolved::Static {
+                name,
+                mut projection,
+            } => {
+                projection.push(step);
+                Some(Value::Ref(RefTarget::Static { name, projection }))
+            }
+            Resolved::Alloc {
+                id,
+                mut projection,
+            } => {
+                projection.push(step);
+                Some(Value::Ref(RefTarget::Alloc { id, projection }))
+            }
+            Resolved::Value(..) => None,
+        })
     }
 
     /// A reference to field 0 of the aggregate `arg` points at:
