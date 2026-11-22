@@ -406,10 +406,11 @@ impl<'a> Interpreter<'a> {
                 self.decode_src(operand),
                 Rc::from(discriminants.as_slice()),
             ),
-            // Unsize, BoxDerefTransmute, PtrField, Reinterpret,
-            // Ref, CopyForDeref, ThreadLocalRef, Unsupported: their
-            // evaluation is entangled with place resolution or is
-            // an explicit error; the original evaluator runs them.
+            // DataPtr, RawPtrAggregate, Unsize, BoxDerefTransmute,
+            // PtrField, Reinterpret, PtrOffset, Ref, CopyForDeref,
+            // ThreadLocalRef, Unsupported: their evaluation is
+            // entangled with place resolution or is an explicit
+            // error; the original evaluator runs them.
             _ => DRvalue::Orig(Box::new(rv.clone())),
         }
     }
@@ -459,8 +460,10 @@ impl<'a> Interpreter<'a> {
     /// original read (zero-sized fallback and errors), the
     /// projection walks with `project_value` under the
     /// precomputed description, and a projected uninitialized
-    /// value is the same `UninitializedRead` the general path
-    /// reports after projection.
+    /// read is rescued by the body's recorded zero-sized field
+    /// value (`zst_field_value`) or reported as the same
+    /// `UninitializedRead` the general path reports after
+    /// projection.
     fn read_local_proj(
         &self,
         frames: &[Frame],
@@ -479,13 +482,27 @@ impl<'a> Interpreter<'a> {
         if base == Value::Uninit {
             return self.read_place(frames, body, place);
         }
-        let value = project_value(base, proj, &frame.func, desc)?;
-        if value == Value::Uninit {
-            return Err(InterpError::UninitializedRead {
-                func: frame.func.clone(),
-                place: desc.to_string(),
-            });
-        }
+        // Mirror `read_resolved`: a projected read that comes
+        // back uninitialized (as a value, or as the projection's
+        // own uninitialized-read error) is rescued by the single
+        // value of a zero-sized field whose store was elided,
+        // recorded in the body's `zst_fields` table; any other
+        // projection error is the original one.
+        let value = match project_value(base, proj, &frame.func, desc) {
+            Ok(v) if v != Value::Uninit => v,
+            Ok(_) | Err(InterpError::UninitializedRead { .. }) => {
+                match self.zst_field_value(frame, local, proj) {
+                    Some(v) => v,
+                    None => {
+                        return Err(InterpError::UninitializedRead {
+                            func: frame.func.clone(),
+                            place: desc.to_string(),
+                        });
+                    }
+                }
+            }
+            Err(e) => return Err(e),
+        };
         Ok(value)
     }
 

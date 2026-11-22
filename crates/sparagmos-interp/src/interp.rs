@@ -4978,7 +4978,7 @@ impl<'a> Interpreter<'a> {
     /// local (see the note in `read_resolved`); `None` when the
     /// projection is not a pure field path or conversion recorded
     /// no single-valued value for it.
-    fn zst_field_value(
+    pub(crate) fn zst_field_value(
         &self,
         frame: &Frame,
         local: usize,
