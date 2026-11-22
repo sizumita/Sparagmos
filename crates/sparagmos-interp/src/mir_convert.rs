@@ -3051,6 +3051,48 @@ impl<'a> Converter<'a> {
 
     // ----- transmute casts ---------------------------------------------------
 
+    /// The operand denoting the thin pointer at the bottom of
+    /// a chain of one-field ADTs (the `NonNull` shape:
+    /// `NonNull { pointer: NonZero<*const T> }` — the payload
+    /// hides behind the `NonZero` newtype, one layer deeper
+    /// than the transparent wrappers `wrapper_shape` matches,
+    /// whose payload field must be the pointer itself). Each
+    /// layer must be a struct with exactly one field; the chain
+    /// ends at the first field that is itself a thin pointer.
+    /// `None` for any other shape.
+    fn ptr_chain_operand(
+        &self,
+        body: &mir::Body,
+        operand: &mir::Operand,
+        v: &ir::Operand,
+        def: &mir::AdtDefId,
+        args: &[mir::Ty],
+    ) -> Option<ir::Operand> {
+        let field_ty = self.single_field_ty(def, args)?;
+        let field_v = self.field_operand(body, operand, v, 0, &field_ty)?;
+        if is_thin_ptr_ty(&field_ty) {
+            return Some(field_v);
+        }
+        let mir::Ty::Adt(fdef, fargs) = &field_ty else {
+            return None;
+        };
+        // The next layer's operand: the same place extended by
+        // the field projection (a constant operand stays a
+        // constant: `field_operand` reads its fields from the
+        // converted value instead).
+        let next_operand = match operand.place() {
+            Some(place) => {
+                let place = place.clone().field(0, field_ty.clone());
+                match operand {
+                    mir::Operand::Move(_) => mir::Operand::Move(place),
+                    _ => mir::Operand::Copy(place),
+                }
+            }
+            None => operand.clone(),
+        };
+        self.ptr_chain_operand(body, &next_operand, &field_v, fdef, fargs)
+    }
+
     /// Convert a `CastKind::Transmute` rvalue: `operand` is the
     /// MIR operand, `v` its converted IR form, `target` the cast's
     /// target type. Only the shapes this value model can
@@ -3254,6 +3296,36 @@ impl<'a> Converter<'a> {
             // the integer of exactly its field's type) the result
             // is the same value: the field itself.
             (_, _) if generic.is_some() => generic.clone().unwrap(),
+            // ADT -> integer through a newtype chain over a
+            // thin pointer (the `NonNull` shape, whose payload
+            // field is a `NonZero<*const T>`): the synthetic
+            // address of the pointer at the bottom of the chain
+            // (what `NonNull::as_ptr().addr()` and the packed
+            // `io::Error` repr decode compute).
+            (Some(mir::Ty::Adt(def, args)), mir::Ty::Int(_) | mir::Ty::Uint(_))
+                if self
+                    .ptr_chain_operand(body, operand, v, def, args)
+                    .is_some() =>
+            {
+                let op = self
+                    .ptr_chain_operand(body, operand, v, def, args)
+                    .expect("guard checked");
+                ir::Rvalue::PtrToInt(op)
+            }
+            // ADT -> thin pointer through the same chain: the
+            // pointer at the bottom of the chain itself (what
+            // `NonNull::as_ptr()` computes).
+            (Some(mir::Ty::Adt(def, args)), t)
+                if is_thin_ptr_ty(t)
+                    && self
+                        .ptr_chain_operand(body, operand, v, def, args)
+                        .is_some() =>
+            {
+                let op = self
+                    .ptr_chain_operand(body, operand, v, def, args)
+                    .expect("guard checked");
+                ir::Rvalue::Use(op)
+            }
             // Fieldless enum -> integer: the discriminant value.
             // Single-field struct -> integer of exactly the
             // field's type: the field itself (the struct is a
@@ -6758,6 +6830,16 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
             // path uses for the entry crate's types. An
             // unevidenced field stays unaccounted for and fails
             // the plan, as usual.
+            // The bitpacked error representation word: for the
+            // Os / Simple / SimpleMessage tags - the only
+            // representations the runtime produces - the word
+            // owns nothing (an error code, a kind discriminant,
+            // or a `&'static` message). The Custom tag's heap box
+            // is reachable only through `Error::new` construction,
+            // which has no converted body in this model; if that
+            // construction is ever modelled, this entry must be
+            // revisited so the box's glue runs.
+            "core::io::error::repr::Repr" => return Some(P::Trivial),
             "std::io::Error" => {
                 return Some(self.variant_fields_plan(def, args)?)
             }
@@ -6778,6 +6860,18 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                 return Some(P::Trivial)
             }
             "std::cell::BorrowMutError" | "core::cell::BorrowMutError" => {
+                return Some(P::Trivial)
+            }
+            // Process commands: the value is the process
+            // model's handle (an id into the interpreter's
+            // command table); the builder state it denotes
+            // carries no guest-visible destruction, so there
+            // is no glue to run. (A dropped `Child` likewise
+            // has no glue in the model: no child is ever
+            // started, so there is nothing to reap.)
+            "std::process::Command"
+            | "std::sys::process::unix::common::Command"
+            | "std::process::Child" => {
                 return Some(P::Trivial)
             }
             "std::ops::Range" | "std::ops::RangeInclusive" => {
@@ -6873,6 +6967,13 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                 // model (see the `env::args_os` builtin): no owned
                 // resource beyond it.
                 return Some(P::Trivial);
+            }
+            "std::path::PathBuf" => {
+                // A path buffer's only owned content is its
+                // `OsString`, which is the string value itself in
+                // this model (see the `OsString` entry above), so
+                // the evidenced-fields plan is the whole glue.
+                return Some(self.variant_fields_plan(def, args)?);
             }
             "std::io::Stdout" | "std::io::Stderr" | "std::io::StdoutLock"
             | "std::io::StderrLock" => {
