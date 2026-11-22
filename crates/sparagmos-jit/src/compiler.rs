@@ -28,7 +28,8 @@
 
 use crate::emitter::{Cond, Emitter, Reg, Xmm};
 use crate::ir::{
-    BinOp, CheckedOp, FloatBinOp, FloatKind, Function, Instr, Operand, Terminator, UnOp, Value,
+    BinOp, BinOp128, CheckedOp, FloatBinOp, FloatKind, Function, Instr, Operand, ShiftOp128,
+    Terminator, UnOp, Value,
 };
 use crate::memory::JitMemory;
 
@@ -48,6 +49,81 @@ extern "C" fn float_rem_f64(a: f64, b: f64) -> f64 {
 /// The `f32` form of [`float_rem_f64`].
 extern "C" fn float_rem_f32(a: f32, b: f32) -> f32 {
     a % b
+}
+
+/// Rust's `/` on `i128`, with the wrapping overflow case the plain
+/// MIR operator has (`i128::MIN / -1` is `i128::MIN`). x86_64 has
+/// no 128-bit divide instruction, so — like the `__divti3` libcall
+/// a native compiler emits — the generated code calls this helper.
+/// Arguments and result follow the System V 128-bit convention (the
+/// dividend pair in rdi:rsi, the divisor pair in rdx:rcx, the result
+/// in rax:rdx), which is the register layout the compiler's pair
+/// sequences set up. The divisor is never zero: the front end
+/// guards it, as it does for the 64-bit division.
+extern "C" fn int128_div(a: i128, b: i128) -> i128 {
+    a.wrapping_div(b)
+}
+
+/// The `i128` remainder form of [`int128_div`] (`i128::MIN % -1`
+/// is 0, as the plain MIR operator wraps).
+extern "C" fn int128_rem(a: i128, b: i128) -> i128 {
+    a.wrapping_rem(b)
+}
+
+/// The `u128` division form of [`int128_div`].
+extern "C" fn uint128_div(a: u128, b: u128) -> u128 {
+    a / b
+}
+
+/// The `u128` remainder form of [`int128_div`].
+extern "C" fn uint128_rem(a: u128, b: u128) -> u128 {
+    a % b
+}
+
+/// Whether `a * b` overflows the 128-bit integer type of the given
+/// signedness: the flag half of a checked 128-bit multiply, whose
+/// wrapped value the generated code computes itself from the
+/// widening 64-bit multiplies. The fifth System V argument word
+/// carries the signedness (0 = unsigned, nonzero = signed).
+extern "C" fn int128_mul_overflows(a: u128, b: u128, signed: u64) -> u64 {
+    let overflow = if signed != 0 {
+        (a as i128).checked_mul(b as i128).is_none()
+    } else {
+        a.checked_mul(b).is_none()
+    };
+    overflow as u64
+}
+
+/// `x as i128`: Rust's float-to-integer cast at 128 bits
+/// (saturating, NaN maps to 0). The host conversion is the native
+/// semantics, as for the float remainder helpers above.
+extern "C" fn float_to_int128(x: f64) -> i128 {
+    x as i128
+}
+
+/// `x as u128`: the unsigned form of [`float_to_int128`].
+extern "C" fn float_to_uint128(x: f64) -> u128 {
+    x as u128
+}
+
+/// `x as f64` for a 128-bit integer source.
+extern "C" fn int128_to_f64(x: i128) -> f64 {
+    x as f64
+}
+
+/// `x as f64` for a 128-bit unsigned source.
+extern "C" fn uint128_to_f64(x: u128) -> f64 {
+    x as f64
+}
+
+/// `x as f32` for a 128-bit integer source.
+extern "C" fn int128_to_f32(x: i128) -> f32 {
+    x as f32
+}
+
+/// `x as f32` for a 128-bit unsigned source.
+extern "C" fn uint128_to_f32(x: u128) -> f32 {
+    x as f32
 }
 
 #[derive(Debug)]
@@ -530,6 +606,271 @@ impl<'a> Compiler<'a> {
                     self.store_reg(*dst_val, Reg::Rcx)?;
                     self.store_result(*dst_flag)?;
                 }
+            }
+            Instr::BinOp128 {
+                dst,
+                dst2,
+                op,
+                lhs_lo,
+                lhs_hi,
+                rhs_lo,
+                rhs_hi,
+            } => {
+                match op {
+                    BinOp128::Add | BinOp128::Sub => {
+                        self.load_operand(Reg::Rax, *lhs_lo)?;
+                        self.load_operand(Reg::Rcx, *rhs_lo)?;
+                        self.load_operand(Reg::Rdx, *lhs_hi)?;
+                        self.load_operand(Reg::R8, *rhs_hi)?;
+                        match op {
+                            BinOp128::Add => {
+                                self.e.add_rr(Reg::Rax, Reg::Rcx);
+                                self.e.adc_rr(Reg::Rdx, Reg::R8);
+                            }
+                            _ => {
+                                self.e.sub_rr(Reg::Rax, Reg::Rcx);
+                                self.e.sbb_rr(Reg::Rdx, Reg::R8);
+                            }
+                        }
+                        self.store_result(*dst)?;
+                        self.store_reg(*dst2, Reg::Rdx)?;
+                    }
+                    BinOp128::Mul => {
+                        // The low 128 bits of the full product are
+                        // the widening low product plus the low
+                        // halves of the two cross products, each
+                        // shifted by 64: `res_hi = hi(lo*lo) +
+                        // lo(lo*hi) + lo(hi*lo)` (mod 2^64). The
+                        // `hi*hi` term lands above bit 128 and is
+                        // dropped, as the wrapping operator drops it.
+                        self.load_operand(Reg::Rax, *lhs_lo)?;
+                        self.load_operand(Reg::Rcx, *rhs_lo)?;
+                        self.e.mul(Reg::Rcx); // rdx:rax = lhs_lo * rhs_lo
+                        self.load_operand(Reg::Rcx, *lhs_lo)?;
+                        self.load_operand(Reg::R8, *rhs_hi)?;
+                        self.e.imul_rr(Reg::Rcx, Reg::R8);
+                        self.e.add_rr(Reg::Rdx, Reg::Rcx);
+                        self.load_operand(Reg::Rcx, *lhs_hi)?;
+                        self.load_operand(Reg::R8, *rhs_lo)?;
+                        self.e.imul_rr(Reg::Rcx, Reg::R8);
+                        self.e.add_rr(Reg::Rdx, Reg::Rcx);
+                        self.store_result(*dst)?;
+                        self.store_reg(*dst2, Reg::Rdx)?;
+                    }
+                    BinOp128::And | BinOp128::Or | BinOp128::Xor => {
+                        for (dst, lhs, rhs) in
+                            [(*dst, lhs_lo, rhs_lo), (*dst2, lhs_hi, rhs_hi)]
+                        {
+                            self.load_operand(Reg::Rax, *lhs)?;
+                            self.load_operand(Reg::Rcx, *rhs)?;
+                            match op {
+                                BinOp128::And => self.e.and_rr(Reg::Rax, Reg::Rcx),
+                                BinOp128::Or => self.e.or_rr(Reg::Rax, Reg::Rcx),
+                                _ => self.e.xor_rr(Reg::Rax, Reg::Rcx),
+                            }
+                            self.store_result(dst)?;
+                        }
+                    }
+                    BinOp128::Div | BinOp128::Rem | BinOp128::DivU | BinOp128::RemU => {
+                        // No 128-bit divide instruction exists; the
+                        // helpers take the pairs in the System V
+                        // 128-bit argument registers and return the
+                        // pair in rax:rdx.
+                        self.load_operand(Reg::Rdi, *lhs_lo)?;
+                        self.load_operand(Reg::Rsi, *lhs_hi)?;
+                        self.load_operand(Reg::Rdx, *rhs_lo)?;
+                        self.load_operand(Reg::Rcx, *rhs_hi)?;
+                        let helper = match op {
+                            BinOp128::Div => int128_div as usize,
+                            BinOp128::Rem => int128_rem as usize,
+                            BinOp128::DivU => uint128_div as usize,
+                            _ => uint128_rem as usize,
+                        };
+                        self.e.mov_ri64(Reg::Rax, helper as i64);
+                        self.e.call_r(Reg::Rax);
+                        self.store_result(*dst)?;
+                        self.store_reg(*dst2, Reg::Rdx)?;
+                    }
+                }
+            }
+            Instr::Shift128 {
+                dst,
+                dst2,
+                op,
+                lo,
+                hi,
+                amount,
+            } => {
+                self.load_operand(Reg::Rax, *lo)?;
+                self.load_operand(Reg::Rdx, *hi)?;
+                self.load_operand(Reg::Rcx, *amount)?;
+                // The amount is in `0..=127`. Below 64 the shift
+                // crosses the word boundary partially and the
+                // double-precision shifts serve it (their counts
+                // are masked to 6 bits by the hardware, which is
+                // exactly the range this path sees); at 64 and
+                // above the far word shifts alone by `amount - 64`
+                // and the near word becomes its fill.
+                self.e.cmp_ri(Reg::Rcx, 64);
+                let small = self.e.jcc_rel32(Cond::Below);
+                self.e.sub_ri(Reg::Rcx, 64);
+                match op {
+                    ShiftOp128::Shl => {
+                        self.e.mov_rr(Reg::Rdx, Reg::Rax);
+                        self.e.shl_cl(Reg::Rdx);
+                        self.e.xor_rr(Reg::Rax, Reg::Rax);
+                    }
+                    ShiftOp128::Shr => {
+                        self.e.mov_rr(Reg::Rax, Reg::Rdx);
+                        self.e.shr_cl(Reg::Rax);
+                        self.e.xor_rr(Reg::Rdx, Reg::Rdx);
+                    }
+                    ShiftOp128::Sar => {
+                        self.e.mov_rr(Reg::R8, Reg::Rdx);
+                        self.e.sar_imm(Reg::R8, 63);
+                        self.e.mov_rr(Reg::Rax, Reg::Rdx);
+                        self.e.sar_cl(Reg::Rax);
+                        self.e.mov_rr(Reg::Rdx, Reg::R8);
+                    }
+                }
+                let done = self.e.jmp_rel32();
+                let small_at = self.e.position();
+                self.e.buf.patch_rel32(small, small_at);
+                match op {
+                    ShiftOp128::Shl => {
+                        self.e.shld_cl(Reg::Rdx, Reg::Rax);
+                        self.e.shl_cl(Reg::Rax);
+                    }
+                    ShiftOp128::Shr | ShiftOp128::Sar => {
+                        self.e.shrd_cl(Reg::Rax, Reg::Rdx);
+                        match op {
+                            ShiftOp128::Shr => self.e.shr_cl(Reg::Rdx),
+                            _ => self.e.sar_cl(Reg::Rdx),
+                        }
+                    }
+                }
+                let done_at = self.e.position();
+                self.e.buf.patch_rel32(done, done_at);
+                self.store_result(*dst)?;
+                self.store_reg(*dst2, Reg::Rdx)?;
+            }
+            Instr::CheckedBinOp128 {
+                dst_val,
+                dst_val2,
+                dst_flag,
+                op,
+                signed,
+                lhs_lo,
+                lhs_hi,
+                rhs_lo,
+                rhs_hi,
+            } => {
+                match op {
+                    CheckedOp::Add | CheckedOp::Sub => {
+                        self.load_operand(Reg::Rax, *lhs_lo)?;
+                        self.load_operand(Reg::Rcx, *rhs_lo)?;
+                        self.load_operand(Reg::Rdx, *lhs_hi)?;
+                        self.load_operand(Reg::R8, *rhs_hi)?;
+                        match op {
+                            CheckedOp::Add => {
+                                self.e.add_rr(Reg::Rax, Reg::Rcx);
+                                self.e.adc_rr(Reg::Rdx, Reg::R8);
+                            }
+                            _ => {
+                                self.e.sub_rr(Reg::Rax, Reg::Rcx);
+                                self.e.sbb_rr(Reg::Rdx, Reg::R8);
+                            }
+                        }
+                        // The stores below are `mov`s, which do
+                        // not touch flags, so the carry chain's
+                        // flags still describe the full-width
+                        // operation when read afterwards: the final
+                        // adc/sbb's OF is the signed overflow of
+                        // the 128-bit operation and its CF the
+                        // unsigned carry / borrow out.
+                        self.store_result(*dst_val)?;
+                        self.store_reg(*dst_val2, Reg::Rdx)?;
+                        let cc = if *signed {
+                            Cond::Overflow
+                        } else {
+                            Cond::Below
+                        };
+                        self.e.setcc_al(cc);
+                        self.e.movzx_rax_al();
+                        self.store_result(*dst_flag)?;
+                    }
+                    CheckedOp::Mul => {
+                        // The wrapped value comes from the widening
+                        // multiplies, exactly as the plain 128-bit
+                        // multiply computes it...
+                        self.load_operand(Reg::Rax, *lhs_lo)?;
+                        self.load_operand(Reg::Rcx, *rhs_lo)?;
+                        self.e.mul(Reg::Rcx);
+                        self.load_operand(Reg::Rcx, *lhs_lo)?;
+                        self.load_operand(Reg::R8, *rhs_hi)?;
+                        self.e.imul_rr(Reg::Rcx, Reg::R8);
+                        self.e.add_rr(Reg::Rdx, Reg::Rcx);
+                        self.load_operand(Reg::Rcx, *lhs_hi)?;
+                        self.load_operand(Reg::R8, *rhs_lo)?;
+                        self.e.imul_rr(Reg::Rcx, Reg::R8);
+                        self.e.add_rr(Reg::Rdx, Reg::Rcx);
+                        self.store_result(*dst_val)?;
+                        self.store_reg(*dst_val2, Reg::Rdx)?;
+                        // ...and the flag from the checked-multiply
+                        // helper, whose host `checked_mul` is the
+                        // exact overflow predicate at this width.
+                        self.load_operand(Reg::Rdi, *lhs_lo)?;
+                        self.load_operand(Reg::Rsi, *lhs_hi)?;
+                        self.load_operand(Reg::Rdx, *rhs_lo)?;
+                        self.load_operand(Reg::Rcx, *rhs_hi)?;
+                        self.load_operand(Reg::R8, Operand::Const(*signed as i64))?;
+                        self.e.mov_ri64(Reg::Rax, int128_mul_overflows as usize as i64);
+                        self.e.call_r(Reg::Rax);
+                        self.store_result(*dst_flag)?;
+                    }
+                }
+            }
+            Instr::FloatToInt128 {
+                dst,
+                dst2,
+                kind,
+                src,
+                signed,
+            } => {
+                self.load_float_operand(Xmm::Xmm0, *kind, *src)?;
+                // Widening f32 to f64 is exact, so one f64 helper
+                // serves both formats, as in the 64-bit cast.
+                if *kind == FloatKind::F32 {
+                    self.e.cvtss2sd(Xmm::Xmm0, Xmm::Xmm0);
+                }
+                let helper = if *signed {
+                    float_to_int128 as usize
+                } else {
+                    float_to_uint128 as usize
+                };
+                self.e.mov_ri64(Reg::Rax, helper as i64);
+                self.e.call_r(Reg::Rax);
+                self.store_result(*dst)?;
+                self.store_reg(*dst2, Reg::Rdx)?;
+            }
+            Instr::Int128ToFloat {
+                dst,
+                kind,
+                lo,
+                hi,
+                signed,
+            } => {
+                self.load_operand(Reg::Rdi, *lo)?;
+                self.load_operand(Reg::Rsi, *hi)?;
+                let helper = match (kind, signed) {
+                    (FloatKind::F64, true) => int128_to_f64 as usize,
+                    (FloatKind::F64, false) => uint128_to_f64 as usize,
+                    (FloatKind::F32, true) => int128_to_f32 as usize,
+                    (FloatKind::F32, false) => uint128_to_f32 as usize,
+                };
+                self.e.mov_ri64(Reg::Rax, helper as i64);
+                self.e.call_r(Reg::Rax);
+                self.store_float_result(*dst, *kind)?;
             }
             Instr::FloatBinOp {
                 dst,
@@ -1222,5 +1563,336 @@ mod tests {
         assert_eq!(unsafe { cf.call1(10) }, 55);
         assert_eq!(unsafe { cf.call1(15) }, 610);
         assert_eq!(unsafe { cf.call1(20) }, 6765);
+    }
+
+    /// Build a 4-word-argument function whose body is a single
+    /// 128-bit pair instruction over the parameter pairs, returning
+    /// the result pair (rax:rdx).
+    fn pair_fn(build: impl Fn(&mut FunctionBuilder) -> (Value, Value)) -> CompiledFunction {
+        let mut b = FunctionBuilder::new("pair", 4);
+        let (lo, hi) = build(&mut b);
+        let f = b.finish(Terminator::Return {
+            value: lo.into(),
+            second: Some(hi.into()),
+        });
+        compile(&f).unwrap()
+    }
+
+    fn call_pair(
+        cf: &CompiledFunction,
+        a: u128,
+        b: u128,
+    ) -> u128 {
+        let f: unsafe extern "C" fn(u64, u64, u64, u64) -> (u64, u64) =
+            unsafe { cf.function_ptr() };
+        let (lo, hi) = unsafe {
+            f(
+                a as u64,
+                (a >> 64) as u64,
+                b as u64,
+                (b >> 64) as u64,
+            )
+        };
+        ((hi as u128) << 64) | lo as u128
+    }
+
+    #[test]
+    fn int128_add_sub() {
+        let add = pair_fn(|b| {
+            let (a, c) = (b.param(0), b.param(2));
+            let (d, e) = (b.fresh(), b.fresh());
+            b.push_raw(Instr::BinOp128 {
+                dst: d,
+                dst2: e,
+                op: BinOp128::Add,
+                lhs_lo: a.into(),
+                lhs_hi: b.param(1).into(),
+                rhs_lo: c.into(),
+                rhs_hi: b.param(3).into(),
+            });
+            (d, e)
+        });
+        assert_eq!(call_pair(&add, u64::MAX as u128, 1), 1u128 << 64);
+        assert_eq!(call_pair(&add, u128::MAX, 1), 0);
+        assert_eq!(call_pair(&add, (1u128 << 100) + 7, 9), (1u128 << 100) + 16);
+        let sub = pair_fn(|b| {
+            let (a, c) = (b.param(0), b.param(2));
+            let (d, e) = (b.fresh(), b.fresh());
+            b.push_raw(Instr::BinOp128 {
+                dst: d,
+                dst2: e,
+                op: BinOp128::Sub,
+                lhs_lo: a.into(),
+                lhs_hi: b.param(1).into(),
+                rhs_lo: c.into(),
+                rhs_hi: b.param(3).into(),
+            });
+            (d, e)
+        });
+        assert_eq!(call_pair(&sub, 0, 1), u128::MAX);
+        assert_eq!(call_pair(&sub, 1u128 << 64, 1), (1u128 << 64) - 1);
+    }
+
+    #[test]
+    fn int128_mul() {
+        let mul = pair_fn(|b| {
+            let (a, c) = (b.param(0), b.param(2));
+            let (d, e) = (b.fresh(), b.fresh());
+            b.push_raw(Instr::BinOp128 {
+                dst: d,
+                dst2: e,
+                op: BinOp128::Mul,
+                lhs_lo: a.into(),
+                lhs_hi: b.param(1).into(),
+                rhs_lo: c.into(),
+                rhs_hi: b.param(3).into(),
+            });
+            (d, e)
+        });
+        assert_eq!(call_pair(&mul, 3, 5), 15);
+        assert_eq!(call_pair(&mul, 1 << 32, 1 << 32), 1u128 << 64);
+        assert_eq!(call_pair(&mul, 1u128 << 64, 2), 1u128 << 65);
+        // (2^64 - 1)^2 = 2^128 - 2^65 + 1
+        assert_eq!(
+            call_pair(&mul, u64::MAX as u128, u64::MAX as u128),
+            u128::MAX - (1u128 << 65) + 2
+        );
+        // -3 * 7 = -21 (two's complement through the pair)
+        assert_eq!(call_pair(&mul, u128::MAX - 2, 7), u128::MAX - 20);
+    }
+
+    #[test]
+    fn int128_div_rem() {
+        let div = pair_fn(|b| {
+            let (a, c) = (b.param(0), b.param(2));
+            let (d, e) = (b.fresh(), b.fresh());
+            b.push_raw(Instr::BinOp128 {
+                dst: d,
+                dst2: e,
+                op: BinOp128::Div,
+                lhs_lo: a.into(),
+                lhs_hi: b.param(1).into(),
+                rhs_lo: c.into(),
+                rhs_hi: b.param(3).into(),
+            });
+            (d, e)
+        });
+        // -100 / 7 = -14, truncating toward zero.
+        assert_eq!(call_pair(&div, (-100i128) as u128, 7), (-14i128) as u128);
+        // i128::MIN / -1 wraps to i128::MIN.
+        assert_eq!(
+            call_pair(&div, (i128::MIN) as u128, u128::MAX),
+            (i128::MIN) as u128
+        );
+        let rem = pair_fn(|b| {
+            let (a, c) = (b.param(0), b.param(2));
+            let (d, e) = (b.fresh(), b.fresh());
+            b.push_raw(Instr::BinOp128 {
+                dst: d,
+                dst2: e,
+                op: BinOp128::Rem,
+                lhs_lo: a.into(),
+                lhs_hi: b.param(1).into(),
+                rhs_lo: c.into(),
+                rhs_hi: b.param(3).into(),
+            });
+            (d, e)
+        });
+        assert_eq!(call_pair(&rem, (-100i128) as u128, 7), (-2i128) as u128);
+        let divu = pair_fn(|b| {
+            let (a, c) = (b.param(0), b.param(2));
+            let (d, e) = (b.fresh(), b.fresh());
+            b.push_raw(Instr::BinOp128 {
+                dst: d,
+                dst2: e,
+                op: BinOp128::DivU,
+                lhs_lo: a.into(),
+                lhs_hi: b.param(1).into(),
+                rhs_lo: c.into(),
+                rhs_hi: b.param(3).into(),
+            });
+            (d, e)
+        });
+        assert_eq!(call_pair(&divu, 1u128 << 100, 100), (1u128 << 100) / 100);
+        assert_eq!(call_pair(&divu, u128::MAX, 3), u128::MAX / 3);
+    }
+
+    #[test]
+    fn int128_shifts() {
+        fn shift_fn(op: ShiftOp128) -> CompiledFunction {
+            let mut b = FunctionBuilder::new("shift", 3);
+            let (lo, hi, amt) = (b.param(0), b.param(1), b.param(2));
+            let (d, e) = (b.fresh(), b.fresh());
+            b.push_raw(Instr::Shift128 {
+                dst: d,
+                dst2: e,
+                op,
+                lo: lo.into(),
+                hi: hi.into(),
+                amount: amt.into(),
+            });
+            let f = b.finish(Terminator::Return {
+                value: d.into(),
+                second: Some(e.into()),
+            });
+            compile(&f).unwrap()
+        }
+        fn call_shift(cf: &CompiledFunction, v: u128, amt: u64) -> u128 {
+            let f: unsafe extern "C" fn(u64, u64, u64) -> (u64, u64) =
+                unsafe { cf.function_ptr() };
+            let (lo, hi) = unsafe { f(v as u64, (v >> 64) as u64, amt) };
+            ((hi as u128) << 64) | lo as u128
+        }
+        let shl = shift_fn(ShiftOp128::Shl);
+        assert_eq!(call_shift(&shl, 1, 100), 1u128 << 100);
+        assert_eq!(call_shift(&shl, 1, 127), 1u128 << 127);
+        assert_eq!(call_shift(&shl, 1, 64), 1u128 << 64);
+        assert_eq!(call_shift(&shl, 1, 0), 1);
+        assert_eq!(call_shift(&shl, 0xFF, 60), 0xFFu128 << 60);
+        assert_eq!(call_shift(&shl, u128::MAX, 4), u128::MAX << 4);
+        let shr = shift_fn(ShiftOp128::Shr);
+        assert_eq!(call_shift(&shr, 1u128 << 100, 70), 1u128 << 30);
+        assert_eq!(call_shift(&shr, u128::MAX, 127), 1);
+        assert_eq!(call_shift(&shr, u128::MAX, 64), u64::MAX as u128);
+        let sar = shift_fn(ShiftOp128::Sar);
+        assert_eq!(
+            call_shift(&sar, (-16i128) as u128, 2),
+            (-4i128) as u128
+        );
+        assert_eq!(
+            call_shift(&sar, (i128::MIN) as u128, 127),
+            u128::MAX
+        );
+        assert_eq!(
+            call_shift(&sar, (i128::MIN) as u128, 100),
+            (-(1i128 << 27)) as u128
+        );
+    }
+
+    #[test]
+    fn int128_checked() {
+        // (value pair, flag) in one function: return the flag as the
+        // second word of a *second* pair-shaped return is not
+        // available, so check the flag by returning it in place of
+        // the high word.
+        fn checked_fn(
+            op: CheckedOp,
+            signed: bool,
+            want_flag: bool,
+        ) -> CompiledFunction {
+            let mut b = FunctionBuilder::new("checked", 4);
+            let (a_lo, a_hi, b_lo, b_hi) =
+                (b.param(0), b.param(1), b.param(2), b.param(3));
+            let (v, v2, flag) = (b.fresh(), b.fresh(), b.fresh());
+            b.push_raw(Instr::CheckedBinOp128 {
+                dst_val: v,
+                dst_val2: v2,
+                dst_flag: flag,
+                op,
+                signed,
+                lhs_lo: a_lo.into(),
+                lhs_hi: a_hi.into(),
+                rhs_lo: b_lo.into(),
+                rhs_hi: b_hi.into(),
+            });
+            let (value, second) = if want_flag {
+                (flag, b.const_(0))
+            } else {
+                (v, v2)
+            };
+            let f = b.finish(Terminator::Return {
+                value: value.into(),
+                second: Some(second.into()),
+            });
+            compile(&f).unwrap()
+        }
+        // Signed add: i128::MAX + 1 overflows, value wraps to MIN.
+        let cf = checked_fn(CheckedOp::Add, true, true);
+        assert_eq!(call_pair(&cf, i128::MAX as u128, 1), 1);
+        let cf = checked_fn(CheckedOp::Add, true, false);
+        assert_eq!(call_pair(&cf, i128::MAX as u128, 1), i128::MIN as u128);
+        // Unsigned add: MAX + 1 overflows; 5 + 7 does not.
+        let cf = checked_fn(CheckedOp::Add, false, true);
+        assert_eq!(call_pair(&cf, u128::MAX, 1), 1);
+        assert_eq!(call_pair(&cf, 5, 7), 0);
+        // Signed sub: i128::MIN - 1 overflows.
+        let cf = checked_fn(CheckedOp::Sub, true, true);
+        assert_eq!(call_pair(&cf, i128::MIN as u128, 1), 1);
+        // Unsigned sub: 0 - 1 borrows out.
+        let cf = checked_fn(CheckedOp::Sub, false, true);
+        assert_eq!(call_pair(&cf, 0, 1), 1);
+        assert_eq!(call_pair(&cf, 9, 4), 0);
+        // Mul: 2^64 * 2^64 overflows both ways; -3 * 7 does not.
+        let cf = checked_fn(CheckedOp::Mul, true, true);
+        assert_eq!(call_pair(&cf, 1u128 << 64, 1u128 << 64), 1);
+        assert_eq!(call_pair(&cf, (-3i128) as u128, 7), 0);
+        let cf = checked_fn(CheckedOp::Mul, false, true);
+        assert_eq!(call_pair(&cf, 1u128 << 64, 1u128 << 64), 1);
+        assert_eq!(call_pair(&cf, u64::MAX as u128, u64::MAX as u128), 0);
+        // Mul value: (2^64 - 1)^2 fits unsigned, wrapping pair.
+        let cf = checked_fn(CheckedOp::Mul, false, false);
+        assert_eq!(
+            call_pair(&cf, u64::MAX as u128, u64::MAX as u128),
+            u128::MAX - (1u128 << 65) + 2
+        );
+    }
+
+    #[test]
+    fn int128_float_casts() {
+        // f64 -> i128 through the helper: 1e30 is in range and
+        // converts exactly as the host cast does.
+        let mut b = FunctionBuilder::new("f2i", 1);
+        let x = b.param(0);
+        let (d, e) = (b.fresh(), b.fresh());
+        b.push_raw(Instr::FloatToInt128 {
+            dst: d,
+            dst2: e,
+            kind: FloatKind::F64,
+            src: x.into(),
+            signed: true,
+        });
+        let f = b.finish(Terminator::Return {
+            value: d.into(),
+            second: Some(e.into()),
+        });
+        let cf = compile(&f).unwrap();
+        // The compiled function's parameter is the f64's bit
+        // pattern as a word (the slot model's float convention).
+        let g: unsafe extern "C" fn(i64) -> (i64, i64) = unsafe { cf.function_ptr() };
+        let call = |x: f64| unsafe { g(x.to_bits() as i64) };
+        let want = 1e30f64 as i128;
+        assert_eq!(call(1e30), (want as i64, (want >> 64) as i64));
+        // Saturation at the top and NaN -> 0.
+        let want_max = i128::MAX;
+        assert_eq!(
+            call(1e300),
+            (want_max as i64, (want_max >> 64) as i64)
+        );
+        let want_min = i128::MIN;
+        assert_eq!(
+            call(-1e300),
+            (want_min as i64, (want_min >> 64) as i64)
+        );
+        assert_eq!(call(f64::NAN), (0, 0));
+        // i128 -> f32: 16777217 rounds to 16777216.
+        let mut b = FunctionBuilder::new("i2f", 2);
+        let (lo, hi) = (b.param(0), b.param(1));
+        let d = b.fresh();
+        b.push_raw(Instr::Int128ToFloat {
+            dst: d,
+            kind: FloatKind::F32,
+            lo: lo.into(),
+            hi: hi.into(),
+            signed: true,
+        });
+        let f = b.finish(Terminator::Return {
+            value: d.into(),
+            second: None,
+        });
+        let cf = compile(&f).unwrap();
+        assert_eq!(
+            unsafe { cf.call2(16777217, 0) },
+            16777216f32.to_bits() as i32 as i64
+        );
     }
 }

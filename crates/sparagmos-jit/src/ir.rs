@@ -9,7 +9,12 @@
 //! ([`crate::mir_jit`]) keeps every integer in canonical form for its
 //! type (sign-extended for signed types, zero-extended / masked for
 //! unsigned types and `bool`), so the plain 64-bit operations below
-//! are exact for any integer type of up to 64 bits.
+//! are exact for any integer type of up to 64 bits. A 128-bit integer
+//! occupies two consecutive slots — the low word first, then the high
+//! word, the layout the interpreter's `i128` / `u128` values, the
+//! constant materialisation and the System V pair convention all
+//! share — and is computed on by the dedicated pair operations
+//! ([`Instr::BinOp128`] and friends).
 //!
 //! A floating-point value occupies one slot too, holding its IEEE
 //! 754 bit pattern: all 64 bits for `f64`, the low 32 bits for `f32`
@@ -159,6 +164,33 @@ impl IntKind {
     }
 }
 
+/// The operations on a 128-bit integer, held as a pair of 64-bit
+/// words (low word first). Division and remainder come in signed
+/// (`Div` / `Rem`, truncating toward zero, like Rust's `/` and `%`
+/// on `i128`) and unsigned forms, as for the 64-bit operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinOp128 {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    DivU,
+    RemU,
+    And,
+    Or,
+    Xor,
+}
+
+/// The shift operations on a 128-bit integer: `Shl` (left), `Shr`
+/// (logical right) and `Sar` (arithmetic right).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShiftOp128 {
+    Shl,
+    Shr,
+    Sar,
+}
+
 /// One instruction. Every instruction that produces a value names its
 /// destination value explicitly.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,6 +220,48 @@ pub enum Instr {
         lhs: Operand,
         rhs: Operand,
         kind: IntKind,
+    },
+    /// A binary operation on 128-bit integers: the operands are
+    /// the word pairs `(lhs_lo, lhs_hi)` and `(rhs_lo, rhs_hi)`,
+    /// and the result's low word lands in `dst`, its high word in
+    /// `dst2`. The operation wraps, as the plain MIR operators do.
+    BinOp128 {
+        dst: Value,
+        dst2: Value,
+        op: BinOp128,
+        lhs_lo: Operand,
+        lhs_hi: Operand,
+        rhs_lo: Operand,
+        rhs_hi: Operand,
+    },
+    /// A shift of the 128-bit pair `(lo, hi)` by `amount`, which
+    /// the front end has already reduced to the range `0..=127`
+    /// (the plain operators take the amount modulo the type width;
+    /// a checked shift's overshift panic is a separate flag). The
+    /// result's low word lands in `dst`, its high word in `dst2`.
+    Shift128 {
+        dst: Value,
+        dst2: Value,
+        op: ShiftOp128,
+        lo: Operand,
+        hi: Operand,
+        amount: Operand,
+    },
+    /// Checked arithmetic on 128-bit integers: like
+    /// [`Instr::CheckedBinOp`], but the wrapped value is the word
+    /// pair stored into `dst_val` (low) and `dst_val2` (high), and
+    /// the overflow flag — for the 128-bit type whose signedness
+    /// is `signed` — lands in `dst_flag`.
+    CheckedBinOp128 {
+        dst_val: Value,
+        dst_val2: Value,
+        dst_flag: Value,
+        op: CheckedOp,
+        signed: bool,
+        lhs_lo: Operand,
+        lhs_hi: Operand,
+        rhs_lo: Operand,
+        rhs_hi: Operand,
     },
     /// Call function `func` (an index into the program's function
     /// table) with the given argument words: the first six in the
@@ -269,6 +343,28 @@ pub enum Instr {
         kind: FloatKind,
         src: Operand,
         int: IntKind,
+    },
+    /// `dst = src as <int>`: Rust's float-to-integer cast with a
+    /// 128-bit target — saturating at the target type's bounds and
+    /// mapping NaN to 0, as the 64-bit form does. The result's low
+    /// word lands in `dst`, its high word in `dst2`; `signed` is
+    /// the target type's signedness.
+    FloatToInt128 {
+        dst: Value,
+        dst2: Value,
+        kind: FloatKind,
+        src: Operand,
+        signed: bool,
+    },
+    /// `dst = src as <float>`: a 128-bit integer-to-float cast with
+    /// round-to-nearest-even; the source is the word pair `(lo,
+    /// hi)` of the type whose signedness is `signed`.
+    Int128ToFloat {
+        dst: Value,
+        kind: FloatKind,
+        lo: Operand,
+        hi: Operand,
+        signed: bool,
     },
     /// `dst = src as <float>`: a float-to-float conversion. Widening
     /// (`f32` to `f64`) is exact; narrowing rounds to nearest even

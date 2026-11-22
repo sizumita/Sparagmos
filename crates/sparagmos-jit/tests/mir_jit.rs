@@ -1040,27 +1040,6 @@ fn unsupported_constructs_report_reasons() {
         other => panic!("expected Unsupported, got {other}"),
     }
 
-    // A 128-bit integer local.
-    let wide_fn = MirFunctionInput {
-        name: "wide".to_string(),
-        def_id: Some(def(0)),
-        body: mir::Body::new(
-            locals(&[i(mir::IntTy::I128), i(mir::IntTy::I128)]),
-            1,
-            vec![bb(vec![], mir::TerminatorKind::Return)],
-        ),
-    };
-    let err = JitProgram::compile(&MirProgramInput {
-        functions: vec![wide_fn],
-        names: HashMap::new(),
-        adt_discriminants: Default::default(),
-    })
-    .expect_err("i128 must be unsupported");
-    match err {
-        JitError::Unsupported(what) => assert!(what.contains("128-bit"), "{what}"),
-        other => panic!("expected Unsupported, got {other}"),
-    }
-
     // A call to a function that is not part of the program.
     let caller = spec(
         "caller",

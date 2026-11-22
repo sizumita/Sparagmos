@@ -304,6 +304,14 @@ impl Emitter {
     pub fn sub_rr(&mut self, dst: Reg, src: Reg) {
         self.alu_rr(0x29, dst, src);
     }
+    /// `adc dst, src` (add with carry): REX.W 11 /r
+    pub fn adc_rr(&mut self, dst: Reg, src: Reg) {
+        self.alu_rr(0x11, dst, src);
+    }
+    /// `sbb dst, src` (subtract with borrow): REX.W 19 /r
+    pub fn sbb_rr(&mut self, dst: Reg, src: Reg) {
+        self.alu_rr(0x19, dst, src);
+    }
     pub fn and_rr(&mut self, dst: Reg, src: Reg) {
         self.alu_rr(0x21, dst, src);
     }
@@ -389,6 +397,23 @@ impl Emitter {
     }
     pub fn sar_cl(&mut self, dst: Reg) {
         self.shift_cl(7, dst);
+    }
+    /// `shld dst, src, cl` (double-precision shift left: `dst` is
+    /// shifted left by `%cl`, with bits entering from the top of
+    /// `src`): REX.W 0F A5 /r. The count is masked to 6 bits by the
+    /// hardware, like the single-register shifts.
+    pub fn shld_cl(&mut self, dst: Reg, src: Reg) {
+        self.rex_w_rb(src, dst);
+        self.buf.emit_bytes(&[0x0F, 0xA5]);
+        self.modrm_rr(src, dst);
+    }
+    /// `shrd dst, src, cl` (double-precision shift right: `dst` is
+    /// shifted right by `%cl`, with bits entering from the bottom
+    /// of `src`): REX.W 0F AD /r
+    pub fn shrd_cl(&mut self, dst: Reg, src: Reg) {
+        self.rex_w_rb(src, dst);
+        self.buf.emit_bytes(&[0x0F, 0xAD]);
+        self.modrm_rr(src, dst);
     }
     /// Shift by a constant 1..=63: REX.W C1 /digit ib
     fn shift_imm(&mut self, digit: u8, dst: Reg, imm: u8) {
@@ -750,6 +775,16 @@ mod tests {
         assert_eq!(enc(|e| e.add_rr(Reg::Rax, Reg::Rcx)), [0x48, 0x01, 0xC8]);
         // sub rdx, rsi = 48 29 F2
         assert_eq!(enc(|e| e.sub_rr(Reg::Rdx, Reg::Rsi)), [0x48, 0x29, 0xF2]);
+        assert_eq!(enc(|e| e.adc_rr(Reg::Rax, Reg::Rcx)), [0x48, 0x11, 0xC8]);
+        assert_eq!(enc(|e| e.sbb_rr(Reg::Rdx, Reg::Rsi)), [0x48, 0x19, 0xF2]);
+        assert_eq!(
+            enc(|e| e.shld_cl(Reg::Rdx, Reg::Rax)),
+            [0x48, 0x0F, 0xA5, 0xC2]
+        );
+        assert_eq!(
+            enc(|e| e.shrd_cl(Reg::Rax, Reg::Rdx)),
+            [0x48, 0x0F, 0xAD, 0xD0]
+        );
         // imul rax, rcx = 48 0F AF C1
         assert_eq!(
             enc(|e| e.imul_rr(Reg::Rax, Reg::Rcx)),

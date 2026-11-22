@@ -217,10 +217,14 @@ extern "C" fn format_slice_index_message(from: u64, end: u64, buf: *mut u8) -> u
 pub enum StaticBlob {
     /// Raw bytes (a string / byte-string constant's contents).
     Bytes(Vec<u8>),
-    /// A constant value's leaf words, in leaf order. A word is
-    /// either a plain value or the address of another blob — the
-    /// address words are resolved when the program is laid out,
-    /// once every blob's address is known.
+    /// A constant value's leaf words, in leaf order. The words
+    /// are laid out the way every guest value lies in memory:
+    /// word 0 at the blob's address, word `k` at address − 8k
+    /// (descending), so a multi-word pointee reads exactly like
+    /// the same value in a frame. A word is either a plain value
+    /// or the address of another blob — the address words are
+    /// resolved when the program is laid out, once every blob's
+    /// address is known.
     Words(Vec<StaticWord>),
     /// A byte array's contents in the memory model's own layout:
     /// one word per byte, element 0 in the last word, so the
@@ -253,13 +257,19 @@ fn blob_len(b: &StaticBlob) -> usize {
 }
 
 /// The address generated code takes for a blob: the storage's
-/// start, except for a [`StaticBlob::GuestBytes`], whose address
-/// is the last word's (element 0 sits there; the earlier words
-/// hold the later elements, descending).
+/// start, except for the descending layouts — a
+/// [`StaticBlob::GuestBytes`], whose address is the last word's
+/// (element 0 sits there; the earlier words hold the later
+/// elements), and a [`StaticBlob::Words`], whose address is
+/// likewise its last word's (word 0 sits there; the later words
+/// descend from it, like a guest value's leaves).
 fn blob_addr(b: &StaticBlob, storage: &[u8]) -> usize {
     match b {
         StaticBlob::GuestBytes(bytes) if !bytes.is_empty() => {
             storage.as_ptr() as usize + (bytes.len() - 1) * 8
+        }
+        StaticBlob::Words(words) if !words.is_empty() => {
+            storage.as_ptr() as usize + (words.len() - 1) * 8
         }
         _ => storage.as_ptr() as usize,
     }
@@ -445,6 +455,9 @@ pub fn compile_program_with_builtins(
                 }
             }
             StaticBlob::Words(words) => {
+                // Descending: word 0 in the last storage word, so
+                // the blob's address (that word) reads word `k` at
+                // address − 8k, like a guest value's leaves.
                 for (i, w) in words.iter().enumerate() {
                     let value = match w {
                         StaticWord::Imm(v) => *v,
@@ -452,7 +465,8 @@ pub fn compile_program_with_builtins(
                             static_addrs[*idx as usize] as i64
                         }
                     };
-                    storage[i * 8..i * 8 + 8].copy_from_slice(&value.to_le_bytes());
+                    let off = (words.len() - 1 - i) * 8;
+                    storage[off..off + 8].copy_from_slice(&value.to_le_bytes());
                 }
             }
         }

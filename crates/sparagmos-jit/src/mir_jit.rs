@@ -155,7 +155,7 @@
 //! builtins) and are lowered inline, the iterator value holding
 //! the array's elements followed by the `alive` range (see
 //! [`ArrayIterShape`]).
-//! Anything else — `f16` / `f128`, 128-bit integers, references
+//! Anything else — `f16` / `f128`, references
 //! to trait objects, unions, ADT values wider than the layout
 //! bound or with a field type the program never reveals, a second dynamic
 //! index within one place,
@@ -175,9 +175,10 @@ use sparagmos_runtime::error::PanicRecord;
 
 use crate::compiler::CompileError;
 use crate::ir::{
-    BasicBlock as IrBlock, BinOp as IrBinOp, CheckedOp, FloatBinOp as IrFloatBinOp,
-    FloatKind as IrFloatKind, Function as IrFunction, Instr, IntKind as IrIntKind,
-    Operand as IrOperand, Terminator as IrTerminator, UnOp as IrUnOp,
+    BasicBlock as IrBlock, BinOp as IrBinOp, BinOp128 as IrBinOp128, CheckedOp,
+    FloatBinOp as IrFloatBinOp, FloatKind as IrFloatKind, Function as IrFunction, Instr,
+    IntKind as IrIntKind, Operand as IrOperand, ShiftOp128 as IrShiftOp128,
+    Terminator as IrTerminator, UnOp as IrUnOp,
 };
 use crate::builtins::{self, Builtin, BuiltinTables, FmtDescriptor, FmtTrait, FmtTy};
 use crate::program::{compile_program_with_builtins, CompiledProgram, StaticBlob, StaticWord};
@@ -1521,20 +1522,8 @@ fn build_leaf_count(
 ) -> Result<usize, String> {
     match ty {
         mir::Ty::Bool | mir::Ty::Char => Ok(1),
-        mir::Ty::Int(it) => {
-            if int_bits(*it) <= 64 {
-                Ok(1)
-            } else {
-                Err("128-bit integer type".to_string())
-            }
-        }
-        mir::Ty::Uint(ut) => {
-            if uint_bits(*ut) <= 64 {
-                Ok(1)
-            } else {
-                Err("128-bit integer type".to_string())
-            }
-        }
+        mir::Ty::Int(it) => Ok(if int_bits(*it) <= 64 { 1 } else { 2 }),
+        mir::Ty::Uint(ut) => Ok(if uint_bits(*ut) <= 64 { 1 } else { 2 }),
         mir::Ty::Tuple(ts) => {
             let mut n = 0;
             for t in ts {
@@ -1699,6 +1688,33 @@ fn subslice_offset(from: u64, per: usize) -> usize {
     }
 }
 
+/// The signedness of a 128-bit integer type (`i128` / `u128`),
+/// whose values occupy a word pair in the slot model; `None` for
+/// every other type.
+fn int128_signed(ty: &mir::Ty) -> Option<bool> {
+    match ty {
+        mir::Ty::Int(it) if int_bits(*it) == 128 => Some(true),
+        mir::Ty::Uint(ut) if uint_bits(*ut) == 128 => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether a type's derived `PartialEq` is leaf-wise word
+/// equality: every leaf is a raw word whose semantic equality is
+/// word equality. Floats are excluded (their equality is IEEE,
+/// not bitwise), as are references and pointers inside the value
+/// (a derived comparison would follow them), strings and slices
+/// (variable-length data, not fixed words), and ADTs (a variant's
+/// inactive field slots hold no defined value to compare).
+fn word_transparent(ty: &mir::Ty) -> bool {
+    match ty {
+        mir::Ty::Bool | mir::Ty::Char | mir::Ty::Int(_) | mir::Ty::Uint(_) => true,
+        mir::Ty::Array(elem, mir::ArrayLen::Known(_)) => word_transparent(elem),
+        mir::Ty::Tuple(fields) => fields.iter().all(|f| word_transparent(f)),
+        _ => false,
+    }
+}
+
 fn int_kind(ty: &mir::Ty) -> Option<IrIntKind> {
     match ty {
         mir::Ty::Int(it) => {
@@ -1728,20 +1744,8 @@ const MAX_ARRAY_LEAVES: usize = 4096;
 fn flatten(ty: &mir::Ty, fname: &str, layouts: &AdtLayouts) -> Result<usize, JitError> {
     match ty {
         mir::Ty::Bool | mir::Ty::Char => Ok(1),
-        mir::Ty::Int(it) => {
-            if int_bits(*it) <= 64 {
-                Ok(1)
-            } else {
-                Err(unsup(fname, "128-bit integer type"))
-            }
-        }
-        mir::Ty::Uint(ut) => {
-            if uint_bits(*ut) <= 64 {
-                Ok(1)
-            } else {
-                Err(unsup(fname, "128-bit integer type"))
-            }
-        }
+        mir::Ty::Int(it) => Ok(if int_bits(*it) <= 64 { 1 } else { 2 }),
+        mir::Ty::Uint(ut) => Ok(if uint_bits(*ut) <= 64 { 1 } else { 2 }),
         mir::Ty::Tuple(ts) => {
             let mut n = 0;
             for t in ts {
@@ -3511,6 +3515,20 @@ impl<'a> FnLower<'a> {
                     // A zero-leaf value (unit / never) stores nothing.
                     return Ok(());
                 }
+                if int128_signed(ctx).is_some() {
+                    // A 128-bit scalar constant is the word pair of
+                    // its full-width pattern, low word first.
+                    let w = self.const_value_u128(v, ctx)?;
+                    self.emit(Instr::Const {
+                        dst,
+                        imm: w as u64 as i64,
+                    });
+                    self.emit(Instr::Const {
+                        dst: dst + 1,
+                        imm: (w >> 64) as u64 as i64,
+                    });
+                    return Ok(());
+                }
                 let w = self.const_value_i64(v, ctx)?;
                 self.emit(Instr::Const { dst, imm: w });
                 Ok(())
@@ -3691,6 +3709,13 @@ impl<'a> FnLower<'a> {
                 };
                 self.pointer_const_words(v, pointee, width)
             }
+            _ if int128_signed(ty).is_some() => {
+                let w = self.const_value_u128(v, ty)?;
+                Ok(vec![
+                    StaticWord::Imm(w as u64 as i64),
+                    StaticWord::Imm((w >> 64) as u64 as i64),
+                ])
+            }
             _ => Ok(vec![StaticWord::Imm(self.const_value_i64(v, ty)?)]),
         }
     }
@@ -3721,6 +3746,26 @@ impl<'a> FnLower<'a> {
                 Err(self.err(&format!("unevaluated constant {def}")))
             }
         }
+    }
+
+    /// The full 128-bit pattern of a constant under a 128-bit
+    /// integer context: the scalar's own stored pattern, masked to
+    /// the context width (which is the full width here). Mirrors
+    /// [`Self::const_value_i64`]'s treatment of the scalar forms.
+    fn const_value_u128(
+        &self,
+        v: &mir::ConstValue,
+        _ctx: &mir::Ty,
+    ) -> Result<u128, JitError> {
+        Ok(match v {
+            mir::ConstValue::Bool(b) => *b as u128,
+            mir::ConstValue::Char(ch) => *ch as u128,
+            mir::ConstValue::ZeroSized => 0,
+            mir::ConstValue::Scalar(mir::Scalar::Int { data, .. }) => *data,
+            _ => {
+                return Err(self.err("constant without a 128-bit integer pattern"));
+            }
+        })
     }
 
     fn const_value_i64(&self, v: &mir::ConstValue, ctx: &mir::Ty) -> Result<i64, JitError> {
@@ -4047,6 +4092,9 @@ impl<'a> FnLower<'a> {
         match rvalue {
             R::Use(op) => match count {
                 1 => Ok(vec![self.operand_value(op, dst_ty)?]),
+                2 if int128_signed(dst_ty).is_some() => {
+                    self.operand_leaves(op, dst_ty, count)
+                }
                 2 => {
                     let (a, b) = self.operand_pair(op)?;
                     Ok(vec![a, b])
@@ -4054,23 +4102,35 @@ impl<'a> FnLower<'a> {
                 _ => self.operand_leaves(op, dst_ty, count),
             },
             R::BinaryOp(op, pair) => {
-                if count != 1 {
+                if count != 1 && !(count == 2 && int128_signed(dst_ty).is_some()) {
                     return Err(self.err("binary operation assigned through a dereference"));
                 }
                 let (lhs, rhs) = &**pair;
                 let tmp = self.fresh();
+                if count == 2 {
+                    self.fresh();
+                }
                 self.lower_binop_to(tmp, dst_ty, *op, lhs, rhs)?;
-                Ok(vec![tmp])
+                Ok((0..count as u32).map(|k| tmp + k).collect())
             }
             R::UnaryOp(op, operand) => {
-                if count != 1 {
+                if count != 1 && !(count == 2 && int128_signed(dst_ty).is_some()) {
                     return Err(self.err("unary operation assigned through a dereference"));
                 }
                 let tmp = self.fresh();
+                if count == 2 {
+                    self.fresh();
+                }
                 self.lower_unop_to(tmp, dst_ty, *op, operand)?;
-                Ok(vec![tmp])
+                Ok((0..count as u32).map(|k| tmp + k).collect())
             }
             R::Cast(kind, operand, target) => {
+                if count == 2 && int128_signed(target).is_some() {
+                    let tmp = self.fresh();
+                    self.fresh();
+                    self.lower_cast_to(tmp, kind, operand, target)?;
+                    return Ok(vec![tmp, tmp + 1]);
+                }
                 if count == 2 {
                     let (a, b) = self.unsize_pair(kind, operand, target)?;
                     return Ok(vec![a, b]);
@@ -4397,13 +4457,16 @@ impl<'a> FnLower<'a> {
             }
             R::UnaryOp(op, operand) => {
                 let (dst, count, dst_ty) = self.place_leaves(place)?;
-                if count != 1 {
+                if count != 1 && int128_signed(&dst_ty).is_none() {
                     return Err(self.err("unary operation on an aggregate value"));
                 }
                 self.lower_unop_to(dst, &dst_ty, *op, operand)
             }
             R::Cast(kind, operand, target) => {
                 let (dst, count, _) = self.place_leaves(place)?;
+                if count == 2 && int128_signed(target).is_some() {
+                    return self.lower_cast_to(dst, kind, operand, target);
+                }
                 if count == 2 {
                     let (a, b) = self.unsize_pair(kind, operand, target)?;
                     self.emit(Instr::Copy {
@@ -4578,15 +4641,14 @@ impl<'a> FnLower<'a> {
                 Ok(())
             }
             mir::Operand::Constant(_) => {
-                if per != 1 {
-                    return Err(self.err("Repeat of a constant aggregate element"));
-                }
-                let v = self.operand_value(op, &elem_ty)?;
-                for i in 0..count as u32 {
-                    self.emit(Instr::Copy {
-                        dst: dst + i,
-                        src: IrOperand::Value(v),
-                    });
+                let leaves = self.operand_leaves(op, &elem_ty, per)?;
+                for i in 0..count as usize {
+                    for (k, leaf) in leaves.iter().enumerate() {
+                        self.emit(Instr::Copy {
+                            dst: dst + (i * per) as u32 + k as u32,
+                            src: IrOperand::Value(*leaf),
+                        });
+                    }
                 }
                 Ok(())
             }
@@ -4613,6 +4675,41 @@ impl<'a> FnLower<'a> {
         lhs: &mir::Operand,
         rhs: &mir::Operand,
     ) -> Result<(), JitError> {
+        // The 128-bit form: the (value, bool) result is three
+        // words — the value's pair, then the flag.
+        if let mir::Ty::Tuple(fields) = dst_ty {
+            if fields.len() == 2 {
+                if let Some(signed) = int128_signed(&fields[0]) {
+                    if matches!(op, mir::BinOp::Shl | mir::BinOp::Shr) {
+                        return self.lower_checked_shift128_to(
+                            dst,
+                            op == mir::BinOp::Shl,
+                            lhs,
+                            rhs,
+                            &fields[0],
+                        );
+                    }
+                    let Some(base) = Self::checked_base(op) else {
+                        return Err(self.err(&format!("checked operation {op:?}")));
+                    };
+                    let val_ty = fields[0].clone();
+                    let l = self.operand_leaves(lhs, &val_ty, 2)?;
+                    let r = self.operand_leaves(rhs, &val_ty, 2)?;
+                    self.emit(Instr::CheckedBinOp128 {
+                        dst_val: dst,
+                        dst_val2: dst + 1,
+                        dst_flag: dst + 2,
+                        op: base,
+                        signed,
+                        lhs_lo: IrOperand::Value(l[0]),
+                        lhs_hi: IrOperand::Value(l[1]),
+                        rhs_lo: IrOperand::Value(r[0]),
+                        rhs_hi: IrOperand::Value(r[1]),
+                    });
+                    return Ok(());
+                }
+            }
+        }
         if matches!(op, mir::BinOp::Shl | mir::BinOp::Shr) {
             return self.lower_checked_shift_to(dst, dst_ty, op == mir::BinOp::Shl, lhs, rhs);
         }
@@ -4658,9 +4755,6 @@ impl<'a> FnLower<'a> {
         {
             return self.lower_checked_binop_to(dst, dst_ty, op, lhs, rhs);
         }
-        if flatten(dst_ty, &self.func.name, self.layouts)? != 1 {
-            return Err(self.err("binary operation on an aggregate value"));
-        }
         let is_compare = matches!(op, M::Eq | M::Ne | M::Lt | M::Le | M::Gt | M::Ge);
         // Arithmetic operands share the destination's type; comparison
         // operands share each other's type (the destination is bool,
@@ -4678,6 +4772,15 @@ impl<'a> FnLower<'a> {
         } else {
             dst_ty.clone()
         };
+        // A 128-bit integer operation works on the operands' word
+        // pair: the destination is the pair itself for arithmetic
+        // and a single bool word for a comparison.
+        if let Some(signed) = int128_signed(&op_ty) {
+            return self.lower_binop128_to(dst, op, lhs, rhs, &op_ty, signed);
+        }
+        if flatten(dst_ty, &self.func.name, self.layouts)? != 1 {
+            return Err(self.err("binary operation on an aggregate value"));
+        }
         if let Some(fk) = float_kind(&op_ty) {
             return self.lower_float_binop(dst, op, lhs, rhs, fk, &op_ty);
         }
@@ -4756,6 +4859,230 @@ impl<'a> FnLower<'a> {
             M::AddWithOverflow | M::SubWithOverflow | M::MulWithOverflow => unreachable!(),
         }
         Ok(())
+    }
+
+    /// A binary operation on 128-bit integers: both operands are
+    /// word pairs (low word first, the layout every 128-bit value
+    /// has in the slot model), computed on by the backend's pair
+    /// operations. The destination is the pair for arithmetic and
+    /// shifts, a single bool word for a comparison.
+    fn lower_binop128_to(
+        &mut self,
+        dst: u32,
+        op: mir::BinOp,
+        lhs: &mir::Operand,
+        rhs: &mir::Operand,
+        op_ty: &mir::Ty,
+        signed: bool,
+    ) -> Result<(), JitError> {
+        use mir::BinOp as M;
+        match op {
+            M::Shl | M::ShlUnchecked | M::Shr | M::ShrUnchecked => {
+                let l = self.operand_leaves(lhs, op_ty, 2)?;
+                let amount = self.operand_value(rhs, op_ty)?;
+                // The plain operators take the amount modulo the
+                // type width, as the interpreter's plain form does
+                // (the overshift panic belongs to the `Assert`
+                // after a checked shift).
+                let masked = self.fresh();
+                self.emit(Instr::BinOp {
+                    dst: masked,
+                    op: IrBinOp::And,
+                    lhs: IrOperand::Value(amount),
+                    rhs: IrOperand::Const(127),
+                });
+                let shift_op = if matches!(op, M::Shl | M::ShlUnchecked) {
+                    IrShiftOp128::Shl
+                } else if signed {
+                    IrShiftOp128::Sar
+                } else {
+                    IrShiftOp128::Shr
+                };
+                self.emit(Instr::Shift128 {
+                    dst,
+                    dst2: dst + 1,
+                    op: shift_op,
+                    lo: IrOperand::Value(l[0]),
+                    hi: IrOperand::Value(l[1]),
+                    amount: IrOperand::Value(masked),
+                });
+                Ok(())
+            }
+            M::Div | M::Rem => {
+                let l = self.operand_leaves(lhs, op_ty, 2)?;
+                let r = self.operand_leaves(rhs, op_ty, 2)?;
+                // A zero divisor panics with the same messages as
+                // the 64-bit path; the pair is zero exactly when
+                // both of its words are.
+                let msg = self.messages.intern(if op == M::Rem {
+                    "attempt to calculate the remainder with a divisor of zero"
+                } else {
+                    "attempt to divide by zero"
+                });
+                let pblk = self.panic_block(msg);
+                let lo_nz = self.fresh();
+                self.emit(Instr::BinOp {
+                    dst: lo_nz,
+                    op: IrBinOp::Ne,
+                    lhs: IrOperand::Value(r[0]),
+                    rhs: IrOperand::Const(0),
+                });
+                let hi_nz = self.fresh();
+                self.emit(Instr::BinOp {
+                    dst: hi_nz,
+                    op: IrBinOp::Ne,
+                    lhs: IrOperand::Value(r[1]),
+                    rhs: IrOperand::Const(0),
+                });
+                let nonzero = self.fresh();
+                self.emit(Instr::BinOp {
+                    dst: nonzero,
+                    op: IrBinOp::Or,
+                    lhs: IrOperand::Value(lo_nz),
+                    rhs: IrOperand::Value(hi_nz),
+                });
+                let cont = self.new_block();
+                self.seal_and_continue(
+                    IrTerminator::Branch {
+                        cond: IrOperand::Value(nonzero),
+                        then_blk: cont,
+                        else_blk: pblk,
+                    },
+                    cont,
+                );
+                let ir_op = match (op, signed) {
+                    (M::Div, true) => IrBinOp128::Div,
+                    (M::Div, false) => IrBinOp128::DivU,
+                    (M::Rem, true) => IrBinOp128::Rem,
+                    _ => IrBinOp128::RemU,
+                };
+                self.emit(Instr::BinOp128 {
+                    dst,
+                    dst2: dst + 1,
+                    op: ir_op,
+                    lhs_lo: IrOperand::Value(l[0]),
+                    lhs_hi: IrOperand::Value(l[1]),
+                    rhs_lo: IrOperand::Value(r[0]),
+                    rhs_hi: IrOperand::Value(r[1]),
+                });
+                Ok(())
+            }
+            M::Eq | M::Ne | M::Lt | M::Le | M::Gt | M::Ge => {
+                let l = self.operand_leaves(lhs, op_ty, 2)?;
+                let r = self.operand_leaves(rhs, op_ty, 2)?;
+                let result = self.emit_cmp128(op, signed, &l, &r);
+                self.emit(Instr::Copy {
+                    dst,
+                    src: IrOperand::Value(result),
+                });
+                Ok(())
+            }
+            M::Add
+            | M::AddUnchecked
+            | M::Sub
+            | M::SubUnchecked
+            | M::Mul
+            | M::MulUnchecked
+            | M::BitAnd
+            | M::BitOr
+            | M::BitXor => {
+                let l = self.operand_leaves(lhs, op_ty, 2)?;
+                let r = self.operand_leaves(rhs, op_ty, 2)?;
+                let ir_op = match op {
+                    M::Add | M::AddUnchecked => IrBinOp128::Add,
+                    M::Sub | M::SubUnchecked => IrBinOp128::Sub,
+                    M::Mul | M::MulUnchecked => IrBinOp128::Mul,
+                    M::BitAnd => IrBinOp128::And,
+                    M::BitOr => IrBinOp128::Or,
+                    _ => IrBinOp128::Xor,
+                };
+                self.emit(Instr::BinOp128 {
+                    dst,
+                    dst2: dst + 1,
+                    op: ir_op,
+                    lhs_lo: IrOperand::Value(l[0]),
+                    lhs_hi: IrOperand::Value(l[1]),
+                    rhs_lo: IrOperand::Value(r[0]),
+                    rhs_hi: IrOperand::Value(r[1]),
+                });
+                Ok(())
+            }
+            M::Offset => Err(self.err("Offset binary operation")),
+            M::Cmp => Err(self.err("Cmp binary operation")),
+            M::AddWithOverflow | M::SubWithOverflow | M::MulWithOverflow => {
+                unreachable!()
+            }
+        }
+    }
+
+    /// Emit `a op b` (both already in slots) into a fresh slot
+    /// and return it.
+    fn emit_binop_fresh(&mut self, op: IrBinOp, a: u32, b: u32) -> u32 {
+        let d = self.fresh();
+        self.emit(Instr::BinOp {
+            dst: d,
+            op,
+            lhs: IrOperand::Value(a),
+            rhs: IrOperand::Value(b),
+        });
+        d
+    }
+
+    /// Emit a 128-bit comparison of the word pairs `l` and `r`
+    /// (slot pairs, low word first) and return the slot holding
+    /// the 0/1 result. The high words decide, compared with the
+    /// type's signedness; equal high words fall to the low words,
+    /// compared unsigned, as the pair's numeric order dictates.
+    fn emit_cmp128(
+        &mut self,
+        op: mir::BinOp,
+        signed: bool,
+        l: &[u32],
+        r: &[u32],
+    ) -> u32 {
+        use mir::BinOp as M;
+        match op {
+            M::Eq | M::Ne => {
+                let lo_eq = self.emit_binop_fresh(IrBinOp::Eq, l[0], r[0]);
+                let hi_eq = self.emit_binop_fresh(IrBinOp::Eq, l[1], r[1]);
+                let both = self.emit_binop_fresh(IrBinOp::And, lo_eq, hi_eq);
+                if op == M::Eq {
+                    both
+                } else {
+                    let d = self.fresh();
+                    self.emit(Instr::BinOp {
+                        dst: d,
+                        op: IrBinOp::Xor,
+                        lhs: IrOperand::Value(both),
+                        rhs: IrOperand::Const(1),
+                    });
+                    d
+                }
+            }
+            M::Lt | M::Le | M::Gt | M::Ge => {
+                // `Gt` / `Ge` compare the swapped pair; `Le` / `Ge`
+                // add the equality case to the strict order.
+                let (a, b) = if matches!(op, M::Gt | M::Ge) {
+                    (r, l)
+                } else {
+                    (l, r)
+                };
+                let hi_op = if signed { IrBinOp::Lt } else { IrBinOp::LtU };
+                let hi_lt = self.emit_binop_fresh(hi_op, a[1], b[1]);
+                let hi_eq = self.emit_binop_fresh(IrBinOp::Eq, a[1], b[1]);
+                let lo_lt = self.emit_binop_fresh(IrBinOp::LtU, a[0], b[0]);
+                let tie = self.emit_binop_fresh(IrBinOp::And, hi_eq, lo_lt);
+                let lt = self.emit_binop_fresh(IrBinOp::Or, hi_lt, tie);
+                if matches!(op, M::Lt | M::Gt) {
+                    lt
+                } else {
+                    let lo_eq = self.emit_binop_fresh(IrBinOp::Eq, a[0], b[0]);
+                    let eq = self.emit_binop_fresh(IrBinOp::And, hi_eq, lo_eq);
+                    self.emit_binop_fresh(IrBinOp::Or, lt, eq)
+                }
+            }
+            _ => unreachable!("emit_cmp128 on a non-comparison operator"),
+        }
     }
 
     /// A plain `BinaryOp` on floats: arithmetic and comparisons map
@@ -5039,6 +5366,58 @@ impl<'a> FnLower<'a> {
         Ok(())
     }
 
+    /// Checked shift on a 128-bit value (`CheckedBinaryOp` with
+    /// `Shl` / `Shr`): the value wraps (the amount taken modulo
+    /// 128) into the pair at `dst`, and the flag at `dst + 2`
+    /// reports an overshift only — the 128-bit form of
+    /// [`Self::lower_checked_shift_to`].
+    fn lower_checked_shift128_to(
+        &mut self,
+        dst: u32,
+        is_shl: bool,
+        lhs: &mir::Operand,
+        rhs: &mir::Operand,
+        val_ty: &mir::Ty,
+    ) -> Result<(), JitError> {
+        let signed = int128_signed(val_ty).expect("128-bit value type");
+        let l = self.operand_leaves(lhs, val_ty, 2)?;
+        let amount = self.operand_value(rhs, val_ty)?;
+        let over = self.fresh();
+        self.emit(Instr::BinOp {
+            dst: over,
+            op: IrBinOp::GeU,
+            lhs: IrOperand::Value(amount),
+            rhs: IrOperand::Const(128),
+        });
+        let masked = self.fresh();
+        self.emit(Instr::BinOp {
+            dst: masked,
+            op: IrBinOp::And,
+            lhs: IrOperand::Value(amount),
+            rhs: IrOperand::Const(127),
+        });
+        let shift_op = if is_shl {
+            IrShiftOp128::Shl
+        } else if signed {
+            IrShiftOp128::Sar
+        } else {
+            IrShiftOp128::Shr
+        };
+        self.emit(Instr::Shift128 {
+            dst,
+            dst2: dst + 1,
+            op: shift_op,
+            lo: IrOperand::Value(l[0]),
+            hi: IrOperand::Value(l[1]),
+            amount: IrOperand::Value(masked),
+        });
+        self.emit(Instr::Copy {
+            dst: dst + 2,
+            src: IrOperand::Value(over),
+        });
+        Ok(())
+    }
+
     fn lower_unop_to(
         &mut self,
         dst: u32,
@@ -5046,6 +5425,37 @@ impl<'a> FnLower<'a> {
         op: mir::UnOp,
         operand: &mir::Operand,
     ) -> Result<(), JitError> {
+        // A 128-bit operand is a word pair: negation is the
+        // pair's subtraction from zero, `Not` flips each word.
+        if int128_signed(dst_ty).is_some() {
+            match op {
+                mir::UnOp::Neg => {
+                    let l = self.operand_leaves(operand, dst_ty, 2)?;
+                    self.emit(Instr::BinOp128 {
+                        dst,
+                        dst2: dst + 1,
+                        op: IrBinOp128::Sub,
+                        lhs_lo: IrOperand::Const(0),
+                        lhs_hi: IrOperand::Const(0),
+                        rhs_lo: IrOperand::Value(l[0]),
+                        rhs_hi: IrOperand::Value(l[1]),
+                    });
+                    return Ok(());
+                }
+                mir::UnOp::Not => {
+                    let l = self.operand_leaves(operand, dst_ty, 2)?;
+                    for k in 0..2u32 {
+                        self.emit(Instr::UnOp {
+                            dst: dst + k,
+                            op: IrUnOp::Not,
+                            src: IrOperand::Value(l[k as usize]),
+                        });
+                    }
+                    return Ok(());
+                }
+                mir::UnOp::PtrMetadata => {}
+            }
+        }
         match op {
             mir::UnOp::Neg => {
                 if let Some(fk) = float_kind(dst_ty) {
@@ -5126,6 +5536,72 @@ impl<'a> FnLower<'a> {
     ) -> Result<(), JitError> {
         match kind {
             mir::CastKind::IntToInt => {
+                // The source type comes from the operand's place,
+                // or from the literal itself for a constant operand.
+                let src_ty = self
+                    .operand_place_ty(operand)
+                    .or_else(|| literal_int_ty(operand))
+                    .unwrap_or_else(|| target.clone());
+                // The 128-bit forms move the value's word pair: a
+                // same-width cast is the pair itself, a narrower
+                // target is the pair's low word normalised to it,
+                // and a wider (128-bit) target is the source's
+                // canonical word plus its extension word — the
+                // sign extension for a signed source, zero for an
+                // unsigned one.
+                if int128_signed(target).is_some() {
+                    if int128_signed(&src_ty).is_some() {
+                        let l = self.operand_leaves(operand, &src_ty, 2)?;
+                        for k in 0..2u32 {
+                            self.emit(Instr::Copy {
+                                dst: dst + k,
+                                src: IrOperand::Value(l[k as usize]),
+                            });
+                        }
+                        return Ok(());
+                    }
+                    let Some(src_kind) = int_kind(&src_ty) else {
+                        return Err(self.err(&format!(
+                            "cast from type {}",
+                            src_ty.kind_name()
+                        )));
+                    };
+                    let v = self.operand_value(operand, &src_ty)?;
+                    self.emit(Instr::Copy {
+                        dst,
+                        src: IrOperand::Value(v),
+                    });
+                    self.normalize(dst, &src_ty);
+                    if src_kind.signed {
+                        self.emit(Instr::BinOp {
+                            dst: dst + 1,
+                            op: IrBinOp::Sar,
+                            lhs: IrOperand::Value(dst),
+                            rhs: IrOperand::Const(63),
+                        });
+                    } else {
+                        self.emit(Instr::Const {
+                            dst: dst + 1,
+                            imm: 0,
+                        });
+                    }
+                    return Ok(());
+                }
+                if int128_signed(&src_ty).is_some() {
+                    if int_kind(target).is_none() {
+                        return Err(self.err(&format!(
+                            "cast to type {}",
+                            target.kind_name()
+                        )));
+                    }
+                    let l = self.operand_leaves(operand, &src_ty, 2)?;
+                    self.emit(Instr::Copy {
+                        dst,
+                        src: IrOperand::Value(l[0]),
+                    });
+                    self.normalize(dst, target);
+                    return Ok(());
+                }
                 if int_kind(target).is_none() {
                     return Err(self.err(&format!(
                         "cast to type {}",
@@ -5135,9 +5611,6 @@ impl<'a> FnLower<'a> {
                 // The source value is canonical for its own type, so
                 // casting is exactly normalising that 64-bit value to
                 // the target type.
-                let src_ty = self
-                    .operand_place_ty(operand)
-                    .unwrap_or_else(|| target.clone());
                 let v = self.operand_value(operand, &src_ty)?;
                 self.emit(Instr::Copy {
                     dst,
@@ -5151,6 +5624,17 @@ impl<'a> FnLower<'a> {
                     return Err(self.err("FloatToInt cast with an unknown source type"));
                 };
                 let fk = float_kind(&src_ty).expect("operand_float_ty yields a float kind");
+                if let Some(signed) = int128_signed(target) {
+                    let v = self.operand_value(operand, &src_ty)?;
+                    self.emit(Instr::FloatToInt128 {
+                        dst,
+                        dst2: dst + 1,
+                        kind: fk,
+                        src: IrOperand::Value(v),
+                        signed,
+                    });
+                    return Ok(());
+                }
                 let Some(int) = int_kind(target) else {
                     return Err(self.err(&format!(
                         "FloatToInt cast to type {}",
@@ -5181,6 +5665,17 @@ impl<'a> FnLower<'a> {
                 else {
                     return Err(self.err("IntToFloat cast with an unknown source type"));
                 };
+                if let Some(signed) = int128_signed(&src_ty) {
+                    let l = self.operand_leaves(operand, &src_ty, 2)?;
+                    self.emit(Instr::Int128ToFloat {
+                        dst,
+                        kind: fk,
+                        lo: IrOperand::Value(l[0]),
+                        hi: IrOperand::Value(l[1]),
+                        signed,
+                    });
+                    return Ok(());
+                }
                 let Some(int) = int_kind(&src_ty) else {
                     return Err(self.err("IntToFloat cast from a non-integer type"));
                 };
@@ -5514,6 +6009,9 @@ impl<'a> FnLower<'a> {
         let discr_ty = self
             .operand_place_ty(discr)
             .unwrap_or(mir::Ty::Uint(mir::UintTy::U64));
+        if let Some(signed) = int128_signed(&discr_ty) {
+            return self.lower_switch128(discr, &discr_ty, signed, targets);
+        }
         let v = self.operand_value(discr, &discr_ty)?;
         if targets.values.is_empty() {
             self.seal_terminator(IrTerminator::Jump(targets.otherwise.index() as u32));
@@ -5551,6 +6049,48 @@ impl<'a> FnLower<'a> {
             // run() re-initialises the cursor before that block is
             // filled with its own contents. The block itself is not
             // sealed here.
+        }
+        Ok(())
+    }
+
+    /// `SwitchInt` on a 128-bit discriminant: each target value
+    /// is a full-width constant, compared against the
+    /// discriminant's word pair.
+    fn lower_switch128(
+        &mut self,
+        discr: &mir::Operand,
+        discr_ty: &mir::Ty,
+        signed: bool,
+        targets: &mir::SwitchTargets,
+    ) -> Result<(), JitError> {
+        let l = self.operand_leaves(discr, discr_ty, 2)?;
+        if targets.values.is_empty() {
+            self.seal_terminator(IrTerminator::Jump(targets.otherwise.index() as u32));
+            return Ok(());
+        }
+        for (i, (value, target)) in targets
+            .values
+            .iter()
+            .zip(targets.targets.iter())
+            .enumerate()
+        {
+            let lo = self.const_slot(*value as u64);
+            let hi = self.const_slot((*value >> 64) as u64);
+            let eq = self.emit_cmp128(mir::BinOp::Eq, signed, &l, &[lo, hi]);
+            let last = i + 1 == targets.values.len();
+            let next = if last {
+                targets.otherwise.index() as u32
+            } else {
+                self.new_block()
+            };
+            self.seal_and_continue(
+                IrTerminator::Branch {
+                    cond: IrOperand::Value(eq),
+                    then_blk: target.index() as u32,
+                    else_blk: next,
+                },
+                next,
+            );
         }
         Ok(())
     }
@@ -5725,20 +6265,12 @@ impl<'a> FnLower<'a> {
     /// admitted; anything else is an explicit unsupported error.
     fn fmt_ty_of(&self, ty: &mir::Ty) -> Result<FmtTy, JitError> {
         Ok(match ty {
-            mir::Ty::Int(it) => {
-                let bits = int_bits(*it);
-                if bits > 64 {
-                    return Err(self.err("fmt argument of a 128-bit integer type"));
-                }
-                FmtTy::Int { bits }
-            }
-            mir::Ty::Uint(ut) => {
-                let bits = uint_bits(*ut);
-                if bits > 64 {
-                    return Err(self.err("fmt argument of a 128-bit integer type"));
-                }
-                FmtTy::Uint { bits }
-            }
+            mir::Ty::Int(it) => FmtTy::Int {
+                bits: int_bits(*it),
+            },
+            mir::Ty::Uint(ut) => FmtTy::Uint {
+                bits: uint_bits(*ut),
+            },
             mir::Ty::Bool => FmtTy::Bool,
             mir::Ty::Char => FmtTy::Char,
             mir::Ty::Float(mir::FloatTy::F32) => FmtTy::F32,
@@ -5909,6 +6441,95 @@ impl<'a> FnLower<'a> {
                     vec![IrOperand::Value(ptr)],
                 );
                 self.finish_builtin_call(&dst_loc, dst, target, true);
+                Ok(())
+            }
+            Builtin::PartialEqEq | Builtin::PartialEqNe => {
+                // Semantic (derived) value equality, the
+                // interpreter's builtin of the same name: both
+                // arguments are references to the compared values.
+                // The JIT lowers it for the shapes whose derived
+                // equality is leaf-wise word equality (see
+                // `word_transparent`): the pointees' words are
+                // loaded and compared word by word.
+                if args.len() != 2 {
+                    return Err(self.err("PartialEq call with wrong arity"));
+                }
+                let Some(self_ty) = generic_args.first() else {
+                    return Err(self.err("PartialEq call without a Self type"));
+                };
+                let self_ty = self_ty.clone();
+                if !word_transparent(&self_ty) {
+                    return Err(self.err(&format!(
+                        "PartialEq on type {}",
+                        self_ty.kind_name()
+                    )));
+                }
+                let count = flatten(&self_ty, &self.func.name, self.layouts)?;
+                let mut words: Vec<Vec<u32>> = Vec::with_capacity(2);
+                for arg in args {
+                    let (mir::Operand::Copy(p) | mir::Operand::Move(p)) = arg else {
+                        return Err(self.err("PartialEq argument is not a place"));
+                    };
+                    // The pointee place: the argument's place
+                    // with a dereference appended.
+                    let mut projection = p.projection.clone();
+                    projection.push(mir::PlaceElem::Deref);
+                    let pointee = mir::Place {
+                        local: p.local,
+                        projection,
+                    };
+                    words.push(self.operand_leaves(
+                        &mir::Operand::Copy(pointee),
+                        &self_ty,
+                        count,
+                    )?);
+                }
+                let mut eq: Option<u32> = None;
+                for k in 0..count {
+                    let e = self.fresh();
+                    self.emit(Instr::BinOp {
+                        dst: e,
+                        op: IrBinOp::Eq,
+                        lhs: IrOperand::Value(words[0][k]),
+                        rhs: IrOperand::Value(words[1][k]),
+                    });
+                    eq = Some(match eq {
+                        None => e,
+                        Some(acc) => {
+                            let d = self.fresh();
+                            self.emit(Instr::BinOp {
+                                dst: d,
+                                op: IrBinOp::And,
+                                lhs: IrOperand::Value(acc),
+                                rhs: IrOperand::Value(e),
+                            });
+                            d
+                        }
+                    });
+                }
+                // A zero-word Self (unit) is trivially equal.
+                let result = eq.unwrap_or_else(|| self.const_slot(1));
+                let result = if kind == Builtin::PartialEqNe {
+                    let d = self.fresh();
+                    self.emit(Instr::BinOp {
+                        dst: d,
+                        op: IrBinOp::Xor,
+                        lhs: IrOperand::Value(result),
+                        rhs: IrOperand::Const(1),
+                    });
+                    d
+                } else {
+                    result
+                };
+                let (dst_loc, dst, dcount) = self.builtin_destination(destination)?;
+                if dcount != 1 {
+                    return Err(self.err("PartialEq destination is not one word"));
+                }
+                self.emit(Instr::Copy {
+                    dst,
+                    src: IrOperand::Value(result),
+                });
+                self.finish_builtin_call(&dst_loc, dst, target, false);
                 Ok(())
             }
             Builtin::ArgumentsNew => {
@@ -6717,9 +7338,18 @@ impl<'a> FnLower<'a> {
                     ir_args.push(IrOperand::Value(v));
                 }
                 2 => {
-                    let (a, b) = self.operand_pair(arg)?;
-                    ir_args.push(IrOperand::Value(a));
-                    ir_args.push(IrOperand::Value(b));
+                    if int128_signed(pty).is_some() {
+                        // A 128-bit argument is the value's own
+                        // leaf pair (a constant included), not a
+                        // fat pointer.
+                        let leaves = self.operand_leaves(arg, pty, 2)?;
+                        ir_args.push(IrOperand::Value(leaves[0]));
+                        ir_args.push(IrOperand::Value(leaves[1]));
+                    } else {
+                        let (a, b) = self.operand_pair(arg)?;
+                        ir_args.push(IrOperand::Value(a));
+                        ir_args.push(IrOperand::Value(b));
+                    }
                 }
                 n => {
                     let leaves = self.operand_leaves(arg, pty, n)?;

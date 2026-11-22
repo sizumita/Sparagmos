@@ -240,6 +240,11 @@ pub enum Builtin {
     IteratorNext,
     /// A primitive `f32` / `f64` inherent method.
     FloatMethod { f32: bool, op: FloatOp },
+    /// `PartialEq::eq(&a, &b)`: semantic (derived) value equality,
+    /// as the interpreter's builtin of the same name computes it.
+    PartialEqEq,
+    /// `PartialEq::ne(&a, &b)`.
+    PartialEqNe,
 }
 
 /// Look a canonical callee name up in the registry.
@@ -268,6 +273,8 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         _ if canonical.contains("RangeInclusive") && canonical.ends_with("::new") => {
             Builtin::RangeInclusiveNew
         }
+        _ if canonical.ends_with("::PartialEq::eq") => Builtin::PartialEqEq,
+        _ if canonical.ends_with("::PartialEq::ne") => Builtin::PartialEqNe,
         _ => return float_method(canonical),
     })
 }
@@ -1224,8 +1231,27 @@ fn read_value_at(ty: &FmtTy, addr: i64) -> Result<HostVal, String> {
     // captured frame still on the stack).
     unsafe {
         Ok(match ty {
-            FmtTy::Int { bits } => HostVal::Int(load_word(addr) as i128, *bits),
-            FmtTy::Uint { bits } => HostVal::Uint(load_word(addr) as u64 as u128, *bits),
+            FmtTy::Int { bits } => {
+                if *bits == 128 {
+                    // A 128-bit value's words are the low word at
+                    // `addr` and the high word below it (the slot
+                    // layout: leaf `k` at `addr - 8 * k`).
+                    let lo = load_word(addr) as u64 as u128;
+                    let hi = load_word(addr - 8) as u64 as u128;
+                    HostVal::Int(((hi << 64) | lo) as i128, *bits)
+                } else {
+                    HostVal::Int(load_word(addr) as i128, *bits)
+                }
+            }
+            FmtTy::Uint { bits } => {
+                if *bits == 128 {
+                    let lo = load_word(addr) as u64 as u128;
+                    let hi = load_word(addr - 8) as u64 as u128;
+                    HostVal::Uint((hi << 64) | lo, *bits)
+                } else {
+                    HostVal::Uint(load_word(addr) as u64 as u128, *bits)
+                }
+            }
             FmtTy::Bool => HostVal::Bool(load_word(addr) != 0),
             FmtTy::Char => {
                 let n = load_word(addr) as u64 as u32;
