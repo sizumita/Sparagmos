@@ -7423,6 +7423,7 @@ pub(crate) fn navigate_mut<'x>(
                 }
             }
             navigate_mut(&mut fields[*idx], rest, func, place)
+        }
         RefProj::ByteOffset(disp) => {
             if *disp == 0 {
                 navigate_mut(slot, rest, func, place)
