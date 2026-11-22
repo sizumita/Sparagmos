@@ -6237,6 +6237,11 @@ impl<'a> Interpreter<'a> {
                     None => Ok(base),
                     Some(meta_op) => {
                         let meta_value = self.eval_operand(frames, body, meta_op)?;
+                        if meta_value == Value::Unit {
+                            // Unit metadata is no metadata: the
+                            // aggregate is the data pointer itself.
+                            return Ok(base);
+                        }
                         let len = match meta_value {
                             Value::Uint(v) => v,
                             Value::Int(v) => v as u128,

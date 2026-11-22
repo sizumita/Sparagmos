@@ -4296,6 +4296,21 @@ impl<'a> Converter<'a> {
                                 self.convert_operand(body, &ops[0], Some(&data_ctx))?;
                             ir::Rvalue::RawPtrAggregate { data, meta: None }
                         }
+                        (_, 2) => {
+                            // Any other two-operand shape (a sized
+                            // pointee with unit metadata, a `str`
+                            // pointer's length, ...): the metadata
+                            // operand converts without a context and
+                            // the evaluation decides its meaning
+                            // (unit metadata is no metadata).
+                            let data =
+                                self.convert_operand(body, &ops[0], Some(&data_ctx))?;
+                            let meta = self.convert_operand(body, &ops[1], None)?;
+                            ir::Rvalue::RawPtrAggregate {
+                                data,
+                                meta: Some(meta),
+                            }
+                        }
                         _ => ir::Rvalue::Unsupported(format!(
                             "Aggregate RawPtr ({} operands)",
                             ops.len()
