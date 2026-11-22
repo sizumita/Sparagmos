@@ -7596,6 +7596,43 @@ const BOXED_VIEWS_SRC: &str = r#"fn main() {
 }
 "#;
 
+const CALLER_LOCATION_INLINED_SRC: &str = r#"macro_rules! caller_location_from_macro {
+    () => (core::panic::Location::caller());
+}
+
+fn main() {
+    let loc = core::panic::Location::caller();
+    assert_eq!(loc.file(), file!());
+    assert_eq!(loc.line(), 6);
+    assert_eq!(loc.column(), 15);
+
+    let loc2 = caller_location_from_macro!();
+    assert_eq!(loc2.file(), file!());
+    assert_eq!(loc2.line(), 11);
+    assert_eq!(loc2.column(), 16);
+}
+"#;
+
+#[test]
+fn run_mode_caller_location_after_inlining() {
+    // At high MIR optimization levels `Location::caller` is
+    // inlined into the calling body, leaving a bare
+    // `caller_location` intrinsic call: the stamp must come
+    // from that call site's own span (the intrinsic is not
+    // itself `#[track_caller]`, so the usual stamping gate
+    // skips it).
+    let dir = temp_dir("caller-location-inlined");
+    let src = fixture(&dir, "caller_location.rs", CALLER_LOCATION_INLINED_SRC);
+    let out = run_driver_extra(
+        &src,
+        &["--rustc-arg", "-Zmir-opt-level=4"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "");
+}
+
 #[test]
 fn run_mode_boxed_conversions_and_ref_views() {
     // `String::into_boxed_str` and `Vec::into_boxed_slice` move
