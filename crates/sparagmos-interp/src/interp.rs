@@ -7317,6 +7317,27 @@ pub(crate) fn project_value(
                     .get(*idx)
                     .map(|byte| Value::Uint(*byte as u128))
                     .ok_or_else(|| index_oob(s.len(), *idx))?,
+                // A single-field aggregate whose only field is
+                // an array is layout-identical to the array
+                // itself, and guest code indexes through that
+                // pun (a pointer cast between a `#[repr(simd)]`
+                // struct and `[T; N]`, as `Simd::as_array`
+                // does): the index step continues into the
+                // field's elements.
+                Value::Enum { ref fields, .. }
+                    if fields.len() == 1
+                        && matches!(
+                            fields[0],
+                            Value::Tuple(_) | Value::Bytes(_)
+                        ) =>
+                {
+                    project_value(
+                        fields[0].clone(),
+                        &[RefProj::Index(*idx)],
+                        func,
+                        place,
+                    )?
+                }
                 // A `Vec` value is the aggregate of its elements
                 // (see the `Vec::from` / `Deref` builtin model):
                 // indexing the vector's own place reads the
@@ -7528,6 +7549,30 @@ pub(crate) fn project_value_ref<'a>(
                 }
                 Value::Tuple(items) => {
                     cur = items.get(*idx).ok_or_else(|| index_oob(items.len(), *idx))?;
+                }
+                Value::Enum { fields, .. }
+                    if fields.len() == 1
+                        && matches!(
+                            fields[0],
+                            Value::Tuple(_) | Value::Bytes(_)
+                        ) =>
+                {
+                    // The single-array-field pun, as in
+                    // `project_value`: the index step continues
+                    // into the field's elements.
+                    match project_value_ref(
+                        &fields[0],
+                        std::slice::from_ref(step),
+                        func,
+                        place,
+                    )? {
+                        Cow::Borrowed(v) => cur = v,
+                        Cow::Owned(v) => {
+                            return Ok(Cow::Owned(project_value(
+                                v, rest, func, place,
+                            )?));
+                        }
+                    }
                 }
                 Value::Enum { fields, .. } => {
                     cur = fields.get(*idx).ok_or_else(|| index_oob(fields.len(), *idx))?;
@@ -7822,10 +7867,24 @@ pub(crate) fn navigate_mut<'x>(
             // indexing the vector's own place writes the element
             // field (the read direction in `project_value`).
             Value::Enum { fields, .. } => {
-                if *idx >= fields.len() {
+                if fields.len() == 1
+                    && matches!(
+                        fields[0],
+                        Value::Tuple(_) | Value::Bytes(_)
+                    )
+                {
+                    // The single-array-field pun, as in
+                    // `project_value`: the write continues into
+                    // the field's elements.
+                    let mut full = Vec::with_capacity(rest.len() + 1);
+                    full.push(RefProj::Index(*idx));
+                    full.extend_from_slice(rest);
+                    navigate_mut(&mut fields[0], &full, func, place)
+                } else if *idx >= fields.len() {
                     return Err(index_oob(fields.len(), *idx));
+                } else {
+                    navigate_mut(&mut fields[*idx], rest, func, place)
                 }
-                navigate_mut(&mut fields[*idx], rest, func, place)
             }
             Value::Bytes(b) => {
                 if *idx >= b.len() {
