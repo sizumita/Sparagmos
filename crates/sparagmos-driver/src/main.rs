@@ -5582,6 +5582,10 @@ fn execute(
 ///
 /// ```text
 /// break <line>     a breakpoint in the input file (repeatable)
+/// pretty-printers  render gdb prints through the sysroot Rust
+///                  pretty printers (the harness emits this for
+///                  gdb sessions whose test does not opt out with
+///                  `disable-gdb-pretty-printers`)
 /// run              start (the session start; at most one, first)
 /// continue         resume to the next breakpoint
 /// next             step over
@@ -5627,7 +5631,7 @@ fn execute_debug(
             return 2;
         }
     };
-    let (breakpoints, commands) = match parse_debug_script(&script_text) {
+    let (breakpoints, commands, pretty_printers) = match parse_debug_script(&script_text) {
         Ok(parsed) => parsed,
         Err(reason) => {
             eprintln!("sparagmos-driver debug: bad script: {reason}");
@@ -5659,6 +5663,7 @@ fn execute_debug(
     for line in &breakpoints {
         session.set_breakpoint(input, *line);
     }
+    session.set_pretty_printers(pretty_printers);
     if let Ok(text) = std::fs::read_to_string(input) {
         session.set_source_text(input, &text);
     }
@@ -5677,10 +5682,11 @@ fn execute_debug(
 /// its breakpoint lines and its command list.
 fn parse_debug_script(
     text: &str,
-) -> Result<(Vec<u32>, Vec<sparagmos_interp::DebugCommand>), String> {
+) -> Result<(Vec<u32>, Vec<sparagmos_interp::DebugCommand>, bool), String> {
     use sparagmos_interp::{DebugCommand, DebugPrint, PrintFormat};
     let mut breakpoints = Vec::new();
     let mut commands = Vec::new();
+    let mut pretty_printers = false;
     for (lineno, raw) in text.lines().enumerate() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -5692,6 +5698,12 @@ fn parse_debug_script(
             None => (line, ""),
         };
         match head {
+            "pretty-printers" => {
+                if !rest.is_empty() {
+                    return Err(bad("`pretty-printers` takes no argument"));
+                }
+                pretty_printers = true;
+            }
             "break" => {
                 let n: u32 = rest
                     .parse()
@@ -5734,7 +5746,7 @@ fn parse_debug_script(
             _ => return Err(bad(&format!("unknown command `{head}`"))),
         }
     }
-    Ok((breakpoints, commands))
+    Ok((breakpoints, commands, pretty_printers))
 }
 
 /// The crate type an auxiliary source declares for itself

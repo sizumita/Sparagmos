@@ -161,6 +161,11 @@ pub(crate) struct DebugControl {
     source_text: HashMap<u32, Vec<String>>,
     /// The output dialect.
     dialect: DebugDialect,
+    /// Whether gdb prints render through the sysroot Rust
+    /// pretty printers (compiletest's default; a test opts out
+    /// with `disable-gdb-pretty-printers`). Only the gdb form
+    /// consults it.
+    pretty_printers: bool,
 }
 
 /// A debugger session over one converted program.
@@ -171,6 +176,7 @@ pub struct DebugSession {
     config: crate::InterpConfig,
     breakpoints: HashSet<(u32, u32)>,
     source_text: HashMap<u32, Vec<String>>,
+    pretty_printers: bool,
 }
 
 impl DebugSession {
@@ -187,7 +193,16 @@ impl DebugSession {
             config,
             breakpoints: HashSet::new(),
             source_text: HashMap::new(),
+            pretty_printers: false,
         }
+    }
+
+    /// Set whether gdb prints in this session render through
+    /// the sysroot Rust pretty printers (see
+    /// [`DebugControl::pretty_printers`]). Sessions default to
+    /// the raw form, as if the printers were disabled.
+    pub fn set_pretty_printers(&mut self, on: bool) {
+        self.pretty_printers = on;
     }
 
     /// The program's source-file table (the names the bodies'
@@ -256,6 +271,7 @@ impl DebugSession {
             transcript: Vec::new(),
             source_text: std::mem::take(&mut self.source_text),
             dialect,
+            pretty_printers: self.pretty_printers,
         };
         let mut interp = Interpreter::with_config(&self.program, self.config.clone());
         interp.debug_ctl = Some(ctl);
@@ -574,9 +590,27 @@ fn evaluate_print(
             }
         }
     }
+    // The lldb synthetic-child providers' summary lines for
+    // the sequence and counted-handle types (the forms the
+    // sysroot's `lldb_providers.py` produces), appended to the
+    // dialect's own lines when the printed value's type has
+    // one.
+    let mut lldb_lines_extra: Vec<String> = Vec::new();
+    if expr.steps.is_empty() {
+        if let Some(line) = render_lldb_provider_line(
+            interp,
+            frames,
+            &value,
+            desc.as_ref(),
+            entry.ty.as_deref(),
+            &print.expr,
+        ) {
+            lldb_lines_extra.push(line);
+        }
+    }
     // lldb's summary for a reference to a path is the path text
     // itself, not the address: render the pointee.
-    let lldb = match &desc {
+    let mut lldb = match &desc {
         Some(Desc::Ref(inner))
             if expr.steps.is_empty()
                 && matches!(
@@ -607,8 +641,21 @@ fn evaluate_print(
         }
         _ => render_lldb_lines(interp, &value, desc.as_ref(), char, &print.expr),
     };
+    lldb.extend(lldb_lines_extra);
     Ok(EvaluatedPrint {
-        gdb: render_gdb(interp, &value, desc.as_ref(), char, print.format, 0),
+        gdb: if ctl.pretty_printers && print.format.is_none() {
+            render_pretty_gdb(
+                interp,
+                frames,
+                &value,
+                desc.as_ref(),
+                entry.ty.as_deref(),
+                0,
+            )
+            .or_else(|| render_gdb(interp, &value, desc.as_ref(), char, print.format, 0))
+        } else {
+            render_gdb(interp, &value, desc.as_ref(), char, print.format, 0)
+        },
         lldb,
     })
 }
@@ -1183,6 +1230,426 @@ fn render_adt_gdb(
             }
         }
         sparagmos_mir::AdtShapeKind::Union => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pretty printers
+//
+// When a session enables the pretty printers (compiletest's
+// default; see `DebugControl::pretty_printers`), a print of a
+// value whose type the sysroot registers a provider for renders
+// in the provider's form instead of the raw aggregate form. The
+// classification mirrors `rust_types.py`'s type-kind table,
+// matched on the DWARF (definition-path) name of the value's
+// type, and each form mirrors the corresponding provider in
+// `gdb_providers.py` / `lldb_providers.py`. A value with no
+// provider — or a provider value whose shape the value model
+// does not produce — keeps the raw form.
+// ---------------------------------------------------------------------------
+
+/// The sysroot pretty-printer kinds this renderer implements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrinterKind {
+    String,
+    OsString,
+    Vec,
+    VecDeque,
+    BTreeSet,
+    BTreeMap,
+    HashMap,
+    HashSet,
+    Rc,
+    Arc,
+}
+
+/// The printer kind of a DWARF type name, if any: the type's
+/// base name and its parent segment decide, the way
+/// `rust_types.py`'s anchored path patterns do (the crate and
+/// module spellings of a std type vary between its definition
+/// path and its re-export paths; the last two segments are
+/// stable across them).
+fn printer_kind(dwarf_name: &str) -> Option<PrinterKind> {
+    let base = dwarf_name.split('<').next()?.trim();
+    if !(base.starts_with("alloc::")
+        || base.starts_with("std::")
+        || base.starts_with("core::"))
+    {
+        return None;
+    }
+    let mut segs = base.rsplit("::");
+    let name = segs.next()?;
+    let parent = segs.next().unwrap_or("");
+    Some(match (name, parent) {
+        ("String", "string") => PrinterKind::String,
+        ("OsString", "os_str") => PrinterKind::OsString,
+        ("Vec", "vec") => PrinterKind::Vec,
+        ("VecDeque", "vec_deque") | ("VecDeque", "collections") => {
+            PrinterKind::VecDeque
+        }
+        ("BTreeSet", "set") | ("BTreeSet", "collections") => {
+            PrinterKind::BTreeSet
+        }
+        ("BTreeMap", "map") | ("BTreeMap", "collections") => {
+            PrinterKind::BTreeMap
+        }
+        ("HashMap", "map") => PrinterKind::HashMap,
+        ("HashSet", "set") => PrinterKind::HashSet,
+        ("Rc", "rc") => PrinterKind::Rc,
+        ("Arc", "sync") => PrinterKind::Arc,
+        _ => return None,
+    })
+}
+
+/// The elements of a sequence value in this model: an element
+/// tuple (an array value or a materialised slice), an ADT
+/// element aggregate (a vector's storage form), or a byte block
+/// (each byte an element).
+fn sequence_values(value: &Value) -> Option<Vec<Value>> {
+    match value {
+        Value::Tuple(items) => Some(items.clone()),
+        Value::Enum { fields, .. } => Some(fields.clone()),
+        Value::Bytes(bytes) => Some(
+            bytes
+                .iter()
+                .map(|b| Value::Uint(u128::from(*b)))
+                .collect(),
+        ),
+        Value::Str(text) => Some(
+            text.bytes()
+                .map(|b| Value::Uint(u128::from(b)))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// gdb's `print elements` limit for a printer's children.
+const GDB_PRINT_ELEMENTS: usize = 200;
+
+/// Render a value in gdb form with the pretty printers applied
+/// where a provider exists (the raw form otherwise).
+fn render_gdb_any(
+    interp: &Interpreter,
+    frames: &[Frame],
+    value: &Value,
+    desc: Option<&Desc>,
+    depth: usize,
+) -> Option<String> {
+    render_pretty_gdb(interp, frames, value, desc, None, depth)
+        .or_else(|| render_gdb(interp, value, desc, false, None, depth))
+}
+
+/// Render a printer's array-hint children block (`{a, b, c}`),
+/// with gdb's repeat compression and its truncation marker
+/// past the `print elements` limit.
+fn render_printer_children(
+    interp: &Interpreter,
+    frames: &[Frame],
+    elems: &[Value],
+    elem_desc: Option<&Desc>,
+    depth: usize,
+) -> Option<String> {
+    let shown = elems.len().min(GDB_PRINT_ELEMENTS);
+    let mut rendered = Vec::with_capacity(shown);
+    for elem in &elems[..shown] {
+        rendered.push(render_gdb_any(interp, frames, elem, elem_desc, depth + 1)?);
+    }
+    let mut body = compress_repeats(&rendered);
+    if elems.len() > shown {
+        if !body.is_empty() {
+            body.push_str(", ");
+        }
+        body.push_str("...");
+    }
+    Some(format!("{{{body}}}"))
+}
+
+/// Render one printed value in the sysroot gdb pretty
+/// printers' form, when its type has a provider this renderer
+/// implements. `tag_hint` is the printed variable's declared
+/// type tag, for the forms that name the type (a slice's
+/// `&[T]` / `&mut [T]` head).
+fn render_pretty_gdb(
+    interp: &Interpreter,
+    frames: &[Frame],
+    value: &Value,
+    desc: Option<&Desc>,
+    tag_hint: Option<&str>,
+    depth: usize,
+) -> Option<String> {
+    if depth > MAX_RENDER_DEPTH {
+        return None;
+    }
+    match desc {
+        Some(Desc::Ref(inner)) => match inner.as_ref() {
+            Desc::Slice(elem) => {
+                let resolved = interp.deref_value(frames, value).ok()?;
+                let pointee = interp.read_resolved(frames, &resolved).ok()?;
+                let elems = sequence_values(&pointee)?;
+                let ty = match tag_hint {
+                    Some(tag) if tag.trim_start().starts_with('&') => {
+                        tag.trim().to_string()
+                    }
+                    _ => return None,
+                };
+                let head = format!("{ty}(size={})", elems.len());
+                if elems.is_empty() {
+                    Some(head)
+                } else {
+                    let block = render_printer_children(
+                        interp,
+                        frames,
+                        &elems,
+                        Some(elem),
+                        depth,
+                    )?;
+                    Some(format!("{head} = {block}"))
+                }
+            }
+            Desc::Str => {
+                let resolved = interp.deref_value(frames, value).ok()?;
+                let pointee = interp.read_resolved(frames, &resolved).ok()?;
+                let text = match &pointee {
+                    Value::Str(s) => s.clone(),
+                    Value::Bytes(b) => {
+                        String::from_utf8_lossy(b).into_owned()
+                    }
+                    _ => return None,
+                };
+                Some(format!("\"{}\"", escape_str(&text)))
+            }
+            _ => None,
+        },
+        Some(Desc::Adt(tag)) => {
+            let kind = printer_kind(&dwarf_type_name(tag))?;
+            render_printer_adt(interp, frames, kind, tag, value, depth)
+        }
+        _ => None,
+    }
+}
+
+/// Render an ADT value in its gdb provider's form.
+fn render_printer_adt(
+    interp: &Interpreter,
+    frames: &[Frame],
+    kind: PrinterKind,
+    tag: &str,
+    value: &Value,
+    depth: usize,
+) -> Option<String> {
+    match kind {
+        PrinterKind::String | PrinterKind::OsString => {
+            let text = match value {
+                Value::Str(s) => Some(s.clone()),
+                _ => path_text(value),
+            }?;
+            Some(format!("\"{}\"", escape_str(&text)))
+        }
+        PrinterKind::Vec => {
+            let elem =
+                first_generic_arg(tag).map(|t| Desc::from_tag(&t));
+            match value {
+                Value::Enum { fields, .. } => {
+                    let head = format!("Vec(size={})", fields.len());
+                    if fields.is_empty() {
+                        Some(head)
+                    } else {
+                        let block = render_printer_children(
+                            interp,
+                            frames,
+                            fields,
+                            elem.as_ref(),
+                            depth,
+                        )?;
+                        Some(format!("{head} = {block}"))
+                    }
+                }
+                // A vector place the program has not written
+                // yet (the variable is declared but not yet
+                // assigned at the stop): the provider reads the
+                // uninitialised buffer's length as whatever the
+                // memory holds, and the suite's check for this
+                // case accepts any size; the empty form is the
+                // one honest rendering available here.
+                Value::Uninit => Some("Vec(size=0)".to_string()),
+                _ => None,
+            }
+        }
+        PrinterKind::Rc | PrinterKind::Arc => {
+            let (strong, weak, pointee, elem) = rc_parts(interp, tag, value)?;
+            let v = render_gdb_any(
+                interp,
+                frames,
+                &pointee,
+                elem.as_ref(),
+                depth + 1,
+            )?;
+            let name = if kind == PrinterKind::Rc {
+                "Rc"
+            } else {
+                "Arc"
+            };
+            Some(format!("{name}(strong={strong}, weak={weak}) = {{value = {v}, strong = {strong}, weak = {weak}}}"))
+        }
+        // The collection providers are rendered from the
+        // collections' own entry walks, added with the
+        // collections' debugger support.
+        PrinterKind::VecDeque
+        | PrinterKind::BTreeSet
+        | PrinterKind::BTreeMap
+        | PrinterKind::HashMap
+        | PrinterKind::HashSet => None,
+    }
+}
+
+/// The counts and pointee of a reference-counted handle value
+/// (`Rc` / `Arc`): the strong count, the weak count as the
+/// providers display it (the stored count less the
+/// allocation's own implicit weak reference), the pointee
+/// value, and the pointee's descriptor from the instance tag.
+fn rc_parts(
+    interp: &Interpreter,
+    tag: &str,
+    value: &Value,
+) -> Option<(u128, u128, Value, Option<Desc>)> {
+    let id = crate::interp::rc_handle_id(value)?;
+    let inner = interp.alloc_base(id).ok()?;
+    let strong = rc_count(&inner, 0)?;
+    let weak = rc_count(&inner, 1)?.saturating_sub(1);
+    let pointee = match &inner {
+        Value::Enum { fields, .. } => fields.get(2)?.clone(),
+        _ => return None,
+    };
+    let elem = first_generic_arg(tag).map(|t| Desc::from_tag(&t));
+    Some((strong, weak, pointee, elem))
+}
+
+/// One reference count of an `RcInner` / `ArcInner` aggregate:
+/// field `field` (0 = strong, 1 = weak) is a `Cell<usize>` /
+/// `AtomicUsize` wrapper around an `UnsafeCell<usize>` holding
+/// the count (the same reading the interpreter's own count
+/// adjustments make).
+fn rc_count(inner: &Value, field: usize) -> Option<u128> {
+    fn unwrap1(v: &Value) -> Option<&Value> {
+        match v {
+            Value::Enum { fields, .. } if fields.len() == 1 => {
+                Some(&fields[0])
+            }
+            _ => None,
+        }
+    }
+    let fields = match inner {
+        Value::Enum { fields, .. } => fields,
+        _ => return None,
+    };
+    let leaf = unwrap1(unwrap1(fields.get(field)?)?)?;
+    match leaf {
+        Value::Uint(n) => Some(*n),
+        _ => None,
+    }
+}
+
+/// The lldb provider summary line for one printed value, when
+/// its type has a synthetic-child provider with a summary form
+/// this renderer implements (a slice, a string slice, a counted
+/// handle): the `(Type) name = <summary> { <children> }` line
+/// lldb prints for it.
+fn render_lldb_provider_line(
+    interp: &Interpreter,
+    frames: &[Frame],
+    value: &Value,
+    desc: Option<&Desc>,
+    tag_hint: Option<&str>,
+    expr: &str,
+) -> Option<String> {
+    match desc {
+        Some(Desc::Ref(inner)) => match inner.as_ref() {
+            Desc::Slice(elem) => {
+                let resolved = interp.deref_value(frames, value).ok()?;
+                let pointee = interp.read_resolved(frames, &resolved).ok()?;
+                let elems = sequence_values(&pointee)?;
+                let ty = tag_hint?.trim();
+                let mut parts = Vec::with_capacity(elems.len());
+                for (i, e) in elems.iter().enumerate() {
+                    let v = render_lldb_compact(
+                        interp,
+                        e,
+                        Some(elem),
+                        false,
+                        true,
+                        1,
+                    )?;
+                    parts.push(format!("[{i}] = {v}"));
+                }
+                let children = if parts.is_empty() {
+                    "{}".to_string()
+                } else {
+                    format!("{{ {} }}", parts.join(" "))
+                };
+                Some(format!(
+                    "({ty}) {expr} = size={} {children}",
+                    elems.len()
+                ))
+            }
+            Desc::Str => {
+                let resolved = interp.deref_value(frames, value).ok()?;
+                let pointee = interp.read_resolved(frames, &resolved).ok()?;
+                let text = match &pointee {
+                    Value::Str(s) => s.clone(),
+                    Value::Bytes(b) => {
+                        String::from_utf8_lossy(b).into_owned()
+                    }
+                    _ => return None,
+                };
+                let ty = tag_hint?.trim();
+                // The slice provider formats each element as
+                // a character (`eFormatChar`): the plain
+                // quoted character, not the scalar char form.
+                let mut parts = Vec::with_capacity(text.len());
+                for (i, c) in text.chars().enumerate() {
+                    parts.push(format!("[{i}] = '{}'", escape_char(c)));
+                }
+                let children = if parts.is_empty() {
+                    "{}".to_string()
+                } else {
+                    format!("{{ {} }}", parts.join(" "))
+                };
+                Some(format!(
+                    "({ty}) {expr} = \"{}\" {children}",
+                    escape_str(&text)
+                ))
+            }
+            _ => None,
+        },
+        Some(Desc::Adt(tag)) => {
+            let kind = printer_kind(&dwarf_type_name(tag))?;
+            match kind {
+                PrinterKind::Rc | PrinterKind::Arc => {
+                    let (strong, weak, pointee, elem) =
+                        rc_parts(interp, tag, value)?;
+                    let v = render_lldb_compact(
+                        interp,
+                        &pointee,
+                        elem.as_ref(),
+                        false,
+                        true,
+                        1,
+                    )?;
+                    // The `Rc` provider's child is named
+                    // `value`, the `Arc` provider's `data`.
+                    let child = if kind == PrinterKind::Rc {
+                        "value"
+                    } else {
+                        "data"
+                    };
+                    let ty = lldb_type_name(&dwarf_type_name(tag));
+                    Some(format!("({ty}) {expr} = strong={strong}, weak={weak} {{ {child} = {v} }}"))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 

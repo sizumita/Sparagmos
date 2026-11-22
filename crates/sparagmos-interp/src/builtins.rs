@@ -997,6 +997,17 @@ pub enum Builtin {
     /// project the RawVec struct's fields off the abstract
     /// aggregate and fail, so the entry points are modelled here.
     VecShrink,
+    /// `Vec::set_len(&mut vec, new_len)`: resize the element
+    /// list to `new_len`, padding with uninitialized elements
+    /// when growing. The collected body first reads the
+    /// capacity through the `RawVec` fields for its UB
+    /// precondition check, and capacity is not represented in
+    /// this value model (the same reason `Vec::capacity` is
+    /// the explicit `VecCapacity` error), so the entry point
+    /// is modelled here. Shrinking forgets the tail elements
+    /// without dropping them, exactly as the real `set_len`
+    /// contract specifies.
+    VecSetLen,
     /// `Vec::extend_trusted(&mut vec, iter)`: append every item
     /// the iterator yields. The collected body is the TrustedLen
     /// fast path (`SpecFromIter::from_iter` reaches it for every
@@ -2435,6 +2446,9 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
                 || canonical.ends_with(">::shrink_to")) =>
         {
             Builtin::VecShrink
+        }
+        _ if canonical.starts_with("std::vec::Vec") && canonical.ends_with(">::set_len") => {
+            Builtin::VecSetLen
         }
         _ if canonical.starts_with("std::vec::Vec")
             && canonical.ends_with(">::extend_trusted") =>
@@ -6625,6 +6639,43 @@ impl<'a> Interpreter<'a> {
                         }
                     };
                     Ok(io_simple_error_value(disc))
+                } else if (target.starts_with("std::rc::Rc<")
+                    || target.starts_with("std::sync::Arc<"))
+                    && (source.starts_with("std::vec::Vec<")
+                        || source.starts_with("&[")
+                        || source.starts_with("&mut ["))
+                {
+                    // `Rc<[T]>: From<Vec<T>>` / `From<&[T]>` (and
+                    // the `Arc` twins): a fresh counted handle
+                    // over the element sequence. The slice
+                    // pointee lives in the allocation store as
+                    // the element tuple, the shape every slice
+                    // consumer of a reference-counted handle
+                    // derives the length from (see the handle
+                    // arm of `unsize_to_slice`).
+                    let resolved = self.resolve_value(frames, &value)?;
+                    let elements = match resolved {
+                        Value::Enum { fields, .. } => fields,
+                        Value::Tuple(items) => items,
+                        Value::FatRef { base, .. } => match *base {
+                            Value::Tuple(items) => items,
+                            other => {
+                                return Err(InterpError::type_mismatch(
+                                    "From::from to a counted slice",
+                                    "slice value over an element tuple",
+                                    other.kind_name(),
+                                ));
+                            }
+                        },
+                        ref other => {
+                            return Err(InterpError::type_mismatch(
+                                "From::from to a counted slice",
+                                "vector or slice value",
+                                other.kind_name(),
+                            ));
+                        }
+                    };
+                    Ok(self.rc_new_handle(Value::Tuple(elements)))
                 } else if target == "std::path::PathBuf" {
                     // `PathBuf: From<&str> / From<&Path> /
                     // From<&OsStr> / From<String> / From<OsString>`:
@@ -8299,6 +8350,44 @@ impl<'a> Interpreter<'a> {
                     ));
                 }
                 Ok(Value::Unit)
+            }
+            Builtin::VecSetLen => {
+                arity(2)?;
+                let new_len = match vals[1] {
+                    Value::Uint(n) => n as usize,
+                    Value::Int(n) if n >= 0 => n as usize,
+                    ref other => {
+                        return Err(InterpError::type_mismatch(
+                            "Vec::set_len",
+                            "unsigned length",
+                            other.kind_name(),
+                        ));
+                    }
+                };
+                // The element list is materialised value by
+                // value, so an astronomical length (the
+                // `Vec::with_capacity(1_000_000_000)` +
+                // `set_len` idiom) cannot be represented: it
+                // stays an explicit unsupported error rather
+                // than an allocation failure that takes the
+                // whole process down.
+                if new_len > MAX_VEC_SET_LEN_ELEMENTS {
+                    return Err(unsupported(format!(
+                        "Vec::set_len to {new_len} elements is beyond the value model's materialisation limit"
+                    )));
+                }
+                let target = self.deref_value(frames, &vals[0])?;
+                self.modify_resolved(frames, &target, |slot| match slot {
+                    Value::Enum { fields, .. } => {
+                        fields.resize(new_len, Value::Uninit);
+                        Ok(Value::Unit)
+                    }
+                    other => Err(InterpError::type_mismatch(
+                        "Vec::set_len",
+                        "vector value",
+                        other.kind_name(),
+                    )),
+                })
             }
             Builtin::VecExtendTrusted => {
                 arity(2)?;
@@ -16477,6 +16566,12 @@ fn io_simple_error_value(kind_discriminant: u32) -> Value {
 }
 
 /// The `ErrorKind::InvalidInput` discriminant.
+/// The largest element count `Vec::set_len` will materialise
+/// (see the `VecSetLen` builtin): the element list is stored
+/// value by value, so the count is bounded well clear of the
+/// memory a pathological length would need.
+const MAX_VEC_SET_LEN_ELEMENTS: usize = 1 << 22;
+
 const ERROR_KIND_INVALID_INPUT: u32 = 20;
 /// The `errno` for a missing file or directory.
 const ERRNO_NOT_FOUND: i32 = 2;

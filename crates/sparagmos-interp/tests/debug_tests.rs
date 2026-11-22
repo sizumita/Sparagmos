@@ -412,3 +412,137 @@ fn lldb_prints_aggregate_values_in_summary_form() {
         );
     }
 }
+
+/// A program whose debug variables are constants the conversion
+/// recorded: a slice, a string slice, and an unassigned `Vec`
+/// (the pretty-uninitialized-vec shape).
+fn constant_sequence_program() -> Program {
+    fn cvar(name: &str, constant: Constant, ty: &str) -> DebugVarEntry {
+        DebugVarEntry {
+            name: name.to_string(),
+            source: DebugVar::Constant(constant),
+            is_char: false,
+            ty: Some(ty.to_string()),
+            lines: (2, 2),
+        }
+    }
+    let p = program_with_vars(vec![
+        cvar(
+            "slice",
+            Constant::Ref(Box::new(Constant::Tuple(vec![
+                Constant::Int(0),
+                Constant::Int(1),
+                Constant::Int(2),
+            ]))),
+            "&[i32]",
+        ),
+        cvar(
+            "text",
+            Constant::Ref(Box::new(Constant::Str(
+                "string slice".to_string(),
+            ))),
+            "&str",
+        ),
+        cvar("vec", Constant::Uninit, "alloc::vec::Vec<i32>"),
+    ]);
+    p
+}
+
+#[test]
+fn gdb_pretty_printers_render_provider_forms() {
+    // With the printers enabled (compiletest's default), a
+    // value whose type has a sysroot provider renders in the
+    // provider's form; a value with no provider keeps the raw
+    // form.
+    let mut s = session(aggregate_program());
+    s.set_pretty_printers(true);
+    s.set_breakpoint("test.rs", 3);
+    let run = s.run_script(
+        vec![DebugCommand::Run, print("v"), print("p")],
+        DebugDialect::Gdb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    for want in [
+        "$1 = Vec(size=3) = {1, 2, 3}",
+        "$2 = test::Point {x: 10, y: 20}",
+    ] {
+        assert!(
+            run.transcript.iter().any(|l| l == want),
+            "missing `{want}` in {:?}",
+            run.transcript
+        );
+    }
+}
+
+#[test]
+fn gdb_pretty_printers_render_slice_str_and_uninit_vec() {
+    let mut s = session(constant_sequence_program());
+    s.set_pretty_printers(true);
+    s.set_breakpoint("test.rs", 3);
+    let run = s.run_script(
+        vec![
+            DebugCommand::Run,
+            print("slice"),
+            print("text"),
+            print("vec"),
+        ],
+        DebugDialect::Gdb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    for want in [
+        "$1 = &[i32](size=3) = {0, 1, 2}",
+        "$2 = \"string slice\"",
+        "$3 = Vec(size=0)",
+    ] {
+        assert!(
+            run.transcript.iter().any(|l| l == want),
+            "missing `{want}` in {:?}",
+            run.transcript
+        );
+    }
+}
+
+#[test]
+fn lldb_provider_lines_for_slice_and_str() {
+    let mut s = session(constant_sequence_program());
+    s.set_breakpoint("test.rs", 3);
+    let run = s.run_script(
+        vec![DebugCommand::Run, print("slice"), print("text")],
+        DebugDialect::Lldb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    for want in [
+        "(&[i32]) slice = size=3 { [0] = 0 [1] = 1 [2] = 2 }",
+        "(&str) text = \"string slice\" { [0] = 's' [1] = 't' [2] = 'r' \
+         [3] = 'i' [4] = 'n' [5] = 'g' [6] = ' ' [7] = 's' [8] = 'l' \
+         [9] = 'i' [10] = 'c' [11] = 'e' }",
+    ] {
+        assert!(
+            run.transcript.iter().any(|l| l == want),
+            "missing `{want}` in {:?}",
+            run.transcript
+        );
+    }
+}
+
+#[test]
+fn gdb_without_pretty_printers_keeps_raw_vec_form() {
+    // The printers are opt-in per session: without them the
+    // `Vec` value has no raw rendering (its element aggregate
+    // does not match the library layout in the shape table),
+    // exactly as before.
+    let mut s = session(aggregate_program());
+    s.set_breakpoint("test.rs", 3);
+    let run = s.run_script(
+        vec![DebugCommand::Run, print("v")],
+        DebugDialect::Gdb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    assert!(
+        run.transcript
+            .iter()
+            .all(|l| !l.contains("Vec(size=")),
+        "transcript: {:?}",
+        run.transcript
+    );
+}

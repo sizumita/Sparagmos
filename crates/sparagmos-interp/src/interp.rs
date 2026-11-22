@@ -435,6 +435,24 @@ pub(crate) fn box_alloc_pointer(value: &Value) -> Option<(u64, Vec<RefProj>)> {
 /// `NonNull` aggregate holding a reference to the allocation's
 /// storage. Any further fields (the zero-sized phantom and
 /// allocator fields of `Rc` / `Arc`) do not name the allocation.
+/// Whether the value has the `Rc` / `Arc` handle shape, as
+/// opposed to a `Box` (or a `Weak`): the reference-counted
+/// handles carry the phantom and allocator fields next to the
+/// pointer field, so their aggregate has at least two fields,
+/// where a `Box` value is the one-field pointer wrapper alone.
+/// The distinction matters where a trait-object value's base is
+/// classified by shape only: a `Box<dyn Trait>` and an
+/// `Rc<dyn Trait>` have the same first-field shape, but field
+/// steps through the trait object resolve differently (the
+/// box's field 0 is the fat pointer itself, the handle's fields
+/// are the handle's own).
+pub(crate) fn is_rc_arc_handle(value: &Value) -> bool {
+    if rc_handle_id(value).is_none() {
+        return false;
+    }
+    matches!(value, Value::Enum { fields, .. } if fields.len() >= 2)
+}
+
 pub(crate) fn rc_handle_id(value: &Value) -> Option<u64> {
     let fields = match value {
         Value::Enum { fields, .. } if !fields.is_empty() => fields,
@@ -11472,6 +11490,20 @@ pub(crate) fn project_value(
                 // vector form reach it through the modelled
                 // `Vec` API, not through these projections.
                 Value::Str(_) if *idx == 0 => value,
+                // A reference-counted handle in trait-object
+                // form: the `DynRef` *is* the `Rc` / `Arc` /
+                // `Weak` value, so a field step reads the
+                // handle's own field (field 0 is its `ptr`, the
+                // `NonNull` over the `RcInner` allocation).
+                // Code that walks the handle's inner structure
+                // through the raw pointer (`Rc::inner` and with
+                // it `strong_count`, `downgrade`, ...) depends on
+                // this: resolving the step to the trait object
+                // itself would send the pointer's dereference to
+                // the pointee instead of the `RcInner`.
+                Value::DynRef { base, .. } if is_rc_arc_handle(&base) => {
+                    project_value(*base, std::slice::from_ref(step), func, place)?
+                }
                 // Field 0 of a fat pointer value is the pointer
                 // field of its smart-pointer wrapper (a `Box`'s
                 // `Unique`): in this model the `DynRef` *is* that
@@ -12052,6 +12084,19 @@ pub(crate) fn project_value_ref<'a>(
                             place: place.to_string(),
                         }
                     })?,
+                    // A reference-counted handle in trait-object
+                    // form, as in `project_value`: the field step
+                    // reads the handle's own field, so the walk
+                    // continues into the base handle with this
+                    // step and the remaining ones.
+                    Value::DynRef { base, .. }
+                        if is_rc_arc_handle(base) =>
+                    {
+                        let mut sub: Vec<RefProj> =
+                            vec![RefProj::Field(*idx)];
+                        sub.extend_from_slice(rest);
+                        return project_value_ref(base, &sub, func, place);
+                    }
                     Value::DynRef { .. } if *idx == 0 => cur,
                     // The byte-string wrapper chain, as in
                     // `project_value`: field 0 of the transparent

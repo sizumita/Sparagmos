@@ -2862,7 +2862,15 @@ def _fill_result_debugger(rec, rust_dir, driver_bin, out, td):
         for debugger, breakpoints, commands, checks in variants:
             if not commands and not checks:
                 continue
-            script_lines = [f"break {line}" for line in breakpoints]
+            script_lines = []
+            if debugger == "gdb" and not view.has(
+                    "disable-gdb-pretty-printers"):
+                # compiletest runs gdb with the sysroot Rust
+                # pretty printers loaded unless the test opts
+                # out; the session script carries that fact to
+                # the driver (see parse_debug_script).
+                script_lines.append("pretty-printers")
+            script_lines += [f"break {line}" for line in breakpoints]
             for command in commands:
                 line = translate_debugger_command(debugger, command)
                 if line is None:
