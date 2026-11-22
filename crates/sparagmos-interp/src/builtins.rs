@@ -5450,6 +5450,101 @@ impl<'a> Interpreter<'a> {
                     // A one-field newtype wrapper: the result is a
                     // reference to the held value.
                     self.field_zero_ref(frames, &vals[0], "Deref::deref for AssertUnwindSafe")
+                } else if self_ty == "std::path::PathBuf" {
+                    // `PathBuf::deref -> &Path`: the model's path
+                    // values hold the byte string itself at the
+                    // bottom of a chain of one-field wrappers (the
+                    // `OsString`, its buffer, the byte vector's own
+                    // wrapper), and a `Path` is that same byte
+                    // string under the same kind of wrappers (the
+                    // constructors reach it through raw pointer
+                    // casts). Descend the chain and return a
+                    // reference to the byte data: a live reference
+                    // when the buffer lives in a place, and a
+                    // self-contained fat pointer when the data is a
+                    // byte vector's element aggregate.
+                    let resolved = self.deref_value(frames, &vals[0])?;
+                    let stored = self.read_resolved(frames, &resolved)?;
+                    let mut depth = 0usize;
+                    let mut bottom = &stored;
+                    while let Value::Enum { fields, .. } = bottom {
+                        if fields.len() != 1 {
+                            break;
+                        }
+                        depth += 1;
+                        bottom = &fields[0];
+                    }
+                    match bottom {
+                        Value::Str(_) | Value::Bytes(_) => {
+                            let steps =
+                                vec![RefProj::Field(0); depth];
+                            match resolved {
+                                Resolved::Place {
+                                    frame_pos,
+                                    local,
+                                    mut projection,
+                                } => {
+                                    projection.extend(steps);
+                                    Ok(Value::Ref(RefTarget::Place {
+                                        frame: frames[frame_pos].id,
+                                        local,
+                                        projection,
+                                    }))
+                                }
+                                Resolved::Static {
+                                    name,
+                                    mut projection,
+                                } => {
+                                    projection.extend(steps);
+                                    Ok(Value::Ref(RefTarget::Static {
+                                        name,
+                                        projection,
+                                    }))
+                                }
+                                Resolved::Alloc {
+                                    id,
+                                    mut projection,
+                                } => {
+                                    projection.extend(steps);
+                                    Ok(Value::Ref(RefTarget::Alloc {
+                                        id,
+                                        projection,
+                                    }))
+                                }
+                                Resolved::Value(base, mut projection) => {
+                                    projection.extend(steps);
+                                    Ok(Value::Ref(RefTarget::Value(
+                                        Box::new(base),
+                                        projection,
+                                    )))
+                                }
+                            }
+                        }
+                        Value::FatRef { .. } => Ok(bottom.clone()),
+                        Value::Enum { fields, .. }
+                            if fields
+                                .iter()
+                                .all(|f| matches!(f, Value::Uint(_))) =>
+                        {
+                            let bytes: Vec<u8> = fields
+                                .iter()
+                                .map(|f| match f {
+                                    Value::Uint(b) => *b as u8,
+                                    _ => unreachable!("shape checked"),
+                                })
+                                .collect();
+                            let len = bytes.len() as u128;
+                            Ok(Value::FatRef {
+                                base: Box::new(Value::Bytes(bytes)),
+                                len,
+                            })
+                        }
+                        other => Err(InterpError::type_mismatch(
+                            "Deref::deref for PathBuf",
+                            "path buffer holding byte data",
+                            other.kind_name(),
+                        )),
+                    }
                 } else {
                     Err(unsupported(format!(
                         "Deref::deref for {self_ty} is not runtime-supported"
