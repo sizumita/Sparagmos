@@ -356,6 +356,11 @@ pub enum Builtin {
     /// receiver place itself is the viewed storage, so the
     /// argument reference is returned unchanged.
     AsMut,
+    /// `alloc::__rust_no_alloc_shim_is_unstable_v2()`: the alloc
+    /// shim's link marker. Allocation in the model never goes
+    /// through the shim symbols (the allocation store is the
+    /// allocator), so the marker call is a no-op.
+    NoAllocShimMarker,
     /// `String::push_str(&mut String, &str)`.
     StringPushStr,
     /// `String::push(&mut String, char)`.
@@ -1135,6 +1140,15 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         {
             Builtin::ThreadJoin
         }
+        // Optimizing MIR inlines `JoinHandle::join` into a
+        // direct call to the inner type's join; it has the same
+        // contract (the thread's result or panic payload) and
+        // the same modelled receiver (see `join_handle_value`).
+        _ if canonical.starts_with("std::thread::lifecycle::JoinInner")
+            && canonical.ends_with("::join") =>
+        {
+            Builtin::ThreadJoin
+        }
         _ if canonical.starts_with("std::thread::ScopedJoinHandle")
             && canonical.ends_with("::join") =>
         {
@@ -1313,6 +1327,9 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         }
         "std::string::String::into_boxed_str" | "alloc::string::String::into_boxed_str" => {
             Builtin::StringIntoBoxedStr
+        }
+        "alloc::alloc::__rust_no_alloc_shim_is_unstable_v2" => {
+            Builtin::NoAllocShimMarker
         }
         "std::convert::AsRef::as_ref" | "core::convert::AsRef::as_ref" => Builtin::AsRef,
         "std::convert::AsMut::as_mut" | "core::convert::AsMut::as_mut" => Builtin::AsMut,
@@ -2849,7 +2866,7 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::ThreadJoin | Builtin::ScopedThreadJoin => {
                 arity(1)?;
-                let Some(id) = channel_handle_id(&vals[0]) else {
+                let Some(id) = join_handle_id(&vals[0]) else {
                     return Err(InterpError::type_mismatch(
                         "JoinHandle::join",
                         "a join handle value",
@@ -4006,6 +4023,10 @@ impl<'a> Interpreter<'a> {
                 arity(1)?;
                 let s = self.resolve_string(frames, &vals[0])?;
                 Ok(self.new_box(Value::Str(s)))
+            }
+            Builtin::NoAllocShimMarker => {
+                arity(0)?;
+                Ok(Value::Unit)
             }
             Builtin::AsRef => {
                 arity(1)?;
@@ -6869,7 +6890,7 @@ impl<'a> Interpreter<'a> {
         match callable {
             Value::Closure { .. } | Value::FnPtr(_) => {
                 let id = self.spawn_thread(callable);
-                Ok(id_handle(id))
+                Ok(join_handle_value(id))
             }
             other => Err(unsupported(format!(
                 "thread spawn of a {} value is not runtime-supported",
@@ -10314,6 +10335,35 @@ fn id_handle(id: u64) -> Value {
     Value::Enum {
         variant: 0,
         fields: vec![Value::Uint(u128::from(id))],
+    }
+}
+
+/// A join handle value: `JoinHandle { inner: JoinInner }`, the
+/// inner value being the one-field handle of the thread id.
+/// Optimizing MIR moves field 0 (the `JoinInner`) out of the
+/// handle and calls `JoinInner::join` on it directly, so the
+/// nesting is observable: the inner value must have the
+/// `JoinInner` type's shape, not the bare id.
+fn join_handle_value(id: u64) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![id_handle(id)],
+    }
+}
+
+/// The thread id a join handle value carries, at whichever
+/// nesting the value arrives with: the `JoinHandle` aggregate,
+/// the `JoinInner` moved out of it, or the bare id.
+fn join_handle_id(value: &Value) -> Option<u64> {
+    let mut cur = value;
+    loop {
+        match cur {
+            Value::Uint(id) => return Some(*id as u64),
+            Value::Enum { fields, .. } if fields.len() == 1 => {
+                cur = &fields[0];
+            }
+            _ => return None,
+        }
     }
 }
 
