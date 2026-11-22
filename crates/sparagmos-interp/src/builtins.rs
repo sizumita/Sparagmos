@@ -4679,7 +4679,7 @@ impl<'a> Interpreter<'a> {
             Builtin::DefaultDefault => {
                 arity(0)?;
                 let tag = generic_args.first().map(String::as_str).unwrap_or("");
-                match default_value_for_tag(tag) {
+                match self.default_value(tag) {
                     Some(value) => Ok(value),
                     None => Err(unsupported(format!(
                         "Default::default for {tag} is not runtime-supported"
@@ -12034,10 +12034,20 @@ fn zeroed_value_for_tag(tag: &str) -> Option<Value> {
 }
 
 
+/// The first generic argument of a rendered generic type tag
+/// (`std::cell::RefCell<std::vec::Vec<u32>>` -> the `Vec` tag), or
+/// `None` when the tag does not start with `prefix`.
+fn generic_first_arg<'a>(tag: &'a str, prefix: &str) -> Option<&'a str> {
+    let inner = tag.strip_prefix(prefix)?.strip_suffix('>')?;
+    split_top_level(inner).into_iter().next()
+}
+
 fn default_value_for_tag(tag: &str) -> Option<Value> {
     let tag = tag.trim();
     Some(match tag {
         "bool" => Value::Bool(false),
+        "f32" | "f64" => Value::Float(0.0),
+        "&str" => Value::Str(String::new()),
         "i8" | "i16" | "i32" | "i64" | "i128" | "isize" => Value::Int(0),
         "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "char" => Value::Uint(0),
         "()" => Value::Unit,
@@ -12046,6 +12056,22 @@ fn default_value_for_tag(tag: &str) -> Option<Value> {
             variant: 0,
             fields: Vec::new(),
         },
+        // The cell wrappers whose `Default` impl wraps the inner
+        // type's default (`RefCell::new`, `Cell::new` of
+        // `T::default()`): the shapes are the ones the
+        // corresponding `new` builtins build. The allocating
+        // wrappers (`Box`, `Rc`, `Arc`) are handled in
+        // `Interpreter::default_value`, whose shapes only the
+        // interpreter can mint.
+        _ if generic_first_arg(tag, "std::cell::RefCell<").is_some() => {
+            let inner =
+                generic_first_arg(tag, "std::cell::RefCell<").expect("guard checked");
+            refcell_value(default_value_for_tag(inner)?)
+        }
+        _ if generic_first_arg(tag, "std::cell::Cell<").is_some() => {
+            let inner = generic_first_arg(tag, "std::cell::Cell<").expect("guard checked");
+            cell_value(default_value_for_tag(inner)?)
+        }
         _ if tag.contains("option::Option<") => Value::Enum {
             variant: 0,
             fields: Vec::new(),
@@ -12082,13 +12108,79 @@ impl<'a> Interpreter<'a> {
     /// monomorphic ADT instances, recorded by the driver) for ADT
     /// tags. `None` stays an explicit unsupported error at the call
     /// site.
+    /// `Default::default()` for a rendered type tag: the pure
+    /// shapes come from `default_value_for_tag`; the allocating
+    /// wrappers wrap the inner type's default in the value their
+    /// `new` builtin builds (an allocation for `Box`, a counted
+    /// handle for `Rc` / `Arc`), which only the interpreter can
+    /// mint.
+    fn default_value(&self, tag: &str) -> Option<Value> {
+        let tag = tag.trim();
+        if let Some(inner) = generic_first_arg(tag, "std::boxed::Box<") {
+            let pointee = if inner.starts_with('[') && inner.ends_with(']') && !inner.contains(';')
+            {
+                // `Box<[T]>`: its `Default` is an empty boxed
+                // slice -- the pointee an empty
+                // `Vec::into_boxed_slice` builds.
+                Value::Tuple(Vec::new())
+            } else {
+                self.default_value(inner)?
+            };
+            return Some(self.new_box(pointee));
+        }
+        if let Some(inner) = generic_first_arg(tag, "std::rc::Rc<")
+            .or_else(|| generic_first_arg(tag, "std::sync::Arc<"))
+        {
+            let pointee = self.default_value(inner)?;
+            return Some(self.rc_new_handle(pointee));
+        }
+        default_value_for_tag(tag)
+    }
+
     fn layout_of(&self, tag: &str) -> Option<(u128, u128)> {
-        type_layout(tag).or_else(|| {
-            self.program()
-                .adt_layouts
-                .get(tag)
-                .map(|&(size, align)| (u128::from(size), u128::from(align)))
-        })
+        let tag = tag.trim();
+        if let Some(layout) = type_layout(tag) {
+            return Some(layout);
+        }
+        // Arrays: the layout is fixed by the element layout alone.
+        // Elements sit at a stride of the element's size (a type's
+        // size is always a multiple of its alignment, for the
+        // primitive table, for the compiler-recorded ADT layouts
+        // and for the composites computed here alike), so an array
+        // is `n` element sizes at the element's alignment.
+        if tag.starts_with('[') && tag.ends_with(']') {
+            let inner = &tag[1..tag.len() - 1];
+            if let Some((elem, n)) = inner.rsplit_once(';') {
+                let n: u128 = n.trim().parse().ok()?;
+                let (elem_size, elem_align) = self.layout_of(elem.trim())?;
+                return Some((elem_size.checked_mul(n)?, elem_align));
+            }
+            // A slice is unsized: it has no static layout.
+            return None;
+        }
+        // Tuples: rustc's `repr(Rust)` aggregate layout orders the
+        // fields by decreasing alignment before assigning offsets.
+        // Because every field's size is a multiple of its own
+        // alignment, no padding is inserted between fields in that
+        // order, so the size is the sum of the field sizes rounded
+        // up to the largest field alignment -- a function of the
+        // field layouts alone, independent of the written order.
+        if tag.len() > 2 && tag.starts_with('(') && tag.ends_with(')') {
+            let inner = &tag[1..tag.len() - 1];
+            let mut size: u128 = 0;
+            let mut align: u128 = 1;
+            for part in split_top_level(inner) {
+                let (field_size, field_align) = self.layout_of(part)?;
+                size = size.checked_add(field_size)?;
+                align = align.max(field_align);
+            }
+            let size = size.checked_add(align - 1)? & !(align - 1);
+            return Some((size, align));
+        }
+        self.program()
+            .adt_layouts
+            .get(tag)
+            .map(|&(size, align)| (u128::from(size), u128::from(align)))
     }
 }
 
