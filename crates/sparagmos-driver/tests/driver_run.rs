@@ -15426,3 +15426,56 @@ fn run_mode_tls_destructors_run_at_thread_exit() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
 }
 
+
+const PANIC_IN_DTOR_SRC: &str = r#"
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static FIELD_DROPPED: AtomicBool = AtomicBool::new(false);
+
+struct Field {
+    _foo: isize,
+}
+
+impl Drop for Field {
+    fn drop(&mut self) {
+        FIELD_DROPPED.store(true, Ordering::SeqCst);
+    }
+}
+
+struct Outer {
+    _field: Field,
+}
+
+impl Drop for Outer {
+    fn drop(&mut self) {
+        panic!("outer destructor panics");
+    }
+}
+
+fn main() {
+    let handle = std::thread::spawn(|| {
+        let _outer = Outer { _field: Field { _foo: 3 } };
+    });
+    assert!(handle.join().is_err());
+    assert!(FIELD_DROPPED.load(Ordering::SeqCst));
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_panicking_destructor_still_drops_fields() {
+    // When a destructor panics, the remaining drop glue of the
+    // value (its fields) is the cleanup of the drop itself: the
+    // field destructors still run while the panic unwinds, and
+    // the panic then continues to the thread boundary.
+    let dir = temp_dir("panic-in-dtor");
+    let src = fixture(&dir, "panic_in_dtor.rs", PANIC_IN_DTOR_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a panicking destructor must still drop the fields; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}

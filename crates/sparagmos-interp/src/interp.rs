@@ -117,6 +117,18 @@ struct DropContinuation {
     sessions: Vec<GlueSession>,
 }
 
+/// The outcome of running a suspended glue session as an
+/// unwinding panic's cleanup.
+enum GlueCleanupFlow {
+    /// The session ran to completion synchronously; unwinding
+    /// continues with the returned panic.
+    Completed(InterpError),
+    /// The session suspended on a field destructor's frame:
+    /// executing that frame resumes the session, whose
+    /// completion re-raises the stashed panic into the unwinder.
+    Suspended,
+}
+
 /// One run of drop glue: a work stack of (path from `root`, plan)
 /// items against one dropped place, with the ADT glue table the
 /// plans index into.
@@ -140,6 +152,11 @@ enum GlueCompletion {
     /// The session is the nested glue of a `dyn` value's concrete
     /// type: the session below it on the stack resumes.
     Resume,
+    /// The session runs as the cleanup of a panic unwinding out of
+    /// its destructor call: when the work runs out, the stashed
+    /// panic (in `Interpreter::glue_unwind_panic`) continues
+    /// unwinding instead of control returning to the owner frame.
+    UnwindCleanup,
 }
 
 /// A place fully resolved against the frame stack: either a concrete
@@ -468,6 +485,10 @@ pub struct Interpreter<'a> {
     /// Drop glue suspended on destructor calls (see
     /// [`DropContinuation`]); a stack, innermost last.
     drop_continuations: Vec<DropContinuation>,
+    /// The panic stashed while a glue session runs as that
+    /// panic's cleanup (see `GlueCompletion::UnwindCleanup`):
+    /// taken back when the session's work runs out.
+    glue_unwind_panic: Option<(String, Option<PanicPayload>)>,
     /// The guest's panic hook, installed by `std::panic::set_hook`
     /// (the boxed `dyn Fn` value as the guest handed it over);
     /// `None` is the default hook, which this runtime does not
@@ -769,6 +790,7 @@ impl<'a> Interpreter<'a> {
             output: String::new(),
             error_output: String::new(),
             drop_continuations: Vec::new(),
+            glue_unwind_panic: None,
             resume_signaled: false,
             panic_hook: std::cell::RefCell::new(None),
             last_panic_stamp: std::cell::RefCell::new(None),
@@ -1036,7 +1058,32 @@ impl<'a> Interpreter<'a> {
                                 break;
                             }
                             crate::ir::UnwindAction::Continue => {
-                                self.pop_unwind_frame(frames);
+                                // A destructor frame unwound out of
+                                // with glue still suspended under it:
+                                // the remaining glue is the cleanup
+                                // of the native `drop_in_place` whose
+                                // destructor panicked, so it runs
+                                // before the panic moves on (the
+                                // destructor frame itself is popped
+                                // first; the glue works on the owner
+                                // frame below it).
+                                let cont_pos = frames.last().and_then(|top| {
+                                    self.drop_continuations
+                                        .iter()
+                                        .rposition(|c| c.callee_frame == top.id)
+                                });
+                                if let Some(pos) = cont_pos {
+                                    let cont = self.drop_continuations.remove(pos);
+                                    self.pop_unwind_frame(frames);
+                                    match self.run_glue_cleanup(frames, cont, panic)? {
+                                        GlueCleanupFlow::Completed(p) => {
+                                            panic = p;
+                                        }
+                                        GlueCleanupFlow::Suspended => break,
+                                    }
+                                } else {
+                                    self.pop_unwind_frame(frames);
+                                }
                                 // The caller frame is now on top and
                                 // the panic resumes into it: that is
                                 // a resumption, not a fresh panic in
@@ -1069,7 +1116,10 @@ impl<'a> Interpreter<'a> {
     }
 
     /// Pop one frame during unwinding, discarding any suspended
-    /// drop glue that belonged to it (its destructors never resume:
+    /// drop glue that belonged to it. The unwinder runs a popped
+    /// destructor frame's glue as the panic's cleanup before
+    /// calling this (see `drive`); what remains here is glue whose
+    /// session can no longer run (its destructors never resume:
     /// the frame they would have resumed into is gone).
     fn pop_unwind_frame(&mut self, frames: &mut Vec<Frame>) {
         let Some(frame) = frames.pop() else {
@@ -1736,17 +1786,56 @@ impl<'a> Interpreter<'a> {
                     // unwinder in `drive` continues the panic in
                     // the caller at its call site.
                     let frame = frames.pop().expect("frame");
-                    self.drop_continuations
-                        .retain(|cont| cont.callee_frame != frame.id);
-                    match frame.unwind_payload {
-                        Some((message, payload)) => {
-                            self.resume_signaled = true;
-                            return Err(InterpError::Panic { message, payload });
+                    // A destructor frame whose own cleanup chain
+                    // just ran: its suspended glue session is the
+                    // panic's next cleanup — the fields of the
+                    // dropped value, as in a native `drop_in_place`
+                    // whose destructor panicked.
+                    let cont_pos = self
+                        .drop_continuations
+                        .iter()
+                        .rposition(|cont| cont.callee_frame == frame.id);
+                    match cont_pos {
+                        Some(pos) => {
+                            let cont = self.drop_continuations.remove(pos);
+                            match frame.unwind_payload {
+                                Some((message, payload)) => {
+                                    match self.run_glue_cleanup(
+                                        frames,
+                                        cont,
+                                        InterpError::Panic { message, payload },
+                                    )? {
+                                        GlueCleanupFlow::Completed(p) => return Err(p),
+                                        // The cleanup suspended on a
+                                        // field destructor's frame:
+                                        // the run loop continues into
+                                        // it, and the session's
+                                        // completion re-raises the
+                                        // stashed panic.
+                                        GlueCleanupFlow::Suspended => {}
+                                    }
+                                }
+                                None => {
+                                    return Err(InterpError::UnsupportedTerminator {
+                                        kind: "Resume".to_string(),
+                                    });
+                                }
+                            }
                         }
                         None => {
-                            return Err(InterpError::UnsupportedTerminator {
-                                kind: "Resume".to_string(),
-                            });
+                            self.drop_continuations
+                                .retain(|cont| cont.callee_frame != frame.id);
+                            match frame.unwind_payload {
+                                Some((message, payload)) => {
+                                    self.resume_signaled = true;
+                                    return Err(InterpError::Panic { message, payload });
+                                }
+                                None => {
+                                    return Err(InterpError::UnsupportedTerminator {
+                                        kind: "Resume".to_string(),
+                                    });
+                                }
+                            }
                         }
                     }
                 }
@@ -3439,6 +3528,31 @@ impl<'a> Interpreter<'a> {
     /// finishes. When the work is done, the dropped place's own slot
     /// is cleared (for a direct local of the owner frame) and the
     /// owner frame jumps to `target`.
+    /// Run a suspended drop-glue session as the cleanup of the
+    /// panic unwinding out of its destructor call: the remaining
+    /// glue (the fields the destructor itself did not reach) is
+    /// the cleanup a native `drop_in_place` performs when the
+    /// destructor panics, and the original panic then continues
+    /// unwinding.
+    fn run_glue_cleanup(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        cont: DropContinuation,
+        panic: InterpError,
+    ) -> InterpResult<GlueCleanupFlow> {
+        let InterpError::Panic { message, payload } = panic else {
+            return Ok(GlueCleanupFlow::Completed(panic));
+        };
+        self.glue_unwind_panic = Some((message, payload));
+        let mut session = cont.session;
+        session.completion = GlueCompletion::UnwindCleanup;
+        match self.run_glue_session(frames, session, cont.sessions) {
+            Ok(()) => Ok(GlueCleanupFlow::Suspended),
+            Err(e @ InterpError::Panic { .. }) => Ok(GlueCleanupFlow::Completed(e)),
+            Err(e) => Err(e),
+        }
+    }
+
     fn run_drop_glue(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -4146,50 +4260,67 @@ impl<'a> Interpreter<'a> {
                 }
             }
             // The active session's work is done.
-            match active.completion {
-                GlueCompletion::Jump(target) => {
-                    // Glue finished: the dropped place is dead, as in
-                    // MIR, when the place is a local of the frame
-                    // executing the drop. A place that resolved
-                    // through a pointer into another frame (the
-                    // `drop_in_place` shim dropping the caller's
-                    // local through its `*mut` argument) is not
-                    // killed: the pointer operation is invisible to
-                    // the owner body's drop elaboration, which keeps
-                    // treating the local as live -- it may still be
-                    // moved, reassigned or forgotten afterwards.
-                    // Only the pointee's glue ran, as in real memory,
-                    // where `drop_in_place` leaves the bytes in
-                    // place.
-                    // A dropped box's allocation is freed with it:
-                    // the pointee's glue has run, and the storage
-                    // the box pointed at is gone, as a real free
-                    // makes it. (A box nested inside a larger
-                    // dropped value is reached as a work item of
-                    // that value's session, not as a session root;
-                    // its allocation entry is left in the store —
-                    // ids are never reused, so nothing can observe
-                    // the difference within a run.)
-                    if let Ok(Some(value)) = self.read_at(frames, &active.root, &[]) {
-                        if let Some((id, _)) = box_alloc_pointer(&value) {
-                            self.free_alloc(id);
-                        }
+            let finishing_target = match active.completion {
+                GlueCompletion::Resume => match suspended.pop() {
+                    Some(session) => {
+                        active = session;
+                        continue 'sessions;
                     }
-                    if let RefTarget::Place {
-                        frame,
-                        local,
-                        projection,
-                    } = &active.root
-                    {
-                        if projection.is_empty()
-                            && frames.last().map(|f| f.id) == Some(*frame)
-                        {
-                            let frame_pos = self.frame_pos(frames, *frame)?;
-                            if let Some(slot) = frames[frame_pos].locals.get_mut(*local) {
-                                *slot = Value::Uninit;
-                            }
-                        }
+                    None => {
+                        return Err(InterpError::type_mismatch(
+                            "drop glue",
+                            "an enclosing glue session to resume",
+                            "none",
+                        ));
                     }
+                },
+                GlueCompletion::Jump(target) => Some(target),
+                GlueCompletion::UnwindCleanup => None,
+            };
+            // A finishing session releases the dropped place
+            // exactly as a completed drop does: the place is dead,
+            // as in MIR -- a direct local of the owner frame is
+            // cleared, and a dropped box's allocation is freed with
+            // it: the pointee's glue has run, and the storage the
+            // box pointed at is gone, as a real free makes it. (A
+            // box nested inside a larger dropped value is reached
+            // as a work item of that value's session, not as a
+            // session root; its allocation entry is left in the
+            // store -- ids are never reused, so nothing can observe
+            // the difference within a run.)
+            if let Ok(Some(value)) = self.read_at(frames, &active.root, &[]) {
+                if let Some((id, _)) = box_alloc_pointer(&value) {
+                    self.free_alloc(id);
+                }
+            }
+            // The place is cleared only when it is a local of the
+            // frame executing the drop. A place that resolved
+            // through a pointer into another frame (the
+            // `drop_in_place` shim dropping the caller's local
+            // through its `*mut` argument) is not killed: the
+            // pointer operation is invisible to the owner body's
+            // drop elaboration, which keeps treating the local as
+            // live -- it may still be moved, reassigned or
+            // forgotten afterwards. Only the pointee's glue ran,
+            // as in real memory, where `drop_in_place` leaves the
+            // bytes in place.
+            if let RefTarget::Place {
+                frame,
+                local,
+                projection,
+            } = &active.root
+            {
+                if projection.is_empty()
+                    && frames.last().map(|f| f.id) == Some(*frame)
+                {
+                    let frame_pos = self.frame_pos(frames, *frame)?;
+                    if let Some(slot) = frames[frame_pos].locals.get_mut(*local) {
+                        *slot = Value::Uninit;
+                    }
+                }
+            }
+            match finishing_target {
+                Some(target) => {
                     let owner = frames.last().expect("owner frame");
                     let owner_body = self
                         .program
@@ -4200,18 +4331,21 @@ impl<'a> Interpreter<'a> {
                         })?;
                     return Self::jump(frames, &owner_body, target);
                 }
-                GlueCompletion::Resume => match suspended.pop() {
-                    Some(session) => {
-                        active = session;
-                    }
-                    None => {
+                None => {
+                    // The session ran as a panic's cleanup: the
+                    // stashed panic continues unwinding from here,
+                    // as a resume of the original unwinding (the
+                    // panic hook does not fire again for it).
+                    let Some((message, payload)) = self.glue_unwind_panic.take() else {
                         return Err(InterpError::type_mismatch(
-                            "drop glue",
-                            "an enclosing glue session to resume",
+                            "drop glue cleanup",
+                            "a stashed panic to resume",
                             "none",
                         ));
-                    }
-                },
+                    };
+                    self.resume_signaled = true;
+                    return Err(InterpError::Panic { message, payload });
+                }
             }
         }
     }
