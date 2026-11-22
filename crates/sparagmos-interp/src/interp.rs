@@ -7223,6 +7223,17 @@ pub(crate) fn project_value(
                 // `Unique`): in this model the `DynRef` *is* that
                 // pointer, metadata included.
                 Value::DynRef { .. } if *idx == 0 => value,
+                // The same wrapper chain for a thin pointer: a
+                // `Box`'s field 0 is its `Unique`, whose field 0
+                // is the `NonNull`, whose field 0 is the raw
+                // pointer — and in this model the box's one field
+                // is the pointer value itself, so each of those
+                // steps yields it unchanged. (A reference to a
+                // place never sits at a field step of a value
+                // projection: place references are resolved before
+                // value projection begins, so a `Ref` here is a
+                // pointer value extracted from a wrapper.)
+                Value::Ref(_) if *idx == 0 => value,
                 ref other => {
                     return Err(InterpError::type_mismatch(
                         format!("field projection on {place}"),
