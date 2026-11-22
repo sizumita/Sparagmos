@@ -1340,6 +1340,19 @@ pub enum Builtin {
     /// `std::path::PathBuf` over the model's byte string, as
     /// for `_push`.
     PathBufPop,
+    /// `std::path::PathBuf::_set_extension(&mut self,
+    /// extension: &OsStr) -> bool`: the mutation
+    /// `PathBuf::set_extension` forwards to; no MIR body is
+    /// available for it. Answered with the host's
+    /// `std::path::PathBuf` over the model's byte string, as
+    /// for `_push`.
+    PathBufSetExtension,
+    /// `std::path::Path::_with_extension(&self, extension:
+    /// &OsStr) -> PathBuf`: the leaf `Path::with_extension`
+    /// forwards to; no MIR body is available for it.
+    /// Answered with the host's `std::path::PathBuf` over
+    /// the model's byte string.
+    PathWithExtension,
     /// `std::path::PathBuf::new() -> PathBuf` and
     /// `PathBuf::with_capacity(n)`: the empty buffer in the
     /// model's shape (`pathbuf_value` over no bytes; a
@@ -2244,6 +2257,8 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::path::Path::to_path_buf" => Builtin::PathToPathBuf,
         "std::path::PathBuf::_push" => Builtin::PathBufPush,
         "std::path::PathBuf::pop" => Builtin::PathBufPop,
+        "std::path::PathBuf::_set_extension" => Builtin::PathBufSetExtension,
+        "std::path::Path::_with_extension" => Builtin::PathWithExtension,
         "std::path::PathBuf::new" => Builtin::PathBufNew,
         "std::path::PathBuf::with_capacity" => Builtin::PathBufNew,
         "std::str::from_utf8" | "core::str::from_utf8" => Builtin::FromUtf8,
@@ -5738,6 +5753,7 @@ impl<'a> Interpreter<'a> {
                     || self_ty.starts_with("std::iter::SkipWhile<")
                     || self_ty.starts_with("std::iter::Once<")
                     || self_ty.starts_with("std::path::Components")
+                    || self_ty.starts_with("std::path::Ancestors")
                     || self_ty_is(self_ty, "std::fs::ReadDir")
                     || self_ty.starts_with("std::iter::Empty<")
                     || self_ty.starts_with("std::iter::Repeat<")
@@ -7048,6 +7064,35 @@ impl<'a> Interpreter<'a> {
                     Ok(Value::Bool(popped))
                 })
             }
+            Builtin::PathBufSetExtension => {
+                arity(2)?;
+                let (extension, _) = self.path_bytes_of(frames, &vals[1])?;
+                let target = self.deref_value(frames, &vals[0])?;
+                self.modify_resolved(frames, &target, |slot| {
+                    let current = string_aggregate_bytes(slot).ok_or_else(|| {
+                        InterpError::type_mismatch(
+                            "PathBuf::set_extension",
+                            "path buffer holding byte data",
+                            slot.kind_name(),
+                        )
+                    })?;
+                    use std::os::unix::ffi::OsStrExt;
+                    let mut buf = host_path(&current);
+                    let set =
+                        buf.set_extension(std::ffi::OsStr::from_bytes(&extension));
+                    *slot = pathbuf_value(&host_path_bytes(&buf));
+                    Ok(Value::Bool(set))
+                })
+            }
+            Builtin::PathWithExtension => {
+                arity(2)?;
+                let (bytes, _) = self.path_bytes_of(frames, &vals[0])?;
+                let (extension, _) = self.path_bytes_of(frames, &vals[1])?;
+                use std::os::unix::ffi::OsStrExt;
+                let buf = host_path(&bytes)
+                    .with_extension(std::ffi::OsStr::from_bytes(&extension));
+                Ok(pathbuf_value(&host_path_bytes(&buf)))
+            }
             Builtin::PathBufNew => Ok(pathbuf_value(&[])),
             Builtin::FromUtf8 => {
                 arity(1)?;
@@ -7666,13 +7711,7 @@ impl<'a> Interpreter<'a> {
                 // model, so the path types are recognised by the
                 // call's own generic arguments (the `Self` and
                 // `Rhs` type tags).
-                let path_cmp = generic_args.iter().take(2).any(|tag| {
-                    let tag = tag
-                        .strip_prefix("&mut ")
-                        .or_else(|| tag.strip_prefix('&'))
-                        .unwrap_or(tag);
-                    matches!(tag, "std::path::Path" | "std::path::PathBuf")
-                });
+                let path_cmp = self.comparison_is_path(frames, generic_args, &vals);
                 let eq = if path_cmp {
                     let lhs = self.path_cmp_bytes(frames, &vals[0])?;
                     let rhs = self.path_cmp_bytes(frames, &vals[1])?;
@@ -7688,7 +7727,13 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::PartialCmp => {
                 arity(2)?;
-                let ord = self.values_cmp(frames, &vals[0], &vals[1], cmp_discriminants)?;
+                let ord = if self.comparison_is_path(frames, generic_args, &vals) {
+                    let lhs = self.path_cmp_bytes(frames, &vals[0])?;
+                    let rhs = self.path_cmp_bytes(frames, &vals[1])?;
+                    Some(path_ordering(&lhs, &rhs))
+                } else {
+                    self.values_cmp(frames, &vals[0], &vals[1], cmp_discriminants)?
+                };
                 Ok(match ord {
                     Some(ord) => Value::Enum {
                         variant: 1,
@@ -7702,7 +7747,13 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::OrdCmp => {
                 arity(2)?;
-                let ord = self.values_cmp(frames, &vals[0], &vals[1], cmp_discriminants)?;
+                let ord = if self.comparison_is_path(frames, generic_args, &vals) {
+                    let lhs = self.path_cmp_bytes(frames, &vals[0])?;
+                    let rhs = self.path_cmp_bytes(frames, &vals[1])?;
+                    Some(path_ordering(&lhs, &rhs))
+                } else {
+                    self.values_cmp(frames, &vals[0], &vals[1], cmp_discriminants)?
+                };
                 match ord {
                     Some(ord) => Ok(ordering_value(ord)),
                     // `Ord` is a total ordering: an unordered pair
@@ -7717,7 +7768,13 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::PartialOrdRel(op) => {
                 arity(2)?;
-                let ord = self.values_cmp(frames, &vals[0], &vals[1], cmp_discriminants)?;
+                let ord = if self.comparison_is_path(frames, generic_args, &vals) {
+                    let lhs = self.path_cmp_bytes(frames, &vals[0])?;
+                    let rhs = self.path_cmp_bytes(frames, &vals[1])?;
+                    Some(path_ordering(&lhs, &rhs))
+                } else {
+                    self.values_cmp(frames, &vals[0], &vals[1], cmp_discriminants)?
+                };
                 // An unordered pair makes every relational operator
                 // false, as `partial_cmp` returning `None` does.
                 Ok(Value::Bool(match (ord, op) {
@@ -11944,6 +12001,13 @@ fn value_fingerprint(value: &Value) -> u64 {
             // host's own parsing from it.
             return self.components_step(state, false);
         }
+        if self_ty.starts_with("std::path::Ancestors") {
+            // The state is the struct the converted
+            // `Path::ancestors` body built: one field, the
+            // `Option<&Path>` holding the next ancestor to
+            // yield (see `ancestors_step`).
+            return self.ancestors_step(frames, state);
+        }
         if self_ty.starts_with("std::slice::Windows<") {
             // Two state shapes reach here: the native struct
             // {tail slice, window size} (built by a struct
@@ -12092,6 +12156,58 @@ fn value_fingerprint(value: &Value) -> u64 {
                 Some(value) => some_value(value),
                 None => none_value(),
             },
+        ))
+    }
+
+    /// One step of a `std::path::Ancestors` state: the one
+    /// field is the `Option<&Path>` the iterator yields
+    /// next; the step returns it and stores its parent in
+    /// its place (`None` once the parent chain ends) —
+    /// exactly the native `Ancestors::next`. The parent is
+    /// taken with the host's own `std::path`, as for the
+    /// other path-parsing models, and the yielded value is
+    /// a `&Path` in the model's usual form (`sub_path_value`).
+    fn ancestors_step(
+        &self,
+        frames: &[Frame],
+        state: Value,
+    ) -> InterpResult<(Value, Value)> {
+        let fields = iterator_fields(&state, "std::path::Ancestors")?;
+        if fields.len() != 1 {
+            return Err(InterpError::type_mismatch(
+                "Ancestors state",
+                "one field (the next ancestor)",
+                format!("{} field(s)", fields.len()),
+            ));
+        }
+        let field = fields.into_iter().next().unwrap();
+        if matches!(&field, Value::Enum { variant: 0, .. }) {
+            // The `next` field is `None`: the iterator is
+            // exhausted and stays exhausted.
+            return Ok((state, none_value()));
+        }
+        let Some(payload) = option_payload_opt(field) else {
+            return Err(InterpError::type_mismatch(
+                "Ancestors state",
+                "an Option<&Path> field",
+                "a non-Option field",
+            ));
+        };
+        let bytes = self.path_bytes_of(frames, &payload)?.0;
+        let next = {
+            use std::os::unix::ffi::OsStrExt;
+            let path =
+                std::path::Path::new(std::ffi::OsStr::from_bytes(&bytes));
+            match path.parent() {
+                Some(parent) => {
+                    some_value(sub_path_value(parent.as_os_str().as_bytes()))
+                }
+                None => none_value(),
+            }
+        };
+        Ok((
+            rebuild_state(&state, vec![next]),
+            some_value(sub_path_value(&bytes)),
         ))
     }
 
@@ -13318,6 +13434,30 @@ fn value_fingerprint(value: &Value) -> u64 {
             }
         }
         Ok(out)
+    }
+
+    /// Whether a comparison call compares paths: the
+    /// call's generic arguments name a path type
+    /// (`path_cmp_subject`), or — for a call the converter
+    /// kept in generic form, which carries no type tags —
+    /// both operands are owned `PathBuf` values by shape
+    /// (`is_pathbuf_value`).
+    fn comparison_is_path(
+        &self,
+        frames: &[Frame],
+        generic_args: &[String],
+        vals: &[Value],
+    ) -> bool {
+        if path_cmp_subject(generic_args) {
+            return true;
+        }
+        if !generic_args.is_empty() || vals.len() != 2 {
+            return false;
+        }
+        vals.iter().all(|v| {
+            self.resolve_value(frames, v)
+                .is_ok_and(|resolved| is_pathbuf_value(&resolved))
+        })
     }
 
     /// The bytes of a path argument: a path value is a fat
@@ -16198,6 +16338,81 @@ fn path_components(bytes: &[u8]) -> Vec<PathComponent<'_>> {
         first = false;
     }
     comps
+}
+
+/// Whether a comparison call's generic arguments name a
+/// path type (`Path` / `PathBuf`) as the `Self` or `Rhs`
+/// type. The callee name carries no impl subject in this
+/// model, so the path comparisons are recognised by the
+/// call's own generic arguments (the type tags, with any
+/// reference marker stripped).
+fn path_cmp_subject(generic_args: &[String]) -> bool {
+    generic_args.iter().take(2).any(|tag| {
+        let tag = tag
+            .strip_prefix("&mut ")
+            .or_else(|| tag.strip_prefix('&'))
+            .unwrap_or(tag);
+        matches!(tag, "std::path::Path" | "std::path::PathBuf")
+    })
+}
+
+/// Whether a comparison call compares paths. The primary
+/// signal is the call's own generic arguments
+/// (`path_cmp_subject`). A call the converter kept in
+/// generic form (a comparison inside a generic library
+/// body, reached through the run-time name fallback)
+/// carries no type tags at all; there the owned operands
+/// themselves are the only signal, and an owned `PathBuf`
+/// value is recognised by its exact shape — three
+/// one-field wrappers (`PathBuf` over `OsString` over its
+/// buffer) around the byte-element list. No other modelled
+/// string-like type has that shape: an `OsString` has one
+/// wrapper fewer, a `String` two fewer, and a `Vec<u8>`
+/// none, so their byte-order semantics are untouched.
+fn is_pathbuf_value(value: &Value) -> bool {
+    let mut cur = value;
+    let mut wrappers = 0usize;
+    loop {
+        match cur {
+            Value::Enum { fields, .. }
+                if fields.len() == 1
+                    && matches!(fields[0], Value::Enum { .. }) =>
+            {
+                wrappers += 1;
+                cur = &fields[0];
+            }
+            Value::Enum { fields, .. } => {
+                return wrappers == 3
+                    && fields
+                        .iter()
+                        .all(|f| matches!(f, Value::Uint(_) | Value::Int(_)));
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// std's ordering of two paths: `Path::cmp` compares the
+/// parsed component sequences lexicographically, and a
+/// component orders first by kind — `Component`'s
+/// declaration order (root directory, current directory,
+/// parent directory, then normal names) — and only then by
+/// the name's bytes. This differs from the raw byte order
+/// wherever a name contains a byte below '/' (notably '.'):
+/// "a/c" < "a.b/c" here, the opposite bytewise.
+fn path_ordering(lhs: &[u8], rhs: &[u8]) -> Ordering {
+    fn key<'a>(component: &PathComponent<'a>) -> (u8, &'a [u8]) {
+        match component {
+            PathComponent::RootDir => (1, &[]),
+            PathComponent::CurDir => (2, &[]),
+            PathComponent::ParentDir => (3, &[]),
+            PathComponent::Normal(name) => (4, name),
+        }
+    }
+    path_components(lhs)
+        .iter()
+        .map(key)
+        .cmp(path_components(rhs).iter().map(key))
 }
 
 fn string_aggregate_bytes(value: &Value) -> Option<Vec<u8>> {
