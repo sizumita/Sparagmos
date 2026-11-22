@@ -9754,3 +9754,146 @@ fn run_mode_write_bytes_volatile_and_offset_from_execute() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
 }
+
+// ----- drop glue for modelled std shapes (Issue #114) --------------------------
+
+const DROP_MAYBE_UNINIT_SRC: &str = r#"
+use std::mem::MaybeUninit;
+
+fn main() {
+    let mut v: Vec<MaybeUninit<[u32; 2]>> = Vec::new();
+    v.push(MaybeUninit::new([1, 2]));
+    v.push(MaybeUninit::uninit());
+    let b: Box<MaybeUninit<String>> = Box::new(MaybeUninit::new(String::from("held")));
+    drop(v);
+    drop(b);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_drop_maybe_uninit_containers() {
+    run_ok("drop-maybe-uninit", DROP_MAYBE_UNINIT_SRC, "ok\n");
+}
+
+const DROP_CELL_SRC: &str = r#"
+use std::cell::Cell;
+
+struct Flag(u32);
+impl Drop for Flag {
+    fn drop(&mut self) { println!("flag {} dropped", self.0); }
+}
+
+fn main() {
+    let c = Cell::new(Some(Flag(7)));
+    drop(c);
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_drop_cell_runs_contents_glue() {
+    // The modelled `Cell` value nests its contents two aggregates
+    // deep; dropping the cell must reach the contents' destructor.
+    run_ok("drop-cell", DROP_CELL_SRC, "flag 7 dropped\ndone\n");
+}
+
+const DROP_WAKER_SRC: &str = r#"
+use std::sync::Arc;
+use std::task::{Wake, Waker};
+
+struct FlagWaker {
+    held: String,
+}
+impl Wake for FlagWaker {
+    fn wake(self: Arc<Self>) {}
+}
+
+fn main() {
+    let w = Waker::from(Arc::new(FlagWaker { held: String::from("x") }));
+    drop(w);
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_drop_waker_releases_wake_object() {
+    // Dropping a Waker releases the counted handle behind it;
+    // the erased wake object's own glue is judged by shape (the
+    // Dynamic plan), which carries the held string's release.
+    run_ok("drop-waker", DROP_WAKER_SRC, "done\n");
+}
+
+const DROP_LOCK_GUARDS_SRC: &str = r#"
+use std::sync::Mutex;
+
+fn main() {
+    let m = Mutex::new(1u32);
+    {
+        let _g = m.lock().unwrap();
+    }
+    println!("guards dropped");
+}
+"#;
+
+#[test]
+fn run_mode_drop_lock_guards() {
+    // Acquiring and dropping each guard kind: the guards' glue is
+    // their fields' (a lock reference and a poison flag), since
+    // the lock state itself is not modelled.
+    run_ok("drop-lock-guards", DROP_LOCK_GUARDS_SRC, "guards dropped\n");
+}
+
+const DROP_TYPEID_SRC: &str = r#"
+use std::any::TypeId;
+
+fn main() {
+    let ids = [TypeId::of::<u32>(), TypeId::of::<String>()];
+    println!("{}", ids[0] == TypeId::of::<u32>());
+    drop(ids);
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_drop_type_id_values() {
+    run_ok("drop-typeid", DROP_TYPEID_SRC, "true\ndone\n");
+}
+
+const DROP_FLAT_MAP_SRC: &str = r#"
+fn main() {
+    let it = Some(())
+        .into_iter()
+        .flat_map(|_| Some(()).into_iter().flat_map(|_| vec![1, 2]));
+    drop(it);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_drop_flat_map_chain() {
+    run_ok("drop-flat-map", DROP_FLAT_MAP_SRC, "ok\n");
+}
+
+const DROP_PHANTOM_PINNED_SRC: &str = r#"
+use std::marker::PhantomPinned;
+
+struct Pinned {
+    value: u32,
+    _pin: PhantomPinned,
+}
+impl Drop for Pinned {
+    fn drop(&mut self) { println!("pinned {} dropped", self.value); }
+}
+
+fn main() {
+    let p = Pinned { value: 3, _pin: PhantomPinned };
+    drop(p);
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_drop_phantom_pinned_struct() {
+    run_ok("drop-phantom-pinned", DROP_PHANTOM_PINNED_SRC, "pinned 3 dropped\ndone\n");
+}
