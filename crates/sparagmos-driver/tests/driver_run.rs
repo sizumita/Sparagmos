@@ -11972,3 +11972,183 @@ fn run_mode_ffi_struct_and_callback_helpers_execute() {
         "the guest's stdout is the driver's stdout"
     );
 }
+const BOX_CELL_SRC: &str = r#"
+use std::cell::Cell;
+fn main() {
+    let b = Box::new(Cell::new(1u32));
+    b.set(5);
+    println!("{}", b.get());
+    std::mem::forget(b);
+}
+"#;
+
+#[test]
+fn run_mode_box_cell_set_through_deref() {
+    // Method resolution reaches the `Cell` through the `Deref`
+    // builtin for `Box`. The builtin used to hand back a snapshot
+    // of the pointee value, so `Cell::set` (a write through the
+    // reference) failed with "expected mutable place, found
+    // constant aggregate". A box is uniquely owned, so the builtin
+    // now returns a reference to the place the pointee lives in.
+    // (The box is forgotten because dropping a `Box<Cell<u32>>` is
+    // a separate drop-glue gap.)
+    let dir = temp_dir("box-cell");
+    let src = fixture(&dir, "box_cell.rs", BOX_CELL_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Cell::set through a Box deref must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "5\n");
+}
+
+const RC_REFCELL_SRC: &str = r#"
+use std::cell::RefCell;
+use std::rc::Rc;
+fn main() {
+    let rc = Rc::new(RefCell::new(1u32));
+    *rc.borrow_mut() = 7;
+    let v = *rc.borrow();
+    println!("{}", v);
+    std::mem::forget(rc);
+}
+"#;
+
+#[test]
+fn run_mode_rc_refcell_borrow_mut_assignment() {
+    // `RefCell::borrow_mut` is reached through the `Deref`
+    // builtin for `Rc`; with a snapshot result the RefCell borrow
+    // could not be tracked ("RefCell with no live place (constant
+    // aggregate)"). The handle's pointee lives in a place in this
+    // value model, so the builtin returns that place and the
+    // borrow registers.
+    let dir = temp_dir("rc-refcell");
+    let src = fixture(&dir, "rc_refcell.rs", RC_REFCELL_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "borrow_mut assignment through Rc<RefCell> must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
+}
+
+const VEC_CELL_SRC: &str = r#"
+use std::cell::Cell;
+fn main() {
+    let v = vec![Cell::new(0u32), Cell::new(0u32)];
+    v[1].set(9);
+    println!("{} {}", v[0].get(), v[1].get());
+    std::mem::forget(v);
+}
+"#;
+
+#[test]
+fn run_mode_vec_cell_index_set() {
+    // `v[1].set(..)` reaches the element through the `Index`
+    // builtin; with a snapshot element the `Cell::set` write
+    // failed with "expected mutable place, found constant
+    // aggregate". When the indexed value lives in a place, the
+    // builtin returns a reference to the element place.
+    let dir = temp_dir("vec-cell");
+    let src = fixture(&dir, "vec_cell.rs", VEC_CELL_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Cell::set through a Vec index must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "0 9\n");
+}
+const PANIC_BOX_HOLDER_SRC: &str = r#"
+use std::cell::Cell;
+use std::ops::Deref;
+use std::panic;
+struct Holder {
+    c: Cell<u32>,
+}
+fn main() {
+    let r = panic::catch_unwind(|| {
+        panic::panic_any(Holder { c: Cell::new(1u32) });
+    });
+    let err = match r {
+        Ok(()) => panic!("no panic"),
+        Err(e) => e,
+    };
+    let b = match err.downcast::<Holder>() {
+        Ok(b) => b,
+        Err(_) => panic!("downcast failed"),
+    };
+    let hr: &Holder = Deref::deref(&b);
+    hr.c.set(5);
+    println!("{}", b.c.get());
+    std::mem::forget(b);
+}
+"#;
+
+#[test]
+fn run_mode_panic_box_holder_cell_set_through_deref() {
+    // A panic payload's by-value downcast hands back its payload
+    // in an aggregate-shaped box (the payload value as the box's
+    // single field), not an allocation-backed one. The box lives
+    // in a place, so the `Deref` builtin's result must denote
+    // that place's field 0: with a snapshot of the payload, the
+    // `Cell::set` write through the deref cannot reach the box's
+    // storage.
+    let dir = temp_dir("panic-box-holder");
+    let src = fixture(&dir, "panic_box_holder.rs", PANIC_BOX_HOLDER_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Cell::set through a panic-payload Box deref must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "5\n");
+}
+
+const PANIC_BOX_STRING_SRC: &str = r#"
+use std::ops::DerefMut;
+use std::panic;
+fn main() {
+    let r = panic::catch_unwind(|| {
+        panic::panic_any(String::from("a"));
+    });
+    let err = match r {
+        Ok(()) => panic!("no panic"),
+        Err(e) => e,
+    };
+    let mut b = match err.downcast::<String>() {
+        Ok(b) => b,
+        Err(_) => panic!("downcast failed"),
+    };
+    let s: &mut String = DerefMut::deref_mut(&mut b);
+    s.push_str("z");
+    println!("{}", b.as_str());
+    std::mem::forget(b);
+}
+"#;
+
+#[test]
+fn run_mode_panic_box_string_push_through_deref_mut() {
+    // The mutable counterpart: an explicit `DerefMut` call on an
+    // aggregate-shaped box in a place must yield a reference to
+    // that place's field 0, so the write through the result lands
+    // in the box instead of failing on the snapshot the builtin
+    // used to hand back ("expected mutable place, found constant
+    // aggregate").
+    let dir = temp_dir("panic-box-string");
+    let src = fixture(&dir, "panic_box_string.rs", PANIC_BOX_STRING_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "push_str through a panic-payload Box deref_mut must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "az\n");
+}
