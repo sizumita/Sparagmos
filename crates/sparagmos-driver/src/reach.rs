@@ -65,7 +65,9 @@ use rustc_public::CrateDef;
 
 use sparagmos_mir as sm;
 
-use crate::convert::{args_mention_params, closure_kind, stable_mir_panic_reason, Converter};
+use crate::convert::{
+    args_mention_params, closure_kind, guarded_ty_kind, stable_mir_panic_reason, Converter,
+};
 use crate::report::{FnOutcome, FnReport};
 
 /// Cap on collected bodies per program; see the module docs.
@@ -154,7 +156,13 @@ pub fn generic_args_within_expanded_size(args: &GenericArgs, limit: usize) -> bo
             if !self.node() {
                 return false;
             }
-            match ty.kind() {
+            // A type passing through a coroutine-closure type
+            // cannot be asked its kind (see `guarded_ty_kind`);
+            // it counts as one node, like any other leaf.
+            let Some(kind) = guarded_ty_kind(ty) else {
+                return true;
+            };
+            match kind {
                 TyKind::RigidTy(RigidTy::Tuple(elems)) => {
                     elems.iter().all(|elem| self.ty(elem))
                 }
@@ -681,9 +689,10 @@ fn synthetic_ctor_body(
     def: &rustc_public::ty::FnDef,
     inst: &Instance,
 ) -> Option<sm::Body> {
-    let sig = inst.ty().kind().fn_sig()?.skip_binder();
+    let sig = guarded_ty_kind(&inst.ty())?.fn_sig()?.skip_binder();
     let (output, inputs) = sig.inputs_and_output.split_last()?;
-    let TyKind::RigidTy(RigidTy::Adt(adt_def, adt_args)) = output.kind() else {
+    let TyKind::RigidTy(RigidTy::Adt(adt_def, adt_args)) =
+        guarded_ty_kind(output)? else {
         return None;
     };
     if matches!(adt_def.kind(), rustc_public::ty::AdtKind::Union) {
@@ -750,7 +759,13 @@ pub fn call_targets(body: &mir::Body) -> Vec<(rustc_public::ty::FnDef, GenericAr
         let Operand::Constant(c) = func else {
             continue;
         };
-        if let TyKind::RigidTy(RigidTy::FnDef(def, args)) = c.const_.ty().kind() {
+        // A constant whose type passes through a coroutine-
+        // closure type cannot be asked its kind (see
+        // `guarded_ty_kind`); it names no FnDef target that
+        // could be extracted here.
+        if let Some(TyKind::RigidTy(RigidTy::FnDef(def, args))) =
+            guarded_ty_kind(&c.const_.ty())
+        {
             out.push((def, args));
         }
     }
@@ -770,7 +785,11 @@ pub fn call_targets(body: &mir::Body) -> Vec<(rustc_public::ty::FnDef, GenericAr
 pub fn fndef_constants(body: &mir::Body) -> Vec<(rustc_public::ty::FnDef, GenericArgs)> {
     fn visit(op: &Operand, out: &mut Vec<(rustc_public::ty::FnDef, GenericArgs)>) {
         let Operand::Constant(c) = op else { return };
-        if let TyKind::RigidTy(RigidTy::FnDef(def, args)) = c.const_.ty().kind() {
+        // As in `call_targets`: an unaskable constant type
+        // names no extractable FnDef target.
+        if let Some(TyKind::RigidTy(RigidTy::FnDef(def, args))) =
+            guarded_ty_kind(&c.const_.ty())
+        {
             out.push((def, args));
         }
     }
@@ -922,7 +941,16 @@ fn walk_closure_args(args: &GenericArgs, out: &mut Vec<(ClosureDef, GenericArgs)
 }
 
 fn walk_closure_ty(ty: &Ty, out: &mut Vec<(ClosureDef, GenericArgs)>) {
-    match ty.kind() {
+    // A type whose conversion tree passes through a coroutine-
+    // closure type cannot be asked its kind at all (the bridge
+    // leaves that conversion unimplemented); nothing can be
+    // extracted from it here. The aggregate that creates an async
+    // closure's value carries the demand instead (see
+    // `closure_targets`).
+    let Some(kind) = guarded_ty_kind(ty) else {
+        return;
+    };
+    match kind {
         TyKind::RigidTy(RigidTy::Closure(def, args)) => {
             out.push((def, args.clone()));
             walk_closure_args(&args, out);
@@ -1010,7 +1038,7 @@ fn consumer_instance_needs_body(canonical: &str, args: &GenericArgs) -> bool {
 /// `Empty`, and the mpsc channel iterators, judged by the
 /// iterator type's ADT name.
 fn iterator_self_modelled(ty: &Ty) -> bool {
-    let TyKind::RigidTy(RigidTy::Adt(def, _)) = ty.kind() else {
+    let Some(TyKind::RigidTy(RigidTy::Adt(def, _))) = guarded_ty_kind(ty) else {
         return false;
     };
     matches!(
@@ -1120,6 +1148,23 @@ pub fn closure_targets(body: &mir::Body) -> Vec<(ClosureDef, GenericArgs)> {
                         operand_ty(op, &mut out);
                     }
                 }
+                Rvalue::Aggregate(AggregateKind::CoroutineClosure(def, args), ops) => {
+                    // An async closure's value is created here, and
+                    // the aggregate is the one place that carries
+                    // its definition and arguments: the closure's
+                    // *type* cannot be asked for them (the bridge
+                    // leaves coroutine-closure type conversion
+                    // unimplemented). The demand is recorded under
+                    // the same `ClosureDef` key the closure
+                    // collection resolves, since an async closure
+                    // is instantiated through the closure machinery
+                    // like any other closure.
+                    out.push((ClosureDef(def.def_id()), args.clone()));
+                    walk_closure_args(args, &mut out);
+                    for op in ops {
+                        operand_ty(op, &mut out);
+                    }
+                }
                 Rvalue::Aggregate(_, ops) => {
                     for op in ops {
                         operand_ty(op, &mut out);
@@ -1188,7 +1233,13 @@ pub fn coroutine_targets(body: &mir::Body) -> Vec<(rustc_public::ty::CoroutineDe
     }
 
     fn walk_ty(ty: &Ty, out: &mut Vec<(rustc_public::ty::CoroutineDef, GenericArgs)>) {
-        match ty.kind() {
+        // A type passing through a coroutine-closure type
+        // cannot be asked its kind (see `guarded_ty_kind`);
+        // nothing can be extracted from it here either.
+        let Some(kind) = guarded_ty_kind(ty) else {
+            return;
+        };
+        match kind {
             TyKind::RigidTy(RigidTy::Coroutine(def, args)) => {
                 out.push((def, args.clone()));
                 walk_args(&args, out);

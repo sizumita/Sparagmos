@@ -99,9 +99,10 @@ use rustc_public::{CrateDef, CrateDefType};
 use rustc_public::ItemKind;
 
 use sparagmos_driver::convert::{
-    args_mention_params, closure_kind, stable_mir_panic_reason, Converter,
-    CONST_EXPR_REASON, COROUTINE_CLOSURE_TYPE_REASON, INSTANCE_CONST_REASON,
-    TAIL_CALL_REASON, UNSAFE_BINDER_REASON,
+    args_mention_params, clear_captured_panic, closure_kind, coroutine_closure_args,
+    peek_captured_panic, record_captured_panic, stable_mir_panic_reason,
+    take_captured_panic, Converter, CONST_EXPR_REASON, COROUTINE_CLOSURE_TYPE_REASON,
+    INSTANCE_CONST_REASON, TAIL_CALL_REASON, UNSAFE_BINDER_REASON,
 };
 use sparagmos_driver::report::{ConversionReport, FnOutcome, FnReport};
 use sparagmos_mir::Body;
@@ -200,14 +201,6 @@ fn take() -> Option<Collected> {
 /// The process panic hook, as returned by `std::panic::take_hook`.
 type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static>;
 
-/// First panic message observed while the panic-capture hook is
-/// installed (see `begin_panic_capture`). The hook also fires for
-/// panics on the compiler's own threads and for panics the compiler
-/// handles internally; the recorded message is only consumed when a
-/// panic actually escapes the compiler run (the `catch_unwind` in
-/// `main`), so a handled panic never changes the outcome.
-static PANIC_CAPTURE: Mutex<Option<String>> = Mutex::new(None);
-
 /// Format a panic as a concrete reason: the payload text when the
 /// payload is a string, plus the panic location when known. The
 /// compiler also panics with non-string marker payloads; those are
@@ -266,12 +259,6 @@ fn payload_reason(payload: &(dyn std::any::Any + Send)) -> Option<String> {
     } else {
         None
     }
-}
-
-/// Peek at the panic-capture slot without clearing it (see
-/// `take_captured_panic`).
-fn peek_captured_panic() -> Option<String> {
-    PANIC_CAPTURE.lock().ok().and_then(|slot| slot.clone())
 }
 
 /// The skip reason for a caught panic whose payload is the
@@ -397,7 +384,9 @@ fn is_contained_reason(reason: &str) -> bool {
 }
 
 /// Install a panic hook that records the first panic's message into
-/// `PANIC_CAPTURE` and prints nothing. While the compiler runs, the
+/// the library's panic-capture slot (see
+/// `sparagmos_driver::convert::record_captured_panic`) and prints
+/// nothing. While the compiler runs, the
 /// default panic dump must not leak into this process's stderr: run
 /// mode reserves stderr for the contract messages, and the captured
 /// message is reported as the conversion-failure reason instead.
@@ -405,26 +394,16 @@ fn is_contained_reason(reason: &str) -> bool {
 /// as soon as the compiler run is over — panics outside the run
 /// (e.g. in the interpreter) keep the normal reporting.
 fn begin_panic_capture() -> PanicHook {
-    if let Ok(mut slot) = PANIC_CAPTURE.lock() {
-        *slot = None;
-    }
+    clear_captured_panic();
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(|info| {
-        if let Ok(mut slot) = PANIC_CAPTURE.lock() {
-            if slot.is_none() {
-                *slot = Some(panic_reason(info));
-            }
-        }
+        record_captured_panic(panic_reason(info));
     }));
     previous
 }
 
 fn end_panic_capture(previous: PanicHook) {
     std::panic::set_hook(previous);
-}
-
-fn take_captured_panic() -> Option<String> {
-    PANIC_CAPTURE.lock().ok().and_then(|mut slot| slot.take())
 }
 
 /// Guard that points the process's stdout file descriptor at stderr
@@ -600,6 +579,15 @@ enum ClosureAttempt {
     /// collection after the item loop converts the instances
     /// actually demanded (the same deferral generic functions get).
     GenericContext,
+    /// The item is an async closure: asking for its type hits the
+    /// bridge's unimplemented coroutine-closure type conversion,
+    /// so no instance can be formed from the item alone — but a
+    /// converted body that creates the closure carries its
+    /// definition and arguments in the coroutine-closure
+    /// aggregate, and the closure collection after the item loop
+    /// accounts the instances actually demanded (the same
+    /// deferral generic functions get).
+    CoroutineClosure,
 }
 
 /// Instantiate a local closure item's body.
@@ -618,16 +606,20 @@ enum ClosureAttempt {
 /// functions — so the item loop defers it and the closure
 /// collection after the loop converts the instances that
 /// monomorphic bodies actually demand. Async closures are
-/// coroutine closures; their bodies are coroutines, which are
-/// not converted — and merely asking for an async closure
+/// coroutine closures: merely asking for an async closure
 /// item's type hits the unimplemented coroutine-closure type
-/// conversion, so the guard accounts the item unsupported
-/// before its kind is ever seen (the `CoroutineClosure` arm
-/// below only fires if a future Stable MIR implements the
-/// conversion).
+/// conversion, so no instance can be formed from the item —
+/// the guard's reason identifies the item, and it is deferred
+/// the same way, to be accounted from the coroutine-closure
+/// aggregates of converted bodies (the `CoroutineClosure` arm
+/// of `closure_instance_kind` below only fires if a future
+/// Stable MIR implements the type conversion).
 fn closure_instance(item: &rustc_public::CrateItem) -> ClosureAttempt {
     match guard_stable_mir_query(|| closure_instance_kind(item)) {
         Ok(attempt) => attempt,
+        Err(reason) if reason == COROUTINE_CLOSURE_TYPE_REASON => {
+            ClosureAttempt::CoroutineClosure
+        }
         Err(reason) => ClosureAttempt::Unsupported(reason),
     }
 }
@@ -1147,6 +1139,21 @@ fn collect_closure_instances(
                     continue;
                 }
                 let Some(kind) = closure_kind(&args) else {
+                    if coroutine_closure_args(&args) {
+                        // An async closure demand: the definition
+                        // has no closure instance of its own (the
+                        // compiler's closure resolution rejects
+                        // coroutine closures), and its execution
+                        // bodies — the AsyncFn shim and the
+                        // coroutine — are collected by the instance
+                        // and coroutine demands under their own
+                        // definitions. Record no demand for the
+                        // closure definition itself: the deferred
+                        // item is accounted not demanded, under the
+                        // coroutine-closure reason it was deferred
+                        // with.
+                        continue;
+                    }
                     if unresolved_seen.insert((referenced, format!("{args:?}"))) {
                         *target_demands
                             .entry(referenced)
@@ -1370,6 +1377,12 @@ fn collect_const_closure_instances(
                     return;
                 }
                 let Some(kind) = closure_kind(args) else {
+                    if coroutine_closure_args(args) {
+                        // An async closure demand: no demand is
+                        // recorded for the closure definition
+                        // itself (see collect_closure_instances).
+                        return;
+                    }
                     if unresolved_seen.insert((referenced, format!("{args:?}"))) {
                         fail_all(
                             &mut *target_demands,
@@ -1531,6 +1544,16 @@ fn collect_coroutine_instances(
                 let Some(&base_name) = deferred_names.get(&referenced) else {
                     continue;
                 };
+                if coroutine_closure_args(&args) {
+                    // An async closure demanded as a coroutine
+                    // target: it has no instance of its own (see
+                    // the closure collection), so there is no
+                    // demand to record for its definition; the
+                    // coroutine body inside it is a separate
+                    // definition, collected by the reachability
+                    // pass under its own name.
+                    continue;
+                }
                 if args_mention_params(&args) {
                     continue;
                 }
@@ -2610,6 +2633,34 @@ fn collect() -> ControlFlow<()> {
                             .to_string(),
                         1,
                     );
+                    deferred_closures.push(DeferredFn {
+                        def: item.def_id(),
+                        name: name.clone(),
+                        report_idx: report.functions.len(),
+                        ctor: false,
+                    });
+                    report.functions.push(FnReport {
+                        name,
+                        blocks: 0,
+                        locals: 0,
+                        arg_count: 0,
+                        outcome: FnOutcome::Skipped { reasons },
+                    });
+                    continue;
+                }
+                ClosureAttempt::CoroutineClosure => {
+                    // An async closure: its type cannot be asked
+                    // (see `closure_instance`), so it has no
+                    // instance as an item, but a converted body
+                    // that creates it mentions it with concrete
+                    // arguments in the coroutine-closure
+                    // aggregate. Defer it like a generic-context
+                    // closure: a placeholder report entry keeps
+                    // the target-crate accounting in place, and
+                    // the closure collection after this loop fills
+                    // in the outcome.
+                    let mut reasons = BTreeMap::new();
+                    reasons.insert(COROUTINE_CLOSURE_TYPE_REASON.to_string(), 1);
                     deferred_closures.push(DeferredFn {
                         def: item.def_id(),
                         name: name.clone(),

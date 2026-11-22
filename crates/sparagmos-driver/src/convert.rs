@@ -401,18 +401,22 @@ enum UniqueConst {
     Many,
 }
 
-/// Why a body that mentions a coroutine-closure (async closure)
-/// type cannot be converted: rustc_public 1.100.0's
+/// The gap behind every coroutine-closure (async closure)
+/// accounting in this crate: rustc_public 1.100.0's
 /// internal-to-stable type conversion is unimplemented for
 /// `ty::CoroutineClosure` ("FIXME(async_closures): Lower these
 /// to SMIR"), and Stable MIR types are opaque, so the panic
 /// fires lazily, the first time a conversion asks for the kind
 /// of such a type — inside `convert_body`, or when the type of
-/// an async closure item is asked for directly. The affected
-/// body is skipped with this reason instead of the panic
-/// aborting the conversion of the whole crate; every other body
-/// still converts. Async closure bodies themselves stay
-/// unconverted: Stable MIR 1.100.0 cannot hand them over at all.
+/// an async closure item is asked for directly. Conversions
+/// guard the question (see `guarded_ty_kind`): a body that
+/// merely mentions the type still converts, with the type
+/// recorded as a placeholder, and an async closure item — whose
+/// type cannot be asked at all — is deferred and accounted
+/// from converted bodies' demands. This reason names the gap:
+/// it classifies the panic where one escapes a guard, and it
+/// is the recorded reason of an async closure item that no
+/// converted body demanded.
 pub const COROUTINE_CLOSURE_TYPE_REASON: &str = "body mentions a coroutine-closure \
     (async closure) type, which Stable MIR 1.100.0 cannot convert \
     (rustc_public leaves ty::CoroutineClosure unimplemented)";
@@ -427,7 +431,89 @@ pub fn is_coroutine_closure_panic(payload: &(dyn std::any::Any + Send)) -> bool 
     } else {
         None
     };
-    message.is_some_and(|m| m.contains("FIXME(async_closures)"))
+    let r = message
+        .as_deref()
+        .is_some_and(|m| m.contains("FIXME(async_closures)"));
+    r
+}
+
+/// The first panic's hook record (its message and location)
+/// while the driver's panic-capture hook is installed; the hook
+/// itself lives in the driver binary (its `begin_panic_capture`)
+/// and records through [`record_captured_panic`]. The record is
+/// the reliable witness of a panic whose payload the bridge made
+/// opaque: a panic raised inside a Stable MIR query crosses the
+/// bridge, which replaces the payload, so a `catch_unwind`
+/// around the query cannot read the message from the payload —
+/// but the hook saw the panic at its origin, location included.
+/// Consumers clear the slot before the operation they guard and
+/// take the record after it, so the record they read is that
+/// operation's own panic (the discipline the driver's
+/// location-based classification relies on as well).
+static CAPTURED_PANIC: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Record a panic's hook text; only the first record stands
+/// until it is taken or cleared.
+pub fn record_captured_panic(text: String) {
+    if let Ok(mut slot) = CAPTURED_PANIC.lock() {
+        if slot.is_none() {
+            *slot = Some(text);
+        }
+    }
+}
+
+/// Peek at the panic-capture slot without clearing it (see
+/// [`take_captured_panic`]).
+pub fn peek_captured_panic() -> Option<String> {
+    CAPTURED_PANIC.lock().ok().and_then(|slot| slot.clone())
+}
+
+/// Take the recorded panic text, clearing the slot.
+pub fn take_captured_panic() -> Option<String> {
+    CAPTURED_PANIC.lock().ok().and_then(|mut slot| slot.take())
+}
+
+/// Clear the panic-capture slot without reading it.
+pub fn clear_captured_panic() {
+    if let Ok(mut slot) = CAPTURED_PANIC.lock() {
+        *slot = None;
+    }
+}
+
+/// The kind of a Stable MIR type, or `None` when the type is a
+/// coroutine-closure type: asking for its kind materializes the
+/// bridge's unimplemented coroutine-closure type conversion
+/// (`FIXME(async_closures)`), which panics instead of answering.
+/// The type's definition and arguments are not recoverable from
+/// the opaque handle in that case. Any other panic is resumed —
+/// only this one known gap is tolerated.
+pub fn guarded_ty_kind(ty: &rustc_public::ty::Ty) -> Option<rustc_public::ty::TyKind> {
+    clear_captured_panic();
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ty.kind())) {
+        Ok(kind) => Some(kind),
+        Err(payload) => {
+            if is_coroutine_closure_panic(&payload) {
+                // Consume this panic's hook record, so no outer
+                // containment mistakes it for its own.
+                let _ = take_captured_panic();
+                return None;
+            }
+            // The payload of a panic that crossed the bridge is
+            // opaque (neither `&str` nor `String`), so the hook's
+            // record of the same panic — taken after the slot was
+            // cleared above, hence this very panic's — is the
+            // witness that identifies it.
+            match take_captured_panic() {
+                Some(record) if record.contains("FIXME(async_closures)") => None,
+                other => {
+                    if let Some(record) = other {
+                        record_captured_panic(record);
+                    }
+                    std::panic::resume_unwind(payload)
+                }
+            }
+        }
+    }
 }
 
 /// Why a body containing a tail call cannot be converted:
@@ -1385,7 +1471,7 @@ impl Converter {
     /// conversion is not needed for the literal reading, and
     /// asking for it could fail where the constant itself is fine.
     fn constant_scalar_ty(&mut self, c: &mir::ConstOperand) -> Option<sm::Ty> {
-        match c.const_.ty().kind() {
+        match guarded_ty_kind(&c.const_.ty())? {
             TyKind::RigidTy(
                 RigidTy::Int(_)
                 | RigidTy::Uint(_)
@@ -1407,10 +1493,20 @@ impl Converter {
                 // definition); keep the type so call targets stay
                 // identifiable.
                 let ty = mc.ty();
-                if matches!(
-                    ty.kind(),
-                    TyKind::RigidTy(RigidTy::FnDef(..) | RigidTy::Closure(..))
-                ) {
+                // A type whose kind cannot be asked (it passes
+                // through a coroutine-closure type; see
+                // `guarded_ty_kind`) is not treated as naming a
+                // callable: it may only contain an async closure.
+                // It falls through to the zero-sized value below,
+                // whose walk is guarded the same way.
+                let names_callable = match guarded_ty_kind(&ty) {
+                    Some(kind) => matches!(
+                        kind,
+                        TyKind::RigidTy(RigidTy::FnDef(..) | RigidTy::Closure(..))
+                    ),
+                    None => false,
+                };
+                if names_callable {
                     let t = self.ty(&ty);
                     return sm::Constant {
                         literal: sm::ConstKind::Ty(t),
@@ -1442,11 +1538,19 @@ impl Converter {
                 TyConstKind::ZSTValue(ty) => {
                     // A zero-sized type constant of function-item or
                     // closure type names a callable; keep the type,
-                    // as for `CK::ZeroSized` above.
-                    if matches!(
-                        ty.kind(),
-                        TyKind::RigidTy(RigidTy::FnDef(..) | RigidTy::Closure(..))
-                    ) {
+                    // as for `CK::ZeroSized` above. A type whose
+                    // kind cannot be asked (it passes through a
+                    // coroutine-closure type; see
+                    // `guarded_ty_kind`) is not treated as naming
+                    // a callable either: it falls through to the
+                    // zero-sized value below.
+                    if match guarded_ty_kind(ty) {
+                        Some(kind) => matches!(
+                            kind,
+                            TyKind::RigidTy(RigidTy::FnDef(..) | RigidTy::Closure(..))
+                        ),
+                        None => false,
+                    } {
                         let t = self.ty(ty);
                         return sm::Constant {
                             literal: sm::ConstKind::Ty(t),
@@ -1525,7 +1629,14 @@ impl Converter {
         if depth > 32 {
             return UniqueConst::Many;
         }
-        match ty.kind() {
+        // A coroutine-closure type's kind cannot be asked (see
+        // `guarded_ty_kind`); its value is the closure value
+        // itself, which this walk does not construct, so the
+        // type has no unique value here.
+        let Some(kind) = guarded_ty_kind(ty) else {
+            return UniqueConst::Many;
+        };
+        match kind {
             TyKind::RigidTy(RigidTy::Never) => UniqueConst::Uninhabited,
             TyKind::RigidTy(RigidTy::Tuple(elems)) => {
                 let mut fields = Vec::with_capacity(elems.len());
@@ -1607,7 +1718,15 @@ impl Converter {
         ty: &rustc_public::ty::Ty,
         alloc: &Allocation,
     ) -> sm::ConstValue {
-        match ty.kind() {
+        // A constant whose type passes through a coroutine-
+        // closure type cannot be asked its kind (see
+        // `guarded_ty_kind`); the value is a zero-sized closure
+        // value, or a composite containing one, and carries no
+        // allocation bytes to decode.
+        let Some(kind) = guarded_ty_kind(ty) else {
+            return sm::ConstValue::ZeroSized;
+        };
+        match kind {
             TyKind::RigidTy(RigidTy::Bool) => match alloc.read_bool() {
                 Ok(b) => sm::ConstValue::Bool(b),
                 Err(_) => {
@@ -1740,13 +1859,18 @@ impl Converter {
         inner: &rustc_public::ty::Ty,
         alloc: &Allocation,
     ) -> sm::ConstValue {
+        // The pointee kind, asked once: a type passing through
+        // a coroutine-closure type cannot be asked at all (see
+        // `guarded_ty_kind`), and none of the materialisation
+        // shortcuts below apply to it.
+        let inner_kind = guarded_ty_kind(inner);
         // Fat-pointer shape: `&str` and `&[u8]` literals take the
         // shortcut; every other shape falls through to the decoder
         // below (a raw-byte slice of wider or non-scalar elements
         // has no value form in the interpreter).
         if let Some((data, meta)) = self.read_fat_pointer(alloc) {
-            match inner.kind() {
-                TyKind::RigidTy(RigidTy::Str) => {
+            match &inner_kind {
+                Some(TyKind::RigidTy(RigidTy::Str)) => {
                     return match String::from_utf8(data) {
                         Ok(s) => sm::ConstValue::Str(s),
                         Err(_) => {
@@ -1755,7 +1879,7 @@ impl Converter {
                         }
                     }
                 }
-                TyKind::RigidTy(RigidTy::Slice(elem))
+                Some(TyKind::RigidTy(RigidTy::Slice(elem)))
                     if matches!(
                         elem.kind(),
                         TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8))
@@ -1773,8 +1897,8 @@ impl Converter {
                 mir::alloc::GlobalAlloc::from(prov.0)
             {
                 let plain = pointee.provenance.ptrs.is_empty();
-                match inner.kind() {
-                    TyKind::RigidTy(RigidTy::Str) if plain => {
+                match &inner_kind {
+                    Some(TyKind::RigidTy(RigidTy::Str)) if plain => {
                         return match pointee.raw_bytes().map(String::from_utf8) {
                             Ok(Ok(s)) => sm::ConstValue::Str(s),
                             _ => {
@@ -1783,7 +1907,7 @@ impl Converter {
                             }
                         };
                     }
-                    TyKind::RigidTy(RigidTy::Slice(elem)) if plain => {
+                    Some(TyKind::RigidTy(RigidTy::Slice(elem))) if plain => {
                         if matches!(
                             elem.kind(),
                             TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8))
@@ -1800,7 +1924,7 @@ impl Converter {
                             };
                         }
                     }
-                    TyKind::RigidTy(RigidTy::Array(elem, _)) if plain => {
+                    Some(TyKind::RigidTy(RigidTy::Array(elem, _))) if plain => {
                         if matches!(
                             elem.kind(),
                             TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8))
@@ -1835,7 +1959,7 @@ impl Converter {
         // `slice::from_raw_parts(ptr, len)` in a const context has
         // no pointee, but its address identity and length are
         // exactly observable, so it decodes as a `FatPtr`.
-        if matches!(inner.kind(), TyKind::RigidTy(RigidTy::Slice(_))) {
+        if matches!(&inner_kind, Some(TyKind::RigidTy(RigidTy::Slice(_)))) {
             if let (Ok(addr), Ok(meta)) = (
                 alloc.read_partial_uint(0..PTR_SIZE),
                 alloc.read_partial_uint(PTR_SIZE..2 * PTR_SIZE),
@@ -2412,6 +2536,13 @@ impl Converter {
         if depth > MAX_CONST_DEPTH {
             return None;
         }
+        // A pointee type passing through a coroutine-closure
+        // type cannot be asked its kind (see `guarded_ty_kind`)
+        // and has no decodable value form; the caller keeps the
+        // `ByRef` identity instead.
+        if guarded_ty_kind(inner).is_none() {
+            return None;
+        }
         let prov = alloc
             .provenance
             .ptrs
@@ -2753,12 +2884,22 @@ impl Converter {
     }
 
     pub fn ty(&mut self, ty: &rustc_public::ty::Ty) -> sm::Ty {
+        let Some(kind) = guarded_ty_kind(ty) else {
+            // A coroutine-closure type, whose kind the bridge
+            // cannot hand over (see `guarded_ty_kind`): neither
+            // its structure nor a layout can be asked. The value
+            // it types is created by a coroutine-closure
+            // aggregate, which carries the closure's definition
+            // and arguments itself, so the body still converts
+            // with the type recorded as the unit placeholder.
+            return sm::Ty::unit();
+        };
         let converted = self.ty_inner(ty);
-        match ty.kind() {
+        match &kind {
             TyKind::RigidTy(RigidTy::Adt(def, args)) => {
-                self.record_layout(ty, &def, &args, &converted);
-                self.record_debug_shape(&def, &converted);
-                self.record_instance_shape(ty, &def, &args, &converted);
+                self.record_layout(ty, def, args, &converted);
+                self.record_debug_shape(def, &converted);
+                self.record_instance_shape(ty, def, args, &converted);
             }
             TyKind::RigidTy(RigidTy::Closure(..))
             | TyKind::RigidTy(RigidTy::Coroutine(..))
@@ -3873,6 +4014,58 @@ pub fn closure_kind(args: &GenericArgs) -> Option<ClosureKind> {
     }
 }
 
+/// Whether a demanded closure's generic arguments are a
+/// coroutine closure's (an async closure's). A plain closure
+/// packs its tail as `[kind, sig, captures]`; a coroutine
+/// closure packs `[kind, sig, captures, captures-by-ref]` —
+/// an integer kind marker type, a fn-pointer signature, a
+/// tuple of upvars, and a fn-pointer producing the
+/// by-reference captures. The check is purely structural,
+/// over the tail shapes; a plain closure's arguments never
+/// match it (their last argument is the upvars tuple, not a
+/// fn-pointer).
+pub fn coroutine_closure_args(args: &GenericArgs) -> bool {
+    let mut tail = args.0.iter().rev();
+    let (Some(by_ref), Some(upvars), Some(sig), Some(kind)) =
+        (tail.next(), tail.next(), tail.next(), tail.next())
+    else {
+        return false;
+    };
+    let is_fn_ptr = |arg: &GenericArgKind| {
+        matches!(
+            arg,
+            GenericArgKind::Type(t)
+                if matches!(
+                    guarded_ty_kind(t),
+                    Some(TyKind::RigidTy(RigidTy::FnPtr(..)))
+                )
+        )
+    };
+    let is_tuple = |arg: &GenericArgKind| {
+        matches!(
+            arg,
+            GenericArgKind::Type(t)
+                if matches!(
+                    guarded_ty_kind(t),
+                    Some(TyKind::RigidTy(RigidTy::Tuple(_)))
+                )
+        )
+    };
+    let is_kind = |arg: &GenericArgKind| {
+        matches!(
+            arg,
+            GenericArgKind::Type(t)
+                if matches!(
+                    guarded_ty_kind(t),
+                    Some(TyKind::RigidTy(RigidTy::Int(
+                        SmirIntTy::I8 | SmirIntTy::I16 | SmirIntTy::I32
+                    )))
+                )
+        )
+    };
+    is_fn_ptr(by_ref) && is_tuple(upvars) && is_fn_ptr(sig) && is_kind(kind)
+}
+
 /// Whether any generic argument still mentions a type or const
 /// parameter, i.e. the item is not fully monomorphic.
 pub fn args_mention_params(args: &GenericArgs) -> bool {
@@ -3893,7 +4086,15 @@ fn const_mentions_param(konst: &rustc_public::ty::TyConst) -> bool {
 }
 
 fn ty_mentions_param(ty: &Ty) -> bool {
-    match ty.kind() {
+    // A type passing through a coroutine-closure type cannot
+    // be asked its kind (see `guarded_ty_kind`); counting it
+    // as mentioning a parameter is the conservative answer
+    // for every caller (they all treat `true` as "not fully
+    // monomorphic here" and defer or fall back).
+    let Some(kind) = guarded_ty_kind(ty) else {
+        return true;
+    };
+    match kind {
         TyKind::Param(_) => true,
         TyKind::Alias(_, alias) => args_mention_params(&alias.args),
         TyKind::RigidTy(rigid) => match rigid {

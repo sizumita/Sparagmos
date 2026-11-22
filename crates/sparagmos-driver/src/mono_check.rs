@@ -52,6 +52,8 @@ use rustc_public::mir::{Body, Operand, TerminatorKind};
 use rustc_public::ty::{AdtKind, RigidTy, Ty, TyKind};
 use rustc_public::{CrateDef, CrateDefType};
 
+use crate::convert::guarded_ty_kind;
+
 /// Scan the Stable MIR bodies that were converted for this program
 /// and return the first monomorphization failure rustc would have
 /// reported, if any.
@@ -188,7 +190,13 @@ fn walk_layout_type(
     if depth > 256 {
         return false;
     }
-    match ty.kind() {
+    // A type passing through a coroutine-closure type cannot be
+    // asked its kind (see `guarded_ty_kind`); its layout safety
+    // cannot be judged structurally, so it is not safe to query.
+    let Some(kind) = guarded_ty_kind(&ty) else {
+        return false;
+    };
+    match kind {
         TyKind::RigidTy(RigidTy::Adt(def, args)) => {
             if !visited.insert(ty) {
                 return true;
@@ -279,7 +287,9 @@ fn check_measured_call(
     let Operand::Constant(c) = func else {
         return None;
     };
-    let kind = c.const_.ty().kind();
+    let Some(kind) = guarded_ty_kind(&c.const_.ty()) else {
+        return None;
+    };
     let TyKind::RigidTy(RigidTy::FnDef(def, args)) = &kind else {
         return None;
     };
@@ -337,14 +347,19 @@ fn simd_layout_exists(ty: Ty) -> bool {
 /// Whether a type is a SIMD vector type (a `#[repr(simd)]` ADT or
 /// `core::simd::Simd`), the notion rustc's own check uses.
 fn is_simd(ty: Ty) -> bool {
-    ty.kind().is_simd()
+    // A type passing through a coroutine-closure type cannot be
+    // asked its kind (see `guarded_ty_kind`) and is not a SIMD
+    // type this check can judge.
+    guarded_ty_kind(&ty).is_some_and(|kind| kind.is_simd())
 }
 
 fn check_call(func: &Operand) -> Option<String> {
     let Operand::Constant(c) = func else {
         return None;
     };
-    let kind = c.const_.ty().kind();
+    let Some(kind) = guarded_ty_kind(&c.const_.ty()) else {
+        return None;
+    };
     let TyKind::RigidTy(RigidTy::FnDef(def, args)) = &kind else {
         return None;
     };

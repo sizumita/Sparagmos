@@ -220,6 +220,13 @@ fn main() {
 }
 "#;
 
+const ASYNC_CLOSURE_CALL_SRC: &str = r#"
+fn main() {
+    let f = async move |x: i32| x + 1;
+    let _fut = f(1);
+}
+"#;
+
 const LOG_SYNTAX_SRC: &str = r#"
 #![feature(log_syntax)]
 fn main() {
@@ -273,34 +280,62 @@ fn run_mode_tail_call_body_is_skipped_and_call_exits_two() {
 
 
 #[test]
-fn run_mode_async_closure_exits_two_with_named_reason() {
-    // Async closures hit an `unimplemented!()` inside Stable MIR
-    // (type conversion: "FIXME(async_closures)"): a body that
-    // mentions a coroutine-closure type cannot be converted at
-    // all. The conversion contains that panic per body and skips
-    // the body with a named reason, so run mode reports the
-    // unconverted `main` — exit 2, the skip reason as the
-    // message, no conversion panic and no process panic.
+fn run_mode_async_closure_call_exits_two_with_named_reason() {
+    // A body that mentions a coroutine-closure (async closure)
+    // type converts (the type question is guarded; see the
+    // driver_bodies async-closure tests), but *calling* the
+    // closure goes through the `AsyncFn::async_call` shim, whose
+    // body is not collected: run mode reports that call under
+    // the usual contract — exit 2, the unconverted callee named,
+    // no conversion panic and no process panic.
     let dir = temp_dir("asyncclosure");
-    let src = fixture(&dir, "asyncclosure.rs", ASYNC_CLOSURE_SRC);
+    let src = fixture(&dir, "asyncclosure.rs", ASYNC_CLOSURE_CALL_SRC);
     let out = run_driver(&src);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         out.status.code(),
         Some(2),
-        "an unconvertible main is a conversion failure (exit 2), not a process panic; stderr={stderr}"
+        "calling an async closure is unsupported (exit 2), not a process panic; stderr={stderr}"
     );
     assert!(
-        stderr.contains("`main` was not converted (body mentions a coroutine-closure"),
-        "the reason names the coroutine-closure skip: {stderr}"
+        stderr.contains("std::ops::AsyncFn::async_call"),
+        "the reason names the unconverted shim: {stderr}"
+    );
+    assert!(
+        stderr.contains("no converted body"),
+        "the reason names the unconverted body: {stderr}"
     );
     assert!(
         !stderr.contains("conversion panicked"),
-        "the failure is a named skip, not a conversion panic: {stderr}"
+        "the failure is a named unsupported call, not a conversion panic: {stderr}"
     );
     assert!(
         !stderr.contains("RUST_BACKTRACE"),
         "the default panic dump is suppressed, the message is reported as the reason: {stderr}"
+    );
+}
+
+
+#[test]
+fn run_mode_uncalled_async_closure_runs() {
+    // Defining an async closure and borrowing the value never
+    // calls it: the closure value is a zero-sized value whose
+    // creation the converted body represents without the
+    // closure's type (which Stable MIR cannot hand over), so
+    // the program runs to completion.
+    let dir = temp_dir("asyncclosure_uncalled");
+    let src = fixture(&dir, "asyncclosure.rs", ASYNC_CLOSURE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an uncalled async closure runs; stderr={stderr}"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "run mode keeps stdout clean: {:?}",
+        String::from_utf8_lossy(&out.stdout)
     );
 }
 

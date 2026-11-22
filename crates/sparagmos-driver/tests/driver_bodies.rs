@@ -133,35 +133,57 @@ fn main() {
 
 
 #[test]
-fn async_closure_in_main_is_skipped_with_named_reason() {
-    // Stable MIR 1.100.0 cannot convert a body that mentions a
-    // coroutine-closure (async closure) type at all (rustc_public
-    // leaves ty::CoroutineClosure unimplemented), so the body is
-    // skipped with that named reason instead of the conversion
-    // panic aborting the whole crate conversion.
+fn async_closure_in_main_converts_and_closure_item_is_not_demanded() {
+    // Stable MIR 1.100.0 cannot hand over a coroutine-closure
+    // (async closure) type (rustc_public leaves
+    // ty::CoroutineClosure unimplemented), but a body that merely
+    // mentions the type still converts: the type is recorded as
+    // a placeholder and the conversion panic is contained at the
+    // guarded type question instead of aborting the body. The
+    // async closure item itself, whose type cannot be asked at
+    // all, is accounted not demanded with the named reason; the
+    // coroutine body inside it is a separate definition and
+    // converts under its own name.
     let fixture = write_fixture("async_closure_main", ASYNC_CLOSURE_MAIN_RS);
     let (stdout, status) = run_driver(&[], &fixture);
     assert!(status.success(), "driver failed: {stdout}");
     assert!(
+        stdout.contains("fn async_closure_main::main: blocks="),
+        "main not converted:\n{stdout}"
+    );
+    assert!(
         stdout.contains(
-            "fn async_closure_main::main: SKIPPED (body mentions a coroutine-closure"
+            "fn async_closure_main::main::{closure#0}: NOT DEMANDED \
+             (body mentions a coroutine-closure"
         ),
-        "main not skipped with the coroutine-closure reason:\n{stdout}"
+        "closure item not accounted with the coroutine-closure reason:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "fn async_closure_main::main::{closure#0}::{closure#0}: blocks="
+        ),
+        "coroutine body not converted:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("target-crate converted: 2, skipped: 0"),
+        "target crate not fully accounted:\n{stdout}"
     );
 }
 
 #[test]
 fn async_closure_in_uncalled_helper_does_not_block_main() {
-    // Only the function whose body mentions the async closure is
-    // skipped; the rest of the crate converts and runs.
+    // A helper whose body mentions an async closure converts
+    // like any other body (see
+    // `async_closure_in_main_converts_and_closure_item_is_not_demanded`);
+    // the rest of the crate converts and runs. Only *calling*
+    // an async closure is unsupported at run time, and the
+    // helper is never called.
     let fixture = write_fixture("async_closure_helper", ASYNC_CLOSURE_HELPER_RS);
     let (stdout, status) = run_driver(&[], &fixture);
     assert!(status.success(), "driver failed: {stdout}");
     assert!(
-        stdout.contains(
-            "fn async_closure_helper::make: SKIPPED (body mentions a coroutine-closure"
-        ),
-        "helper not skipped with the coroutine-closure reason:\n{stdout}"
+        stdout.contains("fn async_closure_helper::make: blocks="),
+        "helper not converted:\n{stdout}"
     );
     assert!(
         stdout.contains("fn async_closure_helper::main: blocks="),
