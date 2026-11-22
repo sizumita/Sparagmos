@@ -12,6 +12,16 @@ pub enum FnOutcome {
     /// Skipped. `reasons` maps a human-readable reason (usually the
     /// unsupported variant name) to the number of occurrences.
     Skipped { reasons: BTreeMap<String, usize> },
+    /// A generic definition no converted body demands an instance
+    /// of: it has no monomorphic instance in this program, the way
+    /// rustc's monomorphization collector never instantiates it
+    /// either. The definition is not part of the program, so its
+    /// absence does not make the conversion incomplete — but it
+    /// is recorded, not dropped: `reason` is the item loop's
+    /// original no-instance record. A definition that *is*
+    /// demanded and whose instances cannot be converted stays
+    /// `Skipped` with the instances' reasons.
+    NotDemanded { reason: String },
 }
 
 #[derive(Clone, Debug)]
@@ -29,6 +39,9 @@ impl FnReport {
     pub fn is_converted(&self) -> bool {
         matches!(self.outcome, FnOutcome::Converted)
     }
+    pub fn is_skipped(&self) -> bool {
+        matches!(self.outcome, FnOutcome::Skipped { .. })
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -41,7 +54,13 @@ impl ConversionReport {
         self.functions.iter().filter(|f| f.is_converted()).count()
     }
     pub fn skipped_count(&self) -> usize {
-        self.functions.len() - self.converted_count()
+        self.functions.iter().filter(|f| f.is_skipped()).count()
+    }
+    pub fn not_demanded_count(&self) -> usize {
+        self.functions
+            .iter()
+            .filter(|f| matches!(f.outcome, FnOutcome::NotDemanded { .. }))
+            .count()
     }
     /// Unsupported-variant totals across all skipped functions.
     pub fn unsupported_totals(&self) -> BTreeMap<String, usize> {

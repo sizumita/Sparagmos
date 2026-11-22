@@ -49,7 +49,7 @@ pub fn render(
     let skipped: Vec<_> = report
         .functions
         .iter()
-        .filter(|f| !f.is_converted())
+        .filter(|f| f.is_skipped())
         .collect();
     if !skipped.is_empty() {
         let _ = writeln!(out, "\n=== skipped");
@@ -58,6 +58,19 @@ pub fn render(
                 let rs: Vec<String> =
                     reasons.iter().map(|(k, v)| format!("{k} x{v}")).collect();
                 let _ = writeln!(out, "{}: {}", f.name, rs.join(", "));
+            }
+        }
+    }
+    let not_demanded: Vec<_> = report
+        .functions
+        .iter()
+        .filter(|f| matches!(f.outcome, FnOutcome::NotDemanded { .. }))
+        .collect();
+    if !not_demanded.is_empty() {
+        let _ = writeln!(out, "\n=== not demanded");
+        for f in not_demanded {
+            if let FnOutcome::NotDemanded { reason } = &f.outcome {
+                let _ = writeln!(out, "{}: {}", f.name, reason);
             }
         }
     }

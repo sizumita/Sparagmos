@@ -1333,14 +1333,19 @@ fn collect_coroutine_instances(
 /// [`collect_local_instances`] in the report: a deferred
 /// definition is converted when every instance demanded of it
 /// converted; when some instance could not be converted it stays
-/// skipped with that instance's reasons, and a definition nothing
-/// demands keeps the item loop's "no monomorphic instance
-/// available" record. One exception: a *constructor* nothing
-/// demands is accounted converted without a body — its direct
-/// uses are aggregate rvalues in the callers (already converted
-/// with them), and the constructor item has no body in any
-/// monomorphization that was not demanded, so there is nothing
-/// left unconverted (the same accounting as a trivial constant).
+/// skipped with that instance's reasons. A definition nothing
+/// demands is accounted [`FnOutcome::NotDemanded`]: no converted
+/// body reaches it, so it is not part of the program — rustc's
+/// monomorphization collector never instantiates it either —
+/// and its lack of an instance does not make the conversion
+/// incomplete. The record itself stays, under the item loop's
+/// original no-instance reason; it is never counted converted.
+/// One exception: a *constructor* nothing demands is accounted
+/// converted without a body — its direct uses are aggregate
+/// rvalues in the callers (already converted with them), and the
+/// constructor item has no body in any monomorphization that was
+/// not demanded, so there is nothing left unconverted (the same
+/// accounting as a trivial constant).
 fn apply_instance_demands(
     report: &mut ConversionReport,
     deferred: &[DeferredFn],
@@ -1348,8 +1353,17 @@ fn apply_instance_demands(
 ) {
     for dfn in deferred {
         let Some(demand) = demands.get(&dfn.def) else {
+            let entry = &mut report.functions[dfn.report_idx];
             if dfn.ctor {
-                report.functions[dfn.report_idx].outcome = FnOutcome::Converted;
+                entry.outcome = FnOutcome::Converted;
+            } else {
+                let reason = match &entry.outcome {
+                    FnOutcome::Skipped { reasons } if reasons.len() == 1 => {
+                        reasons.keys().next().expect("one reason").clone()
+                    }
+                    _ => "no monomorphic instance available".to_string(),
+                };
+                entry.outcome = FnOutcome::NotDemanded { reason };
             }
             continue;
         };
@@ -1660,6 +1674,15 @@ fn drop_candidates(
 /// drops in turn. An ADT whose impl does not resolve, or whose
 /// instance has no body, is left as it was: the interpreter keeps
 /// refusing its drop with the reason it already reports.
+///
+/// The returned accounting credits each converted destructor
+/// instance to its impl method's definition (instance count and
+/// the first instance's shape) and records each failed conversion
+/// under the same definition, so the caller can fold both into
+/// the demand accounting: a generic `Drop` impl is itself a
+/// deferred definition, and without the credit its placeholder
+/// entry would stand against the conversion even though the
+/// demanded instance was converted here.
 #[allow(clippy::too_many_arguments)]
 fn demand_drop_instances(
     conv: &mut Converter,
@@ -1668,12 +1691,23 @@ fn demand_drop_instances(
     body_def_ids: &mut Vec<sparagmos_mir::DefId>,
     body_def_names: &mut Vec<String>,
     seed_bodies: &mut Vec<rustc_public::mir::Body>,
+) -> (
+    std::collections::HashMap<rustc_public::DefId, (usize, (usize, usize, usize))>,
+    std::collections::HashMap<rustc_public::DefId, BTreeMap<String, usize>>,
 ) {
     let local_crate = rustc_public::local_crate();
     let local_crate_name = local_crate.name.as_str();
     let impl_methods = local_drop_impl_methods();
+    let mut credited: std::collections::HashMap<
+        rustc_public::DefId,
+        (usize, (usize, usize, usize)),
+    > = std::collections::HashMap::new();
+    let mut failures: std::collections::HashMap<
+        rustc_public::DefId,
+        BTreeMap<String, usize>,
+    > = std::collections::HashMap::new();
     if impl_methods.is_empty() {
-        return;
+        return (credited, failures);
     }
     let mut seen_candidates: std::collections::HashSet<String> = Default::default();
     let mut demanded = 0usize;
@@ -1769,6 +1803,7 @@ fn demand_drop_instances(
                 continue;
             }
             let before = bodies.len();
+            let report_before = report.functions.len();
             convert_item(
                 conv,
                 report,
@@ -1783,12 +1818,32 @@ fn demand_drop_instances(
                 seed_bodies.push(sm_body);
                 demanded += 1;
                 added = true;
+                if let Some(entry) = report.functions.last() {
+                    let counts = (entry.blocks, entry.locals, entry.arg_count);
+                    let slot = credited
+                        .entry(inst.def.def_id())
+                        .or_insert((0, counts));
+                    slot.0 += 1;
+                }
+            } else if report.functions.len() > report_before {
+                // The demanded instance could not be converted:
+                // the failure stands against the impl definition,
+                // exactly as a call-graph demand failure would.
+                if let Some(FnOutcome::Skipped { reasons }) =
+                    report.functions.last().map(|e| &e.outcome)
+                {
+                    let slot = failures.entry(inst.def.def_id()).or_default();
+                    for (k, v) in reasons {
+                        *slot.entry(k.clone()).or_default() += v;
+                    }
+                }
             }
         }
         if !added {
             break;
         }
     }
+    (credited, failures)
 }
 
 /// The `dyn` trait references one Stable MIR body forms: every
@@ -2343,7 +2398,7 @@ fn collect() -> ControlFlow<()> {
     // collection (drop glue is not a call edge), so without this
     // pass the interpreter's glue builder finds the impl recorded
     // but bodiless and refuses the drop.
-    demand_drop_instances(
+    let (drop_credited, drop_failures) = demand_drop_instances(
         &mut conv,
         &mut report,
         &mut bodies,
@@ -2603,6 +2658,24 @@ fn collect() -> ControlFlow<()> {
         demand
             .failures
             .remove("dynamic dispatch target (virtual instance)");
+    }
+    // Credit the destructor instances the drop demand converted
+    // to their impl definitions (and record its failures) the
+    // same way: drop glue is not a call edge, so without this the
+    // generic `Drop` impl's placeholder entry would stand against
+    // the conversion even when the demanded instance converted.
+    for (def, (count, counts)) in &drop_credited {
+        let demand = demand_state.demands.entry(*def).or_default();
+        demand.converted += count;
+        if demand.first_counts.is_none() {
+            demand.first_counts = Some(*counts);
+        }
+    }
+    for (def, reasons) in &drop_failures {
+        let demand = demand_state.demands.entry(*def).or_default();
+        for (k, v) in reasons {
+            *demand.failures.entry(k.clone()).or_default() += v;
+        }
     }
     apply_instance_demands(&mut report, &deferred, &demand_state.demands);
     apply_instance_demands(&mut report, &deferred_closures, &demand_state.demands);
@@ -3869,6 +3942,9 @@ fn main() {
                             reasons.iter().map(|(k, v)| format!("{k} x{v}")).collect();
                         println!("fn {}: SKIPPED ({})", f.name, rs.join(", "));
                     }
+                    FnOutcome::NotDemanded { reason } => {
+                        println!("fn {}: NOT DEMANDED ({})", f.name, reason);
+                    }
                 }
             }
             println!(
@@ -3876,14 +3952,25 @@ fn main() {
                 c.report.converted_count(),
                 c.report.skipped_count()
             );
+            let not_demanded = c.report.not_demanded_count();
+            if not_demanded > 0 {
+                println!("not demanded: {not_demanded}");
+            }
             {
                 let target = &c.report.functions[..c.local_report_count];
                 let t_converted = target
                     .iter()
                     .filter(|f| matches!(f.outcome, FnOutcome::Converted))
                     .count();
-                let t_skipped = target.len() - t_converted;
+                let t_skipped = target.iter().filter(|f| f.is_skipped()).count();
                 println!("target-crate converted: {t_converted}, skipped: {t_skipped}");
+                let t_not_demanded = target
+                    .iter()
+                    .filter(|f| matches!(f.outcome, FnOutcome::NotDemanded { .. }))
+                    .count();
+                if t_not_demanded > 0 {
+                    println!("target-crate not demanded: {t_not_demanded}");
+                }
                 if t_skipped > 0 {
                     let mut totals: std::collections::BTreeMap<&str, usize> =
                         std::collections::BTreeMap::new();
