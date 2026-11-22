@@ -1551,6 +1551,13 @@ pub struct Program {
     /// consulted by the `size_of` / `align_of` / `size_of_val`
     /// builtins for ADT tags the static layout table cannot answer.
     pub adt_layouts: std::collections::HashMap<String, (u64, u64)>,
+    /// Per-variant field byte layouts of the program's
+    /// monomorphic ADT instances, keyed like `adt_layouts`, as
+    /// recorded by the driver (see
+    /// `sparagmos_mir::AdtFieldLayouts`). The byte view of an
+    /// ADT value's storage resolves raw byte pointer positions
+    /// through the field spans recorded here.
+    pub adt_field_layouts: sparagmos_mir::AdtFieldLayouts,
     /// Derived-`Debug` shapes of the program's monomorphic ADT
     /// instances, keyed by the rendered instance name (the type
     /// tag the formatter sees), as recorded by the driver (see

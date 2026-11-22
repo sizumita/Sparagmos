@@ -112,6 +112,14 @@ pub struct Converter {
     /// compiler cannot give (generic parameters, unsized types) get
     /// no entry.
     pub adt_layouts: sm::AdtLayouts,
+    /// Per-variant field byte layouts of the monomorphic ADT
+    /// instances converted so far, keyed like `adt_layouts`
+    /// (see `sm::AdtFieldLayouts`). Handed to the interpreter
+    /// with the converted program: its byte view of an ADT
+    /// value's storage resolves raw byte pointer positions
+    /// through the field spans recorded here. Filled from the
+    /// same layout query as `adt_layouts`.
+    pub adt_field_layouts: sm::AdtFieldLayouts,
     /// Storage-slot maps of the monomorphic coroutine instances
     /// converted so far, keyed like `adt_layouts` (see
     /// `sm::CoroutineLayouts`). Handed to the interpreter with the
@@ -920,6 +928,7 @@ impl Converter {
             def_names: Vec::new(),
             adt_discriminants: sm::AdtDiscriminants::new(),
             adt_layouts: sm::AdtLayouts::new(),
+            adt_field_layouts: sm::AdtFieldLayouts::new(),
             coroutine_layouts: sm::CoroutineLayouts::new(),
             coroutine_slots_attempted: std::collections::HashSet::new(),
             layout_attempted: std::collections::HashSet::new(),
@@ -3912,9 +3921,103 @@ impl Converter {
             return;
         }
         self.adt_layouts.insert(
-            key,
+            key.clone(),
             (shape.size.bytes() as u64, shape.abi_align),
         );
+        self.record_field_layouts(def, args, &shape, &key);
+    }
+
+    /// Record the per-variant field byte layout of one ADT
+    /// instance (see `sm::AdtFieldLayouts`) from the layout
+    /// `record_layout` already queried. Variant field offsets
+    /// come from the layout shape itself; each field's size
+    /// comes from the field type's own contained layout query.
+    /// An instance whose fields cannot all be sized gets no
+    /// entry, exactly as a failed whole-layout query leaves
+    /// `adt_layouts` without one. Unions get no entry: their
+    /// fields share one offset and the interpreter reads them
+    /// through its own reinterpretation machinery.
+    fn record_field_layouts(
+        &mut self,
+        def: &AdtDef,
+        args: &rustc_public::ty::GenericArgs,
+        shape: &rustc_public::abi::LayoutShape,
+        key: &str,
+    ) {
+        use rustc_public::abi::{FieldsShape, VariantsShape};
+        if def.kind() == AdtKind::Union {
+            return;
+        }
+        // (variant index, field offsets in declaration order)
+        let variant_offsets: Vec<(usize, Vec<u64>)> = match &shape.variants {
+            VariantsShape::Empty => return,
+            VariantsShape::Single { index } => {
+                let offsets = match &shape.fields {
+                    FieldsShape::Arbitrary { offsets } => {
+                        offsets.iter().map(|o| o.bytes() as u64).collect()
+                    }
+                    FieldsShape::Array { stride, count } => (0..*count)
+                        .map(|i| (i as u64) * (stride.bytes() as u64))
+                        .collect(),
+                    FieldsShape::Primitive | FieldsShape::Union(_) => return,
+                };
+                vec![(index.to_index(), offsets)]
+            }
+            VariantsShape::Multiple { variants, .. } => variants
+                .iter()
+                .enumerate()
+                .map(|(v, variant)| {
+                    (
+                        v,
+                        variant
+                            .offsets
+                            .iter()
+                            .map(|o| o.bytes() as u64)
+                            .collect::<Vec<u64>>(),
+                    )
+                })
+                .collect(),
+        };
+        let width = variant_offsets
+            .iter()
+            .map(|(v, _)| v + 1)
+            .max()
+            .unwrap_or(0);
+        let mut out: Vec<Vec<(u64, u64)>> = vec![Vec::new(); width];
+        for (v, offsets) in &variant_offsets {
+            let Some(variant) = def.variant(rustc_public::ty::VariantIdx::to_val(*v))
+            else {
+                return;
+            };
+            let fields = variant.fields();
+            if fields.len() != offsets.len() {
+                return;
+            }
+            let mut row = Vec::with_capacity(offsets.len());
+            for (field, &off) in fields.iter().zip(offsets.iter()) {
+                let fty = field.ty_with_args(args);
+                // A field type mentioning a coroutine is never
+                // queried: computing such a type's layout can
+                // drive the compiler into the coroutine's own
+                // destructor-shim construction, which is not
+                // total — an `async_drop_in_place` coroutine's
+                // layout query aborts the whole compilation
+                // with an internal error the containment cannot
+                // catch. The interpreter's byte view loses
+                // nothing: a coroutine value is not an aggregate
+                // of fields it could descend into.
+                if ty_mentions_coroutine(&fty) {
+                    return;
+                }
+                let queried = std::panic::catch_unwind(
+                    std::panic::AssertUnwindSafe(|| fty.layout()),
+                );
+                let Ok(Ok(flayout)) = queried else { return };
+                row.push((off, flayout.shape().size.bytes() as u64));
+            }
+            out[*v] = row;
+        }
+        self.adt_field_layouts.insert(key.to_string(), out);
     }
 
     /// Record the niche discriminant encoding of one
@@ -4946,6 +5049,34 @@ fn uint_ty_size(t: &SmirUintTy) -> Option<usize> {
         SmirUintTy::U64 | SmirUintTy::Usize => 8,
         SmirUintTy::U128 => 16,
     })
+}
+
+/// Whether a type mentions a coroutine anywhere in its
+/// structure (through ADT generic arguments, tuples, arrays,
+/// slices, references and pointer wrappers). See the guard in
+/// `Converter::record_field_layouts`: such a type's layout is
+/// never queried for a field size.
+fn ty_mentions_coroutine(ty: &rustc_public::ty::Ty) -> bool {
+    use rustc_public::ty::{GenericArgKind, RigidTy, TyKind};
+    fn args_mention(args: &rustc_public::ty::GenericArgs) -> bool {
+        args.0.iter().any(|arg| match arg {
+            GenericArgKind::Type(t) => ty_mentions_coroutine(t),
+            _ => false,
+        })
+    }
+    match ty.kind() {
+        TyKind::RigidTy(RigidTy::Coroutine(..)) => true,
+        TyKind::RigidTy(RigidTy::Adt(_, args)) => args_mention(&args),
+        TyKind::RigidTy(RigidTy::Closure(_, args)) => args_mention(&args),
+        TyKind::RigidTy(RigidTy::Tuple(tys)) => tys.iter().any(ty_mentions_coroutine),
+        TyKind::RigidTy(RigidTy::Array(elem, _))
+        | TyKind::RigidTy(RigidTy::Slice(elem))
+        | TyKind::RigidTy(RigidTy::Pat(elem, _)) => ty_mentions_coroutine(&elem),
+        TyKind::RigidTy(RigidTy::Ref(_, inner, _))
+        | TyKind::RigidTy(RigidTy::RawPtr(inner, _)) => ty_mentions_coroutine(&inner),
+        TyKind::Alias(_, alias) => args_mention(&alias.args),
+        _ => false,
+    }
 }
 
 /// Field offsets of a type's layout, in definition order.

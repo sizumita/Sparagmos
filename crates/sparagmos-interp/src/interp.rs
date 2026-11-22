@@ -6196,10 +6196,21 @@ impl<'a> Interpreter<'a> {
     fn read_bulk_base(&self, frames: &[Frame], target: &Resolved) -> InterpResult<Value> {
         match self.read_resolved(frames, target) {
             Ok(v) => Ok(v),
-            Err(e) => match self.displaced_scalar_byte(frames, target) {
-                Ok(Some(byte)) => Ok(byte),
-                _ => Err(e),
-            },
+            Err(e) => {
+                // A byte-displaced aggregate target: the byte
+                // view of the base value's storage denotes the
+                // byte (the scalar fallback below prices the
+                // displacement within the head element's slot,
+                // which is only the position when the
+                // displacement stays inside that element).
+                if let Some(Ok(byte)) = self.byte_view_read(frames, target, 0, false) {
+                    return Ok(byte);
+                }
+                match self.displaced_scalar_byte(frames, target) {
+                    Ok(Some(byte)) => Ok(byte),
+                    _ => Err(e),
+                }
+            }
         }
     }
 
@@ -8008,13 +8019,18 @@ impl<'a> Interpreter<'a> {
     /// absorbed into the index projection, so reads and writes
     /// through the result resolve structurally. The same absorption
     /// applies over any element aggregate the target's value
-    /// denotes (see [`Self::absorb_displacement`]). Otherwise the
-    /// displacement is carried as a trailing
-    /// [`RefProj::ByteOffset`] step: the position is faithfully
-    /// denoted (and further offsets accumulate into it), but
-    /// reading or writing through it is an explicit error at the
-    /// use site. A total displacement of zero never appears in the
-    /// result: an offset that cancels a carried one restores the
+    /// denotes (see [`Self::absorb_displacement`]). One position
+    /// is never absorbed: a position whose declared type is an
+    /// ADT with a recorded field layout, where the displacement
+    /// denotes a storage byte the byte view resolves (see
+    /// [`Self::byte_view_covers`]). Otherwise the displacement
+    /// is carried as a trailing [`RefProj::ByteOffset`] step:
+    /// the position is faithfully denoted (and further offsets
+    /// accumulate into it), and reading or writing through it
+    /// resolves through the byte view where the target's layout
+    /// is recorded, as an explicit error where it is not. A
+    /// total displacement of zero never appears in the result:
+    /// an offset that cancels a carried one restores the
     /// structural position.
     fn offset_projection(
         &self,
@@ -8084,7 +8100,9 @@ impl<'a> Interpreter<'a> {
         // above. The array verdict governs whenever it applies, so
         // a byte displacement into a typed array is never
         // reinterpreted this way.
-        if array_pos.is_none() {
+        if array_pos.is_none()
+            && !self.byte_view_covers(frames, place, static_name, &projection, base)
+        {
             if let Some(base) = base {
                 if let Some(absorbed) =
                     self.absorb_displacement(base, &projection, total, elem_size)
@@ -8956,6 +8974,14 @@ impl<'a> Interpreter<'a> {
                 if let Some(scalar) = self.seq_scalar(frames, target)? {
                     return Ok(Value::Uint(scalar_byte(&scalar, index)? as u128));
                 }
+                // A byte-displaced aggregate target: the byte
+                // view of the base value's storage owns the
+                // read (the indexed access below cannot address
+                // a byte inside an element or a field).
+                if let Some(view) = self.byte_view_read(frames, target, index as i128, true)
+                {
+                    return view;
+                }
                 self.read_resolved_at(frames, target, index)
             }
         }
@@ -8985,9 +9011,1038 @@ impl<'a> Interpreter<'a> {
                     let patched = scalar_with_byte(&scalar, index, byte)?;
                     return self.write_resolved(frames, target, patched);
                 }
+                // A byte-displaced aggregate target: the byte
+                // view of the base value's storage owns the
+                // write (see `read_seq_at`).
+                if let Some(view) =
+                    self.byte_view_write(frames, target, index as i128, &value, true)
+                {
+                    return view;
+                }
                 self.write_resolved_at(frames, target, index, value)
             }
         }
+    }
+
+    // ----- byte view of a value's storage ----------------------
+    //
+    // A raw byte pointer displaced into the middle of a value's
+    // storage (a `*const u8` cast of an array's address, advanced
+    // past an element boundary; a byte pointer into a struct
+    // field's interior) denotes a byte position in the storage
+    // of the value the target place or static holds. The load /
+    // store path resolves such a position through the value's
+    // declared type and the layout tables the driver recorded:
+    // the position is walked from the base of the value, scalar
+    // by scalar, array element by array element, ADT field by
+    // ADT field (through the per-variant field spans of
+    // `Program::adt_field_layouts`), and the byte it lands in is
+    // read or spliced there. The view judges a position only
+    // when every step is determined by recorded layout: a
+    // position in the padding between an ADT's fields, or one
+    // outside the value's storage, is an explicit error, and a
+    // position whose layout is not recorded (a tuple's interior,
+    // an ADT with no field-layout entry, an allocation's raw
+    // bytes) is left to the existing paths unchanged. Composing
+    // the position from the base — never decomposing it into an
+    // element index plus a within-element offset at offset time —
+    // is what keeps a read that crosses an element boundary
+    // exact: the walk crosses into the next element because the
+    // flat position does.
+
+    /// The layout the byte view descends by (see
+    /// [`Self::byte_layout_of_ty`] and [`Self::byte_layout_of_tag`]).
+    /// A scalar's bytes are its own declared width's: an integer's
+    /// low bytes, a float's bit pattern at its own width (an `f32`
+    /// field's bytes are its `f32` bits, not the widened `f64`
+    /// storage's), a `char`'s code point.
+    fn byte_layout_of_ty(&self, ty: &Ty) -> Option<ByteLayout> {
+        Some(match ty {
+            Ty::Bool => ByteLayout::Scalar(ByteScalar::Bool),
+            Ty::Int(t) => ByteLayout::Scalar(ByteScalar::Int(*t)),
+            Ty::Uint(t) => ByteLayout::Scalar(ByteScalar::Uint(*t)),
+            Ty::Float(t) => ByteLayout::Scalar(ByteScalar::Float(*t)),
+            Ty::Array(elem, n) => {
+                let elem_layout = self.byte_layout_of_ty(elem)?;
+                let elem_size = usize::try_from(self.ty_size(elem)?).ok()?;
+                ByteLayout::Seq(
+                    Box::new(elem_layout),
+                    elem_size,
+                    usize::try_from(*n).ok()?,
+                )
+            }
+            Ty::Adt(name) => ByteLayout::Adt(name.clone()),
+            _ => return None,
+        })
+    }
+
+    /// The byte layout of a field type named by its recorded
+    /// debug-shape tag (see [`Self::byte_layout_of_ty`]): the
+    /// scalar and array tags resolve structurally, an ADT tag
+    /// resolves when the instance has a recorded field layout,
+    /// and anything else (a tuple tag, a pointer tag, an unsized
+    /// tag) has no byte layout here.
+    fn byte_layout_of_tag(&self, tag: &str) -> Option<ByteLayout> {
+        let tag = tag.trim();
+        let scalar = match tag {
+            "bool" => Some(ByteScalar::Bool),
+            "char" => Some(ByteScalar::Char),
+            "i8" => Some(ByteScalar::Int(IntTy::I8)),
+            "i16" => Some(ByteScalar::Int(IntTy::I16)),
+            "i32" => Some(ByteScalar::Int(IntTy::I32)),
+            "i64" => Some(ByteScalar::Int(IntTy::I64)),
+            "i128" => Some(ByteScalar::Int(IntTy::I128)),
+            "isize" => Some(ByteScalar::Int(IntTy::Isize)),
+            "u8" => Some(ByteScalar::Uint(UintTy::U8)),
+            "u16" => Some(ByteScalar::Uint(UintTy::U16)),
+            "u32" => Some(ByteScalar::Uint(UintTy::U32)),
+            "u64" => Some(ByteScalar::Uint(UintTy::U64)),
+            "u128" => Some(ByteScalar::Uint(UintTy::U128)),
+            "usize" => Some(ByteScalar::Uint(UintTy::Usize)),
+            "f16" => Some(ByteScalar::Float(FloatTy::F16)),
+            "f32" => Some(ByteScalar::Float(FloatTy::F32)),
+            "f64" => Some(ByteScalar::Float(FloatTy::F64)),
+            "f128" => Some(ByteScalar::Float(FloatTy::F128)),
+            _ => None,
+        };
+        if let Some(scalar) = scalar {
+            return Some(ByteLayout::Scalar(scalar));
+        }
+        if tag.starts_with('[') && tag.ends_with(']') {
+            let inner = &tag[1..tag.len() - 1];
+            let (elem_tag, count) = inner.rsplit_once(';')?;
+            let elem_tag = elem_tag.trim();
+            let count: usize = count.trim().parse().ok()?;
+            let elem_layout = self.byte_layout_of_tag(elem_tag)?;
+            let (elem_size, _) = self.layout_of(elem_tag)?;
+            let elem_size = usize::try_from(elem_size).ok()?;
+            if self.byte_layout_size(&elem_layout)? != elem_size {
+                return None;
+            }
+            return Some(ByteLayout::Seq(Box::new(elem_layout), elem_size, count));
+        }
+        if self.program().adt_field_layouts.contains_key(tag) {
+            return Some(ByteLayout::Adt(tag.to_string()));
+        }
+        None
+    }
+
+    /// The total storage size of a byte layout, when it is
+    /// recorded (an ADT's size comes from its recorded layout).
+    fn byte_layout_size(&self, layout: &ByteLayout) -> Option<usize> {
+        match layout {
+            ByteLayout::Scalar(scalar) => Some(scalar.width()),
+            ByteLayout::Seq(_, elem_size, count) => elem_size.checked_mul(*count),
+            ByteLayout::Adt(name) => self
+                .program()
+                .adt_layouts
+                .get(name)
+                .map(|&(size, _)| size as usize),
+        }
+    }
+
+    /// The recorded type tag of field `field` of variant
+    /// `variant` of the ADT instance `name`, from its debug
+    /// shape; `None` when no shape is recorded.
+    fn adt_field_tag(&self, name: &str, variant: usize, field: usize) -> Option<String> {
+        self.program()
+            .adt_debug_shapes
+            .get(name)?
+            .variants
+            .get(variant)?
+            .fields
+            .get(field)
+            .map(|f| f.ty.clone())
+    }
+
+    /// Walk a structural projection prefix over the declared
+    /// type `base_ty`, returning the byte offset of the position
+    /// it denotes within the base value's storage and the
+    /// declared type at that position, when every step's storage
+    /// offset is determined by the type and the recorded layout
+    /// tables. A field step into an ADT prices through the
+    /// instance's recorded field layout; the field's own type is
+    /// recovered only when its recorded tag names another
+    /// laid-out ADT instance (the descent from the base needs no
+    /// more: it re-walks the flat position through the field
+    /// tags itself). A tuple field step is not priced: a tuple's
+    /// field offsets are the compiler's choice and are not
+    /// recorded.
+    fn projection_storage_offset(
+        &self,
+        base_ty: &Ty,
+        prefix: &[RefProj],
+    ) -> Option<(usize, Option<Ty>)> {
+        let mut ty: Option<Ty> = Some(base_ty.clone());
+        let mut off: usize = 0;
+        let mut variant: usize = 0;
+        for step in prefix {
+            match step {
+                RefProj::Field(i) => match &ty {
+                    Some(Ty::Adt(name)) => {
+                        let rows = self.program().adt_field_layouts.get(name)?;
+                        let row = rows.get(variant)?;
+                        let &(field_off, _) = row.get(*i)?;
+                        off = off.checked_add(usize::try_from(field_off).ok()?)?;
+                        ty = self
+                            .adt_field_tag(name, variant, *i)
+                            .filter(|tag| {
+                                self.program().adt_field_layouts.contains_key(tag)
+                            })
+                            .map(Ty::Adt);
+                        variant = 0;
+                    }
+                    _ => return None,
+                },
+                RefProj::Index(k) => match &ty {
+                    Some(Ty::Array(elem, _)) => {
+                        let elem_size = usize::try_from(self.ty_size(elem)?).ok()?;
+                        off = off.checked_add(k.checked_mul(elem_size)?)?;
+                        ty = Some((**elem).clone());
+                    }
+                    _ => return None,
+                },
+                RefProj::Downcast(v) => match &ty {
+                    Some(Ty::Adt(_)) | None => {
+                        variant = *v as usize;
+                    }
+                    _ => return None,
+                },
+                RefProj::Subslice { offset, len } => match &ty {
+                    Some(Ty::Array(elem, _)) => {
+                        let elem_size = usize::try_from(self.ty_size(elem)?).ok()?;
+                        off = off.checked_add(offset.checked_mul(elem_size)?)?;
+                        ty = Some(Ty::Array(elem.clone(), u64::try_from(*len).ok()?));
+                    }
+                    _ => return None,
+                },
+                _ => return None,
+            }
+        }
+        Some((off, ty))
+    }
+
+    /// The flat byte position a byte-displaced projection
+    /// denotes within the storage of a value of type `base_ty`,
+    /// plus `extra` further bytes (a sequence access's byte
+    /// index, or a wider access's byte offset within the
+    /// position). `None` when the projection is not a displaced
+    /// position this view judges: no displacement step, a step
+    /// other than the caller's own after the displacement, a
+    /// union field step anywhere, or a prefix step whose
+    /// storage offset the type does not determine. `Err`
+    /// carries the position when it is negative — a judged
+    /// position before the value's storage.
+    fn byte_view_position(
+        &self,
+        base_ty: &Ty,
+        projection: &[RefProj],
+        extra: i128,
+    ) -> Option<Result<usize, i128>> {
+        if projection
+            .iter()
+            .any(|s| matches!(s, RefProj::UnionField { .. }))
+        {
+            return None;
+        }
+        let at = projection
+            .iter()
+            .position(|s| matches!(s, RefProj::ByteOffset(_)))?;
+        let RefProj::ByteOffset(disp) = projection[at] else {
+            unreachable!()
+        };
+        if !projection[at + 1..].is_empty() {
+            return None;
+        }
+        let (off, _) = self.projection_storage_offset(base_ty, &projection[..at])?;
+        let flat = (off as i128).checked_add(disp)?.checked_add(extra)?;
+        if flat < 0 {
+            return Some(Err(flat));
+        }
+        Some(Ok(usize::try_from(flat).ok()?))
+    }
+
+    /// Read the byte at flat position `pos` of `value`'s
+    /// storage under `layout` (see the byte view above).
+    /// `None` when the position's layout is not fully recorded
+    /// (the caller then keeps the existing path); a judged
+    /// position answers `Ok` or the verdict it meets.
+    fn storage_byte(
+        &self,
+        value: &Value,
+        layout: &ByteLayout,
+        pos: usize,
+    ) -> Option<Result<u8, ByteVerdict>> {
+        if *value == Value::Uninit {
+            return Some(Err(ByteVerdict::Uninit));
+        }
+        match layout {
+            ByteLayout::Scalar(kind) => {
+                if pos >= kind.width() {
+                    return Some(Err(ByteVerdict::Outside(pos)));
+                }
+                let bits: u128 = match (kind, value) {
+                    (ByteScalar::Int(_), Value::Int(i)) => *i as u128,
+                    (ByteScalar::Uint(_), Value::Uint(u)) => *u,
+                    (ByteScalar::Char, Value::Uint(u)) => *u,
+                    (ByteScalar::Bool, Value::Bool(b)) => u128::from(*b),
+                    (ByteScalar::Float(FloatTy::F16), Value::Float(f)) => {
+                        u128::from(crate::f128::f64_to_f16_bits(*f))
+                    }
+                    (ByteScalar::Float(FloatTy::F32), Value::Float(f)) => {
+                        u128::from((*f as f32).to_bits())
+                    }
+                    (ByteScalar::Float(FloatTy::F64), Value::Float(f)) => {
+                        u128::from(f.to_bits())
+                    }
+                    (ByteScalar::Float(FloatTy::F128), Value::Float128(bits)) => *bits,
+                    _ => return None,
+                };
+                Some(Ok((bits >> (8 * pos)) as u8))
+            }
+            ByteLayout::Seq(elem, elem_size, count) => {
+                if *elem_size == 0 {
+                    return None;
+                }
+                let i = pos / elem_size;
+                if i >= *count {
+                    return Some(Err(ByteVerdict::Outside(pos)));
+                }
+                match value {
+                    Value::Tuple(items) => {
+                        let item = items.get(i)?;
+                        self.storage_byte(item, elem, pos % elem_size)
+                    }
+                    Value::Bytes(bytes)
+                        if *elem_size == 1
+                            && matches!(
+                                **elem,
+                                ByteLayout::Scalar(ByteScalar::Uint(UintTy::U8))
+                            ) =>
+                    {
+                        match bytes.get(pos) {
+                            Some(b) => Some(Ok(*b)),
+                            None => Some(Err(ByteVerdict::Outside(pos))),
+                        }
+                    }
+                    Value::Str(text)
+                        if *elem_size == 1
+                            && matches!(
+                                **elem,
+                                ByteLayout::Scalar(ByteScalar::Uint(UintTy::U8))
+                            ) =>
+                    {
+                        match text.as_bytes().get(pos) {
+                            Some(b) => Some(Ok(*b)),
+                            None => Some(Err(ByteVerdict::Outside(pos))),
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            ByteLayout::Adt(name) => {
+                let Value::Enum { variant, fields } = value else {
+                    return None;
+                };
+                let rows = self.program().adt_field_layouts.get(name)?;
+                let row = rows.get(*variant as usize)?;
+                let mut hit = None;
+                for (f, &(field_off, field_size)) in row.iter().enumerate() {
+                    let (field_off, field_size) =
+                        (field_off as usize, field_size as usize);
+                    if field_size > 0 && pos >= field_off && pos < field_off + field_size
+                    {
+                        hit = Some((f, field_off));
+                        break;
+                    }
+                }
+                let Some((f, field_off)) = hit else {
+                    return Some(Err(ByteVerdict::Padding(pos)));
+                };
+                let field = fields.get(f)?;
+                let tag = self.adt_field_tag(name, *variant as usize, f)?;
+                let field_layout = self.byte_layout_of_tag(&tag)?;
+                if self.byte_layout_size(&field_layout)? != row[f].1 as usize {
+                    return None;
+                }
+                self.storage_byte(field, &field_layout, pos - field_off)
+            }
+        }
+    }
+
+    /// Splice `byte` into the byte at flat position `pos` of
+    /// `slot`'s storage under `layout`, in place (the write
+    /// side of the byte view; see [`Self::storage_byte`] for the
+    /// `None` contract). A scalar slot that was never written is
+    /// zero storage for this purpose — the convention
+    /// `splice_scalar_storage_byte` already keeps: a buffer
+    /// being filled byte by byte is written whole before it is
+    /// read, so the bytes the fill has not reached are never
+    /// observed. An unwritten aggregate has no storage to
+    /// splice into and is left to the existing path.
+    fn splice_storage_byte(
+        &self,
+        slot: &mut Value,
+        layout: &ByteLayout,
+        pos: usize,
+        byte: u8,
+    ) -> Option<Result<(), ByteVerdict>> {
+        match layout {
+            ByteLayout::Scalar(kind) => {
+                if pos >= kind.width() {
+                    return Some(Err(ByteVerdict::Outside(pos)));
+                }
+                let shift = 8 * pos;
+                let splice = |bits: u128| -> u128 {
+                    (bits & !(0xffu128 << shift)) | (u128::from(byte) << shift)
+                };
+                match (kind, &*slot) {
+                    (ByteScalar::Int(t), Value::Int(i)) => {
+                        let bits = t.bits();
+                        let mask: u128 = if bits >= 128 {
+                            u128::MAX
+                        } else {
+                            (1u128 << bits) - 1
+                        };
+                        let mut next = splice((*i as u128) & mask);
+                        if bits < 128 && (next >> (bits - 1)) & 1 == 1 {
+                            next |= !mask;
+                        }
+                        *slot = Value::Int(next as i128);
+                    }
+                    (ByteScalar::Int(t), Value::Uninit) => {
+                        let bits = t.bits();
+                        let mask: u128 = if bits >= 128 {
+                            u128::MAX
+                        } else {
+                            (1u128 << bits) - 1
+                        };
+                        let mut next = splice(0);
+                        if bits < 128 && (next >> (bits - 1)) & 1 == 1 {
+                            next |= !mask;
+                        }
+                        *slot = Value::Int(next as i128);
+                    }
+                    (ByteScalar::Uint(t), Value::Uint(u)) => {
+                        *slot = Value::Uint(splice(*u) & t.max());
+                    }
+                    (ByteScalar::Uint(t), Value::Uninit) => {
+                        *slot = Value::Uint(splice(0) & t.max());
+                    }
+                    (ByteScalar::Char, Value::Uint(u)) => {
+                        let v = splice(*u) as u32;
+                        if char::from_u32(v).is_none() {
+                            return Some(Err(ByteVerdict::InvalidChar(v)));
+                        }
+                        *slot = Value::Uint(u128::from(v));
+                    }
+                    (ByteScalar::Char, Value::Uninit) => {
+                        let v = splice(0) as u32;
+                        if char::from_u32(v).is_none() {
+                            return Some(Err(ByteVerdict::InvalidChar(v)));
+                        }
+                        *slot = Value::Uint(u128::from(v));
+                    }
+                    (ByteScalar::Bool, Value::Bool(_))
+                    | (ByteScalar::Bool, Value::Uninit) => {
+                        *slot = Value::Bool(byte != 0);
+                    }
+                    (ByteScalar::Float(FloatTy::F16), Value::Float(f)) => {
+                        let bits = splice(u128::from(crate::f128::f64_to_f16_bits(*f)));
+                        *slot = Value::Float(crate::f128::f16_bits_to_f64(bits as u16));
+                    }
+                    (ByteScalar::Float(FloatTy::F16), Value::Uninit) => {
+                        let bits = splice(0);
+                        *slot = Value::Float(crate::f128::f16_bits_to_f64(bits as u16));
+                    }
+                    (ByteScalar::Float(FloatTy::F32), Value::Float(f)) => {
+                        let bits = splice(u128::from((*f as f32).to_bits()));
+                        *slot = Value::Float(f32::from_bits(bits as u32) as f64);
+                    }
+                    (ByteScalar::Float(FloatTy::F32), Value::Uninit) => {
+                        *slot = Value::Float(f32::from_bits(splice(0) as u32) as f64);
+                    }
+                    (ByteScalar::Float(FloatTy::F64), Value::Float(f)) => {
+                        let bits = splice(u128::from(f.to_bits()));
+                        *slot = Value::Float(f64::from_bits(bits as u64));
+                    }
+                    (ByteScalar::Float(FloatTy::F64), Value::Uninit) => {
+                        *slot = Value::Float(f64::from_bits(splice(0) as u64));
+                    }
+                    (ByteScalar::Float(FloatTy::F128), Value::Float128(bits)) => {
+                        *slot = Value::Float128(splice(*bits));
+                    }
+                    (ByteScalar::Float(FloatTy::F128), Value::Uninit) => {
+                        *slot = Value::Float128(splice(0));
+                    }
+                    _ => return None,
+                }
+                Some(Ok(()))
+            }
+            ByteLayout::Seq(elem, elem_size, count) => {
+                if *elem_size == 0 {
+                    return None;
+                }
+                let i = pos / elem_size;
+                if i >= *count {
+                    return Some(Err(ByteVerdict::Outside(pos)));
+                }
+                match slot {
+                    Value::Tuple(items) => {
+                        let item = items.get_mut(i)?;
+                        self.splice_storage_byte(item, elem, pos % elem_size, byte)
+                    }
+                    Value::Bytes(bytes)
+                        if *elem_size == 1
+                            && matches!(
+                                **elem,
+                                ByteLayout::Scalar(ByteScalar::Uint(UintTy::U8))
+                            ) =>
+                    {
+                        match bytes.get_mut(pos) {
+                            Some(b) => {
+                                *b = byte;
+                                Some(Ok(()))
+                            }
+                            None => Some(Err(ByteVerdict::Outside(pos))),
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            ByteLayout::Adt(name) => {
+                let (variant, row) = {
+                    let Value::Enum { variant, .. } = &*slot else {
+                        return None;
+                    };
+                    let rows = self.program().adt_field_layouts.get(name)?;
+                    let row = rows.get(*variant as usize)?.clone();
+                    (*variant, row)
+                };
+                let mut hit = None;
+                for (f, &(field_off, field_size)) in row.iter().enumerate() {
+                    let (field_off, field_size) =
+                        (field_off as usize, field_size as usize);
+                    if field_size > 0 && pos >= field_off && pos < field_off + field_size
+                    {
+                        hit = Some((f, field_off));
+                        break;
+                    }
+                }
+                let Some((f, field_off)) = hit else {
+                    return Some(Err(ByteVerdict::Padding(pos)));
+                };
+                let tag = self.adt_field_tag(name, variant as usize, f)?;
+                let field_layout = self.byte_layout_of_tag(&tag)?;
+                if self.byte_layout_size(&field_layout)? != row[f].1 as usize {
+                    return None;
+                }
+                let Value::Enum { fields, .. } = slot else {
+                    return None;
+                };
+                let field = fields.get_mut(f)?;
+                self.splice_storage_byte(field, &field_layout, pos - field_off, byte)
+            }
+        }
+    }
+
+    /// The error a judged byte-view verdict reports.
+    fn byte_view_error(
+        &self,
+        verdict: ByteVerdict,
+        func: &str,
+        place: &str,
+        read: bool,
+    ) -> InterpError {
+        let verb = if read { "read" } else { "write" };
+        match verdict {
+            ByteVerdict::Uninit => InterpError::UninitializedRead {
+                func: func.to_string(),
+                place: place.to_string(),
+            },
+            ByteVerdict::Outside(pos) => InterpError::UnsupportedProjection {
+                kind: format!(
+                    "{verb} through a byte pointer at position {pos}, \
+                     outside the value's storage"
+                ),
+            },
+            ByteVerdict::Padding(pos) => InterpError::UnsupportedProjection {
+                kind: format!(
+                    "{verb} through a byte pointer at position {pos}, \
+                     which falls in the padding of the value's layout"
+                ),
+            },
+            ByteVerdict::InvalidChar(v) => InterpError::UnsupportedProjection {
+                kind: format!("byte write assembles the invalid char value {v:#x}"),
+            },
+        }
+    }
+
+    /// The base value, declared base type, and error context
+    /// of a place/static target, for the byte view (see
+    /// [`Self::byte_view_read`]). `None` for targets the view
+    /// does not judge (an allocation, a constant aggregate) and
+    /// for a base whose declared type is not recorded.
+    fn byte_view_base<'t>(
+        &self,
+        frames: &[Frame],
+        target: &'t Resolved,
+    ) -> Option<(&'t Vec<RefProj>, Value, Ty, String, String)> {
+        match target {
+            Resolved::Place {
+                frame_pos,
+                local,
+                projection,
+            } => {
+                let frame = frames.get(*frame_pos)?;
+                let base = frame.locals.get(*local)?.clone();
+                let body = self.program().functions.get(&frame.func)?;
+                let base_ty = body.local_tys.get(*local)?.clone();
+                Some((
+                    projection,
+                    base,
+                    base_ty,
+                    frame.func.clone(),
+                    describe_resolved(*local, projection),
+                ))
+            }
+            Resolved::Static { name, projection } => {
+                let base = self.static_base(name).ok()?;
+                let base_ty = self.program().static_tys.get(name)?.clone();
+                let func = frames
+                    .last()
+                    .map(|f| f.func.clone())
+                    .unwrap_or_else(|| "<static>".to_string());
+                Some((
+                    projection,
+                    base,
+                    base_ty,
+                    func,
+                    format!("static {name}"),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// A shaped whole-pointee load through a byte-displaced
+    /// target (see [`Self::shaped_load`]): the load's bytes are
+    /// composed one by one through the byte view, little-endian,
+    /// and the composed pattern is constructed through the
+    /// shape — the same composition `read_punned_int` performs
+    /// for a type-punned pointer. `None` when the byte view
+    /// does not judge the target or any of the load's bytes.
+    fn byte_view_shaped_load(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        shape: &ScalarShape,
+    ) -> Option<InterpResult<Value>> {
+        let width = (shape.bits() / 8) as usize;
+        if width == 0 || width > 16 {
+            return None;
+        }
+        let mut bits: u128 = 0;
+        for k in 0..width {
+            match self.byte_view_read(frames, target, k as i128, false)? {
+                Ok(Value::Uint(b)) => bits |= (b & 0xff) << (8 * k),
+                Ok(_) => return None,
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        Some(self.construct_scalar(bits, shape))
+    }
+
+    /// Compose a shaped scalar load at a target's structural
+    /// position through the byte view: a byte pointer (or a
+    /// scalar format argument) aimed at the base of an
+    /// aggregate value denotes the bytes at that position, not
+    /// the aggregate — a `*const u8` at a struct's address
+    /// reads the struct's first byte. The composition applies
+    /// only when the value at the position is not already a
+    /// scalar the shape flattens (that load is the plain one),
+    /// and only when every byte of the shape's width is judged
+    /// by the recorded layout; anything else is left to the
+    /// existing paths.
+    fn byte_view_compose(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        shape: &ScalarShape,
+    ) -> Option<InterpResult<Value>> {
+        if !matches!(
+            shape,
+            ScalarShape::Int { .. }
+                | ScalarShape::Float { .. }
+                | ScalarShape::Bool
+                | ScalarShape::Char
+        ) {
+            return None;
+        }
+        let width = (shape.bits() / 8) as usize;
+        if width == 0 || width > 16 {
+            return None;
+        }
+        let (projection, base, base_ty, func, place_desc) =
+            self.byte_view_base(frames, target)?;
+        if projection
+            .iter()
+            .any(|s| matches!(s, RefProj::ByteOffset(_)))
+        {
+            return None;
+        }
+        let (pos, _) = self.projection_storage_offset(&base_ty, projection)?;
+        let position_value =
+            project_value(base.clone(), projection, &func, &place_desc).ok()?;
+        if self.flatten_scalar(&position_value, shape).is_ok() {
+            return None;
+        }
+        let layout = self.byte_layout_of_ty(&base_ty)?;
+        let mut bits: u128 = 0;
+        for k in 0..width {
+            match self.storage_byte(&base, &layout, pos + k)? {
+                Ok(byte) => bits |= u128::from(byte) << (8 * k),
+                Err(verdict) => {
+                    return Some(Err(self.byte_view_error(
+                        verdict,
+                        &func,
+                        &place_desc,
+                        true,
+                    )))
+                }
+            }
+        }
+        Some(self.construct_scalar(bits, shape))
+    }
+
+    /// The pointee a format argument of scalar type `ty`
+    /// (the argument's rendered type tag) denotes through a
+    /// byte-displaced target: the tag is the load's width, so
+    /// the byte view composes the value exactly (see
+    /// [`Self::byte_view_shaped_load`]). `None` when the tag
+    /// names no scalar shape, the target is not a reference to
+    /// a judged position, or the view does not judge it.
+    pub(crate) fn byte_view_fmt_arg(
+        &self,
+        frames: &[Frame],
+        target: &Value,
+        ty: &str,
+    ) -> Option<InterpResult<Value>> {
+        let shape = match ty.trim() {
+            "bool" => ScalarShape::Bool,
+            "char" => ScalarShape::Char,
+            "i8" => ScalarShape::Int { bits: 8, signed: true },
+            "i16" => ScalarShape::Int { bits: 16, signed: true },
+            "i32" => ScalarShape::Int { bits: 32, signed: true },
+            "i64" => ScalarShape::Int { bits: 64, signed: true },
+            "i128" => ScalarShape::Int { bits: 128, signed: true },
+            "isize" => ScalarShape::Int { bits: 64, signed: true },
+            "u8" => ScalarShape::Int { bits: 8, signed: false },
+            "u16" => ScalarShape::Int { bits: 16, signed: false },
+            "u32" => ScalarShape::Int { bits: 32, signed: false },
+            "u64" => ScalarShape::Int { bits: 64, signed: false },
+            "u128" => ScalarShape::Int { bits: 128, signed: false },
+            "usize" => ScalarShape::Int { bits: 64, signed: false },
+            "f16" => ScalarShape::Float { bits: 16 },
+            "f32" => ScalarShape::Float { bits: 32 },
+            "f64" => ScalarShape::Float { bits: 64 },
+            "f128" => ScalarShape::Float { bits: 128 },
+            _ => return None,
+        };
+        let resolved = self.deref_value(frames, target).ok()?;
+        self.byte_view_shaped_load(frames, &resolved, &shape)
+            .or_else(|| self.byte_view_compose(frames, &resolved, &shape))
+    }
+
+    /// A shaped whole-pointee store through a byte-displaced
+    /// target (see [`Self::shaped_store`]): the value's bytes
+    /// are spliced into a clone of the base value through the
+    /// byte view, and the composed base is written back whole,
+    /// so a position the view cannot judge leaves the store
+    /// exactly as it was (the caller keeps the existing path)
+    /// and a judged position is never half-written.
+    fn byte_view_shaped_store(
+        &self,
+        frames: &mut Vec<Frame>,
+        target: &Resolved,
+        value: &Value,
+        shape: &ScalarShape,
+    ) -> Option<InterpResult<()>> {
+        let bits = self.flatten_scalar(value, shape).ok()?;
+        let width = (shape.bits() / 8) as usize;
+        if width == 0 || width > 16 {
+            return None;
+        }
+        let (projection, mut base, base_ty, func, place_desc) =
+            self.byte_view_base(frames, target)?;
+        let pos = if projection
+            .iter()
+            .any(|s| matches!(s, RefProj::ByteOffset(_)))
+        {
+            match self.byte_view_position(&base_ty, projection, 0)? {
+                Ok(p) => p,
+                Err(neg) => {
+                    return Some(Err(InterpError::UnsupportedProjection {
+                        kind: format!(
+                            "write through a pointer displaced {neg} bytes from a value boundary"
+                        ),
+                    }))
+                }
+            }
+        } else {
+            // A shaped store aimed at a structural position
+            // whose storage is wider than the shape — a byte
+            // store at an element's first byte, whose target
+            // the offset evaluation absorbed into the element
+            // index, or at an aggregate's base: the plain
+            // whole-value store would replace the whole element
+            // or aggregate with the byte, so the shape's bytes
+            // are spliced at the position instead. A position
+            // the shape already covers exactly (a plain scalar
+            // store) keeps the whole-value store.
+            let (off, pos_ty) = self.projection_storage_offset(&base_ty, projection)?;
+            let position_value =
+                project_value(base.clone(), projection, &func, &place_desc).ok()?;
+            let wider_scalar = matches!(
+                (&pos_ty, &position_value),
+                (Some(t), Value::Int(_) | Value::Uint(_) | Value::Float(_) | Value::Float128(_) | Value::Bool(_))
+                    if self.ty_size(t).is_some_and(|s| s as usize > width)
+            );
+            let aggregate = matches!(
+                position_value,
+                Value::Tuple(_) | Value::Enum { .. } | Value::Bytes(_) | Value::Str(_)
+            );
+            if !wider_scalar && !aggregate {
+                return None;
+            }
+            off
+        };
+        let layout = self.byte_layout_of_ty(&base_ty)?;
+        for k in 0..width {
+            let byte = ((bits >> (8 * k)) & 0xff) as u8;
+            match self.splice_storage_byte(&mut base, &layout, pos + k, byte)? {
+                Ok(()) => {}
+                Err(verdict) => {
+                    return Some(Err(self.byte_view_error(
+                        verdict,
+                        &func,
+                        &place_desc,
+                        false,
+                    )))
+                }
+            }
+        }
+        let base_target = match target {
+            Resolved::Place {
+                frame_pos, local, ..
+            } => Resolved::Place {
+                frame_pos: *frame_pos,
+                local: *local,
+                projection: Vec::new(),
+            },
+            Resolved::Static { name, .. } => Resolved::Static {
+                name: name.clone(),
+                projection: Vec::new(),
+            },
+            _ => return None,
+        };
+        Some(self.write_resolved(frames, &base_target, base))
+    }
+
+    /// Read the byte a byte-displaced place/static target
+    /// denotes, `extra` bytes past the displaced position (a
+    /// sequence access's byte index; zero for a direct deref of
+    /// a byte pointer, whose caller has established the access
+    /// is one byte wide). `None` when the byte view does not
+    /// judge the target (see the byte view above); the caller
+    /// then keeps the existing path. A sequence access over a
+    /// bare scalar target is the existing indexed byte view's
+    /// own case (its storage is the widened slot's), so the
+    /// view declines it there and judges scalars only for the
+    /// direct deref, whose width is the declared type's.
+    fn byte_view_read(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        extra: i128,
+        seq: bool,
+    ) -> Option<InterpResult<Value>> {
+        let (projection, base, base_ty, func, place_desc) =
+            self.byte_view_base(frames, target)?;
+        let pos = match self.byte_view_position(&base_ty, projection, extra)? {
+            Ok(p) => p,
+            Err(neg) => {
+                return Some(Err(InterpError::UnsupportedProjection {
+                    kind: format!(
+                        "read through a pointer displaced {neg} bytes from a value boundary"
+                    ),
+                }))
+            }
+        };
+        let layout = self.byte_layout_of_ty(&base_ty)?;
+        if seq && matches!(layout, ByteLayout::Scalar(_)) {
+            return None;
+        }
+        match self.storage_byte(&base, &layout, pos)? {
+            Ok(byte) => Some(Ok(Value::Uint(u128::from(byte)))),
+            Err(verdict) => {
+                Some(Err(self.byte_view_error(verdict, &func, &place_desc, true)))
+            }
+        }
+    }
+
+    /// Write `value` (a byte value) through a byte-displaced
+    /// place/static target, `extra` bytes past the displaced
+    /// position (see [`Self::byte_view_read`] for the contract).
+    fn byte_view_write(
+        &self,
+        frames: &mut Vec<Frame>,
+        target: &Resolved,
+        extra: i128,
+        value: &Value,
+        seq: bool,
+    ) -> Option<InterpResult<()>> {
+        let byte = value_as_storage_byte(value)?;
+        let (projection, base_ty, func, place_desc) = match target {
+            Resolved::Place {
+                frame_pos,
+                local,
+                projection,
+            } => {
+                let frame = frames.get(*frame_pos)?;
+                let body = self.program().functions.get(&frame.func)?;
+                let base_ty = body.local_tys.get(*local)?.clone();
+                (
+                    projection,
+                    base_ty,
+                    frame.func.clone(),
+                    describe_resolved(*local, projection),
+                )
+            }
+            Resolved::Static { name, projection } => {
+                let base_ty = self.program().static_tys.get(name)?.clone();
+                (
+                    projection,
+                    base_ty,
+                    "<static>".to_string(),
+                    format!("static {name}"),
+                )
+            }
+            _ => return None,
+        };
+        let pos = match self.byte_view_position(&base_ty, projection, extra)? {
+            Ok(p) => p,
+            Err(neg) => {
+                return Some(Err(InterpError::UnsupportedProjection {
+                    kind: format!(
+                        "write through a pointer displaced {neg} bytes from a value boundary"
+                    ),
+                }))
+            }
+        };
+        let layout = self.byte_layout_of_ty(&base_ty)?;
+        if seq && matches!(layout, ByteLayout::Scalar(_)) {
+            return None;
+        }
+        let verdict = match target {
+            Resolved::Place {
+                frame_pos, local, ..
+            } => {
+                let slot = frames.get_mut(*frame_pos)?.locals.get_mut(*local)?;
+                self.splice_storage_byte(slot, &layout, pos, byte)?
+            }
+            Resolved::Static { name, .. } => {
+                let mut store = self.statics.borrow_mut();
+                let slot = store.get_mut(name)?;
+                self.splice_storage_byte(slot, &layout, pos, byte)?
+            }
+            _ => return None,
+        };
+        Some(match verdict {
+            Ok(()) => Ok(()),
+            Err(verdict) => Err(self.byte_view_error(verdict, &func, &place_desc, false)),
+        })
+    }
+
+    /// The declared type of the value a place denotes, walked
+    /// over the place's own projection (the type a direct deref
+    /// of the place reads or writes). `None` when a step's type
+    /// is not determined by the local's declared type alone (a
+    /// field of an ADT, a deref of an ADT-typed local such as a
+    /// `Box`).
+    fn place_result_ty(&self, body: &Body, place: &Place) -> Option<Ty> {
+        let mut ty = body.local_ty(place.local)?.clone();
+        for elem in &place.projection {
+            ty = match (elem, &ty) {
+                (ProjectionElem::Deref, Ty::Ref(inner)) => (**inner).clone(),
+                (ProjectionElem::Field(i), Ty::Tuple(ts)) => ts.get(*i)?.clone(),
+                (ProjectionElem::Index(_), Ty::Array(elem, _)) => (**elem).clone(),
+                (ProjectionElem::Index(_), Ty::Slice(elem)) => (**elem).clone(),
+                (ProjectionElem::ConstantIndex { .. }, Ty::Array(elem, _)) => {
+                    (**elem).clone()
+                }
+                (ProjectionElem::ConstantIndex { .. }, Ty::Slice(elem)) => (**elem).clone(),
+                (ProjectionElem::Downcast(_), t) => t.clone(),
+                (ProjectionElem::Subslice { .. }, Ty::Array(elem, _)) => {
+                    Ty::Array(elem.clone(), 0)
+                }
+                (ProjectionElem::Subslice { .. }, Ty::Slice(elem)) => {
+                    Ty::Slice(elem.clone())
+                }
+                _ => return None,
+            };
+        }
+        Some(ty)
+    }
+
+    /// Whether the byte view judges byte positions over the
+    /// position `projection` denotes in a place/static target:
+    /// the position's declared type is an ADT instance with a
+    /// recorded field layout and the value there is the ADT
+    /// aggregate. Over such a position a byte displacement
+    /// denotes a storage byte, never an element index into the
+    /// field vector, so `offset_projection` must not absorb it
+    /// into one: an ADT's fields are not its elements, and a
+    /// byte offset reinterpreted as a field index names a
+    /// different field than the byte's (a byte-2 read over a
+    /// three-field struct returned the third field's first
+    /// byte). Positions the view cannot judge — a tuple field's
+    /// interior, an ADT with no recorded layout, a value that
+    /// is not the aggregate — keep the absorption unchanged.
+    fn byte_view_covers(
+        &self,
+        frames: &[Frame],
+        place: Option<(u64, usize)>,
+        static_name: Option<&str>,
+        projection: &[RefProj],
+        base: Option<&Value>,
+    ) -> bool {
+        let base_ty = match (static_name, place) {
+            (Some(name), _) => self.program().static_tys.get(name).cloned(),
+            (None, Some((frame_id, local))) => {
+                let pos = self.frame_pos(frames, frame_id).ok();
+                pos.and_then(|pos| {
+                    let frame = frames.get(pos)?;
+                    let body = self.program().functions.get(&frame.func)?;
+                    body.local_tys.get(local).cloned()
+                })
+            }
+            (None, None) => None,
+        };
+        let Some(base_ty) = base_ty else { return false };
+        let Some((_, Some(Ty::Adt(name)))) =
+            self.projection_storage_offset(&base_ty, projection)
+        else {
+            return false;
+        };
+        if !self.program().adt_field_layouts.contains_key(&name) {
+            return false;
+        }
+        let Some(base) = base else { return false };
+        matches!(
+            project_value(base.clone(), projection, "<offset>", "pointer target"),
+            Ok(Value::Enum { .. })
+        )
     }
 
     /// The integer a sequence target denotes as a whole, when a
@@ -9406,6 +10461,19 @@ impl<'a> Interpreter<'a> {
         place: &Place,
     ) -> InterpResult<Value> {
         let target = self.resolve_place(frames, body, place)?;
+        // A direct deref of a byte pointer (the place's own type
+        // is one byte wide) into a byte-displaced target: the
+        // byte view of the base value's storage owns the read.
+        if let Some(ty) = self.place_result_ty(body, place) {
+            if matches!(
+                ty,
+                Ty::Uint(UintTy::U8) | Ty::Int(IntTy::I8) | Ty::Bool
+            ) {
+                if let Some(view) = self.byte_view_read(frames, &target, 0, false) {
+                    return view;
+                }
+            }
+        }
         // Read through the borrowing form: a projected read lends
         // the denoted value out of the frame's storage, so only
         // the projected part is cloned into the owned result,
@@ -9424,6 +10492,20 @@ impl<'a> Interpreter<'a> {
         value: Value,
     ) -> InterpResult<()> {
         let target = self.resolve_place_mode(frames, body, place, false)?;
+        // A direct deref of a byte pointer (see `read_place`):
+        // the byte view of the base value's storage owns the
+        // write.
+        if let Some(ty) = self.place_result_ty(body, place) {
+            if matches!(
+                ty,
+                Ty::Uint(UintTy::U8) | Ty::Int(IntTy::I8) | Ty::Bool
+            ) {
+                if let Some(view) = self.byte_view_write(frames, &target, 0, &value, false)
+                {
+                    return view;
+                }
+            }
+        }
         self.write_resolved(frames, &target, value)
     }
 
@@ -10390,6 +11472,13 @@ impl<'a> Interpreter<'a> {
         shape: &ScalarShape,
     ) -> InterpResult<Value> {
         let elem_block = matches!(target, Resolved::Alloc { id, .. } if self.is_elem_block(*id));
+        // A byte-displaced place/static target: the load's
+        // bytes are the byte view's to compose (the resolved
+        // read below has no byte-level view of the base value's
+        // storage).
+        if let Some(view) = self.byte_view_shaped_load(frames, target, shape) {
+            return view;
+        }
         match self.read_resolved(frames, target) {
             Ok(v) => {
                 if let Ok(bits) = self.flatten_scalar(&v, shape) {
@@ -10407,6 +11496,13 @@ impl<'a> Interpreter<'a> {
                 if elem_block || seq_base {
                     let bits = self.shaped_bits_from_elements(frames, target, shape)?;
                     return self.construct_scalar(bits, shape);
+                }
+                // A scalar load aimed at an aggregate position
+                // (a byte pointer at a struct's base): the bytes
+                // at the position are the load's value, composed
+                // through the byte view.
+                if let Some(view) = self.byte_view_compose(frames, target, shape) {
+                    return view;
                 }
                 Ok(v)
             }
@@ -10478,6 +11574,12 @@ impl<'a> Interpreter<'a> {
                 }
                 return Ok(());
             }
+        }
+        // A byte-displaced place/static target: the store's
+        // bytes are spliced through the byte view of the base
+        // value's storage (see `shaped_load`).
+        if let Some(view) = self.byte_view_shaped_store(frames, target, &value, shape) {
+            return view;
         }
         self.write_resolved(frames, target, value)
     }
@@ -11832,6 +12934,63 @@ fn subslice_value(value: &Value, offset: usize, len: usize) -> Option<Value> {
         Value::Str(text) => Some(Value::Str(text.get(offset..end)?.to_string())),
         _ => None,
     }
+}
+
+/// A scalar shape for the byte view of a value's storage (see
+/// `Interpreter::storage_byte`): the scalar's bytes are its own
+/// declared width's, extracted from the stored value's kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ByteScalar {
+    Int(IntTy),
+    Uint(UintTy),
+    Float(FloatTy),
+    Bool,
+    /// A `char` field's storage: its code point's four bytes.
+    /// (`char` locals ride as `u32` in the IR type model; the
+    /// shape arises from ADT field tags.)
+    Char,
+}
+
+impl ByteScalar {
+    /// The scalar's storage width in bytes.
+    fn width(self) -> usize {
+        match self {
+            ByteScalar::Int(t) => (t.bits() / 8) as usize,
+            ByteScalar::Uint(t) => (t.bits() / 8) as usize,
+            ByteScalar::Float(t) => (t.bits() / 8) as usize,
+            ByteScalar::Bool => 1,
+            ByteScalar::Char => 4,
+        }
+    }
+}
+
+/// The layout the byte view of a value's storage descends by
+/// (see `Interpreter::storage_byte`).
+#[derive(Clone, Debug)]
+enum ByteLayout {
+    Scalar(ByteScalar),
+    /// Elements of one layout repeated: (element layout,
+    /// element size in bytes, element count).
+    Seq(Box<ByteLayout>, usize, usize),
+    /// An ADT instance by its rendered name, resolved through
+    /// the recorded field layouts and debug shapes.
+    Adt(String),
+}
+
+/// The verdict a judged byte-view position meets (see
+/// `Interpreter::storage_byte`).
+#[derive(Clone, Copy, Debug)]
+enum ByteVerdict {
+    /// The byte's storage was never written.
+    Uninit,
+    /// The position is outside the value's storage.
+    Outside(usize),
+    /// The position falls in the padding between an ADT's
+    /// fields: it has no byte to read.
+    Padding(usize),
+    /// A byte write into a `char` field assembled a value that
+    /// is not a `char`.
+    InvalidChar(u32),
 }
 
 fn index_oob(len: usize, index: usize) -> InterpError {

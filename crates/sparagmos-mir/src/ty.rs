@@ -83,6 +83,22 @@ pub type StaticTys = std::collections::HashMap<DefId, Ty>;
 /// interpreter.
 pub type AdtLayouts = std::collections::HashMap<String, (u64, u64)>;
 
+/// Per-variant field byte layouts of the monomorphic ADT
+/// instances in a program: `variants[v][f]` is the (byte
+/// offset, byte size) of field `f` of variant `v`, fields in
+/// declaration order, as the compiler's layout query gives
+/// them. Keyed like [`AdtLayouts`] by the rendered instance
+/// name. The driver fills one entry per instance it records a
+/// layout for; unions get no entry (their fields share one
+/// offset, and the value model reads them through its own
+/// reinterpretation machinery). The interpreter's byte view of
+/// a value's storage (raw byte pointer reads and writes into
+/// an ADT value) resolves byte positions through this table:
+/// a position inside one field's span is that field's byte,
+/// and a position in the padding between fields has no byte
+/// to read.
+pub type AdtFieldLayouts = std::collections::HashMap<String, Vec<Vec<(u64, u64)>>>;
+
 /// The storage-slot map of one monomorphic coroutine instance:
 /// which slot of the interpreter's flat coroutine field vector
 /// each state field of the compiler's state-machine layout lives

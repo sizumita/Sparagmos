@@ -110,9 +110,12 @@ pub enum RefProj {
     /// into the middle of a scalar's or struct's storage is the
     /// canonical case. The step faithfully denotes the position (it
     /// participates in pointer identity and in further offsets,
-    /// which accumulate), but reading or writing through it is an
-    /// explicit error: the model has no byte-level view of a value's
-    /// storage to reinterpret. A zero displacement never appears;
+    /// which accumulate). Reading or writing through it resolves
+    /// through the interpreter's byte view of the target value's
+    /// storage when the target is a place or static whose declared
+    /// type and recorded field layouts determine the position's
+    /// byte exactly; where they do not, the access is an explicit
+    /// error at the use site. A zero displacement never appears;
     /// offset evaluation absorbs or drops it.
     ByteOffset(i128),
 }

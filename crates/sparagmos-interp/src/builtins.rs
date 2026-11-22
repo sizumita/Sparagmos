@@ -20584,7 +20584,16 @@ impl<'a> Interpreter<'a> {
                         }
                     }
                 }
-                let pointee = self.resolve_value(frames, target)?;
+                // A scalar argument read through a
+                // byte-displaced pointer: the argument's type
+                // tag is the load's width, and the byte view of
+                // the base value's storage composes it (the
+                // resolved read has no byte-level view of that
+                // storage).
+                let pointee = match self.byte_view_fmt_arg(frames, target, ty) {
+                    Some(view) => view?,
+                    None => self.resolve_value(frames, target)?,
+                };
                 self.format_value(frames, &pointee, *trait_, ty, options, indent)
             }
             Value::FmtCount(_) => Err(template_error(

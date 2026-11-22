@@ -10518,31 +10518,37 @@ fn main() {
     let arr = [10i32, 20, 30, 40];
     unsafe {
         let b = (arr.as_ptr() as *const u8).byte_add(1);
-        let _x = *(b as *const i32);
+        let x = *(b as *const i32);
+        assert_eq!(x, 0x1400_0000);
+        let y = *((arr.as_ptr() as *const u8).byte_add(4));
+        assert_eq!(y, 20);
+        let z = *((arr.as_ptr() as *const u8).byte_add(5));
+        assert_eq!(z, 0);
     }
-    println!("unreachable");
+    println!("ok");
 }
 "#;
 
 #[test]
-fn run_mode_ptr_byte_displaced_read_is_explicit_unsupported() {
+fn run_mode_ptr_byte_displaced_reads_match_native() {
     // A pointer displaced by a non-element number of bytes denotes
-    // a position between elements: the model carries the
-    // displacement but reading through it is an explicit
-    // unsupported error, never a silent wrong value.
+    // a position between elements: the load/store path reads and
+    // writes it through the type-width byte view of the value's
+    // storage (Lane LP, #228), composing the very bytes the native
+    // program reads — an unaligned i32 load across an element
+    // boundary and single bytes inside elements — never a silent
+    // wrong value. Positions the byte view cannot judge (padding,
+    // outside the storage) remain explicit unsupported errors.
     let dir = temp_dir("ptr-byte-displaced");
     let src = fixture(&dir, "ptr_byte_displaced.rs", PTR_BYTE_DISPLACED_READ_SRC);
     let out = run_driver(&src);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         out.status.code(),
-        Some(2),
-        "byte-displaced read must be an explicit unsupported; stderr={stderr}"
+        Some(0),
+        "byte-displaced reads must run with native values; stderr={stderr}"
     );
-    assert!(
-        stderr.contains("displaced"),
-        "the reason names the displacement; stderr={stderr}"
-    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
 }
 
 const PTR_SLICE_SRC: &str = r#"
