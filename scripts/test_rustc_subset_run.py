@@ -40,6 +40,20 @@ class HeaderTests(unittest.TestCase):
         self.assertEqual(h.values("edition"), ["2018"])
         self.assertEqual(h.values("failure-status"), ["7"])
 
+    def test_directive_with_trailing_remark(self):
+        # compiletest ends the directive name at the first space;
+        # an unbalanced parenthesized remark must not drop the
+        # directive (mirrors compiletest's line parser).
+        h = header("//@ build-pass (FIXME(62277): could be check-pass?\n")
+        self.assertTrue(h.has("build-pass"))
+        self.assertEqual(
+            run.compile_expectation("ui", h), "success")
+
+    def test_directive_with_balanced_remark_keeps_paren_value(self):
+        h = header("//@ check-pass (a remark)\n")
+        self.assertTrue(h.has("check-pass"))
+        self.assertEqual(h.values("check-pass"), ["a remark"])
+
     def test_non_directive_lines_ignored(self):
         h = header("// run-pass\n/* //@ run-fail */\n")
         self.assertIsNone(run.run_mode(h))

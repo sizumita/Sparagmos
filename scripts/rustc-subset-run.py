@@ -125,7 +125,14 @@ DRIVER_TIMEOUT = 60
 # `[lib] compile-flags: --crate-type lib` would have named).
 DIRECTIVE_RE = re.compile(
     r"^\s*//@\s*(?:\[([^\]]+)\])?\s*([a-zA-Z][a-zA-Z0-9-]*)"
-    r"(?:\s*:\s*(.*?)|\s*\((.*)\))?\s*$")
+    r"(?:\s*:\s*(.*?)|\s*\((.*)\)|\s+.*)?\s*$")
+
+# The last alternative above is a trailing remark: compiletest
+# ends the directive name at the first colon or space and treats
+# the rest of the line as a remark, so a line such as
+# `//@ build-pass (FIXME(62277): could be check-pass?` (unbalanced
+# parenthesis) still declares the directive. Without it the whole
+# line failed to match and the directive was silently dropped.
 
 RUN_MODES = ("run-pass", "run-fail", "run-crash")
 
