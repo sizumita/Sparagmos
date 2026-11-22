@@ -14089,3 +14089,109 @@ fn run_mode_enum_wrapper_transmutes() {
         "enum-wrapper-ok\n",
     );
 }
+
+// ---------------------------------------------------------------------
+// Async block state storage (Lane JY, Issue #186): a coroutine's
+// upvar storage and its per-state saved storage are distinct even
+// where their field indices coincide. An async block keeps its
+// captures in the upvar storage and reads them back after a
+// suspension whose saved field 0 is the awaitee; an async fn's
+// transform copies the capture into the state instead. Both shapes
+// (and nesting, and dropping a suspended block future) must run.
+
+const ASYNC_BLOCK_STATE_SRC: &str = r#"
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll, Wake, Waker};
+
+struct Nop;
+impl Wake for Nop {
+    fn wake(self: Arc<Self>) {}
+}
+
+struct YieldOnce(bool);
+impl Future for YieldOnce {
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        if self.0 {
+            Poll::Ready(())
+        } else {
+            self.0 = true;
+            Poll::Pending
+        }
+    }
+}
+
+fn async_block(x: u8) -> impl Future<Output = u8> {
+    async move {
+        YieldOnce(false).await;
+        x
+    }
+}
+
+fn two_awaits(a: u8, b: u8) -> impl Future<Output = u8> {
+    async move {
+        YieldOnce(false).await;
+        let c = a + 1;
+        YieldOnce(false).await;
+        c + b
+    }
+}
+
+fn nested(x: u8) -> impl Future<Output = u8> {
+    async move {
+        let inner = async move {
+            YieldOnce(false).await;
+            x + 1
+        };
+        inner.await
+    }
+}
+
+fn string_upvar() -> impl Future<Output = usize> {
+    let s = String::from("hello");
+    async move {
+        YieldOnce(false).await;
+        s.len()
+    }
+}
+
+fn main() {
+    let waker = Waker::from(Arc::new(Nop));
+    let mut cx = Context::from_waker(&waker);
+
+    let mut fut = Box::pin(async_block(9));
+    assert_eq!(Poll::Pending, fut.as_mut().poll(&mut cx));
+    assert_eq!(Poll::Ready(9), fut.as_mut().poll(&mut cx));
+
+    let mut fut = Box::pin(two_awaits(9, 3));
+    assert_eq!(Poll::Pending, fut.as_mut().poll(&mut cx));
+    assert_eq!(Poll::Pending, fut.as_mut().poll(&mut cx));
+    assert_eq!(Poll::Ready(13), fut.as_mut().poll(&mut cx));
+
+    let mut fut = Box::pin(nested(10));
+    assert_eq!(Poll::Pending, fut.as_mut().poll(&mut cx));
+    assert_eq!(Poll::Ready(11), fut.as_mut().poll(&mut cx));
+
+    // A suspended block future holding a non-Copy capture drops
+    // its saved state and the capture.
+    let mut fut = Box::pin(string_upvar());
+    assert_eq!(Poll::Pending, fut.as_mut().poll(&mut cx));
+    drop(fut);
+    let mut fut = Box::pin(string_upvar());
+    assert_eq!(Poll::Pending, fut.as_mut().poll(&mut cx));
+    assert_eq!(Poll::Ready(5), fut.as_mut().poll(&mut cx));
+
+    println!("async-block-state-ok");
+}
+"#;
+
+#[test]
+fn run_mode_async_block_state_storage() {
+    run_ok_edition(
+        "async-block-state",
+        ASYNC_BLOCK_STATE_SRC,
+        "async-block-state-ok\n",
+    );
+}
