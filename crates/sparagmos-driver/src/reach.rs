@@ -374,6 +374,7 @@ pub fn collect_reachable(
             let canonical = sparagmos_interp::builtins::canonical_name(&def_name);
             if sparagmos_interp::builtins::lookup(&canonical).is_some()
                 && !consumer_instance_needs_body(&canonical, &args)
+                && !partial_eq_ref_instance_needs_body(&canonical, &args)
             {
                 if builtin_seen.insert(def_id) {
                     records.push(Record {
@@ -1079,6 +1080,37 @@ fn consumer_instance_needs_body(canonical: &str, args: &GenericArgs) -> bool {
         return false;
     };
     !iterator_self_modelled(ty)
+}
+
+/// Whether a call target naming `PartialEq::eq` / `ne` whose
+/// `Self` type is a reference must still have its instance body
+/// collected: that instance is core's blanket impl for `&A`,
+/// whose body is a dereference plus a call to `A`'s own `eq`.
+/// The builtin's structural comparison cannot serve it — it
+/// compares the pointees field by field, which is a different
+/// result whenever `A`'s `eq` is hand-written or derived over a
+/// field with a hand-written `eq` (a derived `PartialEq` compares
+/// its fields through exactly this blanket impl). The blanket
+/// body is tiny and its inner call resolves by the ordinary
+/// rules, so collecting it is the faithful execution; every
+/// non-reference `Self` keeps the builtin model.
+fn partial_eq_ref_instance_needs_body(canonical: &str, args: &GenericArgs) -> bool {
+    if !matches!(
+        canonical,
+        "std::cmp::PartialEq::eq"
+            | "core::cmp::PartialEq::eq"
+            | "std::cmp::PartialEq::ne"
+            | "core::cmp::PartialEq::ne"
+    ) {
+        return false;
+    }
+    let Some(GenericArgKind::Type(ty)) = args.0.first() else {
+        return false;
+    };
+    matches!(
+        guarded_ty_kind(ty),
+        Some(TyKind::RigidTy(RigidTy::Ref(..)))
+    )
 }
 
 /// The Stable MIR counterpart of the interpreter's modelled
