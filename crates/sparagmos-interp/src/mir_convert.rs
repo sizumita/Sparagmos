@@ -8140,35 +8140,43 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
             plans.push(self.one_variant_fields(def, args, v)?);
         }
         // When the driver recorded the instance's storage-slot
-        // map, the value's state fields live at layout slots, not
-        // at variant-relative positions: re-index each state's
-        // field plans by slot, so the glue reads the cell the
-        // body wrote. Variant 0 is the unresumed state, whose
-        // fields are the upvars themselves and already
-        // slot-positional. Plans are padded to the instance's
-        // full slot count with trivial entries, so the plan
-        // covers every cell the value can hold.
+        // map, the conversion rewrote the body's state-field
+        // projections to bare slot fields, so at run time the
+        // state fields live in the value's flat field vector -
+        // the storage a bare field step addresses - and not in
+        // the per-state saved storage the glue's `Fields` arm
+        // reads for a suspended coroutine. A slot-indexed
+        // `Fields` plan would be judged against that saved
+        // storage: its entries past the saved vector's length
+        // read as never written and are silently skipped, and
+        // the surviving indices name the wrong cells. Address
+        // each state's field plans at their slots directly
+        // instead: an `At` step carrying the bare slot field
+        // resolves, through the ordinary projectors, to the
+        // cell the body wrote. Variant 0 is the unresumed
+        // state, whose fields are the upvars themselves; its
+        // positional `Fields` plan already addresses the upvar
+        // storage in exactly that way, so it is left alone.
         let key = crate::builtins::ty_tag(&mir::Ty::Coroutine(def, args.to_vec()), conv.names);
         if let Some(slots) = conv.coroutine_layouts.get(&key) {
-            let total = slots
-                .variants
-                .iter()
-                .flatten()
-                .max()
-                .map(|m| *m as usize + 1)
-                .unwrap_or(0);
             for (v, plan) in plans.iter_mut().enumerate().skip(1) {
                 let Some(variant_slots) = slots.variants.get(v) else {
                     continue;
                 };
                 if let P::Fields { fields, .. } = plan {
-                    let mut by_slot = vec![P::Trivial; total];
+                    let mut steps: Vec<P> = Vec::new();
                     for (f, field_plan) in fields.drain(..).enumerate() {
+                        if field_plan == P::Trivial {
+                            continue;
+                        }
                         if let Some(slot) = variant_slots.get(f) {
-                            by_slot[*slot as usize] = field_plan;
+                            steps.push(P::At {
+                                path: vec![RefProj::Field(*slot as usize)],
+                                plan: Box::new(field_plan),
+                            });
                         }
                     }
-                    *fields = by_slot;
+                    *plan = P::Seq(steps);
                 }
             }
         }
