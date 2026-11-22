@@ -10390,3 +10390,166 @@ fn run_mode_assert_inhabited_is_a_no_op() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
 }
+
+
+const ALLOC_CYCLE_SRC: &str = r#"
+use std::alloc::{alloc, alloc_zeroed, dealloc, realloc, Layout};
+fn main() {
+    unsafe {
+        let layout = Layout::array::<u32>(4).unwrap();
+        let p = alloc(layout) as *mut u32;
+        assert!(!p.is_null());
+        for i in 0..4 { p.add(i).write(10 + i as u32); }
+        for i in 0..4 { assert_eq!(*p.add(i), 10 + i as u32); }
+        let layout8 = Layout::array::<u32>(8).unwrap();
+        let p = realloc(p as *mut u8, layout, layout8.size()) as *mut u32;
+        assert!(!p.is_null());
+        for i in 0..4 { assert_eq!(*p.add(i), 10 + i as u32); }
+        dealloc(p as *mut u8, layout8);
+        let zlayout = Layout::array::<u8>(3).unwrap();
+        let z = alloc_zeroed(zlayout);
+        assert!(!z.is_null());
+        assert_eq!(*z, 0);
+        assert_eq!(*z.add(2), 0);
+        dealloc(z, zlayout);
+    }
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_raw_allocator_cycle() {
+    let dir = temp_dir("alloc-cycle");
+    let src = fixture(&dir, "alloc_cycle.rs", ALLOC_CYCLE_SRC);
+    let out = run_driver(&src);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+const SIMD_SRC: &str = r#"
+#![feature(core_intrinsics, repr_simd)]
+use std::intrinsics::simd::*;
+#[repr(simd)]
+#[derive(Clone, Copy)]
+struct Simd<T, const N: usize>([T; N]);
+type I4 = Simd<i32, 4>;
+fn main() {
+    unsafe {
+        let a: I4 = Simd([1, 2, 3, 4]);
+        let b: I4 = Simd([10, 20, 30, 40]);
+        let c: I4 = simd_mul(simd_add(a, b), Simd([2, 2, 2, 2]));
+        let e0: i32 = simd_extract(c, 0);
+        let e1: i32 = simd_extract(c, 1);
+        let e3: i32 = simd_extract(c, 3);
+        assert_eq!((e0, e1, e3), (22, 44, 88));
+        let total: i32 = simd_reduce_add_unordered(c);
+        assert_eq!(total, 220);
+        let m: Simd<i32, 4> = simd_gt(c, Simd([50, 50, 50, 50]));
+        let bits: u8 = simd_bitmask(m);
+        assert_eq!(bits, 0b1100);
+    }
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_simd_intrinsics() {
+    let dir = temp_dir("simd");
+    let src = fixture(&dir, "simd.rs", SIMD_SRC);
+    let out = run_driver(&src);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+const VOLATILE_SRC: &str = r#"
+#![feature(core_intrinsics)]
+use std::intrinsics::{volatile_load, volatile_store};
+#[derive(Debug, Eq, PartialEq)]
+struct A(u32);
+fn main() {
+    unsafe {
+        let mut x = A(0);
+        volatile_store(&mut x as *mut A, A(1));
+        assert_eq!(x, A(1));
+        let v = volatile_load(&x as *const A);
+        assert_eq!(v, A(1));
+    }
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_volatile_composite_access() {
+    let dir = temp_dir("volatile");
+    let src = fixture(&dir, "volatile.rs", VOLATILE_SRC);
+    let out = run_driver(&src);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+const POW_PARSE_SRC: &str = r#"
+fn main() {
+    assert_eq!(2i32.pow(10), 1024);
+    assert_eq!((-3i64).pow(3), -27);
+    assert_eq!(7u32.pow(0), 1);
+    let x: f64 = "3.1415".parse().unwrap();
+    assert!(x > 3.1414 && x < 3.1416);
+    let n: i32 = "-42".parse().unwrap();
+    assert_eq!(n, -42);
+    assert!("abc".parse::<i32>().is_err());
+    assert!("99999999999999999999".parse::<i32>().is_err());
+    let b: bool = "true".parse().unwrap();
+    assert!(b);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_pow_and_from_str_parse() {
+    let dir = temp_dir("pow-parse");
+    let src = fixture(&dir, "pow_parse.rs", POW_PARSE_SRC);
+    let out = run_driver(&src);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+const POW_OVERFLOW_SRC: &str = r#"
+fn main() { let _ = 2i32.pow(1024); }
+"#;
+
+#[test]
+fn run_mode_pow_overflow_panics() {
+    let dir = temp_dir("pow-overflow");
+    let src = fixture(&dir, "pow_overflow.rs", POW_OVERFLOW_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "overflowing pow must exit 101; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("attempt to exponentiate with overflow"),
+        "overflow message goes to stderr: {stderr}"
+    );
+}
