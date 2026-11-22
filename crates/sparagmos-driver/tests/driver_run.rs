@@ -7613,6 +7613,29 @@ fn main() {
 }
 "#;
 
+const THREAD_JOIN_OPT_SRC: &str = r#"fn main() {
+    let h = std::thread::spawn(|| 40 + 2);
+    let v = h.join().unwrap();
+    assert_eq!(v, 42);
+}
+"#;
+
+#[test]
+fn run_mode_thread_join_at_optimized_mir() {
+    // Optimizing MIR inlines `JoinHandle::join`: field 0 (the
+    // `JoinInner`) is moved out of the handle and
+    // `JoinInner::join` is called directly. The modelled spawn
+    // result nests the thread-id handle inside the join handle
+    // so the move yields a `JoinInner`-shaped value, and the
+    // inner join is served by the same builtin as
+    // `JoinHandle::join`.
+    let dir = temp_dir("thread-join-opt");
+    let src = fixture(&dir, "thread_join_opt.rs", THREAD_JOIN_OPT_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "-O"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+}
+
 #[test]
 fn run_mode_caller_location_after_inlining() {
     // At high MIR optimization levels `Location::caller` is
