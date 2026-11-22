@@ -50,7 +50,7 @@ DIRECTIVE_RE = re.compile(
     r"(?:\s*:\s*(.*?)|\s*\((.*)\))?\s*$")
 
 DEF_NAME_RE = re.compile(r"^  DefId\(0:(\d+)\) = (.*)$", re.M)
-FN_HEADER_RE = re.compile(r"^=== fn (.*) \(args=\d+, blocks=\d+, locals=\d+\)$",
+FN_HEADER_RE = re.compile(r"^=== fn (.*) \((?:def=DefId\(0:\d+\), )?args=\d+, blocks=\d+, locals=\d+\)$",
                           re.M)
 CALL_RE = re.compile(r"kind: (?:Call|TailCall) \{")
 FNDEF_RE = re.compile(r"FnDef\(\s*DefId \{\s*krate: (\d+),\s*index: (\d+)")
