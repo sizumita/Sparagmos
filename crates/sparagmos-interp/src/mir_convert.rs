@@ -5522,9 +5522,7 @@ impl<'a> Converter<'a> {
                 }
             }
             T::Drop { place, target, .. } => {
-                let glue = self
-                    .place_ty(body, place)
-                    .and_then(|t| self.drop_glue(&t));
+                let glue = self.place_ty(body, place).and_then(|t| self.drop_glue(&t));
                 match glue {
                     Some(glue) => ir::TerminatorKind::Drop {
                         place: self.convert_place(body, place)?,
@@ -6272,6 +6270,32 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
             "std::fmt::Arguments" | "core::fmt::rt::Argument" => return Some(P::Trivial),
             // `ManuallyDrop` is defined to run no glue at all.
             "std::mem::ManuallyDrop" | "core::mem::ManuallyDrop" => return Some(P::Trivial),
+            // `MaybeUninit<T>` runs no glue either: its contents
+            // are manually managed, so dropping the wrapper (e.g.
+            // the `Box<MaybeUninit<[T; N]>>` a `vec!` construction
+            // is assembled in before `assume_init`) drops nothing.
+            "std::mem::MaybeUninit" | "core::mem::MaybeUninit" => return Some(P::Trivial),
+            // The unit allocator marker: a zero-sized value with
+            // no fields and no `Drop` impl.
+            "std::alloc::Global" => return Some(P::Trivial),
+            // A fieldless error struct (the payload of a failed
+            // channel receive): nothing to drop.
+            "std::sync::mpmc::RecvError" => return Some(P::Trivial),
+            // A type identity: its payload is a hash value with
+            // no glue of its own.
+            "std::any::TypeId" => return Some(P::Trivial),
+            "std::sync::mpmc::SendError" => {
+                return Some(self.variant_fields_plan(def, args)?);
+            }
+            // `FlatMap` has no modelled iterator state in the
+            // interpreter (its `next` is the converted body), so
+            // its value keeps the real layout and the glue is the
+            // fields': the source iterator, the closure and the
+            // two in-flight inner iterators.
+            "std::iter::FlatMap" | "std::iter::adapters::flatten::FlattenCompat"
+            | "std::iter::Fuse" => {
+                return Some(self.variant_fields_plan(def, args)?);
+            }
             "std::panic::AssertUnwindSafe" | "core::panic::AssertUnwindSafe" => {
                 // A one-field transparent wrapper with no `Drop`
                 // impl of its own: dropping it drops the held
@@ -6281,7 +6305,7 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                 let inner = self.plan(args.first()?)?;
                 return Some(at_field0(inner));
             }
-            "std::pin::Pin" | "core::pin::Pin" => {
+            "std::pin::Pin" | "core::pin::Pin" | "std::pin::PinMacroHelper" => {
                 // `Pin<P>` has no destructor of its own (it is a
                 // transparent newtype with no `Drop` impl); dropping
                 // it drops the pointer it wraps, exactly as dropping
@@ -6359,6 +6383,22 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
             "std::cell::RefMut" | "core::cell::RefMut" => {
                 return Some(P::RefCellRelease { mutable: true })
             }
+            "std::cell::Cell" | "core::cell::Cell" => {
+                // A transparent wrapper with no `Drop` impl of
+                // its own: the modelled value is the two-layer
+                // aggregate `Cell { UnsafeCell { value } }` (see
+                // `cell_value` in `builtins`), so the held value's
+                // glue runs through both field-0 layers.
+                let inner = self.plan(args.first()?)?;
+                return Some(at_field0(at_field0(inner)));
+            }
+            "std::cell::UnsafeCell" | "core::cell::UnsafeCell" => {
+                // The one-layer transparent wrapper the `Cell`
+                // plan above peels: dropping it drops the held
+                // value, as for `Cell` itself.
+                let inner = self.plan(args.first()?)?;
+                return Some(at_field0(inner));
+            }
             "std::cell::RefCell" | "core::cell::RefCell" => {
                 // `RefCell` has no `Drop` impl of its own: the
                 // flag `Cell` is plain data, and the value's glue
@@ -6417,6 +6457,98 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
             }
             "std::sync::mpsc::Receiver" => {
                 return Some(P::ChannelHandleDrop { sender: false })
+            }
+            "std::collections::VecDeque" => {
+                // A deque's glue is its elements' glue. The value
+                // model has no deque shape of its own to run a
+                // non-trivial element plan against, so only a
+                // trivial element type is accounted for (the
+                // `vec::IntoIter` rule).
+                let elem = self.plan(args.first()?)?;
+                return match elem {
+                    P::Trivial => Some(P::Trivial),
+                    _ => None,
+                };
+            }
+            // Lock and atomic wrappers with no modelled lock
+            // state: their glue is their fields' glue (the data
+            // cell's, through the `UnsafeCell` plan), planned
+            // from the same evidence the generic path uses for
+            // the entry crate's types.
+            "std::sync::Mutex" | "std::sync::RwLock" | "std::sync::atomic::Atomic" => {
+                return Some(self.variant_fields_plan(def, args)?);
+            }
+            // The integer parse error types: a struct holding a
+            // fieldless kind enum; neither has a `Drop` impl, so
+            // the evidenced-fields plan is the whole glue.
+            "std::num::ParseIntError" | "core::num::ParseIntError"
+            | "std::num::IntErrorKind" | "core::num::IntErrorKind" => {
+                return Some(self.variant_fields_plan(def, args)?);
+            }
+            "std::task::Waker" | "core::task::Waker" | "std::task::LocalWaker"
+            | "core::task::LocalWaker" => {
+                // The modelled waker value is a one-field
+                // aggregate holding the `Arc` / `Rc` handle the
+                // `From` conversion carried (see the `From::from`
+                // builtin): the vtable's drop function is that
+                // handle's release. The pointee type is erased by
+                // the waker, so its glue is judged from the stored
+                // value's shape when the last handle goes away -
+                // the `Dynamic` judgment, which refuses shapes
+                // that can hide a destructor.
+                return Some(P::At {
+                    path: vec![RefProj::Field(0)],
+                    plan: Box::new(P::RcHandleDrop {
+                        value: Box::new(P::Dynamic),
+                    }),
+                });
+            }
+            // Marker types: no fields with glue, no `Drop` impl.
+            "std::marker::PhantomPinned" | "std::marker::PhantomData" => {
+                return Some(P::Trivial)
+            }
+            // The futex-backed sys synchronization primitives:
+            // their state is atomic words only, with no glue.
+            "std::sys::sync::mutex::futex::Mutex" | "std::sys::sync::rwlock::futex::RwLock" => {
+                return Some(P::Trivial)
+            }
+            // The lock poisoning state: a flag wrapping an atomic
+            // bool, and the guard token a lock guard holds. Neither
+            // carries glue.
+            "std::sync::poison::Flag" | "std::sync::poison::Guard" => {
+                return Some(P::Trivial)
+            }
+            // The futex thread parker (atomic state words only)
+            // and the atomic storage alignment wrappers (byte
+            // blocks with no contents of their own): no glue.
+            "std::sys::sync::thread_parking::futex::Parker"
+            | "std::sync::atomic::private::Align1" | "std::sync::atomic::private::Align2"
+            | "std::sync::atomic::private::Align4" | "std::sync::atomic::private::Align8"
+            | "std::sync::atomic::private::Align16" | "std::sync::atomic::private::Align32"
+            | "std::sync::atomic::private::Align64" | "std::sync::atomic::private::Align128" => {
+                return Some(P::Trivial)
+            }
+            "std::async_iter::FromIter" => {
+                // A one-field adapter holding the wrapped
+                // iterator: dropping it drops the iterator.
+                let inner = self.plan(args.first()?)?;
+                return Some(at_field0(inner));
+            }
+            // Lock guards: the destructor releases the lock,
+            // which the value model does not track as state, so
+            // the glue is the fields' (a lock reference and a
+            // poison flag - neither carries glue of its own).
+            // The guarded value is borrowed, never dropped
+            // through the guard. `Hook` is the panic hook holder:
+            // its one field is the boxed hook, whose glue the
+            // evidenced-fields plan reaches through the `Box`
+            // plan. A thread handle's fields are its id and name.
+            "std::sync::MutexGuard" | "std::sync::RwLockReadGuard"
+            | "std::sync::RwLockWriteGuard" | "std::sync::nonpoison::MutexGuard"
+            | "std::sync::nonpoison::RwLockReadGuard"
+            | "std::sync::nonpoison::RwLockWriteGuard" | "std::panicking::Hook"
+            | "std::thread::Thread" | "std::thread::thread::Inner" => {
+                return Some(self.variant_fields_plan(def, args)?);
             }
             // `std::io::Error` (the payload of a `Builder::spawn`
             // result) has no `Drop` impl: its glue is its fields'
