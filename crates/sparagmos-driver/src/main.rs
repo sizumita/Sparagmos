@@ -873,11 +873,16 @@ fn collect_local_instances(
         // constants naming anything else cost one hash lookup.
         let mut targets = sparagmos_driver::reach::call_targets(&body);
         if !deferred.is_empty() {
-            for (def, args) in sparagmos_driver::reach::fndef_constants(&body) {
-                if deferred_defs.contains(&def.def_id()) {
-                    targets.push((def, args));
-                }
-            }
+            // Constants are resolved and filtered by the same
+            // referenced-or-resolved deferred check as call targets
+            // below, not by the referenced definition alone: a
+            // constant can name a trait method whose resolution is
+            // the deferred definition (an impl method). `core::fmt`'s
+            // argument constructors materialize exactly that shape —
+            // the formatter stored in an `Argument` is the trait
+            // method `FnDef` constant in the constructor's body,
+            // which the reachability pass walks for this purpose.
+            targets.extend(sparagmos_driver::reach::fndef_constants(&body));
         }
         for (def, args) in targets {
             let referenced = def.def_id();
@@ -2039,6 +2044,31 @@ fn apply_foreign_closure_demands(
 /// no report entries — the impl method's own entry already
 /// accounts for the body; the alias is the same body under the
 /// key call sites use.
+/// Whether `name` (a definition name as the driver's name
+/// table renders it) is one of `core::fmt`'s formatting trait
+/// methods — the methods `core::fmt::rt::Argument`'s
+/// constructors store as the formatting function.
+fn is_fmt_trait_method(name: &str) -> bool {
+    let Some(rest) = name
+        .strip_prefix("std::fmt::")
+        .or_else(|| name.strip_prefix("core::fmt::"))
+    else {
+        return false;
+    };
+    matches!(
+        rest,
+        "Display::fmt"
+            | "Debug::fmt"
+            | "Octal::fmt"
+            | "LowerHex::fmt"
+            | "UpperHex::fmt"
+            | "Binary::fmt"
+            | "LowerExp::fmt"
+            | "UpperExp::fmt"
+            | "Pointer::fmt"
+    )
+}
+
 fn register_trait_key_aliases(
     conv: &mut Converter,
     bodies: &mut Vec<(String, Body)>,
@@ -2108,6 +2138,51 @@ fn register_trait_key_aliases(
                     suffixed
                 };
                 additions.push((display, bodies[idx].1.clone(), call_key, ref_name));
+            }
+            // `core::fmt`'s argument constructors materialize
+            // the formatting function as an `FnDef` constant
+            // naming the trait method, never as a call target,
+            // so the loop above never sees the demand. The
+            // interpreter's fmt engine addresses the impl body
+            // by its instance name (the name the item loop
+            // records non-generic impls under), so register
+            // that alias as well: the body may be keyed by the
+            // referenced definition (the instance-demand pass
+            // and the reachability collection) or by the
+            // resolved one (the item loop).
+            for (def, args) in sparagmos_driver::reach::fndef_constants(source) {
+                let referenced_name = def.def_id().name();
+                if !is_fmt_trait_method(&referenced_name) {
+                    continue;
+                }
+                let Ok(inst) = Instance::resolve(def, &args) else {
+                    continue;
+                };
+                if matches!(
+                    inst.kind,
+                    rustc_public::mir::mono::InstanceKind::Virtual { .. }
+                ) {
+                    continue;
+                }
+                let instance_name = inst.name().to_string();
+                if used_names.contains(&instance_name) {
+                    continue;
+                }
+                let call_key = conv.instance_def_id(def.def_id(), &inst);
+                let impl_key = conv.instance_def_id(inst.def.def_id(), &inst);
+                let Some(&idx) = present
+                    .get(&call_key)
+                    .or_else(|| present.get(&impl_key))
+                else {
+                    continue;
+                };
+                used_names.insert(instance_name.clone());
+                additions.push((
+                    instance_name,
+                    bodies[idx].1.clone(),
+                    call_key,
+                    referenced_name,
+                ));
             }
             additions
         }));

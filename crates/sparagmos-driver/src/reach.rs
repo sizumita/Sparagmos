@@ -387,6 +387,32 @@ pub fn collect_reachable(
                         },
                     });
                 }
+                // `core::fmt`'s argument constructors are builtins,
+                // but the formatter function each one stores — and,
+                // through that function's body, the `fmt` method of
+                // the type being formatted — is real code whose
+                // body the interpreter needs: formatting runs the
+                // type's own `Debug`/`Display` implementation
+                // against a captured `Formatter`. Walk the
+                // constructor's body (never collected: the builtin
+                // serves the call) so the formatter function it
+                // names is demanded through the normal pipeline
+                // below, and the trait method through the formatter
+                // function's own body in turn.
+                if is_fmt_argument_constructor(&canonical) {
+                    if let Ok(inst) = Instance::resolve(def, &args) {
+                        if let Ok(Some(ctor_body)) = fetch_body_contained(&inst) {
+                            // The walk queue demands the formatter
+                            // function through the pipeline above;
+                            // `walked_bodies` is what the caller's
+                            // local-instance pass scans, and the
+                            // trait method the formatter names is a
+                            // local instance when the type is local.
+                            queue.push_back(ctor_body.clone());
+                            walked_bodies.push(ctor_body);
+                        }
+                    }
+                }
                 // The excluded body is also where the demand for
                 // the closures handed to it would have come from:
                 // a generic consumer's body calls its closure
@@ -1112,6 +1138,16 @@ fn partial_eq_ref_instance_needs_body(canonical: &str, args: &GenericArgs) -> bo
         Some(TyKind::RigidTy(RigidTy::Ref(..)))
     )
 }
+
+/// Whether `canonical` (a builtin lookup name) is one of
+/// `core::fmt::rt::Argument`'s value constructors — the functions
+/// that pair a reference to the value being formatted with the
+/// formatting function for its type. `from_usize` is not one: it
+/// formats an argument index and stores no formatter function.
+fn is_fmt_argument_constructor(canonical: &str) -> bool {
+    canonical.starts_with("core::fmt::rt::Argument::new_")
+}
+
 
 /// The Stable MIR counterpart of the interpreter's modelled
 /// `next` shapes (see `iterator_next_modelled` in
