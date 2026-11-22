@@ -10025,3 +10025,46 @@ fn run_mode_element_pointer_cast_back_to_array() {
     assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "30\n");
 }
+
+// ----- one closure instance demanded by two collectors (Lane HM) -----------
+
+const SUM_CLOSURE_SRC: &str = r#"
+fn main() {
+    let v: [i128; 3] = [10, 20, 12];
+    let s: i128 = v.iter().sum();
+    assert_eq!(s, 42);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_closure_demanded_by_two_collectors_converts_once() {
+    // `<i128 as Sum<&i128>>::sum` creates a closure and hands it
+    // to `Iterator::fold`. Two collectors demand that one closure
+    // instance: the reachability collection resolves the closures
+    // in a call's generic arguments itself (the callee is
+    // builtin-owned, so its body is excluded), and the closure
+    // demand pass finds the same closure mentioned in the
+    // collected `sum` body. Both used to convert it, the program
+    // held two bodies under one DefId, and conversion failed with
+    // "duplicate function name
+    // `<i128 as Sum<&'a i128>>::sum::{closure#0}`" (the
+    // tests/ui/numbers-arithmetic/i128.rs shape). The demand
+    // passes now skip an instance another collector already
+    // converted, and the reachability merges drop duplicates by
+    // DefId, so the closure enters the program exactly once.
+    let dir = temp_dir("sum-closure");
+    let src = fixture(&dir, "sum_closure.rs", SUM_CLOSURE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the doubly-demanded closure must convert once and run; stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("duplicate function name"),
+        "no duplicate registration; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
