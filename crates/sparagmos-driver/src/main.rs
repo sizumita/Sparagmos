@@ -2709,14 +2709,21 @@ fn demand_drop_instances(
     let local_crate = rustc_public::local_crate();
     let local_crate_name = local_crate.name.as_str();
     let impl_methods = local_drop_impl_methods();
-    // Drop impls of foreign crates, built per crate on first
-    // use: an impl lives in its self type's crate (the orphan
-    // rule leaves no other home for a `Drop` impl), so the type
-    // name's first segment names the crate to scan.
-    let mut foreign_impl_methods: std::collections::HashMap<
-        String,
+    // Drop impls of foreign crates, built once on first use.
+    // An impl lives in its self type's defining crate (the
+    // orphan rule leaves no other home for a `Drop` impl), but
+    // a type's rendered name need not start with that crate:
+    // facade crates re-export other crates' types under their
+    // own path (`std::array::Guard`, the cleanup guard inside
+    // `core`'s array clone, renders with the `std` facade), and
+    // the impl method's key is rendered in the same facade path
+    // space. Scanning only the named crate therefore misses
+    // exactly the impls of re-exported types, so the scan
+    // covers every external crate; the keys are full rendered
+    // paths, unique per type, which keeps the merged map exact.
+    let mut foreign_impl_methods: Option<
         std::collections::HashMap<String, rustc_public::ty::FnDef>,
-    > = std::collections::HashMap::new();
+    > = None;
     let mut credited: std::collections::HashMap<
         rustc_public::DefId,
         (usize, (usize, usize, usize)),
@@ -2851,17 +2858,15 @@ fn demand_drop_instances(
             let impl_fn = if type_crate == local_crate_name {
                 impl_methods.get(&def_name)
             } else {
-                let methods = foreign_impl_methods
-                    .entry(type_crate.to_string())
-                    .or_insert_with(|| {
-                        let mut defs = Vec::new();
-                        for krate in rustc_public::find_crates(type_crate) {
-                            if !krate.is_local {
-                                defs.extend(krate.fn_defs());
-                            }
+                let methods = foreign_impl_methods.get_or_insert_with(|| {
+                    let mut defs = Vec::new();
+                    for krate in rustc_public::external_crates() {
+                        if !krate.is_local {
+                            defs.extend(krate.fn_defs());
                         }
-                        drop_impl_methods(defs)
-                    });
+                    }
+                    drop_impl_methods(defs)
+                });
                 methods.get(&def_name)
             };
             let Some(impl_fn) = impl_fn else {
@@ -3070,13 +3075,19 @@ fn demand_clone_instances(
 /// The ADT instantiations among the types the collected bodies
 /// drop that have no `Drop` impl at all, keyed like
 /// `certify_drop_trivial`'s result. A `Drop` impl for a type can
-/// only live in the type's own crate (the orphan rule: the trait
-/// is `core`'s, so no other crate may implement it for the type),
-/// so scanning that crate's function definitions for an impl of
-/// the type is complete — absence there is absence everywhere.
-/// A crate that cannot be found by name certifies nothing, and
-/// an impl under any generic spelling blocks certification:
-/// both keep the interpreter's refusal for the type.
+/// only live in the type's defining crate (the orphan rule: the
+/// trait is `core`'s, so no other crate may implement it for the
+/// type), so the scan must cover that crate — but a type's
+/// rendered name need not start with it: facade crates
+/// re-export other crates' types under their own path
+/// (`std::array::Guard`, the cleanup guard inside `core`'s
+/// array clone, is defined in `core`), and the impl keys are
+/// rendered in the same facade path space. The foreign scan
+/// therefore covers every external crate, and absence from
+/// that merged key set — full rendered paths, unique per
+/// type — is absence everywhere. An impl under any generic
+/// spelling blocks certification: it keeps the interpreter's
+/// refusal for the type.
 fn certify_drop_no_impl(
     conv: &mut Converter,
     bodies: &[rustc_public::mir::Body],
@@ -3108,6 +3119,10 @@ fn certify_drop_no_impl(
     let local_crate_name = rustc_public::local_crate().name;
     let mut scans: std::collections::HashMap<String, Option<std::collections::HashSet<String>>> =
         std::collections::HashMap::new();
+    // The merged foreign impl-name set (see the doc comment
+    // above), built on first use and shared by every foreign
+    // candidate.
+    let mut foreign_names: Option<std::collections::HashSet<String>> = None;
     let mut out = std::collections::HashSet::new();
     let mut queried = 0usize;
     for (ty, def, args) in candidates {
@@ -3124,15 +3139,19 @@ fn certify_drop_no_impl(
             if type_crate == local_crate_name.as_str() {
                 Some(local_drop_impl_methods().into_keys().collect())
             } else {
-                let mut defs = Vec::new();
-                let mut found = false;
-                for krate in rustc_public::find_crates(type_crate) {
-                    if !krate.is_local {
-                        found = true;
-                        defs.extend(krate.fn_defs());
-                    }
-                }
-                found.then(|| drop_impl_methods(defs).into_keys().collect())
+                Some(
+                    foreign_names
+                        .get_or_insert_with(|| {
+                            let mut defs = Vec::new();
+                            for krate in rustc_public::external_crates() {
+                                if !krate.is_local {
+                                    defs.extend(krate.fn_defs());
+                                }
+                            }
+                            drop_impl_methods(defs).into_keys().collect()
+                        })
+                        .clone(),
+                )
             }
         });
         let Some(impl_names) = scan else {
@@ -4318,25 +4337,70 @@ fn collect() -> ControlFlow<()> {
     // converted are skipped by identity inside the pass.
     {
         let mut all_bodies = alias_sources.clone();
-        let (credited2, failures2, dtor_bodies2) = demand_drop_instances(
-            &mut conv,
-            &mut report,
-            &mut bodies,
-            &mut body_def_ids,
-            &mut body_def_names,
-            &mut all_bodies,
-        );
-        for (def, (count, counts)) in credited2 {
-            let slot = drop_credited.entry(def).or_insert((0, counts));
-            slot.0 += count;
-        }
-        for (def, reasons) in failures2 {
-            let slot = drop_failures.entry(def).or_default();
-            for (k, v) in reasons {
-                *slot.entry(k).or_default() += v;
+        // The destructor bodies this round converts call
+        // functions of their own (the array clone guard's drop
+        // calls a slice-index precondition check, for one), and
+        // drop glue is not a call edge, so no earlier
+        // reachability wave walked them: walk each newly
+        // converted destructor body's call edges, merge what
+        // they reach, and demand drops again over the enlarged
+        // set, until a round converts no new destructor body.
+        loop {
+            let seeds_before = all_bodies.len();
+            let bodies_before = bodies.len();
+            let (credited2, failures2, dtor_bodies2) = demand_drop_instances(
+                &mut conv,
+                &mut report,
+                &mut bodies,
+                &mut body_def_ids,
+                &mut body_def_names,
+                &mut all_bodies,
+            );
+            for (def, (count, counts)) in credited2 {
+                let slot = drop_credited.entry(def).or_insert((0, counts));
+                slot.0 += count;
+            }
+            for (def, reasons) in failures2 {
+                let slot = drop_failures.entry(def).or_default();
+                for (k, v) in reasons {
+                    *slot.entry(k).or_default() += v;
+                }
+            }
+            dtor_bodies.extend(dtor_bodies2);
+            if bodies.len() == bodies_before {
+                break;
+            }
+            if foreign_taken >= sparagmos_driver::reach::MAX_COLLECTED_BODIES {
+                break;
+            }
+            let walk_seeds: Vec<rustc_public::mir::Body> =
+                all_bodies[seeds_before..].to_vec();
+            let reached = sparagmos_driver::reach::collect_reachable(
+                &mut conv,
+                &walk_seeds,
+                &local_defs,
+                sparagmos_driver::reach::MAX_COLLECTED_BODIES - foreign_taken,
+            );
+            alias_sources.extend(reached.walked_bodies.iter().cloned());
+            all_bodies.extend(reached.walked_bodies.iter().cloned());
+            for ((name, body), (def_id, def_name)) in reached
+                .bodies
+                .into_iter()
+                .zip(reached.body_def_ids.into_iter().zip(reached.body_def_names))
+            {
+                if collected_ids.insert(def_id) {
+                    foreign_taken += 1;
+                    bodies.push((name, body));
+                    body_def_ids.push(def_id);
+                    body_def_names.push(def_name);
+                }
+            }
+            for entry in reached.reports {
+                if report_names.insert(entry.name.clone()) {
+                    report.functions.push(entry);
+                }
             }
         }
-        dtor_bodies.extend(dtor_bodies2);
     }
     // Credit the vtable instances the dyn demand converted for
     // deferred definitions (a trait default method is the common
