@@ -65,6 +65,24 @@ fn compiler_tcx() -> Option<rustc_middle::ty::TyCtxt<'static>> {
     COMPILER_TCX.with(|slot| slot.get())
 }
 
+/// Whether the running compilation's crate graph defines the
+/// `drop_glue` lang item. A crate compiled against a minicore
+/// (which defines only the lang items it names itself) has none:
+/// asking the compiler to resolve `drop_in_place` there emits a
+/// fatal "requires `drop_glue` lang_item" diagnostic that no
+/// `catch_unwind` can contain, so drop-glue certification must
+/// not ask (see `certify_drop_trivial` in the binary). Outside a
+/// compilation callback there is no graph to consult; the item
+/// is reported defined, preserving the caller's plain behavior.
+pub fn drop_glue_lang_item_defined() -> bool {
+    let Some(tcx) = compiler_tcx() else {
+        return true;
+    };
+    tcx.lang_items()
+        .get(rustc_attr_ir::lang_items::LangItem::DropGlue)
+        .is_some()
+}
+
 /// Per-run converter state (DefId assignment) plus per-function error bag.
 pub struct Converter {
     def_ids: HashMap<rustc_public::DefId, u32>,

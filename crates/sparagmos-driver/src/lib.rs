@@ -20,15 +20,21 @@
 //! through `rustc_public` (Stable MIR). The internal crates declared are
 //! the ones the `rustc_public::run_with_tcx!` macro expansion itself
 //! requires (`rustc_driver`, `rustc_interface`, `rustc_middle`,
-//! `rustc_span`). One internal facility is used directly, by design:
+//! `rustc_span`). Two internal facilities are used directly, by design:
 //! the debugger's statement lines are resolved through
 //! `rustc_span::hygiene::walk_chain_collapsed` (via the
 //! `rustc_public::rustc_internal` span conversions), because that
 //! collapsed attribution is what the compiler's own debuginfo
-//! records and the public span API cannot express it.
+//! records and the public span API cannot express it; and
+//! `rustc_attr_ir::lang_items::LangItem` names the `drop_glue` lang
+//! item so drop-glue certification can check the item exists before
+//! asking the compiler to resolve `drop_in_place` (a minicore
+//! defines no `drop_glue` item, and asking emits a fatal diagnostic
+//! no `catch_unwind` can contain).
 
 #![feature(rustc_private)]
 
+extern crate rustc_attr_ir;
 extern crate rustc_driver;
 extern crate rustc_interface;
 extern crate rustc_middle;

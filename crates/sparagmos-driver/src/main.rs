@@ -3302,6 +3302,15 @@ fn certify_drop_trivial(
     conv: &mut Converter,
     bodies: &[rustc_public::mir::Body],
 ) -> std::collections::HashSet<String> {
+    // Resolving `drop_in_place` requires the `drop_glue` lang
+    // item; a crate graph without one (a minicore) makes the
+    // query emit a fatal diagnostic instead of panicking, which
+    // the `catch_unwind` below cannot contain. Certify nothing
+    // there: no type is proven trivial, and conversion of the
+    // crate itself is unaffected.
+    if !sparagmos_driver::convert::drop_glue_lang_item_defined() {
+        return std::collections::HashSet::new();
+    }
     let mut candidates = Vec::new();
     let mut seen = Default::default();
     for body in bodies {
