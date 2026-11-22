@@ -54,6 +54,16 @@
 //!   the interpreter's iterator state uses; `Iterator::next` is a
 //!   host function that steps that state in guest memory through
 //!   the `&mut` pointer it is handed.
+//! * A `std::string::String` value is its real layout — the
+//!   (pointer, capacity, length) triple — with the pointer
+//!   naming a real host allocation: the `__rust_alloc` family is
+//!   served by the host allocator, and the string-producing
+//!   builtins (`From::from` from a `str`, `fmt::format`, the
+//!   case conversions) allocate the buffer and write the triple
+//!   through the destination's address. The guest's own
+//!   converted drop bodies read the triple's fields and free
+//!   the buffer through `__rust_dealloc`, so construction and
+//!   destruction agree by construction.
 //!
 //! Anything the layer does not model — a callee name with no
 //! registry entry, an iterator over a type whose state is not the
@@ -245,6 +255,65 @@ pub enum Builtin {
     PartialEqEq,
     /// `PartialEq::ne(&a, &b)`.
     PartialEqNe,
+    /// `alloc::alloc::__rust_alloc(size, align) -> *mut u8`: a
+    /// real host allocation; the guest's own drop path frees it
+    /// through `__rust_dealloc` with the same layout.
+    RustAlloc,
+    /// `alloc::alloc::__rust_alloc_zeroed(size, align)`.
+    RustAllocZeroed,
+    /// `alloc::alloc::__rust_dealloc(ptr, size, align)`.
+    RustDealloc,
+    /// `alloc::alloc::__rust_realloc(ptr, old_size, align, new_size)`.
+    RustRealloc,
+    /// `std::fmt::format(Arguments) -> String`.
+    Format,
+    /// `str::to_uppercase(&str) -> String`.
+    StrToUppercase,
+    /// `str::to_lowercase(&str) -> String`.
+    StrToLowercase,
+    /// `std::convert::From::from(value)` (modelled conversions:
+    /// string construction from a `str` source, and the identity
+    /// conversions the interpreter's builtin also serves).
+    FromFrom,
+    /// `std::convert::Into::into(value)`: `From::from` with the
+    /// generic arguments in the other order.
+    IntoInto,
+    /// `std::ops::Deref::deref(&value)` for the buffer types
+    /// (`String`, `Vec<T>`): the (pointer, length) pair read out
+    /// of the value's own triple.
+    Deref,
+    /// `std::hint::must_use(value)`: the identity.
+    MustUse,
+    /// An integer bit intrinsic (`ctpop`, `ctlz`, `cttz`,
+    /// `bitreverse`, `bswap`); the payload is the operation code
+    /// the host function dispatches on (see `host_bit_op`).
+    IntBitOp(u8),
+    /// `core::panicking::panic_nounwind_fmt(Arguments, bool)`:
+    /// format the arguments and raise the guest panic with that
+    /// message (the call never returns in core either).
+    PanicNounwindFmt,
+    /// `String::new() -> String`: the empty triple.
+    StringNew,
+    /// `String::len(&String) -> usize`: the triple's length word.
+    StringLen,
+    /// `String::is_empty(&String) -> bool`.
+    StringIsEmpty,
+    /// `String::capacity(&String) -> usize`: the triple's
+    /// capacity word.
+    StringCapacity,
+    /// `String::push_str(&mut String, &str)`.
+    StringPushStr,
+    /// `String::push(&mut String, char)`.
+    StringPush,
+    /// `str::len(&str) -> usize`: the pair's length word.
+    StrLen,
+    /// `str::is_empty(&str) -> bool`.
+    StrIsEmpty,
+    /// A `str` pattern search (`starts_with`, `ends_with`,
+    /// `contains` with a `&str` pattern); the payload is the
+    /// operation code the host function dispatches on (see
+    /// `host_str_op`).
+    StrOp(u8),
 }
 
 /// Look a canonical callee name up in the registry.
@@ -257,6 +326,54 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
             Builtin::ArgumentsFromStr
         }
         "std::fmt::Arguments::new" => Builtin::ArgumentsNew,
+        "alloc::alloc::__rust_alloc" => Builtin::RustAlloc,
+        "alloc::alloc::__rust_alloc_zeroed" => Builtin::RustAllocZeroed,
+        "alloc::alloc::__rust_dealloc" => Builtin::RustDealloc,
+        "alloc::alloc::__rust_realloc" => Builtin::RustRealloc,
+        "std::fmt::format" => Builtin::Format,
+        "std::convert::From::from" => Builtin::FromFrom,
+        "std::convert::Into::into" => Builtin::IntoInto,
+        "std::ops::Deref::deref" => Builtin::Deref,
+        "std::hint::must_use" => Builtin::MustUse,
+        "core::panicking::panic_nounwind_fmt" => Builtin::PanicNounwindFmt,
+        "std::intrinsics::ctpop" | "core::intrinsics::ctpop" => Builtin::IntBitOp(0),
+        "std::intrinsics::ctlz" | "core::intrinsics::ctlz" => Builtin::IntBitOp(1),
+        "std::intrinsics::cttz" | "core::intrinsics::cttz" => Builtin::IntBitOp(2),
+        "std::intrinsics::ctlz_nonzero" | "core::intrinsics::ctlz_nonzero" => {
+            Builtin::IntBitOp(1)
+        }
+        "std::intrinsics::cttz_nonzero" | "core::intrinsics::cttz_nonzero" => {
+            Builtin::IntBitOp(2)
+        }
+        "std::intrinsics::bitreverse" | "core::intrinsics::bitreverse" => {
+            Builtin::IntBitOp(3)
+        }
+        "std::intrinsics::bswap" | "core::intrinsics::bswap" => Builtin::IntBitOp(4),
+        "std::string::String::new" | "alloc::string::String::new" => Builtin::StringNew,
+        "std::string::String::len" | "alloc::string::String::len" => Builtin::StringLen,
+        "std::string::String::is_empty" | "alloc::string::String::is_empty" => {
+            Builtin::StringIsEmpty
+        }
+        "std::string::String::capacity" | "alloc::string::String::capacity" => {
+            Builtin::StringCapacity
+        }
+        "std::string::String::push_str" | "alloc::string::String::push_str" => {
+            Builtin::StringPushStr
+        }
+        "std::string::String::push" | "alloc::string::String::push" => {
+            Builtin::StringPush
+        }
+        // `String::as_str` / `String::as_bytes` are the
+        // dereference to the buffer's pair, the `Deref` model's
+        // own operation.
+        "std::string::String::as_str" | "alloc::string::String::as_str" => {
+            Builtin::Deref
+        }
+        "std::string::String::as_bytes" | "alloc::string::String::as_bytes" => {
+            Builtin::Deref
+        }
+        "core::str::<impl str>::len" => Builtin::StrLen,
+        "core::str::<impl str>::is_empty" => Builtin::StrIsEmpty,
         "core::fmt::rt::Argument::new_display" => Builtin::ArgumentNew(F::Display),
         "core::fmt::rt::Argument::new_debug" => Builtin::ArgumentNew(F::Debug),
         "core::fmt::rt::Argument::new_debug_noop" => Builtin::ArgumentNew(F::DebugNoop),
@@ -275,6 +392,17 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         }
         _ if canonical.ends_with("::PartialEq::eq") => Builtin::PartialEqEq,
         _ if canonical.ends_with("::PartialEq::ne") => Builtin::PartialEqNe,
+        _ if canonical.ends_with("::to_uppercase") => Builtin::StrToUppercase,
+        _ if canonical.ends_with("::to_lowercase") => Builtin::StrToLowercase,
+        _ if canonical.starts_with("core::str::<impl") && canonical.ends_with(">::starts_with") => {
+            Builtin::StrOp(0)
+        }
+        _ if canonical.starts_with("core::str::<impl") && canonical.ends_with(">::ends_with") => {
+            Builtin::StrOp(1)
+        }
+        _ if canonical.starts_with("core::str::<impl") && canonical.ends_with(">::contains") => {
+            Builtin::StrOp(2)
+        }
         _ => return float_method(canonical),
     })
 }
@@ -365,6 +493,12 @@ pub enum FmtTy {
     /// pointee address (first word the pointer, second the length)
     /// or carried directly as a fat constructor argument.
     Str,
+    /// A `std::string::String` value: the (pointer, capacity,
+    /// length) triple at the pointee address, in the aggregate's
+    /// leaf order; the formatted content is the `length` bytes at
+    /// `pointer` — the same bytes `String`'s own `Display` / `Debug`
+    /// impls present.
+    OwnedStr,
     /// A reference to another formattable value: the word at the
     /// pointee address is the inner value's address (or, for a fat
     /// inner type, the inner pair itself).
@@ -587,6 +721,42 @@ pub const HOST_NEXT_RANGE: u32 = 6;
 pub const HOST_NEXT_RANGE_INCLUSIVE: u32 = 7;
 /// Host table index of [`host_float_method`].
 pub const HOST_FLOAT_METHOD: u32 = 8;
+/// Host table index of [`host_rust_alloc`].
+pub const HOST_RUST_ALLOC: u32 = 9;
+/// Host table index of [`host_rust_alloc_zeroed`].
+pub const HOST_RUST_ALLOC_ZEROED: u32 = 10;
+/// Host table index of [`host_rust_dealloc`].
+pub const HOST_RUST_DEALLOC: u32 = 11;
+/// Host table index of [`host_rust_realloc`].
+pub const HOST_RUST_REALLOC: u32 = 12;
+/// Host table index of [`host_string_from_str`].
+pub const HOST_STRING_FROM_STR: u32 = 13;
+/// Host table index of [`host_string_format`].
+pub const HOST_STRING_FORMAT: u32 = 14;
+/// Host table index of [`host_str_to_uppercase`].
+pub const HOST_STR_TO_UPPERCASE: u32 = 15;
+/// Host table index of [`host_str_to_lowercase`].
+pub const HOST_STR_TO_LOWERCASE: u32 = 16;
+/// Host table index of [`host_deref_buffer`].
+pub const HOST_DEREF_BUFFER: u32 = 17;
+/// Host table index of [`host_bit_op`].
+pub const HOST_BIT_OP: u32 = 18;
+/// Host table index of [`host_panic_nounwind_fmt`].
+pub const HOST_PANIC_NOUNWIND_FMT: u32 = 19;
+/// Host table index of [`host_arguments_from_struct`].
+pub const HOST_ARGUMENTS_FROM_STRUCT: u32 = 20;
+/// Host table index of [`host_string_len`].
+pub const HOST_STRING_LEN: u32 = 21;
+/// Host table index of [`host_string_capacity`].
+pub const HOST_STRING_CAPACITY: u32 = 22;
+/// Host table index of [`host_string_push_str`].
+pub const HOST_STRING_PUSH_STR: u32 = 23;
+/// Host table index of [`host_string_push`].
+pub const HOST_STRING_PUSH: u32 = 24;
+/// Host table index of [`host_str_op`].
+pub const HOST_STR_OP: u32 = 25;
+/// Host table index of [`host_str_eq`].
+pub const HOST_STR_EQ: u32 = 26;
 
 /// The host function table, in [`HOST_*`] index order. The program
 /// layer copies these addresses into the backend's program context.
@@ -601,6 +771,24 @@ pub fn host_fns() -> Vec<usize> {
         host_next_range as usize,
         host_next_range_inclusive as usize,
         host_float_method as usize,
+        host_rust_alloc as usize,
+        host_rust_alloc_zeroed as usize,
+        host_rust_dealloc as usize,
+        host_rust_realloc as usize,
+        host_string_from_str as usize,
+        host_string_format as usize,
+        host_str_to_uppercase as usize,
+        host_str_to_lowercase as usize,
+        host_deref_buffer as usize,
+        host_bit_op as usize,
+        host_panic_nounwind_fmt as usize,
+        host_arguments_from_struct as usize,
+        host_string_len as usize,
+        host_string_capacity as usize,
+        host_string_push_str as usize,
+        host_string_push as usize,
+        host_str_op as usize,
+        host_str_eq as usize,
     ]
 }
 
@@ -757,6 +945,562 @@ fn read_str(ptr: i64, len: i64) -> Result<String, String> {
     // and length; the bytes are the string's data.
     let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) };
     String::from_utf8(bytes.to_vec()).map_err(|_| "string is not valid UTF-8".to_string())
+}
+
+/// Read `len` raw bytes at guest address `ptr` (no UTF-8
+/// validation: the caller models a producer whose input is
+/// already a `str`).
+fn read_bytes(ptr: i64, len: i64) -> Result<Vec<u8>, String> {
+    if len < 0 || len > (1 << 31) {
+        return Err("string length out of range".to_string());
+    }
+    // Safety: the caller hands over a guest `&str`'s own pointer
+    // and length; the bytes are the string's data.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) };
+    Ok(bytes.to_vec())
+}
+
+/// Write a `String` value for `bytes` at guest address `dst`:
+/// the (pointer, capacity, length) triple, capacity equal to
+/// length, at the aggregate's descending leaf stride. The buffer
+/// is a real host allocation of exactly `bytes.len()` bytes, so
+/// the guest's own drop path (`__rust_dealloc` with the layout
+/// its converted bodies compute from the triple) frees exactly
+/// this allocation. The empty string's pointer is the dangling
+/// address an empty `Vec` carries (the alignment of `u8`), and
+/// no allocation backs it — the drop path frees nothing for a
+/// zero capacity, as in core.
+fn write_string_at(ctx: &mut BuiltinCtx, dst: i64, bytes: &[u8]) -> HostRet {
+    let len = bytes.len();
+    let ptr = if len == 0 {
+        1
+    } else {
+        let layout = std::alloc::Layout::from_size_align(len, 1)
+            .expect("a byte count is a valid u8 layout");
+        // Safety: the layout is non-zero; the result is checked.
+        let p = unsafe { std::alloc::alloc(layout) };
+        if p.is_null() {
+            return ctx.fail("memory allocation failed");
+        }
+        // Safety: `p` owns `len` fresh bytes; the source is a
+        // live host string of the same length.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, len) };
+        p as i64
+    };
+    // Safety: `dst` is the destination value's own first-word
+    // address (the front end hands over the address of the
+    // destination's slot run or of its memory place).
+    unsafe {
+        store_word(dst, ptr);
+        store_word(dst - 8, len as i64);
+        store_word(dst - 16, len as i64);
+    }
+    HostRet::one(0)
+}
+
+/// The host allocation layout a `__rust_*` call names, when it
+/// is well-formed.
+fn guest_layout(size: i64, align: i64) -> Option<std::alloc::Layout> {
+    if size < 0 || align <= 0 || !(align as u64).is_power_of_two() {
+        return None;
+    }
+    std::alloc::Layout::from_size_align(size as usize, align as usize).ok()
+}
+
+/// `__rust_alloc(size, align) -> *mut u8`: a real host
+/// allocation, null on failure (the contract core's allocator
+/// shim exposes; the guest's allocation path checks for null).
+/// Arguments: (size, align, _, _, _).
+extern "C" fn host_rust_alloc(
+    _ctx: *mut BuiltinCtx,
+    size: i64,
+    align: i64,
+    _a: i64,
+    _b: i64,
+    _c: i64,
+) -> HostRet {
+    let Some(layout) = guest_layout(size, align) else {
+        return HostRet::one(0);
+    };
+    if layout.size() == 0 {
+        // A zero-size allocation is never dereferenced; the
+        // aligned dangling address is its pointer, as in core.
+        return HostRet::one(align);
+    }
+    // Safety: the layout is non-zero and well-formed.
+    HostRet::one(unsafe { std::alloc::alloc(layout) } as i64)
+}
+
+/// `__rust_alloc_zeroed(size, align) -> *mut u8`: as
+/// [`host_rust_alloc`], with the allocation zero-filled.
+/// Arguments: (size, align, _, _, _).
+extern "C" fn host_rust_alloc_zeroed(
+    _ctx: *mut BuiltinCtx,
+    size: i64,
+    align: i64,
+    _a: i64,
+    _b: i64,
+    _c: i64,
+) -> HostRet {
+    let Some(layout) = guest_layout(size, align) else {
+        return HostRet::one(0);
+    };
+    if layout.size() == 0 {
+        return HostRet::one(align);
+    }
+    // Safety: the layout is non-zero and well-formed.
+    HostRet::one(unsafe { std::alloc::alloc_zeroed(layout) } as i64)
+}
+
+/// `__rust_dealloc(ptr, size, align)`: free an allocation a
+/// `__rust_alloc*` call (or a modelled string construction)
+/// produced, with the layout the guest's drop path computed for
+/// it. A null pointer or a zero size frees nothing (the empty
+/// buffer's dangling pointer reaches here in no correct
+/// program, but the guard keeps the model total). Arguments:
+/// (pointer, size, align, _, _).
+extern "C" fn host_rust_dealloc(
+    _ctx: *mut BuiltinCtx,
+    ptr: i64,
+    size: i64,
+    align: i64,
+    _a: i64,
+    _b: i64,
+) -> HostRet {
+    if ptr == 0 || size == 0 {
+        return HostRet::one(0);
+    }
+    let Some(layout) = guest_layout(size, align) else {
+        return HostRet::one(0);
+    };
+    // Safety: the guest hands back an allocation of exactly
+    // this layout (its own drop glue computed it from the
+    // value's recorded pointer and capacity).
+    unsafe { std::alloc::dealloc(ptr as *mut u8, layout) };
+    HostRet::one(0)
+}
+
+/// `__rust_realloc(ptr, old_size, align, new_size) -> *mut u8`:
+/// resize a host allocation, null on failure (the old block is
+/// left untouched then, as the contract requires). Arguments:
+/// (pointer, old size, align, new size, _).
+extern "C" fn host_rust_realloc(
+    _ctx: *mut BuiltinCtx,
+    ptr: i64,
+    old_size: i64,
+    align: i64,
+    new_size: i64,
+    _a: i64,
+) -> HostRet {
+    if ptr == 0 {
+        return host_rust_alloc(_ctx, new_size, align, 0, 0, 0);
+    }
+    let Some(layout) = guest_layout(old_size, align) else {
+        return HostRet::one(0);
+    };
+    if new_size < 0 {
+        return HostRet::one(0);
+    }
+    // Safety: `ptr` is a live allocation of `layout`; the
+    // result is checked before use, as core checks it.
+    let p = unsafe { std::alloc::realloc(ptr as *mut u8, layout, new_size as usize) };
+    HostRet::one(p as i64)
+}
+
+/// `String::from(&str)` (the string case of `From::from`):
+/// copy the source's bytes into a fresh buffer and write the
+/// `String` triple at the destination address. Arguments:
+/// (destination address, data pointer, length, _, _).
+extern "C" fn host_string_from_str(
+    ctx: *mut BuiltinCtx,
+    dst: i64,
+    ptr: i64,
+    len: i64,
+    _a: i64,
+    _b: i64,
+) -> HostRet {
+    let ctx = unsafe { &mut *ctx };
+    let bytes = match read_bytes(ptr, len) {
+        Ok(b) => b,
+        Err(m) => return ctx.fail(&m),
+    };
+    write_string_at(ctx, dst, &bytes)
+}
+
+/// `std::fmt::format(Arguments) -> String`: format the
+/// arguments with the fmt engine and write the resulting text
+/// as a `String` at the destination address. Arguments:
+/// (destination address, arguments handle, _, _, _).
+extern "C" fn host_string_format(
+    ctx: *mut BuiltinCtx,
+    dst: i64,
+    handle: i64,
+    _a: i64,
+    _b: i64,
+    _c: i64,
+) -> HostRet {
+    let ctx = unsafe { &mut *ctx };
+    let Some(StoreEntry::Arguments(data)) = ctx.entry(handle) else {
+        return ctx.fail("fmt::format of a value that is not fmt::Arguments");
+    };
+    let data = data.clone();
+    let text = match format_arguments(ctx, &data) {
+        Ok(t) => t,
+        Err(m) => return ctx.fail(&m),
+    };
+    write_string_at(ctx, dst, text.as_bytes())
+}
+
+/// `str::to_uppercase(&str) -> String`: the host's own
+/// `str::to_uppercase` (the very code the guest's std ships, so
+/// the result matches exactly), written as a `String` at the
+/// destination address. Arguments: (destination address, data
+/// pointer, length, _, _).
+extern "C" fn host_str_to_uppercase(
+    ctx: *mut BuiltinCtx,
+    dst: i64,
+    ptr: i64,
+    len: i64,
+    _a: i64,
+    _b: i64,
+) -> HostRet {
+    let ctx = unsafe { &mut *ctx };
+    let s = match read_str(ptr, len) {
+        Ok(s) => s,
+        Err(m) => return ctx.fail(&m),
+    };
+    write_string_at(ctx, dst, s.to_uppercase().as_bytes())
+}
+
+/// `str::to_lowercase(&str) -> String`: as
+/// [`host_str_to_uppercase`], with `to_lowercase`. Arguments:
+/// (destination address, data pointer, length, _, _).
+extern "C" fn host_str_to_lowercase(
+    ctx: *mut BuiltinCtx,
+    dst: i64,
+    ptr: i64,
+    len: i64,
+    _a: i64,
+    _b: i64,
+) -> HostRet {
+    let ctx = unsafe { &mut *ctx };
+    let s = match read_str(ptr, len) {
+        Ok(s) => s,
+        Err(m) => return ctx.fail(&m),
+    };
+    write_string_at(ctx, dst, s.to_lowercase().as_bytes())
+}
+
+/// `Deref::deref` for a buffer value (`String`, `Vec<T>`): the
+/// dereferenced slice is the (pointer, length) pair the value's
+/// own triple starts and ends with. Arguments: (value address,
+/// _, _, _, _).
+extern "C" fn host_deref_buffer(
+    _ctx: *mut BuiltinCtx,
+    addr: i64,
+    _a: i64,
+    _b: i64,
+    _c: i64,
+    _d: i64,
+) -> HostRet {
+    // Safety: the argument is the guest's own reference to the
+    // buffer value; its triple is live for the call.
+    let ptr = unsafe { load_word(addr) };
+    let len = unsafe { load_word(addr - 16) };
+    HostRet::pair(ptr, len)
+}
+
+/// An integer bit intrinsic (`ctpop`, `ctlz`, `cttz`,
+/// `bitreverse`, `bswap` — operation codes 0..=4): the
+/// interpreter's builtin computes on the operand's bit pattern
+/// masked to the type's width; so does this. Arguments:
+/// (operation, low word, high word, bit width, _). The result
+/// is the value as a (low, high) pair (counts are one word;
+/// `bitreverse` / `bswap` of a 128-bit operand are two).
+extern "C" fn host_bit_op(
+    _ctx: *mut BuiltinCtx,
+    op: i64,
+    lo: i64,
+    hi: i64,
+    bits: i64,
+    _a: i64,
+) -> HostRet {
+    if !(1..=128).contains(&bits) {
+        return HostRet::one(0);
+    }
+    let bits = bits as u32;
+    let pattern = ((hi as u64 as u128) << 64) | (lo as u64 as u128);
+    let pattern = if bits == 128 {
+        pattern
+    } else {
+        pattern & ((1u128 << bits) - 1)
+    };
+    let result: u128 = match op {
+        0 => pattern.count_ones() as u128,
+        1 => (pattern.leading_zeros() - (128 - bits)) as u128,
+        2 => {
+            if pattern == 0 {
+                bits as u128
+            } else {
+                pattern.trailing_zeros() as u128
+            }
+        }
+        3 => pattern.reverse_bits() >> (128 - bits),
+        4 => pattern.swap_bytes() >> (128 - bits),
+        _ => 0,
+    };
+    HostRet::pair(result as u64 as i64, (result >> 64) as u64 as i64)
+}
+
+/// A structural `fmt::Arguments` value, as core's own
+/// constructors build it (the aggregate in a panic path, not
+/// an `Arguments::new` call): two words — the template's data
+/// pointer and a second word. In the tagged form (low bit
+/// set) the second word packs the template's byte length
+/// above the tag and there is no argument array: the value
+/// is the plain string itself (the shape of the static
+/// panic messages). Arguments: (data pointer, second word,
+/// _, _, _).
+extern "C" fn host_arguments_from_struct(
+    ctx: *mut BuiltinCtx,
+    ptr: i64,
+    second: i64,
+    _a: i64,
+    _b: i64,
+    _c: i64,
+) -> HostRet {
+    let ctx = unsafe { &mut *ctx };
+    if second & 1 == 1 {
+        let len = ((second as u64) >> 1) as i64;
+        let s = match read_str(ptr, len) {
+            Ok(s) => s,
+            Err(m) => return ctx.fail(&m),
+        };
+        let handle = ctx.push(StoreEntry::Arguments(ArgumentsData::Plain(s)));
+        return HostRet::one(handle);
+    }
+    ctx.fail("structural fmt::Arguments with an argument array")
+}
+
+/// `String::len(&String)`: the triple's length word.
+/// Arguments: (value address, _, _, _, _).
+extern "C" fn host_string_len(
+    _ctx: *mut BuiltinCtx,
+    addr: i64,
+    _a: i64,
+    _b: i64,
+    _c: i64,
+    _d: i64,
+) -> HostRet {
+    // Safety: the argument is the guest's own reference to the
+    // string value; its triple is live for the call.
+    HostRet::one(unsafe { load_word(addr - 16) })
+}
+
+/// `String::capacity(&String)`: the triple's capacity word.
+/// Arguments: (value address, _, _, _, _).
+extern "C" fn host_string_capacity(
+    _ctx: *mut BuiltinCtx,
+    addr: i64,
+    _a: i64,
+    _b: i64,
+    _c: i64,
+    _d: i64,
+) -> HostRet {
+    // Safety: as `host_string_len`.
+    HostRet::one(unsafe { load_word(addr - 8) })
+}
+
+/// Ensure the string at `addr` can hold `additional` more
+/// bytes, growing its buffer the way core's `RawVec` growth
+/// does: the new capacity is the largest of the required
+/// capacity, twice the old capacity, and the minimum
+/// non-zero capacity of a byte buffer (8).
+/// Returns false when the allocation failed.
+fn string_grow(_ctx: &mut BuiltinCtx, addr: i64, additional: i64) -> bool {
+    // Safety: `addr` is the guest's own `&mut String` target;
+    // its triple is live and exclusively borrowed for the call.
+    let (ptr, cap, len) = unsafe {
+        (
+            load_word(addr),
+            load_word(addr - 8),
+            load_word(addr - 16),
+        )
+    };
+    let required = len + additional;
+    if additional < 0 || required <= cap {
+        return additional >= 0;
+    }
+    let doubled = if cap > (1i64 << 62) { required } else { cap * 2 };
+    let new_cap = required.max(doubled).max(8);
+    let layout_new = match guest_layout(new_cap, 1) {
+        Some(l) => l,
+        None => return false,
+    };
+    let new_ptr = if cap == 0 {
+        // Safety: the layout is non-zero and well-formed.
+        unsafe { std::alloc::alloc(layout_new) }
+    } else {
+        let layout_old = match guest_layout(cap, 1) {
+            Some(l) => l,
+            None => return false,
+        };
+        // Safety: `ptr` is a live allocation of `layout_old`.
+        unsafe { std::alloc::realloc(ptr as *mut u8, layout_old, new_cap as usize) }
+    };
+    if new_ptr.is_null() {
+        return false;
+    }
+    // Safety: as above; the triple's words are the value's own.
+    unsafe {
+        store_word(addr, new_ptr as i64);
+        store_word(addr - 8, new_cap);
+    }
+    true
+}
+
+/// Append `bytes` to the string at `addr` (growing first).
+fn string_append(ctx: &mut BuiltinCtx, addr: i64, bytes: &[u8]) -> HostRet {
+    if !string_grow(ctx, addr, bytes.len() as i64) {
+        return ctx.fail("memory allocation failed");
+    }
+    // Safety: the buffer now has room; the triple is the
+    // value's own.
+    let (ptr, len) = unsafe { (load_word(addr), load_word(addr - 16)) };
+    if !bytes.is_empty() {
+        // Safety: `ptr + len` is inside the (grown) allocation
+        // with `bytes.len()` bytes free.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                (ptr as *mut u8).add(len as usize),
+                bytes.len(),
+            );
+        }
+    }
+    // Safety: as above.
+    unsafe { store_word(addr - 16, len + bytes.len() as i64) };
+    HostRet::one(0)
+}
+
+/// `String::push_str(&mut String, &str)`: append the source's
+/// bytes. Arguments: (string address, source pointer, source
+/// length, _, _).
+extern "C" fn host_string_push_str(
+    ctx: *mut BuiltinCtx,
+    addr: i64,
+    src_ptr: i64,
+    src_len: i64,
+    _a: i64,
+    _b: i64,
+) -> HostRet {
+    let ctx = unsafe { &mut *ctx };
+    let bytes = match read_bytes(src_ptr, src_len) {
+        Ok(b) => b,
+        Err(m) => return ctx.fail(&m),
+    };
+    string_append(ctx, addr, &bytes)
+}
+
+/// `String::push(&mut String, char)`: append the character's
+/// UTF-8 encoding. Arguments: (string address, char word, _,
+/// _, _).
+extern "C" fn host_string_push(
+    ctx: *mut BuiltinCtx,
+    addr: i64,
+    ch: i64,
+    _a: i64,
+    _b: i64,
+    _c: i64,
+) -> HostRet {
+    let ctx = unsafe { &mut *ctx };
+    let Some(c) = char::from_u32(ch as u64 as u32) else {
+        return ctx.fail("String::push of an invalid char value");
+    };
+    let mut buf = [0u8; 4];
+    let s = c.encode_utf8(&mut buf);
+    string_append(ctx, addr, s.as_bytes())
+}
+
+/// A `str` pattern search (`starts_with` = 0, `ends_with` = 1,
+/// `contains` = 2) with a `&str` pattern: the host's own `str`
+/// methods, so the answer matches the guest's std exactly.
+/// Arguments: (operation, data pointer, length, pattern
+/// pointer, pattern length).
+extern "C" fn host_str_op(
+    ctx: *mut BuiltinCtx,
+    op: i64,
+    ptr: i64,
+    len: i64,
+    pat_ptr: i64,
+    pat_len: i64,
+) -> HostRet {
+    let ctx = unsafe { &mut *ctx };
+    let s = match read_str(ptr, len) {
+        Ok(s) => s,
+        Err(m) => return ctx.fail(&m),
+    };
+    let pat = match read_str(pat_ptr, pat_len) {
+        Ok(s) => s,
+        Err(m) => return ctx.fail(&m),
+    };
+    let r = match op {
+        0 => s.starts_with(&pat),
+        1 => s.ends_with(&pat),
+        2 => s.contains(&pat),
+        _ => return ctx.fail("str search with an unknown operation"),
+    };
+    HostRet::one(r as i64)
+}
+
+/// String equality: the byte comparison of the two contents
+/// (the equality `str`'s `PartialEq` defines, which the
+/// `String` impls share). Arguments: (pointer, length,
+/// pointer, length, _).
+extern "C" fn host_str_eq(
+    ctx: *mut BuiltinCtx,
+    p1: i64,
+    l1: i64,
+    p2: i64,
+    l2: i64,
+    _a: i64,
+) -> HostRet {
+    let ctx = unsafe { &mut *ctx };
+    if l1 != l2 {
+        return HostRet::one(0);
+    }
+    let a = match read_bytes(p1, l1) {
+        Ok(b) => b,
+        Err(m) => return ctx.fail(&m),
+    };
+    let b = match read_bytes(p2, l2) {
+        Ok(b) => b,
+        Err(m) => return ctx.fail(&m),
+    };
+    HostRet::one((a == b) as i64)
+}
+
+/// `core::panicking::panic_nounwind_fmt(Arguments, bool)`:
+/// the message is the formatted arguments; the call raises the
+/// guest panic with it and never returns a value. Arguments:
+/// (arguments handle, _, _, _, _).
+extern "C" fn host_panic_nounwind_fmt(
+    ctx: *mut BuiltinCtx,
+    handle: i64,
+    _a: i64,
+    _b: i64,
+    _c: i64,
+    _d: i64,
+) -> HostRet {
+    let ctx = unsafe { &mut *ctx };
+    let Some(StoreEntry::Arguments(data)) = ctx.entry(handle) else {
+        return ctx.fail("panic_nounwind_fmt of a value that is not fmt::Arguments");
+    };
+    let data = data.clone();
+    match format_arguments(ctx, &data) {
+        Ok(text) => ctx.fail(&text),
+        Err(m) => ctx.fail(&m),
+    }
 }
 
 /// `std::io::_print(Arguments)` / `_eprint`: format the arguments
@@ -1262,6 +2006,9 @@ fn read_value_at(ty: &FmtTy, addr: i64) -> Result<HostVal, String> {
             FmtTy::F32 => HostVal::Float(f32::from_bits(load_word(addr) as u32) as f64, true),
             FmtTy::F64 => HostVal::Float(f64::from_bits(load_word(addr) as u64), false),
             FmtTy::Str => HostVal::Str(read_str(load_word(addr), load_word(addr - 8))?),
+            FmtTy::OwnedStr => {
+                HostVal::Str(read_str(load_word(addr), load_word(addr - 16))?)
+            }
             FmtTy::Ref(inner) => {
                 if matches!(&**inner, FmtTy::Str) {
                     return read_value_at(inner, addr);
