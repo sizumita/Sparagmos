@@ -7524,6 +7524,21 @@ impl<'a> Interpreter<'a> {
     /// may be formed, and reading through it stays an explicit
     /// out-of-bounds error). Anything else answers `None`, and
     /// the caller carries the displacement as before.
+    ///
+    /// One position shape is judged at a different level: when
+    /// the steps after the last index step only enter a whole
+    /// sub-value — field-0 steps into single-field aggregates
+    /// and downcasts, the shape a transparent-wrapper entry
+    /// (`PtrField`) leaves — the position denotes that sub-value
+    /// as a whole, so the offset ranges over the repetitions of
+    /// the sub-value: the elements of the container the last
+    /// index step ranged over, whose stride is the entered
+    /// value's size exactly because every entry step is
+    /// size-preserving. The index step is adjusted and the
+    /// entry steps are kept. Judging such a position at the
+    /// entered value instead would index the offset into the
+    /// value's own fields — a different position entirely (the
+    /// `MaybeUninit` buffer walk behind array clone).
     fn absorb_displacement(
         &self,
         base: &Value,
@@ -7559,9 +7574,36 @@ impl<'a> Interpreter<'a> {
         // after the step); `None` while the walk denotes the
         // container it has navigated to itself.
         let mut pending_container: Option<Value> = None;
+        // The last index step the walk crossed — its position in
+        // the projection, the container it ranges over and the
+        // index it selects — and whether every step since then
+        // only enters a whole sub-value (a field-0 step into a
+        // single-field aggregate, or a downcast). A position of
+        // that shape denotes the entered sub-value as a whole,
+        // and an offset over it ranges over the container of
+        // that index step, not over the entered value (see the
+        // doc comment above).
+        let mut index_level: Option<(usize, Value, i128)> = None;
+        let mut trailing_entry = true;
         for (j, step) in projection.iter().enumerate() {
             match step {
                 RefProj::Field(idx) => {
+                    // A field step after an index step keeps the
+                    // whole-value-entry shape only when it enters
+                    // a single-field aggregate at field 0 (the
+                    // transparent wrappers): any other field is a
+                    // genuine sub-position whose stride the offset
+                    // cannot denominate.
+                    let single_field = match cur {
+                        Value::Tuple(items) => items.len() == 1,
+                        Value::Enum { fields, .. } => fields.len() == 1,
+                        Value::Coroutine { fields, .. } => fields.len() == 1,
+                        Value::Closure { env, .. } => env.len() == 1,
+                        _ => false,
+                    };
+                    if *idx != 0 || !single_field {
+                        trailing_entry = false;
+                    }
                     cur = match cur {
                         Value::Tuple(items) => items.get(*idx)?,
                         Value::Enum { fields, .. } => fields.get(*idx)?,
@@ -7576,11 +7618,15 @@ impl<'a> Interpreter<'a> {
                     }
                 }
                 RefProj::Subslice { offset, len } => {
+                    trailing_entry = false;
                     let sub = subslice_value(cur, *offset, *len)?;
                     temps.push(Box::new(sub));
                     cur = temps.last().expect("just pushed");
                 }
                 RefProj::Index(idx) => {
+                    index_level =
+                        Some((j, cur.clone(), i128::try_from(*idx).ok()?));
+                    trailing_entry = true;
                     if j + 1 == projection.len() {
                         prefix = j;
                         index = i128::try_from(*idx).ok()?;
@@ -7603,6 +7649,54 @@ impl<'a> Interpreter<'a> {
                     }
                 }
                 _ => return None,
+            }
+        }
+        // A position that ends in whole-value entry steps after
+        // its last index step denotes the entered sub-value as a
+        // whole: the offset ranges over the repetitions of that
+        // sub-value in the container the index step ranged over
+        // (the entry steps are size-preserving, so the offset's
+        // element size is the stride there). Adjust that index
+        // and keep the entry steps. A displacement that does not
+        // land on a repetition boundary, or lands outside the
+        // container, is not absorbed at this level — and is not
+        // judged at the entered value either, whose fields the
+        // offset does not denominate.
+        if let Some((pos, snap_container, snap_index)) = &index_level {
+            let trailing = &projection[pos + 1..];
+            if !trailing.is_empty() && trailing_entry {
+                let count: i128 = match snap_container {
+                    Value::Tuple(items) => i128::try_from(items.len()).ok()?,
+                    Value::Enum { fields, .. } => {
+                        i128::try_from(fields.len()).ok()?
+                    }
+                    Value::Bytes(b) => {
+                        if size != 1 {
+                            return None;
+                        }
+                        i128::try_from(b.len()).ok()?
+                    }
+                    Value::Str(text) => {
+                        if size != 1 {
+                            return None;
+                        }
+                        i128::try_from(text.len()).ok()?
+                    }
+                    _ => return None,
+                };
+                let byte_pos = snap_index.checked_mul(size)?.checked_add(total)?;
+                if byte_pos < 0 || byte_pos % size != 0 {
+                    return None;
+                }
+                let new_index = byte_pos / size;
+                if new_index > count {
+                    return None;
+                }
+                let new_index = usize::try_from(new_index).ok()?;
+                let mut out: Vec<RefProj> = projection[..*pos].to_vec();
+                out.push(RefProj::Index(new_index));
+                out.extend_from_slice(trailing);
+                return Some(out);
             }
         }
         // The container's element count, unwrapping the shapes a
@@ -10929,19 +11023,38 @@ fn check_subslice(value_len: usize, offset: usize, count: usize) -> InterpResult
 /// slice-relative index denotes the element `base + idx` of that
 /// container, not an element of the first element: the trailing
 /// step is advanced instead of a nested step being appended.
-/// Any other target shape answers `None` and the caller appends
-/// the step as usual.
+/// The base may also enter that first element through whole-value
+/// entry steps (field steps and downcasts — the shape a
+/// transparent-wrapper entry leaves, as in a slice over the `S`
+/// values of a `[MaybeUninit<S>]` buffer): the position inside
+/// the element is the same in every element, so the index step
+/// before the entry steps is advanced and the entry steps are
+/// kept. Any other target shape answers `None` and the caller
+/// appends the step as usual.
 fn compose_fat_index(cur: &Resolved, idx: usize) -> Option<Resolved> {
     fn advanced(projection: &[RefProj], idx: usize) -> Option<Vec<RefProj>> {
-        match projection.last() {
-            Some(RefProj::Index(k)) => {
-                let mut out = projection.to_vec();
-                *out.last_mut().expect("nonempty projection") =
-                    RefProj::Index(k.checked_add(idx)?);
-                Some(out)
+        // The element index the composition advances: the
+        // projection's last index step, with only whole-value
+        // entry steps (fields, downcasts) after it.
+        let mut pos = projection.len();
+        loop {
+            match projection.get(pos.wrapping_sub(1)) {
+                Some(RefProj::Field(_)) | Some(RefProj::Downcast(_)) => {
+                    pos -= 1;
+                }
+                Some(RefProj::Index(_)) => {
+                    pos -= 1;
+                    break;
+                }
+                _ => return None,
             }
-            _ => None,
         }
+        let Some(RefProj::Index(k)) = projection.get(pos) else {
+            return None;
+        };
+        let mut out = projection.to_vec();
+        out[pos] = RefProj::Index(k.checked_add(idx)?);
+        Some(out)
     }
     match cur {
         Resolved::Place {
