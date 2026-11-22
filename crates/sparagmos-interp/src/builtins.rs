@@ -10818,6 +10818,23 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
     ) -> InterpResult<(SliceElems<'x>, u128)> {
         match value {
             Value::FatRef { base, len } => {
+                // A base pointer denoting one element of a
+                // container (a raw-parts slice formed over an
+                // offset element pointer) denotes the elements
+                // from that position on, not the pointed element
+                // itself: read them through the sequence accessor,
+                // which continues to the element's siblings in the
+                // container (and reads within the element when the
+                // element is itself an aggregate).
+                if let Ok(target) = self.deref_value(frames, base) {
+                    if target_ends_at_element(&target) {
+                        let mut elems = Vec::with_capacity(*len as usize);
+                        for i in 0..(*len as usize) {
+                            elems.push(self.read_seq_at(frames, &target, i)?);
+                        }
+                        return Ok((SliceElems::Values(Cow::Owned(elems)), *len));
+                    }
+                }
                 let base = self.resolve_ref(frames, base)?;
                 let elems = elements_of(base)?.truncated(*len as usize);
                 Ok((elems, *len))
@@ -13098,6 +13115,20 @@ impl<'a> SliceElems<'a> {
     }
 }
 
+/// Whether a resolved target denotes one element of a container
+/// (its projection ends at an index step): a fat pointer over
+/// such a target denotes the elements from that position on, not
+/// the element itself.
+fn target_ends_at_element(target: &Resolved) -> bool {
+    let projection = match target {
+        Resolved::Place { projection, .. }
+        | Resolved::Static { projection, .. }
+        | Resolved::Alloc { projection, .. }
+        | Resolved::Value(_, projection) => projection,
+    };
+    matches!(projection.last(), Some(RefProj::Index(_)))
+}
+
 /// The elements of an already-resolved value, borrowed where
 /// possible: the borrowing form of [`value_elements`], with the
 /// same results and errors.
@@ -14751,6 +14782,38 @@ impl<'a> Interpreter<'a> {
                 trait_,
                 ty,
             } => {
+                // A reference to a fat pointer whose base denotes
+                // an element of a container: the stored fat pointer
+                // denotes the slice starting at that element, so
+                // format it as the slice it is rather than resolving
+                // through to the element.
+                if let Ok(resolved) = self.deref_value(frames, target) {
+                    if let Ok(stored) = self.read_resolved(frames, &resolved) {
+                        if let Value::FatRef { base, .. } = &stored {
+                            if let Ok(bd) = self.deref_value(frames, base) {
+                                if target_ends_at_element(&bd) {
+                                    return self.format_value(
+                                        frames, &stored, *trait_, ty, options, 0,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                // A fat pointer whose base denotes an element of a
+                // container denotes the slice starting at that
+                // element: resolving it would read the element
+                // itself and lose the slice shape, so hand the fat
+                // pointer itself to the formatter.
+                if let Value::FatRef { base, .. } = &**target {
+                    if let Ok(resolved) = self.deref_value(frames, base) {
+                        if target_ends_at_element(&resolved) {
+                            return self.format_value(
+                                frames, target, *trait_, ty, options, 0,
+                            );
+                        }
+                    }
+                }
                 let pointee = self.resolve_value(frames, target)?;
                 self.format_value(frames, &pointee, *trait_, ty, options, 0)
             }
@@ -14777,15 +14840,27 @@ impl<'a> Interpreter<'a> {
             let pointee = self.resolve_value(frames, value)?;
             return self.format_value(frames, &pointee, trait_, ty, options, indent);
         }
-        if matches!(value, Value::FatRef { .. }) {
+        if let Value::FatRef { base, .. } = value {
             // A slice value: only Debug is defined for it (a list).
             if trait_ != FmtTrait::Debug {
                 return Err(unsupported(format!(
                     "{trait_:?} formatting for a slice value"
                 )));
             }
-            let pointee = self.resolve_value(frames, value)?;
             let elem = slice_elem_tag(pointee_tag(ty));
+            // A base denoting an element of a container denotes
+            // the slice from that element on: keep the fat pointer
+            // itself so the sequence formatter reads the elements
+            // from that position (resolving it would read just the
+            // element).
+            if let Ok(resolved) = self.deref_value(frames, base) {
+                if target_ends_at_element(&resolved) {
+                    return self.format_debug_seq(
+                        frames, value, options, indent, '[', ']', elem,
+                    );
+                }
+            }
+            let pointee = self.resolve_value(frames, value)?;
             return self.format_debug_seq(frames, &pointee, options, indent, '[', ']', elem);
         }
         if let Value::DynRef {

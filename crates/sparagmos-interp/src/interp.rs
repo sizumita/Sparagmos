@@ -5448,8 +5448,18 @@ impl<'a> Interpreter<'a> {
                 local,
                 projection,
             } => {
-                let projection =
-                    self.offset_projection(frames, Some((frame, local)), projection, disp)?;
+                let base = self
+                    .frame_pos(frames, frame)
+                    .ok()
+                    .and_then(|pos| frames[pos].locals.get(local));
+                let projection = self.offset_projection(
+                    frames,
+                    Some((frame, local)),
+                    projection,
+                    disp,
+                    elem_size,
+                    base,
+                )?;
                 Ok(RefTarget::Place {
                     frame,
                     local,
@@ -5459,8 +5469,17 @@ impl<'a> Interpreter<'a> {
             RefTarget::Static { name, projection } => {
                 // A static's declared type is not part of the IR
                 // program, so no array absorption is attempted for
-                // statics: the displacement is carried.
-                let projection = self.offset_projection(frames, None, projection, disp)?;
+                // statics: the displacement is carried unless the
+                // static value's own shape absorbs it.
+                let base = self.static_base(&name).ok();
+                let projection = self.offset_projection(
+                    frames,
+                    None,
+                    projection,
+                    disp,
+                    elem_size,
+                    base.as_ref(),
+                )?;
                 Ok(RefTarget::Static { name, projection })
             }
             RefTarget::Alloc { id, projection } => {
@@ -5478,7 +5497,15 @@ impl<'a> Interpreter<'a> {
                 {
                     return absorbed.map(|projection| RefTarget::Alloc { id, projection });
                 }
-                let projection = self.offset_projection(frames, None, projection, disp)?;
+                let base = self.alloc_base(id).ok();
+                let projection = self.offset_projection(
+                    frames,
+                    None,
+                    projection,
+                    disp,
+                    elem_size,
+                    base.as_ref(),
+                )?;
                 Ok(RefTarget::Alloc { id, projection })
             }
             RefTarget::Value(v, projection) => {
@@ -5519,7 +5546,14 @@ impl<'a> Interpreter<'a> {
                     // the projection, as for statics and
                     // allocations, whose pointees are likewise not
                     // declared locals.
-                    let projection = self.offset_projection(frames, None, projection, disp)?;
+                    let projection = self.offset_projection(
+                        frames,
+                        None,
+                        projection,
+                        disp,
+                        elem_size,
+                        Some(&v),
+                    )?;
                     Ok(RefTarget::Value(v, projection))
                 }
             }
@@ -5608,7 +5642,9 @@ impl<'a> Interpreter<'a> {
     /// of an array place (or the array place itself) and the total
     /// displacement lands exactly on an element boundary, it is
     /// absorbed into the index projection, so reads and writes
-    /// through the result resolve structurally. Otherwise the
+    /// through the result resolve structurally. The same absorption
+    /// applies over any element aggregate the target's value
+    /// denotes (see [`Self::absorb_displacement`]). Otherwise the
     /// displacement is carried as a trailing
     /// [`RefProj::ByteOffset`] step: the position is faithfully
     /// denoted (and further offsets accumulate into it), but
@@ -5622,6 +5658,8 @@ impl<'a> Interpreter<'a> {
         place: Option<(u64, usize)>,
         mut projection: Vec<RefProj>,
         disp: Option<i128>,
+        elem_size: Option<u64>,
+        base: Option<&Value>,
     ) -> InterpResult<Vec<RefProj>> {
         // A displacement already carried on the target accumulates
         // into this one: the combination is what decides
@@ -5644,7 +5682,8 @@ impl<'a> Interpreter<'a> {
         if total == 0 {
             return Ok(projection);
         }
-        if let Some((cur, elem)) = self.array_position(frames, place, &projection) {
+        let array_pos = self.array_position(frames, place, &projection);
+        if let Some((cur, elem)) = array_pos {
             if elem > 0 {
                 if let Some(byte_pos) = cur.checked_mul(elem).and_then(|b| b.checked_add(total)) {
                     if byte_pos >= 0 && byte_pos % elem == 0 {
@@ -5668,8 +5707,137 @@ impl<'a> Interpreter<'a> {
                 }
             }
         }
+        // When the declared type cannot judge the position (the
+        // target is not an array place), the value's own shape can:
+        // a displacement over an element aggregate (a tuple, or an
+        // ADT value whose fields are its elements, as a `Vec` value
+        // is) in whole units of the offset's element size denotes
+        // the element at that index, exactly as the array case
+        // above. The array verdict governs whenever it applies, so
+        // a byte displacement into a typed array is never
+        // reinterpreted this way.
+        if array_pos.is_none() {
+            if let Some(base) = base {
+                if let Some(absorbed) =
+                    self.absorb_displacement(base, &projection, total, elem_size)
+                {
+                    return Ok(absorbed);
+                }
+            }
+        }
         projection.push(RefProj::ByteOffset(total));
         Ok(projection)
+    }
+
+    /// Absorb a byte displacement into an element index over the
+    /// element aggregate `base` that `projection` denotes a
+    /// position in (see the call in
+    /// [`Self::offset_projection`]). The projection must navigate
+    /// structurally (fields, downcasts) to an element container —
+    /// a tuple, a byte string, or an ADT value whose fields are
+    /// its elements — and end either at the container itself
+    /// (element 0) or at one index step into it. The displacement
+    /// must move the position by a whole number of the offset's
+    /// element size and land within the container (one past the
+    /// end included: such a pointer may be formed, and reading
+    /// through it stays an explicit out-of-bounds error).
+    /// Anything else answers `None`, and the caller carries the
+    /// displacement as before.
+    fn absorb_displacement(
+        &self,
+        base: &Value,
+        projection: &[RefProj],
+        total: i128,
+        elem_size: Option<u64>,
+    ) -> Option<Vec<RefProj>> {
+        let size = i128::from(elem_size?);
+        if size <= 0 {
+            return None;
+        }
+        // Navigate to the container the position sits in.
+        let mut cur: &Value = base;
+        let mut prefix = projection.len();
+        let mut index: i128 = 0;
+        for (j, step) in projection.iter().enumerate() {
+            match step {
+                RefProj::Field(idx) => {
+                    cur = match cur {
+                        Value::Tuple(items) => items.get(*idx)?,
+                        Value::Enum { fields, .. } => fields.get(*idx)?,
+                        Value::Coroutine { fields, .. } => fields.get(*idx)?,
+                        Value::Closure { env, .. } => env.get(*idx)?,
+                        _ => return None,
+                    };
+                }
+                RefProj::Downcast(_) => {
+                    if !matches!(cur, Value::Enum { .. } | Value::Coroutine { .. }) {
+                        return None;
+                    }
+                }
+                RefProj::Index(idx) => {
+                    if j + 1 != projection.len() {
+                        return None;
+                    }
+                    prefix = j;
+                    index = i128::try_from(*idx).ok()?;
+                }
+                _ => return None,
+            }
+        }
+        // The container's element count, unwrapping the shapes a
+        // pointer position can sit in: a fat reference denotes its
+        // base's elements with the carried length, and a
+        // single-field ADT whose only field is an element
+        // aggregate is indexed through that field (the
+        // `#[repr(simd)]` pun `project_value` also honours).
+        let mut container: &Value = cur;
+        loop {
+            match container {
+                Value::FatRef { base, .. } => container = base,
+                Value::Enum { fields, .. }
+                    if fields.len() == 1
+                        && matches!(fields[0], Value::Tuple(_) | Value::Bytes(_))
+                        && prefix < projection.len() =>
+                {
+                    container = &fields[0];
+                }
+                _ => break,
+            }
+        }
+        let count: i128 = match container {
+            Value::Tuple(items) => i128::try_from(items.len()).ok()?,
+            Value::Enum { fields, .. } => i128::try_from(fields.len()).ok()?,
+            Value::Bytes(b) => {
+                if size != 1 {
+                    return None;
+                }
+                i128::try_from(b.len()).ok()?
+            }
+            Value::Str(text) => {
+                if size != 1 {
+                    return None;
+                }
+                i128::try_from(text.len()).ok()?
+            }
+            _ => return None,
+        };
+        let byte_pos = index.checked_mul(size)?.checked_add(total)?;
+        if byte_pos < 0 || byte_pos % size != 0 {
+            return None;
+        }
+        let new_index = byte_pos / size;
+        if new_index > count {
+            return None;
+        }
+        let new_index = usize::try_from(new_index).ok()?;
+        let mut out: Vec<RefProj> = projection[..prefix].to_vec();
+        // Keep the input's form when the position stays at the
+        // container base itself (see `offset_projection`).
+        if prefix == projection.len() && new_index == 0 {
+            return Some(out);
+        }
+        out.push(RefProj::Index(new_index));
+        Some(out)
     }
 
     /// The array position a place target denotes, when it is

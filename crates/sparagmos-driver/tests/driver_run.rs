@@ -12415,3 +12415,70 @@ fn run_mode_libtest_should_panic_mismatch_section_has_report() {
         "stdout={stdout}"
     );
 }
+
+const WINDOWS_DISPLACED_SRC: &str = r#"
+pub trait Iter {
+    type Item<'a> where Self: 'a;
+    fn next<'a>(&'a mut self) -> Option<Self::Item<'a>>;
+    fn for_each<F>(mut self, mut f: F)
+    where Self: Sized, F: for<'a> FnMut(Self::Item<'a>)
+    {
+        while let Some(item) = self.next() {
+            f(item);
+        }
+    }
+}
+pub struct Windows<T> {
+    items: Vec<T>,
+    start: usize,
+    len: usize,
+}
+impl<T> Windows<T> {
+    pub fn new(items: Vec<T>, len: usize) -> Self {
+        Self { items, start: 0, len }
+    }
+}
+impl<T> Iter for Windows<T> {
+    type Item<'a> = &'a mut [T] where T: 'a;
+    fn next<'a>(&'a mut self) -> Option<Self::Item<'a>> {
+        let slice = self.items.get_mut(self.start..self.start + self.len)?;
+        self.start += 1;
+        Some(slice)
+    }
+}
+fn main() {
+    Windows::new(vec![1, 2, 3, 4, 5], 3)
+        .for_each(|slice| {
+            println!("{:?}", slice);
+            assert_eq!(slice.len(), 3);
+            let mut sum = 0;
+            for x in slice.iter() {
+                sum += x;
+            }
+            println!("sum={}", sum);
+        });
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_windows_displaced_slice_reads_elements() {
+    // A slice formed by displacing a container pointer by a whole
+    // number of elements (the `windows` shape: a range index into
+    // the middle of a Vec) denotes the elements from that position
+    // on: its length, its iterated elements and its Debug rendering
+    // all see the displaced window, not just the first element.
+    let dir = temp_dir("windows-displaced");
+    let src = fixture(&dir, "windows_displaced.rs", WINDOWS_DISPLACED_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "displaced window slices must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[1, 2, 3]\nsum=6\n[2, 3, 4]\nsum=9\n[3, 4, 5]\nsum=12\nok\n"
+    );
+}
