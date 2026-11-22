@@ -245,10 +245,10 @@ pub enum TerminatorKind {
 /// would invent a continuation the program does not have). Anything
 /// else — real instructions, port I/O, fences, `cpuid` — has effects
 /// this predicate does not model, and the caller keeps it an explicit
-/// error. Whether the block may be *converted* at all additionally
-/// depends on its operands (an operand with an out place is written
-/// by the assembly, which no executor here models); that check is
-/// the driver's, since only it sees the operand places.
+/// error at execution time. Conversion is faithful regardless of
+/// this predicate: the driver carries every asm block into the
+/// structured form, and the classification lives here, with the
+/// executors that consume it.
 pub fn inline_asm_is_noop(template: &str, options: &str) -> bool {
     if options.contains("NORETURN") {
         return false;
@@ -865,8 +865,8 @@ fn asm_step(text: &str, operands: &[InlineAsmOperand]) -> Option<AsmStep> {
 ///   `ret` (a `noreturn` block) is outside the class, as is AT&T
 ///   syntax.
 ///
-/// Anything else keeps the named conversion error the caller
-/// already produces for `InlineAsm`.
+/// Anything else is outside the class: the executors keep it a
+/// named explicit error at execution time.
 pub fn inline_asm_program(
     template: &str,
     options: &str,

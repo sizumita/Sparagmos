@@ -1172,37 +1172,20 @@ impl Converter {
                 unwind,
                 ..
             } => {
-                // Two classes convert for real (see
+                // Conversion is faithful for every shape: the
+                // structured form carries the template, the operands
+                // and the options in full. Which blocks *execute* is
+                // the executors' classification, applied where the
+                // terminator is consumed (see
                 // `sm::inline_asm_is_noop` and
-                // `sm::inline_asm_program`): the no-op class
-                // (empty / comment-only / nop-only template, no
-                // NORETURN) when no operand place is written, and
-                // the evaluable register-program class, whose
-                // operands the structured form below carries in
-                // full. Anything else keeps the named conversion
-                // error.
-                let has_out_place = operands.iter().any(|op| op.out_place.is_some());
-                let noop = !has_out_place && sm::inline_asm_is_noop(template, options);
-                let supported = noop
-                    || sm::inline_asm_program(
-                        template,
-                        options,
-                        &operands
-                            .iter()
-                            .map(|op| self.asm_operand(body, op, false))
-                            .collect::<Vec<_>>(),
-                        destination.is_some(),
-                    )
-                    .is_some();
-                let ops = if supported {
-                    operands
-                        .iter()
-                        .map(|op| self.asm_operand(body, op, true))
-                        .collect()
-                } else {
-                    self.err("TerminatorKind::InlineAsm");
-                    Vec::new()
-                };
+                // `sm::inline_asm_program`): the no-op class and the
+                // evaluable register-program class run, and anything
+                // else is a named explicit error at execution time —
+                // never a reason to drop the whole body here.
+                let ops = operands
+                    .iter()
+                    .map(|op| self.asm_operand(body, op))
+                    .collect();
                 sm::TerminatorKind::InlineAsm {
                     template: template.clone(),
                     operands: ops,
@@ -1218,15 +1201,11 @@ impl Converter {
     /// the executors consume. The public operand struct keeps only
     /// the value/place pair, so the kind and the register are read
     /// from its raw representation (`In { reg: RegClass(X86(reg)),
-    /// value: .. }`, `Const { value: const 5_usize }`, ...). With
-    /// `convert` false only the classification facts are computed
-    /// (the value and place stay empty): classification must not
-    /// itself convert operands of a terminator it may reject.
+    /// value: .. }`, `Const { value: const 5_usize }`, ...).
     fn asm_operand(
         &mut self,
         body: &mir::Body,
         op: &mir::InlineAsmOperand,
-        convert: bool,
     ) -> sm::InlineAsmOperand {
         let raw = op.raw_rpr.as_str();
         let kind = if raw.starts_with("InOut {") {
@@ -1267,16 +1246,8 @@ impl Converter {
             reg_class,
             width,
             const_bits,
-            in_value: if convert {
-                op.in_value.as_ref().map(|v| self.operand(v))
-            } else {
-                None
-            },
-            out_place: if convert {
-                op.out_place.as_ref().map(|p| self.place(p))
-            } else {
-                None
-            },
+            in_value: op.in_value.as_ref().map(|v| self.operand(v)),
+            out_place: op.out_place.as_ref().map(|p| self.place(p)),
         }
     }
 
