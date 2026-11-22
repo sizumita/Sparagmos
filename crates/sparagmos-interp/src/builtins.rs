@@ -4878,17 +4878,24 @@ impl<'a> Interpreter<'a> {
                 let tests = self.read_test_descs(frames, &vals[0])?;
                 // A `-Z` option is rejected before anything else
                 // happens: the harness this models is a
-                // stable-channel one (the toolchain's own harness
-                // refuses `-Z` without a nightly channel). The
-                // one exception is `-Z unstable-options` unlocking
-                // the json format, the pair libtest's own JSON
-                // consumers pass; any other `-Z` use, and
-                // unstable-options without a json request, is
-                // refused as before. The json format without the
-                // unlocking option is likewise refused before
-                // listing or running.
+                // stable-channel one, and libtest's own gate is
+                // `is_nightly()` -- a nightly-built harness, or
+                // `RUSTC_BOOTSTRAP` present in the environment.
+                // The modelled harness is not nightly-built, so
+                // the environment decides (the run's environment
+                // is the guest's, as for `RUST_TEST_THREADS`
+                // below): with no bootstrap, every `-Z` use is
+                // refused, `-Z unstable-options` included. With
+                // bootstrap, the one exception is `-Z
+                // unstable-options` unlocking the json format, the
+                // pair libtest's own JSON consumers pass; any
+                // other `-Z` use, and unstable-options without a
+                // json request, is refused as before. The json
+                // format without the unlocking option is likewise
+                // refused before listing or running.
                 let raw_args: Vec<String> = self.guest_args().to_vec();
                 let opts = HarnessOpts::parse(&raw_args);
+                let bootstrap = std::env::var("RUSTC_BOOTSTRAP").is_ok();
                 let mut unstable_options = false;
                 let mut other_z = false;
                 {
@@ -4912,7 +4919,7 @@ impl<'a> Interpreter<'a> {
                         j += 1;
                     }
                 }
-                if other_z || (unstable_options && !opts.json) {
+                if other_z || (unstable_options && (!bootstrap || !opts.json)) {
                     self.push_error_output(
                         "error: the option `Z` is only accepted on the nightly compiler\n",
                     );
