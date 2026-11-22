@@ -340,3 +340,54 @@ through the general `eval_operand` path (59.6% inclusive on
 loop_sum, with place-description formatting at 21.2%), and the
 `Vec` builtins' `resolve_value` clones the whole vector
 (about 50% inclusive on vec_push_sum_s).
+
+## Update 2026-11-22 (gpu-3070): iter-map-fold regression — foreign-closure cap verdict, memoized type walks
+
+`tests/ui/iterators/iter-map-fold-type-length.rs` passed at
+both18 (39.5s on this host) but at both19/both20 exceeded the
+60s driver timeout; given a longer budget it finished at
+121.8s with a spurious instantiation-size-limit failure. A
+per-commit bisect plus a sampling profile (LD_PRELOAD SIGPROF,
+as in the fleur pass above) split the regression into three
+independent wave-12 changes:
+
+- HH (closure demand passes): a foreign closure demanded
+  with oversized but finite monomorphic arguments (std
+  `map_fold`'s closure over the twelve-deep `Map` tower)
+  tripped the local expanded-size cap and set the
+  compilation-wide recursion-limit failure. A foreign
+  instance is finite by construction — the compiler already
+  monomorphized it — and the reachability collection already
+  exempts foreign demand from the cap for exactly this
+  reason.
+- HN (closure layout recording): +46s. The rendered instance
+  key is a rendering of the whole type tree, and it was
+  computed on every closure-type encounter before the
+  per-instance memo could apply.
+- The HS+HR segment: +33s, profile-attributed to HR's
+  guarded kind query — every structural type walk pays a
+  mutex lock and a `catch_unwind` per node; the
+  expanded-size guard walk alone was 41% inclusive.
+
+Fixes, all in the driver:
+
+- The closure demand passes now fail only the demand itself
+  (recorded under the recursion-limit reason) when a
+  *foreign* closure trips the expanded-size cap; the
+  compilation-wide failure is reserved for locally generated
+  expansion. Local behaviour is unchanged: the
+  size-increasing tuple test still fails in 0.33s.
+- `record_layout` / `record_coroutine_layout` dedup attempts
+  by the compiler type handle before rendering the key.
+- `generic_args_within_expanded_size` memoizes exact
+  expanded sizes per type handle across all checks of a
+  compilation (the argument graph is a DAG; only fully
+  measured sizes are stored, so verdicts are unchanged).
+- `ty_mentions_param` is memoized per type handle, cleared
+  per compilation.
+
+Result on this host: 121.8s / exit 2 -> 49.1s / exit 0 (the
+remaining distance to the 39.5s base is wave 12's added
+collection and recording work, now paid once per distinct
+instance). Suites: workspace 602, driver 376, corpus 47/47,
+pytest 349.
