@@ -882,6 +882,34 @@ fn env_upvar_count(args: &GenericArgs) -> Option<usize> {
     })
 }
 
+/// The body an environment shape is read from, for one resolved
+/// closure/coroutine instance: the instance's own body when the
+/// instance is a plain item, else the definition's own body.
+///
+/// A resolution that lands on a compiler shim (the async
+/// destructor glue of `core::future::async_drop_in_place` is the
+/// known case: resolving its coroutine yields a shim instance)
+/// has no body of its own to read debug info from — the shim's
+/// body is synthesized glue, not the environment the definition
+/// declares — and forcing the shim builder out of band can
+/// panic inside the compiler (its preconditions are the mono
+/// collector's, not a bare query's). Such an instance gets no
+/// shape: `None` here skips the recording instead of falling
+/// back to the definition body, whose generic debug info does
+/// not describe the monomorphic environment either.
+fn instance_item_body(
+    inst: Option<Instance>,
+    def_body: impl FnOnce() -> Option<mir::Body>,
+) -> Option<mir::Body> {
+    match inst {
+        Some(inst) if matches!(inst.kind, InstanceKind::Item) => {
+            inst.body().or_else(def_body)
+        }
+        Some(_) => None,
+        None => def_body(),
+    }
+}
+
 impl Converter {
     pub fn new() -> Self {
         TY_MENTIONS_PARAM_CACHE.with(|cache| cache.borrow_mut().clear());
@@ -4295,10 +4323,10 @@ impl Converter {
                 };
                 let body = std::panic::catch_unwind(
                     std::panic::AssertUnwindSafe(|| {
-                        Instance::resolve_closure(*def, args, ck)
-                            .ok()
-                            .and_then(|inst| inst.body())
-                            .or_else(|| def.body())
+                        instance_item_body(
+                            Instance::resolve_closure(*def, args, ck).ok(),
+                            || def.body(),
+                        )
                     }),
                 );
                 let Ok(Some(body)) = body else {
@@ -4309,10 +4337,10 @@ impl Converter {
             TyKind::RigidTy(RigidTy::Coroutine(def, args)) => {
                 let body = std::panic::catch_unwind(
                     std::panic::AssertUnwindSafe(|| {
-                        Instance::resolve(FnDef(def.def_id()), args)
-                            .ok()
-                            .and_then(|inst| inst.body())
-                            .or_else(|| def.body())
+                        instance_item_body(
+                            Instance::resolve(FnDef(def.def_id()), args).ok(),
+                            || def.body(),
+                        )
                     }),
                 );
                 let Ok(Some(body)) = body else {

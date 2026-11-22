@@ -2785,6 +2785,26 @@ fn unify_self_arg(
     }
 }
 
+/// The function definitions of one foreign crate, for the
+/// merged foreign scans (`demand_drop_instances`,
+/// `certify_drop_no_impl`). Enumerating a crate's functions
+/// walks the compiler's metadata tables, and not every crate
+/// kind has the entries that walk needs: a proc-macro crate's
+/// registered macro items live outside the regular item tables,
+/// and enumerating such a crate panics inside the compiler.
+/// A crate that cannot be enumerated contributes no definitions
+/// to the scan — for a proc-macro crate that is also the exact
+/// answer, since its items are not linkable into the compiled
+/// program and so cannot hold a `Drop` impl for a type the
+/// program can hold. The containment is per crate, in the style
+/// of the demand passes' guarded compiler queries: one
+/// unenumerable crate must not abort the whole scan (or the
+/// conversion with it).
+fn foreign_fn_defs(krate: &rustc_public::Crate) -> Vec<rustc_public::ty::FnDef> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| krate.fn_defs()))
+        .unwrap_or_default()
+}
+
 /// Demand a converted body for the `Drop` impl of every local ADT
 /// instantiation that the converted bodies drop (see the call site
 /// in `collect`). Each demanded body is converted like a local item
@@ -2975,7 +2995,7 @@ fn demand_drop_instances(
                     let mut defs = Vec::new();
                     for krate in rustc_public::external_crates() {
                         if !krate.is_local {
-                            defs.extend(krate.fn_defs());
+                            defs.extend(foreign_fn_defs(&krate));
                         }
                     }
                     drop_impl_methods(defs)
@@ -3264,7 +3284,7 @@ fn certify_drop_no_impl(
                             let mut defs = Vec::new();
                             for krate in rustc_public::external_crates() {
                                 if !krate.is_local {
-                                    defs.extend(krate.fn_defs());
+                                    defs.extend(foreign_fn_defs(&krate));
                                 }
                             }
                             drop_impl_methods(defs).into_keys().collect()
