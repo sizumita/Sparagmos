@@ -616,6 +616,7 @@ fn convert_all(
     failures.retain(|key, _| !out.functions.contains_key(key));
     out.adt_layouts = program.adt_layouts.clone();
     out.adt_debug_shapes = program.adt_debug_shapes.clone();
+    out.alloc_shims = conv.alloc_shims.clone();
     // The thread-locals table: each recorded static's initializer,
     // converted with its declared type as context and keyed by the
     // same static key the `ThreadLocalRef` rvalues carry. A seed
@@ -1689,6 +1690,13 @@ struct Converter<'a> {
     /// honestly can be (see `resolve_body_callee`). Empty in the
     /// first conversion phase.
     unconverted: HashMap<String, String>,
+    /// The guest's allocation shims, when the program defines a
+    /// `#[global_allocator]`: symbol (`__rust_alloc`, ...) ->
+    /// program key of the shim body (`<crate>::_::__rust_alloc`,
+    /// ...). In a linked binary the std allocation entry points
+    /// bind to these shims; the conversion binds them the same
+    /// way (see `resolve_body_callee`).
+    alloc_shims: HashMap<String, String>,
     /// Scalar-shape tables of the program's union instances (see
     /// [`ir::Program::union_tables`]), interned in
     /// `Converter::new` by [`Self::compute_union_tables`]: every
@@ -1729,6 +1737,21 @@ impl<'a> Converter<'a> {
             .iter()
             .find(|f| f.name == "main" || f.name.ends_with("::main"))
             .map(|f| f.name.split("::").next().unwrap_or("").to_string());
+        let mut alloc_shims: HashMap<String, String> = HashMap::new();
+        for key in keys {
+            for symbol in [
+                "__rust_alloc",
+                "__rust_dealloc",
+                "__rust_realloc",
+                "__rust_alloc_zeroed",
+            ] {
+                if key.contains("::_::") && key.ends_with(symbol) {
+                    alloc_shims
+                        .entry(symbol.to_string())
+                        .or_insert_with(|| key.clone());
+                }
+            }
+        }
         let mut conv = Converter {
             bodies,
             def_names,
@@ -1745,6 +1768,7 @@ impl<'a> Converter<'a> {
             dtor_bodies: &program.dtor_bodies,
             adt_aggregates,
             local_crate,
+            alloc_shims,
             impl_targets: None,
             unconverted: HashMap::new(),
             union_tables: Vec::new(),
@@ -4309,6 +4333,27 @@ let inner = match (&src, target) {
             (_, mir::Ty::Adt(def, args)) if src_is_int => {
                 if let Some(table) = self.fieldless_enum_discriminants(def) {
                     ir::Rvalue::IntToEnum(v.clone(), table)
+                } else if let Some(field_ty) = self.single_field_ty(def, args) {
+                    // One-field struct wrapping a fieldless
+                    // enum, from the discriminant integer (the
+                    // `mem::Alignment` construction).
+                    match &field_ty {
+                        mir::Ty::Adt(fdef, _) => {
+                            match self.fieldless_enum_discriminants(fdef) {
+                                Some(table) => {
+                                    ir::Rvalue::IntToEnumWrapped {
+                                        operand: v.clone(),
+                                        discriminants: table,
+                                        payload_index: 0,
+                                        field_count: 1,
+                                        fill: Vec::new(),
+                                    }
+                                }
+                                None => unsupported(),
+                            }
+                        }
+                        _ => unsupported(),
+                    }
                 } else if let Some(payload) =
                     self.single_variant_payload(def, args)
                 {
@@ -6253,6 +6298,15 @@ let inner = match (&src, target) {
     /// different result.
     fn resolve_body_callee(&self, func: &mir::Operand) -> Option<String> {
         let Some(name) = self.resolve_callee(func) else {
+            // The std allocation entry points have no collected
+            // body (the builtin model pre-empts them), so they
+            // never resolve here; a program with a
+            // `#[global_allocator]` binds them to its own shims
+            // instead, exactly as the linker binds the symbols
+            // in a native binary.
+            if let Some(key) = self.alloc_shim_route(func) {
+                return Some(key);
+            }
             return self.resolve_impl_callee(func);
         };
         let Some(plain) = self.unconverted.get(&name) else {
@@ -6288,6 +6342,35 @@ let inner = match (&src, target) {
             return None;
         }
         Some(name)
+    }
+
+    /// The guest allocation shim serving a call to one of the
+    /// std allocation entry points, when the program defines a
+    /// `#[global_allocator]` (see `alloc_shims`). A shim that
+    /// itself failed conversion does not serve the call; the
+    /// builtin model below does.
+    fn alloc_shim_route(&self, func: &mir::Operand) -> Option<String> {
+        let mir::Operand::Constant(c) = func else {
+            return None;
+        };
+        let def = match &c.literal {
+            mir::ConstKind::Ty(mir::Ty::FnDef(def, _)) => def,
+            mir::ConstKind::Unevaluated { def, .. } => def,
+            _ => return None,
+        };
+        let name = self.names.get(def)?;
+        let symbol = match name.as_str() {
+            "alloc::alloc::__rust_alloc" => "__rust_alloc",
+            "alloc::alloc::__rust_dealloc" => "__rust_dealloc",
+            "alloc::alloc::__rust_realloc" => "__rust_realloc",
+            "alloc::alloc::__rust_alloc_zeroed" => "__rust_alloc_zeroed",
+            _ => return None,
+        };
+        let shim = self.alloc_shims.get(symbol)?;
+        if self.unconverted.contains_key(shim) {
+            return None;
+        }
+        Some(shim.clone())
     }
 
     /// Whether the external/builtin conversion below would serve

@@ -321,6 +321,29 @@ pub(crate) fn channel_handle_id(value: &Value) -> Option<u64> {
 /// exact: a one-field aggregate whose field is an allocation
 /// reference is a built box, and projecting its field 0 denotes
 /// the pointee, not the pointer slot.
+/// The `mem::Alignment` value for a byte alignment, in the
+/// shape the conversion produces for a `usize` -> `Alignment`
+/// transmute: the variant whose discriminant is the alignment
+/// (the variants are the powers of two in order), wrapped as
+/// the struct's single field. An alignment with no variant
+/// (not a power of two, or beyond the enum's range) keeps the
+/// plain integer shape.
+pub(crate) fn alignment_value(align: u128) -> Value {
+    if align >= 1 && align.is_power_of_two() {
+        let exponent = align.trailing_zeros();
+        if exponent <= 26 {
+            return Value::Enum {
+                variant: 0,
+                fields: vec![Value::Enum {
+                    variant: exponent,
+                    fields: Vec::new(),
+                }],
+            };
+        }
+    }
+    Value::Uint(align)
+}
+
 pub(crate) fn box_alloc_pointer(value: &Value) -> Option<(u64, Vec<RefProj>)> {
     match value {
         Value::Enum { fields, .. } if fields.len() == 1 => match &fields[0] {
@@ -476,6 +499,33 @@ pub struct Interpreter<'a> {
     config: InterpConfig,
     steps: usize,
     next_frame_id: u64,
+    /// Buffers of abstract strings created by
+    /// `String::with_capacity` under a guest allocator, keyed by
+    /// the (frame, local) place the string was written to: the
+    /// allocation pointer and capacity the guest allocator
+    /// handed out, which the abstract string value does not
+    /// carry. The matching deallocation runs when that place's
+    /// drop glue finishes. A string that moves to another place
+    /// loses the association (its buffer then leaks in the
+    /// model, as abstract-string buffers did before).
+    string_buffers: std::cell::RefCell<
+        std::collections::HashMap<(u64, usize), (Value, u128)>,
+    >,
+    /// The buffer a `String::with_capacity` call just allocated
+    /// through the guest allocator, waiting for the call's
+    /// destination place to be recorded in `string_buffers`.
+    pub(crate) pending_string_buffer:
+        std::cell::RefCell<Option<(Value, u128)>>,
+    /// Pointee layouts of boxes the allocation builtins created,
+    /// by allocation id: a dropped box's storage is freed through
+    /// the guest deallocator with the pointee's layout, which the
+    /// box value itself does not carry.
+    box_layouts: std::cell::RefCell<std::collections::HashMap<u64, (u128, u128)>>,
+    /// Whether the lazy stdout buffer allocation has been
+    /// modelled (see `note_stdout_use`): std's stdout handle
+    /// allocates its line buffer through the global allocator on
+    /// first use, which a guest allocator observes.
+    stdout_buffer_modelled: std::cell::Cell<bool>,
     /// Everything the guest wrote to its stdout (via the runtime
     /// print support) during the most recent run.
     output: String,
@@ -814,6 +864,12 @@ impl<'a> Interpreter<'a> {
             config,
             steps: 0,
             next_frame_id: 0,
+            string_buffers: std::cell::RefCell::new(
+                std::collections::HashMap::new(),
+            ),
+            pending_string_buffer: std::cell::RefCell::new(None),
+            box_layouts: std::cell::RefCell::new(std::collections::HashMap::new()),
+            stdout_buffer_modelled: std::cell::Cell::new(false),
             output: String::new(),
             error_output: String::new(),
             drop_continuations: Vec::new(),
@@ -1741,6 +1797,33 @@ impl<'a> Interpreter<'a> {
                         let work = vec![(Vec::new(), glue.root.clone())];
                         self.run_drop_glue(frames, root, work, &glue.adts, *bb)?;
                     } else {
+                        // A `mem::drop` of a string whose glue is
+                        // trivial runs no glue session: the recorded
+                        // buffer's deallocation is observed here,
+                        // against the argument place.
+                        if name == "std::mem::drop" && args.len() == 1 {
+                            if let Operand::Copy(place)
+                            | Operand::Move(place) = &args[0]
+                            {
+                                if let Ok(Resolved::Place {
+                                    frame_pos,
+                                    local,
+                                    projection,
+                                }) = self.resolve_place(frames, body, place)
+                                {
+                                    if projection.is_empty() {
+                                        let root = RefTarget::place(
+                                            frames[frame_pos].id,
+                                            local,
+                                            projection,
+                                        );
+                                        self.note_string_buffer_free_inner(
+                                            frames, &root, true,
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         let mut result = self.exec_builtin(
                             frames,
                             body,
@@ -1762,6 +1845,9 @@ impl<'a> Interpreter<'a> {
                         match target {
                             Some(bb) => {
                                 self.write_place(frames, body, destination, result)?;
+                                if name == "std::string::String::with_capacity" {
+                                    self.record_string_buffer(frames, body, destination);
+                                }
                                 Self::jump(frames, body, *bb)?;
                             }
                             None => {
@@ -4329,6 +4415,7 @@ impl<'a> Interpreter<'a> {
             // the difference within a run.)
             if let Ok(Some(value)) = self.read_at(frames, &active.root, &[]) {
                 if let Some((id, _)) = box_alloc_pointer(&value) {
+                    self.note_box_free(frames, &value);
                     self.free_alloc(id);
                 }
             }
@@ -4343,6 +4430,7 @@ impl<'a> Interpreter<'a> {
             // forgotten afterwards. Only the pointee's glue ran,
             // as in real memory, where `drop_in_place` leaves the
             // bytes in place.
+            self.note_string_buffer_free(frames, &active.root);
             if let RefTarget::Place {
                 frame,
                 local,
@@ -4617,6 +4705,193 @@ impl<'a> Interpreter<'a> {
             }
         }
         self.drive_frames(frames, base)
+    }
+
+    /// Record the guest-allocated buffer of a
+    /// `String::with_capacity` result against the place the
+    /// call wrote it to (see `string_buffers`).
+    fn record_string_buffer(
+        &self,
+        frames: &Vec<Frame>,
+        body: &Body,
+        destination: &Place,
+    ) {
+        let pending = self.pending_string_buffer.borrow_mut().take();
+        let Some((ptr, cap)) = pending else {
+            return;
+        };
+        if let Ok(Resolved::Place {
+            frame_pos,
+            local,
+            projection,
+        }) = self.resolve_place(frames, body, destination)
+        {
+            if projection.is_empty() {
+                let frame_id = frames[frame_pos].id;
+                self.string_buffers
+                    .borrow_mut()
+                    .insert((frame_id, local), (ptr, cap));
+            }
+        }
+    }
+
+    /// Run the guest deallocator for the recorded buffer of a
+    /// string whose place's drop glue just finished (see
+    /// `string_buffers`).
+    fn note_string_buffer_free(&mut self, frames: &mut Vec<Frame>, root: &RefTarget) {
+        self.note_string_buffer_free_inner(frames, root, false);
+    }
+
+    /// `note_string_buffer_free`, optionally with the
+    /// single-entry fallback for strings whose recorded place
+    /// was lost through an untracked move. The fallback is only
+    /// sound at a `mem::drop` site, where the dropped value is
+    /// consumed by the call itself.
+    fn note_string_buffer_free_inner(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        root: &RefTarget,
+        allow_fallback: bool,
+    ) {
+        let RefTarget::Place {
+            frame,
+            local,
+            projection,
+        } = root
+        else {
+            return;
+        };
+        if !projection.is_empty() {
+            return;
+        }
+        let entry = self
+            .string_buffers
+            .borrow_mut()
+            .remove(&(*frame, *local));
+        let entry = entry.or_else(|| {
+            if !allow_fallback {
+                return None;
+            }
+            // The string reached this place through a move the
+            // assignment transfer did not track (for example
+            // straight into a call argument): when the frame
+            // holds exactly one recorded buffer, it can only be
+            // this string's.
+            let mut buffers = self.string_buffers.borrow_mut();
+            let in_frame = buffers
+                .keys()
+                .filter(|(f, _)| *f == *frame)
+                .copied()
+                .collect::<Vec<_>>();
+            if in_frame.len() == 1 {
+                buffers.remove(&in_frame[0])
+            } else {
+                None
+            }
+        });
+        let Some((ptr, cap)) = entry else {
+            return;
+        };
+        let Some(shim) = self.program().alloc_shims.get("__rust_dealloc") else {
+            return;
+        };
+        let shim = shim.clone();
+        let _ = self.call_callable_to_completion(
+            frames,
+            &Value::FnPtr(shim),
+            vec![ptr, Value::Uint(cap), alignment_value(1)],
+        );
+    }
+
+    /// Run the guest deallocator for a dropped box, when the
+    /// program defines one: natively the box's storage is freed
+    /// by `__rust_dealloc` with the pointee's layout, which the
+    /// guest allocator observes. The layout is the one recorded
+    /// when the allocation builtins created the box (see
+    /// `box_layouts`); a box with no recorded layout (built by
+    /// another path) frees only in the model, as before. The
+    /// model's own store entry is released by the caller (the
+    /// guest's deallocation usually frees it itself through the
+    /// system path; a guest allocator that pools the block
+    /// instead is beyond what the store can represent).
+    pub(crate) fn note_box_free(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        box_value: &Value,
+    ) {
+        let Some(shim) = self.program().alloc_shims.get("__rust_dealloc") else {
+            return;
+        };
+        let shim = shim.clone();
+        let Some((id, _)) = box_alloc_pointer(box_value) else {
+            return;
+        };
+        let Some((size, align)) = self.box_layouts.borrow_mut().remove(&id) else {
+            return;
+        };
+        let Value::Enum { fields, .. } = box_value else {
+            return;
+        };
+        let Some(ptr) = fields.first().cloned() else {
+            return;
+        };
+        let _ = self.call_callable_to_completion(
+            frames,
+            &Value::FnPtr(shim),
+            vec![ptr, Value::Uint(size), alignment_value(align)],
+        );
+    }
+
+    /// Record the pointee layout of a box the allocation
+    /// builtins just created, for `note_box_free`.
+    pub(crate) fn record_box_layout(&self, box_value: &Value, size: u128, align: u128) {
+        if let Some((id, _)) = box_alloc_pointer(box_value) {
+            self.box_layouts.borrow_mut().insert(id, (size, align));
+        }
+    }
+
+    /// Allocate through the program's guest allocator shim
+    /// (`#[global_allocator]`), when the program defines one:
+    /// the allocation the native entry point
+    /// (`alloc::alloc::__rust_alloc`) would bind to the shim.
+    /// Returns the shim's pointer, or `None` when the program
+    /// has no guest allocator (the caller then allocates in the
+    /// model directly, as before).
+    pub(crate) fn call_guest_alloc(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        size: u128,
+        align: u128,
+    ) -> InterpResult<Option<Value>> {
+        let Some(shim) = self.program().alloc_shims.get("__rust_alloc") else {
+            return Ok(None);
+        };
+        let shim = shim.clone();
+        let align_arg = alignment_value(align);
+        let ptr = self.call_callable_to_completion(
+            frames,
+            &Value::FnPtr(shim),
+            vec![Value::Uint(size), align_arg],
+        )?;
+        Ok(Some(ptr))
+    }
+
+    /// Model std's lazy stdout buffer allocation on the first
+    /// use of the print support: the stdout handle's line buffer
+    /// (1024 bytes) is allocated through the global allocator
+    /// the first time the program prints, and never freed. A
+    /// guest allocator observes exactly that one allocation;
+    /// with no guest allocator there is nothing to model.
+    pub(crate) fn note_stdout_use(
+        &mut self,
+        frames: &mut Vec<Frame>,
+    ) -> InterpResult<()> {
+        if self.stdout_buffer_modelled.get() {
+            return Ok(());
+        }
+        self.stdout_buffer_modelled.set(true);
+        let _ = self.call_guest_alloc(frames, 1024, 8)?;
+        Ok(())
     }
 
     /// Call the callable denoted by `operand` (a closure or
@@ -5119,8 +5394,41 @@ impl<'a> Interpreter<'a> {
     ) -> InterpResult<()> {
         match &statement.kind {
             StatementKind::Assign(place, rvalue) => {
+                // A recorded string buffer follows a plain move of
+                // the string to its new place (see
+                // `string_buffers`).
+                let transfer = match rvalue {
+                    Rvalue::Use(Operand::Move(src) | Operand::Copy(src)) => {
+                        let key_of = |p: &Place| match self
+                            .resolve_place(frames, body, p)
+                        {
+                            Ok(Resolved::Place {
+                                frame_pos,
+                                local,
+                                projection,
+                            }) if projection.is_empty() => {
+                                Some((frames[frame_pos].id, local))
+                            }
+                            _ => None,
+                        };
+                        match (key_of(src), key_of(place)) {
+                            (Some(from), Some(to)) if from != to => Some((from, to)),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
                 let value = self.eval_rvalue(frames, body, rvalue, body.local_ty(place.local))?;
-                self.write_place(frames, body, place, value)
+                let written = self.write_place(frames, body, place, value);
+                if written.is_ok() {
+                    if let Some((from, to)) = transfer {
+                        let entry = self.string_buffers.borrow_mut().remove(&from);
+                        if let Some(entry) = entry {
+                            self.string_buffers.borrow_mut().insert(to, entry);
+                        }
+                    }
+                }
+                written
             }
             StatementKind::ShapedStore { place, value, shape } => {
                 let value = self.eval_operand(frames, body, value)?;
@@ -8431,6 +8739,13 @@ impl<'a> Interpreter<'a> {
             // fieldless (niche) variant value carries no pointer
             // to read, so it stays a mismatch rather than
             // fabricating one.
+            // A pointer-shaped ADT value (`NonNull`, `Unique`)
+            // written to a raw-pointer or reference place: MIR
+            // moves these transparent wrappers into pointer
+            // places verbatim (the `Allocator::deallocate` body
+            // passes its `NonNull<u8>` straight to
+            // `__rust_dealloc`), and the pointer the wrapper
+            // holds is the value the place denotes.
             (Some(Ty::Ref(_)), Value::Enum { fields, .. })
                 if fields.len() == 1
                     && matches!(

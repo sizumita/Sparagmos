@@ -1214,6 +1214,27 @@ pub enum Builtin {
     /// new_size) -> *mut u8`: a fresh block holding the old
     /// block's contents; the old block is freed.
     RustRealloc,
+    /// `libc::unix::malloc(size) -> *mut u8`: the bottom of the
+    /// system allocator's call chain — a fresh uninitialised
+    /// block of `size` bytes in the allocation store, the same
+    /// storage the `__rust_alloc` model hands out.
+    LibcMalloc,
+    /// `libc::unix::calloc(nmemb, size) -> *mut u8`: a fresh
+    /// zero-filled block of `nmemb * size` bytes.
+    LibcCalloc,
+    /// `libc::unix::free(ptr)`: removes the pointer's block
+    /// from the allocation store.
+    LibcFree,
+    /// `libc::unix::realloc(ptr, new_size) -> *mut u8`: a fresh
+    /// block holding the old block's contents; the old block is
+    /// freed.
+    LibcRealloc,
+    /// `libc::unix::posix_memalign(memptr, alignment, size)
+    /// -> c_int`: allocates a block, stores its pointer through
+    /// `memptr`, and answers 0. The model's blocks carry no
+    /// machine address whose alignment could be observed, so
+    /// the alignment argument only documents the request.
+    LibcPosixMemalign,
     /// `core::num::imp::overflow_panic::pow(base, exp)`: the
     /// exponentiation behind the primitive `pow` methods,
     /// panicking on overflow exactly like the checked
@@ -2690,6 +2711,11 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "alloc::alloc::__rust_alloc_zeroed" => Builtin::RustAlloc { zeroed: true },
         "alloc::alloc::__rust_dealloc" => Builtin::RustDealloc,
         "alloc::alloc::__rust_realloc" => Builtin::RustRealloc,
+        "libc::unix::malloc" => Builtin::LibcMalloc,
+        "libc::unix::calloc" => Builtin::LibcCalloc,
+        "libc::unix::free" => Builtin::LibcFree,
+        "libc::unix::realloc" => Builtin::LibcRealloc,
+        "libc::unix::posix_memalign" => Builtin::LibcPosixMemalign,
         _ if canonical.starts_with("std::rc::Rc") && canonical.ends_with(">::new") => {
             Builtin::RcNew
         }
@@ -3643,7 +3669,8 @@ impl<'a> Interpreter<'a> {
         match kind {
             Builtin::Print => {
                 arity(1)?;
-                let text = self.format_arguments(frames, expect_arguments(&vals[0], name)?, 0)?;
+        self.note_stdout_use(frames)?;
+        let text = self.format_arguments(frames, expect_arguments(&vals[0], name)?, 0)?;
                 self.push_output(&text);
                 Ok(Value::Unit)
             }
@@ -6295,8 +6322,23 @@ impl<'a> Interpreter<'a> {
             Builtin::StringWithCapacity => {
                 // The capacity argument is not represented, exactly
                 // as for `Vec::with_capacity`: the result is the
-                // empty string.
+                // empty string. A guest allocator still observes
+                // the buffer allocation the native call makes
+                // (the abstract string never reads the buffer;
+                // the matching deallocation runs through the
+                // string's drop glue as usual).
                 arity(1)?;
+                let cap = match &vals[0] {
+                    Value::Uint(n) => *n,
+                    Value::Int(n) if *n >= 0 => *n as u128,
+                    _ => 0,
+                };
+                if cap > 0 {
+                    if let Some(ptr) = self.call_guest_alloc(frames, cap, 1)? {
+                        *self.pending_string_buffer.borrow_mut() =
+                            Some((ptr, cap));
+                    }
+                }
                 Ok(Value::Str(String::new()))
             }
             Builtin::StringLen | Builtin::StrLen => {
@@ -7032,8 +7074,35 @@ impl<'a> Interpreter<'a> {
                 arity(1)?;
                 // A box's pointee lives in the allocation store;
                 // the box value is the allocation pointer (see
-                // `Interpreter::new_box`).
-                Ok(self.new_box(vals.into_iter().next().expect("arity checked")))
+                // `Interpreter::new_box`). With a guest allocator
+                // the storage comes from its shim, as the native
+                // `__rust_alloc` call inside `Box::new` binds to
+                // it; a zero-sized pointee allocates nothing in
+                // either world.
+                let v = vals.into_iter().next().expect("arity checked");
+                let tag = generic_args.first().map(String::as_str).unwrap_or("");
+                if let Some((size, align)) = self.layout_of(tag) {
+                    if size > 0 {
+                        if let Some(ptr) =
+                            self.call_guest_alloc(frames, size, align)?
+                        {
+                            if matches!(ptr, Value::Ref(RefTarget::Null)) {
+                                return Err(unsupported(
+                                    "guest allocator returned null for Box::new",
+                                ));
+                            }
+                            let target = self.deref_value(frames, &ptr)?;
+                            self.write_resolved(frames, &target, v)?;
+                            let boxed = Value::Enum {
+                                variant: 0,
+                                fields: vec![ptr],
+                            };
+                            self.record_box_layout(&boxed, size, align);
+                            return Ok(boxed);
+                        }
+                    }
+                }
+                Ok(self.new_box(v))
             }
             Builtin::ManuallyDropNew => {
                 arity(1)?;
@@ -7097,7 +7166,41 @@ impl<'a> Interpreter<'a> {
                 arity(0)?;
                 let tag = generic_args.first().map(String::as_str).unwrap_or("");
                 match uninit_value_for_tag(tag) {
-                    Some(pointee) => Ok(self.new_box(pointee)),
+                    Some(pointee) => {
+                        if let Some((size, align)) = self.layout_of(tag) {
+                            if size > 0 {
+                                if let Some(ptr) = self
+                                    .call_guest_alloc(frames, size, align)?
+                                {
+                                    if matches!(
+                                        ptr,
+                                        Value::Ref(RefTarget::Null)
+                                    ) {
+                                        return Err(unsupported(
+                                            "guest allocator returned null \
+                                             for Box::new_uninit",
+                                        ));
+                                    }
+                                    let target =
+                                        self.deref_value(frames, &ptr)?;
+                                    self.write_resolved(
+                                        frames,
+                                        &target,
+                                        pointee,
+                                    )?;
+                                    let boxed = Value::Enum {
+                                        variant: 0,
+                                        fields: vec![ptr],
+                                    };
+                                    self.record_box_layout(
+                                        &boxed, size, align,
+                                    );
+                                    return Ok(boxed);
+                                }
+                            }
+                        }
+                        Ok(self.new_box(pointee))
+                    }
                     None => Err(unsupported(format!(
                         "Box::new_uninit for {tag} is not runtime-supported"
                     ))),
@@ -7930,6 +8033,21 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::MemDrop => {
                 arity(1)?;
+                // A `mem::drop` whose argument's glue was trivial
+                // runs no glue session, so a dropped box's storage
+                // free is observed here instead (see
+                // `Interpreter::note_box_free`).
+                if self.program().alloc_shims.contains_key("__rust_dealloc") {
+                    let arg = vals.into_iter().next().expect("arity checked");
+                    if crate::interp::box_alloc_pointer(&arg).is_some() {
+                        self.note_box_free(frames, &arg);
+                        if let Some((id, _)) =
+                            crate::interp::box_alloc_pointer(&arg)
+                        {
+                            self.free_alloc(id);
+                        }
+                    }
+                }
                 Ok(Value::Unit)
             }
             Builtin::MemSwap => {
@@ -8778,6 +8896,79 @@ impl<'a> Interpreter<'a> {
                     id,
                     projection: Vec::new(),
                 }))
+            }
+            Builtin::LibcMalloc => {
+                arity(1)?;
+                let size = alloc_size_arg(name, &vals[0])?;
+                let id = self.alloc_insert(Value::Tuple(Vec::new()));
+                self.mark_elem_block(id);
+                Ok(Value::Ref(RefTarget::Alloc {
+                    id,
+                    projection: Vec::new(),
+                }))
+            }
+            Builtin::LibcCalloc => {
+                arity(2)?;
+                let count = alloc_size_arg(name, &vals[0])?;
+                let size = alloc_size_arg(name, &vals[1])?;
+                let total = count.saturating_mul(size);
+                if total > (1 << 28) {
+                    return Ok(Value::Ref(RefTarget::Null));
+                }
+                let id = self.alloc_insert(Value::Bytes(vec![0u8; total as usize]));
+                self.mark_elem_block(id);
+                Ok(Value::Ref(RefTarget::Alloc {
+                    id,
+                    projection: Vec::new(),
+                }))
+            }
+            Builtin::LibcFree => {
+                arity(1)?;
+                let ptr = unwrap_wrapper(&vals[0]);
+                if let Value::Ref(RefTarget::Alloc { id, projection }) = ptr {
+                    if projection.is_empty() {
+                        self.free_alloc(*id);
+                    }
+                }
+                Ok(Value::Unit)
+            }
+            Builtin::LibcRealloc => {
+                arity(2)?;
+                let new_size = alloc_size_arg(name, &vals[1])?;
+                let ptr = unwrap_wrapper(&vals[0]).clone();
+                let content = match &ptr {
+                    Value::Ref(RefTarget::Alloc { id, projection })
+                        if projection.is_empty() =>
+                    {
+                        let old = self.alloc_base(*id)?;
+                        self.free_alloc(*id);
+                        old
+                    }
+                    _ => {
+                        let _ = new_size;
+                        Value::Uninit
+                    }
+                };
+                let id = self.alloc_insert(content);
+                self.mark_elem_block(id);
+                Ok(Value::Ref(RefTarget::Alloc {
+                    id,
+                    projection: Vec::new(),
+                }))
+            }
+            Builtin::LibcPosixMemalign => {
+                arity(3)?;
+                let size = alloc_size_arg(name, &vals[2])?;
+                let _ = size;
+                let id = self.alloc_insert(Value::Tuple(Vec::new()));
+                self.mark_elem_block(id);
+                let block = Value::Ref(RefTarget::Alloc {
+                    id,
+                    projection: Vec::new(),
+                });
+                let target = self.deref_value(frames, &vals[0])?;
+                self.write_resolved(frames, &target, block)?;
+                Ok(Value::Int(0))
             }
             Builtin::AtomicCxchg => {
                 arity(3)?;
@@ -16046,6 +16237,20 @@ fn byte_fill_value(tag: &str, byte: u8) -> Option<Value> {
     })
 }
 
+/// An allocation-size argument (`usize`, or a non-negative
+/// `isize`-shaped integer) as a byte count.
+fn alloc_size_arg(name: &str, v: &Value) -> InterpResult<u128> {
+    match v {
+        Value::Uint(n) => Ok(*n),
+        Value::Int(n) if *n >= 0 => Ok(*n as u128),
+        other => Err(InterpError::type_mismatch(
+            name,
+            "allocation size",
+            other.kind_name(),
+        )),
+    }
+}
+
 fn int_tag(tag: &str) -> Option<(u32, bool)> {
     Some(match tag {
         "i8" => (8, true),
@@ -16935,7 +17140,7 @@ impl<'a> Interpreter<'a> {
         default_value_for_tag(tag)
     }
 
-    fn layout_of(&self, tag: &str) -> Option<(u128, u128)> {
+    pub(crate) fn layout_of(&self, tag: &str) -> Option<(u128, u128)> {
         let tag = tag.trim();
         if let Some(layout) = type_layout(tag) {
             return Some(layout);

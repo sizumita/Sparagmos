@@ -1513,6 +1513,17 @@ pub struct Program {
     /// constant each thread's storage for that static is seeded
     /// from on first access.
     pub thread_locals: std::collections::HashMap<String, Constant>,
+    /// The guest allocation shims of a program that defines a
+    /// `#[global_allocator]`: symbol (`__rust_alloc`,
+    /// `__rust_dealloc`, `__rust_realloc`, `__rust_alloc_zeroed`)
+    /// -> program key of the shim body. Calls the conversion
+    /// resolved to the std entry points are bound to these
+    /// bodies directly; the allocation-entry builtins (whose
+    /// native forms allocate through those entry points) call
+    /// them at run time, so a guest allocator observes every
+    /// allocation the program makes. Empty when the program has
+    /// no custom allocator.
+    pub alloc_shims: std::collections::HashMap<String, String>,
     pub functions: HashMap<String, Body>,
     /// Functions that exist in the source program but whose bodies
     /// could not be converted, keyed by name, with the reason

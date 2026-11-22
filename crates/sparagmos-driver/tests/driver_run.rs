@@ -15591,3 +15591,91 @@ fn run_mode_track_caller_location_forwards_through_index() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
 }
+
+const COUNTING_ALLOCATOR_SRC: &str = r#"#![feature(slice_ptr_get)]
+
+use std::alloc::{self, Allocator, Global, Layout, System};
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static HITS: AtomicUsize = AtomicUsize::new(0);
+
+struct A;
+
+unsafe impl alloc::GlobalAlloc for A {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        HITS.fetch_add(1, Ordering::SeqCst);
+        alloc::GlobalAlloc::alloc(&alloc::System, layout)
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        HITS.fetch_add(1, Ordering::SeqCst);
+        alloc::GlobalAlloc::dealloc(&alloc::System, ptr, layout)
+    }
+}
+
+#[global_allocator]
+static GLOBAL: A = A;
+
+fn hits() -> usize {
+    HITS.load(Ordering::SeqCst)
+}
+
+fn main() {
+    println!("hello!");
+    // std's lazy stdout buffer goes through the global
+    // allocator once.
+    let n = hits();
+    assert!(n >= 1, "stdout buffer allocation not observed: {n}");
+
+    unsafe {
+        let layout = Layout::new::<u32>();
+        // The trait entry points count; the System allocator
+        // behind them does not.
+        let memory = Global.allocate(layout).unwrap();
+        assert_eq!(hits(), n + 1);
+        Global.deallocate(NonNull::new(memory.as_non_null_ptr().as_ptr() as *mut u8).unwrap(), layout);
+        assert_eq!(hits(), n + 2);
+
+        let s = String::with_capacity(10);
+        assert_eq!(hits(), n + 3);
+        drop(s);
+        assert_eq!(hits(), n + 4);
+
+        let memory = System.allocate(layout).unwrap();
+        assert_eq!(hits(), n + 4);
+        System.deallocate(NonNull::new(memory.as_non_null_ptr().as_ptr() as *mut u8).unwrap(), layout);
+        assert_eq!(hits(), n + 4);
+
+        let b = Box::new(42u32);
+        assert_eq!(hits(), n + 5);
+        assert_eq!(*b, 42);
+        drop(b);
+        assert_eq!(hits(), n + 6);
+    }
+    println!("counting ok");
+}
+"#;
+
+#[test]
+fn run_mode_guest_global_allocator_observes_allocations() {
+    // A guest `#[global_allocator]` must observe the
+    // allocations the abstract std model performs: the lazy
+    // stdout buffer, `String::with_capacity` and its drop,
+    // `Box::new` and its drop, and the `Global` trait entry
+    // points — while direct `System` allocations stay
+    // invisible, exactly as in the ui allocator tests.
+    let dir = temp_dir("counting-allocator");
+    let src = fixture(&dir, "counting_allocator.rs", COUNTING_ALLOCATOR_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "guest allocator must observe modelled allocations; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "hello!\ncounting ok\n"
+    );
+}
