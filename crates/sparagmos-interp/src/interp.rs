@@ -8812,6 +8812,16 @@ pub(crate) fn project_value(
                 // value projection begins, so a `Ref` here is a
                 // pointer value extracted from a wrapper.)
                 Value::Ref(_) if *idx == 0 => value,
+                // The same wrapper chain for a byte string: a
+                // `Path`'s field 0 is its `OsStr`, whose field 0
+                // is the byte slice, and in this model the value
+                // at the base of that chain is the string itself
+                // (the constructors reach it through raw pointer
+                // casts: `Path::new` casts `&str` to `&Path`).
+                // Each wrapper's only field sits at offset 0 with
+                // exactly the string's representation, so the
+                // step yields the value unchanged.
+                Value::Str(_) | Value::Bytes(_) if *idx == 0 => value,
                 ref other => {
                     return Err(InterpError::type_mismatch(
                         format!("field projection on {place}"),
@@ -9249,6 +9259,11 @@ pub(crate) fn project_value_ref<'a>(
                         }
                     })?,
                     Value::DynRef { .. } if *idx == 0 => cur,
+                    // The byte-string wrapper chain, as in
+                    // `project_value`: field 0 of the transparent
+                    // `Path`/`OsStr`/`CStr` wrappers over a string
+                    // value is the string itself.
+                    Value::Str(_) | Value::Bytes(_) if *idx == 0 => cur,
                     other => {
                         return Err(InterpError::type_mismatch(
                             format!("field projection on {place}"),
@@ -9566,6 +9581,13 @@ pub(crate) fn navigate_mut<'x>(
             }
         }
         RefProj::Field(idx) => {
+            if *idx == 0 && matches!(slot, Value::Str(_) | Value::Bytes(_)) {
+                // The byte-string wrapper chain, as in
+                // `project_value`: a write to field 0 of the
+                // transparent `Path`/`OsStr` wrappers over a
+                // string value lands on the string itself.
+                return navigate_mut(slot, rest, func, place);
+            }
             if let Value::Coroutine { fields, .. } = slot {
                 // The state storage grows to the written slot: a
                 // state field stored for the first time extends the
