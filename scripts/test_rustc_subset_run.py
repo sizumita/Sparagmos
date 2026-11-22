@@ -1775,7 +1775,9 @@ class ProcessStage2RevisionTests(unittest.TestCase):
 
 
 class ProcessStage1FlagsTests(unittest.TestCase):
-    """Stage 1 forwards compile-flags to both sides."""
+    """Stage 1 forwards compile-flags to both sides, preceded by
+    the mode arguments compiletest itself adds for the suite
+    (a ui test is compiled with -Ccodegen-units=1)."""
 
     def setUp(self):
         self.tmp = Path(self.enterContext(__import__("tempfile")
@@ -1815,8 +1817,9 @@ class ProcessStage1FlagsTests(unittest.TestCase):
         res = self.run_with_capture(rec)
         self.assertEqual(res["status"], "pass")
         self.assertEqual(self.seen["native_flags"],
-                         ["-C", "opt-level=3"])
-        self.assertEqual(self.seen["driver_args"], ["-C", "opt-level=3"])
+                         ["-Ccodegen-units=1", "-C", "opt-level=3"])
+        self.assertEqual(self.seen["driver_args"],
+                         ["-Ccodegen-units=1", "-C", "opt-level=3"])
 
     def test_screened_flags_not_attempted(self):
         rec = self.write_test(
