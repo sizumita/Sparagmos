@@ -11279,12 +11279,19 @@ fn compose_projection(
             if j > i + 1 || subslice.is_some() {
                 let element = project_value(cur.clone(), &[RefProj::Index(a)], func, place);
                 if let Ok(element) = element {
+                    // An ADT value is the aggregate of its
+                    // fields, and an index step into it is
+                    // element access over them (a `Vec` value's
+                    // elements, above all): a following index
+                    // step ranges inside it, exactly as for a
+                    // tuple, so the run does not compose.
                     if !matches!(
                         element,
                         Value::Tuple(_)
                             | Value::FatRef { .. }
                             | Value::Bytes(_)
                             | Value::Str(_)
+                            | Value::Enum { .. }
                     ) {
                         let merged = match subslice {
                             Some((offset, len)) => RefProj::Subslice {

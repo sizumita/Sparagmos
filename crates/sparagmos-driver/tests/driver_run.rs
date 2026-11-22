@@ -16323,3 +16323,80 @@ fn run_mode_fs_builtins_roundtrip() {
     assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
     assert_eq!(stdout, "fs guest ok\n", "stderr={stderr}");
 }
+
+const NESTED_REVERSE_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<[u32; 4]> = vec![[1, 2, 3, 4], [5, 6, 7, 8]];
+    v[0].reverse();
+    v[1].reverse();
+    println!("{:?}", v);
+    let mut a = [[1u32, 2, 3], [4, 5, 6]];
+    a[1].reverse();
+    println!("{:?}", a);
+}
+"#;
+
+#[test]
+fn run_mode_nested_aggregate_element_reverse() {
+    // Reversing one row of a nested aggregate (`v[0].reverse()`)
+    // swaps through pointers displaced from an element position
+    // inside the row: the displacement must absorb into the
+    // row's own index space (the innermost container the
+    // pointer's element size denominates), or the swap reads and
+    // writes the wrong elements — it used to splice bytes into
+    // the first element's storage and leave the row's tail
+    // untouched.
+    let dir = temp_dir("nestedreverse");
+    let src = fixture(&dir, "nestedreverse.rs", NESTED_REVERSE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "nested aggregate element reverse must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[[4, 3, 2, 1], [8, 7, 6, 5]]\n[[1, 2, 3], [6, 5, 4]]\n",
+        "each row reverses in place, exactly as natively"
+    );
+}
+
+const NESTED_VEC_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<Vec<u32>> = vec![vec![1, 2, 3, 4], vec![5, 6]];
+    assert_eq!(v[0][1], 2);
+    assert_eq!(v[1][0], 5);
+    v[0].reverse();
+    v[1].push(7);
+    assert_eq!(v[0], vec![4, 3, 2, 1]);
+    assert_eq!(v[1][2], 7);
+    println!("{:?}", v);
+}
+"#;
+
+#[test]
+fn run_mode_nested_vec_index_and_reverse() {
+    // A `Vec` value is the aggregate of its elements, so an
+    // index step into it is element access and a following index
+    // step ranges inside it: composing the two steps into one
+    // index over the outer vector (the flat reading a data
+    // pointer's position takes) reads the sibling vector whole
+    // instead of the element. Nested reads, writes through
+    // `v[0].reverse()`'s swaps, and growth of an inner vector
+    // must all observe the inner elements.
+    let dir = temp_dir("nestedvec");
+    let src = fixture(&dir, "nestedvec.rs", NESTED_VEC_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "nested vec index/reverse must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[[4, 3, 2, 1], [5, 6, 7]]\n",
+        "the inner vectors reverse and grow independently, exactly as natively"
+    );
+}
