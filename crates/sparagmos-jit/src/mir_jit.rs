@@ -105,6 +105,9 @@
 //! block is a guest panic too, with the message `entered unreachable
 //! code` — the interpreter's model — lowered to a jump into a panic
 //! block like a failed `Assert`, never to a hardware trap.
+//! Cleanup blocks are never entered either — the panic model
+//! propagates through the panic flag, not through unwind edges —
+//! so their closing `Resume` is sealed the same way.
 //!
 //! The *plain* (unchecked) operators wrap, in both engines: the
 //! overflow panic belongs to the `Assert` rustc emits after a
@@ -145,7 +148,13 @@
 //! to two words — a fat pointer or a pair — returned in RAX/RDX,
 //! the System V pair-return convention; wider results are stored
 //! through a hidden leading sret argument word),
-//! `Assert`, `Drop`, `Return`, `Unreachable` (as a guest panic).
+//! `Assert`, `Drop`, `Return`, `Unreachable` (as a guest panic);
+//! by-value iteration over arrays: `IntoIterator::into_iter` and
+//! `Iterator::next` for `std::array::IntoIter` are not part of
+//! the program (the driver leaves them to the interpreter's
+//! builtins) and are lowered inline, the iterator value holding
+//! the array's elements followed by the `alive` range (see
+//! [`ArrayIterShape`]).
 //! Anything else — `f16` / `f128`, 128-bit integers, references
 //! to trait objects, unions, ADT values wider than the layout
 //! bound or with a field type the program never reveals, a second dynamic
@@ -918,10 +927,186 @@ fn scan_body_aggregates(scan: &mut AdtScan, body: &mir::Body) {
     }
 }
 
+/// The JIT's shape for one `std::array::IntoIter<T, N>`
+/// instantiation: the iterator value is the array's elements in
+/// order followed by the two `alive` range words (`start`,
+/// `end`) — the shape of the core type. The converted type of
+/// the iterator carries only `T` (the const generic is not part
+/// of it), so the element area is sized from the program's
+/// `into_iter` call sites, whose self type is the array itself
+/// (see [`scan_array_iters`]): `len` is the largest array length
+/// sighted for the instantiation, and an iterator over a
+/// shorter array leaves the tail of the element area unused
+/// (its `end` word still holds its own length).
+#[derive(Clone, Debug)]
+struct ArrayIterShape {
+    /// The element type `T`.
+    elem: mir::Ty,
+    /// The layout's array length: the largest `N` sighted for
+    /// this instantiation.
+    len: usize,
+    /// Leaves per element.
+    per_elem: usize,
+}
+
+impl ArrayIterShape {
+    /// Leaves of the element area.
+    fn data(&self) -> usize {
+        self.per_elem * self.len
+    }
+
+    /// Total leaves of the iterator value.
+    fn total(&self) -> usize {
+        self.data() + 2
+    }
+}
+
+/// Whether a definition name is one of the two spellings of the
+/// array `IntoIterator::into_iter` entry point: the trait method
+/// (the spelling converted call sites use) or the `[T; N]`
+/// implementation itself.
+fn is_array_into_iter_fn(name: &str) -> bool {
+    name == "std::iter::IntoIterator::into_iter"
+        || (name.starts_with("std::array::iter::<impl std::iter::IntoIterator for [")
+            && name.ends_with(">::into_iter"))
+}
+
+/// Whether a definition name is one of the two spellings of the
+/// array iterator's `Iterator::next`: the trait method or the
+/// `IntoIter` implementation itself.
+fn is_array_iter_next_fn(name: &str) -> bool {
+    name == "std::iter::Iterator::next"
+        || (name.starts_with("<std::array::IntoIter<")
+            && name.ends_with("as std::iter::Iterator>::next"))
+}
+
+/// Sightings of `std::array::IntoIter` constructions: for every
+/// call to an array `into_iter` entry point whose self type is
+/// an array of known length and whose destination is a plain
+/// `IntoIter` local, the instantiation key with the element type
+/// and length the call fixes. The converted type does not carry
+/// the length, so one key can be sighted with several lengths;
+/// the recorded length is the largest (see [`ArrayIterShape`]).
+fn scan_array_iters(
+    functions: &[MirFunctionInput],
+    names: &HashMap<mir::DefId, String>,
+) -> Vec<(AdtKey, Result<(mir::Ty, usize), String>)> {
+    let intoiter_defs: Vec<mir::DefId> = names
+        .iter()
+        .filter(|(_, n)| n.as_str() == "std::array::IntoIter")
+        .map(|(d, _)| *d)
+        .collect();
+    if intoiter_defs.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<(AdtKey, Result<(mir::Ty, usize), String>)> = Vec::new();
+    for f in functions {
+        let body = &f.body;
+        for bb in &body.basic_blocks {
+            let Some(term) = &bb.terminator else { continue };
+            let mir::TerminatorKind::Call {
+                func, destination, ..
+            } = &term.kind
+            else {
+                continue;
+            };
+            let mir::Operand::Constant(c) = func else { continue };
+            let mir::ConstKind::Ty(mir::Ty::FnDef(def, gargs)) = &c.literal else {
+                continue;
+            };
+            let Some(name) = names.get(def) else { continue };
+            if !is_array_into_iter_fn(name) {
+                continue;
+            }
+            let Some(mir::Ty::Array(elem, mir::ArrayLen::Known(n))) = gargs.first() else {
+                continue;
+            };
+            if !destination.projection.is_empty() {
+                continue;
+            }
+            let Some(decl) = body.local_decls.get(destination.local.index()) else {
+                continue;
+            };
+            let mir::Ty::Adt(ddef, dgargs) = &decl.ty else {
+                continue;
+            };
+            if !intoiter_defs.contains(ddef) {
+                continue;
+            }
+            let key = AdtKey {
+                def: *ddef,
+                generic_args: dgargs.clone(),
+            };
+            let sighting = ((**elem).clone(), *n as usize);
+            match out.iter_mut().find(|(k, _)| *k == key) {
+                None => out.push((key, Ok(sighting))),
+                Some((_, Ok(prev))) => {
+                    // The key fixes the element type; only the
+                    // length can differ between sightings.
+                    debug_assert_eq!(prev.0, sighting.0);
+                    prev.1 = prev.1.max(sighting.1);
+                }
+                Some((_, Err(_))) => {}
+            }
+        }
+    }
+    out
+}
+
+/// The slot layout of one array-iterator instantiation under
+/// its JIT shape (see [`ArrayIterShape`]): field 0 is the
+/// element array, field 1 the `alive` range — the core type's
+/// own fields, so a projection the program does reveal resolves
+/// the way it does for any other ADT.
+fn array_iter_layout(
+    shape: &ArrayIterShape,
+    names: &HashMap<mir::DefId, String>,
+) -> Result<AdtLayout, String> {
+    let total = shape.total();
+    if total > MAX_ADT_LEAVES {
+        return Err(format!(
+            "ADT value of {total} leaves exceeds the JIT layout bound"
+        ));
+    }
+    let data = shape.data();
+    let range_ty = match names
+        .iter()
+        .find(|(_, n)| n.as_str() == "std::ops::Range")
+    {
+        Some((def, _)) => {
+            mir::Ty::Adt(*def, vec![mir::Ty::Uint(mir::UintTy::Usize)])
+        }
+        None => mir::Ty::Tuple(vec![
+            mir::Ty::Uint(mir::UintTy::Usize),
+            mir::Ty::Uint(mir::UintTy::Usize),
+        ]),
+    };
+    Ok(AdtLayout {
+        tag: false,
+        total,
+        variants: vec![vec![
+            AdtFieldSlot {
+                ty: mir::Ty::Array(
+                    Box::new(shape.elem.clone()),
+                    mir::ArrayLen::Known(shape.len as u64),
+                ),
+                offset: 0,
+                width: data,
+            },
+            AdtFieldSlot {
+                ty: range_ty,
+                offset: data,
+                width: 2,
+            },
+        ]],
+    })
+}
+
 /// The slot layouts of a whole program's ADT instantiations,
 /// computed once before lowering.
 struct AdtLayouts {
     entries: Vec<(AdtKey, Result<AdtLayout, String>)>,
+    array_iters: Vec<(AdtKey, Result<ArrayIterShape, String>)>,
 }
 
 /// A width-exact type for a constant literal, when the literal
@@ -973,6 +1158,48 @@ impl AdtLayouts {
             scan_body_fields(&mut scan, &f.body);
             scan_body_aggregates(&mut scan, &f.body);
         }
+        // The array by-value iterator's layouts are seeded
+        // before the general computation: the scan of projections
+        // and aggregates says nothing about the type (no converted
+        // body ever touches its fields), and nested layout
+        // computations must find the seeded entry the way they
+        // find any other.
+        let mut entries: Vec<(AdtKey, Result<AdtLayout, String>)> = Vec::new();
+        let mut array_iters: Vec<(AdtKey, Result<ArrayIterShape, String>)> = Vec::new();
+        for (key, sighting) in scan_array_iters(functions, names) {
+            let layout = match &sighting {
+                Ok((elem, len)) => {
+                    let mut visiting = Vec::new();
+                    match build_leaf_count(
+                        elem,
+                        &scan,
+                        discriminants,
+                        &mut entries,
+                        &mut visiting,
+                    ) {
+                        Ok(per_elem) => {
+                            let shape = ArrayIterShape {
+                                elem: elem.clone(),
+                                len: *len,
+                                per_elem,
+                            };
+                            let layout = array_iter_layout(&shape, names);
+                            array_iters.push((key.clone(), Ok(shape)));
+                            layout
+                        }
+                        Err(reason) => {
+                            array_iters.push((key.clone(), Err(reason.clone())));
+                            Err(reason)
+                        }
+                    }
+                }
+                Err(reason) => {
+                    array_iters.push((key.clone(), Err(reason.clone())));
+                    Err(reason.clone())
+                }
+            };
+            entries.push((key, layout));
+        }
         let mut keys: Vec<AdtKey> = Vec::new();
         for (k, ..) in &scan.field_tys {
             if !keys.contains(k) {
@@ -994,7 +1221,6 @@ impl AdtLayouts {
                 keys.push(k.clone());
             }
         }
-        let mut entries: Vec<(AdtKey, Result<AdtLayout, String>)> = Vec::new();
         for key in &keys {
             let mut visiting = Vec::new();
             let layout = compute_layout(key, &scan, discriminants, &mut entries, &mut visiting);
@@ -1025,7 +1251,27 @@ impl AdtLayouts {
                 }
             }
         }
-        AdtLayouts { entries }
+        AdtLayouts {
+            entries,
+            array_iters,
+        }
+    }
+
+    /// The array-iterator shape recorded for an instantiation,
+    /// when the program constructs one.
+    fn array_iter(
+        &self,
+        def: mir::DefId,
+        generic_args: &[mir::Ty],
+    ) -> Option<Result<ArrayIterShape, String>> {
+        let key = AdtKey {
+            def,
+            generic_args: generic_args.to_vec(),
+        };
+        self.array_iters
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, r)| r.clone())
     }
 
     /// The layout of one instantiation: the computed layout, the
@@ -5210,7 +5456,21 @@ impl<'a> FnLower<'a> {
                 self.seal_terminator(IrTerminator::Jump(real_target.index() as u32));
                 Ok(())
             }
-            T::Resume => Err(self.err("Resume terminator")),
+            T::Resume => {
+                // The JIT's panic model has no unwinding: a
+                // guest panic propagates through the program's
+                // panic flag and the `CheckPanic` after each
+                // call, so no call ever transfers control to its
+                // cleanup blocks, and a cleanup block's closing
+                // `Resume` is never reached. Seal it the way a
+                // MIR `Unreachable` is sealed — a jump into a
+                // panic block — so that reaching one would be a
+                // recorded guest panic, never a host trap.
+                let msg_idx = self.messages.intern("unwind resume reached");
+                let pblk = self.panic_block(msg_idx);
+                self.seal_terminator(IrTerminator::Jump(pblk));
+                Ok(())
+            }
             T::Terminate(_) => Err(self.err("Terminate terminator")),
             T::Yield { .. } => Err(self.err("Yield terminator")),
             T::CoroutineDrop => Err(self.err("CoroutineDrop terminator")),
@@ -5991,6 +6251,321 @@ impl<'a> FnLower<'a> {
         }
     }
 
+    /// The address of word `off` of the value whose word 0 sits
+    /// at `base` (word `k` lies `8 * k` bytes below the base, the
+    /// slot model's addressing).
+    fn word_addr(&mut self, base: u32, off: usize) -> u32 {
+        if off == 0 {
+            return base;
+        }
+        let d = self.fresh();
+        self.emit(Instr::BinOp {
+            dst: d,
+            op: IrBinOp::Sub,
+            lhs: IrOperand::Value(base),
+            rhs: IrOperand::Const((off * 8) as i64),
+        });
+        d
+    }
+
+    /// The array-iterator shape of the instantiation a `next`
+    /// call's self type names, when the program constructs that
+    /// iterator (see [`AdtLayouts::array_iter`]).
+    fn array_iter_shape_of(
+        &self,
+        func: &mir::Operand,
+    ) -> Option<Result<ArrayIterShape, String>> {
+        let mir::Operand::Constant(c) = func else {
+            return None;
+        };
+        let mir::ConstKind::Ty(mir::Ty::FnDef(_, gargs)) = &c.literal else {
+            return None;
+        };
+        let mir::Ty::Adt(def, args) = gargs.first()? else {
+            return None;
+        };
+        self.layouts.array_iter(*def, args)
+    }
+
+    /// The array-iterator shape recorded for the instantiation
+    /// a call destination's declared type names, when the
+    /// destination is a plain local of that type.
+    fn array_iter_shape_of_destination(
+        &self,
+        destination: &mir::Place,
+    ) -> Option<Result<ArrayIterShape, String>> {
+        if !destination.projection.is_empty() {
+            return None;
+        }
+        let decl = self.body.local_decls.get(destination.local.index())?;
+        let mir::Ty::Adt(def, args) = &decl.ty else {
+            return None;
+        };
+        self.layouts.array_iter(*def, args)
+    }
+
+    /// `IntoIterator::into_iter` on an array, lowered inline:
+    /// the destination takes the iterator's layout shape (see
+    /// [`ArrayIterShape`]) — this call's array leaves copied in
+    /// order, then the `alive` range words `0` and this call's
+    /// own `N`, at the layout's offsets (a shorter array than
+    /// the layout's leaves the element area's tail unused).
+    fn lower_array_into_iter(
+        &mut self,
+        shape: &ArrayIterShape,
+        self_ty: &mir::Ty,
+        args: &[mir::Operand],
+        destination: &mir::Place,
+        target: Option<mir::BasicBlock>,
+    ) -> Result<(), JitError> {
+        let mir::Ty::Array(_, mir::ArrayLen::Known(n)) = self_ty else {
+            return Err(self.err("array into_iter of an array of unknown length"));
+        };
+        let n = *n as usize;
+        if args.len() != 1 {
+            return Err(self.err("array into_iter with an unexpected argument count"));
+        }
+        let data = shape.data();
+        let total = shape.total();
+        let dst_loc = self.classify_place(destination)?;
+        match &dst_loc {
+            PlaceLoc::Slots { first, count, .. } => {
+                if *count != total {
+                    return Err(self.err("array iterator destination shape mismatch"));
+                }
+                let first = *first;
+                self.store_operand_leaves(&args[0], self_ty, first)?;
+                self.emit(Instr::Const {
+                    dst: first + data as u32,
+                    imm: 0,
+                });
+                self.emit(Instr::Const {
+                    dst: first + data as u32 + 1,
+                    imm: n as i64,
+                });
+            }
+            PlaceLoc::Mem { count, .. } => {
+                if *count != Some(total) {
+                    return Err(self.err("array iterator destination shape mismatch"));
+                }
+                let base = self.fresh();
+                for _ in 1..total {
+                    self.fresh();
+                }
+                self.store_operand_leaves(&args[0], self_ty, base)?;
+                self.emit(Instr::Const {
+                    dst: base + data as u32,
+                    imm: 0,
+                });
+                self.emit(Instr::Const {
+                    dst: base + data as u32 + 1,
+                    imm: n as i64,
+                });
+                self.store_mem_from(&dst_loc, base);
+            }
+        }
+        match target {
+            Some(t) => self.seal_terminator(IrTerminator::Jump(t.index() as u32)),
+            None => self.seal_terminator(IrTerminator::Unreachable),
+        }
+        Ok(())
+    }
+
+    /// `Iterator::next` on an array by-value iterator, lowered
+    /// inline: the iterator is reached through the `&mut`
+    /// argument's address. While the `alive` range is non-empty
+    /// the call reads the element at `start`, advances `start`,
+    /// and writes `Some(element)` to the destination; otherwise
+    /// it writes `None` (tag and zeroed payload). Neither outcome
+    /// can panic.
+    fn lower_array_iter_next(
+        &mut self,
+        shape: &ArrayIterShape,
+        args: &[mir::Operand],
+        destination: &mir::Place,
+        target: Option<mir::BasicBlock>,
+    ) -> Result<(), JitError> {
+        if args.len() != 1 {
+            return Err(self.err("array iterator next with an unexpected argument count"));
+        }
+        let dst_loc = self.classify_place(destination)?;
+        let (dst_ty, dst_count) = match &dst_loc {
+            PlaceLoc::Slots { count, ty, .. } => (ty.clone(), *count),
+            PlaceLoc::Mem { count, ty, .. } => (
+                ty.clone(),
+                count.ok_or_else(|| {
+                    self.err("array iterator next destination is an unsized place")
+                })?,
+            ),
+        };
+        let layout = self.adt_layout(&dst_ty)?;
+        if !layout.tag || dst_count != layout.total {
+            return Err(self.err("array iterator next destination has no Option shape"));
+        }
+        let mir::Ty::Adt(option_def, _) = &dst_ty else {
+            return Err(self.err("array iterator next destination is not an enum"));
+        };
+        let option_def = *option_def;
+        // The `Some` variant is the one with a single field (the
+        // element); `None` is the one with none.
+        let mut some_v = None;
+        let mut none_v = None;
+        for (v, fields) in layout.variants.iter().enumerate() {
+            match fields.len() {
+                1 => some_v = Some(v as u32),
+                0 => none_v = Some(v as u32),
+                _ => {}
+            }
+        }
+        let (Some(some_v), Some(none_v)) = (some_v, none_v) else {
+            return Err(self.err("array iterator next destination has no Option shape"));
+        };
+        let slot = layout
+            .field(some_v, 0)
+            .ok_or_else(|| self.err("array iterator next destination has no Option shape"))?;
+        let (payload_off, payload_width) = (slot.offset, slot.width);
+        if payload_width != shape.per_elem {
+            return Err(self.err("array iterator element shape mismatch"));
+        }
+        // The destination's leaves: the place's own slots, or a
+        // scratch run stored through after the join (the same
+        // arrangement as a call destination in memory).
+        let dst_first = match &dst_loc {
+            PlaceLoc::Slots { first, .. } => *first,
+            PlaceLoc::Mem { .. } => {
+                let base = self.fresh();
+                for _ in 1..dst_count {
+                    self.fresh();
+                }
+                base
+            }
+        };
+        let arg_ty = self
+            .operand_place_ty(&args[0])
+            .unwrap_or(mir::Ty::Uint(mir::UintTy::U64));
+        let ptr = self.operand_value(&args[0], &arg_ty)?;
+        let data = shape.data();
+        let start_addr = self.word_addr(ptr, data);
+        let start = self.fresh();
+        self.emit(Instr::LoadPtr {
+            dst: start,
+            ptr: IrOperand::Value(start_addr),
+        });
+        let end_addr = self.word_addr(ptr, data + 1);
+        let end = self.fresh();
+        self.emit(Instr::LoadPtr {
+            dst: end,
+            ptr: IrOperand::Value(end_addr),
+        });
+        let cond = self.fresh();
+        self.emit(Instr::BinOp {
+            dst: cond,
+            op: IrBinOp::LtU,
+            lhs: IrOperand::Value(start),
+            rhs: IrOperand::Value(end),
+        });
+        let some_blk = self.new_block();
+        let none_blk = self.new_block();
+        let join_blk = self.new_block();
+        self.seal_and_continue(
+            IrTerminator::Branch {
+                cond: IrOperand::Value(cond),
+                then_blk: some_blk,
+                else_blk: none_blk,
+            },
+            some_blk,
+        );
+        // Some: read the element at `start` (its first leaf is
+        // word `start * per_elem` of the value), advance `start`,
+        // and write the tag and the payload leaves.
+        let w0 = self.fresh();
+        self.emit(Instr::BinOp {
+            dst: w0,
+            op: IrBinOp::Mul,
+            lhs: IrOperand::Value(start),
+            rhs: IrOperand::Const(shape.per_elem as i64),
+        });
+        let mut leaves = Vec::with_capacity(shape.per_elem);
+        for j in 0..shape.per_elem {
+            let w = if j == 0 {
+                w0
+            } else {
+                let d = self.fresh();
+                self.emit(Instr::BinOp {
+                    dst: d,
+                    op: IrBinOp::Add,
+                    lhs: IrOperand::Value(w0),
+                    rhs: IrOperand::Const(j as i64),
+                });
+                d
+            };
+            let byte = self.fresh();
+            self.emit(Instr::BinOp {
+                dst: byte,
+                op: IrBinOp::Mul,
+                lhs: IrOperand::Value(w),
+                rhs: IrOperand::Const(8),
+            });
+            let a = self.fresh();
+            self.emit(Instr::BinOp {
+                dst: a,
+                op: IrBinOp::Sub,
+                lhs: IrOperand::Value(ptr),
+                rhs: IrOperand::Value(byte),
+            });
+            let leaf = self.fresh();
+            self.emit(Instr::LoadPtr {
+                dst: leaf,
+                ptr: IrOperand::Value(a),
+            });
+            leaves.push(leaf);
+        }
+        let bumped = self.fresh();
+        self.emit(Instr::BinOp {
+            dst: bumped,
+            op: IrBinOp::Add,
+            lhs: IrOperand::Value(start),
+            rhs: IrOperand::Const(1),
+        });
+        self.emit(Instr::StorePtr {
+            ptr: IrOperand::Value(start_addr),
+            src: IrOperand::Value(bumped),
+        });
+        let some_tag = self.discriminant_value(option_def, some_v)?;
+        self.emit(Instr::Const {
+            dst: dst_first,
+            imm: some_tag,
+        });
+        for (j, leaf) in leaves.iter().enumerate() {
+            self.emit(Instr::Copy {
+                dst: dst_first + (payload_off + j) as u32,
+                src: IrOperand::Value(*leaf),
+            });
+        }
+        self.seal_and_continue(IrTerminator::Jump(join_blk), none_blk);
+        // None: the tag, and zeroed payload leaves.
+        let none_tag = self.discriminant_value(option_def, none_v)?;
+        self.emit(Instr::Const {
+            dst: dst_first,
+            imm: none_tag,
+        });
+        for j in 0..payload_width {
+            self.emit(Instr::Const {
+                dst: dst_first + (payload_off + j) as u32,
+                imm: 0,
+            });
+        }
+        self.seal_and_continue(IrTerminator::Jump(join_blk), join_blk);
+        if let PlaceLoc::Mem { .. } = &dst_loc {
+            self.store_mem_from(&dst_loc, dst_first);
+        }
+        match target {
+            Some(t) => self.seal_terminator(IrTerminator::Jump(t.index() as u32)),
+            None => self.seal_terminator(IrTerminator::Unreachable),
+        }
+        Ok(())
+    }
+
     fn lower_call(
         &mut self,
         func: &mir::Operand,
@@ -6015,6 +6590,47 @@ impl<'a> FnLower<'a> {
         let Some((def, generic_args)) = callee else {
             return Err(self.err("call through a non-constant function value"));
         };
+        // The array by-value iterator's two entry points are
+        // never part of the program (the driver leaves them to
+        // the interpreter's builtins); the JIT lowers them
+        // inline. Any other absent callee keeps the path below.
+        if !self.def_index.contains_key(&def) {
+            if let Some(name) = self.def_names.get(&def) {
+                if is_array_into_iter_fn(name) {
+                    if let mir::Operand::Constant(c) = func {
+                        if let mir::ConstKind::Ty(mir::Ty::FnDef(_, gargs)) = &c.literal {
+                            if let Some(self_ty) = gargs.first() {
+                                if matches!(self_ty, mir::Ty::Array(..)) {
+                                    if let Some(shape) =
+                                        self.array_iter_shape_of_destination(destination)
+                                    {
+                                        let shape =
+                                            shape.map_err(|reason| self.err(&reason))?;
+                                        return self.lower_array_into_iter(
+                                            &shape,
+                                            &self_ty.clone(),
+                                            args,
+                                            destination,
+                                            target,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if is_array_iter_next_fn(name) {
+                    if let Some(shape) = self.array_iter_shape_of(func) {
+                        let shape = shape.map_err(|reason| self.err(&reason))?;
+                        return self.lower_array_iter_next(
+                            &shape,
+                            args,
+                            destination,
+                            target,
+                        );
+                    }
+                }
+            }
+        }
         // A callee the program does not define is the builtin
         // layer's business: the interpreter resolves exactly these
         // calls by name, and so does the JIT (see
