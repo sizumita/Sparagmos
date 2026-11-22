@@ -6206,6 +6206,43 @@ fn declared_compile_flags(src_text: &str) -> Vec<String> {
     flags
 }
 
+/// Expand compiletest's `{{...}}` template variables in an
+/// auxiliary crate's declared compile flags. compiletest expands
+/// every directive value before compiling an auxiliary crate with
+/// the crate's own flags; passing `{{src-base}}` verbatim makes a
+/// flag like `--remap-path-prefix={{src-base}}=remapped` a no-op,
+/// so paths baked into the auxiliary crate's metadata (a macro's
+/// `file!()`) stay unremapped. `{{src-base}}` is the auxiliary
+/// file's suite root (the nearest ancestor directory whose parent
+/// is `tests`, as in the subset runner) and `{{cwd}}` the driver's
+/// working directory. Variables that name directories only
+/// compiletest owns (`{{build-base}}` and friends) are left as-is:
+/// no auxiliary crate's flags use them.
+fn expand_aux_flag_variables(flag: &str, src_path: &str) -> String {
+    if !flag.contains("{{") {
+        return flag.to_string();
+    }
+    let src = std::path::Path::new(src_path);
+    let mut src_base = src.parent().map(|p| p.to_path_buf());
+    for ancestor in src.ancestors() {
+        let is_suite_root = ancestor
+            .parent()
+            .is_some_and(|p| p.file_name().is_some_and(|n| n == "tests"));
+        if is_suite_root {
+            src_base = Some(ancestor.to_path_buf());
+            break;
+        }
+    }
+    let mut out = flag.to_string();
+    if let Some(base) = &src_base {
+        out = out.replace("{{src-base}}", &base.to_string_lossy());
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        out = out.replace("{{cwd}}", &cwd.to_string_lossy());
+    }
+    out
+}
+
 /// One `--aux` specification: the crate name and source path from
 /// `<name>=<file.rs>`, plus the optional per-crate attributes that
 /// followed the path (`;crate-type=<type>`, `;edition=<ed>`).
@@ -6410,9 +6447,10 @@ fn compile_aux(
         }
     }
     // The auxiliary crate's own `//@ compile-flags:` (compiletest
-    // compiles each auxiliary crate with its own file's flags).
+    // compiles each auxiliary crate with its own file's flags,
+    // with the `{{...}}` template variables expanded).
     for flag in declared_compile_flags(&src_text) {
-        cmd.arg(flag);
+        cmd.arg(expand_aux_flag_variables(&flag, src_path));
     }
     let out = cmd
         .output()
