@@ -7318,6 +7318,20 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
             // The unit allocator marker: a zero-sized value with
             // no fields and no `Drop` impl.
             "std::alloc::Global" => return Some(P::Trivial),
+            // The raw allocation buffer behind the modelled
+            // containers (`Vec`, `String`, `VecDeque`): rustc's
+            // generated drop glue for a container drops the
+            // buffer field as a place of this type (and, inside
+            // it, of `RawVecInner`). The buffer's real glue only
+            // deallocates -- dropping the elements is the owner's
+            // glue (the `Vec` plan, the slice glue), never the
+            // buffer's -- and the value model does not represent
+            // the allocation at all (a container value holds its
+            // elements directly; capacity is not represented),
+            // so there is no glue to run for the buffer field.
+            "alloc::raw_vec::RawVec" | "alloc::raw_vec::RawVecInner" => {
+                return Some(P::Trivial)
+            }
             // A fieldless error struct (the payload of a failed
             // channel receive): nothing to drop.
             "std::sync::mpmc::RecvError" => return Some(P::Trivial),
@@ -7743,6 +7757,30 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                     P::Trivial => Some(P::Trivial),
                     _ => None,
                 };
+            }
+            // The remaining field-only adapters: the iterator
+            // adapters not listed above and the `str` escape
+            // adapters. None of them has a `Drop` impl of its
+            // own, so the glue is the fields' -- the inner
+            // iterator, the closure / state / peeked slot the
+            // adapter holds -- planned from the same evidence
+            // the generic path uses for the entry crate's types.
+            "std::iter::Rev" | "core::iter::Rev" | "std::iter::Cloned"
+            | "core::iter::Cloned" | "std::iter::Cycle" | "core::iter::Cycle"
+            | "std::iter::Zip" | "core::iter::Zip" | "std::iter::Filter"
+            | "core::iter::Filter" | "std::iter::FilterMap"
+            | "core::iter::FilterMap" | "std::iter::Peekable"
+            | "core::iter::Peekable" | "std::iter::TakeWhile"
+            | "core::iter::TakeWhile" | "std::iter::Scan" | "core::iter::Scan"
+            | "std::iter::Inspect" | "core::iter::Inspect"
+            | "std::iter::StepBy" | "core::iter::StepBy"
+            | "std::str::EscapeDebug" | "core::str::EscapeDebug"
+            | "std::str::EscapeDefault" | "core::str::EscapeDefault"
+            | "std::str::EscapeUnicode" | "core::str::EscapeUnicode"
+            | "std::char::EscapeDebug" | "core::str::CharEscapeDebug"
+            | "std::char::EscapeDefault" | "core::str::CharEscapeDefault"
+            | "std::char::EscapeUnicode" | "core::str::CharEscapeUnicode" => {
+                return Some(self.variant_fields_plan(def, args)?);
             }
             "std::ffi::OsString" | "std::ffi::OsStr" => {
                 // An `OsString` is the string value itself in this

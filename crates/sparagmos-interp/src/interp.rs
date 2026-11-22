@@ -4031,8 +4031,18 @@ impl<'a> Interpreter<'a> {
             match active.completion {
                 GlueCompletion::Jump(target) => {
                     // Glue finished: the dropped place is dead, as in
-                    // MIR. A direct local of the owner frame is
-                    // cleared.
+                    // MIR, when the place is a local of the frame
+                    // executing the drop. A place that resolved
+                    // through a pointer into another frame (the
+                    // `drop_in_place` shim dropping the caller's
+                    // local through its `*mut` argument) is not
+                    // killed: the pointer operation is invisible to
+                    // the owner body's drop elaboration, which keeps
+                    // treating the local as live -- it may still be
+                    // moved, reassigned or forgotten afterwards.
+                    // Only the pointee's glue ran, as in real memory,
+                    // where `drop_in_place` leaves the bytes in
+                    // place.
                     // A dropped box's allocation is freed with it:
                     // the pointee's glue has run, and the storage
                     // the box pointed at is gone, as a real free
@@ -4053,7 +4063,9 @@ impl<'a> Interpreter<'a> {
                         projection,
                     } = &active.root
                     {
-                        if projection.is_empty() {
+                        if projection.is_empty()
+                            && frames.last().map(|f| f.id) == Some(*frame)
+                        {
                             let frame_pos = self.frame_pos(frames, *frame)?;
                             if let Some(slot) = frames[frame_pos].locals.get_mut(*local) {
                                 *slot = Value::Uninit;
