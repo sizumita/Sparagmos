@@ -5941,7 +5941,7 @@ let inner = match (&src, target) {
                                     Some(src) => {
                                         let pointee = unsize_pointee(&src);
                                         let concrete = self.concrete_ty_name(
-                                            unsize_concrete_pointee(self, &src),
+                                            unsize_concrete_pointee(self, &src, target),
                                         );
                                         // The value carries the
                                         // pointee's drop glue from
@@ -9674,18 +9674,87 @@ fn unsize_pointee(ty: &mir::Ty) -> &mir::Ty {
     }
 }
 
-/// The concrete type an unsizing cast's *value* answers for, with
-/// every pointer wrapper stripped: the one-step pointee above
-/// names `Box<..>` for a `Pin<Box<T>>` source, but the trait
-/// object the cast forms is a `dyn` of `T` itself - the vtable a
-/// dispatch looks up is `T`'s, and the concrete tag the value
-/// carries must name `T` (see `Value::DynRef`). The first step
-/// is the plain pointee step (any ADT gives up its first
-/// argument); further steps only pass through the standard
-/// pointer wrappers (`Pin`, `Box`, `Rc`, `Arc`, the `Weak`s) and
-/// references, so a user type in the chain stops the walk.
-fn unsize_concrete_pointee<'t>(conv: &Converter<'_>, mut ty: &'t mir::Ty) -> &'t mir::Ty {
-    ty = unsize_pointee(ty);
+/// One wrapper layer on the way from a cast's target type to
+/// the `dyn` type inside it: a reference layer, a raw-pointer
+/// layer, or the generic-argument index of an ADT layer.
+#[derive(Clone, Copy)]
+enum DynStep {
+    Ref,
+    RawPtr,
+    Arg(usize),
+}
+
+/// The wrapper path from a type to the `dyn` type inside it (the
+/// traversal of `dyn_traits_in`, recording each layer).
+fn dyn_path_in(ty: &mir::Ty) -> Option<Vec<DynStep>> {
+    match ty {
+        mir::Ty::Dynamic(..) => Some(Vec::new()),
+        mir::Ty::Ref(_, inner, _) => {
+            let mut path = dyn_path_in(inner)?;
+            path.insert(0, DynStep::Ref);
+            Some(path)
+        }
+        mir::Ty::RawPtr(inner, _) => {
+            let mut path = dyn_path_in(inner)?;
+            path.insert(0, DynStep::RawPtr);
+            Some(path)
+        }
+        mir::Ty::Adt(_, args) => {
+            for (i, arg) in args.iter().enumerate() {
+                if let Some(mut path) = dyn_path_in(arg) {
+                    path.insert(0, DynStep::Arg(i));
+                    return Some(path);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// The source type a `dyn` path names (see `dyn_path_in`): apply
+/// each wrapper step of the target to the source. `None` when
+/// the shapes diverge (the caller falls back to the heuristic
+/// walk in `unsize_concrete_pointee`).
+fn pointee_at_path<'t>(mut ty: &'t mir::Ty, path: &[DynStep]) -> Option<&'t mir::Ty> {
+    for step in path {
+        ty = match (step, ty) {
+            (DynStep::Ref, mir::Ty::Ref(_, inner, _)) => inner,
+            (DynStep::RawPtr, mir::Ty::RawPtr(inner, _)) => inner,
+            (DynStep::Arg(i), mir::Ty::Adt(_, args)) => args.get(*i)?,
+            _ => return None,
+        };
+    }
+    Some(ty)
+}
+
+/// The concrete type an unsizing cast's *value* answers for: the
+/// trait object the cast forms is a `dyn` of the type the
+/// target's own wrapper path names in the source — the layers
+/// above the `dyn` are the pointer the value travels through,
+/// and everything at the path's end is the trait's `Self`,
+/// wrapper layers included: `Box<Box<T>>` cast to `Box<dyn
+/// Trait>` carries the concrete tag `Box<T>` (the trait is
+/// implemented for `Box<T>`), while `Pin<Box<T>>` cast to
+/// `Pin<Box<dyn Trait>>` names `T`. The tag must name that type
+/// (see `Value::DynRef`): it is the vtable a dispatch looks up.
+/// When the target's path cannot be followed in the source, the
+/// heuristic walk below applies: the first step is the plain
+/// pointee step (any ADT gives up its first argument) and
+/// further steps only pass through the standard pointer wrappers
+/// (`Pin`, `Box`, `Rc`, `Arc`, the `Weak`s) and references, so a
+/// user type in the chain stops the walk.
+fn unsize_concrete_pointee<'t>(
+    conv: &Converter<'_>,
+    src: &'t mir::Ty,
+    target: &mir::Ty,
+) -> &'t mir::Ty {
+    if let Some(path) = dyn_path_in(target) {
+        if let Some(ty) = pointee_at_path(src, &path) {
+            return ty;
+        }
+    }
+    let mut ty = unsize_pointee(src);
     loop {
         match ty {
             mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _) => ty = inner,

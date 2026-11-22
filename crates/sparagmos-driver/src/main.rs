@@ -3373,19 +3373,77 @@ fn certify_drop_trivial(
 /// still mentions a type parameter are skipped the same way: a
 /// monomorphic instance body carries the concrete cast.
 fn dyn_trait_refs(body: &rustc_public::mir::Body) -> Vec<rustc_public::ty::TraitRef> {
-    fn find_dyn(
+    /// One wrapper layer on the way from a cast's target type to
+    /// the `dyn` type inside it: a reference layer, a raw-pointer
+    /// layer, or the generic-argument index of an ADT layer.
+    #[derive(Clone, Copy)]
+    enum DynStep {
+        Ref,
+        RawPtr,
+        Arg(usize),
+    }
+    /// The bounds of the `dyn` type inside `ty`, together with
+    /// the wrapper path to it:
+    /// the vtable a cast materializes belongs to the source type
+    /// the same path names — the layers above the `dyn` are the
+    /// pointer the value travels through, and everything at the
+    /// path's end is the trait's `Self`, wrapper layers included:
+    /// `Box<Box<T>>` cast to `Box<dyn Trait>` forms the vtable of
+    /// `Box<T>` (the trait is implemented for `Box<T>`), not of
+    /// `T`. Stripping every pointer wrapper instead (the fallback
+    /// in `pointee`) names a `Self` no impl answers for.
+    fn find_dyn_path(
         ty: &Ty,
-    ) -> Option<Vec<rustc_public::ty::Binder<rustc_public::ty::ExistentialPredicate>>> {
+    ) -> Option<(
+        Vec<rustc_public::ty::Binder<rustc_public::ty::ExistentialPredicate>>,
+        Vec<DynStep>,
+    )> {
         match ty.kind() {
-            TyKind::RigidTy(RigidTy::Dynamic(bounds, _)) => Some(bounds),
-            TyKind::RigidTy(RigidTy::Ref(_, inner, _)) => find_dyn(&inner),
-            TyKind::RigidTy(RigidTy::RawPtr(inner, _)) => find_dyn(&inner),
-            TyKind::RigidTy(RigidTy::Adt(_, args)) => args.0.iter().find_map(|a| match a {
-                GenericArgKind::Type(t) => find_dyn(t),
-                _ => None,
-            }),
+            TyKind::RigidTy(RigidTy::Dynamic(bounds, _)) => Some((bounds, Vec::new())),
+            TyKind::RigidTy(RigidTy::Ref(_, inner, _)) => {
+                let (bounds, mut path) = find_dyn_path(&inner)?;
+                path.insert(0, DynStep::Ref);
+                Some((bounds, path))
+            }
+            TyKind::RigidTy(RigidTy::RawPtr(inner, _)) => {
+                let (bounds, mut path) = find_dyn_path(&inner)?;
+                path.insert(0, DynStep::RawPtr);
+                Some((bounds, path))
+            }
+            TyKind::RigidTy(RigidTy::Adt(_, args)) => {
+                for (i, arg) in args.0.iter().enumerate() {
+                    if let GenericArgKind::Type(t) = arg {
+                        if let Some((bounds, mut path)) = find_dyn_path(t) {
+                            path.insert(0, DynStep::Arg(i));
+                            return Some((bounds, path));
+                        }
+                    }
+                }
+                None
+            }
             _ => None,
         }
+    }
+    /// The source type a `dyn` path names (see `find_dyn_path`):
+    /// apply each wrapper step of the target to the source.
+    /// `None` when the shapes diverge (the caller falls back to
+    /// the heuristic walk in `pointee`).
+    fn pointee_at(ty: &Ty, path: &[DynStep]) -> Option<Ty> {
+        let mut ty = *ty;
+        for step in path {
+            ty = match (step, ty.kind()) {
+                (DynStep::Ref, TyKind::RigidTy(RigidTy::Ref(_, inner, _))) => inner,
+                (DynStep::RawPtr, TyKind::RigidTy(RigidTy::RawPtr(inner, _))) => inner,
+                (DynStep::Arg(i), TyKind::RigidTy(RigidTy::Adt(_, args))) => {
+                    match args.0.get(*i) {
+                        Some(GenericArgKind::Type(t)) => *t,
+                        _ => return None,
+                    }
+                }
+                _ => return None,
+            };
+        }
+        Some(ty)
     }
     fn pointee(ty: &Ty) -> Ty {
         fn first_type_arg(args: &rustc_public::ty::GenericArgs) -> Option<Ty> {
@@ -3394,14 +3452,14 @@ fn dyn_trait_refs(body: &rustc_public::mir::Body) -> Vec<rustc_public::ty::Trait
                 _ => None,
             })
         }
-        // The first step is the plain pointee step (any ADT
-        // gives up its first type argument); the vtable the cast
-        // materializes is the concrete type's own, though, so
-        // the walk continues through the standard pointer
-        // wrappers (`Pin`, `Box`, `Rc`, `Arc`, the `Weak`s) and
-        // references until the sized type itself: `Pin<Box<T>>`
-        // names `T`, not `Box<T>`. Any other ADT stops the walk,
-        // as its first argument is not a pointee.
+        // The heuristic walk, kept as the fallback for shapes
+        // the target-driven path (`find_dyn_path` / `pointee_at`)
+        // cannot follow: the first step is the plain pointee step
+        // (any ADT gives up its first type argument) and the walk
+        // continues through the standard pointer wrappers (`Pin`,
+        // `Box`, `Rc`, `Arc`, the `Weak`s) and references until
+        // the sized type itself. Any other ADT stops the walk, as
+        // its first argument is not a pointee.
         let mut ty = match ty.kind() {
             TyKind::RigidTy(RigidTy::Ref(_, inner, _)) => inner,
             TyKind::RigidTy(RigidTy::RawPtr(inner, _)) => inner,
@@ -3456,13 +3514,13 @@ fn dyn_trait_refs(body: &rustc_public::mir::Body) -> Vec<rustc_public::ty::Trait
             ) {
                 continue;
             }
-            let Some(bounds) = find_dyn(target) else {
+            let Some((bounds, dyn_path)) = find_dyn_path(target) else {
                 continue;
             };
             let Ok(src) = op.ty(&locals) else {
                 continue;
             };
-            let concrete = pointee(&src);
+            let concrete = pointee_at(&src, &dyn_path).unwrap_or_else(|| pointee(&src));
             if matches!(concrete.kind(), TyKind::RigidTy(RigidTy::Dynamic(..))) {
                 continue;
             }
