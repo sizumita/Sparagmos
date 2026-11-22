@@ -135,18 +135,25 @@ pub(crate) struct DebugControl {
     script: VecDeque<DebugCommand>,
     /// The current stop plan.
     plan: StopPlan,
-    /// The last position executed anywhere; step plans fire on
-    /// line *changes*, so consecutive statements on one line are
-    /// a single position.
+    /// The last position the current step plan ranged over;
+    /// step plans fire on line *changes* within that range, so
+    /// consecutive statements on one line are a single position,
+    /// and positions outside the range (a stepped-over call's
+    /// body) leave the tracker untouched. Re-anchored at every
+    /// stop.
     last_pos: Option<(u32, u32)>,
-    /// The last position executed in each live frame, by frame
-    /// id. Breakpoint stops are judged per frame: a line
-    /// breakpoint sits at the line's first instruction, so a
-    /// frame that is already on the line — it called out from
-    /// the line and came back to the line's continuation — does
-    /// not stop again until it has been to another line (a loop
-    /// iteration qualifies; a call's return does not).
-    frame_lines: HashMap<u64, (u32, u32)>,
+    /// Where each line breakpoint has bound, per frame: a
+    /// line breakpoint sits at the line's first instruction —
+    /// in this model, the first position executed on that line
+    /// in that frame — so later positions on the same line (the
+    /// continuation after a call, a merge block's transfer
+    /// terminator) do not stop. The bound position itself stops
+    /// again once execution has left it, which is what a loop
+    /// iteration does. Keyed by (frame id, file id, line); the
+    /// value is the bound (block, statement) position and
+    /// whether the binding is armed, i.e. execution has left
+    /// the bound position since the last stop there.
+    bp_bindings: HashMap<(u64, u32, u32), ((usize, usize), bool)>,
     /// The frame expressions evaluate in, counted from the
     /// innermost frame (0).
     selected_frame: usize,
@@ -265,7 +272,7 @@ impl DebugSession {
             plan: StopPlan::Breakpoints,
             last_pos: None,
             current_pos: None,
-            frame_lines: HashMap::new(),
+            bp_bindings: HashMap::new(),
             selected_frame: 0,
             print_count: 0,
             transcript: Vec::new(),
@@ -299,41 +306,125 @@ pub(crate) fn drive_hook(
     block: usize,
     stmt: usize,
 ) {
+    // Storage markers and nops generate no code, so native
+    // debuggers have no line row for them: they are not
+    // positions in the session's stream at all. (A macro block
+    // argument's result temp, for instance, gets a StorageLive
+    // whose span is the `$b` reference in the macro definition;
+    // counting it would stop the session on a line no debugger
+    // can stop on.)
+    if let Some(stmt_ref) = body.blocks.get(block).and_then(|b| b.statements.get(stmt)) {
+        if matches!(
+            stmt_ref.kind,
+            crate::ir::StatementKind::StorageLive(_)
+                | crate::ir::StatementKind::StorageDead(_)
+                | crate::ir::StatementKind::Nop
+        ) {
+            return;
+        }
+    }
     let Some(pos) = position(body, block, stmt) else {
         return;
     };
+    if std::env::var_os("SPARAGMOS_DEBUG_TRACE").is_some() {
+        let kind = body
+            .blocks
+            .get(block)
+            .and_then(|b| b.statements.get(stmt))
+            .map(|s| format!("{:?}", s.kind))
+            .unwrap_or_else(|| {
+                body.blocks
+                    .get(block)
+                    .map(|b| format!("Terminator {:?}", b.terminator))
+                    .unwrap_or_else(|| "?".to_string())
+            });
+        eprintln!(
+            "[dbgtrace] frame={} block={} stmt={} line={} kind={:.60}",
+            frames.len(),
+            block,
+            stmt,
+            pos.line,
+            kind
+        );
+    }
     let key = (pos.file, pos.line);
     let mut ctl = interp
         .debug_ctl
         .take()
         .expect("drive hook fires only with a session installed");
     let depth = frames.len();
-    // A stop fires on a line *change*: the position differs from
-    // the previously executed one. The tracker therefore updates
-    // on every consultation, not only at stops — otherwise a
-    // breakpoint line reached again later in the run (the same
-    // line in a later call of the same function) would read as
-    // "unchanged" forever after its first stop.
-    let changed = ctl.last_pos != Some(key);
-    ctl.last_pos = Some(key);
     let frame_id = frames.last().map(|f| f.id).unwrap_or(0);
-    let frame_changed = ctl.frame_lines.get(&frame_id) != Some(&key);
-    ctl.frame_lines.insert(frame_id, key);
+    // Leaving a bound breakpoint position re-arms its
+    // binding, whatever line execution moved to.
+    for ((fid, _, _), binding) in ctl.bp_bindings.iter_mut() {
+        if *fid == frame_id && binding.0 != (block, stmt) {
+            binding.1 = true;
+        }
+    }
+    // A step stop fires on a line *change*, but the change is
+    // judged only over the positions the plan ranges over. A
+    // step-over plan ranges over the stepped frame and its
+    // callers: positions inside a stepped-over call must not
+    // rewrite the tracker, or the return to the call line's
+    // continuation reads as a fresh change and the session stops
+    // on the call line a second time. (A real debugger's `next`
+    // runs to the return address; the callee's lines are not
+    // part of the stepped frame's line stream.) A step-out plan
+    // ranges over the callers only, and its stop is the first
+    // position there — the return landing — whatever its line.
+    let eligible = match ctl.plan {
+        StopPlan::StepInto => true,
+        StopPlan::StepOver(d) => depth <= d,
+        StopPlan::StepOut(d) => depth < d,
+        StopPlan::Breakpoints | StopPlan::Done => false,
+    };
+    let changed = eligible && ctl.last_pos != Some(key);
+    if eligible {
+        ctl.last_pos = Some(key);
+    }
     let stop = match ctl.plan {
         StopPlan::Breakpoints => {
-            frame_changed && ctl.breakpoints.contains(&key)
+            if !ctl.breakpoints.contains(&key) {
+                false
+            } else {
+                let bkey = (frame_id, key.0, key.1);
+                match ctl.bp_bindings.get(&bkey) {
+                    // The breakpoint's first executed position
+                    // in this frame: it binds here and stops.
+                    None => {
+                        ctl.bp_bindings.insert(bkey, ((block, stmt), false));
+                        true
+                    }
+                    Some(&((bb, ss), armed)) => {
+                        if (bb, ss) == (block, stmt) && armed {
+                            ctl.bp_bindings.insert(bkey, ((bb, ss), false));
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                }
+            }
         }
         StopPlan::StepInto => changed,
-        StopPlan::StepOver(d) => changed && depth <= d,
-        StopPlan::StepOut(d) => changed && depth < d,
+        StopPlan::StepOver(_) => changed,
+        StopPlan::StepOut(d) => depth < d,
         StopPlan::Done => false,
     };
     if stop {
+        if std::env::var_os("SPARAGMOS_DEBUG_TRACE").is_some() {
+            eprintln!("[dbgtrace] STOP depth={} line={}", depth, pos.line);
+        }
+        // Anchor the step tracker at the stop: the next step
+        // command measures line changes from here, not from
+        // whatever position an earlier plan last ranged over.
+        ctl.last_pos = Some(key);
         ctl.selected_frame = 0;
         ctl.current_pos = Some(key);
         if let Some(lines) = ctl.source_text.get(&pos.file) {
             if let Some(text) = lines.get((pos.line - 1) as usize) {
-                ctl.transcript.push(text.trim().to_string());
+                let rendered = stop_line_text(&ctl, pos.line, text);
+                ctl.transcript.push(rendered);
             }
         }
         // Consume commands until one resumes execution.
@@ -352,7 +443,8 @@ pub(crate) fn drive_hook(
                 Some(DebugCommand::ShowLine) => {
                     if let Some(lines) = ctl.source_text.get(&pos.file) {
                         if let Some(text) = lines.get((pos.line - 1) as usize) {
-                            ctl.transcript.push(text.trim().to_string());
+                            let rendered = stop_line_text(&ctl, pos.line, text);
+                            ctl.transcript.push(rendered);
                         }
                     }
                 }
@@ -380,6 +472,17 @@ pub(crate) fn drive_hook(
         }
     }
     interp.debug_ctl = Some(ctl);
+}
+
+/// A stop's source line as the dialect's debugger shows it:
+/// gdb lists the line numbered, with the source text as
+/// written (indentation intact — check lines are written
+/// against that form), lldb's form here is the bare text.
+fn stop_line_text(ctl: &DebugControl, line: u32, text: &str) -> String {
+    match ctl.dialect {
+        DebugDialect::Gdb => format!("{line}\t{text}"),
+        DebugDialect::Lldb => text.trim().to_string(),
+    }
 }
 
 /// The source position of the statement (or terminator, when

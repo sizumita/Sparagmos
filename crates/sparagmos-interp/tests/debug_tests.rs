@@ -89,7 +89,7 @@ fn breakpoint_stop_and_scalar_print() {
     );
     assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
     assert!(
-        run.transcript.iter().any(|l| l == "zzz();"),
+        run.transcript.iter().any(|l| l == "3\t    zzz();"),
         "transcript: {:?}",
         run.transcript
     );
