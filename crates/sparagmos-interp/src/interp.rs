@@ -26,6 +26,7 @@
 //!   all return errors. Regression coverage lives in
 //!   `tests/robustness_tests.rs`.
 
+use crate::builtins::target_ends_at_element;
 use crate::error::{InterpError, InterpResult};
 use crate::f128;
 use crate::ir::*;
@@ -5421,6 +5422,26 @@ impl<'a> Interpreter<'a> {
                             // written by an aggregate and never
                             // projected lands here with an untyped plan.
                             Some(Value::Enum { fields, .. }) if fields.is_empty() => {}
+                            // A one-field aggregate is a wrapper
+                            // whose only content is its field (a
+                            // `PhantomData` newtype, a cell): judge
+                            // the field by the same untyped plan,
+                            // exactly as a tuple's elements are
+                            // judged. Only a structural payload
+                            // (an enum or a tuple) is entered; a
+                            // scalar payload stays under the
+                            // conservative error below.
+                            Some(Value::Enum { fields, .. })
+                                if fields.len() == 1
+                                    && matches!(
+                                        fields[0],
+                                        Value::Enum { .. } | Value::Tuple(_)
+                                    ) =>
+                            {
+                                let mut sub = path.clone();
+                                sub.push(RefProj::Field(0));
+                                active.work.push((sub, P::Untyped));
+                            }
                             Some(Value::Enum { .. })
                             | Some(Value::SparseVec { .. })
                             | Some(Value::Coroutine { .. }) => {
@@ -7826,6 +7847,27 @@ impl<'a> Interpreter<'a> {
                     out.extend_from_slice(&projection[1..]);
                     return out;
                 }
+            }
+            // A field-first projection addresses the pointee's
+            // own structure: the block's base pointer denotes
+            // its first element, so the element step belongs in
+            // front. (A plain field step would otherwise land
+            // on the block's element tuple itself, whose field
+            // 0 happens to be the element and whose other
+            // fields do not exist.) Index- and sub-slice-first
+            // projections already denote positions in the
+            // block's element sequence and keep their form.
+            if matches!(
+                projection.first(),
+                Some(
+                    RefProj::Field(_)
+                        | RefProj::UnionField { .. }
+                        | RefProj::Downcast(_)
+                )
+            ) {
+                let mut out = vec![RefProj::Index(0)];
+                out.extend_from_slice(projection);
+                return out;
             }
         }
         projection.to_vec()
@@ -10317,6 +10359,8 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+
+
     pub(crate) fn fat_deref_len(
         &self,
         frames: &[Frame],
@@ -11110,6 +11154,111 @@ impl<'a> Interpreter<'a> {
                 other.kind_name(),
             )),
         }
+    }
+
+    /// Rewrite the elements of the slice a fat pointer
+    /// denotes, one `MaybeUninit` / `UnsafeCell` wrapper
+    /// layer per element, in place in the backing
+    /// allocation: the execution of
+    /// [`Rvalue::UnwrapSliceElems`] / [`Rvalue::WrapSliceElems`].
+    /// The elements live behind the pointer, so unlike the
+    /// by-value array forms the operand value itself is
+    /// returned unchanged. Uninitialized elements keep
+    /// their state (an uninitialized element has no
+    /// representation to change); an element that does not
+    /// hold the expected form is left as it is, so casting
+    /// an already-rewritten slice again is harmless. A fat
+    /// pointer over a value snapshot has no storage to
+    /// rewrite through this API and is left unchanged.
+    fn rewrite_slice_elems(
+        &self,
+        frames: &mut Vec<Frame>,
+        value: &Value,
+        wrap: bool,
+    ) -> InterpResult<()> {
+        let fat = match value {
+            Value::FatRef { .. } => value.clone(),
+            Value::Ref(_) => {
+                let target = self.deref_value(frames, value)?;
+                match self.read_resolved(frames, &target) {
+                    Ok(inner @ Value::FatRef { .. }) => inner,
+                    _ => return Ok(()),
+                }
+            }
+            _ => return Ok(()),
+        };
+        let Value::FatRef { base, len } = fat else {
+            return Ok(());
+        };
+        let Value::Ref(RefTarget::Alloc { id, projection }) = *base else {
+            return Ok(());
+        };
+        // The base may denote the slice's first element
+        // itself (a projection ending in an index step, the
+        // form a sub-slice or an offset element pointer
+        // takes): the elements are then the base's sequence
+        // positions, reached with the sequence accessor,
+        // not index steps into the element.
+        let base_resolved = Resolved::Alloc {
+            id,
+            projection: projection.clone(),
+        };
+        let ends_at_element = target_ends_at_element(&base_resolved);
+        for i in 0..(len as usize) {
+            let elem = if ends_at_element {
+                self.read_seq_at(frames, &base_resolved, i)
+            } else {
+                let mut proj = projection.clone();
+                proj.push(RefProj::Index(i as usize));
+                self.read_resolved(
+                    frames,
+                    &Resolved::Alloc {
+                        id,
+                        projection: proj,
+                    },
+                )
+            };
+            let elem = match elem {
+                Ok(v) => v,
+                Err(InterpError::UninitializedRead { .. }) => continue,
+                Err(e) => {
+                    return Err(e);
+                }
+            };
+            let rewritten = if wrap {
+                match elem {
+                    Value::Uninit => None,
+                    other => Some(Value::Enum {
+                        variant: 0,
+                        fields: vec![other],
+                    }),
+                }
+            } else {
+                match elem {
+                    Value::Enum { fields, .. } if fields.len() == 1 => {
+                        fields.into_iter().next()
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(new) = rewritten {
+                if ends_at_element {
+                    self.write_seq_at(frames, &base_resolved, i, new)?;
+                } else {
+                    let mut proj = projection.clone();
+                    proj.push(RefProj::Index(i as usize));
+                    self.write_resolved(
+                        frames,
+                        &Resolved::Alloc {
+                            id,
+                            projection: proj,
+                        },
+                        new,
+                    )?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// `[T; N]` -> `[MaybeUninit<T>; N]` (or the `UnsafeCell`
@@ -12609,13 +12758,50 @@ impl<'a> Interpreter<'a> {
                     if *idx != 0 || !single_field {
                         trailing_entry = false;
                     }
-                    cur = match cur {
-                        Value::Tuple(items) => items.get(*idx)?,
-                        Value::Enum { fields, .. } => fields.get(*idx)?,
-                        Value::Coroutine { fields, .. } => fields.get(*idx)?,
-                        Value::Closure { env, .. } => env.get(*idx)?,
-                        _ => return None,
-                    };
+                    // The judgment above is made at the step's
+                    // own level: a step that retries through a
+                    // one-field wrapper below is out of range at
+                    // that level, so its index is non-zero and
+                    // the judgment already answers for the
+                    // retried levels too.
+                    // The transparent-wrapper descent of
+                    // `project_value`: a field step past the end
+                    // of a one-field wrapper the storage acquired
+                    // through a wrapper pointer (a `MaybeUninit`
+                    // pointee) retries on the wrapper's only
+                    // field — the projection itself carries no
+                    // wrapper step, so the prefix accounting is
+                    // unaffected.
+                    loop {
+                        match cur {
+                            Value::Tuple(items) => {
+                                cur = items.get(*idx)?;
+                                break;
+                            }
+                            Value::Enum { fields, .. } => {
+                                if let Some(v) = fields.get(*idx) {
+                                    cur = v;
+                                    break;
+                                }
+                                if fields.len() == 1
+                                    && wrapper_payload(&fields[0])
+                                {
+                                    cur = &fields[0];
+                                    continue;
+                                }
+                                return None;
+                            }
+                            Value::Coroutine { fields, .. } => {
+                                cur = fields.get(*idx)?;
+                                break;
+                            }
+                            Value::Closure { env, .. } => {
+                                cur = env.get(*idx)?;
+                                break;
+                            }
+                            _ => return None,
+                        }
+                    }
                 }
                 RefProj::Downcast(_) => {
                     if !matches!(cur, Value::Enum { .. } | Value::Coroutine { .. }) {
@@ -12945,6 +13131,11 @@ impl<'a> Interpreter<'a> {
             Resolved::Alloc { id, projection } => {
                 let projection = &self.elem_block_projection(*id, projection);
                 let base = self.alloc_base(*id)?;
+                let projection = &if self.is_elem_block(*id) {
+                    pointee_field0_rewrite(&base, projection)
+                } else {
+                    projection.clone()
+                };
                 let func = frames
                     .last()
                     .map(|f| f.func.clone())
@@ -12967,7 +13158,7 @@ impl<'a> Interpreter<'a> {
                         }
                         _ => false,
                     };
-                let value = match self.project_value_t(base, projection, &func, &place_desc) {
+                let value = match self.project_value_t(base.clone(), projection, &func, &place_desc) {
                     Ok(v) => v,
                     Err(e) => {
                         // The stored form of an allocation is a
@@ -13260,6 +13451,12 @@ impl<'a> Interpreter<'a> {
             }
             Resolved::Alloc { id, projection } => {
                 let projection = &self.elem_block_projection(*id, projection);
+                let projection = &if self.is_elem_block(*id) {
+                    let base = self.alloc_base(*id).unwrap_or(Value::Uninit);
+                    pointee_field0_rewrite(&base, projection)
+                } else {
+                    projection.clone()
+                };
                 let mut store = self.allocs.borrow_mut();
                 let slot = store
                     .get_mut(id)
@@ -13317,6 +13514,7 @@ impl<'a> Interpreter<'a> {
                         }
                     }
                 }
+                grow_tuples_along(slot, projection);
                 let place_desc = format!("allocation #{id}");
                 assign_projected(slot, projection, value, "<allocation>", &place_desc, true)
             }
@@ -13496,6 +13694,7 @@ impl<'a> Interpreter<'a> {
                 let slot = store
                     .get_mut(id)
                     .ok_or_else(|| self.missing_alloc(*id))?;
+                grow_tuples_along(slot, projection);
                 let place_desc = format!("allocation #{id}");
                 let slot = navigate_mut(slot, projection, "<allocation>", &place_desc)?;
                 f(slot)
@@ -16019,7 +16218,12 @@ impl<'a> Interpreter<'a> {
     /// conversion into a `Box<dyn Trait>`, whose result goes
     /// through the same unsizing (see
     /// `TerminatorKind::CallBuiltin::result_unsize`).
-    fn eval_unsize(&self, frames: &[Frame], v: Value, meta: &UnsizeMeta) -> InterpResult<Value> {
+    fn eval_unsize(
+        &self,
+        frames: &[Frame],
+        v: Value,
+        meta: &UnsizeMeta,
+    ) -> InterpResult<Value> {
         match meta {
             UnsizeMeta::Slice { array_len } => {
                 self.unsize_to_slice(frames, v, *array_len)
@@ -18714,6 +18918,16 @@ impl<'a> Interpreter<'a> {
                 let value = self.eval_operand(frames, body, operand)?;
                 Self::unwrap_array_elems(value)
             }
+            Rvalue::UnwrapSliceElems(operand) => {
+                let value = self.eval_operand(frames, body, operand)?;
+                self.rewrite_slice_elems(frames, &value, false)?;
+                Ok(value)
+            }
+            Rvalue::WrapSliceElems(operand) => {
+                let value = self.eval_operand(frames, body, operand)?;
+                self.rewrite_slice_elems(frames, &value, true)?;
+                Ok(value)
+            }
             Rvalue::IntToPtr(operand) => {
                 let value = self.eval_operand(frames, body, operand)?;
                 match value {
@@ -18885,7 +19099,8 @@ impl<'a> Interpreter<'a> {
             }
             Rvalue::Reinterpret(operand, src, dst) => {
                 let value = self.eval_operand(frames, body, operand)?;
-                self.reinterpret_value(&value, src, dst)
+                let r = self.reinterpret_value(&value, src, dst);
+                r
             }
             Rvalue::ShapedLoad(place, shape, moved) => {
                 let target = self.resolve_place(frames, body, place)?;
@@ -20432,6 +20647,25 @@ pub(crate) fn is_vec_adt_ty(ty: &Ty) -> bool {
         _ => false,
     }
 }
+/// Whether a one-field wrapper's only field is an aggregate the
+/// transparent-wrapper descent may enter: a tuple, a multi-field
+/// aggregate, or another wrapper in the chain. A value-holding
+/// enum (a unit variant, or a wrapper around a scalar) is NOT
+/// entered: the wrapper itself is the aggregate being addressed,
+/// so an out-of-range field step grows it instead of burrowing
+/// into the value it happens to hold (a leaf node's `parent:
+/// Option<_>` None value must not become the leaf's storage).
+fn wrapper_payload(v: &Value) -> bool {
+    match v {
+        Value::Tuple(_) => true,
+        Value::Enum { fields, .. } => {
+            fields.len() >= 2
+                || (fields.len() == 1
+                    && wrapper_payload(&fields[0]))
+        }
+        _ => false,
+    }
+}
 
 /// The element count a stored capacity value carries: the
 /// integer itself, or the single field of the one-field
@@ -20570,6 +20804,51 @@ fn projection_enters_coroutine(root: &Value, projection: &[RefProj], func: &str)
     }
     false
 }
+/// Rewrite a terminal `Field(0)` step that addresses a field of a
+/// pointee whose storage acquired transparent-wrapper layers when
+/// it was materialised through projected writes (a
+/// `Box::new_uninit` pointee written through `as_mut_ptr` carries
+/// the `MaybeUninit` wrapper as one-field `Enum` layers around the
+/// payload aggregate). A direct pointer formed after
+/// `assume_init` spells the payload's field 0 with a single
+/// `Field(0)`, which is also the wrapper's only in-range field, so
+/// the step must first enter each wrapper layer, exactly as the
+/// wrapped pointer form spells it. Only allocation storage is
+/// rewritten: locals and statics hold genuine one-field aggregates
+/// whose field 0 is a real field. The rewrite applies only when
+/// the value at the head of the projection really is such a
+/// wrapper chain ending at a multi-field aggregate.
+fn pointee_field0_rewrite(root: &Value, projection: &[RefProj]) -> Vec<RefProj> {
+    let Some((RefProj::Field(0), head)) = projection.split_last() else {
+        return projection.to_vec();
+    };
+    let Ok(at) = project_value(root.clone(), head, "<pointee>", "field0 rewrite")
+    else {
+        return projection.to_vec();
+    };
+    let mut levels = 0usize;
+    let mut cur = &at;
+    while let Value::Enum { fields, .. } = cur {
+        if fields.len() != 1
+            || !wrapper_payload(&fields[0])
+        {
+            break;
+        }
+        levels += 1;
+        cur = &fields[0];
+    }
+    let reaches_struct =
+        matches!(cur, Value::Enum { fields, .. } if fields.len() >= 2);
+    if levels == 0 || !reaches_struct {
+        return projection.to_vec();
+    }
+    let mut out = head.to_vec();
+    for _ in 0..levels {
+        out.push(RefProj::Field(0));
+    }
+    out.push(RefProj::Field(0));
+    out
+}
 
 pub(crate) fn project_value(
     value: Value,
@@ -20600,6 +20879,37 @@ pub(crate) fn project_value(
             });
         }
         let step_state = downcast_state.take();
+        // A one-field wrapper the storage acquired through a
+        // transparent-wrapper pointer (a `MaybeUninit` pointee
+        // materialised by projected writes that entered field 0
+        // — see `ptr_field_value`): the payload's own readers
+        // address the payload's fields directly on the storage
+        // (a `Box<Leaf>` after `assume_init` reads the leaf's
+        // fields where the wrapper's field 0 holds them), so an
+        // out-of-range field step descends into the wrapper's
+        // only field first. In-range steps are unaffected, and a
+        // step that stays out of range keeps its error.
+        if let RefProj::Field(idx) = step {
+            loop {
+                let descend = match &value {
+                    Value::Enum { fields, .. } => {
+                        fields.len() == 1
+                            && fields.get(*idx).is_none()
+                            && wrapper_payload(&fields[0])
+                    }
+                    _ => false,
+                };
+                if !descend {
+                    break;
+                }
+                value = match value {
+                    Value::Enum { mut fields, .. } => {
+                        fields.pop().expect("one field checked")
+                    }
+                    _ => unreachable!("descent checked the shape"),
+                };
+            }
+        }
         value = match step {
             RefProj::Field(idx) => match value {
                 Value::Tuple(ref items) => items.get(*idx).cloned().ok_or_else(|| {
@@ -21231,6 +21541,58 @@ fn splice_scalar_storage_byte(slot: &mut Value, idx: usize, byte: u8) -> bool {
 /// storage (see [`scalar_storage_byte`]) has no byte slot to
 /// hand out, so it is spliced into the scalar in place. Every
 /// other shape navigates to the selected slot and assigns, with
+/// Grow every tuple an `Index` step of `projection` addresses
+/// along the path the step denotes, filling with `Uninit` slots.
+/// Allocation storage materialises an array field element by
+/// element (a fresh node's key area has no array value yet: its
+/// tuple is exactly as long as the highest index written), so an
+/// allocation write's path is grown before navigation refuses an
+/// index past a partial tuple's end. A built array value in a
+/// local or a static keeps its length: the same step there is the
+/// guest's own out-of-bounds error, which `navigate_mut` reports.
+/// The walk mirrors navigation only where the current value's
+/// shape already determines the next slot; anything else (an
+/// `Uninit` slot above all) is left for navigation to
+/// materialise or refuse.
+fn grow_tuples_along(value: &mut Value, projection: &[RefProj]) {
+    let Some((step, rest)) = projection.split_first() else {
+        return;
+    };
+    match (value, step) {
+        (Value::Tuple(items), RefProj::Index(idx)) => {
+            if *idx >= items.len() {
+                items.resize(*idx + 1, Value::Uninit);
+            }
+            grow_tuples_along(&mut items[*idx], rest);
+        }
+        (Value::Tuple(items), RefProj::Field(idx)) => {
+            if let Some(item) = items.get_mut(*idx) {
+                grow_tuples_along(item, rest);
+            }
+        }
+        (Value::Enum { fields, .. }, RefProj::Field(idx)) => {
+            if *idx < fields.len() {
+                grow_tuples_along(&mut fields[*idx], rest);
+            } else if fields.len() == 1 && wrapper_payload(&fields[0]) {
+                // The transparent-wrapper descent navigation
+                // performs: the step retries one level down.
+                grow_tuples_along(&mut fields[0], projection);
+            }
+        }
+        (Value::Enum { fields, .. }, RefProj::Index(idx)) => {
+            if fields.len() == 1
+                && matches!(fields[0], Value::Tuple(_) | Value::Bytes(_))
+            {
+                grow_tuples_along(&mut fields[0], projection);
+            } else if *idx < fields.len() {
+                grow_tuples_along(&mut fields[*idx], rest);
+            }
+        }
+        (value, RefProj::Downcast(_)) => grow_tuples_along(value, rest),
+        _ => {}
+    }
+}
+
 /// exactly the errors that navigation produced before.
 fn assign_projected(
     slot: &mut Value,
@@ -21273,15 +21635,29 @@ fn assign_projected(
         // A byte pointer displaced into the storage first
         // (`p.add(k)`) puts a byte-offset step immediately before
         // the index step; the byte position is the sum.
-        let (idx, head) = match head.split_last() {
+        let (idx, head, byte_displaced) = match head.split_last() {
             Some((&RefProj::ByteOffset(disp), head)) if disp >= 0 => {
-                (idx + disp as usize, head)
+                (idx + disp as usize, head, true)
             }
-            _ => (idx, head),
+            _ => (idx, head, false),
         };
         if let Some(byte) = value_as_storage_byte(&value) {
             if let Ok(head_slot) = navigate_mut_grow(slot, head, func, place, grow) {
-                if splice_scalar_storage_byte(head_slot, idx, byte) {
+                // The splice is a byte position inside a scalar's
+                // storage. It applies when the projection is
+                // byte-displaced (its shape says so outright), or
+                // when the head slot actually holds a scalar. An
+                // unwritten head slot is not evidence of a scalar:
+                // it is just as often an array field no write has
+                // materialised yet (a fresh node's key area being
+                // filled element by element), and splicing the
+                // first elements into a fabricated scalar there
+                // would pack them into one integer and lose the
+                // array. Such a write belongs to the ordinary
+                // navigation below, which materialises the array.
+                if (byte_displaced || scalar_storage_len(head_slot).is_some())
+                    && splice_scalar_storage_byte(head_slot, idx, byte)
+                {
                     return Ok(());
                 }
             }
@@ -21423,6 +21799,19 @@ pub(crate) fn project_value_ref<'a>(
         let step_state = downcast_state.take();
         match step {
             RefProj::Field(idx) => {
+                // The transparent-wrapper descent of
+                // `project_value`, in borrowing form: retry the
+                // step on the wrapper's only field.
+                while let Value::Enum { fields, .. } = cur {
+                    if fields.len() == 1
+                        && fields.get(*idx).is_none()
+                        && wrapper_payload(&fields[0])
+                    {
+                        cur = &fields[0];
+                    } else {
+                        break;
+                    }
+                }
                 cur = match cur {
                     Value::Tuple(items) => items.get(*idx).ok_or_else(|| {
                         InterpError::UninitializedRead {
@@ -22065,6 +22454,24 @@ fn navigate_mut_grow<'x>(
             // the vector with Uninit padding up to the written
             // index; slots never written keep reading as
             // uninitialized.
+            // The transparent-wrapper descent of
+            // `project_value`, in writing form: a field step
+            // past the end of a one-field wrapper whose only
+            // field is an aggregate continues into that field
+            // with the whole projection, instead of growing
+            // the wrapper with padding it does not have.
+            if matches!(
+                slot,
+                Value::Enum { fields, .. }
+                    if fields.len() == 1
+                        && fields.len() <= *idx
+                        && wrapper_payload(&fields[0])
+            ) {
+                let Value::Enum { fields, .. } = slot else {
+                    unreachable!("descent checked the shape")
+                };
+                return navigate_mut(&mut fields[0], projection, func, place);
+            }
             if let Value::Enum { fields, .. } = slot {
                 if fields.len() <= *idx {
                     fields.resize(*idx + 1, Value::Uninit);
@@ -22331,23 +22738,46 @@ fn navigate_mut_grow<'x>(
             // A downcast with no field step after it (a whole-state
             // place) denotes the coroutine value itself.
             Value::Coroutine { .. } => navigate_mut_grow(slot, rest, func, place, grow),
-            Value::Enum {
-                variant: current,
-                fields,
-            } => {
-                if current != variant {
-                    // A mutable navigation through the downcast of
-                    // a variant other than the one the tag names is
-                    // an in-place reinitialization: the old variant's
-                    // payload is invalidated and the new variant's
-                    // storage is rematerialized empty (the Field arm
-                    // pads it with Uninit slots as fields are
-                    // written). The tag switches here so that the
-                    // closing SetDiscriminant, when the MIR emits
-                    // one after the stores, names the held variant
-                    // and leaves the stored fields in place.
-                    *current = *variant;
-                    fields.clear();
+            Value::Enum { .. } => {
+                if let Value::Enum {
+                    variant: current,
+                    fields,
+                } = slot
+                {
+                    if current != variant {
+                        // A mutable navigation through the downcast of
+                        // a variant other than the one the tag names is
+                        // an in-place reinitialization: the old variant's
+                        // payload is invalidated and the new variant's
+                        // storage is rematerialized empty (the Field arm
+                        // pads it with Uninit slots as fields are
+                        // written). The tag switches here so that the
+                        // closing SetDiscriminant, when the MIR emits
+                        // one after the stores, names the held variant
+                        // and leaves the stored fields in place.
+                        *current = *variant;
+                        fields.clear();
+                    }
+                }
+                // A field step right after a downcast names one of
+                // the variant's own fields: consume it here, growing
+                // the field vector as the `Field` arm would, so the
+                // wrapper descent there never sees a post-downcast
+                // step (a variant's field 0 is not a transparent
+                // wrapper's payload).
+                if matches!(rest.first(), Some(RefProj::Field(_))) {
+                    let Value::Enum { fields, .. } = slot else {
+                        unreachable!("enum checked above")
+                    };
+                    let Some((RefProj::Field(idx), tail)) = rest.split_first()
+                    else {
+                        unreachable!("field step checked above")
+                    };
+                    let idx = *idx;
+                    if fields.len() <= idx {
+                        fields.resize(idx + 1, Value::Uninit);
+                    }
+                    return navigate_mut_grow(&mut fields[idx], tail, func, place, grow);
                 }
                 navigate_mut_grow(slot, rest, func, place, grow)
             }

@@ -10540,7 +10540,7 @@ impl<'a> Interpreter<'a> {
                 }
                 let (elems, len) = self.slice_elements_ref(frames, &vals[0])?;
                 if idx as u128 >= len {
-                    return Err(InterpError::panic(format!(
+                return Err(InterpError::panic(format!(
                         "index out of bounds: the len is {len} but the index is {idx}"
                     )));
                 }
@@ -10605,7 +10605,7 @@ impl<'a> Interpreter<'a> {
                             })?,
                         };
                         if idx as u128 >= len {
-                            return Err(InterpError::panic(format!(
+                return Err(InterpError::panic(format!(
                                 "index out of bounds: the len is {len} but the index is {idx}"
                             )));
                         }
@@ -10672,7 +10672,7 @@ impl<'a> Interpreter<'a> {
                             )
                         })?;
                         if idx as u128 >= len {
-                            return Err(InterpError::panic(format!(
+                return Err(InterpError::panic(format!(
                                 "index out of bounds: the len is {len} but the index is {idx}"
                             )));
                         }
@@ -10716,7 +10716,7 @@ impl<'a> Interpreter<'a> {
                             )
                         })?;
                         if idx as u128 >= len {
-                            return Err(InterpError::panic(format!(
+                return Err(InterpError::panic(format!(
                                 "index out of bounds: the len is {len} but the index is {idx}"
                             )));
                         }
@@ -11953,6 +11953,9 @@ impl<'a> Interpreter<'a> {
                     }
                 };
                 let ptr = unwrap_wrapper(&vals[0]).clone();
+                // A block-base pointer: the empty projection, or
+                // the element-0 form an elem block's base pointer
+                // also travels in (a `RawVec`'s stored pointer).
                 let content = match &ptr {
                     Value::Ref(RefTarget::Alloc { id, projection })
                         if self.alloc_ptr_is_base(*id, projection) =>
@@ -12012,6 +12015,9 @@ impl<'a> Interpreter<'a> {
                 arity(2)?;
                 let new_size = alloc_size_arg(name, &vals[1])?;
                 let ptr = unwrap_wrapper(&vals[0]).clone();
+                // A block-base pointer: the empty projection, or
+                // the element-0 form an elem block's base pointer
+                // also travels in (a `RawVec`'s stored pointer).
                 let content = match &ptr {
                     Value::Ref(RefTarget::Alloc { id, projection })
                         if self.alloc_ptr_is_base(*id, projection) =>
@@ -19481,7 +19487,7 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
             },
         };
         if idx as u128 >= len {
-            return Err(InterpError::panic(format!(
+                return Err(InterpError::panic(format!(
                 "index out of bounds: the len is {len} but the index is {idx}"
             )));
         }
@@ -26065,7 +26071,7 @@ fn resolved_with_projection(target: &Resolved, projection: Vec<RefProj>) -> Reso
 /// (its projection ends at an index step): a fat pointer over
 /// such a target denotes the elements from that position on, not
 /// the element itself.
-fn target_ends_at_element(target: &Resolved) -> bool {
+pub(crate) fn target_ends_at_element(target: &Resolved) -> bool {
     let projection = match target {
         Resolved::Place { projection, .. }
         | Resolved::Static { projection, .. }
@@ -27930,6 +27936,89 @@ impl<'a> Interpreter<'a> {
         {
             let pointee = self.default_value(inner)?;
             return Some(self.rc_new_handle(pointee));
+        }
+        if let Some(inner) = generic_first_arg(tag, "std::hash::BuildHasherDefault<") {
+            let _ = inner;
+            // `BuildHasherDefault<H>` is a tuple struct over a
+            // single `PhantomData<H>` field; the hasher it builds
+            // comes from `H::default()` at `build_hasher` time,
+            // not from anything stored here.
+            return Some(Value::Enum {
+                variant: 0,
+                fields: vec![Value::Enum {
+                    variant: 0,
+                    fields: Vec::new(),
+                }],
+            });
+        }
+        if tag.starts_with("std::collections::HashMap<")
+            || tag.starts_with("std::collections::HashSet<")
+        {
+            // `HashMap::default()` is `with_hasher(S::default())`
+            // over an empty raw table; `HashSet::default()` wraps
+            // the same map. The shapes are the ones the collected
+            // `new` bodies build: the table inner names the static
+            // empty control group (sixteen `EMPTY` bytes) through
+            // a value-target pointer, with zero mask, growth and
+            // items.
+            let inner = tag
+                .trim_start_matches("std::collections::HashMap<")
+                .trim_start_matches("std::collections::HashSet<");
+            let inner = inner.strip_suffix('>')?;
+            let args = split_top_level(inner);
+            let hasher_idx = if tag.starts_with("std::collections::HashSet<") {
+                1
+            } else {
+                2
+            };
+            let hasher_tag = args
+                .get(hasher_idx)
+                .map(|s| s.trim())
+                .unwrap_or("std::hash::RandomState");
+            let hasher = self.default_value(hasher_tag)?;
+            let ctrl = Value::Enum {
+                variant: 0,
+                fields: vec![Value::Ref(RefTarget::Value(
+                    Box::new(Value::Bytes(vec![u8::MAX; 16])),
+                    Vec::new(),
+                ))],
+            };
+            let table_inner = Value::Enum {
+                variant: 0,
+                fields: vec![Value::Uint(0), ctrl, Value::Uint(0), Value::Uint(0)],
+            };
+            let table = Value::Enum {
+                variant: 0,
+                fields: vec![
+                    table_inner,
+                    Value::Enum {
+                        variant: 0,
+                        fields: Vec::new(),
+                    },
+                    Value::Enum {
+                        variant: 0,
+                        fields: Vec::new(),
+                    },
+                ],
+            };
+            let base = Value::Enum {
+                variant: 0,
+                fields: vec![hasher, table],
+            };
+            // `HashSet` wraps the map in its own one-field `base`
+            // struct on top of the map's.
+            let base = if tag.starts_with("std::collections::HashSet<") {
+                Value::Enum {
+                    variant: 0,
+                    fields: vec![base],
+                }
+            } else {
+                base
+            };
+            return Some(Value::Enum {
+                variant: 0,
+                fields: vec![base],
+            });
         }
         if tag == "std::hash::RandomState" || tag == "core::hash::RandomState" {
             // `RandomState::default()` is `RandomState::new()`:

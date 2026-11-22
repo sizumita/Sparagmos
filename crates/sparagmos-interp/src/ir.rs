@@ -992,6 +992,23 @@ pub enum Rvalue {
     /// `UnsafeCell` twin): each element's wrapper representation
     /// is unwrapped to the payload it holds.
     UnwrapArrayElems(Operand),
+    /// `*const [MaybeUninit<T>]` -> `*const [T]` (and the
+    /// reference / `UnsafeCell` twins): the fat pointer itself
+    /// is unchanged, but in this model the elements in storage
+    /// hold the wrapper's value representation (the payload at
+    /// field 0 of an enum value), while every reader through
+    /// the cast pointer expects the payload itself. The cast
+    /// therefore rewrites the elements of the denoted slice
+    /// in place, one wrapper layer per element (the execution
+    /// counterpart of [`Rvalue::UnwrapArrayElems`] for slices,
+    /// whose storage lives behind the pointer rather than in
+    /// the operand value). Uninitialized elements stay
+    /// uninitialized.
+    UnwrapSliceElems(Operand),
+    /// The reverse cast (`*const [T]` -> `*const
+    /// [MaybeUninit<T>]`): each element takes the wrapper's
+    /// value representation.
+    WrapSliceElems(Operand),
     /// An integer-to-pointer `Transmute` cast: the mirror image of
     /// [`Rvalue::PtrToInt`]. The integer is an address in the
     /// model's synthetic address space, so the result is an
