@@ -4670,7 +4670,7 @@ impl<'a> Interpreter<'a> {
                         // it to zero runs the glue the value carries,
                         // against the allocation's value field, with
                         // the weak bundle released after it.
-                        let rc_base = rc_handle_id(&base);
+                        let rc_base = self.rc_inner_id(&base);
                         if let Some(id) = rc_base {
                             if !self.rc_dec_strong(id)? {
                                 continue;
@@ -5745,6 +5745,33 @@ impl<'a> Interpreter<'a> {
 
     /// Record a strong handle's drop; returns true when the
     /// strong count reached zero and the pointee's glue must run.
+    /// The reference-counted allocation a value denotes, when
+    /// the value has a handle's shape AND the allocation it
+    /// names really holds an `RcInner` / `ArcInner` aggregate:
+    /// a `Box` handle has the same value shape as an rc handle,
+    /// so shape alone cannot license count discipline -- the
+    /// store's contents are the deciding evidence.
+    pub(crate) fn rc_inner_id(&self, value: &Value) -> Option<u64> {
+        let id = rc_handle_id(value)?;
+        let store = self.allocs.borrow();
+        let inner = store.get(&id)?;
+        fn count_cell(v: &Value) -> bool {
+            fn unwrap1(v: &Value) -> Option<&Value> {
+                match v {
+                    Value::Enum { fields, .. } if fields.len() == 1 => fields.first(),
+                    _ => None,
+                }
+            }
+            matches!(unwrap1(v).and_then(unwrap1), Some(Value::Uint(_)))
+        }
+        match inner {
+            Value::Enum { fields, .. } if fields.len() >= 3 => {
+                (count_cell(&fields[0]) && count_cell(&fields[1])).then_some(id)
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn rc_dec_strong(&self, id: u64) -> InterpResult<bool> {
         Ok(self.rc_adjust_count(id, 0, -1)? == 0)
     }
@@ -14523,16 +14550,22 @@ fn is_default_hook(value: &Value) -> bool {
 }
 
 fn ref_shaped_receiver(value: Value) -> Value {
-    // A reference-counted handle (the data pointer of an
-    // `Rc<dyn Trait>` / `Arc<dyn Trait>`) names its pointee in
-    // the allocation store, not inside the handle value: the
+    // A reference-counted handle names its pointee in the
+    // allocation store, not inside the handle value: the
     // receiver is a reference to the stored value field, live
-    // for every handle on the allocation.
-    if let Some(id) = rc_handle_id(&value) {
-        return Value::Ref(RefTarget::Alloc {
-            id,
-            projection: vec![RefProj::Field(2)],
-        });
+    // for every handle on the allocation. A trait-object
+    // receiver is excluded: a `Box<dyn Trait>` handle has the
+    // same value shape as an rc handle, and only the
+    // allocation's contents tell them apart, which a receiver
+    // reshape cannot consult -- the dyn dispatch downstream
+    // rebuilds the receiver from the fat pointer itself.
+    if !matches!(value, Value::DynRef { .. }) {
+        if let Some(id) = rc_handle_id(&value) {
+            return Value::Ref(RefTarget::Alloc {
+                id,
+                projection: vec![RefProj::Field(2)],
+            });
+        }
     }
     match value {
         Value::Enum { fields, .. } if fields.len() == 1 => {
