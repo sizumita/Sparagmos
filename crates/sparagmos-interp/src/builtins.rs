@@ -524,6 +524,113 @@ pub enum Builtin {
     /// from the host clock and a per-process counter (see
     /// `fresh_hash_keys`).
     HashmapRandomKeys,
+    /// `std::sys::process::unix::common::Command::new(&OsStr)`:
+    /// begin a modelled process command. The returned value is
+    /// a handle carrying the id of the builder state in the
+    /// interpreter's command table (see [`CommandState`]); the
+    /// sys `Command` methods below record into that state. No
+    /// child process is ever started (see `ProcessSpawn`).
+    ProcessCommandNew,
+    /// `std::process::Command::new(program)`: the public
+    /// constructor. The public `Command` is a one-field struct
+    /// over the sys command, so the value is the sys handle
+    /// wrapped in one aggregate layer. (The public method
+    /// bodies are not available to conversion either, so the
+    /// public builder surface is modelled here directly,
+    /// alongside the sys layer other std code calls.)
+    ProcessCommandNewPublic,
+    /// `std::process::Command::arg(&mut self, arg) -> &mut
+    /// Command`: record one argument; returns the receiver.
+    ProcessCommandArgPublic,
+    /// `std::process::Command::current_dir(&mut self, dir) ->
+    /// &mut Command`: record the child's working directory;
+    /// returns the receiver.
+    ProcessCommandCwdPublic,
+    /// `std::process::Command::env(&mut self, key, val) ->
+    /// &mut Command`: record an environment entry.
+    ProcessCommandEnvPublic,
+    /// `std::process::Command::env_remove(&mut self, key) ->
+    /// &mut Command`: record an environment removal.
+    ProcessCommandEnvRemovePublic,
+    /// `std::process::Command::env_clear(&mut self) -> &mut
+    /// Command`: record that the environment was cleared.
+    ProcessCommandEnvClearPublic,
+    /// `std::process::Command::stdin` / `stdout` / `stderr`
+    /// `(&mut self, cfg) -> &mut Command`: accepted and dropped
+    /// like the sys layer's; returns the receiver.
+    ProcessCommandStdioPublic,
+    /// `std::process::Command::output(&mut self) ->
+    /// io::Result<Output>` and `std::sys::process::output`:
+    /// the resolution failure a spawn would report; a program
+    /// that would start is a named unsupported error.
+    ProcessOutput,
+    /// `std::sys::process::unix::common::Command::arg(&mut self,
+    /// &OsStr)`: record one argument on the command.
+    ProcessCommandArg,
+    /// `std::sys::process::unix::common::Command::cwd(&mut self,
+    /// &OsStr)`: record the child's working directory.
+    ProcessCommandCwd,
+    /// `std::sys::process::unix::common::Command::env_mut(&mut
+    /// self) -> &mut CommandEnv`: the returned reference denotes
+    /// a handle value carrying the command's id, which the
+    /// `CommandEnv` builtins read back.
+    ProcessCommandEnvMut,
+    /// `std::sys::process::env::CommandEnv::set(&mut self, &OsStr,
+    /// &OsStr)`: record an environment entry on the command.
+    ProcessCommandEnvSet,
+    /// `std::sys::process::env::CommandEnv::remove(&mut self,
+    /// &OsStr)`: record an environment removal on the command.
+    ProcessCommandEnvRemove,
+    /// `std::sys::process::env::CommandEnv::clear(&mut self)`:
+    /// record that the command's environment was cleared.
+    ProcessCommandEnvClear,
+    /// `std::sys::process::unix::common::Command::stdin` /
+    /// `stdout` / `stderr` `(&mut self, Stdio)`: the stdio
+    /// configuration is not observed by the process model (no
+    /// child is ever started, so no descriptor is ever wired),
+    /// so it is accepted and dropped.
+    ProcessCommandStdio,
+    /// `std::sys::process::unix::unix::Command::spawn(&mut self,
+    /// Stdio, bool) -> io::Result<(Process, StdioPipes)>`:
+    /// resolve the program against the command's state; a
+    /// resolution failure is the `io::Error` std produces for it,
+    /// and a program that would start is a named unsupported
+    /// error, because the model does not start child processes.
+    ProcessSpawn,
+    /// `std::env::current_exe() -> io::Result<PathBuf>`: the
+    /// path of the executable running the guest program, which
+    /// is the driver host process's own executable path.
+    CurrentExe,
+    /// `std::process::id() -> u32`: the id of the process
+    /// running the guest program (the driver host process).
+    ProcessId,
+    /// `core::io::error::os_functions::get_os_functions()`:
+    /// the OS error function table std registers for `core`'s
+    /// `io::Error` machinery. In a native run std installs its
+    /// table before any error is decoded (the guest's own
+    /// registration path, `set_functions`, has no converted
+    /// body); the model answers with the table directly, its
+    /// entries naming the model functions below.
+    IoGetOsFunctions,
+    /// `core::io::error::os_functions::set_functions(...)` and
+    /// its inner helper: registering the OS error table. A
+    /// no-op in the model: `get_os_functions` always answers
+    /// the model's table, which carries the same entries std
+    /// would register.
+    IoSetOsFunctions,
+    /// `std::sys::io::error::unix::decode_error_kind(errno)`:
+    /// std's unix errno -> `ErrorKind` table (the entry the OS
+    /// error function table names).
+    IoDecodeErrorKind,
+    /// `std::sys::io::error::unix::format_error(errno, fmt)`:
+    /// write the OS error message. The model writes nothing:
+    /// the message text of an OS error is the one part of its
+    /// observable surface the value model does not reproduce
+    /// (its kind, raw code and interrupted-ness are exact).
+    IoFormatOsError,
+    /// `std::sys::io::error::unix::is_interrupted(errno)`:
+    /// the error is `EINTR`.
+    IoIsInterrupted,
     /// `Instant::checked_add` / `SystemTime::checked_add`
     /// (payload: true for `SystemTime`).
     TimeCheckedAdd(bool),
@@ -1182,6 +1289,14 @@ pub(crate) fn runtime_name_fallback(kind: Builtin) -> bool {
             // path carries no type for the model to default, and
             // the interpreter's fallback rejects it there.
             | Builtin::DefaultDefault
+            // The OS error function table's entries: they are
+            // only ever invoked indirectly, through the table
+            // `get_os_functions` hands out (their bodies are
+            // std-internal and never collected), so the name
+            // fallback is the only dispatch that reaches them.
+            | Builtin::IoDecodeErrorKind
+            | Builtin::IoFormatOsError
+            | Builtin::IoIsInterrupted
     )
 }
 
@@ -1282,6 +1397,40 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::time::Instant::now" => Builtin::InstantNow,
         "std::time::SystemTime::now" => Builtin::SystemTimeNow,
         "std::sys::random::linux::hashmap_random_keys" => Builtin::HashmapRandomKeys,
+        "std::sys::process::unix::common::Command::new" => Builtin::ProcessCommandNew,
+        "std::sys::process::unix::common::Command::arg" => Builtin::ProcessCommandArg,
+        "std::sys::process::unix::common::Command::cwd" => Builtin::ProcessCommandCwd,
+        "std::sys::process::unix::common::Command::env_mut" => Builtin::ProcessCommandEnvMut,
+        "std::sys::process::env::CommandEnv::set" => Builtin::ProcessCommandEnvSet,
+        "std::sys::process::env::CommandEnv::remove" => Builtin::ProcessCommandEnvRemove,
+        "std::sys::process::env::CommandEnv::clear" => Builtin::ProcessCommandEnvClear,
+        "std::sys::process::unix::common::Command::stdin" => Builtin::ProcessCommandStdio,
+        "std::sys::process::unix::common::Command::stdout" => Builtin::ProcessCommandStdio,
+        "std::sys::process::unix::common::Command::stderr" => Builtin::ProcessCommandStdio,
+        "std::sys::process::unix::unix::Command::spawn" => Builtin::ProcessSpawn,
+        "std::env::current_exe" => Builtin::CurrentExe,
+        "std::process::id" => Builtin::ProcessId,
+        "core::io::error::os_functions::get_os_functions" => Builtin::IoGetOsFunctions,
+        "core::io::error::os_functions::set_functions" => Builtin::IoSetOsFunctions,
+        "core::io::error::os_functions::set_functions::set_functions_inner" => {
+            Builtin::IoSetOsFunctions
+        }
+        "std::sys::io::error::unix::decode_error_kind" => Builtin::IoDecodeErrorKind,
+        "std::sys::io::error::unix::format_error" => Builtin::IoFormatOsError,
+        "std::sys::io::error::unix::is_interrupted" => Builtin::IoIsInterrupted,
+        "std::process::Command::new" => Builtin::ProcessCommandNewPublic,
+        "std::process::Command::arg" => Builtin::ProcessCommandArgPublic,
+        "std::process::Command::current_dir" => Builtin::ProcessCommandCwdPublic,
+        "std::process::Command::env" => Builtin::ProcessCommandEnvPublic,
+        "std::process::Command::env_remove" => Builtin::ProcessCommandEnvRemovePublic,
+        "std::process::Command::env_clear" => Builtin::ProcessCommandEnvClearPublic,
+        "std::process::Command::stdin" => Builtin::ProcessCommandStdioPublic,
+        "std::process::Command::stdout" => Builtin::ProcessCommandStdioPublic,
+        "std::process::Command::stderr" => Builtin::ProcessCommandStdioPublic,
+        "std::process::Command::spawn" => Builtin::ProcessSpawn,
+        "std::process::Command::output" => Builtin::ProcessOutput,
+        "std::process::Command::status" => Builtin::ProcessSpawn,
+        "std::sys::process::output" => Builtin::ProcessOutput,
         "std::time::Instant::checked_add" => Builtin::TimeCheckedAdd(false),
         "std::time::SystemTime::checked_add" => Builtin::TimeCheckedAdd(true),
         "std::time::Instant::checked_sub" => Builtin::TimeCheckedSub(false),
@@ -3675,6 +3824,248 @@ impl<'a> Interpreter<'a> {
                     Value::Uint(u128::from(k0)),
                     Value::Uint(u128::from(k1)),
                 ]))
+            }
+            Builtin::ProcessCommandNew => {
+                arity(1)?;
+                let program = self.os_str_bytes(frames, &vals[0])?;
+                Ok(id_handle(self.new_command(command_state_new(program))))
+            }
+            Builtin::ProcessCommandArg => {
+                arity(2)?;
+                let id = self.command_id_of(frames, &vals[0], name)?;
+                let arg = self.os_str_bytes(frames, &vals[1])?;
+                self.with_command(id, |state| {
+                    state.saw_nul |= arg.contains(&0);
+                    state.args.push(arg);
+                })
+                .ok_or_else(|| unsupported(format!("call to {name} on a stale command handle")))?;
+                Ok(Value::Unit)
+            }
+            Builtin::ProcessCommandCwd => {
+                arity(2)?;
+                let id = self.command_id_of(frames, &vals[0], name)?;
+                let dir = self.os_str_bytes(frames, &vals[1])?;
+                self.with_command(id, |state| {
+                    state.saw_nul |= dir.contains(&0);
+                    state.cwd = Some(dir);
+                })
+                .ok_or_else(|| unsupported(format!("call to {name} on a stale command handle")))?;
+                Ok(Value::Unit)
+            }
+            Builtin::ProcessCommandEnvMut => {
+                arity(1)?;
+                let id = self.command_id_of(frames, &vals[0], name)?;
+                // The environment editor is a handle value
+                // carrying the command's id, in a reference the
+                // `CommandEnv` builtins resolve back.
+                Ok(Value::Ref(RefTarget::value(id_handle(id))))
+            }
+            Builtin::ProcessCommandEnvSet => {
+                arity(3)?;
+                let id = self.command_id_of(frames, &vals[0], name)?;
+                let key = self.os_str_bytes(frames, &vals[1])?;
+                let val = self.os_str_bytes(frames, &vals[2])?;
+                self.with_command(id, |state| {
+                    state.saw_nul |= key.contains(&0) || val.contains(&0);
+                    state.envs.push((key, Some(val)));
+                })
+                .ok_or_else(|| unsupported(format!("call to {name} on a stale command handle")))?;
+                Ok(Value::Unit)
+            }
+            Builtin::ProcessCommandEnvRemove => {
+                arity(2)?;
+                let id = self.command_id_of(frames, &vals[0], name)?;
+                let key = self.os_str_bytes(frames, &vals[1])?;
+                self.with_command(id, |state| {
+                    state.envs.push((key, None));
+                })
+                .ok_or_else(|| unsupported(format!("call to {name} on a stale command handle")))?;
+                Ok(Value::Unit)
+            }
+            Builtin::ProcessCommandEnvClear => {
+                arity(1)?;
+                let id = self.command_id_of(frames, &vals[0], name)?;
+                self.with_command(id, |state| {
+                    state.env_clear = true;
+                    state.envs.clear();
+                })
+                .ok_or_else(|| unsupported(format!("call to {name} on a stale command handle")))?;
+                Ok(Value::Unit)
+            }
+            Builtin::ProcessCommandStdio => {
+                arity(2)?;
+                // The receiver must still denote a live command;
+                // the configuration itself is not observed.
+                let _ = self.command_id_of(frames, &vals[0], name)?;
+                Ok(Value::Unit)
+            }
+            Builtin::ProcessSpawn => {
+                // The public entry points (`Command::spawn`,
+                // `Command::status`) pass only the receiver; the
+                // sys entry point also passes the default stdio
+                // and a flag. The outcome is the same.
+                if vals.len() != 1 && vals.len() != 3 {
+                    return Err(InterpError::type_mismatch(
+                        format!("builtin {name}"),
+                        "1 or 3 argument(s)",
+                        format!("{} argument(s)", vals.len()),
+                    ));
+                }
+                let id = self.command_id_of(frames, &vals[0], name)?;
+                let state = self
+                    .command_snapshot(id)
+                    .ok_or_else(|| unsupported(format!("call to {name} on a stale command handle")))?;
+                match process_spawn_error(&state) {
+                    Some(error) => Ok(err_result(error)),
+                    None => Err(unsupported(format!(
+                        "spawning program `{}` is not runtime-supported (the process model does not start child processes)",
+                        String::from_utf8_lossy(&state.program)
+                    ))),
+                }
+            }
+            Builtin::ProcessCommandNewPublic => {
+                arity(1)?;
+                let program = self.os_str_bytes(frames, &vals[0])?;
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields: vec![id_handle(self.new_command(command_state_new(program)))],
+                })
+            }
+            Builtin::ProcessCommandArgPublic => {
+                arity(2)?;
+                let id = self.command_id_of(frames, &vals[0], name)?;
+                let arg = self.os_str_bytes(frames, &vals[1])?;
+                self.with_command(id, |state| {
+                    state.saw_nul |= arg.contains(&0);
+                    state.args.push(arg);
+                })
+                .ok_or_else(|| unsupported(format!("call to {name} on a stale command handle")))?;
+                Ok(vals.into_iter().next().expect("arity checked"))
+            }
+            Builtin::ProcessCommandCwdPublic => {
+                arity(2)?;
+                let id = self.command_id_of(frames, &vals[0], name)?;
+                let dir = self.os_str_bytes(frames, &vals[1])?;
+                self.with_command(id, |state| {
+                    state.saw_nul |= dir.contains(&0);
+                    state.cwd = Some(dir);
+                })
+                .ok_or_else(|| unsupported(format!("call to {name} on a stale command handle")))?;
+                Ok(vals.into_iter().next().expect("arity checked"))
+            }
+            Builtin::ProcessCommandEnvPublic => {
+                arity(3)?;
+                let id = self.command_id_of(frames, &vals[0], name)?;
+                let key = self.os_str_bytes(frames, &vals[1])?;
+                let val = self.os_str_bytes(frames, &vals[2])?;
+                self.with_command(id, |state| {
+                    state.saw_nul |= key.contains(&0) || val.contains(&0);
+                    state.envs.push((key, Some(val)));
+                })
+                .ok_or_else(|| unsupported(format!("call to {name} on a stale command handle")))?;
+                Ok(vals.into_iter().next().expect("arity checked"))
+            }
+            Builtin::ProcessCommandEnvRemovePublic => {
+                arity(2)?;
+                let id = self.command_id_of(frames, &vals[0], name)?;
+                let key = self.os_str_bytes(frames, &vals[1])?;
+                self.with_command(id, |state| {
+                    state.envs.push((key, None));
+                })
+                .ok_or_else(|| unsupported(format!("call to {name} on a stale command handle")))?;
+                Ok(vals.into_iter().next().expect("arity checked"))
+            }
+            Builtin::ProcessCommandEnvClearPublic => {
+                arity(1)?;
+                let id = self.command_id_of(frames, &vals[0], name)?;
+                self.with_command(id, |state| {
+                    state.env_clear = true;
+                    state.envs.clear();
+                })
+                .ok_or_else(|| unsupported(format!("call to {name} on a stale command handle")))?;
+                Ok(vals.into_iter().next().expect("arity checked"))
+            }
+            Builtin::ProcessCommandStdioPublic => {
+                arity(2)?;
+                let _ = self.command_id_of(frames, &vals[0], name)?;
+                Ok(vals.into_iter().next().expect("arity checked"))
+            }
+            Builtin::ProcessOutput => {
+                arity(1)?;
+                let id = self.command_id_of(frames, &vals[0], name)?;
+                let state = self
+                    .command_snapshot(id)
+                    .ok_or_else(|| unsupported(format!("call to {name} on a stale command handle")))?;
+                match process_spawn_error(&state) {
+                    Some(error) => Ok(err_result(error)),
+                    None => Err(unsupported(format!(
+                        "running program `{}` to collect its output is not runtime-supported (the process model does not start child processes)",
+                        String::from_utf8_lossy(&state.program)
+                    ))),
+                }
+            }
+            Builtin::CurrentExe => {
+                arity(0)?;
+                let path = std::env::current_exe().map_err(|e| {
+                    unsupported(format!("current_exe is not available in this run: {e}"))
+                })?;
+                Ok(ok_result(path_buf_value(&path)))
+            }
+            Builtin::ProcessId => {
+                arity(0)?;
+                Ok(Value::Uint(u128::from(std::process::id())))
+            }
+            Builtin::IoGetOsFunctions => {
+                arity(0)?;
+                Ok(Value::Ref(RefTarget::value(os_functions_table())))
+            }
+            Builtin::IoSetOsFunctions => {
+                arity(1)?;
+                Ok(Value::Unit)
+            }
+            Builtin::IoDecodeErrorKind => {
+                arity(1)?;
+                let code = match vals[0] {
+                    Value::Int(v) => v as i32,
+                    Value::Uint(v) => v as i32,
+                    ref other => {
+                        return Err(InterpError::type_mismatch(
+                            format!("builtin {name}"),
+                            "an errno integer",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                Ok(Value::Enum {
+                    variant: decode_error_kind_unix(code),
+                    fields: Vec::new(),
+                })
+            }
+            Builtin::IoFormatOsError => {
+                arity(2)?;
+                // `fmt::Result` is the unit-like `Result<(), Error>`
+                // aggregate: Ok is variant 0 with no payload in
+                // this model (the formatter error type is the
+                // fieldless `core::fmt::Error`).
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Unit],
+                })
+            }
+            Builtin::IoIsInterrupted => {
+                arity(1)?;
+                let code = match vals[0] {
+                    Value::Int(v) => v as i32,
+                    Value::Uint(v) => v as i32,
+                    ref other => {
+                        return Err(InterpError::type_mismatch(
+                            format!("builtin {name}"),
+                            "an errno integer",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                Ok(Value::Bool(code == 4))
             }
             Builtin::TimeCheckedAdd(system) => {
                 arity(2)?;
@@ -10508,6 +10899,41 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
 
     /// The string data a value denotes: the value itself, or the
     /// pointee of a reference to string data.
+    /// The bytes an `&OsStr` argument denotes (a process
+    /// program, argument, environment entry or directory): in
+    /// this model an `OsStr` is its byte string.
+    fn os_str_bytes(&self, frames: &[Frame], value: &Value) -> InterpResult<Vec<u8>> {
+        match self.resolve_value(frames, value)? {
+            Value::Str(s) => Ok(s.into_bytes()),
+            Value::Bytes(b) => Ok(b),
+            other => Err(InterpError::type_mismatch(
+                "OsStr argument",
+                "string or byte data",
+                other.kind_name(),
+            )),
+        }
+    }
+
+    /// The command id a process-command receiver denotes: the
+    /// receiver is a reference to the handle value the
+    /// `Command::new` builtin returned (possibly reached through
+    /// the public `Command`'s `inner` field projection).
+    fn command_id_of(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+        name: &str,
+    ) -> InterpResult<u64> {
+        let resolved = self.resolve_value(frames, value)?;
+        command_handle_id(&resolved).ok_or_else(|| {
+            InterpError::type_mismatch(
+                format!("builtin {name}"),
+                "a process command handle",
+                resolved.kind_name(),
+            )
+        })
+    }
+
     fn resolve_string(&self, frames: &[Frame], value: &Value) -> InterpResult<String> {
         match self.resolve_value(frames, value)? {
             Value::Str(s) => Ok(s),
@@ -11666,6 +12092,241 @@ fn uint_arg(value: &Value, name: &str) -> InterpResult<u64> {
 }
 
 /// `Ok(value)` in the value model.
+/// The initial builder state for a command over `program`.
+fn command_state_new(program: Vec<u8>) -> crate::interp::CommandState {
+    crate::interp::CommandState {
+        saw_nul: program.contains(&0),
+        program,
+        args: Vec::new(),
+        argv0: None,
+        envs: Vec::new(),
+        env_clear: false,
+        cwd: None,
+    }
+}
+
+/// The command id a handle value carries, at whichever nesting
+/// the value arrives with (the bare handle, or the handle inside
+/// the public `Command` aggregate).
+fn command_handle_id(value: &Value) -> Option<u64> {
+    let mut cur = value;
+    loop {
+        match cur {
+            Value::Uint(id) => return Some(*id as u64),
+            Value::Enum { fields, .. } if fields.len() == 1 => {
+                cur = &fields[0];
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// An `std::io::Error` value in the bitpacked `Repr` layout the
+/// platform's `core::io::error` uses: the error is a one-field
+/// struct whose field is the tagged word (a `NonNull<()>`),
+/// with the payload in the word's top 32 bits over a two-bit
+/// tag (`0b10` for an OS error, `0b11` for a bare `ErrorKind`).
+fn io_error_value(tagged_word: u128) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![Value::Enum {
+            variant: 0,
+            fields: vec![Value::Enum {
+                variant: 0,
+                fields: vec![Value::Ref(RefTarget::Address(tagged_word as u64))],
+            }],
+        }],
+    }
+}
+
+/// An `std::io::Error` holding OS error `code` (an errno).
+fn io_os_error_value(code: i32) -> Value {
+    io_error_value(((code as u32 as u128) << 32) | 0b10)
+}
+
+/// An `std::io::Error` holding the bare `ErrorKind` with the
+/// given discriminant (the shape of std's `const_error!`).
+fn io_simple_error_value(kind_discriminant: u32) -> Value {
+    io_error_value(((kind_discriminant as u128) << 32) | 0b11)
+}
+
+/// The `ErrorKind::InvalidInput` discriminant.
+const ERROR_KIND_INVALID_INPUT: u32 = 20;
+/// The `errno` for a missing file or directory.
+const ERRNO_NOT_FOUND: i32 = 2;
+/// The `errno` for a permission failure.
+const ERRNO_PERMISSION_DENIED: i32 = 13;
+/// The `errno` for a path component that is not a directory.
+const ERRNO_NOT_A_DIRECTORY: i32 = 20;
+
+/// Whether `candidate` could be executed as a program: it must
+/// exist, not be a directory, and carry an execute bit. The
+/// error is the `errno` the native spawn reports for it.
+fn check_executable(candidate: &std::path::Path) -> Result<(), i32> {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(candidate) {
+        Ok(m) if m.is_dir() => Err(ERRNO_PERMISSION_DENIED),
+        Ok(m) if m.permissions().mode() & 0o111 == 0 => Err(ERRNO_PERMISSION_DENIED),
+        Ok(_) => Ok(()),
+        Err(_) => Err(ERRNO_NOT_FOUND),
+    }
+}
+
+/// Resolve a command's program the way `execvp` does at spawn:
+/// a program containing a path separator is used as-is
+/// (relative to the child's working directory when one is set);
+/// any other program is searched along the effective `PATH`
+/// (the command's own `PATH` entry wins over the inherited one,
+/// as in std's environment capture). `Ok` means the program
+/// would start; `Err` is the `errno` the failed spawn reports.
+fn resolve_program(state: &crate::interp::CommandState) -> Result<(), i32> {
+    use std::os::unix::ffi::OsStrExt;
+    let program = std::ffi::OsStr::from_bytes(&state.program);
+    if state.program.contains(&b'/') {
+        let candidate = if state.program.starts_with(b"/") {
+            std::path::PathBuf::from(program)
+        } else {
+            match &state.cwd {
+                Some(cwd) => {
+                    std::path::Path::new(std::ffi::OsStr::from_bytes(cwd)).join(program)
+                }
+                None => std::path::PathBuf::from(program),
+            }
+        };
+        return check_executable(&candidate);
+    }
+    // The effective PATH: the inherited environment with the
+    // command's entries applied in order.
+    let mut path_var: Option<Vec<u8>> =
+        std::env::var_os("PATH").map(|v| v.as_bytes().to_vec());
+    if state.env_clear {
+        path_var = None;
+    }
+    for (key, value) in &state.envs {
+        if key == b"PATH" {
+            path_var = value.clone();
+        }
+    }
+    let search: Vec<u8> = path_var.unwrap_or_else(|| b"/bin:/usr/bin".to_vec());
+    let mut denied = false;
+    for dir in std::env::split_paths(std::ffi::OsStr::from_bytes(&search)) {
+        let candidate = dir.join(program);
+        match check_executable(&candidate) {
+            Ok(()) => return Ok(()),
+            Err(ERRNO_PERMISSION_DENIED) => denied = true,
+            Err(_) => {}
+        }
+    }
+    Err(if denied {
+        ERRNO_PERMISSION_DENIED
+    } else {
+        ERRNO_NOT_FOUND
+    })
+}
+
+/// The `io::Error` a spawn of this command fails with, if it
+/// fails before any program starts: a NUL byte in the program
+/// or an argument is std's `InvalidInput` const error, a bad
+/// working directory fails the spawn's `chdir`, and an
+/// unresolvable program fails the `exec`. `None` means the
+/// program would start — which the process model does not do,
+/// so the caller reports it as a named unsupported error.
+fn process_spawn_error(state: &crate::interp::CommandState) -> Option<Value> {
+    use std::os::unix::ffi::OsStrExt;
+    if state.saw_nul {
+        return Some(io_simple_error_value(ERROR_KIND_INVALID_INPUT));
+    }
+    if let Some(cwd) = &state.cwd {
+        let dir = std::path::Path::new(std::ffi::OsStr::from_bytes(cwd));
+        match std::fs::metadata(dir) {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => return Some(io_os_error_value(ERRNO_NOT_A_DIRECTORY)),
+            Err(_) => return Some(io_os_error_value(ERRNO_NOT_FOUND)),
+        }
+    }
+    match resolve_program(state) {
+        Ok(()) => None,
+        Err(code) => Some(io_os_error_value(code)),
+    }
+}
+
+/// A `PathBuf` value holding `path`: the path is the string
+/// data itself, wrapped in the `OsString` field.
+fn path_buf_value(path: &std::path::Path) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![Value::Enum {
+            variant: 0,
+            fields: vec![Value::Str(path.to_string_lossy().into_owned())],
+        }],
+    }
+}
+
+/// The OS error function table the model answers for
+/// `get_os_functions`: std's unix entries, by name (the
+/// `decode_error_kind` and `is_interrupted` entries are the
+/// builtins above; `format_error` writes no message text).
+fn os_functions_table() -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![
+            Value::FnPtr("std::sys::io::error::unix::format_error".to_string()),
+            Value::FnPtr("std::sys::io::error::unix::decode_error_kind".to_string()),
+            Value::FnPtr("std::sys::io::error::unix::is_interrupted".to_string()),
+        ],
+    }
+}
+
+/// std's unix `decode_error_kind`: the `ErrorKind` discriminant
+/// for an `errno` (Linux values). Mirrors the table in
+/// `std::sys::io::error::unix` entry for entry; anything not
+/// listed is `Uncategorized` (43).
+fn decode_error_kind_unix(errno: i32) -> u32 {
+    match errno {
+        7 => 34,   // E2BIG -> ArgumentListTooLong
+        98 => 8,   // EADDRINUSE -> AddrInUse
+        99 => 9,   // EADDRNOTAVAIL -> AddrNotAvailable
+        16 => 28,  // EBUSY -> ResourceBusy
+        103 => 6,  // ECONNABORTED -> ConnectionAborted
+        111 => 2,  // ECONNREFUSED -> ConnectionRefused
+        104 => 3,  // ECONNRESET -> ConnectionReset
+        35 => 30,  // EDEADLK -> Deadlock
+        122 => 26, // EDQUOT -> QuotaExceeded
+        17 => 12,  // EEXIST -> AlreadyExists
+        27 => 27,  // EFBIG -> FileTooLarge
+        113 => 4,  // EHOSTUNREACH -> HostUnreachable
+        4 => 35,   // EINTR -> Interrupted
+        22 => 20,  // EINVAL -> InvalidInput
+        21 => 15,  // EISDIR -> IsADirectory
+        40 => 18,  // ELOOP -> FilesystemLoop
+        2 => 0,    // ENOENT -> NotFound
+        12 => 38,  // ENOMEM -> OutOfMemory
+        28 => 24,  // ENOSPC -> StorageFull
+        31 => 32,  // EMLINK -> TooManyLinks
+        36 => 33,  // ENAMETOOLONG -> InvalidFilename
+        100 => 10, // ENETDOWN -> NetworkDown
+        101 => 5,  // ENETUNREACH -> NetworkUnreachable
+        107 => 7,  // ENOTCONN -> NotConnected
+        20 => 14,  // ENOTDIR -> NotADirectory
+        39 => 16,  // ENOTEMPTY -> DirectoryNotEmpty
+        32 => 11,  // EPIPE -> BrokenPipe
+        30 => 17,  // EROFS -> ReadOnlyFilesystem
+        29 => 25,  // ESPIPE -> NotSeekable
+        116 => 19, // ESTALE -> StaleNetworkFileHandle
+        110 => 22, // ETIMEDOUT -> TimedOut
+        26 => 29,  // ETXTBSY -> ExecutableFileBusy
+        18 => 31,  // EXDEV -> CrossesDevices
+        115 => 39, // EINPROGRESS -> InProgress
+        24 | 23 => 40, // EMFILE | ENFILE -> TooManyOpenFiles
+        5 => 41,   // EIO -> InputOutputError
+        13 | 1 => 1, // EACCES | EPERM -> PermissionDenied
+        38 => 36,  // ENOSYS -> Unsupported
+        95 => 36,  // EOPNOTSUPP / ENOTSUP -> Unsupported
+        11 => 13,  // EAGAIN / EWOULDBLOCK -> WouldBlock
+        _ => 43,   // Uncategorized
+    }
+}
+
 fn ok_result(value: Value) -> Value {
     Value::Enum {
         variant: 0,

@@ -204,6 +204,37 @@ pub(crate) struct ChannelState {
     pub bound: Option<usize>,
 }
 
+/// A modelled `std::process::Command` under construction (the
+/// process model in `builtins.rs`): the builder state the sys
+/// `Command` methods record, keyed by the id inside the handle
+/// value the `Command::new` builtin returns. No child process is
+/// ever started; at spawn time the program is resolved
+/// deterministically and the outcome is either the `io::Error`
+/// the resolution failure produces natively or a named
+/// unsupported error (see `process_spawn_error` in `builtins.rs`).
+#[derive(Clone)]
+pub(crate) struct CommandState {
+    /// The program path as passed to `Command::new` (raw bytes:
+    /// an `OsStr` is not required to be UTF-8).
+    pub program: Vec<u8>,
+    /// The arguments after argv[0].
+    pub args: Vec<Vec<u8>>,
+    /// An explicit argv[0] (`CommandExt::arg0`); `None` means
+    /// argv[0] is the program, as std defaults it.
+    pub argv0: Option<Vec<u8>>,
+    /// Environment entries set on the command, in order; a
+    /// `None` value is a removal (`env_remove`).
+    pub envs: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    /// Whether the inherited environment was cleared.
+    pub env_clear: bool,
+    /// The working directory for the child, if set.
+    pub cwd: Option<Vec<u8>>,
+    /// Whether any program/argument byte string contained a NUL
+    /// byte (std rejects such commands at spawn with an
+    /// `InvalidInput` error).
+    pub saw_nul: bool,
+}
+
 /// The channel id carried by an mpsc handle value, if the value
 /// has the handle shape (a one-field aggregate holding the id).
 pub(crate) fn channel_handle_id(value: &Value) -> Option<u64> {
@@ -370,6 +401,13 @@ pub struct Interpreter<'a> {
     channels: std::cell::RefCell<HashMap<u64, ChannelState>>,
     /// The id the next created channel gets.
     next_channel: std::cell::RefCell<u64>,
+    /// Modelled process commands under construction (see
+    /// [`CommandState`]), keyed by the id inside the handle
+    /// values. Interior-mutable for the same reason as the
+    /// channel table.
+    commands: std::cell::RefCell<HashMap<u64, CommandState>>,
+    /// The id the next created command gets.
+    next_command: std::cell::RefCell<u64>,
     /// The program-level heap allocation store: one storage per
     /// live `Box` allocation, keyed by the allocation id the box
     /// value carries as its single field (see
@@ -543,6 +581,8 @@ impl<'a> Interpreter<'a> {
             current_thread: std::cell::Cell::new(1),
             channels: std::cell::RefCell::new(HashMap::new()),
             next_channel: std::cell::RefCell::new(1),
+            commands: std::cell::RefCell::new(HashMap::new()),
+            next_command: std::cell::RefCell::new(1),
             allocs: std::cell::RefCell::new(HashMap::new()),
             elem_blocks: std::cell::RefCell::new(std::collections::HashSet::new()),
             next_alloc: std::cell::Cell::new(1),
@@ -3664,6 +3704,33 @@ impl<'a> Interpreter<'a> {
 
     /// Create a channel state (one sender, one receiver) and
     /// return its id.
+    /// Register a freshly built process command and return the
+    /// id its handle value carries.
+    pub(crate) fn new_command(&self, state: CommandState) -> u64 {
+        let mut next = self.next_command.borrow_mut();
+        let id = *next;
+        *next += 1;
+        drop(next);
+        self.commands.borrow_mut().insert(id, state);
+        id
+    }
+
+    /// Run `f` against the state of the command with the given
+    /// id; `None` if the id names no live command.
+    pub(crate) fn with_command<R>(
+        &self,
+        id: u64,
+        f: impl FnOnce(&mut CommandState) -> R,
+    ) -> Option<R> {
+        let mut commands = self.commands.borrow_mut();
+        commands.get_mut(&id).map(f)
+    }
+
+    /// A snapshot of the state of the command with the given id.
+    pub(crate) fn command_snapshot(&self, id: u64) -> Option<CommandState> {
+        self.commands.borrow().get(&id).cloned()
+    }
+
     pub(crate) fn new_channel(&self, bound: Option<usize>) -> u64 {
         let id = {
             let mut next = self.next_channel.borrow_mut();
