@@ -7573,6 +7573,58 @@ fn run_mode_env_args_len_uses_the_real_wrapper_layout() {
     assert_eq!(lines[5], "os-len-after 2");
 }
 
+const BOXED_VIEWS_SRC: &str = r#"fn main() {
+    let b: Box<str> = "hi".to_owned().into_boxed_str();
+    println!("boxed {}", &*b);
+    let v: Box<[i32]> = vec![10, 20, 30].into_boxed_slice();
+    println!("slice {} {}", v.len(), v[1]);
+    let mut s: Box<str> = "ab".to_owned().into_boxed_str();
+    s.make_ascii_uppercase();
+    println!("upper {}", &*s);
+    let text = String::from("hello");
+    let r: &str = text.as_ref();
+    println!("asref {}", r);
+    let bytes: &[u8] = text.as_ref();
+    println!("bytes {}", bytes.len());
+    let vec = vec![1u8, 2, 3];
+    let vb: &[u8] = vec.as_ref();
+    println!("vec {}", vb.len());
+    let mut m = String::from("xy");
+    let mm: &mut str = m.as_mut();
+    mm.make_ascii_uppercase();
+    println!("asmut {}", m);
+}
+"#;
+
+#[test]
+fn run_mode_boxed_conversions_and_ref_views() {
+    // `String::into_boxed_str` and `Vec::into_boxed_slice` move
+    // the `vec` field out of the value and rebuild a box from
+    // raw parts in their collected bodies, which the string /
+    // vector models cannot serve; the `AsRef` / `AsMut` bodies
+    // for the std containers build their views the same way.
+    // The builtins compute the views from the modelled data
+    // directly.
+    let dir = temp_dir("boxed-views");
+    let src = fixture(&dir, "boxed_views.rs", BOXED_VIEWS_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        [
+            "boxed hi",
+            "slice 3 20",
+            "upper AB",
+            "asref hello",
+            "bytes 5",
+            "vec 3",
+            "asmut XY",
+        ]
+    );
+}
+
 const CALLER_LOCATION_SRC: &str = r#"
 #[track_caller]
 fn here() -> u32 {
