@@ -1637,7 +1637,25 @@ impl Converter {
         // the whole receiver expression and would name the
         // receiver instead.
         let mut term = term.clone();
-        term.source_info.span = c.span;
+        // The stamp is located by the function operand's span
+        // (see below), but an optimized body can carry the
+        // operand as a promoted constant whose span was erased
+        // (it resolves to line 0): the terminator's own span
+        // still names the call site then, so it takes over.
+        // A span with a real position always wins, because for
+        // a method call the terminator span covers the whole
+        // receiver expression and would name the receiver.
+        let operand_has_position = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.collapsed_filename_lines(c.span, body.span)
+                .unwrap_or_else(|| (c.span.get_filename(), c.span.get_lines()))
+                .1
+                .start_line
+                != 0
+        }))
+        .unwrap_or(false);
+        if operand_has_position {
+            term.source_info.span = c.span;
+        }
         let mc = body.caller_location(&term, None);
         let constant = self.constant(&mir::ConstOperand {
             span: term.source_info.span,

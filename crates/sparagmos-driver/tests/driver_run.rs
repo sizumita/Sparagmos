@@ -8103,6 +8103,49 @@ fn run_mode_boxed_conversions_and_ref_views() {
     );
 }
 
+const CALLER_LOCATION_TRACK_CALLER_OPT_SRC: &str = r#"#[inline(never)]
+#[track_caller]
+fn codegen_caller_loc() -> &'static core::panic::Location<'static> {
+    core::panic::Location::caller()
+}
+
+macro_rules! caller_location_from_macro {
+    () => (codegen_caller_loc());
+}
+
+fn main() {
+    let loc = codegen_caller_loc();
+    assert_eq!(loc.line(), 12);
+    assert_eq!(loc.column(), 15);
+
+    let loc2 = caller_location_from_macro!();
+    assert_eq!(loc2.line(), 16);
+    assert_eq!(loc2.column(), 16);
+}
+"#;
+
+#[test]
+fn run_mode_caller_location_track_caller_at_optimized_mir() {
+    // At mir-opt level 4 `Location::caller` is inlined into
+    // the `#[track_caller]` body (a bare intrinsic call), and
+    // the caller's call carries its function operand as a
+    // promoted constant whose span is erased: the stamp for
+    // the track-caller call must still name the call site,
+    // taken from the call terminator's own span.
+    let dir = temp_dir("caller-location-track-caller-opt");
+    let src = fixture(
+        &dir,
+        "caller_location_opt.rs",
+        CALLER_LOCATION_TRACK_CALLER_OPT_SRC,
+    );
+    let out = run_driver_extra(
+        &src,
+        &["--rustc-arg", "-Zmir-opt-level=4"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+}
+
 const CALLER_LOCATION_SRC: &str = r#"
 #[track_caller]
 fn here() -> u32 {
