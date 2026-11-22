@@ -7755,10 +7755,8 @@ fn main() {
     assert_eq!(v[0].get(), 5);
     assert_eq!(v[1].get(), 6);
     println!("vec cell ok");
-    // Dropping a `Vec<Cell<_>>` is a separate unsupported case
-    // (the `Drop` terminator for the cell element glue); the
-    // behaviour under test here is the index write above.
-    std::mem::forget(v);
+    // The vector is dropped at the end of `main`: the `Drop`
+    // terminator for the cell element glue runs as well.
 }
 "#;
 
@@ -7808,6 +7806,80 @@ fn run_mode_shared_index_write_through_cell() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
     assert_eq!(stdout, "vec cell ok\n");
+}
+
+const VEC_CELL_DROP_SRC: &str = r#"use std::cell::Cell;
+struct D(i32);
+impl Drop for D { fn drop(&mut self) { println!("drop D({})", self.0); } }
+fn main() {
+    let v = vec![Cell::new(D(1)), Cell::new(D(2))];
+    drop(v);
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_vec_cell_drop_runs_element_destructors() {
+    // Dropping a `Vec<Cell<D>>` runs the element drop glue
+    // through the cells: each element's destructor observes the
+    // value the cell holds.
+    let dir = temp_dir("vec-cell-drop");
+    let src = fixture(&dir, "vec_cell_drop.rs", VEC_CELL_DROP_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "drop D(1)\ndrop D(2)\ndone\n");
+}
+
+const PRINTLN_DYNAMIC_COUNT_SRC: &str = r#"fn main() {
+    let w = 6usize;
+    println!("{:w$}", 42);
+    println!("{:.*}", 2, 3.14159f64);
+}
+"#;
+
+#[test]
+fn run_mode_println_dynamic_width_and_precision() {
+    // A dynamic width / precision (`{:w$}`, `{:.*}`) reaches
+    // the formatter through `rt::Argument::from_usize`, which
+    // current core calls with a *reference* to the count (the
+    // format-args capture tuple holds references): the builtin
+    // reads through the reference to the count value.
+    let dir = temp_dir("println-dynamic-count");
+    let src = fixture(&dir, "println_count.rs", PRINTLN_DYNAMIC_COUNT_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "    42\n3.14\n");
+}
+
+const TRANSMUTE_NONNULL_SRC: &str = r#"use std::ptr::NonNull;
+fn main() {
+    let p = NonNull::<u8>::dangling();
+    let n: usize = unsafe { std::mem::transmute(p) };
+    assert!(n != 0);
+    let q: NonNull<u8> = unsafe { std::mem::transmute(n) };
+    assert_eq!(q, p);
+    println!("nonnull roundtrip ok");
+}
+"#;
+
+#[test]
+fn run_mode_transmute_nonnull_integer_roundtrip() {
+    // `NonNull::dangling` transmutes a `mem::Alignment` into
+    // the pointer wrapper (the discriminant is the address),
+    // and user code transmutes the wrapper to `usize` and
+    // back: the wrapper <-> integer transmutes carry the
+    // payload pointer's synthetic address.
+    let dir = temp_dir("transmute-nonnull");
+    let src = fixture(&dir, "transmute_nonnull.rs", TRANSMUTE_NONNULL_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "nonnull roundtrip ok\n");
 }
 
 #[test]
