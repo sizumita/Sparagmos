@@ -12753,3 +12753,120 @@ fn main() {
 fn run_mode_unsize_raw_pointer_slice_view() {
     run_ok("unsize-raw-view", UNSIZE_RAW_ONE_ELEM_SRC, "len=1 v=5\ndone\n");
 }
+
+// ---- Lane IW: Skip / Chain adapters over modelled iterators (issue #158) ----
+// The `next` / `into_iter` / `size_hint` builtins step the
+// adapter states directly, and the adapters drop glue is
+
+// ---- Lane IW: Skip / Chain adapters over modelled iterators (issue #158) ----
+// The `next` / `into_iter` / `size_hint` builtins step the
+// adapter states directly, and the adapters' drop glue is
+// accounted like the other modelled adapters': a `Skip` or
+// `Chain` over the argument iterator runs end to end, and
+// dropping one (a statement temporary, an explicit
+// `mem::drop`) is a faithful no-op for the string elements.
+
+const SKIP_CHAIN_SRC: &str = r#"
+use std::env;
+fn main() {
+    let mut it = (0..6).skip(2);
+    println!("{} {} {}", it.next().unwrap(), it.next().unwrap(), it.next().unwrap());
+    let mut short = (0..2).skip(5);
+    println!("{:?} {:?}", short.next(), short.next());
+    let hinted = (0..10).skip(3);
+    println!("hint {:?}", hinted.size_hint());
+    let rest: Vec<String> = env::args().skip(1).collect();
+    println!("rest {:?}", rest);
+    println!("skip-next {:?}", env::args().skip(2).next());
+    let mut ch = (0..2).chain(5..7);
+    println!("{} {} {} {} {:?}", ch.next().unwrap(), ch.next().unwrap(), ch.next().unwrap(), ch.next().unwrap(), ch.next());
+    println!("chain-hint {:?}", (0..3).chain(0..4).size_hint());
+    let all: Vec<i32> = (0..2).chain(9..11).collect();
+    println!("all {:?}", all);
+    println!("doubled {}", env::args().chain(env::args()).count());
+    std::mem::drop(env::args().skip(1));
+    std::mem::drop((0..3).chain(4..6));
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_skip_and_chain_adapters_over_modelled_iterators() {
+    let dir = temp_dir("skip-chain");
+    let src = fixture(&dir, "skip_chain.rs", SKIP_CHAIN_SRC);
+    let out = run_driver_extra(&src, &["--guest-arg", "one", "--guest-arg", "two"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "2 3 4\nNone None\nhint (7, Some(7))\nrest [\"one\", \"two\"]\nskip-next Some(\"two\")\n0 1 5 6 None\nchain-hint (7, Some(7))\nall [0, 1, 9, 10]\ndoubled 6\ndone\n"
+    );
+}
+
+// ---- Lane IW: one-payload wrapper transmutes (issue #158) ----
+// A one-field struct (or a `MaybeUninit`) transmuted to
+// exactly its payload type reads the payload field out, and
+// the reverse transmute wraps the value back up -- the
+// `assume_init` shape an inlined `mem::zeroed` performs
+// under optimization.
+
+const TRANSMUTE_PAYLOAD_WRAPPER_SRC: &str = r#"
+use std::mem::{ManuallyDrop, MaybeUninit};
+struct Wrap(u32);
+fn main() {
+    let mu = MaybeUninit::new([1u32, 2, 3, 4]);
+    let arr: [u32; 4] = unsafe { std::mem::transmute(mu) };
+    println!("arr {:?}", arr);
+    let mu2: MaybeUninit<[u32; 4]> = unsafe { std::mem::transmute(arr) };
+    let arr2 = unsafe { mu2.assume_init() };
+    println!("arr2 {:?}", arr2);
+    let w = Wrap(41);
+    let x: u32 = unsafe { std::mem::transmute(w) };
+    let w2: Wrap = unsafe { std::mem::transmute(x + 1) };
+    println!("wrap {} {}", x, w2.0);
+    let md = ManuallyDrop::new(vec![5, 6, 7]);
+    let v: Vec<i32> = unsafe { std::mem::transmute(md) };
+    println!("vec {:?}", v);
+    let md2: ManuallyDrop<Vec<i32>> = unsafe { std::mem::transmute(v) };
+    println!("md {}", md2.len());
+}
+"#;
+
+#[test]
+fn run_mode_transmute_one_payload_wrapper_round_trips() {
+    run_ok(
+        "transmute-payload-wrapper",
+        TRANSMUTE_PAYLOAD_WRAPPER_SRC,
+        "arr [1, 2, 3, 4]\narr2 [1, 2, 3, 4]\nwrap 41 42\nvec [5, 6, 7]\nmd 3\n",
+    );
+}
+
+// ---- Lane IW: thread spawn under optimization (issue #158) ----
+// With `-O`, `mem::zeroed` inside the spawned closure is
+// inlined into a `write_bytes` plus a `MaybeUninit` ->
+// array `Transmute` cast in the closure body itself; the
+// spawn / join path must carry it.
+
+const SPAWN_ZEROED_OPT_SRC: &str = r#"
+use std::thread;
+fn main() {
+    let h = thread::spawn(|| {
+        let a: [u8; 65536] = unsafe { std::mem::zeroed() };
+        a[0] as i32 + a[65535] as i32
+    });
+    std::process::exit(h.join().unwrap());
+}
+"#;
+
+#[test]
+fn run_mode_thread_spawn_zeroed_array_under_optimization() {
+    // The joined sum of two zeroed bytes is the exit code:
+    // reaching it at all proves the closure's `write_bytes`
+    // plus `Transmute` executed and the handle joined.
+    let dir = temp_dir("spawn-zeroed-opt");
+    let src = fixture(&dir, "spawn_zeroed.rs", SPAWN_ZEROED_OPT_SRC);
+    let out = run_driver_extra(&src, &["--rustc-arg", "-O"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+}
