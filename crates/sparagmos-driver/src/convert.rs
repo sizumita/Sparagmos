@@ -3693,45 +3693,35 @@ impl Converter {
         // the compiler lays out without doubt (the niche
         // recorder above already relies on exactly that). The
         // query below is contained, so attempting it for a
-        // screened instance costs at most the contained failure
-        // the unscreened path already tolerates: the instance
-        // simply gets no entry and stays unsupported. One
-        // exception: a screened instance with a directly
-        // unsized field (a `str` in a non-final position) is
-        // ill-formed for layout, and asking can surface as a
-        // compiler crash rather than a contained failure, so
-        // the guard under this comment keeps the screen's
-        // verdict for it without a query.
+        // screened instance whose unsizedness is only suspected
+        // costs at most the contained failure the unscreened
+        // path already tolerates: the instance simply gets no
+        // entry and stays unsupported.
+        // One class must not be asked at all: an instance the
+        // sizedness walk proves genuinely unsized — a slice,
+        // `str` or trait object reachable through its fields,
+        // at any depth, with the instance's arguments composed
+        // in — is ill-formed for layout, and asking does not
+        // fail inside the query. The layout computation records
+        // a delayed bug instead, which the compiler flushes as
+        // an abort when the run ends, outside every containment
+        // the driver has. The niche recorder's screen already
+        // judges by exactly this walk; the layout table follows
+        // it. (An earlier form of this guard looked only at the
+        // instance's own declared field types, which let
+        // wrappers through — an enum over ill-formed structs,
+        // a generic ADT instantiated with `str` — and aborted
+        // the whole compilation for them.)
         // The layout query is not total: for some types that can
-        // appear in converted bodies (ill-formed bounds, types the
-        // layout computation itself rejects) it panics inside the
-        // compiler. The table is auxiliary — a failed query must
-        // never fail the conversion — so the query is contained:
-        // the instance simply gets no entry and stays unsupported.
-        // (The panic is silent under the driver's panic-capture
-        // hook, which is installed while the compiler runs.)
-        // The field inspection judges the declared field
-        // types (no substitution): `ty_with_args` normalizes,
-        // and a normalization panic poisons the compiler query
-        // it runs in, surfacing later as an ICE in the guest
-        // compilation itself — the failure this guard exists
-        // to avoid. A generic parameter field is not directly
-        // unsized by declaration, so such an instance still
-        // reaches the contained query below.
-        if adt_may_be_unsized(def, args, 0)
-            && def.variants().iter().any(|variant| {
-                variant.fields().iter().any(|field| {
-                    matches!(
-                        field.ty().kind(),
-                        rustc_public::ty::TyKind::RigidTy(
-                            rustc_public::ty::RigidTy::Str
-                                | rustc_public::ty::RigidTy::Slice(_)
-                                | rustc_public::ty::RigidTy::Dynamic(..)
-                        )
-                    )
-                })
-            })
-        {
+        // appear in converted bodies (ill-formed bounds, types
+        // the layout computation itself rejects) it panics
+        // inside the compiler. The table is auxiliary — a
+        // failed query must never fail the conversion — so the
+        // query is contained: the instance simply gets no entry
+        // and stays unsupported. (The panic is silent under the
+        // driver's panic-capture hook, which is installed while
+        // the compiler runs.)
+        if adt_sizedness(def, args, 0) == Sizedness::Unsized {
             return;
         }
         let layout = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ty.layout()));

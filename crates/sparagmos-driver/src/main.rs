@@ -2445,9 +2445,14 @@ fn drop_place_ty(body: &rustc_public::mir::Body, place: &rustc_public::mir::Plac
     use rustc_public::mir::ProjectionElem as P;
     let mut ty = body.locals().get(place.local)?.ty;
     for elem in &place.projection {
+        // The intermediate types are of unknown provenance (a
+        // projection can step onto any field type), so their
+        // kinds go through the guarded question; an unaskable
+        // intermediate type ends the walk with `None`, the same
+        // answer the unrecognized shapes below give.
         ty = match elem {
             P::Field(_, t) => *t,
-            P::Deref => match ty.kind() {
+            P::Deref => match sparagmos_driver::convert::guarded_ty_kind(&ty)? {
                 TyKind::RigidTy(RigidTy::Ref(_, inner, _)) => inner,
                 TyKind::RigidTy(RigidTy::RawPtr(inner, _)) => inner,
                 TyKind::RigidTy(RigidTy::Adt(def, ref args)) => {
@@ -2462,11 +2467,13 @@ fn drop_place_ty(body: &rustc_public::mir::Body, place: &rustc_public::mir::Plac
                 }
                 _ => return None,
             },
-            P::Index(_) | P::ConstantIndex { .. } | P::Subslice { .. } => match ty.kind() {
-                TyKind::RigidTy(RigidTy::Array(elem, _)) => elem,
-                TyKind::RigidTy(RigidTy::Slice(elem)) => elem,
-                _ => return None,
-            },
+            P::Index(_) | P::ConstantIndex { .. } | P::Subslice { .. } => {
+                match sparagmos_driver::convert::guarded_ty_kind(&ty)? {
+                    TyKind::RigidTy(RigidTy::Array(elem, _)) => elem,
+                    TyKind::RigidTy(RigidTy::Slice(elem)) => elem,
+                    _ => return None,
+                }
+            }
             P::Downcast(_) => ty,
             P::OpaqueCast(t) => *t,
         };
@@ -2486,7 +2493,17 @@ fn drop_candidates(
     out: &mut Vec<(Ty, rustc_public::ty::AdtDef, GenericArgs)>,
     seen: &mut std::collections::HashSet<String>,
 ) {
-    match ty.kind() {
+    // The walk reaches every type in the dropped places' trees,
+    // including types whose kind rustc_public cannot answer for
+    // (coroutine-closure types panic inside `Ty::kind`); the
+    // guarded question is the driver's standing convention for
+    // types of unknown provenance. An unaskable type contributes
+    // no candidates, exactly like the shapes the walk does not
+    // descend into.
+    let Some(kind) = sparagmos_driver::convert::guarded_ty_kind(ty) else {
+        return;
+    };
+    match kind {
         TyKind::RigidTy(RigidTy::Adt(def, args)) => {
             let key = format!("{:?} {:?}", def.def_id(), args);
             if !seen.insert(key) {
@@ -2500,7 +2517,22 @@ fn drop_candidates(
             }
             for variant in def.variants() {
                 for field in variant.fields() {
-                    drop_candidates(&field.ty_with_args(&args), out, seen);
+                    // Substituting the instance's arguments into a
+                    // field type normalizes inside the compiler,
+                    // and some argument shapes (associated-type
+                    // projections the erasing-regions folder
+                    // cannot normalize) panic there instead of
+                    // answering. The demand pass is auxiliary: a
+                    // field whose substituted type cannot be asked
+                    // for contributes no candidates, the same
+                    // containment the layout recorder uses for its
+                    // queries.
+                    let Ok(field_ty) = std::panic::catch_unwind(
+                        std::panic::AssertUnwindSafe(|| field.ty_with_args(&args)),
+                    ) else {
+                        continue;
+                    };
+                    drop_candidates(&field_ty, out, seen);
                 }
             }
         }
@@ -2583,12 +2615,19 @@ fn unify_self_ty(
     bindings: &mut std::collections::HashMap<u32, GenericArgKind>,
 ) -> Option<()> {
     use rustc_public::ty::{RigidTy, TyKind};
-    match (pattern.kind(), concrete.kind()) {
-        (TyKind::Param(param), _) => {
+    // Either side's arguments can carry a type whose kind
+    // rustc_public cannot answer for; such a pair can only be
+    // judged by the identity fallback below.
+    let kinds = (
+        sparagmos_driver::convert::guarded_ty_kind(pattern),
+        sparagmos_driver::convert::guarded_ty_kind(concrete),
+    );
+    match kinds {
+        (Some(TyKind::Param(param)), _) => {
             bindings.insert(param.index, GenericArgKind::Type(*concrete));
             Some(())
         }
-        (TyKind::RigidTy(RigidTy::Adt(def_p, args_p)), TyKind::RigidTy(RigidTy::Adt(def_c, args_c))) => {
+        (Some(TyKind::RigidTy(RigidTy::Adt(def_p, args_p))), Some(TyKind::RigidTy(RigidTy::Adt(def_c, args_c)))) => {
             if def_p != def_c || args_p.0.len() != args_c.0.len() {
                 return None;
             }
@@ -2597,11 +2636,11 @@ fn unify_self_ty(
             }
             Some(())
         }
-        (TyKind::RigidTy(RigidTy::Ref(_, inner_p, _)), TyKind::RigidTy(RigidTy::Ref(_, inner_c, _)))
-        | (TyKind::RigidTy(RigidTy::RawPtr(inner_p, _)), TyKind::RigidTy(RigidTy::RawPtr(inner_c, _))) => {
+        (Some(TyKind::RigidTy(RigidTy::Ref(_, inner_p, _))), Some(TyKind::RigidTy(RigidTy::Ref(_, inner_c, _))))
+        | (Some(TyKind::RigidTy(RigidTy::RawPtr(inner_p, _))), Some(TyKind::RigidTy(RigidTy::RawPtr(inner_c, _)))) => {
             unify_self_ty(&inner_p, &inner_c, bindings)
         }
-        (TyKind::RigidTy(RigidTy::Tuple(ts_p)), TyKind::RigidTy(RigidTy::Tuple(ts_c))) => {
+        (Some(TyKind::RigidTy(RigidTy::Tuple(ts_p))), Some(TyKind::RigidTy(RigidTy::Tuple(ts_c)))) => {
             if ts_p.len() != ts_c.len() {
                 return None;
             }
@@ -2610,8 +2649,8 @@ fn unify_self_ty(
             }
             Some(())
         }
-        (TyKind::RigidTy(RigidTy::Array(elem_p, _)), TyKind::RigidTy(RigidTy::Array(elem_c, _)))
-        | (TyKind::RigidTy(RigidTy::Slice(elem_p)), TyKind::RigidTy(RigidTy::Slice(elem_c))) => {
+        (Some(TyKind::RigidTy(RigidTy::Array(elem_p, _))), Some(TyKind::RigidTy(RigidTy::Array(elem_c, _))))
+        | (Some(TyKind::RigidTy(RigidTy::Slice(elem_p))), Some(TyKind::RigidTy(RigidTy::Slice(elem_c)))) => {
             unify_self_ty(&elem_p, &elem_c, bindings)
         }
         // Any other pattern shape must be identical to the
@@ -2777,8 +2816,13 @@ fn demand_drop_instances(
                     else {
                         continue;
                     };
-                    if !matches!(target.kind(), TyKind::RigidTy(RigidTy::Dynamic(..)))
-                        && !matches!(target.kind(), TyKind::RigidTy(RigidTy::Adt(..)))
+                    let Some(target_kind) =
+                        sparagmos_driver::convert::guarded_ty_kind(target)
+                    else {
+                        continue;
+                    };
+                    if !matches!(target_kind, TyKind::RigidTy(RigidTy::Dynamic(..)))
+                        && !matches!(target_kind, TyKind::RigidTy(RigidTy::Adt(..)))
                     {
                         continue;
                     }
@@ -2790,10 +2834,10 @@ fn demand_drop_instances(
                     let Some(src) = drop_place_ty(body, place) else {
                         continue;
                     };
-                    let pointee = match src.kind() {
-                        TyKind::RigidTy(RigidTy::Ref(_, inner, _)) => inner,
-                        TyKind::RigidTy(RigidTy::RawPtr(inner, _)) => inner,
-                        TyKind::RigidTy(RigidTy::Adt(def, ref args))
+                    let pointee = match sparagmos_driver::convert::guarded_ty_kind(&src) {
+                        Some(TyKind::RigidTy(RigidTy::Ref(_, inner, _))) => inner,
+                        Some(TyKind::RigidTy(RigidTy::RawPtr(inner, _))) => inner,
+                        Some(TyKind::RigidTy(RigidTy::Adt(def, ref args)))
                             if def.name() == "std::boxed::Box" =>
                         {
                             match args.0.iter().find_map(|a| match a {
@@ -3007,9 +3051,11 @@ fn demand_clone_instances(
                     continue;
                 };
                 if !matches!(
-                    self_ty.kind(),
-                    TyKind::RigidTy(RigidTy::Tuple(_))
-                        | TyKind::RigidTy(RigidTy::Array(..))
+                    sparagmos_driver::convert::guarded_ty_kind(&self_ty),
+                    Some(
+                        TyKind::RigidTy(RigidTy::Tuple(_))
+                            | TyKind::RigidTy(RigidTy::Array(..))
+                    )
                 ) {
                     continue;
                 }
