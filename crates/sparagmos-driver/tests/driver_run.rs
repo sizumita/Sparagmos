@@ -12527,3 +12527,123 @@ fn run_mode_ufcs_impl_qualified_fallbacks() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
 }
+
+const SCALAR_BYTE_COPY_SRC: &str = r#"
+fn main() {
+    // A bulk byte copy through a `*mut u8` cast of a scalar's
+    // address writes the scalar's storage byte by byte (the
+    // pattern `core::hash::Hasher::write` uses to assemble its
+    // next word in a `u64` buffer), and a copy back out reads
+    // the same bytes.
+    let mut buf: u64 = 0;
+    let msg: &[u8] = &[1, 2, 3];
+    unsafe {
+        let p = &mut buf as *mut u64 as *mut u8;
+        std::ptr::copy_nonoverlapping(msg.as_ptr(), p, 3);
+    }
+    assert_eq!(buf, 0x030201);
+    let mut out = [0u8; 2];
+    unsafe {
+        let p = &buf as *const u64 as *const u8;
+        std::ptr::copy_nonoverlapping(p.add(1), out.as_mut_ptr(), 2);
+    }
+    assert_eq!(out, [2, 3]);
+    println!("ok {buf}");
+}
+"#;
+
+#[test]
+fn run_mode_byte_copy_through_scalar_storage() {
+    let dir = temp_dir("scalar-byte-copy");
+    let src = fixture(&dir, "scalar_byte_copy.rs", SCALAR_BYTE_COPY_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok 197121\n");
+}
+
+const C_MAIN_SRC: &str = r#"
+#![no_std]
+#![no_main]
+
+extern crate std as other;
+
+#[no_mangle]
+extern "C" fn main(argc: core::ffi::c_int, argv: *const *const u8) -> core::ffi::c_int {
+    // The modelled entry arguments: the program path alone,
+    // NUL-terminated, followed by a null terminator slot.
+    if argc != 1 || argv.is_null() {
+        return 3;
+    }
+    unsafe {
+        let path = *argv;
+        if path.is_null() || *path == 0 || !(*argv.add(1)).is_null() {
+            return 4;
+        }
+    }
+    0
+}
+"#;
+
+#[test]
+fn run_mode_c_convention_main_gets_argc_argv() {
+    let dir = temp_dir("c-main");
+    let src = fixture(&dir, "c_main.rs", C_MAIN_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+}
+
+const HAND_BUILT_WAKER_SRC: &str = r#"
+use std::sync::Arc;
+use std::task::{RawWaker, RawWakerVTable, Waker};
+
+struct Wake;
+
+unsafe fn clone_raw(data: *const ()) -> RawWaker {
+    let arc = Arc::from_raw(data as *const Wake);
+    let cloned = arc.clone();
+    let _ = Arc::into_raw(arc);
+    let _ = Arc::into_raw(cloned);
+    RawWaker::new(data, &VTABLE)
+}
+
+unsafe fn wake_raw(data: *const ()) {
+    let arc = Arc::from_raw(data as *const Wake);
+    drop(arc);
+}
+
+unsafe fn wake_by_ref_raw(_data: *const ()) {}
+
+unsafe fn drop_raw(data: *const ()) {
+    let arc = Arc::from_raw(data as *const Wake);
+    drop(arc);
+}
+
+static VTABLE: RawWakerVTable =
+    RawWakerVTable::new(clone_raw, wake_raw, wake_by_ref_raw, drop_raw);
+
+fn main() {
+    // A waker built by hand from a raw `Arc` (the `arc_wake`
+    // pattern): dropping it releases the handle the data
+    // pointer denotes, so the weak handle observes the strong
+    // count reaching zero.
+    let arc = Arc::new(Wake);
+    let weak = Arc::downgrade(&arc);
+    let raw = Arc::into_raw(arc) as *const ();
+    let waker = unsafe { Waker::from_raw(RawWaker::new(raw, &VTABLE)) };
+    assert!(weak.upgrade().is_some());
+    drop(waker);
+    println!("released={}", weak.upgrade().is_none());
+}
+"#;
+
+#[test]
+fn run_mode_hand_built_waker_drop_releases_arc() {
+    let dir = temp_dir("hand-built-waker");
+    let src = fixture(&dir, "hand_built_waker.rs", HAND_BUILT_WAKER_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "released=true\n");
+}
