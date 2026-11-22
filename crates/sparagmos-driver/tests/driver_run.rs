@@ -9399,16 +9399,40 @@ fn main() {
 
 #[test]
 fn run_mode_inline_asm_outside_class_is_named_error() {
-    // `push` is outside the evaluable class: the run fails with
-    // exit 2 and the reason names InlineAsm.
+    // `push` is outside the evaluable class: conversion carries
+    // the block faithfully, and the interpreter refuses it at
+    // execution time — exit 2, and the reason names InlineAsm.
     let dir = temp_dir("asm-push");
     let src = fixture(&dir, "case.rs", ASM_PUSH_SRC);
     let out = run_driver(&src);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr={stderr}");
     assert!(
-        stderr.contains("TerminatorKind::InlineAsm"),
+        stderr.contains("unsupported terminator: InlineAsm"),
         "the reason names InlineAsm: {stderr}"
+    );
+}
+
+#[test]
+fn convert_mode_inline_asm_outside_class_converts() {
+    // The same out-of-class block converts in full: conversion is
+    // faithful for every asm shape, and only execution is gated
+    // on the evaluable classes.
+    let dir = temp_dir("asm-push-convert");
+    let src = fixture(&dir, "case.rs", ASM_PUSH_SRC);
+    let out = Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg(&src)
+        .output()
+        .expect("failed to run sparagmos-driver");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "convert succeeds: {stdout} {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("target-crate converted: 1, skipped: 0"),
+        "the asm body converts: {stdout}"
     );
 }
 
