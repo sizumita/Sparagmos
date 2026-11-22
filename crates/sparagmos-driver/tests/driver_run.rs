@@ -7620,6 +7620,36 @@ const THREAD_JOIN_OPT_SRC: &str = r#"fn main() {
 }
 "#;
 
+const VEC_CELL_INDEX_SRC: &str = r#"use std::cell::Cell;
+fn main() {
+    let mut v = vec![Cell::new(1u32), Cell::new(2u32)];
+    v[0].set(5);
+    v[1].set(v[0].get() + 1);
+    assert_eq!(v[0].get(), 5);
+    assert_eq!(v[1].get(), 6);
+    println!("vec cell ok");
+    // Dropping a `Vec<Cell<_>>` is a separate unsupported case
+    // (the `Drop` terminator for the cell element glue); the
+    // behaviour under test here is the index write above.
+    std::mem::forget(v);
+}
+"#;
+
+#[test]
+fn run_mode_shared_index_write_through_cell() {
+    // `v[i].set(..)` mutates through the *shared* element
+    // reference `Index::index` returns: the reference must name
+    // the vector's storage (a live place), not a snapshot of the
+    // element, or the `Cell` write has no place to land.
+    let dir = temp_dir("vec-cell-index");
+    let src = fixture(&dir, "vec_cell.rs", VEC_CELL_INDEX_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "vec cell ok\n");
+}
+
 #[test]
 fn run_mode_thread_join_at_optimized_mir() {
     // Optimizing MIR inlines `JoinHandle::join`: field 0 (the
