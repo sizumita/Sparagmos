@@ -112,7 +112,7 @@ Usage:
         --rust-dir ~/rust-1.100.0-survey \
         --driver-bin crates/sparagmos-driver/target/debug/sparagmos-driver \
         --out subset-run-results.json [--jobs 48] [--limit N]
-        [--stages 1|2|both] [--stage2-limit N] [--jit]
+        [--stages 1|2|3|both|all] [--stage2-limit N] [--stage3-limit N] [--jit]
 """
 
 import argparse
@@ -121,6 +121,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -2927,7 +2928,7 @@ def _fill_result_debugger(rec, rust_dir, driver_bin, out, td):
     out["status"] = "pass"
 
 
-def process_test(rec, rust_dir, driver_bin, stage2=False, jit=False):
+def process_test(rec, rust_dir, driver_bin, stage2=False, stage3=False, jit=False):
     """Produce the result record for one survey record."""
     out = {
         "suite": rec["suite"],
@@ -2950,6 +2951,8 @@ def process_test(rec, rust_dir, driver_bin, stage2=False, jit=False):
             fill_result_debugger(rec, rust_dir, driver_bin, out)
         elif stage2 and rec["nature"] == "compile-check":
             fill_result_stage2(rec, rust_dir, driver_bin, out, jit=jit)
+        elif stage3 and rec["nature"] == "procedure":
+            fill_result_procedure(rec, rust_dir, driver_bin, out)
         else:
             fill_result(rec, rust_dir, driver_bin, out, jit=jit)
     except Exception as e:  # a runner bug must not lose the whole run
@@ -4560,6 +4563,283 @@ def fill_result_stage2(rec, rust_dir, driver_bin, out, jit=False):
 # Main
 # ---------------------------------------------------------------------------
 
+
+# ---------------------------------------------------------------------------
+# Stage 3: procedure tests (run-make recipes)
+# ---------------------------------------------------------------------------
+
+STAGE3_NATIVE_TIMEOUT = 300
+STAGE3_TIMEOUT = 600
+STAGE3_SUPPORT_TIMEOUT = 1800
+
+_stage3_lock = threading.Lock()
+_stage3_support = None       # (flat_dir, support_rlib) once built
+_stage3_support_error = None
+_stage3_paths = None         # pinned toolchain paths
+
+
+def stage3_toolchain_paths():
+    """The pinned 1.100.0 toolchain's rustc/rustdoc/cargo paths.
+
+    Recipes read the compiler's path from the `RUSTC` environment
+    variable, and the driver's tool interception matches the
+    invoked program against `--tool-program`, so both sides must
+    name the very same file: the toolchain's own rustc binary,
+    not a rustup shim (a shim would be a different program path
+    than the one the recipe was told about only if the two
+    disagree -- here both are this path by construction).
+    """
+    global _stage3_paths
+    if _stage3_paths is None:
+        rustup = Path.home() / ".cargo" / "bin" / "rustup"
+        base = [str(rustup), "which", "--toolchain", TOOLCHAIN] \
+            if rustup.exists() else ["rustup", "which",
+                                     "--toolchain", TOOLCHAIN]
+        out = {}
+        for tool in ("rustc", "rustdoc", "cargo"):
+            res = run_cmd(base + [tool], timeout=30)
+            out[tool] = res["stdout"].strip()
+        # Two dylib dirs matter: the sysroot's own lib dir
+        # (librustc_driver / libLLVM for the compiler binaries)
+        # and the host target's lib dir (libstd.so for
+        # prefer-dynamic recipe binaries and produced exes).
+        root = Path(out["rustc"]).parent.parent
+        out["sysroot_lib"] = str(root / "lib")
+        out["target_lib"] = str(
+            root / "lib" / "rustlib" / "x86_64-unknown-linux-gnu" / "lib")
+        _stage3_paths = out
+    return _stage3_paths
+
+
+def ensure_stage3_support(rust_dir):
+    """Build run-make-support (debug profile) once per process.
+
+    Returns (flat_dir, support_rlib): a directory holding the
+    support rlib plus every transitive dependency rlib/dylib in
+    one flat `-L dependency` dir (the layout the driver's
+    `--aux-lib` binding expects: the rlib's parent is the deps
+    dir). The build tree is cached under the system temp dir,
+    keyed by the rust tree's path, so later runs reuse it.
+    Raises RuntimeError with the build output on failure.
+    """
+    global _stage3_support, _stage3_support_error
+    with _stage3_lock:
+        if _stage3_support is not None:
+            return _stage3_support
+        if _stage3_support_error is not None:
+            raise RuntimeError(_stage3_support_error)
+        try:
+            _stage3_support = _build_stage3_support(rust_dir)
+        except RuntimeError as e:
+            _stage3_support_error = str(e)
+            raise
+        return _stage3_support
+
+
+def _build_stage3_support(rust_dir):
+    key = hashlib.sha256(str(rust_dir).encode()).hexdigest()[:16]
+    root = Path(tempfile.gettempdir()) / f"sparagmos-stage3-support-{key}"
+    flat = root / "flat"
+    rlib = flat / "librun_make_support.rlib"
+    if rlib.exists():
+        return flat, rlib
+    root.mkdir(parents=True, exist_ok=True)
+    # Extract the support crate and its in-tree path deps (plus
+    # src/stage0, which build_helper includes as text).
+    archive = subprocess.run(
+        ["git", "-C", str(rust_dir), "archive", "HEAD",
+         "src/tools/run-make-support", "src/build_helper",
+         "src/rustdoc-json-types", "src/stage0"],
+        capture_output=True, timeout=120)
+    if archive.returncode != 0:
+        raise RuntimeError("git archive of run-make-support failed: "
+                           + archive.stderr.decode("utf-8", "replace")[:300])
+    subprocess.run(["tar", "-x", "-C", str(root)], input=archive.stdout,
+                   check=True, timeout=120)
+    crate_dir = root / "src" / "tools" / "run-make-support"
+    env = dict(os.environ)
+    env["RUSTC_BOOTSTRAP"] = "1"
+    env["RUSTFLAGS"] = "-Zalways-encode-mir"
+    rustup = Path.home() / ".cargo" / "bin" / "rustup"
+    cargo = [str(rustup), "run", TOOLCHAIN, "cargo"] \
+        if rustup.exists() else ["rustup", "run", TOOLCHAIN, "cargo"]
+    build = subprocess.run(cargo + ["build"], cwd=crate_dir, env=env,
+                           capture_output=True, text=True,
+                           timeout=STAGE3_SUPPORT_TIMEOUT)
+    if build.returncode != 0:
+        raise RuntimeError("run-make-support build failed: "
+                           + (build.stderr or "")[-500:])
+    target = crate_dir / "target" / "debug"
+    flat.mkdir(parents=True, exist_ok=True)
+    for f in flat.iterdir():
+        f.unlink()
+    copied = 0
+    for cand in [target / "librun_make_support.rlib"]:
+        if cand.exists():
+            shutil.copy2(cand, flat / cand.name)
+            copied += 1
+    build_dir = target / "build"
+    if build_dir.exists():
+        for out_dir in build_dir.glob("*/*/out"):
+            for f in out_dir.iterdir():
+                if f.suffix in (".rlib", ".so", ".dylib"):
+                    shutil.copy2(f, flat / f.name)
+                    copied += 1
+    if not rlib.exists() or copied < 2:
+        raise RuntimeError(
+            f"run-make-support artifacts incomplete in {flat} "
+            f"({copied} files gathered)")
+    return flat, rlib
+
+
+def stage3_recipe_env(rust_dir, build_root, suite):
+    """The environment compiletest runs a recipe with.
+
+    Mirrors compiletest's run-make setup (runtest/run_make.rs):
+    the pinned toolchain's paths, the target, the source/build
+    roots, the C toolchain names, and the dylib path variables
+    run-make-support's helpers require.
+    """
+    paths = stage3_toolchain_paths()
+    env = {
+        "RUSTC": paths["rustc"],
+        "RUSTDOC": paths["rustdoc"],
+        "TARGET": "x86_64-unknown-linux-gnu",
+        "SOURCE_ROOT": str(rust_dir),
+        "BUILD_ROOT": str(build_root),
+        "PYTHON": sys.executable or "python3",
+        "CC": "cc",
+        "CXX": "c++",
+        "AR": "ar",
+        "CC_DEFAULT_FLAGS": "",
+        "CXX_DEFAULT_FLAGS": "",
+        "LLVM_COMPONENTS": "",
+        "LD_LIB_PATH_ENVVAR": "LD_LIBRARY_PATH",
+        "LD_LIBRARY_PATH": paths["sysroot_lib"] + ":" + paths["target_lib"],
+        "HOST_RUSTC_DYLIB_PATH": paths["sysroot_lib"],
+        "TARGET_EXE_DYLIB_PATH": paths["target_lib"],
+        "__BOOTSTRAP_JOBS": "8",
+        # compiletest itself runs under the build's bootstrap
+        # environment, and recipes routinely pass `-Z` flags to
+        # the compiler they invoke; without this the pinned
+        # release-channel rustc rejects them all.
+        "RUSTC_BOOTSTRAP": "1",
+    }
+    if suite in ("run-make-cargo", "build-std"):
+        env["CARGO"] = paths["cargo"]
+    return env
+
+
+def fill_result_procedure(rec, rust_dir, driver_bin, out):
+    """Stage 3: run one run-make recipe natively (the oracle)
+    and under the driver with tool interception.
+
+    The recipe passes natively first -- a recipe that fails
+    natively is a plain failure, exactly as compiletest would
+    report it, and is not attempted under the driver. Under the
+    driver, the recipe's compiler invocations are answered by
+    the driver's own conversion machinery (the tool
+    interception), never by real child processes: exit 0 is a
+    pass, the driver's named-unsupported exit 2 is an
+    unsupported result, and any other exit is a failure.
+    """
+    out["stage"] = 3
+    test_dir = rust_dir / rec["path"]
+    rmake_rs = test_dir / "rmake.rs"
+    if not rmake_rs.exists():
+        out["reason"] = "no rmake.rs in the test directory"
+        out["bucket"] = "out of stage-3 scope (no recipe)"
+        return
+    header = Header(rmake_rs.read_text(errors="ignore"))
+    status, why = applicability(header)
+    if status == "out-of-environment":
+        out["reason"] = why
+        out["bucket"] = "out of environment"
+        return
+    if status == "unevaluatable":
+        out["reason"] = why
+        out["bucket"] = "not attempted (unevaluatable condition)"
+        return
+    if header.revisions():
+        out["reason"] = "recipe declares revisions (stage 3 runs the plain recipe only)"
+        out["bucket"] = "out of stage-3 scope (revisions)"
+        return
+    try:
+        flat, rlib = ensure_stage3_support(rust_dir)
+    except RuntimeError as e:
+        out["reason"] = str(e)
+        out["bucket"] = "stage-3 support build failure"
+        return
+    paths = stage3_toolchain_paths()
+    with tempfile.TemporaryDirectory(prefix="subset-stage3-") as td:
+        td = Path(td)
+        # compiletest copies every test-dir entry except rmake.rs
+        # itself into the recipe's working directory (rmake_out).
+        oracle_out = td / "oracle" / "rmake_out"
+        guest_out = td / "guest" / "rmake_out"
+        for dest in (oracle_out, guest_out):
+            dest.mkdir(parents=True)
+            for entry in test_dir.iterdir():
+                if entry.name == "rmake.rs":
+                    continue
+                if entry.is_dir():
+                    shutil.copytree(entry, dest / entry.name)
+                else:
+                    shutil.copy2(entry, dest / entry.name)
+        env = stage3_recipe_env(rust_dir, td, rec["suite"])
+        compile_res = run_cmd(
+            rustc_cmd() + ["--edition=2024",
+                           "--extern", f"run_make_support={rlib}",
+                           "-L", f"dependency={flat}",
+                           "-Cprefer-dynamic", "-Dunused_must_use",
+                           "-o", str(td / "oracle" / "rmake"),
+                           str(rmake_rs)],
+            timeout=STAGE3_NATIVE_TIMEOUT, cwd=td / "oracle",
+            env_extra={"RUSTC_BOOTSTRAP": "-1"})
+        if compile_res["timeout"] or compile_res["exit_code"] != 0:
+            out["status"] = "fail"
+            out["reason"] = ("native recipe compile failed: "
+                             + first_error_line(compile_res["stderr"]))
+            out["bucket"] = "native recipe failure"
+            return
+        native = run_cmd([str(td / "oracle" / "rmake")],
+                         timeout=STAGE3_NATIVE_TIMEOUT, cwd=oracle_out,
+                         env_extra=env)
+        if native["timeout"] or native["exit_code"] != 0:
+            out["status"] = "fail"
+            out["reason"] = (
+                f"native recipe exit {native['exit_code']}: "
+                + first_error_line(native["stderr"] or native["stdout"]))
+            out["bucket"] = "native recipe failure"
+            return
+        guest_env = dict(env)
+        guest_env.update(BOOTSTRAP_ENV)
+        got = run_cmd(
+            [str(driver_bin), "run", str(rmake_rs),
+             "--edition", "2024",
+             "--aux-lib", f"run_make_support={rlib}",
+             "--tool-program", paths["rustc"]],
+            timeout=STAGE3_TIMEOUT, cwd=guest_out, env_extra=guest_env)
+        if got["timeout"]:
+            out["status"] = "fail"
+            out["reason"] = f"driver timed out after {STAGE3_TIMEOUT}s"
+            out["bucket"] = bucket_reason(out["reason"])
+            return
+        if got["exit_code"] == 0:
+            out["status"] = "pass"
+            return
+        if got["exit_code"] == 2:
+            out["status"] = "unsupported"
+            out["reason"] = driver_reason(got["stderr"])
+            out["bucket"] = bucket_reason(out["reason"])
+            return
+        out["status"] = "fail"
+        out["reason"] = (f"recipe failed under sparagmos "
+                          f"(exit {got['exit_code']}): "
+                          + first_error_line(got["stderr"]))
+        out["bucket"] = "recipe failed under sparagmos"
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--survey-json", type=Path, required=True,
@@ -4575,11 +4855,15 @@ def main():
     ap.add_argument("--limit", type=int, default=0,
                     help="only process the first N stage-1 candidates "
                          "(smoke runs); 0 = all")
-    ap.add_argument("--stages", choices=("1", "2", "both"),
+    ap.add_argument("--stages", choices=("1", "2", "3", "both", "all"),
                     default="both",
-                    help="which stages to run (default: both)")
+                    help="which stages to run (default: both; "
+                         "'both' is stages 1+2, 'all' adds stage 3)")
     ap.add_argument("--stage2-limit", type=int, default=0,
                     help="only process the first N stage-2 candidates "
+                         "(smoke runs); 0 = all")
+    ap.add_argument("--stage3-limit", type=int, default=0,
+                    help="only process the first N stage-3 candidates "
                          "(smoke runs); 0 = all")
     ap.add_argument("--jit", action="store_true",
                     help="metric 4: judge through the JIT path "
@@ -4596,8 +4880,9 @@ def main():
     args = ap.parse_args()
     args.driver_bin = args.driver_bin.resolve()
     args.rust_dir = args.rust_dir.resolve()
-    stage1_on = args.stages in ("1", "both")
-    stage2_on = args.stages in ("2", "both")
+    stage1_on = args.stages in ("1", "both", "all")
+    stage2_on = args.stages in ("2", "both", "all")
+    stage3_on = args.stages in ("3", "all")
 
     global _HOST_FACTS
     _HOST_FACTS = ToolchainFacts()
@@ -4639,6 +4924,11 @@ def main():
                 and r["suite"] == "debuginfo"
                 and not r["env_excluded"])
 
+    def is_candidate3(r):
+        return (r["nature"] == "procedure"
+
+                and not r["env_excluded"])
+
     all_candidates = ([r for r in records if is_candidate(r)]
                       if stage1_on else [])
     candidates = (all_candidates[:args.limit] if args.limit
@@ -4654,14 +4944,21 @@ def main():
     # nature inside process_test.
     candidates_dbg = ([r for r in records if is_candidate_debugger(r)]
                       if stage2_on else [])
+    all_candidates3 = ([r for r in records if is_candidate3(r)]
+                       if stage3_on else [])
+    candidates3 = (all_candidates3[:args.stage3_limit]
+                   if args.stage3_limit else all_candidates3)
+    limited_out3 = all_candidates3[len(candidates3):]
     others = [r for r in records
               if not is_candidate(r) and not r["env_excluded"]
               and not (stage2_on and is_candidate2(r))
-              and not (stage2_on and is_candidate_debugger(r))]
+              and not (stage2_on and is_candidate_debugger(r))
+              and not (stage3_on and is_candidate3(r))]
 
     print(f"denominator: {denominator}; stage-1 candidates: "
           f"{len(candidates)}; stage-2 candidates: {len(candidates2)}; "
           f"debugger candidates: {len(candidates_dbg)}; "
+          f"stage-3 candidates: {len(candidates3)}; "
           f"other records carried as not-attempted: {len(others)}",
           flush=True)
 
@@ -4670,16 +4967,20 @@ def main():
     with concurrent.futures.ThreadPoolExecutor(
             max_workers=args.jobs) as pool:
         futs = [pool.submit(process_test, r, args.rust_dir,
-                            args.driver_bin, False, args.jit)
+                            args.driver_bin, jit=args.jit)
                 for r in candidates]
         futs += [pool.submit(process_test, r, args.rust_dir,
-                             args.driver_bin, True, args.jit)
+                             args.driver_bin, stage2=True, jit=args.jit)
                  for r in candidates2]
         futs += [pool.submit(process_test, r, args.rust_dir,
-                             args.driver_bin, True, args.jit)
+                             args.driver_bin, stage2=True, jit=args.jit)
                  for r in candidates_dbg]
+        futs += [pool.submit(process_test, r, args.rust_dir,
+                             args.driver_bin, stage3=True)
+                 for r in candidates3]
         total_jobs = (len(candidates) + len(candidates2)
-                      + len(candidates_dbg))
+                      + len(candidates_dbg) + len(candidates3))
+
         done = 0
         for fut in concurrent.futures.as_completed(futs):
             results.append(fut.result())
@@ -4721,6 +5022,16 @@ def main():
             "mode": None, "stage": 2, "seconds": 0.0,
         })
 
+    for r in limited_out3:
+        results.append({
+            "suite": r["suite"], "path": r["path"],
+            "nature": r["nature"], "single_file": r["single_file"],
+            "ffi": r["ffi"], "status": "not-attempted",
+            "reason": "beyond --stage3-limit (smoke run)",
+            "bucket": "not attempted (smoke-run limit)",
+            "mode": None, "stage": 3, "seconds": 0.0,
+        })
+
     results.sort(key=lambda r: r["path"])
     passed = sum(1 for r in results if r["status"] == "pass")
     failed = sum(1 for r in results if r["status"] == "fail")
@@ -4743,6 +5054,8 @@ def main():
     cand = [r for r in results if r["path"] in cand_paths]
     cand2_paths = {r["path"] for r in candidates2}
     cand2 = [r for r in results if r["path"] in cand2_paths]
+    cand3_paths = {r["path"] for r in candidates3}
+    cand3 = [r for r in results if r["path"] in cand3_paths]
 
     snap_keys = ("stderr_snapshot", "error_annotations", "fixed_file",
                  "mir_snapshot", "filecheck", "run_rustfix")
@@ -4792,6 +5105,8 @@ def main():
         "stage1_passed": sum(1 for r in cand if r["status"] == "pass"),
         "stage2_candidates": len(candidates2),
         "stage2_passed": sum(1 for r in cand2 if r["status"] == "pass"),
+        "stage3_candidates": len(candidates3),
+        "stage3_passed": sum(1 for r in cand3 if r["status"] == "pass"),
         "compile_check_category": by_nature.get(
             "compile-check",
             {"total": 0, "passed": 0, "pass_rate_percent": 0.0}),

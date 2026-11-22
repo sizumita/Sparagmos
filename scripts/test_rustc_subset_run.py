@@ -15,6 +15,7 @@ import os
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -3246,3 +3247,142 @@ class ProcessJitTests(unittest.TestCase):
                                Path("/fake/driver"), stage2=True, jit=True)
         self.assertEqual(res["status"], "not-attempted")
         self.assertEqual(res["bucket"], "out of stage-1 scope (nature)")
+
+
+class Stage3ProcedureTests(unittest.TestCase):
+    """Stage 3 (procedure / run-make): the native oracle runs
+    first, the driver run second; both sides are stubbed."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.rust_dir = Path(self.td.name)
+        self.test_dir = self.rust_dir / "tests" / "run-make" / "demo"
+        self.test_dir.mkdir(parents=True)
+        (self.test_dir / "input.txt").write_text("data")
+        self.rec = {"suite": "run-make", "path": "tests/run-make/demo",
+                    "nature": "procedure", "single_file": False,
+                    "ffi": False, "env_excluded": False}
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def write_recipe(self, text="fn main() {}\n"):
+        (self.test_dir / "rmake.rs").write_text(text)
+
+    def run_procedure(self, compile_res, native_res, guest_res):
+        calls = []
+
+        def fake_run_cmd(argv, **kw):
+            calls.append(argv)
+            if "-o" in argv:
+                return compile_res
+            if str(argv[0]).endswith("rmake"):
+                return native_res
+            return guest_res
+
+        ok = {"exit_code": 0, "stdout": "", "stderr": "",
+              "timeout": False}
+        out = {"status": "not-attempted", "reason": "", "bucket": ""}
+        with unittest.mock.patch.object(run, "run_cmd", fake_run_cmd),                 unittest.mock.patch.object(
+                    run, "ensure_stage3_support",
+                    lambda rd: (Path("/flat"),
+                                Path("/flat/librun_make_support.rlib"))),                 unittest.mock.patch.object(
+                    run, "stage3_toolchain_paths",
+                    lambda: {"rustc": "/tc/rustc",
+                             "rustdoc": "/tc/rustdoc",
+                             "cargo": "/tc/cargo",
+                             "sysroot_lib": "/tc/lib",
+                             "target_lib": "/tc/target-lib"}),                 unittest.mock.patch.object(run, "rustc_cmd",
+                                           lambda: ["rustc"]):
+            run.fill_result_procedure(self.rec, self.rust_dir,
+                                      Path("/driver"), out)
+        return out, calls
+
+    def test_missing_recipe_is_not_attempted(self):
+        out, calls = self.run_procedure(None, None, None)
+        self.assertEqual(out["status"], "not-attempted")
+        self.assertEqual(out["bucket"], "out of stage-3 scope (no recipe)")
+        self.assertEqual(calls, [])
+
+    def test_revisions_are_out_of_scope(self):
+        self.write_recipe("//@ revisions: a b\nfn main() {}\n")
+        out, calls = self.run_procedure(None, None, None)
+        self.assertEqual(out["status"], "not-attempted")
+        self.assertEqual(out["bucket"], "out of stage-3 scope (revisions)")
+        self.assertEqual(calls, [])
+
+    def test_native_failure_is_a_plain_failure(self):
+        self.write_recipe()
+        bad = {"exit_code": 1, "stdout": "",
+               "stderr": "recipe blew up", "timeout": False}
+        ok = {"exit_code": 0, "stdout": "", "stderr": "",
+              "timeout": False}
+        out, calls = self.run_procedure(ok, bad, ok)
+        self.assertEqual(out["status"], "fail")
+        self.assertEqual(out["bucket"], "native recipe failure")
+        # compile + oracle run only; the driver is never invoked
+        self.assertEqual(len(calls), 2)
+
+    def test_native_compile_failure_is_a_plain_failure(self):
+        self.write_recipe()
+        bad = {"exit_code": 1, "stdout": "",
+               "stderr": "error[E0308]: mismatched types",
+               "timeout": False}
+        ok = {"exit_code": 0, "stdout": "", "stderr": "",
+              "timeout": False}
+        out, calls = self.run_procedure(bad, ok, ok)
+        self.assertEqual(out["status"], "fail")
+        self.assertEqual(out["bucket"], "native recipe failure")
+        self.assertEqual(len(calls), 1)
+
+    def test_driver_success_passes(self):
+        self.write_recipe()
+        ok = {"exit_code": 0, "stdout": "", "stderr": "",
+              "timeout": False}
+        out, calls = self.run_procedure(ok, ok, ok)
+        self.assertEqual(out["status"], "pass")
+        self.assertEqual(out["stage"], 3)
+        driver_argv = calls[-1]
+        self.assertIn("--tool-program", driver_argv)
+        self.assertIn("/tc/rustc", driver_argv)
+        self.assertIn("--aux-lib", driver_argv)
+
+    def test_driver_unsupported_is_unsupported(self):
+        self.write_recipe()
+        ok = {"exit_code": 0, "stdout": "", "stderr": "",
+              "timeout": False}
+        unsup = {"exit_code": 2, "stdout": "",
+                 "stderr": "sparagmos-driver run: unsupported: no\n",
+                 "timeout": False}
+        out, _ = self.run_procedure(ok, ok, unsup)
+        self.assertEqual(out["status"], "unsupported")
+        self.assertIn("unsupported: no", out["reason"])
+
+    def test_driver_failure_is_a_failure(self):
+        self.write_recipe()
+        ok = {"exit_code": 0, "stdout": "", "stderr": "",
+              "timeout": False}
+        guest_fail = {"exit_code": 101, "stdout": "",
+                      "stderr": "thread main panicked",
+                      "timeout": False}
+        out, _ = self.run_procedure(ok, ok, guest_fail)
+        self.assertEqual(out["status"], "fail")
+        self.assertEqual(out["bucket"], "recipe failed under sparagmos")
+
+    def test_recipe_env_shape(self):
+        with unittest.mock.patch.object(
+                run, "stage3_toolchain_paths",
+                lambda: {"rustc": "/tc/rustc", "rustdoc": "/tc/rustdoc",
+                         "cargo": "/tc/cargo", "sysroot_lib": "/tc/lib",
+                             "target_lib": "/tc/target-lib"}):
+            env = run.stage3_recipe_env(Path("/rust"), Path("/build"),
+                                        "run-make")
+            self.assertEqual(env["RUSTC"], "/tc/rustc")
+            self.assertEqual(env["TARGET"],
+                             "x86_64-unknown-linux-gnu")
+            self.assertEqual(env["LD_LIB_PATH_ENVVAR"],
+                             "LD_LIBRARY_PATH")
+            self.assertNotIn("CARGO", env)
+            env = run.stage3_recipe_env(Path("/rust"), Path("/build"),
+                                        "run-make-cargo")
+            self.assertEqual(env["CARGO"], "/tc/cargo")
