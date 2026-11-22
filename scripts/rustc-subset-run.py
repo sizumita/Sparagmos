@@ -4676,7 +4676,7 @@ def main():
                              args.driver_bin, True, args.jit)
                  for r in candidates2]
         futs += [pool.submit(process_test, r, args.rust_dir,
-                             args.driver_bin, True)
+                             args.driver_bin, True, args.jit)
                  for r in candidates_dbg]
         total_jobs = (len(candidates) + len(candidates2)
                       + len(candidates_dbg))

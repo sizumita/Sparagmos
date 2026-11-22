@@ -3233,3 +3233,16 @@ class ProcessJitTests(unittest.TestCase):
         res = run.process_test(rec, self.rust_dir,
                                Path("/fake/driver"), jit=True)
         self.assertEqual(res["status"], "not-attempted")
+
+    def test_debugger_nature_stays_not_attempted_under_jit(self):
+        # The debugger harness judges through the interpreter, so
+        # under --jit an exec-debugger record must not reach it:
+        # metric 4 counts it as not-attempted, exactly like the
+        # other unattemptable natures. (The debugger candidates in
+        # main() are submitted with the same jit flag; this pins
+        # the dispatch they land on.)
+        rec = self.write_test("fn main() {}\n", nature="exec-debugger")
+        res = run.process_test(rec, self.rust_dir,
+                               Path("/fake/driver"), stage2=True, jit=True)
+        self.assertEqual(res["status"], "not-attempted")
+        self.assertEqual(res["bucket"], "out of stage-1 scope (nature)")
