@@ -1368,6 +1368,17 @@ pub struct DebugVarEntry {
     /// Whether the variable's source-level type is `char` or a
     /// reference to one (see [`Body::debug_vars`]).
     pub is_char: bool,
+    /// The variable's declared type, rendered as a type tag (the
+    /// rendering the program's ADT debug-shape table is keyed by),
+    /// when the conversion recorded it. A debugger knows each
+    /// variable's type; the tag is what lets the debugger
+    /// interface render an aggregate value with its full instance
+    /// name (generic arguments included), which the body's local
+    /// type table — keyed by definition, without instance
+    /// arguments — cannot supply. `None` when unknown (a projected
+    /// variable whose projected type the conversion could not
+    /// recover, or a hand-built entry).
+    pub ty: Option<String>,
     /// The (start, end) source lines of the span the compiler
     /// recorded for the entry: usually a point span at the
     /// declaration. `(0, 0)` when unknown. When several entries

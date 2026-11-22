@@ -22,6 +22,7 @@ fn sample_program() -> Program {
         name: "x".to_string(),
         source: DebugVar::Place(1, vec![]),
         is_char: false,
+        ty: None,
         lines: (2, 2),
     }])
 }
@@ -155,6 +156,7 @@ fn constant_debug_variable_prints_its_recorded_value() {
         name: "shadowed".to_string(),
         source: DebugVar::Constant(Constant::Int(231)),
         is_char: false,
+        ty: None,
         lines: (2, 2),
     }]);
     let mut s = session(p);
@@ -169,4 +171,244 @@ fn constant_debug_variable_prints_its_recorded_value() {
         "transcript: {:?}",
         run.transcript
     );
+}
+
+/// A program whose main builds aggregate values — a named-field
+/// struct, an enum, a tuple, an array, a nested struct, a `Vec`
+/// in the std model's element form, and an `Option` — with the
+/// debug-variable type tags and debug shapes the converter
+/// records for them.
+fn aggregate_program() -> Program {
+    use sparagmos_mir::{AdtDebugField, AdtDebugShape, AdtDebugVariant, AdtShapeKind};
+    fn field(name: Option<&str>, ty: &str) -> AdtDebugField {
+        AdtDebugField { name: name.map(str::to_string), ty: ty.to_string() }
+    }
+    fn shape(kind: AdtShapeKind, variants: Vec<AdtDebugVariant>) -> AdtDebugShape {
+        AdtDebugShape { kind, variants }
+    }
+    fn variant(name: &str, fields: Vec<AdtDebugField>) -> AdtDebugVariant {
+        AdtDebugVariant { name: name.to_string(), fields }
+    }
+    fn var(name: &str, local: usize, ty: &str) -> DebugVarEntry {
+        DebugVarEntry {
+            name: name.to_string(),
+            source: DebugVar::Place(local, vec![]),
+            is_char: false,
+            ty: Some(ty.to_string()),
+            lines: (2, 2),
+        }
+    }
+    fn adt(variant: u32, operands: Vec<Operand>) -> Rvalue {
+        Rvalue::AggregateAdt {
+            variant,
+            operands,
+            field_index: None,
+            units_from: None,
+        }
+    }
+    let debug_vars = vec![
+        var("p", 1, "test::Point"),
+        var("e", 2, "test::E"),
+        var("t", 3, "(i32, bool)"),
+        var("a", 4, "[i32; 3]"),
+        var("q", 5, "test::Outer"),
+        var("v", 6, "alloc::vec::Vec<i32>"),
+        var("o", 7, "std::option::Option<i32>"),
+    ];
+    let mut body = Body::new(
+        "main",
+        0,
+        vec![
+            Ty::Unit,
+            Ty::Adt("test::Point".to_string()),
+            Ty::Adt("test::E".to_string()),
+            Ty::Tuple(vec![Ty::i64(), Ty::Bool]),
+            Ty::Array(Box::new(Ty::i64()), 3),
+            Ty::Adt("test::Outer".to_string()),
+            Ty::Adt("alloc::vec::Vec<i32>".to_string()),
+            Ty::Adt("std::option::Option<i32>".to_string()),
+        ],
+        vec![
+            BasicBlockData::new(
+                vec![
+                    Statement::assign(
+                        Place::from_index(1),
+                        adt(0, vec![Operand::const_int(10), Operand::const_int(20)]),
+                    ),
+                    Statement::assign(
+                        Place::from_index(2),
+                        adt(1, vec![Operand::const_uint(7)]),
+                    ),
+                    Statement::assign(
+                        Place::from_index(3),
+                        Rvalue::AggregateTuple(vec![
+                            Operand::const_int(1),
+                            Operand::const_bool(true),
+                        ]),
+                    ),
+                    Statement::assign(
+                        Place::from_index(4),
+                        Rvalue::AggregateTuple(vec![
+                            Operand::const_int(5),
+                            Operand::const_int(5),
+                            Operand::const_int(5),
+                        ]),
+                    ),
+                    Statement::assign(
+                        Place::from_index(5),
+                        adt(
+                            0,
+                            vec![
+                                Operand::copy_local(1),
+                                Operand::const_int(3),
+                            ],
+                        ),
+                    ),
+                    Statement::assign(
+                        Place::from_index(6),
+                        adt(
+                            0,
+                            vec![
+                                Operand::const_int(1),
+                                Operand::const_int(2),
+                                Operand::const_int(3),
+                            ],
+                        ),
+                    ),
+                    Statement::assign(
+                        Place::from_index(7),
+                        adt(1, vec![Operand::const_int(4)]),
+                    ),
+                ],
+                TerminatorKind::Goto { target: BasicBlock(1) },
+            ),
+            BasicBlockData::new(
+                vec![Statement::assign(
+                    Place::from_index(0),
+                    Rvalue::Use(Operand::const_unit()),
+                )],
+                TerminatorKind::Return,
+            ),
+        ],
+    );
+    body.source_lines = vec![
+        BlockSourceLines { statements: vec![line(2); 7], terminator: line(2) },
+        BlockSourceLines { statements: vec![line(3)], terminator: line(3) },
+    ];
+    body.debug_vars = debug_vars;
+    let mut p = Program::new();
+    p.add_function(body);
+    p.source_files = vec!["test.rs".to_string()];
+    p.adt_debug_shapes.insert(
+        "test::Point".to_string(),
+        shape(
+            AdtShapeKind::Struct,
+            vec![variant(
+                "Point",
+                vec![field(Some("x"), "i32"), field(Some("y"), "i32")],
+            )],
+        ),
+    );
+    p.adt_debug_shapes.insert(
+        "test::E".to_string(),
+        shape(
+            AdtShapeKind::Enum,
+            vec![
+                variant("A", vec![]),
+                variant("B", vec![field(None, "u32")]),
+            ],
+        ),
+    );
+    p.adt_debug_shapes.insert(
+        "test::Outer".to_string(),
+        shape(
+            AdtShapeKind::Struct,
+            vec![variant(
+                "Outer",
+                vec![
+                    field(Some("inner"), "test::Point"),
+                    field(Some("tag"), "i32"),
+                ],
+            )],
+        ),
+    );
+    p.adt_debug_shapes.insert(
+        "std::option::Option<i32>".to_string(),
+        shape(
+            AdtShapeKind::Enum,
+            vec![
+                variant("None", vec![]),
+                variant("Some", vec![field(None, "i32")]),
+            ],
+        ),
+    );
+    p
+}
+
+#[test]
+fn gdb_prints_aggregate_values_in_rust_form() {
+    let mut s = session(aggregate_program());
+    s.set_breakpoint("test.rs", 3);
+    let run = s.run_script(
+        vec![
+            DebugCommand::Run,
+            print("p"),
+            print("e"),
+            print("t"),
+            print("a"),
+            print("q"),
+            print("o"),
+        ],
+        DebugDialect::Gdb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    for want in [
+        "$1 = test::Point {x: 10, y: 20}",
+        "$2 = test::E::B(7)",
+        "$3 = (1, true)",
+        "$4 = [5, 5, 5]",
+        "$5 = test::Outer {inner: test::Point {x: 10, y: 20}, tag: 3}",
+        // The printed name is the definition path, not the
+        // `std` re-export path the recorded tag carries.
+        "$6 = core::option::Option<i32>::Some(4)",
+    ] {
+        assert!(
+            run.transcript.iter().any(|l| l == want),
+            "missing `{want}` in {:?}",
+            run.transcript
+        );
+    }
+}
+
+#[test]
+fn lldb_prints_aggregate_values_in_summary_form() {
+    let mut s = session(aggregate_program());
+    s.set_breakpoint("test.rs", 3);
+    let run = s.run_script(
+        vec![
+            DebugCommand::Run,
+            print("p"),
+            print("e"),
+            print("t"),
+            print("a"),
+            print("q"),
+            print("v"),
+        ],
+        DebugDialect::Lldb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    for want in [
+        "(test::Point) p = {x:10, y:20}",
+        "(test::E) e = B(7)",
+        "= (1, true)",
+        "= (5, 5, 5)",
+        "(test::Outer) q = {inner:{x:10, y:20}, tag:3}",
+        "(alloc::vec::Vec<int>) v = size=3 { [0] = 1 [1] = 2 [2] = 3 }",
+    ] {
+        assert!(
+            run.transcript.iter().any(|l| l == want),
+            "missing `{want}` in {:?}",
+            run.transcript
+        );
+    }
 }

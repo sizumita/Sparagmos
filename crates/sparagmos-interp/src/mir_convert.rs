@@ -1974,6 +1974,10 @@ impl<'a> Converter<'a> {
                         name: info.name.clone(),
                         source: ir::DebugVar::Place(local.0 as usize, Vec::new()),
                         is_char: ty_is_char(&body.local_decls.get(local.0 as usize)?.ty),
+                        ty: Some(crate::builtins::ty_tag(
+                            &body.local_decls.get(local.0 as usize)?.ty,
+                            self.names,
+                        )),
                         lines,
                     }),
                     mir::VarDebugInfoContents::Place(place) => {
@@ -2000,10 +2004,19 @@ impl<'a> Converter<'a> {
                         // tracked here.
                         let is_char = place.projection.is_empty()
                             && ty_is_char(&body.local_decls.get(place.local.0 as usize)?.ty);
+                        // The projected type's tag, when the
+                        // projection walk can recover it.
+                        let ty = self
+                            .debug_projected_ty(
+                                &body.local_decls.get(place.local.0 as usize)?.ty,
+                                &proj,
+                            )
+                            .map(|t| crate::builtins::ty_tag(&t, self.names));
                         Some(ir::DebugVarEntry {
                             name: info.name.clone(),
                             source: ir::DebugVar::Place(place.local.0 as usize, proj),
                             is_char,
+                            ty,
                             lines,
                         })
                     }
@@ -2014,6 +2027,10 @@ impl<'a> Converter<'a> {
                             name: info.name.clone(),
                             source: ir::DebugVar::Constant(constant),
                             is_char,
+                            ty: c
+                                .ty
+                                .as_ref()
+                                .map(|t| crate::builtins::ty_tag(t, self.names)),
                             lines,
                         })
                     }
@@ -5570,6 +5587,39 @@ let inner = match (&src, target) {
     /// this `args`) win over the shape's declared types, whose
     /// parameter indices can misalign — the same resolution as
     /// `unique_value`.
+    /// The type a debugger variable's recorded projection reaches,
+    /// starting from its local's declared type: the walk the
+    /// debugger interface's variable table is built with, so an
+    /// entry can carry the projected type's rendered tag. Only
+    /// field and downcast steps are walked (the steps the table
+    /// itself carries); anything else leaves the type unknown.
+    fn debug_projected_ty(
+        &self,
+        base: &mir::Ty,
+        proj: &[crate::RefProj],
+    ) -> Option<mir::Ty> {
+        let mut ty = base.clone();
+        let mut variant = 0u32;
+        for step in proj {
+            match step {
+                crate::RefProj::Downcast(v) => variant = *v as u32,
+                crate::RefProj::Field(i) => {
+                    ty = match &ty {
+                        mir::Ty::Tuple(ts) => ts.get(*i)?.clone(),
+                        mir::Ty::Array(elem, _) => (**elem).clone(),
+                        mir::Ty::Adt(def, args) => self
+                            .instantiated_field_tys(def, args, variant)?
+                            .get(*i)?
+                            .clone(),
+                        _ => return None,
+                    };
+                }
+                _ => return None,
+            }
+        }
+        Some(ty)
+    }
+
     fn instantiated_field_tys(
         &self,
         def: &mir::AdtDefId,
