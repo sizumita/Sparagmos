@@ -15679,3 +15679,68 @@ fn run_mode_guest_global_allocator_observes_allocations() {
         "hello!\ncounting ok\n"
     );
 }
+
+const SWAPPED_DROP_IMPL_SRC: &str = r#"
+use std::mem;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static COUNT: AtomicUsize = AtomicUsize::new(0);
+
+struct S<U, V> {
+    _u: U,
+    size_of_u: usize,
+    _v: V,
+    size_of_v: usize,
+}
+
+impl<U, V> S<U, V> {
+    fn new(u: U, v: V) -> Self {
+        S {
+            _u: u,
+            size_of_u: mem::size_of::<U>(),
+            _v: v,
+            size_of_v: mem::size_of::<V>(),
+        }
+    }
+}
+
+// The impl declares its parameters in the opposite order
+// from the self type: the destructor instance for
+// `S<u8, u16>` must still substitute U = u8, V = u16.
+impl<V, U> Drop for S<U, V> {
+    fn drop(&mut self) {
+        assert_eq!(mem::size_of::<U>(), self.size_of_u);
+        assert_eq!(mem::size_of::<V>(), self.size_of_v);
+        COUNT.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn main() {
+    assert_eq!(COUNT.load(Ordering::SeqCst), 0);
+    {
+        S::new(0u8, 1u16);
+    }
+    assert_eq!(COUNT.load(Ordering::SeqCst), 1);
+    println!("swapped drop ok");
+}
+"#;
+
+#[test]
+fn run_mode_drop_impl_with_swapped_generic_params() {
+    // A `Drop` impl whose generic parameters are declared in
+    // a different order than the self type's must be
+    // monomorphized by unifying the impl's self type with the
+    // concrete type, not by copying the self type's arguments
+    // positionally (which would run the destructor of the
+    // swapped instantiation).
+    let dir = temp_dir("swapped-drop-impl");
+    let src = fixture(&dir, "swapped_drop_impl.rs", SWAPPED_DROP_IMPL_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "swapped-parameter Drop impl must substitute correctly; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "swapped drop ok\n");
+}

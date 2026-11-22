@@ -2502,6 +2502,159 @@ fn drop_candidates(
     }
 }
 
+/// Resolve a `Drop` impl method for a concrete self type.
+///
+/// `self_args` are the self type's generic arguments, in the
+/// self type's declaration order. The impl method's own
+/// parameter list is the impl's, whose names and declaration
+/// order are the impl author's choice: `impl<V, U> Drop for
+/// S<U, V>` is legal and assigns the parameters the other way
+/// round, so resolving with the self type's arguments
+/// positionally monomorphizes the WRONG instance (the
+/// destructor of `S<u16, u8>` for a value of `S<u8, u16>`).
+/// The impl's arguments are instead recovered by unifying the
+/// impl's self-type pattern (from the impl's trait reference,
+/// whose arguments are still the impl's parameters) with the
+/// concrete self type. When unification does not determine
+/// every impl parameter, the positional resolution is used,
+/// as before.
+fn resolve_drop_instance(
+    impl_fn: &rustc_public::ty::FnDef,
+    self_ty: &Ty,
+    self_args: &GenericArgs,
+) -> Option<rustc_public::mir::mono::Instance> {
+    let positional = |args: &GenericArgs| {
+        Instance::resolve(*impl_fn, args)
+            .ok()
+            .filter(|inst| inst.has_body())
+    };
+    let unified = (|| -> Option<GenericArgs> {
+        let parent = impl_fn.def_id().parent()?;
+        let impl_def = rustc_public::ty::ImplDef(parent);
+        let pattern = impl_def.trait_impl().value.self_ty();
+        let mut bindings: std::collections::HashMap<u32, GenericArgKind> =
+            std::collections::HashMap::new();
+        unify_self_ty(&pattern, self_ty, &mut bindings)?;
+        let generics = impl_def.generics_of();
+        let mut impl_args = Vec::with_capacity(generics.params.len());
+        for param in &generics.params {
+            impl_args.push(bindings.get(&param.index)?.clone());
+        }
+        Some(GenericArgs(impl_args))
+    })();
+    match unified {
+        Some(impl_args) => Instance::resolve(*impl_fn, &impl_args)
+            .ok()
+            .filter(|inst| inst.has_body())
+            .or_else(|| positional(self_args)),
+        None => positional(self_args),
+    }
+}
+
+/// Unify an impl's self-type pattern with the concrete self
+/// type, recording the generic argument each impl parameter
+/// (by parameter index) takes. `None` when the two do not
+/// have the same shape, or a concrete pattern argument does
+/// not match the concrete type's.
+fn unify_self_ty(
+    pattern: &Ty,
+    concrete: &Ty,
+    bindings: &mut std::collections::HashMap<u32, GenericArgKind>,
+) -> Option<()> {
+    use rustc_public::ty::{RigidTy, TyKind};
+    match (pattern.kind(), concrete.kind()) {
+        (TyKind::Param(param), _) => {
+            bindings.insert(param.index, GenericArgKind::Type(*concrete));
+            Some(())
+        }
+        (TyKind::RigidTy(RigidTy::Adt(def_p, args_p)), TyKind::RigidTy(RigidTy::Adt(def_c, args_c))) => {
+            if def_p != def_c || args_p.0.len() != args_c.0.len() {
+                return None;
+            }
+            for (pa, ca) in args_p.0.iter().zip(args_c.0.iter()) {
+                unify_self_arg(pa, ca, bindings)?;
+            }
+            Some(())
+        }
+        (TyKind::RigidTy(RigidTy::Ref(_, inner_p, _)), TyKind::RigidTy(RigidTy::Ref(_, inner_c, _)))
+        | (TyKind::RigidTy(RigidTy::RawPtr(inner_p, _)), TyKind::RigidTy(RigidTy::RawPtr(inner_c, _))) => {
+            unify_self_ty(&inner_p, &inner_c, bindings)
+        }
+        (TyKind::RigidTy(RigidTy::Tuple(ts_p)), TyKind::RigidTy(RigidTy::Tuple(ts_c))) => {
+            if ts_p.len() != ts_c.len() {
+                return None;
+            }
+            for (tp, tc) in ts_p.iter().zip(ts_c.iter()) {
+                unify_self_ty(tp, tc, bindings)?;
+            }
+            Some(())
+        }
+        (TyKind::RigidTy(RigidTy::Array(elem_p, _)), TyKind::RigidTy(RigidTy::Array(elem_c, _)))
+        | (TyKind::RigidTy(RigidTy::Slice(elem_p)), TyKind::RigidTy(RigidTy::Slice(elem_c))) => {
+            unify_self_ty(&elem_p, &elem_c, bindings)
+        }
+        // Any other pattern shape must be identical to the
+        // concrete type (a fully concrete self type, or a
+        // shape this unification does not descend into).
+        _ => {
+            if pattern == concrete {
+                Some(())
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Unify one generic argument of a self-type pattern with
+/// the concrete argument (see `unify_self_ty`).
+fn unify_self_arg(
+    pattern: &GenericArgKind,
+    concrete: &GenericArgKind,
+    bindings: &mut std::collections::HashMap<u32, GenericArgKind>,
+) -> Option<()> {
+    use rustc_public::ty::TyConstKind;
+    match (pattern, concrete) {
+        (GenericArgKind::Type(tp), GenericArgKind::Type(tc)) => {
+            unify_self_ty(tp, tc, bindings)
+        }
+        (GenericArgKind::Const(cp), GenericArgKind::Const(_)) => {
+            match cp.kind() {
+                TyConstKind::Param(param) => {
+                    bindings.insert(param.index, concrete.clone());
+                    Some(())
+                }
+                // A concrete pattern constant must match.
+                _ => {
+                    if pattern == concrete {
+                        Some(())
+                    } else {
+                        None
+                    }
+                }
+            }
+        }
+        (GenericArgKind::Lifetime(rp), GenericArgKind::Lifetime(_)) => {
+            use rustc_public::ty::RegionKind;
+            match &rp.kind {
+                RegionKind::ReEarlyParam(region) => {
+                    bindings.insert(region.index, concrete.clone());
+                    Some(())
+                }
+                // A concrete pattern region must match.
+                _ => {
+                    if pattern == concrete {
+                        Some(())
+                    } else {
+                        None
+                    }
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Demand a converted body for the `Drop` impl of every local ADT
 /// instantiation that the converted bodies drop (see the call site
 /// in `collect`). Each demanded body is converted like a local item
@@ -2639,17 +2792,16 @@ fn demand_drop_instances(
             let Some(impl_fn) = impl_fn else {
                 continue;
             };
-            // The impl's generic parameters are the self type's, in
-            // declaration order, for the standard
-            // `impl<...> Drop for Type<...>` shape; a resolution
-            // failure simply means the shape differs or this ADT
-            // has no applicable impl, and a compiler panic on an
-            // odd instantiation must not take the whole conversion
+            // The impl's generic arguments are recovered from
+            // the self type by unification (see
+            // `resolve_drop_instance`); a resolution failure
+            // simply means the shape differs or this ADT has no
+            // applicable impl, and a compiler panic on an odd
+            // instantiation must not take the whole conversion
             // down with it.
             let impl_fn = *impl_fn;
             let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                Instance::resolve(impl_fn, &args)
-                    .ok()
+                resolve_drop_instance(&impl_fn, &cand_ty, &args)
                     .filter(|inst| inst.has_body())
                     .and_then(|inst| inst.body().map(|body| (inst, body)))
             }));
