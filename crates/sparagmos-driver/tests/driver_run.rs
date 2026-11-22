@@ -13288,3 +13288,80 @@ fn run_mode_pathbuf_deref_to_path() {
         "the dereferenced path reads the buffer's byte string"
     );
 }
+
+// ---- Lane JL: one io::Error representation (issue #173) ----
+// Every io::Error producer (the fs layer, the process model,
+// From<ErrorKind>) builds the bitpacked `Repr` layout std's own
+// converted `Error::kind` / `raw_os_error` bodies read. The fs
+// layer previously built an aggregate `Error { repr }` shape
+// those bodies cannot consume.
+
+const FS_NUL_KIND_SRC: &str = r#"
+use std::io::ErrorKind;
+fn main() {
+    let e = std::fs::metadata("\0").unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::InvalidInput);
+    assert_eq!(e.raw_os_error(), None);
+    let exe = std::env::current_exe().unwrap();
+    let e = std::fs::rename(&exe, "\0").unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::InvalidInput);
+    let e = std::fs::remove_file("\0").unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::InvalidInput);
+    println!("fs-nul-kind-ok");
+}
+"#;
+
+#[test]
+fn run_mode_fs_nul_path_error_kind() {
+    let dir = temp_dir("fs-nul-kind");
+    let src = fixture(&dir, "fs_nul_kind.rs", FS_NUL_KIND_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "fs-nul-kind-ok\n");
+}
+
+const FS_OS_ERROR_SRC: &str = r#"
+use std::io::ErrorKind;
+fn main() {
+    let e = std::fs::metadata("/no/such/path-xyz-123").unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::NotFound);
+    assert_eq!(e.raw_os_error(), Some(2));
+    println!("fs-os-error-ok");
+}
+"#;
+
+#[test]
+fn run_mode_fs_os_error_kind_and_raw() {
+    let dir = temp_dir("fs-os-error");
+    let src = fixture(&dir, "fs_os_error.rs", FS_OS_ERROR_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "fs-os-error-ok\n");
+}
+
+const ERROR_FROM_KIND_SRC: &str = r#"
+use std::io::ErrorKind;
+fn main() {
+    let e = std::io::Error::from(ErrorKind::PermissionDenied);
+    assert_eq!(e.kind(), ErrorKind::PermissionDenied);
+    assert_eq!(e.raw_os_error(), None);
+    let e: std::io::Error = ErrorKind::Other.into();
+    assert_eq!(e.kind(), ErrorKind::Other);
+    println!("error-from-kind-ok");
+}
+"#;
+
+#[test]
+fn run_mode_io_error_from_error_kind() {
+    let dir = temp_dir("error-from-kind");
+    let src = fixture(&dir, "error_from_kind.rs", ERROR_FROM_KIND_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "error-from-kind-ok\n"
+    );
+}
