@@ -11169,3 +11169,37 @@ fn run_mode_phantom_data_default() {
     assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
 }
+
+const FROM_INTO_WRAPPERS_SRC: &str = r#"
+struct Outer { outer: std::cell::Cell<i32> }
+fn main() {
+    let o = Outer { outer: 1.into() };
+    o.outer.set(0);
+    println!("{}", o.outer.get());
+    let c = std::cell::Cell::from(5);
+    println!("{}", c.get());
+    let rc: std::cell::RefCell<i32> = 7.into();
+    println!("{}", *rc.borrow());
+    let rf = std::cell::RefCell::from(9);
+    println!("{}", *rf.borrow());
+}
+"#;
+
+#[test]
+fn run_mode_from_into_cell_and_refcell() {
+    // The shape of tests/ui/contracts/
+    // contracts-requires-is-not-inherited-when-nesting.rs: a
+    // `Cell` field built with `1.into()`. `Into::into`'s instance
+    // arguments are [Self, T] with T as the destination; reading
+    // them in `From`'s order returned the bare integer here.
+    let dir = temp_dir("from-into-wrappers");
+    let src = fixture(&dir, "case.rs", FROM_INTO_WRAPPERS_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Cell/RefCell From and Into conversions must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n5\n7\n9\n");
+}

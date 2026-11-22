@@ -4663,3 +4663,152 @@ fn simd_eq_mask_drives_select() {
     );
 }
 
+
+// ----- From/Into destination roles and Cell/RefCell (Lane EM) ---------------
+//
+// The instance arguments of both `From::from` and `Into::into` are
+// `[Self, T]`, but the destination is Self for `From`
+// (`From<T> for Self`) and `T` for `Into` (`Into<T> for Self`).
+// Reading argument 0 as the destination for both made `.into()`
+// into a wrapper type return the bare source value (which then
+// failed assignment into e.g. a `Cell` place). `From<T> for
+// Cell<T>` / `RefCell<T>` are `Cell::new` / `RefCell::new` by
+// definition in core, so the conversion builds the natural shapes
+// those constructors build.
+
+const INTO_INTO: mir::DefId = mir::DefId::new(0, 440);
+const REFCELL_TY: mir::DefId = mir::DefId::new(0, 442);
+
+fn names_em() -> HashMap<mir::DefId, String> {
+    let mut names = names_bi();
+    names.extend([
+        (FROM_FROM, "std::convert::From::from".to_string()),
+        (INTO_INTO, "std::convert::Into::into".to_string()),
+        (CELL_TY, "std::cell::Cell".to_string()),
+        (REFCELL_TY, "std::cell::RefCell".to_string()),
+    ]);
+    names
+}
+
+fn program_em(body: mir::Body) -> MirProgram {
+    let mut prog = MirProgram::new();
+    prog.add("main", body);
+    prog.fn_names = names_em();
+    prog
+}
+
+fn cell_i32_ty() -> mir::Ty {
+    mir::Ty::Adt(CELL_TY, vec![i32_ty()])
+}
+
+fn refcell_i32_ty() -> mir::Ty {
+    mir::Ty::Adt(REFCELL_TY, vec![i32_ty()])
+}
+
+fn cell_shape(v: Value) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![Value::Enum {
+            variant: 0,
+            fields: vec![v],
+        }],
+    }
+}
+
+#[test]
+fn into_into_cell_wraps_the_value() {
+    // fn main() -> Cell<i32> {
+    //   _0 = Into::into::<i32, Cell<i32>>(7);
+    //   return _0;
+    // }
+    let body = mir::Body::new(
+        decls(&[cell_i32_ty()]),
+        0,
+        vec![
+            block(
+                vec![],
+                call(
+                    fndef(INTO_INTO, vec![i32_ty(), cell_i32_ty()]),
+                    vec![const_i32(7)],
+                    0,
+                    1,
+                ),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_em(body), "main", vec![]).expect("run");
+    assert_eq!(value, cell_shape(Value::Uint(7)));
+}
+
+#[test]
+fn from_from_cell_wraps_the_value() {
+    // fn main() -> Cell<i32> {
+    //   _0 = From::from::<Cell<i32>, i32>(7);
+    //   return _0;
+    // }
+    let body = mir::Body::new(
+        decls(&[cell_i32_ty()]),
+        0,
+        vec![
+            block(
+                vec![],
+                call(
+                    fndef(FROM_FROM, vec![cell_i32_ty(), i32_ty()]),
+                    vec![const_i32(7)],
+                    0,
+                    1,
+                ),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_em(body), "main", vec![]).expect("run");
+    assert_eq!(value, cell_shape(Value::Uint(7)));
+}
+
+#[test]
+fn into_into_refcell_wraps_the_value() {
+    // fn main() -> RefCell<i32> {
+    //   _0 = Into::into::<i32, RefCell<i32>>(7);
+    //   return _0;
+    // }
+    let body = mir::Body::new(
+        decls(&[refcell_i32_ty()]),
+        0,
+        vec![
+            block(
+                vec![],
+                call(
+                    fndef(INTO_INTO, vec![i32_ty(), refcell_i32_ty()]),
+                    vec![const_i32(7)],
+                    0,
+                    1,
+                ),
+            ),
+            block(vec![], ret()),
+        ],
+    );
+    let value = interpret_mir(&program_em(body), "main", vec![]).expect("run");
+    assert_eq!(
+        value,
+        Value::Enum {
+            variant: 0,
+            fields: vec![
+                // Borrow flag: `Cell { UnsafeCell { 0 } }`.
+                Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Enum {
+                        variant: 0,
+                        fields: vec![Value::Int(0)],
+                    }],
+                },
+                // Held value: `UnsafeCell { 7 }`.
+                Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Uint(7)],
+                },
+            ],
+        }
+    );
+}
