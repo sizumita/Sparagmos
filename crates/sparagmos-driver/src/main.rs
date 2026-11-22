@@ -751,6 +751,12 @@ struct InstanceDemandState {
     plain_taken: HashSet<rustc_public::DefId>,
     taken: usize,
     demands: HashMap<rustc_public::DefId, Demand>,
+    /// Outcomes accumulated for closures defined in other crates
+    /// (see [`collect_closure_instances`] and
+    /// [`collect_const_closure_instances`]): a foreign closure has
+    /// no item-loop report entry to fill in, so the caller records
+    /// these with [`apply_foreign_closure_demands`].
+    foreign_closure_demands: HashMap<rustc_public::DefId, Demand>,
     /// The first recursion-limit failure the demand passes hit
     /// (see [`RECURSION_LIMIT_DEPTH`]), reported as a compilation
     /// failure alongside the monomorphization checks.
@@ -801,6 +807,7 @@ fn collect_local_instances(
         plain_taken,
         taken,
         demands,
+        foreign_closure_demands: _,
         recursion_limit,
     } = state;
 
@@ -1038,12 +1045,27 @@ fn collect_local_instances(
 /// [`apply_instance_demands`]. The Stable MIR bodies converted
 /// here are returned so the reachability collection can walk them
 /// for foreign targets too.
+///
+/// The same pass also collects closures defined in *other*
+/// crates. A foreign closure is never an item of the local crate,
+/// so no item loop defers it, and the reachability collection
+/// follows `FnDef` targets and constants only — a closure created
+/// inside a generic foreign function (the closure
+/// `std::sys::thread_local::destroy::<T>` passes to
+/// `abort_on_dtor_unwind`, the one inside `slice::binary_search`)
+/// is mentioned concretely by the collected foreign body yet
+/// demanded by no pass, and calls to it fail as unknown
+/// functions. Foreign outcomes accumulate in their own map of
+/// the shared state and are recorded with
+/// [`apply_foreign_closure_demands`]: there is no local item to
+/// credit them to.
 fn collect_closure_instances(
     conv: &mut Converter,
     bodies: &mut Vec<(String, Body)>,
     body_def_ids: &mut Vec<sparagmos_mir::DefId>,
     body_def_names: &mut Vec<String>,
     deferred: &[DeferredFn],
+    local_defs: &HashSet<rustc_public::DefId>,
     seeds: &[rustc_public::mir::Body],
     state: &mut InstanceDemandState,
 ) -> Vec<rustc_public::mir::Body> {
@@ -1055,6 +1077,7 @@ fn collect_closure_instances(
         plain_taken,
         taken,
         demands,
+        foreign_closure_demands,
         recursion_limit,
     } = state;
 
@@ -1072,8 +1095,34 @@ fn collect_closure_instances(
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             for (def, args) in sparagmos_driver::reach::closure_targets(&body) {
                 let referenced = def.def_id();
-                let Some(&base_name) = deferred_names.get(&referenced) else {
-                    continue;
+                // Two kinds of closures are collected here. One
+                // defined in a generic context of the local crate
+                // was deferred by the item loop and is accounted
+                // through the shared demand state, like a generic
+                // function. One defined in another crate is
+                // demanded by no other pass: no item loop iterates
+                // foreign items, and the reachability collection
+                // follows `FnDef` targets only, so a foreign
+                // closure a converted body mentions concretely
+                // (the closure inside a generic std function is
+                // the common case) is collected here or nowhere;
+                // it is accounted in the state's foreign map
+                // instead. A local closure outside a generic
+                // context is the item loop's business and is
+                // skipped.
+                let (base_name, foreign) = match deferred_names.get(&referenced) {
+                    Some(&name) => (name.to_string(), false),
+                    None => {
+                        if local_defs.contains(&referenced) {
+                            continue;
+                        }
+                        (referenced.name(), true)
+                    }
+                };
+                let target_demands: &mut HashMap<rustc_public::DefId, Demand> = if foreign {
+                    &mut *foreign_closure_demands
+                } else {
+                    &mut *demands
                 };
                 if args_mention_params(&args) {
                     continue;
@@ -1093,12 +1142,12 @@ fn collect_closure_instances(
                             base_name
                         ));
                     }
-                    fail_all(&mut *demands, &owners, "recursion limit reached".to_string());
+                    fail_all(&mut *target_demands, &owners, "recursion limit reached".to_string());
                     continue;
                 }
                 let Some(kind) = closure_kind(&args) else {
                     if unresolved_seen.insert((referenced, format!("{args:?}"))) {
-                        *demands
+                        *target_demands
                             .entry(referenced)
                             .or_default()
                             .failures
@@ -1114,7 +1163,7 @@ fn collect_closure_instances(
                     Ok(inst) => inst,
                     Err(_) => {
                         if unresolved_seen.insert((referenced, format!("{args:?}"))) {
-                            *demands
+                            *target_demands
                                 .entry(referenced)
                                 .or_default()
                                 .failures
@@ -1128,11 +1177,11 @@ fn collect_closure_instances(
                     continue;
                 }
                 if *taken >= MAX_LOCAL_INSTANCES {
-                    fail_all(&mut *demands, &owners, "collection limit reached".to_string());
+                    fail_all(&mut *target_demands, &owners, "collection limit reached".to_string());
                     continue;
                 }
                 if !inst.has_body() {
-                    fail_all(&mut *demands, &owners, "no MIR body available".to_string());
+                    fail_all(&mut *target_demands, &owners, "no MIR body available".to_string());
                     continue;
                 }
                 let ibody = match fetch_instance_body(&inst) {
@@ -1165,7 +1214,7 @@ fn collect_closure_instances(
                         bodies.push((display, converted));
                         body_def_ids.push(conv.instance_def_id(referenced, &inst));
                         body_def_names.push(base_name.to_string());
-                        let demand = demands.entry(referenced).or_default();
+                        let demand = target_demands.entry(referenced).or_default();
                         demand.converted += 1;
                         if demand.first_counts.is_none() {
                             demand.first_counts = Some(counts);
@@ -1173,7 +1222,7 @@ fn collect_closure_instances(
                     }
                     Err(errs) => {
                         for e in errs {
-                            fail_all(&mut *demands, &owners, e);
+                            fail_all(&mut *target_demands, &owners, e);
                         }
                     }
                 }
@@ -1187,6 +1236,214 @@ fn collect_closure_instances(
     }
 
     extra_seeds
+}
+
+/// Convert the closures that converted bodies materialize as
+/// *values* out of constants.
+///
+/// A closure can be demanded without any body's types mentioning
+/// it: const evaluation stores it inside a constant allocation —
+/// a function pointer in a constant struct, a closure value
+/// nested in a constant aggregate — and body conversion decodes
+/// the allocation into a closure value (see
+/// `Converter::const_closure_mentions`). The canonical case is
+/// `std::hash::RandomState::new::KEYS`: the `LocalKey` value is a
+/// constant whose function-pointer field names the thread-local
+/// initializer closure, so every `HashMap` program materializes
+/// that closure as a value while no local declaration, operand
+/// type, or aggregate anywhere mentions its type. The
+/// type-driven passes ([`collect_closure_instances`],
+/// [`sparagmos_driver::reach::closure_targets`]) cannot see it,
+/// and the foreign constant's own body is never converted (no
+/// item loop iterates foreign items), so without this pass the
+/// closure's body is collected by no pass and calls to it fail
+/// as unknown functions.
+///
+/// The mentions are exactly the constants conversion itself
+/// decoded — constants of reached bodies and the initializers of
+/// statics they reference — so the pass demands nothing
+/// conversion did not already touch. Routing and accounting
+/// mirror the closure demand pass: a closure the item loop
+/// deferred (a generic-context local closure) is accounted in
+/// the shared demand state, a local closure outside a generic
+/// context is the item loop's business and is skipped, and a
+/// closure defined in another crate is accounted in the state's
+/// foreign map (see [`apply_foreign_closure_demands`]). The
+/// shared `seen` set deduplicates against the type-driven pass:
+/// whichever pass reaches an instance first converts it.
+///
+/// Coroutine mentions are not part of this record: a constant
+/// cannot hold a coroutine value (the constant decoder has no
+/// coroutine value form — coroutines are created by aggregates
+/// in bodies, never stored in allocations), so there is no
+/// constant-content coroutine mention to scan for.
+fn collect_const_closure_instances(
+    conv: &mut Converter,
+    bodies: &mut Vec<(String, Body)>,
+    body_def_ids: &mut Vec<sparagmos_mir::DefId>,
+    body_def_names: &mut Vec<String>,
+    deferred: &[DeferredFn],
+    local_defs: &HashSet<rustc_public::DefId>,
+    state: &mut InstanceDemandState,
+) -> Vec<rustc_public::mir::Body> {
+    let InstanceDemandState {
+        seen,
+        unresolved_seen,
+        plain_taken,
+        taken,
+        demands,
+        foreign_closure_demands,
+        recursion_limit,
+    } = state;
+
+    let deferred_names: HashMap<rustc_public::DefId, &str> =
+        deferred.iter().map(|d| (d.def, d.name.as_str())).collect();
+    let mut converted_bodies: Vec<rustc_public::mir::Body> = Vec::new();
+
+    // Converting one mentioned closure's body decodes its own
+    // constants, which can mention further closures; drain the
+    // converter's record until a round adds nothing. Each
+    // distinct mention is recorded once and each conversion is
+    // deduplicated and capped through the shared state, so the
+    // loop terminates.
+    loop {
+        let mentions = std::mem::take(&mut conv.const_closure_mentions);
+        if mentions.is_empty() {
+            break;
+        }
+        for (def, args) in &mentions {
+            let referenced = def.def_id();
+            let (base_name, foreign) = match deferred_names.get(&referenced) {
+                Some(&name) => (name.to_string(), false),
+                None => {
+                    if local_defs.contains(&referenced) {
+                        continue;
+                    }
+                    (referenced.name(), true)
+                }
+            };
+            if args_mention_params(args) {
+                continue;
+            }
+            // Instance resolution goes through the compiler's
+            // internals and can panic on exotic targets; isolate
+            // each mention exactly as the other demand passes
+            // isolate each scanned body.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let target_demands: &mut HashMap<rustc_public::DefId, Demand> = if foreign {
+                    &mut *foreign_closure_demands
+                } else {
+                    &mut *demands
+                };
+                let owners = [referenced];
+                // The expanded-size cap, as in the closure
+                // demand pass: a closure demanded with
+                // size-increasing arguments is the same
+                // recursion-limit situation.
+                if !sparagmos_driver::reach::generic_args_within_expanded_size(
+                    args,
+                    sparagmos_driver::reach::MAX_INSTANTIATION_EXPANDED_SIZE,
+                ) {
+                    if recursion_limit.is_none() {
+                        *recursion_limit = Some(format!(
+                            "reached the recursion limit while instantiating `{}` (instantiation size limit)",
+                            base_name
+                        ));
+                    }
+                    fail_all(
+                        &mut *target_demands,
+                        &owners,
+                        "recursion limit reached".to_string(),
+                    );
+                    return;
+                }
+                let Some(kind) = closure_kind(args) else {
+                    if unresolved_seen.insert((referenced, format!("{args:?}"))) {
+                        fail_all(
+                            &mut *target_demands,
+                            &owners,
+                            "closure kind is not recoverable from its generic arguments"
+                                .to_string(),
+                        );
+                    }
+                    return;
+                };
+                let inst = match Instance::resolve_closure(*def, args, kind) {
+                    Ok(inst) => inst,
+                    Err(_) => {
+                        if unresolved_seen.insert((referenced, format!("{args:?}"))) {
+                            fail_all(
+                                &mut *target_demands,
+                                &owners,
+                                "closure instance resolution failed".to_string(),
+                            );
+                        }
+                        return;
+                    }
+                };
+                if !seen.insert((referenced, inst)) {
+                    return;
+                }
+                if *taken >= MAX_LOCAL_INSTANCES {
+                    fail_all(
+                        &mut *target_demands,
+                        &owners,
+                        "collection limit reached".to_string(),
+                    );
+                    return;
+                }
+                if !inst.has_body() {
+                    fail_all(
+                        &mut *target_demands,
+                        &owners,
+                        "no MIR body available".to_string(),
+                    );
+                    return;
+                }
+                let Some(ibody) = inst.body() else {
+                    fail_all(
+                        &mut *target_demands,
+                        &owners,
+                        "no MIR body available".to_string(),
+                    );
+                    return;
+                };
+                match convert_body_isolated(&mut *conv, &ibody) {
+                    Ok(converted) => {
+                        *taken += 1;
+                        converted_bodies.push(ibody.clone());
+                        let counts =
+                            (ibody.blocks.len(), ibody.locals().len(), ibody.arg_locals().len());
+                        let display = if plain_taken.insert(referenced) {
+                            base_name.clone()
+                        } else {
+                            format!("{} [{}]", base_name, inst.name())
+                        };
+                        bodies.push((display, converted));
+                        body_def_ids.push(conv.instance_def_id(referenced, &inst));
+                        body_def_names.push(base_name.clone());
+                        let demand = target_demands.entry(referenced).or_default();
+                        demand.converted += 1;
+                        if demand.first_counts.is_none() {
+                            demand.first_counts = Some(counts);
+                        }
+                    }
+                    Err(errs) => {
+                        for e in errs {
+                            fail_all(&mut *target_demands, &owners, e);
+                        }
+                    }
+                }
+            }));
+            if outcome.is_err() {
+                // Contained panic: clear the capture slot, as the
+                // other demand passes do.
+                let _ = take_captured_panic();
+            }
+        }
+    }
+
+    converted_bodies
 }
 
 /// Convert the demanded instances of the local coroutines
@@ -1234,6 +1491,7 @@ fn collect_coroutine_instances(
         plain_taken,
         taken,
         demands,
+        foreign_closure_demands: _,
         recursion_limit,
     } = state;
 
@@ -1420,6 +1678,46 @@ fn apply_instance_demands(
                 reasons: demand.failures.clone(),
             };
         }
+    }
+}
+
+/// Record the demand outcomes accumulated for closures defined
+/// in other crates in the report: one entry per closure
+/// definition, with the accounting [`apply_instance_demands`]
+/// gives a deferred local definition — converted when every
+/// demanded instance converted, skipped with the accumulated
+/// reasons otherwise. A foreign closure has no item-loop
+/// placeholder entry (no item loop iterates foreign items), so
+/// the entries are appended here, past the target-crate section
+/// of the report, like the reachability collection's entries.
+fn apply_foreign_closure_demands(
+    report: &mut ConversionReport,
+    demands: &HashMap<rustc_public::DefId, Demand>,
+) {
+    let mut defs: Vec<&rustc_public::DefId> = demands.keys().collect();
+    defs.sort_by_key(|d| d.name());
+    for def in defs {
+        let demand = &demands[def];
+        let converted = demand.converted > 0 && demand.failures.is_empty();
+        let (blocks, locals, arg_count) = if converted {
+            demand.first_counts.unwrap_or((0, 0, 0))
+        } else {
+            (0, 0, 0)
+        };
+        let outcome = if converted {
+            FnOutcome::Converted
+        } else {
+            FnOutcome::Skipped {
+                reasons: demand.failures.clone(),
+            }
+        };
+        report.functions.push(FnReport {
+            name: def.name(),
+            blocks,
+            locals,
+            arg_count,
+            outcome,
+        });
     }
 }
 
@@ -2475,6 +2773,7 @@ fn collect() -> ControlFlow<()> {
         &mut body_def_ids,
         &mut body_def_names,
         &deferred_closures,
+        &local_defs,
         &closure_scan,
         &mut demand_state,
     );
@@ -2494,6 +2793,20 @@ fn collect() -> ControlFlow<()> {
         &coroutine_scan,
         &mut demand_state,
     );
+    // Convert the closures the conversions so far materialized
+    // as values out of constants (see
+    // collect_const_closure_instances): their bodies join the
+    // reachability seeds and the fixpoint scan set like the
+    // closure pass's.
+    let const_seeds = collect_const_closure_instances(
+        &mut conv,
+        &mut bodies,
+        &mut body_def_ids,
+        &mut body_def_names,
+        &deferred_closures,
+        &local_defs,
+        &mut demand_state,
+    );
     // Local bodies converted by the closure and coroutine passes
     // have not been scanned for the *function* instances they
     // demand (each demand pass scans only for its own kind of
@@ -2503,10 +2816,12 @@ fn collect() -> ControlFlow<()> {
     // every converted body is eventually scanned by every pass.
     let mut local_scan: Vec<rustc_public::mir::Body> = closure_seeds.clone();
     local_scan.extend(coroutine_seeds.iter().cloned());
+    local_scan.extend(const_seeds.iter().cloned());
     let mut reach_seeds = seed_bodies;
     reach_seeds.extend(instance_seeds);
     reach_seeds.extend(closure_seeds);
     reach_seeds.extend(coroutine_seeds);
+    reach_seeds.extend(const_seeds);
 
     // Demand the vtable method bodies of the `dyn` values the
     // bodies scanned so far form (trait default methods reached
@@ -2598,6 +2913,7 @@ fn collect() -> ControlFlow<()> {
             &mut body_def_ids,
             &mut body_def_names,
             &deferred_closures,
+            &local_defs,
             &closure_scan,
             &mut demand_state,
         );
@@ -2633,16 +2949,31 @@ fn collect() -> ControlFlow<()> {
             &mut dyn_credited,
             &mut dyn_demanded,
         );
+        // Newly converted bodies also decode constants, which
+        // can materialize further closures as values (the
+        // `RandomState::new::KEYS` shape: a foreign constant's
+        // function pointer naming a closure no type mentions).
+        let new_const_bodies = collect_const_closure_instances(
+            &mut conv,
+            &mut bodies,
+            &mut body_def_ids,
+            &mut body_def_names,
+            &deferred_closures,
+            &local_defs,
+            &mut demand_state,
+        );
         if new_instances.is_empty()
             && new_closure_bodies.is_empty()
             && new_coroutine_bodies.is_empty()
             && new_dyn_bodies.is_empty()
+            && new_const_bodies.is_empty()
         {
             break;
         }
         local_scan = new_closure_bodies.clone();
         local_scan.extend(new_coroutine_bodies.iter().cloned());
         local_scan.extend(new_dyn_bodies.iter().cloned());
+        local_scan.extend(new_const_bodies.iter().cloned());
         for id in &body_def_ids[ids_before..] {
             collected_ids.insert(*id);
         }
@@ -2653,6 +2984,7 @@ fn collect() -> ControlFlow<()> {
         reach_input.extend(new_closure_bodies.iter().cloned());
         reach_input.extend(new_coroutine_bodies.iter().cloned());
         reach_input.extend(new_dyn_bodies.iter().cloned());
+        reach_input.extend(new_const_bodies.iter().cloned());
         let reached = sparagmos_driver::reach::collect_reachable(
             &mut conv,
             &reach_input,
@@ -2664,6 +2996,59 @@ fn collect() -> ControlFlow<()> {
         alias_sources.extend(new_closure_bodies.iter().cloned());
         alias_sources.extend(new_coroutine_bodies.iter().cloned());
         alias_sources.extend(new_dyn_bodies.iter().cloned());
+        alias_sources.extend(new_const_bodies.iter().cloned());
+        for ((name, body), (def_id, def_name)) in reached
+            .bodies
+            .into_iter()
+            .zip(reached.body_def_ids.into_iter().zip(reached.body_def_names))
+        {
+            if collected_ids.insert(def_id) {
+                foreign_taken += 1;
+                bodies.push((name, body));
+                body_def_ids.push(def_id);
+                body_def_names.push(def_name);
+            }
+        }
+        for entry in reached.reports {
+            if report_names.insert(entry.name.clone()) {
+                report.functions.push(entry);
+            }
+        }
+    }
+    // The reachability conversions of the final round above can
+    // record further constant-content closure mentions (their
+    // conversions decode new constants), so drain that demand to
+    // a fixpoint as well: demand what the mentions name, walk
+    // what it converts for the foreign functions those closures
+    // call, and repeat until a round converts nothing.
+    loop {
+        let ids_before = body_def_ids.len();
+        let new_const_bodies = collect_const_closure_instances(
+            &mut conv,
+            &mut bodies,
+            &mut body_def_ids,
+            &mut body_def_names,
+            &deferred_closures,
+            &local_defs,
+            &mut demand_state,
+        );
+        if new_const_bodies.is_empty() {
+            break;
+        }
+        for id in &body_def_ids[ids_before..] {
+            collected_ids.insert(*id);
+        }
+        alias_sources.extend(new_const_bodies.iter().cloned());
+        if foreign_taken >= sparagmos_driver::reach::MAX_COLLECTED_BODIES {
+            break;
+        }
+        let reached = sparagmos_driver::reach::collect_reachable(
+            &mut conv,
+            &new_const_bodies,
+            &local_defs,
+            sparagmos_driver::reach::MAX_COLLECTED_BODIES - foreign_taken,
+        );
+        alias_sources.extend(reached.walked_bodies.iter().cloned());
         for ((name, body), (def_id, def_name)) in reached
             .bodies
             .into_iter()
@@ -2720,6 +3105,7 @@ fn collect() -> ControlFlow<()> {
     }
     apply_instance_demands(&mut report, &deferred, &demand_state.demands);
     apply_instance_demands(&mut report, &deferred_closures, &demand_state.demands);
+    apply_foreign_closure_demands(&mut report, &demand_state.foreign_closure_demands);
 
     // Register converted impl method bodies under the trait keys
     // their call sites resolve through (Issue #64). Demands can
