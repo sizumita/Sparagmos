@@ -8296,60 +8296,6 @@ impl<'a> Interpreter<'a> {
         }
     }
 
-    /// Read one gather/masked-load lane through its pointer.
-    /// A pointer formed by casting an array pointer to an
-    /// element pointer (an array's `as_ptr`) carries no
-    /// projection: the plain read yields the whole array, and
-    /// the pointer denotes its first element, so the read
-    /// steps into index 0.
-    fn simd_pointee_read(
-        &self,
-        frames: &[Frame],
-        ptr: &Value,
-    ) -> InterpResult<Value> {
-        let target = self.deref_value(frames, ptr)?;
-        let value = self.read_resolved(frames, &target)?;
-        let empty_projection = match &target {
-            Resolved::Place { projection, .. }
-            | Resolved::Static { projection, .. }
-            | Resolved::Alloc { projection, .. } => projection.is_empty(),
-            Resolved::Value(..) => false,
-        };
-        if empty_projection {
-            if let Value::Tuple(items) = &value {
-                if !items.is_empty() {
-                    return self.read_resolved_at(frames, &target, 0);
-                }
-            }
-        }
-        Ok(value)
-    }
-
-    /// Write one scatter/masked-store lane through its
-    /// pointer, with the same array-start treatment as
-    /// `simd_pointee_read`.
-    fn simd_pointee_write(
-        &self,
-        frames: &mut Vec<Frame>,
-        ptr: &Value,
-        value: Value,
-    ) -> InterpResult<()> {
-        let target = self.deref_value(frames, ptr)?;
-        let empty_projection = match &target {
-            Resolved::Place { projection, .. }
-            | Resolved::Static { projection, .. }
-            | Resolved::Alloc { projection, .. } => projection.is_empty(),
-            Resolved::Value(..) => false,
-        };
-        if empty_projection {
-            let cur = self.read_resolved(frames, &target)?;
-            if matches!(cur, Value::Tuple(_)) {
-                return self.write_resolved_at(frames, &target, 0, value);
-            }
-        }
-        self.write_resolved(frames, &target, value)
-    }
-
     /// The equality an atomic compare-exchange performs: the
     /// pointee's current value against the expected one.
     /// Pointer-shaped values compare by identity — the synthetic
@@ -8584,12 +8530,17 @@ impl<'a> Interpreter<'a> {
             S::Splat => {
                 // The generic arguments name the element type and
                 // the vector type, in one order or the other; the
-                // scalar one is the element.
+                // scalar one is the element. Raw pointers are
+                // scalar elements too (a vector of pointers is a
+                // supported `simd_splat` target).
                 let scalar = generic_args
                     .iter()
                     .find(|t| {
-                        int_tag(t.as_str()).is_some()
-                            || matches!(t.as_str(), "f16" | "f32" | "f64" | "bool" | "char")
+                        let t = t.as_str();
+                        int_tag(t).is_some()
+                            || matches!(t, "f16" | "f32" | "f64" | "bool" | "char")
+                            || t.starts_with("*const ")
+                            || t.starts_with("*mut ")
                     })
                     .ok_or_else(|| {
                         unsupported("simd_splat without an element type is not runtime-supported")
@@ -8687,6 +8638,22 @@ impl<'a> Interpreter<'a> {
                         bits |= 1u128 << i;
                     }
                 }
+                // The result type is the call's second generic
+                // argument, and `simd_bitmask` is declared over
+                // two shapes for it: an integer, or a byte array
+                // holding the mask's little-endian byte
+                // decomposition.
+                if let Some(bytes) = generic_args
+                    .get(1)
+                    .and_then(|tag| tag.trim().strip_prefix("[u8;"))
+                    .and_then(|rest| rest.trim().strip_suffix(']'))
+                    .and_then(|n| n.trim().parse::<usize>().ok())
+                {
+                    let out: Vec<Value> = (0..bytes)
+                        .map(|i| Value::Uint((bits >> (8 * i)) & 0xff))
+                        .collect();
+                    return Ok(Value::Tuple(out));
+                }
                 Ok(Value::Uint(bits))
             }
             S::Select => {
@@ -8704,7 +8671,24 @@ impl<'a> Interpreter<'a> {
                 simd_wrap(&vals[1], out)
             }
             S::SelectBitmask => {
-                let bits = as_u128(&vals[0], "simd select bitmask")?;
+                // The mask arrives as an integer or in the byte
+                // array form `simd_bitmask` also produces; the
+                // array's bytes compose little-endian.
+                let bits = match &vals[0] {
+                    Value::Tuple(items) => {
+                        let mut bits: u128 = 0;
+                        for (i, item) in items.iter().enumerate() {
+                            bits |=
+                                as_u128(item, "simd select bitmask")? << (8 * i);
+                        }
+                        bits
+                    }
+                    Value::Bytes(bytes) => bytes.iter().enumerate().fold(
+                        0u128,
+                        |acc, (i, b)| acc | ((*b as u128) << (8 * i)),
+                    ),
+                    other => as_u128(other, "simd select bitmask")?,
+                };
                 let yes = simd_lanes(&vals[1])?;
                 let no = simd_lanes(&vals[2])?;
                 let mut out = Vec::with_capacity(yes.len());
@@ -8756,7 +8740,13 @@ impl<'a> Interpreter<'a> {
                 for (i, default) in defaults.iter().enumerate() {
                     if simd_lane_active(&mask[i])? {
                         let value = if aggregate || i > 0 {
-                            self.read_resolved_at(frames, &target, i)?
+                            // The sequence accessor, not the plain
+                            // indexed one: the pointer may denote
+                            // a single element (an element pointer
+                            // into an array), whose lanes are its
+                            // siblings in the enclosing aggregate,
+                            // not indices into the element itself.
+                            self.read_seq_at(frames, &target, i)?
                         } else {
                             self.read_resolved(frames, &target)?
                         };
@@ -8795,7 +8785,10 @@ impl<'a> Interpreter<'a> {
                 for (i, value) in values.iter().enumerate() {
                     if simd_lane_active(&mask[i])? {
                         if aggregate || i > 0 {
-                            self.write_resolved_at(frames, &target, i, value.clone())?;
+                            // Sequence access, as in MaskedLoad:
+                            // an element pointer's lanes are its
+                            // siblings, not indices into it.
+                            self.write_seq_at(frames, &target, i, value.clone())?;
                         } else {
                             self.write_resolved(frames, &target, value.clone())?;
                         }
@@ -11376,6 +11369,20 @@ impl<'a> Interpreter<'a> {
             }
             return self.elems_equal(frames, &ea, &eb);
         }
+        // An address-only pointer (the value
+        // `simd_with_exposed_provenance` and pointer arithmetic
+        // produce) denotes no place in the current frames, so
+        // there is no pointee to resolve to: it compares by
+        // address against the other side's synthetic address,
+        // the identity every pointer value carries in this
+        // model.
+        if matches!(a, Value::Ref(RefTarget::Address(_)))
+            || matches!(b, Value::Ref(RefTarget::Address(_)))
+        {
+            if let (Some(x), Some(y)) = (synthetic_address(a), synthetic_address(b)) {
+                return Ok(x == y);
+            }
+        }
         let a = self.resolve_ref(frames, a)?;
         let b = self.resolve_ref(frames, b)?;
         // A `dyn Trait` value denotes its concrete pointee: two
@@ -11459,6 +11466,43 @@ impl<'a> Interpreter<'a> {
                         matches!(elem, Value::Uint(v) if *v == u128::from(*byte))
                             || matches!(elem, Value::Int(v) if *v == i128::from(*byte))
                     })
+            }
+            // A byte string against an ADT value whose single
+            // field is a sequence: the holder is the sequence it
+            // holds -- a vector read through an array-typed
+            // pointer (`simd.as_array()`) against a byte-array
+            // literal is the array against the bytes, not a
+            // one-element tuple of it.
+            (Value::Enum { variant: 0, fields: x }, Value::Bytes(_))
+            | (Value::Bytes(_), Value::Enum { variant: 0, fields: x })
+                if x.len() == 1
+                    && matches!(x[0], Value::Tuple(_) | Value::Bytes(_)) =>
+            {
+                let field = x[0].clone();
+                let bytes_side = if matches!(&*a, Value::Bytes(_)) {
+                    &*a
+                } else {
+                    &*b
+                };
+                return self.values_equal(frames, &field, bytes_side);
+            }
+            // The same holder against a tuple, when the tuple
+            // cannot be the holder's field list (its length
+            // differs from the field count): it is the held
+            // sequence's own tuple form.
+            (Value::Enum { variant: 0, fields: x }, Value::Tuple(y))
+            | (Value::Tuple(y), Value::Enum { variant: 0, fields: x })
+                if x.len() == 1
+                    && y.len() != 1
+                    && matches!(x[0], Value::Tuple(_) | Value::Bytes(_)) =>
+            {
+                let field = x[0].clone();
+                let tuple_side = if matches!(&*a, Value::Tuple(_)) {
+                    &*a
+                } else {
+                    &*b
+                };
+                return self.values_equal(frames, &field, tuple_side);
             }
             // A single-variant ADT value (a tuple struct) and a
             // plain tuple of the same fields: the constant decoder

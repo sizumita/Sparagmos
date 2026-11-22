@@ -7032,6 +7032,45 @@ impl<'a> Interpreter<'a> {
                 value = inner.clone();
             }
         }
+        // An array place whose value arrives as a one-field
+        // wrapper aggregate: reading a one-field struct over an
+        // array (a `#[repr(simd)]` vector, above all) through a
+        // pointer cast to the array type -- `Simd::into_array`
+        // dereferences a `*const [T; N]` at the vector's own
+        // address -- yields the wrapper's aggregate value,
+        // because the pointer names the wrapper place itself.
+        // The wrapper's only field IS the array at that address,
+        // so the store unwraps it, recursively for nested
+        // wrappers: the aggregate counterpart of the scalar
+        // unwrap above. The field must be exactly the declared
+        // array (a tuple of the declared length, or the byte
+        // form of a `u8` array); any other field shape keeps
+        // the type mismatch.
+        if let Some(Ty::Array(elem, n)) = ty {
+            let mut inner = &value;
+            while let Value::Enum {
+                variant: 0,
+                fields,
+            } = inner
+            {
+                if fields.len() != 1 {
+                    break;
+                }
+                let field = &fields[0];
+                let is_the_array = match field {
+                    Value::Tuple(items) => items.len() as u64 == *n,
+                    Value::Bytes(b) => {
+                        **elem == Ty::Uint(UintTy::U8) && b.len() as u64 == *n
+                    }
+                    _ => false,
+                };
+                if is_the_array {
+                    value = field.clone();
+                    break;
+                }
+                inner = field;
+            }
+        }
         match (ty, &value) {
             (Some(Ty::Bool), Value::Bool(_))
             | (Some(Ty::Unit), Value::Unit)
@@ -7767,6 +7806,15 @@ impl<'a> Interpreter<'a> {
                     "an ADT value holding the payload field",
                     "an ADT value without it",
                 )),
+            },
+            // The storage form of the same payload: a write
+            // through a pointer cast to the payload field's type
+            // (the `Simd::load` copy through a `*mut [T; N]`
+            // into the union's slot) stores the field's own
+            // value where the aggregate would sit. Its bits are
+            // the payload's bits, so it flattens as the payload.
+            (ScalarShape::AdtField { inner, .. }, value) => {
+                self.flatten_scalar(value, inner)
             },
             (
                 ScalarShape::NicheEnum {

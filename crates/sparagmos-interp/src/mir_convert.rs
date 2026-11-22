@@ -1466,15 +1466,36 @@ fn scan_body_aggregates(
                             def,
                             variant_index,
                             generic_args,
+                            field_index,
                             ..
-                        } => Some((*def, generic_args.clone(), *variant_index)),
+                        } => Some((
+                            *def,
+                            generic_args.clone(),
+                            *variant_index,
+                            *field_index,
+                        )),
                         mir::AggregateKind::Coroutine { def, generic_args } => {
-                            Some((*def, generic_args.clone(), 0))
+                            Some((*def, generic_args.clone(), 0, None))
                         }
                         _ => None,
                     };
-                    if let Some((def, generic_args, variant_index)) = aggregate_key {
-                        counts.record(def, generic_args.clone(), variant_index, ops.len());
+                    if let Some((def, generic_args, variant_index, field_index)) =
+                        aggregate_key
+                    {
+                        // A union aggregate lists only its active
+                        // field's operand: the operand belongs to
+                        // that field (not to operand position 0),
+                        // and the operand count says nothing about
+                        // the variant's field count, so no count is
+                        // recorded for it.
+                        if field_index.is_none() {
+                            counts.record(
+                                def,
+                                generic_args.clone(),
+                                variant_index,
+                                ops.len(),
+                            );
+                        }
                         for (i, op) in ops.iter().enumerate() {
                             if let Some(place) = op.place() {
                                 if let Some(ty) = operand_place_ty(body, place) {
@@ -1483,7 +1504,8 @@ fn scan_body_aggregates(
                                             def,
                                             generic_args: generic_args.clone(),
                                             variant: variant_index,
-                                            field: i as u32,
+                                            field: field_index
+                                                .unwrap_or(i as u32),
                                         },
                                         ty,
                                     );
@@ -3999,6 +4021,30 @@ impl<'a> Converter<'a> {
                 Some(S::Array(Box::new(elem), *n))
             }
             mir::Ty::Adt(def, args) => {
+                // A `MaybeUninit<T>` value holds its payload at
+                // field 0 in this model -- the slot its pointer
+                // accesses denote and its constructions store --
+                // not at the declared `value` field's index, so a
+                // transmute through the union flattens and builds
+                // that slot: the payload's own shape behind a
+                // one-field wrapper at index 0. Without a
+                // scalar-shaped payload the union has no shape,
+                // as before.
+                if matches!(
+                    self.def_display_name(def).as_str(),
+                    "std::mem::MaybeUninit" | "core::mem::MaybeUninit"
+                ) {
+                    if args.len() != 1 {
+                        return None;
+                    }
+                    let inner = self.scalar_shape(&args[0], depth + 1)?;
+                    return Some(S::AdtField {
+                        index: 0,
+                        count: 1,
+                        fill: Vec::new(),
+                        inner: Box::new(inner),
+                    });
+                }
                 let shape = self.adt_shapes.get(def)?;
                 if shape.variants.len() != 1 {
                     return self.niche_enum_shape(def, args, shape, depth);

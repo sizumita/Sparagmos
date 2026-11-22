@@ -243,6 +243,35 @@ fn instance_mentions_param(args: &GenericArgs) -> bool {
     false
 }
 
+/// Whether a type mentions an array length the converter
+/// cannot resolve by substitution: a const generic parameter
+/// (or an unevaluated const) stands where a concrete length
+/// belongs (see `Converter::record_instance_shape`).
+fn ty_mentions_param_len(ty: &sm::Ty) -> bool {
+    match ty {
+        sm::Ty::Array(elem, len) => {
+            !matches!(len, sm::ArrayLen::Known(_)) || ty_mentions_param_len(elem)
+        }
+        sm::Ty::Adt(_, args)
+        | sm::Ty::FnDef(_, args)
+        | sm::Ty::Closure(_, args)
+        | sm::Ty::Coroutine(_, args)
+        | sm::Ty::CoroutineWitness(_, args)
+        | sm::Ty::Alias(_, _, args) => args.iter().any(ty_mentions_param_len),
+        sm::Ty::Slice(elem)
+        | sm::Ty::RawPtr(elem, _)
+        | sm::Ty::Ref(_, elem, _)
+        | sm::Ty::Pat(elem, _) => ty_mentions_param_len(elem),
+        sm::Ty::FnPtr(sig) => {
+            sig.inputs.iter().any(ty_mentions_param_len)
+                || ty_mentions_param_len(&sig.output)
+        }
+        sm::Ty::Dynamic(_, self_ty, _) => ty_mentions_param_len(self_ty),
+        sm::Ty::Tuple(ts) => ts.iter().any(ty_mentions_param_len),
+        _ => false,
+    }
+}
+
 fn ty_mentions_alias(ty: &sm::Ty) -> bool {
     match ty {
         sm::Ty::Alias(..) => true,
@@ -3293,14 +3322,20 @@ impl Converter {
     }
 
     /// Record the field types of one monomorphic ADT instance
-    /// whose generic shape mentions a type alias (see
-    /// `sm::AdtInstanceShapes`), once per distinct instance.
+    /// whose generic shape mentions a type alias or a const
+    /// generic array length (see `sm::AdtInstanceShapes`), once
+    /// per distinct instance.
     ///
     /// The generic shape's field types are the definition's own,
     /// so a projection alias among them reaches the interpreter
     /// unresolved — the `NonZero<T>` field is declared as
     /// `<T as ZeroablePrimitive>::NonZeroInner`, and the
-    /// interpreter has no trait solver. The compiler resolves it:
+    /// interpreter has no trait solver — and an array length
+    /// that is a const generic parameter (`[T; N]`, the field
+    /// of every `core::simd` vector) reaches it unresolvable by
+    /// substitution: the converter's instantiated types drop
+    /// const arguments, so no substitution can ever produce the
+    /// concrete length. The compiler resolves both:
     /// `FieldDef::ty_with_args` instantiates a field's declared
     /// type with the instance's arguments and normalizes it in a
     /// monomorphic environment, which is exactly the resolution
@@ -3340,7 +3375,12 @@ impl Converter {
         let Some(shape) = self.adt_shapes.get(id) else {
             return;
         };
-        if !shape.variants.iter().flatten().any(|t| ty_mentions_alias(t)) {
+        if !shape
+            .variants
+            .iter()
+            .flatten()
+            .any(|t| ty_mentions_alias(t) || ty_mentions_param_len(t))
+        {
             return;
         }
         // `ty_with_args` normalizes in a codegen typing
