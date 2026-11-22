@@ -9192,17 +9192,8 @@ impl<'a> Interpreter<'a> {
                     // part uninitialized too, so a later `Drop` of
                     // the whole value does not run the moved-out
                     // part's glue a second time (rustc's drop flags
-                    // track exactly this). A heap allocation's
-                    // storage clears the same way: a boxed
-                    // coroutine's prologue moves its parameters out
-                    // of the environment (the allocation's upvar
-                    // storage), and leaving the stale copies in
-                    // place would drop them a second time when the
-                    // future's own glue walks the environment.
-                    if matches!(
-                        target,
-                        Resolved::Place { .. } | Resolved::Static { .. } | Resolved::Alloc { .. }
-                    ) {
+                    // track exactly this).
+                    if matches!(target, Resolved::Place { .. } | Resolved::Static { .. }) {
                         self.write_resolved(frames, &target, Value::Uninit)?;
                     }
                 }
