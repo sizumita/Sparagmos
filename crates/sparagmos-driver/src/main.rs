@@ -2727,6 +2727,60 @@ fn demand_drop_instances(
                     drop_candidates(&ty, &mut candidates, &mut seen);
                 }
             }
+            // An unsizing cast to a trait object makes the
+            // source pointee droppable through the object's
+            // vtable: the converter builds the pointee's glue
+            // into the cast, which needs the same destructor
+            // bodies a terminator would demand. The pointee of
+            // the cast operand (a reference, raw pointer or box
+            // around it, or the value itself) is a candidate.
+            for bb in &body.blocks {
+                for stmt in &bb.statements {
+                    let rustc_public::mir::StatementKind::Assign(
+                        _,
+                        rustc_public::mir::Rvalue::Cast(
+                            rustc_public::mir::CastKind::PointerCoercion(
+                                rustc_public::mir::PointerCoercion::Unsize,
+                            ),
+                            operand,
+                            target,
+                        ),
+                    ) = &stmt.kind
+                    else {
+                        continue;
+                    };
+                    if !matches!(target.kind(), TyKind::RigidTy(RigidTy::Dynamic(..)))
+                        && !matches!(target.kind(), TyKind::RigidTy(RigidTy::Adt(..)))
+                    {
+                        continue;
+                    }
+                    let (rustc_public::mir::Operand::Copy(place)
+                    | rustc_public::mir::Operand::Move(place)) = operand
+                    else {
+                        continue;
+                    };
+                    let Some(src) = drop_place_ty(body, place) else {
+                        continue;
+                    };
+                    let pointee = match src.kind() {
+                        TyKind::RigidTy(RigidTy::Ref(_, inner, _)) => inner,
+                        TyKind::RigidTy(RigidTy::RawPtr(inner, _)) => inner,
+                        TyKind::RigidTy(RigidTy::Adt(def, ref args))
+                            if def.name() == "std::boxed::Box" =>
+                        {
+                            match args.0.iter().find_map(|a| match a {
+                                GenericArgKind::Type(t) => Some(*t),
+                                _ => None,
+                            }) {
+                                Some(t) => t,
+                                None => continue,
+                            }
+                        }
+                        _ => src,
+                    };
+                    drop_candidates(&pointee, &mut candidates, &mut seen);
+                }
+            }
             // A `std::mem::drop` call runs the dropped type's glue
             // without a `Drop` terminator, and the interpreter
             // accounts for that glue when it converts the call,

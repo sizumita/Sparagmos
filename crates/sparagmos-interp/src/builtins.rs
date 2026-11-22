@@ -183,6 +183,16 @@ pub fn ty_tag(ty: &mir::Ty, names: &HashMap<mir::DefId, String>) -> String {
             }
         }
         T::Param(_, name) => name.clone(),
+        T::Dynamic(bounds, ..) => {
+            // The rendering the driver records in instance
+            // names (`dyn std::marker::Send`): the bounds are
+            // already trait path strings.
+            if bounds.is_empty() {
+                "dyn".to_string()
+            } else {
+                format!("dyn {}", bounds.join(" + "))
+            }
+        }
         _ => ty.kind_name().to_string(),
     }
 }

@@ -6973,13 +6973,83 @@ let inner = match (&src, target) {
                 return Some(key);
             }
         }
-        let mut candidates = self
+        let candidates: Vec<&String> = self
             .bodies
             .keys()
-            .filter(|k| is_dtor_name(k, adt_name));
-        match (candidates.next(), candidates.next()) {
-            (Some(only), None) => Some(only.clone()),
-            _ => None,
+            .filter(|k| is_dtor_name(k, adt_name))
+            .collect();
+        match candidates.len() {
+            1 => Some(candidates[0].clone()),
+            0 => None,
+            _ => {
+                // Several monomorphizations of one generic impl
+                // coexist: prefer the candidate whose rendered
+                // arguments match the requested ones. The
+                // driver's instance names also render lifetime
+                // arguments (as `'_`), which the requested
+                // argument list does not carry, so lifetimes are
+                // skipped on the candidate side.
+                let want: Vec<String> = args
+                    .iter()
+                    .map(|t| crate::builtins::ty_tag(t, self.names))
+                    .collect();
+                let matching: Vec<&&String> = candidates
+                    .iter()
+                    .filter(|k| {
+                        let Some(rest) = k.strip_prefix('<') else {
+                            return false;
+                        };
+                        let Some((self_part, _)) = rest.split_once(" as ") else {
+                            return false;
+                        };
+                        let Some(open) = self_part.find('<') else {
+                            return want.is_empty();
+                        };
+                        let Some(close) = self_part.rfind('>') else {
+                            return false;
+                        };
+                        let inside = &self_part[open + 1..close];
+                        let mut parts: Vec<String> = Vec::new();
+                        let mut depth = 0i32;
+                        let mut current = String::new();
+                        for c in inside.chars() {
+                            match c {
+                                '<' | '(' | '[' => {
+                                    depth += 1;
+                                    current.push(c);
+                                }
+                                '>' | ')' | ']' => {
+                                    depth -= 1;
+                                    current.push(c);
+                                }
+                                ',' if depth == 0 => {
+                                    parts.push(current.trim().to_string());
+                                    current = String::new();
+                                }
+                                _ => current.push(c),
+                            }
+                        }
+                        if !current.trim().is_empty() {
+                            parts.push(current.trim().to_string());
+                        }
+                        let parts: Vec<&String> = parts
+                            .iter()
+                            .filter(|a| {
+                                !a.starts_with('\'')
+                            })
+                            .collect();
+                        parts.len() == want.len()
+                            && parts
+                                .iter()
+                                .zip(want.iter())
+                                .all(|(a, b)| a == &b)
+                    })
+                    .collect();
+                match matching.len() {
+                    1 => Some((*matching[0]).clone()),
+                    _ => None,
+                }
+            }
         }
     }
 

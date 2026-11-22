@@ -15744,3 +15744,44 @@ fn run_mode_drop_impl_with_swapped_generic_params() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "swapped drop ok\n");
 }
+
+const BOX_DYN_SEND_DROP_SRC: &str = r#"
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static DROPPED: AtomicUsize = AtomicUsize::new(0);
+
+struct Marker;
+
+impl Drop for Marker {
+    fn drop(&mut self) {
+        DROPPED.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn main() {
+    {
+        let _: Box<dyn Send> = Box::new(Marker);
+    }
+    assert_eq!(DROPPED.load(Ordering::SeqCst), 1);
+    println!("dyn drop ok");
+}
+"#;
+
+#[test]
+fn run_mode_box_dyn_drop_runs_concrete_dtor() {
+    // Dropping a `Box<dyn Trait>` runs the concrete type's
+    // destructor through the vtable: the unsizing cast's
+    // source pointee is a drop candidate like any dropped
+    // type, so its destructor instance is demanded, and the
+    // glue the cast carries is the concrete type's.
+    let dir = temp_dir("box-dyn-send-drop");
+    let src = fixture(&dir, "box_dyn_send_drop.rs", BOX_DYN_SEND_DROP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Box<dyn Trait> drop must run the concrete destructor; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "dyn drop ok\n");
+}
