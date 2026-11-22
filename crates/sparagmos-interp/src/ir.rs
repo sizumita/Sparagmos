@@ -1545,6 +1545,14 @@ pub struct Program {
     /// formatter when it meets an ADT value.
     pub adt_debug_shapes:
         std::collections::HashMap<String, sparagmos_mir::AdtDebugShape>,
+    /// Debugger shapes of the program's monomorphic closure and
+    /// coroutine instances, keyed by the rendered instance name
+    /// (the type tag the debugger interface sees), as recorded by
+    /// the driver (see `sparagmos_mir::EnvDebugShapes`).
+    /// Consulted by the debugger interface when it prints a
+    /// closure or coroutine value.
+    pub env_debug_shapes:
+        std::collections::HashMap<String, sparagmos_mir::EnvDebugShape>,
     /// Thread-local statics of the program, keyed by the static
     /// key a `ThreadLocalRef` rvalue carries: the initializer
     /// constant each thread's storage for that static is seeded

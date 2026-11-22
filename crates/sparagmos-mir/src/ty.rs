@@ -141,6 +141,63 @@ pub struct AdtDebugVariant {
     pub fields: Vec<AdtDebugField>,
 }
 
+/// The debugger shape of one monomorphic closure or coroutine
+/// instance: the environment type name and field structure the
+/// compiler's debuginfo describes, recorded without any function
+/// body. Keyed like [`AdtDebugShapes`] by the rendered instance
+/// name - the type tag the debugger interface sees.
+///
+/// The driver fills one entry per monomorphic closure/coroutine
+/// instance it converts whose environment fields are all named by
+/// the instance body's debug info (see
+/// `Converter::record_env_shape` in the driver); the debugger
+/// interface consults the table when it prints a closure or
+/// coroutine value. An instance with no entry stays unrenderable
+/// in the debugger, exactly as an ADT with no debug shape stays
+/// unformattable.
+pub type EnvDebugShapes = std::collections::HashMap<String, EnvDebugShape>;
+
+/// Debugger shape of one closure/coroutine instance (see
+/// [`EnvDebugShapes`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct EnvDebugShape {
+    /// The environment type's DWARF name: the definition path of
+    /// the closure/coroutine with its final segment in the
+    /// `{<kind>_env#<disambiguator>}` form the compiler's
+    /// debuginfo uses (e.g. `crate::main::{closure_env#0}`).
+    pub dwarf_name: String,
+    /// The captured variables (upvars) in environment field
+    /// order, with the names the compiler's debuginfo gives them
+    /// (a by-reference capture's name carries its `_ref__`
+    /// prefix). A coroutine's every state renders these after the
+    /// state's own saved fields.
+    pub upvars: Vec<AdtDebugField>,
+    /// A coroutine's states in discriminant order (empty for a
+    /// closure): each state's saved fields, not including the
+    /// upvars (see `upvars`).
+    pub variants: Vec<EnvDebugVariant>,
+    /// Whether the variants' `slots` index the coroutine value's
+    /// flat field vector (the instance has a storage-slot map in
+    /// [`CoroutineLayouts`], and its saved storage lives there).
+    /// When false, a variant's fields are read positionally from
+    /// the value's per-state saved storage instead, and `slots`
+    /// is the identity.
+    pub slotted: bool,
+}
+
+/// One state of an [`EnvDebugShape`]: its printed name (the
+/// DWARF variant name - `Unresumed`, `Returned`, `Panicked`, or
+/// `Suspend<N>`) and its saved fields in layout order.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EnvDebugVariant {
+    pub name: String,
+    pub fields: Vec<AdtDebugField>,
+    /// The storage index of each field, parallel to `fields`:
+    /// the flat field-vector slot when the shape is `slotted`,
+    /// else the field's position in the per-state saved vector.
+    pub slots: Vec<u32>,
+}
+
 /// One field of an [`AdtDebugVariant`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct AdtDebugField {

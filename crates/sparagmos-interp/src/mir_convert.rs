@@ -127,6 +127,11 @@ pub struct MirProgram {
     /// `mir::AdtDebugShapes`). Consulted by the `Debug` formatter
     /// for ADT values.
     pub adt_debug_shapes: mir::AdtDebugShapes,
+    /// Debugger shapes of the program's monomorphic closure and
+    /// coroutine instances, as recorded by the driver (see
+    /// `mir::EnvDebugShapes`). Consulted by the debugger
+    /// interface when it prints a closure or coroutine value.
+    pub env_debug_shapes: mir::EnvDebugShapes,
     /// Thread-local statics of the program, as recorded by the
     /// driver (see `mir::ThreadLocalDef`): each entry's initializer
     /// seeds one thread's storage for that static.
@@ -616,6 +621,7 @@ fn convert_all(
     failures.retain(|key, _| !out.functions.contains_key(key));
     out.adt_layouts = program.adt_layouts.clone();
     out.adt_debug_shapes = program.adt_debug_shapes.clone();
+    out.env_debug_shapes = program.env_debug_shapes.clone();
     out.alloc_shims = conv.alloc_shims.clone();
     // The thread-locals table: each recorded static's initializer,
     // converted with its declared type as context and keyed by the

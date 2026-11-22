@@ -174,6 +174,7 @@ fn build_with_table(
         coroutine_layouts: Default::default(),
         adt_shapes: Default::default(),
         adt_debug_shapes: Default::default(),
+        env_debug_shapes: Default::default(),
         thread_locals: Default::default(),
         adt_instance_shapes: Default::default(),
         adt_niches: Default::default(),
