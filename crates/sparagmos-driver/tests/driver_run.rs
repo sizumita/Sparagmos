@@ -12482,3 +12482,48 @@ fn run_mode_windows_displaced_slice_reads_elements() {
         "[1, 2, 3]\nsum=6\n[2, 3, 4]\nsum=9\n[3, 4, 5]\nsum=12\nok\n"
     );
 }
+
+const UFCS_FALLBACK_SRC: &str = r#"
+use std::iter::FromIterator;
+
+fn collect_into<I: IntoIterator<Item = i32>>(iter: I) -> Vec<i32> {
+    <Vec<i32> as FromIterator<i32>>::from_iter(iter)
+}
+
+fn main() {
+    let v = collect_into(Some(5).into_iter());
+    assert_eq!(v.len(), 1);
+    assert_eq!(v[0], 5);
+    let add: fn(i32, i32) -> i32 = <i32 as std::ops::Add>::add;
+    assert_eq!(add(5, 6), 11);
+    let sub: fn(u32, u32) -> u32 = <u32 as std::ops::Sub>::sub;
+    assert_eq!(sub(10, 4), 6);
+    let neg: fn(i32) -> i32 = <i32 as std::ops::Neg>::neg;
+    assert_eq!(neg(7), -7);
+    let not: fn(bool) -> bool = <bool as std::ops::Not>::not;
+    assert_eq!(not(true), false);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_ufcs_impl_qualified_fallbacks() {
+    // Calls whose names conversion kept in impl-qualified
+    // generic form have no body and no plain trait-path lookup
+    // entry: the run-time name fallback serves the ones whose
+    // semantics are value-level — `FromIterator::from_iter` for
+    // a Vec target (the name carries the target; the iterator
+    // state steps by its shape) and the primitive arithmetic
+    // traits (the name carries the Self type whose width the
+    // operation computes at).
+    let dir = temp_dir("ufcs-fallback");
+    let src = fixture(&dir, "ufcs_fallback.rs", UFCS_FALLBACK_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "impl-qualified UFCS calls must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}

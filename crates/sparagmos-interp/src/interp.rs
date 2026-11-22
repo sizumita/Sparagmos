@@ -490,7 +490,7 @@ pub(crate) fn synthetic_address(value: &Value) -> Option<u128> {
 /// (`<i32 as std::default::Default>::default` gives `i32`):
 /// the text between the leading `<` and the ` as ` separator at
 /// the same bracket depth. `None` for any other name shape.
-fn impl_qualified_self_type(name: &str) -> Option<String> {
+pub(crate) fn impl_qualified_self_type(name: &str) -> Option<String> {
     let inner = name.strip_prefix('<')?;
     let bytes = inner.as_bytes();
     let mut depth = 1usize;
@@ -540,6 +540,61 @@ fn impl_path_trait_method(name: &str) -> Option<crate::builtins::Builtin> {
         let impl_header = format!("::{trait_seg} for ");
         if name.contains(&qualified) || name.contains(&impl_header) {
             return Some(*kind);
+        }
+    }
+    None
+}
+
+/// The primitive arithmetic trait method an impl-qualified
+/// spelling of a call denotes (`<i32 as std::ops::Add>::add`,
+/// `<i32 as std::ops::Add<i32>>::add`): the operator traits on
+/// the primitive types, whose core impls are the operations
+/// themselves. The Self type must be a primitive the value
+/// model computes on — for any other Self type the impl body
+/// is the only honest source, so the name does not qualify.
+/// The plain trait path (`std::ops::Add::add`) does not
+/// qualify either: it names no Self type, and the values carry
+/// no width to compute with. `None` for any other shape.
+fn impl_path_primitive_op(name: &str) -> Option<crate::builtins::Builtin> {
+    use crate::builtins::Builtin;
+    use crate::ir::{BinOp, UnOp};
+    const BINOPS: &[(&str, &str, BinOp)] = &[
+        ("Add", "add", BinOp::Add),
+        ("Sub", "sub", BinOp::Sub),
+        ("Mul", "mul", BinOp::Mul),
+        ("Div", "div", BinOp::Div),
+        ("Rem", "rem", BinOp::Rem),
+        ("BitAnd", "bitand", BinOp::BitAnd),
+        ("BitOr", "bitor", BinOp::BitOr),
+        ("BitXor", "bitxor", BinOp::BitXor),
+        ("Shl", "shl", BinOp::Shl),
+        ("Shr", "shr", BinOp::Shr),
+    ];
+    const UNOPS: &[(&str, &str, UnOp)] = &[
+        ("Neg", "neg", UnOp::Neg),
+        ("Not", "not", UnOp::Not),
+    ];
+    const PRIMITIVE_SELF: &[&str] = &[
+        "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64",
+        "u128", "usize", "f32", "f64", "bool",
+    ];
+    let self_ty = impl_qualified_self_type(name)?;
+    if !PRIMITIVE_SELF.contains(&self_ty.as_str()) {
+        return None;
+    }
+    // The trait segment: the last path segment before the
+    // closing `>::`, generic arguments aside.
+    let close = name.rfind(">::")?;
+    let segment = name[..close].rsplit("::").next()?;
+    let trait_name = segment.split('<').next()?;
+    for (trait_seg, method, op) in BINOPS {
+        if trait_name == *trait_seg && name.ends_with(&format!("::{method}")) {
+            return Some(Builtin::PrimitiveBinOp(*op));
+        }
+    }
+    for (trait_seg, method, op) in UNOPS {
+        if trait_name == *trait_seg && name.ends_with(&format!("::{method}")) {
+            return Some(Builtin::PrimitiveUnOp(*op));
         }
     }
     None
@@ -1793,6 +1848,13 @@ impl<'a> Interpreter<'a> {
         if let Some(kind) = impl_path_trait_method(&canonical) {
             return Some((canonical, kind, Vec::new()));
         }
+        // The same for the primitive arithmetic traits
+        // (`<i32 as std::ops::Add>::add`): their core impls are
+        // the operations themselves at the Self type the name
+        // carries.
+        if let Some(kind) = impl_path_primitive_op(&canonical) {
+            return Some((canonical, kind, Vec::new()));
+        }
         // An impl-qualified `Default::default` name (`<i32 as
         // std::default::Default>::default`). The global lookup
         // deliberately has no suffix rule for this shape —
@@ -1808,6 +1870,57 @@ impl<'a> Interpreter<'a> {
                     crate::builtins::Builtin::DefaultDefault,
                     vec![self_ty],
                 ));
+            }
+        }
+        // The same shape for the specialization entry point
+        // every Vec collect delegates to
+        // (`<std::vec::Vec<T> as std::vec::spec_from_iter_nested::
+        // SpecFromIterNested>::from_iter`): the name carries the
+        // Vec target, and the nested-collect model computes from
+        // the iterator value alone (an empty iterator tag: the
+        // generic transition reads the state value's shape).
+        if canonical.ends_with(">::from_iter")
+            && canonical.contains("::spec_from_iter_nested::SpecFromIterNested")
+        {
+            if let Some(target) = impl_qualified_self_type(&canonical) {
+                if target.starts_with("std::vec::Vec<")
+                    || target.starts_with("alloc::vec::Vec<")
+                {
+                    return Some((
+                        canonical,
+                        crate::builtins::Builtin::VecFromIterNested,
+                        vec![String::new()],
+                    ));
+                }
+            }
+        }
+        // An impl-qualified `FromIterator::from_iter` name
+        // (`<std::vec::Vec<T> as std::iter::FromIterator<T>>::
+        // from_iter`): the caller stayed in generic form, so no
+        // impl instance was ever resolved and the plain trait-path
+        // lookup never saw the name. The name itself carries the
+        // target collection, and the collect model computes from
+        // the iterator value alone (the iterator type tag only
+        // selects special state machines; the generic transition
+        // reads the state value), so serve it with the trait
+        // path's builtin for the targets the model has a shape
+        // for.
+        if canonical.ends_with(">::from_iter")
+            && (canonical.contains("::FromIterator<")
+                || canonical.contains("::FromIterator>::"))
+        {
+            if let Some(target) = impl_qualified_self_type(&canonical) {
+                if target.starts_with("std::vec::Vec<")
+                    || target.starts_with("alloc::vec::Vec<")
+                    || target == "std::string::String"
+                    || target == "alloc::string::String"
+                {
+                    return Some((
+                        canonical,
+                        crate::builtins::Builtin::FromIteratorFromIter,
+                        vec![target, String::new(), String::new()],
+                    ));
+                }
             }
         }
         None

@@ -33,10 +33,11 @@ use sparagmos_mir as mir;
 
 use crate::error::{InterpError, InterpResult};
 use crate::interp::{
-    box_alloc_pointer, channel_handle_id, float_to_int, float_to_uint, rc_handle_id,
-    round_to_f16, synthetic_address, Frame, Interpreter, Resolved,
+    box_alloc_pointer, channel_handle_id, eval_binary, eval_unary, float_to_int,
+    float_to_uint, impl_qualified_self_type, rc_handle_id, round_to_f16,
+    synthetic_address, Frame, Interpreter, Resolved,
 };
-use crate::ir::{Body, Operand};
+use crate::ir::{BinOp, Body, FloatTy, IntTy, Operand, Ty, UintTy, UnOp};
 use crate::value::{FmtArguments, FmtTrait, PanicPayload, RefProj, RefTarget, Value};
 
 // ---------------------------------------------------------------------------
@@ -283,6 +284,14 @@ pub enum Builtin {
     IteratorForEach,
     IteratorCollect,
     FromIteratorFromIter,
+    /// A primitive arithmetic trait method served by the
+    /// run-time name fallback (`<i32 as std::ops::Add>::add` and
+    /// kin): the computation is the interpreter's own binary
+    /// evaluation at the Self type the name carries.
+    PrimitiveBinOp(BinOp),
+    /// The unary counterpart (`<i32 as std::ops::Neg>::neg`,
+    /// `<bool as std::ops::Not>::not`).
+    PrimitiveUnOp(UnOp),
     /// `std::convert::From::from(value)` (modelled conversions only).
     FromFrom,
     /// `std::hint::must_use(value)`: identity.
@@ -4994,6 +5003,18 @@ impl<'a> Interpreter<'a> {
                 let state = vals.into_iter().next().expect("arity checked");
                 self.exec_collect(frames, self_ty, target, state)
             }
+            Builtin::PrimitiveBinOp(op) => {
+                arity(2)?;
+                let mut vals = vals.into_iter();
+                let lhs = vals.next().expect("arity checked");
+                let rhs = vals.next().expect("arity checked");
+                self.exec_primitive_binop(name, op, &lhs, &rhs)
+            }
+            Builtin::PrimitiveUnOp(op) => {
+                arity(1)?;
+                let value = vals.into_iter().next().expect("arity checked");
+                self.exec_primitive_unop(name, op, &value)
+            }
             Builtin::FromFrom | Builtin::IntoInto => {
                 arity(1)?;
                 // `From::from` renders the callee's generic
@@ -9614,6 +9635,42 @@ impl<'a> Interpreter<'a> {
         self_ty: &str,
         state: &Value,
     ) -> InterpResult<(Value, Value)> {
+        if self_ty.is_empty() {
+            // No type tag: the caller stayed in generic form (a
+            // trait method taken as a function value, an
+            // impl-qualified name conversion could not resolve),
+            // so the state value is all there is. The one state
+            // shape whose stepping does not depend on the tag is
+            // the owned-sequence state [items, next index] the
+            // model builds for the array / Vec / Option
+            // into-iterators: all three step it identically in
+            // their tagged arm below, including marking the taken
+            // slot uninitialized. Any other shape falls through to
+            // the tag dispatch, which names it unsupported.
+            if let Ok(fields) = iterator_fields(state, self_ty) {
+                if fields.len() == 2 {
+                    if let (Value::Tuple(items), Value::Uint(idx)) =
+                        (&fields[0], &fields[1])
+                    {
+                        let idx = *idx as usize;
+                        if idx < items.len() {
+                            let item = items[idx].clone();
+                            let mut items = items.clone();
+                            items[idx] = Value::Uninit;
+                            let new_state = rebuild_state(
+                                state,
+                                vec![
+                                    Value::Tuple(items),
+                                    Value::Uint((idx + 1) as u128),
+                                ],
+                            );
+                            return Ok((new_state, some_value(item)));
+                        }
+                        return Ok((state.clone(), none_value()));
+                    }
+                }
+            }
+        }
         if self_ty.starts_with("std::option::Iter<")
             || self_ty.starts_with("std::option::IterMut<")
         {
@@ -10298,6 +10355,63 @@ impl<'a> Interpreter<'a> {
         // calls failed outright even when the default was the
         // whole story.)
         Ok(hint(0, None))
+    }
+
+    /// Execute a primitive arithmetic trait method served by
+    /// the run-time name fallback: the name carries the Self
+    /// type, whose tag selects the operation's width and
+    /// signedness, and the computation is the interpreter's own
+    /// binary evaluation (division by zero panics there, as the
+    /// operation itself requires). In an overflow-checked build
+    /// the core impls panic on overflow — the same panic the
+    /// `Assert` after a checked MIR operation raises — so the
+    /// checked form's flag is consulted here; otherwise the
+    /// wrapped result stands.
+    fn exec_primitive_binop(
+        &self,
+        name: &str,
+        op: BinOp,
+        lhs: &Value,
+        rhs: &Value,
+    ) -> InterpResult<Value> {
+        let ty = primitive_self_ty(name)?;
+        let (result, overflowed) = eval_binary(op, lhs, rhs, Some(&ty), true)?;
+        if overflowed && self.overflow_checks() {
+            return Err(InterpError::panic_str_payload(
+                primitive_overflow_message(op),
+            ));
+        }
+        Ok(result)
+    }
+
+    /// The unary counterpart: `Neg` on the Self type's minimum
+    /// is the one overflowing case (the checked form of the
+    /// unary evaluation wraps it, leaving the panic to the
+    /// following `Assert` in MIR; here the call is the whole
+    /// operation, so the panic is raised directly).
+    fn exec_primitive_unop(
+        &self,
+        name: &str,
+        op: UnOp,
+        value: &Value,
+    ) -> InterpResult<Value> {
+        let ty = primitive_self_ty(name)?;
+        if op == UnOp::Neg && self.overflow_checks() {
+            if let (Value::Int(a), Ty::Int(it)) = (value, &ty) {
+                let bits = it.bits();
+                let min = if bits >= 128 {
+                    i128::MIN
+                } else {
+                    -(1i128 << (bits - 1))
+                };
+                if *a == min {
+                    return Err(InterpError::panic_str_payload(
+                        "attempt to negate with overflow",
+                    ));
+                }
+            }
+        }
+        eval_unary(op, value, Some(&ty))
     }
 
     /// Execute `Iterator::collect` / `FromIterator::from_iter`:
@@ -13112,6 +13226,62 @@ impl<'a> SliceElems<'a> {
                 b.iter().map(|byte| Value::Uint(*byte as u128)).collect()
             }
         }
+    }
+}
+
+/// The IR type of a primitive tag (`i32`, `usize`, `f64`,
+/// `bool`): the Self types the arithmetic trait models compute
+/// on. `None` for anything else.
+fn primitive_ty(tag: &str) -> Option<Ty> {
+    Some(match tag {
+        "i8" => Ty::Int(IntTy::I8),
+        "i16" => Ty::Int(IntTy::I16),
+        "i32" => Ty::Int(IntTy::I32),
+        "i64" => Ty::Int(IntTy::I64),
+        "i128" => Ty::Int(IntTy::I128),
+        "isize" => Ty::Int(IntTy::Isize),
+        "u8" => Ty::Uint(UintTy::U8),
+        "u16" => Ty::Uint(UintTy::U16),
+        "u32" => Ty::Uint(UintTy::U32),
+        "u64" => Ty::Uint(UintTy::U64),
+        "u128" => Ty::Uint(UintTy::U128),
+        "usize" => Ty::Uint(UintTy::Usize),
+        "f32" => Ty::Float(FloatTy::F32),
+        "f64" => Ty::Float(FloatTy::F64),
+        "bool" => Ty::Bool,
+        _ => return None,
+    })
+}
+
+/// The Self type of an impl-qualified arithmetic trait call, as
+/// an IR type: the only width / signedness source the model
+/// has, so a name that does not carry a primitive Self type
+/// does not qualify.
+fn primitive_self_ty(name: &str) -> InterpResult<Ty> {
+    let self_tag = impl_qualified_self_type(name).ok_or_else(|| {
+        unsupported(format!(
+            "arithmetic trait call {name} does not name its Self type"
+        ))
+    })?;
+    primitive_ty(&self_tag).ok_or_else(|| {
+        unsupported(format!(
+            "arithmetic trait call for {self_tag} is not runtime-supported"
+        ))
+    })
+}
+
+/// Core's overflow panic messages for the arithmetic traits,
+/// verbatim (they are the messages the checked impls raise).
+fn primitive_overflow_message(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "attempt to add with overflow",
+        BinOp::Sub => "attempt to subtract with overflow",
+        BinOp::Mul => "attempt to multiply with overflow",
+        BinOp::Div => "attempt to divide with overflow",
+        BinOp::Rem => "attempt to calculate the remainder with overflow",
+        BinOp::Shl => "attempt to shift left with overflow",
+        BinOp::Shr => "attempt to shift right with overflow",
+        _ => "attempt to perform an arithmetic operation with overflow",
     }
 }
 
