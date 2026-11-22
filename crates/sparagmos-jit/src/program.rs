@@ -27,6 +27,7 @@ use std::cell::Cell;
 
 use sparagmos_runtime::error::{clear_last_panic, PanicRecord};
 
+use crate::builtins::{BuiltinCtx, BuiltinTables};
 use crate::compiler::{compile_with_ctx, CompileError, ProgramCtx};
 use crate::ir::Function;
 use crate::memory::JitMemory;
@@ -221,6 +222,14 @@ pub enum StaticBlob {
     /// address words are resolved when the program is laid out,
     /// once every blob's address is known.
     Words(Vec<StaticWord>),
+    /// A byte array's contents in the memory model's own layout:
+    /// one word per byte, element 0 in the last word, so the
+    /// blob's address (the address of element 0's word) reads
+    /// descending exactly like a guest array's. This is the shape
+    /// a byte-array constant needs when its address is consumed
+    /// the way a guest array's address is — by the builtin layer's
+    /// host functions (an fmt template) or by guest index reads.
+    GuestBytes(Vec<u8>),
 }
 
 /// One word of a [`StaticBlob::Words`] image.
@@ -237,6 +246,22 @@ fn blob_len(b: &StaticBlob) -> usize {
     match b {
         StaticBlob::Bytes(bytes) => bytes.len(),
         StaticBlob::Words(words) => words.len() * 8,
+        // One word per byte; an empty blob still gets one word of
+        // storage, so its address is a valid word address.
+        StaticBlob::GuestBytes(bytes) => bytes.len().max(1) * 8,
+    }
+}
+
+/// The address generated code takes for a blob: the storage's
+/// start, except for a [`StaticBlob::GuestBytes`], whose address
+/// is the last word's (element 0 sits there; the earlier words
+/// hold the later elements, descending).
+fn blob_addr(b: &StaticBlob, storage: &[u8]) -> usize {
+    match b {
+        StaticBlob::GuestBytes(bytes) if !bytes.is_empty() => {
+            storage.as_ptr() as usize + (bytes.len() - 1) * 8
+        }
+        _ => storage.as_ptr() as usize,
     }
 }
 
@@ -265,6 +290,11 @@ pub struct CompiledProgram {
     /// (address-stable; see [`StaticBlob`]).
     #[allow(dead_code)]
     statics: Vec<Box<[u8]>>,
+    /// The builtin layer's host-side state (the store and output
+    /// buffers host calls reach); boxed for a stable address,
+    /// which is embedded into the generated code as the host
+    /// calls' first argument.
+    builtin_ctx: Box<BuiltinCtx>,
 }
 
 impl CompiledProgram {
@@ -275,6 +305,12 @@ impl CompiledProgram {
 
     pub fn function_count(&self) -> usize {
         self.offsets.len()
+    }
+
+    /// The guest output the builtin layer has captured so far in
+    /// the current (or last) call: (stdout, stderr).
+    pub fn guest_output(&self) -> (String, String) {
+        self.builtin_ctx.output()
     }
 
     /// Call function `idx` with `args` (exactly the function's
@@ -308,6 +344,15 @@ impl CompiledProgram {
         );
         self.panic_ctx.panicked.set(0);
         self.panic_ctx.message_index.set(0);
+        // The builtin layer starts each Rust-side entry with a
+        // fresh store and empty output buffers, like the panic
+        // context above. Safety: no generated code is running at
+        // entry, so the context is exclusively ours here; during
+        // the call, generated code mutates it through this same
+        // pointer (that is the host-call contract).
+        let builtin_ptr =
+            &*self.builtin_ctx as *const BuiltinCtx as *mut BuiltinCtx;
+        unsafe { (*builtin_ptr).reset() };
         clear_last_panic();
         // The trampoline reads the first six words unconditionally,
         // so hand it a zero-padded buffer of at least six words.
@@ -342,6 +387,27 @@ pub fn compile_program(
     places: Vec<String>,
     statics: Vec<StaticBlob>,
 ) -> Result<CompiledProgram, CompileError> {
+    compile_program_with_builtins(
+        funcs,
+        messages,
+        places,
+        statics,
+        BuiltinTables::default(),
+    )
+}
+
+/// Compile a table of IR functions into one executable program,
+/// with the builtin layer's compile-time tables (see
+/// [`BuiltinTables`]): the front end interns fmt descriptors and
+/// literal strings while lowering, and the generated code reaches
+/// the layer through host calls.
+pub fn compile_program_with_builtins(
+    funcs: &[Function],
+    messages: Vec<String>,
+    places: Vec<String>,
+    statics: Vec<StaticBlob>,
+    tables: BuiltinTables,
+) -> Result<CompiledProgram, CompileError> {
     // Everything the generated code refers to by absolute address is
     // created first and kept in the returned program: the panic
     // context (boxed) and the message strings (each boxed).
@@ -360,10 +426,24 @@ pub fn compile_program(
         .iter()
         .map(|b| vec![0u8; blob_len(b)].into_boxed_slice())
         .collect();
-    let static_addrs: Vec<usize> = storages.iter().map(|b| b.as_ptr() as usize).collect();
+    let static_addrs: Vec<usize> = statics
+        .iter()
+        .zip(storages.iter())
+        .map(|(b, storage)| blob_addr(b, storage))
+        .collect();
     for (blob, storage) in statics.iter().zip(storages.iter_mut()) {
         match blob {
             StaticBlob::Bytes(bytes) => storage.copy_from_slice(bytes),
+            StaticBlob::GuestBytes(bytes) => {
+                // One word per byte, element 0 in the last word:
+                // byte `k` is the low byte of the word `k` slots
+                // below element 0's word (the storage is
+                // zero-initialised, so the rest of each word is
+                // already zero).
+                for (k, byte) in bytes.iter().enumerate() {
+                    storage[(bytes.len() - 1 - k) * 8] = *byte;
+                }
+            }
             StaticBlob::Words(words) => {
                 for (i, w) in words.iter().enumerate() {
                     let value = match w {
@@ -377,6 +457,14 @@ pub fn compile_program(
             }
         }
     }
+    // The builtin context: boxed for a stable address, then wired
+    // to the panic path (its flag words and scratch buffer have
+    // the same layout the dynamic-message formatters use).
+    let mut builtin_ctx = Box::new(BuiltinCtx::new(tables));
+    builtin_ctx.wire_panic(
+        panic_ctx.as_ref() as *const PanicCtx as *mut u64,
+        scratch_buf.as_ptr() as *mut u8,
+    );
     let ctx = ProgramCtx {
         flag_addr: panic_ctx.as_ref() as *const PanicCtx as usize,
         panic_fn: sparagmos_runtime::ffi::sparagmos_panic as usize,
@@ -394,6 +482,8 @@ pub fn compile_program(
             .collect(),
         scratch_buf: scratch_buf.as_ptr() as usize,
         statics: static_addrs,
+        host_fns: crate::builtins::host_fns(),
+        host_ctx: builtin_ctx.as_ref() as *const BuiltinCtx as usize,
     };
 
     // Compile each function separately, then lay the bodies out in
@@ -439,6 +529,7 @@ pub fn compile_program(
         places,
         scratch_buf,
         statics: storages,
+        builtin_ctx,
     })
 }
 

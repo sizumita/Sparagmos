@@ -170,7 +170,8 @@ use crate::ir::{
     FloatKind as IrFloatKind, Function as IrFunction, Instr, IntKind as IrIntKind,
     Operand as IrOperand, Terminator as IrTerminator, UnOp as IrUnOp,
 };
-use crate::program::{compile_program, CompiledProgram, StaticBlob, StaticWord};
+use crate::builtins::{self, Builtin, BuiltinTables, FmtDescriptor, FmtTrait, FmtTy};
+use crate::program::{compile_program_with_builtins, CompiledProgram, StaticBlob, StaticWord};
 
 // ---------------------------------------------------------------------------
 // Public input / output types
@@ -296,10 +297,11 @@ impl JitProgram {
                     .collect()
             })
             .collect();
-        let layouts = AdtLayouts::build(&input.functions, &input.adt_discriminants);
+        let layouts = AdtLayouts::build(&input.functions, &input.adt_discriminants, &input.names);
         let mut messages = MsgTable::default();
         let mut places = MsgTable::default();
         let mut statics = StaticsTable::default();
+        let mut tables = BuiltinTables::default();
         let mut ir_funcs: Vec<IrFunction> = Vec::with_capacity(input.functions.len());
         for f in &input.functions {
             let lower = FnLower::new(
@@ -312,6 +314,7 @@ impl JitProgram {
                 &mut messages,
                 &mut places,
                 &mut statics,
+                &mut tables,
             );
             ir_funcs.push(lower.run()?);
         }
@@ -324,11 +327,12 @@ impl JitProgram {
                 &layouts,
             )?);
         }
-        let inner = compile_program(
+        let inner = compile_program_with_builtins(
             &ir_funcs,
             messages.into_vec(),
             places.into_vec(),
             statics.into_vec(),
+            tables,
         )?;
         Ok(JitProgram {
             inner,
@@ -347,6 +351,13 @@ impl JitProgram {
     /// Names of the program's functions, in input order.
     pub fn function_names(&self) -> Vec<&str> {
         self.names.iter().map(|s| s.as_str()).collect()
+    }
+
+    /// The guest output the builtin layer captured during the
+    /// current (or last) call: (stdout, stderr). A program that
+    /// never prints yields two empty strings.
+    pub fn guest_output(&self) -> (String, String) {
+        self.inner.guest_output()
     }
 
     /// Call the function called `name` with the function's
@@ -955,6 +966,7 @@ impl AdtLayouts {
     fn build(
         functions: &[MirFunctionInput],
         discriminants: &mir::AdtDiscriminants,
+        names: &HashMap<mir::DefId, String>,
     ) -> AdtLayouts {
         let mut scan = AdtScan::default();
         for f in functions {
@@ -990,6 +1002,29 @@ impl AdtLayouts {
                 entries.push((key.clone(), layout));
             }
         }
+        // The builtin-owned ADT layouts: the representation of
+        // these types is defined by the builtin layer (see
+        // `crate::builtins`), not recovered from the program — the
+        // scan cannot see how a `fmt::Arguments` is built, because
+        // building one *is* a builtin call. Every instantiation
+        // the program mentions (in a local declaration, at any
+        // nesting depth) gets the builtin definition, replacing
+        // whatever the scan derived for it.
+        let mut mentioned: Vec<AdtKey> = Vec::new();
+        for f in functions {
+            for decl in &f.body.local_decls {
+                collect_adt_keys(&decl.ty, &mut mentioned);
+            }
+        }
+        for key in mentioned {
+            if let Some(layout) = builtin_adt_layout(&key, names) {
+                if let Some(e) = entries.iter_mut().find(|(k, _)| *k == key) {
+                    e.1 = Ok(layout);
+                } else {
+                    entries.push((key, Ok(layout)));
+                }
+            }
+        }
         AdtLayouts { entries }
     }
 
@@ -1016,6 +1051,125 @@ impl AdtLayouts {
         Ok(self.layout(*def, args)?.total)
     }
 }
+
+/// Collect every ADT instantiation a type mentions, at any
+/// nesting depth (an `Argument` inside an array type, a range
+/// inside a tuple, ...).
+fn collect_adt_keys(ty: &mir::Ty, out: &mut Vec<AdtKey>) {
+    match ty {
+        mir::Ty::Adt(def, args) => {
+            let key = AdtKey {
+                def: *def,
+                generic_args: args.clone(),
+            };
+            if !out.contains(&key) {
+                out.push(key);
+            }
+            for a in args {
+                collect_adt_keys(a, out);
+            }
+        }
+        mir::Ty::Tuple(ts) => {
+            for t in ts {
+                collect_adt_keys(t, out);
+            }
+        }
+        mir::Ty::Array(e, _) | mir::Ty::Slice(e) => collect_adt_keys(e, out),
+        mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _) => collect_adt_keys(inner, out),
+        mir::Ty::Closure(_, args) | mir::Ty::Coroutine(_, args) => {
+            for a in args {
+                collect_adt_keys(a, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The layout the builtin layer defines for one of its own ADT
+/// types, if `key` is one: a `fmt` value is the one-leaf store
+/// handle; a range is its field layout (the shape the
+/// interpreter's iterator state uses). `None` for any other ADT —
+/// and for a range over a non-scalar element type, whose layout
+/// stays the scan's business.
+fn builtin_adt_layout(
+    key: &AdtKey,
+    names: &HashMap<mir::DefId, String>,
+) -> Option<AdtLayout> {
+    let name = names.get(&key.def)?.as_str();
+    match name {
+        "core::fmt::rt::Argument" | "std::fmt::Arguments" => Some(AdtLayout {
+            tag: false,
+            total: 1,
+            variants: vec![Vec::new()],
+        }),
+        "std::option::Option" => {
+            // The return value of the builtin `Iterator::next`:
+            // the standard enum layout (tag leaf, then the
+            // payload), for the scalar payloads `next` produces.
+            // A payload of any other shape stays the scan's
+            // business.
+            let item = key.generic_args.first()?;
+            if !matches!(
+                item,
+                mir::Ty::Int(_)
+                    | mir::Ty::Uint(_)
+                    | mir::Ty::Bool
+                    | mir::Ty::Char
+                    | mir::Ty::Float(_)
+            ) {
+                return None;
+            }
+            Some(AdtLayout {
+                tag: true,
+                total: 2,
+                variants: vec![
+                    Vec::new(),
+                    vec![AdtFieldSlot {
+                        ty: item.clone(),
+                        offset: 1,
+                        width: 1,
+                    }],
+                ],
+            })
+        }
+        "std::ops::Range" | "std::ops::RangeInclusive" => {
+            let idx = key.generic_args.first()?;
+            if !matches!(
+                idx,
+                mir::Ty::Int(_) | mir::Ty::Uint(_) | mir::Ty::Char | mir::Ty::Bool
+            ) {
+                return None;
+            }
+            let mut fields = vec![
+                AdtFieldSlot {
+                    ty: idx.clone(),
+                    offset: 0,
+                    width: 1,
+                },
+                AdtFieldSlot {
+                    ty: idx.clone(),
+                    offset: 1,
+                    width: 1,
+                },
+            ];
+            if name == "std::ops::RangeInclusive" {
+                fields.push(AdtFieldSlot {
+                    ty: mir::Ty::Bool,
+                    offset: 2,
+                    width: 1,
+                });
+            }
+            let total = fields.len();
+            Some(AdtLayout {
+                tag: false,
+                total,
+                variants: vec![fields],
+            })
+        }
+        _ => None,
+    }
+}
+
 
 /// Compute one instantiation's layout, memoising into `entries`
 /// (nested ADT field types recurse into their own layouts;
@@ -1724,6 +1878,10 @@ struct FnLower<'a> {
     places: &'a mut MsgTable,
     /// The program's static blobs, interned like `messages`.
     statics: &'a mut StaticsTable,
+    /// The builtin layer's compile-time tables (fmt descriptors,
+    /// literal strings), interned like `messages` while lowering
+    /// builtin calls.
+    tables: &'a mut BuiltinTables,
     /// The slot holding the hidden sret argument (the address of
     /// the caller's destination storage), for a function whose
     /// return value is wider than two words. `None` otherwise.
@@ -1750,6 +1908,7 @@ impl<'a> FnLower<'a> {
         messages: &'a mut MsgTable,
         places: &'a mut MsgTable,
         statics: &'a mut StaticsTable,
+        tables: &'a mut BuiltinTables,
     ) -> Self {
         Self {
             func,
@@ -1762,6 +1921,7 @@ impl<'a> FnLower<'a> {
             messages,
             places,
             statics,
+            tables,
             sret_slot: None,
             local_slots: Vec::new(),
             next_value: 0,
@@ -2871,6 +3031,9 @@ impl<'a> FnLower<'a> {
                 }
             }
             mir::Operand::Constant(c) => {
+                if let Some(slot) = self.const_data_addr(c, ctx) {
+                    return Ok(slot);
+                }
                 if let mir::ConstKind::Value(v) = &c.literal {
                     if is_pointer_shaped(v) {
                         // A pointer-shaped constant in a single-word
@@ -3041,6 +3204,17 @@ impl<'a> FnLower<'a> {
         ctx: &mir::Ty,
         dst: u32,
     ) -> Result<(), JitError> {
+        // A byte-array constant in reference position: its
+        // address is the statics blob in guest-array layout, on
+        // this path exactly as on the operand paths (see
+        // `byte_array_blob_index`) — a value's address cannot
+        // depend on which lowering path materialised it.
+        if let mir::ConstValue::Bytes(b) = v {
+            if let Some(index) = self.byte_array_blob_index(b, ctx) {
+                self.emit(Instr::StaticAddr { dst, index });
+                return Ok(());
+            }
+        }
         match (v, ctx) {
             (mir::ConstValue::Adt { variant, fields }, mir::Ty::Adt(def, _)) => {
                 let layout = self.adt_layout(ctx)?;
@@ -3923,6 +4097,13 @@ impl<'a> FnLower<'a> {
                     }
                     mir::Operand::Constant(c) => {
                         if dst_count == 1 {
+                            if let Some(slot) = self.const_data_addr(c, &dst_ty) {
+                                self.emit(Instr::Copy {
+                                    dst,
+                                    src: IrOperand::Value(slot),
+                                });
+                                return Ok(());
+                            }
                             match &c.literal {
                                 // A pointer-shaped constant (a
                                 // reference to a scalar constant, a
@@ -5114,6 +5295,702 @@ impl<'a> FnLower<'a> {
         Ok(())
     }
 
+    /// The recorded full name of a definition, for diagnostics
+    /// and the builtin layer's name resolution.
+    fn callee_name(&self, def: mir::DefId) -> String {
+        self.def_names
+            .get(&def)
+            .cloned()
+            .unwrap_or_else(|| format!("{def}"))
+    }
+
+    // ── The builtin layer's call lowering ──────────────────────
+    //
+    // A call whose callee the program does not define is resolved
+    // by name, exactly like the interpreter's builtin resolution
+    // (mirrored in `crate::builtins`). The discipline is the guest
+    // call's: operands are read with the same helpers, the
+    // destination is classified the same way, and an operation
+    // that can fail the guest program is followed by a panic
+    // check, like a guest call.
+
+    /// The destination of a builtin call: its location and word
+    /// count, with scratch words reserved for a memory place (the
+    /// results land there and are stored through by
+    /// [`FnLower::finish_builtin_call`]). A zero-word destination
+    /// gets a fresh dummy slot, like the guest call's.
+    fn builtin_destination(
+        &mut self,
+        destination: &mir::Place,
+    ) -> Result<(PlaceLoc, u32, usize), JitError> {
+        let dst_loc = self.classify_place(destination)?;
+        let (dst, count) = match &dst_loc {
+            PlaceLoc::Mem { count, .. } => {
+                let count = match count {
+                    Some(c) => *c,
+                    None => {
+                        return Err(
+                            self.err("builtin call destination is an unsized place")
+                        )
+                    }
+                };
+                let first = self.fresh();
+                for _ in 1..count.max(1) {
+                    self.fresh();
+                }
+                (first, count)
+            }
+            PlaceLoc::Slots { .. } => {
+                let (dst, count, _) = self.place_leaves(destination)?;
+                if count == 0 {
+                    (self.fresh(), 0)
+                } else {
+                    (dst, count)
+                }
+            }
+        };
+        Ok((dst_loc, dst, count))
+    }
+
+    /// Emit a host call (arguments zero-padded to the host
+    /// convention's five words).
+    fn emit_host_call(
+        &mut self,
+        host: u32,
+        dst: u32,
+        dst2: Option<u32>,
+        mut args: Vec<IrOperand>,
+    ) {
+        while args.len() < 5 {
+            args.push(IrOperand::Const(0));
+        }
+        self.emit(Instr::HostCall {
+            dst,
+            dst2,
+            host,
+            args,
+        });
+    }
+
+    /// Finish a builtin call: the panic check (when the operation
+    /// can fail), the store-through for a memory destination, and
+    /// the terminator seal — the guest call's tail.
+    fn finish_builtin_call(
+        &mut self,
+        dst_loc: &PlaceLoc,
+        dst: u32,
+        target: Option<mir::BasicBlock>,
+        check_panic: bool,
+    ) {
+        if check_panic {
+            self.emit(Instr::CheckPanic);
+        }
+        if let PlaceLoc::Mem { .. } = dst_loc {
+            self.store_mem_from(dst_loc, dst);
+        }
+        match target {
+            Some(t) => self.seal_terminator(IrTerminator::Jump(t.index() as u32)),
+            None => self.seal_terminator(IrTerminator::Unreachable),
+        }
+    }
+
+    /// One word of a place operand (the operand's own type taken
+    /// from its place).
+    fn arg_word(&mut self, arg: &mir::Operand, what: &str) -> Result<u32, JitError> {
+        let ty = self
+            .operand_place_ty(arg)
+            .ok_or_else(|| self.err(&format!("{what} from a constant")))?;
+        self.operand_value(arg, &ty)
+    }
+
+    /// Intern an fmt descriptor for (trait, pointee type),
+    /// validating the type's shape at compile time.
+    fn intern_descriptor(
+        &mut self,
+        trait_: FmtTrait,
+        ty: &mir::Ty,
+    ) -> Result<u32, JitError> {
+        let desc = FmtDescriptor {
+            trait_,
+            ty: self.fmt_ty(trait_, ty)?,
+        };
+        if let Some(i) = self.tables.descriptors.iter().position(|d| *d == desc) {
+            return Ok(i as u32);
+        }
+        let i = self.tables.descriptors.len() as u32;
+        self.tables.descriptors.push(desc);
+        Ok(i)
+    }
+
+    /// The [`FmtTy`] of a pointee type, with the trait's shape
+    /// rules applied (radix traits format integers, exponent
+    /// traits integers and floats; the Pointer trait has no JIT
+    /// builtin, like the interpreter).
+    fn fmt_ty(&self, trait_: FmtTrait, ty: &mir::Ty) -> Result<FmtTy, JitError> {
+        if trait_ == FmtTrait::Pointer {
+            return Err(self.err("fmt argument with the Pointer trait"));
+        }
+        if trait_ == FmtTrait::DebugNoop {
+            return Ok(FmtTy::Ignored);
+        }
+        let v = self.fmt_ty_of(ty)?;
+        let mut core = &v;
+        while let FmtTy::Ref(inner) = core {
+            core = inner;
+        }
+        match trait_ {
+            FmtTrait::Octal
+            | FmtTrait::LowerHex
+            | FmtTrait::UpperHex
+            | FmtTrait::Binary => {
+                if !matches!(core, FmtTy::Int { .. } | FmtTy::Uint { .. }) {
+                    return Err(self.err("fmt radix argument of a non-integer type"));
+                }
+            }
+            FmtTrait::LowerExp | FmtTrait::UpperExp => {
+                if !matches!(
+                    core,
+                    FmtTy::Int { .. } | FmtTy::Uint { .. } | FmtTy::F32 | FmtTy::F64
+                ) {
+                    return Err(self.err("fmt exponent argument of a non-numeric type"));
+                }
+            }
+            _ => {}
+        }
+        Ok(v)
+    }
+
+    /// The runtime shape of a formatted value's type. Only the
+    /// scalar and reference shapes the fmt engine reads are
+    /// admitted; anything else is an explicit unsupported error.
+    fn fmt_ty_of(&self, ty: &mir::Ty) -> Result<FmtTy, JitError> {
+        Ok(match ty {
+            mir::Ty::Int(it) => {
+                let bits = int_bits(*it);
+                if bits > 64 {
+                    return Err(self.err("fmt argument of a 128-bit integer type"));
+                }
+                FmtTy::Int { bits }
+            }
+            mir::Ty::Uint(ut) => {
+                let bits = uint_bits(*ut);
+                if bits > 64 {
+                    return Err(self.err("fmt argument of a 128-bit integer type"));
+                }
+                FmtTy::Uint { bits }
+            }
+            mir::Ty::Bool => FmtTy::Bool,
+            mir::Ty::Char => FmtTy::Char,
+            mir::Ty::Float(mir::FloatTy::F32) => FmtTy::F32,
+            mir::Ty::Float(mir::FloatTy::F64) => FmtTy::F64,
+            mir::Ty::Float(_) => {
+                return Err(self.err("fmt argument of a 16/128-bit float type"))
+            }
+            mir::Ty::Str => FmtTy::Str,
+            mir::Ty::Ref(_, inner, _) => FmtTy::Ref(Box::new(self.fmt_ty_of(inner)?)),
+            mir::Ty::Adt(def, _) => {
+                return Err(self.err(&format!(
+                    "fmt argument of ADT type `{}`",
+                    self.callee_name(*def)
+                )))
+            }
+            other => {
+                return Err(self.err(&format!(
+                    "fmt argument of type {}",
+                    other.kind_name()
+                )))
+            }
+        })
+    }
+
+    /// Intern a literal string for the builtin layer.
+    fn intern_string(&mut self, text: &str) -> u32 {
+        if let Some(i) = self.tables.strings.iter().position(|t| t == text) {
+            return i as u32;
+        }
+        let i = self.tables.strings.len() as u32;
+        self.tables.strings.push(text.to_string());
+        i
+    }
+
+    /// Intern a static byte blob — as a
+    /// [`StaticBlob::GuestBytes`] in the program's statics table,
+    /// the one interning mechanism for static data — and
+    /// materialise its address in a fresh slot.
+    fn intern_data_addr(&mut self, bytes: &[u8]) -> u32 {
+        let index = self.statics.intern(StaticBlob::GuestBytes(bytes.to_vec()));
+        let dst = self.fresh();
+        self.emit(Instr::StaticAddr { dst, index });
+        dst
+    }
+
+    /// The statics index of a byte array's
+    /// [`StaticBlob::GuestBytes`] blob, when `ctx` is a reference
+    /// (or raw pointer) to a byte array of exactly the bytes'
+    /// length; `None` otherwise.
+    fn byte_array_blob_index(&mut self, b: &[u8], ctx: &mir::Ty) -> Option<u32> {
+        let inner = match ctx {
+            mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _) => inner,
+            _ => return None,
+        };
+        let mir::Ty::Array(elem, mir::ArrayLen::Known(n)) = &**inner else {
+            return None;
+        };
+        if !matches!(&**elem, mir::Ty::Uint(mir::UintTy::U8)) {
+            return None;
+        }
+        if *n != b.len() as u64 {
+            return None;
+        }
+        Some(self.statics.intern(StaticBlob::GuestBytes(b.to_vec())))
+    }
+
+    /// A byte-array constant (an fmt pieces template) read as a
+    /// value: its address in the program's statics table, when the
+    /// constant's type in context is a reference to a byte array
+    /// of exactly the constant's length.
+    fn const_data_addr(
+        &mut self,
+        c: &mir::Constant,
+        ctx: &mir::Ty,
+    ) -> Option<u32> {
+        let mir::ConstKind::Value(mir::ConstValue::Bytes(b)) = &c.literal else {
+            return None;
+        };
+        let index = self.byte_array_blob_index(b, ctx)?;
+        let dst = self.fresh();
+        self.emit(Instr::StaticAddr { dst, index });
+        Some(dst)
+    }
+
+    /// Lower a call the program does not define through the
+    /// builtin layer. A name the layer does not know keeps the
+    /// error the JIT has always produced for it.
+    fn lower_builtin_call(
+        &mut self,
+        generic_args: &[mir::Ty],
+        def: mir::DefId,
+        args: &[mir::Operand],
+        destination: &mir::Place,
+        target: Option<mir::BasicBlock>,
+    ) -> Result<(), JitError> {
+        let name = self.callee_name(def);
+        let canonical = builtins::canonical_name(&name);
+        let Some(kind) = builtins::lookup(&canonical) else {
+            return Err(self.err(&format!(
+                "call to function `{name}` which is not part of the program"
+            )));
+        };
+        match kind {
+            Builtin::ArgumentNew(trait_) => {
+                if args.len() != 1 {
+                    return Err(self.err("fmt argument constructor with wrong arity"));
+                }
+                let Some(pointee_ty) = generic_args.first() else {
+                    return Err(
+                        self.err("fmt argument constructor without a pointee type")
+                    );
+                };
+                let desc = self.intern_descriptor(trait_, pointee_ty)?;
+                // The argument is a reference to the pointee: one
+                // word (thin), or two for a `str` pointee (fat).
+                let arg_ty = self.operand_place_ty(&args[0]).ok_or_else(|| {
+                    self.err("fmt argument constructor from a constant")
+                })?;
+                let words = flatten(&arg_ty, &self.func.name, self.layouts)?;
+                let (ptr, second, fat) = match words {
+                    1 => (
+                        self.operand_value(&args[0], &arg_ty)?,
+                        IrOperand::Const(0),
+                        0,
+                    ),
+                    2 => {
+                        if self.tables.descriptors[desc as usize].ty != FmtTy::Str {
+                            return Err(
+                                self.err("fat fmt argument of a non-str type")
+                            );
+                        }
+                        let (a, b) = self.operand_pair(&args[0])?;
+                        (a, IrOperand::Value(b), 1)
+                    }
+                    _ => return Err(self.err("fmt argument of an unsupported shape")),
+                };
+                let (dst_loc, dst, count) = self.builtin_destination(destination)?;
+                if count != 1 {
+                    return Err(self.err("fmt argument destination is not one word"));
+                }
+                self.emit_host_call(
+                    builtins::HOST_ARGUMENT_NEW,
+                    dst,
+                    None,
+                    vec![
+                        IrOperand::Value(ptr),
+                        second,
+                        IrOperand::Const(desc as i64),
+                        IrOperand::Const(fat),
+                    ],
+                );
+                self.finish_builtin_call(&dst_loc, dst, target, true);
+                Ok(())
+            }
+            Builtin::ArgumentFromUsize => {
+                if args.len() != 1 {
+                    return Err(self.err("fmt count constructor with wrong arity"));
+                }
+                let ptr = self.arg_word(&args[0], "fmt count argument")?;
+                let (dst_loc, dst, count) = self.builtin_destination(destination)?;
+                if count != 1 {
+                    return Err(self.err("fmt count destination is not one word"));
+                }
+                self.emit_host_call(
+                    builtins::HOST_ARGUMENT_FROM_USIZE,
+                    dst,
+                    None,
+                    vec![IrOperand::Value(ptr)],
+                );
+                self.finish_builtin_call(&dst_loc, dst, target, true);
+                Ok(())
+            }
+            Builtin::ArgumentsNew => {
+                if args.len() != 2 {
+                    return Err(self.err("fmt::Arguments::new with wrong arity"));
+                }
+                let (tmpl_ptr, tmpl_len) = match &args[0] {
+                    mir::Operand::Constant(c) => match &c.literal {
+                        mir::ConstKind::Value(mir::ConstValue::Bytes(b)) => {
+                            (self.intern_data_addr(b), b.len() as i64)
+                        }
+                        _ => {
+                            return Err(self.err(
+                                "fmt::Arguments::new with a non-literal pieces constant",
+                            ))
+                        }
+                    },
+                    _ => {
+                        let ty = self.operand_place_ty(&args[0]).ok_or_else(|| {
+                            self.err("fmt::Arguments::new pieces operand without a type")
+                        })?;
+                        let n = match &ty {
+                            mir::Ty::Ref(_, inner, _)
+                            | mir::Ty::RawPtr(inner, _) => match &**inner {
+                                mir::Ty::Array(elem, mir::ArrayLen::Known(n))
+                                    if matches!(
+                                        &**elem,
+                                        mir::Ty::Uint(mir::UintTy::U8)
+                                    ) =>
+                                {
+                                    *n
+                                }
+                                _ => {
+                                    return Err(self.err(
+                                        "fmt::Arguments::new pieces is not a byte array",
+                                    ))
+                                }
+                            },
+                            _ => {
+                                return Err(self.err(
+                                    "fmt::Arguments::new pieces is not a reference",
+                                ))
+                            }
+                        };
+                        (self.operand_value(&args[0], &ty)?, n as i64)
+                    }
+                };
+                let arr_ty = self.operand_place_ty(&args[1]).ok_or_else(|| {
+                    self.err("fmt::Arguments::new arguments operand without a type")
+                })?;
+                let argc = match &arr_ty {
+                    mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _) => {
+                        match &**inner {
+                            mir::Ty::Array(_, mir::ArrayLen::Known(n)) => *n,
+                            _ => {
+                                return Err(self.err(
+                                    "fmt::Arguments::new arguments is not an array",
+                                ))
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(self.err(
+                            "fmt::Arguments::new arguments is not a reference",
+                        ))
+                    }
+                };
+                let arr = self.operand_value(&args[1], &arr_ty)?;
+                let (dst_loc, dst, count) = self.builtin_destination(destination)?;
+                if count != 1 {
+                    return Err(self.err("fmt::Arguments destination is not one word"));
+                }
+                self.emit_host_call(
+                    builtins::HOST_ARGUMENTS_NEW,
+                    dst,
+                    None,
+                    vec![
+                        IrOperand::Value(tmpl_ptr),
+                        IrOperand::Const(tmpl_len),
+                        IrOperand::Value(arr),
+                        IrOperand::Const(argc as i64),
+                    ],
+                );
+                self.finish_builtin_call(&dst_loc, dst, target, true);
+                Ok(())
+            }
+            Builtin::ArgumentsFromStr => {
+                if args.len() != 1 {
+                    return Err(self.err("fmt::Arguments::from_str with wrong arity"));
+                }
+                let (dst_loc, dst, count) = self.builtin_destination(destination)?;
+                if count != 1 {
+                    return Err(self.err("fmt::Arguments destination is not one word"));
+                }
+                match &args[0] {
+                    mir::Operand::Constant(c) => match &c.literal {
+                        mir::ConstKind::Value(mir::ConstValue::Str(text)) => {
+                            let index = self.intern_string(text);
+                            self.emit_host_call(
+                                builtins::HOST_ARGUMENTS_FROM_STR_CONST,
+                                dst,
+                                None,
+                                vec![IrOperand::Const(index as i64)],
+                            );
+                        }
+                        _ => {
+                            return Err(self.err(
+                                "fmt::Arguments::from_str with a non-literal string",
+                            ))
+                        }
+                    },
+                    _ => {
+                        let (a, b) = self.operand_pair(&args[0])?;
+                        self.emit_host_call(
+                            builtins::HOST_ARGUMENTS_FROM_STR_RT,
+                            dst,
+                            None,
+                            vec![IrOperand::Value(a), IrOperand::Value(b)],
+                        );
+                    }
+                }
+                self.finish_builtin_call(&dst_loc, dst, target, true);
+                Ok(())
+            }
+            Builtin::Print | Builtin::Eprint => {
+                let to_stderr = matches!(kind, Builtin::Eprint);
+                if args.len() != 1 {
+                    return Err(self.err("print intrinsic with wrong arity"));
+                }
+                let handle = self.arg_word(&args[0], "print argument")?;
+                let (dst_loc, dst, count) = self.builtin_destination(destination)?;
+                if count != 0 {
+                    return Err(self.err("print destination is not unit"));
+                }
+                self.emit_host_call(
+                    builtins::HOST_PRINT,
+                    dst,
+                    None,
+                    vec![
+                        IrOperand::Value(handle),
+                        IrOperand::Const(to_stderr as i64),
+                    ],
+                );
+                self.finish_builtin_call(&dst_loc, dst, target, true);
+                Ok(())
+            }
+            Builtin::RangeInclusiveNew => {
+                if args.len() != 2 {
+                    return Err(self.err("RangeInclusive::new with wrong arity"));
+                }
+                let Some(idx_ty) = generic_args.first() else {
+                    return Err(self.err("RangeInclusive::new without an element type"));
+                };
+                let start = self.operand_value(&args[0], idx_ty)?;
+                let end = self.operand_value(&args[1], idx_ty)?;
+                let (dst_loc, dst, count) = self.builtin_destination(destination)?;
+                if count != 3 {
+                    return Err(
+                        self.err("RangeInclusive destination is not three words")
+                    );
+                }
+                self.emit(Instr::Copy {
+                    dst,
+                    src: IrOperand::Value(start),
+                });
+                self.emit(Instr::Copy {
+                    dst: dst + 1,
+                    src: IrOperand::Value(end),
+                });
+                self.emit(Instr::Copy {
+                    dst: dst + 2,
+                    src: IrOperand::Const(0),
+                });
+                self.finish_builtin_call(&dst_loc, dst, target, false);
+                Ok(())
+            }
+            Builtin::IntoIter => {
+                if args.len() != 1 {
+                    return Err(self.err("IntoIterator::into_iter with wrong arity"));
+                }
+                let Some(iter_ty) = generic_args.first() else {
+                    return Err(self.err("IntoIterator::into_iter without a type"));
+                };
+                // Only the ranges are their own iterator state;
+                // anything else keeps the explicit error (the
+                // interpreter's layer answers it the same way).
+                let mir::Ty::Adt(def, _) = iter_ty else {
+                    return Err(self.err(
+                        "IntoIterator::into_iter for a non-ADT iterable",
+                    ));
+                };
+                let def_name = self.callee_name(*def);
+                if def_name != "std::ops::Range"
+                    && def_name != "std::ops::RangeInclusive"
+                {
+                    return Err(self.err(&format!(
+                        "IntoIterator::into_iter for `{def_name}`"
+                    )));
+                }
+                let count = flatten(iter_ty, &self.func.name, self.layouts)?;
+                let leaves = self.operand_leaves(&args[0], iter_ty, count)?;
+                let (dst_loc, dst, dcount) = self.builtin_destination(destination)?;
+                if dcount != count {
+                    return Err(self.err("into_iter destination has the wrong shape"));
+                }
+                for (k, src) in leaves.iter().enumerate() {
+                    if dst + k as u32 != *src {
+                        self.emit(Instr::Copy {
+                            dst: dst + k as u32,
+                            src: IrOperand::Value(*src),
+                        });
+                    }
+                }
+                self.finish_builtin_call(&dst_loc, dst, target, false);
+                Ok(())
+            }
+            Builtin::IteratorNext => {
+                if args.len() != 1 {
+                    return Err(self.err("Iterator::next with wrong arity"));
+                }
+                let Some(iter_ty) = generic_args.first() else {
+                    return Err(self.err("Iterator::next without an iterator type"));
+                };
+                let mir::Ty::Adt(def, iargs) = iter_ty else {
+                    return Err(self.err("Iterator::next for a non-ADT iterator"));
+                };
+                let def_name = self.callee_name(*def);
+                let inclusive = match def_name.as_str() {
+                    "std::ops::Range" => false,
+                    "std::ops::RangeInclusive" => true,
+                    _ => {
+                        return Err(self.err(&format!(
+                            "Iterator::next for `{def_name}`"
+                        )))
+                    }
+                };
+                let Some(idx_ty) = iargs.first() else {
+                    return Err(self.err("Iterator::next without an element type"));
+                };
+                let signed = match idx_ty {
+                    mir::Ty::Int(_) => 1,
+                    mir::Ty::Uint(_) | mir::Ty::Char => 0,
+                    _ => {
+                        return Err(self.err(
+                            "Iterator::next for a range of non-integer type",
+                        ))
+                    }
+                };
+                let dst_ty = self.place_ty(destination)?;
+                let mir::Ty::Adt(option_def, _) = dst_ty else {
+                    return Err(self.err("Iterator::next destination is not an Option"));
+                };
+                let none = self.discriminant_value(option_def, 0)?;
+                let some = self.discriminant_value(option_def, 1)?;
+                let ptr = self.arg_word(&args[0], "Iterator::next receiver")?;
+                let (dst_loc, dst, count) = self.builtin_destination(destination)?;
+                if count != 2 {
+                    return Err(self.err("Iterator::next destination is not two words"));
+                }
+                let host = if inclusive {
+                    builtins::HOST_NEXT_RANGE_INCLUSIVE
+                } else {
+                    builtins::HOST_NEXT_RANGE
+                };
+                self.emit_host_call(
+                    host,
+                    dst,
+                    Some(dst + 1),
+                    vec![
+                        IrOperand::Value(ptr),
+                        IrOperand::Const(signed),
+                        IrOperand::Const(none),
+                        IrOperand::Const(some),
+                    ],
+                );
+                self.finish_builtin_call(&dst_loc, dst, target, true);
+                Ok(())
+            }
+            Builtin::FloatMethod { f32: is32, op } => {
+                // The registry resolved the method from the
+                // receiver type's name, so the float type is the
+                // one the name carried.
+                let float_ty = mir::Ty::Float(if is32 {
+                    mir::FloatTy::F32
+                } else {
+                    mir::FloatTy::F64
+                });
+                let binary = matches!(
+                    op,
+                    builtins::FloatOp::Powi
+                        | builtins::FloatOp::Powf
+                        | builtins::FloatOp::Min
+                        | builtins::FloatOp::Max
+                );
+                if args.len() != if binary { 2 } else { 1 } {
+                    return Err(self.err("float method with wrong arity"));
+                }
+                let (x, y) = if op == builtins::FloatOp::FromBits {
+                    let bits_ty = if is32 {
+                        mir::Ty::Uint(mir::UintTy::U32)
+                    } else {
+                        mir::Ty::Uint(mir::UintTy::U64)
+                    };
+                    (
+                        self.operand_value(&args[0], &bits_ty)?,
+                        IrOperand::Const(0),
+                    )
+                } else {
+                    let recv = self.operand_value(&args[0], &float_ty)?;
+                    let y = if binary {
+                        let y_ty = if op == builtins::FloatOp::Powi {
+                            mir::Ty::Int(mir::IntTy::I32)
+                        } else {
+                            float_ty.clone()
+                        };
+                        IrOperand::Value(self.operand_value(&args[1], &y_ty)?)
+                    } else {
+                        IrOperand::Const(0)
+                    };
+                    (recv, y)
+                };
+                let (dst_loc, dst, count) = self.builtin_destination(destination)?;
+                if count != 1 {
+                    return Err(self.err("float method destination is not one word"));
+                }
+                self.emit_host_call(
+                    builtins::HOST_FLOAT_METHOD,
+                    dst,
+                    None,
+                    vec![
+                        IrOperand::Value(x),
+                        y,
+                        IrOperand::Const(op.code() as i64),
+                        IrOperand::Const(is32 as i64),
+                    ],
+                );
+                self.finish_builtin_call(&dst_loc, dst, target, true);
+                Ok(())
+            }
+        }
+    }
+
     fn lower_call(
         &mut self,
         func: &mir::Operand,
@@ -5123,26 +6000,28 @@ impl<'a> FnLower<'a> {
     ) -> Result<(), JitError> {
         // Resolve the callee: only direct calls to functions of this
         // program (a FnDef constant naming a known DefId).
-        let def = match func {
+        let callee = match func {
             mir::Operand::Constant(c) => match &c.literal {
-                mir::ConstKind::Ty(mir::Ty::FnDef(def, _)) => Some(*def),
-                mir::ConstKind::Unevaluated { def, .. } => Some(*def),
+                mir::ConstKind::Ty(mir::Ty::FnDef(def, gargs)) => {
+                    Some((*def, gargs.to_vec()))
+                }
+                mir::ConstKind::Unevaluated { def, args: gargs } => {
+                    Some((*def, gargs.to_vec()))
+                }
                 _ => None,
             },
             _ => None,
         };
-        let Some(def) = def else {
+        let Some((def, generic_args)) = callee else {
             return Err(self.err("call through a non-constant function value"));
         };
+        // A callee the program does not define is the builtin
+        // layer's business: the interpreter resolves exactly these
+        // calls by name, and so does the JIT (see
+        // `lower_builtin_call`). A name neither layer knows stays
+        // the same explicit error as before.
         let Some(&callee) = self.def_index.get(&def) else {
-            let name = self
-                .def_names
-                .get(&def)
-                .cloned()
-                .unwrap_or_else(|| format!("{def}"));
-            return Err(self.err(&format!(
-                "call to function `{name}` which is not part of the program"
-            )));
+            return self.lower_builtin_call(&generic_args, def, args, destination, target);
         };
         let callee_tys = &self.param_tys[callee];
         if args.len() != callee_tys.len() {

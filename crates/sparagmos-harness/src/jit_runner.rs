@@ -9,11 +9,12 @@
 //! and calls its `main`. Result mapping follows the harness
 //! contract:
 //!
-//! * the guest terminates → exit 0 with empty stdout (a program
-//!   whose output the JIT path could produce would have to print,
-//!   and every printing path is outside the JIT's supported range,
-//!   so such cases are unsupported at compile time, never faked);
-//! * the guest panics → exit 101, the panic message on stderr;
+//! * the guest terminates → exit 0, with the stdout the guest
+//!   produced (the JIT's builtin layer captures guest output —
+//!   `std::io::_print` and friends are builtins, so printing is
+//!   inside the supported range and the output is real);
+//! * the guest panics → exit 101, the stdout it produced before
+//!   the panic, the panic message on stderr;
 //! * anything the driver, the dump reader, or the JIT cannot handle
 //!   → [`UnsupportedReason::Feature`] with the concrete reason.
 //!
@@ -148,16 +149,22 @@ impl JitRunner {
             }
         })?;
         match prog.call(&entry, &[]) {
-            Ok(_) => Ok(RunResult {
-                stdout: String::new(),
-                stderr: String::new(),
-                exit_code: Some(0),
-            }),
-            Err(JitCallError::Panic(rec)) => Ok(RunResult {
-                stdout: String::new(),
-                stderr: format!("panicked: {}", rec.message),
-                exit_code: Some(101),
-            }),
+            Ok(_) => {
+                let (stdout, stderr) = prog.guest_output();
+                Ok(RunResult {
+                    stdout,
+                    stderr,
+                    exit_code: Some(0),
+                })
+            }
+            Err(JitCallError::Panic(rec)) => {
+                let (stdout, stderr) = prog.guest_output();
+                Ok(RunResult {
+                    stdout,
+                    stderr: format!("{stderr}panicked: {}", rec.message),
+                    exit_code: Some(101),
+                })
+            }
             Err(other) => Err(UnsupportedReason::Feature(other.to_string())),
         }
     }

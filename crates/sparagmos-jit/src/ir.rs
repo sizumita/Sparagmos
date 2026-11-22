@@ -305,6 +305,25 @@ pub enum Instr {
     /// `*ptr = src`: store the full 64-bit word `src` at the address
     /// held in `ptr` (the counterpart of [`Instr::LoadPtr`]).
     StorePtr { ptr: Operand, src: Operand },
+    /// Call host function `host` (an index into the program's host
+    /// function table) with the given argument words: the backend
+    /// passes the program's builtin context pointer as the first
+    /// System V argument and the words in the registers after it,
+    /// so a host call carries at most five words. The result lands
+    /// in `dst`, and its second word — when the host function
+    /// returns a pair — in `dst2` (RAX / RDX, the pair-return
+    /// convention, as for [`Instr::Call`]). This is how the MIR
+    /// front end lowers the builtin layer's calls (see
+    /// [`crate::builtins`]): the semantics live in host functions
+    /// because they are the host-side half of the std model (the
+    /// fmt engine, the primitive float methods). Program compiles
+    /// only, like [`Instr::Call`].
+    HostCall {
+        dst: Value,
+        dst2: Option<Value>,
+        host: u32,
+        args: Vec<Operand>,
+    },
 }
 
 /// How a basic block ends.

@@ -66,6 +66,11 @@ pub enum CompileError {
     /// A static-address instruction referenced a static blob
     /// outside the table.
     BadStaticIndex(u32),
+    /// A host call referenced a function outside the host table.
+    BadHostIndex(u32),
+    /// A host call carried more argument words than the host
+    /// calling convention holds.
+    BadHostArgCount(usize),
     Memory(std::io::Error),
 }
 
@@ -81,6 +86,10 @@ impl std::fmt::Display for CompileError {
             CompileError::BadMessageIndex(i) => write!(f, "panic message index {i} out of range"),
             CompileError::BadPlaceIndex(i) => write!(f, "panic place index {i} out of range"),
             CompileError::BadStaticIndex(i) => write!(f, "static index {i} out of range"),
+            CompileError::BadHostIndex(i) => write!(f, "host function index {i} out of range"),
+            CompileError::BadHostArgCount(n) => {
+                write!(f, "host call with {n} argument words (at most five fit)")
+            }
             CompileError::Memory(e) => write!(f, "jit memory error: {e}"),
         }
     }
@@ -137,6 +146,12 @@ pub struct ProgramCtx {
     /// compiled program, so the addresses stay valid for its whole
     /// lifetime.
     pub statics: Vec<usize>,
+    /// The builtin layer's host functions (see
+    /// [`crate::builtins`]): addresses a host call indexes into.
+    pub host_fns: Vec<usize>,
+    /// Address of the program's builtin context, passed as the
+    /// first argument of every host call.
+    pub host_ctx: usize,
 }
 
 /// Call fixups produced when compiling one function of a program:
@@ -726,6 +741,31 @@ impl<'a> Compiler<'a> {
                 self.load_operand(Reg::Rax, *ptr)?;
                 self.load_operand(Reg::Rcx, *src)?;
                 self.e.mov_store(Reg::Rax, 0, Reg::Rcx);
+            }
+            Instr::HostCall { dst, dst2, host, args } => {
+                let ctx = self
+                    .ctx
+                    .ok_or(CompileError::ProgramOnly("HostCall"))?;
+                let faddr = ctx
+                    .host_fns
+                    .get(*host as usize)
+                    .copied()
+                    .ok_or(CompileError::BadHostIndex(*host))?;
+                if args.len() > 5 {
+                    return Err(CompileError::BadHostArgCount(args.len()));
+                }
+                // The builtin context pointer is the first System V
+                // argument; the call's words follow it.
+                self.e.mov_ri64(Reg::Rdi, ctx.host_ctx as i64);
+                for (i, a) in args.iter().enumerate() {
+                    self.load_operand(Reg::SYSV_ARG_REGS[i + 1], *a)?;
+                }
+                self.e.mov_ri64(Reg::Rax, faddr as i64);
+                self.e.call_r(Reg::Rax);
+                self.store_result(*dst)?;
+                if let Some(dst2) = dst2 {
+                    self.store_reg(*dst2, Reg::Rdx)?;
+                }
             }
             Instr::Call { dst, dst2, func, args } => {
                 if self.ctx.is_none() {

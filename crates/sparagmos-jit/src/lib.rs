@@ -16,6 +16,7 @@
 //! through [`program`]. The single-function IR API ([`compile`],
 //! [`CompiledFunction`]) remains for the backend's own use and tests.
 
+pub mod builtins;
 pub mod compiler;
 pub mod emitter;
 pub mod ir;
@@ -29,6 +30,7 @@ pub use ir::{
     BasicBlock, BinOp, BlockId, FloatBinOp, FloatKind, Function, FunctionBuilder, Instr, IntKind,
     Operand, Terminator, UnOp, Value,
 };
+pub use builtins::{Builtin, BuiltinCtx, BuiltinTables, FloatOp, FmtDescriptor, FmtTrait, FmtTy};
 pub use memory::JitMemory;
 pub use mir_jit::{JitCallError, JitError, JitProgram, MirFunctionInput, MirProgramInput};
 pub use program::CompiledProgram;
