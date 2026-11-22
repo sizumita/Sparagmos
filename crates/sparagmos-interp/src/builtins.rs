@@ -776,6 +776,16 @@ pub enum Builtin {
     /// a wrapping subtract through the pointer, as for
     /// `AtomicXadd`.
     AtomicXsub,
+    /// The atomic fetch family other than add/sub
+    /// (`atomic_and`, `atomic_or`, `atomic_xor`, `atomic_nand`,
+    /// `atomic_max`, `atomic_min`, `atomic_umax`, `atomic_umin`):
+    /// a read-modify-write through the pointer that returns the
+    /// previous value. The interpreter is single-threaded, so the
+    /// update is indivisible by construction; the arithmetic
+    /// wraps at the operand type's width, as the corresponding
+    /// hardware operations do. (`atomic_xadd` / `atomic_xsub`
+    /// keep their own variants above.)
+    AtomicFetchOp(FetchOp),
     /// `std::intrinsics::atomic_fence()`: orders other threads'
     /// accesses; there are none, so it is a no-op.
     AtomicFence,
@@ -864,6 +874,24 @@ pub enum BitOp {
     Cttz,
     BitReverse,
     Bswap,
+}
+
+/// One atomic read-modify-write operation, selected by the
+/// intrinsic's name. `Max` / `Min` compare in the signed domain
+/// and `UMax` / `UMin` in the unsigned domain, matching the
+/// intrinsic names (the operand type agrees in practice).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchOp {
+    Add,
+    Sub,
+    And,
+    Or,
+    Xor,
+    Nand,
+    Max,
+    Min,
+    UMax,
+    UMin,
 }
 
 /// A saturating arithmetic operation, selected by the
@@ -1282,13 +1310,29 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
             Builtin::ManuallyDropNew
         }
         "std::intrinsics::black_box" => Builtin::BlackBox,
-        "std::intrinsics::ctpop" => Builtin::IntBitOp(BitOp::CtPop),
-        "std::intrinsics::ctlz" => Builtin::IntBitOp(BitOp::Ctlz),
-        "std::intrinsics::cttz" => Builtin::IntBitOp(BitOp::Cttz),
-        "std::intrinsics::bitreverse" => Builtin::IntBitOp(BitOp::BitReverse),
-        "std::intrinsics::bswap" => Builtin::IntBitOp(BitOp::Bswap),
-        "std::intrinsics::saturating_add" => Builtin::SaturatingArith(SatOp::Add),
-        "std::intrinsics::saturating_sub" => Builtin::SaturatingArith(SatOp::Sub),
+        "std::intrinsics::ctpop" | "core::intrinsics::ctpop" => Builtin::IntBitOp(BitOp::CtPop),
+        "std::intrinsics::ctlz" | "core::intrinsics::ctlz" => Builtin::IntBitOp(BitOp::Ctlz),
+        "std::intrinsics::cttz" | "core::intrinsics::cttz" => Builtin::IntBitOp(BitOp::Cttz),
+        // The `_nonzero` variants promise a non-zero operand (a
+        // zero operand is undefined behaviour in the guest); on
+        // every input where they are defined they agree with the
+        // plain operation, which is what the model computes.
+        "std::intrinsics::ctlz_nonzero" | "core::intrinsics::ctlz_nonzero" => {
+            Builtin::IntBitOp(BitOp::Ctlz)
+        }
+        "std::intrinsics::cttz_nonzero" | "core::intrinsics::cttz_nonzero" => {
+            Builtin::IntBitOp(BitOp::Cttz)
+        }
+        "std::intrinsics::bitreverse" | "core::intrinsics::bitreverse" => {
+            Builtin::IntBitOp(BitOp::BitReverse)
+        }
+        "std::intrinsics::bswap" | "core::intrinsics::bswap" => Builtin::IntBitOp(BitOp::Bswap),
+        "std::intrinsics::saturating_add" | "core::intrinsics::saturating_add" => {
+            Builtin::SaturatingArith(SatOp::Add)
+        }
+        "std::intrinsics::saturating_sub" | "core::intrinsics::saturating_sub" => {
+            Builtin::SaturatingArith(SatOp::Sub)
+        }
         "std::intrinsics::atomic_load" | "core::intrinsics::atomic_load" => Builtin::AtomicLoad,
         "std::intrinsics::atomic_store" | "core::intrinsics::atomic_store" => {
             Builtin::AtomicStore
@@ -1302,6 +1346,30 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::intrinsics::atomic_xchg" | "core::intrinsics::atomic_xchg" => Builtin::AtomicXchg,
         "std::intrinsics::atomic_xadd" | "core::intrinsics::atomic_xadd" => Builtin::AtomicXadd,
         "std::intrinsics::atomic_xsub" | "core::intrinsics::atomic_xsub" => Builtin::AtomicXsub,
+        "std::intrinsics::atomic_and" | "core::intrinsics::atomic_and" => {
+            Builtin::AtomicFetchOp(FetchOp::And)
+        }
+        "std::intrinsics::atomic_or" | "core::intrinsics::atomic_or" => {
+            Builtin::AtomicFetchOp(FetchOp::Or)
+        }
+        "std::intrinsics::atomic_xor" | "core::intrinsics::atomic_xor" => {
+            Builtin::AtomicFetchOp(FetchOp::Xor)
+        }
+        "std::intrinsics::atomic_nand" | "core::intrinsics::atomic_nand" => {
+            Builtin::AtomicFetchOp(FetchOp::Nand)
+        }
+        "std::intrinsics::atomic_max" | "core::intrinsics::atomic_max" => {
+            Builtin::AtomicFetchOp(FetchOp::Max)
+        }
+        "std::intrinsics::atomic_min" | "core::intrinsics::atomic_min" => {
+            Builtin::AtomicFetchOp(FetchOp::Min)
+        }
+        "std::intrinsics::atomic_umax" | "core::intrinsics::atomic_umax" => {
+            Builtin::AtomicFetchOp(FetchOp::UMax)
+        }
+        "std::intrinsics::atomic_umin" | "core::intrinsics::atomic_umin" => {
+            Builtin::AtomicFetchOp(FetchOp::UMin)
+        }
         "std::intrinsics::atomic_fence" | "core::intrinsics::atomic_fence" => {
             Builtin::AtomicFence
         }
@@ -5119,6 +5187,50 @@ impl<'a> Interpreter<'a> {
                 };
                 let _ = signed;
                 self.atomic_write(frames, &target, new)?;
+                Ok(old)
+            }
+            Builtin::AtomicFetchOp(op) => {
+                arity(2)?;
+                let target = self.deref_value(frames, &vals[0])?;
+                let current = self.read_resolved(frames, &target)?;
+                let old = unwrap_wrapper(&current).clone();
+                let tag = generic_args.first().map(String::as_str).unwrap_or("");
+                let (bits, signed) = int_tag(tag).ok_or_else(|| {
+                    unsupported(format!("{name} on `{tag}` is not runtime-supported"))
+                })?;
+                let mask = bit_mask(bits);
+                let cur = as_u128(&old, name)? & mask;
+                let operand = as_u128(&vals[1], name)? & mask;
+                let new = match op {
+                    FetchOp::Add => cur.wrapping_add(operand) & mask,
+                    FetchOp::Sub => cur.wrapping_sub(operand) & mask,
+                    FetchOp::And => cur & operand,
+                    FetchOp::Or => cur | operand,
+                    FetchOp::Xor => cur ^ operand,
+                    FetchOp::Nand => !(cur & operand) & mask,
+                    FetchOp::Max => {
+                        if sign_extend(cur, bits) >= sign_extend(operand, bits) {
+                            cur
+                        } else {
+                            operand
+                        }
+                    }
+                    FetchOp::Min => {
+                        if sign_extend(cur, bits) <= sign_extend(operand, bits) {
+                            cur
+                        } else {
+                            operand
+                        }
+                    }
+                    FetchOp::UMax => cur.max(operand),
+                    FetchOp::UMin => cur.min(operand),
+                };
+                let new_value = if signed {
+                    Value::Int(sign_extend(new, bits))
+                } else {
+                    Value::Uint(new)
+                };
+                self.atomic_write(frames, &target, new_value)?;
                 Ok(old)
             }
             Builtin::PtrCopy => {
