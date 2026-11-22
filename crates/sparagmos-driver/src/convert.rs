@@ -1614,7 +1614,40 @@ impl Converter {
         if k.ty.is_none() {
             k.ty = self.constant_scalar_ty(c);
         }
+        if k.ty.is_none() {
+            k.ty = self.constant_adt_ty(c, &k);
+        }
         k
+    }
+
+    /// The constant's own type when the constant is a decoded
+    /// ADT value: a `transmute` of such a constant -- the form
+    /// a const-propagated `core` body takes (the folded
+    /// dangling-pointer construction inside
+    /// `Unique::dangling` is a transmute of the folded
+    /// `Alignment` constant) -- is decided from the source
+    /// type, which the value's structure alone does not name
+    /// (a one-field wrapper around a fieldless enum does not
+    /// say which enum). Recorded only for ADT-typed constants
+    /// whose literal decoded to an ADT value; every other
+    /// constant keeps the narrower rules above.
+    fn constant_adt_ty(
+        &mut self,
+        c: &mir::ConstOperand,
+        k: &sm::Constant,
+    ) -> Option<sm::Ty> {
+        if !matches!(
+            k.literal,
+            sm::ConstKind::Value(sm::ConstValue::Adt { .. })
+        ) {
+            return None;
+        }
+        match guarded_ty_kind(&c.const_.ty())? {
+            TyKind::RigidTy(RigidTy::Adt(..)) => {
+                Some(self.ty(&c.const_.ty()))
+            }
+            _ => None,
+        }
     }
 
     /// The constant's own type when it is a plain scalar type:
