@@ -935,6 +935,20 @@ pub enum Builtin {
     /// Collected impl bodies for other types win over this
     /// model through the usual impl-resolution path.
     FromStrParse,
+    /// `std::intrinsics::volatile_load(ptr)`: a plain load;
+    /// volatility only orders accesses, which a sequential
+    /// interpreter already does.
+    VolatileLoad,
+    /// `std::intrinsics::volatile_store(ptr, val)`: a plain
+    /// store, as with `VolatileLoad`.
+    VolatileStore,
+    /// `std::intrinsics::volatile_copy_memory(dst, src, count)`
+    /// and its non-overlapping twin: note the destination
+    /// comes first, unlike the `copy` intrinsics.
+    VolatileCopy,
+    /// `std::intrinsics::volatile_set_memory(dst, val, count)`:
+    /// store `val` at each of `count` consecutive elements.
+    VolatileSet,
 
 }
 
@@ -1640,20 +1654,20 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         // compiler's reordering and caching, neither of which the
         // interpreter performs, and no concurrent observer exists.
         "std::intrinsics::volatile_load" | "core::intrinsics::volatile_load" => {
-            Builtin::AtomicLoad
+            Builtin::VolatileLoad
         }
         "std::intrinsics::unaligned_volatile_load"
         | "core::intrinsics::unaligned_volatile_load" => Builtin::AtomicLoad,
         "std::intrinsics::volatile_store" | "core::intrinsics::volatile_store" => {
-            Builtin::AtomicStore
+            Builtin::VolatileStore
         }
         "std::intrinsics::unaligned_volatile_store"
         | "core::intrinsics::unaligned_volatile_store" => Builtin::AtomicStore,
         "std::intrinsics::volatile_copy_memory" | "core::intrinsics::volatile_copy_memory" => {
-            Builtin::PtrCopy
+            Builtin::VolatileCopy
         }
         "std::intrinsics::volatile_copy_nonoverlapping_memory"
-        | "core::intrinsics::volatile_copy_nonoverlapping_memory" => Builtin::PtrCopy,
+        | "core::intrinsics::volatile_copy_nonoverlapping_memory" => Builtin::VolatileCopy,
         // The `copy` intrinsics in their call form (the statement
         // form of `copy_nonoverlapping` is handled in the
         // interpreter proper): the same element copy as the
@@ -1665,7 +1679,7 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         }
         "std::intrinsics::write_bytes" | "core::intrinsics::write_bytes" => Builtin::WriteBytes,
         "std::intrinsics::volatile_set_memory" | "core::intrinsics::volatile_set_memory" => {
-            Builtin::WriteBytes
+            Builtin::VolatileSet
         }
         "std::intrinsics::arith_offset" | "core::intrinsics::arith_offset" => {
             Builtin::ArithOffset { wrapping: true }
@@ -5772,6 +5786,66 @@ impl<'a> Interpreter<'a> {
                 let tag = generic_args.first().map(String::as_str).unwrap_or("");
                 let text = self.resolve_string(frames, &vals[0])?;
                 return self.exec_from_str(tag, &text, name);
+            }
+            Builtin::VolatileLoad => {
+                arity(1)?;
+                let target = self.deref_value(frames, &vals[0])?;
+                // The pointee value itself, composite types
+                // included: no wrapper unwrapping (that is the
+                // atomic operations' UnsafeCell model, not a
+                // property of a plain load).
+                Ok(self.read_resolved(frames, &target)?)
+            }
+            Builtin::VolatileStore => {
+                arity(2)?;
+                let tag = generic_args.first().map(String::as_str).unwrap_or("");
+                if self.layout_of(tag).is_some_and(|(size, _)| size == 0) {
+                    return Ok(Value::Unit);
+                }
+                let target = self.deref_value(frames, &vals[0])?;
+                self.write_resolved(frames, &target, vals[1].clone())?;
+                Ok(Value::Unit)
+            }
+            Builtin::VolatileSet => {
+                arity(3)?;
+                let tag = generic_args.first().map(String::as_str).unwrap_or("");
+                let (size, _) = self.layout_of(tag).ok_or_else(|| {
+                    unsupported(format!(
+                        "volatile_set_memory element type {tag} has no recorded layout"
+                    ))
+                })?;
+                let count = match &vals[2] {
+                    Value::Uint(n) => *n,
+                    Value::Int(n) if *n >= 0 => *n as u128,
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            "volatile_set_memory count",
+                            "unsigned integer",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                for i in 0..count {
+                    let p = self.ptr_offset_value(
+                        frames,
+                        vals[0].clone(),
+                        i as i128,
+                        Some(size as u64),
+                        true,
+                    )?;
+                    let target = self.deref_value(frames, &p)?;
+                    self.write_resolved(frames, &target, vals[1].clone())?;
+                }
+                Ok(Value::Unit)
+            }
+            Builtin::VolatileCopy => {
+                arity(3)?;
+                let mut vals = vals.into_iter();
+                let dst = vals.next().expect("arity checked");
+                let src_v = vals.next().expect("arity checked");
+                let count = vals.next().expect("arity checked");
+                self.exec_copy_nonoverlapping(frames, src_v, dst, count)?;
+                Ok(Value::Unit)
             }
             Builtin::PtrNull => {
                 arity(0)?;
