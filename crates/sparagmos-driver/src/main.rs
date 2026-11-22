@@ -2488,6 +2488,90 @@ fn drop_place_ty(body: &rustc_public::mir::Body, place: &rustc_public::mir::Plac
     Some(ty)
 }
 
+/// Every place in `body` whose projection contains a
+/// `Downcast` step (see the certification candidate scan in
+/// `certify_drop_trivial` / `certify_drop_no_impl`).
+fn downcast_places(body: &rustc_public::mir::Body) -> Vec<rustc_public::mir::Place> {
+    use rustc_public::mir::{Operand, ProjectionElem, Rvalue, StatementKind, TerminatorKind};
+    fn operand_place<'a>(op: &'a Operand, out: &mut Vec<&'a rustc_public::mir::Place>) {
+        if let Operand::Copy(place) | Operand::Move(place) = op {
+            out.push(place);
+        }
+    }
+    fn rvalue_places<'a>(rv: &'a Rvalue, out: &mut Vec<&'a rustc_public::mir::Place>) {
+        match rv {
+            Rvalue::Use(op, _)
+            | Rvalue::Repeat(op, _)
+            | Rvalue::Cast(_, op, _)
+            | Rvalue::UnaryOp(_, op) => operand_place(op, out),
+            Rvalue::BinaryOp(_, l, r) | Rvalue::CheckedBinaryOp(_, l, r) => {
+                operand_place(l, out);
+                operand_place(r, out);
+            }
+            Rvalue::Aggregate(_, ops) => {
+                for op in ops {
+                    operand_place(op, out);
+                }
+            }
+            Rvalue::Ref(_, _, place)
+            | Rvalue::AddressOf(_, place)
+            | Rvalue::Len(place)
+            | Rvalue::Discriminant(place) => out.push(place),
+            _ => {}
+        }
+    }
+    let mut refs: Vec<&rustc_public::mir::Place> = Vec::new();
+    for bb in &body.blocks {
+        for stmt in &bb.statements {
+            match &stmt.kind {
+                StatementKind::Assign(place, rv) => {
+                    refs.push(place);
+                    rvalue_places(rv, &mut refs);
+                }
+                StatementKind::SetDiscriminant { place, .. } => refs.push(place),
+                StatementKind::Intrinsic(intr) => match intr {
+                    rustc_public::mir::NonDivergingIntrinsic::Assume(op) => {
+                        operand_place(op, &mut refs)
+                    }
+                    rustc_public::mir::NonDivergingIntrinsic::CopyNonOverlapping(cno) => {
+                        operand_place(&cno.src, &mut refs);
+                        operand_place(&cno.dst, &mut refs);
+                        operand_place(&cno.count, &mut refs);
+                    }
+                },
+                _ => {}
+            }
+        }
+        match &bb.terminator.kind {
+            TerminatorKind::Drop { place, .. } => refs.push(place),
+            TerminatorKind::Call {
+                func,
+                args,
+                destination,
+                ..
+            } => {
+                operand_place(func, &mut refs);
+                for arg in args {
+                    operand_place(arg, &mut refs);
+                }
+                refs.push(destination);
+            }
+            TerminatorKind::SwitchInt { discr, .. } => operand_place(discr, &mut refs),
+            TerminatorKind::Assert { cond, .. } => operand_place(cond, &mut refs),
+            _ => {}
+        }
+    }
+    refs.into_iter()
+        .filter(|place| {
+            place
+                .projection
+                .iter()
+                .any(|elem| matches!(elem, ProjectionElem::Downcast(_)))
+        })
+        .cloned()
+        .collect()
+}
+
 /// Whether the type tree of `ty` contains an alias type (an
 /// associated-type projection, an inherent alias or an opaque
 /// type) anywhere the substitution in `drop_candidates` would
@@ -3254,6 +3338,23 @@ fn certify_drop_no_impl(
                 drop_candidates(&ty, &mut candidates, &mut seen);
             }
         }
+        // The types of places projected through a `Downcast`
+        // step: a coroutine's state fields are projected that
+        // way (a `Downcast` + `Field` pair from the state
+        // object), and they are the one class of field type the
+        // candidate walk cannot reach from a dropped type — a
+        // coroutine definition declares no variant fields the
+        // walk could substitute into. The interpreter's glue
+        // builder plans a dropped coroutine state by state from
+        // exactly these projected field types, so a state field
+        // type no scan certifies (a foreign marker type like
+        // `std::future::ResumeTy`, saved in every suspended
+        // state) would refuse the whole drop.
+        for place in downcast_places(body) {
+            if let Some(ty) = drop_place_ty(body, &place) {
+                drop_candidates(&ty, &mut candidates, &mut seen);
+            }
+        }
     }
     let local_crate_name = rustc_public::local_crate().name;
     let mut scans: std::collections::HashMap<String, Option<std::collections::HashSet<String>>> =
@@ -3361,6 +3462,23 @@ fn certify_drop_trivial(
                 GenericArgKind::Type(t) => Some(*t),
                 _ => None,
             }) {
+                drop_candidates(&ty, &mut candidates, &mut seen);
+            }
+        }
+        // The types of places projected through a `Downcast`
+        // step: a coroutine's state fields are projected that
+        // way (a `Downcast` + `Field` pair from the state
+        // object), and they are the one class of field type the
+        // candidate walk cannot reach from a dropped type — a
+        // coroutine definition declares no variant fields the
+        // walk could substitute into. The interpreter's glue
+        // builder plans a dropped coroutine state by state from
+        // exactly these projected field types, so a state field
+        // type no scan certifies (a foreign marker type like
+        // `std::future::ResumeTy`, saved in every suspended
+        // state) would refuse the whole drop.
+        for place in downcast_places(body) {
+            if let Some(ty) = drop_place_ty(body, &place) {
                 drop_candidates(&ty, &mut candidates, &mut seen);
             }
         }

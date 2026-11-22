@@ -7154,8 +7154,24 @@ let inner = match (&src, target) {
     /// keeps it — the surrounding body runs the fields' glue
     /// itself (a compiler `drop_glue` shim does, through its own
     /// `Drop` terminators), which the full-glue conversion would
-    /// run a second time. A call whose glue cannot be built
-    /// falls through to the ordinary call conversion.
+    /// run a second time.
+    ///
+    /// A second exception: a `Box` call that resolves to a
+    /// collected body keeps it. The glue builder plans a box
+    /// structurally (the pointee's plan at field 0), so the glue
+    /// names no destructor step for the box itself — but the
+    /// box's `Drop::drop` body is not the pointee's destruction:
+    /// it only releases the allocation (the compiler destroys
+    /// the pointee before the method runs). An async-destructor
+    /// coroutine calls it as exactly that final shell step,
+    /// after the pointee's async destruction has completed;
+    /// expanding the call to the full glue would destroy the
+    /// pointee a second time. (Modelled containers such as
+    /// `Vec` keep the glue conversion: their collected bodies
+    /// operate on the native buffer representation the value
+    /// model replaces, so the glue is their only faithful
+    /// route.) A call whose glue cannot be built falls through
+    /// to the ordinary call conversion.
     fn drop_call_terminator(
         &self,
         body: &mir::Body,
@@ -7188,6 +7204,17 @@ let inner = match (&src, target) {
                 other => other,
             })
             .or_else(|| raw_generic_args.first().cloned())?;
+        // The `Box` shell-step exception (see the doc comment).
+        if let mir::Ty::Adt(def, _) = &self_ty {
+            let is_box = self
+                .names
+                .get(def)
+                .or_else(|| self.def_names.get(def))
+                .is_some_and(|n| n == "std::boxed::Box");
+            if is_box && self.resolve_body_callee(func).is_some() {
+                return None;
+            }
+        }
         let glue = self.drop_glue(&self_ty)?;
         // When the dropped type's own glue routes its destructor
         // step through a collected destructor body for this very
