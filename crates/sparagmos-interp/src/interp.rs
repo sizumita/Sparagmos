@@ -5432,6 +5432,66 @@ impl<'a> Interpreter<'a> {
     /// array as a whole again. Any other shape passes through
     /// unchanged: a pointer to an element past the first has no
     /// array-base representation in this model.
+    /// The element values of an array value: a tuple of
+    /// elements, or the bytes of a byte array (each byte is its
+    /// own element value). Anything else is not an array value.
+    fn array_elem_values(value: Value) -> InterpResult<Vec<Value>> {
+        match value {
+            Value::Tuple(elems) => Ok(elems),
+            Value::Bytes(bytes) => Ok(bytes
+                .into_iter()
+                .map(|b| Value::Uint(b as u128))
+                .collect()),
+            other => Err(InterpError::type_mismatch(
+                "array element wrapper transmute",
+                "an array value",
+                other.kind_name(),
+            )),
+        }
+    }
+
+    /// `[T; N]` -> `[MaybeUninit<T>; N]` (or the `UnsafeCell`
+    /// twin): each element takes the wrapper's value
+    /// representation, an ADT value holding the payload at
+    /// field 0 -- the shape `MaybeUninit::new` constructions
+    /// are normalized to.
+    fn wrap_array_elems(value: Value) -> InterpResult<Value> {
+        Ok(Value::Tuple(
+            Self::array_elem_values(value)?
+                .into_iter()
+                .map(|elem| Value::Enum {
+                    variant: 0,
+                    fields: vec![elem],
+                })
+                .collect(),
+        ))
+    }
+
+    /// The reverse cast: each element's wrapper representation
+    /// is unwrapped to the payload it holds. The payload sits
+    /// at field 0 in the normalized representation, or in the
+    /// union's value field (index 1) in a raw aggregate that
+    /// still carries the uninitialized field before it.
+    fn unwrap_array_elems(value: Value) -> InterpResult<Value> {
+        let elems = Self::array_elem_values(value)?
+            .into_iter()
+            .map(|elem| match elem {
+                Value::Enum { fields, .. } if fields.len() == 1 => {
+                    Ok(fields.into_iter().next().expect("one field"))
+                }
+                Value::Enum { fields, .. } if fields.len() == 2 => {
+                    Ok(fields.into_iter().nth(1).expect("two fields"))
+                }
+                other => Err(InterpError::type_mismatch(
+                    "array element wrapper transmute",
+                    "a wrapper element value",
+                    other.kind_name(),
+                )),
+            })
+            .collect::<InterpResult<Vec<_>>>()?;
+        Ok(Value::Tuple(elems))
+    }
+
     pub(crate) fn ptr_array_base_value(&self, value: Value) -> InterpResult<Value> {
         match value {
             Value::Ref(RefTarget::Place {
@@ -8247,6 +8307,14 @@ impl<'a> Interpreter<'a> {
             Rvalue::PtrArrayBase(operand) => {
                 let value = self.eval_operand(frames, body, operand)?;
                 self.ptr_array_base_value(value)
+            }
+            Rvalue::WrapArrayElems(operand) => {
+                let value = self.eval_operand(frames, body, operand)?;
+                Self::wrap_array_elems(value)
+            }
+            Rvalue::UnwrapArrayElems(operand) => {
+                let value = self.eval_operand(frames, body, operand)?;
+                Self::unwrap_array_elems(value)
             }
             Rvalue::IntToPtr(operand) => {
                 let value = self.eval_operand(frames, body, operand)?;

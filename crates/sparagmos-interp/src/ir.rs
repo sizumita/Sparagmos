@@ -636,6 +636,20 @@ pub enum Rvalue {
     /// passes through unchanged and reads through it keep failing
     /// with a type mismatch, as they did before.
     PtrArrayBase(Operand),
+    /// An array -> array `Transmute` cast entering an element
+    /// wrapper (`[T; N]` -> `[MaybeUninit<T>; N]`, or the
+    /// `UnsafeCell` twin): each element takes the wrapper's
+    /// value representation -- an ADT value holding the payload
+    /// at field 0, the shape `MaybeUninit::new` constructions
+    /// are normalized to -- so the cast maps that representation
+    /// over the array's elements. (The reverse cast out of the
+    /// wrapper is [`Rvalue::UnwrapArrayElems`].)
+    WrapArrayElems(Operand),
+    /// An array -> array `Transmute` cast leaving an element
+    /// wrapper (`[MaybeUninit<T>; N]` -> `[T; N]`, or the
+    /// `UnsafeCell` twin): each element's wrapper representation
+    /// is unwrapped to the payload it holds.
+    UnwrapArrayElems(Operand),
     /// An integer-to-pointer `Transmute` cast: the mirror image of
     /// [`Rvalue::PtrToInt`]. The integer is an address in the
     /// model's synthetic address space, so the result is an

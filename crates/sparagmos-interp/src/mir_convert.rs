@@ -3276,6 +3276,27 @@ impl<'a> Converter<'a> {
     ///   an inlined `mem::zeroed` performs under optimization,
     ///   and its reverse.
     ///
+    /// * function pointer -> function pointer: the value is
+    ///   the function identity, independent of the signature it
+    ///   is viewed through (an inlined `fmt::Argument`
+    ///   construction rewrites the display fn pointer to the
+    ///   erased unsafe signature the struct stores);
+    /// * array -> array of the same length across an element
+    ///   wrapper boundary (`[T; N]` <-> `[MaybeUninit<T>; N]`,
+    ///   or the `UnsafeCell` twin): the cast maps the wrapper's
+    ///   value representation over the elements
+    ///   ([`ir::Rvalue::WrapArrayElems`] /
+    ///   [`ir::Rvalue::UnwrapArrayElems`]). An inlined by-value
+    ///   array iterator construction performs this cast on the
+    ///   backing array;
+    /// * a byte-string constant in pointer position (it
+    ///   carries no place type) -> a thin pointer or a
+    ///   transparent wrapper over one: const propagation
+    ///   replaced the reference to the static byte string with
+    ///   the allocation's bytes themselves (the `fmt::Arguments`
+    ///   template), so the reference to those bytes is formed
+    ///   first and the pointer decisions above run on it.
+    ///
     /// Every other shape — aggregate <-> aggregate byte
     /// reinterpretation beyond one payload field, fat pointers,
     /// enums with payloads beyond the niche-encoded shape —
@@ -3292,6 +3313,39 @@ impl<'a> Converter<'a> {
             ir::Rvalue::Unsupported("Cast Transmute".to_string())
         }
         let src = self.operand_place_ty(body, operand);
+        // A byte-string constant in pointer position carries no
+        // place type: const propagation replaced the reference to
+        // the static byte string with the allocation's bytes
+        // themselves (the shape an inlined `fmt::Arguments::new`
+        // gives the template field: the bytes transmuted to the
+        // `NonNull<u8>` the struct stores). The pointer the
+        // transmute means is the reference to those bytes, so
+        // when the target is a thin pointer or a transparent
+        // wrapper over one, form that reference and record the
+        // pointer type it denotes; the ordinary pointer decisions
+        // below then run on the wrapped operand.
+        let bytes_ref;
+        let bytes_ty;
+        let (src, v) = match v {
+            ir::Operand::Constant(ir::Constant::Bytes(b))
+                if is_thin_ptr_ty(target)
+                    || matches!(
+                        target,
+                        mir::Ty::Adt(def, args)
+                            if self.wrapper_shape(def, args).is_some()
+                    ) =>
+            {
+                bytes_ref = ir::Operand::Constant(ir::Constant::Ref(
+                    Box::new(ir::Constant::Bytes(b.clone())),
+                ));
+                bytes_ty = Some(mir::Ty::RawPtr(
+                    Box::new(mir::Ty::Uint(mir::UintTy::U8)),
+                    mir::Mutability::Not,
+                ));
+                (bytes_ty, &bytes_ref)
+            }
+            _ => (src, v),
+        };
         // A constant integer operand carries no place type; the
         // converted operand itself is the evidence for its kind.
         let src_is_int = matches!(src, Some(mir::Ty::Int(_) | mir::Ty::Uint(_)))
@@ -3481,6 +3535,18 @@ impl<'a> Converter<'a> {
                             if is_str_or_byte_slice(a) && is_str_or_byte_slice(b)
                     ) =>
             {
+                ir::Rvalue::Use(v.clone())
+            }
+            // Function pointer -> function pointer: the value
+            // is the function identity, which does not depend on
+            // the signature it is viewed through, so the value
+            // carries over unchanged. This is the transmute the
+            // `fmt` argument construction performs when it
+            // rewrites a safe `fn(&T, &mut Formatter)` into the
+            // type-erased `unsafe fn(NonNull<()>, &mut
+            // Formatter)` stored in an `Argument` (inlined into
+            // callers at higher opt levels).
+            (Some(mir::Ty::FnPtr(..)), mir::Ty::FnPtr(..)) => {
                 ir::Rvalue::Use(v.clone())
             }
             // Integer -> thin pointer: an address-only reference.
@@ -3785,6 +3851,22 @@ impl<'a> Converter<'a> {
                     },
                 }
             }
+            // Array -> array of the same length across an
+            // element wrapper boundary: `[T; N]` <->
+            // `[MaybeUninit<T>; N]` (or the `UnsafeCell` twin).
+            // The wrapper is transparent in this model -- its
+            // payload is the element value at field 0 -- so the
+            // array value, which stores its elements one by one,
+            // carries over unchanged; only the element type the
+            // destination declares changes. This is the transmute
+            // an inlined array `IntoIter` construction performs
+            // on the backing array.
+            (Some(s), t) if self.array_elem_wrap_direction(s, t).is_some() => {
+                match self.array_elem_wrap_direction(s, t) {
+                    Some(true) => ir::Rvalue::WrapArrayElems(v.clone()),
+                    _ => ir::Rvalue::UnwrapArrayElems(v.clone()),
+                }
+            }
             // Zero-sized -> zero-sized with a uniquely determined
             // value: the value is the target type's unique value,
             // whatever the source value was (a zero-sized source
@@ -3926,6 +4008,61 @@ impl<'a> Converter<'a> {
                     .map(|c| ir::Operand::Constant(c.clone())),
                 _ => None,
             },
+        }
+    }
+
+    /// The direction in which an array -> array transmute of
+    /// the same length crosses an element wrapper boundary:
+    /// `Some(true)` when the target's element is the source's
+    /// element wrapped in `MaybeUninit` or `UnsafeCell` (the two
+    /// wrappers this model treats as transparent
+    /// payload-at-field-0 carriers, as in
+    /// [`Self::pointee_crosses_cell_wrapper`]), `Some(false)`
+    /// for the reverse crossing, `None` when the pair does not
+    /// cross the boundary.
+    fn array_elem_wrap_direction(
+        &self,
+        src: &mir::Ty,
+        target: &mir::Ty,
+    ) -> Option<bool> {
+        let (
+            mir::Ty::Array(src_elem, src_len),
+            mir::Ty::Array(target_elem, target_len),
+        ) = (src, target)
+        else {
+            return None;
+        };
+        if !matches!(
+            (src_len, target_len),
+            (
+                mir::ArrayLen::Known(a),
+                mir::ArrayLen::Known(b)
+            ) if a == b
+        ) {
+            return None;
+        }
+        let wraps = |wrapper: &mir::Ty, inner: &mir::Ty| -> bool {
+            match wrapper {
+                mir::Ty::Adt(def, args) => {
+                    args.len() == 1
+                        && args[0] == *inner
+                        && matches!(
+                            self.def_display_name(def).as_str(),
+                            "core::mem::MaybeUninit"
+                                | "std::mem::MaybeUninit"
+                                | "core::cell::UnsafeCell"
+                                | "std::cell::UnsafeCell"
+                        )
+                }
+                _ => false,
+            }
+        };
+        if wraps(target_elem, src_elem) {
+            Some(true)
+        } else if wraps(src_elem, target_elem) {
+            Some(false)
+        } else {
+            None
         }
     }
 
