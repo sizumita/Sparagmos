@@ -9897,3 +9897,131 @@ fn main() {
 fn run_mode_drop_phantom_pinned_struct() {
     run_ok("drop-phantom-pinned", DROP_PHANTOM_PINNED_SRC, "pinned 3 dropped\ndone\n");
 }
+
+const ARRAY_AS_PTR_SRC: &str = r#"
+fn main() {
+    let arr = [10i32, 20, 30];
+    let p = arr.as_ptr();
+    let q = &arr as *const i32;
+    let r = &arr[0] as *const i32;
+    unsafe {
+        println!("{}", *p);
+        println!("{}", *q);
+        println!("{}", p == r);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_array_as_ptr_reads_first_element() {
+    // An element pointer (from `as_ptr` or an `as` cast) denotes the
+    // array's first element, not the whole array aggregate: reading
+    // through it used to read the tuple value of the whole array.
+    // It also denotes exactly the place `&arr[0]` denotes.
+    let dir = temp_dir("array-as-ptr");
+    let src = fixture(&dir, "array_as_ptr.rs", ARRAY_AS_PTR_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "10\n10\ntrue\n");
+}
+
+const ELEM_PTR_WRITE_SRC: &str = r#"
+fn main() {
+    let mut a = [10i32, 20, 30];
+    let p = a.as_mut_ptr();
+    unsafe { *p = 99; }
+    let mut b = [10i32, 20, 30];
+    let q = &mut b as *mut i32;
+    unsafe { *q = 7; }
+    println!("{} {}", a[0], b[0]);
+}
+"#;
+
+#[test]
+fn run_mode_element_pointer_writes_hit_first_element() {
+    // Writing through an element pointer writes the first element;
+    // it used to fail as an assignment of a scalar to the whole
+    // array place.
+    let dir = temp_dir("elem-ptr-write");
+    let src = fixture(&dir, "elem_ptr_write.rs", ELEM_PTR_WRITE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "99 7\n");
+}
+
+const STR_AS_PTR_SRC: &str = r#"
+fn main() {
+    let s = "hello";
+    let owned = String::from("hi");
+    let bytes = b"abc";
+    unsafe {
+        println!("{}", *s.as_ptr());
+        println!("{}", *owned.as_ptr());
+        println!("{}", *bytes.as_ptr());
+    }
+}
+"#;
+
+#[test]
+fn run_mode_str_as_ptr_reads_first_byte() {
+    // `str::as_ptr` (and `String::as_ptr` through it) denotes the
+    // first byte; it used to read the whole string value, which the
+    // formatter then printed verbatim - a silent wrong result.
+    let dir = temp_dir("str-as-ptr");
+    let src = fixture(&dir, "str_as_ptr.rs", STR_AS_PTR_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "104\n104\n97\n");
+}
+
+const ELEM_PTR_SHAPES_SRC: &str = r#"
+struct S { a: [i32; 3] }
+static ARR: [i32; 3] = [1, 2, 3];
+fn main() {
+    let s = S { a: [10, 20, 30] };
+    let arr = [40i32, 50, 60];
+    let slice: &[i32] = &arr[..];
+    unsafe {
+        println!("{}", *s.a.as_ptr());
+        println!("{}", *ARR.as_ptr());
+        println!("{}", *slice.as_ptr());
+    }
+}
+"#;
+
+#[test]
+fn run_mode_element_pointers_for_field_static_and_slice() {
+    // The first-element retargeting composes with the projection
+    // the base pointer already carries (a struct field), with
+    // statics, and with slices (whose pointer rides a fat base).
+    let dir = temp_dir("elem-ptr-shapes");
+    let src = fixture(&dir, "elem_ptr_shapes.rs", ELEM_PTR_SHAPES_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "10\n1\n40\n");
+}
+
+const ELEM_PTR_ROUNDTRIP_SRC: &str = r#"
+fn main() {
+    let arr = [10i32, 20, 30];
+    let p = arr.as_ptr().cast::<[i32; 3]>();
+    unsafe { println!("{}", (*p)[2]); }
+}
+"#;
+
+#[test]
+fn run_mode_element_pointer_cast_back_to_array() {
+    // Casting an element pointer back to a whole-array pointer
+    // denotes the array again (the index-0 projection the
+    // first-element cast added is removed).
+    let dir = temp_dir("elem-ptr-roundtrip");
+    let src = fixture(&dir, "elem_ptr_roundtrip.rs", ELEM_PTR_ROUNDTRIP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "30\n");
+}
