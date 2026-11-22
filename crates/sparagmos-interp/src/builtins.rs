@@ -14753,7 +14753,10 @@ impl<'a> Interpreter<'a> {
             return self.format_debug_seq(frames, &pointee, options, indent, '[', ']', elem);
         }
         if let Value::DynRef {
-            base, concrete, ..
+            base,
+            concrete,
+            traits,
+            ..
         } = value
         {
             // A trait object's `Debug` is its concrete type's
@@ -14763,6 +14766,23 @@ impl<'a> Interpreter<'a> {
             // are handwritten bodies, not the derived shape this
             // formatter models.
             if trait_ == FmtTrait::Debug {
+                // Core's `Debug` impls for the `dyn Any` family
+                // ignore the concrete value and print `Any { .. }`:
+                // the vtable entry for such an object is that impl,
+                // not the concrete type's `Debug`.
+                let is_any = traits.iter().any(|t| t.trim().ends_with("::any::Any"));
+                let only_auto = traits.iter().all(|t| {
+                    let t = t.trim();
+                    t.ends_with("::any::Any")
+                        || t.ends_with("::marker::Send")
+                        || t.ends_with("::marker::Sync")
+                        || t.ends_with("::marker::Unpin")
+                        || t.ends_with("::panic::UnwindSafe")
+                        || t.ends_with("::panic::RefUnwindSafe")
+                });
+                if is_any && only_auto {
+                    return Ok(pad_width("Any { .. }", options));
+                }
                 let pointee = self.resolve_value(frames, base)?;
                 // The base is the data pointer in the shape the
                 // sized value had: a `Box<dyn Trait>` base is the
@@ -15075,6 +15095,141 @@ impl<'a> Interpreter<'a> {
                 "an ADT value whose fields match the recorded shape",
                 "an ADT value with a different field count",
             ));
+        }
+        // Three `core` wrapper types whose handwritten `Debug`
+        // impls are a fixed function of the stored value, produced
+        // here like the `ops::Range` family below. The match is on
+        // the tag's head (the path before any generic arguments),
+        // so a user type that merely shares the base name keeps
+        // its derived shape.
+        let head = tag.split('<').next().unwrap_or(tag).trim();
+        match head {
+            "core::cell::UnsafeCell" | "std::cell::UnsafeCell" => {
+                // The impl is non-exhaustive by design.
+                return Ok(pad_width("UnsafeCell { .. }", options));
+            }
+            "core::marker::PhantomData" | "std::marker::PhantomData" => {
+                // The impl prints the type parameter it carries.
+                let arg = first_generic_arg(tag).unwrap_or("");
+                return Ok(pad_width(&format!("PhantomData<{arg}>"), options));
+            }
+            "core::cell::RefCell" | "std::cell::RefCell" => {
+                // The impl shows only the `value` field, as the
+                // inner value behind its `UnsafeCell`, or as
+                // `<borrowed>` while a borrow is outstanding (the
+                // `borrow` field's flag is nonzero then). The
+                // fields are located by their recorded names.
+                let named_field = |want: &str| -> Option<Value> {
+                    variant_shape
+                        .fields
+                        .iter()
+                        .position(|f| f.name.as_deref() == Some(want))
+                        .and_then(|i| fields.get(i).cloned())
+                };
+                let unwrap_one = |v: &Value| -> Option<Value> {
+                    match v {
+                        Value::Enum { fields: inner, .. } if inner.len() == 1 => {
+                            Some(inner[0].clone())
+                        }
+                        Value::Tuple(inner) if inner.len() == 1 => Some(inner[0].clone()),
+                        _ => None,
+                    }
+                };
+                let borrowed = named_field("borrow")
+                    .and_then(|b| unwrap_one(&b))
+                    .and_then(|b| unwrap_one(&b))
+                    .map(|flag| !matches!(flag, Value::Int(0) | Value::Uint(0)));
+                if let (Some(borrowed), Some(stored)) = (borrowed, named_field("value")) {
+                    let stored = if matches!(stored, Value::Ref(_)) {
+                        self.resolve_value(frames, &stored)?
+                    } else {
+                        stored
+                    };
+                    if borrowed {
+                        return Ok(pad_width("RefCell { value: <borrowed> }", options));
+                    }
+                    if let Some(inner) = unwrap_one(&stored) {
+                        let elem = first_generic_arg(tag).unwrap_or("");
+                        if options.alternate() {
+                            let inner_indent = indent + 4;
+                            let text = self.format_value(
+                                frames,
+                                &inner,
+                                FmtTrait::Debug,
+                                elem,
+                                options,
+                                inner_indent,
+                            )?;
+                            return Ok(format!(
+                                "RefCell {{\n{}value: {},\n{}}}",
+                                " ".repeat(inner_indent),
+                                text,
+                                " ".repeat(indent)
+                            ));
+                        }
+                        let text = self.format_value(
+                            frames,
+                            &inner,
+                            FmtTrait::Debug,
+                            elem,
+                            &FmtOptions::new(),
+                            indent,
+                        )?;
+                        return Ok(pad_width(
+                            &format!("RefCell {{ value: {text} }}"),
+                            options,
+                        ));
+                    }
+                }
+            }
+            "core::cell::Cell" | "std::cell::Cell" if fields.len() == 1 => {
+                // The impl shows the inner value as the `value`
+                // field, not the `UnsafeCell` wrapper the value is
+                // stored in: unwrap one layer and format the inner
+                // value with the wrapper's own type argument.
+                let stored = if matches!(fields[0], Value::Ref(_)) {
+                    self.resolve_value(frames, &fields[0])?
+                } else {
+                    fields[0].clone()
+                };
+                let inner = match &stored {
+                    Value::Enum { fields: inner, .. } if inner.len() == 1 => {
+                        Some(inner[0].clone())
+                    }
+                    Value::Tuple(inner) if inner.len() == 1 => Some(inner[0].clone()),
+                    _ => None,
+                };
+                if let Some(inner) = inner {
+                    let elem = first_generic_arg(tag).unwrap_or("");
+                    if options.alternate() {
+                        let inner_indent = indent + 4;
+                        let text = self.format_value(
+                            frames,
+                            &inner,
+                            FmtTrait::Debug,
+                            elem,
+                            options,
+                            inner_indent,
+                        )?;
+                        return Ok(format!(
+                            "Cell {{\n{}value: {},\n{}}}",
+                            " ".repeat(inner_indent),
+                            text,
+                            " ".repeat(indent)
+                        ));
+                    }
+                    let text = self.format_value(
+                        frames,
+                        &inner,
+                        FmtTrait::Debug,
+                        elem,
+                        &FmtOptions::new(),
+                        indent,
+                    )?;
+                    return Ok(pad_width(&format!("Cell {{ value: {text} }}"), options));
+                }
+            }
+            _ => {}
         }
         // The `ops::Range` family's `Debug` impls are handwritten
         // in core, but their output is a fixed function of the
