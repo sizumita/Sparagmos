@@ -15517,3 +15517,33 @@ fn run_mode_unaligned_volatile_access_composes_bytes() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
 }
+
+const CONST_CAST_SRC: &str = r#"
+fn main() {
+    // A constant operand of a cast is read under its own
+    // (source) type: u128::MAX is not -1i128.
+    assert!(u128::MAX as f32 == f32::INFINITY);
+    assert!(u64::MAX as f32 == 18446744073709551616.0);
+    assert!((-1i8) as u32 == u32::MAX);
+    assert!((-1i128) as f64 == -1.0);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_constant_cast_operand_keeps_source_type() {
+    // The operand of a cast on a constant must be converted
+    // under the constant's own type, not the cast destination's:
+    // typing it by the destination read `u128::MAX` as a signed
+    // value and the int-to-float cast produced -1.0.
+    let dir = temp_dir("const-cast");
+    let src = fixture(&dir, "const_cast.rs", CONST_CAST_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "constant cast operands keep their source type; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}

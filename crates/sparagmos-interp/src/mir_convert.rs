@@ -5601,9 +5601,20 @@ let inner = match (&src, target) {
                 }
             }
             R::Cast(kind, operand, target) => {
-                let ctx = self
-                    .operand_place_ty(body, operand)
-                    .or_else(|| dest_ty.cloned());
+                // The operand is read under its own (source) type,
+                // never the cast's destination type: a constant
+                // operand typed by the destination loses its
+                // signedness (an `u128::MAX` operand of an
+                // int-to-float cast was read as `-1i128` through
+                // the float destination, which names neither).
+                // `convert_operand` fills a constant's context
+                // from the constant's own recorded type.
+                let ctx = self.operand_place_ty(body, operand).or_else(|| {
+                    match operand {
+                        mir::Operand::Constant(_) => None,
+                        _ => dest_ty.cloned(),
+                    }
+                });
                 let v = self.convert_operand(body, operand, ctx.as_ref())?;
                 match kind {
                     mir::CastKind::IntToInt
