@@ -8767,3 +8767,87 @@ fn run_mode_thread_local_initializer_runs_once_per_thread() {
         "a 5\nb 5\nt 5\nt2 5\nruns 2\n"
     );
 }
+
+const MANUALLY_DROP_DEREF_SRC: &str = r#"
+use std::mem::ManuallyDrop;
+
+struct Counter { n: u32 }
+impl Counter {
+    fn bump(&mut self) { self.n += 1; }
+    fn get(&self) -> u32 { self.n }
+}
+
+fn main() {
+    let mut md = ManuallyDrop::new(Counter { n: 41 });
+    assert_eq!(md.get(), 41);
+    assert_eq!(md.n, 41);
+    md.bump();
+    assert_eq!(md.get(), 42);
+    *md = Counter { n: 7 };
+    assert_eq!(md.n, 7);
+    let mut v = ManuallyDrop::new(vec![1, 2, 3]);
+    v.push(4);
+    assert_eq!(v.len(), 4);
+    assert_eq!(v[3], 4);
+    let s = ManuallyDrop::new(String::from("hello"));
+    assert_eq!(s.len(), 5);
+    assert_eq!(&*s, "hello");
+    let x = 2u8;
+    let md2 = ManuallyDrop::new(&x);
+    assert_eq!(**md2, 2);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_manually_drop_deref_and_deref_mut() {
+    // `ManuallyDrop<T>` derefs to its held value: method calls and
+    // field reads go through `Deref`, mutations through `DerefMut`
+    // land in the wrapper's own storage (a resolved-value snapshot
+    // would silently drop them), and assignment through the
+    // dereference replaces the held value.
+    let dir = temp_dir("manually-drop-deref");
+    let src = fixture(&dir, "manually_drop_deref.rs", MANUALLY_DROP_DEREF_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "ok\n", "stdout={stdout}");
+}
+
+const MANUALLY_DROP_UNION_SRC: &str = r#"
+use std::mem::ManuallyDrop;
+
+union MaybeItem<T: Iterator> {
+    elem: ManuallyDrop<T::Item>,
+    none: (),
+}
+
+fn main() {
+    let v: Vec<u8> = vec![1, 2, 3];
+    let mut i = v.iter();
+    i.next();
+    let mi = MaybeItem::<std::slice::Iter<'_, u8>> {
+        elem: ManuallyDrop::new(i.next().unwrap()),
+    };
+    unsafe {
+        assert_eq!(**mi.elem, 2);
+    }
+    println!("union ok");
+}
+"#;
+
+#[test]
+fn run_mode_manually_drop_in_union_field_deref() {
+    // The union-generic shape: a `ManuallyDrop` read out of a
+    // union field is dereferenced twice (`**mi.elem`) — the first
+    // star is `ManuallyDrop`'s own `Deref`, the second the
+    // reference it holds.
+    let dir = temp_dir("manually-drop-union");
+    let src = fixture(&dir, "manually_drop_union.rs", MANUALLY_DROP_UNION_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "union ok\n", "stdout={stdout}");
+}
