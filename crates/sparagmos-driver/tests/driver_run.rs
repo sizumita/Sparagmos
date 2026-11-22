@@ -9374,3 +9374,188 @@ fn run_mode_iter_mut() {
         "writes through the yielded references land in the container"
     );
 }
+
+// ----- pointer offset arithmetic (Lane DV) --------------------------------
+// `BinaryOp::Offset` (what `ptr::add` / `ptr::offset` compute in
+// MIR) and the `arith_offset` intrinsic (what the `wrapping_*`
+// family lowers to) move a pointer by whole elements. Element
+// positions of an array place are represented exactly; positions
+// between elements are carried as byte displacements, through
+// which reads and writes stay explicit unsupported errors.
+
+const PTR_ADD_SRC: &str = r#"
+fn main() {
+    let mut arr = [10i32, 20, 30, 40];
+    unsafe {
+        let p = arr.as_mut_ptr();
+        *p.add(2) = 99;
+        let q = p.add(1);
+        assert_eq!(*q, 20);
+        assert_eq!(*p.add(2), 99);
+    }
+    assert_eq!(arr[2], 99);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_ptr_add_reads_and_writes_elements() {
+    let dir = temp_dir("ptr-add");
+    let src = fixture(&dir, "ptr_add.rs", PTR_ADD_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "ptr::add element access must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+const PTR_OFFSET_SRC: &str = r#"
+fn main() {
+    let arr = [10i32, 20, 30, 40];
+    unsafe {
+        let p = arr.as_ptr();
+        let q = p.offset(1);
+        assert_eq!(*q, 20);
+        let r = q.offset(-1);
+        assert_eq!(*r, 10);
+        let z = q.offset(0);
+        assert_eq!(*z, 20);
+    }
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_ptr_offset_checked_round_trip() {
+    let dir = temp_dir("ptr-offset");
+    let src = fixture(&dir, "ptr_offset.rs", PTR_OFFSET_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "checked ptr::offset round trip must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+const PTR_WRAPPING_SRC: &str = r#"
+fn main() {
+    let v: i8 = 42;
+    let p = &v as *const i8;
+    unsafe {
+        let q = p.wrapping_sub(1);
+        let r = q.wrapping_add(1);
+        assert_eq!(*r, 42);
+        let s = p.wrapping_offset(0);
+        assert_eq!(*s, 42);
+    }
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_ptr_wrapping_offset_round_trip() {
+    let dir = temp_dir("ptr-wrapping");
+    let src = fixture(&dir, "ptr_wrapping.rs", PTR_WRAPPING_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "wrapping pointer offsets must round-trip; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+const PTR_BYTE_SRC: &str = r#"
+fn main() {
+    let mut arr = [10i32, 20, 30, 40];
+    unsafe {
+        let p = arr.as_mut_ptr();
+        let b = (p as *mut u8).byte_add(8);
+        assert_eq!(*(b as *const i32), 30);
+        let c = (p as *mut u8).byte_offset(4);
+        *(c as *mut i32) = 21;
+        let d = (p as *const u8).byte_add(1).byte_add(3);
+        assert_eq!(*(d as *const i32), 21);
+    }
+    assert_eq!(arr[1], 21);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_ptr_byte_add_and_byte_offset() {
+    let dir = temp_dir("ptr-byte");
+    let src = fixture(&dir, "ptr_byte.rs", PTR_BYTE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "byte_add/byte_offset on element boundaries must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+const PTR_BYTE_DISPLACED_READ_SRC: &str = r#"
+fn main() {
+    let arr = [10i32, 20, 30, 40];
+    unsafe {
+        let b = (arr.as_ptr() as *const u8).byte_add(1);
+        let _x = *(b as *const i32);
+    }
+    println!("unreachable");
+}
+"#;
+
+#[test]
+fn run_mode_ptr_byte_displaced_read_is_explicit_unsupported() {
+    // A pointer displaced by a non-element number of bytes denotes
+    // a position between elements: the model carries the
+    // displacement but reading through it is an explicit
+    // unsupported error, never a silent wrong value.
+    let dir = temp_dir("ptr-byte-displaced");
+    let src = fixture(&dir, "ptr_byte_displaced.rs", PTR_BYTE_DISPLACED_READ_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "byte-displaced read must be an explicit unsupported; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("displaced"),
+        "the reason names the displacement; stderr={stderr}"
+    );
+}
+
+const PTR_SLICE_SRC: &str = r#"
+fn main() {
+    let s: &[i32] = &[10, 20, 30];
+    unsafe {
+        let p = s.as_ptr();
+        assert_eq!(*p.add(2), 30);
+        assert_eq!(*p.offset(1), 20);
+    }
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_ptr_offset_through_slice_pointer() {
+    let dir = temp_dir("ptr-slice");
+    let src = fixture(&dir, "ptr_slice.rs", PTR_SLICE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "offsets through a slice (fat) pointer must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
