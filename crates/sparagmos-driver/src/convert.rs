@@ -129,6 +129,25 @@ pub struct Converter {
     noting_track_caller: bool,
     /// Unsupported hits of the function currently being converted.
     errors: Vec<String>,
+    /// Closures materialized as *values* out of constants during
+    /// conversion so far: a function pointer stored in a constant
+    /// allocation that names a closure (directly or through its
+    /// `Fn` adapter shim), or a closure value nested inside a
+    /// constant aggregate. No converted body's types mention these
+    /// closures — the decoded value is the only mention — so the
+    /// type-driven demand passes never see them; the driver binary
+    /// collects their bodies from this record instead (see
+    /// `collect_const_closure_instances` in the binary). A mention
+    /// is recorded when a constant is decoded during a conversion
+    /// attempt, mirroring how the reachability collection walks
+    /// the targets of bodies whose conversion failed.
+    pub const_closure_mentions:
+        Vec<(rustc_public::ty::ClosureDef, rustc_public::ty::GenericArgs)>,
+    /// Deduplication keys for `const_closure_mentions`
+    /// (definition + rendered generic arguments, the key shape
+    /// the demand passes use for unresolved mentions).
+    const_closure_mentions_seen:
+        std::collections::HashSet<(rustc_public::DefId, String)>,
 }
 
 impl Default for Converter {
@@ -530,6 +549,8 @@ impl Converter {
             fn_shim_locations: [None, None, None],
             noting_track_caller: false,
             errors: Vec::new(),
+            const_closure_mentions: Vec::new(),
+            const_closure_mentions_seen: std::collections::HashSet::new(),
         }
     }
 
@@ -1999,6 +2020,7 @@ impl Converter {
                 // callable itself; a captured environment has no
                 // constant form here and stays undecoded.
                 if Self::closure_env_is_empty(&args) {
+                    self.note_const_closure(&def, &args);
                     let d = self.closure_def_id(&def, &args);
                     Some(sm::ConstValue::Closure(d))
                 } else {
@@ -2333,6 +2355,7 @@ impl Converter {
             for arg in &inst.args().0 {
                 if let GenericArgKind::Type(t) = arg {
                     if let TyKind::RigidTy(RigidTy::Closure(def, args)) = t.kind() {
+                        self.note_const_closure(&def, &args);
                         let d = self.closure_def_id(&def, &args);
                         return Some(sm::ConstValue::Closure(d));
                     }
@@ -2340,11 +2363,27 @@ impl Converter {
             }
         }
         if let TyKind::RigidTy(RigidTy::Closure(def, args)) = inst.ty().kind() {
+            self.note_const_closure(&def, &args);
             let d = self.closure_def_id(&def, &args);
             return Some(sm::ConstValue::Closure(d));
         }
         let d = self.instance_def_id(inst.def.def_id(), inst);
         Some(sm::ConstValue::FnDef(d))
+    }
+
+    /// Record a closure materialized as a value out of a constant
+    /// (see the `const_closure_mentions` field): the demand passes
+    /// collect the bodies of the closures recorded here, because
+    /// no type in any converted body mentions them.
+    fn note_const_closure(
+        &mut self,
+        def: &rustc_public::ty::ClosureDef,
+        args: &rustc_public::ty::GenericArgs,
+    ) {
+        let key = (def.def_id(), format!("{args:?}"));
+        if self.const_closure_mentions_seen.insert(key) {
+            self.const_closure_mentions.push((*def, args.clone()));
+        }
     }
 
     fn decode_ref(
