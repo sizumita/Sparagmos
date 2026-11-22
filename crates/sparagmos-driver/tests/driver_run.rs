@@ -13103,3 +13103,108 @@ fn run_mode_path_to_str_and_from_utf8() {
         "utf8 validation results and error fields match std"
     );
 }
+
+const PATH_NEW_SRC: &str = r#"
+use std::path::Path;
+
+fn main() {
+    // `Path::new` reaches the path through raw pointer casts
+    // over the string data: the projections through the
+    // `Path`/`OsStr` wrappers read the string itself.
+    let p = Path::new("abc");
+    assert_eq!(p.as_os_str(), "abc");
+    assert_eq!(p.as_os_str().len(), 3);
+    assert_eq!(p.as_os_str().as_encoded_bytes(), b"abc");
+    let o = std::ffi::OsStr::new("xy");
+    assert_eq!(o.len(), 2);
+    println!("path-new-ok");
+}
+"#;
+
+#[test]
+fn run_mode_path_new_and_os_str_projections() {
+    let dir = temp_dir("path-new");
+    let src = fixture(&dir, "path_new.rs", PATH_NEW_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Path::new over a string literal runs; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "path-new-ok\n",
+        "the path projections read the string data"
+    );
+}
+
+const PATH_PARTS_SRC: &str = r#"
+use std::path::Path;
+
+fn main() {
+    let p = Path::new("/foo/bar/baz.txt");
+    assert_eq!(p.parent().unwrap(), Path::new("/foo/bar"));
+    assert_eq!(p.file_name().unwrap(), "baz.txt");
+    assert_eq!(p.extension().unwrap(), "txt");
+    assert_eq!(p.file_stem().unwrap(), "baz");
+    let root = Path::new("/");
+    assert_eq!(root.parent(), None);
+    assert_eq!(root.file_name(), None);
+    let rel = Path::new("foo");
+    assert_eq!(rel.parent().unwrap(), Path::new(""));
+    assert_eq!(rel.extension(), None);
+    let hidden = Path::new("/a/.gitignore");
+    assert_eq!(hidden.file_stem().unwrap(), ".gitignore");
+    assert_eq!(hidden.extension(), None);
+    println!("path-parts-ok");
+}
+"#;
+
+#[test]
+fn run_mode_path_part_accessors() {
+    let dir = temp_dir("path-parts");
+    let src = fixture(&dir, "path_parts.rs", PATH_PARTS_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the Path parsing accessors run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "path-parts-ok\n",
+        "parent/file_name/file_stem/extension match std"
+    );
+}
+
+const PATHBUF_DEREF_SRC: &str = r#"
+fn main() {
+    // `PathBuf` dereferences to `Path`: the methods below are
+    // `Path` methods reached through the `Deref` impl.
+    let p = std::env::current_exe().unwrap();
+    assert!(p.as_os_str().len() > 0);
+    assert!(p.parent().is_some());
+    assert!(p.file_name().is_some());
+    println!("pathbuf-deref-ok");
+}
+"#;
+
+#[test]
+fn run_mode_pathbuf_deref_to_path() {
+    let dir = temp_dir("pathbuf-deref");
+    let src = fixture(&dir, "pathbuf_deref.rs", PATHBUF_DEREF_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "PathBuf deref to Path runs; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "pathbuf-deref-ok\n",
+        "the dereferenced path reads the buffer's byte string"
+    );
+}
