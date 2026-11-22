@@ -14791,7 +14791,19 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
     /// program, argument, environment entry or directory): in
     /// this model an `OsStr` is its byte string.
     fn os_str_bytes(&self, frames: &[Frame], value: &Value) -> InterpResult<Vec<u8>> {
-        let mut resolved = self.resolve_value(frames, value)?;
+        let resolved0 = self.resolve_value(frames, value)?;
+        // An owned byte-string aggregate in buffer form (an
+        // `OsString` or `PathBuf` wrapping a `Buf` wrapping the
+        // byte vector): the unwrap loop below cannot descend
+        // into the byte list itself, so read the bytes off the
+        // aggregate's shape first. Where both readings apply
+        // they agree (the string form's data is the same bytes).
+        if let Some(bytes) =
+            os_string_bytes(&resolved0).or_else(|| path_buf_bytes(&resolved0))
+        {
+            return Ok(bytes);
+        }
+        let mut resolved = resolved0;
         // The path and OS-string values of this model wrap the
         // string data in one-field aggregates (`PathBuf`
         // around `OsString` around the string itself, an owned
