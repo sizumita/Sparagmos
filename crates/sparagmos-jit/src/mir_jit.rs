@@ -1343,7 +1343,79 @@ fn builtin_adt_layout(
     names: &HashMap<mir::DefId, String>,
 ) -> Option<AdtLayout> {
     let name = names.get(&key.def)?.as_str();
+    let find_def = |want: &str| {
+        names
+            .iter()
+            .find(|(_, n)| n.as_str() == want)
+            .map(|(d, _)| *d)
+    };
     match name {
+        "std::string::String" => {
+            // The heap model the builtin layer owns (see
+            // `crate::builtins`): a `String` is its `Vec<u8>`
+            // field, the (pointer, capacity, length) triple.
+            // No converted body projects the field (construction
+            // is the `From::from` builtin, the drop terminator
+            // runs no code), so the scan cannot derive this
+            // layout; the builtin layer defines it.
+            let vec_def = find_def("std::vec::Vec")?;
+            let global_def = find_def("std::alloc::Global")?;
+            Some(AdtLayout {
+                tag: false,
+                total: 3,
+                variants: vec![vec![AdtFieldSlot {
+                    ty: mir::Ty::Adt(
+                        vec_def,
+                        vec![
+                            mir::Ty::Uint(mir::UintTy::U8),
+                            mir::Ty::Adt(global_def, Vec::new()),
+                        ],
+                    ),
+                    offset: 0,
+                    width: 3,
+                }]],
+            })
+        }
+        "std::vec::Vec" => {
+            // A `Vec<T, A>` is its `RawVec<T, A>` field (the
+            // (pointer, capacity) pair) followed by its length.
+            // Same builtin-owned reasoning as `String`.
+            let raw_def = find_def("alloc::raw_vec::RawVec")?;
+            Some(AdtLayout {
+                tag: false,
+                total: 3,
+                variants: vec![vec![
+                    AdtFieldSlot {
+                        ty: mir::Ty::Adt(raw_def, key.generic_args.clone()),
+                        offset: 0,
+                        width: 2,
+                    },
+                    AdtFieldSlot {
+                        ty: mir::Ty::Uint(mir::UintTy::Usize),
+                        offset: 2,
+                        width: 1,
+                    },
+                ]],
+            })
+        }
+        "std::mem::Alignment" => {
+            // `Alignment` is its `AlignmentEnum` field alone.
+            // The type flows through `Layout` values without any
+            // converted body projecting it, so the scan cannot
+            // derive this layout; the enum itself keeps the
+            // tag-only shape (a unit-variant tag leaf), which is
+            // its real one-word layout.
+            let enum_def = find_def("std::mem::alignment::AlignmentEnum")?;
+            Some(AdtLayout {
+                tag: false,
+                total: 1,
+                variants: vec![vec![AdtFieldSlot {
+                    ty: mir::Ty::Adt(enum_def, Vec::new()),
+                    offset: 0,
+                    width: 1,
+                }]],
+            })
+        }
         "core::fmt::rt::Argument" | "std::fmt::Arguments" => Some(AdtLayout {
             tag: false,
             total: 1,
@@ -3619,6 +3691,23 @@ impl<'a> FnLower<'a> {
             }
             V::Ref(inner) => {
                 if is_pointer_shaped(inner) {
+                    if width == 1 {
+                        // A thin reference to a fat constant (a
+                        // `&&str` literal): the value is the
+                        // address of a static blob holding the
+                        // constant's own pointer words, in the
+                        // descending layout every guest value
+                        // uses (a reference to a reference nests
+                        // the same way, one blob per level).
+                        let inner_width = match &**inner {
+                            V::Str(_) | V::Slice { .. } | V::SliceVal(_) => 2,
+                            _ => 1,
+                        };
+                        let words =
+                            self.pointer_const_words(inner, pointee, inner_width)?;
+                        let idx = self.statics.intern(StaticBlob::Words(words));
+                        return Ok(vec![StaticWord::AddrOf(idx)]);
+                    }
                     // A reference to a pointer-shaped constant is
                     // the constant's own pointer value.
                     return self.pointer_const_words(inner, pointee, width);
@@ -4096,8 +4185,10 @@ impl<'a> FnLower<'a> {
                     self.operand_leaves(op, dst_ty, count)
                 }
                 2 => {
-                    let (a, b) = self.operand_pair(op)?;
-                    Ok(vec![a, b])
+                    // Any two-word value (a fat pointer, a
+                    // two-field aggregate constant, ...): its
+                    // own two leaves.
+                    self.operand_leaves(op, dst_ty, count)
                 }
                 _ => self.operand_leaves(op, dst_ty, count),
             },
@@ -4125,7 +4216,13 @@ impl<'a> FnLower<'a> {
                 Ok((0..count as u32).map(|k| tmp + k).collect())
             }
             R::Cast(kind, operand, target) => {
-                if count == 2 && int128_signed(target).is_some() {
+                if count == 2
+                    && (int128_signed(target).is_some()
+                        || matches!(kind, mir::CastKind::Transmute))
+                {
+                    // A two-word value the cast machinery writes
+                    // leaf by leaf (a 128-bit result, a transmute
+                    // between two-word types), not an unsize pair.
                     let tmp = self.fresh();
                     self.fresh();
                     self.lower_cast_to(tmp, kind, operand, target)?;
@@ -4240,6 +4337,9 @@ impl<'a> FnLower<'a> {
                             self.store_operand_leaves(op, elem, base + off as u32)?;
                             off += per;
                         }
+                    }
+                    mir::AggregateKind::RawPtr { data_ty, .. } => {
+                        self.store_raw_ptr_aggregate(data_ty, ops, base, count)?;
                     }
                     other => {
                         return Err(self.err(&format!(
@@ -4464,7 +4564,10 @@ impl<'a> FnLower<'a> {
             }
             R::Cast(kind, operand, target) => {
                 let (dst, count, _) = self.place_leaves(place)?;
-                if count == 2 && int128_signed(target).is_some() {
+                if count == 2
+                    && (int128_signed(target).is_some()
+                        || matches!(kind, mir::CastKind::Transmute))
+                {
                     return self.lower_cast_to(dst, kind, operand, target);
                 }
                 if count == 2 {
@@ -5729,14 +5832,96 @@ impl<'a> FnLower<'a> {
                 let src_ty = self
                     .operand_place_ty(operand)
                     .unwrap_or_else(|| target.clone());
-                let v = self.operand_value(operand, &src_ty)?;
+                // A cast from a fat pointer to a thin one (a
+                // `*const str` read as a `*const u8`) keeps the
+                // data word and drops the metadata; every other
+                // shape here is one word on both sides.
+                let v = if flatten(&src_ty, &self.func.name, self.layouts)? == 2
+                    && flatten(target, &self.func.name, self.layouts)? == 1
+                {
+                    self.operand_leaves(operand, &src_ty, 2)?[0]
+                } else {
+                    self.operand_value(operand, &src_ty)?
+                };
                 self.emit(Instr::Copy {
                     dst,
                     src: IrOperand::Value(v),
                 });
                 Ok(())
             }
+            mir::CastKind::Transmute => {
+                // A transmute reinterprets the value's own
+                // words: between two types of the same leaf
+                // count, the canonical words are already the
+                // bit pattern both sides read (a pointer
+                // wrapper and the raw pointer, an integer and
+                // the float of the same width, a 128-bit integer
+                // and its word pair). A transmute across leaf
+                // counts would need byte-level repacking, which
+                // the word model does not do.
+                let src_ty = self
+                    .operand_place_ty(operand)
+                    .unwrap_or_else(|| target.clone());
+                let src_count = flatten(&src_ty, &self.func.name, self.layouts)?;
+                let dst_count = flatten(target, &self.func.name, self.layouts)?;
+                if src_count != dst_count || src_count == 0 {
+                    return Err(self.err(&format!(
+                        "transmute between {src_count}-leaf and {dst_count}-leaf types"
+                    )));
+                }
+                let leaves = self.operand_leaves(operand, &src_ty, src_count)?;
+                for (k, leaf) in leaves.iter().enumerate() {
+                    self.emit(Instr::Copy {
+                        dst: dst + k as u32,
+                        src: IrOperand::Value(*leaf),
+                    });
+                }
+                Ok(())
+            }
             other => Err(self.err(&format!("cast {other:?}"))),
+        }
+    }
+
+    /// Store an `AggregateKind::RawPtr` value's words at
+    /// `base`: the data pointer, then the metadata word for an
+    /// unsized pointee (a slice / `str` length). `count` is the
+    /// destination's leaf count (1 thin, 2 fat); a two-operand
+    /// aggregate with a one-word destination carries unit
+    /// metadata, which is no word (the interpreter's conversion
+    /// decides the same shapes the same way). A `dyn` pointee's
+    /// metadata is a vtable pointer and stays unsupported.
+    fn store_raw_ptr_aggregate(
+        &mut self,
+        data_ty: &mir::Ty,
+        ops: &[mir::Operand],
+        base: u32,
+        count: usize,
+    ) -> Result<(), JitError> {
+        if matches!(data_ty, mir::Ty::Dynamic(..)) {
+            return Err(self.err("raw pointer aggregate with dyn metadata"));
+        }
+        // The data operand is a thin pointer to the pointee's
+        // first element (to the element type for a slice, to
+        // `u8` for `str`), whatever the aggregate's pointee.
+        let data_ctx = mir::Ty::RawPtr(
+            Box::new(match data_ty {
+                mir::Ty::Slice(elem) => (**elem).clone(),
+                mir::Ty::Str => mir::Ty::Uint(mir::UintTy::U8),
+                other => other.clone(),
+            }),
+            mir::Mutability::Not,
+        );
+        match (ops.len(), count) {
+            (1, 1) | (2, 1) => self.store_operand_leaves(&ops[0], &data_ctx, base),
+            (2, 2) => {
+                self.store_operand_leaves(&ops[0], &data_ctx, base)?;
+                self.store_operand_leaves(
+                    &ops[1],
+                    &mir::Ty::Uint(mir::UintTy::Usize),
+                    base + 1,
+                )
+            }
+            _ => Err(self.err("raw pointer aggregate shape mismatch")),
         }
     }
 
@@ -5746,6 +5931,39 @@ impl<'a> FnLower<'a> {
         kind: &mir::AggregateKind,
         ops: &[mir::Operand],
     ) -> Result<(), JitError> {
+        // A structural `fmt::Arguments` aggregate (core's own
+        // constructors build the value from its two fields
+        // instead of calling `Arguments::new`): the builtin
+        // layer's representation of the type is the one-word
+        // store handle, so the two field words go to the host
+        // function that interprets the structural encoding and
+        // produces the handle.
+        if let mir::AggregateKind::Adt { def, .. } = kind {
+            if builtins::canonical_name(&self.callee_name(*def))
+                == "std::fmt::Arguments"
+            {
+                let (dst, count, _ty) = self.place_leaves(place)?;
+                if count != 1 || ops.len() != 2 {
+                    return Err(
+                        self.err("structural fmt::Arguments aggregate shape mismatch")
+                    );
+                }
+                let word_ty = mir::Ty::RawPtr(
+                    Box::new(mir::Ty::Uint(mir::UintTy::U8)),
+                    mir::Mutability::Not,
+                );
+                let f0 = self.operand_value(&ops[0], &word_ty)?;
+                let f1 = self.operand_value(&ops[1], &word_ty)?;
+                self.emit_host_call(
+                    builtins::HOST_ARGUMENTS_FROM_STRUCT,
+                    dst,
+                    None,
+                    vec![IrOperand::Value(f0), IrOperand::Value(f1)],
+                );
+                self.emit(Instr::CheckPanic);
+                return Ok(());
+            }
+        }
         match kind {
             mir::AggregateKind::Tuple => {}
             mir::AggregateKind::Adt {
@@ -5802,6 +6020,11 @@ impl<'a> FnLower<'a> {
                 for (i, op) in ops.iter().enumerate() {
                     self.store_operand_leaves(op, &elem, dst + (i * per) as u32)?;
                 }
+                return Ok(());
+            }
+            mir::AggregateKind::RawPtr { data_ty, .. } => {
+                let (dst, count, _dst_ty) = self.place_leaves(place)?;
+                self.store_raw_ptr_aggregate(data_ty, ops, dst, count)?;
                 return Ok(());
             }
             other => {
@@ -6194,6 +6417,159 @@ impl<'a> FnLower<'a> {
         }
     }
 
+    /// The address a `String`-producing builtin call writes
+    /// its result through: the (pointer, capacity, length)
+    /// triple is three words, more than the host-call
+    /// convention returns, so the host function writes it at
+    /// the destination's own address (the sret shape the guest
+    /// call uses for wide results) — the destination place's
+    /// slot-run address, or its memory address with its checks
+    /// emitted. The host call's own result word is a dummy (see
+    /// [`Self::finish_string_call`]).
+    fn string_destination(
+        &mut self,
+        destination: &mir::Place,
+    ) -> Result<u32, JitError> {
+        let dst_loc = self.classify_place(destination)?;
+        match &dst_loc {
+            PlaceLoc::Slots { first, count, .. } => {
+                if *count != 3 {
+                    return Err(self.err("String destination is not three words"));
+                }
+                let addr = self.fresh();
+                self.emit(Instr::SlotAddr {
+                    dst: addr,
+                    slot: *first,
+                });
+                Ok(addr)
+            }
+            PlaceLoc::Mem {
+                addr,
+                count,
+                checks,
+                ..
+            } => {
+                if *count != Some(3) {
+                    return Err(self.err("String destination is not three words"));
+                }
+                self.emit_checks(checks);
+                Ok(self.materialize_addr(addr))
+            }
+        }
+    }
+
+    /// Finish a `String`-producing builtin call: the panic
+    /// check and the terminator seal. Unlike
+    /// [`Self::finish_builtin_call`] there is no store-through:
+    /// the host function already wrote the result at the
+    /// destination's address.
+    fn finish_string_call(&mut self, target: Option<mir::BasicBlock>) {
+        self.emit(Instr::CheckPanic);
+        match target {
+            Some(t) => self.seal_terminator(IrTerminator::Jump(t.index() as u32)),
+            None => self.seal_terminator(IrTerminator::Unreachable),
+        }
+    }
+
+    /// The (data pointer, length) word slots of the string-like
+    /// value a `PartialEq` argument references, under the
+    /// argument's value type: a `str` value is the fat reference
+    /// itself; a `String` value's pair is read out of its triple
+    /// by the host function; a reference to either first loads
+    /// the inner reference's words.
+    fn string_pair_of(
+        &mut self,
+        arg: &mir::Operand,
+        value_ty: &mir::Ty,
+    ) -> Result<(u32, u32), JitError> {
+        match value_ty {
+            mir::Ty::Str => self.operand_pair(arg),
+            mir::Ty::Adt(def, _) if self.is_string_def(*def) => {
+                let addr = self.arg_word(arg, "string comparison argument")?;
+                let a = self.fresh();
+                let b = self.fresh();
+                debug_assert_eq!(b, a + 1);
+                self.emit_host_call(
+                    builtins::HOST_DEREF_BUFFER,
+                    a,
+                    Some(b),
+                    vec![IrOperand::Value(addr)],
+                );
+                Ok((a, b))
+            }
+            mir::Ty::Ref(_, inner, _) => match &**inner {
+                mir::Ty::Str => {
+                    let base = self.arg_word(arg, "string comparison argument")?;
+                    let ptr = self.fresh();
+                    self.emit(Instr::LoadPtr {
+                        dst: ptr,
+                        ptr: IrOperand::Value(base),
+                    });
+                    let len_addr = self.word_addr(base, 1);
+                    let len = self.fresh();
+                    self.emit(Instr::LoadPtr {
+                        dst: len,
+                        ptr: IrOperand::Value(len_addr),
+                    });
+                    Ok((ptr, len))
+                }
+                mir::Ty::Adt(def, _) if self.is_string_def(*def) => {
+                    let base = self.arg_word(arg, "string comparison argument")?;
+                    let inner_addr = self.fresh();
+                    self.emit(Instr::LoadPtr {
+                        dst: inner_addr,
+                        ptr: IrOperand::Value(base),
+                    });
+                    let a = self.fresh();
+                    let b = self.fresh();
+                    debug_assert_eq!(b, a + 1);
+                    self.emit_host_call(
+                        builtins::HOST_DEREF_BUFFER,
+                        a,
+                        Some(b),
+                        vec![IrOperand::Value(inner_addr)],
+                    );
+                    Ok((a, b))
+                }
+                _ => Err(self.err("string comparison of an unsupported shape")),
+            },
+            _ => Err(self.err("string comparison of an unsupported shape")),
+        }
+    }
+
+    /// Whether the ADT definition is `std::string::String`.
+    fn is_string_def(&self, def: mir::DefId) -> bool {
+        builtins::canonical_name(&self.callee_name(def)) == "std::string::String"
+    }
+
+    /// Lower a call whose semantics is moving the argument's
+    /// own leaves into the destination (the identity
+    /// conversions `From::from` / `Into::into` serve between
+    /// equal types and between integer types, and
+    /// `hint::must_use`).
+    fn lower_leaf_copy(
+        &mut self,
+        arg: &mir::Operand,
+        arg_ty: &mir::Ty,
+        destination: &mir::Place,
+        target: Option<mir::BasicBlock>,
+    ) -> Result<(), JitError> {
+        let (dst_loc, dst, count) = self.builtin_destination(destination)?;
+        let want = flatten(arg_ty, &self.func.name, self.layouts)?;
+        if count != want {
+            return Err(self.err("identity conversion with a mismatched shape"));
+        }
+        let leaves = self.operand_leaves(arg, arg_ty, count)?;
+        for (k, leaf) in leaves.iter().enumerate() {
+            self.emit(Instr::Copy {
+                dst: dst + k as u32,
+                src: IrOperand::Value(*leaf),
+            });
+        }
+        self.finish_builtin_call(&dst_loc, dst, target, false);
+        Ok(())
+    }
+
     /// One word of a place operand (the operand's own type taken
     /// from its place).
     fn arg_word(&mut self, arg: &mir::Operand, what: &str) -> Result<u32, JitError> {
@@ -6281,6 +6657,15 @@ impl<'a> FnLower<'a> {
             mir::Ty::Str => FmtTy::Str,
             mir::Ty::Ref(_, inner, _) => FmtTy::Ref(Box::new(self.fmt_ty_of(inner)?)),
             mir::Ty::Adt(def, _) => {
+                // A `String`'s formatted content is the byte
+                // string its (pointer, capacity, length) triple
+                // names — the same content its own `Display` /
+                // `Debug` impls present.
+                if builtins::canonical_name(&self.callee_name(*def))
+                    == "std::string::String"
+                {
+                    return Ok(FmtTy::OwnedStr);
+                }
                 return Err(self.err(&format!(
                     "fmt argument of ADT type `{}`",
                     self.callee_name(*def)
@@ -6471,6 +6856,67 @@ impl<'a> FnLower<'a> {
                     return Err(self.err("PartialEq call without a Self type"));
                 };
                 let self_ty = self_ty.clone();
+                // String equality: the `PartialEq` impls between
+                // `String` and `str`, in any reference
+                // combination, compare the contents — each side's
+                // (pointer, length) pair goes to the host
+                // comparison, whose result is the answer (negated
+                // for `ne`, as below).
+                let rhs_ty = generic_args
+                    .get(1)
+                    .cloned()
+                    .unwrap_or_else(|| self_ty.clone());
+                let string_like = |ty: &mir::Ty| match ty {
+                    mir::Ty::Str => true,
+                    mir::Ty::Adt(def, _) => self.is_string_def(*def),
+                    mir::Ty::Ref(_, inner, _) => match &**inner {
+                        mir::Ty::Str => true,
+                        mir::Ty::Adt(def, _) => self.is_string_def(*def),
+                        _ => false,
+                    },
+                    _ => false,
+                };
+                if string_like(&self_ty) || string_like(&rhs_ty) {
+                    let (p1, l1) = self.string_pair_of(&args[0], &self_ty)?;
+                    let (p2, l2) = self.string_pair_of(&args[1], &rhs_ty)?;
+                    let raw = self.fresh();
+                    self.emit_host_call(
+                        builtins::HOST_STR_EQ,
+                        raw,
+                        None,
+                        vec![
+                            IrOperand::Value(p1),
+                            IrOperand::Value(l1),
+                            IrOperand::Value(p2),
+                            IrOperand::Value(l2),
+                        ],
+                    );
+                    let result = if kind == Builtin::PartialEqNe {
+                        let d = self.fresh();
+                        self.emit(Instr::BinOp {
+                            dst: d,
+                            op: IrBinOp::Xor,
+                            lhs: IrOperand::Value(raw),
+                            rhs: IrOperand::Const(1),
+                        });
+                        d
+                    } else {
+                        raw
+                    };
+                    let (dst_loc, dst, dcount) =
+                        self.builtin_destination(destination)?;
+                    if dcount != 1 {
+                        return Err(
+                            self.err("PartialEq destination is not one word")
+                        );
+                    }
+                    self.emit(Instr::Copy {
+                        dst,
+                        src: IrOperand::Value(result),
+                    });
+                    self.finish_builtin_call(&dst_loc, dst, target, true);
+                    return Ok(());
+                }
                 if !word_transparent(&self_ty) {
                     return Err(self.err(&format!(
                         "PartialEq on type {}",
@@ -6882,6 +7328,461 @@ impl<'a> FnLower<'a> {
                 self.finish_builtin_call(&dst_loc, dst, target, true);
                 Ok(())
             }
+            Builtin::RustAlloc | Builtin::RustAllocZeroed => {
+                if args.len() != 2 {
+                    return Err(self.err("allocation call with wrong arity"));
+                }
+                let size = self.arg_word(&args[0], "allocation size")?;
+                let align = self.arg_word(&args[1], "allocation alignment")?;
+                let (dst_loc, dst, count) = self.builtin_destination(destination)?;
+                if count != 1 {
+                    return Err(self.err("allocation destination is not one word"));
+                }
+                let host = if kind == Builtin::RustAlloc {
+                    builtins::HOST_RUST_ALLOC
+                } else {
+                    builtins::HOST_RUST_ALLOC_ZEROED
+                };
+                self.emit_host_call(
+                    host,
+                    dst,
+                    None,
+                    vec![IrOperand::Value(size), IrOperand::Value(align)],
+                );
+                self.finish_builtin_call(&dst_loc, dst, target, false);
+                Ok(())
+            }
+            Builtin::RustDealloc => {
+                if args.len() != 3 {
+                    return Err(self.err("deallocation call with wrong arity"));
+                }
+                let ptr = self.arg_word(&args[0], "deallocation pointer")?;
+                let size = self.arg_word(&args[1], "deallocation size")?;
+                let align = self.arg_word(&args[2], "deallocation alignment")?;
+                let (dst_loc, dst, count) = self.builtin_destination(destination)?;
+                if count != 0 {
+                    return Err(self.err("deallocation destination is not unit"));
+                }
+                self.emit_host_call(
+                    builtins::HOST_RUST_DEALLOC,
+                    dst,
+                    None,
+                    vec![
+                        IrOperand::Value(ptr),
+                        IrOperand::Value(size),
+                        IrOperand::Value(align),
+                    ],
+                );
+                self.finish_builtin_call(&dst_loc, dst, target, false);
+                Ok(())
+            }
+            Builtin::RustRealloc => {
+                if args.len() != 4 {
+                    return Err(self.err("reallocation call with wrong arity"));
+                }
+                let ptr = self.arg_word(&args[0], "reallocation pointer")?;
+                let old = self.arg_word(&args[1], "reallocation old size")?;
+                let align = self.arg_word(&args[2], "reallocation alignment")?;
+                let new = self.arg_word(&args[3], "reallocation new size")?;
+                let (dst_loc, dst, count) = self.builtin_destination(destination)?;
+                if count != 1 {
+                    return Err(self.err("reallocation destination is not one word"));
+                }
+                self.emit_host_call(
+                    builtins::HOST_RUST_REALLOC,
+                    dst,
+                    None,
+                    vec![
+                        IrOperand::Value(ptr),
+                        IrOperand::Value(old),
+                        IrOperand::Value(align),
+                        IrOperand::Value(new),
+                    ],
+                );
+                self.finish_builtin_call(&dst_loc, dst, target, false);
+                Ok(())
+            }
+            Builtin::Format => {
+                if args.len() != 1 {
+                    return Err(self.err("fmt::format with wrong arity"));
+                }
+                let handle = self.arg_word(&args[0], "fmt::format argument")?;
+                let addr = self.string_destination(destination)?;
+                let dummy = self.fresh();
+                self.emit_host_call(
+                    builtins::HOST_STRING_FORMAT,
+                    dummy,
+                    None,
+                    vec![IrOperand::Value(addr), IrOperand::Value(handle)],
+                );
+                self.finish_string_call(target);
+                Ok(())
+            }
+            Builtin::StrToUppercase | Builtin::StrToLowercase => {
+                if args.len() != 1 {
+                    return Err(self.err("case conversion with wrong arity"));
+                }
+                let (ptr, len) = self.operand_pair(&args[0])?;
+                let addr = self.string_destination(destination)?;
+                let host = if kind == Builtin::StrToUppercase {
+                    builtins::HOST_STR_TO_UPPERCASE
+                } else {
+                    builtins::HOST_STR_TO_LOWERCASE
+                };
+                let dummy = self.fresh();
+                self.emit_host_call(
+                    host,
+                    dummy,
+                    None,
+                    vec![
+                        IrOperand::Value(addr),
+                        IrOperand::Value(ptr),
+                        IrOperand::Value(len),
+                    ],
+                );
+                self.finish_string_call(target);
+                Ok(())
+            }
+            Builtin::FromFrom | Builtin::IntoInto => {
+                if args.len() != 1 {
+                    return Err(self.err("conversion call with wrong arity"));
+                }
+                // `From::from` renders its generic arguments as
+                // [target, source]; `Into::into` as [source,
+                // target] (the interpreter's builtin resolves
+                // the same pair the same way).
+                let (target_ty, source_ty) = if kind == Builtin::IntoInto {
+                    (generic_args.get(1), generic_args.first())
+                } else {
+                    (generic_args.first(), generic_args.get(1))
+                };
+                let (Some(target_ty), Some(source_ty)) = (target_ty, source_ty)
+                else {
+                    return Err(self.err("conversion call without generic types"));
+                };
+                let target_ty = target_ty.clone();
+                let source_ty = source_ty.clone();
+                let is_string = |ty: &mir::Ty| match ty {
+                    mir::Ty::Adt(def, _) => {
+                        builtins::canonical_name(&self.callee_name(*def))
+                            == "std::string::String"
+                    }
+                    _ => false,
+                };
+                let is_str_source = |ty: &mir::Ty| match ty {
+                    mir::Ty::Str => true,
+                    mir::Ty::Ref(_, inner, _) => matches!(&**inner, mir::Ty::Str),
+                    _ => false,
+                };
+                if is_string(&target_ty) && is_str_source(&source_ty) {
+                    // `String::from(&str)`: copy the source's
+                    // bytes into a fresh buffer.
+                    let (ptr, len) = self.operand_pair(&args[0])?;
+                    let addr = self.string_destination(destination)?;
+                    let dummy = self.fresh();
+                    self.emit_host_call(
+                        builtins::HOST_STRING_FROM_STR,
+                        dummy,
+                        None,
+                        vec![
+                            IrOperand::Value(addr),
+                            IrOperand::Value(ptr),
+                            IrOperand::Value(len),
+                        ],
+                    );
+                    self.finish_string_call(target);
+                    return Ok(());
+                }
+                // The identity conversions: the reflexive
+                // `From<T> for T`, and the value-preserving
+                // conversions between integer types of the same
+                // word count (the interpreter's builtin serves
+                // the same set; the destination place's own
+                // reads apply the width).
+                let int_like = |ty: &mir::Ty| {
+                    matches!(ty, mir::Ty::Int(_) | mir::Ty::Uint(_))
+                };
+                if target_ty == source_ty
+                    || (int_like(&target_ty) && int_like(&source_ty))
+                {
+                    return self.lower_leaf_copy(
+                        &args[0],
+                        &source_ty,
+                        destination,
+                        target,
+                    );
+                }
+                Err(self.err(&format!(
+                    "From::from conversion from {} to {}",
+                    source_ty.kind_name(),
+                    target_ty.kind_name()
+                )))
+            }
+            Builtin::Deref => {
+                if args.len() != 1 {
+                    return Err(self.err("Deref::deref with wrong arity"));
+                }
+                let Some(self_ty) = generic_args.first() else {
+                    return Err(self.err("Deref::deref without a Self type"));
+                };
+                let buffer = match self_ty {
+                    mir::Ty::Adt(def, _) => {
+                        let name =
+                            builtins::canonical_name(&self.callee_name(*def));
+                        name == "std::string::String"
+                            || name.starts_with("std::vec::Vec")
+                    }
+                    _ => false,
+                };
+                if !buffer {
+                    return Err(self.err(&format!(
+                        "Deref::deref for {}",
+                        self_ty.kind_name()
+                    )));
+                }
+                // The argument is `&Self`: the buffer value's
+                // address, whose triple the host function reads
+                // the (pointer, length) pair out of.
+                let addr = self.arg_word(&args[0], "Deref::deref argument")?;
+                let (dst_loc, dst, count) = self.builtin_destination(destination)?;
+                if count != 2 {
+                    return Err(self.err("Deref::deref destination is not a pair"));
+                }
+                self.emit_host_call(
+                    builtins::HOST_DEREF_BUFFER,
+                    dst,
+                    Some(dst + 1),
+                    vec![IrOperand::Value(addr)],
+                );
+                self.finish_builtin_call(&dst_loc, dst, target, false);
+                Ok(())
+            }
+            Builtin::MustUse => {
+                if args.len() != 1 {
+                    return Err(self.err("must_use with wrong arity"));
+                }
+                let Some(ty) = generic_args.first() else {
+                    return Err(self.err("must_use without a type"));
+                };
+                let ty = ty.clone();
+                self.lower_leaf_copy(&args[0], &ty, destination, target)
+            }
+            Builtin::IntBitOp(op) => {
+                if args.len() != 1 {
+                    return Err(self.err("bit intrinsic with wrong arity"));
+                }
+                let Some(ty) = generic_args.first() else {
+                    return Err(self.err("bit intrinsic without a type"));
+                };
+                let bits = match ty {
+                    mir::Ty::Int(it) => int_bits(*it),
+                    mir::Ty::Uint(ut) => uint_bits(*ut),
+                    _ => {
+                        return Err(self.err("bit intrinsic of a non-integer type"))
+                    }
+                };
+                let ty = ty.clone();
+                let count = flatten(&ty, &self.func.name, self.layouts)?;
+                let leaves = self.operand_leaves(&args[0], &ty, count)?;
+                let (dst_loc, dst, dcount) = self.builtin_destination(destination)?;
+                if dcount != count {
+                    return Err(self.err("bit intrinsic destination shape mismatch"));
+                }
+                let hi = if count == 2 {
+                    IrOperand::Value(leaves[1])
+                } else {
+                    IrOperand::Const(0)
+                };
+                self.emit_host_call(
+                    builtins::HOST_BIT_OP,
+                    dst,
+                    if count == 2 { Some(dst + 1) } else { None },
+                    vec![
+                        IrOperand::Const(op as i64),
+                        IrOperand::Value(leaves[0]),
+                        hi,
+                        IrOperand::Const(bits as i64),
+                    ],
+                );
+                self.finish_builtin_call(&dst_loc, dst, target, false);
+                Ok(())
+            }
+            Builtin::PanicNounwindFmt => {
+                if args.is_empty() {
+                    return Err(self.err("panic_nounwind_fmt with no arguments"));
+                }
+                let handle = self.arg_word(&args[0], "panic_nounwind_fmt argument")?;
+                let (dst_loc, dst, count) = self.builtin_destination(destination)?;
+                if count != 0 {
+                    return Err(self.err("panic_nounwind_fmt destination is not never"));
+                }
+                self.emit_host_call(
+                    builtins::HOST_PANIC_NOUNWIND_FMT,
+                    dst,
+                    None,
+                    vec![IrOperand::Value(handle)],
+                );
+                self.finish_builtin_call(&dst_loc, dst, target, true);
+                Ok(())
+            }
+            Builtin::StringNew => {
+                if !args.is_empty() {
+                    return Err(self.err("String::new with arguments"));
+                }
+                let (dst_loc, dst, count) = self.builtin_destination(destination)?;
+                if count != 3 {
+                    return Err(self.err("String::new destination is not three words"));
+                }
+                // The empty string: the dangling pointer of an
+                // empty buffer (the alignment of `u8`), zero
+                // capacity, zero length.
+                self.emit(Instr::Const { dst, imm: 1 });
+                self.emit(Instr::Const {
+                    dst: dst + 1,
+                    imm: 0,
+                });
+                self.emit(Instr::Const {
+                    dst: dst + 2,
+                    imm: 0,
+                });
+                self.finish_builtin_call(&dst_loc, dst, target, false);
+                Ok(())
+            }
+            Builtin::StringLen | Builtin::StringCapacity => {
+                if args.len() != 1 {
+                    return Err(self.err("String accessor with wrong arity"));
+                }
+                let addr = self.arg_word(&args[0], "String accessor argument")?;
+                let (dst_loc, dst, count) = self.builtin_destination(destination)?;
+                if count != 1 {
+                    return Err(self.err("String accessor destination is not one word"));
+                }
+                let host = if kind == Builtin::StringLen {
+                    builtins::HOST_STRING_LEN
+                } else {
+                    builtins::HOST_STRING_CAPACITY
+                };
+                self.emit_host_call(host, dst, None, vec![IrOperand::Value(addr)]);
+                self.finish_builtin_call(&dst_loc, dst, target, false);
+                Ok(())
+            }
+            Builtin::StringIsEmpty => {
+                if args.len() != 1 {
+                    return Err(self.err("String::is_empty with wrong arity"));
+                }
+                let addr = self.arg_word(&args[0], "String::is_empty argument")?;
+                let len = self.fresh();
+                self.emit_host_call(
+                    builtins::HOST_STRING_LEN,
+                    len,
+                    None,
+                    vec![IrOperand::Value(addr)],
+                );
+                let (dst_loc, dst, count) = self.builtin_destination(destination)?;
+                if count != 1 {
+                    return Err(self.err("String::is_empty destination is not one word"));
+                }
+                self.emit(Instr::BinOp {
+                    dst,
+                    op: IrBinOp::Eq,
+                    lhs: IrOperand::Value(len),
+                    rhs: IrOperand::Const(0),
+                });
+                self.finish_builtin_call(&dst_loc, dst, target, false);
+                Ok(())
+            }
+            Builtin::StrLen | Builtin::StrIsEmpty => {
+                if args.len() != 1 {
+                    return Err(self.err("str accessor with wrong arity"));
+                }
+                let (_ptr, len) = self.operand_pair(&args[0])?;
+                let (dst_loc, dst, count) = self.builtin_destination(destination)?;
+                if count != 1 {
+                    return Err(self.err("str accessor destination is not one word"));
+                }
+                if kind == Builtin::StrLen {
+                    self.emit(Instr::Copy {
+                        dst,
+                        src: IrOperand::Value(len),
+                    });
+                } else {
+                    self.emit(Instr::BinOp {
+                        dst,
+                        op: IrBinOp::Eq,
+                        lhs: IrOperand::Value(len),
+                        rhs: IrOperand::Const(0),
+                    });
+                }
+                self.finish_builtin_call(&dst_loc, dst, target, false);
+                Ok(())
+            }
+            Builtin::StringPushStr | Builtin::StringPush => {
+                if args.len() != 2 {
+                    return Err(self.err("String push with wrong arity"));
+                }
+                let addr = self.arg_word(&args[0], "String push argument")?;
+                let (dst_loc, dst, count) = self.builtin_destination(destination)?;
+                if count != 0 {
+                    return Err(self.err("String push destination is not unit"));
+                }
+                if kind == Builtin::StringPushStr {
+                    let (ptr, len) = self.operand_pair(&args[1])?;
+                    self.emit_host_call(
+                        builtins::HOST_STRING_PUSH_STR,
+                        dst,
+                        None,
+                        vec![
+                            IrOperand::Value(addr),
+                            IrOperand::Value(ptr),
+                            IrOperand::Value(len),
+                        ],
+                    );
+                } else {
+                    let ch = self.operand_value(&args[1], &mir::Ty::Char)?;
+                    self.emit_host_call(
+                        builtins::HOST_STRING_PUSH,
+                        dst,
+                        None,
+                        vec![IrOperand::Value(addr), IrOperand::Value(ch)],
+                    );
+                }
+                self.finish_builtin_call(&dst_loc, dst, target, true);
+                Ok(())
+            }
+            Builtin::StrOp(op) => {
+                if args.len() != 2 {
+                    return Err(self.err("str search with wrong arity"));
+                }
+                let (ptr, len) = self.operand_pair(&args[0])?;
+                // The modelled pattern is a `&str` (the
+                // interpreter's builtin serves the pattern types
+                // by value shape; a one-word pattern here — a
+                // `char` or a predicate — stays unsupported).
+                if let Some(pat_ty) = self.operand_place_ty(&args[1]) {
+                    if flatten(&pat_ty, &self.func.name, self.layouts)? != 2 {
+                        return Err(self.err("str search with a non-str pattern"));
+                    }
+                }
+                let (pp, pl) = self.operand_pair(&args[1])?;
+                let (dst_loc, dst, count) = self.builtin_destination(destination)?;
+                if count != 1 {
+                    return Err(self.err("str search destination is not one word"));
+                }
+                self.emit_host_call(
+                    builtins::HOST_STR_OP,
+                    dst,
+                    None,
+                    vec![
+                        IrOperand::Const(op as i64),
+                        IrOperand::Value(ptr),
+                        IrOperand::Value(len),
+                        IrOperand::Value(pp),
+                        IrOperand::Value(pl),
+                    ],
+                );
+                self.finish_builtin_call(&dst_loc, dst, target, true);
+                Ok(())
+            }
         }
     }
 
@@ -7274,6 +8175,17 @@ impl<'a> FnLower<'a> {
             return self.lower_builtin_call(&generic_args, def, args, destination, target);
         };
         let callee_tys = &self.param_tys[callee];
+        // A `#[track_caller]` callee arrives with one extra
+        // trailing argument: the caller-location stamp the
+        // driver appended to the call (the interpreter pops it
+        // before binding the declared arguments, the same way).
+        // The callee's body declares no local for the stamp, so
+        // it is simply dropped here.
+        let args = if args.len() == callee_tys.len() + 1 {
+            &args[..callee_tys.len()]
+        } else {
+            args
+        };
         if args.len() != callee_tys.len() {
             return Err(self.err("call argument count does not match the callee"));
         }
@@ -7359,9 +8271,15 @@ impl<'a> FnLower<'a> {
                         ir_args.push(IrOperand::Value(leaves[0]));
                         ir_args.push(IrOperand::Value(leaves[1]));
                     } else {
-                        let (a, b) = self.operand_pair(arg)?;
-                        ir_args.push(IrOperand::Value(a));
-                        ir_args.push(IrOperand::Value(b));
+                        // Any other two-word argument — a fat
+                        // pointer, but equally a two-word
+                        // aggregate (a `Layout` constant passed
+                        // to an allocator function): its own two
+                        // leaves, materialised the same way for
+                        // places and constants.
+                        let leaves = self.operand_leaves(arg, pty, 2)?;
+                        ir_args.push(IrOperand::Value(leaves[0]));
+                        ir_args.push(IrOperand::Value(leaves[1]));
                     }
                 }
                 n => {
