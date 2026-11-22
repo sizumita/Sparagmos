@@ -1067,6 +1067,7 @@ fn collect_closure_instances(
     deferred: &[DeferredFn],
     local_defs: &HashSet<rustc_public::DefId>,
     seeds: &[rustc_public::mir::Body],
+    collected: &HashSet<sparagmos_mir::DefId>,
     state: &mut InstanceDemandState,
 ) -> Vec<rustc_public::mir::Body> {
     use std::collections::VecDeque;
@@ -1176,6 +1177,16 @@ fn collect_closure_instances(
                 if !seen.insert((referenced, inst)) {
                     continue;
                 }
+                // The reachability collection resolves the
+                // closures in a call's generic arguments itself,
+                // so an instance it already converted must not be
+                // converted again here: two bodies under one
+                // program DefId collide when the program is built.
+                // Its copy (and its report entry) stands.
+                let collected_id = conv.instance_def_id(referenced, &inst);
+                if collected.contains(&collected_id) {
+                    continue;
+                }
                 if *taken >= MAX_LOCAL_INSTANCES {
                     fail_all(&mut *target_demands, &owners, "collection limit reached".to_string());
                     continue;
@@ -1212,7 +1223,7 @@ fn collect_closure_instances(
                             format!("{} [{}]", base_name, inst.name())
                         };
                         bodies.push((display, converted));
-                        body_def_ids.push(conv.instance_def_id(referenced, &inst));
+                        body_def_ids.push(collected_id);
                         body_def_names.push(base_name.to_string());
                         let demand = target_demands.entry(referenced).or_default();
                         demand.converted += 1;
@@ -1284,6 +1295,7 @@ fn collect_const_closure_instances(
     body_def_names: &mut Vec<String>,
     deferred: &[DeferredFn],
     local_defs: &HashSet<rustc_public::DefId>,
+    collected: &HashSet<sparagmos_mir::DefId>,
     state: &mut InstanceDemandState,
 ) -> Vec<rustc_public::mir::Body> {
     let InstanceDemandState {
@@ -1384,6 +1396,14 @@ fn collect_const_closure_instances(
                 if !seen.insert((referenced, inst)) {
                     return;
                 }
+                // Already converted by the reachability
+                // collection (see collect_closure_instances):
+                // a second copy under the same program DefId
+                // would collide when the program is built.
+                let collected_id = conv.instance_def_id(referenced, &inst);
+                if collected.contains(&collected_id) {
+                    return;
+                }
                 if *taken >= MAX_LOCAL_INSTANCES {
                     fail_all(
                         &mut *target_demands,
@@ -1420,7 +1440,7 @@ fn collect_const_closure_instances(
                             format!("{} [{}]", base_name, inst.name())
                         };
                         bodies.push((display, converted));
-                        body_def_ids.push(conv.instance_def_id(referenced, &inst));
+                        body_def_ids.push(collected_id);
                         body_def_names.push(base_name.clone());
                         let demand = target_demands.entry(referenced).or_default();
                         demand.converted += 1;
@@ -2760,6 +2780,16 @@ fn collect() -> ControlFlow<()> {
         &seed_bodies,
         &mut demand_state,
     );
+    // The program DefIds and report names collected so far,
+    // shared with every merge and demand pass below: the
+    // reachability collection resolves some of the same closure
+    // instances the closure demand passes do, and a body may
+    // enter the program only once under its DefId (report
+    // entries only once under their display name).
+    let mut collected_ids: HashSet<sparagmos_mir::DefId> =
+        body_def_ids.iter().copied().collect();
+    let mut report_names: HashSet<String> =
+        report.functions.iter().map(|f| f.name.clone()).collect();
     // Convert the demanded instances of closures defined in
     // generic contexts: the converted local bodies and the
     // demanded function instances mention them with concrete
@@ -2775,6 +2805,7 @@ fn collect() -> ControlFlow<()> {
         &deferred_closures,
         &local_defs,
         &closure_scan,
+        &collected_ids,
         &mut demand_state,
     );
     // Convert the demanded instances of the local coroutines
@@ -2805,6 +2836,7 @@ fn collect() -> ControlFlow<()> {
         &mut body_def_names,
         &deferred_closures,
         &local_defs,
+        &collected_ids,
         &mut demand_state,
     );
     // Local bodies converted by the closure and coroutine passes
@@ -2859,12 +2891,26 @@ fn collect() -> ControlFlow<()> {
         &local_defs,
         sparagmos_driver::reach::MAX_COLLECTED_BODIES,
     );
-    let mut foreign_taken = reached.bodies.len();
+    collected_ids.extend(body_def_ids.iter().copied());
+    let mut foreign_taken = 0usize;
     let mut frontier = reached.walked_bodies;
-    bodies.extend(reached.bodies);
-    body_def_ids.extend(reached.body_def_ids);
-    body_def_names.extend(reached.body_def_names);
-    report.functions.extend(reached.reports);
+    for ((name, body), (def_id, def_name)) in reached
+        .bodies
+        .into_iter()
+        .zip(reached.body_def_ids.into_iter().zip(reached.body_def_names))
+    {
+        if collected_ids.insert(def_id) {
+            foreign_taken += 1;
+            bodies.push((name, body));
+            body_def_ids.push(def_id);
+            body_def_names.push(def_name);
+        }
+    }
+    for entry in reached.reports {
+        if report_names.insert(entry.name.clone()) {
+            report.functions.push(entry);
+        }
+    }
 
     // A generic local definition can also be demanded from inside
     // a collected foreign body (a std adapter calling a trait
@@ -2878,18 +2924,15 @@ fn collect() -> ControlFlow<()> {
     // instances. Later reachability passes re-walk (and
     // re-convert) targets earlier passes already collected; the
     // duplicates are dropped by DefId for bodies and by display
-    // name for report entries, and both collections keep their
+    // name for report entries (the sets above, which the initial
+    // merge already used), and both collections keep their
     // per-program caps across passes (shared demand state, and a
     // remaining-budget argument for reachability).
-    let mut collected_ids: HashSet<sparagmos_mir::DefId> =
-        body_def_ids.iter().copied().collect();
     // Stable MIR sources for the trait-key alias pass below: the
     // local seeds plus every foreign body the reachability passes
     // walk, across all fixpoint rounds.
     let mut alias_sources = reach_seeds.clone();
     alias_sources.extend(frontier.iter().cloned());
-    let mut report_names: HashSet<String> =
-        report.functions.iter().map(|f| f.name.clone()).collect();
     loop {
         let ids_before = body_def_ids.len();
         let mut fn_scan = frontier.clone();
@@ -2915,6 +2958,7 @@ fn collect() -> ControlFlow<()> {
             &deferred_closures,
             &local_defs,
             &closure_scan,
+            &collected_ids,
             &mut demand_state,
         );
         // Newly collected bodies can likewise create or hold
@@ -2960,6 +3004,7 @@ fn collect() -> ControlFlow<()> {
             &mut body_def_names,
             &deferred_closures,
             &local_defs,
+            &collected_ids,
             &mut demand_state,
         );
         if new_instances.is_empty()
@@ -3030,6 +3075,7 @@ fn collect() -> ControlFlow<()> {
             &mut body_def_names,
             &deferred_closures,
             &local_defs,
+            &collected_ids,
             &mut demand_state,
         );
         if new_const_bodies.is_empty() {
