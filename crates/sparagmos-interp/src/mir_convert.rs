@@ -7023,16 +7023,20 @@ let inner = match (&src, target) {
                 .collect();
             let instantiated = format!("{adt_name}<{}>", parts.join(", "));
             for trait_path in ["std::ops::Drop", "core::ops::Drop"] {
-                let key = format!("<{instantiated} as {trait_path}>::drop");
-                if self.bodies.contains_key(&key) {
-                    return Some(key);
+                for method in ["drop", "pin_drop"] {
+                    let key = format!("<{instantiated} as {trait_path}>::{method}");
+                    if self.bodies.contains_key(&key) {
+                        return Some(key);
+                    }
                 }
             }
         }
         for trait_path in ["std::ops::Drop", "core::ops::Drop"] {
-            let key = format!("<{adt_name} as {trait_path}>::drop");
-            if self.bodies.contains_key(&key) {
-                return Some(key);
+            for method in ["drop", "pin_drop"] {
+                let key = format!("<{adt_name} as {trait_path}>::{method}");
+                if self.bodies.contains_key(&key) {
+                    return Some(key);
+                }
             }
         }
         let candidates: Vec<&String> = self
@@ -8172,10 +8176,18 @@ fn impl_self_matches(self_part: &str, self_name: &str) -> bool {
 /// accepted as well.
 fn is_dtor_name(name: &str, adt_name: &str) -> bool {
     for trait_path in ["std::ops::Drop", "core::ops::Drop"] {
-        let suffix = format!(" as {trait_path}>::drop");
-        let Some(head) = name.strip_suffix(&suffix) else {
+        // `pin_drop` is the same trait's destructor entry point
+        // under pin ergonomics: a type that provides it has no
+        // `drop` method, and the compiler's glue for dropping
+        // the type is a call to it.
+        let suffix = ["drop", "pin_drop"]
+            .iter()
+            .find_map(|m| name.strip_suffix(&format!(" as {trait_path}>::{m}")));
+        let Some(head) = suffix else {
             continue;
         };
+        let head = head.to_string();
+        let head = head.as_str();
         if head == format!("<{adt_name}") {
             return true;
         }

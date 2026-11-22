@@ -4400,7 +4400,22 @@ impl<'a> Interpreter<'a> {
                         }
                         let target_ref = self.extend_ref(frames, &active.root, &path)?;
                         let mut locals = vec![Value::Uninit; local_count];
-                        locals[1] = Value::Ref(target_ref);
+                        // A `pin_drop` destructor takes
+                        // `Pin<&mut Self>`, and `Pin` is a one-field
+                        // aggregate in this value model (the shape
+                        // converted `Pin::new` bodies build): pass
+                        // the wrapper, not the bare pointer, or the
+                        // body's own `Deref` for `Pin` resolves
+                        // through the pointee and unwraps the wrong
+                        // field.
+                        locals[1] = if func.ends_with(">::pin_drop") {
+                            Value::Enum {
+                                variant: 0,
+                                fields: vec![Value::Ref(target_ref)],
+                            }
+                        } else {
+                            Value::Ref(target_ref)
+                        };
                         let frame_id = self.fresh_frame_id();
                         self.drop_continuations.push(DropContinuation {
                             callee_frame: frame_id,

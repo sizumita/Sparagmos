@@ -15902,3 +15902,51 @@ fn run_mode_suspended_coroutine_drop_runs_capture_dtor() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "coroutine drop env ok\n");
 }
+
+const PIN_DROP_SRC: &str = r#"
+#![feature(pin_ergonomics)]
+#![allow(incomplete_features)]
+
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+#[pin_v2]
+struct Foo {
+    dropped: Arc<AtomicBool>,
+}
+
+impl Drop for Foo {
+    fn pin_drop(self: Pin<&mut Self>) {
+        self.dropped.store(true, Ordering::Relaxed);
+    }
+}
+
+fn main() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    {
+        let _f = Foo { dropped: dropped.clone() };
+    }
+    assert!(dropped.load(Ordering::Relaxed));
+    println!("pin drop ok");
+}
+"#;
+
+#[test]
+fn run_mode_pin_drop_runs_as_the_destructor() {
+    // Under pin ergonomics a type's destructor entry point is
+    // `pin_drop(self: Pin<&mut Self>)` and there is no `drop`
+    // method: the glue must call it, with the argument in the
+    // one-field `Pin` aggregate shape the value model uses for
+    // `Pin` everywhere else.
+    let dir = temp_dir("pin-drop");
+    let src = fixture(&dir, "pin_drop.rs", PIN_DROP_SRC);
+    let out = run_driver_extra(&src, &["--edition", "2024"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "pin_drop must run as the type's destructor; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "pin drop ok\n");
+}

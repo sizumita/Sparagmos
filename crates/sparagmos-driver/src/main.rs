@@ -2394,7 +2394,9 @@ fn drop_impl_methods(
     for f in fn_defs {
         let name = f.name();
         if !(name.ends_with(" as std::ops::Drop>::drop")
-            || name.ends_with(" as core::ops::Drop>::drop"))
+            || name.ends_with(" as core::ops::Drop>::drop")
+            || name.ends_with(" as std::ops::Drop>::pin_drop")
+            || name.ends_with(" as core::ops::Drop>::pin_drop"))
         {
             continue;
         }
