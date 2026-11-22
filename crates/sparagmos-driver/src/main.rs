@@ -410,6 +410,50 @@ fn fetch_instance_body(
     guard_stable_mir_query(|| inst.body())
 }
 
+/// Whether this instance is a compiler-generated impl method
+/// (a derived impl) over a `#[repr(simd)]` `Self` type. A
+/// derived method carries the very span of its impl — both are
+/// the derive attribute's span — while a hand-written method's
+/// span is its own definition inside the impl block, never the
+/// impl's. The distinction matters because a derived body is
+/// synthesized by projecting the ADT's fields, and projecting
+/// into a SIMD type is exactly what rustc's MIR validator
+/// bans (MCP#838): asking for such a body emits the ICE
+/// diagnostic that poisons the whole compilation, even when
+/// the panic itself is contained. A hand-written body chooses
+/// its own accesses (the `as_array` pointer-cast idiom is the
+/// known shape) and is safe to fetch.
+fn generated_simd_impl_method(inst: &Instance) -> bool {
+    use rustc_public::CrateDef as _;
+    let def = inst.def.def_id();
+    let Some(parent) = def.parent() else {
+        return false;
+    };
+    if def.span() != parent.span() {
+        return false;
+    }
+    // The instance's own arguments are relative to the impl
+    // method's definition (its `T`, `N`, ...), not the trait's,
+    // so the `Self` type is read off the method's receiver: the
+    // first input of the instance's signature, behind the
+    // reference a `&self` receiver adds.
+    let Some(sig) = sparagmos_driver::convert::guarded_ty_kind(&inst.ty())
+        .and_then(|kind| kind.fn_sig())
+        .map(|sig| sig.skip_binder())
+    else {
+        return false;
+    };
+    let Some(receiver) = sig.inputs_and_output.first() else {
+        return false;
+    };
+    let self_ty = match sparagmos_driver::convert::guarded_ty_kind(receiver) {
+        Some(TyKind::RigidTy(RigidTy::Ref(_, inner, _))) => inner,
+        _ => receiver.clone(),
+    };
+    sparagmos_driver::convert::guarded_ty_kind(&self_ty)
+        .is_some_and(|kind| kind.is_simd())
+}
+
 /// Whether a conversion error is one of the contained Stable
 /// MIR panics' named reasons (see `stable_mir_panic_reason`).
 fn is_contained_reason(reason: &str) -> bool {
@@ -994,6 +1038,27 @@ fn collect_local_instances(
                 fail_all(&mut *demands, &owners, reason.to_string());
                 continue;
             }
+            // Mirror the virtual guard for compiler-generated
+            // impl bodies over a SIMD type: the derived body
+            // projects the ADT's fields, the MIR validator bans
+            // projections into SIMD types (MCP#838), and the
+            // ICE diagnostic emitted while asking poisons the
+            // whole compilation even when the panic is
+            // contained. The derived rendering is served
+            // without the body (the interpreter's structural
+            // Debug shapes, or the trait's builtin model), so
+            // the demand is recorded unmet instead of fetched.
+            // Hand-written methods over SIMD types do not trip
+            // the ban (their bodies choose their own accesses)
+            // and are fetched as usual.
+            if generated_simd_impl_method(&inst) {
+                fail_all(
+                    &mut *demands,
+                    &owners,
+                    "compiler-generated impl body over a SIMD type".to_string(),
+                );
+                continue;
+            }
             let ibody = match fetch_instance_body(&inst) {
                 Ok(Some(b)) => b,
                 Ok(None) => {
@@ -1257,6 +1322,17 @@ fn collect_closure_instances(
                 }
                 if !inst.has_body() {
                     fail_all(&mut *target_demands, &owners, "no MIR body available".to_string());
+                    continue;
+                }
+                // As in `collect_local_instances`: a
+                // compiler-generated impl body over a SIMD type
+                // must not be asked for (MCP#838 validation ICE).
+                if generated_simd_impl_method(&inst) {
+                    fail_all(
+                        &mut *target_demands,
+                        &owners,
+                        "compiler-generated impl body over a SIMD type".to_string(),
+                    );
                     continue;
                 }
                 let ibody = match fetch_instance_body(&inst) {
@@ -1844,6 +1920,19 @@ fn collect_coroutine_instances(
                                 &mut *demands,
                                 &owners,
                                 "no MIR body available".to_string(),
+                            );
+                            continue;
+                        }
+                        // As in `collect_local_instances`: a
+                        // compiler-generated impl body over a
+                        // SIMD type must not be asked for
+                        // (MCP#838 validation ICE).
+                        if generated_simd_impl_method(&inst) {
+                            fail_all(
+                                &mut *demands,
+                                &owners,
+                                "compiler-generated impl body over a SIMD type"
+                                    .to_string(),
                             );
                             continue;
                         }
