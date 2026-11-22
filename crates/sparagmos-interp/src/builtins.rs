@@ -8271,6 +8271,16 @@ impl<'a> Interpreter<'a> {
             Builtin::VolatileLoad => {
                 arity(1)?;
                 let target = self.deref_value(frames, &vals[0])?;
+                // As with the atomic load: a wider-than-byte
+                // access into byte storage composes the bytes.
+                let tag = generic_args.first().map(String::as_str).unwrap_or("");
+                if let Some((bits, signed)) = int_tag(tag) {
+                    if let Some(value) =
+                        self.read_punned_int(frames, &target, bits, signed)?
+                    {
+                        return Ok(value);
+                    }
+                }
                 // The pointee value itself, composite types
                 // included: no wrapper unwrapping (that is the
                 // atomic operations' UnsafeCell model, not a
@@ -8284,6 +8294,12 @@ impl<'a> Interpreter<'a> {
                     return Ok(Value::Unit);
                 }
                 let target = self.deref_value(frames, &vals[0])?;
+                // The store matching the punned load above.
+                if let Some((bits, _)) = int_tag(tag) {
+                    if self.write_punned_int(frames, &target, bits, &vals[1])? {
+                        return Ok(Value::Unit);
+                    }
+                }
                 self.write_resolved(frames, &target, vals[1].clone())?;
                 Ok(Value::Unit)
             }
@@ -8517,6 +8533,17 @@ impl<'a> Interpreter<'a> {
             Builtin::AtomicLoad => {
                 arity(1)?;
                 let target = self.deref_value(frames, &vals[0])?;
+                // A wider-than-byte access through a pointer into
+                // byte storage (an unaligned / type-punned load)
+                // composes the stored bytes.
+                let tag = generic_args.first().map(String::as_str).unwrap_or("");
+                if let Some((bits, signed)) = int_tag(tag) {
+                    if let Some(value) =
+                        self.read_punned_int(frames, &target, bits, signed)?
+                    {
+                        return Ok(value);
+                    }
+                }
                 let current = self.read_resolved(frames, &target)?;
                 Ok(unwrap_wrapper(&current).clone())
             }
@@ -8524,6 +8551,13 @@ impl<'a> Interpreter<'a> {
                 arity(2)?;
                 let target = self.deref_value(frames, &vals[0])?;
                 let value = vals.into_iter().nth(1).expect("arity checked");
+                // The store matching the punned load above.
+                let tag = generic_args.first().map(String::as_str).unwrap_or("");
+                if let Some((bits, _)) = int_tag(tag) {
+                    if self.write_punned_int(frames, &target, bits, &value)? {
+                        return Ok(Value::Unit);
+                    }
+                }
                 self.atomic_write(frames, &target, value)?;
                 Ok(Value::Unit)
             }

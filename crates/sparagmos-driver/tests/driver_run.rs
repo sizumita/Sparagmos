@@ -15479,3 +15479,41 @@ fn run_mode_panicking_destructor_still_drops_fields() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
 }
+
+const PUNNED_ACCESS_SRC: &str = r#"
+#![feature(core_intrinsics)]
+
+use std::intrinsics::{unaligned_volatile_load, unaligned_volatile_store};
+
+fn main() {
+    unsafe {
+        let mut arr: [u8; 3] = [1, 2, 3];
+        // A u16 load through a pointer into byte storage composes
+        // the two stored bytes.
+        let ptr = arr[1..].as_mut_ptr() as *mut u16;
+        unaligned_volatile_store(ptr, 0);
+        assert_eq!(arr, [1, 0, 0]);
+        unaligned_volatile_store(ptr, 0x0504);
+        assert_eq!(arr, [1, 4, 5]);
+        assert_eq!(unaligned_volatile_load(ptr as *const u16), 0x0504);
+        println!("ok");
+    }
+}
+"#;
+
+#[test]
+fn run_mode_unaligned_volatile_access_composes_bytes() {
+    // An unaligned (type-punned) volatile access through a
+    // pointer into byte storage reads and writes the composed
+    // bytes of the wider integer, not just the first byte.
+    let dir = temp_dir("punned-access");
+    let src = fixture(&dir, "punned_access.rs", PUNNED_ACCESS_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "unaligned volatile accesses must compose bytes; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}

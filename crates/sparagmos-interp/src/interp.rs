@@ -7785,6 +7785,84 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// Read an integer of `bits` width at `target` by composing
+    /// the bytes of the byte sequence the target addresses, when
+    /// the target denotes one byte of such a sequence: the shape
+    /// a type-punned pointer has (a `*const u16` into a `[u8]`
+    /// buffer, the access `unaligned_volatile_load` performs).
+    /// The interpreter's values are not byte-addressed, so a
+    /// wider-than-byte access through such a pointer can only be
+    /// honoured by composing the stored bytes (little-endian, the
+    /// only target layout the model uses). `None` when the target
+    /// does not denote a byte sequence position with enough bytes
+    /// left — the plain element read is then the access's meaning.
+    pub(crate) fn read_punned_int(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        bits: u32,
+        signed: bool,
+    ) -> InterpResult<Option<Value>> {
+        let n = (bits / 8) as usize;
+        if n <= 1 {
+            return Ok(None);
+        }
+        let mut raw: u128 = 0;
+        for k in 0..n {
+            let byte = match self.read_seq_at(frames, target, k) {
+                Ok(Value::Uint(b)) if b <= 0xFF => b,
+                Ok(Value::Int(b)) if (0..=0xFF).contains(&b) => b as u128,
+                _ => return Ok(None),
+            };
+            raw |= byte << (8 * k);
+        }
+        if signed {
+            let shift = 128 - bits;
+            Ok(Some(Value::Int(((raw << shift) as i128) >> shift)))
+        } else {
+            let mask = if bits >= 128 { u128::MAX } else { (1u128 << bits) - 1 };
+            Ok(Some(Value::Uint(raw & mask)))
+        }
+    }
+
+    /// The store matching [`Self::read_punned_int`]: decompose
+    /// `value`'s low `bits` into bytes over the byte sequence at
+    /// `target`. Returns `false` (and writes nothing) when the
+    /// target does not denote a byte sequence position with
+    /// enough bytes left.
+    pub(crate) fn write_punned_int(
+        &self,
+        frames: &mut Vec<Frame>,
+        target: &Resolved,
+        bits: u32,
+        value: &Value,
+    ) -> InterpResult<bool> {
+        let n = (bits / 8) as usize;
+        if n <= 1 {
+            return Ok(false);
+        }
+        // Probe first: every byte of the access must land on a
+        // stored byte, so a non-byte target writes nothing.
+        for k in 0..n {
+            match self.read_seq_at(frames, target, k) {
+                Ok(Value::Uint(b)) if b <= 0xFF => {}
+                Ok(Value::Int(b)) if (0..=0xFF).contains(&b) => {}
+                _ => return Ok(false),
+            }
+        }
+        let mask = if bits >= 128 { u128::MAX } else { (1u128 << bits) - 1 };
+        let raw = match value {
+            Value::Uint(u) => *u & mask,
+            Value::Int(i) => (*i as u128) & mask,
+            _ => return Ok(false),
+        };
+        for k in 0..n {
+            let byte = (raw >> (8 * k)) & 0xFF;
+            self.write_seq_at(frames, target, k, Value::Uint(byte))?;
+        }
+        Ok(true)
+    }
+
     /// The directly-resolved target of element `index` of the
     /// sequence starting at `target`, when `target` denotes a
     /// single element of it (see [`Self::read_seq_at`]); `None`
