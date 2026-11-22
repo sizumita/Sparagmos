@@ -622,6 +622,18 @@ HOST_TRUE_CFGS = {
     "elf",
 }
 
+# compiletest builds the channel conditions in the same condition set
+# (directives/cfg.rs): exactly one of stable/beta/nightly is true, for
+# the channel of the compiler under test, and a "dev" build counts as
+# nightly. The channel is the compiler's own declaration -- the suffix
+# of its version string. The pinned reference toolchain is the
+# official 1.100.0 release build, whose version string
+# ("rustc 1.100.0 (...)") carries no -nightly/-beta/-dev suffix, so
+# its channel is stable. RUSTC_BOOTSTRAP=1, which both sides run
+# under, unlocks unstable features but does not change the declared
+# channel, so it plays no part here.
+RELEASE_CHANNEL = "stable"
+
 # ---------------------------------------------------------------------------
 # needs-* conditions (compiletest's model, mirrored)
 # ---------------------------------------------------------------------------
@@ -1140,6 +1152,11 @@ def eval_cfg_atom(atom):
     atom = atom.strip()
     if atom in HOST_TRUE_CFGS:
         return True
+    if atom in ("stable", "beta", "nightly"):
+        # Channel conditions (see RELEASE_CHANNEL): exactly one is
+        # true, where the bare-name rule below would make all three
+        # false, which no compiletest run ever sees.
+        return atom == RELEASE_CHANNEL
     if atom in ("windows", "macos", "win32", "32bit"):
         return False
     m = re.match(r'^(target_[a-z_]+)\s*=\s*"([^"]*)"$', atom)
@@ -1316,6 +1333,13 @@ def stage1_blocker(header, survey_rec):
     Checks that depend only on the header and the survey record
     (environment applicability is checked separately).
     """
+    # compiletest decides ignore-test before any mode or revision
+    # dispatch: the test never runs, whatever else its header says.
+    # Checking it after the run-mode test would report an ignore-test
+    # file without a run directive as a header-feature blocker
+    # instead of under its own bucket.
+    if header.has("ignore-test"):
+        return "ignore-test (compiletest itself never runs this test)"
     if header.has("revisions") or any(
             rev is not None for (rev, _n) in header.scoped):
         return "revisions present (per-revision cfgs not run in stage 1)"
@@ -1328,8 +1352,6 @@ def stage1_blocker(header, survey_rec):
         return "stdin directive present (guest stdin is not modelled)"
     if header.has("add-core-stubs"):
         return "add-core-stubs (test links the minicore stub crate)"
-    if header.has("ignore-test"):
-        return "ignore-test (compiletest itself never runs this test)"
     return None
 
 
@@ -1343,6 +1365,10 @@ def stage1_view_blocker(view):
     are not a blocker here; fill_result judges a revision test once
     per revision (see fill_result_revisions).
     """
+    # ignore-test first, as in stage1_blocker: compiletest's ignore
+    # decision precedes every per-revision mode dispatch.
+    if view.has("ignore-test"):
+        return "ignore-test (compiletest itself never runs this test)"
     mode = run_mode(view)
     if mode == "run-crash":
         return "run-crash mode (crash reproduction is out of stage-1 scope)"
@@ -1350,8 +1376,6 @@ def stage1_view_blocker(view):
         return "stdin directive present (guest stdin is not modelled)"
     if view.has("add-core-stubs"):
         return "add-core-stubs (test links the minicore stub crate)"
-    if view.has("ignore-test"):
-        return "ignore-test (compiletest itself never runs this test)"
     return None
 
 
