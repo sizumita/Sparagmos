@@ -965,6 +965,19 @@ pub enum Builtin {
     RcNew,
     /// `Arc::new(value)`: the `Rc` shape, with an `ArcInner`.
     ArcNew,
+    /// `Rc::from_raw(ptr)`: rebuild the strong handle naming
+    /// the allocation the raw data pointer denotes (the
+    /// reverse of the data-field pointer `into_raw` produces;
+    /// see the evaluation arm). No count moves: `into_raw`
+    /// forgot a live handle, and `from_raw` reconstitutes it.
+    RcFromRaw,
+    /// `Arc::from_raw(ptr)`: the `Rc` shape, with an `ArcInner`.
+    ArcFromRaw,
+    /// `Weak::from_raw(ptr)` (either the `Rc` or the `Arc`
+    /// weak handle): the weak handle naming the same
+    /// allocation, with no count movement, as for the strong
+    /// reconstruction.
+    WeakFromRaw,
     /// An integer bit intrinsic (`ctpop`, `ctlz`, `cttz`,
     /// `bitreverse`, `bswap`): a unary operation on the operand
     /// type's bit pattern, at the type's own width.
@@ -2448,6 +2461,18 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         }
         _ if canonical.starts_with("std::sync::Arc") && canonical.ends_with(">::new") => {
             Builtin::ArcNew
+        }
+        _ if canonical.starts_with("std::rc::Rc") && canonical.ends_with(">::from_raw") => {
+            Builtin::RcFromRaw
+        }
+        _ if canonical.starts_with("std::sync::Arc") && canonical.ends_with(">::from_raw") => {
+            Builtin::ArcFromRaw
+        }
+        _ if (canonical.starts_with("std::rc::Weak")
+            || canonical.starts_with("std::sync::Weak"))
+            && canonical.ends_with(">::from_raw") =>
+        {
+            Builtin::WeakFromRaw
         }
         _ => return float_method(canonical),
     })
@@ -6345,6 +6370,18 @@ impl<'a> Interpreter<'a> {
                     Value::Ref(_) => {
                         let target = self.deref_value(frames, &vals[0])?;
                         let value = self.read_resolved(frames, &target)?;
+                        // A `Waker` / `LocalWaker` clone is not
+                        // a value copy: a waker built by
+                        // `from_raw` clones through its
+                        // `RawWakerVTable` clone entry (which is
+                        // where the reference count moves), and
+                        // the modelled `From` waker clones the
+                        // handle it carries.
+                        if self_ty == "std::task::Waker"
+                            || self_ty == "std::task::LocalWaker"
+                        {
+                            return self.clone_waker_value(frames, &value, name);
+                        }
                         // A `Box` clone owns a fresh allocation
                         // holding a clone of the pointee: copying
                         // the box value itself would alias the
@@ -6493,6 +6530,46 @@ impl<'a> Interpreter<'a> {
                 // accessors, `Weak`) operate on the real layout.
                 let v = vals.into_iter().next().expect("arity checked");
                 Ok(self.rc_new_handle(v))
+            }
+            Builtin::RcFromRaw | Builtin::ArcFromRaw | Builtin::WeakFromRaw => {
+                arity(1)?;
+                // Rebuild the handle naming the allocation the
+                // raw pointer denotes. The pointer `into_raw`
+                // produces (and the only shape this reconstruction
+                // accepts) is the stored inner aggregate's data
+                // pointer: a reference to the allocation carrying
+                // the data field's projection (`Field(2)`, the
+                // position `Deref::deref` reads through), or the
+                // bare allocation reference itself. The handle is
+                // the allocation's canonical handle value; no
+                // count moves, as `into_raw` forgot a live
+                // handle rather than releasing one. Any other
+                // pointer shape denotes no allocation this model
+                // can name, and is an explicit error.
+                // The argument is the pointer value itself (a
+                // reference into the allocation store), not a
+                // place denoting it: it is matched as it stands.
+                let ptr = vals.into_iter().next().expect("arity checked");
+                let id = match &ptr {
+                    Value::Ref(RefTarget::Alloc { id, projection })
+                        if projection.is_empty()
+                            || matches!(
+                                projection.as_slice(),
+                                [RefProj::Field(2)]
+                            ) =>
+                    {
+                        Some(*id)
+                    }
+                    _ => None,
+                };
+                match id {
+                    Some(id) => Ok(self.rc_handle(id)),
+                    None => Err(InterpError::type_mismatch(
+                        "Rc::from_raw / Arc::from_raw / Weak::from_raw",
+                        "a raw pointer to a reference-counted allocation's data field",
+                        ptr.kind_name(),
+                    )),
+                }
             }
             Builtin::BoxNewUninit => {
                 arity(0)?;
@@ -8972,6 +9049,84 @@ impl<'a> Interpreter<'a> {
                     .collect::<InterpResult<Vec<_>>>()?,
             ),
             other => other.clone(),
+        })
+    }
+
+    /// Clone a `Waker` / `LocalWaker` value the way std's manual
+    /// `Clone` impls do. The modelled `From<Arc<T: Wake>>` /
+    /// `From<Rc<T: LocalWake>>` waker is a one-field aggregate
+    /// carrying the handle itself: the clone is another live
+    /// handle on the same allocation, so the strong count moves
+    /// and the value copies. A `from_raw` waker holds a real
+    /// `RawWaker` (as the waker value itself or as its one
+    /// non-zero-sized field): the clone calls the vtable's clone
+    /// entry with the data pointer and wraps the `RawWaker` it
+    /// returns in the same shape. Any other shape is an explicit
+    /// error.
+    fn clone_waker_value(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        value: &Value,
+        name: &str,
+    ) -> InterpResult<Value> {
+        if let Value::Enum { fields, .. } = value {
+            if fields.len() == 1 {
+                if let Some(id) = rc_handle_id(&fields[0]) {
+                    self.rc_inc_strong(id)?;
+                    return Ok(value.clone());
+                }
+            }
+        }
+        let (variant, wrapped, raw) = match value {
+            Value::Enum { variant, fields } if fields.len() == 1 => {
+                (*variant, true, fields[0].clone())
+            }
+            Value::Enum { .. } => (0, false, value.clone()),
+            other => {
+                return Err(InterpError::type_mismatch(
+                    format!("builtin {name}"),
+                    "a Waker value",
+                    other.kind_name(),
+                ));
+            }
+        };
+        let Value::Enum { fields: raw_fields, .. } = &raw else {
+            return Err(InterpError::type_mismatch(
+                format!("builtin {name}"),
+                "a RawWaker value",
+                raw.kind_name(),
+            ));
+        };
+        if raw_fields.len() != 2 {
+            return Err(InterpError::type_mismatch(
+                format!("builtin {name}"),
+                "a RawWaker value (data pointer and vtable)",
+                raw.kind_name(),
+            ));
+        }
+        let data = raw_fields[0].clone();
+        let resolved = self.deref_value(frames, &raw_fields[1])?;
+        let vtable = self.read_resolved(frames, &resolved)?;
+        let Value::Enum { fields: vtable_fields, .. } = &vtable else {
+            return Err(InterpError::type_mismatch(
+                format!("builtin {name}"),
+                "a RawWakerVTable value",
+                vtable.kind_name(),
+            ));
+        };
+        let Some(Value::FnPtr(clone_name)) = vtable_fields.first() else {
+            return Err(InterpError::type_mismatch(
+                format!("builtin {name}"),
+                "a RawWakerVTable with a function-pointer clone entry",
+                vtable.kind_name(),
+            ));
+        };
+        let clone_name = clone_name.clone();
+        let new_raw = self.call_sync(frames, &clone_name, vec![data])?;
+        Ok(if wrapped {
+            Value::Enum { variant, fields: vec![new_raw] }
+        } else {
+            new_raw
         })
     }
 

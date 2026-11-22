@@ -813,6 +813,10 @@ fn drop_glue_edges<'a>(glue: &'a ir::DropGlue, targets: &mut Vec<&'a str>) -> bo
             ir::DropPlan::ChannelHandleDrop { .. } => true,
             // Releasing a weak reference calls no destructor body.
             ir::DropPlan::RcWeakRelease => true,
+            // A waker's release is chosen from the value at run
+            // time (a handle release, or the vtable entry the
+            // value itself carries): no static edges.
+            ir::DropPlan::WakerDrop => true,
             ir::DropPlan::RcHandleDrop { value } => walk(value, adts, targets, seen),
             // Judged from the value at run time; calls no
             // destructor body.
@@ -3280,7 +3284,12 @@ impl<'a> Converter<'a> {
     ///   values): `NonNull<str>` and its kin;
     /// * one-field struct over a fieldless enum -> integer:
     ///   the discriminant of the field's value (`mem::Alignment`
-    ///   -> `usize`).
+    ///   -> `usize`), and the reverse (integer -> the wrapper:
+    ///   the integer is the wrapped enum's discriminant);
+    /// * fieldless enum <-> the one-field transparent struct
+    ///   wrapping it (`mem::Alignment` <-> its enum): the enum
+    ///   value itself, wrapped into / read out of the struct's
+    ///   single field.
     /// * one-payload wrapper <-> its payload, for a payload of
     ///   any type: a one-field struct whose only field has
     ///   exactly the other side's type, and `MaybeUninit<T>`
@@ -3756,6 +3765,25 @@ impl<'a> Converter<'a> {
                             .map(|(i, c)| (*i as u32, c.clone()))
                             .collect(),
                     }
+                } else if let Some((table, shape)) =
+                    self.enum_wrapper_shape(def, args)
+                {
+                    // A transparent wrapper around a fieldless
+                    // enum (`mem::Alignment`): the integer is the
+                    // discriminant of the enum value the wrapper
+                    // holds — the reverse of the
+                    // wrapper-to-integer transmute above.
+                    ir::Rvalue::IntToEnumWrapped {
+                        operand: v.clone(),
+                        discriminants: table,
+                        payload_index: shape.payload_index as u32,
+                        field_count: shape.field_count,
+                        fill: shape
+                            .fill
+                            .iter()
+                            .map(|(i, c)| (*i as u32, c.clone()))
+                            .collect(),
+                    }
                 } else {
                     unsupported()
                 }
@@ -3901,6 +3929,32 @@ impl<'a> Converter<'a> {
                                 .iter()
                                 .map(|(i, c)| (*i as u32, c.clone()))
                                 .collect(),
+                        }
+                    }
+                    // A fieldless enum transmuted to the
+                    // one-field transparent struct wrapping it
+                    // (the `mem::Alignment` shape: a struct whose
+                    // single field is the enum itself): the value
+                    // is the enum value, becoming the struct's
+                    // single field.
+                    (None, None)
+                        if self.fieldless_enum_discriminants(def).is_some()
+                            && self.single_field_ty(tdef, targs)
+                                == Some(mir::Ty::Adt(def.clone(), args.to_vec())) =>
+                    {
+                        ir::Rvalue::AggregateAdt {
+                            variant: 0,
+                            operands: vec![v.clone()],
+                            field_index: None,
+                        }
+                    }
+                    // The reverse direction: the one-field
+                    // struct over a fieldless enum transmuted to
+                    // the enum it wraps: the field itself.
+                    (Some(field_ty), Some(_)) if field_ty == *target => {
+                        match self.field_operand(body, operand, v, 0, &field_ty) {
+                            Some(op) => ir::Rvalue::Use(op),
+                            None => unsupported(),
                         }
                     }
                     _ => match (self.zst_value(src.as_ref().unwrap(), 0), self.zst_value(target, 0)) {
@@ -4563,6 +4617,51 @@ impl<'a> Converter<'a> {
         self.wrapper_shape_matching(def, args, is_fat_ptr_ty)
     }
 
+    /// The transparent-wrapper shape whose payload field is a
+    /// fieldless enum, together with that enum's discriminant
+    /// table (`mem::Alignment` over its `AlignmentEnum` is the
+    /// canonical case): the same one-payload rule as
+    /// [`Self::wrapper_shape`], with the enum as the payload.
+    fn enum_wrapper_shape(
+        &self,
+        def: &mir::AdtDefId,
+        args: &[mir::Ty],
+    ) -> Option<(Vec<i128>, WrapperShape)> {
+        let shape = self.adt_shapes.get(def)?;
+        if shape.kind != mir::AdtShapeKind::Struct || shape.variants.len() != 1 {
+            return None;
+        }
+        let fields = self.instantiated_field_tys(def, args, 0)?;
+        let mut payload: Option<(usize, mir::Ty, Vec<i128>)> = None;
+        let mut fill = Vec::new();
+        for (i, fty) in fields.iter().enumerate() {
+            let table = match fty {
+                mir::Ty::Adt(fdef, _) => self.fieldless_enum_discriminants(fdef),
+                _ => None,
+            };
+            if let Some(table) = table {
+                if payload.is_some() {
+                    return None;
+                }
+                payload = Some((i, fty.clone(), table));
+            } else if let Some(zv) = self.zst_value(fty, 0) {
+                fill.push((i, value_to_constant(&zv)?));
+            } else {
+                return None;
+            }
+        }
+        let (payload_index, payload_ty, table) = payload?;
+        Some((
+            table,
+            WrapperShape {
+                field_count: fields.len(),
+                payload_index,
+                payload_ty,
+                fill,
+            },
+        ))
+    }
+
     fn wrapper_shape_matching(
         &self,
         def: &mir::AdtDefId,
@@ -4768,7 +4867,9 @@ impl<'a> Converter<'a> {
                                     }
                                     Some(src) => {
                                         let pointee = unsize_pointee(&src);
-                                        let concrete = self.concrete_ty_name(pointee);
+                                        let concrete = self.concrete_ty_name(
+                                            unsize_concrete_pointee(self, &src),
+                                        );
                                         // The value carries the
                                         // pointee's drop glue from
                                         // here, like a vtable's
@@ -7389,21 +7490,13 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
             }
             "std::task::Waker" | "core::task::Waker" | "std::task::LocalWaker"
             | "core::task::LocalWaker" => {
-                // The modelled waker value is a one-field
-                // aggregate holding the `Arc` / `Rc` handle the
-                // `From` conversion carried (see the `From::from`
-                // builtin): the vtable's drop function is that
-                // handle's release. The pointee type is erased by
-                // the waker, so its glue is judged from the stored
-                // value's shape when the last handle goes away -
-                // the `Dynamic` judgment, which refuses shapes
-                // that can hide a destructor.
-                return Some(P::At {
-                    path: vec![RefProj::Field(0)],
-                    plan: Box::new(P::RcHandleDrop {
-                        value: Box::new(P::Dynamic),
-                    }),
-                });
+                // Which release a waker's drop runs depends on
+                // the shape of the stored value (the modelled
+                // `From` conversion's handle aggregate, or a real
+                // `RawWaker` from `Waker::from_raw` whose vtable
+                // drop entry runs): the `WakerDrop` plan judges
+                // the value at run time (see `ir::DropPlan`).
+                return Some(P::WakerDrop);
             }
             // Marker types: no fields with glue, no `Drop` impl.
             "std::marker::PhantomPinned" | "std::marker::PhantomData" => {
@@ -7837,5 +7930,52 @@ fn unsize_pointee(ty: &mir::Ty) -> &mir::Ty {
         mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _) => inner,
         mir::Ty::Adt(_, args) => args.first().unwrap_or(ty),
         other => other,
+    }
+}
+
+/// The concrete type an unsizing cast's *value* answers for, with
+/// every pointer wrapper stripped: the one-step pointee above
+/// names `Box<..>` for a `Pin<Box<T>>` source, but the trait
+/// object the cast forms is a `dyn` of `T` itself - the vtable a
+/// dispatch looks up is `T`'s, and the concrete tag the value
+/// carries must name `T` (see `Value::DynRef`). The first step
+/// is the plain pointee step (any ADT gives up its first
+/// argument); further steps only pass through the standard
+/// pointer wrappers (`Pin`, `Box`, `Rc`, `Arc`, the `Weak`s) and
+/// references, so a user type in the chain stops the walk.
+fn unsize_concrete_pointee<'t>(conv: &Converter<'_>, mut ty: &'t mir::Ty) -> &'t mir::Ty {
+    ty = unsize_pointee(ty);
+    loop {
+        match ty {
+            mir::Ty::Ref(_, inner, _) | mir::Ty::RawPtr(inner, _) => ty = inner,
+            mir::Ty::Adt(def, args) => {
+                let name = conv
+                    .names
+                    .get(def)
+                    .or_else(|| conv.def_names.get(def))
+                    .map(|n| n.as_str());
+                match name {
+                    Some(
+                        "std::pin::Pin"
+                        | "core::pin::Pin"
+                        | "std::boxed::Box"
+                        | "alloc::boxed::Box"
+                        | "std::rc::Rc"
+                        | "alloc::rc::Rc"
+                        | "std::sync::Arc"
+                        | "alloc::sync::Arc"
+                        | "std::rc::Weak"
+                        | "alloc::rc::Weak"
+                        | "std::sync::Weak"
+                        | "alloc::sync::Weak",
+                    ) => match args.first() {
+                        Some(inner) => ty = inner,
+                        None => return ty,
+                    },
+                    _ => return ty,
+                }
+            }
+            other => return other,
+        }
     }
 }

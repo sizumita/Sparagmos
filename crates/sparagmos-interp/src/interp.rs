@@ -2072,14 +2072,59 @@ impl<'a> Interpreter<'a> {
         func: &str,
         args: &[Value],
     ) -> Option<Result<(String, Value), InterpError>> {
+        // The receiver of a trait call is the trait object, but a
+        // method whose self type is a wrapper reaches here with
+        // the object still inside it: `Future::poll` takes
+        // `Pin<&mut Self>`, so the argument is the one-field `Pin`
+        // aggregate around the `DynRef`. See through one-field
+        // aggregates (a bounded walk: the wrappers are one-field
+        // newtypes) to the object; the layers are remembered so
+        // the receiver handed to the impl body can be rebuilt in
+        // the callee's own self-type shape below.
+        let mut layers: Vec<u32> = Vec::new();
+        let mut cursor = args.first()?;
+        while layers.len() <= 4 {
+            match cursor {
+                Value::Enum { variant, fields } if fields.len() == 1 => {
+                    layers.push(*variant);
+                    cursor = &fields[0];
+                }
+                _ => break,
+            }
+        }
         let Value::DynRef {
             base,
             concrete,
             traits,
             ..
-        } = args.first()?
+        } = cursor
         else {
             return None;
+        };
+        // The receiver the impl body is handed: with no wrapper
+        // layers, the fat pointer's data pointer as it stands.
+        // With layers, the callee's self type is those same
+        // wrappers around the *concrete* data pointer, so the
+        // box-shaped base is stripped down to the pointer it
+        // carries and the wrappers are rebuilt around it.
+        let receiver = {
+            let mut inner = (**base).clone();
+            if !layers.is_empty() {
+                while let Value::Enum { fields, .. } = &inner {
+                    if fields.len() == 1 {
+                        inner = fields[0].clone();
+                    } else {
+                        break;
+                    }
+                }
+                for variant in layers.iter().rev() {
+                    inner = Value::Enum {
+                        variant: *variant,
+                        fields: vec![inner],
+                    };
+                }
+            }
+            inner
         };
         let (trait_path, method) = func.rsplit_once("::")?;
         if trait_path.is_empty() || method.is_empty() {
@@ -2089,14 +2134,43 @@ impl<'a> Interpreter<'a> {
         if self.program.get(&candidate).is_some()
             || self.program.unconverted_reason(&candidate).is_some()
         {
-            return Some(Ok((candidate, (**base).clone())));
+            return Some(Ok((candidate, receiver)));
         }
         // The impl key may carry the trait's generic arguments
         // (`<S as std::ops::FnMut<(i32,)>>::call_mut`) or spell the
         // trait through the other of `std::` / `core::`: scan the
         // program's keys for the unique matching impl body.
         if let Some(found) = self.scan_virtual_impl(concrete, trait_path, method) {
-            return Some(Ok((found, (**base).clone())));
+            return Some(Ok((found, receiver)));
+        }
+        // A coroutine's `Future::poll` (and likewise a
+        // generator's `Coroutine::resume` and an async
+        // generator's `AsyncIterator::poll_next`) is the
+        // coroutine body itself: the compiler synthesizes the
+        // impl from the coroutine transform, so the vtable's
+        // method instance *is* the coroutine definition, and its
+        // body is in the program under the coroutine's own name
+        // - which is exactly the concrete tag the value carries
+        // (a tag only a coroutine definition produces: it ends
+        // in a `{closure#N}` segment no user type can be named
+        // with).
+        if concrete.contains("::{closure#")
+            && ((method == "poll"
+                && matches!(trait_path, "std::future::Future" | "core::future::Future"))
+                || (method == "resume"
+                    && matches!(
+                        trait_path,
+                        "std::ops::Coroutine" | "core::ops::Coroutine"
+                    ))
+                || (method == "poll_next"
+                    && matches!(
+                        trait_path,
+                        "std::async_iter::AsyncIterator"
+                            | "core::async_iter::AsyncIterator"
+                    )))
+            && self.program.get(concrete).is_some()
+        {
+            return Some(Ok((concrete.to_string(), receiver)));
         }
         if traits.iter().any(|t| t == trait_path) {
             return Some(Err(InterpError::UnsupportedDynamicDispatch {
@@ -3549,6 +3623,126 @@ impl<'a> Interpreter<'a> {
                         suspended.push(std::mem::replace(&mut active, release));
                         suspended.push(std::mem::replace(&mut active, nested));
                         continue 'sessions;
+                    }
+                    P::WakerDrop => {
+                        // A moved-out / never-written waker has
+                        // nothing to release, as with rustc's drop
+                        // flags.
+                        let Some(value) = self.read_at(frames, &active.root, &path)? else {
+                            continue;
+                        };
+                        // The modelled `From` conversion's waker:
+                        // a one-field aggregate carrying the
+                        // `Arc` / `Rc` handle itself. Its release
+                        // is the handle's, at the field's path.
+                        if let Value::Enum { fields, .. } = &value {
+                            if fields.len() == 1 && rc_handle_id(&fields[0]).is_some() {
+                                let mut sub = path.clone();
+                                sub.push(RefProj::Field(0));
+                                active.work.push((
+                                    sub,
+                                    P::RcHandleDrop {
+                                        value: Box::new(P::Dynamic),
+                                    },
+                                ));
+                                continue;
+                            }
+                        }
+                        // A real `RawWaker` (the `Waker::from_raw`
+                        // shape): the waker value's field is the
+                        // raw waker, whose fields are the data
+                        // pointer and the vtable reference. Dropping
+                        // the waker calls the vtable's drop entry
+                        // with the data pointer, as `Waker`'s own
+                        // `Drop` impl does; the call runs as a
+                        // nested frame with this session as its
+                        // continuation, exactly as a `CallDtor`
+                        // call does.
+                        let raw = match &value {
+                            Value::Enum { fields, .. } if fields.len() == 1 => {
+                                fields[0].clone()
+                            }
+                            _ => value.clone(),
+                        };
+                        let Value::Enum {
+                            fields: raw_fields,
+                            ..
+                        } = &raw
+                        else {
+                            return Err(InterpError::type_mismatch(
+                                "waker drop glue",
+                                "a RawWaker value or a modelled waker handle",
+                                value.kind_name(),
+                            ));
+                        };
+                        if raw_fields.len() != 2 {
+                            return Err(InterpError::type_mismatch(
+                                "waker drop glue",
+                                "a RawWaker value (data pointer and vtable)",
+                                value.kind_name(),
+                            ));
+                        }
+                        let data = raw_fields[0].clone();
+                        let resolved = self.deref_value(frames, &raw_fields[1])?;
+                        let vtable = self.read_resolved(frames, &resolved)?;
+                        let Value::Enum {
+                            fields: vtable_fields,
+                            ..
+                        } = &vtable
+                        else {
+                            return Err(InterpError::type_mismatch(
+                                "waker drop glue",
+                                "a RawWakerVTable value",
+                                vtable.kind_name(),
+                            ));
+                        };
+                        let Some(Value::FnPtr(drop_name)) = vtable_fields.get(3) else {
+                            return Err(InterpError::type_mismatch(
+                                "waker drop glue",
+                                "a RawWakerVTable with a function-pointer drop entry",
+                                vtable.kind_name(),
+                            ));
+                        };
+                        let drop_name = drop_name.clone();
+                        let callee = self.program.get(&drop_name).ok_or_else(|| {
+                            InterpError::UnknownFunction {
+                                name: drop_name.clone(),
+                            }
+                        })?;
+                        if frames.len() >= self.config.max_call_depth {
+                            return Err(InterpError::CallDepthExceeded {
+                                limit: self.config.max_call_depth,
+                            });
+                        }
+                        let (arg_count, local_count) =
+                            (callee.arg_count, callee.local_count());
+                        if arg_count != 1 || local_count < 2 {
+                            return Err(InterpError::type_mismatch(
+                                format!("waker vtable drop entry `{drop_name}`"),
+                                "one argument",
+                                format!("{arg_count} argument(s)"),
+                            ));
+                        }
+                        let mut locals = vec![Value::Uninit; local_count];
+                        locals[1] = data;
+                        let frame_id = self.fresh_frame_id();
+                        self.drop_continuations.push(DropContinuation {
+                            callee_frame: frame_id,
+                            session: active,
+                            sessions: suspended,
+                        });
+                        frames.push(Frame {
+                            id: frame_id,
+                            func: drop_name,
+                            locals,
+                            block: 0,
+                            stmt: 0,
+                            return_dest: None,
+                            return_block: None,
+                            unwind_payload: None,
+                            in_cleanup: false,
+                        });
+                        return Ok(());
                     }
                     P::RcWeakRelease => {
                         // The weak reference being released: the
@@ -8528,6 +8722,48 @@ impl<'a> Interpreter<'a> {
                         format!("integer {bits}"),
                     )),
                 }
+            }
+            Rvalue::IntToEnumWrapped {
+                operand,
+                discriminants,
+                payload_index,
+                field_count,
+                fill,
+            } => {
+                let value = self.eval_operand(frames, body, operand)?;
+                let bits = match value {
+                    Value::Int(i) => i as u128,
+                    Value::Uint(u) => u,
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            "integer-to-enum-wrapper transmute",
+                            "an integer value",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                let variant = discriminants
+                    .iter()
+                    .position(|d| *d as u128 == bits)
+                    .ok_or_else(|| {
+                        InterpError::type_mismatch(
+                            "integer-to-enum-wrapper transmute",
+                            "a discriminant value of the wrapped enum",
+                            format!("integer {bits}"),
+                        )
+                    })?;
+                let mut fields = vec![Value::Uninit; *field_count];
+                fields[*payload_index as usize] = Value::Enum {
+                    variant: variant as u32,
+                    fields: Vec::new(),
+                };
+                for (index, constant) in fill {
+                    fields[*index as usize] = self.eval_constant(constant)?;
+                }
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields,
+                })
             }
             Rvalue::Reinterpret(operand, src, dst) => {
                 let value = self.eval_operand(frames, body, operand)?;

@@ -155,6 +155,20 @@ pub struct Converter {
     /// the demand passes use for unresolved mentions).
     const_closure_mentions_seen:
         std::collections::HashSet<(rustc_public::DefId, String)>,
+    /// Function items materialized as values out of constants,
+    /// the plain-function counterpart of
+    /// `const_closure_mentions`: a function pointer stored
+    /// inside a constant allocation (a `RawWakerVTable`'s
+    /// entries are the canonical case) names a body no converted
+    /// body's call operands mention, because the call goes
+    /// through the decoded pointer value at run time. The driver
+    /// binary collects these bodies from this record instead
+    /// (see `collect_const_fn_instances` in the binary).
+    pub const_fn_mentions: Vec<rustc_public::mir::mono::Instance>,
+    /// Deduplication keys for `const_fn_mentions` (definition +
+    /// rendered generic arguments).
+    const_fn_mentions_seen:
+        std::collections::HashSet<(rustc_public::DefId, String)>,
 }
 
 impl Default for Converter {
@@ -691,6 +705,8 @@ impl Converter {
             errors: Vec::new(),
             const_closure_mentions: Vec::new(),
             const_closure_mentions_seen: std::collections::HashSet::new(),
+            const_fn_mentions: Vec::new(),
+            const_fn_mentions_seen: std::collections::HashSet::new(),
         }
     }
 
@@ -2335,6 +2351,9 @@ impl Converter {
             TyKind::RigidTy(RigidTy::FnDef(def, args)) => {
                 // A function item value is zero-sized: the type
                 // itself names the callable, no bytes are stored.
+                if let Ok(inst) = rustc_public::mir::mono::Instance::resolve(def, &args) {
+                    self.note_const_fn(&inst);
+                }
                 let d = self.fn_def_id(&def, &args);
                 Some(sm::ConstValue::FnDef(d))
             }
@@ -2693,6 +2712,7 @@ impl Converter {
             let d = self.closure_def_id(&def, &args);
             return Some(sm::ConstValue::Closure(d));
         }
+        self.note_const_fn(inst);
         let d = self.instance_def_id(inst.def.def_id(), inst);
         Some(sm::ConstValue::FnDef(d))
     }
@@ -2709,6 +2729,18 @@ impl Converter {
         let key = (def.def_id(), format!("{args:?}"));
         if self.const_closure_mentions_seen.insert(key) {
             self.const_closure_mentions.push((*def, args.clone()));
+        }
+    }
+
+    /// Record a function item materialized as a value out of a
+    /// constant (see the `const_fn_mentions` field). The record
+    /// keeps the resolved instance itself: constant evaluation
+    /// has already monomorphized the pointer, so no resolution
+    /// is left for the collection pass.
+    fn note_const_fn(&mut self, inst: &rustc_public::mir::mono::Instance) {
+        let key = (inst.def.def_id(), format!("{:?}", inst.args()));
+        if self.const_fn_mentions_seen.insert(key) {
+            self.const_fn_mentions.push(inst.clone());
         }
     }
 

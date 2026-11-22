@@ -13896,3 +13896,196 @@ fn run_mode_copy_nonoverlapping_through_deref_into_fresh_alloc() {
     assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "deref-copy-ok\n");
 }
+
+// ---------------------------------------------------------------------
+// Async execution base (Lane JF, Issue #167): the modelled waker
+// machinery - RawWaker vtable function-pointer calls, `Arc::from_raw`
+// reconstruction, waker drop through the vtable, and `Future::poll`
+// dispatch, static and through a `dyn` receiver.
+
+fn run_ok_edition(tag: &str, src: &str, expected_stdout: &str) {
+    let dir = temp_dir(tag);
+    let src_path = fixture(&dir, "case.rs", src);
+    let out = run_driver_extra(&src_path, &["--edition", "2021"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "case {tag} must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        expected_stdout,
+        "case {tag} stdout mismatch; stderr={stderr}"
+    );
+}
+
+const ARC_WAKE_SRC: &str = r#"
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+static WAKES: AtomicUsize = AtomicUsize::new(0);
+
+trait ArcWake {
+    fn wake(self: Arc<Self>);
+    fn wake_by_ref(arc_self: &Arc<Self>) { arc_self.clone().wake() }
+    fn into_waker(wake: Arc<Self>) -> Waker where Self: Sized {
+        let ptr = Arc::into_raw(wake) as *const ();
+        unsafe { Waker::from_raw(RawWaker::new(ptr, vtable::<Self>())) }
+    }
+}
+
+fn vtable<T: ArcWake>() -> &'static RawWakerVTable {
+    &RawWakerVTable::new(clone_arc_raw::<T>, wake_arc_raw::<T>, wake_by_ref_arc_raw::<T>, drop_arc_raw::<T>)
+}
+unsafe fn clone_arc_raw<T: ArcWake>(data: *const ()) -> RawWaker {
+    let arc: Arc<T> = Arc::from_raw(data as *const T);
+    let c = arc.clone();
+    let _ = Arc::into_raw(arc);
+    let _ = Arc::into_raw(c);
+    RawWaker::new(data, vtable::<T>())
+}
+unsafe fn wake_arc_raw<T: ArcWake>(data: *const ()) {
+    let arc: Arc<T> = Arc::from_raw(data as *const T);
+    ArcWake::wake(arc);
+}
+unsafe fn wake_by_ref_arc_raw<T: ArcWake>(data: *const ()) {
+    let arc: Arc<T> = Arc::from_raw(data as *const T);
+    ArcWake::wake_by_ref(&arc);
+    let _ = Arc::into_raw(arc);
+}
+unsafe fn drop_arc_raw<T: ArcWake>(data: *const ()) {
+    let _: Arc<T> = Arc::from_raw(data as *const T);
+}
+
+struct Counter;
+impl ArcWake for Counter {
+    fn wake(self: Arc<Self>) { WAKES.fetch_add(1, Ordering::SeqCst); }
+}
+
+struct YieldOnce(bool);
+impl Future for YieldOnce {
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.0 { Poll::Ready(()) } else { cx.waker().wake_by_ref(); self.0 = true; Poll::Pending }
+    }
+}
+
+fn main() {
+    let counter = Arc::new(Counter);
+    let waker = ArcWake::into_waker(counter);
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = YieldOnce(false);
+    let mut pinned = unsafe { Pin::new_unchecked(&mut fut) };
+    assert_eq!(pinned.as_mut().poll(&mut cx), Poll::Pending);
+    assert_eq!(WAKES.load(Ordering::SeqCst), 1);
+    assert_eq!(pinned.as_mut().poll(&mut cx), Poll::Ready(()));
+    // Dropping the waker runs the vtable drop entry; cloning it
+    // first runs the clone entry as well.
+    let waker2 = waker.clone();
+    drop(waker2);
+    drop(waker);
+    println!("arc-wake-ok");
+}
+"#;
+
+#[test]
+fn run_mode_arc_wake_vtable_waker() {
+    // The whole RawWaker vtable surface as function-pointer
+    // calls: the vtable entries live inside a constant
+    // allocation, the waker is dropped through the vtable drop
+    // entry, and the entries rebuild their `Arc` with
+    // `Arc::from_raw`.
+    run_ok_edition("arc-wake", ARC_WAKE_SRC, "arc-wake-ok\n");
+}
+
+const DYN_FUTURE_SRC: &str = r#"
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+fn raw_waker() -> RawWaker {
+    unsafe fn clone(_: *const ()) -> RawWaker { raw_waker() }
+    unsafe fn no_op(_: *const ()) {}
+    RawWaker::new(std::ptr::null(), &RawWakerVTable::new(clone, no_op, no_op, no_op))
+}
+
+async fn me() -> i32 { 41 }
+
+fn main() {
+    let waker = unsafe { Waker::from_raw(raw_waker()) };
+    let mut cx = Context::from_waker(&waker);
+    let mut fut: Pin<Box<dyn Future<Output = i32>>> = Box::pin(me());
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Ready(v) => assert_eq!(v, 41),
+        Poll::Pending => panic!("pending"),
+    }
+    println!("dyn-future-ok");
+}
+"#;
+
+#[test]
+fn run_mode_dyn_future_poll() {
+    // `Future::poll` through a `Pin<Box<dyn Future>>`: the
+    // dispatch finds the coroutine body (the compiler's own
+    // poll implementation for an async fn) through the vtable
+    // demand, with the receiver rebuilt in the callee's
+    // `Pin<&mut Self>` shape.
+    run_ok_edition("dyn-future", DYN_FUTURE_SRC, "dyn-future-ok\n");
+}
+
+const ARC_FROM_RAW_SRC: &str = r#"
+use std::sync::Arc;
+fn main() {
+    let arc = Arc::new(41u32);
+    let raw = Arc::into_raw(arc);
+    let p2 = unsafe { raw.byte_add(8) };
+    let p3 = unsafe { p2.byte_sub(8) };
+    let arc2 = unsafe { Arc::from_raw(p3) };
+    assert_eq!(*arc2, 41);
+    assert_eq!(Arc::strong_count(&arc2), 1);
+    println!("from-raw-ok");
+}
+"#;
+
+#[test]
+fn run_mode_arc_from_raw_roundtrip() {
+    run_ok_edition("arc-from-raw", ARC_FROM_RAW_SRC, "from-raw-ok\n");
+}
+
+const ENUM_WRAPPER_TRANSMUTE_SRC: &str = r#"
+#[derive(Clone, Copy, PartialEq, Debug)]
+#[repr(usize)]
+enum AlignEnum { A1 = 1, A2 = 2, A4 = 4, A8 = 8 }
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct Wrap(AlignEnum);
+fn main() {
+    let w: Wrap = unsafe { std::mem::transmute(AlignEnum::A8) };
+    let back: AlignEnum = unsafe { std::mem::transmute(w) };
+    assert_eq!(back, AlignEnum::A8);
+    let n: usize = unsafe { std::mem::transmute(w) };
+    assert_eq!(n, 8);
+    let w2: Wrap = unsafe { std::mem::transmute(4usize) };
+    let back2: AlignEnum = unsafe { std::mem::transmute(w2) };
+    assert_eq!(back2, AlignEnum::A4);
+    println!("enum-wrapper-ok");
+}
+"#;
+
+#[test]
+fn run_mode_enum_wrapper_transmutes() {
+    // The `mem::Alignment` shapes: a fieldless enum and the
+    // one-field transparent struct wrapping it transmute in
+    // both directions, and an integer transmutes to the
+    // wrapper through the wrapped enum's discriminant table
+    // (the transmute `Arc::from_raw`'s alignment path uses).
+    run_ok_edition(
+        "enum-wrapper-transmute",
+        ENUM_WRAPPER_TRANSMUTE_SRC,
+        "enum-wrapper-ok\n",
+    );
+}

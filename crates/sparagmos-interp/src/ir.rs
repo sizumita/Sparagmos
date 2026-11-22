@@ -733,6 +733,21 @@ pub enum Rvalue {
     /// is an explicit error: the model does not fabricate an
     /// invalid enum value.
     IntToEnum(Operand, Vec<i128>),
+    /// A `Transmute` cast from an integer to a transparent
+    /// wrapper struct around a fieldless enum (`mem::Alignment`
+    /// is the canonical case): the integer is the discriminant
+    /// of the enum value the wrapper's payload field holds (the
+    /// same table convention as [`Rvalue::IntToEnum`]); the
+    /// remaining fields are zero-sized and take their unique
+    /// values. An integer matching no discriminant is an
+    /// explicit error, as for [`Rvalue::IntToEnum`].
+    IntToEnumWrapped {
+        operand: Operand,
+        discriminants: Vec<i128>,
+        payload_index: u32,
+        field_count: usize,
+        fill: Vec<(u32, Constant)>,
+    },
     /// A `Transmute` cast between scalar-shaped types of equal
     /// total size: the operand's bit pattern, flattened through
     /// the source [`ScalarShape`], reinterpreted through the
@@ -989,6 +1004,20 @@ pub enum DropPlan {
     /// synthesizes for the allocation). A moved-out handle has no
     /// count to decrement.
     RcHandleDrop { value: Box<DropPlan> },
+    /// The glue of a `std::task::Waker` / `LocalWaker`: which
+    /// release runs depends on the shape the waker value has.
+    /// A waker built by the modelled `From<Arc<T: Wake>>` /
+    /// `From<Rc<T: LocalWake>>` conversion is a one-field
+    /// aggregate carrying the handle itself, and dropping it
+    /// releases that handle (the `RcHandleDrop` of the stored
+    /// value, its pointee judged dynamically, as the erased
+    /// pointee's glue can only be judged from the value). A
+    /// waker built by `Waker::from_raw` holds a real `RawWaker`
+    /// - a data pointer and a reference to a `RawWakerVTable`
+    /// value - and dropping it calls the vtable's drop entry
+    /// with the data pointer, exactly as `Waker`'s own `Drop`
+    /// impl does. Any other shape is an explicit error.
+    WakerDrop,
     /// Release one weak reference to a reference-counted
     /// allocation: decrement its weak count, freeing the storage
     /// when both counts are zero. The drop glue of a `Weak`
