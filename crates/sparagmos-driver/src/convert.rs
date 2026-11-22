@@ -955,18 +955,34 @@ impl Converter {
         let TyKind::RigidTy(RigidTy::FnDef(def, args)) = c.const_.ty().kind() else {
             return None;
         };
-        let inst = Instance::resolve(def, &args).ok()?;
-        if !inst.requires_caller_location() {
-            return None;
-        }
-        // A builtin-served callee has no body to bind the stamp
-        // to; only the builtins that consume the location (the
-        // intrinsic, the panic entry points) are stamped, so the
-        // other builtins keep their declared argument lists.
         let canonical = sparagmos_interp::builtins::canonical_name(&def.def_id().name());
-        if let Some(kind) = sparagmos_interp::builtins::lookup(&canonical) {
-            if !sparagmos_interp::builtins::consumes_caller_location(kind) {
+        let builtin = sparagmos_interp::builtins::lookup(&canonical);
+        // The location intrinsic is not itself `#[track_caller]`
+        // (it produces the location rather than receiving one),
+        // so the gate below would never stamp its calls. That is
+        // fine while `Location::caller` stays a separate body —
+        // the stamp reaches the intrinsic through the callee's
+        // synthetic local — but once the compiler inlines
+        // `Location::caller` into a body that received no stamp,
+        // the intrinsic call carries no argument at all and the
+        // call site's own location is the only correct stamp.
+        if !matches!(
+            builtin,
+            Some(sparagmos_interp::builtins::Builtin::CallerLocation)
+        ) {
+            let inst = Instance::resolve(def, &args).ok()?;
+            if !inst.requires_caller_location() {
                 return None;
+            }
+            // A builtin-served callee has no body to bind the
+            // stamp to; only the builtins that consume the
+            // location (the intrinsic, the panic entry points)
+            // are stamped, so the other builtins keep their
+            // declared argument lists.
+            if let Some(kind) = builtin {
+                if !sparagmos_interp::builtins::consumes_caller_location(kind) {
+                    return None;
+                }
             }
         }
         // The location of a call is the span of its function
