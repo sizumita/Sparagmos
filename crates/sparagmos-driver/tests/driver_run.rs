@@ -34139,3 +34139,82 @@ fn run_mode_str_pattern_predicate_mutates_by_value_capture() {
         "true false true true\n",
     );
 }
+
+const STR_PATTERN_PRED_BORROWED_SRC: &str = r#"
+fn main() {
+    let mut n = 0;
+    let mut pred = move |_| { n += 1; n == 2 };
+    let a = "b".contains(&mut pred);
+    let b = "b".contains(&mut pred);
+    let c = "b".contains(&mut pred);
+    println!("{a} {b} {c}");
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_borrowed_predicate_keeps_its_environment() {
+    // A borrowed predicate (`&mut pred`) keeps the caller's
+    // environment: the counter lives in the caller's closure, so
+    // it advances across separate `contains` calls (1, 2, 3) and
+    // only the second call sees it reach 2. Resolving the
+    // argument to a clone of the closure would give each call a
+    // fresh counter and report `false false false`.
+    run_ok(
+        "str-pattern-pred-borrowed",
+        STR_PATTERN_PRED_BORROWED_SRC,
+        "false true false\n",
+    );
+}
+
+const STR_PATTERN_PRED_ENDS_WITH_SRC: &str = r#"
+fn main() {
+    let mut e = 0;
+    let a = "ab".ends_with(move |_| { e += 1; e == 1 });
+    let mut v = 0;
+    let pred = move |_| { v += 1; v == 2 };
+    let b = "ab".contains(pred);
+    println!("{a} {b}");
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_predicate_ends_with_and_moved_variable() {
+    // The by-value predicate arrangement also covers `ends_with`
+    // (which consults the predicate for the last character) and a
+    // predicate held in a variable before being moved into the
+    // call.
+    run_ok(
+        "str-pattern-pred-ends-with",
+        STR_PATTERN_PRED_ENDS_WITH_SRC,
+        "true true\n",
+    );
+}
+
+const STR_PATTERN_CHAR_SLICE_SRC: &str = r#"
+fn main() {
+    let chars = ['a', 'b'];
+    let slice = unsafe { std::slice::from_raw_parts(&chars[0], 2) };
+    let a = "b".contains(slice);
+    let b = "a".contains(slice);
+    let c = "z".contains(slice);
+    let d = "b".contains(&chars[..]);
+    let e = "b".contains(&chars[0..2]);
+    let f = "b".contains(&chars[1..2]);
+    let g = "a".contains(&chars[1..2]);
+    println!("{a} {b} {c} {d} {e} {f} {g}");
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_char_slice_from_element_base() {
+    // A `&[char]` pattern whose fat base references an individual
+    // array element (the `from_raw_parts` slice) must be read as
+    // the whole set {'a', 'b'}: resolving the base first yields
+    // the scalar 'a', which would mistake the set for its first
+    // character and report `false` for the first query.
+    run_ok(
+        "str-pattern-char-slice",
+        STR_PATTERN_CHAR_SLICE_SRC,
+        "true true false true true true false\n",
+    );
+}

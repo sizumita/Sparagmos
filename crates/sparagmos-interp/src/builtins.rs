@@ -10509,16 +10509,36 @@ impl<'a> Interpreter<'a> {
                 let resolved = self.resolve_value(frames, &vals[1])?;
                 let needle = match resolved {
                     Value::Str(_) | Value::Bytes(_) => Needle::Text(text_of(&vals[1])?),
-                    Value::Uint(v) => match char::from_u32(v as u32) {
-                        Some(c) => Needle::One(c),
-                        None => {
-                            return Err(InterpError::type_mismatch(
-                                "str pattern argument",
-                                "valid char pattern",
-                                "out-of-range char value",
-                            ))
+                    Value::Uint(v) => {
+                        // A `&[char]` pattern whose fat base
+                        // references an individual element (a
+                        // slice built with
+                        // `slice::from_raw_parts(&chars[0], 2)`,
+                        // say) resolves to that element's scalar
+                        // above. Detect the slice on the argument
+                        // itself and read it through
+                        // `slice_elements`, which preserves the
+                        // length and the sibling elements, before
+                        // accepting the scalar as the needle.
+                        let char_set = if matches!(vals[1], Value::FatRef { .. }) {
+                            self.char_set_of_slice(frames, &vals[1])
+                        } else {
+                            None
+                        };
+                        match char_set {
+                            Some(set) => Needle::Set(set),
+                            None => match char::from_u32(v as u32) {
+                                Some(c) => Needle::One(c),
+                                None => {
+                                    return Err(InterpError::type_mismatch(
+                                        "str pattern argument",
+                                        "valid char pattern",
+                                        "out-of-range char value",
+                                    ))
+                                }
+                            },
                         }
-                    },
+                    }
                     Value::FnPtr(_) | Value::Closure { .. } => Needle::Pred(resolved),
                     ref other => {
                         // A `&[char]` pattern arrives as a fat
@@ -10568,28 +10588,54 @@ impl<'a> Interpreter<'a> {
                         // A predicate is an `FnMut`: it may
                         // mutate a by-value capture, and the
                         // mutation must be visible to the next
-                        // character's invocation. The predicate
-                        // value was moved into this call, so it
-                        // gets storage of its own in the
-                        // allocation store for the call's
-                        // duration, and every invocation receives
-                        // a reference to that storage -- the
-                        // arrangement the place-based iterator
-                        // predicates use with their predicate
-                        // field's storage. With no environment
-                        // reference the call machinery would wrap
-                        // a clone of the closure in a value
-                        // target instead, and a write to a
-                        // capture through it would fail as a
-                        // write to a constant aggregate.
-                        let pred_alloc = match &needle {
-                            Needle::Pred(pred) => Some(self.alloc_insert(pred.clone())),
+                        // character's invocation -- and, for a
+                        // borrowed predicate, to the caller
+                        // after the call. A borrowed predicate
+                        // (`&pred` / `&mut pred`) arrives as a
+                        // reference to the closure's own
+                        // storage, which serves as the
+                        // environment reference directly, so
+                        // capture writes land in the caller's
+                        // closure -- the arrangement the
+                        // place-based iterator predicates use
+                        // with their predicate field's storage.
+                        // (A reference to a value snapshot is
+                        // not storage, and falls through to the
+                        // by-value arrangement.) A predicate
+                        // passed by value was moved into this
+                        // call, so it gets storage of its own in
+                        // the allocation store for the call's
+                        // duration, and every invocation
+                        // receives a reference to that storage.
+                        // With no environment reference the call
+                        // machinery would wrap a clone of the
+                        // closure in a value target instead, and
+                        // a write to a capture through it would
+                        // fail as a write to a constant
+                        // aggregate.
+                        let borrowed_env = match &needle {
+                            Needle::Pred(_) => match &vals[1] {
+                                Value::Ref(target)
+                                    if !matches!(target, RefTarget::Value(..)) =>
+                                {
+                                    Some(vals[1].clone())
+                                }
+                                _ => None,
+                            },
                             _ => None,
                         };
-                        let pred_env = pred_alloc.map(|id| {
-                            Value::Ref(RefTarget::Alloc {
-                                id,
-                                projection: Vec::new(),
+                        let pred_alloc = match &needle {
+                            Needle::Pred(pred) if borrowed_env.is_none() => {
+                                Some(self.alloc_insert(pred.clone()))
+                            }
+                            _ => None,
+                        };
+                        let pred_env = borrowed_env.or_else(|| {
+                            pred_alloc.map(|id| {
+                                Value::Ref(RefTarget::Alloc {
+                                    id,
+                                    projection: Vec::new(),
+                                })
                             })
                         });
                         let mut test = |c: char| -> InterpResult<bool> {
@@ -19346,6 +19392,21 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
             }
         }
         Ok(())
+    }
+
+    /// The character set of a `&[char]` pattern argument, read
+    /// through `slice_elements` so the length and the sibling
+    /// elements survive even when the slice's base references an
+    /// individual element. `None` when the value is not a slice
+    /// whose every element is a character.
+    fn char_set_of_slice(&self, frames: &[Frame], value: &Value) -> Option<Vec<char>> {
+        let (elems, _) = self.slice_elements(frames, value).ok()?;
+        let mut set = Vec::with_capacity(elems.len());
+        for e in &elems {
+            let Value::Uint(v) = e else { return None };
+            set.push(char::from_u32(*v as u32)?);
+        }
+        Some(set)
     }
 
     pub(crate) fn slice_elements(
