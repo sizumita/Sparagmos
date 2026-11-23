@@ -83,6 +83,18 @@ denominator. Runs on every push to `main` and on manual dispatch.
   the merged records), derives metric 3 with
   `scripts/std-coverage.py`, and publishes metrics 2(b), 3, and 4 to
   the job summary. The merged result JSONs are kept as run artifacts.
+- The denominator is asserted at merge time, not taken from the
+  merged records: both merges (metrics 2(b) and 4) run with
+  `--expect-total 24937`, the per-nature expectations
+  (`exec` 4,149; `procedure` 551; `exec-debugger` 170;
+  `compile-check` 18,332; `rustdoc-check` 1,735), and `--survey`
+  pointing at the survey the shards were cut from. The merge fails
+  without writing output when the survey's total or per-nature
+  counts, or the merged records' total or per-nature counts, differ
+  from the expectations (survey counts exclude its `env_excluded`
+  tests, as the denominator definition does), so a survey
+  regenerated through the cache with a different population cannot
+  silently become the official denominator.
 
 ## Hosted-runner calibration
 
@@ -90,11 +102,20 @@ Hosted runners are smaller and slower than the dev host (4 vCPU,
 16 GB class), so the measurement workflows:
 
 - run the subset runner with `--jobs 2`;
-- raise the runner's per-record timeouts through the
-  `SPARAGMOS_NATIVE_COMPILE_TIMEOUT`, `SPARAGMOS_NATIVE_RUN_TIMEOUT`,
-  `SPARAGMOS_DRIVER_TIMEOUT`, and `SPARAGMOS_CONVERT_TIMEOUT`
-  environment variables (the runner's built-in defaults are
-  unchanged, so dev-host runs behave as before);
+- raise the runner's per-record timeouts through environment
+  variables: `SPARAGMOS_NATIVE_COMPILE_TIMEOUT=240`,
+  `SPARAGMOS_DRIVER_TIMEOUT=240`, and
+  `SPARAGMOS_CONVERT_TIMEOUT=240` (and
+  `SPARAGMOS_NATIVE_RUN_TIMEOUT=60`), where the runner's built-in
+  defaults -- the conditions of the manual `both`-series
+  measurements on the dev host -- are 60-second class
+  (compile 60, driver 60, convert 60, run 30). The raised values
+  are a calibration for the slower hosted CPUs, nothing more: a
+  record near the timeout boundary can pass in CI and time out
+  under the `both`-series conditions, or the reverse. The official
+  values published by CI are therefore not a same-conditions time
+  series with the `both` series, and the two are not mixed when
+  comparing measurements over time;
 - free disk space before measuring and cache the Rust source tree,
   the survey, and cargo build outputs;
 - give every job an explicit `timeout-minutes` below the 6-hour

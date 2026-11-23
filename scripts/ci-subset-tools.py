@@ -13,7 +13,12 @@ Subcommands:
 - merge: combine several subset result JSONs (one per shard) into a
   single result JSON whose aggregates are recomputed from the merged
   records, so the merged file is a drop-in replacement for a result
-  file produced by one unsharded run.
+  file produced by one unsharded run. With --expect-total /
+  --expect-nature (and optionally --survey) the merge additionally
+  asserts that the denominator matches the expected population, and
+  fails without writing output when it does not; the official
+  measurement workflow always passes these options, while partial
+  populations (flip-diff etc.) merge without them.
 - diff: compare two result JSONs (base driver vs head driver) and
   report gains and losses. A record passes when its bucket is empty;
   the comparison key is path + nature, matching the flip-diff
@@ -164,10 +169,86 @@ def summary_markdown(agg, title):
     return "\n".join(lines) + "\n"
 
 
+def parse_expect_nature(entries):
+    """Parse repeated NAME=COUNT expectation arguments into a dict."""
+    expected = {}
+    for entry in entries or []:
+        name, sep, count = entry.partition("=")
+        if not sep or not name:
+            raise ValueError(f"invalid --expect-nature {entry!r} "
+                             f"(want NAME=COUNT)")
+        try:
+            expected[name] = int(count)
+        except ValueError:
+            raise ValueError(f"invalid --expect-nature {entry!r} "
+                             f"(count is not an integer)") from None
+    return expected
+
+
+def denominator_errors(agg, expect_total, expect_nature, survey_counts=None):
+    """Return a list of denominator mismatches (empty when all match).
+
+    Checks, for every expectation that was given: the merged total,
+    the merged per-nature totals, and -- when survey_counts (a Counter
+    over the survey's tests) is given -- the survey's own total and
+    per-nature counts, plus survey-vs-merged agreement per nature.
+    """
+    errors = []
+    by_nature = agg["by_nature"]
+
+    def check_total(label, actual, expected):
+        if expected is not None and actual != expected:
+            errors.append(f"{label}: expected {expected}, got {actual}")
+
+    def check_natures(label, totals, expected):
+        for nature in sorted(set(totals) | set(expected)):
+            if totals.get(nature, 0) != expected.get(nature, 0):
+                errors.append(
+                    f"{label}: nature {nature!r} expected "
+                    f"{expected.get(nature, 0)}, got {totals.get(nature, 0)}")
+
+    check_total("merged total", agg["denominator"], expect_total)
+    if expect_nature:
+        check_natures("merged", {n: e["total"] for n, e in by_nature.items()},
+                      expect_nature)
+    if survey_counts is not None:
+        check_total("survey total", sum(survey_counts.values()), expect_total)
+        if expect_nature:
+            check_natures("survey", dict(survey_counts), expect_nature)
+        merged_totals = {n: e["total"] for n, e in by_nature.items()}
+        for nature in sorted(set(merged_totals) | set(survey_counts)):
+            if merged_totals.get(nature, 0) != survey_counts.get(nature, 0):
+                errors.append(
+                    f"survey vs merged: nature {nature!r} survey has "
+                    f"{survey_counts.get(nature, 0)}, merged has "
+                    f"{merged_totals.get(nature, 0)}")
+    return errors
+
+
 def cmd_merge(args):
+    try:
+        expect_nature = parse_expect_nature(args.expect_nature)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     merged = merge_files(args.inputs)
-    write_json(args.out, merged)
     agg = merged["aggregates"]
+    survey_counts = None
+    if args.survey is not None:
+        survey = load_json(args.survey)
+        # The survey's denominator excludes env_excluded tests (they
+        # never reach the runner), matching the survey's own
+        # aggregates and the merged results.
+        survey_counts = Counter(t["nature"] for t in survey["tests"]
+                                if not t.get("env_excluded"))
+    errors = denominator_errors(agg, args.expect_total, expect_nature,
+                                survey_counts)
+    if errors:
+        for e in errors:
+            print(f"error: denominator assertion failed: {e}",
+                  file=sys.stderr)
+        return 1
+    write_json(args.out, merged)
     print(f"merge: {agg['passed']}/{agg['denominator']} passed "
           f"({agg['metric_2b_pass_rate_percent']}%)")
     if args.summary:
@@ -239,6 +320,15 @@ def main():
     p = sub.add_parser("merge")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--summary", type=Path)
+    p.add_argument("--expect-total", type=int,
+                   help="fail unless the merged denominator equals this")
+    p.add_argument("--expect-nature", action="append", default=[],
+                   metavar="NAME=COUNT",
+                   help="fail unless the merged total for NAME equals "
+                        "COUNT (repeatable)")
+    p.add_argument("--survey", type=Path,
+                   help="survey JSON the shards were cut from; its total "
+                        "and per-nature counts are asserted as well")
     p.add_argument("inputs", nargs="+", type=Path)
     p.set_defaults(func=cmd_merge)
 

@@ -293,11 +293,22 @@ jobs:
           path: ${{ runner.temp }}/shards
           merge-multiple: true
 
+      # The denominator is asserted, not derived: the merge fails
+      # unless the survey and the merged records both total 24,937
+      # with the expected per-nature split, so a regenerated or
+      # truncated survey cannot silently change the official value.
       - name: Merge subset results (metric 2(b))
         run: |
           python3 scripts/ci-subset-tools.py merge \
             --out "$RUNNER_TEMP/subset-merged.json" \
             --summary "$RUNNER_TEMP/metric2b.md" \
+            --expect-total 24937 \
+            --expect-nature exec=4149 \
+            --expect-nature procedure=551 \
+            --expect-nature exec-debugger=170 \
+            --expect-nature compile-check=18332 \
+            --expect-nature rustdoc-check=1735 \
+            --survey "$SURVEY_JSON" \
             "$RUNNER_TEMP"/shards/subset-shard-*.json
           cat "$RUNNER_TEMP/metric2b.md" >> "$GITHUB_STEP_SUMMARY"
 
@@ -330,6 +341,13 @@ jobs:
           python3 scripts/ci-subset-tools.py merge \
             --out "$RUNNER_TEMP/subset-jit-merged.json" \
             --summary "$RUNNER_TEMP/metric4.md" \
+            --expect-total 24937 \
+            --expect-nature exec=4149 \
+            --expect-nature procedure=551 \
+            --expect-nature exec-debugger=170 \
+            --expect-nature compile-check=18332 \
+            --expect-nature rustdoc-check=1735 \
+            --survey "$SURVEY_JSON" \
             "$RUNNER_TEMP"/shards/subset-jit-shard-*.json
           cat "$RUNNER_TEMP/metric4.md" >> "$GITHUB_STEP_SUMMARY"
 
