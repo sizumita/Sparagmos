@@ -14351,16 +14351,20 @@ fn value_fingerprint(value: &Value) -> u64 {
                 } else if let Some(remaining) = iter_zst_remaining(&fields) {
                     // The zero-sized form the real-layout step
                     // above declines: the end field is the
-                    // remaining length as a provenance-free
+                    // terminal length as a provenance-free
                     // address and the front pointer never moves;
                     // each step hands it out again and decrements
-                    // the length.
+                    // the stored terminal index, the same
+                    // representation the back step reads (see
+                    // `iter_zst_bounds`).
                     if remaining == 0 {
                         return Ok((state.clone(), none_value()));
                     }
                     let item =
                         iter_ptr_value(&ptr_field).expect("front pointer checked");
-                    let new_end = Value::Ref(RefTarget::Address(remaining - 1));
+                    let (_, stored_end) =
+                        iter_zst_bounds(&fields).expect("remaining checked");
+                    let new_end = Value::Ref(RefTarget::Address(stored_end - 1));
                     return Ok((
                         rebuild_state(
                             state,
@@ -19800,25 +19804,44 @@ fn slice_container_element_tag(container_ty: &str) -> Option<&str> {
 }
 
 
-/// The remaining element count a slice iterator state encodes
-/// for a zero-sized element type: core stores the length itself
-/// in the `end_or_len` field as a provenance-free address
-/// (`without_provenance_mut(len)`), and the front pointer never
-/// moves — every step hands the front pointer out again and
-/// decrements the stored length. Recognised by the address-only
-/// end field together with a front pointer denoting a real
-/// place: an address-only front pointer is a dangling empty
-/// slice instead, whose end field is its data address, not a
-/// length.
-fn iter_zst_remaining(fields: &[Value]) -> Option<u64> {
-    let Value::Ref(RefTarget::Address(n)) = fields.get(1)? else {
+/// The (current, end) element indices a slice iterator state
+/// encodes for a zero-sized element type: core stores the
+/// length itself in the `end_or_len` field as a provenance-free
+/// address (`without_provenance_mut(len)`), so that field
+/// carries the terminal element index, not a remaining count.
+/// The current index is the front pointer's own element index
+/// when the pointer denotes a storage position (the mixed form
+/// `slice_iter_step_real` steps: the front pointer advances by
+/// index while the end field stays the terminal index); a front
+/// pointer denoting no position stands at index zero and the
+/// steps that serve that form keep it there, decrementing the
+/// stored terminal index instead. Both forms therefore read
+/// the same way — the remaining count is `end - current` —
+/// which is what keeps front and back steps in agreement when
+/// they alternate. Recognised by the address-only end field
+/// together with a front pointer denoting a real place: an
+/// address-only front pointer is a dangling empty slice
+/// instead, whose end field is its data address, not a length.
+fn iter_zst_bounds(fields: &[Value]) -> Option<(u64, u64)> {
+    let end_field = fields.get(1)?;
+    let Value::Ref(RefTarget::Address(end)) = iter_ptr_value(end_field)? else {
         return None;
     };
     let ptr = iter_ptr_value(fields.first()?)?;
     if matches!(ptr, Value::Ref(RefTarget::Address(_))) {
         return None;
     }
-    Some(*n)
+    let cur = iter_ptr_index(fields.first()?).unwrap_or(0) as u64;
+    Some((cur, end))
+}
+
+/// The remaining element count a slice iterator state encodes
+/// for a zero-sized element type (see `iter_zst_bounds`): the
+/// distance from the front pointer's current index to the
+/// terminal index the end field carries.
+fn iter_zst_remaining(fields: &[Value]) -> Option<u64> {
+    let (cur, end) = iter_zst_bounds(fields)?;
+    Some(end.saturating_sub(cur))
 }
 
 /// The element index a slice-iterator pointer denotes: the
@@ -19945,10 +19968,12 @@ fn slice_iter_bounds(state: &Value, self_ty: &str) -> InterpResult<(usize, usize
             format!("{} field(s)", fields.len()),
         ));
     }
-    if let Some(remaining) = iter_zst_remaining(&fields) {
-        // The zero-sized form: the front pointer never moves, so
-        // the bounds are the origin and the stored length.
-        return Ok((0, remaining as usize));
+    if let Some((cur, end)) = iter_zst_bounds(&fields) {
+        // The zero-sized form (see `iter_zst_bounds`): the end
+        // field carries the terminal index and the front
+        // pointer its current index, exactly as the steps read
+        // them.
+        return Ok((cur as usize, end as usize));
     }
     let (Some(cur), Some(end)) = (iter_ptr_index(&fields[0]), iter_ptr_index(&fields[1]))
     else {
@@ -20015,19 +20040,49 @@ fn step_slice_iter_back(
             format!("{} field(s)", fields.len()),
         ));
     }
-    if let Some(remaining) = iter_zst_remaining(&fields) {
-        // The zero-sized form (see `next_on_state`): the back
-        // step decrements the stored length and hands out the
-        // front pointer, exactly as the front step does.
-        if remaining == 0 {
+    if let Some((cur, end)) = iter_zst_bounds(&fields) {
+        if cur >= end {
             return Ok((state.clone(), None));
         }
+        let new_end = |fields: &[Value]| -> Value {
+            let raw = Value::Ref(RefTarget::Address(end - 1));
+            match &fields[1] {
+                Value::Enum { variant, .. } => Value::Enum {
+                    variant: *variant,
+                    fields: vec![raw],
+                },
+                _ => raw,
+            }
+        };
+        if iter_ptr_index(&fields[0]).is_some() {
+            // The mixed zero-sized form (see `iter_zst_bounds`):
+            // the end field is the terminal index the front
+            // step's index advance is measured against, so the
+            // back step yields the element at the index below
+            // it and pulls the terminal index down — the front
+            // pointer is untouched, exactly as
+            // `slice_iter_step_real`'s back step does.
+            let item_field = iter_ptr_with_index(&fields[0], (end - 1) as usize)
+                .expect("index step checked");
+            let item = iter_ptr_value(&item_field).expect("pointer field checked");
+            let item = btree_pair_item(self_ty, item);
+            return Ok((
+                iterator_state_like(
+                    state,
+                    vec![fields[0].clone(), new_end(&fields), fields[2].clone()],
+                ),
+                Some(item),
+            ));
+        }
+        // The zero-sized form whose front pointer denotes no
+        // position (see `next_on_state`): the back step
+        // decrements the stored length and hands out the front
+        // pointer, exactly as the front step does.
         let item = iter_ptr_value(&fields[0]).expect("front pointer checked");
-        let new_end = Value::Ref(RefTarget::Address(remaining - 1));
         return Ok((
             iterator_state_like(
                 state,
-                vec![fields[0].clone(), new_end, fields[2].clone()],
+                vec![fields[0].clone(), new_end(&fields), fields[2].clone()],
             ),
             Some(item),
         ));

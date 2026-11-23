@@ -11208,6 +11208,97 @@ fn run_mode_iter_mut_zst() {
     );
 }
 
+const ITER_MUT_ZST_MIXED_SRC: &str = r#"
+fn main() {
+    // Regression for the front/back count disagreement: the
+    // front step of a storage-backed ZST `IterMut` advances the
+    // front pointer's element index while the end field carries
+    // the terminal index, so a back step must read the end
+    // field as that terminal index, not as a remaining count.
+    // Front step then two back steps over a two-element array
+    // yield two items total.
+    let mut a = [(); 2];
+    let mut it = (&mut a).into_iter();
+    println!("repro {} {} {} {}",
+        it.next().is_some(), it.next_back().is_some(),
+        it.next_back().is_some(), it.next().is_some());
+    // Back first, then front, on three elements.
+    let mut b = [(); 3];
+    let mut it = (&mut b).into_iter();
+    println!("bf {} {} {} {} {}",
+        it.next_back().is_some(), it.next().is_some(),
+        it.next_back().is_some(), it.next().is_some(),
+        it.next_back().is_some());
+    // Alternating drain of five, with the size hint after
+    // each step.
+    let mut c = [(); 5];
+    let mut it = (&mut c).into_iter();
+    let mut total = 0;
+    println!("hint0 {:?}", it.size_hint());
+    if it.next().is_some() { total += 1; }
+    println!("hint1 {:?}", it.size_hint());
+    if it.next_back().is_some() { total += 1; }
+    println!("hint2 {:?}", it.size_hint());
+    if it.next_back().is_some() { total += 1; }
+    if it.next().is_some() { total += 1; }
+    if it.next_back().is_some() { total += 1; }
+    println!("drain {} end {} {}", total,
+        it.next().is_some(), it.next_back().is_some());
+    // The collected `iter_mut` body shape, over a Vec and an
+    // array, mixes the same way.
+    let mut v = vec![(); 3];
+    let mut it = v.iter_mut();
+    let mut n = 0;
+    if it.next().is_some() { n += 1; }
+    while it.next_back().is_some() { n += 1; }
+    println!("vec {}", n);
+    let mut d = [(); 4];
+    let mut it = d.iter_mut();
+    let mut n = 0;
+    if it.next_back().is_some() { n += 1; }
+    while it.next().is_some() { n += 1; }
+    println!("arr {}", n);
+    // A named zero-sized struct element type.
+    #[derive(Clone, Copy)]
+    struct Zst;
+    let mut e = [Zst; 3];
+    let mut it = (&mut e).into_iter();
+    let mut n = 0;
+    if it.next().is_some() { n += 1; }
+    while it.next_back().is_some() { n += 1; }
+    println!("named {}", n);
+    // The immutable iterator over the same shapes.
+    let f = [(); 3];
+    let mut it = f.iter();
+    let mut n = 0;
+    if it.next().is_some() { n += 1; }
+    while it.next_back().is_some() { n += 1; }
+    println!("iter {}", n);
+    // Rev composes the back step.
+    let mut g = [(); 3];
+    let n = (&mut g).into_iter().rev().count();
+    println!("rev {}", n);
+}
+"#;
+
+#[test]
+fn run_mode_iter_mut_zst_front_back_mixed() {
+    let dir = temp_dir("iter-mut-zst-mixed");
+    let src = fixture(&dir, "iter_mut_zst_mixed.rs", ITER_MUT_ZST_MIXED_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "mixed front/back steps of a ZST slice::IterMut must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "repro true true false false\nbf true true true false false\nhint0 (5, Some(5))\nhint1 (4, Some(4))\nhint2 (3, Some(3))\ndrain 5 end false false\nvec 3\narr 4\nnamed 3\niter 3\nrev 3\n",
+        "front and back steps agree on the remaining count in every shape"
+    );
+}
+
 // ----- pointer offset arithmetic (Lane DV) --------------------------------
 // `BinaryOp::Offset` (what `ptr::add` / `ptr::offset` compute in
 // MIR) and the `arith_offset` intrinsic (what the `wrapping_*`
