@@ -27347,6 +27347,16 @@ impl<'a> Interpreter<'a> {
         options: &FmtOptions,
         indent: usize,
     ) -> InterpResult<String> {
+        // `CStr` / `CString` `Debug` is a fixed function of the
+        // string's bytes (core prints the quoted, ASCII-escaped
+        // text), and the value model stores those bytes behind
+        // several shapes, so it is handled here, before the
+        // shape-driven dispatch below.
+        if trait_ == FmtTrait::Debug {
+            if let Some(text) = self.format_c_string(frames, value, ty)? {
+                return Ok(text);
+            }
+        }
         // A one-field wrapper aggregate around string data,
         // formatted as a `String`: the storage form a
         // `MaybeUninit` payload slot leaves in raw storage (a
@@ -27761,6 +27771,83 @@ impl<'a> Interpreter<'a> {
             }
             _ => None,
         })
+    }
+
+    /// `Debug` text of a `CStr` / `CString` value: core's impl
+    /// prints the string's bytes (without the terminating NUL)
+    /// as a quoted literal, each byte escaped with
+    /// `u8::escape_ascii`, written fragment by fragment with
+    /// no padding. `None` when the type tag is not a C string
+    /// type or the value's bytes cannot be read, in which case
+    /// the existing behaviour stands.
+    fn format_c_string(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+        ty: &str,
+    ) -> InterpResult<Option<String>> {
+        // Only the standard library's own C string types take
+        // this path: the tag must be one of their qualified
+        // paths (the defining crate's or the `std` re-export).
+        // A user-defined type that merely shares the base name
+        // keeps its own `Debug` behaviour.
+        let plain = pointee_tag(ty);
+        if !matches!(
+            plain,
+            "std::ffi::CStr"
+                | "core::ffi::CStr"
+                | "alloc::ffi::CStr"
+                | "std::ffi::CString"
+                | "alloc::ffi::CString"
+        ) {
+            return Ok(None);
+        }
+        let Some(bytes) = self.c_string_value_bytes(frames, value)? else {
+            return Ok(None);
+        };
+        let content = match bytes.last() {
+            Some(0) => &bytes[..bytes.len() - 1],
+            _ => &bytes[..],
+        };
+        let mut out = String::with_capacity(content.len() + 2);
+        out.push('"');
+        out.extend(content.iter().flat_map(|b| b.escape_ascii()).map(char::from));
+        out.push('"');
+        Ok(Some(out))
+    }
+
+    /// The bytes of a C string value, in whichever shape the
+    /// value model stored them: a byte block (a `CStr`
+    /// constant), a snapshot tuple of byte values (the buffer
+    /// an `as_c_str` fat reference denotes), a fat reference
+    /// over the buffer, or the owned aggregate (a `CString`'s
+    /// wrapper chain down to its boxed slice). `None` for any
+    /// other shape.
+    fn c_string_value_bytes(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+    ) -> InterpResult<Option<Vec<u8>>> {
+        match value {
+            Value::Bytes(b) => Ok(Some(b.clone())),
+            Value::Str(s) => Ok(Some(s.as_bytes().to_vec())),
+            Value::Tuple(items) => Ok(byte_values(items)),
+            Value::SparseVec { .. } | Value::FatRef { .. } => {
+                let (elems, _) = self.slice_elements(frames, value)?;
+                Ok(byte_values(&elems))
+            }
+            Value::Ref(_) | Value::DynRef { .. } => {
+                let resolved = self.resolve_value(frames, value)?;
+                if matches!(resolved, Value::Ref(_) | Value::DynRef { .. }) {
+                    return Ok(None);
+                }
+                self.c_string_value_bytes(frames, &resolved)
+            }
+            Value::Enum { fields, .. } if fields.len() == 1 => {
+                self.c_string_value_bytes(frames, &fields[0])
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Structural `Display` / `Debug` for `std::io::Error` and
@@ -28184,6 +28271,16 @@ impl<'a> Interpreter<'a> {
                     None => s.clone(),
                 };
                 Ok(pad_width(&format!("{truncated:?}"), options))
+            }
+            // A byte block: the storage form of a byte slice or
+            // array value (and of a byte-string constant). The
+            // tag names the element type; only its signedness
+            // matters (`i8` / `c_char` elements print signed).
+            Value::Bytes(b) if pointee_tag(ty).starts_with('[') => {
+                let elem = slice_elem_tag(pointee_tag(ty));
+                let items = byte_seq_items(b, elem);
+                let tys: Vec<&str> = items.iter().map(|_| elem).collect();
+                self.format_debug_seq_items(frames, &items, options, indent, '[', ']', &tys)
             }
             // Arrays ride as tuple values; the type tag is what
             // distinguishes `[T; N]` / `[T]` from a tuple, and core's
@@ -28702,8 +28799,8 @@ impl<'a> Interpreter<'a> {
                 );
             }
             Value::Bytes(b) => {
-                let items: Vec<Value> = b.iter().map(|byte| Value::Uint(*byte as u128)).collect();
-                let tys: Vec<&str> = items.iter().map(|_| "u8").collect();
+                let items = byte_seq_items(b, elem_ty);
+                let tys: Vec<&str> = items.iter().map(|_| elem_ty).collect();
                 return self.format_debug_seq_items(frames, &items, options, indent, open, close, &tys);
             }
             other => {
@@ -28774,6 +28871,31 @@ impl<'a> Interpreter<'a> {
         };
         Ok(pad_width(&body, options))
     }
+}
+
+/// The element values of a byte block formatted as a byte
+/// sequence with element tag `elem`: bytes read as signed
+/// values when the element type is a signed byte type (`i8`,
+/// `c_char`), as unsigned values otherwise.
+fn byte_seq_items(bytes: &[u8], elem: &str) -> Vec<Value> {
+    if elem == "i8" || tag_base_name(elem) == "c_char" {
+        bytes.iter().map(|b| Value::Int(*b as i8 as i128)).collect()
+    } else {
+        bytes.iter().map(|b| Value::Uint(*b as u128)).collect()
+    }
+}
+
+/// The byte list of a sequence of byte values, when every
+/// element is one (`None` otherwise).
+fn byte_values(items: &[Value]) -> Option<Vec<u8>> {
+    items
+        .iter()
+        .map(|item| match item {
+            Value::Uint(b) => u8::try_from(*b).ok(),
+            Value::Int(b) => u8::try_from(*b).ok(),
+            _ => None,
+        })
+        .collect()
 }
 
 fn bool_str(b: bool) -> &'static str {
