@@ -882,6 +882,23 @@ pub enum Builtin {
     /// `std::sys::io::error::unix::is_interrupted(errno)`:
     /// the error is `EINTR`.
     IoIsInterrupted,
+    /// `alloc::io::error::custom_owner_from_box(kind, error)`:
+    /// build the `Custom` payload of an `io::Error::new` (its
+    /// kind, the boxed trait object, and the two drop functions
+    /// std stores beside them) in a fresh allocation and hand
+    /// back its owner. The function's body is not exposed
+    /// through Stable MIR (it assembles raw pointers and
+    /// function pointers), so the model performs the same
+    /// assembly: the allocation is the box the packed
+    /// representation's word will name by synthetic address.
+    IoCustomOwnerFromBox,
+    /// `core::io::error::repr::Repr::new_custom(owner)`: pack
+    /// the owner's payload into the bitpacked representation
+    /// word (the allocation's synthetic address plus the
+    /// `Custom` tag), registering the address -> allocation
+    /// reverse lookup every later access goes through. The
+    /// body is not exposed through Stable MIR.
+    IoReprNewCustom,
     /// `Instant::checked_add` / `SystemTime::checked_add`
     /// (payload: true for `SystemTime`).
     TimeCheckedAdd(bool),
@@ -2444,6 +2461,8 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
             Builtin::IoSetOsFunctions
         }
         "std::sys::io::error::unix::decode_error_kind" => Builtin::IoDecodeErrorKind,
+        "alloc::io::error::custom_owner_from_box" => Builtin::IoCustomOwnerFromBox,
+        "core::io::error::repr::Repr::new_custom" => Builtin::IoReprNewCustom,
         "std::sys::io::error::unix::format_error" => Builtin::IoFormatOsError,
         "std::sys::io::error::unix::is_interrupted" => Builtin::IoIsInterrupted,
         "std::process::Command::new" => Builtin::ProcessCommandNewPublic,
@@ -5968,6 +5987,90 @@ impl<'a> Interpreter<'a> {
                     }
                 };
                 Ok(Value::Bool(code == 4))
+            }
+            Builtin::IoCustomOwnerFromBox => {
+                arity(2)?;
+                // The `Custom` payload std assembles: the kind,
+                // the boxed trait object (the conversion's result
+                // unsizing already formed the trait-object value),
+                // and the two drop functions std stores beside
+                // them (one name, two instantiations: dropping a
+                // `Box<dyn Error>` and dropping a `Box<Custom>`).
+                let payload = match &vals[1] {
+                    Value::DynRef { .. } => vals[1].clone(),
+                    Value::Enum { fields, .. } if fields.len() == 1 => {
+                        match &fields[0] {
+                            Value::DynRef { .. } => fields[0].clone(),
+                            other => {
+                                return Err(InterpError::type_mismatch(
+                                    format!("builtin {name}"),
+                                    "a boxed trait object",
+                                    other.kind_name(),
+                                ))
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            format!("builtin {name}"),
+                            "a boxed trait object",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                let custom = Value::Enum {
+                    variant: 0,
+                    fields: vec![
+                        vals[0].clone(),
+                        payload,
+                        Value::FnPtr(IO_ERROR_DROP_BOX_RAW_NAME.to_string()),
+                        Value::FnPtr(IO_ERROR_DROP_BOX_RAW_NAME.to_string()),
+                    ],
+                };
+                // The payload lives in its own allocation (the
+                // box the packed word will name), and the owner is
+                // the one-field aggregate around the allocation
+                // pointer, the shape `Box::into_non_null` +
+                // `CustomOwner::from_raw` produce.
+                let id = self.alloc_insert(custom);
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Ref(RefTarget::Alloc {
+                        id,
+                        projection: Vec::new(),
+                    })],
+                })
+            }
+            Builtin::IoReprNewCustom => {
+                arity(1)?;
+                // The owner's allocation, named by the synthetic
+                // address the packed word carries: register the
+                // reverse lookup, then pack `address + tag` as
+                // the representation word, in the same nesting
+                // `io_error_value` builds below the `Error` level.
+                let Some(id) = io_owner_alloc_id(&vals[0]).or_else(|| {
+                    io_pointer_address(&vals[0])
+                        .and_then(|addr| self.address_owner(addr))
+                }) else {
+                    return Err(InterpError::type_mismatch(
+                        format!("builtin {name}"),
+                        "a custom error owner over an allocation",
+                        vals[0].kind_name(),
+                    ));
+                };
+                let Some(address) = synthetic_address(&Value::Ref(RefTarget::Alloc {
+                    id,
+                    projection: Vec::new(),
+                })) else {
+                    return Err(InterpError::type_mismatch(
+                        format!("builtin {name}"),
+                        "an allocation with a synthetic address",
+                        vals[0].kind_name(),
+                    ));
+                };
+                let address = address as u64;
+                self.register_address_owner(address, id);
+                Ok(io_repr_value(address | 0b01))
             }
             Builtin::TimeCheckedAdd(system) => {
                 arity(2)?;
@@ -21655,6 +21758,56 @@ fn string_aggregate_bytes(value: &Value) -> Option<Vec<u8>> {
     }
 }
 
+/// The name the model gives the drop functions an `io::Error`
+/// `Custom` payload stores beside its trait object
+/// (`alloc::io::error::custom_owner_from_box`'s nested
+/// `drop_box_raw`, in its two instantiations). No converted
+/// body exists for them (the enclosing function has none), so
+/// a call through one of these pointers is an explicit error
+/// unless the drop machinery has already accounted for the
+/// payload — the packed representation's own drop plan runs
+/// the payload's glue directly (see `DropPlan::IoErrorRepr`).
+const IO_ERROR_DROP_BOX_RAW_NAME: &str =
+    "alloc::io::error::custom_owner_from_box::drop_box_raw";
+
+/// The `Repr`-level value of an `io::Error` in the bitpacked
+/// layout: the two inner nestings of [`io_error_value`] (the
+/// representation struct around the `NonNull` around the tagged
+/// word).
+fn io_repr_value(tagged_word: u64) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![Value::Enum {
+            variant: 0,
+            fields: vec![Value::Ref(RefTarget::Address(tagged_word))],
+        }],
+    }
+}
+
+/// The allocation a `Custom` owner value names: unwrap the
+/// one-field aggregates (the owner around its `NonNull`, the
+/// `NonNull` around its pointer) down to the allocation
+/// pointer.
+fn io_owner_alloc_id(value: &Value) -> Option<u64> {
+    match value {
+        Value::Ref(RefTarget::Alloc { id, projection }) if projection.is_empty() => Some(*id),
+        Value::Enum { fields, .. } if fields.len() == 1 => io_owner_alloc_id(&fields[0]),
+        _ => None,
+    }
+}
+
+/// The address an owner-shaped value carries when its pointer
+/// is an address-only one (the form a guest-reconstructed owner
+/// takes after the packed word was decoded back): unwrap the
+/// one-field aggregates down to the address.
+fn io_pointer_address(value: &Value) -> Option<u64> {
+    match value {
+        Value::Ref(RefTarget::Address(addr)) => Some(*addr),
+        Value::Enum { fields, .. } if fields.len() == 1 => io_pointer_address(&fields[0]),
+        _ => None,
+    }
+}
+
 /// An `std::io::Error` value in the bitpacked `Repr` layout the
 /// platform's `core::io::error` uses: the error is a one-field
 /// struct whose field is the tagged word (a `NonNull<()>`),
@@ -21691,7 +21844,7 @@ fn io_simple_error_value(kind_discriminant: u32) -> Value {
 /// `PhantomData` field a guest-built value carries), so the
 /// word is the value tree's unique address leaf; a tree with
 /// zero or several address leaves is not this representation.
-fn io_error_tagged_word(value: &Value) -> Option<u64> {
+pub(crate) fn io_error_tagged_word(value: &Value) -> Option<u64> {
     match value {
         Value::Ref(RefTarget::Address(word)) => Some(*word),
         Value::Enum { fields, .. } | Value::Tuple(fields) => {
@@ -26290,6 +26443,11 @@ impl<'a> Interpreter<'a> {
         // decoded representation (and, for OS errors, of the
         // platform's message text), produced here like the other
         // std shapes the structural engine models.
+        if let Some(text) =
+            self.format_io_error_custom(frames, value, trait_, ty, options, indent)?
+        {
+            return Ok(text);
+        }
         if let Some(text) = self.format_io_error(value, trait_, ty, options, indent) {
             return Ok(text);
         }
@@ -26343,6 +26501,134 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// `Display` / `Debug` for an `io::Error` in the `Custom`
+    /// representation: the payload the packed word names by
+    /// registered synthetic address. `Display` is the payload's
+    /// own `Display` (std's `Error` `Display` forwards to it);
+    /// `Debug` is the `Custom { kind, error }` struct core's
+    /// `Debug for Custom` writes, over the payload's `Debug`.
+    /// Any other representation, and a word whose address the
+    /// registry does not know, keeps the existing behaviour
+    /// (`None`).
+    fn format_io_error_custom(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        value: &Value,
+        trait_: FmtTrait,
+        ty: &str,
+        options: &FmtOptions,
+        indent: usize,
+    ) -> InterpResult<Option<String>> {
+        let plain = pointee_tag(ty);
+        if plain != "std::io::Error" && plain != "core::io::Error" {
+            return Ok(None);
+        }
+        let Some(word) = io_error_tagged_word(value) else {
+            return Ok(None);
+        };
+        if word & 0b11 != 0b01 {
+            return Ok(None);
+        }
+        let Some(id) = self.address_owner(word.wrapping_sub(1)) else {
+            return Ok(None);
+        };
+        // The payload: the `Custom` value in the allocation,
+        // whose fields are (kind, error, error_drop, outer_drop).
+        let custom = self.resolve_value(
+            frames,
+            &Value::Ref(RefTarget::Alloc {
+                id,
+                projection: Vec::new(),
+            }),
+        )?;
+        let Value::Enum { fields, .. } = &custom else {
+            return Ok(None);
+        };
+        if fields.len() < 2 {
+            return Ok(None);
+        }
+        let payload = fields[1].clone();
+        let payload_ty = match &payload {
+            Value::DynRef { concrete, .. } => concrete.clone(),
+            _ => String::new(),
+        };
+        Ok(match trait_ {
+            FmtTrait::Display => {
+                // A trait object's `Display` is its concrete
+                // type's `Display` (the vtable entry), so format
+                // the pointee under the concrete tag, shaping the
+                // box base the way the trait-object arm of
+                // `format_value` shapes it for `Debug`.
+                let Value::DynRef { base, concrete, .. } = &payload else {
+                    return Ok(None);
+                };
+                let pointee = self.resolve_value(frames, base)?;
+                let pointee = match &pointee {
+                    Value::Enum { fields, .. }
+                        if fields.len() == 1
+                            && matches!(
+                                fields[0],
+                                Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. }
+                            ) =>
+                    {
+                        fields[0].clone()
+                    }
+                    _ => pointee,
+                };
+                let text =
+                    self.format_value(frames, &pointee, trait_, concrete, options, indent)?;
+                // `io::Error`'s `Display` forwards the formatter
+                // to the payload's own `Display`, so the text
+                // `format_value` produced under those options is
+                // the final output: applying string padding
+                // semantics on top would truncate or pad payloads
+                // whose `Display` ignores precision / width, which
+                // native leaves untouched.
+                Some(text)
+            }
+            FmtTrait::Debug => {
+                // The kind formats as an `ErrorKind` value (its
+                // own `Debug` names the variant), not by index:
+                // the variant index and the discriminant differ
+                // for the kinds std added out of order. The
+                // rendering goes through `debug_struct_text`, like
+                // the other `io::Error` representations, so under
+                // `{:#?}` the struct takes the multi-line layout;
+                // the fields are formatted at the inner indent
+                // then, so a nested payload's own multi-line
+                // `Debug` lines up under its field.
+                let field_indent = if options.alternate() {
+                    indent + 4
+                } else {
+                    indent
+                };
+                let kind = self.format_value(
+                    frames,
+                    &fields[0],
+                    trait_,
+                    "std::io::ErrorKind",
+                    options,
+                    field_indent,
+                )?;
+                let error = self.format_value(
+                    frames,
+                    &payload,
+                    trait_,
+                    &payload_ty,
+                    options,
+                    field_indent,
+                )?;
+                Some(debug_struct_text(
+                    "Custom",
+                    &[("kind", kind), ("error", error)],
+                    options,
+                    indent,
+                ))
+            }
+            _ => None,
+        })
+    }
+
     /// Structural `Display` / `Debug` for `std::io::Error` and
     /// `ErrorKind` values, mirroring core's own implementations
     /// (`core::io::error`): an OS error displays as
@@ -26353,10 +26639,11 @@ impl<'a> Interpreter<'a> {
     /// `SimpleMessage` error displays as its message and debugs
     /// as `Error { kind, message }`, decoded from the preserved
     /// constant block the guest stored through the erased slot.
-    /// The `Custom` representation holds a pointer the value
-    /// model does not resolve here, so it keeps the existing
-    /// behaviour (`None`). Under `{:#?}` the `Debug` forms take
-    /// the multi-line layout of core's `debug_struct` /
+    /// The `Custom` representation is resolved through the
+    /// address registry by `format_io_error_custom`, which is
+    /// consulted before this function, so it does not reach
+    /// here. Under `{:#?}` the `Debug` forms take the
+    /// multi-line layout of core's `debug_struct` /
     /// `debug_tuple` rendering, with fields at `indent + 4` and
     /// the closing delimiter at `indent`, like the derived form
     /// in `format_debug_adt`.

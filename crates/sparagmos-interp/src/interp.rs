@@ -841,6 +841,19 @@ pub struct Interpreter<'a> {
     /// outlives the call, as a leaked allocation does). Interior-
     /// mutable because most execution paths hold only `&self`.
     allocs: std::cell::RefCell<HashMap<u64, Value>>,
+    /// The reverse registry for synthetic addresses that denote
+    /// an allocation in the store: a synthetic address (see
+    /// [`synthetic_address`]) -> the allocation id it denotes.
+    /// Synthetic addresses are one-way hashes of their target, so
+    /// a value the guest can only name by address (the payload of
+    /// an `io::Error`'s packed `Custom` representation: the error
+    /// word stores `address + tag`, and every later access names
+    /// the payload through that integer) needs this map to find
+    /// its way back to the stored value. Entries are added when
+    /// such an address is minted and removed when the owning
+    /// value's drop glue has run, so a live entry always denotes
+    /// a live allocation.
+    address_owners: std::cell::RefCell<HashMap<u64, u64>>,
     /// Allocations created by the raw allocator builtins
     /// (`__rust_alloc` and friends): their content is an
     /// element tuple (or a zeroed byte block), and a pointer
@@ -1495,6 +1508,7 @@ impl<'a> Interpreter<'a> {
             next_va_list: std::cell::RefCell::new(1),
             allocs: std::cell::RefCell::new(HashMap::new()),
             consumed_iter_final: std::cell::RefCell::new(None),
+            address_owners: std::cell::RefCell::new(HashMap::new()),
             elem_blocks: std::cell::RefCell::new(std::collections::HashSet::new()),
             next_alloc: std::cell::Cell::new(1),
             decoded: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -5272,6 +5286,48 @@ impl<'a> Interpreter<'a> {
                         suspended.push(std::mem::replace(&mut active, nested));
                         continue 'sessions;
                     }
+                    P::IoErrorRepr => {
+                        // The packed `io::Error` representation:
+                        // only the `Custom` tag owns anything (see
+                        // `DropPlan::IoErrorRepr`). A moved-out /
+                        // never-written representation has no glue
+                        // to run, as with rustc's drop flags.
+                        let Some(value) = self.read_at(frames, &active.root, &path)? else {
+                            continue;
+                        };
+                        let Some(word) = crate::builtins::io_error_tagged_word(&value) else {
+                            // Not the packed shape: the value owns
+                            // nothing this plan can name.
+                            continue;
+                        };
+                        if word & 0b11 != 0b01 {
+                            continue;
+                        }
+                        // The word minus the tag is the
+                        // registered synthetic address of the
+                        // payload's allocation. Take the
+                        // registration out before the payload's
+                        // destructor runs (the address denotes
+                        // nothing from here on), then drop the
+                        // boxed trait object the payload's `Custom`
+                        // value holds (its error field) in a
+                        // nested session rooted at the allocation,
+                        // as the real owner drop does.
+                        let Some(id) = self.take_address_owner(word.wrapping_sub(1)) else {
+                            continue;
+                        };
+                        let nested = GlueSession {
+                            root: RefTarget::Alloc {
+                                id,
+                                projection: Vec::new(),
+                            },
+                            work: vec![(vec![RefProj::Field(1)], P::Dyn)],
+                            adts: active.adts.clone(),
+                            completion: GlueCompletion::Resume,
+                        };
+                        suspended.push(std::mem::replace(&mut active, nested));
+                        continue 'sessions;
+                    }
                     P::WakerDrop => {
                         // A moved-out / never-written waker has
                         // nothing to release, as with rustc's drop
@@ -6940,6 +6996,27 @@ impl<'a> Interpreter<'a> {
             .get(&id)
             .cloned()
             .ok_or_else(|| self.missing_alloc(id))
+    }
+
+    /// Register `addr` as a synthetic address denoting
+    /// allocation `id` in the store (see the `address_owners`
+    /// field): the reverse lookup a guest needs when a value it
+    /// owns is named only by the address an owning word carries.
+    pub(crate) fn register_address_owner(&self, addr: u64, id: u64) {
+        self.address_owners.borrow_mut().insert(addr, id);
+    }
+
+    /// The allocation a registered synthetic address denotes, if
+    /// the address is registered.
+    pub(crate) fn address_owner(&self, addr: u64) -> Option<u64> {
+        self.address_owners.borrow().get(&addr).copied()
+    }
+
+    /// Remove and return the allocation a registered synthetic
+    /// address denotes: its owner's drop glue has run, so the
+    /// address denotes nothing from here on.
+    pub(crate) fn take_address_owner(&self, addr: u64) -> Option<u64> {
+        self.address_owners.borrow_mut().remove(&addr)
     }
 
     /// Remove allocation `id` from the store (its owning box's
@@ -9632,11 +9709,25 @@ impl<'a> Interpreter<'a> {
                 "reference",
                 "null pointer",
             )),
-            Value::Ref(RefTarget::Address(_)) => Err(InterpError::type_mismatch(
-                "dereference",
-                "reference",
-                "address-only pointer (no pointee in this model)",
-            )),
+            Value::Ref(RefTarget::Address(addr)) => {
+                // A registered synthetic address denotes its
+                // allocation in the store (see `address_owners`):
+                // dereferencing it reaches the stored value,
+                // exactly as dereferencing the allocation pointer
+                // the address was minted from would. An
+                // unregistered address denotes nothing readable.
+                match self.address_owner(*addr) {
+                    Some(id) => Ok(Resolved::Alloc {
+                        id,
+                        projection: Vec::new(),
+                    }),
+                    None => Err(InterpError::type_mismatch(
+                        "dereference",
+                        "reference",
+                        "address-only pointer (no pointee in this model)",
+                    )),
+                }
+            }
             // A byte-array reference local holds the byte data
             // itself (see `normalize_for_ty`), and a `&str` value
             // that was materialised as bare string data likewise:

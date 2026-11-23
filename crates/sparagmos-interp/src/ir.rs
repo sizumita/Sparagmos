@@ -1326,6 +1326,19 @@ pub enum DropPlan {
     /// with the data pointer, exactly as `Waker`'s own `Drop`
     /// impl does. Any other shape is an explicit error.
     WakerDrop,
+    /// The glue of an `std::io::Error`'s packed representation
+    /// (`core::io::error::repr::Repr`): what dropping releases
+    /// depends on the tag the representation word carries, which
+    /// only the value knows. The `Os` / `Simple` / `SimpleMessage`
+    /// tags own nothing (an error code, a kind discriminant, a
+    /// `&'static` message). The `Custom` tag's word is a
+    /// registered synthetic address plus the tag: the payload (a
+    /// `Custom` value in the allocation store, named by that
+    /// address in the interpreter's reverse registry) is dropped
+    /// as the boxed trait object it holds, exactly as the real
+    /// `Repr::drop` reconstructs and drops the owner. Execution
+    /// judges the word at run time.
+    IoErrorRepr,
     /// Release one weak reference to a reference-counted
     /// allocation: decrement its weak count, freeing the storage
     /// when both counts are zero. The drop glue of a `Weak`
