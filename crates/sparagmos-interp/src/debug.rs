@@ -35,7 +35,7 @@
 
 use crate::interp::{Frame, Interpreter};
 use crate::ir::{Body, FloatTy, IntTy, Program, SourceLine, Ty, UintTy};
-use crate::value::{RefProj, Value};
+use crate::value::{RefProj, RefTarget, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// One command of a debugger session script, in the vocabulary the
@@ -4224,8 +4224,12 @@ fn printer_kind(dwarf_name: &str) -> Option<PrinterKind> {
         ("BTreeMap", "map") | ("BTreeMap", "collections") => {
             PrinterKind::BTreeMap
         }
-        ("HashMap", "map") => PrinterKind::HashMap,
-        ("HashSet", "set") => PrinterKind::HashSet,
+        ("HashMap", "map") | ("HashMap", "collections") => {
+            PrinterKind::HashMap
+        }
+        ("HashSet", "set") | ("HashSet", "collections") => {
+            PrinterKind::HashSet
+        }
         ("Rc", "rc") => PrinterKind::Rc,
         ("Arc", "sync") => PrinterKind::Arc,
         _ => return None,
@@ -4521,15 +4525,435 @@ fn render_printer_adt(
             };
             Some(format!("{name}(strong={strong}, weak={weak}) = {{value = {v}, strong = {strong}, weak = {weak}}}"))
         }
-        // The collection providers are rendered from the
-        // collections' own entry walks, added with the
-        // collections' debugger support.
-        PrinterKind::VecDeque
-        | PrinterKind::BTreeSet
-        | PrinterKind::BTreeMap
-        | PrinterKind::HashMap
-        | PrinterKind::HashSet => None,
+        PrinterKind::VecDeque => {
+            let elem =
+                first_generic_arg(tag).map(|t| Desc::from_tag(&t));
+            let elems = interp.vec_deque_elements(value).ok()??;
+            let head = format!("VecDeque(size={})", elems.len());
+            if elems.is_empty() {
+                Some(head)
+            } else {
+                let block = render_printer_children(
+                    interp,
+                    frames,
+                    &elems,
+                    elem.as_ref(),
+                    depth,
+                )?;
+                Some(format!("{head} = {block}"))
+            }
+        }
+        PrinterKind::BTreeSet => {
+            let (entries, size) = btree_entries(interp, value, true)?;
+            let elem =
+                first_generic_arg(tag).map(|t| Desc::from_tag(&t));
+            let head = format!("BTreeSet(size={size})");
+            if entries.is_empty() {
+                Some(head)
+            } else {
+                let keys: Vec<Value> =
+                    entries.into_iter().map(|(k, _)| k).collect();
+                let block = render_printer_children(
+                    interp,
+                    frames,
+                    &keys,
+                    elem.as_ref(),
+                    depth,
+                )?;
+                Some(format!("{head} = {block}"))
+            }
+        }
+        PrinterKind::BTreeMap => {
+            let (entries, size) = btree_entries(interp, value, false)?;
+            let args = generic_args(tag);
+            let key_desc = args
+                .first()
+                .map(|t| Desc::from_tag(t));
+            let val_desc = args
+                .get(1)
+                .map(|t| Desc::from_tag(t));
+            let head = format!("BTreeMap(size={size})");
+            if entries.is_empty() {
+                Some(head)
+            } else {
+                let block = render_printer_map_children(
+                    interp,
+                    frames,
+                    &entries,
+                    key_desc.as_ref(),
+                    val_desc.as_ref(),
+                    depth,
+                )?;
+                Some(format!("{head} = {block}"))
+            }
+        }
+        PrinterKind::HashMap => {
+            let (entries, size) = hash_entries(interp, value, false)?;
+            let args = generic_args(tag);
+            let key_desc = args
+                .first()
+                .map(|t| Desc::from_tag(t));
+            let val_desc = args
+                .get(1)
+                .map(|t| Desc::from_tag(t));
+            let head = format!("HashMap(size={size})");
+            if entries.is_empty() {
+                Some(head)
+            } else {
+                let block = render_printer_map_children(
+                    interp,
+                    frames,
+                    &entries,
+                    key_desc.as_ref(),
+                    val_desc.as_ref(),
+                    depth,
+                )?;
+                Some(format!("{head} = {block}"))
+            }
+        }
+        PrinterKind::HashSet => {
+            let (entries, size) = hash_entries(interp, value, true)?;
+            let elem =
+                first_generic_arg(tag).map(|t| Desc::from_tag(&t));
+            let head = format!("HashSet(size={size})");
+            if entries.is_empty() {
+                Some(head)
+            } else {
+                let keys: Vec<Value> =
+                    entries.into_iter().map(|(k, _)| k).collect();
+                let block = render_printer_children(
+                    interp,
+                    frames,
+                    &keys,
+                    elem.as_ref(),
+                    depth,
+                )?;
+                Some(format!("{head} = {block}"))
+            }
+        }
     }
+}
+
+/// All generic arguments of a rendered instance tag.
+fn generic_args(tag: &str) -> Vec<String> {
+    let Some(open) = tag.find('<') else {
+        return Vec::new();
+    };
+    let Some(inner) = tag.get(open + 1..tag.len().saturating_sub(1)) else {
+        return Vec::new();
+    };
+    split_top_level(inner)
+        .into_iter()
+        .filter(|arg| !arg.is_empty())
+        .collect()
+}
+
+/// The fields of an aggregate value (an ADT value in this
+/// model), when it is one.
+fn agg_fields(value: &Value) -> Option<&Vec<Value>> {
+    match value {
+        Value::Enum { fields, .. } => Some(fields),
+        _ => None,
+    }
+}
+
+/// The integer an aggregate field holds, when it is one.
+fn agg_uint(value: &Value) -> Option<u128> {
+    match value {
+        Value::Uint(n) => Some(*n),
+        Value::Int(n) => Some(*n as u128),
+        _ => None,
+    }
+}
+
+/// The value under one single-field aggregate layer (the
+/// `MaybeUninit` shell a collection element is stored in);
+/// any other value stands as it is.
+fn unwrap_element(value: &Value) -> Value {
+    match value {
+        Value::Enum { fields, .. } if fields.len() == 1 => {
+            fields[0].clone()
+        }
+        _ => value.clone(),
+    }
+}
+
+/// The allocation a pointer-shaped aggregate denotes: the
+/// chain of single-field wrappers (`NonNull`, `Unique`, a
+/// box shell) unwrapped down to the reference they hold.
+/// Returns the allocation id and the reference's projection.
+fn wrapped_alloc_ref(value: &Value) -> Option<(u64, Vec<RefProj>)> {
+    let mut cur = value;
+    loop {
+        match cur {
+            Value::Ref(RefTarget::Alloc { id, projection }) => {
+                return Some((*id, projection.clone()));
+            }
+            Value::Enum { fields, .. } if fields.len() == 1 => {
+                cur = &fields[0];
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Render a map provider's children block (`{[k] = v, ...}`),
+/// with the same repeat compression and truncation as the
+/// array-hint children.
+fn render_printer_map_children(
+    interp: &Interpreter,
+    frames: &[Frame],
+    entries: &[(Value, Value)],
+    key_desc: Option<&Desc>,
+    val_desc: Option<&Desc>,
+    depth: usize,
+) -> Option<String> {
+    let shown = entries.len().min(GDB_PRINT_ELEMENTS);
+    let mut rendered = Vec::with_capacity(shown);
+    for (k, v) in &entries[..shown] {
+        let ks = render_gdb_any(interp, frames, k, key_desc, depth + 1)?;
+        let vs = render_gdb_any(interp, frames, v, val_desc, depth + 1)?;
+        rendered.push(format!("[{ks}] = {vs}"));
+    }
+    let mut body = compress_repeats(&rendered);
+    if entries.len() > shown {
+        if !body.is_empty() {
+            body.push_str(", ");
+        }
+        body.push_str("...");
+    }
+    Some(format!("{{{body}}}"))
+}
+
+/// The `(key, value)` entries of a B-tree collection value
+/// (a `BTreeMap`, or a `BTreeSet` through its inner map), in
+/// the tree's own order, with the collection's length. The
+/// walk reads the nodes the way the tree's own code lays
+/// them out: a node allocation's element is the node
+/// aggregate under its single-field shells; a leaf holds
+/// `len` keys and values in its last two fields; an internal
+/// node interleaves `len + 1` child edges with its keys, the
+/// edges held in the node's second field (the flattened
+/// storage form the cast between the leaf and internal node
+/// types produces) or after the data aggregate (the nested
+/// form). Elements sit in their `MaybeUninit` shells in
+/// storage; the shells are not part of the values.
+fn btree_entries(
+    interp: &Interpreter,
+    value: &Value,
+    is_set: bool,
+) -> Option<(Vec<(Value, Value)>, u128)> {
+    let map = if is_set {
+        agg_fields(value)?.first()?
+    } else {
+        value
+    };
+    let map_fields = agg_fields(map)?;
+    let root = map_fields.first()?;
+    let size = agg_uint(map_fields.get(1)?)?;
+    let root_fields = agg_fields(root)?;
+    if root_fields.is_empty() {
+        // `None` root: the empty tree.
+        return Some((Vec::new(), size));
+    }
+    let noderef = root_fields.first()?;
+    let noderef_fields = agg_fields(noderef)?;
+    let height = usize::try_from(agg_uint(noderef_fields.first()?)?)
+        .ok()?;
+    let mut entries = Vec::new();
+    btree_walk(
+        interp,
+        noderef_fields.get(1)?,
+        height,
+        size,
+        &mut entries,
+    )?;
+    if entries.len() as u128 != size {
+        return None;
+    }
+    Some((entries, size))
+}
+
+/// One node of the B-tree walk: append the subtree's entries
+/// to `out`, in order. `node_ptr` is the pointer-shaped value
+/// naming the node; `height` is its height (0 = leaf).
+fn btree_walk(
+    interp: &Interpreter,
+    node_ptr: &Value,
+    height: usize,
+    total: u128,
+    out: &mut Vec<(Value, Value)>,
+) -> Option<()> {
+    let (id, _) = wrapped_alloc_ref(node_ptr)?;
+    let base = interp.alloc_base(id).ok()?;
+    let node = btree_node_value(&base)?;
+    let fields = agg_fields(&node)?;
+    let (len, keys, vals, edges) = if fields.len() == 5 {
+        let len = usize::try_from(agg_uint(fields.get(2)?)?).ok()?;
+        let edges = if height > 0 {
+            Some(fields.get(1)?.clone())
+        } else {
+            None
+        };
+        (
+            len,
+            fields.get(3)?.clone(),
+            fields.get(4)?.clone(),
+            edges,
+        )
+    } else if fields.len() == 2 {
+        let data = btree_node_value(fields.first()?)?;
+        let data_fields = agg_fields(&data)?;
+        if data_fields.len() != 5 {
+            return None;
+        }
+        let len =
+            usize::try_from(agg_uint(data_fields.get(2)?)?).ok()?;
+        (
+            len,
+            data_fields.get(3)?.clone(),
+            data_fields.get(4)?.clone(),
+            Some(fields.get(1)?.clone()),
+        )
+    } else {
+        return None;
+    };
+    let keys = match &keys {
+        Value::Tuple(items) => items,
+        _ => return None,
+    };
+    let vals = match &vals {
+        Value::Tuple(items) => items,
+        _ => return None,
+    };
+    if keys.len() < len || vals.len() < len {
+        return None;
+    }
+    let pairs: Vec<(Value, Value)> = (0..len)
+        .map(|i| (unwrap_element(&keys[i]), unwrap_element(&vals[i])))
+        .collect();
+    if height == 0 {
+        out.extend(pairs);
+        return Some(());
+    }
+    let edges = edges?;
+    let edge_items = match &edges {
+        Value::Tuple(items) => items.clone(),
+        _ => return None,
+    };
+    if edge_items.len() < len + 1 {
+        return None;
+    }
+    for (i, pair) in pairs.into_iter().enumerate() {
+        btree_walk(interp, &edge_items[i], height - 1, total, out)?;
+        out.push(pair);
+        if out.len() as u128 > total {
+            return None;
+        }
+    }
+    btree_walk(interp, &edge_items[len], height - 1, total, out)?;
+    Some(())
+}
+
+/// The node aggregate an allocation (or a data field) holds:
+/// the element value under its single-field shells, down to
+/// the multi-field node aggregate.
+fn btree_node_value(stored: &Value) -> Option<Value> {
+    let mut cur = match stored {
+        Value::Tuple(items) => items.first()?.clone(),
+        other => other.clone(),
+    };
+    for _ in 0..8 {
+        match &cur {
+            Value::Enum { fields, .. } if fields.len() == 1 => {
+                cur = fields[0].clone();
+            }
+            _ => break,
+        }
+    }
+    Some(cur)
+}
+
+/// The `(key, value)` entries of a hash collection value (a
+/// `HashMap`, or a `HashSet` through its inner map), in
+/// bucket order, with the table's item count. The walk
+/// reads the raw table the way hashbrown lays it out in
+/// this model: one allocation holds the buckets and the
+/// control bytes; the control pointer's projection names
+/// the slot where the control bytes begin, the bucket
+/// region before it is split evenly among the buckets, and
+/// bucket `i`'s pair sits at the start of its reversed
+/// stride — the position the table's own pointer arithmetic
+/// materialised. A bucket is live when its slot holds a
+/// pair and its control byte is a hash byte (below the
+/// empty/deleted sentinels).
+fn hash_entries(
+    interp: &Interpreter,
+    value: &Value,
+    is_set: bool,
+) -> Option<(Vec<(Value, Value)>, u128)> {
+    let base = agg_fields(value)?.first()?;
+    let map = if is_set {
+        agg_fields(base)?.first()?
+    } else {
+        base
+    };
+    let table = agg_fields(map)?.get(1)?;
+    let inner = agg_fields(table)?.first()?;
+    let inner_fields = agg_fields(inner)?;
+    if inner_fields.len() != 4 {
+        return None;
+    }
+    let mask = agg_uint(inner_fields.first()?)?;
+    let size = agg_uint(inner_fields.get(3)?)?;
+    if size == 0 {
+        return Some((Vec::new(), 0));
+    }
+    let (id, projection) = wrapped_alloc_ref(inner_fields.get(1)?)?;
+    let ctrl_index = projection.iter().rev().find_map(|step| {
+        match step {
+            RefProj::Index(i) => Some(*i as usize),
+            _ => None,
+        }
+    })?;
+    let num_buckets = usize::try_from(mask + 1).ok()?;
+    if num_buckets == 0 || ctrl_index % num_buckets != 0 {
+        return None;
+    }
+    let stride = ctrl_index / num_buckets;
+    if stride == 0 {
+        return None;
+    }
+    let stored = interp.alloc_base(id).ok()?;
+    let slots = match &stored {
+        Value::Tuple(items) => items,
+        _ => return None,
+    };
+    let mut entries = Vec::new();
+    for i in 0..num_buckets {
+        let pos = (num_buckets - 1 - i) * stride;
+        let slot = slots.get(pos)?;
+        if matches!(slot, Value::Uninit) {
+            continue;
+        }
+        let ctrl = slots.get(ctrl_index + i)?;
+        let ctrl_byte = match unwrap_element(ctrl) {
+            Value::Uint(b) => b,
+            _ => return None,
+        };
+        if ctrl_byte >= 0x80 {
+            continue;
+        }
+        let pair = match slot {
+            Value::Tuple(items) if items.len() == 2 => items,
+            _ => return None,
+        };
+        entries.push((pair[0].clone(), pair[1].clone()));
+    }
+    if entries.len() as u128 != size {
+        return None;
+    }
+    Some((entries, size))
 }
 
 /// The counts and pointee of a reference-counted handle value
@@ -4681,10 +5105,96 @@ fn render_lldb_provider_line(
                     let ty = lldb_type_name(&dwarf_type_name(tag));
                     Some(format!("({ty}) {expr} = strong={strong}, weak={weak} {{ {child} = {v} }}"))
                 }
+                PrinterKind::VecDeque => {
+                    let elem = first_generic_arg(tag)
+                        .map(|t| Desc::from_tag(&t));
+                    let elems =
+                        interp.vec_deque_elements(value).ok()??;
+                    let ty = lldb_type_name(&dwarf_type_name(tag));
+                    let children = lldb_children(interp, elems.iter().map(|e| {
+                        render_lldb_compact(
+                            interp,
+                            e,
+                            elem.as_ref(),
+                            false,
+                            true,
+                            1,
+                        )
+                    }))?;
+                    Some(format!(
+                        "({ty}) {expr} = size={} {children}",
+                        elems.len()
+                    ))
+                }
+                PrinterKind::HashMap => {
+                    let (entries, size) =
+                        hash_entries(interp, value, false)?;
+                    let args = generic_args(tag);
+                    let pair_desc = Desc::Tuple(vec![
+                        args.first().map(|t| Desc::from_tag(t))?,
+                        args.get(1).map(|t| Desc::from_tag(t))?,
+                    ]);
+                    let ty = lldb_type_name(&dwarf_type_name(tag));
+                    let children = lldb_children(interp, entries.iter().map(|(k, v)| {
+                        render_lldb_compact(
+                            interp,
+                            &Value::Tuple(vec![k.clone(), v.clone()]),
+                            Some(&pair_desc),
+                            false,
+                            true,
+                            1,
+                        )
+                    }))?;
+                    Some(format!(
+                        "({ty}) {expr} = size={size} {children}"
+                    ))
+                }
+                PrinterKind::HashSet => {
+                    let (entries, size) =
+                        hash_entries(interp, value, true)?;
+                    let elem = first_generic_arg(tag)
+                        .map(|t| Desc::from_tag(&t));
+                    let ty = lldb_type_name(&dwarf_type_name(tag));
+                    let children = lldb_children(interp, entries.iter().map(|(k, _)| {
+                        render_lldb_compact(
+                            interp,
+                            k,
+                            elem.as_ref(),
+                            false,
+                            true,
+                            1,
+                        )
+                    }))?;
+                    Some(format!(
+                        "({ty}) {expr} = size={size} {children}"
+                    ))
+                }
                 _ => None,
             }
         }
         _ => None,
+    }
+}
+
+/// The children block of an lldb provider line: the
+/// `[i] = value` parts in braces, or the empty block.
+fn lldb_children(
+    _interp: &Interpreter,
+    parts: impl Iterator<Item = Option<String>>,
+) -> Option<String> {
+    let mut rendered = Vec::new();
+    for part in parts {
+        rendered.push(part?);
+    }
+    if rendered.is_empty() {
+        Some("{}".to_string())
+    } else {
+        let parts: Vec<String> = rendered
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| format!("[{i}] = {v}"))
+            .collect();
+        Some(format!("{{ {} }}", parts.join(" ")))
     }
 }
 
