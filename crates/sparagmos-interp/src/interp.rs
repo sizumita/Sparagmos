@@ -361,6 +361,15 @@ pub(crate) struct FmtCapture {
     pub width: u16,
     pub precision: u16,
     pub indent: usize,
+    /// Whether writes to this capture stream straight into the
+    /// interpreter's captured stderr instead of accumulating in
+    /// `buffer`: the shape of a `Termination` report rendering,
+    /// whose formatter natively writes to stderr as the payload's
+    /// `Debug` body runs, interleaved with the body's own stderr
+    /// writes. Only the report rendering's own payload body
+    /// capture streams (see `Interpreter::fmt_stream_arm`); a
+    /// streaming capture's `buffer` stays empty.
+    pub stream: bool,
     /// The rendered type whose `fmt` body this capture serves
     /// (the pointee tag the dispatch was invoked with). The
     /// finisher and builder builtins read the type's recorded
@@ -855,6 +864,16 @@ pub struct Interpreter<'a> {
     formatters: std::cell::RefCell<HashMap<u64, FmtCapture>>,
     /// The id the next captured formatter gets.
     next_formatter: std::cell::RefCell<u64>,
+    /// The one-shot stream arm for captured formatters (see
+    /// [`FmtCapture::stream`]): while set, the next capture a
+    /// guest `fmt` body dispatch creates streams, and creating it
+    /// clears the arm. The detached `Debug` rendering a
+    /// `Termination` report performs arms it, so the payload's
+    /// own `Debug` body writes through a streaming capture, as
+    /// natively; structural composition suppresses the arm while
+    /// it composes (its subvalue bodies buffer into the composed
+    /// text instead), so no other capture can take it.
+    pub(crate) fmt_stream_arm: bool,
     /// `core::fmt` builder states (see [`FmtBuilderState`]),
     /// keyed by the id inside the builder handle values.
     fmt_builders: std::cell::RefCell<HashMap<u64, FmtBuilderState>>,
@@ -1539,6 +1558,7 @@ impl<'a> Interpreter<'a> {
             next_command: std::cell::RefCell::new(1),
             formatters: std::cell::RefCell::new(HashMap::new()),
             next_formatter: std::cell::RefCell::new(1),
+            fmt_stream_arm: false,
             fmt_builders: std::cell::RefCell::new(HashMap::new()),
             next_fmt_builder: std::cell::RefCell::new(1),
             va_lists: std::cell::RefCell::new(HashMap::new()),

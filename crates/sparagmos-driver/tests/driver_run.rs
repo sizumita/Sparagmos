@@ -9643,6 +9643,214 @@ fn run_mode_termination_report_drops_payload_and_prefix_order() {
     );
 }
 
+const RESULT_ERR_FMT_PANIC_DROP_EXITS_SRC: &str = r#"
+use std::fmt;
+struct E;
+impl fmt::Debug for E {
+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        panic!("fmt exploded");
+    }
+}
+impl Drop for E {
+    fn drop(&mut self) {
+        eprintln!("dropped");
+        std::process::exit(7);
+    }
+}
+fn main() -> Result<(), E> { Err(E) }
+"#;
+
+const RESULT_ERR_FMT_PANIC_DROP_SRC: &str = r#"
+use std::fmt;
+struct E;
+impl fmt::Debug for E {
+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        panic!("fmt exploded");
+    }
+}
+impl Drop for E {
+    fn drop(&mut self) {
+        eprintln!("dropped");
+    }
+}
+fn main() -> Result<(), E> { Err(E) }
+"#;
+
+const RESULT_ERR_FMT_PANIC_DROP_PANICS_SRC: &str = r#"
+use std::fmt;
+struct E;
+impl fmt::Debug for E {
+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        panic!("fmt exploded");
+    }
+}
+impl Drop for E {
+    fn drop(&mut self) {
+        panic!("drop exploded");
+    }
+}
+fn main() -> Result<(), E> { Err(E) }
+"#;
+
+const RESULT_ERR_STREAMING_DEBUG_SRC: &str = r#"
+use std::fmt;
+struct E;
+impl fmt::Debug for E {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "first")?;
+        eprintln!("side effect");
+        write!(f, "last")
+    }
+}
+fn main() -> Result<(), E> { Err(E) }
+"#;
+
+const RESULT_ERR_PARTIAL_PANIC_DEBUG_SRC: &str = r#"
+use std::fmt;
+struct E;
+impl fmt::Debug for E {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "partial")?;
+        panic!("fmt exploded");
+    }
+}
+fn main() -> Result<(), E> { Err(E) }
+"#;
+
+const RESULT_ERR_PARTIAL_EXIT_DEBUG_SRC: &str = r#"
+use std::fmt;
+struct E;
+impl fmt::Debug for E {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "partial")?;
+        std::process::exit(5);
+    }
+}
+fn main() -> Result<(), E> { Err(E) }
+"#;
+
+const RESULT_ERR_DERIVED_DEBUG_SRC: &str = r#"
+#[derive(Debug)]
+struct E {
+    x: i32,
+    name: String,
+}
+fn main() -> Result<(), E> {
+    Err(E {
+        x: 42,
+        name: "n".to_string(),
+    })
+}
+"#;
+
+const RESULT_ERR_INNER_FORMAT_DEBUG_SRC: &str = r#"
+use std::fmt;
+struct Inner;
+impl fmt::Debug for Inner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "INNER")
+    }
+}
+struct E;
+impl fmt::Debug for E {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = format!("{:?}", Inner);
+        eprintln!("composed={s}");
+        write!(f, "outer[{s}]")
+    }
+}
+fn main() -> Result<(), E> { Err(E) }
+"#;
+
+#[test]
+fn run_mode_termination_report_unwind_drop_and_streaming() {
+    // A panic in the payload's `Debug` body unwinds through the
+    // native report, dropping the error as it goes: the drop
+    // runs as the panic's cleanup (its own guest outcome -- an
+    // exit -- replaces the panic; a second panic aborts), while
+    // an abort or a `process::exit` in the body keeps the
+    // no-drop behavior. And the report's formatter writes
+    // stream to stderr as they happen: they interleave with the
+    // body's own stderr writes in native order, and text
+    // written before a panic or an exit stands.
+    let dir = temp_dir("termination-report-unwind");
+    let src = fixture(
+        &dir,
+        "err_fmt_panic_drop_exits.rs",
+        RESULT_ERR_FMT_PANIC_DROP_EXITS_SRC,
+    );
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(7), "drop exits during unwind cleanup");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Error: dropped\n"
+    );
+    let src = fixture(&dir, "err_fmt_panic_drop.rs", RESULT_ERR_FMT_PANIC_DROP_SRC);
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(101), "drop runs during unwind cleanup");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Error: dropped\nthread 'main' panicked: fmt exploded\n"
+    );
+    let src = fixture(
+        &dir,
+        "err_fmt_panic_drop_panics.rs",
+        RESULT_ERR_FMT_PANIC_DROP_PANICS_SRC,
+    );
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(101), "second panic aborts");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Error: thread 'main' aborted: panic `drop exploded` raised in the \
+         drop of the Termination report payload while unwinding: \
+         panicking while unwinding aborts the run\n"
+    );
+    let src = fixture(&dir, "err_streaming_debug.rs", RESULT_ERR_STREAMING_DEBUG_SRC);
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(1), "streaming Debug::fmt");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Error: firstside effect\nlast\n"
+    );
+    let src = fixture(
+        &dir,
+        "err_partial_panic_debug.rs",
+        RESULT_ERR_PARTIAL_PANIC_DEBUG_SRC,
+    );
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(101), "partial text stands on panic");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Error: partialthread 'main' panicked: fmt exploded\n"
+    );
+    let src = fixture(
+        &dir,
+        "err_partial_exit_debug.rs",
+        RESULT_ERR_PARTIAL_EXIT_DEBUG_SRC,
+    );
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(5), "partial text stands on exit");
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "Error: partial");
+    let src = fixture(&dir, "err_derived_debug.rs", RESULT_ERR_DERIVED_DEBUG_SRC);
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(1), "derived Debug payload");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Error: E { x: 42, name: \"n\" }\n"
+    );
+    let src = fixture(
+        &dir,
+        "err_inner_format_debug.rs",
+        RESULT_ERR_INNER_FORMAT_DEBUG_SRC,
+    );
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(1), "inner format! composes");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Error: composed=INNER\nouter[INNER]\n"
+    );
+}
+
 const LIBTEST_SRC: &str = r#"
 #[test]
 fn alpha() { assert_eq!(1 + 1, 2); }

@@ -26498,9 +26498,22 @@ impl<'a> Interpreter<'a> {
         })
     }
 
-    /// Append text to a captured formatter's buffer.
-    fn formatter_push(&self, id: u64, text: &str) {
-        self.with_formatter(id, |capture| capture.buffer.push_str(text));
+    /// Append text to a captured formatter: into its buffer, or
+    /// -- for a streaming capture (a `Termination` report
+    /// rendering's own formatter, see [`FmtCapture::stream`]) --
+    /// straight into the captured stderr, at the position the
+    /// write happens, interleaved with the body's own stderr
+    /// writes as natively.
+    fn formatter_push(&mut self, id: u64, text: &str) {
+        if self
+            .formatter_snapshot(id)
+            .map(|capture| capture.stream)
+            .unwrap_or(false)
+        {
+            self.push_error_output(text);
+        } else {
+            self.with_formatter(id, |capture| capture.buffer.push_str(text));
+        }
     }
 
     /// Run a guest `fmt` implementation body for `value`, if
@@ -26530,6 +26543,12 @@ impl<'a> Interpreter<'a> {
         let Some(call) = self.fmt_body_call(ty, trait_) else {
             return Ok(None);
         };
+        // A capture created under the stream arm streams (see
+        // [`FmtCapture::stream`]): the arm is one-shot, so bodies
+        // dispatched inside this one -- a nested value's body, an
+        // inner `format!` -- buffer and compose as usual.
+        let stream = self.fmt_stream_arm;
+        self.fmt_stream_arm = false;
         let id = self.new_formatter(FmtCapture {
             buffer: String::new(),
             flags: options.flags,
@@ -26537,6 +26556,7 @@ impl<'a> Interpreter<'a> {
             precision: options.precision,
             indent,
             self_tag: pointee_tag(ty).to_string(),
+            stream,
         });
         let formatter = Value::Ref(RefTarget::value(Value::Formatter(id)));
         let receiver = Value::Ref(RefTarget::value(value.clone()));
@@ -27112,15 +27132,44 @@ impl<'a> Interpreter<'a> {
     /// still live. A payload that reaches into the finished run's
     /// frames does not render here and yields the engine's error,
     /// exactly as a live formatting of an unresolvable value does.
-    pub fn format_debug_detached(&mut self, value: &Value, ty: &str) -> InterpResult<String> {
-        self.format_value(
+    ///
+    /// The rendering streams when it goes through a guest `Debug`
+    /// body for the payload itself: natively the report's
+    /// formatter writes straight to stderr, so the body's writes
+    /// land in the captured stderr as they happen, interleaved
+    /// with the body's own stderr writes, and text written before
+    /// a panic or a `process::exit` in the body stands. In that
+    /// case the result is `None` -- the text is already in the
+    /// captured stderr, and only the report line's ending is the
+    /// caller's to write. A rendering the structural engine
+    /// composes (no guest body for the payload itself) yields the
+    /// composed text as `Some`, for the caller to write.
+    pub fn format_debug_detached(
+        &mut self,
+        value: &Value,
+        ty: &str,
+    ) -> InterpResult<Option<String>> {
+        let saved = self.fmt_stream_arm;
+        self.fmt_stream_arm = true;
+        let result = self.format_value(
             &mut Vec::new(),
             value,
             FmtTrait::Debug,
             ty,
             &FmtOptions::new(),
             0,
-        )
+        );
+        // The arm survives only when no capture took it: that is
+        // the structural case, whose composed text is the result.
+        // A capture that took it streamed the whole rendering
+        // (its buffer stays empty), so the composed text is empty
+        // there and `None` reports the streaming.
+        let streamed = !self.fmt_stream_arm;
+        self.fmt_stream_arm = saved;
+        match result {
+            Ok(text) => Ok(if streamed { None } else { Some(text) }),
+            Err(e) => Err(e),
+        }
     }
 
     /// Format one argument value through a formatting trait.
@@ -27378,6 +27427,27 @@ impl<'a> Interpreter<'a> {
     /// registry does not know, keeps the existing behaviour
     /// (`None`).
     fn format_io_error_custom(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        value: &Value,
+        trait_: FmtTrait,
+        ty: &str,
+        options: &FmtOptions,
+        indent: usize,
+    ) -> InterpResult<Option<String>> {
+        // The `Custom { .. }` text is composed around the
+        // payload's own formatted text, so the payload's body
+        // buffers into the composition as usual: suppress the
+        // stream arm for the duration, as `format_debug` does.
+        let saved = self.fmt_stream_arm;
+        self.fmt_stream_arm = false;
+        let result =
+            self.format_io_error_custom_composed(frames, value, trait_, ty, options, indent);
+        self.fmt_stream_arm = saved;
+        result
+    }
+
+    fn format_io_error_custom_composed(
         &mut self,
         frames: &mut Vec<Frame>,
         value: &Value,
@@ -27849,6 +27919,28 @@ impl<'a> Interpreter<'a> {
     }
 
     fn format_debug(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        value: &Value,
+        ty: &str,
+        options: &FmtOptions,
+        indent: usize,
+    ) -> InterpResult<String> {
+        // Structural composition: the text is composed bottom-up
+        // from the subvalues' own formatted texts, so a guest
+        // body dispatched for a subvalue buffers into the
+        // composition as usual -- the stream arm (see
+        // [`FmtCapture::stream`]) is suppressed for the duration,
+        // so only a `Termination` report rendering's own payload
+        // body can take it.
+        let saved = self.fmt_stream_arm;
+        self.fmt_stream_arm = false;
+        let result = self.format_debug_composed(frames, value, ty, options, indent);
+        self.fmt_stream_arm = saved;
+        result
+    }
+
+    fn format_debug_composed(
         &mut self,
         frames: &mut Vec<Frame>,
         value: &Value,
@@ -28359,6 +28451,27 @@ impl<'a> Interpreter<'a> {
     /// Debug formatting of a tuple or slice value: `(a, b)` / `[a, b]`,
     /// or the multi-line form under `{:#?}`.
     fn format_debug_seq(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        value: &Value,
+        options: &FmtOptions,
+        indent: usize,
+        open: char,
+        close: char,
+        elem_ty: &str,
+    ) -> InterpResult<String> {
+        // A sequence composition reached straight from a slice
+        // value: suppress the stream arm for the composition, as
+        // `format_debug` does.
+        let saved = self.fmt_stream_arm;
+        self.fmt_stream_arm = false;
+        let result =
+            self.format_debug_seq_composed(frames, value, options, indent, open, close, elem_ty);
+        self.fmt_stream_arm = saved;
+        result
+    }
+
+    fn format_debug_seq_composed(
         &mut self,
         frames: &mut Vec<Frame>,
         value: &Value,
