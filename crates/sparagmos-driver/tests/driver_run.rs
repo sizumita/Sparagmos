@@ -11547,6 +11547,246 @@ fn run_mode_naked_fn_ret() {
     run_ok("asm-naked-ret", ASM_NAKED_SRC, "back\n");
 }
 
+const ASM_NAKED_ARGS_SRC: &str = r#"
+use std::arch::naked_asm;
+
+#[unsafe(naked)]
+pub extern "sysv64" fn identity(x: u64) -> u64 {
+    naked_asm!("mov rax, rdi", "ret");
+}
+
+#[unsafe(naked)]
+pub extern "sysv64" fn add2(a: u64, b: u64) -> u64 {
+    naked_asm!("mov rax, rdi", "add rax, rsi", "ret");
+}
+
+#[unsafe(naked)]
+pub extern "win64" fn identity_win(x: u64) -> u64 {
+    naked_asm!("mov rax, rcx", "ret");
+}
+
+#[unsafe(naked)]
+pub extern "C" fn float_bits(x: f64) -> u64 {
+    naked_asm!("movq rax, xmm0", "ret");
+}
+
+#[unsafe(naked)]
+pub extern "C" fn sink(x: u64) {
+    naked_asm!("ret");
+}
+
+fn main() {
+    sink(9);
+    println!(
+        "{} {} {} {}",
+        identity(42),
+        add2(40, 2),
+        identity_win(42),
+        float_bits(1.5)
+    );
+}
+"#;
+
+#[test]
+fn run_mode_naked_fn_seeds_incoming_abi_registers() {
+    // A naked function's parameters arrive through the enclosing
+    // function's ABI, not through asm operands: the register
+    // file is seeded from the frame's argument locals (SysV64
+    // integer registers, the Win64 position registers, and the
+    // xmm sequence for a float), so the programs read their
+    // actual arguments. A bare-`ret` body with a parameter it
+    // never reads needs no seeding and still runs.
+    run_ok(
+        "asm-naked-args",
+        ASM_NAKED_ARGS_SRC,
+        "42 42 42 4609434218613702656\n",
+    );
+}
+
+const ASM_NAKED_AGGREGATE_SRC: &str = r#"
+use std::arch::naked_asm;
+
+pub struct Pair(pub u64, pub u64);
+
+#[unsafe(naked)]
+pub extern "C" fn first(p: Pair) -> u64 {
+    naked_asm!("mov rax, rdi", "ret");
+}
+
+fn main() {
+    println!("{}", first(Pair(42, 1)));
+}
+"#;
+
+#[test]
+fn run_mode_naked_fn_unseedable_parameters_are_a_named_error() {
+    // An aggregate parameter is not register-passed in the
+    // model: the naked body is a named error rather than a
+    // block that reads zeroed registers as if they were the
+    // argument.
+    let dir = temp_dir("asm-naked-aggregate");
+    let src = fixture(&dir, "case.rs", ASM_NAKED_AGGREGATE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an unseedable naked parameter must exit two; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("incoming ABI registers cannot be seeded"),
+        "the reason names the unseedable parameters: {stderr}"
+    );
+}
+
+const ASM_SYM_LOCAL_SRC: &str = r#"
+use std::arch::asm;
+
+pub extern "C" fn add_one(x: u64) -> u64 {
+    x + 1
+}
+
+mod inner {
+    pub extern "C" fn add_two(x: u64) -> u64 {
+        x + 2
+    }
+}
+
+fn main() {
+    let out1: u64;
+    let out2: u64;
+    unsafe {
+        asm!(
+            "mov rdi, {inp}",
+            "call {target}",
+            inp = in(reg) 41u64,
+            target = sym add_one,
+            lateout("rax") out1,
+        );
+        asm!(
+            "mov rdi, {inp}",
+            "call {target}",
+            inp = in(reg) 41u64,
+            target = sym inner::add_two,
+            lateout("rax") out2,
+        );
+    }
+    println!("{out1} {out2}");
+}
+"#;
+
+#[test]
+fn run_mode_asm_sym_call_resolves_local_functions() {
+    // A `sym` operand denoting a function of the local crate —
+    // at the crate root or in a module — resolves by its
+    // complete path and the call executes that function.
+    run_ok("asm-sym-local", ASM_SYM_LOCAL_SRC, "42 43\n");
+}
+
+const ASM_SYM_AUX_LIB_SRC: &str = r#"
+pub extern "C" fn foo(x: u64) -> u64 {
+    x + 1000
+}
+"#;
+
+const ASM_SYM_AUX_MAIN_SRC: &str = r#"
+extern crate auxlib;
+
+use std::arch::asm;
+
+// A local function whose last name segment collides with the
+// external `auxlib::foo` the asm block actually names. It is
+// never called from Rust code.
+pub extern "C" fn foo(x: u64) -> u64 {
+    x + 1
+}
+
+fn main() {
+    let out: u64;
+    unsafe {
+        asm!(
+            "mov rdi, {inp}",
+            "call {target}",
+            inp = in(reg) 41u64,
+            target = sym auxlib::foo,
+            lateout("rax") out,
+        );
+    }
+    println!("{out}");
+}
+"#;
+
+#[test]
+fn run_mode_asm_sym_call_to_an_external_function_is_rejected() {
+    // The `sym` operand names `auxlib::foo`, a function of
+    // another crate: it must not resolve to the unrelated local
+    // `foo` whose last name segment happens to match. The call
+    // stays outside the evaluable class (exit two) instead of
+    // executing the local function (which would print 42; the
+    // named function would print 1041).
+    let dir = temp_dir("asm-sym-aux");
+    let aux = fixture(&dir, "auxlib.rs", ASM_SYM_AUX_LIB_SRC);
+    let src = fixture(&dir, "auxmain.rs", ASM_SYM_AUX_MAIN_SRC);
+    let out = run_driver_with_aux(&src, &[("auxlib", &aux)]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an external asm call target must exit two; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "",
+        "the unrelated local function must not execute"
+    );
+}
+
+#[test]
+fn convert_mode_asm_with_generic_const_and_sym_operands_converts() {
+    // Regression: recording function ABIs for the naked-body
+    // argument seeding queried `Instance::ty` on still-generic
+    // instances (here `core::mem::size_of::<T>`, named by a
+    // `const` asm operand), which panics with "needs further
+    // instantiation"; the panic escaped the ABI query's
+    // containment and read as a conversion crash (exit 101) in
+    // convert mode.
+    let dir = temp_dir("asm-generic-const");
+    let src = fixture(
+        &dir,
+        "generic_const.rs",
+        r#"use std::arch::asm;
+
+fn foofoo<const N: usize>() {}
+
+unsafe fn foo<const N: usize>() {
+    asm!("/* {0} */", const N);
+    asm!("/* {0} */", sym foofoo::<N>);
+}
+
+fn barbar<T>() {}
+
+unsafe fn bar<T>() {
+    asm!("/* {0} */", const std::mem::size_of::<T>());
+    asm!("/* {0} */", sym barbar::<T>);
+}
+
+fn main() {
+    unsafe {
+        foo::<0>();
+        bar::<usize>();
+    }
+}
+"#,
+    );
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "generic asm const/sym operands must convert; stderr={stderr}"
+    );
+}
+
 const ASM_PUSH_SRC: &str = r#"
 use std::arch::asm;
 fn main() {

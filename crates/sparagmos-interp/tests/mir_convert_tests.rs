@@ -2760,6 +2760,56 @@ fn inline_asm_with_real_instructions_is_a_named_error() {
     }
 }
 
+// ----- InlineAsm: naked functions receive arguments in ABI registers -----
+
+fn naked_identity_body() -> mir::Body {
+    // fn f(x: u64) -> u64 { naked_asm!("mov rax, rdi", "ret") }
+    mir::Body::new(
+        decls(&[u64_ty(), u64_ty()]),
+        1,
+        vec![block(
+            vec![],
+            asm_prog_term("mov rax, rdi\nret", vec![], None),
+        )],
+    )
+}
+
+#[test]
+fn naked_fn_with_parameters_and_no_recorded_abi_is_a_named_error() {
+    // A hand-built program records no ABI for `f`: its parameter
+    // cannot be seeded into the register the ABI would pass it
+    // in, so the block is a named error rather than a program
+    // that reads a zeroed register as if it were the argument.
+    let mut prog = MirProgram::new();
+    prog.add("f", naked_identity_body());
+    match interpret_mir(&prog, "f", vec![Value::Uint(42)]) {
+        Err(MirRunError::Interp(InterpError::UnsupportedTerminator { kind })) => {
+            assert!(
+                kind.contains("incoming ABI registers cannot be seeded"),
+                "error names the unseedable parameters: {kind}"
+            );
+        }
+        Err(e) => panic!("expected UnsupportedTerminator for the naked body, got {e}"),
+        Ok(v) => panic!("expected UnsupportedTerminator for the naked body, got {v:?}"),
+    }
+}
+
+#[test]
+fn naked_fn_parameters_are_seeded_from_the_frame_arguments() {
+    // With the function's ABI recorded (`extern "C"`, the
+    // SysV64 family on this target), the argument local is
+    // seeded into rdi before the steps run and the naked body
+    // returns its argument.
+    const F_DEF: mir::DefId = mir::DefId::new(0, 77);
+    let mut prog = MirProgram::new();
+    prog.add_with_def_id("f", F_DEF, naked_identity_body());
+    prog.fn_abis.insert(F_DEF, mir::Abi::C);
+    assert_eq!(
+        interpret_mir(&prog, "f", vec![Value::Uint(42)]).expect("naked identity runs"),
+        Value::Uint(42)
+    );
+}
+
 // ----- InlineAsm: the evaluable register class executes (Lane GI) -----
 
 fn asm_op(

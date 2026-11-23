@@ -3053,8 +3053,10 @@ impl<'a> Interpreter<'a> {
                     steps,
                     target,
                     ret,
+                    arg_seeds,
                 } => {
-                    let outcome = self.exec_inline_asm(frames, body, regs, steps, *ret)?;
+                    let outcome =
+                        self.exec_inline_asm(frames, body, regs, steps, *ret, arg_seeds)?;
                     match outcome {
                         AsmOutcome::JumpTo(block) => {
                             Self::jump(frames, body, block)?;
@@ -3091,6 +3093,7 @@ impl<'a> Interpreter<'a> {
         regs: &[AsmReg],
         steps: &[AsmStep],
         ret: Option<AsmRet>,
+        arg_seeds: &[AsmArgSeed],
     ) -> InterpResult<AsmOutcome> {
         let mut slots: Vec<u64> = Vec::with_capacity(regs.len());
         for reg in regs {
@@ -3112,6 +3115,23 @@ impl<'a> Interpreter<'a> {
         // and the operand's slot in step as the program runs.
         let mut arch = [0u64; 48];
         let mut arch_written = [false; 48];
+        // A naked block's incoming state: the enclosing function's
+        // arguments, which `naked_asm!` receives through the
+        // function's ABI rather than through operands, are seeded
+        // into the registers the ABI passes them in. (A naked
+        // block has no operands, so nothing below overwrites the
+        // seedings; for other blocks the list is empty.)
+        for seed in arg_seeds {
+            let value = frames
+                .last()
+                .expect("frame")
+                .locals
+                .get(seed.local as usize)
+                .cloned()
+                .unwrap_or(Value::Uninit);
+            arch[seed.arch as usize] = asm_scalar_bits(&value, &seed.scalar)?;
+            arch_written[seed.arch as usize] = true;
+        }
         let mut bound: [Option<usize>; 48] = [None; 48];
         for (i, reg) in regs.iter().enumerate() {
             if let Some(a) = reg.arch {

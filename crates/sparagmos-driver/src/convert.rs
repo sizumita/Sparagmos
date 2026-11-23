@@ -230,6 +230,14 @@ pub struct Converter {
     /// instead, which is the location the compiler's shim
     /// presents to the callee.
     pub track_caller_defs: HashMap<sm::DefId, sm::ConstValue>,
+    /// Declared ABIs of the function instances registered so
+    /// far, keyed by the instance's Sparagmos `DefId` (see
+    /// `note_fn_abi`). Handed to the interpreter with the
+    /// converted program: a naked function's incoming arguments
+    /// arrive in the registers of its declared ABI, which the
+    /// interpreter's seed plan for the function's asm block is
+    /// computed from.
+    pub fn_abis: HashMap<sm::DefId, sm::Abi>,
     /// The location stamps of the `Fn` / `FnMut` / `FnOnce`
     /// vtable shims — the trait method definitions in core,
     /// which compiler-generated `Fn` impls are attributed to —
@@ -977,6 +985,7 @@ impl Converter {
             static_tys: HashMap::new(),
             static_tys_mir: sm::StaticTys::new(),
             track_caller_defs: HashMap::new(),
+            fn_abis: HashMap::new(),
             fn_shim_locations: [None, None, None],
             link_symbols: HashMap::new(),
             noting_track_caller: false,
@@ -1078,7 +1087,30 @@ impl Converter {
         let id = sm::DefId::new(0, idx);
         self.note_link_symbol(id, inst);
         self.note_track_caller_instance(id, inst);
+        self.note_fn_abi(id, inst);
         id
+    }
+
+    /// Record the declared ABI of a registered function
+    /// instance (see [`Converter::fn_abis`]). Runs once per
+    /// registered instance — every instance resolution in the
+    /// driver flows through `instance_def_id`, so every body
+    /// the program can enter has its ABI recorded under the
+    /// very id the body is registered with.
+    fn note_fn_abi(&mut self, id: sm::DefId, inst: &Instance) {
+        if let Some(abi) = instance_fn_abi(inst) {
+            self.fn_abis.insert(id, abi);
+        }
+    }
+
+    /// Record the declared ABI of a function definition under
+    /// its own (non-instance) id: the registration the
+    /// auxiliary-crate item loop uses for bodies no instance
+    /// demand has registered (see [`Converter::fn_abis`]).
+    pub fn note_fn_abi_for_def(&mut self, id: sm::DefId, def: &FnDef) {
+        if let Some(abi) = def_fn_abi(def) {
+            self.fn_abis.insert(id, abi);
+        }
     }
 
     /// If `inst` is a `#[track_caller]` instance with a body,
@@ -2014,18 +2046,19 @@ impl Converter {
     /// Resolve an asm `sym` operand naming a function to the
     /// register-passing call signature a `call` step executes
     /// through: the function must be the local crate's unique
-    /// function of that (last-segment) name, non-generic, with a
-    /// fully scalar signature under the SysV64 or Win64 ABI
-    /// families (the `C` and `System` ABIs are SysV64-shaped on
-    /// this target), and register-passed throughout (no stack
-    /// arguments). Anything else returns `None` and the call
-    /// stays outside the evaluable class.
+    /// function the operand's path denotes (see
+    /// [`asm_ref_matches_def`] — the complete path, never just
+    /// its last segment), non-generic, with a fully scalar
+    /// signature under the SysV64 or Win64 ABI families (the
+    /// `C` and `System` ABIs are SysV64-shaped on this target),
+    /// and register-passed throughout (no stack arguments).
+    /// Anything else returns `None` and the call stays outside
+    /// the evaluable class.
     fn asm_call_sig(&mut self, name: &str) -> Option<sm::AsmCallSig> {
-        let last = name.rsplit("::").next()?;
         let mut candidates = rustc_public::local_crate()
             .fn_defs()
             .into_iter()
-            .filter(|def| def.name().rsplit("::").next() == Some(last));
+            .filter(|def| asm_ref_matches_def(&def.name(), name));
         let def = candidates.next()?;
         if candidates.next().is_some() {
             return None;
@@ -6069,6 +6102,76 @@ fn asm_scalar(ty: &rustc_public::ty::Ty) -> Option<sm::AsmScalar> {
         },
         _ => return None,
     })
+}
+
+/// Whether the local function whose full definition name is
+/// `def_name` (crate segment included) is the very function an
+/// asm `sym` operand references by `referenced`. The operand's
+/// raw form names the resolved item by its complete path —
+/// crate-relative for an item of the local crate (`local::foo`
+/// for the definition `test::local::foo`), crate-qualified for
+/// any other crate's item (`aux::foo`) — so a local definition
+/// matches only when the referenced path is its whole
+/// crate-relative path, or its full name. Matching only the
+/// last segment would let an unrelated local function stand in
+/// for an external target the operand actually names.
+fn asm_ref_matches_def(def_name: &str, referenced: &str) -> bool {
+    if def_name == referenced {
+        return true;
+    }
+    let Some(prefix) = def_name.strip_suffix(referenced) else {
+        return false;
+    };
+    // The elided prefix must be exactly the crate segment:
+    // "<crate>::", with no further "::" inside it.
+    prefix.len() > 2 && prefix.ends_with("::") && !prefix[..prefix.len() - 2].contains("::")
+}
+
+/// The declared ABI of a function type (the type of a function
+/// definition or of a resolved instance), for recording with
+/// the function's converted body. `None` when the type carries
+/// no function signature.
+fn fn_ty_abi(ty: &rustc_public::ty::Ty) -> Option<sm::Abi> {
+    let sig = guarded_ty_kind(ty)?.fn_sig()?.skip_binder();
+    Some(abi_of(&sig.abi))
+}
+
+/// Run an ABI query under the panic-capture discipline of
+/// [`guarded_ty_kind`]. Asking a still-generic instance for its
+/// type panics with "needs further instantiation" — a known
+/// gap, not a crash: the instance's ABI is not needed, since a
+/// monomorphized instance of the same function registers (and
+/// is recorded) separately. That panic's hook record is
+/// consumed, so no outer containment mistakes it for a
+/// conversion panic; any other panic resumes.
+fn guarded_abi_query(query: impl FnOnce() -> Option<sm::Abi>) -> Option<sm::Abi> {
+    clear_captured_panic();
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(query)) {
+        Ok(abi) => abi,
+        Err(payload) => match take_captured_panic() {
+            Some(record) if record.contains("needs further instantiation") => None,
+            other => {
+                if let Some(record) = other {
+                    record_captured_panic(record);
+                }
+                std::panic::resume_unwind(payload)
+            }
+        },
+    }
+}
+
+/// The declared ABI of a resolved instance's function type,
+/// for recording with the instance's converted body (see
+/// [`guarded_abi_query`] for the containment).
+pub fn instance_fn_abi(inst: &Instance) -> Option<sm::Abi> {
+    guarded_abi_query(|| fn_ty_abi(&inst.ty()))
+}
+
+/// The declared ABI of a function definition's type, for
+/// recording with the definition's converted body (see
+/// [`guarded_abi_query`] for the containment).
+pub fn def_fn_abi(def: &FnDef) -> Option<sm::Abi> {
+    guarded_abi_query(|| fn_ty_abi(&def.ty()))
 }
 
 /// The ABI family of an asm call signature, from the signature's

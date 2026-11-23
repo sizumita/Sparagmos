@@ -100,6 +100,13 @@ pub struct MirProgram {
     /// (std callees, ADT types). Used to name ADT locals and to
     /// resolve calls into runtime support.
     pub fn_names: HashMap<mir::DefId, String>,
+    /// Declared ABIs of the program's function instances, keyed
+    /// by the same `DefId` a converted body carries, as recorded
+    /// by the driver when it registered each instance.
+    /// Consulted for a naked function's asm block: its incoming
+    /// arguments arrive in the registers of the function's ABI
+    /// (see `asm_arg_seed_plan`).
+    pub fn_abis: HashMap<mir::DefId, mir::Abi>,
     /// Discriminant values of the enum ADTs in the program, keyed by
     /// `DefId` (variant index -> discriminant value), as recorded by
     /// the driver. `Discriminant` rvalues are evaluated with these
@@ -2085,6 +2092,9 @@ struct Converter<'a> {
     /// `DefId` -> name for every named item (the driver's table,
     /// including body-less callees and ADT types).
     names: &'a HashMap<mir::DefId, String>,
+    /// Declared ABIs of the program's function instances (see
+    /// `MirProgram::fn_abis`).
+    fn_abis: &'a HashMap<mir::DefId, mir::Abi>,
     /// Declared ADT field types recovered from `Field` projections
     /// across the whole program (see [`AdtFieldTys`]).
     adt_fields: AdtFieldTys,
@@ -2235,6 +2245,7 @@ impl<'a> Converter<'a> {
             bodies,
             def_names,
             names: &program.fn_names,
+            fn_abis: &program.fn_abis,
             adt_fields,
             discriminants: &program.adt_discriminants,
             adt_shapes: &program.adt_shapes,
@@ -2552,9 +2563,10 @@ impl<'a> Converter<'a> {
                 }
             }
         }
+        let fn_abi = func.def_id.and_then(|id| self.fn_abis.get(&id));
         let mut blocks = Vec::with_capacity(body.basic_blocks.len());
         for bb in &body.basic_blocks {
-            blocks.push(self.convert_block(body, bb)?);
+            blocks.push(self.convert_block(body, bb, fn_abi)?);
         }
         let mut out = ir::Body::new(key.to_string(), body.arg_count, local_tys, blocks);
         out.local_elem_sizes = body
@@ -3094,13 +3106,14 @@ impl<'a> Converter<'a> {
         &self,
         body: &mir::Body,
         bb: &mir::BasicBlockData,
+        fn_abi: Option<&mir::Abi>,
     ) -> Result<ir::BasicBlockData, ConvertError> {
         let mut statements = Vec::with_capacity(bb.statements.len());
         for stmt in &bb.statements {
             statements.push(self.convert_statement(body, stmt)?);
         }
         let terminator = match &bb.terminator {
-            Some(term) => self.convert_terminator(body, &term.kind)?,
+            Some(term) => self.convert_terminator(body, &term.kind, fn_abi)?,
             None => ir::TerminatorKind::Unsupported("missing terminator".to_string()),
         };
         Ok(ir::BasicBlockData::new(statements, terminator))
@@ -9113,6 +9126,7 @@ let inner = match (&src, target) {
         &self,
         body: &mir::Body,
         kind: &mir::TerminatorKind,
+        fn_abi: Option<&mir::Abi>,
     ) -> Result<ir::TerminatorKind, ConvertError> {
         use mir::TerminatorKind as T;
         Ok(match kind {
@@ -9763,7 +9777,35 @@ let inner = match (&src, target) {
                                 None => shape_ok = false,
                             }
                         }
-                        if shape_ok {
+                        // A naked block's parameters arrive in
+                        // the enclosing function's ABI registers,
+                        // not through operands: they are seeded
+                        // from the frame's argument locals. A
+                        // naked body whose parameters cannot be
+                        // seeded (an ABI family or an argument
+                        // shape the register model does not
+                        // cover) is a named error rather than a
+                        // block that reads zeroed registers as if
+                        // they were the arguments. A bare-`ret`
+                        // body never reads the registers, so it
+                        // needs no seeding.
+                        let mut arg_seeds = Vec::new();
+                        let mut seeds_ok = true;
+                        if program.returns && body.arg_count > 0 {
+                            match asm_arg_seed_plan(body, fn_abi) {
+                                Some(plan) => arg_seeds = plan,
+                                None => {
+                                    if program
+                                        .steps
+                                        .iter()
+                                        .any(|st| !matches!(st, mir::AsmStep::Ret))
+                                    {
+                                        seeds_ok = false;
+                                    }
+                                }
+                            }
+                        }
+                        if shape_ok && seeds_ok {
                             ir::TerminatorKind::InlineAsm {
                                 regs: self.convert_asm_regs(body, operands)?,
                                 steps: program.steps,
@@ -9778,7 +9820,13 @@ let inner = match (&src, target) {
                                     destination.map(|b| ir::BasicBlock(b.index()))
                                 },
                                 ret,
+                                arg_seeds,
                             }
+                        } else if !seeds_ok {
+                            ir::TerminatorKind::Unsupported(
+                                "InlineAsm (naked function with parameters whose incoming ABI registers cannot be seeded)"
+                                    .to_string(),
+                            )
                         } else {
                             ir::TerminatorKind::Unsupported(format!(
                                 "InlineAsm (template {template:?} is not a no-op)"
@@ -11830,6 +11878,130 @@ fn unsize_concrete_pointee<'t>(
     }
 }
 
+
+/// The register-passing ABI family of a naked function's
+/// declared ABI: the families the interpreter's register file
+/// models. The `C` and `System` ABIs are SysV64-shaped on this
+/// target; the `sysv64` / `win64` spellings arrive as
+/// [`mir::Abi::Other`]. Anything else (the Rust ABI included —
+/// its register assignment is the compiler's own and is not
+/// modelled) returns `None`.
+fn naked_asm_abi_family(abi: &mir::Abi) -> Option<mir::AsmAbi> {
+    match abi {
+        mir::Abi::C | mir::Abi::System => Some(mir::AsmAbi::SysV64),
+        mir::Abi::Other(name) if name.starts_with("SysV64") => Some(mir::AsmAbi::SysV64),
+        mir::Abi::Other(name) if name.starts_with("Win64") => Some(mir::AsmAbi::Win64),
+        _ => None,
+    }
+}
+
+/// The register scalar of one naked-function parameter type:
+/// the same classification the driver applies to an asm call
+/// signature's parameters. Anything else (aggregates, pointers,
+/// 128-bit integers, 16/128-bit floats) is not register-passed
+/// in this model and returns `None`.
+fn asm_arg_scalar(ty: &mir::Ty) -> Option<mir::AsmScalar> {
+    Some(match ty {
+        mir::Ty::Int(it) => mir::AsmScalar::Int {
+            width: match it {
+                mir::IntTy::I8 => 8,
+                mir::IntTy::I16 => 16,
+                mir::IntTy::I32 => 32,
+                mir::IntTy::I64 | mir::IntTy::Isize => 64,
+                mir::IntTy::I128 => return None,
+            },
+            signed: true,
+        },
+        mir::Ty::Uint(it) => mir::AsmScalar::Int {
+            width: match it {
+                mir::UintTy::U8 => 8,
+                mir::UintTy::U16 => 16,
+                mir::UintTy::U32 => 32,
+                mir::UintTy::U64 | mir::UintTy::Usize => 64,
+                mir::UintTy::U128 => return None,
+            },
+            signed: false,
+        },
+        mir::Ty::Bool => mir::AsmScalar::Bool,
+        mir::Ty::Char => mir::AsmScalar::Int {
+            width: 32,
+            signed: false,
+        },
+        mir::Ty::Float(ft) => mir::AsmScalar::Float {
+            width: match ft {
+                mir::FloatTy::F32 => 32,
+                mir::FloatTy::F64 => 64,
+                _ => return None,
+            },
+        },
+        _ => return None,
+    })
+}
+
+/// The incoming-argument seedings of a naked-function body:
+/// one entry per parameter, assigning the architectural
+/// register the function's ABI passes it in. Returns `None`
+/// when any parameter cannot be seeded — an unmodelled ABI
+/// family, an argument shape outside the register scalars, or
+/// more arguments than the ABI passes in registers (the rest
+/// would arrive on the stack, which the register file does
+/// not model).
+fn asm_arg_seed_plan(body: &mir::Body, abi: Option<&mir::Abi>) -> Option<Vec<ir::AsmArgSeed>> {
+    // Register-file indices in argument order (see
+    // `exec_asm_call`'s tables): SysV64 integer arguments in
+    // rdi, rsi, rdx, rcx, r8, r9 and floats in xmm0..; Win64
+    // arguments by position in rcx, rdx, r8, r9 / xmm0...
+    const SYSV_INT: [u8; 6] = [7, 6, 2, 1, 8, 9];
+    const WIN_INT: [u8; 4] = [1, 2, 8, 9];
+    let family = naked_asm_abi_family(abi?)?;
+    let mut seeds = Vec::with_capacity(body.arg_count);
+    let (mut next_int, mut next_float) = (0usize, 0usize);
+    for (pos, decl) in body
+        .local_decls
+        .iter()
+        .skip(1)
+        .take(body.arg_count)
+        .enumerate()
+    {
+        let scalar = asm_arg_scalar(&decl.ty)?;
+        let arch = match (family, scalar) {
+            (mir::AsmAbi::SysV64, mir::AsmScalar::Float { .. }) => {
+                if next_float >= 8 {
+                    return None;
+                }
+                let a = 16 + next_float as u8;
+                next_float += 1;
+                a
+            }
+            (mir::AsmAbi::SysV64, _) => {
+                if next_int >= SYSV_INT.len() {
+                    return None;
+                }
+                let a = SYSV_INT[next_int];
+                next_int += 1;
+                a
+            }
+            (mir::AsmAbi::Win64, mir::AsmScalar::Float { .. }) => {
+                if pos >= WIN_INT.len() {
+                    return None;
+                }
+                16 + pos as u8
+            }
+            (mir::AsmAbi::Win64, _) => {
+                if pos >= WIN_INT.len() {
+                    return None;
+                }
+                WIN_INT[pos]
+            }
+        };
+        seeds.push(ir::AsmArgSeed {
+            local: (pos + 1) as u32,
+            arch,
+            scalar,
+        });
+    }
+    Some(seeds)
+}
 
 /// The return shape of a body whose terminator is a naked asm
 /// block: the interpreter reads the return value out of the

@@ -1658,6 +1658,13 @@ pub enum TerminatorKind {
         /// file's `rax` once the steps have run. `None` for
         /// fallthrough and asm-goto blocks.
         ret: Option<AsmRet>,
+        /// Incoming-argument seedings of a naked-function block:
+        /// the frame's argument locals copied into the
+        /// architectural registers the enclosing function's ABI
+        /// passes them in, before the steps run. Empty for
+        /// non-naked blocks and for naked functions without
+        /// parameters.
+        arg_seeds: Vec<AsmArgSeed>,
     },
     /// Any terminator kind not modelled yet; executing it is an explicit error.
     Unsupported(String),
@@ -1701,6 +1708,18 @@ pub enum AsmRegKind {
 pub struct AsmRet {
     pub width: u32,
     pub kind: AsmRegKind,
+}
+
+/// One incoming-argument seeding of a naked-function asm block:
+/// the argument held in frame local `local` (1-based, in
+/// declaration order) enters the block in the architectural
+/// register `arch` (a register-file index, as in
+/// [`AsmReg::arch`]), read at the argument's scalar shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AsmArgSeed {
+    pub local: u32,
+    pub arch: u8,
+    pub scalar: sparagmos_mir::AsmScalar,
 }
 
 /// A basic block: statements followed by exactly one terminator.
