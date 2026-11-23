@@ -5721,6 +5721,20 @@ struct ToolArtifact {
     /// hands to the run subprocess so the artifact's source
     /// converts against the same libraries its build used.
     aux_specs: Vec<String>,
+    /// The dependency version each entry of `aux_specs`
+    /// bound when this artifact's build linked it, in the
+    /// same order: the dependency artifact's source path
+    /// and the bytes its build converted. A later run of
+    /// this artifact resolves its `--aux` specs against
+    /// these pins, not against the registry as it then
+    /// stands: the registry replaces a rebuilt artifact's
+    /// entry and keys nothing by version, so resolving by
+    /// source path at execution time would hand the run
+    /// whatever build of the dependency happens to be
+    /// current then -- a library rebuilt after this
+    /// artifact was, or another output built from the
+    /// same source.
+    aux_pins: Vec<(std::path::PathBuf, Vec<u8>)>,
     /// The compilation-shaping options the producing
     /// invocation carried (its forwarded rustc arguments --
     /// `--cfg`, `--check-cfg`, codegen and lint options, and
@@ -5760,6 +5774,7 @@ fn cloned_artifact(a: &ToolArtifact) -> ToolArtifact {
         compile_env_clear: a.compile_env_clear,
         compile_envs: a.compile_envs.clone(),
         aux_specs: a.aux_specs.clone(),
+        aux_pins: a.aux_pins.clone(),
         rustc_args: a.rustc_args.clone(),
     }
 }
@@ -5781,31 +5796,37 @@ impl ToolRegistry {
     /// materialised snapshot of the recorded bytes once the
     /// recipe has rewritten or deleted the file.
     fn effective_source(&self, artifact: &ToolArtifact) -> std::path::PathBuf {
-        if std::fs::read(&artifact.source).is_ok_and(|bytes| bytes == artifact.source_snapshot) {
-            return artifact.source.clone();
+        self.effective_source_of(&artifact.source, &artifact.source_snapshot)
+    }
+
+    /// `effective_source` for a bare (source path, bytes)
+    /// pair: an artifact's own source, or one recorded
+    /// dependency pin (see `ToolArtifact::aux_pins`).
+    fn effective_source_of(&self, source: &std::path::Path, snapshot: &[u8]) -> std::path::PathBuf {
+        if std::fs::read(source).is_ok_and(|bytes| bytes == snapshot) {
+            return source.to_path_buf();
         }
         use std::hash::Hasher as _;
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        hasher.write(&artifact.source_snapshot);
+        hasher.write(snapshot);
         let hash = hasher.finish();
         let mut files = self.snapshot_files.lock().unwrap();
-        if let Some((h, path)) = files.get(&artifact.source) {
+        if let Some((h, path)) = files.get(source) {
             if *h == hash {
                 return path.clone();
             }
         }
         let dir = std::env::temp_dir()
             .join(format!("sparagmos-artifact-sources-{}", std::process::id()));
-        let file_name = artifact
-            .source
+        let file_name = source
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "source.rs".to_string());
         let path = dir.join(format!("{hash:016x}-{file_name}"));
         if std::fs::create_dir_all(&dir).is_ok() {
-            let _ = std::fs::write(&path, &artifact.source_snapshot);
+            let _ = std::fs::write(&path, snapshot);
         }
-        files.insert(artifact.source.clone(), (hash, path.clone()));
+        files.insert(source.to_path_buf(), (hash, path.clone()));
         path
     }
 
@@ -5844,6 +5865,57 @@ impl ToolRegistry {
 
     fn effective_aux_specs(&self, specs: &[String]) -> Vec<String> {
         specs.iter().map(|s| self.effective_aux_spec(s)).collect()
+    }
+
+    /// One `--aux` spec with its source path routed
+    /// through a recorded dependency pin rather than the
+    /// registry's current state: the conversion the spec
+    /// feeds reads the bytes the pinned build converted,
+    /// even if the dependency has since been rebuilt (at
+    /// the same output path, or as another output from
+    /// the same source).
+    fn pinned_aux_spec(&self, spec: &str, pin: &(std::path::PathBuf, Vec<u8>)) -> String {
+        let Some((name, rest)) = spec.split_once('=') else {
+            return spec.to_string();
+        };
+        let attrs = match rest.split_once(';') {
+            Some((_, a)) => format!(";{a}"),
+            None => String::new(),
+        };
+        format!(
+            "{}={}{}",
+            name,
+            self.effective_source_of(&pin.0, &pin.1).display(),
+            attrs
+        )
+    }
+
+    /// `specs` with each entry routed through its
+    /// recorded pin (see `pinned_aux_spec`); a spec
+    /// without a pin (the two vectors are recorded
+    /// together, so this is only a defensive case)
+    /// resolves live, as `effective_aux_spec` does.
+    fn pinned_aux_specs(
+        &self,
+        specs: &[String],
+        pins: &[(std::path::PathBuf, Vec<u8>)],
+    ) -> Vec<String> {
+        specs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| match pins.get(i) {
+                Some(pin) => self.pinned_aux_spec(s, pin),
+                None => self.effective_aux_spec(s),
+            })
+            .collect()
+    }
+
+    /// The `--aux` specs a run of `artifact` hands its
+    /// subprocess: the specs its build recorded, each
+    /// resolved against the dependency version that
+    /// build bound (see `ToolArtifact::aux_pins`).
+    fn artifact_aux_specs(&self, artifact: &ToolArtifact) -> Vec<String> {
+        self.pinned_aux_specs(&artifact.aux_specs, &artifact.aux_pins)
     }
 
     fn record(&self, path: std::path::PathBuf, artifact: ToolArtifact) {
@@ -6111,6 +6183,12 @@ fn tool_run(
     let mut crate_types: Vec<String> = Vec::new();
     let mut forward: Vec<String> = Vec::new();
     let mut aux: Vec<String> = Vec::new();
+    // The dependency version each `aux` entry binds, in
+    // the same order (see `ToolArtifact::aux_pins`): the
+    // specs are resolved through these pins, so a build
+    // -- and the artifact it records -- keeps the
+    // dependency builds it actually named.
+    let mut aux_pins: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
     let mut emits: Vec<(String, Option<String>)> = Vec::new();
     let mut out_file: Option<String> = None;
     let mut out_dir: Option<String> = None;
@@ -6187,7 +6265,10 @@ fn tool_run(
                         registry.get(&abs).map(|art| (name.clone(), art))
                     });
                     match bound {
-                        Some((name, art)) => aux.push(aux_spec_for(&name, &art)),
+                        Some((name, art)) => {
+                            aux_pins.push((art.source.clone(), art.source_snapshot.clone()));
+                            aux.push(aux_spec_for(&name, &art));
+                        }
                         None => {
                             // A real file (a sysroot or prebuilt
                             // rlib) or a name the session must
@@ -6252,7 +6333,7 @@ fn tool_run(
             }
         };
         let mut tail = vec![input];
-        for spec in registry.effective_aux_specs(&aux) {
+        for spec in registry.pinned_aux_specs(&aux, &aux_pins) {
             tail.push("--aux".to_string());
             tail.push(spec);
         }
@@ -6306,6 +6387,7 @@ fn tool_run(
         if source_text.contains(&needle)
             && !aux.iter().any(|s| s == &aux_spec_for(&art.name, &art))
         {
+            aux_pins.push((art.source.clone(), art.source_snapshot.clone()));
             aux.push(aux_spec_for(&art.name, &art));
         }
     }
@@ -6329,7 +6411,7 @@ fn tool_run(
         "--edition".to_string(),
         edition.clone(),
     ];
-    for spec in registry.effective_aux_specs(&aux) {
+    for spec in registry.pinned_aux_specs(&aux, &aux_pins) {
         tail.push("--aux".to_string());
         tail.push(spec);
     }
@@ -6415,6 +6497,7 @@ fn tool_run(
                 compile_env_clear: request.env_clear,
                 compile_envs: request.envs.clone(),
                 aux_specs: aux.clone(),
+                aux_pins: aux_pins.clone(),
                 rustc_args: forward.clone(),
             },
         );
@@ -6533,7 +6616,10 @@ fn tool_run(
 /// stands: the source it converts is the recorded path while
 /// that file still holds the build's bytes, and the recorded
 /// snapshot once the recipe has rewritten or deleted it (see
-/// `ToolRegistry::effective_source`); the program's argv[0]
+/// `ToolRegistry::effective_source`), and its `--aux` bindings
+/// likewise resolve against the dependency versions its build
+/// bound, not the registry's current entries (see
+/// `ToolArtifact::aux_pins`); the program's argv[0]
 /// is the name the recipe invoked it under, not the source
 /// path; and the two environments are kept apart -- the
 /// subprocess is spawned under the producing invocation's
@@ -6637,7 +6723,7 @@ fn artifact_run(
         tail.push("--edition".to_string());
         tail.push(edition.clone());
     }
-    for spec in registry.effective_aux_specs(&artifact.aux_specs) {
+    for spec in registry.artifact_aux_specs(&artifact) {
         tail.push("--aux".to_string());
         tail.push(spec);
     }

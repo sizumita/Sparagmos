@@ -21762,6 +21762,59 @@ fn main() {
     assert!(out.status.success(), "running useslib failed");
     assert_eq!(String::from_utf8(out.stdout).unwrap(), "lib says 1\n");
 
+    // A binary keeps the library version it was built
+    // against: rebuilding the library at the same output
+    // path afterwards does not change what the earlier
+    // binary runs.
+    build(
+        &rustc,
+        "libw",
+        "pub fn f() -> u32 { 1 }\n",
+        &["--crate-type=rlib"],
+    );
+    build(
+        &rustc,
+        "usesw",
+        "extern crate libw; fn main() { println!(\"lib says {}\", libw::f()); }\n",
+        &["--extern", "libw=liblibw.rlib"],
+    );
+    build(
+        &rustc,
+        "libw",
+        "pub fn f() -> u32 { 2 }\n",
+        &["--crate-type=rlib"],
+    );
+    let out = Command::new(dir.join("usesw")).output().unwrap();
+    assert!(out.status.success(), "running usesw failed");
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "lib says 1\n");
+
+    // Two library outputs built from one source at
+    // different times bind by the artifact each binary
+    // named, not by whichever artifact the source path
+    // resolves to later: a binary linked against the
+    // second build runs the second build's code.
+    build(
+        &rustc,
+        "libx",
+        "pub fn f() -> u32 { 1 }\n",
+        &["--crate-type=rlib", "-o", "libx_a.rlib"],
+    );
+    build(
+        &rustc,
+        "libx",
+        "pub fn f() -> u32 { 2 }\n",
+        &["--crate-type=rlib", "-o", "libx_b.rlib"],
+    );
+    build(
+        &rustc,
+        "usesx",
+        "extern crate libx; fn main() { println!(\"lib says {}\", libx::f()); }\n",
+        &["--extern", "libx=libx_b.rlib"],
+    );
+    let out = Command::new(dir.join("usesx")).output().unwrap();
+    assert!(out.status.success(), "running usesx failed");
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "lib says 2\n");
+
     println!("artifact fidelity guest ok");
 }
 "#;
