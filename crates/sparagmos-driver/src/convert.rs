@@ -815,6 +815,70 @@ fn trait_has_impls(trait_def: rustc_public::DefId) -> bool {
     })
 }
 
+thread_local! {
+    /// Per-trait memo for `trait_is_compiler_implemented`.
+    static COMPILER_IMPLEMENTED_TRAITS: std::cell::RefCell<
+        Option<HashMap<rustc_public::DefId, bool>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// Whether the compiler itself provides `trait_def`'s
+/// implementations, so the implementation table is no evidence
+/// about the trait at all. The compiler marks such traits
+/// `#[rustc_deny_explicit_impl]`: user implementations are
+/// forbidden outright, and the compiler supplies the
+/// implementations from its own knowledge — every type
+/// implements `Pointee` with the metadata its kind carries,
+/// every enum implements `DiscriminantKind`, the sized
+/// hierarchy and `Unsize` hold by construction. Such a
+/// trait's projections normalize for the self types the
+/// compiler assigns them to, table or no table, so the screen
+/// must not reject them.
+///
+/// The mark is read two ways, because the attribute is not
+/// encoded in dependency metadata: directly, for a trait
+/// whose attributes the running compilation itself reads,
+/// and by lang item for core's own marked traits, whose lang
+/// items are the identity that survives into a dependent
+/// compilation. Outside a compilation callback there is no
+/// compiler context to consult (see `compiler_tcx`); the
+/// trait is reported user-implemented, preserving the
+/// screen's plain judgment.
+fn trait_is_compiler_implemented(trait_def: rustc_public::DefId) -> bool {
+    COMPILER_IMPLEMENTED_TRAITS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let memo = cache.get_or_insert_with(HashMap::new);
+        if let Some(&known) = memo.get(&trait_def) {
+            return known;
+        }
+        let implemented = compiler_tcx().is_some_and(|tcx| {
+            let internal = rustc_public::rustc_internal::internal(tcx, trait_def);
+            let marked = tcx
+                .get_attrs(internal, rustc_span::sym::rustc_deny_explicit_impl)
+                .into_iter()
+                .next()
+                .is_some();
+            let lang_items = tcx.lang_items();
+            let core_compiler_trait = [
+                rustc_attr_ir::lang_items::LangItem::PointeeTrait,
+                rustc_attr_ir::lang_items::LangItem::DiscriminantKind,
+                rustc_attr_ir::lang_items::LangItem::Sized,
+                rustc_attr_ir::lang_items::LangItem::MetaSized,
+                rustc_attr_ir::lang_items::LangItem::PointeeSized,
+                rustc_attr_ir::lang_items::LangItem::Unsize,
+                rustc_attr_ir::lang_items::LangItem::Destruct,
+                rustc_attr_ir::lang_items::LangItem::Tuple,
+                rustc_attr_ir::lang_items::LangItem::BikeshedGuaranteedNoDrop,
+            ]
+            .iter()
+            .any(|item| lang_items.get(*item) == Some(internal));
+            marked || core_compiler_trait
+        });
+        memo.insert(trait_def, implemented);
+        implemented
+    })
+}
+
 /// Whether the projection `alias` cannot normalize in a
 /// fully-monomorphized typing environment. The one judgment
 /// the implementation table decides: the projection's trait
@@ -822,11 +886,13 @@ fn trait_has_impls(trait_def: rustc_public::DefId) -> bool {
 /// compilation. No instantiation of a definition mentioning
 /// the projection can satisfy its bounds then, so the
 /// projection normalizes for no self type — parameter,
-/// concrete, or otherwise — with one exception the screen
-/// checks separately: a trait-object self type, whose own
-/// existential projection predicate binds the item and so
-/// normalizes the projection without any implementation
-/// (see `dyn_binding_normalizes`).
+/// concrete, or otherwise — with two exceptions the screen
+/// checks separately: a trait the compiler itself implements
+/// (see `trait_is_compiler_implemented`), whose
+/// implementations never reach the table, and a trait-object
+/// self type, whose own existential projection predicate
+/// binds the item and so normalizes the projection without
+/// any implementation (see `dyn_binding_normalizes`).
 ///
 /// Nothing else is judged. Whether an implementation
 /// *covers* a concrete self type is not decidable from the
@@ -841,7 +907,7 @@ fn projection_cannot_normalize(alias: &rustc_public::ty::AliasTy) -> bool {
     let Some(trait_def) = alias.def_id.def_id().parent() else {
         return false;
     };
-    !trait_has_impls(trait_def)
+    !trait_has_impls(trait_def) && !trait_is_compiler_implemented(trait_def)
 }
 
 /// Whether the projection `alias` normalizes through an

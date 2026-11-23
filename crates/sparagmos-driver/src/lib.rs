@@ -30,7 +30,11 @@
 //! item so drop-glue certification can check the item exists before
 //! asking the compiler to resolve `drop_in_place` (a minicore
 //! defines no `drop_glue` item, and asking emits a fatal diagnostic
-//! no `catch_unwind` can contain).
+//! no `catch_unwind` can contain); and the
+//! `rustc_deny_explicit_impl` attribute and the lang items naming
+//! core's compiler-implemented traits are read through the internal
+//! context so the unnormalizable-projection screen can exempt those
+//! traits, whose implementations no `impl` item ever records.
 
 #![feature(rustc_private)]
 

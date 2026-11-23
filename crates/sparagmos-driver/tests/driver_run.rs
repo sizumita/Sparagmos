@@ -1898,6 +1898,88 @@ fn run_mode_dyn_bound_projection_supertrait_runs() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "9\n");
 }
 
+const POINTEE_METADATA_PROJECTION_SRC: &str = r#"
+#![feature(ptr_metadata)]
+struct Holder<T: ?Sized> {
+    value: <T as std::ptr::Pointee>::Metadata,
+}
+fn direct() -> <[u8] as std::ptr::Pointee>::Metadata {
+    4
+}
+fn main() {
+    let h = Holder::<[u8]> { value: 3 };
+    let s = Holder::<str> { value: 5 };
+    println!("{} {} {}", h.value, s.value, direct());
+}
+"#;
+
+#[test]
+fn run_mode_compiler_implemented_trait_pointee_runs() {
+    // `Pointee` is implemented by the compiler itself (core
+    // marks it `#[rustc_deny_explicit_impl]`): no `impl` item
+    // ever records it, so the implementation table is empty
+    // for it, yet `<T as Pointee>::Metadata` normalizes for
+    // every self type. The unnormalizable-projection screen
+    // must not reject the holder or `main` over it -- natively
+    // the program prints `3 5 4`.
+    let dir = temp_dir("pointee-metadata-projection");
+    let src = fixture(
+        &dir,
+        "pointee_metadata_projection.rs",
+        POINTEE_METADATA_PROJECTION_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the Pointee-metadata projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3 5 4\n");
+}
+
+const DISCRIMINANT_KIND_PROJECTION_SRC: &str = r#"
+#![feature(discriminant_kind)]
+use std::marker::DiscriminantKind;
+struct Holder<T: DiscriminantKind> {
+    value: T::Discriminant,
+}
+#[allow(dead_code)]
+enum E {
+    A,
+    B,
+}
+fn main() {
+    let h = Holder::<E> { value: 1 };
+    println!("{}", h.value);
+}
+"#;
+
+#[test]
+fn run_mode_compiler_implemented_trait_discriminant_kind_runs() {
+    // The exemption is the compiler-implemented class, not
+    // `Pointee` by name: `DiscriminantKind` is another trait
+    // core marks `#[rustc_deny_explicit_impl]`, implemented
+    // by the compiler for every enum, with no `impl` item
+    // recording it. Its projection normalizes (to `isize`
+    // here), and the screen must not reject the program --
+    // natively it prints `1`.
+    let dir = temp_dir("discriminant-kind-projection");
+    let src = fixture(
+        &dir,
+        "discriminant_kind_projection.rs",
+        DISCRIMINANT_KIND_PROJECTION_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the DiscriminantKind projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n");
+}
+
 const COROUTINE_ONLY_CALLER_SRC: &str = r#"
 fn helper<T: Copy>(v: T) -> T { v }
 fn main() {
