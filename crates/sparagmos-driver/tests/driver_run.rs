@@ -19088,3 +19088,32 @@ fn run_mode_waker_from_raw_vtable_wake() {
         "w3 wake_by_ref 4\nw3 wake_by_ref 4\nw3 wake 4\nmid\nw3 wake 4\ndone\n",
     );
 }
+
+const SLICE_JOIN_CLOSURE_CONST_SRC: &str = r#"
+fn main() {
+    let a: &[&[i32]] = &[&[1, 2], &[3]];
+    let j = a.join(&0);
+    println!("done {}", j.len());
+}
+"#;
+
+#[test]
+fn run_mode_slice_join_closure_constant_converts() {
+    // The length fold inside slice Join::join reaches conversion as a
+    // closure *type constant* whose environment captures the sum
+    // closure (const-prop folded, all captures zero-sized).
+    // Conversion must materialize that environment instead of
+    // rejecting the constant; before the fix this program died in
+    // conversion with "closure constant ... with a captured
+    // environment". The joined length itself is Vec bookkeeping
+    // territory and is not what this test pins.
+    let dir = temp_dir("slice-join-closure-const");
+    let src = fixture(&dir, "case.rs", SLICE_JOIN_CLOSURE_CONST_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "join runs; stderr={stderr}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).starts_with("done "),
+        "join completed: {stderr}"
+    );
+}
