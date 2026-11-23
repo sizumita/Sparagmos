@@ -6656,6 +6656,10 @@ fn execute(
 ///
 /// ```text
 /// break <line>     a breakpoint in the input file (repeatable)
+/// break-at <file>:<line>
+///                  a breakpoint in the named file (repeatable)
+/// break-fn <path>  a function breakpoint: stop at the first
+///                  position of each frame of the named body
 /// pretty-printers  render gdb prints through the sysroot Rust
 ///                  pretty printers (the harness emits this for
 ///                  gdb sessions whose test does not opt out with
@@ -6668,8 +6672,15 @@ fn execute(
 /// print <expr>     gdb-form print (also `print/d`, `print/x`,
 ///                  `print/t`, `print/c` for the value format)
 /// v <expr>         lldb-form print
+/// whatis <expr>    print the expression's declared type
+/// ptype <expr>     print the expression's type with its layout
+/// repr <name>      the debugger_tester repr pseudo-command
 /// frame <n>        select frame n (0 = innermost)
+/// up / down        move the frame selection out / in one frame
 /// show-line        emit the current stop line again
+/// info-functions [-q] [<pattern>]
+///                  list the program's matching functions
+/// info-locals      list the selected frame's locals
 /// ```
 ///
 /// The session transcript is printed to stdout (the guest's own
@@ -6705,13 +6716,16 @@ fn execute_debug(
             return 2;
         }
     };
-    let (breakpoints, commands, pretty_printers) = match parse_debug_script(&script_text) {
+    let parsed = match parse_debug_script(&script_text) {
         Ok(parsed) => parsed,
         Err(reason) => {
             eprintln!("sparagmos-driver debug: bad script: {reason}");
             return 2;
         }
     };
+    let breakpoints = parsed.break_lines;
+    let commands = parsed.commands;
+    let pretty_printers = parsed.pretty_printers;
     let built = match build_program(c, input, guest_args) {
         Ok(b) => b,
         Err(code) => return code,
@@ -6737,6 +6751,12 @@ fn execute_debug(
     for line in &breakpoints {
         session.set_breakpoint(input, *line);
     }
+    for (file, line) in &parsed.break_files {
+        session.set_breakpoint(file, *line);
+    }
+    for name in &parsed.break_fns {
+        session.set_fn_breakpoint(name);
+    }
     session.set_pretty_printers(pretty_printers);
     // Register the source text of every file the converted
     // program references, not just the main input: a session
@@ -6759,13 +6779,27 @@ fn execute_debug(
     0
 }
 
+/// A parsed debugger session script (see [`execute_debug`]).
+struct ParsedDebugScript {
+    /// Breakpoint lines in the input file.
+    break_lines: Vec<u32>,
+    /// Breakpoints in a named file: (file, line) pairs.
+    break_files: Vec<(String, u32)>,
+    /// Function breakpoints: body-name patterns.
+    break_fns: Vec<String>,
+    /// The session's commands, in script order.
+    commands: Vec<sparagmos_interp::DebugCommand>,
+    /// Whether gdb prints render through the pretty printers.
+    pretty_printers: bool,
+}
+
 /// Parse a debugger session script (see [`execute_debug`]) into
 /// its breakpoint lines and its command list.
-fn parse_debug_script(
-    text: &str,
-) -> Result<(Vec<u32>, Vec<sparagmos_interp::DebugCommand>, bool), String> {
+fn parse_debug_script(text: &str) -> Result<ParsedDebugScript, String> {
     use sparagmos_interp::{DebugCommand, DebugPrint, PrintFormat};
     let mut breakpoints = Vec::new();
+    let mut break_files = Vec::new();
+    let mut break_fns = Vec::new();
     let mut commands = Vec::new();
     let mut pretty_printers = false;
     for (lineno, raw) in text.lines().enumerate() {
@@ -6791,6 +6825,21 @@ fn parse_debug_script(
                     .map_err(|_| bad(&format!("bad breakpoint line `{rest}`")))?;
                 breakpoints.push(n);
             }
+            "break-at" => {
+                let (file, line) = rest
+                    .rsplit_once(':')
+                    .ok_or_else(|| bad(&format!("bad file breakpoint `{rest}`")))?;
+                let n: u32 = line
+                    .parse()
+                    .map_err(|_| bad(&format!("bad breakpoint line `{rest}`")))?;
+                break_files.push((file.to_string(), n));
+            }
+            "break-fn" => {
+                if rest.is_empty() {
+                    return Err(bad("`break-fn` takes a function path"));
+                }
+                break_fns.push(rest.to_string());
+            }
             "run" => commands.push(DebugCommand::Run),
             "continue" => commands.push(DebugCommand::Continue),
             "next" => commands.push(DebugCommand::Next),
@@ -6811,6 +6860,28 @@ fn parse_debug_script(
                 expr: rest.to_string(),
                 format: None,
             })),
+            "whatis" => commands.push(DebugCommand::WhatIs(DebugPrint {
+                expr: rest.to_string(),
+                format: None,
+            })),
+            "ptype" => commands.push(DebugCommand::Ptype(DebugPrint {
+                expr: rest.to_string(),
+                format: None,
+            })),
+            "repr" => commands.push(DebugCommand::Repr(rest.to_string())),
+            "up" => commands.push(DebugCommand::FrameUp),
+            "down" => commands.push(DebugCommand::FrameDown),
+            "info-locals" => commands.push(DebugCommand::InfoLocals),
+            "info-functions" | "info-functions-q" => {
+                commands.push(DebugCommand::InfoFunctions {
+                    pattern: if rest.is_empty() || rest == "-" {
+                        None
+                    } else {
+                        Some(rest.to_string())
+                    },
+                    quiet: head == "info-functions-q",
+                });
+            }
             _ if head.starts_with("print/") => {
                 let format = match &head["print/".len()..] {
                     "d" => Some(PrintFormat::Decimal),
@@ -6827,7 +6898,13 @@ fn parse_debug_script(
             _ => return Err(bad(&format!("unknown command `{head}`"))),
         }
     }
-    Ok((breakpoints, commands, pretty_printers))
+    Ok(ParsedDebugScript {
+        break_lines: breakpoints,
+        break_files,
+        break_fns,
+        commands,
+        pretty_printers,
+    })
 }
 
 /// The crate type an auxiliary source declares for itself

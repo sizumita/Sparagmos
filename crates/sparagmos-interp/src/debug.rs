@@ -65,6 +65,36 @@ pub enum DebugCommand {
     /// `frame select` without a number): emits the line the
     /// session is stopped on into the transcript again.
     ShowLine,
+    /// Print an expression's declared type (gdb `whatis`):
+    /// emits `type = <type>` in gdb form.
+    WhatIs(DebugPrint),
+    /// Print an expression's declared type with its layout
+    /// (gdb `ptype`): the `whatis` head line plus, for an
+    /// aggregate type, the field lines of its shape.
+    Ptype(DebugPrint),
+    /// The debugger_tester `repr` pseudo-command: evaluate and
+    /// render the named value; success emits `<name>: Ok` (the
+    /// check line compiletest synthesises for the directive).
+    Repr(String),
+    /// Move the frame selection one frame toward the caller
+    /// (gdb/lldb `up`): emits the newly selected frame's line.
+    FrameUp,
+    /// Move the frame selection one frame toward the innermost
+    /// frame (gdb/lldb `down`): emits the newly selected
+    /// frame's line.
+    FrameDown,
+    /// List the program's functions whose names match a
+    /// pattern (gdb `info functions [-q] [pattern]`): one
+    /// declaration line per matching body. `quiet` is gdb's
+    /// `-q` form, whose lines carry the `static fn` prefix and
+    /// the full signature; the plain form is `fn <name>();`.
+    InfoFunctions {
+        pattern: Option<String>,
+        quiet: bool,
+    },
+    /// List the selected frame's locals (gdb `info locals`):
+    /// `No locals.` when none are in scope at the stop.
+    InfoLocals,
 }
 
 /// A print command: the expression text plus the number format
@@ -173,6 +203,18 @@ pub(crate) struct DebugControl {
     /// with `disable-gdb-pretty-printers`). Only the gdb form
     /// consults it.
     pretty_printers: bool,
+    /// Function breakpoints (gdb `break <fn-path>` in a command
+    /// section): body names to stop at on first entry.
+    fn_breakpoints: Vec<String>,
+    /// Frame ids a function breakpoint has already stopped in:
+    /// a function breakpoint stops once per frame instance, at
+    /// the first position that frame executes.
+    fn_bp_stopped: HashSet<u64>,
+    /// The program's statics' initializer constants, by static
+    /// key (see [`collect_static_seeds`]): the seeds a print of
+    /// a static evaluates to reach its storage before the
+    /// program itself has touched it.
+    static_seeds: HashMap<String, crate::ir::Constant>,
 }
 
 /// A debugger session over one converted program.
@@ -182,6 +224,7 @@ pub struct DebugSession {
     args: Vec<Value>,
     config: crate::InterpConfig,
     breakpoints: HashSet<(u32, u32)>,
+    fn_breakpoints: Vec<String>,
     source_text: HashMap<u32, Vec<String>>,
     pretty_printers: bool,
 }
@@ -199,9 +242,18 @@ impl DebugSession {
             args,
             config,
             breakpoints: HashSet::new(),
+            fn_breakpoints: Vec::new(),
             source_text: HashMap::new(),
             pretty_printers: false,
         }
+    }
+
+    /// Set a function breakpoint (gdb `break <fn-path>`): the
+    /// session stops at the first position executed by each
+    /// frame of a body whose name matches `name` (exactly, or
+    /// as a suffix at a `::` boundary).
+    pub fn set_fn_breakpoint(&mut self, name: &str) {
+        self.fn_breakpoints.push(name.to_string());
     }
 
     /// Set whether gdb prints in this session render through
@@ -262,12 +314,12 @@ impl DebugSession {
         commands: Vec<DebugCommand>,
         dialect: DebugDialect,
     ) -> DebugRun {
-        let mut script: VecDeque<DebugCommand> = commands.into();
-        if matches!(script.front(), Some(DebugCommand::Run)) {
-            script.pop_front();
-        }
-        let ctl = DebugControl {
+        let script: VecDeque<DebugCommand> = commands.into();
+        let mut ctl = DebugControl {
             breakpoints: std::mem::take(&mut self.breakpoints),
+            fn_breakpoints: std::mem::take(&mut self.fn_breakpoints),
+            fn_bp_stopped: HashSet::new(),
+            static_seeds: collect_static_seeds(&self.program),
             script,
             plan: StopPlan::Breakpoints,
             last_pos: None,
@@ -281,6 +333,31 @@ impl DebugSession {
             pretty_printers: self.pretty_printers,
         };
         let mut interp = Interpreter::with_config(&self.program, self.config.clone());
+        // Commands ahead of the session's first `run` are
+        // consumed against the loaded-but-not-started program,
+        // as a real debugger consumes them: prints there read
+        // the statics at their initial values (the only values
+        // in scope before any frame exists). A leading `run`
+        // itself is the session start and is consumed here.
+        loop {
+            match ctl.script.front() {
+                Some(DebugCommand::Run) => {
+                    ctl.script.pop_front();
+                    break;
+                }
+                Some(
+                    DebugCommand::Print(_)
+                    | DebugCommand::WhatIs(_)
+                    | DebugCommand::Ptype(_)
+                    | DebugCommand::Repr(_)
+                    | DebugCommand::InfoFunctions { .. },
+                ) => {
+                    let cmd = ctl.script.pop_front().expect("front checked");
+                    exec_session_command(&mut ctl, &interp, &[], &cmd);
+                }
+                _ => break,
+            }
+        }
         interp.debug_ctl = Some(ctl);
         let result = interp.run(&self.entry, std::mem::take(&mut self.args));
         let ctl = interp.debug_ctl.take().expect("session control installed");
@@ -291,6 +368,210 @@ impl DebugSession {
             stderr: interp.error_output().to_string(),
         }
     }
+}
+
+/// Execute one non-resuming session command against the current
+/// stop (or, with no frames, against the not-yet-started
+/// program): prints, type queries, the `repr` pseudo-command
+/// and the `info` listings render into the transcript. Shared
+/// by the pre-run phase and the drive hook's stop loop.
+fn exec_session_command(
+    ctl: &mut DebugControl,
+    interp: &Interpreter,
+    frames: &[Frame],
+    cmd: &DebugCommand,
+) {
+    match cmd {
+        DebugCommand::Print(print) => {
+            let lines = render_print(interp, ctl, frames, print);
+            ctl.transcript.extend(lines);
+            if ctl.dialect == DebugDialect::Gdb {
+                ctl.print_count += 1;
+            }
+        }
+        DebugCommand::WhatIs(print) => {
+            let lines = render_type_query(interp, ctl, frames, print, false);
+            ctl.transcript.extend(lines);
+        }
+        DebugCommand::Ptype(print) => {
+            let lines = render_type_query(interp, ctl, frames, print, true);
+            ctl.transcript.extend(lines);
+        }
+        DebugCommand::Repr(name) => {
+            let print = DebugPrint {
+                expr: name.clone(),
+                format: None,
+            };
+            let ok = match evaluate_print(interp, ctl, frames, &print) {
+                Ok(ev) => match ctl.dialect {
+                    DebugDialect::Gdb => ev.gdb.is_some(),
+                    DebugDialect::Lldb => !ev.lldb.is_empty(),
+                },
+                Err(_) => false,
+            };
+            ctl.transcript.push(if ok {
+                format!("{name}: Ok")
+            } else {
+                format!("{name}: Err")
+            });
+        }
+        DebugCommand::InfoFunctions { pattern, quiet } => {
+            let lines = render_info_functions(interp, pattern.as_deref(), *quiet);
+            ctl.transcript.extend(lines);
+        }
+        DebugCommand::InfoLocals => {
+            let lines = render_info_locals(interp, ctl, frames);
+            ctl.transcript.extend(lines);
+        }
+        _ => {}
+    }
+}
+
+/// Collect the program's statics' initializer constants, by
+/// static key: walk every body's operands for the `StaticRef`
+/// constants the conversion embedded (each carries its
+/// static's full initializer as its seed). A static no body
+/// references has no seed here; a print of it stays an explicit
+/// error, as it did before statics could be printed at all.
+fn collect_static_seeds(
+    program: &Program,
+) -> HashMap<String, crate::ir::Constant> {
+    use crate::ir::{Operand, Rvalue, StatementKind, TerminatorKind};
+    fn collect_constant(
+        c: &crate::ir::Constant,
+        seeds: &mut HashMap<String, crate::ir::Constant>,
+    ) {
+        match c {
+            crate::ir::Constant::StaticRef { name, value, .. } => {
+                seeds
+                    .entry(name.clone())
+                    .or_insert_with(|| (**value).clone());
+                collect_constant(value, seeds);
+            }
+            crate::ir::Constant::Ref(inner) => collect_constant(inner, seeds),
+            crate::ir::Constant::Tuple(items)
+            | crate::ir::Constant::SliceVal(items) => {
+                for item in items {
+                    collect_constant(item, seeds);
+                }
+            }
+            crate::ir::Constant::Adt { fields, .. } => {
+                for field in fields {
+                    collect_constant(field, seeds);
+                }
+            }
+            crate::ir::Constant::ErasedAlloc { relocs, .. } => {
+                for (_, reloc) in relocs {
+                    collect_constant(reloc, seeds);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn collect_operand(
+        op: &Operand,
+        seeds: &mut HashMap<String, crate::ir::Constant>,
+    ) {
+        if let Operand::Constant(c) = op {
+            collect_constant(c, seeds);
+        }
+    }
+    fn collect_rvalue(
+        rv: &Rvalue,
+        seeds: &mut HashMap<String, crate::ir::Constant>,
+    ) {
+        match rv {
+            Rvalue::Use(op)
+            | Rvalue::UnaryOp(_, op)
+            | Rvalue::Cast(op, _)
+            | Rvalue::Unsize(op, _)
+            | Rvalue::BoxDerefTransmute(op)
+            | Rvalue::DataPtr(op)
+            | Rvalue::Materialize(op, _)
+            | Rvalue::PtrToInt(op)
+            | Rvalue::PtrField(op, _)
+            | Rvalue::PtrFieldFirstElem(op, _)
+            | Rvalue::PtrCastUnits(op, _)
+            | Rvalue::PtrFirstElem(op)
+            | Rvalue::PtrArrayBase(op)
+            | Rvalue::WrapArrayElems(op)
+            | Rvalue::UnwrapArrayElems(op)
+            | Rvalue::IntToPtr(op)
+            | Rvalue::EnumToInt(op, _, _)
+            | Rvalue::Reinterpret(op, _, _)
+            | Rvalue::IntToEnum(op, _) => collect_operand(op, seeds),
+            Rvalue::BinaryOp(_, pair) | Rvalue::CheckedBinaryOp(_, pair) => {
+                collect_operand(&pair.0, seeds);
+                collect_operand(&pair.1, seeds);
+            }
+            Rvalue::AggregateTuple(ops) | Rvalue::CoroutineAggregate(ops) => {
+                for op in ops {
+                    collect_operand(op, seeds);
+                }
+            }
+            Rvalue::AggregateAdt { operands, .. }
+            | Rvalue::ClosureAggregate { operands, .. } => {
+                for op in operands {
+                    collect_operand(op, seeds);
+                }
+            }
+            Rvalue::RawPtrAggregate { data, meta } => {
+                collect_operand(data, seeds);
+                if let Some(meta) = meta {
+                    collect_operand(meta, seeds);
+                }
+            }
+            Rvalue::PtrOffset(a, b, ..) => {
+                collect_operand(a, seeds);
+                collect_operand(b, seeds);
+            }
+            _ => {}
+        }
+    }
+    let mut seeds = HashMap::new();
+    for body in program.functions.values() {
+        for entry in &body.debug_vars {
+            if let crate::ir::DebugVar::Constant(c) = &entry.source {
+                collect_constant(c, &mut seeds);
+            }
+        }
+        for block in &body.blocks {
+            for stmt in &block.statements {
+                match &stmt.kind {
+                    StatementKind::Assign(_, rv) => {
+                        collect_rvalue(rv, &mut seeds)
+                    }
+                    StatementKind::Assume(op) => collect_operand(op, &mut seeds),
+                    _ => {}
+                }
+            }
+            match &block.terminator {
+                TerminatorKind::SwitchInt { discr, .. } => {
+                    collect_operand(discr, &mut seeds)
+                }
+                TerminatorKind::Call { args, .. }
+                | TerminatorKind::CallBuiltin { args, .. } => {
+                    for op in args {
+                        collect_operand(op, &mut seeds);
+                    }
+                }
+                TerminatorKind::CallIndirect { func, args, .. } => {
+                    collect_operand(func, &mut seeds);
+                    for op in args {
+                        collect_operand(op, &mut seeds);
+                    }
+                }
+                TerminatorKind::CallTrait {
+                    receiver, args, ..
+                } => {
+                    collect_operand(receiver, &mut seeds);
+                    collect_operand(args, &mut seeds);
+                }
+                _ => {}
+            }
+        }
+    }
+    seeds
 }
 
 /// The drive loop's debugger hook: consulted before the statement
@@ -382,7 +663,22 @@ pub(crate) fn drive_hook(
     if eligible {
         ctl.last_pos = Some(key);
     }
-    let stop = match ctl.plan {
+    // A function breakpoint stops at the first position a
+    // matching frame executes, under any plan that is still
+    // running the program (gdb breakpoints interrupt `next`
+    // too; only the exhausted-script plan runs free).
+    let fn_stop = !matches!(ctl.plan, StopPlan::Done)
+        && !ctl.fn_breakpoints.is_empty()
+        && !ctl.fn_bp_stopped.contains(&frame_id)
+        && ctl
+            .fn_breakpoints
+            .iter()
+            .any(|pat| fn_name_matches(&body.name, pat));
+    if fn_stop {
+        ctl.fn_bp_stopped.insert(frame_id);
+    }
+    let stop = fn_stop
+        || match ctl.plan {
         StopPlan::Breakpoints => {
             if !ctl.breakpoints.contains(&key) {
                 false
@@ -430,23 +726,31 @@ pub(crate) fn drive_hook(
         // Consume commands until one resumes execution.
         loop {
             match ctl.script.pop_front() {
-                Some(DebugCommand::Print(print)) => {
-                    let lines = render_print(interp, &ctl, frames, &print);
-                    ctl.transcript.extend(lines);
-                    if ctl.dialect == DebugDialect::Gdb {
-                        ctl.print_count += 1;
-                    }
+                Some(
+                    cmd @ (DebugCommand::Print(_)
+                    | DebugCommand::WhatIs(_)
+                    | DebugCommand::Ptype(_)
+                    | DebugCommand::Repr(_)
+                    | DebugCommand::InfoFunctions { .. }
+                    | DebugCommand::InfoLocals),
+                ) => {
+                    exec_session_command(&mut ctl, interp, frames, &cmd);
                 }
                 Some(DebugCommand::FrameSelect(n)) => {
                     ctl.selected_frame = n;
                 }
-                Some(DebugCommand::ShowLine) => {
-                    if let Some(lines) = ctl.source_text.get(&pos.file) {
-                        if let Some(text) = lines.get((pos.line - 1) as usize) {
-                            let rendered = stop_line_text(&ctl, pos.line, text);
-                            ctl.transcript.push(rendered);
-                        }
+                Some(DebugCommand::FrameUp) => {
+                    if ctl.selected_frame + 1 < frames.len() {
+                        ctl.selected_frame += 1;
                     }
+                    emit_selected_line(&mut ctl, interp, frames, pos);
+                }
+                Some(DebugCommand::FrameDown) => {
+                    ctl.selected_frame = ctl.selected_frame.saturating_sub(1);
+                    emit_selected_line(&mut ctl, interp, frames, pos);
+                }
+                Some(DebugCommand::ShowLine) => {
+                    emit_selected_line(&mut ctl, interp, frames, pos);
                 }
                 Some(DebugCommand::Next) => {
                     ctl.plan = StopPlan::StepOver(depth);
@@ -482,6 +786,54 @@ fn stop_line_text(ctl: &DebugControl, line: u32, text: &str) -> String {
     match ctl.dialect {
         DebugDialect::Gdb => format!("{line}\t{text}"),
         DebugDialect::Lldb => text.trim().to_string(),
+    }
+}
+
+/// Whether a body name matches a function-breakpoint pattern:
+/// an exact match, or the pattern naming a suffix of the body
+/// name at a `::` boundary (the pattern names the item from
+/// its crate root; a body key may carry a longer prefix for
+/// items the conversion names through their impl).
+fn fn_name_matches(body_name: &str, pattern: &str) -> bool {
+    if body_name == pattern {
+        return true;
+    }
+    match body_name.len().checked_sub(pattern.len()) {
+        Some(idx) if idx >= 2 => {
+            body_name.ends_with(pattern) && body_name[..idx].ends_with("::")
+        }
+        _ => false,
+    }
+}
+
+/// Emit the selected frame's current source line into the
+/// transcript (gdb `frame` / `up` / `down`, lldb `frame
+/// select`): the stop line itself for the innermost frame,
+/// the caller frame's suspended call line for an outer one.
+fn emit_selected_line(
+    ctl: &mut DebugControl,
+    interp: &Interpreter,
+    frames: &[Frame],
+    stop_pos: SourceLine,
+) {
+    let mut pos = stop_pos;
+    if ctl.selected_frame != 0 {
+        if let Some(frame) =
+            frames.get(frames.len().saturating_sub(1 + ctl.selected_frame))
+        {
+            if let Some(body) = interp.program().get(&frame.func) {
+                let (block, stmt) = frame.current_block_stmt();
+                if let Some(p) = position(body, block, stmt) {
+                    pos = p;
+                }
+            }
+        }
+    }
+    if let Some(lines) = ctl.source_text.get(&pos.file) {
+        if let Some(text) = lines.get((pos.line - 1) as usize) {
+            let rendered = stop_line_text(ctl, pos.line, text);
+            ctl.transcript.push(rendered);
+        }
     }
 }
 
@@ -548,16 +900,50 @@ struct EvaluatedPrint {
     lldb: Vec<String>,
 }
 
-/// Evaluate a print expression in the selected frame: a variable
-/// of the frame's body (as recorded in its debug variable table),
-/// followed by dereferences, field and index steps, and render
-/// the resulting value in both dialects' forms.
-fn evaluate_print(
+/// A print expression evaluated to a value: the value itself,
+/// its rendering descriptor, its `char` fact, and its declared
+/// type tag when the conversion recorded one (the form the
+/// pretty printers key on and the type queries print).
+struct EvaluatedValue {
+    value: Value,
+    desc: Option<Desc>,
+    char: bool,
+    tag: Option<String>,
+}
+
+/// Resolve a print expression's base name: a variable of the
+/// selected frame's body (as recorded in its debug variable
+/// table), or — for a name no local carries, and for any
+/// path-qualified name — a static of the program.
+fn resolve_base(
     interp: &Interpreter,
     ctl: &DebugControl,
     frames: &[Frame],
-    print: &DebugPrint,
-) -> Result<EvaluatedPrint, String> {
+    expr: &ParsedExpr,
+) -> Result<EvaluatedValue, String> {
+    // A path-qualified name can only name a static: debug
+    // variable entries carry plain identifiers.
+    if !expr.base.contains("::") && !frames.is_empty() {
+        if let Some(local) = resolve_local_base(interp, ctl, frames, expr)? {
+            return Ok(local);
+        }
+    }
+    if let Some(statik) = resolve_static_base(interp, ctl, frames, &expr.base) {
+        return Ok(statik);
+    }
+    Err(format!("no variable `{}` in scope", expr.base))
+}
+
+/// Resolve a print expression's base name against the selected
+/// frame's debug variable table. `Ok(None)` when the frame's
+/// body records no variable of that name (the caller then
+/// tries the statics).
+fn resolve_local_base(
+    interp: &Interpreter,
+    ctl: &DebugControl,
+    frames: &[Frame],
+    expr: &ParsedExpr,
+) -> Result<Option<EvaluatedValue>, String> {
     let frame = frames
         .get(frames.len().saturating_sub(1 + ctl.selected_frame))
         .ok_or_else(|| format!("frame {} is not live", ctl.selected_frame))?;
@@ -565,7 +951,6 @@ fn evaluate_print(
         .program()
         .get(&frame.func)
         .ok_or_else(|| format!("no body for frame `{}`", frame.func))?;
-    let expr = parse_expr(&print.expr)?;
     // Resolve the name the way a debugger does: among the
     // body's entries of that name, prefer the declaration whose
     // recorded span contains the current line (the smallest such
@@ -594,14 +979,16 @@ fn evaluate_print(
             .copied()
             .or_else(|| named.last().copied())
     };
-    let entry = entry.ok_or_else(|| format!("no variable `{}` in scope", expr.base))?;
+    let Some(entry) = entry else {
+        return Ok(None);
+    };
     let (source, char_hint) = (&entry.source, entry.is_char);
     // The value's type, as a rendering descriptor: the variable
     // entry's recorded type tag when the conversion supplied one
     // (it carries the full instance name, generic arguments
     // included), else — for a plain local — the frame body's
     // local type, which names an ADT by its definition only.
-    let (mut value, mut desc): (Value, Option<Desc>) = match source {
+    let (value, desc): (Value, Option<Desc>) = match source {
         crate::ir::DebugVar::Place(local, proj) => {
             let value = frame
                 .locals
@@ -634,21 +1021,306 @@ fn evaluate_print(
             entry.ty.as_ref().map(|tag| Desc::from_tag(tag)),
         ),
     };
-    // Whether the value (or, for a reference variable, its
-    // pointee) is a `char` at the source level: the IR type
-    // system has no char (it is a u32), so the conversion
-    // recorded it in the debug variable table.
-    let mut char = char_hint;
+    Ok(Some(EvaluatedValue {
+        value,
+        desc,
+        // Whether the value (or, for a reference variable, its
+        // pointee) is a `char` at the source level: the IR type
+        // system has no char (it is a u32), so the conversion
+        // recorded it in the debug variable table.
+        char: char_hint,
+        tag: entry.ty.clone(),
+    }))
+}
+
+/// Resolve a print expression's base name against the
+/// program's statics: the name is a static key (a full item
+/// path), or the last segment of one (a plain name, as gdb
+/// resolves a static from any scope). The value is the
+/// static's current storage content — evaluating its
+/// `StaticRef` constant seeds the storage from the
+/// initializer on first touch, so a print before the program
+/// has touched the static reads the initial value, and a
+/// print after a write reads the written one.
+fn resolve_static_base(
+    interp: &Interpreter,
+    ctl: &DebugControl,
+    frames: &[Frame],
+    base: &str,
+) -> Option<EvaluatedValue> {
+    let program = interp.program();
+    let mut exact: Option<&String> = None;
+    let mut by_segment: Option<&String> = None;
+    for key in program.static_debug_tags.keys() {
+        let stripped = key.split('#').next().unwrap_or(key);
+        if stripped == base {
+            exact = Some(key);
+            break;
+        }
+        if !base.contains("::") && stripped.rsplit("::").next() == Some(base) {
+            // Prefer the shortest key among last-segment
+            // matches (the least-qualified reading).
+            match by_segment {
+                Some(cur) if cur.len() <= key.len() => {}
+                _ => by_segment = Some(key),
+            }
+        }
+    }
+    let key = exact.or(by_segment)?;
+    let seed = ctl.static_seeds.get(key)?;
+    let reference = interp
+        .eval_constant(&crate::ir::Constant::StaticRef {
+            name: key.clone(),
+            value: Box::new(seed.clone()),
+            projection: Vec::new(),
+            len: None,
+        })
+        .ok()?;
+    let resolved = interp.deref_value(frames, &reference).ok()?;
+    let value = interp.read_resolved(frames, &resolved).ok()?;
+    let tag = program.static_debug_tags.get(key).cloned();
+    let desc = tag
+        .as_deref()
+        .map(Desc::from_tag)
+        .or_else(|| program.static_tys.get(key).map(Desc::from_ir));
+    let char = matches!(desc, Some(Desc::Char));
+    Some(EvaluatedValue {
+        value,
+        desc,
+        char,
+        tag,
+    })
+}
+
+/// Follow a reference or smart-pointer value to its pointee:
+/// the (pointee, pointee descriptor) when the value is one, the
+/// value itself otherwise. Field and index steps apply this
+/// first, as a debugger's field access dereferences through
+/// references and smart pointers implicitly.
+fn deref_if_pointer(
+    interp: &Interpreter,
+    frames: &[Frame],
+    value: Value,
+    desc: Option<Desc>,
+) -> Result<(Value, Option<Desc>), String> {
+    let is_pointer = matches!(
+        value,
+        Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. }
+    ) || matches!(&desc, Some(Desc::Adt(tag)) if smart_pointer_pointee(tag).is_some());
+    if !is_pointer {
+        return Ok((value, desc));
+    }
+    let resolved = interp
+        .deref_value(frames, &value)
+        .map_err(|e| e.to_string())?;
+    let pointee = interp
+        .read_resolved(frames, &resolved)
+        .map_err(|e| e.to_string())?;
+    let next = match desc {
+        Some(Desc::Ref(inner)) => Some(*inner),
+        Some(Desc::Adt(tag)) => {
+            smart_pointer_pointee(&tag).map(|t| Desc::from_tag(&t))
+        }
+        other => other,
+    };
+    Ok((pointee, next))
+}
+
+/// The length a `.length` step reads: a fat pointer's element
+/// count, a string's byte count, a stored sequence's element
+/// count. gdb spells a slice's and a `String`'s length this
+/// way (the fat pointer's and the vector's length field).
+fn sequence_length(
+    interp: &Interpreter,
+    frames: &[Frame],
+    value: &Value,
+    desc: Option<&Desc>,
+) -> Result<u128, String> {
+    match value {
+        Value::FatRef { len, .. } => Ok(*len),
+        Value::Str(s) => Ok(s.len() as u128),
+        Value::Bytes(b) => Ok(b.len() as u128),
+        Value::SparseVec { len, .. } => Ok(*len),
+        Value::Tuple(items) => Ok(items.len() as u128),
+        Value::Ref(_) | Value::DynRef { .. } => {
+            let resolved = interp
+                .deref_value(frames, value)
+                .map_err(|e| e.to_string())?;
+            let pointee = interp
+                .read_resolved(frames, &resolved)
+                .map_err(|e| e.to_string())?;
+            sequence_length(interp, frames, &pointee, None)
+        }
+        Value::Enum { fields, .. } => {
+            // A `Vec` value in this model is its element
+            // aggregate; a `String` value wraps its text (a
+            // plain string value is handled above, so what
+            // remains is the wrapped form `path_text` reads).
+            if let Some(tag) = desc.and_then(|d| match d {
+                Desc::Adt(tag) => Some(tag),
+                _ => None,
+            }) {
+                match tag_base_name(tag) {
+                    "Vec" => return Ok(fields.len() as u128),
+                    "String" | "OsString" => {
+                        if let Some(text) = path_text(value) {
+                            return Ok(text.len() as u128);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Err("value has no length".to_string())
+        }
+        _ => Err("value has no length".to_string()),
+    }
+}
+
+/// Apply one named-field step (`.name`) to a value: the fat
+/// pointer pseudo-fields (`length`, `data_ptr`), then — after
+/// an implicit dereference — the active variant's named field
+/// from the value's debug shape, or a closure environment's
+/// capture of that name.
+fn apply_field_name(
+    interp: &Interpreter,
+    frames: &[Frame],
+    value: Value,
+    desc: Option<Desc>,
+    name: &str,
+    expr_text: &str,
+) -> Result<(Value, Option<Desc>), String> {
+    if name == "length" {
+        let len = sequence_length(interp, frames, &value, desc.as_ref())?;
+        return Ok((Value::Uint(len), Some(Desc::Int(false))));
+    }
+    if name == "data_ptr" {
+        if let Value::FatRef { base, .. } = &value {
+            let elem = match &desc {
+                Some(Desc::Ref(inner)) => match inner.as_ref() {
+                    Desc::Slice(elem) => Some((**elem).clone()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            return Ok((
+                (**base).clone(),
+                elem.map(|e| Desc::Ref(Box::new(e))),
+            ));
+        }
+    }
+    let (value, desc) = deref_if_pointer(interp, frames, value, desc)?;
+    if let Some(Desc::Adt(tag)) = &desc {
+        if let Some(shape) = interp.program().adt_debug_shapes.get(tag) {
+            let variant = match &value {
+                Value::Enum { variant, .. } => *variant as usize,
+                _ => 0,
+            };
+            if let Some(vshape) = shape.variants.get(variant) {
+                if let Some(index) = vshape
+                    .fields
+                    .iter()
+                    .position(|f| f.name.as_deref() == Some(name))
+                {
+                    let next = Desc::from_tag(&vshape.fields[index].ty);
+                    let projected = crate::interp::project_value(
+                        value,
+                        &[RefProj::Field(index)],
+                        "debugger",
+                        expr_text,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    return Ok((projected, Some(next)));
+                }
+            }
+        }
+        if let Some(shape) = interp.program().env_debug_shapes.get(tag) {
+            if let Value::Closure { env, .. } = &value {
+                if let Some(index) = shape
+                    .upvars
+                    .iter()
+                    .position(|f| f.name.as_deref() == Some(name))
+                {
+                    if let Some(stored) = env.get(index) {
+                        let next = Desc::from_tag(&shape.upvars[index].ty);
+                        return Ok((stored.clone(), Some(next)));
+                    }
+                }
+            }
+        }
+    }
+    Err(format!("no field `{name}` in `{expr_text}`"))
+}
+
+/// Apply a cast step (`as *const [T; N]` and kin): a pointer
+/// cast retargets the descriptor; an array cast views the
+/// pointee's elements as an array value (the form the slice
+/// tests print through a fat pointer's `data_ptr`).
+fn apply_cast(
+    interp: &Interpreter,
+    frames: &[Frame],
+    value: Value,
+    target: Desc,
+) -> Result<(Value, Option<Desc>), String> {
+    match target {
+        Desc::Array(_, _) | Desc::Slice(_) => {
+            let pointee = match &value {
+                Value::FatRef { base, .. } => match &**base {
+                    Value::Tuple(items) => Value::Tuple(items.clone()),
+                    Value::Ref(_) | Value::DynRef { .. } => {
+                        let resolved = interp
+                            .deref_value(frames, base)
+                            .map_err(|e| e.to_string())?;
+                        interp
+                            .read_resolved(frames, &resolved)
+                            .map_err(|e| e.to_string())?
+                    }
+                    other => other.clone(),
+                },
+                Value::Ref(_) | Value::DynRef { .. } => {
+                    let resolved = interp
+                        .deref_value(frames, &value)
+                        .map_err(|e| e.to_string())?;
+                    interp
+                        .read_resolved(frames, &resolved)
+                        .map_err(|e| e.to_string())?
+                }
+                other => other.clone(),
+            };
+            Ok((pointee, Some(target)))
+        }
+        other => Ok((value, Some(other))),
+    }
+}
+
+/// Evaluate a print expression: resolve its base name, then
+/// apply its dereference, field, index and cast steps.
+fn evaluate_expr(
+    interp: &Interpreter,
+    ctl: &DebugControl,
+    frames: &[Frame],
+    expr_text: &str,
+) -> Result<EvaluatedValue, String> {
+    let expr = parse_expr(expr_text)?;
+    let mut ev = resolve_base(interp, ctl, frames, &expr)?;
     for step in &expr.steps {
         match step {
             ExprStep::Deref => {
+                // A cast to an array type already replaced the
+                // value with the pointee's elements (see
+                // `apply_cast`): dereferencing that pointer
+                // value is the identity on the elements.
+                if matches!(ev.desc, Some(Desc::Array(..) | Desc::Slice(_)))
+                    && matches!(ev.value, Value::Tuple(_))
+                {
+                    continue;
+                }
                 let resolved = interp
-                    .deref_value(frames, &value)
+                    .deref_value(frames, &ev.value)
                     .map_err(|e| e.to_string())?;
-                value = interp
+                ev.value = interp
                     .read_resolved(frames, &resolved)
                     .map_err(|e| e.to_string())?;
-                desc = match desc {
+                ev.desc = match ev.desc {
                     Some(Desc::Ref(inner)) => Some(*inner),
                     Some(Desc::Adt(tag)) => {
                         smart_pointer_pointee(&tag).map(|t| Desc::from_tag(&t))
@@ -661,51 +1333,93 @@ fn evaluate_print(
                 // A dereference step therefore keeps it.
             }
             ExprStep::Field(index) => {
-                let next =
-                    desc.as_ref()
-                        .and_then(|d| field_desc(interp, d, &value, *index));
-                value = crate::interp::project_value(
-                    value,
+                let (v, d) = deref_if_pointer(interp, frames, ev.value, ev.desc)?;
+                ev.value = v;
+                ev.desc = d;
+                let next = ev
+                    .desc
+                    .as_ref()
+                    .and_then(|d| field_desc(interp, d, &ev.value, *index));
+                ev.value = crate::interp::project_value(
+                    ev.value,
                     &[RefProj::Field(*index)],
                     "debugger",
-                    &print.expr,
+                    expr_text,
                 )
                 .map_err(|e| e.to_string())?;
-                desc = next;
-                char = false;
+                ev.desc = next;
+                ev.char = false;
+            }
+            ExprStep::FieldName(name) => {
+                let (v, d) = apply_field_name(
+                    interp,
+                    frames,
+                    ev.value,
+                    ev.desc,
+                    name,
+                    expr_text,
+                )?;
+                ev.value = v;
+                ev.desc = d;
+                ev.char = false;
             }
             ExprStep::Index(index) => {
-                let next = desc.as_ref().and_then(|d| match d {
+                let (v, d) = deref_if_pointer(interp, frames, ev.value, ev.desc)?;
+                ev.value = v;
+                ev.desc = d;
+                let next = ev.desc.as_ref().and_then(|d| match d {
                     Desc::Array(elem, _) | Desc::Slice(elem) => {
                         Some((**elem).clone())
                     }
                     _ => None,
                 });
-                value = crate::interp::project_value(
-                    value,
+                ev.value = crate::interp::project_value(
+                    ev.value,
                     &[RefProj::Index(*index)],
                     "debugger",
-                    &print.expr,
+                    expr_text,
                 )
                 .map_err(|e| e.to_string())?;
-                desc = next;
-                char = false;
+                ev.desc = next;
+                ev.char = false;
+            }
+            ExprStep::Cast(target) => {
+                let (v, d) = apply_cast(interp, frames, ev.value, target.clone())?;
+                ev.value = v;
+                ev.desc = d;
+                ev.char = false;
             }
         }
+        // The recorded tag describes the base value's declared
+        // type; after a step it no longer describes the value.
+        ev.tag = None;
     }
+    Ok(ev)
+}
+
+/// Evaluate a print expression in the selected frame and
+/// render the resulting value in both dialects' forms.
+fn evaluate_print(
+    interp: &Interpreter,
+    ctl: &DebugControl,
+    frames: &[Frame],
+    print: &DebugPrint,
+) -> Result<EvaluatedPrint, String> {
+    let ev = evaluate_expr(interp, ctl, frames, &print.expr)?;
+    let (value, desc, char) = (ev.value, ev.desc, ev.char);
     // The lldb synthetic-child providers' summary lines for
     // the sequence and counted-handle types (the forms the
     // sysroot's `lldb_providers.py` produces), appended to the
     // dialect's own lines when the printed value's type has
     // one.
     let mut lldb_lines_extra: Vec<String> = Vec::new();
-    if expr.steps.is_empty() {
+    if parse_expr(&print.expr).map(|e| e.steps.is_empty()).unwrap_or(false) {
         if let Some(line) = render_lldb_provider_line(
             interp,
             frames,
             &value,
             desc.as_ref(),
-            entry.ty.as_deref(),
+            ev.tag.as_deref(),
             &print.expr,
         ) {
             lldb_lines_extra.push(line);
@@ -721,7 +1435,7 @@ fn evaluate_print(
     } else {
         match &desc {
             Some(Desc::Ref(inner))
-                if expr.steps.is_empty()
+                if parse_expr(&print.expr).map(|e| e.steps.is_empty()).unwrap_or(false)
                     && matches!(
                         inner.as_ref(),
                         Desc::Adt(tag)
@@ -759,7 +1473,7 @@ fn evaluate_print(
                 frames,
                 &value,
                 desc.as_ref(),
-                entry.ty.as_deref(),
+                ev.tag.as_deref(),
                 0,
             )
             .or_else(|| render_gdb(interp, &value, desc.as_ref(), char, print.format, 0))
@@ -768,6 +1482,323 @@ fn evaluate_print(
         },
         lldb,
     })
+}
+
+/// The declared type name of an evaluated expression, as a
+/// type query (`whatis`) prints it: the recorded type tag in
+/// its DWARF (definition-path) form when the conversion
+/// recorded one, else the name rebuilt from the rendering
+/// descriptor.
+fn expr_type_name(ev: &EvaluatedValue) -> Option<String> {
+    if matches!(ev.desc, Some(Desc::FnPtr)) {
+        // A function pointer's tag is the type's kind name,
+        // not a signature; gdb spells the type as a raw
+        // pointer to the unit-signature function.
+        return Some("*mut fn ()".to_string());
+    }
+    if let Some(tag) = &ev.tag {
+        return Some(dwarf_type_name(tag));
+    }
+    ev.desc.as_ref().and_then(desc_type_name)
+}
+
+/// A rendering descriptor's type name, for the forms whose
+/// names the descriptor fully determines.
+fn desc_type_name(desc: &Desc) -> Option<String> {
+    Some(match desc {
+        Desc::Unit => "()".to_string(),
+        Desc::Bool => "bool".to_string(),
+        Desc::Char => "char".to_string(),
+        Desc::Str => "str".to_string(),
+        Desc::Tuple(ts) => {
+            let parts: Option<Vec<String>> =
+                ts.iter().map(desc_type_name).collect();
+            let parts = parts?;
+            if parts.len() == 1 {
+                format!("({},)", parts[0])
+            } else {
+                format!("({})", parts.join(", "))
+            }
+        }
+        Desc::Array(elem, n) => {
+            format!("[{}; {n}]", desc_type_name(elem)?)
+        }
+        Desc::Slice(elem) => format!("[{}]", desc_type_name(elem)?),
+        Desc::Ref(inner) => format!("&{}", desc_type_name(inner)?),
+        Desc::Adt(tag) => dwarf_type_name(tag),
+        Desc::Closure(name) | Desc::Coroutine(name) => name.clone(),
+        Desc::FnPtr => "*mut fn ()".to_string(),
+        Desc::Int(_) | Desc::Float | Desc::Unknown => return None,
+    })
+}
+
+/// Render one type query (gdb `whatis`, or `ptype` with
+/// `layout`): the `type = <name>` head line, plus — for
+/// `ptype` over an aggregate shape — the shape's field lines
+/// in gdb's layout form.
+fn render_type_query(
+    interp: &Interpreter,
+    ctl: &DebugControl,
+    frames: &[Frame],
+    print: &DebugPrint,
+    layout: bool,
+) -> Vec<String> {
+    let ev = match evaluate_expr(interp, ctl, frames, &print.expr) {
+        Ok(ev) => ev,
+        Err(e) => return vec![format!("type = <error: {e}>")],
+    };
+    let Some(name) = expr_type_name(&ev) else {
+        return vec!["type = <unknown>".to_string()];
+    };
+    if !layout {
+        return vec![format!("type = {name}")];
+    }
+    // The layout form of a closure environment: gdb spells the
+    // type as a struct over its captures, a capture taken by
+    // reference appearing as the raw pointer the environment
+    // stores.
+    if let Some(Desc::Adt(tag)) = &ev.desc {
+        if let Some(shape) = interp.program().env_debug_shapes.get(tag) {
+            if shape.upvars.is_empty() {
+                return vec![format!("type = struct {}", shape.dwarf_name)];
+            }
+            let mut lines = vec![format!("type = struct {} {{", shape.dwarf_name)];
+            for field in &shape.upvars {
+                let ty = dwarf_type_name(&field.ty);
+                let ty = match ty.strip_prefix("&mut ") {
+                    Some(inner) => format!("*mut {inner}"),
+                    None => match ty.strip_prefix('&') {
+                        Some(inner) => format!("*mut {inner}"),
+                        None => ty,
+                    },
+                };
+                lines.push(format!("    {ty},"));
+            }
+            lines.push("}".to_string());
+            return lines;
+        }
+        if let Some(shape) = interp.program().adt_debug_shapes.get(tag) {
+            if shape.kind == sparagmos_mir::AdtShapeKind::Struct {
+                if let Some(vshape) = shape.variants.first() {
+                    if vshape.fields.is_empty() {
+                        return vec![format!("type = struct {name}")];
+                    }
+                    let mut lines = vec![format!("type = struct {name} {{")];
+                    for field in &vshape.fields {
+                        let fty = dwarf_type_name(&field.ty);
+                        match &field.name {
+                            Some(fname) => {
+                                lines.push(format!("    {fty} {fname},"))
+                            }
+                            None => lines.push(format!("    {fty},")),
+                        }
+                    }
+                    lines.push("}".to_string());
+                    return lines;
+                }
+            }
+        }
+    }
+    vec![format!("type = {name}")]
+}
+
+/// An IR type's name in the form a function declaration
+/// listing prints (gdb `info functions`): the Rust spelling,
+/// with an ADT named by its definition path.
+fn ir_ty_name(ty: &Ty) -> String {
+    use crate::ir::{FloatTy, IntTy, UintTy};
+    match ty {
+        Ty::Unit => "()".to_string(),
+        Ty::Bool => "bool".to_string(),
+        Ty::Int(k) => match k {
+            IntTy::I8 => "i8",
+            IntTy::I16 => "i16",
+            IntTy::I32 => "i32",
+            IntTy::I64 => "i64",
+            IntTy::I128 => "i128",
+            IntTy::Isize => "isize",
+        }
+        .to_string(),
+        Ty::Uint(k) => match k {
+            UintTy::U8 => "u8",
+            UintTy::U16 => "u16",
+            UintTy::U32 => "u32",
+            UintTy::U64 => "u64",
+            UintTy::U128 => "u128",
+            UintTy::Usize => "usize",
+        }
+        .to_string(),
+        Ty::Float(k) => match k {
+            FloatTy::F16 => "f16",
+            FloatTy::F32 => "f32",
+            FloatTy::F64 => "f64",
+            FloatTy::F128 => "f128",
+        }
+        .to_string(),
+        Ty::Tuple(ts) => {
+            let parts: Vec<String> = ts.iter().map(ir_ty_name).collect();
+            if parts.len() == 1 {
+                format!("({},)", parts[0])
+            } else {
+                format!("({})", parts.join(", "))
+            }
+        }
+        Ty::Never => "!".to_string(),
+        Ty::Adt(name) => dwarf_type_name(name),
+        Ty::Ref(inner) => format!("&{}", ir_ty_name(inner)),
+        Ty::Slice(elem) => format!("[{}]", ir_ty_name(elem)),
+        Ty::Array(elem, n) => format!("[{}; {n}]", ir_ty_name(elem)),
+        Ty::Str => "str".to_string(),
+        Ty::FnPtr => "fn()".to_string(),
+        Ty::FnDef(name) => name.clone(),
+        Ty::Closure(name, _) => name.clone(),
+        Ty::Dynamic(_) => "dyn".to_string(),
+        Ty::Coroutine(name) => name.clone(),
+    }
+}
+
+/// A small regular-expression search over function names, in
+/// the subset of gdb's pattern language the debuginfo suite
+/// uses: literal characters, `.` (any character) and `*`
+/// (repeat the previous atom). Unanchored, as gdb's `info
+/// functions` pattern is.
+fn fn_pattern_search(pattern: &str, text: &str) -> bool {
+    #[derive(Clone, Copy)]
+    enum Atom {
+        Lit(char),
+        Any,
+    }
+    let mut atoms: Vec<(Atom, bool)> = Vec::new();
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' => {
+                if let Some(last) = atoms.last_mut() {
+                    last.1 = true;
+                }
+            }
+            '.' => atoms.push((Atom::Any, false)),
+            '\\' => match chars.next() {
+                Some(esc) => atoms.push((Atom::Lit(esc), false)),
+                None => atoms.push((Atom::Lit('\\'), false)),
+            },
+            _ => atoms.push((Atom::Lit(c), false)),
+        }
+    }
+    let text: Vec<char> = text.chars().collect();
+    fn matches(atoms: &[(Atom, bool)], text: &[char]) -> bool {
+        if atoms.is_empty() {
+            return true;
+        }
+        let (atom, star) = atoms[0];
+        if star {
+            // Zero repetitions, or one and stay.
+            if matches(&atoms[1..], text) {
+                return true;
+            }
+            return !text.is_empty()
+                && atom_matches(atom, text[0])
+                && matches(atoms, &text[1..]);
+        }
+        !text.is_empty()
+            && atom_matches(atom, text[0])
+            && matches(&atoms[1..], &text[1..])
+    }
+    fn atom_matches(atom: Atom, c: char) -> bool {
+        match atom {
+            Atom::Lit(l) => l == c,
+            Atom::Any => true,
+        }
+    }
+    // Unanchored: a match may start at any offset, and need
+    // not reach the end of the name.
+    (0..=text.len()).any(|start| matches(&atoms, &text[start..]))
+}
+
+/// Render gdb's `info functions [-q] [pattern]`: one
+/// declaration line per body of the program whose name the
+/// pattern matches (every body without a pattern), in name
+/// order. The `-q` form carries the `static fn` prefix and
+/// the signature; the plain form is `fn <name>();`.
+fn render_info_functions(
+    interp: &Interpreter,
+    pattern: Option<&str>,
+    quiet: bool,
+) -> Vec<String> {
+    let program = interp.program();
+    let mut names: Vec<&String> = program.functions.keys().collect();
+    names.sort();
+    let mut lines = Vec::new();
+    for name in names {
+        if let Some(pat) = pattern {
+            if !fn_pattern_search(pat, name) {
+                continue;
+            }
+        }
+        let Some(body) = program.get(name) else {
+            continue;
+        };
+        if quiet {
+            let args: Vec<String> = (1..=body.arg_count)
+                .filter_map(|i| body.local_tys.get(i).map(ir_ty_name))
+                .collect();
+            let ret = match body.local_tys.first() {
+                Some(Ty::Unit) | None => String::new(),
+                Some(ty) => format!(" -> {}", ir_ty_name(ty)),
+            };
+            lines.push(format!(
+                "static fn {}({}){};",
+                dwarf_type_name(name),
+                args.join(", "),
+                ret
+            ));
+        } else {
+            lines.push(format!("fn {}();", dwarf_type_name(name)));
+        }
+    }
+    lines
+}
+
+/// Render gdb's `info locals` for the selected frame: the
+/// variables in scope at the stop, one `name = value` line
+/// each, or `No locals.` when none are.
+fn render_info_locals(
+    interp: &Interpreter,
+    ctl: &DebugControl,
+    frames: &[Frame],
+) -> Vec<String> {
+    let Some(frame) =
+        frames.get(frames.len().saturating_sub(1 + ctl.selected_frame))
+    else {
+        return vec!["No locals.".to_string()];
+    };
+    let Some(body) = interp.program().get(&frame.func) else {
+        return vec!["No locals.".to_string()];
+    };
+    let at_line = ctl.current_pos.map(|(_, line)| line).unwrap_or(0);
+    let mut seen: Vec<String> = Vec::new();
+    let mut lines = Vec::new();
+    for entry in &body.debug_vars {
+        if entry.lines.0 == 0 || entry.lines.0 > at_line {
+            continue;
+        }
+        if seen.contains(&entry.name) {
+            continue;
+        }
+        seen.push(entry.name.clone());
+        if let Ok(ev) = evaluate_expr(interp, ctl, frames, &entry.name) {
+            if let Some(gdb) =
+                render_gdb(interp, &ev.value, ev.desc.as_ref(), ev.char, None, 0)
+            {
+                lines.push(format!("{} = {gdb}", entry.name));
+            }
+        }
+    }
+    if lines.is_empty() {
+        vec!["No locals.".to_string()]
+    } else {
+        lines
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2565,9 +3596,10 @@ fn escape_char(c: char) -> String {
     }
 }
 
-/// A parsed print expression: dereferences first (they prefix the
-/// whole expression in debugger syntax), then a base variable,
-/// then field/index steps.
+/// A parsed print expression: dereferences first (they prefix
+/// the whole expression in debugger syntax), then a base
+/// variable — a plain name or a path naming a static — then
+/// field/index steps.
 struct ParsedExpr {
     base: String,
     steps: Vec<ExprStep>,
@@ -2576,41 +3608,36 @@ struct ParsedExpr {
 enum ExprStep {
     Deref,
     Field(usize),
+    FieldName(String),
     Index(usize),
+    /// A cast to the given type (`as *const [T; N]` and kin).
+    Cast(Desc),
 }
 
-fn parse_expr(text: &str) -> Result<ParsedExpr, String> {
-    let text = text.trim();
+/// Parse the steps that follow a print expression's base (or a
+/// parenthesised sub-expression): `.field` / `.name` and
+/// `[index]` steps, in order.
+fn parse_steps(text: &str, steps: &mut Vec<ExprStep>) -> Result<(), String> {
     let bytes = text.as_bytes();
     let mut i = 0;
-    let mut steps = Vec::new();
-    while i < bytes.len() && (bytes[i] == b'*' || bytes[i] == b' ') {
-        if bytes[i] == b'*' {
-            steps.push(ExprStep::Deref);
-        }
-        i += 1;
-    }
-    let start = i;
-    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-        i += 1;
-    }
-    if start == i {
-        return Err(format!("cannot parse expression `{text}`"));
-    }
-    let base = text[start..i].to_string();
     while i < bytes.len() {
         match bytes[i] {
             b'.' => {
                 i += 1;
                 let s = i;
-                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
+                {
                     i += 1;
                 }
+                if s == i {
+                    return Err(format!("cannot parse expression `{text}`"));
+                }
                 let field = &text[s..i];
-                let index: usize = field
-                    .parse()
-                    .map_err(|_| format!("named field `{field}` is not supported"))?;
-                steps.push(ExprStep::Field(index));
+                match field.parse::<usize>() {
+                    Ok(index) => steps.push(ExprStep::Field(index)),
+                    Err(_) => steps.push(ExprStep::FieldName(field.to_string())),
+                }
             }
             b'[' => {
                 i += 1;
@@ -2633,5 +3660,79 @@ fn parse_expr(text: &str) -> Result<ParsedExpr, String> {
             _ => return Err(format!("cannot parse expression `{text}`")),
         }
     }
+    Ok(())
+}
+
+/// The byte index of the `)` matching the `(` at the start of
+/// `text` (which must start with `(`), or None when unbalanced.
+fn matching_paren(text: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    for (i, c) in text.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn parse_expr(text: &str) -> Result<ParsedExpr, String> {
+    let text = text.trim();
+    // Leading dereferences prefix the whole expression.
+    let mut derefs = 0usize;
+    let mut rest = text;
+    while let Some(r) = rest.strip_prefix('*') {
+        derefs += 1;
+        rest = r.trim_start();
+    }
+    if let Some(after_open) = rest.strip_prefix('(') {
+        let close = matching_paren(rest)
+            .ok_or_else(|| format!("cannot parse expression `{text}`"))?;
+        let inner = &after_open[..close - 1];
+        let mut parsed = if let Some((lhs, ty)) = inner.split_once(" as ") {
+            let mut parsed = parse_expr(lhs)?;
+            parsed.steps.push(ExprStep::Cast(Desc::from_tag(ty.trim())));
+            parsed
+        } else {
+            parse_expr(inner)?
+        };
+        // The leading dereferences apply to the parenthesised
+        // value as a whole, after its own steps.
+        for _ in 0..derefs {
+            parsed.steps.push(ExprStep::Deref);
+        }
+        parse_steps(&rest[close + 1..], &mut parsed.steps)?;
+        return Ok(parsed);
+    }
+    // A base name: a plain identifier, or a path of identifiers
+    // joined by `::` (the form that names a static).
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    let ident = |i: &mut usize| -> Result<String, String> {
+        let s = *i;
+        while *i < bytes.len()
+            && (bytes[*i].is_ascii_alphanumeric() || bytes[*i] == b'_')
+        {
+            *i += 1;
+        }
+        if s == *i {
+            return Err(format!("cannot parse expression `{text}`"));
+        }
+        Ok(rest[s..*i].to_string())
+    };
+    let mut base = ident(&mut i)?;
+    while rest[i..].starts_with("::") {
+        i += 2;
+        base.push_str("::");
+        base.push_str(&ident(&mut i)?);
+    }
+    let mut steps: Vec<ExprStep> = (0..derefs).map(|_| ExprStep::Deref).collect();
+    parse_steps(&rest[i..], &mut steps)?;
     Ok(ParsedExpr { base, steps })
 }

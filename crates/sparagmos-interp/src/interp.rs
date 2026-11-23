@@ -200,6 +200,18 @@ pub(crate) struct Frame {
     incoming_asm: Option<([u64; 48], [bool; 48])>,
 }
 
+impl Frame {
+    /// The frame's current position as a (block, statement)
+    /// index pair into its body: the statement about to execute
+    /// (or, for a caller frame, the call terminator it is
+    /// suspended at, as a statement index past the block's
+    /// statements). The debugger interface reads it to render a
+    /// selected caller frame's source line.
+    pub(crate) fn current_block_stmt(&self) -> (usize, usize) {
+        (self.block, self.stmt)
+    }
+}
+
 /// Drop glue suspended while a destructor body runs. A `Drop`
 /// terminator whose glue calls a destructor pushes the destructor's
 /// frame and one of these; when that frame returns, the interpreter

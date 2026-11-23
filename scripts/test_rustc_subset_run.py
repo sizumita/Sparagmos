@@ -2995,8 +2995,71 @@ class DebuggerHarnessTests(unittest.TestCase):
             run.translate_debugger_command("gdb", "set print pretty"),
             "# inert: set print pretty")
         self.assertIsNone(run.translate_debugger_command("gdb", "quit"))
+        self.assertEqual(
+            run.translate_debugger_command("gdb", "ptype x"), "ptype x")
+
+    def test_translate_gdb_d2_scope(self):
+        # Statics by path, named fields, and casts print.
+        self.assertEqual(
+            run.translate_debugger_command(
+                "gdb", "print simple_struct::NO_PADDING_16"),
+            "print simple_struct::NO_PADDING_16")
+        self.assertEqual(
+            run.translate_debugger_command("gdb", "print stack_unique.value"),
+            "print stack_unique.value")
+        self.assertEqual(
+            run.translate_debugger_command(
+                "gdb", "print *(singleton.data_ptr as *const [i64; 1])"),
+            "print *(singleton.data_ptr as *const [i64; 1])")
+        # Type queries and the repr pseudo-command.
+        self.assertEqual(
+            run.translate_debugger_command("gdb", "whatis local"),
+            "whatis local")
+        self.assertEqual(
+            run.translate_debugger_command("gdb", "repr b"), "repr b")
+        # Counted steps repeat the step line.
+        self.assertEqual(
+            run.translate_debugger_command("gdb", "next 2"), "next\nnext")
+        self.assertEqual(
+            run.translate_debugger_command("gdb", "step 3"),
+            "step\nstep\nstep")
+        # Frame navigation.
+        self.assertEqual(
+            run.translate_debugger_command("gdb", "up"), "up")
+        self.assertEqual(
+            run.translate_debugger_command("gdb", "down"), "down")
+        # Breakpoints from the command section.
+        self.assertEqual(
+            run.translate_debugger_command("gdb", "break 12"), "break 12")
+        self.assertEqual(
+            run.translate_debugger_command(
+                "gdb", "break cross_crate_spans.rs:12"),
+            "break-at cross_crate_spans.rs:12")
+        self.assertEqual(
+            run.translate_debugger_command(
+                "gdb", "break constant_ordering_prologue::binding"),
+            "break-fn constant_ordering_prologue::binding")
+        # info listings.
+        self.assertEqual(
+            run.translate_debugger_command("gdb", "info functions"),
+            "info-functions -")
+        self.assertEqual(
+            run.translate_debugger_command(
+                "gdb", "info functions -q function_names::main"),
+            "info-functions-q function_names::main")
+        self.assertEqual(
+            run.translate_debugger_command("gdb", "info locals"),
+            "info-locals")
+        # A run with guest arguments still starts the session.
+        self.assertEqual(
+            run.translate_debugger_command("gdb", "run 7"), "run")
+        # Call expressions and printf stay outside the scope.
         self.assertIsNone(
-            run.translate_debugger_command("gdb", "ptype x"))
+            run.translate_debugger_command("gdb", "print fun(45, true)"))
+        self.assertIsNone(
+            run.translate_debugger_command("gdb", 'printf "x\\n"'))
+        self.assertIsNone(
+            run.translate_debugger_command("gdb", "print sizeof(packed)"))
 
     def test_translate_lldb(self):
         self.assertEqual(
@@ -3011,6 +3074,28 @@ class DebuggerHarnessTests(unittest.TestCase):
             "show-line")
         self.assertIsNone(
             run.translate_debugger_command("lldb", "breakpoint set -l 3"))
+
+    def test_translate_lldb_d2_scope(self):
+        # Statics by path.
+        self.assertEqual(
+            run.translate_debugger_command(
+                "lldb", "v basic_types_globals::B"),
+            "v basic_types_globals::B")
+        # The `fr v` abbreviation of `frame variable`.
+        self.assertEqual(
+            run.translate_debugger_command("lldb", "fr v empty_string"),
+            "v empty_string")
+        # Format registrations are session-shaping comments.
+        self.assertEqual(
+            run.translate_debugger_command(
+                "lldb", "type format add -f decimal char"),
+            "# inert: type format add -f decimal char")
+        # The repr pseudo-command and frame navigation.
+        self.assertEqual(
+            run.translate_debugger_command("lldb", "repr slice"),
+            "repr slice")
+        self.assertEqual(
+            run.translate_debugger_command("lldb", "up"), "up")
 
     def test_variant_skipping(self):
         h = run.Header("//@ ignore-gdb\nfn main() {}\n")
