@@ -4539,31 +4539,41 @@ impl<'a> Converter<'a> {
                 // with no trace of the declared type's structure:
                 // element writes into the storage then land in a
                 // shapeless value and element reads fail as
-                // uninitialized-place reads. When this reference
-                // denotes the static whole (empty projection), the
-                // seed is a value of the static's declared type:
-                // the recorded declared type when the driver has
-                // it, and otherwise the pointee context -- the
-                // declared type itself for a thin reference, and
-                // for a fat slice reference the array type the
-                // slice covers, rebuilt from the element type and
-                // the carried length. The recorded type must win
-                // for a slice reference: the slice's length bounds
-                // only the view it denotes, never the storage, so
-                // a seed rebuilt from the length of a prefix slice
-                // evaluated first would shrink the storage to the
-                // slice's extent, and a later whole-static access
-                // would fail its bounds check against elements the
-                // slice never claimed. Give the seed the declared
-                // type's skeleton exactly as the thread-local table
-                // does for its seeds. An interior reference's seed
-                // is still the full initializer, whose type this
-                // conversion does not know, so it keeps the bare
-                // form.
-                let seed = if projection.is_empty() {
-                    let seed_ty = match self.static_tys.get(def) {
-                        Some(ty) => Some(ty.clone()),
-                        None => match (inner_ctx, len) {
+                // uninitialized-place reads. The seed is the
+                // static's full initializer whatever this reference
+                // denotes -- the whole static or a sub-value inside
+                // it -- and the first reference evaluated seeds the
+                // storage every later access observes, so whenever
+                // the driver recorded the declared type, expand
+                // the seed to that type's skeleton exactly as the
+                // thread-local table does for its seeds. A bare
+                // seed kept for an interior reference (a pointer
+                // to one element, a slice of one field) leaves the
+                // storage shapeless: a write through the projection
+                // collapses the projected slot to the written
+                // scalar, and a later write to a sibling element
+                // then fails against the scalar where the declared
+                // aggregate belongs. The recorded type must also
+                // win for a slice reference: the slice's length
+                // bounds only the view it denotes, never the
+                // storage, so a seed rebuilt from the length of a
+                // prefix slice evaluated first would shrink the
+                // storage to the slice's extent. Only a reference
+                // with no recorded type falls back to the pointee
+                // context -- the declared type itself for a thin
+                // whole-static reference, and for a fat slice
+                // reference the array type the slice covers,
+                // rebuilt from the element type and the carried
+                // length; an interior reference with no recorded
+                // type keeps the bare form, as the full type is
+                // unknown to this conversion.
+                let seed = match self.static_tys.get(def) {
+                    Some(ty) => {
+                        let ty = ty.clone();
+                        self.expand_uninit_constant(&seed, &ty, 0)
+                    }
+                    None if projection.is_empty() => {
+                        let seed_ty = match (inner_ctx, len) {
                             (Some(ty), None) => Some(ty.clone()),
                             (Some(mir::Ty::Slice(elem)), Some(n)) => {
                                 Some(mir::Ty::Array(
@@ -4575,14 +4585,13 @@ impl<'a> Converter<'a> {
                                 Some(ty.clone())
                             }
                             _ => None,
-                        },
-                    };
-                    match seed_ty {
-                        Some(ty) => self.expand_uninit_constant(&seed, &ty, 0),
-                        None => seed,
+                        };
+                        match seed_ty {
+                            Some(ty) => self.expand_uninit_constant(&seed, &ty, 0),
+                            None => seed,
+                        }
                     }
-                } else {
-                    seed
+                    None => seed,
                 };
                 ir::Constant::StaticRef {
                     name: self.static_key(def),
