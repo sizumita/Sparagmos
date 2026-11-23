@@ -26566,9 +26566,10 @@ impl<'a> Interpreter<'a> {
         match result {
             Value::Enum { variant: 0, .. } => {}
             _ => {
-                return Err(unsupported(format!(
-                    "the {trait_:?} implementation for {ty} returned an error"
-                )))
+                return Err(InterpError::FmtReturnedError {
+                    trait_: format!("{trait_:?}"),
+                    ty: ty.to_string(),
+                })
             }
         }
         Ok(Some(capture.map(|c| c.buffer).unwrap_or_default()))
@@ -27144,6 +27145,14 @@ impl<'a> Interpreter<'a> {
     /// caller's to write. A rendering the structural engine
     /// composes (no guest body for the payload itself) yields the
     /// composed text as `Some`, for the caller to write.
+    ///
+    /// A payload `fmt` body that returns `Err(fmt::Error)` is
+    /// the one rendering failure this does not pass through as
+    /// an ordinary error: the report's sink is a `write_fmt` to
+    /// stderr whose own writes do not fail, and core's
+    /// `write_fmt` panics on a formatting error there, so the
+    /// rendering's outcome is that panic (see
+    /// [`InterpError::FmtReturnedError`]).
     pub fn format_debug_detached(
         &mut self,
         value: &Value,
@@ -27168,6 +27177,20 @@ impl<'a> Interpreter<'a> {
         self.fmt_stream_arm = saved;
         match result {
             Ok(text) => Ok(if streamed { None } else { Some(text) }),
+            // The report renders through a `write_fmt` to stderr,
+            // whose own writes do not fail here; a payload `fmt`
+            // implementation that returns `Err` therefore panics
+            // natively, out of core's `write_fmt` -- it does not
+            // fall back to the payload's structural form, and the
+            // report does not complete. Raise that panic (with
+            // core's own message) as the rendering's outcome, so
+            // the caller runs the payload's drop as the panic's
+            // unwind cleanup, as it does for a panic the body
+            // itself raises.
+            Err(InterpError::FmtReturnedError { .. }) => Err(InterpError::panic_str_payload(
+                "a formatting trait implementation returned an error \
+                     when the underlying stream did not",
+            )),
             Err(e) => Err(e),
         }
     }

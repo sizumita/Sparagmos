@@ -9851,6 +9851,152 @@ fn run_mode_termination_report_unwind_drop_and_streaming() {
     );
 }
 
+const RESULT_ERR_FMT_ERROR_SRC: &str = r#"
+use std::fmt;
+struct E;
+impl fmt::Debug for E {
+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Err(fmt::Error)
+    }
+}
+fn main() -> Result<(), E> { Err(E) }
+"#;
+
+const RESULT_ERR_FMT_ERROR_DROP_SRC: &str = r#"
+use std::fmt;
+struct E;
+impl fmt::Debug for E {
+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Err(fmt::Error)
+    }
+}
+impl Drop for E {
+    fn drop(&mut self) {
+        eprintln!("dropped");
+    }
+}
+fn main() -> Result<(), E> { Err(E) }
+"#;
+
+const RESULT_ERR_FMT_ERROR_PARTIAL_SRC: &str = r#"
+use std::fmt;
+struct E;
+impl fmt::Debug for E {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "partial")?;
+        Err(fmt::Error)
+    }
+}
+fn main() -> Result<(), E> { Err(E) }
+"#;
+
+const RESULT_ERR_FMT_ERROR_DROP_EXITS_SRC: &str = r#"
+use std::fmt;
+struct E;
+impl fmt::Debug for E {
+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Err(fmt::Error)
+    }
+}
+impl Drop for E {
+    fn drop(&mut self) {
+        eprintln!("dropped");
+        std::process::exit(7);
+    }
+}
+fn main() -> Result<(), E> { Err(E) }
+"#;
+
+const RESULT_ERR_FMT_ERROR_DROP_PANICS_SRC: &str = r#"
+use std::fmt;
+struct E;
+impl fmt::Debug for E {
+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Err(fmt::Error)
+    }
+}
+impl Drop for E {
+    fn drop(&mut self) {
+        panic!("drop exploded");
+    }
+}
+fn main() -> Result<(), E> { Err(E) }
+"#;
+
+#[test]
+fn run_mode_termination_report_fmt_error_panics() {
+    // A payload `Debug` body that returns `Err(fmt::Error)`
+    // does not make the native report fall back or complete:
+    // the report's `write_fmt` to stderr panics on the
+    // formatting error (core's message), the panic unwinds
+    // through the report dropping the payload as its cleanup
+    // (a destructor that exits replaces the panic; a second
+    // panic in the drop aborts), text the body streamed before
+    // returning the error stands, and the run exits 101.
+    let dir = temp_dir("termination-report-fmt-error");
+    let src = fixture(&dir, "err_fmt_error.rs", RESULT_ERR_FMT_ERROR_SRC);
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(101), "fmt error panics the report");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Error: thread 'main' panicked: a formatting trait implementation \
+         returned an error when the underlying stream did not\n"
+    );
+    let src = fixture(&dir, "err_fmt_error_drop.rs", RESULT_ERR_FMT_ERROR_DROP_SRC);
+    let out = run_driver(&src);
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "drop runs during unwind cleanup"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Error: dropped\nthread 'main' panicked: a formatting trait \
+         implementation returned an error when the underlying stream did not\n"
+    );
+    let src = fixture(
+        &dir,
+        "err_fmt_error_partial.rs",
+        RESULT_ERR_FMT_ERROR_PARTIAL_SRC,
+    );
+    let out = run_driver(&src);
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "partial text stands on fmt error"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Error: partialthread 'main' panicked: a formatting trait \
+         implementation returned an error when the underlying stream did not\n"
+    );
+    let src = fixture(
+        &dir,
+        "err_fmt_error_drop_exits.rs",
+        RESULT_ERR_FMT_ERROR_DROP_EXITS_SRC,
+    );
+    let out = run_driver(&src);
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "drop exits during unwind cleanup"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "Error: dropped\n");
+    let src = fixture(
+        &dir,
+        "err_fmt_error_drop_panics.rs",
+        RESULT_ERR_FMT_ERROR_DROP_PANICS_SRC,
+    );
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(101), "second panic aborts");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Error: thread 'main' aborted: panic `drop exploded` raised in the \
+         drop of the Termination report payload while unwinding: \
+         panicking while unwinding aborts the run\n"
+    );
+}
+
 const LIBTEST_SRC: &str = r#"
 #[test]
 fn alpha() { assert_eq!(1 + 1, 2); }
