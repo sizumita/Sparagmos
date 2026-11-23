@@ -21201,3 +21201,257 @@ fn run_mode_arc_handle_in_struct_field_still_releases() {
         "a real handle aggregate in a struct field is still released"
     );
 }
+const VEC_CAPACITY_GROWTH_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<i32> = Vec::new();
+    for i in 0..5 {
+        v.push(i);
+    }
+    println!("push5 cap {} spare {}", v.capacity(), v.spare_capacity_mut().len());
+    let mut b: Vec<u8> = Vec::new();
+    b.push(1);
+    println!("u8 push1 cap {}", b.capacity());
+    let mut w: Vec<i32> = Vec::with_capacity(1);
+    w.push(1);
+    w.push(2);
+    println!("withcap1 push2 cap {}", w.capacity());
+    let mut r = vec![1, 2, 3];
+    r.reserve(1);
+    println!("reserve cap {}", r.capacity());
+    let mut e = vec![1, 2, 3];
+    e.reserve_exact(1);
+    println!("reserve_exact cap {}", e.capacity());
+    let mut t = vec![1, 2, 3];
+    println!("try_reserve ok {}", t.try_reserve(20).is_ok());
+    println!("try_reserve cap {}", t.capacity());
+}
+"#;
+
+#[test]
+fn run_mode_vec_capacity_growth_matches_rawvec() {
+    // Capacity is the storage extent in this model, and growth
+    // follows RawVec's rules exactly: an append that outgrows
+    // the storage doubles it (floored at the minimum non-zero
+    // capacity for the element size -- 8 for bytes, 4 for
+    // 4-byte elements), `reserve` grows amortized,
+    // `reserve_exact` to the exact requirement, and a
+    // successful `try_reserve` grows like `reserve`. The
+    // answers are observable through `capacity()` and
+    // `spare_capacity_mut().len()`, as natively.
+    let dir = temp_dir("veccapacitygrowth");
+    let src = fixture(&dir, "veccapacitygrowth.rs", VEC_CAPACITY_GROWTH_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Vec capacity growth must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "push5 cap 8 spare 3\nu8 push1 cap 8\nwithcap1 push2 cap 4\nreserve cap 6\nreserve_exact cap 4\ntry_reserve ok true\ntry_reserve cap 23\n"
+    );
+}
+
+const VEC_SPARE_WRITE_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<i32> = Vec::with_capacity(8);
+    v.push(10);
+    v.push(20);
+    let spare = v.spare_capacity_mut();
+    println!("spare {}", spare.len());
+    spare[0].write(30);
+    spare[1].write(40);
+    unsafe { v.set_len(4) };
+    println!("v = {:?}", v);
+    println!("idx {}", v[2]);
+    println!("pop {:?}", v.pop());
+}
+"#;
+
+#[test]
+fn run_mode_vec_spare_capacity_write_then_set_len_readback() {
+    // Elements written through the spare-capacity slice are
+    // stored as `MaybeUninit` payload slots; once `set_len`
+    // declares them, every read of them -- indexing, the
+    // vector's own Debug list, `pop` -- sees the payload, as
+    // natively. (Formatting a spare-written element goes
+    // through the fmt engine's storage-wrapper unwrap.)
+    let dir = temp_dir("vecsparewrite");
+    let src = fixture(&dir, "vecsparewrite.rs", VEC_SPARE_WRITE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "spare-capacity write + set_len readback must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "spare 6\nv = [10, 20, 30, 40]\nidx 30\npop Some(40)\n"
+    );
+}
+
+const VEC_ZST_CAPACITY_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<()> = Vec::with_capacity(10);
+    println!("cap {}", v.capacity());
+    println!("spare {}", v.spare_capacity_mut().len());
+    v.push(());
+    println!("cap {}", v.capacity());
+}
+"#;
+
+#[test]
+fn run_mode_vec_zero_sized_element_capacity() {
+    // A zero-sized element's allocation is the dangling
+    // pointer: std's capacity for it is `usize::MAX` by
+    // definition, not the storage extent the model holds.
+    let dir = temp_dir("veczstcapacity");
+    let src = fixture(&dir, "veczstcapacity.rs", VEC_ZST_CAPACITY_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "ZST Vec capacity must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "cap 18446744073709551615\nspare 18446744073709551615\ncap 18446744073709551615\n"
+    );
+}
+
+const VEC_SPARSE_ORDERING_SRC: &str = r#"
+use std::cmp::Ordering;
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct Wrap(Vec<i32>);
+
+fn main() {
+    let mut v: Vec<i32> = Vec::new();
+    v.push(1);
+    println!("self le {} cmp {:?}", v <= v, v.cmp(&v));
+    println!("partial {:?}", v.partial_cmp(&v));
+
+    let mut a: Vec<i32> = Vec::new();
+    a.push(1);
+    a.push(3);
+    let mut b: Vec<i32> = Vec::new();
+    b.push(1);
+    b.push(2);
+    b.push(9);
+    println!("a<b {} a>b {} a==b {}", a < b, a > b, a == b);
+    println!("a cmp {:?}", a.cmp(&b));
+
+    let lit = vec![1, 3];
+    println!("a==lit {} a<=lit {} a>=lit {}", a == lit, a <= lit, a >= lit);
+    let lit2 = vec![1, 4];
+    println!("a<lit2 {} a cmp lit2 {:?}", a < lit2, a.cmp(&lit2));
+
+    let mut short: Vec<i32> = Vec::new();
+    short.push(1);
+    println!("short<a {} short cmp a {:?}", short < a, short.cmp(&a));
+
+    let w1 = Wrap(a.clone());
+    let w2 = Wrap(vec![1, 3]);
+    println!("wrap cmp {:?}", w1.cmp(&w2));
+    let _ = Ordering::Equal;
+}
+"#;
+
+#[test]
+fn run_mode_vec_sparse_ordering_after_growth() {
+    // A push that leaves spare capacity puts the vector in
+    // its sparse form (declared length below the stored
+    // elements); ordering -- `PartialOrd`, `cmp`,
+    // `partial_cmp`, and derived `Ord` over a field holding
+    // such a vector -- compares the declared elements only,
+    // exactly as equality does, against sparse and plain
+    // forms alike. The spare storage past the length is not
+    // part of the value and never enters the comparison.
+    let dir = temp_dir("vecsparseord");
+    let src = fixture(&dir, "vecsparseord.rs", VEC_SPARSE_ORDERING_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "ordering of spare-capacity vectors must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "self le true cmp Equal\npartial Some(Equal)\na<b false a>b true a==b false\na cmp Greater\na==lit true a<=lit true a>=lit true\na<lit2 true a cmp lit2 Less\nshort<a true short cmp a Less\nwrap cmp Equal\n"
+    );
+}
+
+const VEC_SPARSE_CONSUMERS_SRC: &str = r#"
+use std::collections::VecDeque;
+use std::io::Write;
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::Arc;
+
+fn main() {
+    let mut v = Vec::new();
+    v.push(10);
+    v.push(20);
+    for x in v {
+        println!("elem {x}");
+    }
+
+    let mut v = Vec::new();
+    v.push(10);
+    v.push(20);
+    let r: Rc<[i32]> = v.into();
+    println!("rc {:?} len {}", r, r.len());
+    let mut w = Vec::new();
+    w.push(7);
+    let a: Arc<[i32]> = w.into();
+    println!("arc {:?} len {}", a, a.len());
+
+    let mut v = Vec::new();
+    v.push(10);
+    v.push(20);
+    let mut d: VecDeque<i32> = v.into();
+    println!("deque len {}", d.len());
+    println!("front {:?} back {:?}", d.front(), d.back());
+    println!("pop {:?}", d.pop_front());
+
+    let mut bytes: Vec<u8> = Vec::new();
+    bytes.push(65u8);
+    write!(bytes, "BC").unwrap();
+    println!("written {:?}", String::from_utf8(bytes).unwrap());
+
+    let mut paths = Vec::new();
+    paths.push(PathBuf::from("/a"));
+    paths.push(PathBuf::from("/b"));
+    let joined = std::env::join_paths(paths).unwrap();
+    println!("joined {}", joined.to_string_lossy());
+}
+"#;
+
+#[test]
+fn run_mode_vec_sparse_consumers_after_growth() {
+    // Consumers of a vector the growth path left in its
+    // sparse form take its declared elements, exactly as
+    // equality and ordering do: owning iteration, the
+    // counted-slice conversions (`Rc<[T]>` / `Arc<[T]>`),
+    // the `VecDeque` conversion, a formatted write into a
+    // byte vector, and `join_paths` over a by-value vector.
+    // The spare storage past the length is not part of the
+    // value and never reaches any of them.
+    let dir = temp_dir("vecsparseuse");
+    let src = fixture(&dir, "vecsparseuse.rs", VEC_SPARSE_CONSUMERS_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "consumers of spare-capacity vectors must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "elem 10\nelem 20\nrc [10, 20] len 2\narc [7] len 1\ndeque len 2\nfront Some(10) back Some(20)\npop Some(10)\nwritten \"ABC\"\njoined /a:/b\n"
+    );
+}
