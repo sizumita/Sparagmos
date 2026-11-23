@@ -9743,6 +9743,39 @@ fn run_mode_termination_result_report() {
     );
 }
 
+const RESULT_ERR_RANGE_FROM_SRC: &str = r#"
+use std::ops::RangeFrom;
+use std::path::PathBuf;
+
+fn main() -> Result<(), RangeFrom<PathBuf>> {
+    Err(RangeFrom {
+        start: PathBuf::from("hello"),
+    })
+}
+"#;
+
+#[test]
+fn run_mode_termination_range_from_pathbuf_report() {
+    // The report renders the payload through the detached
+    // `Debug` path (the payload's own formatting is never
+    // demanded by the guest): a `RangeFrom` payload keeps
+    // its handwritten form, `"hello"..`, rather than
+    // collapsing to the held byte string.
+    let dir = temp_dir("termination-range-from");
+    let src = fixture(&dir, "err_range_from.rs", RESULT_ERR_RANGE_FROM_SRC);
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(1), "Result::Err(RangeFrom<PathBuf>)");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Error: \"hello\"..\n"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "the report writes nothing to stdout: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 const RESULT_OK_EXIT_CODE_SRC: &str = r#"
 fn main() -> Result<std::process::ExitCode, String> {
     Ok(std::process::ExitCode::from(3))
@@ -16552,6 +16585,58 @@ fn run_mode_debug_forward_only_transparent_adapters() {
         String::from_utf8_lossy(&out.stdout),
         "Reverse(\"hello\")\nReverse(\"hello\")\n\"hello\"..\n\"hello\"\nReverse(\"hello\")\nReverse(\"hello\")\n",
         "Debug forwards only through transparent adapters"
+    );
+}
+
+const PATH_DISPLAY_PRECISION_SRC: &str = r#"
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
+
+fn main() {
+    // Precision and width on the `display()` adapters: the
+    // adapters' `Display` text is the lossy content rendered
+    // under the caller's options, so precision truncates and
+    // width pads, exactly as `str` itself formats (measured
+    // against native rustc 1.100.0).
+    let os = OsStr::new("hello");
+    println!("[{:.1}]", os.display());
+    println!("[{:.0}]", os.display());
+    println!("[{:>10.1}]", os.display());
+    println!("[{:>10}]", os.display());
+    let p = Path::new("hello");
+    println!("[{:.1}]", p.display());
+    println!("[{:>10.1}]", p.display());
+    println!("[{:.3}]", PathBuf::from("hello world").display());
+    println!("[{:.2}]", OsString::from("hello").display());
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let bad = OsStr::from_bytes(b"a\xFFbcdef");
+        println!("[{:.2}]", bad.display());
+        println!("[{:>12.2}]", bad.display());
+    }
+}
+"#;
+
+#[test]
+fn run_mode_path_display_precision_and_width() {
+    let dir = temp_dir("path-display-precision");
+    let src = fixture(
+        &dir,
+        "path_display_precision.rs",
+        PATH_DISPLAY_PRECISION_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "display-adapter precision and width runs; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[h]\n[]\n[         h]\n[     hello]\n[h]\n[         h]\n[hel]\n[he]\n[a\u{FFFD}]\n[          a\u{FFFD}]\n",
+        "display adapters truncate by precision and pad by width like str"
     );
 }
 
