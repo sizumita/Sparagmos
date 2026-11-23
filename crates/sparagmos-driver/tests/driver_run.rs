@@ -22128,6 +22128,69 @@ fn run_mode_io_error_custom_payload() {
     );
 }
 
+const IO_ERROR_CUSTOM_FMT_SRC: &str = r#"
+use std::error::Error;
+use std::fmt;
+
+#[derive(Debug)]
+struct MyErr;
+impl fmt::Display for MyErr {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "my error display")
+    }
+}
+impl Error for MyErr {}
+
+#[derive(Debug)]
+struct Inner {
+    x: i32,
+    name: &'static str,
+}
+impl fmt::Display for Inner {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "inner display")
+    }
+}
+impl Error for Inner {}
+
+fn main() {
+    let e = std::io::Error::new(std::io::ErrorKind::InvalidInput, MyErr);
+    println!("plain: {e}");
+    println!("debug: {e:?}");
+    println!("prec: [{}]", format!("{e:.3}"));
+    println!("width: [{}]", format!("{e:>20}"));
+    println!("pretty:\n{}", format!("{e:#?}"));
+    let e2 = std::io::Error::new(std::io::ErrorKind::Other, Inner { x: 5, name: "n" });
+    println!("nested pretty:\n{}", format!("{e2:#?}"));
+    println!("nested debug: {e2:?}");
+    let v = vec![std::io::Error::new(std::io::ErrorKind::Other, MyErr)];
+    println!("in vec pretty:\n{v:#?}");
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_io_error_custom_payload_fmt_forwarding() {
+    // `io::Error`'s `Display` forwards the formatter to the
+    // payload's own `Display`: a payload that ignores precision
+    // and width (a plain `write!` of a literal) renders in full
+    // under `{e:.3}` and unpadded under `{e:>20}`, exactly as
+    // native. Its `Debug` is core's `Custom` `debug_struct`, so
+    // under `{:#?}` it takes the multi-line layout with the
+    // payload's own multi-line `Debug` indented under its
+    // field, while `{}` / `{:?}` keep the plain / compact
+    // forms.
+    let dir = temp_dir("io-error-custom-fmt");
+    let src = fixture(&dir, "io_error_custom_fmt.rs", IO_ERROR_CUSTOM_FMT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "plain: my error display\ndebug: Custom { kind: InvalidInput, error: MyErr }\nprec: [my error display]\nwidth: [my error display]\npretty:\nCustom {\n    kind: InvalidInput,\n    error: MyErr,\n}\nnested pretty:\nCustom {\n    kind: Other,\n    error: Inner {\n        x: 5,\n        name: \"n\",\n    },\n}\nnested debug: Custom { kind: Other, error: Inner { x: 5, name: \"n\" } }\nin vec pretty:\n[\n    Custom {\n        kind: Other,\n        error: MyErr,\n    },\n]\ndone\n"
+    );
+}
+
 const IO_ERROR_CUSTOM_DROP_SRC: &str = r#"
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};

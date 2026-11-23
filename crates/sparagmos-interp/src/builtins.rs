@@ -26577,26 +26577,52 @@ impl<'a> Interpreter<'a> {
                 };
                 let text =
                     self.format_value(frames, &pointee, trait_, concrete, options, indent)?;
-                Some(pad_str(&text, options))
+                // `io::Error`'s `Display` forwards the formatter
+                // to the payload's own `Display`, so the text
+                // `format_value` produced under those options is
+                // the final output: applying string padding
+                // semantics on top would truncate or pad payloads
+                // whose `Display` ignores precision / width, which
+                // native leaves untouched.
+                Some(text)
             }
             FmtTrait::Debug => {
                 // The kind formats as an `ErrorKind` value (its
                 // own `Debug` names the variant), not by index:
                 // the variant index and the discriminant differ
-                // for the kinds std added out of order.
+                // for the kinds std added out of order. The
+                // rendering goes through `debug_struct_text`, like
+                // the other `io::Error` representations, so under
+                // `{:#?}` the struct takes the multi-line layout;
+                // the fields are formatted at the inner indent
+                // then, so a nested payload's own multi-line
+                // `Debug` lines up under its field.
+                let field_indent = if options.alternate() {
+                    indent + 4
+                } else {
+                    indent
+                };
                 let kind = self.format_value(
                     frames,
                     &fields[0],
                     trait_,
                     "std::io::ErrorKind",
                     options,
-                    indent,
+                    field_indent,
                 )?;
-                let error =
-                    self.format_value(frames, &payload, trait_, &payload_ty, options, indent)?;
-                Some(pad_width(
-                    &format!("Custom {{ kind: {kind}, error: {error} }}"),
+                let error = self.format_value(
+                    frames,
+                    &payload,
+                    trait_,
+                    &payload_ty,
                     options,
+                    field_indent,
+                )?;
+                Some(debug_struct_text(
+                    "Custom",
+                    &[("kind", kind), ("error", error)],
+                    options,
+                    indent,
                 ))
             }
             _ => None,
