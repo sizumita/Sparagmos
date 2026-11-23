@@ -18029,6 +18029,51 @@ fn run_mode_io_error_display_and_debug() {
     );
 }
 
+const IO_ERROR_SIMPLE_MESSAGE_FMT_SRC: &str = r#"
+use std::io::{self, Read, Write};
+
+struct ZeroWriter;
+impl io::Write for ZeroWriter {
+    fn write(&mut self, _buf: &[u8]) -> io::Result<usize> { Ok(0) }
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+}
+
+fn main() {
+    let data: &[u8] = &[1, 2, 3];
+    let mut buf = [0u8; 8];
+    let mut slice = data;
+    let err = slice.read_exact(&mut buf).unwrap_err();
+    println!("{} | {:?} | {:?}", err, err, err.kind());
+    let mut slice2 = data;
+    let r: io::Result<()> = slice2.read_exact(&mut buf);
+    println!("{:?}", r);
+    let mut w = ZeroWriter;
+    let err2 = w.write_all(b"hello").unwrap_err();
+    println!("{} | {:?} | {:?}", err2, err2, err2.kind());
+}
+"#;
+
+#[test]
+fn run_mode_io_error_simple_message_display_and_debug() {
+    // A guest-built `SimpleMessage` error (the `read_exact` EOF
+    // error, the `write_all` zero error) stores its
+    // `&'static SimpleMessage` through the repr's type-erased
+    // slot; its `Display` is the message text and its `Debug`
+    // is core's `Error { kind, message }` form, including when
+    // the error is nested inside a `Result`'s `Debug`.
+    let dir = temp_dir("io-error-simple-message-fmt");
+    let src = fixture(&dir, "io_error_simple_message.rs", IO_ERROR_SIMPLE_MESSAGE_FMT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "failed to fill whole buffer | Error { kind: UnexpectedEof, message: \"failed to fill whole buffer\" } | UnexpectedEof\n\
+         Err(Error { kind: UnexpectedEof, message: \"failed to fill whole buffer\" })\n\
+         failed to write whole buffer | Error { kind: WriteZero, message: \"failed to write whole buffer\" } | WriteZero\n"
+    );
+}
+
 const POINTER_WRAPPER_FMT_SRC: &str = r#"
 use std::fmt;
 use std::rc::Rc;

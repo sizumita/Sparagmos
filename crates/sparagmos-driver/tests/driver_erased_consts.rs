@@ -208,18 +208,15 @@ fn main() {
 fn read_exact_eof_kind_and_raw_os_error() {
     // The error value itself — an erased `SimpleMessage`
     // allocation — survives conversion: its kind and raw OS
-    // error read back exactly. Rendering the error's `Display`
-    // is a separate, still-open formatting gap (the erased
-    // message text is not decoded yet), so the run stops there
-    // with the named unsupported error after printing the two
-    // lines above.
+    // error read back exactly, and its `Display` renders the
+    // message text decoded from the preserved constant block
+    // (OJ, #299).
     let (stdout, stderr, status) = run_fixture("read_exact_eof", READ_EXACT_RS);
-    assert_eq!(stdout, "kind: UnexpectedEof\nraw: None\n");
-    assert_eq!(status.code(), Some(2), "stderr={stderr}");
-    assert!(
-        stderr.contains("Display formatting for an ADT value"),
-        "stderr={stderr}"
+    assert_eq!(
+        stdout,
+        "kind: UnexpectedEof\nraw: None\ndisplay: failed to fill whole buffer\n"
     );
+    assert_eq!(status.code(), Some(0), "stderr={stderr}");
 }
 
 const IDENTITY_ROUND_TRIP_RS: &str = r#"
