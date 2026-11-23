@@ -259,6 +259,14 @@ pub struct Converter {
     /// instead, which is the location the compiler's shim
     /// presents to the callee.
     pub track_caller_defs: HashMap<sm::DefId, sm::ConstValue>,
+    /// Declared ABIs of the function instances registered so
+    /// far, keyed by the instance's Sparagmos `DefId` (see
+    /// `note_fn_abi`). Handed to the interpreter with the
+    /// converted program: a naked function's incoming arguments
+    /// arrive in the registers of its declared ABI, which the
+    /// interpreter's seed plan for the function's asm block is
+    /// computed from.
+    pub fn_abis: HashMap<sm::DefId, sm::Abi>,
     /// The location stamps of the `Fn` / `FnMut` / `FnOnce`
     /// vtable shims — the trait method definitions in core,
     /// which compiler-generated `Fn` impls are attributed to —
@@ -1007,6 +1015,7 @@ impl Converter {
             static_tys: HashMap::new(),
             static_tys_mir: sm::StaticTys::new(),
             track_caller_defs: HashMap::new(),
+            fn_abis: HashMap::new(),
             fn_shim_locations: [None, None, None],
             link_symbols: HashMap::new(),
             noting_track_caller: false,
@@ -1112,7 +1121,30 @@ impl Converter {
         let id = sm::DefId::new(0, idx);
         self.note_link_symbol(id, inst);
         self.note_track_caller_instance(id, inst);
+        self.note_fn_abi(id, inst);
         id
+    }
+
+    /// Record the declared ABI of a registered function
+    /// instance (see [`Converter::fn_abis`]). Runs once per
+    /// registered instance — every instance resolution in the
+    /// driver flows through `instance_def_id`, so every body
+    /// the program can enter has its ABI recorded under the
+    /// very id the body is registered with.
+    fn note_fn_abi(&mut self, id: sm::DefId, inst: &Instance) {
+        if let Some(abi) = instance_fn_abi(inst) {
+            self.fn_abis.insert(id, abi);
+        }
+    }
+
+    /// Record the declared ABI of a function definition under
+    /// its own (non-instance) id: the registration the
+    /// auxiliary-crate item loop uses for bodies no instance
+    /// demand has registered (see [`Converter::fn_abis`]).
+    pub fn note_fn_abi_for_def(&mut self, id: sm::DefId, def: &FnDef) {
+        if let Some(abi) = def_fn_abi(def) {
+            self.fn_abis.insert(id, abi);
+        }
     }
 
     /// If `inst` is a `#[track_caller]` instance with a body,
@@ -1924,15 +1956,17 @@ impl Converter {
                 // evaluable register-program class run, and anything
                 // else is a named explicit error at execution time —
                 // never a reason to drop the whole body here.
-                let ops = operands
+                let ops: Vec<sm::InlineAsmOperand> = operands
                     .iter()
                     .map(|op| self.asm_operand(body, op))
                     .collect();
+                let targets = self.asm_targets(body, *destination, options, &ops);
                 sm::TerminatorKind::InlineAsm {
                     template: template.clone(),
                     operands: ops,
                     options: options.clone(),
                     destination: destination.map(bb),
+                    targets,
                     unwind: self.unwind(unwind),
                 }
             }
@@ -1958,6 +1992,8 @@ impl Converter {
             sm::AsmOperandKind::Out
         } else if raw.starts_with("Const {") {
             sm::AsmOperandKind::Const
+        } else if raw.starts_with("Label {") {
+            sm::AsmOperandKind::Label
         } else {
             sm::AsmOperandKind::Sym
         };
@@ -1967,7 +2003,7 @@ impl Converter {
                 Some((bits, width)) => (width, Some(bits)),
                 None => (0, None),
             },
-            sm::AsmOperandKind::Sym => (0, None),
+            sm::AsmOperandKind::Sym | sm::AsmOperandKind::Label => (0, None),
             sm::AsmOperandKind::In => (
                 op.in_value
                     .as_ref()
@@ -1983,6 +2019,16 @@ impl Converter {
                 None,
             ),
         };
+        let static_name = if kind == sm::AsmOperandKind::Sym {
+            asm_raw_sym_name(raw)
+        } else {
+            None
+        };
+        let call_sig = if raw.starts_with("SymFn {") {
+            static_name.as_deref().and_then(|name| self.asm_call_sig(name))
+        } else {
+            None
+        };
         sm::InlineAsmOperand {
             kind,
             reg_class,
@@ -1990,7 +2036,109 @@ impl Converter {
             const_bits,
             in_value: op.in_value.as_ref().map(|v| self.operand(v)),
             out_place: op.out_place.as_ref().map(|p| self.place(p)),
+            reg_name: asm_raw_reg_name(raw),
+            static_name,
+            label_index: if kind == sm::AsmOperandKind::Label {
+                asm_raw_label_index(raw)
+            } else {
+                None
+            },
+            call_sig,
         }
+    }
+
+    /// The successor list of an InlineAsm terminator: the
+    /// destination followed by its label blocks, restored
+    /// structurally by [`restore_asm_label_blocks`]. A terminator
+    /// without label operands — or whose labels could not be
+    /// restored — carries just its destination (or nothing).
+    fn asm_targets(
+        &self,
+        body: &mir::Body,
+        destination: Option<mir::BasicBlockIdx>,
+        options: &str,
+        ops: &[sm::InlineAsmOperand],
+    ) -> Vec<sm::BasicBlock> {
+        let dest = destination.map(bb);
+        let label_count = ops
+            .iter()
+            .filter(|op| op.kind == sm::AsmOperandKind::Label)
+            .count();
+        if label_count == 0 {
+            return dest.into_iter().collect();
+        }
+        let Some(restored) =
+            restore_asm_label_blocks(body, label_count, options.contains("NORETURN"))
+        else {
+            return dest.into_iter().collect();
+        };
+        let mut targets: Vec<sm::BasicBlock> = dest.into_iter().collect();
+        targets.extend(restored);
+        targets
+    }
+
+    /// Resolve an asm `sym` operand naming a function to the
+    /// register-passing call signature a `call` step executes
+    /// through: the function must be the local crate's unique
+    /// function the operand's path denotes (see
+    /// [`asm_ref_matches_def`] — the complete path, never just
+    /// its last segment), non-generic, with a fully scalar
+    /// signature under the SysV64 or Win64 ABI families (the
+    /// `C` and `System` ABIs are SysV64-shaped on this target),
+    /// and register-passed throughout (no stack arguments).
+    /// Anything else returns `None` and the call stays outside
+    /// the evaluable class.
+    fn asm_call_sig(&mut self, name: &str) -> Option<sm::AsmCallSig> {
+        let mut candidates = rustc_public::local_crate()
+            .fn_defs()
+            .into_iter()
+            .filter(|def| asm_ref_matches_def(&def.name(), name));
+        let def = candidates.next()?;
+        if candidates.next().is_some() {
+            return None;
+        }
+        // Resolution can panic inside the compiler for shapes
+        // it cannot monomorphize from empty arguments (generic
+        // or predicate-carrying functions): such a function is
+        // simply not a resolvable call target.
+        let sig = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let inst = Instance::resolve(def, &GenericArgs(vec![])).ok()?;
+            Some(guarded_ty_kind(&inst.ty())?.fn_sig()?.skip_binder())
+        }))
+        .ok()??;
+        if sig.c_variadic {
+            return None;
+        }
+        let abi = asm_abi_family(&sig.abi)?;
+        let (output, inputs) = sig.inputs_and_output.split_last()?;
+        let mut params = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            params.push(asm_scalar(input)?);
+        }
+        let (mut ints, mut floats) = (0usize, 0usize);
+        for param in &params {
+            match param {
+                sm::AsmScalar::Float { .. } => floats += 1,
+                _ => ints += 1,
+            }
+        }
+        let register_passed = match abi {
+            sm::AsmAbi::SysV64 => ints <= 6 && floats <= 8,
+            sm::AsmAbi::Win64 => params.len() <= 4,
+        };
+        if !register_passed {
+            return None;
+        }
+        let ret = match guarded_ty_kind(output)? {
+            TyKind::RigidTy(RigidTy::Tuple(ts)) if ts.is_empty() => None,
+            _ => Some(asm_scalar(output)?),
+        };
+        Some(sm::AsmCallSig {
+            name: def.name(),
+            abi,
+            params,
+            ret,
+        })
     }
 
     fn assert_msg(&mut self, msg: &mir::AssertMessage) -> sm::AssertMessage {
@@ -6289,6 +6437,247 @@ fn asm_type_width(ty: &Ty) -> u32 {
         TyKind::RigidTy(RigidTy::Char) => 32,
         _ => 0,
     }
+}
+
+/// The explicit register name of an asm operand's raw
+/// representation (`reg: Reg(X86(ax))`), when the operand is
+/// bound to one architectural register rather than a register
+/// class.
+fn asm_raw_reg_name(raw: &str) -> Option<String> {
+    let rest = raw.split("reg: Reg(X86(").nth(1)?;
+    let name = rest.split(')').next()?;
+    Some(name.to_string())
+}
+
+/// The item name of a `Sym` asm operand's raw representation
+/// (`SymFn { value: foo }`, `SymStatic { value: BAR }`).
+fn asm_raw_sym_name(raw: &str) -> Option<String> {
+    let rest = raw.split("value: ").nth(1)?;
+    Some(rest.trim_end_matches('}').trim().to_string())
+}
+
+/// The target index of a `Label` asm operand's raw
+/// representation (`Label { target_index: 1 }`): the index into
+/// the terminator's internal successor list, where the
+/// fallthrough destination (when the terminator has one) is
+/// index 0 and the label blocks follow in operand order.
+fn asm_raw_label_index(raw: &str) -> Option<usize> {
+    let rest = raw.split("target_index: ").nth(1)?;
+    rest.chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+/// The register scalar of a plain integer / bool / char / float
+/// type, for an asm call signature. Anything else (aggregates,
+/// pointers, 128-bit integers) is not register-passed in this
+/// model and returns `None`.
+fn asm_scalar(ty: &rustc_public::ty::Ty) -> Option<sm::AsmScalar> {
+    use rustc_public::ty::{FloatTy, IntTy, UintTy};
+    let TyKind::RigidTy(rigid) = guarded_ty_kind(ty)? else {
+        return None;
+    };
+    Some(match rigid {
+        RigidTy::Int(it) => sm::AsmScalar::Int {
+            width: match it {
+                IntTy::Isize => 64,
+                IntTy::I8 => 8,
+                IntTy::I16 => 16,
+                IntTy::I32 => 32,
+                IntTy::I64 => 64,
+                IntTy::I128 => return None,
+            },
+            signed: true,
+        },
+        RigidTy::Uint(it) => sm::AsmScalar::Int {
+            width: match it {
+                UintTy::Usize => 64,
+                UintTy::U8 => 8,
+                UintTy::U16 => 16,
+                UintTy::U32 => 32,
+                UintTy::U64 => 64,
+                UintTy::U128 => return None,
+            },
+            signed: false,
+        },
+        RigidTy::Bool => sm::AsmScalar::Bool,
+        RigidTy::Char => sm::AsmScalar::Int {
+            width: 32,
+            signed: false,
+        },
+        RigidTy::Float(ft) => sm::AsmScalar::Float {
+            width: match ft {
+                FloatTy::F32 => 32,
+                FloatTy::F64 => 64,
+                _ => return None,
+            },
+        },
+        _ => return None,
+    })
+}
+
+/// Whether the local function whose full definition name is
+/// `def_name` (crate segment included) is the very function an
+/// asm `sym` operand references by `referenced`. The operand's
+/// raw form names the resolved item by its complete path —
+/// crate-relative for an item of the local crate (`local::foo`
+/// for the definition `test::local::foo`), crate-qualified for
+/// any other crate's item (`aux::foo`) — so a local definition
+/// matches only when the referenced path is its whole
+/// crate-relative path, or its full name. Matching only the
+/// last segment would let an unrelated local function stand in
+/// for an external target the operand actually names.
+fn asm_ref_matches_def(def_name: &str, referenced: &str) -> bool {
+    if def_name == referenced {
+        return true;
+    }
+    let Some(prefix) = def_name.strip_suffix(referenced) else {
+        return false;
+    };
+    // The elided prefix must be exactly the crate segment:
+    // "<crate>::", with no further "::" inside it.
+    prefix.len() > 2 && prefix.ends_with("::") && !prefix[..prefix.len() - 2].contains("::")
+}
+
+/// The declared ABI of a function type (the type of a function
+/// definition or of a resolved instance), for recording with
+/// the function's converted body. `None` when the type carries
+/// no function signature.
+fn fn_ty_abi(ty: &rustc_public::ty::Ty) -> Option<sm::Abi> {
+    let sig = guarded_ty_kind(ty)?.fn_sig()?.skip_binder();
+    Some(abi_of(&sig.abi))
+}
+
+/// Run an ABI query under the panic-capture discipline of
+/// [`guarded_ty_kind`]. Asking a still-generic instance for its
+/// type panics with "needs further instantiation" — a known
+/// gap, not a crash: the instance's ABI is not needed, since a
+/// monomorphized instance of the same function registers (and
+/// is recorded) separately. That panic's hook record is
+/// consumed, so no outer containment mistakes it for a
+/// conversion panic; any other panic resumes.
+fn guarded_abi_query(query: impl FnOnce() -> Option<sm::Abi>) -> Option<sm::Abi> {
+    clear_captured_panic();
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(query)) {
+        Ok(abi) => abi,
+        Err(payload) => match take_captured_panic() {
+            Some(record) if record.contains("needs further instantiation") => None,
+            other => {
+                if let Some(record) = other {
+                    record_captured_panic(record);
+                }
+                std::panic::resume_unwind(payload)
+            }
+        },
+    }
+}
+
+/// The declared ABI of a resolved instance's function type,
+/// for recording with the instance's converted body (see
+/// [`guarded_abi_query`] for the containment).
+pub fn instance_fn_abi(inst: &Instance) -> Option<sm::Abi> {
+    guarded_abi_query(|| fn_ty_abi(&inst.ty()))
+}
+
+/// The declared ABI of a function definition's type, for
+/// recording with the definition's converted body (see
+/// [`guarded_abi_query`] for the containment).
+pub fn def_fn_abi(def: &FnDef) -> Option<sm::Abi> {
+    guarded_abi_query(|| fn_ty_abi(&def.ty()))
+}
+
+/// The ABI family of an asm call signature, from the signature's
+/// rustc ABI. Only the two register conventions the interpreter
+/// assembles are recognized; `C` and `System` are SysV64-shaped
+/// on x86_64.
+fn asm_abi_family(abi: &rustc_public::ty::Abi) -> Option<sm::AsmAbi> {
+    let dbg = format!("{abi:?}");
+    if dbg.starts_with("Win64") {
+        Some(sm::AsmAbi::Win64)
+    } else if dbg.starts_with("SysV64")
+        || dbg.starts_with("System")
+        || dbg == "C"
+        || dbg.starts_with("C {")
+    {
+        Some(sm::AsmAbi::SysV64)
+    } else {
+        None
+    }
+}
+
+/// Structurally restore the label blocks of a body's asm-goto
+/// terminator. Stable MIR does not publish them: an InlineAsm
+/// terminator's only reported successor is its fallthrough
+/// destination. The label blocks are exactly the roots of the
+/// region the body's control-flow graph cannot reach under that
+/// reading — a label block's own continuation blocks may be
+/// unreachable too, but only the label blocks themselves have
+/// no predecessor inside the unreachable region. Restoration
+/// applies only when the body has exactly one label-carrying
+/// InlineAsm terminator (a single carrier) and the root count
+/// matches the label count; for a `noreturn` terminator the
+/// reported destination is itself the first label block, so one
+/// fewer root is expected. Anything else returns `None`, and
+/// the terminator's labels stay unrestored (which keeps the
+/// terminator outside the evaluable class).
+fn restore_asm_label_blocks(
+    body: &mir::Body,
+    label_count: usize,
+    noreturn: bool,
+) -> Option<Vec<sm::BasicBlock>> {
+    let blocks = &body.blocks;
+    let mut carriers = 0usize;
+    for block in blocks.iter() {
+        if let mir::TerminatorKind::InlineAsm { operands, .. } = &block.terminator.kind {
+            if operands.iter().any(|op| op.raw_rpr.starts_with("Label")) {
+                carriers += 1;
+            }
+        }
+    }
+    if carriers != 1 {
+        return None;
+    }
+    let n = blocks.len();
+    let succ: Vec<Vec<usize>> = blocks
+        .iter()
+        .map(|block| block.terminator.successors())
+        .collect();
+    let mut reachable = vec![false; n];
+    reachable[0] = true;
+    let mut stack = vec![0usize];
+    while let Some(i) = stack.pop() {
+        for &j in &succ[i] {
+            if !reachable[j] {
+                reachable[j] = true;
+                stack.push(j);
+            }
+        }
+    }
+    let mut has_unreachable_pred = vec![false; n];
+    for i in 0..n {
+        if reachable[i] {
+            continue;
+        }
+        for &j in &succ[i] {
+            if !reachable[j] {
+                has_unreachable_pred[j] = true;
+            }
+        }
+    }
+    let roots: Vec<usize> = (0..n)
+        .filter(|&i| !reachable[i] && !has_unreachable_pred[i])
+        .collect();
+    let expected = if noreturn {
+        label_count.checked_sub(1)?
+    } else {
+        label_count
+    };
+    if roots.len() != expected {
+        return None;
+    }
+    Some(roots.iter().map(|&i| sm::BasicBlock(i as u32)).collect())
 }
 
 /// Read an integer literal out of a `Const` asm operand's raw

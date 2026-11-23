@@ -1723,6 +1723,18 @@ pub enum TerminatorKind {
         regs: Vec<AsmReg>,
         steps: Vec<AsmStep>,
         target: Option<BasicBlock>,
+        /// For a naked-function block (no continuation): the
+        /// function's return shape, read out of the register
+        /// file's `rax` once the steps have run. `None` for
+        /// fallthrough and asm-goto blocks.
+        ret: Option<AsmRet>,
+        /// Incoming-argument seedings of a naked-function block:
+        /// the frame's argument locals copied into the
+        /// architectural registers the enclosing function's ABI
+        /// passes them in, before the steps run. Empty for
+        /// non-naked blocks and for naked functions without
+        /// parameters.
+        arg_seeds: Vec<AsmArgSeed>,
     },
     /// Any terminator kind not modelled yet; executing it is an explicit error.
     Unsupported(String),
@@ -1745,6 +1757,11 @@ pub struct AsmReg {
     /// `Unsigned` at width 32: the value model carries chars as
     /// code-point integers.)
     pub kind: AsmRegKind,
+    /// The architectural register this operand is bound to (an
+    /// explicit-register operand), as a register-file index: the
+    /// operand's slot and the register alias each other for the
+    /// duration of the block. `None` for register-class operands.
+    pub arch: Option<u8>,
 }
 
 /// The value kind of an [`AsmReg`]'s operand type.
@@ -1753,6 +1770,26 @@ pub enum AsmRegKind {
     Signed,
     Unsigned,
     Bool,
+}
+
+/// The return shape of a naked-function asm block: the width
+/// and kind the value in the register file's `rax` is read as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AsmRet {
+    pub width: u32,
+    pub kind: AsmRegKind,
+}
+
+/// One incoming-argument seeding of a naked-function asm block:
+/// the argument held in frame local `local` (1-based, in
+/// declaration order) enters the block in the architectural
+/// register `arch` (a register-file index, as in
+/// [`AsmReg::arch`]), read at the argument's scalar shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AsmArgSeed {
+    pub local: u32,
+    pub arch: u8,
+    pub scalar: sparagmos_mir::AsmScalar,
 }
 
 /// A basic block: statements followed by exactly one terminator.

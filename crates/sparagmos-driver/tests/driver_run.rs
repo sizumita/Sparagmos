@@ -12805,6 +12805,246 @@ fn run_mode_naked_fn_ret() {
     run_ok("asm-naked-ret", ASM_NAKED_SRC, "back\n");
 }
 
+const ASM_NAKED_ARGS_SRC: &str = r#"
+use std::arch::naked_asm;
+
+#[unsafe(naked)]
+pub extern "sysv64" fn identity(x: u64) -> u64 {
+    naked_asm!("mov rax, rdi", "ret");
+}
+
+#[unsafe(naked)]
+pub extern "sysv64" fn add2(a: u64, b: u64) -> u64 {
+    naked_asm!("mov rax, rdi", "add rax, rsi", "ret");
+}
+
+#[unsafe(naked)]
+pub extern "win64" fn identity_win(x: u64) -> u64 {
+    naked_asm!("mov rax, rcx", "ret");
+}
+
+#[unsafe(naked)]
+pub extern "C" fn float_bits(x: f64) -> u64 {
+    naked_asm!("movq rax, xmm0", "ret");
+}
+
+#[unsafe(naked)]
+pub extern "C" fn sink(x: u64) {
+    naked_asm!("ret");
+}
+
+fn main() {
+    sink(9);
+    println!(
+        "{} {} {} {}",
+        identity(42),
+        add2(40, 2),
+        identity_win(42),
+        float_bits(1.5)
+    );
+}
+"#;
+
+#[test]
+fn run_mode_naked_fn_seeds_incoming_abi_registers() {
+    // A naked function's parameters arrive through the enclosing
+    // function's ABI, not through asm operands: the register
+    // file is seeded from the frame's argument locals (SysV64
+    // integer registers, the Win64 position registers, and the
+    // xmm sequence for a float), so the programs read their
+    // actual arguments. A bare-`ret` body with a parameter it
+    // never reads needs no seeding and still runs.
+    run_ok(
+        "asm-naked-args",
+        ASM_NAKED_ARGS_SRC,
+        "42 42 42 4609434218613702656\n",
+    );
+}
+
+const ASM_NAKED_AGGREGATE_SRC: &str = r#"
+use std::arch::naked_asm;
+
+pub struct Pair(pub u64, pub u64);
+
+#[unsafe(naked)]
+pub extern "C" fn first(p: Pair) -> u64 {
+    naked_asm!("mov rax, rdi", "ret");
+}
+
+fn main() {
+    println!("{}", first(Pair(42, 1)));
+}
+"#;
+
+#[test]
+fn run_mode_naked_fn_unseedable_parameters_are_a_named_error() {
+    // An aggregate parameter is not register-passed in the
+    // model: the naked body is a named error rather than a
+    // block that reads zeroed registers as if they were the
+    // argument.
+    let dir = temp_dir("asm-naked-aggregate");
+    let src = fixture(&dir, "case.rs", ASM_NAKED_AGGREGATE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an unseedable naked parameter must exit two; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("incoming ABI registers cannot be seeded"),
+        "the reason names the unseedable parameters: {stderr}"
+    );
+}
+
+const ASM_SYM_LOCAL_SRC: &str = r#"
+use std::arch::asm;
+
+pub extern "C" fn add_one(x: u64) -> u64 {
+    x + 1
+}
+
+mod inner {
+    pub extern "C" fn add_two(x: u64) -> u64 {
+        x + 2
+    }
+}
+
+fn main() {
+    let out1: u64;
+    let out2: u64;
+    unsafe {
+        asm!(
+            "mov rdi, {inp}",
+            "call {target}",
+            inp = in(reg) 41u64,
+            target = sym add_one,
+            lateout("rax") out1,
+        );
+        asm!(
+            "mov rdi, {inp}",
+            "call {target}",
+            inp = in(reg) 41u64,
+            target = sym inner::add_two,
+            lateout("rax") out2,
+        );
+    }
+    println!("{out1} {out2}");
+}
+"#;
+
+#[test]
+fn run_mode_asm_sym_call_resolves_local_functions() {
+    // A `sym` operand denoting a function of the local crate —
+    // at the crate root or in a module — resolves by its
+    // complete path and the call executes that function.
+    run_ok("asm-sym-local", ASM_SYM_LOCAL_SRC, "42 43\n");
+}
+
+const ASM_SYM_AUX_LIB_SRC: &str = r#"
+pub extern "C" fn foo(x: u64) -> u64 {
+    x + 1000
+}
+"#;
+
+const ASM_SYM_AUX_MAIN_SRC: &str = r#"
+extern crate auxlib;
+
+use std::arch::asm;
+
+// A local function whose last name segment collides with the
+// external `auxlib::foo` the asm block actually names. It is
+// never called from Rust code.
+pub extern "C" fn foo(x: u64) -> u64 {
+    x + 1
+}
+
+fn main() {
+    let out: u64;
+    unsafe {
+        asm!(
+            "mov rdi, {inp}",
+            "call {target}",
+            inp = in(reg) 41u64,
+            target = sym auxlib::foo,
+            lateout("rax") out,
+        );
+    }
+    println!("{out}");
+}
+"#;
+
+#[test]
+fn run_mode_asm_sym_call_to_an_external_function_is_rejected() {
+    // The `sym` operand names `auxlib::foo`, a function of
+    // another crate: it must not resolve to the unrelated local
+    // `foo` whose last name segment happens to match. The call
+    // stays outside the evaluable class (exit two) instead of
+    // executing the local function (which would print 42; the
+    // named function would print 1041).
+    let dir = temp_dir("asm-sym-aux");
+    let aux = fixture(&dir, "auxlib.rs", ASM_SYM_AUX_LIB_SRC);
+    let src = fixture(&dir, "auxmain.rs", ASM_SYM_AUX_MAIN_SRC);
+    let out = run_driver_with_aux(&src, &[("auxlib", &aux)]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an external asm call target must exit two; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "",
+        "the unrelated local function must not execute"
+    );
+}
+
+#[test]
+fn convert_mode_asm_with_generic_const_and_sym_operands_converts() {
+    // Regression: recording function ABIs for the naked-body
+    // argument seeding queried `Instance::ty` on still-generic
+    // instances (here `core::mem::size_of::<T>`, named by a
+    // `const` asm operand), which panics with "needs further
+    // instantiation"; the panic escaped the ABI query's
+    // containment and read as a conversion crash (exit 101) in
+    // convert mode.
+    let dir = temp_dir("asm-generic-const");
+    let src = fixture(
+        &dir,
+        "generic_const.rs",
+        r#"use std::arch::asm;
+
+fn foofoo<const N: usize>() {}
+
+unsafe fn foo<const N: usize>() {
+    asm!("/* {0} */", const N);
+    asm!("/* {0} */", sym foofoo::<N>);
+}
+
+fn barbar<T>() {}
+
+unsafe fn bar<T>() {
+    asm!("/* {0} */", const std::mem::size_of::<T>());
+    asm!("/* {0} */", sym barbar::<T>);
+}
+
+fn main() {
+    unsafe {
+        foo::<0>();
+        bar::<usize>();
+    }
+}
+"#,
+    );
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "generic asm const/sym operands must convert; stderr={stderr}"
+    );
+}
+
 const ASM_PUSH_SRC: &str = r#"
 use std::arch::asm;
 fn main() {
@@ -12829,6 +13069,512 @@ fn run_mode_inline_asm_outside_class_is_named_error() {
     assert!(
         stderr.contains("unsupported terminator: InlineAsm"),
         "the reason names InlineAsm: {stderr}"
+    );
+}
+
+const ASM_LATEOUT_ALIAS_SRC: &str = r#"
+use std::arch::asm;
+fn main() {
+    let y: u64;
+    unsafe {
+        asm!("mov rcx, rax", in("rax") 42u64, lateout("rax") y, out("rcx") _);
+    }
+    println!("{y}");
+}
+"#;
+
+#[test]
+fn run_mode_inline_asm_lateout_aliased_with_input() {
+    // The template never writes rax, but the lateout bound to
+    // it still observes the incoming content the aliased input
+    // seeded: natively y == 42.
+    run_ok("asm-lateout-alias", ASM_LATEOUT_ALIAS_SRC, "42\n");
+}
+
+const ASM_CALL_BOOL_ABI_WIDTH_SRC: &str = r#"
+use std::arch::asm;
+
+pub extern "sysv64" fn choose(x: bool) -> u64 {
+    if x {
+        42
+    } else {
+        43
+    }
+}
+
+fn main() {
+    let out1: u64;
+    let out2: u64;
+    unsafe {
+        asm!(
+            "call {target}",
+            target = sym choose,
+            in("rdi") 0x1_0000_0000u64,
+            lateout("rax") out1,
+        );
+        asm!(
+            "call {target}",
+            target = sym choose,
+            in("rdi") 0x1_0000_0001u64,
+            lateout("rax") out2,
+        );
+    }
+    println!("{out1} {out2}");
+}
+"#;
+
+#[test]
+fn run_mode_asm_call_bool_argument_reads_only_the_abi_byte() {
+    // A boolean argument occupies one byte of its register: the
+    // callee reads only the low byte, and the upper bits are
+    // unspecified incoming state. The first call passes a false
+    // whose upper bits are nonzero (natively 43); the second a
+    // genuine true in the low byte (natively 42).
+    run_ok(
+        "asm-call-bool-width",
+        ASM_CALL_BOOL_ABI_WIDTH_SRC,
+        "43 42\n",
+    );
+}
+
+const ASM_LEA_WRAP_SRC: &str = r#"
+use std::arch::asm;
+fn main() {
+    let y: u64;
+    let z: u64;
+    unsafe {
+        asm!("lea {0}, [ecx + 1]", out(reg) y, in("rcx") 0xffff_ffffu64);
+        asm!("lea {0}, [rcx + 1]", out(reg) z, in("rcx") 0xffff_ffffu64);
+    }
+    println!("{y} {z}");
+}
+"#;
+
+#[test]
+fn run_mode_inline_asm_lea_wraps_at_address_size() {
+    // The 32-bit base form wraps the effective address at 32
+    // bits before it is zero-extended into the destination (0);
+    // the 64-bit base form keeps the full sum (2^32).
+    run_ok("asm-lea-wrap", ASM_LEA_WRAP_SRC, "0 4294967296\n");
+}
+
+const ASM_NAKED_SIGNED_RET_SRC: &str = r#"
+use std::arch::naked_asm;
+
+#[unsafe(naked)]
+pub extern "sysv64" fn neg_one64() -> i64 {
+    naked_asm!("mov rax, -1", "ret");
+}
+
+#[unsafe(naked)]
+pub extern "sysv64" fn neg_one32() -> i32 {
+    naked_asm!("mov eax, -1", "ret");
+}
+
+#[unsafe(naked)]
+pub extern "sysv64" fn neg_one16() -> i16 {
+    naked_asm!("mov ax, -1", "ret");
+}
+
+#[unsafe(naked)]
+pub extern "sysv64" fn neg_one8() -> i8 {
+    naked_asm!("mov al, -1", "ret");
+}
+
+fn main() {
+    println!(
+        "{} {} {} {}",
+        neg_one64(),
+        neg_one32(),
+        neg_one16(),
+        neg_one8()
+    );
+}
+"#;
+
+#[test]
+fn run_mode_naked_fn_signed_return_values() {
+    // A naked body's return value is the register content read
+    // at the return type's shape: a signed type reads the bits
+    // as two's complement at its width, so each body above
+    // returns -1 — natively `-1 -1 -1 -1`.
+    run_ok(
+        "asm-naked-signed-ret",
+        ASM_NAKED_SIGNED_RET_SRC,
+        "-1 -1 -1 -1\n",
+    );
+}
+
+const ASM_NAKED_RSP_SRC: &str = r#"
+use std::arch::naked_asm;
+
+#[unsafe(naked)]
+pub extern "sysv64" fn alignment() -> u64 {
+    naked_asm!("mov rax, rsp", "and rax, 15", "ret");
+}
+
+fn main() {
+    println!("{}", alignment());
+}
+"#;
+
+#[test]
+fn run_mode_naked_fn_incoming_rsp_read_is_a_named_error() {
+    // The incoming `rsp` is fixed by the caller's frame layout
+    // (natively this body returns 8, for the return address on
+    // the stack); the register model does not represent it, so
+    // reading it is a named error — exit 2 — rather than a
+    // computation with a fabricated zero stack pointer.
+    let dir = temp_dir("asm-naked-rsp");
+    let src = fixture(&dir, "case.rs", ASM_NAKED_RSP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a read of the incoming stack pointer must exit two; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("stack pointer"),
+        "the reason names the incoming stack pointer: {stderr}"
+    );
+}
+
+const ASM_SYM_NAKED_SRC: &str = r#"
+use std::arch::{asm, naked_asm};
+
+#[unsafe(naked)]
+pub extern "sysv64" fn read_r10() -> u64 {
+    naked_asm!("mov rax, r10", "ret");
+}
+
+#[unsafe(naked)]
+pub extern "sysv64" fn add_r10(x: u64) -> u64 {
+    naked_asm!("mov rax, rdi", "add rax, r10", "ret");
+}
+
+fn main() {
+    let out1: u64;
+    let out2: u64;
+    unsafe {
+        asm!(
+            "call {target}",
+            target = sym read_r10,
+            in("r10") 42u64,
+            lateout("rax") out1,
+        );
+        asm!(
+            "mov rdi, {inp}",
+            "call {target}",
+            inp = in(reg) 41u64,
+            target = sym add_r10,
+            in("r10") 100u64,
+            lateout("rax") out2,
+        );
+    }
+    println!("{out1} {out2}");
+}
+"#;
+
+#[test]
+fn run_mode_asm_sym_call_to_naked_fn_forwards_caller_registers() {
+    // A `sym` call into a naked function preserves the calling
+    // block's architectural register state: the callee's body
+    // reads `r10`, a register no argument seeding supplies,
+    // whose value the caller established with an explicit
+    // `in("r10")` operand. The second callee also takes an
+    // argument: its argument register is seeded from the
+    // argument as usual, and the forwarded `r10` composes with
+    // it. Natively this prints `42 141`.
+    run_ok("asm-sym-naked", ASM_SYM_NAKED_SRC, "42 141\n");
+}
+
+const ASM_SYM_NAKED_RSP_SRC: &str = r#"
+use std::arch::{asm, naked_asm};
+
+#[unsafe(naked)]
+pub extern "sysv64" fn read_rsp() -> u64 {
+    naked_asm!("mov rax, rsp", "and rax, 15", "ret");
+}
+
+fn main() {
+    let out: u64;
+    unsafe {
+        asm!(
+            "call {target}",
+            target = sym read_rsp,
+            lateout("rax") out,
+        );
+    }
+    println!("{out}");
+}
+"#;
+
+#[test]
+fn run_mode_asm_sym_call_to_naked_fn_rsp_read_stays_a_named_error() {
+    // Forwarding the calling block's register state does not
+    // fabricate an incoming stack pointer for the callee: the
+    // caller never established `rsp`, so the naked callee's
+    // read of it stays the named error (exit 2), exactly as
+    // for a naked function called from Rust code.
+    let dir = temp_dir("asm-sym-naked-rsp");
+    let src = fixture(&dir, "case.rs", ASM_SYM_NAKED_RSP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a forwarded read of the incoming stack pointer must exit two; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("stack pointer"),
+        "the reason names the incoming stack pointer: {stderr}"
+    );
+}
+
+const ASM_SYM_NAKED_OUTGOING_SRC: &str = r#"
+use std::arch::{asm, naked_asm};
+
+#[unsafe(naked)]
+pub extern "sysv64" fn set_r10() -> u64 {
+    naked_asm!("mov r10, 42", "mov rax, 1", "ret");
+}
+
+fn main() {
+    let via_bound: u64;
+    let via_step: u64;
+    let ret: u64;
+    unsafe {
+        asm!(
+            "call {helper}",
+            helper = sym set_r10,
+            lateout("rax") ret,
+            lateout("r10") via_bound,
+        );
+        asm!(
+            "call {helper}",
+            "mov {out}, r10",
+            helper = sym set_r10,
+            out = lateout(reg) via_step,
+        );
+    }
+    println!("{ret} {via_bound} {via_step}");
+}
+"#;
+
+#[test]
+fn run_mode_asm_sym_call_to_naked_fn_propagates_outgoing_registers() {
+    // A `sym` call into a naked function hands the callee's
+    // outgoing register state back to the calling block: the
+    // helper writes `r10`, which is not its return register,
+    // and the caller observes 42 both through an output bound
+    // to `r10` and through a step that reads `r10` after the
+    // call. The declared return value still comes back in
+    // `rax`. Natively this prints `1 42 42`.
+    run_ok(
+        "asm-sym-naked-outgoing",
+        ASM_SYM_NAKED_OUTGOING_SRC,
+        "1 42 42\n",
+    );
+}
+
+const ASM_SYM_NAKED_PRESERVE_SRC: &str = r#"
+use std::arch::{asm, naked_asm};
+
+#[unsafe(naked)]
+pub extern "sysv64" fn five() -> u64 {
+    naked_asm!("mov rax, 5", "ret");
+}
+
+fn main() {
+    let kept: u64;
+    let ret: u64;
+    unsafe {
+        asm!(
+            "call {helper}",
+            helper = sym five,
+            in("r10") 7u64,
+            lateout("rax") ret,
+            lateout("r10") kept,
+        );
+    }
+    println!("{ret} {kept}");
+}
+"#;
+
+#[test]
+fn run_mode_asm_sym_call_to_naked_fn_preserves_untouched_registers() {
+    // The outgoing hand-back covers only the registers the
+    // callee's body actually changed: a register the body
+    // never writes keeps the calling block's own state across
+    // the call, exactly as a native `call` preserves whatever
+    // the callee does not overwrite. Natively this prints
+    // `5 7`.
+    run_ok(
+        "asm-sym-naked-preserve",
+        ASM_SYM_NAKED_PRESERVE_SRC,
+        "5 7\n",
+    );
+}
+
+const ASM_SYM_NAKED_WIDE_ARG_SRC: &str = r#"
+use std::arch::{asm, naked_asm};
+
+#[unsafe(naked)]
+pub extern "sysv64" fn helper(x: u8) -> u64 {
+    naked_asm!("mov rax, rdi", "ret");
+}
+
+fn main() {
+    let out: u64;
+    unsafe {
+        asm!(
+            "call {target}",
+            target = sym helper,
+            in("rdi") 0x1_0000_0001u64,
+            lateout("rax") out,
+        );
+    }
+    println!("{out}");
+}
+"#;
+
+#[test]
+fn run_mode_asm_sym_call_to_naked_fn_keeps_forwarded_argument_bits() {
+    // The caller establishes rdi at full width; the callee's
+    // parameter is a u8, but its body reads the register itself,
+    // whose upper bits are the caller's and observable: argument
+    // seeding supplies only the registers the forwarded state
+    // did not establish, so it cannot narrow this one. Natively
+    // this prints `4294967297`.
+    run_ok(
+        "asm-sym-naked-wide-arg",
+        ASM_SYM_NAKED_WIDE_ARG_SRC,
+        "4294967297\n",
+    );
+}
+
+const ASM_SYM_NAKED_WIDE_RET_SRC: &str = r#"
+use std::arch::{asm, naked_asm};
+
+#[unsafe(naked)]
+pub extern "sysv64" fn helper() -> u8 {
+    naked_asm!("mov rax, 0x100000001", "ret");
+}
+
+fn main() {
+    let y: u64;
+    unsafe {
+        asm!(
+            "call {target}",
+            target = sym helper,
+            lateout("rax") y,
+        );
+    }
+    println!("{y}");
+}
+"#;
+
+#[test]
+fn run_mode_asm_sym_call_to_naked_fn_keeps_raw_return_register() {
+    // The callee's declared return is a u8, but the calling
+    // block's output reads rax itself at u64 width: the
+    // callee's outgoing register state is the register's
+    // content, and the narrowed Rust return value must not be
+    // scattered over it. Natively this prints `4294967297`.
+    run_ok(
+        "asm-sym-naked-wide-ret",
+        ASM_SYM_NAKED_WIDE_RET_SRC,
+        "4294967297\n",
+    );
+}
+
+const ASM_SYM_NAKED_BARE_RET_SRC: &str = r#"
+use std::arch::{asm, naked_asm};
+
+#[unsafe(naked)]
+pub extern "sysv64" fn id_u64() -> u64 {
+    naked_asm!("ret");
+}
+
+#[unsafe(naked)]
+pub extern "sysv64" fn id_u8() -> u8 {
+    naked_asm!("ret");
+}
+
+fn main() {
+    let a: u64;
+    let b: u64;
+    unsafe {
+        asm!(
+            "call {target}",
+            target = sym id_u64,
+            inout("rax") 42u64 => a,
+        );
+        asm!(
+            "call {target}",
+            target = sym id_u8,
+            inout("rax") 0x1_0000_0001u64 => b,
+        );
+    }
+    println!("{a} {b}");
+}
+"#;
+
+#[test]
+fn run_mode_asm_sym_call_to_bare_ret_naked_fn_reads_the_return_register() {
+    // A bare-`ret` naked body returns whatever the caller left
+    // in the return register: the scalar return shape is read
+    // from the register file even though the body has no steps
+    // before the `ret`, and the register itself is preserved
+    // across the call at full width — the u8 callee's upper
+    // bits are the caller's. Natively this prints
+    // `42 4294967297`.
+    run_ok(
+        "asm-sym-naked-bare-ret",
+        ASM_SYM_NAKED_BARE_RET_SRC,
+        "42 4294967297\n",
+    );
+}
+
+const ASM_SYM_NAKED_CALLS_ORDINARY_SRC: &str = r#"
+use std::arch::{asm, naked_asm};
+
+pub extern "sysv64" fn normal() -> u64 {
+    42
+}
+
+#[unsafe(naked)]
+pub extern "sysv64" fn helper() -> u64 {
+    naked_asm!("call {f}", "ret", f = sym normal);
+}
+
+fn main() {
+    let direct = helper();
+    let via: u64;
+    unsafe {
+        asm!(
+            "call {t}",
+            t = sym helper,
+            lateout("rax") via,
+        );
+    }
+    println!("{direct} {via}");
+}
+"#;
+
+#[test]
+fn run_mode_asm_sym_call_to_naked_fn_propagates_ordinary_callee_return() {
+    // The naked helper's body obtains its return value by
+    // calling an ordinary function: the call establishes the
+    // return register, so the helper's outgoing state carries
+    // it and a caller entering through an asm `call` observes
+    // the same value as a direct call. Natively this prints
+    // `42 42`.
+    run_ok(
+        "asm-sym-naked-calls-ordinary",
+        ASM_SYM_NAKED_CALLS_ORDINARY_SRC,
+        "42 42\n",
     );
 }
 

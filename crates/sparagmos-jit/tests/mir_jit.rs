@@ -169,6 +169,7 @@ fn build_with_table(
             })
             .collect(),
         fn_names: names,
+        fn_abis: Default::default(),
         adt_discriminants: table,
         adt_layouts: Default::default(),
         coroutine_layouts: Default::default(),
@@ -4112,6 +4113,7 @@ fn intrinsic_assume_true_and_inline_asm_noop_do_not_affect_execution() {
                     operands: Vec::new(),
                     options: String::new(),
                     destination: Some(mir::BasicBlock(1)),
+                    targets: vec![mir::BasicBlock(1)],
                     unwind: mir::UnwindAction::Continue,
                 },
             ),

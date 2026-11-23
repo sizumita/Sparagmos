@@ -163,6 +163,10 @@ struct Collected {
     /// instances it is the definition name even when the display
     /// name carries an instance suffix.
     body_def_names: Vec<String>,
+    /// Declared ABIs of the collected function instances, keyed
+    /// by the `DefId` their bodies carry (see
+    /// `Converter::fn_abis`).
+    fn_abis: std::collections::HashMap<sparagmos_mir::DefId, sparagmos_mir::Abi>,
     def_names: Vec<String>,
     /// Discriminant values of the converted enum ADTs, for the
     /// interpreter (see `Converter::adt_discriminants`).
@@ -5228,6 +5232,7 @@ fn collect() -> ControlFlow<()> {
                     continue;
                 }
                 let def_id = conv.crate_def_id(&fn_def);
+                conv.note_fn_abi_for_def(def_id, &fn_def);
                 conv.note_link_symbol_for_def(def_id, fn_def.def_id());
                 let generic = fn_def.generics_of().params.iter().any(|param| {
                     matches!(
@@ -5290,6 +5295,7 @@ fn collect() -> ControlFlow<()> {
         bodies,
         body_def_ids,
         body_def_names,
+        fn_abis: conv.fn_abis.clone(),
         local_body_count,
         local_report_count,
         entry_def_id,
@@ -6279,6 +6285,7 @@ fn build_program(
             name.clone(),
         );
     }
+    program.fn_abis = c.fn_abis.clone();
     program.adt_discriminants = c.adt_discriminants.clone();
     program.adt_layouts = c.adt_layouts.clone();
     program.adt_field_layouts = c.adt_field_layouts.clone();

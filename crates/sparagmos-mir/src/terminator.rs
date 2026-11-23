@@ -146,6 +146,7 @@ pub enum AsmOperandKind {
     InOut,
     Const,
     Sym,
+    Label,
 }
 
 /// One operand of an [`TerminatorKind::InlineAsm`], with the facts
@@ -171,6 +172,175 @@ pub struct InlineAsmOperand {
     pub const_bits: Option<u64>,
     pub in_value: Option<Operand>,
     pub out_place: Option<Place>,
+    /// For an operand bound to an explicit register (`reg:
+    /// Reg(X86(ax))` in the raw representation): the register's
+    /// name as the driver read it (`"ax"`, `"di"`, `"xmm0"`, ...).
+    /// `None` for register-class operands and non-register kinds.
+    pub reg_name: Option<String>,
+    /// For a [`AsmOperandKind::Sym`] operand: the name of the
+    /// item it denotes, as rendered in the raw representation
+    /// (`SymFn { value: foo }`, `SymStatic { value: BAR }`).
+    pub static_name: Option<String>,
+    /// For a [`AsmOperandKind::Label`] operand: the operand's
+    /// index into the terminator's `targets` list, as read from
+    /// the raw representation (`Label { target_index: N }`).
+    /// `None` when the driver could not restore the terminator's
+    /// label blocks, which keeps any program that would jump
+    /// outside the evaluable class.
+    pub label_index: Option<usize>,
+    /// For a [`AsmOperandKind::Sym`] operand the driver resolved
+    /// to a function with a fully scalar signature under a
+    /// modelled register-passing ABI: the signature a `call`
+    /// step executes through. `None` for every other operand.
+    pub call_sig: Option<AsmCallSig>,
+}
+
+/// The register-passing ABI family of an [`AsmCallSig`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AsmAbi {
+    /// System V AMD64 — also the `C` and `System` ABIs on
+    /// x86_64 Unix: integer arguments in rdi, rsi, rdx, rcx,
+    /// r8, r9; float arguments in xmm0..=xmm7; the return value
+    /// in rax (integer) or xmm0 (float).
+    SysV64,
+    /// Microsoft x64: arguments by position — integers in rcx,
+    /// rdx, r8, r9, floats in xmm0..=xmm3; the return value in
+    /// rax (integer) or xmm0 (float).
+    Win64,
+}
+
+/// One scalar of an [`AsmCallSig`]: a value that travels in one
+/// register of the ABI's argument or return sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AsmScalar {
+    /// An integer scalar of `width` bits (8, 16, 32 or 64).
+    Int { width: u32, signed: bool },
+    /// A `bool`: one byte in an integer register.
+    Bool,
+    /// A float of `width` bits (32 or 64) in an xmm register.
+    Float { width: u32 },
+}
+
+/// The signature of a function an asm `call` step invokes: the
+/// callee's program name, its register-passing ABI family, and
+/// the scalar classification of its parameters and return value.
+/// The driver resolves it for `Sym` operands denoting a function
+/// whose signature is fully scalar and register-passed; anything
+/// else (an aggregate parameter, a stack-passed argument, an
+/// unmodelled ABI, an ambiguous name) leaves the operand without
+/// a signature, and a `call` step naming it stays outside the
+/// evaluable class.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AsmCallSig {
+    pub name: String,
+    pub abi: AsmAbi,
+    pub params: Vec<AsmScalar>,
+    pub ret: Option<AsmScalar>,
+}
+
+/// An architectural x86-64 register, named literally by an asm
+/// template or bound by an explicit-register operand: a
+/// general-purpose register or an xmm register at one access
+/// width. `index` is the register-file position: 0..16 are rax,
+/// rcx, rdx, rbx, rsp, rbp, rsi, rdi, r8..=r15; 16..48 are
+/// xmm0..=xmm31. `width` is the access width in bits (8, 16, 32
+/// or 64); `high` selects the bits 8..16 form (`ah`..`bh`) and
+/// is only set at width 8.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArchReg {
+    pub index: u8,
+    pub width: u32,
+    pub high: bool,
+}
+
+/// The register-file index of the architectural register an
+/// explicit-register operand's raw name denotes (`ax`, `di`,
+/// `r8`, `xmm0`): the raw name is the register's identity at its
+/// 16-bit base form (or the r8..r15 / xmm forms) — the operand's
+/// own `width` field gives the access size. `None` for registers
+/// the register file does not model (mask, MMX, x87, ...): an
+/// operand naming one can only be an inert clobber.
+pub fn arch_reg_index(name: &str) -> Option<u8> {
+    const GP: [&str; 8] = ["ax", "cx", "dx", "bx", "sp", "bp", "si", "di"];
+    if let Some(i) = GP.iter().position(|&n| n == name) {
+        return Some(i as u8);
+    }
+    if let Some(rest) = name.strip_prefix('r') {
+        if let Ok(n) = rest.parse::<u8>() {
+            if (8..=15).contains(&n) {
+                return Some(n);
+            }
+        }
+    }
+    if let Some(rest) = name.strip_prefix("xmm") {
+        if let Ok(n) = rest.parse::<u8>() {
+            if n < 32 {
+                return Some(16 + n);
+            }
+        }
+    }
+    None
+}
+
+/// An architectural register as named literally in a template
+/// (`rax`, `eax`, `ax`, `al`, `ah`, `r8d`, `xmm0`, ...): the
+/// name fixes both the register and the access width. An xmm
+/// name carries no width in the name itself; it is reported at
+/// 64 bits and the instruction parser narrows it for the
+/// `movd` form.
+pub fn arch_reg_named(name: &str) -> Option<ArchReg> {
+    const GP64: [&str; 8] = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi"];
+    const GP32: [&str; 8] = ["eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"];
+    const GP16: [&str; 8] = ["ax", "cx", "dx", "bx", "sp", "bp", "si", "di"];
+    const GP8L: [&str; 8] = ["al", "cl", "dl", "bl", "spl", "bpl", "sil", "dil"];
+    const GP8H: [&str; 4] = ["ah", "ch", "dh", "bh"];
+    for (names, width, high) in [
+        (&GP64[..], 64u32, false),
+        (&GP32[..], 32, false),
+        (&GP16[..], 16, false),
+        (&GP8L[..], 8, false),
+        (&GP8H[..], 8, true),
+    ] {
+        if let Some(i) = names.iter().position(|&n| n == name) {
+            return Some(ArchReg {
+                index: i as u8,
+                width,
+                high,
+            });
+        }
+    }
+    if let Some(rest) = name.strip_prefix('r') {
+        let (digits, width) = if let Some(d) = rest.strip_suffix('d') {
+            (d, 32)
+        } else if let Some(d) = rest.strip_suffix('w') {
+            (d, 16)
+        } else if let Some(d) = rest.strip_suffix('b') {
+            (d, 8)
+        } else {
+            (rest, 64)
+        };
+        if let Ok(n) = digits.parse::<u8>() {
+            if (8..=15).contains(&n) {
+                return Some(ArchReg {
+                    index: n,
+                    width,
+                    high: false,
+                });
+            }
+        }
+    }
+    if let Some(rest) = name.strip_prefix("xmm") {
+        if let Ok(n) = rest.parse::<u8>() {
+            if n < 32 {
+                return Some(ArchReg {
+                    index: 16 + n,
+                    width: 64,
+                    high: false,
+                });
+            }
+        }
+    }
+    None
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -227,6 +397,16 @@ pub enum TerminatorKind {
         operands: Vec<InlineAsmOperand>,
         options: String,
         destination: Option<BasicBlock>,
+        /// The terminator's full successor list as rustc orders
+        /// it — the fallthrough `destination` first (when there
+        /// is one), then the asm-goto label blocks in operand
+        /// order — restored structurally by the driver, because
+        /// Stable MIR does not publish the label blocks (see
+        /// [`InlineAsmOperand::label_index`]). For a terminator
+        /// without label operands this is just the destination
+        /// (or empty); it is empty altogether in hand-built
+        /// bodies, where `destination` alone stands.
+        targets: Vec<BasicBlock>,
         unwind: UnwindAction,
     },
     TailCall {
@@ -345,6 +525,18 @@ pub enum AsmSrc {
     Reg(usize, Option<char>),
     /// An integer immediate, as raw bits.
     Imm(u64),
+    /// An architectural register named literally by the template
+    /// (`mov rcx, rax`): read from the register file at the
+    /// register's access width.
+    Arch(ArchReg),
+}
+
+/// The destination of a classified asm instruction whose target
+/// may be an architectural register rather than an operand slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AsmDst {
+    Operand(usize, Option<char>),
+    Arch(ArchReg),
 }
 
 /// The binary operations of a classified asm program.
@@ -370,7 +562,7 @@ pub enum AsmUnOp {
 }
 
 /// One instruction of a classified asm program.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AsmStep {
     /// A `nop` instruction: no effect. Classification drops these
     /// from the program; the variant exists so the parser can
@@ -391,6 +583,46 @@ pub enum AsmStep {
         op: AsmUnOp,
         dst: usize,
         dst_mod: Option<char>,
+    },
+    /// A `mov` (or `movd` / `movq`) to an architectural register.
+    MovArch {
+        dst: ArchReg,
+        src: AsmSrc,
+    },
+    /// A binary operation on an architectural register.
+    BinArch {
+        op: AsmBinOp,
+        dst: ArchReg,
+        src: AsmSrc,
+    },
+    /// A unary operation on an architectural register.
+    UnArch {
+        op: AsmUnOp,
+        dst: ArchReg,
+    },
+    /// A `lea` instruction: address arithmetic only. The bracket
+    /// expression is one register (an operand slot or an
+    /// architectural register) plus a signed displacement; no
+    /// memory is read.
+    Lea {
+        dst: AsmDst,
+        base: AsmSrc,
+        disp: i64,
+    },
+    /// An unconditional jump to one of the terminator's label
+    /// blocks (an asm-goto label operand): the block's outputs
+    /// are written back, then control transfers there. Always
+    /// the last step of its program.
+    Jump {
+        target: BasicBlock,
+    },
+    /// A `call` to the function a `sym` operand denotes, through
+    /// its register-passing signature: the arguments are
+    /// gathered from the architectural register file, the callee
+    /// runs to completion, and its return value is scattered
+    /// back into the file.
+    Call {
+        sig: AsmCallSig,
     },
     Ret,
 }
@@ -720,6 +952,15 @@ fn asm_src(token: &str, operands: &[InlineAsmOperand]) -> Option<AsmSrc> {
                 return None;
             }
         }
+        // A label or sym operand is not a value source: labels
+        // are jump targets and syms are call targets, each read
+        // by its own instruction arm.
+        if matches!(
+            operands[idx].kind,
+            AsmOperandKind::Label | AsmOperandKind::Sym
+        ) {
+            return None;
+        }
         return Some(AsmSrc::Reg(idx, modifier));
     }
     if token.contains('\u{1}') {
@@ -728,7 +969,89 @@ fn asm_src(token: &str, operands: &[InlineAsmOperand]) -> Option<AsmSrc> {
         // outside the class.
         return None;
     }
+    if let Some(reg) = arch_reg_named(token) {
+        return Some(AsmSrc::Arch(reg));
+    }
     asm_immediate(token).map(AsmSrc::Imm)
+}
+
+/// The operand index a lone placeholder token names, when the
+/// token is exactly one placeholder sentinel (the shape a `jmp`
+/// or `call` target takes).
+fn asm_placeholder_idx(token: &str) -> Option<usize> {
+    let inner = token
+        .trim()
+        .strip_prefix('\u{1}')
+        .and_then(|t| t.strip_suffix('\u{2}'))?;
+    if inner.contains(':') {
+        return None;
+    }
+    inner.parse::<usize>().ok()
+}
+
+/// Narrow the xmm registers of a `mov` / `movd` / `movq` step's
+/// source to the instruction's transfer width (`movd` moves 32
+/// bits, the others 64 in the scalar register-file model).
+fn asm_mov_src(src: AsmSrc, mnemonic: &str) -> AsmSrc {
+    if let AsmSrc::Arch(mut reg) = src {
+        if reg.index >= 16 {
+            reg.width = if mnemonic == "movd" { 32 } else { 64 };
+        }
+        return AsmSrc::Arch(reg);
+    }
+    src
+}
+
+/// Parse the bracket expression of a `lea` instruction: one
+/// register term (a placeholder or an architectural register)
+/// plus immediate terms, joined by `+` / `-`. Anything else —
+/// a scaled index, a second register, a bare displacement with
+/// no register — is outside the class.
+fn asm_lea_base(token: &str, operands: &[InlineAsmOperand]) -> Option<(AsmSrc, i64)> {
+    let inner = token.trim().strip_prefix('[')?.strip_suffix(']')?.trim();
+    if inner.contains('*') {
+        return None;
+    }
+    let mut base: Option<AsmSrc> = None;
+    let mut disp: i64 = 0;
+    // Split into signed terms.
+    let mut terms: Vec<(bool, String)> = Vec::new();
+    let mut cur = String::new();
+    let mut neg = false;
+    for c in inner.chars() {
+        if c == '+' || c == '-' {
+            if !cur.trim().is_empty() {
+                terms.push((neg, std::mem::take(&mut cur)));
+            } else if !terms.is_empty() {
+                return None;
+            }
+            neg = c == '-';
+        } else {
+            cur.push(c);
+        }
+    }
+    if !cur.trim().is_empty() {
+        terms.push((neg, cur));
+    }
+    if terms.is_empty() {
+        return None;
+    }
+    for (neg, term) in terms {
+        let term = term.trim();
+        match asm_src(term, operands)? {
+            AsmSrc::Imm(bits) => {
+                let v = bits as i64;
+                disp = if neg { disp.wrapping_sub(v) } else { disp.wrapping_add(v) };
+            }
+            src @ (AsmSrc::Reg(..) | AsmSrc::Arch(_)) => {
+                if neg || base.is_some() {
+                    return None;
+                }
+                base = Some(src);
+            }
+        }
+    }
+    Some((base?, disp))
 }
 
 fn asm_writable(operands: &[InlineAsmOperand], src: &AsmSrc) -> bool {
@@ -737,13 +1060,17 @@ fn asm_writable(operands: &[InlineAsmOperand], src: &AsmSrc) -> bool {
             operands[*idx].kind,
             AsmOperandKind::Out | AsmOperandKind::InOut
         ),
-        AsmSrc::Imm(_) => false,
+        AsmSrc::Imm(_) | AsmSrc::Arch(_) => false,
     }
 }
 
 /// Parse one instruction of the stream. `None` for anything
 /// outside the supported class.
-fn asm_step(text: &str, operands: &[InlineAsmOperand]) -> Option<AsmStep> {
+fn asm_step(
+    text: &str,
+    operands: &[InlineAsmOperand],
+    targets: &[BasicBlock],
+) -> Option<AsmStep> {
     let mut segments = text.split(',');
     let first = segments.next()?.trim();
     let mut words = first.splitn(2, char::is_whitespace);
@@ -777,28 +1104,31 @@ fn asm_step(text: &str, operands: &[InlineAsmOperand]) -> Option<AsmStep> {
                 None
             }
         }
-        "mov" => {
+        "mov" | "movd" | "movq" => {
             let (dst, src) = dst_src(&args)?;
-            let AsmSrc::Reg(didx, dmod) = dst else {
-                return None;
-            };
-            if !asm_writable(operands, &dst) {
-                return None;
+            let src = asm_mov_src(src, &mnemonic);
+            match dst {
+                AsmSrc::Reg(didx, dmod) => {
+                    if !asm_writable(operands, &dst) {
+                        return None;
+                    }
+                    Some(AsmStep::Mov {
+                        dst: didx,
+                        dst_mod: dmod,
+                        src,
+                    })
+                }
+                AsmSrc::Arch(mut reg) => {
+                    if reg.index >= 16 {
+                        reg.width = if mnemonic == "movd" { 32 } else { 64 };
+                    }
+                    Some(AsmStep::MovArch { dst: reg, src })
+                }
+                AsmSrc::Imm(_) => None,
             }
-            Some(AsmStep::Mov {
-                dst: didx,
-                dst_mod: dmod,
-                src,
-            })
         }
         "add" | "sub" | "and" | "or" | "xor" | "shl" | "shr" | "sar" => {
             let (dst, src) = dst_src(&args)?;
-            let AsmSrc::Reg(didx, dmod) = dst else {
-                return None;
-            };
-            if !asm_writable(operands, &dst) {
-                return None;
-            }
             let op = match mnemonic.as_str() {
                 "add" => AsmBinOp::Add,
                 "sub" => AsmBinOp::Sub,
@@ -809,35 +1139,102 @@ fn asm_step(text: &str, operands: &[InlineAsmOperand]) -> Option<AsmStep> {
                 "shr" => AsmBinOp::Shr,
                 _ => AsmBinOp::Sar,
             };
-            Some(AsmStep::Bin {
-                op,
-                dst: didx,
-                dst_mod: dmod,
-                src,
-            })
+            match dst {
+                AsmSrc::Reg(didx, dmod) => {
+                    if !asm_writable(operands, &dst) {
+                        return None;
+                    }
+                    Some(AsmStep::Bin {
+                        op,
+                        dst: didx,
+                        dst_mod: dmod,
+                        src,
+                    })
+                }
+                AsmSrc::Arch(reg) => Some(AsmStep::BinArch {
+                    op,
+                    dst: reg,
+                    src,
+                }),
+                AsmSrc::Imm(_) => None,
+            }
         }
         "neg" | "not" | "inc" | "dec" => {
             if args.len() != 1 {
                 return None;
             }
             let dst = asm_src(args[0], operands)?;
-            let AsmSrc::Reg(didx, dmod) = dst else {
-                return None;
-            };
-            if !asm_writable(operands, &dst) {
-                return None;
-            }
             let op = match mnemonic.as_str() {
                 "neg" => AsmUnOp::Neg,
                 "not" => AsmUnOp::Not,
                 "inc" => AsmUnOp::Inc,
                 _ => AsmUnOp::Dec,
             };
-            Some(AsmStep::Un {
-                op,
-                dst: didx,
-                dst_mod: dmod,
-            })
+            match dst {
+                AsmSrc::Reg(didx, dmod) => {
+                    if !asm_writable(operands, &dst) {
+                        return None;
+                    }
+                    Some(AsmStep::Un {
+                        op,
+                        dst: didx,
+                        dst_mod: dmod,
+                    })
+                }
+                AsmSrc::Arch(reg) => Some(AsmStep::UnArch {
+                    op,
+                    dst: reg,
+                }),
+                AsmSrc::Imm(_) => None,
+            }
+        }
+        "lea" => {
+            if args.len() != 2 {
+                return None;
+            }
+            let (base, disp) = asm_lea_base(args[1], operands)?;
+            match asm_src(args[0], operands)? {
+                AsmSrc::Reg(didx, dmod) => {
+                    if !asm_writable(operands, &AsmSrc::Reg(didx, dmod)) {
+                        return None;
+                    }
+                    Some(AsmStep::Lea {
+                        dst: AsmDst::Operand(didx, dmod),
+                        base,
+                        disp,
+                    })
+                }
+                AsmSrc::Arch(reg) => Some(AsmStep::Lea {
+                    dst: AsmDst::Arch(reg),
+                    base,
+                    disp,
+                }),
+                AsmSrc::Imm(_) => None,
+            }
+        }
+        "jmp" => {
+            if args.len() != 1 {
+                return None;
+            }
+            let idx = asm_placeholder_idx(args[0])?;
+            let op = operands.get(idx)?;
+            if op.kind != AsmOperandKind::Label {
+                return None;
+            }
+            let target = targets.get(op.label_index?)?;
+            Some(AsmStep::Jump { target: *target })
+        }
+        "call" => {
+            if args.len() != 1 {
+                return None;
+            }
+            let idx = asm_placeholder_idx(args[0])?;
+            let op = operands.get(idx)?;
+            if op.kind != AsmOperandKind::Sym {
+                return None;
+            }
+            let sig = op.call_sig.clone()?;
+            Some(AsmStep::Call { sig })
         }
         _ => None,
     }
@@ -847,23 +1244,34 @@ fn asm_step(text: &str, operands: &[InlineAsmOperand]) -> Option<AsmStep> {
 /// and if so its program. The class is deliberately narrow:
 ///
 /// * the template, comments removed, is a straight-line sequence
-///   of `mov` / `add` / `sub` / `and` / `or` / `xor` / `shl` /
-///   `shr` / `sar` / `neg` / `not` / `inc` / `dec` / `nop`
-///   instructions whose operands are only template placeholders
-///   and integer immediates — no memory references, no literal
-///   register names, no labels, no control flow; or the template
-///   holds no real instructions at all (empty, comment-only or
-///   `nop`-only: the step-over class, where the operands are
-///   inert and never inspected);
+///   of `mov` / `movd` / `movq` / `add` / `sub` / `and` / `or` /
+///   `xor` / `shl` / `shr` / `sar` / `neg` / `not` / `inc` / `dec`
+///   / `nop` instructions whose operands are template
+///   placeholders, integer immediates and literal architectural
+///   register names, plus the three control forms below — no
+///   memory references but the `lea` bracket form (address
+///   arithmetic over one register and a displacement); or the
+///   template holds no real instructions at all (empty,
+///   comment-only or `nop`-only: the step-over class, where the
+///   operands are inert and never inspected);
+/// * a `lea` computes an address from one register operand and
+///   a signed displacement; a `jmp` to a label operand (whose
+///   blocks the driver restored into `targets`) may appear as
+///   the program's last step; a `call` to a `sym` operand with
+///   a resolved [`AsmCallSig`] may appear anywhere;
 /// * every operand of a non-empty program is a register-class
-///   integer operand of width 8, 16, 32 or 64 (no explicit
-///   registers, no `sym` operands, no floats or aggregates), so
-///   each operand is one virtual register in the interpreter;
+///   or explicit-register integer operand of width 8, 16, 32 or
+///   64, a constant with known bits, a `sym` operand, or a label
+///   operand with restored blocks — no floats or aggregates —
+///   so each value operand is one slot of the interpreter's
+///   operand file or of its architectural register file; pure
+///   clobber operands (no place) are inert;
 /// * a `ret` may appear only as the last instruction of a
 ///   destination-less terminator (the naked-function shape);
-/// * a destination-less terminator with real instructions but no
-///   `ret` (a `noreturn` block) is outside the class, as is AT&T
-///   syntax.
+/// * a `noreturn` terminator is in the class only as an
+///   asm-goto whose last step is the label jump; any other
+///   destination-less terminator with real instructions but no
+///   `ret` is outside the class, as is AT&T syntax.
 ///
 /// Anything else is outside the class: the executors keep it a
 /// named explicit error at execution time.
@@ -871,19 +1279,17 @@ pub fn inline_asm_program(
     template: &str,
     options: &str,
     operands: &[InlineAsmOperand],
+    targets: &[BasicBlock],
     has_destination: bool,
 ) -> Option<AsmProgram> {
     if options.contains("ATT_SYNTAX") {
-        return None;
-    }
-    if has_destination && options.contains("NORETURN") {
         return None;
     }
     let instructions = asm_instructions(template);
     let mut steps: Vec<AsmStep> = Vec::new();
     let mut real = 0usize;
     for text in &instructions {
-        match asm_step(text, operands)? {
+        match asm_step(text, operands, targets)? {
             AsmStep::Nop => {}
             step => {
                 real += 1;
@@ -899,26 +1305,81 @@ pub fn inline_asm_program(
             returns: false,
         });
     }
-    // A non-empty program runs on the virtual register file: gate
-    // every operand.
+    // A non-empty program runs on the operand slots and the
+    // architectural register file: gate every operand.
     for op in operands {
-        if op.kind == AsmOperandKind::Sym {
-            return None;
-        }
-        // Register operands must be register-class (an explicit
-        // register is outside the class); a const operand has no
-        // register and is gated on its literal bits below instead.
-        if op.kind != AsmOperandKind::Const && !op.reg_class {
-            return None;
-        }
-        if !matches!(op.width, 8 | 16 | 32 | 64) {
-            return None;
-        }
-        if op.kind == AsmOperandKind::Const && op.const_bits.is_none() {
-            return None;
+        match op.kind {
+            AsmOperandKind::Sym => {
+                // A sym operand is only ever a call target; the
+                // call arm required its signature. A sym the
+                // template never calls is inert.
+            }
+            AsmOperandKind::Label => {
+                // The terminator's label blocks must have been
+                // restored: an unrestored label keeps the whole
+                // terminator outside the class, jumped to or not.
+                let idx = op.label_index?;
+                if idx >= targets.len() {
+                    return None;
+                }
+            }
+            AsmOperandKind::Const => {
+                if op.const_bits.is_none() || !matches!(op.width, 8 | 16 | 32 | 64) {
+                    return None;
+                }
+            }
+            AsmOperandKind::In | AsmOperandKind::Out | AsmOperandKind::InOut => {
+                if op.kind == AsmOperandKind::Out && op.out_place.is_none() {
+                    // A pure clobber (a `clobber_abi` expansion):
+                    // inert whatever register it names.
+                    continue;
+                }
+                if op.reg_class {
+                    if !matches!(op.width, 8 | 16 | 32 | 64) {
+                        return None;
+                    }
+                } else if let Some(name) = &op.reg_name {
+                    // An explicit-register operand: the register
+                    // must be one the register file models, at a
+                    // plain integer width.
+                    arch_reg_index(name)?;
+                    if !matches!(op.width, 8 | 16 | 32 | 64) {
+                        return None;
+                    }
+                } else {
+                    // Neither a register class nor an explicit
+                    // register (a memory operand): outside the
+                    // class.
+                    return None;
+                }
+            }
         }
     }
-    let rets = steps.iter().filter(|s| matches!(s, AsmStep::Ret)).count();
+    // A jump is always the program's last step: the class has no
+    // conditional control flow, so nothing may precede one but
+    // straight-line steps, and nothing may follow one.
+    if steps[..steps.len() - 1]
+        .iter()
+        .any(|t| matches!(t, AsmStep::Jump { .. }))
+    {
+        return None;
+    }
+    if options.contains("NORETURN") {
+        // A noreturn asm-goto: control leaves through the label
+        // jump and never falls through to the destination.
+        let has_labels = operands.iter().any(|op| op.kind == AsmOperandKind::Label);
+        if !has_labels
+            || !matches!(steps.last(), Some(AsmStep::Jump { .. }))
+            || steps.iter().any(|t| matches!(t, AsmStep::Ret))
+        {
+            return None;
+        }
+        return Some(AsmProgram {
+            steps,
+            returns: false,
+        });
+    }
+    let rets = steps.iter().filter(|t| matches!(t, AsmStep::Ret)).count();
     if rets > 0 {
         if has_destination || rets > 1 || !matches!(steps.last(), Some(AsmStep::Ret)) {
             return None;
@@ -1015,11 +1476,14 @@ impl TerminatorKind {
             }
             Self::InlineAsm {
                 destination,
+                targets,
                 unwind,
                 ..
             } => {
                 let mut v = Vec::new();
-                if let Some(d) = destination {
+                if !targets.is_empty() {
+                    v.extend(targets.iter().copied());
+                } else if let Some(d) = destination {
                     v.push(*d);
                 }
                 if let Some(c) = unwind.cleanup_block() {
@@ -1086,6 +1550,7 @@ impl TerminatorKind {
                 operands: vec![],
                 options: String::new(),
                 destination: None,
+                targets: vec![],
                 unwind: UnwindAction::Continue,
             },
             Self::TailCall {
@@ -1186,7 +1651,197 @@ mod tests {
             const_bits: None,
             in_value: None,
             out_place: None,
+            reg_name: None,
+            static_name: None,
+            label_index: None,
+            call_sig: None,
         }
+    }
+
+    fn asm_op_named(kind: AsmOperandKind, width: u32, reg: &str) -> InlineAsmOperand {
+        let mut op = asm_op(kind, width);
+        op.reg_class = false;
+        op.reg_name = Some(reg.to_string());
+        op
+    }
+
+    #[test]
+    fn inline_asm_program_arch_registers() {
+        // A naked body writing the return register literally.
+        let prog = inline_asm_program("mov rax, 5\nret", "", &[], &[], false)
+            .expect("arch register program is in the class");
+        assert!(prog.returns);
+        assert_eq!(
+            prog.steps,
+            vec![
+                AsmStep::MovArch {
+                    dst: ArchReg {
+                        index: 0,
+                        width: 64,
+                        high: false,
+                    },
+                    src: AsmSrc::Imm(5),
+                },
+                AsmStep::Ret,
+            ]
+        );
+        // A 32-bit write to a named register in a fallthrough block.
+        let prog = inline_asm_program("mov eax, 0x3F800000", "", &[], &[], true)
+            .expect("eax write is in the class");
+        assert_eq!(
+            prog.steps,
+            vec![AsmStep::MovArch {
+                dst: ArchReg {
+                    index: 0,
+                    width: 32,
+                    high: false,
+                },
+                src: AsmSrc::Imm(0x3F80_0000),
+            }]
+        );
+        // movd into an xmm register narrows the transfer to 32 bits.
+        let prog = inline_asm_program("movd xmm0, eax", "", &[], &[], true)
+            .expect("movd is in the class");
+        assert_eq!(
+            prog.steps,
+            vec![AsmStep::MovArch {
+                dst: ArchReg {
+                    index: 16,
+                    width: 32,
+                    high: false,
+                },
+                src: AsmSrc::Arch(ArchReg {
+                    index: 0,
+                    width: 32,
+                    high: false,
+                }),
+            }]
+        );
+        // An unmodelled register named literally stays out.
+        assert!(inline_asm_program("mov k0, 1", "", &[], &[], true).is_none());
+    }
+
+    #[test]
+    fn inline_asm_program_explicit_operands_and_call() {
+        use AsmOperandKind::*;
+        let sig = AsmCallSig {
+            name: "test::foo".to_string(),
+            abi: AsmAbi::SysV64,
+            params: vec![AsmScalar::Int {
+                width: 32,
+                signed: true,
+            }],
+            ret: Some(AsmScalar::Int {
+                width: 32,
+                signed: true,
+            }),
+        };
+        let mut sym = asm_op(Sym, 0);
+        sym.reg_class = false;
+        sym.static_name = Some("foo".to_string());
+        sym.call_sig = Some(sig.clone());
+        let in_di = asm_op_named(In, 32, "di");
+        let mut out_ax = asm_op_named(Out, 32, "ax");
+        out_ax.out_place = Some(Place::from_local(crate::Local(2)));
+        // A pure clobber naming an unmodelled register is inert.
+        let clobber = asm_op_named(Out, 0, "k0");
+        let prog = inline_asm_program(
+            "call {0}",
+            "",
+            &[sym, in_di, out_ax, clobber],
+            &[],
+            true,
+        )
+        .expect("call program is in the class");
+        assert_eq!(prog.steps, vec![AsmStep::Call { sig }]);
+        // A call to a sym without a resolved signature is out.
+        let mut bare = asm_op(Sym, 0);
+        bare.reg_class = false;
+        assert!(inline_asm_program("call {0}", "", &[bare], &[], true).is_none());
+        // An explicit operand naming an unmodelled register is out.
+        let bad = asm_op_named(In, 32, "k0");
+        assert!(
+            inline_asm_program("mov {0}, {1}", "", &[asm_op(Out, 32), bad], &[], true)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn inline_asm_program_goto() {
+        use AsmOperandKind::*;
+        let mut label = asm_op(Label, 0);
+        label.reg_class = false;
+        label.label_index = Some(1);
+        let targets = [BasicBlock(1), BasicBlock(2)];
+        let prog = inline_asm_program("jmp {0}", "", &[label.clone()], &targets, true)
+            .expect("goto program is in the class");
+        assert_eq!(
+            prog.steps,
+            vec![AsmStep::Jump {
+                target: BasicBlock(2)
+            }]
+        );
+        // The noreturn form: the same program under NORETURN.
+        let prog = inline_asm_program("jmp {0}", "NORETURN", &[label.clone()], &targets, true)
+            .expect("noreturn goto is in the class");
+        assert_eq!(
+            prog.steps,
+            vec![AsmStep::Jump {
+                target: BasicBlock(2)
+            }]
+        );
+        // An unrestored label is out.
+        let mut lost = label.clone();
+        lost.label_index = None;
+        assert!(inline_asm_program("jmp {0}", "", &[lost], &targets, true).is_none());
+        // A jump that is not the last step is out.
+        assert!(inline_asm_program(
+            "jmp {0}\nmov {1}, 1",
+            "",
+            &[label, asm_op(Out, 64)],
+            &targets,
+            true,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn inline_asm_program_lea() {
+        use AsmOperandKind::*;
+        let prog = inline_asm_program(
+            "lea {0}, [{1} + 1]",
+            "",
+            &[asm_op(Out, 64), asm_op(In, 64)],
+            &[],
+            true,
+        )
+        .expect("lea program is in the class");
+        assert_eq!(
+            prog.steps,
+            vec![AsmStep::Lea {
+                dst: AsmDst::Operand(0, None),
+                base: AsmSrc::Reg(1, None),
+                disp: 1,
+            }]
+        );
+        // A scaled index is out.
+        assert!(inline_asm_program(
+            "lea {0}, [{1} + {1}*4]",
+            "",
+            &[asm_op(Out, 64), asm_op(In, 64)],
+            &[],
+            true,
+        )
+        .is_none());
+        // A memory mov (not lea) is out.
+        assert!(inline_asm_program(
+            "mov {0}, [{1}]",
+            "",
+            &[asm_op(Out, 64), asm_op(In, 64)],
+            &[],
+            true,
+        )
+        .is_none());
     }
 
     #[test]
@@ -1196,7 +1851,7 @@ mod tests {
         let in32 = asm_op(In, 32);
         // The Debug-form mov/add program from a real body.
         let tmpl = "[String(\"mov \"), Placeholder { operand_idx: 0, modifier: Some('e'), span: x }, String(\", \"), Placeholder { operand_idx: 1, modifier: Some('e'), span: y }, String(\"\\n\"), String(\"add \"), Placeholder { operand_idx: 0, modifier: Some('e'), span: z }, String(\", 2\")]";
-        let prog = inline_asm_program(tmpl, "", &[out32.clone(), in32.clone()], true)
+        let prog = inline_asm_program(tmpl, "", &[out32.clone(), in32.clone()], &[], true)
             .expect("mov/add program is in the class");
         assert_eq!(
             prog.steps,
@@ -1220,6 +1875,7 @@ mod tests {
             "sub {}, 0x10",
             "",
             &[asm_op(InOut, 64)],
+            &[],
             true,
         )
         .expect("sub program is in the class");
@@ -1236,39 +1892,39 @@ mod tests {
         // operands are not gated (explicit registers are inert).
         let mut explicit = asm_op(Out, 32);
         explicit.reg_class = false;
-        let prog = inline_asm_program("/* {0} */", "", &[explicit], true)
+        let prog = inline_asm_program("/* {0} */", "", &[explicit], &[], true)
             .expect("comment-only template steps over");
         assert!(prog.steps.is_empty());
         // A destination-less empty template (noreturn) also steps
         // over (to the unreachable continuation).
-        assert!(inline_asm_program("", "NORETURN", &[], false).is_some());
+        assert!(inline_asm_program("", "NORETURN", &[], &[], false).is_some());
         // The naked `ret` shape.
-        let prog = inline_asm_program("ret", "", &[], false).expect("naked ret");
+        let prog = inline_asm_program("ret", "", &[], &[], false).expect("naked ret");
         assert!(prog.returns);
         assert_eq!(prog.steps, vec![AsmStep::Ret]);
         // Outside the class:
         // memory reference
-        assert!(inline_asm_program("mov {}, [{}]", "", &[out32.clone(), in32.clone()], true).is_none());
-        // literal register names
-        assert!(inline_asm_program("mov eax, 1", "", &[], true).is_none());
+        assert!(inline_asm_program("mov {}, [{}]", "", &[out32.clone(), in32.clone()], &[], true).is_none());
+        // a memory reference through a literal register name
+        assert!(inline_asm_program("mov eax, [rcx]", "", &[], &[], true).is_none());
         // control flow / calls / unknown mnemonics
-        assert!(inline_asm_program("call {}", "", &[in32.clone()], true).is_none());
-        assert!(inline_asm_program("jmp {}", "", &[in32.clone()], true).is_none());
-        assert!(inline_asm_program("cpuid", "", &[], true).is_none());
+        assert!(inline_asm_program("call {}", "", &[in32.clone()], &[], true).is_none());
+        assert!(inline_asm_program("jmp {}", "", &[in32.clone()], &[], true).is_none());
+        assert!(inline_asm_program("cpuid", "", &[], &[], true).is_none());
         // ret with a destination, and a destination-less program
         // without ret (noreturn with real instructions)
-        assert!(inline_asm_program("ret", "", &[], true).is_none());
-        assert!(inline_asm_program("mov {}, 1", "NORETURN", &[out32.clone()], false).is_none());
+        assert!(inline_asm_program("ret", "", &[], &[], true).is_none());
+        assert!(inline_asm_program("mov {}, 1", "NORETURN", &[out32.clone()], &[], false).is_none());
         // a sym operand in a real program
-        assert!(inline_asm_program("mov {}, {}", "", &[out32.clone(), asm_op(Sym, 0)], true).is_none());
+        assert!(inline_asm_program("mov {}, {}", "", &[out32.clone(), asm_op(Sym, 0)], &[], true).is_none());
         // a float-width operand (width 0 from the driver)
-        assert!(inline_asm_program("mov {}, {}", "", &[out32.clone(), asm_op(In, 0)], true).is_none());
+        assert!(inline_asm_program("mov {}, {}", "", &[out32.clone(), asm_op(In, 0)], &[], true).is_none());
         // an unknown modifier
-        assert!(inline_asm_program("mov {0:w}, {1:w}", "", &[out32.clone(), in32.clone()], true).is_none());
+        assert!(inline_asm_program("mov {0:w}, {1:w}", "", &[out32.clone(), in32.clone()], &[], true).is_none());
         // writing to an in-only operand
-        assert!(inline_asm_program("mov {}, {}", "", &[in32.clone(), in32.clone()], true).is_none());
+        assert!(inline_asm_program("mov {}, {}", "", &[in32.clone(), in32.clone()], &[], true).is_none());
         // AT&T syntax
-        assert!(inline_asm_program("mov {}, {}", "ATT_SYNTAX", &[out32, in32], true).is_none());
+        assert!(inline_asm_program("mov {}, {}", "ATT_SYNTAX", &[out32, in32], &[], true).is_none());
         // A const operand has no register: it is gated on its
         // literal bits, not on the register class.
         let mut konst = asm_op(Const, 32);
@@ -1278,10 +1934,11 @@ mod tests {
             "mov {}, {1}",
             "",
             &[asm_op(Out, 32), konst.clone()],
+            &[],
             true,
         )
         .is_some());
         konst.const_bits = None;
-        assert!(inline_asm_program("mov {}, {1}", "", &[asm_op(Out, 32), konst], true).is_none());
+        assert!(inline_asm_program("mov {}, {1}", "", &[asm_op(Out, 32), konst], &[], true).is_none());
     }
 }

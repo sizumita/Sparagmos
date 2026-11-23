@@ -32,8 +32,9 @@ pub use statement::{
     UserTypeProjection, Variance,
 };
 pub use terminator::{
-    inline_asm_is_noop, inline_asm_program, AsmBinOp, AsmOperandKind, AsmProgram, AsmSrc, AsmStep,
-    AsmUnOp, AssertMessage, BasicBlock, CallSource, CoroutineKind, InlineAsmOperand, SwitchTargets,
+    arch_reg_index, arch_reg_named, inline_asm_is_noop, inline_asm_program, ArchReg, AsmAbi,
+    AsmBinOp, AsmCallSig, AsmDst, AsmOperandKind, AsmProgram, AsmScalar, AsmSrc, AsmStep, AsmUnOp,
+    AssertMessage, BasicBlock, CallSource, CoroutineKind, InlineAsmOperand, SwitchTargets,
     TerminateKind, Terminator, TerminatorKind, UnwindAction, UnwindTerminateReason,
 };
 pub use ty::{

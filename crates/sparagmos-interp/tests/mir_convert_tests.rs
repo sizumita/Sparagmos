@@ -2700,6 +2700,7 @@ fn asm_term(template: &str, options: &str, destination: Option<u32>) -> mir::Ter
         operands: Vec::new(),
         options: options.to_string(),
         destination: destination.map(mir::BasicBlock),
+        targets: destination.map(mir::BasicBlock).into_iter().collect(),
         unwind: mir::UnwindAction::Continue,
     }
 }
@@ -2739,12 +2740,12 @@ fn inline_asm_noop_templates_step_to_the_destination() {
 
 #[test]
 fn inline_asm_with_real_instructions_is_a_named_error() {
-    // fn f() -> i32 { asm!("mov eax, 1"); return 0 }
+    // fn f() -> i32 { asm!("cpuid"); return 0 }
     let body = mir::Body::new(
         decls(&[i32_ty()]),
         0,
         vec![
-            block(vec![], asm_term("mov eax, 1", "", Some(1))),
+            block(vec![], asm_term("cpuid", "", Some(1))),
             block(vec![], ret()),
         ],
     );
@@ -2756,6 +2757,125 @@ fn inline_asm_with_real_instructions_is_a_named_error() {
         }
         Err(e) => panic!("expected UnsupportedTerminator for InlineAsm, got {e}"),
         Ok(v) => panic!("expected UnsupportedTerminator for InlineAsm, got {v:?}"),
+    }
+}
+
+// ----- InlineAsm: naked functions receive arguments in ABI registers -----
+
+fn naked_identity_body() -> mir::Body {
+    // fn f(x: u64) -> u64 { naked_asm!("mov rax, rdi", "ret") }
+    mir::Body::new(
+        decls(&[u64_ty(), u64_ty()]),
+        1,
+        vec![block(
+            vec![],
+            asm_prog_term("mov rax, rdi\nret", vec![], None),
+        )],
+    )
+}
+
+#[test]
+fn naked_fn_with_parameters_and_no_recorded_abi_is_a_named_error() {
+    // A hand-built program records no ABI for `f`: its parameter
+    // cannot be seeded into the register the ABI would pass it
+    // in, so the block is a named error rather than a program
+    // that reads a zeroed register as if it were the argument.
+    let mut prog = MirProgram::new();
+    prog.add("f", naked_identity_body());
+    match interpret_mir(&prog, "f", vec![Value::Uint(42)]) {
+        Err(MirRunError::Interp(InterpError::UnsupportedTerminator { kind })) => {
+            assert!(
+                kind.contains("incoming ABI registers cannot be seeded"),
+                "error names the unseedable parameters: {kind}"
+            );
+        }
+        Err(e) => panic!("expected UnsupportedTerminator for the naked body, got {e}"),
+        Ok(v) => panic!("expected UnsupportedTerminator for the naked body, got {v:?}"),
+    }
+}
+
+#[test]
+fn naked_fn_parameters_are_seeded_from_the_frame_arguments() {
+    // With the function's ABI recorded (`extern "C"`, the
+    // SysV64 family on this target), the argument local is
+    // seeded into rdi before the steps run and the naked body
+    // returns its argument.
+    const F_DEF: mir::DefId = mir::DefId::new(0, 77);
+    let mut prog = MirProgram::new();
+    prog.add_with_def_id("f", F_DEF, naked_identity_body());
+    prog.fn_abis.insert(F_DEF, mir::Abi::C);
+    assert_eq!(
+        interpret_mir(&prog, "f", vec![Value::Uint(42)]).expect("naked identity runs"),
+        Value::Uint(42)
+    );
+}
+
+#[test]
+fn naked_fn_parameters_are_seeded_with_a_sysv64_recorded_abi() {
+    // The driver records `extern "sysv64"` in its raw form
+    // (`SysV64 { .. }`): the same SysV64 family as `extern "C"`,
+    // so the argument local is seeded into rdi exactly as above.
+    const F_DEF: mir::DefId = mir::DefId::new(0, 78);
+    let mut prog = MirProgram::new();
+    prog.add_with_def_id("f", F_DEF, naked_identity_body());
+    prog.fn_abis.insert(
+        F_DEF,
+        mir::Abi::Other("SysV64 { unwind: false }".to_string()),
+    );
+    assert_eq!(
+        interpret_mir(&prog, "f", vec![Value::Uint(42)]).expect("naked identity runs"),
+        Value::Uint(42)
+    );
+}
+
+#[test]
+fn naked_fn_signed_return_is_read_at_the_return_shape() {
+    // fn f() -> i64 { naked_asm!("mov rax, -1", "ret") }: the
+    // return place is assigned from the register file directly,
+    // with no `write_place` normalization in between, so the
+    // bits are read as the declared type's two's-complement
+    // value: -1, not the zero-extended 2^64 - 1.
+    let body = mir::Body::new(
+        decls(&[i64_ty()]),
+        0,
+        vec![block(
+            vec![],
+            asm_prog_term("mov rax, -1\nret", vec![], None),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("f", body);
+    assert_eq!(
+        interpret_mir(&prog, "f", vec![]).expect("naked body runs"),
+        Value::Int(-1)
+    );
+}
+
+#[test]
+fn naked_fn_incoming_rsp_read_is_a_named_error() {
+    // fn f() -> u64 { naked_asm!("mov rax, rsp", "and rax, 15",
+    // "ret") }: the incoming stack pointer is not modelled, so
+    // the read is a named error rather than a computation with
+    // the fabricated zero the register file starts with.
+    let body = mir::Body::new(
+        decls(&[u64_ty()]),
+        0,
+        vec![block(
+            vec![],
+            asm_prog_term("mov rax, rsp\nand rax, 15\nret", vec![], None),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("f", body);
+    match interpret_mir(&prog, "f", vec![]) {
+        Err(MirRunError::Interp(InterpError::UnsupportedTerminator { kind })) => {
+            assert!(
+                kind.contains("stack pointer"),
+                "error names the incoming stack pointer: {kind}"
+            );
+        }
+        Err(e) => panic!("expected UnsupportedTerminator for the rsp read, got {e}"),
+        Ok(v) => panic!("expected UnsupportedTerminator for the rsp read, got {v:?}"),
     }
 }
 
@@ -2774,6 +2894,10 @@ fn asm_op(
         const_bits: None,
         in_value,
         out_place,
+        reg_name: None,
+        static_name: None,
+        label_index: None,
+        call_sig: None,
     }
 }
 
@@ -2787,6 +2911,7 @@ fn asm_prog_term(
         operands,
         options: String::new(),
         destination: destination.map(mir::BasicBlock),
+        targets: destination.map(mir::BasicBlock).into_iter().collect(),
         unwind: mir::UnwindAction::Continue,
     }
 }
@@ -3074,6 +3199,222 @@ fn inline_asm_memory_operand_is_a_named_error() {
         Err(e) => panic!("expected UnsupportedTerminator for InlineAsm, got {e}"),
         Ok(v) => panic!("expected UnsupportedTerminator for InlineAsm, got {v:?}"),
     }
+}
+
+fn asm_op_named(
+    kind: mir::AsmOperandKind,
+    width: u32,
+    in_value: Option<mir::Operand>,
+    out_place: Option<mir::Place>,
+    reg_name: &str,
+) -> mir::InlineAsmOperand {
+    mir::InlineAsmOperand {
+        kind,
+        reg_class: false,
+        width,
+        const_bits: None,
+        in_value,
+        out_place,
+        reg_name: Some(reg_name.to_string()),
+        static_name: None,
+        label_index: None,
+        call_sig: None,
+    }
+}
+
+#[test]
+fn inline_asm_lateout_aliased_with_input_observes_the_seed() {
+    // asm!("mov rcx, rax", in("rax") 42u64, lateout("rax") y,
+    //      out("rcx") _): the template never writes rax, but the
+    // lateout still observes the register's incoming content —
+    // natively y == 42. (The driver reads a `lateout` as a plain
+    // Out operand; the register name is the operand's identity,
+    // at its 16-bit base form in the raw representation.)
+    // _1: u64 = 42 (the input's value), _2: u64 (y), _3: u64
+    // (the discarded rcx output).
+    let body = mir::Body::new(
+        decls(&[u64_ty(), u64_ty(), u64_ty(), u64_ty()]),
+        0,
+        vec![
+            block(
+                vec![assign(place(1), mir::Rvalue::Use(const_u64(42)))],
+                asm_prog_term(
+                    "mov rcx, rax",
+                    vec![
+                        asm_op_named(mir::AsmOperandKind::In, 64, Some(copy(1)), None, "ax"),
+                        asm_op_named(mir::AsmOperandKind::Out, 64, None, Some(place(2)), "ax"),
+                        asm_op_named(mir::AsmOperandKind::Out, 64, None, Some(place(3)), "cx"),
+                    ],
+                    Some(1),
+                ),
+            ),
+            block(vec![assign(place(0), mir::Rvalue::Use(copy(2)))], ret()),
+        ],
+    );
+    assert_eq!(run_asm_body("f", body), Value::Uint(42));
+}
+
+#[test]
+fn inline_asm_lea_wraps_at_the_base_address_size() {
+    // lea {0}, [ecx + 1] with rcx = 0xffff_ffff: the effective
+    // address wraps at the base form's 32-bit address size
+    // before it is zero-extended into the 64-bit destination —
+    // natively 0, not 2^32.
+    // _1: u64 = 0xffff_ffff (bound to rcx), _2: u64 (the result).
+    let body32 = mir::Body::new(
+        decls(&[u64_ty(), u64_ty(), u64_ty()]),
+        0,
+        vec![
+            block(
+                vec![assign(place(1), mir::Rvalue::Use(const_u64(0xffff_ffff)))],
+                asm_prog_term(
+                    "lea {0}, [ecx + 1]",
+                    vec![
+                        asm_op(mir::AsmOperandKind::Out, 64, None, Some(place(2))),
+                        asm_op_named(mir::AsmOperandKind::In, 64, Some(copy(1)), None, "cx"),
+                    ],
+                    Some(1),
+                ),
+            ),
+            block(vec![assign(place(0), mir::Rvalue::Use(copy(2)))], ret()),
+        ],
+    );
+    assert_eq!(run_asm_body("lea32", body32), Value::Uint(0));
+
+    // The 64-bit base form keeps the full sum: [rcx + 1] at the
+    // same incoming value yields 2^32.
+    let body64 = mir::Body::new(
+        decls(&[u64_ty(), u64_ty(), u64_ty()]),
+        0,
+        vec![
+            block(
+                vec![assign(place(1), mir::Rvalue::Use(const_u64(0xffff_ffff)))],
+                asm_prog_term(
+                    "lea {0}, [rcx + 1]",
+                    vec![
+                        asm_op(mir::AsmOperandKind::Out, 64, None, Some(place(2))),
+                        asm_op_named(mir::AsmOperandKind::In, 64, Some(copy(1)), None, "cx"),
+                    ],
+                    Some(1),
+                ),
+            ),
+            block(vec![assign(place(0), mir::Rvalue::Use(copy(2)))], ret()),
+        ],
+    );
+    assert_eq!(run_asm_body("lea64", body64), Value::Uint(0x1_0000_0000));
+
+    // A placeholder base at the `:e` modifier is a 32-bit
+    // address form too: [{1:e} + 1] wraps the same way.
+    let body_ph = mir::Body::new(
+        decls(&[u64_ty(), u64_ty(), u64_ty()]),
+        0,
+        vec![
+            block(
+                vec![assign(place(1), mir::Rvalue::Use(const_u64(0xffff_ffff)))],
+                asm_prog_term(
+                    "lea {0}, [{1:e} + 1]",
+                    vec![
+                        asm_op(mir::AsmOperandKind::Out, 64, None, Some(place(2))),
+                        asm_op(mir::AsmOperandKind::In, 64, Some(copy(1)), None),
+                    ],
+                    Some(1),
+                ),
+            ),
+            block(vec![assign(place(0), mir::Rvalue::Use(copy(2)))], ret()),
+        ],
+    );
+    assert_eq!(run_asm_body("lea_ph", body_ph), Value::Uint(0));
+}
+
+#[test]
+fn naked_fn_signed_return_is_sign_extended_from_the_return_width() {
+    // A naked body returns whatever it left in rax, read at the
+    // function's return shape: for a signed return type the
+    // register bits are the value's two's-complement form at
+    // that width, so `mov rax, -1` in an i64 body is -1 — not
+    // the zero-extended 2^64 - 1 the raw u64 bits widen to when
+    // they are cast straight to i128.
+    for (template, ty, expected) in [
+        ("mov rax, -1\nret", i64_ty(), -1i128),
+        ("mov eax, -1\nret", i32_ty(), -1),
+        ("mov ax, -1\nret", i16_ty(), -1),
+        ("mov al, -1\nret", i8_ty(), -1),
+        ("mov eax, -128\nret", i32_ty(), -128),
+        ("mov eax, 127\nret", i32_ty(), 127),
+    ] {
+        let body = mir::Body::new(
+            decls(&[ty]),
+            0,
+            vec![block(vec![], asm_prog_term(template, vec![], None))],
+        );
+        assert_eq!(
+            run_asm_body("neg", body),
+            Value::Int(expected),
+            "template {template:?}"
+        );
+    }
+}
+
+#[test]
+fn naked_fn_read_of_the_incoming_stack_pointer_is_a_named_error() {
+    // The incoming `rsp` is fixed by the caller's frame layout;
+    // the register model does not represent it (the register
+    // file starts at zero and no seed supplies it — arguments
+    // never arrive in `rsp`), so a naked body that reads it
+    // before establishing its own value is a named error rather
+    // than a program that computes with a fabricated zero stack
+    // pointer. Natively `mov rax, rsp; and rax, 15` yields 8
+    // (the return address occupies the top of the stack).
+    for template in [
+        "mov rax, rsp\nand rax, 15\nret",
+        "sub rsp, 8\nmov rax, rsp\nret",
+        "lea rax, [rsp + 8]\nret",
+    ] {
+        let body = mir::Body::new(
+            decls(&[u64_ty()]),
+            0,
+            vec![block(vec![], asm_prog_term(template, vec![], None))],
+        );
+        let mut prog = MirProgram::new();
+        prog.add("f", body);
+        match interpret_mir(&prog, "f", vec![]) {
+            Err(MirRunError::Interp(InterpError::UnsupportedTerminator { kind })) => {
+                assert!(
+                    kind.contains("stack pointer"),
+                    "error names the incoming stack pointer: {kind}"
+                );
+            }
+            Err(e) => panic!("expected UnsupportedTerminator for the rsp read, got {e}"),
+            Ok(v) => panic!("expected UnsupportedTerminator for the rsp read, got {v:?}"),
+        }
+    }
+}
+
+#[test]
+fn naked_fn_read_of_a_self_written_stack_pointer_runs() {
+    // A naked body that establishes its own `rsp` value first
+    // reads that value back: only the *incoming* stack pointer
+    // is unmodelled.
+    const F_DEF: mir::DefId = mir::DefId::new(0, 78);
+    let body = mir::Body::new(
+        decls(&[u64_ty(), u64_ty()]),
+        1,
+        vec![block(
+            vec![],
+            asm_prog_term(
+                "mov rax, rdi\nmov rsp, rax\nmov rax, rsp\nret",
+                vec![],
+                None,
+            ),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.add_with_def_id("f", F_DEF, body);
+    prog.fn_abis.insert(F_DEF, mir::Abi::C);
+    assert_eq!(
+        interpret_mir(&prog, "f", vec![Value::Uint(42)]).expect("self-written rsp runs"),
+        Value::Uint(42)
+    );
 }
 
 // ----- transmute: the honestly representable shapes (Lane DN) ----------------
