@@ -2330,8 +2330,10 @@ def sparagmos_side(path, edition, driver_bin, cwd=None, rustc_args=(),
                    env_remove=(), jit=False):
     """Run through the driver. Returns (result_dict, kind, reason).
 
-    kind is "result" (exit 0/101), "unsupported" (driver exit 2),
-    "timeout", or "driver-error". `rustc_args` are the test's
+    kind is "result" (the run completed; the exit code is the
+    guest program's own, passed through for the judge),
+    "unsupported" (driver exit 2), "timeout", or "driver-error"
+    (the driver died by a signal). `rustc_args` are the test's
     compile-flags, forwarded through the driver's `--rustc-arg`.
     Auxiliary crates are handed to the driver with `--aux`, in
     dependency order. `guest_args` are the test's run-flags,
@@ -2362,12 +2364,19 @@ def sparagmos_side(path, edition, driver_bin, cwd=None, rustc_args=(),
                   env_extra=env, env_remove=env_remove)
     if res["timeout"]:
         return None, "timeout", f"driver timed out after {DRIVER_TIMEOUT}s"
-    if res["exit_code"] in (0, 101):
-        return res, "result", ""
     if res["exit_code"] == 2:
         return None, "unsupported", driver_reason(res["stderr"], jit=jit)
-    return None, "driver-error", \
-        f"driver exit {res['exit_code']}: {res['stderr'].strip()[:300]}"
+    if res["exit_code"] is None or res["exit_code"] < 0:
+        return None, "driver-error", \
+            f"driver killed by signal {-res['exit_code']}: " \
+            f"{res['stderr'].strip()[:300]}"
+    # The run-mode contract passes the guest's own exit code
+    # through (a `Termination` failure is 1, `process::exit(n)`
+    # is n, a guest panic is 101): the code is the result the
+    # judge compares against the native run. Only exit 2 (the
+    # driver's unsupported outcome) and death by signal are
+    # reserved.
+    return res, "result", ""
 
 
 def first_error_line(stderr):

@@ -9259,6 +9259,52 @@ fn run_mode_process_exit_and_exit_code() {
     assert_eq!(out.status.code(), Some(3), "ExitCode::from(3)");
 }
 
+const RESULT_OK_SRC: &str = r#"
+fn main() -> Result<(), String> {
+    println!("hello");
+    Ok(())
+}
+"#;
+
+const RESULT_ERR_SRC: &str = r#"
+fn main() -> Result<(), String> {
+    Err("boom".to_string())
+}
+"#;
+
+const RESULT_ERR_IO_SRC: &str = r#"
+fn main() -> Result<(), std::io::Error> {
+    Err(std::io::Error::from_raw_os_error(2))
+}
+"#;
+
+#[test]
+fn run_mode_termination_result_report() {
+    // A `fn main() -> Result<_, _>` entry reports through
+    // `Termination`: `Ok` exits 0, `Err` writes `Error: {err:?}`
+    // to stderr and exits with `ExitCode::FAILURE` (1).
+    let dir = temp_dir("termination-result");
+    let src = fixture(&dir, "ok.rs", RESULT_OK_SRC);
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(0), "Result::Ok");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hello\n");
+    let src = fixture(&dir, "err.rs", RESULT_ERR_SRC);
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(1), "Result::Err(String)");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Error: \"boom\"\n"
+    );
+    let src = fixture(&dir, "err_io.rs", RESULT_ERR_IO_SRC);
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(1), "Result::Err(io::Error)");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Error: Os { code: 2, kind: NotFound, \
+         message: \"No such file or directory\" }\n"
+    );
+}
+
 const LIBTEST_SRC: &str = r#"
 #[test]
 fn alpha() { assert_eq!(1 + 1, 2); }

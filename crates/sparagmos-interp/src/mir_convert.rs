@@ -1232,6 +1232,19 @@ pub fn interpret_mir_captured_with_config(
     }
 }
 
+/// The `Debug` rendering of a `Termination` entry's `Err`
+/// payload, as `Termination::report` prints it (`Error: {err:?}`):
+/// rendered by a fresh interpreter over the converted program,
+/// since the run that produced the value has ended. `None` when
+/// the payload does not render detached from that run (it points
+/// into the run's frames or allocations); the caller still
+/// applies the report's exit code.
+pub fn termination_error_debug(program: &MirProgram, value: &Value, ty: &str) -> Option<String> {
+    let (ir_program, _) = convert_all(program).ok()?;
+    let mut interp = Interpreter::new(&ir_program);
+    interp.format_debug_detached(value, ty).ok()
+}
+
 /// Convert `program` and open a debugger session on `entry`
 /// (see [`crate::debug::DebugSession`]): the caller sets its
 /// breakpoints and source text, then runs a command script; the

@@ -3136,6 +3136,50 @@ class JitSideTests(unittest.TestCase):
         self.assertIsNone(out["jit_compiled"])
 
 
+class SparagmosSideExitCodeTests(unittest.TestCase):
+    """sparagmos_side's exit-code contract: the guest's own exit
+    code passes through as the result; only the driver's
+    reserved outcomes are classified away."""
+
+    def side(self, result):
+        orig = run.run_cmd
+        run.run_cmd = lambda argv, **kw: result
+        self.addCleanup(setattr, run, "run_cmd", orig)
+        return run.sparagmos_side(
+            Path("t.rs"), "2021", Path("/fake/driver"))
+
+    def test_guest_exit_1_is_a_result(self):
+        # A `Termination` failure (main -> Result Err) exits 1
+        # natively; the driver's 1 is the guest's code, not a
+        # driver failure.
+        got, kind, _ = self.side(
+            {"exit_code": 1, "timeout": False,
+             "stdout": "", "stderr": "Error: \"boom\"\n"})
+        self.assertEqual(kind, "result")
+        self.assertEqual(got["exit_code"], 1)
+
+    def test_guest_exit_3_is_a_result(self):
+        got, kind, _ = self.side(
+            {"exit_code": 3, "timeout": False,
+             "stdout": "before\n", "stderr": ""})
+        self.assertEqual(kind, "result")
+        self.assertEqual(got["exit_code"], 3)
+
+    def test_driver_unsupported_stays_unsupported(self):
+        _got, kind, reason = self.side(
+            {"exit_code": 2, "timeout": False, "stdout": "",
+             "stderr": "sparagmos-driver run: unsupported: x\n"})
+        self.assertEqual(kind, "unsupported")
+        self.assertIn("unsupported", reason)
+
+    def test_signal_death_is_a_driver_error(self):
+        _got, kind, reason = self.side(
+            {"exit_code": -6, "timeout": False,
+             "stdout": "", "stderr": ""})
+        self.assertEqual(kind, "driver-error")
+        self.assertIn("signal 6", reason)
+
+
 class ProcessJitTests(unittest.TestCase):
     """process_test(jit=True) with both process sides stubbed."""
 

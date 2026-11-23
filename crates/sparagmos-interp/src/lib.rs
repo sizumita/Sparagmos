@@ -73,7 +73,8 @@ pub use ir::{
 pub use debug::{DebugCommand, DebugDialect, DebugPrint, DebugRun, DebugSession, PrintFormat};
 pub use mir_convert::{
     convert_program, debug_mir, interpret_mir, interpret_mir_captured,
-    interpret_mir_captured_with_config, program_key_of, CapturedRun, ConvertError, MirFunction,
+    interpret_mir_captured_with_config, program_key_of, termination_error_debug, CapturedRun,
+    ConvertError, MirFunction,
     MirProgram, MirRunError,
 };
 pub use value::{FmtArguments, FmtTrait, RefProj, RefTarget, Value};

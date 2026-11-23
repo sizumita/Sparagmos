@@ -5421,6 +5421,65 @@ fn exit_code_value(value: &sparagmos_interp::Value) -> Option<i32> {
     }
 }
 
+/// Whether the entry body at `entry_index` returns
+/// `core::result::Result` (its local 0 is that ADT): a
+/// `fn main() -> Result<_, _>`, whose `Termination::report`
+/// the driver applies itself (see `execute`).
+fn entry_returns_result(c: &Collected, entry_index: usize) -> bool {
+    let Some((_, body)) = c.bodies.get(entry_index) else {
+        return false;
+    };
+    let Some(decl) = body.local_decls.first() else {
+        return false;
+    };
+    let sparagmos_mir::Ty::Adt(def, _) = &decl.ty else {
+        return false;
+    };
+    c.def_names
+        .get(def.index as usize)
+        .map(|n| n == "core::result::Result" || n == "std::result::Result")
+        .unwrap_or(false)
+}
+
+/// `Termination::report` for a returned `Result` value, split
+/// for the caller: the exit code the report applies (0 for
+/// `Ok`, `ExitCode::FAILURE` for `Err`) and, for `Err`, the
+/// payload report prints as `Error: {err:?}`. `None` when the
+/// value does not have the one-field-per-variant shape a
+/// `Result` return carries.
+fn result_report(
+    value: &sparagmos_interp::Value,
+) -> Option<(i32, Option<&sparagmos_interp::Value>)> {
+    let sparagmos_interp::Value::Enum { variant, fields } = value else {
+        return None;
+    };
+    let [payload] = fields.as_slice() else {
+        return None;
+    };
+    match variant {
+        0 => Some((0, None)),
+        1 => Some((1, Some(payload))),
+        _ => None,
+    }
+}
+
+/// The type tag of the `Err` payload type of an entry returning
+/// `Result<T, E>` (local 0's second generic argument), in the
+/// spelling the interpreter's formatting engine keys on.
+fn entry_result_err_tag(
+    c: &Collected,
+    names: &std::collections::HashMap<sparagmos_mir::DefId, String>,
+    entry_index: usize,
+) -> Option<String> {
+    let (_, body) = c.bodies.get(entry_index)?;
+    let decl = body.local_decls.first()?;
+    let sparagmos_mir::Ty::Adt(_, args) = &decl.ty else {
+        return None;
+    };
+    let err_ty = args.get(1)?;
+    Some(sparagmos_interp::builtins::ty_tag(err_ty, names))
+}
+
 /// The session's effective overflow-checks setting, resolved from
 /// the final rustc argument list the way rustc resolves it
 /// (`Session::overflow_checks`): the last `-C overflow-checks`
@@ -6347,6 +6406,40 @@ fn execute(
         Ok(sparagmos_interp::Value::Uint(code)) if entry_arg_count == 2 => {
             code as i32
         }
+        Ok(ref value) if entry_returns_result(c, entry_index) => {
+            // The entry reported through `Termination` (a
+            // `fn main() -> Result<_, _>`): `lang_start` applies
+            // `Termination::report` to the returned value
+            // natively -- `Ok` exits successfully, `Err` writes
+            // `Error: {err:?}` to stderr and exits with
+            // `ExitCode::FAILURE`. The driver applies the same
+            // report to the value the entry returned.
+            match result_report(value) {
+                Some((code, None)) => code,
+                Some((_, Some(payload))) => {
+                    let rendered =
+                        entry_result_err_tag(c, &program.fn_names, entry_index).and_then(|tag| {
+                            sparagmos_interp::termination_error_debug(&program, payload, &tag)
+                        });
+                    match rendered {
+                        Some(text) => eprintln!("Error: {text}"),
+                        // The payload reaches into the finished
+                        // run's allocations and does not render
+                        // detached from it; the report's exit
+                        // code stands, with the value's structural
+                        // form standing in for the Debug text.
+                        None => eprintln!("Error: {payload}"),
+                    }
+                    1
+                }
+                _ => {
+                    eprintln!(
+                        "sparagmos-driver run: unsupported: entry `{entry_name}` returned a malformed Result value"
+                    );
+                    2
+                }
+            }
+        }
         Ok(other) => {
             eprintln!(
                 "sparagmos-driver run: unsupported: entry `{entry_name}` returned {other}, expected ()"
@@ -7236,6 +7329,12 @@ fn execute_jit(c: &Collected, guest_args: &[String]) -> i32 {
     if entry_returns_exit_code(c, entry_index) {
         eprintln!(
             "sparagmos-driver run-jit: unsupported: entry returning `std::process::ExitCode` is not supported by JIT execution"
+        );
+        return 2;
+    }
+    if entry_returns_result(c, entry_index) {
+        eprintln!(
+            "sparagmos-driver run-jit: unsupported: entry returning `core::result::Result` is not supported by JIT execution"
         );
         return 2;
     }

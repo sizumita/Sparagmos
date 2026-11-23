@@ -27103,6 +27103,25 @@ impl<'a> Interpreter<'a> {
         Ok(())
     }
 
+    /// Render `value` through the `Debug` formatting engine
+    /// under the type tag `ty`, outside any running frame: the
+    /// rendering `Termination::report` performs for a `Result`
+    /// entry's `Err` payload, which the driver applies after the
+    /// entry body has returned and its frames are gone. A payload
+    /// that reaches into the finished run's frames or allocations
+    /// does not render here and yields the engine's error, exactly
+    /// as a live formatting of an unresolvable value does.
+    pub fn format_debug_detached(&mut self, value: &Value, ty: &str) -> InterpResult<String> {
+        self.format_value(
+            &mut Vec::new(),
+            value,
+            FmtTrait::Debug,
+            ty,
+            &FmtOptions::new(),
+            0,
+        )
+    }
+
     /// Format one argument value through a formatting trait.
     /// `indent` is the current pretty-print (`{:#?}`) indent level.
     fn format_value(
