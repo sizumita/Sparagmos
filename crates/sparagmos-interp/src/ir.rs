@@ -781,7 +781,7 @@ pub enum Rvalue {
     /// A `Transmute` cast from a pointer/reference value to an
     /// integer: the pointer's address. The model has no flat memory,
     /// so the address is synthetic: a deterministic, non-zero,
-    /// 4096-aligned value derived from the reference target (the
+    /// 65536-aligned value derived from the reference target (the
     /// same target always yields the same address). That is all the
     /// observable behavior the model's pointers can honestly offer:
     /// equality, null and alignment checks (the compiler's UB
