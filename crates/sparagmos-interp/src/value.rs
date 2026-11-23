@@ -95,6 +95,19 @@ use std::fmt;
 #[derive(Clone, Debug, PartialEq)]
 pub enum RefProj {
     Field(usize),
+    /// The length slot of a vector value: the position a
+    /// reference to a `Vec`'s `len` field denotes (`&mut vec.len`
+    /// — the reference `Vec::extend_with` hands its
+    /// `SetLenOnDrop` guard, which writes the final length
+    /// through it when it drops). The value model holds a
+    /// vector as its element list, so the slot is not storage
+    /// inside the value: reading the step answers the declared
+    /// length, and writing it applies the `Vec::set_len`
+    /// storage change to the vector value the preceding steps
+    /// denote (see `assign_projected`). The step only ever
+    /// appears as the last step of a target's projection:
+    /// nothing projects through a `usize`.
+    VecLen,
     /// A field access on a union value (the resolved form of
     /// `ProjectionElem::UnionField`): reading reinterprets the
     /// held field's bits as field `idx`'s type, through the
@@ -508,6 +521,7 @@ impl fmt::Display for RefTarget {
                             write!(f, "[{offset}..{}]", offset + len)?
                         }
                         RefProj::ByteOffset(d) => write!(f, " +byte {d}")?,
+                        RefProj::VecLen => write!(f, ".len")?,
                     }
                 }
                 Ok(())
@@ -525,6 +539,7 @@ impl fmt::Display for RefTarget {
                             write!(f, "[{offset}..{}]", offset + len)?
                         }
                         RefProj::ByteOffset(d) => write!(f, " +byte {d}")?,
+                        RefProj::VecLen => write!(f, ".len")?,
                     }
                 }
                 Ok(())
@@ -541,6 +556,7 @@ impl fmt::Display for RefTarget {
                             write!(f, "[{offset}..{}]", offset + len)?
                         }
                         RefProj::ByteOffset(d) => write!(f, " +byte {d}")?,
+                        RefProj::VecLen => write!(f, ".len")?,
                     }
                 }
                 Ok(())

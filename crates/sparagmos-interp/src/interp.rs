@@ -11096,7 +11096,9 @@ impl<'a> Interpreter<'a> {
                         cur = next;
                     }
                 }
-                RefProj::ByteOffset(_) | RefProj::UnionField { .. } => {
+                RefProj::ByteOffset(_)
+                | RefProj::UnionField { .. }
+                | RefProj::VecLen => {
                     out.push(step.clone());
                     cur = None;
                 }
@@ -12761,6 +12763,111 @@ impl<'a> Interpreter<'a> {
         target: &Resolved,
         f: impl FnOnce(&mut Value) -> InterpResult<R>,
     ) -> InterpResult<R> {
+        // A read-modify-write through a vector length-slot
+        // reference (see [`RefProj::VecLen`]): the slot is not
+        // storage inside the vector value, so the modification
+        // runs on the declared length as a detached value and
+        // the result is stored back through the whole-value
+        // write, which applies the `Vec::set_len` storage
+        // change to the vector itself.
+        let len_head = match target {
+            Resolved::Place {
+                frame_pos,
+                local,
+                projection,
+            } if projection.last() == Some(&RefProj::VecLen) => {
+                Some(Resolved::Place {
+                    frame_pos: *frame_pos,
+                    local: *local,
+                    projection: projection[..projection.len() - 1].to_vec(),
+                })
+            }
+            Resolved::Static { name, projection }
+                if projection.last() == Some(&RefProj::VecLen) =>
+            {
+                Some(Resolved::Static {
+                    name: name.clone(),
+                    projection: projection[..projection.len() - 1].to_vec(),
+                })
+            }
+            Resolved::Alloc { id, projection }
+                if projection.last() == Some(&RefProj::VecLen) =>
+            {
+                Some(Resolved::Alloc {
+                    id: *id,
+                    projection: projection[..projection.len() - 1].to_vec(),
+                })
+            }
+            _ => None,
+        };
+        if let Some(head) = len_head {
+            // Navigate to the vector value itself and update its
+            // declared length where it lives: `Vec::extend_with`'s
+            // fill loop increments the length once per element
+            // through `SetLenOnDrop::increment_len`, so reading
+            // and writing back a clone of the whole vector per
+            // update (the generic whole-value route) would make
+            // growth quadratic in the element count. The update
+            // itself runs on the length as a detached value, then
+            // [`assign_vec_len`] applies it to the navigated slot.
+            macro_rules! len_slot_update {
+                ($slot:expr, $desc:expr) => {{
+                    let slot = $slot;
+                    let len = vec_value_len(slot).ok_or_else(|| {
+                        InterpError::type_mismatch(
+                            "vector length slot read-modify-write",
+                            "vector value",
+                            slot.kind_name(),
+                        )
+                    })?;
+                    let mut current = Value::Uint(len);
+                    let result = f(&mut current)?;
+                    assign_vec_len(slot, current, $desc)?;
+                    return Ok(result);
+                }};
+            }
+            match &head {
+                Resolved::Place {
+                    frame_pos,
+                    local,
+                    projection,
+                } => {
+                    let frame = &mut frames[*frame_pos];
+                    let func = frame.func.clone();
+                    let place_desc = describe_resolved(*local, projection);
+                    let slot = frame.locals.get_mut(*local).ok_or_else(|| {
+                        InterpError::UnknownLocal {
+                            func: func.clone(),
+                            local: *local,
+                        }
+                    })?;
+                    let slot = navigate_mut(slot, projection, &func, &place_desc)?;
+                    len_slot_update!(slot, &place_desc);
+                }
+                Resolved::Static { name, projection } => {
+                    let mut store = self.statics.borrow_mut();
+                    let slot = store
+                        .get_mut(name)
+                        .ok_or_else(|| self.missing_static(name))?;
+                    let place_desc = format!("static {name}");
+                    let slot = navigate_mut(slot, projection, "<static>", &place_desc)?;
+                    len_slot_update!(slot, &place_desc);
+                }
+                Resolved::Alloc { id, projection } => {
+                    let mut store = self.allocs.borrow_mut();
+                    let slot = store
+                        .get_mut(id)
+                        .ok_or_else(|| self.missing_alloc(*id))?;
+                    let place_desc = format!("allocation #{id}");
+                    let slot =
+                        navigate_mut(slot, projection, "<allocation>", &place_desc)?;
+                    len_slot_update!(slot, &place_desc);
+                }
+                Resolved::Value(..) => {
+                    unreachable!("length-slot heads are never constant aggregates")
+                }
+            }
+        }
         match target {
             Resolved::Value(..) => Err(InterpError::type_mismatch(
                 "assignment",
@@ -18232,6 +18339,66 @@ impl<'a> Interpreter<'a> {
                         return Ok(value);
                     }
                 }
+                // A borrow of a vector's length slot (`&mut
+                // vec.len` — the reference `Vec::extend_with`
+                // hands its `SetLenOnDrop` guard, which writes
+                // the final length through it when it drops):
+                // the slot is not storage in the element-list
+                // value, so resolving the place itself would
+                // collapse it to the current length as a
+                // detached value and the write through the
+                // reference would have nowhere to land. The
+                // reference denotes the vector's own target
+                // with a length-slot step appended instead
+                // (see [`RefProj::VecLen`]): reads through it
+                // answer the declared length, and writes apply
+                // the `Vec::set_len` storage change to the
+                // vector itself.
+                if let Some(base_place) = vec_len_slot_base(body, place) {
+                    let target = self.resolve_place(frames, body, &base_place)?;
+                    let value = match target {
+                        Resolved::Place {
+                            frame_pos,
+                            local,
+                            mut projection,
+                        } => {
+                            projection.push(RefProj::VecLen);
+                            Value::Ref(RefTarget::place(
+                                frames[frame_pos].id,
+                                local,
+                                projection,
+                            ))
+                        }
+                        Resolved::Value(base, mut projection) => {
+                            projection.push(RefProj::VecLen);
+                            Value::Ref(RefTarget::Value(
+                                Box::new(base),
+                                projection,
+                            ))
+                        }
+                        Resolved::Static {
+                            name,
+                            mut projection,
+                        } => {
+                            projection.push(RefProj::VecLen);
+                            Value::Ref(RefTarget::Static {
+                                name,
+                                projection,
+                            })
+                        }
+                        Resolved::Alloc {
+                            id,
+                            mut projection,
+                        } => {
+                            projection.push(RefProj::VecLen);
+                            Value::Ref(RefTarget::Alloc {
+                                id,
+                                projection,
+                            })
+                        }
+                    };
+                    return Ok(value);
+                }
                 let target = self.resolve_place(frames, body, place)?;
                 // A pointer to an unsized pointee (a slice or
                 // `str`) is a fat pointer: it must carry the
@@ -18436,6 +18603,9 @@ pub(crate) fn describe_resolved(local: usize, projection: &[RefProj]) -> String 
             }
             RefProj::ByteOffset(d) => {
                 let _ = write!(out, " +byte {d}");
+            }
+            RefProj::VecLen => {
+                let _ = write!(out, ".len");
             }
         }
     }
@@ -20151,9 +20321,41 @@ pub(crate) fn project_value(
                     });
                 }
             }
+            RefProj::VecLen => {
+                // The length slot of a vector value (see the
+                // variant's documentation): the read answers
+                // the declared length, in whichever form the
+                // value holds it.
+                let len = vec_value_len(&value).ok_or_else(|| {
+                    InterpError::type_mismatch(
+                        format!("vector length slot of {place}"),
+                        "vector value",
+                        value.kind_name(),
+                    )
+                })?;
+                Value::Uint(len)
+            }
         };
     }
     Ok(value)
+}
+
+/// The declared length of a vector value in any of its forms:
+/// the sparse form's recorded length, the real aggregate
+/// form's length slot, or the element list's own length (the
+/// same three answers the length-slot arm of place resolution
+/// gives). `None` for a value that is not a vector.
+fn vec_value_len(value: &Value) -> Option<u128> {
+    match value {
+        Value::SparseVec { len, .. } => Some(*len),
+        Value::Enum { fields, .. } => {
+            match crate::builtins::vec_real_aggregate_parts(value) {
+                Some((_, len)) => Some(len as u128),
+                None => Some(fields.len() as u128),
+            }
+        }
+        _ => None,
+    }
 }
 
 /// The number of bytes in a scalar value's storage, for the
@@ -20307,8 +20509,103 @@ fn assign_projected(
             }
         }
     }
+    if let Some((&RefProj::VecLen, head)) = projection.split_last() {
+        // A write to a vector's length slot (see
+        // [`RefProj::VecLen`]): the slot is not storage inside
+        // the element-list value, so the write applies the
+        // `Vec::set_len` storage change to the vector value
+        // the head denotes.
+        let head_slot = navigate_mut_grow(slot, head, func, place, grow)?;
+        return assign_vec_len(head_slot, value, place);
+    }
     let target = navigate_mut_grow(slot, projection, func, place, grow)?;
     *target = value;
+    Ok(())
+}
+
+/// A write to a vector's length slot (see [`RefProj::VecLen`]),
+/// applied to the vector value itself: the declared length
+/// changes and the stored elements stay — the tail past the
+/// new length is spare capacity a later append overwrites,
+/// exactly the storage change the place-shaped write in
+/// `Interpreter::write_vec_len_slot` performs for a direct
+/// place. The growth padding here is the bare uninitialised
+/// marker rather than the element type's shaped uninitialised
+/// form the place-shaped write derives from the vector's
+/// element tag: this projection is type-free, and the slots a
+/// growth declares are the ones the guest writes before it
+/// reads them (the length a `SetLenOnDrop` guard writes
+/// covers slots its fill loop already stored), so the
+/// padding's shape is observable only to a read of a
+/// never-written slot, which is an uninitialised read either
+/// way.
+/// Update a vector value's recorded length to `new_len`
+/// without rebuilding its storage, when the storage form
+/// allows it: the real aggregate form's length field is
+/// rewritten, and a sparse vector whose stored elements
+/// already cover `new_len` (the state `Vec::reserve` leaves
+/// behind, which the `extend_with` fill loop then grows
+/// through one element at a time) just records the new
+/// length — its capacity already accounts for the rest.
+/// Returns whether the update was applied.
+fn set_vec_len_in_place(slot: &mut Value, new_len: u128) -> bool {
+    if crate::builtins::vec_real_aggregate_parts(slot).is_some() {
+        if let Value::Enum { fields, .. } = slot {
+            fields[1] = Value::Uint(new_len);
+            return true;
+        }
+        return false;
+    }
+    match slot {
+        Value::SparseVec { elems, len, .. } if new_len <= elems.len() as u128 => {
+            *len = new_len;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn assign_vec_len(slot: &mut Value, value: Value, place: &str) -> InterpResult<()> {
+    let found = value.kind_name();
+    let new_len = match value {
+        Value::Uint(n) => usize::try_from(n).ok(),
+        Value::Int(n) if n >= 0 => usize::try_from(n).ok(),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        InterpError::type_mismatch(
+            format!("vector length slot of {place}"),
+            "integer length",
+            found,
+        )
+    })?;
+    if set_vec_len_in_place(slot, new_len as u128) {
+        return Ok(());
+    }
+    // A vector in its real aggregate form holds the length in
+    // the slot itself: the store lands on that field, and the
+    // elements (which live behind the buffer pointer) are
+    // untouched.
+    if let Some((buf, _)) = crate::builtins::vec_real_aggregate_parts(slot) {
+        *slot = Value::Enum {
+            variant: 0,
+            fields: vec![buf, Value::Uint(new_len as u128)],
+        };
+        return Ok(());
+    }
+    let prev_cap = crate::builtins::vec_stored_len(slot).unwrap_or(0);
+    let elems = match std::mem::replace(slot, Value::Uninit) {
+        Value::Enum { fields, .. } => fields,
+        Value::SparseVec { elems, .. } => elems,
+        other => {
+            return Err(InterpError::type_mismatch(
+                format!("vector length slot of {place}"),
+                "vector value",
+                other.kind_name(),
+            ));
+        }
+    };
+    *slot = crate::builtins::vec_with_len(elems, new_len, &Value::Uninit, prev_cap);
     Ok(())
 }
 
@@ -20713,6 +21010,25 @@ pub(crate) fn project_value_ref<'a>(
                     "the untyped value projector",
                 ));
             }
+            RefProj::VecLen => {
+                // The length slot is not storage inside the
+                // vector value, so the step materialises the
+                // declared length, as the unmaterialised tail
+                // in the field arm above materialises its slot.
+                let len = vec_value_len(cur).ok_or_else(|| {
+                    InterpError::type_mismatch(
+                        format!("vector length slot of {place}"),
+                        "vector value",
+                        cur.kind_name(),
+                    )
+                })?;
+                return Ok(Cow::Owned(project_value(
+                    Value::Uint(len),
+                    rest,
+                    func,
+                    place,
+                )?));
+            }
             RefProj::ByteOffset(disp) => {
                 if *disp != 0 {
                     // A byte read through a pointer displaced into
@@ -20843,6 +21159,18 @@ fn navigate_mut_grow<'x>(
     }
     let (step, rest) = projection.split_first().expect("non-empty");
     match step {
+        RefProj::VecLen => {
+            // The length slot is not storage inside the vector
+            // value, so there is no slot to lend: whole-value
+            // writes to it go through `assign_projected`'s
+            // length-slot pre-pass, and read-modify-write
+            // through `Interpreter::modify_resolved`'s.
+            return Err(InterpError::type_mismatch(
+                format!("vector length slot of {place}"),
+                "a slot inside the vector value",
+                "the vector's length slot",
+            ));
+        }
         RefProj::UnionField { idx, .. } => {
             // A union holds one field's value: writing field
             // `idx` makes it the held field, so every other slot
@@ -22070,6 +22398,7 @@ fn synthetic_addr(v: &Value) -> u128 {
                         (4u128, ((*offset as u128) << 64) | (*len as u128))
                     }
                     RefProj::ByteOffset(d) => (6u128, *d as u128),
+                    RefProj::VecLen => (7u128, 0u128),
                 };
                 mix(&mut h, tag);
                 mix(&mut h, n);
@@ -22089,6 +22418,7 @@ fn synthetic_addr(v: &Value) -> u128 {
                         (4u128, ((*offset as u128) << 64) | (*len as u128))
                     }
                     RefProj::ByteOffset(d) => (6u128, *d as u128),
+                    RefProj::VecLen => (7u128, 0u128),
                 };
                 mix(&mut h, tag);
                 mix(&mut h, n);
@@ -22111,6 +22441,7 @@ fn synthetic_addr(v: &Value) -> u128 {
                         (4u128, ((*offset as u128) << 64) | (*len as u128))
                     }
                     RefProj::ByteOffset(d) => (6u128, *d as u128),
+                    RefProj::VecLen => (7u128, 0u128),
                 };
                 mix(&mut h, tag);
                 mix(&mut h, n);
@@ -22135,6 +22466,7 @@ fn synthetic_addr(v: &Value) -> u128 {
                         (4u128, ((*offset as u128) << 64) | (*len as u128))
                     }
                     RefProj::ByteOffset(d) => (6u128, *d as u128),
+                    RefProj::VecLen => (7u128, 0u128),
                 };
                 mix(&mut h, tag);
                 mix(&mut h, n);
