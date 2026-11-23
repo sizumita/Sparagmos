@@ -7526,7 +7526,7 @@ impl<'a> Interpreter<'a> {
                 } else if target.starts_with("std::boxed::Box<")
                     && matches!(
                         generic_first_arg(target, "std::boxed::Box<"),
-                        Some(pt) if pt.starts_with('[') && pt.ends_with(']') && !pt.contains(';')
+                        Some(pt) if is_slice_tag(pt)
                     )
                     && (source.starts_with("std::vec::Vec<")
                         || source.starts_with("alloc::vec::Vec<")
@@ -7569,6 +7569,24 @@ impl<'a> Interpreter<'a> {
                                     // it would show through the box.
                                     let (elements, _len) =
                                         self.slice_elements(frames, &held)?;
+                                    // The snapshot copies the
+                                    // elements' `Value`
+                                    // representations: an element
+                                    // that owns an allocation (a
+                                    // `Box`, say) would keep
+                                    // sharing it with the source,
+                                    // and a write through the
+                                    // source's element would show
+                                    // through the box. `Box::from`
+                                    // clones every element, so
+                                    // re-own them the way the
+                                    // clone models do (the
+                                    // `slice::to_vec` treatment)
+                                    // before boxing them.
+                                    let elements = elements
+                                        .iter()
+                                        .map(|e| self.clone_owned_value(frames, e))
+                                        .collect::<InterpResult<Vec<_>>>()?;
                                     self.boxed_slice_value(
                                         Value::Tuple(elements),
                                         pointee_ty,
@@ -17031,7 +17049,7 @@ fn value_fingerprint(value: &Value) -> u64 {
                 self.record_box_ty(&boxed, Ty::Str);
                 return Ok(boxed);
             }
-            if first.starts_with('[') && first.ends_with(']') && !first.contains(';') {
+            if is_slice_tag(first) {
                 // `FromIterator<T> for Box<[T]>`: the collected
                 // items in a fresh boxed slice, built by the
                 // shared boxed-slice construction.
@@ -29897,6 +29915,31 @@ fn ref_item_element_ty(inner_ty: &str) -> String {
         }
         return String::new();
     }
+}
+
+/// Whether a rendered type tag is a slice type `[T]`, as opposed
+/// to an array type `[T; N]`: the tag is bracketed and carries no
+/// semicolon at its own bracket level. An element type may itself
+/// be an array (`[[i32; 2]]` is a slice of arrays), whose
+/// semicolon sits one level deeper and does not make the outer
+/// type an array.
+fn is_slice_tag(tag: &str) -> bool {
+    let Some(rest) = tag.strip_prefix('[') else {
+        return false;
+    };
+    let Some(inner) = rest.strip_suffix(']') else {
+        return false;
+    };
+    let mut depth = 0i32;
+    for c in inner.chars() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth -= 1,
+            ';' if depth == 0 => return false,
+            _ => {}
+        }
+    }
+    true
 }
 
 fn first_generic_arg(tag: &str) -> Option<&str> {

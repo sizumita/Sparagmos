@@ -4804,3 +4804,124 @@ fn into_into_refcell_wraps_the_value() {
         }
     );
 }
+
+// ----- Box<[T]> from a borrowed Cow (PR #373) -------------------------------
+//
+// `Box::from(Cow::Borrowed(&src[..]))` clones the borrowed slice's
+// elements into the new allocation: a later write to the source
+// must not show through the box. The hand-built program keeps the
+// slice reference place-backed (a fat reference to the array
+// local), the shape in which the pre-fix code boxed the reference
+// itself and the write showed through.
+
+const COW_TY: mir::DefId = mir::DefId::new(0, 600);
+
+fn names_cow() -> HashMap<mir::DefId, String> {
+    let mut names = std_names();
+    names.extend([
+        (FROM_FROM, "std::convert::From::from".to_string()),
+        (COW_TY, "std::borrow::Cow".to_string()),
+    ]);
+    names
+}
+
+fn program_cow(body: mir::Body) -> MirProgram {
+    let mut prog = MirProgram::new();
+    prog.add("main", body);
+    prog.fn_names = names_cow();
+    prog
+}
+
+fn cow_slice_i32_ty() -> mir::Ty {
+    mir::Ty::Adt(COW_TY, vec![slice_i32_ty()])
+}
+
+fn box_slice_i32_ty() -> mir::Ty {
+    mir::Ty::Adt(BOX_TY, vec![slice_i32_ty()])
+}
+
+#[test]
+fn box_from_borrowed_cow_clones_place_backed_elements() {
+    // fn main() -> i32 {
+    //   _1 = [1, 2, 3];
+    //   _2 = &_1;
+    //   _3 = _2 as &[i32];
+    //   _4 = Cow::Borrowed(move _3);
+    //   _5 = From::from::<Box<[i32]>, Cow<[i32]>>(move _4);
+    //   _1[0] = 99;
+    //   return (*_5)[0];   // 1, not 99
+    // }
+    let array_ty = mir::Ty::Array(Box::new(i32_ty()), mir::ArrayLen::Known(3));
+    let slice_ref_ty = ref_ty(slice_i32_ty(), false);
+    let mut elem0 = place(1);
+    elem0.projection.push(mir::PlaceElem::ConstantIndex {
+        offset: 0,
+        min_length: 3,
+        from_end: false,
+    });
+    let mut box_elem0 = place(5);
+    box_elem0.projection = vec![
+        mir::PlaceElem::Deref,
+        mir::PlaceElem::ConstantIndex {
+            offset: 0,
+            min_length: 3,
+            from_end: false,
+        },
+    ];
+    let body = mir::Body::new(
+        decls(&[
+            i32_ty(),                // _0 return
+            array_ty.clone(),        // _1 array
+            ref_ty(array_ty, false), // _2 &[i32; 3]
+            slice_ref_ty.clone(),    // _3 &[i32]
+            cow_slice_i32_ty(),      // _4 Cow<[i32]>
+            box_slice_i32_ty(),      // _5 Box<[i32]>
+        ]),
+        0,
+        vec![
+            block(
+                vec![
+                    assign(
+                        place(1),
+                        mir::Rvalue::Aggregate(
+                            Box::new(mir::AggregateKind::Array(i32_ty())),
+                            vec![const_i32(1), const_i32(2), const_i32(3)],
+                        ),
+                    ),
+                    assign(place(2), ref_rvalue(1, false)),
+                    assign(
+                        place(3),
+                        mir::Rvalue::Cast(
+                            mir::CastKind::PointerCoercion(mir::PointerCoercion::Unsize),
+                            copy(2),
+                            slice_ref_ty,
+                        ),
+                    ),
+                    assign(
+                        place(4),
+                        adt_aggregate(COW_TY, 0, vec![slice_i32_ty()], vec![move_(3)]),
+                    ),
+                ],
+                goto(1),
+            ),
+            block(
+                vec![],
+                call(
+                    fndef(FROM_FROM, vec![box_slice_i32_ty(), cow_slice_i32_ty()]),
+                    vec![move_(4)],
+                    5,
+                    2,
+                ),
+            ),
+            block(
+                vec![
+                    assign(elem0, mir::Rvalue::Use(const_i32(99))),
+                    assign(place(0), mir::Rvalue::Use(mir::Operand::Copy(box_elem0))),
+                ],
+                ret(),
+            ),
+        ],
+    );
+    let value = interpret_mir(&program_cow(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Int(1));
+}

@@ -4758,6 +4758,93 @@ fn run_mode_boxed_slice_from_borrowed_cow_clones_elements() {
     );
 }
 
+const BOXED_SLICE_ARRAY_ELEMENTS_SRC: &str = r#"
+fn main() {
+    // The element type of a boxed slice may itself be an array:
+    // the semicolon inside `[i32; 2]` sits one bracket level
+    // deeper and does not make the pointee an array type.
+    let b: Box<[[i32; 2]]> = vec![[1, 2], [3, 4]].into_iter().collect();
+    println!("collect: {:?}", b);
+
+    let v: Vec<[i32; 2]> = vec![[5, 6], [7, 8]];
+    let c: Box<[[i32; 2]]> = Box::from(v);
+    println!("fromvec: {:?}", c);
+
+    let arr: [[i32; 2]; 2] = [[9, 10], [11, 12]];
+    let d: Box<[[i32; 2]]> = Box::from(&arr[..]);
+    println!("fromslice: {:?}", d);
+
+    let e: Box<[[i32; 2]]> = Box::from(std::borrow::Cow::Borrowed(&arr[..]));
+    println!("fromcow: {:?}", e);
+
+    let f: Box<[[[i32; 1]; 2]]> = vec![[[1], [2]], [[3], [4]]].into_iter().collect();
+    println!("deep: {:?}", f);
+}
+"#;
+
+#[test]
+fn run_mode_boxed_slice_array_elements() {
+    let dir = temp_dir("boxed-array-elements");
+    let src = fixture(
+        &dir,
+        "boxed_array_elements.rs",
+        BOXED_SLICE_ARRAY_ELEMENTS_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "boxed slices of array elements must convert and collect; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "collect: [[1, 2], [3, 4]]\nfromvec: [[5, 6], [7, 8]]\nfromslice: [[9, 10], [11, 12]]\nfromcow: [[9, 10], [11, 12]]\ndeep: [[[1], [2]], [[3], [4]]]\n"
+    );
+}
+
+const BOXED_SLICE_FROM_BORROWED_COW_DEEP_SRC: &str = r#"
+use std::borrow::Cow;
+
+fn main() {
+    // The borrowed elements themselves own allocations: boxing
+    // clones every element (reallocating the inner boxes), so a
+    // later write through the source's element -- or dropping it
+    // by replacement -- is invisible through the box.
+    let mut src: Vec<Box<i32>> = vec![Box::new(1), Box::new(2), Box::new(3)];
+    let b: Box<[Box<i32>]> = Box::from(Cow::Borrowed(&src[..]));
+    *src[0] = 99;
+    src[1] = Box::new(77);
+    println!("deepclone: {} {} {:?}", *b[0], *b[1], b);
+
+    let mut sv: Vec<String> = vec!["aa".to_string(), "bb".to_string()];
+    let s: Box<[String]> = Box::from(Cow::Borrowed(&sv[..]));
+    sv[0].push_str("ZZ");
+    println!("strings: {} {:?}", s[0], s);
+}
+"#;
+
+#[test]
+fn run_mode_boxed_slice_from_borrowed_cow_deep_clones_elements() {
+    let dir = temp_dir("boxed-from-borrowed-cow-deep");
+    let src = fixture(
+        &dir,
+        "boxed_from_borrowed_cow_deep.rs",
+        BOXED_SLICE_FROM_BORROWED_COW_DEEP_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Box<[T]> from a borrowed Cow must deep-clone owning elements; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "deepclone: 1 2 [1, 2, 3]\nstrings: aa [\"aa\", \"bb\"]\n"
+    );
+}
+
 #[test]
 fn run_mode_boxed_slice_collect() {
     let dir = temp_dir("boxed-collect");
