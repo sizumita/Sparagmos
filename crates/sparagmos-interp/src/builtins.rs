@@ -16877,7 +16877,6 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         }
     }
 
-    /// The byte data a value denotes (an fmt pieces template).
     /// The `fmt::Arguments` a builtin argument denotes. The
     /// modelled value comes from the `Arguments` constructor
     /// builtins; a body that builds the struct itself (an
@@ -16885,8 +16884,17 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
     /// the shape edition-2015 `unreachable!` reaches through
     /// `core::panicking::unreachable_display`) hands over the
     /// raw aggregate instead: two wrapper fields holding the
-    /// encoded template bytes and a reference to the argument
-    /// array. Both forms denote the same value.
+    /// template pointer and the argument-array pointer. The
+    /// aggregate comes in the two shapes `core::fmt` itself
+    /// builds. In the `Arguments::new` shape the template field
+    /// points at the encoded template bytes and the args field
+    /// at the argument array. In the `Arguments::from_str`
+    /// shape the args field is not a pointer at all but the
+    /// tagged length word `(len << 1) | 1` in pointer clothing,
+    /// while the template field points at the string's bytes —
+    /// the encoding core's own `Arguments::as_str` decodes, and
+    /// the one the `panic_nounwind_fmt` calls in core's UB
+    /// checks hand over.
     fn coerce_arguments(
         &self,
         frames: &[Frame],
@@ -16900,10 +16908,31 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                 let mut fields = fields.into_iter();
                 let template_field = fields.next().expect("two fields");
                 let args_field = fields.next().expect("two fields");
-                let template =
-                    self.resolve_bytes(frames, &unwrap_newtype(template_field))?;
-                let args =
-                    self.resolve_arg_array(frames, &unwrap_newtype(args_field))?;
+                let template_ptr = unwrap_newtype(template_field);
+                let args_ptr = unwrap_newtype(args_field);
+                if let Value::Ref(RefTarget::Address(tagged)) = args_ptr {
+                    if tagged & 1 == 1 {
+                        let len = (tagged >> 1) as usize;
+                        let bytes = self.resolve_bytes(frames, &template_ptr)?;
+                        let text = bytes.get(..len).ok_or_else(|| {
+                            InterpError::type_mismatch(
+                                "fmt::Arguments string",
+                                "byte data of the tagged length",
+                                format!("{} bytes", bytes.len()),
+                            )
+                        })?;
+                        let text = String::from_utf8(text.to_vec()).map_err(|_| {
+                            InterpError::type_mismatch(
+                                "fmt::Arguments string",
+                                "UTF-8 string data",
+                                "invalid UTF-8 bytes",
+                            )
+                        })?;
+                        return Ok(FmtArguments::Plain(text));
+                    }
+                }
+                let template = self.resolve_bytes(frames, &template_ptr)?;
+                let args = self.resolve_arg_array(frames, &args_ptr)?;
                 Ok(FmtArguments::Template { template, args })
             }
             other => Err(InterpError::type_mismatch(
@@ -16914,15 +16943,84 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         }
     }
 
+    /// The byte data a value denotes (an fmt pieces template):
+    /// the bytes themselves, a string's bytes, or the data a
+    /// pointer into string/byte data denotes from the pointed
+    /// element on — the shape a string constant's `as_ptr` and
+    /// a body-built `fmt::Arguments` template field take, where
+    /// the pointer's target is the data value and its trailing
+    /// index step selects the first byte. The denoted data is
+    /// the target from that element, never the element itself
+    /// (the single byte the plain resolution of such a pointer
+    /// yields).
     fn resolve_bytes(&self, frames: &[Frame], value: &Value) -> InterpResult<Vec<u8>> {
+        if let Value::Ref(_) = value {
+            let target = self.deref_value(frames, value)?;
+            if let Some(bytes) = self.byte_data_from(frames, &target)? {
+                return Ok(bytes);
+            }
+        }
         match self.resolve_value(frames, value)? {
             Value::Bytes(b) => Ok(b),
+            Value::Str(s) => Ok(s.into_bytes()),
             other => Err(InterpError::type_mismatch(
                 "fmt pieces template",
                 "byte data",
                 other.kind_name(),
             )),
         }
+    }
+
+    /// The byte data a resolved target denotes from the element
+    /// its trailing index step selects, when the value the steps
+    /// before it reach is string or byte data: that value read
+    /// without the final step, sliced from the selected element.
+    /// Any other shape — no trailing index step, a target value
+    /// that is not byte data, an element past the data's end —
+    /// returns `None` and leaves the caller's ordinary
+    /// resolution to judge the value.
+    fn byte_data_from(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+    ) -> InterpResult<Option<Vec<u8>>> {
+        let (prefix, offset) = match target {
+            Resolved::Place { projection, .. }
+            | Resolved::Value(_, projection)
+            | Resolved::Static { projection, .. }
+            | Resolved::Alloc { projection, .. } => match projection.split_last() {
+                Some((RefProj::Index(index), prefix)) => (prefix, *index),
+                _ => return Ok(None),
+            },
+        };
+        let trimmed = match target {
+            Resolved::Place {
+                frame_pos, local, ..
+            } => Resolved::Place {
+                frame_pos: *frame_pos,
+                local: *local,
+                projection: prefix.to_vec(),
+            },
+            Resolved::Value(base, _) => Resolved::Value(base.clone(), prefix.to_vec()),
+            Resolved::Static { name, .. } => Resolved::Static {
+                name: name.clone(),
+                projection: prefix.to_vec(),
+            },
+            Resolved::Alloc { id, .. } => Resolved::Alloc {
+                id: *id,
+                projection: prefix.to_vec(),
+            },
+        };
+        let base = match self.read_resolved(frames, &trimmed) {
+            Ok(value) => value,
+            Err(_) => return Ok(None),
+        };
+        let bytes = match base {
+            Value::Bytes(bytes) => bytes,
+            Value::Str(text) => text.into_bytes(),
+            _ => return Ok(None),
+        };
+        Ok(bytes.get(offset..).map(|tail| tail.to_vec()))
     }
 
     /// Snapshot the elements of an fmt argument array.

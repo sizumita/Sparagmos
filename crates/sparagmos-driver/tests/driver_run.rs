@@ -18764,3 +18764,44 @@ fn run_mode_vec_insert_one_field_wrapper_elements() {
     );
 }
 
+
+const NOUNWIND_FROM_STR_SRC: &str = r#"
+#![allow(invalid_null_arguments)]
+fn main() {
+    let p: *const u8 = std::ptr::null();
+    let s = unsafe { std::slice::from_raw_parts(p, 0) };
+    println!("{}", s.len());
+}
+"#;
+
+#[test]
+fn run_mode_nounwind_from_str_panic_message() {
+    // A UB-check failure inside a library body reports through
+    // `panic_nounwind_fmt` with an `Arguments::from_str` value
+    // the body built itself: the run must surface the check's
+    // own message as the panic payload, not die in the fmt
+    // coercion with a type mismatch.
+    let dir = temp_dir("nounwind-from-str");
+    let src = fixture(&dir, "case.rs", NOUNWIND_FROM_STR_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "nounwind panic must exit 101; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "unsafe precondition(s) violated: slice::from_raw_parts requires the pointer to be aligned and non-null"
+        ),
+        "the check's message is the payload: {stderr}"
+    );
+    assert!(
+        stderr.contains("This indicates a bug in the program. This Undefined Behavior check is optional"),
+        "the full message renders: {stderr}"
+    );
+    assert!(
+        !stderr.contains("expected byte data"),
+        "no fmt coercion failure masks the message: {stderr}"
+    );
+}
