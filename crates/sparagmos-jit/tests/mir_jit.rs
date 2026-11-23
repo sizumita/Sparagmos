@@ -189,6 +189,7 @@ fn build_with_table(
 
         track_caller_defs: Default::default(),
         fn_shim_locations: Default::default(),
+        link_symbols: Default::default(),
     };
     let jit = JitProgram::compile(&jit_in).expect("JIT compile failed");
     (jit, interp_in)
