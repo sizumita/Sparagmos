@@ -8213,9 +8213,9 @@ impl<'a> Interpreter<'a> {
                                     // address (see
                                     // `enter_tuple_wrapped_sequence`).
                                     match pointee {
-                                        Ty::Array(_, n) => self
+                                        Ty::Array(elem, n) => self
                                             .enter_tuple_wrapped_sequence(
-                                                frames, resolved, *n,
+                                                frames, resolved, elem, *n,
                                             ),
                                         _ => resolved,
                                     }
@@ -8369,10 +8369,26 @@ impl<'a> Interpreter<'a> {
     /// form and is not entered; a one-element array stays
     /// ambiguous with its wrapper and keeps the genuine
     /// reading.
+    ///
+    /// A one-item tuple is ALSO the array's own sparse prefix
+    /// when only its first element is materialised -- a nested
+    /// array whose first row alone is written stores exactly
+    /// that shape (a one-row tuple holding the row) -- so the
+    /// entry is refused when the single item is already
+    /// plausible as one element of the declared array: the
+    /// stored form is then consistent as a prefix of the
+    /// declared array type, and entering it would insert a
+    /// field step the place does not have, leaving the
+    /// following index steps to address the first element's
+    /// own parts instead of the array's elements. The wrapper
+    /// reading stands only when the item cannot be an element:
+    /// a tuple or byte block is never a scalar element, so
+    /// the `([u8; N],)` shape still enters.
     fn enter_tuple_wrapped_sequence(
         &self,
         frames: &[Frame],
         resolved: Resolved,
+        elem: &Ty,
         len: u64,
     ) -> Resolved {
         if len == 1 {
@@ -8386,10 +8402,78 @@ impl<'a> Interpreter<'a> {
         };
         if items.len() == 1
             && matches!(items[0], Value::Tuple(_) | Value::Bytes(_))
+            && !self.value_plausible_for_ty(&items[0], elem, 0)
         {
             enter_wrapper_field(resolved)
         } else {
             resolved
+        }
+    }
+
+    /// Whether `value` is plausible as a value of `ty`, judged
+    /// on the value's own form alone (the type-level mirror of
+    /// [`Self::value_plausible_for_tag`]). Conservative in the
+    /// same way: a slot not yet written is plausible for every
+    /// type, a form this judgment does not model keeps the
+    /// benefit of the doubt, and `false` is answered only on a
+    /// clear mismatch -- a scalar, reference or ADT value is
+    /// never a bare tuple or byte block, and a tuple or array
+    /// value is never a bare scalar.
+    fn value_plausible_for_ty(&self, value: &Value, ty: &Ty, depth: usize) -> bool {
+        if matches!(value, Value::Uninit) || depth > 4 {
+            return true;
+        }
+        match (ty, value) {
+            (Ty::Array(elem, n), Value::Tuple(items)) => {
+                items.len() as u64 <= *n
+                    && items
+                        .iter()
+                        .all(|item| self.value_plausible_for_ty(item, elem, depth + 1))
+            }
+            // A byte block is an array's flat storage form,
+            // whatever the element type: the bytes are
+            // reinterpreted under the declared element type on
+            // every read.
+            (Ty::Array(..), Value::Bytes(_)) => true,
+            (Ty::Tuple(ts), Value::Tuple(items)) => {
+                items.len() <= ts.len()
+                    && items
+                        .iter()
+                        .zip(ts.iter())
+                        .all(|(item, t)| self.value_plausible_for_ty(item, t, depth + 1))
+            }
+            (Ty::Uint(_), Value::Uint(_)) => true,
+            (Ty::Int(_), Value::Int(_)) => true,
+            (Ty::Bool, Value::Bool(_)) => true,
+            (Ty::Float(_), Value::Float(_) | Value::Float128(_)) => true,
+            (Ty::Unit, Value::Unit) => true,
+            (Ty::Str, Value::Str(_) | Value::Bytes(_)) => true,
+            (
+                Ty::Ref(_),
+                Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. },
+            ) => true,
+            (Ty::FnPtr | Ty::FnDef(_), Value::FnPtr(_)) => true,
+            (Ty::Closure(..), Value::Closure { .. }) => true,
+            (Ty::Coroutine(_), Value::Coroutine { .. }) => true,
+            (Ty::Adt(name), Value::Enum { variant, fields }) => {
+                match self.debug_shape_for_def(name) {
+                    Some(shape) => {
+                        shape.kind == sparagmos_mir::AdtShapeKind::Union
+                            || self.plausible_adt_enum(*variant, fields, shape, depth)
+                    }
+                    None => true,
+                }
+            }
+            (Ty::Adt(name), Value::Unit) => self
+                .debug_shape_for_def(name)
+                .is_none_or(|shape| {
+                    shape
+                        .variants
+                        .iter()
+                        .any(|variant| variant.fields.is_empty())
+                }),
+            (Ty::Slice(_) | Ty::Dynamic(_) | Ty::Never, _) => true,
+            _ => false,
         }
     }
 

@@ -20350,3 +20350,39 @@ fn run_mode_one_element_tuple_transmute_crossings() {
         "out 3 1 4 1\nin 9 9 9 9\nscalar 42\nwrapped 7\n",
     );
 }
+
+const SPARSE_NESTED_ARRAY_SRC: &str = r#"
+use std::alloc::{alloc, Layout};
+
+fn main() {
+    unsafe {
+        let layout = Layout::new::<[[u32; 2]; 2]>();
+        let p = alloc(layout) as *mut [[u32; 2]; 2];
+        (*p)[0] = [11, 22];
+        println!("row {:?}", (*p)[0]);
+        println!("elem {}", (*p)[0][1]);
+        let q = p as *const [u32; 2];
+        println!("via_row_ptr {}", (*q)[1]);
+        (*p)[0][1] = 99;
+        println!("written {:?}", (*p)[0]);
+        println!("via_row_ptr_after {}", (*q)[1]);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_sparse_nested_array_prefix_is_not_a_tuple_wrapper() {
+    // A nested array whose first row alone is materialised
+    // stores as a one-item tuple holding the row -- the same
+    // shape a one-element tuple wrapper around the whole array
+    // has. The dereference of the array pointer must keep the
+    // genuine reading (the tuple is the array's own sparse
+    // prefix): reading the row reads the row, indexing through
+    // it reaches the row's elements, and writes through the
+    // array view land in the row the row view reads back.
+    run_ok(
+        "sparsenestedarray",
+        SPARSE_NESTED_ARRAY_SRC,
+        "row [11, 22]\nelem 22\nvia_row_ptr 22\nwritten [11, 99]\nvia_row_ptr_after 99\n",
+    );
+}
