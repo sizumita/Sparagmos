@@ -19760,3 +19760,88 @@ fn run_mode_cloned_handle_elements() {
         "stderr={stderr}"
     );
 }
+const VEC_ZST_ENUM_ITER_SRC: &str = r#"
+#[derive(Debug, PartialEq)]
+struct DropMe;
+impl Drop for DropMe { fn drop(&mut self) {} }
+enum CS<Y, R> { Yielded(Y), Complete(R) }
+enum Never {}
+fn main() {
+    let v: Vec<CS<Never, DropMe>> = vec![CS::Complete(DropMe), CS::Complete(DropMe)];
+    for x in &v {
+        match x { CS::Yielded(_) => println!("y"), CS::Complete(_) => println!("c") }
+    }
+    let s: &[CS<Never, DropMe>] = &v;
+    for x in s {
+        match x { CS::Yielded(_) => println!("y"), CS::Complete(_) => println!("c") }
+    }
+    for x in &v[..] {
+        match x { CS::Yielded(_) => println!("y"), CS::Complete(_) => println!("c") }
+    }
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_vec_of_zero_sized_enum_elements_read_by_iteration() {
+    // The elements of a `vec!` of a zero-sized enum reach an
+    // iteration snapshot as uninitialized slots (their stores
+    // are elided like the index-read case); the snapshot rescue
+    // denotes the element type's single value, so borrowed
+    // iteration, slice iteration and range-slice iteration all
+    // read the `Complete` variant, exactly as natively.
+    let dir = temp_dir("veczstenumiter");
+    let src = fixture(&dir, "veczstenumiter.rs", VEC_ZST_ENUM_ITER_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "iterating a vec! of zero-sized enum elements must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "c\nc\nc\nc\nc\nc\ndone\n",
+        "zero-sized enum elements read by iteration denote their single value"
+    );
+}
+
+const VEC_ZST_ENUM_NESTED_ITER_SRC: &str = r#"
+#[derive(Debug, PartialEq)]
+struct DropMe;
+impl Drop for DropMe { fn drop(&mut self) {} }
+enum CS<Y, R> { Yielded(Y), Complete(R) }
+enum Never {}
+fn main() {
+    let v: Vec<Vec<CS<Never, DropMe>>> = vec![vec![CS::Complete(DropMe)]];
+    for inner in &v {
+        for x in inner {
+            match x { CS::Yielded(_) => println!("y"), CS::Complete(_) => println!("c") }
+        }
+    }
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_nested_vec_of_zero_sized_enum_elements_read_by_iteration() {
+    // The inner `Vec` reaches the outer iteration's snapshot as
+    // a value, detached from any place; the rescue follows the
+    // recorded element path one index step deeper, so the
+    // inner iteration reads the `Complete` variant too.
+    let dir = temp_dir("veczstenumnestediter");
+    let src = fixture(&dir, "veczstenumnestediter.rs", VEC_ZST_ENUM_NESTED_ITER_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "iterating a nested vec! of zero-sized enum elements must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "c\ndone\n",
+        "nested zero-sized enum elements read by iteration denote their single value"
+    );
+}
+

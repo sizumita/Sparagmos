@@ -16351,7 +16351,114 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                 "a slice of {len} elements is beyond the value model's materialisation limit"
             )));
         }
-        Ok((elems.into_vec(), len))
+        let mut elems = elems.into_vec();
+        // An element of a single-valued type whose store MIR
+        // elided reaches the snapshot as an uninitialised slot;
+        // it denotes the type's one value (see
+        // `rescue_elided_snapshot`).
+        if let Some((frame_pos, local, path)) = self.seq_snapshot_key(frames, value) {
+            let frame = &frames[frame_pos];
+            self.rescue_elided_snapshot(frame, local, &path, &mut elems);
+        }
+        Ok((elems, len))
+    }
+
+    /// The (frame, local, path) key of the sequence a reference
+    /// value denotes, for the elided-store rescue: the target
+    /// place and the projection the sequence sits at within it.
+    /// An element snapshot taken from such a place carries no
+    /// type of its own, so this key is the snapshot's only
+    /// route back to the canonical values conversion recorded
+    /// for the place (see `Body::zst_fields`). `None` for
+    /// value-backed targets (their elements were materialised
+    /// by whoever built them).
+    fn seq_snapshot_key(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+    ) -> Option<(usize, usize, Vec<RefProj>)> {
+        let target = match value {
+            Value::FatRef { base, .. } => self.deref_value(frames, base).ok()?,
+            _ => self.deref_value(frames, value).ok()?,
+        };
+        let Resolved::Place {
+            frame_pos,
+            local,
+            projection,
+        } = target
+        else {
+            return None;
+        };
+        let mut path = projection;
+        if matches!(path.last(), Some(RefProj::Index(_))) {
+            path.pop();
+        }
+        Some((frame_pos, local, path))
+    }
+
+    /// Rescue the elided-store elements of an element snapshot
+    /// of the sequence at `path` in `local`: an element whose
+    /// type has a single value denotes that value, which
+    /// conversion recorded under the path's index step (see
+    /// `Body::zst_fields`), so an element that reaches the
+    /// snapshot as an uninitialised slot is replaced by it.
+    /// Elements that are themselves sequences are rescued the
+    /// same way one index step deeper, so a snapshot of a
+    /// nested sequence (`Vec<Vec<..>>`) denotes its elements'
+    /// elements too. Nothing is replaced at a path conversion
+    /// recorded nothing for: an element of a many-valued type
+    /// stays the uninitialised slot it is.
+    fn rescue_elided_snapshot(
+        &self,
+        frame: &Frame,
+        local: usize,
+        path: &[RefProj],
+        elems: &mut [Value],
+    ) {
+        let mut elem_path = path.to_vec();
+        elem_path.push(RefProj::Index(0));
+        if let Some(canonical) = self.zst_field_value(frame, local, &elem_path) {
+            for elem in elems.iter_mut() {
+                if *elem == Value::Uninit {
+                    *elem = canonical.clone();
+                }
+            }
+        }
+        for elem in elems.iter_mut() {
+            // An element that is itself a sequence is rescued
+            // the same way one index step deeper; the uninit
+            // slot it holds may sit several sequences down, so
+            // the descent is not gated on what the element
+            // immediately holds — the recorded-path lookup
+            // inside decides whether anything denotes a value,
+            // and a path conversion recorded nothing for (a
+            // struct's fields sit under field steps, not index
+            // steps) never fires.
+            self.rescue_elided_value(frame, local, &elem_path, elem);
+        }
+    }
+
+    /// [`Self::rescue_elided_snapshot`] on the elements a
+    /// sequence value itself holds.
+    fn rescue_elided_value(
+        &self,
+        frame: &Frame,
+        local: usize,
+        path: &[RefProj],
+        value: &mut Value,
+    ) {
+        match value {
+            Value::Tuple(items) => {
+                self.rescue_elided_snapshot(frame, local, path, items)
+            }
+            Value::Enum { fields, .. } => {
+                self.rescue_elided_snapshot(frame, local, path, fields)
+            }
+            Value::SparseVec { elems, .. } => {
+                self.rescue_elided_snapshot(frame, local, path, elems)
+            }
+            _ => {}
+        }
     }
 
     /// The borrowing form of [`slice_elements`]: the same elements
@@ -16560,7 +16667,21 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                         for i in 0..(*len as usize) {
                             elems.push(self.read_seq_at(frames, &target, i)?);
                         }
-                        return Ok((SliceElems::Values(Cow::Owned(elems)), *len));
+                        let elems = SliceElems::Values(Cow::Owned(elems));
+                        let elems = match self.seq_snapshot_key(frames, value) {
+                            Some((frame_pos, local, path)) => elems.with_rescue(
+                                |elems| {
+                                    self.rescue_elided_snapshot(
+                                        &frames[frame_pos],
+                                        local,
+                                        &path,
+                                        elems,
+                                    )
+                                },
+                            ),
+                            None => elems,
+                        };
+                        return Ok((elems, *len));
                     }
                     // A base ending in an element-entry suffix
                     // denotes one entered element of its
@@ -16575,12 +16696,34 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                 }
                 let base = self.resolve_ref(frames, base)?;
                 let elems = elements_of(base)?.truncated(*len as usize);
+                let elems = match self.seq_snapshot_key(frames, value) {
+                    Some((frame_pos, local, path)) => elems.with_rescue(|elems| {
+                        self.rescue_elided_snapshot(
+                            &frames[frame_pos],
+                            local,
+                            &path,
+                            elems,
+                        )
+                    }),
+                    None => elems,
+                };
                 Ok((elems, *len))
             }
             _ => {
                 let resolved = self.resolve_ref(frames, value)?;
                 let elems = elements_of(resolved)?;
                 let len = elems.len() as u128;
+                let elems = match self.seq_snapshot_key(frames, value) {
+                    Some((frame_pos, local, path)) => elems.with_rescue(|elems| {
+                        self.rescue_elided_snapshot(
+                            &frames[frame_pos],
+                            local,
+                            &path,
+                            elems,
+                        )
+                    }),
+                    None => elems,
+                };
                 Ok((elems, len))
             }
         }
@@ -20532,6 +20675,45 @@ impl<'a> SliceElems<'a> {
                 },
                 len: declared.min(len),
             },
+        }
+    }
+
+    /// These elements after applying an element rewrite (the
+    /// elided-store rescue, see
+    /// `Interpreter::rescue_elided_snapshot`) to the element
+    /// storage: borrowed storage is materialised so the
+    /// rewrite has somewhere to land. Byte elements carry no
+    /// uninitialised slots and pass through. A sparse
+    /// sequence's stored prefix is rewritten; its virtual tail
+    /// stays the uninitialised slots it denotes until a
+    /// consumer materialises it (`slice_elements` rewrites the
+    /// materialised tail the same way).
+    fn with_rescue(self, rescue: impl Fn(&mut [Value])) -> Self {
+        match self {
+            SliceElems::Values(Cow::Borrowed(items)) => {
+                let mut items = items.to_vec();
+                rescue(&mut items);
+                SliceElems::Values(Cow::Owned(items))
+            }
+            SliceElems::Values(Cow::Owned(mut items)) => {
+                rescue(&mut items);
+                SliceElems::Values(Cow::Owned(items))
+            }
+            SliceElems::Sparse { stored, len } => SliceElems::Sparse {
+                stored: match stored {
+                    Cow::Borrowed(items) => {
+                        let mut items = items.to_vec();
+                        rescue(&mut items);
+                        Cow::Owned(items)
+                    }
+                    Cow::Owned(mut items) => {
+                        rescue(&mut items);
+                        Cow::Owned(items)
+                    }
+                },
+                len,
+            },
+            bytes => bytes,
         }
     }
 
