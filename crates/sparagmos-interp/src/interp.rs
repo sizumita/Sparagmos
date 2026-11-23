@@ -812,6 +812,10 @@ pub struct Interpreter<'a> {
     /// call and taken by the caller afterwards, so a state can
     /// never leak into an unrelated call.
     consumed_iter_final: std::cell::RefCell<Option<Value>>,
+    /// Resolved ADT instance keys by bare ADT name (see
+    /// [`Interpreter::adt_instance_key`]), memoised: the
+    /// resolution scans the program's instance tables.
+    adt_instance_keys: std::cell::RefCell<HashMap<String, Option<String>>>,
 }
 
 /// The synthetic address of a pointer value (see
@@ -832,20 +836,22 @@ pub(crate) fn synthetic_address(value: &Value) -> Option<u128> {
     if let Value::Ref(RefTarget::Address(addr)) = value {
         return Some(*addr as u128);
     }
-    fn fnv1a(bytes: &[u8]) -> u64 {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for &b in bytes {
-            h ^= u64::from(b);
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        h
-    }
     if matches!(value, Value::Ref(RefTarget::Null)) {
         // The null pointer's address is 0, as natively: `is_null`
         // and address comparisons depend on it.
         return Some(0);
     }
-    let key = match value {
+    address_key(value).map(|key| hash_address_key(&key))
+}
+
+/// The identity key a pointer value's synthetic address is
+/// hashed from: a rendering of the target the value denotes.
+/// Two values with the same key are the same pointer for every
+/// address purpose in the model; [`Interpreter::pointer_address`]
+/// hashes a normalised form of this key (see
+/// [`Interpreter::canonical_target`]).
+fn address_key(value: &Value) -> Option<String> {
+    Some(match value {
         Value::Ref(target) => format!("ref:{target:?}"),
         Value::FatRef { base, len } => format!("fat:{base:?}:{len}"),
         Value::FnPtr(name) => format!("fn:{name}"),
@@ -858,9 +864,164 @@ pub(crate) fn synthetic_address(value: &Value) -> Option<u128> {
         // different values' pointers in this model).
         Value::DynRef { base, concrete, .. } => format!("dyn:{base:?}:{concrete}"),
         _ => return None,
-    };
+    })
+}
+
+/// Hash an address identity key into the synthetic address
+/// range (see [`synthetic_address`] for the range's contract:
+/// non-zero, 4096-aligned, 44 bits of hash).
+fn hash_address_key(key: &str) -> u128 {
+    fn fnv1a(bytes: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
     let h = fnv1a(key.as_bytes());
-    Some(0x1_0000_0000u128 + u128::from(h & 0xFF_FFFF_FFFF_F000))
+    0x1_0000_0000u128 + u128::from(h & 0xFF_FFFF_FFFF_F000)
+}
+
+/// Whether a stored value's tree contains any scalar content
+/// (a number, a boolean, text, bytes or a pointer): such a
+/// value belongs to a type of nonzero size. Used as a veto
+/// when a comparing operand claims a place's positions are
+/// zero-sized (see [`Interpreter::trailing_zero_ok`]): the
+/// claim is only ever refused, never manufactured, by stored
+/// content, so a scalar-free tree (units and aggregates of
+/// units) leaves the claim untouched.
+fn value_tree_has_scalar(value: &Value) -> bool {
+    match value {
+        Value::Bool(_)
+        | Value::Int(_)
+        | Value::Uint(_)
+        | Value::Float(_)
+        | Value::Float128(_)
+        | Value::Str(_)
+        | Value::Bytes(_)
+        | Value::Ref(_)
+        | Value::FatRef { .. }
+        | Value::DynRef { .. }
+        | Value::FmtCount(_)
+        | Value::FmtArguments(_)
+        | Value::Formatter(_)
+        | Value::FmtBuilder(_)
+        | Value::VaList(_)
+        | Value::FnPtr(_)
+        | Value::PanicPayload(_) => true,
+        Value::Uninit | Value::Unit => false,
+        Value::Tuple(items) => items.iter().any(value_tree_has_scalar),
+        Value::Enum { fields, .. } => fields.iter().any(value_tree_has_scalar),
+        Value::SparseVec { elems, .. } => elems.iter().any(value_tree_has_scalar),
+        Value::FmtArg { target, .. } => value_tree_has_scalar(target),
+        Value::Closure { env, .. } => env.iter().any(value_tree_has_scalar),
+        Value::Coroutine { fields, saved, .. } => {
+            fields.iter().any(value_tree_has_scalar)
+                || saved.iter().flatten().any(value_tree_has_scalar)
+        }
+    }
+}
+
+/// A type in the middle of a projection walk (see
+/// [`Interpreter::canonical_projection`]): either an IR type, or
+/// a rendered type tag — the form an ADT field's type takes in
+/// the program's debug-shape table, and the form a generic
+/// argument of a rendered ADT name takes.
+#[derive(Clone)]
+enum WalkTy {
+    Ty(Ty),
+    Tag(String),
+}
+
+/// The generic arguments of a rendered type name, split at the
+/// top nesting level of the outermost angle brackets
+/// (`std::vec::Vec<(), A>` gives `["()", "A"]`).
+fn generic_args_of(name: &str) -> Option<Vec<&str>> {
+    let open = name.find('<')?;
+    let bytes = name.as_bytes();
+    let mut depth = 0i32;
+    let mut end = None;
+    for i in open..bytes.len() {
+        match bytes[i] {
+            b'<' | b'(' | b'[' => depth += 1,
+            b'>' | b')' | b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let inner = &name[open + 1..end?];
+    Some(split_top_level_str(inner))
+}
+
+/// Split a comma-separated list at the top nesting level
+/// (angle brackets, parentheses and brackets all nest).
+fn split_top_level_str(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(s[start..].trim());
+    parts
+}
+
+/// The element type tag of the sequence a rendered type tag
+/// denotes: an array's element, a pointer or reference position's
+/// pointee sequence (an array pointee's element, any other
+/// pointee itself), or an ADT instance's first generic argument
+/// (the element type of the modelled collections — `Vec<T>` and
+/// its kin — whose element positions a projection indexes
+/// directly).
+fn tag_sequence_elem(tag: &str) -> Option<&str> {
+    let tag = tag.trim();
+    for prefix in ["*const ", "*mut "] {
+        if let Some(rest) = tag.strip_prefix(prefix) {
+            let rest = rest.trim();
+            if rest.starts_with('[') {
+                return tag_sequence_elem(rest);
+            }
+            return Some(rest);
+        }
+    }
+    if let Some(rest) = tag.strip_prefix('&') {
+        let mut rest = rest.trim_start();
+        if let Some(stripped) = rest.strip_prefix('\'') {
+            // A lifetime: skip its name and the following space.
+            rest = stripped
+                .split_once(' ')
+                .map(|(_, tail)| tail)
+                .unwrap_or(stripped)
+                .trim_start();
+        }
+        let rest = rest.strip_prefix("mut ").unwrap_or(rest).trim();
+        if rest.starts_with('[') {
+            return tag_sequence_elem(rest);
+        }
+        return Some(rest);
+    }
+    if tag.starts_with('[') {
+        let inner = tag.strip_prefix('[')?.strip_suffix(']')?;
+        if let Some((elem, _)) = inner.rsplit_once(';') {
+            return Some(elem.trim());
+        }
+        return Some(inner.trim());
+    }
+    generic_args_of(tag)?.into_iter().next()
 }
 
 #[test]
@@ -1092,6 +1253,7 @@ impl<'a> Interpreter<'a> {
             elem_blocks: std::cell::RefCell::new(std::collections::HashSet::new()),
             next_alloc: std::cell::Cell::new(1),
             decoded: std::cell::RefCell::new(std::collections::HashMap::new()),
+            adt_instance_keys: std::cell::RefCell::new(HashMap::new()),
             debug_ctl: None,
         }
     }
@@ -8932,6 +9094,463 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// The synthetic address of a pointer value with the
+    /// size-aware normalisation [`synthetic_address`] cannot
+    /// perform on the value alone: an element position in a
+    /// zero-sized element sequence denotes the same address
+    /// whatever its index — the position's byte displacement is
+    /// zero — so the identity key is hashed from the target with
+    /// such positions normalised to the sequence's base (see
+    /// [`Self::canonical_target`]). Every other position keeps
+    /// the plain synthetic identity: the address returned here
+    /// differs from [`synthetic_address`]'s only where a
+    /// zero-sized element step was actually normalised.
+    /// `leaf_ty` is the declared pointee type of the operand the
+    /// value was read from, when the caller knows it: it prices
+    /// the normalisation of targets whose root type the
+    /// interpreter does not record (allocations, constant
+    /// aggregates).
+    pub(crate) fn pointer_address(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+        leaf_ty: Option<&Ty>,
+    ) -> Option<u128> {
+        if matches!(
+            value,
+            Value::Ref(RefTarget::Address(_)) | Value::Ref(RefTarget::Null)
+        ) {
+            return synthetic_address(value);
+        }
+        match self.canonical_address_key(frames, value, leaf_ty) {
+            Some(key) => Some(hash_address_key(&key)),
+            None => synthetic_address(value),
+        }
+    }
+
+    /// The address identity key of a pointer value with
+    /// zero-sized element positions normalised (see
+    /// [`Self::pointer_address`]); `None` exactly when
+    /// [`address_key`] has no key for the value.
+    fn canonical_address_key(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+        leaf_ty: Option<&Ty>,
+    ) -> Option<String> {
+        match value {
+            Value::Ref(target) => {
+                let target = self.canonical_target(frames, target, leaf_ty);
+                Some(format!("ref:{target:?}"))
+            }
+            Value::FatRef { base, len } => {
+                // The base target's element positions are
+                // denominated in the slice's element type.
+                let elem = match leaf_ty {
+                    Some(Ty::Slice(elem)) => Some(&**elem),
+                    _ => None,
+                };
+                let base = self.canonical_base_value(frames, base, elem);
+                Some(format!("fat:{base:?}:{len}"))
+            }
+            Value::DynRef { base, concrete, .. } => {
+                let base = self.canonical_base_value(frames, base, None);
+                Some(format!("dyn:{base:?}:{concrete}"))
+            }
+            _ => address_key(value),
+        }
+    }
+
+    /// A fat pointer's base value with its target normalised
+    /// (see [`Self::canonical_target`]); a non-reference base
+    /// passes through unchanged.
+    fn canonical_base_value(
+        &self,
+        frames: &[Frame],
+        base: &Value,
+        leaf_ty: Option<&Ty>,
+    ) -> Value {
+        match base {
+            Value::Ref(target) => Value::Ref(self.canonical_target(frames, target, leaf_ty)),
+            _ => base.clone(),
+        }
+    }
+
+    /// The instance key (the rendered name the program's layout
+    /// and debug-shape tables are keyed by) of the ADT instance
+    /// a bare ADT name denotes in this program: the name itself
+    /// when it is a key, else the one table key with that base
+    /// name when exactly one exists. The IR's ADT types carry
+    /// only the definition's name — the generic arguments live
+    /// only in the instance tables — and the driver records a
+    /// layout and a debug shape for every ADT instance a
+    /// converted body mentions, so a bare name with exactly one
+    /// recorded instance can only denote that instance. Two or
+    /// more recorded instances make the name ambiguous here and
+    /// resolve to `None`, as does an unrecorded name.
+    fn adt_instance_key(&self, name: &str) -> Option<String> {
+        if let Some(hit) = self.adt_instance_keys.borrow().get(name) {
+            return hit.clone();
+        }
+        let program = self.program();
+        let resolved = if program.adt_layouts.contains_key(name)
+            || program.adt_debug_shapes.contains_key(name)
+        {
+            Some(name.to_string())
+        } else {
+            let mut found: Option<String> = None;
+            let mut ambiguous = false;
+            for key in program
+                .adt_layouts
+                .keys()
+                .chain(program.adt_debug_shapes.keys())
+            {
+                let base = key.split('<').next().unwrap_or(key.as_str());
+                if base == name {
+                    match &found {
+                        None => found = Some(key.clone()),
+                        Some(prev) if *prev != *key => ambiguous = true,
+                        _ => {}
+                    }
+                }
+            }
+            if ambiguous {
+                None
+            } else {
+                found
+            }
+        };
+        self.adt_instance_keys
+            .borrow_mut()
+            .insert(name.to_string(), resolved.clone());
+        resolved
+    }
+
+    /// The element size a trailing element step is denominated
+    /// in, from the type of the value at the step's position
+    /// (the operand's declared pointee type): the element type
+    /// itself for a thin pointer, the element of an array or
+    /// slice pointee. An ADT element's size comes from the
+    /// layout of the one instance the name denotes in this
+    /// program (see [`Self::adt_instance_key`]).
+    fn leaf_elem_size(&self, leaf: &Ty) -> Option<u64> {
+        match leaf {
+            Ty::Array(elem, _) | Ty::Slice(elem) => self.ty_size(elem),
+            Ty::Adt(name) => self
+                .adt_instance_key(name)
+                .and_then(|key| self.program().adt_layouts.get(&key).map(|&(size, _)| size)),
+            other => self.ty_size(other),
+        }
+    }
+
+    /// A reference target with its zero-sized element positions
+    /// normalised to the sequence base (see
+    /// [`Self::pointer_address`]). The walk that prices each
+    /// element step starts from the root's declared type where
+    /// the interpreter records one — a place's local type, a
+    /// static's declared type — and from the operand's pointee
+    /// type (`leaf_ty`), walking the projection backwards from
+    /// its trailing element step, where it does not (allocations
+    /// and constant aggregates record no root type). A step the
+    /// walk cannot price keeps its index: the normalisation only
+    /// ever merges positions the types prove share one address.
+    fn canonical_target(
+        &self,
+        frames: &[Frame],
+        target: &RefTarget,
+        leaf_ty: Option<&Ty>,
+    ) -> RefTarget {
+        match target {
+            RefTarget::Place {
+                frame,
+                local,
+                projection,
+            } => {
+                let root = frames
+                    .iter()
+                    .find(|f| f.id == *frame)
+                    .and_then(|f| self.program().functions.get(&f.func))
+                    .and_then(|body| body.local_tys.get(*local))
+                    .cloned();
+                // The stored root value vetoes a zero-sized
+                // reading of its positions: a value tree with
+                // scalar content belongs to a type of nonzero
+                // size, whatever a comparing operand claims.
+                let veto_zero = frames
+                    .iter()
+                    .find(|f| f.id == *frame)
+                    .and_then(|f| f.locals.get(*local))
+                    .map(|v| value_tree_has_scalar(v))
+                    .unwrap_or(false);
+                match root {
+                    Some(root) => RefTarget::Place {
+                        frame: *frame,
+                        local: *local,
+                        projection: self.canonical_projection(
+                            &WalkTy::Ty(root),
+                            projection,
+                            leaf_ty,
+                            veto_zero,
+                        ),
+                    },
+                    None => target.clone(),
+                }
+            }
+            RefTarget::Static { name, projection } => {
+                match self.program().static_tys.get(name).cloned() {
+                    Some(root) => RefTarget::Static {
+                        name: name.clone(),
+                        projection: self.canonical_projection(
+                            &WalkTy::Ty(root),
+                            projection,
+                            leaf_ty,
+                            false,
+                        ),
+                    },
+                    None => target.clone(),
+                }
+            }
+            RefTarget::Alloc { id, projection } => RefTarget::Alloc {
+                id: *id,
+                projection: match leaf_ty {
+                    Some(leaf) => self.canonical_projection_bwd(projection, leaf),
+                    None => projection.clone(),
+                },
+            },
+            RefTarget::Value(base, projection) => RefTarget::Value(
+                base.clone(),
+                match leaf_ty {
+                    Some(leaf) => self.canonical_projection_bwd(projection, leaf),
+                    None => projection.clone(),
+                },
+            ),
+            RefTarget::Null | RefTarget::Address(_) => target.clone(),
+        }
+    }
+
+    /// The canonical form of a projection for address purposes,
+    /// walked from the root type: an `Index` or `Subslice` step
+    /// into a sequence whose element size is zero denotes the
+    /// sequence's base position (its byte displacement is zero
+    /// whatever the index), so the step is dropped; every other
+    /// step is kept verbatim. A step the walk cannot price keeps
+    /// its index, and steps past a position whose type the walk
+    /// cannot determine are kept as well: the walk prices a step
+    /// only from the type at that step.
+    fn canonical_projection(
+        &self,
+        root: &WalkTy,
+        projection: &[RefProj],
+        leaf_ty: Option<&Ty>,
+        veto_zero: bool,
+    ) -> Vec<RefProj> {
+        let mut out = Vec::with_capacity(projection.len());
+        let mut cur: Option<WalkTy> = Some(root.clone());
+        let mut variant: u32 = 0;
+        for (i, step) in projection.iter().enumerate() {
+            match step {
+                RefProj::Downcast(v) => {
+                    variant = *v;
+                    out.push(step.clone());
+                }
+                RefProj::Field(idx) => {
+                    out.push(step.clone());
+                    cur = match cur {
+                        Some(c) => self.field_walk_ty(&c, variant, *idx),
+                        None => None,
+                    };
+                }
+                RefProj::Index(_) | RefProj::Subslice { .. } => {
+                    let step_cur = cur.clone();
+                    let elem = cur.as_ref().and_then(|c| self.sequence_elem(c));
+                    let (mut size, next) = match elem {
+                        Some((size, next)) => (size, Some(next)),
+                        None => (None, None),
+                    };
+                    // The trailing step may still be priced
+                    // from the operand's declared pointee type
+                    // when the walk from the root cannot price
+                    // it (a generic collection root whose
+                    // element type the IR type erases) — but
+                    // only under the guards of
+                    // [`Self::trailing_zero_ok`]: generic
+                    // machinery also compares positions through
+                    // pointers cast to `*const ()`, whose
+                    // pointee type denominates nothing.
+                    if size.is_none() && i + 1 == projection.len() && !veto_zero {
+                        if let Some(leaf) = leaf_ty {
+                            if self.trailing_zero_ok(&step_cur, leaf) {
+                                size = Some(0);
+                            }
+                        }
+                    }
+                    if size != Some(0) {
+                        out.push(step.clone());
+                    }
+                    if matches!(step, RefProj::Index(_)) {
+                        cur = next;
+                    }
+                }
+                RefProj::ByteOffset(_) | RefProj::UnionField { .. } => {
+                    out.push(step.clone());
+                    cur = None;
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether a trailing element step the root walk could not
+    /// price may be read as zero-sized from the comparing
+    /// operand's declared pointee type (`leaf`): the leaf must
+    /// itself be zero-sized, and where the step's sequence is a
+    /// bare ADT name, the claim must be consistent with the
+    /// instances of that ADT the program records — at least one
+    /// recorded instance must have a zero-sized (or unpriceable)
+    /// element. A claim no recorded instance supports is a cast
+    /// artefact (generic sort machinery compares element
+    /// positions through `*const ()` pointers), not evidence
+    /// about this root.
+    fn trailing_zero_ok(&self, cur: &Option<WalkTy>, leaf: &Ty) -> bool {
+        if self.leaf_elem_size(leaf) != Some(0) {
+            return false;
+        }
+        match cur {
+            Some(WalkTy::Ty(Ty::Adt(name))) => {
+                let program = self.program();
+                let mut keys: Vec<&String> = Vec::new();
+                for key in program
+                    .adt_layouts
+                    .keys()
+                    .chain(program.adt_debug_shapes.keys())
+                {
+                    if key.split('<').next().unwrap_or(key.as_str()) == name.as_str()
+                        && !keys.contains(&key)
+                    {
+                        keys.push(key);
+                    }
+                }
+                if keys.is_empty() {
+                    return true;
+                }
+                keys.iter().any(|key| {
+                    match tag_sequence_elem(key)
+                        .and_then(|elem| self.layout_of(elem))
+                        .and_then(|(size, _)| u64::try_from(size).ok())
+                    {
+                        Some(0) => true,
+                        Some(_) => false,
+                        None => true,
+                    }
+                })
+            }
+            _ => true,
+        }
+    }
+
+    /// The canonical form of a projection whose root type is
+    /// not recorded (an allocation's, a constant aggregate's),
+    /// walked backwards from the trailing element step with the
+    /// operand's pointee type `leaf`: the trailing `Index` /
+    /// `Subslice` step is denominated in `leaf`'s element size
+    /// (the element type itself for a thin pointer, the element
+    /// of an array or slice pointee), and is dropped when that
+    /// size is zero. Steps before it are kept verbatim: walking
+    /// backwards cannot price them.
+    fn canonical_projection_bwd(&self, projection: &[RefProj], leaf: &Ty) -> Vec<RefProj> {
+        let elem_size = self.leaf_elem_size(leaf);
+        let mut out: Vec<RefProj> = Vec::with_capacity(projection.len());
+        let mut priced = true;
+        for step in projection.iter().rev() {
+            match step {
+                RefProj::Index(_) | RefProj::Subslice { .. } if priced => {
+                    if elem_size != Some(0) {
+                        out.push(step.clone());
+                    }
+                    priced = false;
+                }
+                _ => out.push(step.clone()),
+            }
+        }
+        out.reverse();
+        out
+    }
+
+    /// The element (size, type) of the sequence a walk type
+    /// denotes, when it denotes one: arrays and slices directly,
+    /// a pointer position through its pointee, and an ADT
+    /// instance through its first generic argument (the element
+    /// type of the modelled collections whose element positions
+    /// a projection indexes directly). The size is `None` when
+    /// the element type's layout is not one the interpreter can
+    /// price; the element type is still reported, so the walk
+    /// can continue past the step.
+    fn sequence_elem(&self, cur: &WalkTy) -> Option<(Option<u64>, WalkTy)> {
+        match cur {
+            WalkTy::Ty(Ty::Array(elem, _)) | WalkTy::Ty(Ty::Slice(elem)) => {
+                Some((self.ty_size(elem), WalkTy::Ty((**elem).clone())))
+            }
+            WalkTy::Ty(Ty::Ref(inner)) => match &**inner {
+                Ty::Array(elem, _) | Ty::Slice(elem) => {
+                    Some((self.ty_size(elem), WalkTy::Ty((**elem).clone())))
+                }
+                _ => Some((self.ty_size(inner), WalkTy::Ty((**inner).clone()))),
+            },
+            WalkTy::Ty(Ty::Adt(name)) => {
+                let key = self.adt_instance_key(name)?;
+                let elem = tag_sequence_elem(&key)?;
+                let size = self
+                    .layout_of(elem)
+                    .and_then(|(size, _)| u64::try_from(size).ok());
+                Some((size, WalkTy::Tag(elem.to_string())))
+            }
+            WalkTy::Tag(tag) => {
+                let elem = tag_sequence_elem(tag)?;
+                let size = self
+                    .layout_of(elem)
+                    .and_then(|(size, _)| u64::try_from(size).ok());
+                Some((size, WalkTy::Tag(elem.to_string())))
+            }
+            _ => None,
+        }
+    }
+
+    /// The type of field `idx` of the value a walk type denotes:
+    /// a tuple's element, or an ADT variant's field from the
+    /// program's debug-shape table (whose field types are
+    /// rendered tags).
+    fn field_walk_ty(&self, cur: &WalkTy, variant: u32, idx: usize) -> Option<WalkTy> {
+        match cur {
+            WalkTy::Ty(Ty::Tuple(ts)) => ts.get(idx).map(|t| WalkTy::Ty(t.clone())),
+            WalkTy::Ty(Ty::Adt(name)) => self.adt_field_tag(name, variant, idx).map(WalkTy::Tag),
+            WalkTy::Tag(tag) => {
+                let tag = tag.trim();
+                if tag.starts_with('(') && tag.ends_with(')') {
+                    let parts = split_top_level_str(&tag[1..tag.len() - 1]);
+                    parts
+                        .get(idx)
+                        .map(|part| WalkTy::Tag((*part).to_string()))
+                } else {
+                    self.adt_field_tag(tag, variant, idx).map(WalkTy::Tag)
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The rendered type tag of field `idx` of variant
+    /// `variant` of the ADT instance `name`, from the program's
+    /// debug-shape table.
+    fn adt_field_tag(&self, name: &str, variant: u32, idx: usize) -> Option<String> {
+        let key = self.adt_instance_key(name)?;
+        let shape = self.program().adt_debug_shapes.get(&key)?;
+        let variant = shape
+            .variants
+            .get(variant as usize)
+            .or_else(|| shape.variants.first())?;
+        variant.fields.get(idx).map(|field| field.ty.clone())
+    }
+
     /// The value of a pointer offset (see [`Rvalue::PtrOffset`]):
     /// `base` advanced by `count` elements of `elem_size` bytes
     /// each (the size may be unknown, in which case only the
@@ -14097,12 +14716,21 @@ impl<'a> Interpreter<'a> {
             Rvalue::BinaryOp(op, pair) => {
                 let lhs = self.eval_operand(frames, body, &pair.0)?;
                 let rhs = self.eval_operand(frames, body, &pair.1)?;
-                eval_binary(*op, &lhs, &rhs, dest_ty, false).map(|(v, _)| v)
+                let leaf = operand_pointee_ty(body, &pair.0)
+                    .or_else(|| operand_pointee_ty(body, &pair.1));
+                eval_binary(*op, &lhs, &rhs, dest_ty, false, &|v| {
+                    self.pointer_address(frames, v, leaf.as_ref())
+                })
+                .map(|(v, _)| v)
             }
             Rvalue::CheckedBinaryOp(op, pair) => {
                 let lhs = self.eval_operand(frames, body, &pair.0)?;
                 let rhs = self.eval_operand(frames, body, &pair.1)?;
-                let (v, overflowed) = eval_binary(*op, &lhs, &rhs, dest_ty, true)?;
+                let leaf = operand_pointee_ty(body, &pair.0)
+                    .or_else(|| operand_pointee_ty(body, &pair.1));
+                let (v, overflowed) = eval_binary(*op, &lhs, &rhs, dest_ty, true, &|v| {
+                    self.pointer_address(frames, v, leaf.as_ref())
+                })?;
                 Ok(Value::Tuple(vec![v, Value::Bool(overflowed)]))
             }
             Rvalue::UnaryOp(UnOp::PtrMetadata, operand) => {
@@ -14217,7 +14845,8 @@ impl<'a> Interpreter<'a> {
             }
             Rvalue::PtrToInt(operand) => {
                 let value = self.eval_operand(frames, body, operand)?;
-                match synthetic_address(&value) {
+                let leaf = operand_pointee_ty(body, operand);
+                match self.pointer_address(frames, &value, leaf.as_ref()) {
                     Some(addr) => Ok(Value::Uint(addr)),
                     None => Err(InterpError::TypeMismatch {
                         context: "pointer-to-integer transmute".to_string(),
@@ -17580,6 +18209,7 @@ pub(crate) fn eval_binary(
     rhs: &Value,
     dest_ty: Option<&Ty>,
     checked_form: bool,
+    addr_of: &dyn Fn(&Value) -> Option<u128>,
 ) -> InterpResult<(Value, bool)> {
     use BinOp::*;
     // Boolean operations.
@@ -17830,13 +18460,16 @@ pub(crate) fn eval_binary(
     // Pointer operations: MIR compares raw pointers and function
     // pointers directly. Equality is address identity in the
     // synthetic-address model (the same identity `PtrToInt`
-    // exposes); a fat pointer's equality also compares the
-    // metadata word (its length). Ordering is defined on the
-    // synthetic addresses, which is deterministic within a run --
-    // except between two pointers into the same storage, whose
-    // order is their structural position order (see
-    // `structural_ptr_order`): the synthetic address hashes the
-    // whole target, projections included, so it orders two
+    // exposes), as resolved by `addr_of` -- the caller supplies
+    // the size-aware resolution ([`Interpreter::pointer_address`])
+    // so that element positions in a zero-sized sequence compare
+    // equal, as they do natively; a fat pointer's equality also
+    // compares the metadata word (its length). Ordering is
+    // defined on the resolved addresses, which is deterministic
+    // within a run -- except between two pointers into the same
+    // storage, whose order is their structural position order
+    // (see `structural_ptr_order`): the synthetic address hashes
+    // the whole target, projections included, so it orders two
     // positions of one buffer arbitrarily, while the guest's
     // pointer preconditions (`offset_from_unsigned`'s
     // `self >= origin`, an iterator's `end >= ptr`) are stated
@@ -17875,15 +18508,13 @@ pub(crate) fn eval_binary(
                 // non-zero, a model choice the comparison relation
                 // does not inherit).
                 Value::Ref(RefTarget::Null) => Some((0, None)),
-                Value::FatRef { len, .. } => {
-                    synthetic_address(v).map(|a| (a, Some(*len)))
-                }
+                Value::FatRef { len, .. } => addr_of(v).map(|a| (a, Some(*len))),
                 Value::Ref(_) | Value::FnPtr(_) | Value::DynRef { .. } => {
-                    synthetic_address(v).map(|a| (a, None))
+                    addr_of(v).map(|a| (a, None))
                 }
                 // A non-capturing closure value is a function
                 // pointer; it compares by its body identity.
-                Value::Closure { .. } => synthetic_address(v).map(|a| (a, None)),
+                Value::Closure { .. } => addr_of(v).map(|a| (a, None)),
                 _ => None,
             }
         };

@@ -18375,6 +18375,59 @@ fn main() {
     let mut v = vec![vec![1, 2], vec![4]];
     let x = v[0].pop();
     println!("{:?} {:?}", v, x);
+// ----- zero-sized pointer addresses (Lane NA) -------------------------------
+
+const ZST_VEC_PTR_EQ_SRC: &str = r#"
+fn main() {
+    let v: Vec<()> = vec![(), (), ()];
+    let p = v.as_ptr();
+    unsafe {
+        println!("eq {}", p.add(1) == p);
+        println!("eq2 {}", p.add(2) == p.add(0));
+        println!("ne {}", p.add(1) != p);
+        println!("lt {}", p.add(1) < p);
+        println!("le {}", p.add(1) <= p);
+        println!("gt {}", p.add(1) > p);
+        println!("int {}", p.add(1) as usize == p as usize);
+        println!("ptreq {}", std::ptr::eq(p.add(1), p));
+    }
+    println!("done");
+}
+"#;
+
+const ZST_ARRAY_PTR_EQ_SRC: &str = r#"
+struct Z;
+fn main() {
+    let a = [Z, Z, Z, Z];
+    let p = a.as_ptr();
+    unsafe {
+        println!("arr {}", p.add(3) == p);
+    }
+    let s: &[Z] = &a;
+    println!("slice {}", s.as_ptr() == p);
+    let mut m: Vec<std::mem::MaybeUninit<()>> = Vec::new();
+    m.push(std::mem::MaybeUninit::new(()));
+    m.push(std::mem::MaybeUninit::uninit());
+    let q = m.as_ptr();
+    unsafe {
+        println!("mu {}", q.add(1) == q);
+    }
+    println!("done");
+}
+"#;
+
+const SIZED_PTR_POSITIONS_SRC: &str = r#"
+fn main() {
+    let v: Vec<i32> = vec![10, 20, 30];
+    let p = v.as_ptr();
+    unsafe {
+        println!("eq0 {}", p.add(0) == p);
+        println!("eq1 {}", p.add(1) == p);
+        println!("ne12 {}", p.add(1) != p.add(2));
+        println!("ordered {}", (p < p.add(1)) ^ (p.add(1) < p));
+        println!("refl {}", p.add(1) <= p.add(1) && p.add(1) >= p.add(1));
+    }
+    println!("done");
 }
 "#;
 
@@ -18461,5 +18514,65 @@ fn run_mode_nested_vec_push_after_outer_truncate() {
         "nested-vec-push-trunc",
         NESTED_VEC_PUSH_TRUNC_SRC,
         "[[[7, 8, 10]]]\n",
+fn run_mode_zst_vec_pointer_positions_share_the_base_address() {
+    // A zero-sized element occupies no bytes, so every element
+    // position of a `Vec<()>` is the same address natively:
+    // `p.add(1) == p`, no strict ordering between positions,
+    // and the integer casts agree (Lane MV denominated the
+    // offsets in elements, which had made the positions
+    // distinct synthetic addresses).
+    let dir = temp_dir("zst-vec-ptr-eq");
+    let src = fixture(&dir, "zst_vec_ptr_eq.rs", ZST_VEC_PTR_EQ_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "ZST pointer equality program must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "eq true\neq2 true\nne false\nlt false\nle true\ngt false\nint true\nptreq true\ndone\n"
+    );
+}
+
+#[test]
+fn run_mode_zst_array_slice_and_maybeuninit_pointer_equality() {
+    // The same address rule through an array root, a slice
+    // fat pointer and a `Vec<MaybeUninit<()>>` buffer.
+    let dir = temp_dir("zst-array-ptr-eq");
+    let src = fixture(&dir, "zst_array_ptr_eq.rs", ZST_ARRAY_PTR_EQ_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "ZST array pointer equality program must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "arr true\nslice true\nmu true\ndone\n"
+    );
+}
+
+#[test]
+fn run_mode_sized_pointer_positions_stay_distinct() {
+    // Sized elements keep their position distinction: only
+    // zero-sized element positions collapse onto the base.
+    // Distinct positions stay distinct and strictly ordered
+    // one way or the other (the synthetic address order itself
+    // is the hash order, as before this lane).
+    let dir = temp_dir("sized-ptr-positions");
+    let src = fixture(&dir, "sized_ptr_positions.rs", SIZED_PTR_POSITIONS_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "sized pointer position program must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "eq0 true\neq1 false\nne12 true\nordered true\nrefl true\ndone\n"
     );
 }

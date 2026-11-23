@@ -10885,9 +10885,10 @@ impl<'a> Interpreter<'a> {
 
     /// The equality an atomic compare-exchange performs: the
     /// pointee's current value against the expected one.
-    /// Pointer-shaped values compare by identity — the synthetic
-    /// address, the same identity `PtrToInt` exposes — and every
-    /// other value by the semantic (derived) equality.
+    /// Pointer-shaped values compare by identity — the
+    /// size-aware synthetic address, the same identity
+    /// `PtrToInt` exposes — and every other value by the
+    /// semantic (derived) equality.
     fn atomic_value_eq(
         &self,
         frames: &[Frame],
@@ -10896,7 +10897,10 @@ impl<'a> Interpreter<'a> {
     ) -> InterpResult<bool> {
         let current = unwrap_wrapper(current);
         let expected = unwrap_wrapper(expected);
-        match (synthetic_address(current), synthetic_address(expected)) {
+        match (
+            self.pointer_address(frames, current, None),
+            self.pointer_address(frames, expected, None),
+        ) {
             (Some(a), Some(b)) => Ok(a == b),
             _ => self.values_equal(frames, current, expected),
         }
@@ -14232,7 +14236,8 @@ fn value_fingerprint(value: &Value) -> u64 {
         rhs: &Value,
     ) -> InterpResult<Value> {
         let ty = primitive_self_ty(name)?;
-        let (result, overflowed) = eval_binary(op, lhs, rhs, Some(&ty), true)?;
+        let (result, overflowed) =
+            eval_binary(op, lhs, rhs, Some(&ty), true, &synthetic_address)?;
         if overflowed && self.overflow_checks() {
             return Err(InterpError::panic_str_payload(
                 primitive_overflow_message(op),
@@ -14920,7 +14925,10 @@ fn value_fingerprint(value: &Value) -> u64 {
         if matches!(a, Value::Ref(RefTarget::Address(_)))
             || matches!(b, Value::Ref(RefTarget::Address(_)))
         {
-            if let (Some(x), Some(y)) = (synthetic_address(a), synthetic_address(b)) {
+            if let (Some(x), Some(y)) = (
+                self.pointer_address(frames, a, None),
+                self.pointer_address(frames, b, None),
+            ) {
                 return Ok(x == y);
             }
         }

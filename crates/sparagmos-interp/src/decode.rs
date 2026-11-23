@@ -60,8 +60,8 @@ use std::rc::Rc;
 
 use crate::error::{InterpError, InterpResult};
 use crate::interp::{
-    describe_resolved, eval_binary, eval_cast, eval_unary, navigate_mut, project_value,
-    synthetic_address, Frame, Interpreter,
+    describe_resolved, eval_binary, eval_cast, eval_unary, navigate_mut, operand_pointee_ty,
+    project_value, Frame, Interpreter,
 };
 use crate::ir::{
     BasicBlock, BinOp, Body, Constant, Local, Operand, Place, ProjectionElem, Rvalue, Statement,
@@ -668,6 +668,24 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// The declared pointee type of the pointer value a decoded
+    /// source evaluates to, when it is statically known (a plain
+    /// local of pointer type, or an operand with one): the leaf
+    /// type the address normalisation prices element steps from
+    /// (see [`Interpreter::pointer_address`]).
+    fn dsrc_pointee_ty(body: &Body, src: &DSrc) -> Option<Ty> {
+        match src {
+            DSrc::Local(idx) | DSrc::MoveLocal(idx) => {
+                match body.local_ty(Local(*idx as usize)) {
+                    Some(Ty::Ref(inner)) => Some((**inner).clone()),
+                    _ => None,
+                }
+            }
+            DSrc::Operand(op) => operand_pointee_ty(body, op),
+            DSrc::LocalProj { .. } | DSrc::MoveLocalProj { .. } | DSrc::Const(_) => None,
+        }
+    }
+
     fn eval_drvalue(
         &self,
         frames: &mut Vec<Frame>,
@@ -678,14 +696,23 @@ impl<'a> Interpreter<'a> {
         match rv {
             DRvalue::Use(src) => self.eval_src(frames, body, src),
             DRvalue::BinaryOp(op, lhs, rhs) => {
+                let leaf = Self::dsrc_pointee_ty(body, lhs)
+                    .or_else(|| Self::dsrc_pointee_ty(body, rhs));
                 let lhs = self.eval_src(frames, body, lhs)?;
                 let rhs = self.eval_src(frames, body, rhs)?;
-                eval_binary(*op, &lhs, &rhs, dest_ty, false).map(|(v, _)| v)
+                eval_binary(*op, &lhs, &rhs, dest_ty, false, &|v| {
+                    self.pointer_address(frames, v, leaf.as_ref())
+                })
+                .map(|(v, _)| v)
             }
             DRvalue::CheckedBinaryOp(op, lhs, rhs) => {
+                let leaf = Self::dsrc_pointee_ty(body, lhs)
+                    .or_else(|| Self::dsrc_pointee_ty(body, rhs));
                 let lhs = self.eval_src(frames, body, lhs)?;
                 let rhs = self.eval_src(frames, body, rhs)?;
-                let (v, overflowed) = eval_binary(*op, &lhs, &rhs, dest_ty, true)?;
+                let (v, overflowed) = eval_binary(*op, &lhs, &rhs, dest_ty, true, &|v| {
+                    self.pointer_address(frames, v, leaf.as_ref())
+                })?;
                 Ok(Value::Tuple(vec![v, Value::Bool(overflowed)]))
             }
             DRvalue::UnaryOp(op, src) => {
@@ -815,8 +842,9 @@ impl<'a> Interpreter<'a> {
             }
             DRvalue::Reborrow(dplace) => self.read_dplace(frames, body, dplace),
             DRvalue::PtrToInt(src) => {
+                let leaf = Self::dsrc_pointee_ty(body, src);
                 let value = self.eval_src(frames, body, src)?;
-                match synthetic_address(&value) {
+                match self.pointer_address(frames, &value, leaf.as_ref()) {
                     Some(addr) => Ok(Value::Uint(addr)),
                     None => Err(InterpError::TypeMismatch {
                         context: "pointer-to-integer transmute".to_string(),
@@ -964,6 +992,7 @@ mod dispatch_prototype {
     //!
     //! `cargo test -p sparagmos-interp --release dispatch_prototype -- --ignored --nocapture`
     use super::eval_binary;
+    use crate::interp::synthetic_address;
     use crate::ir::BinOp;
     use crate::value::Value;
     use std::time::Instant;
@@ -998,13 +1027,13 @@ mod dispatch_prototype {
     fn add_ll(ctx: &mut Ctx, dst: u32, a: u32, b: u32) {
         let lhs = ctx.slots[a as usize].clone();
         let rhs = ctx.slots[b as usize].clone();
-        let (v, _) = eval_binary(BinOp::Add, &lhs, &rhs, None, false).unwrap();
+        let (v, _) = eval_binary(BinOp::Add, &lhs, &rhs, None, false, &synthetic_address).unwrap();
         ctx.slots[dst as usize] = v;
     }
     fn add_lc(ctx: &mut Ctx, dst: u32, a: u32, c: u128) {
         let lhs = ctx.slots[a as usize].clone();
         let rhs = Value::Uint(c);
-        let (v, _) = eval_binary(BinOp::Add, &lhs, &rhs, None, false).unwrap();
+        let (v, _) = eval_binary(BinOp::Add, &lhs, &rhs, None, false, &synthetic_address).unwrap();
         ctx.slots[dst as usize] = v;
     }
     fn mov(ctx: &mut Ctx, dst: u32, a: u32) {
@@ -1015,13 +1044,13 @@ mod dispatch_prototype {
     fn lt_ll(ctx: &mut Ctx, dst: u32, a: u32, b: u32) {
         let lhs = ctx.slots[a as usize].clone();
         let rhs = ctx.slots[b as usize].clone();
-        let (v, _) = eval_binary(BinOp::Lt, &lhs, &rhs, None, false).unwrap();
+        let (v, _) = eval_binary(BinOp::Lt, &lhs, &rhs, None, false, &synthetic_address).unwrap();
         ctx.slots[dst as usize] = v;
     }
     fn checked_add_ll(ctx: &mut Ctx, dst: u32, a: u32, b: u32) {
         let lhs = ctx.slots[a as usize].clone();
         let rhs = ctx.slots[b as usize].clone();
-        let (v, overflowed) = eval_binary(BinOp::Add, &lhs, &rhs, None, true).unwrap();
+        let (v, overflowed) = eval_binary(BinOp::Add, &lhs, &rhs, None, true, &synthetic_address).unwrap();
         ctx.slots[dst as usize] = Value::Tuple(vec![v, Value::Bool(overflowed)]);
     }
 
