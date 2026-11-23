@@ -20386,3 +20386,116 @@ fn run_mode_sparse_nested_array_prefix_is_not_a_tuple_wrapper() {
         "row [11, 22]\nelem 22\nvia_row_ptr 22\nwritten [11, 99]\nvia_row_ptr_after 99\n",
     );
 }
+
+const ZST_RAW_SLICE_ITER_SRC: &str = r#"
+use std::slice;
+
+fn foo<T>(v: &[T]) -> Option<&[T]> {
+    let mut it = v.iter();
+    for _ in 0..5 {
+        let _ = it.next();
+    }
+    Some(it.as_slice())
+}
+
+fn foo_mut<T>(v: &mut [T]) -> Option<&mut [T]> {
+    let mut it = v.iter_mut();
+    for _ in 0..5 {
+        let _ = it.next();
+    }
+    Some(it.into_slice())
+}
+
+fn main() {
+    let slice: &[()] = unsafe { slice::from_raw_parts(-5isize as *const (), 10) };
+    println!("len {}", slice.len());
+    println!("count {}", slice.iter().count());
+    let mut it = slice.iter();
+    println!("nth some {}", it.nth(5).is_some());
+    println!("rest {}", it.count());
+    println!("foo some {}", foo(slice).is_some());
+    let slice: &mut [()] = unsafe { slice::from_raw_parts_mut(-5isize as *mut (), 10) };
+    println!("mcount {}", slice.iter_mut().count());
+    {
+        let mut it = slice.iter_mut();
+        println!("mnth some {}", it.nth(5).is_some());
+        println!("mrest {}", it.count());
+    }
+    println!("foo_mut some {}", foo_mut(slice).is_some());
+}
+"#;
+
+#[test]
+fn run_mode_zst_raw_slice_iterators() {
+    // A slice of zero-sized elements over a raw-parts pointer
+    // at the edge of the address space: the iterator's end
+    // pointer carries the remaining count in its own bits, a
+    // representation the collected core bodies read through
+    // pointer-to-integer puns the value model does not
+    // reproduce. Iteration is served by the modelled `next`
+    // state machine (whose address-pair step synthesises the
+    // elements), and the consumers (`count`, `nth`) are served
+    // by the same machine so the accounting cannot disagree.
+    // This program used to spin forever in `slice_elements`
+    // (the fat pointer over the raw address resolved to
+    // itself).
+    run_ok(
+        "zst-raw-slice-iterators",
+        ZST_RAW_SLICE_ITER_SRC,
+        "len 10\ncount 10\nnth some true\nrest 4\nfoo some true\nmcount 10\nmnth some true\nmrest 4\nfoo_mut some true\n",
+    );
+}
+
+const ZST_ARRAY_ITER_NTH_SRC: &str = r#"
+fn main() {
+    let a = [(), (), (), (), (), (), (), (), (), ()];
+    println!("count {}", a.iter().count());
+    let mut it = a.iter();
+    println!("nth some {}", it.nth(5).is_some());
+    println!("rest {}", it.count());
+    let mut m = [(), (), (), ()];
+    println!("mcount {}", m.iter_mut().count());
+}
+"#;
+
+#[test]
+fn run_mode_zst_array_iter_nth_count() {
+    // `nth` on a zero-sized snapshot iterator: core's body
+    // reads the end pointer's bits as the remaining count
+    // through a `*mut usize` pun, which the value model cannot
+    // serve; the modelled `nth` drives the `next` transition
+    // instead.
+    run_ok(
+        "zst-array-iter-nth-count",
+        ZST_ARRAY_ITER_NTH_SRC,
+        "count 10\nnth some true\nrest 4\nmcount 4\n",
+    );
+}
+
+const ITER_MUT_RAW_PARTS_SRC: &str = r#"
+use std::slice;
+
+fn main() {
+    let mut v = vec![10, 20, 30, 40];
+    let ptr = v.as_mut_ptr();
+    let s: &mut [i32] = unsafe { slice::from_raw_parts_mut(ptr, 4) };
+    let mut it = s.iter_mut();
+    println!("first {:?}", it.next());
+    let out = it.into_slice();
+    println!("rest {:?}", out);
+}
+"#;
+
+#[test]
+fn run_mode_slice_iter_mut_raw_parts_next() {
+    // `next` on the real field layout (ptr, end, marker) the
+    // collected `<[T]>::iter_mut` body builds over a raw-parts
+    // slice: the state machine's `IterMut` arm used to serve
+    // only the [container, index, length] state `IntoIterator`
+    // builds, and reported this shape as a type mismatch.
+    run_ok(
+        "slice-iter-mut-raw-parts-next",
+        ITER_MUT_RAW_PARTS_SRC,
+        "first Some(10)\nrest [20, 30, 40]\n",
+    );
+}
