@@ -20811,3 +20811,230 @@ fn run_mode_slice_iter_mut_raw_parts_next() {
         "first Some(10)\nrest [20, 30, 40]\n",
     );
 }
+
+const LIBC_ATOL_SRC: &str = r#"
+use std::ffi::{c_char, c_int, c_long, c_longlong, CString};
+
+mod mlibc {
+    use std::ffi::{c_char, c_long, c_longlong};
+    extern "C" {
+        pub fn atol(x: *const c_char) -> c_long;
+        pub fn atoll(x: *const c_char) -> c_longlong;
+    }
+}
+
+extern "C" {
+    fn atoi(x: *const c_char) -> c_int;
+}
+
+fn main() {
+    let a = CString::new("1024").unwrap();
+    let b = CString::new("  -42xyz").unwrap();
+    let c = CString::new("11111111111111111").unwrap();
+    let d = CString::new("+77").unwrap();
+    let e = CString::new("zzz").unwrap();
+    unsafe {
+        println!("atol={}", mlibc::atol(a.as_ptr()));
+        println!("atol_neg={}", mlibc::atol(b.as_ptr()));
+        println!("atoll={}", mlibc::atoll(c.as_ptr()));
+        println!("atoi={}", atoi(d.as_ptr()));
+        println!("atoi_none={}", atoi(e.as_ptr()));
+    }
+}
+"#;
+
+#[test]
+fn run_mode_libc_atol_family() {
+    // Body-less extern declarations of the libc
+    // string-to-integer family are served by delegating to
+    // the host C library function of the same name (the
+    // shape of tests/ui/abi/c-stack-returning-int64.rs,
+    // whose declarations live in a module).
+    let dir = temp_dir("libc-atol");
+    let src = fixture(&dir, "libc_atol.rs", LIBC_ATOL_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the atol family must execute; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "atol=1024\natol_neg=-42\natoll=11111111111111111\natoi=77\natoi_none=0\n",
+        "the host libc functions' own results"
+    );
+}
+
+const LIBC_STRTOL_SRC: &str = r#"
+use std::ffi::{c_char, c_int, c_long, c_ulong, CString};
+
+extern "C" {
+    fn strtol(x: *const c_char, end: *mut *mut c_char, base: c_int) -> c_long;
+    fn strtoul(x: *const c_char, end: *mut *mut c_char, base: c_int) -> c_ulong;
+}
+
+fn main() {
+    let a = CString::new("0x1F").unwrap();
+    let b = CString::new("-1").unwrap();
+    let c = CString::new("99999999999999999999999999").unwrap();
+    let d = CString::new("12ab34").unwrap();
+    unsafe {
+        println!("hex={}", strtol(a.as_ptr(), std::ptr::null_mut(), 0));
+        println!("neg_ul={}", strtoul(b.as_ptr(), std::ptr::null_mut(), 10));
+        println!("sat={}", strtol(c.as_ptr(), std::ptr::null_mut(), 10));
+        println!("mid={}", strtol(d.as_ptr().add(4), std::ptr::null_mut(), 10));
+    }
+}
+"#;
+
+#[test]
+fn run_mode_libc_strtol_null_endptr() {
+    // The strto* family delegates with a NULL endptr:
+    // base-0 prefix detection, the unsigned wrap of a
+    // negative input, saturation on overflow, and a
+    // mid-string argument pointer all take the host
+    // function's own results.
+    let dir = temp_dir("libc-strtol");
+    let src = fixture(&dir, "libc_strtol.rs", LIBC_STRTOL_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "strtol/strtoul with a NULL endptr must execute; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "hex=31\nneg_ul=18446744073709551615\nsat=9223372036854775807\nmid=34\n",
+        "the host libc functions' own results"
+    );
+}
+
+const LIBC_SIGNED_CHAR_SRC: &str = r#"
+use std::ffi::{c_char, c_int, c_long};
+
+extern "C" {
+    fn atol(x: *const c_char) -> c_long;
+    fn atoi(x: *const c_char) -> c_int;
+}
+
+fn main() {
+    let a: [i8; 3] = [49, -1, 0];
+    let b: [i8; 4] = [53, 50, -128, 0];
+    let c: [u8; 3] = [49, 50, 0];
+    let d: [i8; 3] = [49, 50, 0];
+    unsafe {
+        println!("signed_high={}", atol(a.as_ptr()));
+        println!("signed_high2={}", atoi(b.as_ptr()));
+        println!("plain_u8={}", atol(c.as_ptr().cast()));
+        println!("plain_i8={}", atol(d.as_ptr()));
+    }
+}
+"#;
+
+#[test]
+fn run_mode_libc_signed_char_bytes() {
+    // A signed `c_char` array holding a byte above 127: the
+    // scan keeps the byte's bit pattern (the host reads
+    // "1\xff" and stops there), instead of rejecting the
+    // negative element as a type mismatch.
+    let dir = temp_dir("libc-signed-char");
+    let src = fixture(&dir, "libc_signed_char.rs", LIBC_SIGNED_CHAR_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "signed char byte strings must execute; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "signed_high=1\nsigned_high2=52\nplain_u8=12\nplain_i8=12\n",
+        "the host libc functions' own results"
+    );
+}
+
+const LIBC_WIDE_ELEM_SRC: &str = r#"
+use std::ffi::{c_char, c_long};
+
+extern "C" {
+    fn atol(x: *const c_char) -> c_long;
+}
+
+fn main() {
+    let a: [u16; 3] = [49, 50, 0];
+    let b: [u16; 3] = [0x3231, 0x0033, 0];
+    let c: [u32; 2] = [0x00323331, 0];
+    let d: [i16; 3] = [49, -1, 0];
+    let e: [i16; 3] = [49, -256, 0];
+    unsafe {
+        println!("u16_cast={}", atol(a.as_ptr().cast()));
+        println!("u16_packed={}", atol(b.as_ptr().cast()));
+        println!("u32_packed={}", atol(c.as_ptr().cast()));
+        println!("i16_cast={}", atol(d.as_ptr().cast()));
+        println!("byte_disp={}", atol(b.as_ptr().cast::<c_char>().add(1)));
+        println!("elem_disp={}", atol(b.as_ptr().add(1).cast()));
+        println!("i16_neg={}", atol(e.as_ptr().cast()));
+    }
+}
+"#;
+
+#[test]
+fn run_mode_libc_wide_element_storage() {
+    // A `*const c_char` cast into wider-element storage
+    // denotes the storage's little-endian bytes, not its
+    // elements: the scan reads the declared element type's
+    // bytes, so a high byte of an element terminates (or
+    // joins) the string exactly as on the host.
+    let dir = temp_dir("libc-wide-elem");
+    let src = fixture(&dir, "libc_wide_elem.rs", LIBC_WIDE_ELEM_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "wide-element storage casts must execute; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "u16_cast=1\nu16_packed=123\nu32_packed=132\ni16_cast=1\nbyte_disp=23\nelem_disp=3\ni16_neg=1\n",
+        "the host libc functions' own results"
+    );
+}
+
+const LIBC_STRTOL_ENDPTR_SRC: &str = r#"
+use std::ffi::{c_char, c_int, c_long, CString};
+
+extern "C" {
+    fn strtol(x: *const c_char, end: *mut *mut c_char, base: c_int) -> c_long;
+}
+
+fn main() {
+    let s = CString::new("123").unwrap();
+    let mut end: *mut c_char = std::ptr::null_mut();
+    unsafe {
+        let v = strtol(s.as_ptr(), &mut end, 10);
+        println!("v={v}");
+    }
+}
+"#;
+
+#[test]
+fn run_mode_libc_strtol_nonnull_endptr_is_explicit_error() {
+    // A non-NULL endptr is an explicit unsupported error,
+    // never a silently skipped write-back.
+    let dir = temp_dir("libc-strtol-endptr");
+    let src = fixture(&dir, "libc_strtol_endptr.rs", LIBC_STRTOL_ENDPTR_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a non-NULL endptr must be refused; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("non-NULL endptr is not modelled"),
+        "the refusal names the endptr model limit; stderr={stderr}"
+    );
+}
