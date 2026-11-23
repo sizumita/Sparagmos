@@ -480,6 +480,24 @@ pub enum Builtin {
     IteratorNextBack,
     /// `std::iter::Iterator::size_hint(&iter)`.
     IteratorSizeHint,
+    /// `std::iter::ExactSizeIterator::len(&iter)` for the
+    /// slice-state iterators (see `iterator_len_modelled`):
+    /// core's own body reads the remaining count out of the
+    /// end pointer's address — a zero-sized element's count
+    /// is the end pointer's own bits in a snapshot state,
+    /// whose address word is the snapshot's, and a stepped
+    /// state's front index is invisible to it — which the
+    /// value model does not reproduce. The model reads the
+    /// same unified bounds the modelled steps maintain (see
+    /// `iter_zst_bounds`).
+    IteratorLen,
+    /// `slice::Iter::as_slice` / `slice::IterMut::as_slice`,
+    /// and `IterMut::into_slice` / `as_mut_slice` (the same
+    /// `make_slice` construction): the remaining slice as a
+    /// fat reference over the state's current front pointer
+    /// with the remaining count the unified bounds give (see
+    /// `slice_iter_as_slice`).
+    SliceIterAsSlice,
     /// `std::iter::Iterator::count(iter)`: drive the modelled
     /// `next` state transition to exhaustion and count the items.
     /// (Core's own default body is a `fold`, and several iterator
@@ -2456,6 +2474,21 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         "std::iter::DoubleEndedIterator::next_back"
         | "core::iter::DoubleEndedIterator::next_back" => Builtin::IteratorNextBack,
         "std::iter::Iterator::size_hint" => Builtin::IteratorSizeHint,
+        "std::iter::ExactSizeIterator::len" | "core::iter::ExactSizeIterator::len" => {
+            Builtin::IteratorLen
+        }
+        // The slice views are named with their generic group
+        // in the middle (`std::slice::Iter::<'a, T>::as_slice`),
+        // so they match by prefix and suffix like the `Vec`
+        // methods below.
+        _ if (canonical.starts_with("std::slice::Iter")
+            || canonical.starts_with("core::slice::Iter"))
+            && (canonical.ends_with(">::as_slice")
+                || canonical.ends_with(">::into_slice")
+                || canonical.ends_with(">::as_mut_slice")) =>
+        {
+            Builtin::SliceIterAsSlice
+        }
         "std::iter::Iterator::count" => Builtin::IteratorCount,
         "std::iter::Iterator::nth" => Builtin::IteratorNth,
         "std::iter::Iterator::fold" => Builtin::IteratorFold,
@@ -6984,6 +7017,16 @@ impl<'a> Interpreter<'a> {
                 arity(1)?;
                 let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
                 self.iterator_size_hint(frames, self_ty, &vals[0])
+            }
+            Builtin::IteratorLen => {
+                arity(1)?;
+                let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
+                self.iterator_len(frames, self_ty, &vals[0])
+            }
+            Builtin::SliceIterAsSlice => {
+                arity(1)?;
+                let elem_tag = generic_args.first().map(String::as_str).unwrap_or("");
+                self.slice_iter_as_slice(frames, elem_tag, &vals[0])
             }
             Builtin::IteratorFold | Builtin::IteratorForEach => {
                 unreachable!("fold-like builtins are dispatched before argument evaluation")
@@ -15956,6 +15999,166 @@ fn value_fingerprint(value: &Value) -> u64 {
         }
     }
 
+    /// The `ExactSizeIterator::len` of a slice-state
+    /// iterator: the remaining element count the state's
+    /// unified bounds encode (see
+    /// `slice_iter_front_and_remaining`). Core's own body for
+    /// these types reads the count out of the end pointer's
+    /// address, which is the terminal index rather than the
+    /// remaining count once the front has stepped — and, for
+    /// a snapshot state, the snapshot's address word rather
+    /// than a count at all — so the modelled steps'
+    /// accounting is the only faithful reading.
+    fn iterator_len(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        self_ty: &str,
+        ref_arg: &Value,
+    ) -> InterpResult<Value> {
+        let target = self.deref_value(frames, ref_arg)?;
+        let state = self.read_resolved(frames, &target)?;
+        let elem_tag = first_generic_arg(self_ty).unwrap_or("");
+        let (_, remaining) =
+            self.slice_iter_front_and_remaining(frames, &state, self_ty, elem_tag)?;
+        Ok(Value::Uint(u128::from(remaining)))
+    }
+
+    /// The remaining slice of a `slice::Iter` /
+    /// `slice::IterMut` state: a fat reference over the
+    /// state's current front pointer with the remaining
+    /// count the unified bounds give — the value core's
+    /// `make_slice` builds with `from_raw_parts`, whose
+    /// length operand its body reads out of the end
+    /// pointer's address (see `iterator_len`). The receiver
+    /// is a reference for `as_slice` / `as_mut_slice` and
+    /// the state itself for `into_slice`.
+    fn slice_iter_as_slice(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        elem_tag: &str,
+        arg: &Value,
+    ) -> InterpResult<Value> {
+        let state = if matches!(arg, Value::Ref(_)) {
+            let target = self.deref_value(frames, arg)?;
+            self.read_resolved(frames, &target)?
+        } else {
+            arg.clone()
+        };
+        let (front, remaining) =
+            self.slice_iter_front_and_remaining(frames, &state, "slice iterator", elem_tag)?;
+        Ok(Value::FatRef {
+            base: Box::new(front),
+            len: u128::from(remaining),
+        })
+    }
+
+    /// The (front pointer, remaining count) a slice-iterator
+    /// state denotes, in the unified reading the modelled
+    /// steps maintain (see `iter_zst_bounds`): the front
+    /// pointer is the state's first field unwrapped, and the
+    /// remaining count is the distance from the current
+    /// index to the terminal index. A state whose two
+    /// pointers are both address-only — the pair the step
+    /// machine's own address form steps (see
+    /// `slice_iter_step_real`) — reads the same way over the
+    /// addresses themselves: their distance in element
+    /// units (in address units for a zero-sized element,
+    /// whose step advances the address itself). Any other
+    /// unrecognised shape keeps the bounds reading's error.
+    ///
+    /// Before either reading, a pair denoting two positions
+    /// in the same storage is measured directly with the
+    /// `offset_from` distance (`pointer_distance`): that
+    /// reading composes a trailing byte offset past an index
+    /// step into the position it denotes, which the bounds
+    /// reading's index extraction silently drops — the shape
+    /// a real-pointer iterator over a scalar-backed slice
+    /// takes (an `IterMut` over `slice::from_mut(&mut x)`,
+    /// whose front denotes the scalar place itself and whose
+    /// end denotes that same place one element further on).
+    /// Wherever the distance reading applies to a pair the
+    /// bounds reading also serves, the two agree.
+    fn slice_iter_front_and_remaining(
+        &self,
+        frames: &[Frame],
+        state: &Value,
+        self_ty: &str,
+        elem_tag: &str,
+    ) -> InterpResult<(Value, u64)> {
+        let fields = iterator_fields(state, self_ty)?;
+        if fields.len() != 3 {
+            return Err(InterpError::type_mismatch(
+                "slice::Iter state",
+                "[ptr, end, marker]",
+                format!("{} field(s)", fields.len()),
+            ));
+        }
+        let front = iter_ptr_value(&fields[0]).ok_or_else(|| {
+            InterpError::type_mismatch(
+                "slice::Iter state",
+                "an element pointer in the first field",
+                fields[0].kind_name(),
+            )
+        })?;
+        if let Some(end_ptr) = iter_ptr_value(&fields[1]) {
+            if let Some(remaining) =
+                self.slice_iter_pointer_distance(frames, &front, &end_ptr, elem_tag)
+            {
+                return Ok((front, remaining));
+            }
+        }
+        match slice_iter_bounds(state, self_ty) {
+            Ok((cur, end)) => Ok((front, end.saturating_sub(cur) as u64)),
+            Err(bounds_err) => {
+                let (Some(end_ptr), Some((size, _))) = (
+                    iter_ptr_value(&fields[1]),
+                    self.layout_of(elem_tag)
+                        .and_then(|(size, align)| u64::try_from(size).ok().map(|s| (s, align))),
+                ) else {
+                    return Err(bounds_err);
+                };
+                let (
+                    Value::Ref(RefTarget::Address(cur)),
+                    Value::Ref(RefTarget::Address(end)),
+                ) = (&front, &end_ptr)
+                else {
+                    return Err(bounds_err);
+                };
+                let bytes = end.saturating_sub(*cur);
+                let remaining = if size == 0 {
+                    bytes
+                } else if bytes % size == 0 {
+                    bytes / size
+                } else {
+                    return Err(bounds_err);
+                };
+                Ok((front, remaining))
+            }
+        }
+    }
+
+    /// The remaining element count of a slice-iterator state
+    /// whose front and end pointers denote two positions in
+    /// the same storage, measured with the `offset_from`
+    /// distance reading (`pointer_distance`) over the resolved
+    /// pointers; `None` when either pointer denotes no storage
+    /// position (an address-only or null pointer), when the
+    /// two denote unrelated storage, or when the end does not
+    /// lie at or past the front.
+    fn slice_iter_pointer_distance(
+        &self,
+        frames: &[Frame],
+        front: &Value,
+        end: &Value,
+        elem_tag: &str,
+    ) -> Option<u64> {
+        let front = self.deref_value(frames, front).ok()?;
+        let end = self.deref_value(frames, end).ok()?;
+        let args = [elem_tag.to_string()];
+        let distance = self.pointer_distance(&end, &front, &args).ok()??;
+        u64::try_from(distance).ok()
+    }
+
     /// `Iterator::size_hint` for the modelled iterators: the
     /// `(lower, Option<upper>)` pair the standard library reports
     /// for each, computed from the iterator's state the same way
@@ -21344,6 +21547,35 @@ pub fn hash_collection_tag(self_ty: &str) -> bool {
         || inner.starts_with("std::collections::HashSet<")
         || hash_iterator_tag(inner)
         || hash_iterator_tag(self_ty)
+}
+
+/// Whether the modelled `ExactSizeIterator::len` serves
+/// this type: the slice-state iterators whose remaining
+/// count the unified bounds read (see
+/// `slice_iter_front_and_remaining`) — the family the
+/// modelled `size_hint` reads through `slice_iter_bounds`.
+/// Every other type's `len` keeps its collected body (the
+/// trait default, which delegates to `size_hint`, or the
+/// type's own override).
+///
+/// A reference-wrapper `Self` (`&mut I`, the one reference
+/// form that implements the trait) is deliberately not
+/// modelled here: core's blanket body for `&mut I` is
+/// collected — the reach-side predicate likewise names
+/// only the bare ADT — and forwards to the inner call,
+/// which re-enters with the iterator type itself, the same
+/// arrangement as the modelled `next` (see
+/// `iterator_next_modelled`). Peeling the reference here
+/// would preempt that body while the builtin's receiver
+/// chase dereferences only once, leaving a reference where
+/// the iterator state belongs.
+pub fn iterator_len_modelled(self_ty: &str) -> bool {
+    self_ty.starts_with("std::slice::Iter<")
+        || self_ty.starts_with("std::slice::IterMut<")
+        || self_ty.starts_with("std::collections::btree_set::Iter<")
+        || self_ty.starts_with("std::collections::btree_map::Iter<")
+        || self_ty.starts_with("std::collections::btree_map::Keys<")
+        || self_ty.starts_with("std::collections::btree_map::Values<")
 }
 
 pub fn iterator_next_modelled(self_ty: &str) -> bool {

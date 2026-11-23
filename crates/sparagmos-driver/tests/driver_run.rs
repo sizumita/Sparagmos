@@ -11940,6 +11940,258 @@ fn run_mode_size_hint_unmodelled_iterator_gets_trait_default() {
     );
 }
 
+const ZST_ITER_LEN_SRC: &str = r#"
+use std::iter::ExactSizeIterator;
+fn main() {
+    let a = [(), (), (), (), ()];
+    let mut it = a.iter();
+    println!("len {}", it.len());
+    println!("slice {}", it.as_slice().len());
+    it.next();
+    println!("len {}", it.len());
+    it.next_back();
+    println!("len {}", it.len());
+    println!("slice {}", it.as_slice().len());
+    let e: [(); 0] = [];
+    println!("empty {}", e.iter().len());
+    let v = vec![(), (), ()];
+    println!("vec {}", v.iter().len());
+}
+"#;
+
+#[test]
+fn run_mode_zst_slice_iter_len_and_as_slice() {
+    // Issue #346: for a zero-sized element, core's `len()`
+    // body reads the remaining count out of the end
+    // pointer's own bits, and `as_slice` builds on the same
+    // reading; over the modelled snapshot state that word is
+    // the snapshot's address, not a count. The modelled
+    // `ExactSizeIterator::len` / `as_slice` read the unified
+    // bounds the modelled steps maintain instead, before and
+    // after steps from both ends.
+    let dir = temp_dir("zst-iter-len");
+    let src = fixture(&dir, "zstiterlen.rs", ZST_ITER_LEN_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout, "len 5\nslice 5\nlen 4\nlen 3\nslice 3\nempty 0\nvec 3\n",
+        "stdout={stdout}"
+    );
+}
+
+const ITER_MUT_LEN_SRC: &str = r#"
+use std::iter::ExactSizeIterator;
+#[derive(Debug)]
+struct Z;
+fn main() {
+    let mut a = [Z, Z, Z, Z];
+    let mut m = a.iter_mut();
+    println!("mlen {}", m.len());
+    m.next();
+    println!("mlen {}", m.len());
+    m.next_back();
+    println!("mlen {}", m.len());
+    let mut b = [1, 2, 3, 4];
+    let mut n = b.iter_mut();
+    n.next();
+    println!("rest {:?}", n.as_slice());
+    println!("nlen {}", n.len());
+    let rest = n.into_slice();
+    rest[0] = 20;
+    println!("b {:?}", b);
+}
+"#;
+
+#[test]
+fn run_mode_slice_iter_mut_len_after_steps() {
+    // Issue #346, the stepped-state half of the same defect:
+    // an `IterMut` state built by core's own constructor
+    // pairs a positioned front pointer with an end pointer
+    // holding the terminal index, so the collected `len()`
+    // body — which reads the end pointer's address — stays
+    // at the original length as the front steps. The
+    // modelled `len` reads the current bounds; `as_slice` /
+    // `into_slice` build the remaining slice from the same
+    // reading.
+    let dir = temp_dir("iter-mut-len");
+    let src = fixture(&dir, "itermutlen.rs", ITER_MUT_LEN_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "mlen 4\nmlen 3\nmlen 2\nrest [2, 3, 4]\nnlen 3\nb [1, 20, 3, 4]\n",
+        "stdout={stdout}"
+    );
+}
+
+const EXACT_SIZE_LEN_OTHERS_SRC: &str = r#"
+use std::iter::ExactSizeIterator;
+use std::collections::BTreeSet;
+struct Count(u32, u32);
+impl Iterator for Count {
+    type Item = u32;
+    fn next(&mut self) -> Option<u32> {
+        if self.0 < self.1 { self.0 += 1; Some(self.0) } else { None }
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let r = (self.1 - self.0) as usize;
+        (r, Some(r))
+    }
+}
+impl ExactSizeIterator for Count {}
+fn main() {
+    println!("range {}", (3..7).len());
+    let v = vec![9, 8, 7, 6];
+    let mut vi = v.into_iter();
+    println!("into0 {}", vi.len());
+    vi.next();
+    println!("into1 {}", vi.len());
+    let mut cu = Count(0, 4);
+    println!("user0 {}", cu.len());
+    cu.next();
+    println!("user1 {}", cu.len());
+    let mut set = BTreeSet::new();
+    set.insert(5);
+    set.insert(6);
+    set.insert(7);
+    let mut bi = set.iter();
+    println!("btree0 {}", bi.len());
+    bi.next();
+    println!("btree1 {}", bi.len());
+}
+"#;
+
+#[test]
+fn run_mode_exact_size_len_modelled_family_and_bodies() {
+    // The modelled `len` serves only the slice-state family
+    // (here: the B-tree iterator sharing that state); every
+    // other type keeps its collected body — `Range`'s and
+    // `vec::IntoIter`'s own overrides, and the trait default
+    // (delegating to `size_hint`) for a user iterator.
+    // Registering the builtin must not divert any of them.
+    let dir = temp_dir("exact-size-len-others");
+    let src = fixture(&dir, "exactlenothers.rs", EXACT_SIZE_LEN_OTHERS_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "range 4\ninto0 4\ninto1 3\nuser0 4\nuser1 3\nbtree0 3\nbtree1 2\n",
+        "stdout={stdout}"
+    );
+}
+
+const EXACT_SIZE_LEN_REF_WRAPPER_SRC: &str = r#"
+use std::iter::ExactSizeIterator;
+fn len_of<I: ExactSizeIterator>(it: I) -> usize { it.len() }
+fn main() {
+    let a = [10, 20, 30, 40];
+    let mut it = a.iter();
+    let r = &mut it;
+    println!("mut0 {}", ExactSizeIterator::len(&r));
+    r.next();
+    r.next();
+    println!("mut1 {}", ExactSizeIterator::len(&r));
+    let mut it2 = a.iter();
+    let mut r2 = &mut it2;
+    let rr = &mut r2;
+    println!("dbl0 {}", ExactSizeIterator::len(&rr));
+    let mut it3 = a.iter();
+    println!("gen0 {}", len_of(&mut it3));
+    it3.next();
+    println!("gen1 {}", len_of(&mut it3));
+    let z = [(), (), (), (), ()];
+    let mut zit = z.iter();
+    let zr = &mut zit;
+    println!("zst0 {}", ExactSizeIterator::len(&zr));
+    zr.next();
+    println!("zst1 {}", ExactSizeIterator::len(&zr));
+    let mut b = [1, 2, 3];
+    let mut mit = b.iter_mut();
+    let mr = &mut mit;
+    println!("itermut0 {}", ExactSizeIterator::len(&mr));
+    mr.next();
+    println!("itermut1 {}", ExactSizeIterator::len(&mr));
+    let mut it4 = a.iter();
+    let br = it4.by_ref();
+    println!("byref0 {}", br.len());
+    println!("byref1 {}", it4.len());
+}
+"#;
+
+#[test]
+fn run_mode_exact_size_len_reference_wrapper_forwards() {
+    // A reference-wrapper `Self` (`&mut I`, the one reference
+    // form implementing the trait) is not the modelled
+    // builtin's to serve: core's blanket body for `&mut I` is
+    // collected and forwards to the inner call, which the
+    // builtin then serves with the iterator type itself.
+    // Peeling the reference in the modelled predicate
+    // preempted that body, and the builtin — dereferencing
+    // its receiver only once — found a reference where the
+    // iterator state belongs ("expected ADT value, found
+    // reference"). The ZST case pins that the forwarded
+    // inner call still reaches the modelled builtin.
+    let dir = temp_dir("exact-size-len-ref-wrapper");
+    let src = fixture(&dir, "exactlenref.rs", EXACT_SIZE_LEN_REF_WRAPPER_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "mut0 4\nmut1 2\ndbl0 4\ngen0 4\ngen1 3\nzst0 5\nzst1 4\nitermut0 3\nitermut1 2\nbyref0 4\nbyref1 4\n",
+        "stdout={stdout}"
+    );
+}
+
+const SLICE_ITER_MUT_SCALAR_BACKED_SRC: &str = r#"
+use std::iter::ExactSizeIterator;
+fn main() {
+    let mut x = 41i32;
+    let mut it = std::slice::from_mut(&mut x).iter_mut();
+    println!("len {}", ExactSizeIterator::len(&it));
+    println!("view {}", it.as_slice().len());
+    let rest = it.into_slice();
+    println!("rest {}", rest.len());
+    let mut w = 900u64;
+    let itw = std::slice::from_mut(&mut w).iter_mut();
+    println!("wlen {}", ExactSizeIterator::len(&itw));
+    println!("wview {}", itw.as_slice().len());
+}
+"#;
+
+#[test]
+fn run_mode_slice_iter_mut_scalar_backed_len() {
+    // PR #387, Codex round 2: over a scalar-backed slice
+    // (`slice::from_mut(&mut x)`), the iterator's front
+    // pointer denotes the scalar place while the end pointer
+    // denotes the same place with a trailing
+    // `ByteOffset(size_of::<T>())`. The index reading of the
+    // unified bounds drops that offset and reports an empty
+    // iterator, and the snapshot-address fallback cannot read
+    // a storage-backed pair at all, so the modelled `len`
+    // and slice views failed instead of returning the
+    // one-element result. They now read the pair's distance
+    // through the same storage-backed offset reading as
+    // `offset_from` before falling back to the bounds.
+    let dir = temp_dir("slice-iter-mut-scalar-backed");
+    let src = fixture(&dir, "case.rs", SLICE_ITER_MUT_SCALAR_BACKED_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout, "len 1\nview 1\nrest 1\nwlen 1\nwview 1\n",
+        "stdout={stdout}"
+    );
+}
+
 const CATCH_UNWIND_O3_DATA_SRC: &str = r#"
 #[inline(never)]
 fn boom() { std::panic::resume_unwind(Box::new(7i32)); }
