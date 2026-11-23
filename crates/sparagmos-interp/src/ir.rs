@@ -1449,13 +1449,17 @@ pub enum DebugVar {
 }
 
 /// One step of a canonical-value path (see [`Body::zst_fields`]):
-/// a field of a struct, union, tuple or enum variant, or the
+/// a field of a struct, union, tuple or enum variant, the
 /// downcast that selects the variant whose fields the following
-/// steps address.
+/// steps address, or an index into a sequence — an array's
+/// elements, or the elements a modelled `Vec` value holds. The
+/// canonical value of a single-valued element type is the same
+/// at every index, so the index step carries no index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ZstPathStep {
     Field(usize),
     Downcast(usize),
+    Index,
 }
 
 /// A function body: argument count, local types, and basic blocks.
@@ -1474,19 +1478,23 @@ pub struct Body {
     /// then falls back to the shapes derivable from the IR type
     /// alone.
     pub zst_locals: Vec<Option<Value>>,
-    /// Canonical values of field paths whose type has a single
-    /// value, indexed by local, then by the path from the local
-    /// (conversion-computed; see `mir_convert`'s
+    /// Canonical values of projection paths whose type has a
+    /// single value, indexed by local, then by the path from the
+    /// local (conversion-computed; see `mir_convert`'s
     /// `collect_zst_fields`). A field of a single-valued type —
     /// typically a zero-sized field such as the closure slot of a
     /// `catch_unwind` Data union — may never be written by MIR at
     /// all (its store is elided like a ZST local's), so a read of
     /// the path that otherwise fails as uninitialized denotes this
     /// value instead. An enum's fields sit behind a downcast step,
-    /// recorded as a [`ZstPathStep::Downcast`] path step. A read
-    /// that succeeds from storage is never overridden: a union's
-    /// storage slot can be shared with a field of a different
-    /// type. Empty for hand-built bodies.
+    /// recorded as a [`ZstPathStep::Downcast`] path step. The same
+    /// elision applies to a sequence's elements: a zero-sized
+    /// element's store into a `Vec` may never happen in MIR at
+    /// all, so an element read that comes back uninitialized
+    /// denotes the element type's single value, recorded under an
+    /// index step. A read that succeeds from storage is never
+    /// overridden: a union's storage slot can be shared with a
+    /// field of a different type. Empty for hand-built bodies.
     pub zst_fields: Vec<std::collections::HashMap<Vec<ZstPathStep>, Value>>,
     /// The unwind action of each block terminator, indexed by
     /// block (conversion-preserved from MIR; see [`UnwindAction`]).

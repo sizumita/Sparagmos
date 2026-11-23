@@ -2213,8 +2213,8 @@ impl<'a> Converter<'a> {
         }
     }
 
-    /// Collect the canonical values of the single-valued field
-    /// paths of `ty` into `out`, keyed by projection path (see
+    /// Collect the canonical values of the single-valued
+    /// projection paths of `ty` into `out`, keyed by path (see
     /// `ir::Body::zst_fields`). Structs, unions and tuples expose
     /// their fields under bare field projections; an enum's fields
     /// sit behind a downcast step, so each variant's fields are
@@ -2224,7 +2224,14 @@ impl<'a> Converter<'a> {
     /// to a variant the stored value does not hold fails as a
     /// type mismatch, never as uninitialized — so a path recorded
     /// under one variant's downcast is only ever used for a value
-    /// that actually holds that variant. The walk is depth- and
+    /// that actually holds that variant. A sequence — an array, a
+    /// slice, or a `Vec`, whose modelled value holds its elements
+    /// under bare index projections — exposes its element type
+    /// under an index step: a zero-sized element's store may be
+    /// elided like a ZST field's (a `vec!` of a zero-sized enum
+    /// reaches execution with no element write in MIR at all), so
+    /// the element's single value is recorded for the read that
+    /// comes back uninitialized. The walk is depth- and
     /// size-capped: it serves the shallow paths MIR actually
     /// projects (a wrapper or two around a zero-sized field), not
     /// arbitrary recursive types.
@@ -2243,6 +2250,26 @@ impl<'a> Converter<'a> {
         let mut ty = ty.clone();
         while let mir::Ty::Pat(inner, _) = ty {
             ty = *inner;
+        }
+        match &ty {
+            mir::Ty::Array(elem, _) | mir::Ty::Slice(elem) => {
+                let elem = (**elem).clone();
+                self.collect_zst_element(&elem, path, out, depth, budget);
+                return;
+            }
+            mir::Ty::Adt(def, args)
+                if self.names.get(def).map(String::as_str)
+                    == Some("std::vec::Vec") =>
+            {
+                // A `Vec`'s modelled value holds the elements
+                // themselves, so the element type sits under an
+                // index step from the Vec place, in addition to
+                // the struct fields the walk below records.
+                if let Some(elem) = args.first().cloned() {
+                    self.collect_zst_element(&elem, path, out, depth, budget);
+                }
+            }
+            _ => {}
         }
         let fields: Vec<mir::Ty> = match &ty {
             mir::Ty::Tuple(ts) => ts.clone(),
@@ -2309,6 +2336,28 @@ impl<'a> Converter<'a> {
                 return;
             }
         }
+    }
+
+    /// Record the single value of a sequence's element type
+    /// under an index step at `path`, and recurse into the
+    /// element type's own sub-paths beneath that step (a
+    /// single-valued field of the elements sits under
+    /// `[Index, Field(..)]`, as a struct's sits under
+    /// `[Field(..)]`).
+    fn collect_zst_element(
+        &self,
+        elem: &mir::Ty,
+        path: &mut Vec<ir::ZstPathStep>,
+        out: &mut std::collections::HashMap<Vec<ir::ZstPathStep>, Value>,
+        depth: u32,
+        budget: &mut usize,
+    ) {
+        path.push(ir::ZstPathStep::Index);
+        if let Some(v) = self.zst_value(elem, 0) {
+            out.insert(path.clone(), v);
+        }
+        self.collect_zst_fields(elem, path, out, depth + 1, budget);
+        path.pop();
     }
 
     /// Whether a type has exactly one value (and what it is), no

@@ -2170,6 +2170,87 @@ fn run_mode_vec_macro_of_droppables() {
     );
 }
 
+const VEC_ZST_ENUM_SRC: &str = r#"
+#[derive(Debug, PartialEq)]
+struct DropMe;
+impl Drop for DropMe { fn drop(&mut self) {} }
+enum CS<Y, R> { Yielded(Y), Complete(R) }
+enum Never {}
+fn read_it(v: Vec<CS<Never, DropMe>>) {
+    match &v[0] { CS::Yielded(_) => println!("y"), CS::Complete(_) => println!("c") }
+    match &v[1] { CS::Yielded(_) => println!("y"), CS::Complete(_) => println!("c") }
+    println!("done");
+}
+fn main() {
+    read_it(vec![CS::Complete(DropMe), CS::Complete(DropMe)]);
+}
+"#;
+
+#[test]
+fn run_mode_vec_of_zero_sized_enum_elements_read_by_index() {
+    // A `Vec` of a zero-sized enum (one variant uninhabited, the
+    // other's payload zero-sized) built by `vec!`: MIR elides the
+    // element store entirely, so the elements reach execution as
+    // uninitialized slots, and an index read of an element denotes
+    // the element type's single value (the canonical-value rescue
+    // follows the projection's index step). Both elements read
+    // back as the `Complete` variant, exactly as natively.
+    let dir = temp_dir("veczstenum");
+    let src = fixture(&dir, "veczstenum.rs", VEC_ZST_ENUM_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "vec! of zero-sized enum elements must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "c\nc\ndone\n",
+        "zero-sized enum elements read by index denote their single value"
+    );
+}
+
+const VEC_ZST_ENUM_GENERIC_SRC: &str = r#"
+#[derive(Debug, PartialEq)]
+struct DropMe;
+impl Drop for DropMe { fn drop(&mut self) {} }
+enum CS<Y, R> { Yielded(Y), Complete(R) }
+trait Tr { type Out; }
+struct S;
+impl Tr for S { type Out = DropMe; }
+enum Never {}
+fn read_it<T: Tr>(v: Vec<CS<Never, T::Out>>) {
+    match &v[0] { CS::Yielded(_) => println!("y"), CS::Complete(_) => println!("c") }
+    println!("done");
+}
+fn main() {
+    read_it::<S>(vec![CS::Complete(DropMe)]);
+}
+"#;
+
+#[test]
+fn run_mode_vec_of_zero_sized_enum_elements_generic_projection() {
+    // The same element read with the payload type arriving
+    // through a trait projection (`T::Out`): the element type is
+    // still single-valued after instantiation, so the index read
+    // is rescued the same way.
+    let dir = temp_dir("veczstenumgeneric");
+    let src = fixture(&dir, "veczstenumgeneric.rs", VEC_ZST_ENUM_GENERIC_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "generic vec! of zero-sized enum elements must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "c\ndone\n",
+        "projected zero-sized enum elements read by index denote their single value"
+    );
+}
+
 const VEC_GROWTH_SRC: &str = r#"
 struct D(i32);
 impl Drop for D {

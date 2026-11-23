@@ -9129,10 +9129,10 @@ impl<'a> Interpreter<'a> {
         }
     }
 
-    /// The canonical value of a single-valued field path of a
-    /// local (see the note in `read_resolved`); `None` when the
-    /// projection is not a pure field/downcast path or conversion
-    /// recorded no single-valued value for it.
+    /// The canonical value of a single-valued projection path
+    /// of a local (see the note in `read_resolved`); `None` when
+    /// the projection is not a pure field/downcast/index path or
+    /// conversion recorded no single-valued value for it.
     pub(crate) fn zst_field_value(
         &self,
         frame: &Frame,
@@ -9158,6 +9158,10 @@ impl<'a> Interpreter<'a> {
                 RefProj::Downcast(variant) => {
                     path.push(ZstPathStep::Downcast(*variant as usize))
                 }
+                // An index step into a sequence: the recorded
+                // value is the element type's single value, which
+                // does not depend on the index read.
+                RefProj::Index(_) => path.push(ZstPathStep::Index),
                 _ => return None,
             }
         }
