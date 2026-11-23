@@ -99,6 +99,22 @@ pub type AdtLayouts = std::collections::HashMap<String, (u64, u64)>;
 /// to read.
 pub type AdtFieldLayouts = std::collections::HashMap<String, Vec<Vec<(u64, u64)>>>;
 
+/// Storage layouts of the monomorphic tuple types in a
+/// program: the tuple's total storage size in bytes and, per
+/// field in declaration order, the field's (byte offset, byte
+/// size) within that storage, as the compiler's layout query
+/// gives them. Keyed by the tuple type's rendered name (its
+/// `ty_tag` rendering, e.g. `(u8, u16, u8)`). A tuple's field
+/// order in storage is the compiler's choice — fields may be
+/// reordered and padding inserted — so a bit-level reading of
+/// a tuple (a `transmute` through the interpreter's scalar
+/// shapes) is sound only at these recorded offsets; a tuple
+/// type with no entry has no such reading. The driver fills
+/// one entry per tuple type it converts whose layout the
+/// compiler can give; generic or unsized tuple types get no
+/// entry.
+pub type TupleLayouts = std::collections::HashMap<String, (u64, Vec<(u64, u64)>)>;
+
 /// The stored discriminant tag of one monomorphic enum
 /// instance whose layout uses the direct tag encoding: the
 /// tag is an integer scalar of `size` bytes at byte offset

@@ -39,7 +39,7 @@ pub use terminator::{
 pub use ty::{
     Abi, AdtDebugField, AdtDebugShape, AdtDebugShapes, AdtDebugVariant, AdtDefId,
     EnvDebugShape, EnvDebugShapes, EnvDebugVariant,
-    AdtDiscriminants, AdtFieldLayouts, AdtInstanceShapes, AdtLayouts, AdtNiches, AdtTagLayouts, CoroutineLayouts, CoroutineSlots, AdtShape, AdtShapeKind,
+    AdtDiscriminants, AdtFieldLayouts, AdtInstanceShapes, AdtLayouts, AdtNiches, AdtTagLayouts, CoroutineLayouts, CoroutineSlots, AdtShape, AdtShapeKind, TupleLayouts,
     AdtShapes, AliasKind, ArrayLen, DefId, DiscriminantValues, EnumNiche, EnumTag, FloatTy,
     StaticTys, ThreadLocalDef, ThreadLocals,
     FnSig, IntTy, Mutability, Region, Safety, Ty, UintTy,

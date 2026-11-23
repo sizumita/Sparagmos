@@ -6794,6 +6794,129 @@ fn run_mode_transmute_constant_operands() {
     );
 }
 
+const TRANSMUTE_PACKED_STRUCT_SRC: &str = r#"
+use std::mem;
+#[repr(packed)]
+struct S5 { a: u8, b: u32 }
+fn main() {
+    unsafe {
+        let s5 = S5 { a: 1, b: 0xff_00_00_ff };
+        let transd: [u8; 5] = mem::transmute(s5);
+        assert_eq!(transd, [1, 0xff, 0, 0, 0xff]);
+        let q: S5 = mem::transmute([9u8, 8, 7, 6, 5]);
+        let qa = q.a;
+        let qb = q.b;
+        println!("{} {}", qa, qb);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_transmute_packed_struct_bytes() {
+    // A multi-field packed struct transmuted to its byte
+    // array and back: the fields sit at their recorded
+    // layout offsets with no padding in between.
+    run_ok(
+        "transmute-packed-struct",
+        TRANSMUTE_PACKED_STRUCT_SRC,
+        "9 84281096\n",
+    );
+}
+
+const TRANSMUTE_NICHE_ENUM_SRC: &str = r#"
+#[repr(u16)]
+enum Mix { A, B(u16) }
+enum Nested { C(Mix), D, E }
+struct Bar { a: u16, b: u16 }
+fn code(n: &Nested) -> u32 {
+    match n {
+        Nested::C(Mix::A) => 0,
+        Nested::C(Mix::B(x)) => 100 + (*x as u32),
+        Nested::D => 2,
+        Nested::E => 3,
+    }
+}
+fn main() {
+    let a: Nested = unsafe { std::mem::transmute(Bar { a: 0, b: 0 }) };
+    let b: Nested = unsafe { std::mem::transmute(Bar { a: 1, b: 100 }) };
+    let c: Nested = unsafe { std::mem::transmute(Bar { a: 2, b: 0 }) };
+    let d: Nested = unsafe { std::mem::transmute(Bar { a: 3, b: 0 }) };
+    let e: Nested = unsafe { std::mem::transmute(0u32) };
+    println!("{} {} {} {} {}", code(&a), code(&b), code(&c), code(&d), code(&e));
+}
+"#;
+
+#[test]
+fn run_mode_transmute_niche_enum_from_struct_and_int() {
+    // A struct whose first field is a payload enum's tag
+    // transmuted to an outer enum whose niche lives inside
+    // that payload: the tag selects among the payload's own
+    // variants and the outer enum's extra variants, from a
+    // struct operand and from a bare integer alike. Under
+    // debug assertions the compiler also reads the input's
+    // bytes through a subslice to validate the construction.
+    run_ok(
+        "transmute-niche-enum",
+        TRANSMUTE_NICHE_ENUM_SRC,
+        "0 200 2 3 0\n",
+    );
+}
+
+const TRANSMUTE_TAGGED_ENUM_SRC: &str = r#"
+#[repr(u16)]
+enum Mix { A, B(u16) }
+struct Bar { a: u16, b: u16 }
+fn code(m: &Mix) -> u32 {
+    match m {
+        Mix::A => 0,
+        Mix::B(x) => 100 + (*x as u32),
+    }
+}
+fn main() {
+    let a: Mix = unsafe { std::mem::transmute(Bar { a: 0, b: 0 }) };
+    let b: Mix = unsafe { std::mem::transmute(Bar { a: 1, b: 100 }) };
+    println!("{} {}", code(&a), code(&b));
+}
+"#;
+
+#[test]
+fn run_mode_transmute_tagged_enum_from_struct() {
+    // A struct transmuted to a direct-tag enum: the tag
+    // field at its recorded offset selects the variant and
+    // the remaining fields land at their layout offsets.
+    run_ok(
+        "transmute-tagged-enum",
+        TRANSMUTE_TAGGED_ENUM_SRC,
+        "0 200\n",
+    );
+}
+
+const TRANSMUTE_OPTION_BIGGER_NICHE_SRC: &str = r#"
+#[derive(Debug, PartialEq)]
+#[repr(u32)]
+enum Foo { A = 2, B }
+fn main() {
+    let a: Option<Foo> = unsafe { std::mem::transmute::<u32, Option<Foo>>(2) };
+    let b: Option<Foo> = unsafe { std::mem::transmute::<u32, Option<Foo>>(3) };
+    assert_eq!(a, Some(Foo::A));
+    assert_eq!(b, Some(Foo::B));
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_transmute_int_to_option_of_fieldless_enum() {
+    // An integer transmuted to `Option` of a fieldless enum
+    // whose discriminants do not start at zero: the payload
+    // enum's own scalar is the niche, its discriminant
+    // patterns select the `Some` variants.
+    run_ok(
+        "transmute-option-bigger-niche",
+        TRANSMUTE_OPTION_BIGGER_NICHE_SRC,
+        "ok\n",
+    );
+}
+
 const TRANSMUTE_WIDE_SRC: &str = r#"
 fn main() {
     let big: u128 = unsafe { std::mem::transmute(-1i128) };
@@ -7699,11 +7822,44 @@ fn run_mode_union_field_reads_through_wrapper_fields() {
     );
 }
 
-const UNION_NO_SHAPE_SRC: &str = r#"
+const UNION_MULTI_FIELD_STRUCT_SRC: &str = r#"
 #[derive(Copy, Clone)]
 struct P(u32, u32);
 union X {
     a: P,
+    b: u64,
+}
+fn main() {
+    unsafe {
+        let x = X { b: 0x0000_0005_0000_002a };
+        let p = x.a;
+        println!("{} {}", p.0, p.1);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_union_field_read_multi_field_struct() {
+    // A multi-field struct field read from another field's
+    // bits: the struct's fields sit at their recorded layout
+    // offsets, so the read reinterprets exactly.
+    let dir = temp_dir("union-multi-field-struct");
+    let src = fixture(&dir, "union_multi_field_struct.rs", UNION_MULTI_FIELD_STRUCT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a union read of a multi-field struct must reinterpret; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42 5\n");
+}
+
+const UNION_NO_SHAPE_SRC: &str = r#"
+#[derive(Copy, Clone)]
+struct Big([u64; 3]);
+union X {
+    a: Big,
     b: u64,
 }
 fn main() {
@@ -7717,10 +7873,10 @@ fn main() {
 
 #[test]
 fn run_mode_union_field_read_without_scalar_shape_is_explicit() {
-    // A field whose type has no scalar shape (a two-payload
-    // struct) cannot be reinterpreted from another field's
-    // bits: the read is a named unsupported error, not a
-    // fabricated value.
+    // A field whose type has no scalar shape (a struct over
+    // the 128-bit shape limit) cannot be reinterpreted from
+    // another field's bits: the read is a named unsupported
+    // error, not a fabricated value.
     let dir = temp_dir("union-no-shape");
     let src = fixture(&dir, "union_no_shape.rs", UNION_NO_SHAPE_SRC);
     let out = run_driver(&src);
@@ -25530,5 +25686,192 @@ fn run_mode_cstring_dyn_method_reads_whole_value() {
         "cstring-dyn-measure",
         CSTRING_DYN_MEASURE_SRC,
         "ref_dyn=5\nbox_dyn=6\nrc_dyn=2\nfield_dyn=5\n",
+    );
+}
+
+const TRANSMUTE_TUPLE_FIELD_SRC: &str = r#"
+#[repr(C, packed)]
+struct S {
+    a: (u8, u16, u8),
+    b: u8,
+}
+
+fn main() {
+    let bytes: [u8; 5] = [0x34, 0x12, 0x56, 0x78, 0x9a];
+    let s: S = unsafe { std::mem::transmute(bytes) };
+    let a = s.a;
+    let b = s.b;
+    println!("{} {} {} {}", a.0, a.1, a.2, b);
+}
+"#;
+
+#[test]
+fn run_mode_transmute_tuple_field_at_recorded_offsets() {
+    // A tuple field of a packed struct transmuted from a
+    // byte array: the tuple's storage order is the
+    // compiler's choice (here the `u16` sits first, at
+    // offset 0), so the field's fields are read at the
+    // tuple's recorded layout offsets, not in declaration
+    // order.
+    run_ok(
+        "transmute-tuple-field",
+        TRANSMUTE_TUPLE_FIELD_SRC,
+        "86 4660 120 154\n",
+    );
+}
+
+const TRANSMUTE_TUPLE_LAYOUT_SRC: &str = r#"
+fn main() {
+    let b4: [u8; 4] = [0x34, 0x12, 0x56, 0x78];
+    let t: (u8, u16, u8) = unsafe { std::mem::transmute(b4) };
+    println!("{} {} {}", t.0, t.1, t.2);
+    let back: [u8; 4] = unsafe { std::mem::transmute(t) };
+    println!("{:?}", back);
+    let v: u64 = 0x1122_3344_5566_7788;
+    let p: (u8, u32) = unsafe { std::mem::transmute(v) };
+    println!("{} {}", p.0, p.1);
+    let v2: u64 = unsafe { std::mem::transmute(p) };
+    println!("{:x}", v2);
+    let nb: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+    let n: ((u8, u32), u8) = unsafe { std::mem::transmute(nb) };
+    println!("{} {} {}", (n.0).0, (n.0).1, n.1);
+}
+"#;
+
+#[test]
+fn run_mode_transmute_tuple_at_recorded_offsets() {
+    // Bare tuples transmuted to and from byte arrays and
+    // integers at their recorded layout offsets: a
+    // reordered tuple (`(u8, u16, u8)` stores its `u16`
+    // first), a padded tuple (`(u8, u32)` spans eight
+    // bytes, its pattern the full `u64` width in both
+    // directions), and a nested tuple read field by field.
+    run_ok(
+        "transmute-tuple-layout",
+        TRANSMUTE_TUPLE_LAYOUT_SRC,
+        "86 4660 120\n[52, 18, 86, 120]\n136 287454020\n1122334400000088\n1 134678021 9\n",
+    );
+}
+
+const TRANSMUTE_ENUM_TUPLE_PAYLOAD_SRC: &str = r#"
+#[repr(u8)]
+enum E {
+    A((u8, u16, u8)),
+    B(u32),
+}
+
+fn main() {
+    let e = E::A((0x56, 0x1234, 0x78));
+    let bytes: [u8; 8] = unsafe { std::mem::transmute(e) };
+    let back: E = unsafe { std::mem::transmute(bytes) };
+    match back {
+        E::A(t) => println!("A {} {} {}", t.0, t.1, t.2),
+        E::B(v) => println!("B {}", v),
+    }
+    let e2 = E::B(0xdeadbeef);
+    let bytes2: [u8; 8] = unsafe { std::mem::transmute(e2) };
+    let back2: E = unsafe { std::mem::transmute(bytes2) };
+    match back2 {
+        E::A(t) => println!("A {} {} {}", t.0, t.1, t.2),
+        E::B(v) => println!("B {:x}", v),
+    }
+}
+"#;
+
+#[test]
+fn run_mode_transmute_enum_tuple_payload() {
+    // A direct-tag enum whose one variant carries a
+    // tuple: the tuple payload is rebuilt at its recorded
+    // layout offsets when the enum is reconstructed from
+    // its bytes, for both variants.
+    run_ok(
+        "transmute-enum-tuple-payload",
+        TRANSMUTE_ENUM_TUPLE_PAYLOAD_SRC,
+        "A 86 4660 120\nB deadbeef\n",
+    );
+}
+
+const TRANSMUTE_NICHE_WRAP_SRC: &str = r#"
+#[repr(u8)]
+#[derive(Clone, Copy)]
+enum E { A = 253, B = 254 }
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct W { a: E, b: u8 }
+#[derive(Clone, Copy)]
+enum N { Payload(W), Empty1, Empty2 }
+fn code(n: N) -> u32 {
+    match n {
+        N::Payload(w) => 1000 + (w.a as u32) + ((w.b as u32) << 8),
+        N::Empty1 => 1,
+        N::Empty2 => 2,
+    }
+}
+fn main() {
+    let a: N = unsafe { std::mem::transmute(0u16) };
+    let b: N = unsafe { std::mem::transmute(255u16) };
+    let c: N = unsafe { std::mem::transmute(253u16) };
+    let d: N = unsafe { std::mem::transmute(0x5AFEu16) };
+    println!("{} {} {} {}", code(a), code(b), code(c), code(d));
+    let e2: u16 = unsafe { std::mem::transmute(N::Empty2) };
+    let e1: u16 = unsafe { std::mem::transmute(N::Empty1) };
+    let p: u16 = unsafe { std::mem::transmute(N::Payload(W { a: E::B, b: 0x5A })) };
+    println!("{} {} {}", e2, e1, p);
+}
+"#;
+
+#[test]
+fn run_mode_transmute_niche_range_wraps_at_scalar_width() {
+    // A niche range that starts at the niche scalar's
+    // maximum (255 in a `u8` tag) wraps: the second niche
+    // variant encodes as 0, in both directions. Decoding
+    // measures the distance from the range's start at the
+    // scalar's width, and encoding masks to that width
+    // before shifting instead of spilling into the
+    // adjacent payload byte.
+    run_ok(
+        "transmute-niche-wrap",
+        TRANSMUTE_NICHE_WRAP_SRC,
+        "2 1 1253 24294\n0 255 23294\n",
+    );
+}
+
+const TRANSMUTE_NICHE_WRAP_SHIFTED_SRC: &str = r#"
+#[repr(u8)]
+#[derive(Clone, Copy)]
+enum E { A = 253, B = 254 }
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct W { b: u8, a: E }
+#[derive(Clone, Copy)]
+enum N { Payload(W), Empty1, Empty2 }
+fn code(n: N) -> u32 {
+    match n {
+        N::Payload(w) => 1000 + (w.a as u32) + (w.b as u32),
+        N::Empty1 => 1,
+        N::Empty2 => 2,
+    }
+}
+fn main() {
+    let a: N = unsafe { std::mem::transmute(0x0000u16) };
+    let b: N = unsafe { std::mem::transmute(0xFF00u16) };
+    let c: N = unsafe { std::mem::transmute(0xFE5Au16) };
+    println!("{} {} {}", code(a), code(b), code(c));
+    let e2: u16 = unsafe { std::mem::transmute(N::Empty2) };
+    let p: u16 = unsafe { std::mem::transmute(N::Payload(W { b: 0x5A, a: E::B })) };
+    println!("{} {}", e2, p);
+}
+"#;
+
+#[test]
+fn run_mode_transmute_niche_range_wraps_at_shifted_scalar() {
+    // The same wrapping niche range with the niche scalar
+    // in the payload's second byte: the wrapped value is
+    // masked to the scalar's width before it is shifted
+    // into its window, in both directions.
+    run_ok(
+        "transmute-niche-wrap-shifted",
+        TRANSMUTE_NICHE_WRAP_SHIFTED_SRC,
+        "2 1 1344\n0 65114\n",
     );
 }

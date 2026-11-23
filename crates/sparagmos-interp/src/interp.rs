@@ -16277,8 +16277,12 @@ impl<'a> Interpreter<'a> {
             } => {
                 let raw = Self::mat_tag_raw(bytes, relocs, offset + toff, *size)?;
                 let span = u128::from(end - start);
-                if raw >= *niche_start && raw - niche_start <= span {
-                    let variant = start + (raw - niche_start) as u32;
+                // The niche range may wrap past the tag
+                // scalar's maximum, so the distance from the
+                // range's start is taken at the scalar's width.
+                let offset = raw.wrapping_sub(*niche_start) & bit_mask(u32::from(*size) * 8);
+                if offset <= span {
+                    let variant = start + offset as u32;
                     Ok((variant, variant_fields(variants, variant)?))
                 } else {
                     Ok((*untagged, variant_fields(variants, *untagged)?))
@@ -17097,14 +17101,23 @@ impl<'a> Interpreter<'a> {
                     untagged_variant: suv,
                     niche_variants: snv,
                     niche_start: sns,
+                    niche_shift: sshift,
+                    niche_bits: sbits,
                 },
                 ScalarShape::NicheEnum {
                     inner: dinner,
                     untagged_variant: duv,
                     niche_variants: dnv,
                     niche_start: dns,
+                    niche_shift: dshift,
+                    niche_bits: dbits,
                 },
-            ) if suv == duv && snv == dnv && sns == dns => match value {
+            ) if suv == duv
+                && snv == dnv
+                && sns == dns
+                && sshift == dshift
+                && sbits == dbits =>
+            match value {
                 Value::Enum { variant, fields } if variant == suv => {
                     let payload = fields.first()?;
                     let payload =
@@ -17213,11 +17226,21 @@ impl<'a> Interpreter<'a> {
                     untagged_variant,
                     niche_variants,
                     niche_start,
+                    niche_shift,
+                    niche_bits,
                 },
                 Value::Enum { variant, fields },
             ) => {
                 if (niche_variants.0..=niche_variants.1).contains(variant) {
-                    Ok(*niche_start + u128::from(*variant - niche_variants.0))
+                    // The encoded value is taken at the niche
+                    // scalar's width before shifting: a range
+                    // starting near the scalar's maximum wraps
+                    // (255 + 1 encodes as 0 in a u8 scalar)
+                    // instead of spilling into the adjacent
+                    // payload byte.
+                    Ok(((*niche_start + u128::from(*variant - niche_variants.0))
+                        & bit_mask(*niche_bits))
+                        << niche_shift)
                 } else if variant == untagged_variant {
                     match fields.first() {
                         Some(field) => self.flatten_scalar(field, inner),
@@ -17331,14 +17354,73 @@ impl<'a> Interpreter<'a> {
                 self.fat_values.borrow_mut().insert(bits, value.clone());
                 Ok(bits)
             }
-            (ScalarShape::Fields(fields), Value::Tuple(items))
+            (
+                ScalarShape::AdtFields { fields, .. },
+                Value::Enum { fields: vals, .. },
+            ) => {
+                let mut out = 0u128;
+                for (index, offset, shape) in fields {
+                    let field =
+                        vals.get(*index as usize).ok_or_else(|| {
+                            InterpError::type_mismatch(
+                                "transmute",
+                                "an ADT value holding every field",
+                                "an ADT value without one",
+                            )
+                        })?;
+                    out |= (self.flatten_scalar(field, shape)?
+                        & bit_mask(shape.bits()))
+                        << offset;
+                }
+                Ok(out)
+            }
+            (
+                ScalarShape::TaggedEnum {
+                    tag_offset,
+                    tag_bits,
+                    discriminants,
+                    variants,
+                    ..
+                },
+                Value::Enum { variant, fields },
+            ) => {
+                let disc =
+                    discriminants.get(*variant as usize).ok_or_else(|| {
+                        InterpError::type_mismatch(
+                            "transmute",
+                            "a variant of the tagged enum",
+                            format!("variant {variant}"),
+                        )
+                    })?;
+                let mut out =
+                    (*disc & bit_mask(*tag_bits)) << tag_offset;
+                for (index, offset, shape) in
+                    &variants[*variant as usize].fields
+                {
+                    let field =
+                        fields.get(*index as usize).ok_or_else(|| {
+                            InterpError::type_mismatch(
+                                "transmute",
+                                "an enum value holding every field",
+                                "an enum value without one",
+                            )
+                        })?;
+                    out |= (self.flatten_scalar(field, shape)?
+                        & bit_mask(shape.bits()))
+                        << offset;
+                }
+                Ok(out)
+            }
+            (ScalarShape::Fields { fields, .. }, Value::Tuple(items))
                 if items.len() == fields.len() =>
             {
                 let mut out = 0u128;
-                let mut offset = 0u32;
-                for (item, field) in items.iter().zip(fields.iter()) {
-                    out |= self.flatten_scalar(item, field)? << offset;
-                    offset += field.bits();
+                for (item, (offset, field)) in
+                    items.iter().zip(fields.iter())
+                {
+                    out |= (self.flatten_scalar(item, field)?
+                        & bit_mask(field.bits()))
+                        << offset;
                 }
                 Ok(out)
             }
@@ -17410,11 +17492,21 @@ impl<'a> Interpreter<'a> {
                 untagged_variant,
                 niche_variants,
                 niche_start,
+                niche_shift,
+                niche_bits,
             } => {
+                let window =
+                    (bits >> niche_shift) & bit_mask(*niche_bits);
                 let span = u128::from(niche_variants.1 - niche_variants.0);
-                if bits >= *niche_start && bits - *niche_start <= span {
+                // The niche range may wrap past the niche
+                // scalar's maximum (a range starting at 255 in
+                // a u8 scalar encodes its second variant as 0),
+                // so the distance from the range's start is
+                // taken at the scalar's width.
+                let offset = window.wrapping_sub(*niche_start) & bit_mask(*niche_bits);
+                if offset <= span {
                     Ok(Value::Enum {
-                        variant: niche_variants.0 + (bits - *niche_start) as u32,
+                        variant: niche_variants.0 + offset as u32,
                         fields: Vec::new(),
                     })
                 } else {
@@ -17424,6 +17516,62 @@ impl<'a> Interpreter<'a> {
                         fields: vec![payload],
                     })
                 }
+            }
+            ScalarShape::AdtFields {
+                count,
+                fill,
+                fields,
+                ..
+            } => {
+                let mut vals = vec![Value::Uninit; *count];
+                for (i, c) in fill {
+                    vals[*i as usize] = self.eval_constant(c)?;
+                }
+                for (index, offset, shape) in fields {
+                    let part =
+                        (bits >> offset) & bit_mask(shape.bits());
+                    vals[*index as usize] =
+                        self.construct_scalar(part, shape)?;
+                }
+                Ok(Value::Enum {
+                    variant: 0,
+                    fields: vals,
+                })
+            }
+            ScalarShape::TaggedEnum {
+                tag_offset,
+                tag_bits,
+                discriminants,
+                variants,
+                ..
+            } => {
+                let pattern =
+                    (bits >> tag_offset) & bit_mask(*tag_bits);
+                let Some(variant) = discriminants
+                    .iter()
+                    .position(|d| *d & bit_mask(*tag_bits) == pattern)
+                else {
+                    return Err(InterpError::type_mismatch(
+                        "transmute to a tagged enum",
+                        "a discriminant value of the target enum",
+                        format!("bit pattern {pattern:#x}"),
+                    ));
+                };
+                let vshape = &variants[variant];
+                let mut vals = vec![Value::Uninit; vshape.count];
+                for (i, c) in &vshape.fill {
+                    vals[*i as usize] = self.eval_constant(c)?;
+                }
+                for (index, offset, shape) in &vshape.fields {
+                    let part =
+                        (bits >> offset) & bit_mask(shape.bits());
+                    vals[*index as usize] =
+                        self.construct_scalar(part, shape)?;
+                }
+                Ok(Value::Enum {
+                    variant: variant as u32,
+                    fields: vals,
+                })
             }
             ScalarShape::FatPtr(meta) => {
                 // A pattern a flattened value registered
@@ -17451,13 +17599,11 @@ impl<'a> Interpreter<'a> {
                     }
                 }
             }
-            ScalarShape::Fields(fields) => {
+            ScalarShape::Fields { fields, .. } => {
                 let mut items = Vec::with_capacity(fields.len());
-                let mut offset = 0u32;
-                for field in fields {
+                for (offset, field) in fields {
                     let part = (bits >> offset) & bit_mask(field.bits());
                     items.push(self.construct_scalar(part, field)?);
-                    offset += field.bits();
                 }
                 Ok(Value::Tuple(items))
             }
