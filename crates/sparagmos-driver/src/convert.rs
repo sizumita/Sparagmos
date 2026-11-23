@@ -1890,15 +1890,17 @@ impl Converter {
                 // evaluable register-program class run, and anything
                 // else is a named explicit error at execution time —
                 // never a reason to drop the whole body here.
-                let ops = operands
+                let ops: Vec<sm::InlineAsmOperand> = operands
                     .iter()
                     .map(|op| self.asm_operand(body, op))
                     .collect();
+                let targets = self.asm_targets(body, *destination, options, &ops);
                 sm::TerminatorKind::InlineAsm {
                     template: template.clone(),
                     operands: ops,
                     options: options.clone(),
                     destination: destination.map(bb),
+                    targets,
                     unwind: self.unwind(unwind),
                 }
             }
@@ -1924,6 +1926,8 @@ impl Converter {
             sm::AsmOperandKind::Out
         } else if raw.starts_with("Const {") {
             sm::AsmOperandKind::Const
+        } else if raw.starts_with("Label {") {
+            sm::AsmOperandKind::Label
         } else {
             sm::AsmOperandKind::Sym
         };
@@ -1933,7 +1937,7 @@ impl Converter {
                 Some((bits, width)) => (width, Some(bits)),
                 None => (0, None),
             },
-            sm::AsmOperandKind::Sym => (0, None),
+            sm::AsmOperandKind::Sym | sm::AsmOperandKind::Label => (0, None),
             sm::AsmOperandKind::In => (
                 op.in_value
                     .as_ref()
@@ -1949,6 +1953,16 @@ impl Converter {
                 None,
             ),
         };
+        let static_name = if kind == sm::AsmOperandKind::Sym {
+            asm_raw_sym_name(raw)
+        } else {
+            None
+        };
+        let call_sig = if raw.starts_with("SymFn {") {
+            static_name.as_deref().and_then(|name| self.asm_call_sig(name))
+        } else {
+            None
+        };
         sm::InlineAsmOperand {
             kind,
             reg_class,
@@ -1956,7 +1970,108 @@ impl Converter {
             const_bits,
             in_value: op.in_value.as_ref().map(|v| self.operand(v)),
             out_place: op.out_place.as_ref().map(|p| self.place(p)),
+            reg_name: asm_raw_reg_name(raw),
+            static_name,
+            label_index: if kind == sm::AsmOperandKind::Label {
+                asm_raw_label_index(raw)
+            } else {
+                None
+            },
+            call_sig,
         }
+    }
+
+    /// The successor list of an InlineAsm terminator: the
+    /// destination followed by its label blocks, restored
+    /// structurally by [`restore_asm_label_blocks`]. A terminator
+    /// without label operands — or whose labels could not be
+    /// restored — carries just its destination (or nothing).
+    fn asm_targets(
+        &self,
+        body: &mir::Body,
+        destination: Option<mir::BasicBlockIdx>,
+        options: &str,
+        ops: &[sm::InlineAsmOperand],
+    ) -> Vec<sm::BasicBlock> {
+        let dest = destination.map(bb);
+        let label_count = ops
+            .iter()
+            .filter(|op| op.kind == sm::AsmOperandKind::Label)
+            .count();
+        if label_count == 0 {
+            return dest.into_iter().collect();
+        }
+        let Some(restored) =
+            restore_asm_label_blocks(body, label_count, options.contains("NORETURN"))
+        else {
+            return dest.into_iter().collect();
+        };
+        let mut targets: Vec<sm::BasicBlock> = dest.into_iter().collect();
+        targets.extend(restored);
+        targets
+    }
+
+    /// Resolve an asm `sym` operand naming a function to the
+    /// register-passing call signature a `call` step executes
+    /// through: the function must be the local crate's unique
+    /// function of that (last-segment) name, non-generic, with a
+    /// fully scalar signature under the SysV64 or Win64 ABI
+    /// families (the `C` and `System` ABIs are SysV64-shaped on
+    /// this target), and register-passed throughout (no stack
+    /// arguments). Anything else returns `None` and the call
+    /// stays outside the evaluable class.
+    fn asm_call_sig(&mut self, name: &str) -> Option<sm::AsmCallSig> {
+        let last = name.rsplit("::").next()?;
+        let mut candidates = rustc_public::local_crate()
+            .fn_defs()
+            .into_iter()
+            .filter(|def| def.name().rsplit("::").next() == Some(last));
+        let def = candidates.next()?;
+        if candidates.next().is_some() {
+            return None;
+        }
+        // Resolution can panic inside the compiler for shapes
+        // it cannot monomorphize from empty arguments (generic
+        // or predicate-carrying functions): such a function is
+        // simply not a resolvable call target.
+        let sig = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let inst = Instance::resolve(def, &GenericArgs(vec![])).ok()?;
+            Some(guarded_ty_kind(&inst.ty())?.fn_sig()?.skip_binder())
+        }))
+        .ok()??;
+        if sig.c_variadic {
+            return None;
+        }
+        let abi = asm_abi_family(&sig.abi)?;
+        let (output, inputs) = sig.inputs_and_output.split_last()?;
+        let mut params = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            params.push(asm_scalar(input)?);
+        }
+        let (mut ints, mut floats) = (0usize, 0usize);
+        for param in &params {
+            match param {
+                sm::AsmScalar::Float { .. } => floats += 1,
+                _ => ints += 1,
+            }
+        }
+        let register_passed = match abi {
+            sm::AsmAbi::SysV64 => ints <= 6 && floats <= 8,
+            sm::AsmAbi::Win64 => params.len() <= 4,
+        };
+        if !register_passed {
+            return None;
+        }
+        let ret = match guarded_ty_kind(output)? {
+            TyKind::RigidTy(RigidTy::Tuple(ts)) if ts.is_empty() => None,
+            _ => Some(asm_scalar(output)?),
+        };
+        Some(sm::AsmCallSig {
+            name: def.name(),
+            abi,
+            params,
+            ret,
+        })
     }
 
     fn assert_msg(&mut self, msg: &mir::AssertMessage) -> sm::AssertMessage {
@@ -5875,6 +5990,177 @@ fn asm_type_width(ty: &Ty) -> u32 {
         TyKind::RigidTy(RigidTy::Char) => 32,
         _ => 0,
     }
+}
+
+/// The explicit register name of an asm operand's raw
+/// representation (`reg: Reg(X86(ax))`), when the operand is
+/// bound to one architectural register rather than a register
+/// class.
+fn asm_raw_reg_name(raw: &str) -> Option<String> {
+    let rest = raw.split("reg: Reg(X86(").nth(1)?;
+    let name = rest.split(')').next()?;
+    Some(name.to_string())
+}
+
+/// The item name of a `Sym` asm operand's raw representation
+/// (`SymFn { value: foo }`, `SymStatic { value: BAR }`).
+fn asm_raw_sym_name(raw: &str) -> Option<String> {
+    let rest = raw.split("value: ").nth(1)?;
+    Some(rest.trim_end_matches('}').trim().to_string())
+}
+
+/// The target index of a `Label` asm operand's raw
+/// representation (`Label { target_index: 1 }`): the index into
+/// the terminator's internal successor list, where the
+/// fallthrough destination (when the terminator has one) is
+/// index 0 and the label blocks follow in operand order.
+fn asm_raw_label_index(raw: &str) -> Option<usize> {
+    let rest = raw.split("target_index: ").nth(1)?;
+    rest.chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+/// The register scalar of a plain integer / bool / char / float
+/// type, for an asm call signature. Anything else (aggregates,
+/// pointers, 128-bit integers) is not register-passed in this
+/// model and returns `None`.
+fn asm_scalar(ty: &rustc_public::ty::Ty) -> Option<sm::AsmScalar> {
+    use rustc_public::ty::{FloatTy, IntTy, UintTy};
+    let TyKind::RigidTy(rigid) = guarded_ty_kind(ty)? else {
+        return None;
+    };
+    Some(match rigid {
+        RigidTy::Int(it) => sm::AsmScalar::Int {
+            width: match it {
+                IntTy::Isize => 64,
+                IntTy::I8 => 8,
+                IntTy::I16 => 16,
+                IntTy::I32 => 32,
+                IntTy::I64 => 64,
+                IntTy::I128 => return None,
+            },
+            signed: true,
+        },
+        RigidTy::Uint(it) => sm::AsmScalar::Int {
+            width: match it {
+                UintTy::Usize => 64,
+                UintTy::U8 => 8,
+                UintTy::U16 => 16,
+                UintTy::U32 => 32,
+                UintTy::U64 => 64,
+                UintTy::U128 => return None,
+            },
+            signed: false,
+        },
+        RigidTy::Bool => sm::AsmScalar::Bool,
+        RigidTy::Char => sm::AsmScalar::Int {
+            width: 32,
+            signed: false,
+        },
+        RigidTy::Float(ft) => sm::AsmScalar::Float {
+            width: match ft {
+                FloatTy::F32 => 32,
+                FloatTy::F64 => 64,
+                _ => return None,
+            },
+        },
+        _ => return None,
+    })
+}
+
+/// The ABI family of an asm call signature, from the signature's
+/// rustc ABI. Only the two register conventions the interpreter
+/// assembles are recognized; `C` and `System` are SysV64-shaped
+/// on x86_64.
+fn asm_abi_family(abi: &rustc_public::ty::Abi) -> Option<sm::AsmAbi> {
+    let dbg = format!("{abi:?}");
+    if dbg.starts_with("Win64") {
+        Some(sm::AsmAbi::Win64)
+    } else if dbg.starts_with("SysV64")
+        || dbg.starts_with("System")
+        || dbg == "C"
+        || dbg.starts_with("C {")
+    {
+        Some(sm::AsmAbi::SysV64)
+    } else {
+        None
+    }
+}
+
+/// Structurally restore the label blocks of a body's asm-goto
+/// terminator. Stable MIR does not publish them: an InlineAsm
+/// terminator's only reported successor is its fallthrough
+/// destination. The label blocks are exactly the roots of the
+/// region the body's control-flow graph cannot reach under that
+/// reading — a label block's own continuation blocks may be
+/// unreachable too, but only the label blocks themselves have
+/// no predecessor inside the unreachable region. Restoration
+/// applies only when the body has exactly one label-carrying
+/// InlineAsm terminator (a single carrier) and the root count
+/// matches the label count; for a `noreturn` terminator the
+/// reported destination is itself the first label block, so one
+/// fewer root is expected. Anything else returns `None`, and
+/// the terminator's labels stay unrestored (which keeps the
+/// terminator outside the evaluable class).
+fn restore_asm_label_blocks(
+    body: &mir::Body,
+    label_count: usize,
+    noreturn: bool,
+) -> Option<Vec<sm::BasicBlock>> {
+    let blocks = &body.blocks;
+    let mut carriers = 0usize;
+    for block in blocks.iter() {
+        if let mir::TerminatorKind::InlineAsm { operands, .. } = &block.terminator.kind {
+            if operands.iter().any(|op| op.raw_rpr.starts_with("Label")) {
+                carriers += 1;
+            }
+        }
+    }
+    if carriers != 1 {
+        return None;
+    }
+    let n = blocks.len();
+    let succ: Vec<Vec<usize>> = blocks
+        .iter()
+        .map(|block| block.terminator.successors())
+        .collect();
+    let mut reachable = vec![false; n];
+    reachable[0] = true;
+    let mut stack = vec![0usize];
+    while let Some(i) = stack.pop() {
+        for &j in &succ[i] {
+            if !reachable[j] {
+                reachable[j] = true;
+                stack.push(j);
+            }
+        }
+    }
+    let mut has_unreachable_pred = vec![false; n];
+    for i in 0..n {
+        if reachable[i] {
+            continue;
+        }
+        for &j in &succ[i] {
+            if !reachable[j] {
+                has_unreachable_pred[j] = true;
+            }
+        }
+    }
+    let roots: Vec<usize> = (0..n)
+        .filter(|&i| !reachable[i] && !has_unreachable_pred[i])
+        .collect();
+    let expected = if noreturn {
+        label_count.checked_sub(1)?
+    } else {
+        label_count
+    };
+    if roots.len() != expected {
+        return None;
+    }
+    Some(roots.iter().map(|&i| sm::BasicBlock(i as u32)).collect())
 }
 
 /// Read an integer literal out of a `Const` asm operand's raw

@@ -3048,15 +3048,25 @@ impl<'a> Interpreter<'a> {
                         Self::jump(frames, body, *target)?;
                     }
                 }
-                TerminatorKind::InlineAsm { regs, steps, target } => {
-                    self.exec_inline_asm(frames, body, &regs, &steps)?;
-                    match target {
-                        Some(target) => Self::jump(frames, body, *target)?,
-                        None => {
-                            if let Some(value) = self.exec_return(frames, stop_depth)? {
-                                return Ok(value);
-                            }
+                TerminatorKind::InlineAsm {
+                    regs,
+                    steps,
+                    target,
+                    ret,
+                } => {
+                    let outcome = self.exec_inline_asm(frames, body, regs, steps, *ret)?;
+                    match outcome {
+                        AsmOutcome::JumpTo(block) => {
+                            Self::jump(frames, body, block)?;
                         }
+                        AsmOutcome::Fallthrough => match target {
+                            Some(target) => Self::jump(frames, body, *target)?,
+                            None => {
+                                if let Some(value) = self.exec_return(frames, stop_depth)? {
+                                    return Ok(value);
+                                }
+                            }
+                        },
                     }
                 }
                 TerminatorKind::Unsupported(kind) => {
@@ -3080,7 +3090,8 @@ impl<'a> Interpreter<'a> {
         body: &Body,
         regs: &[AsmReg],
         steps: &[AsmStep],
-    ) -> InterpResult<()> {
+        ret: Option<AsmRet>,
+    ) -> InterpResult<AsmOutcome> {
         let mut slots: Vec<u64> = Vec::with_capacity(regs.len());
         for reg in regs {
             let bits = match &reg.init {
@@ -3092,9 +3103,55 @@ impl<'a> Interpreter<'a> {
             };
             slots.push(bits);
         }
+        // The architectural register file: the 16 general-purpose
+        // registers followed by 32 vector registers (only the low
+        // 64 bits of each vector register are modelled — the part
+        // `movd` / `movq` transfer). An explicit-register operand
+        // aliases the register it names: it is seeded from its
+        // input value, and the step executor keeps the register
+        // and the operand's slot in step as the program runs.
+        let mut arch = [0u64; 48];
+        let mut arch_written = [false; 48];
+        let mut bound: [Option<usize>; 48] = [None; 48];
+        for (i, reg) in regs.iter().enumerate() {
+            if let Some(a) = reg.arch {
+                bound[a as usize] = Some(i);
+                if reg.init.is_some() {
+                    arch[a as usize] = slots[i];
+                    arch_written[a as usize] = true;
+                }
+            }
+        }
         let mut written = vec![false; regs.len()];
+        let mut outcome = AsmOutcome::Fallthrough;
         for step in steps {
-            exec_asm_step(&mut slots, &mut written, regs, step);
+            match step {
+                AsmStep::Jump { target } => {
+                    outcome = AsmOutcome::JumpTo(BasicBlock(target.index()));
+                    break;
+                }
+                AsmStep::Call { sig } => {
+                    self.exec_asm_call(frames, &mut arch, sig)?;
+                    // The call may have rewritten any register:
+                    // resync the slots of bound operands with the
+                    // register file's post-call state.
+                    for (a, slot) in bound.iter().enumerate() {
+                        if let Some(i) = slot {
+                            slots[*i] = arch[a];
+                            written[*i] = true;
+                        }
+                    }
+                }
+                step => exec_asm_step(
+                    &mut slots,
+                    &mut written,
+                    &mut arch,
+                    &mut arch_written,
+                    &bound,
+                    regs,
+                    step,
+                ),
+            }
         }
         for (i, reg) in regs.iter().enumerate() {
             let Some(dest) = &reg.dest else { continue };
@@ -3103,6 +3160,90 @@ impl<'a> Interpreter<'a> {
             }
             let value = asm_output_value(slots[i], reg);
             self.write_place(frames, body, dest, value)?;
+        }
+        if matches!(outcome, AsmOutcome::Fallthrough) {
+            if let Some(shape) = ret {
+            // A naked block: the return value is whatever the
+            // program left in `rax`, read at the function's
+            // return shape.
+            let shape_reg = AsmReg {
+                init: None,
+                dest: None,
+                width: shape.width,
+                kind: shape.kind,
+                arch: None,
+            };
+            let value = asm_output_value(arch[0], &shape_reg);
+            frames.last_mut().expect("frame").locals[0] = value;
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Execute one asm `call` step: assemble the arguments from
+    /// the architectural register file per the signature's ABI,
+    /// run the callee to completion, and scatter its return
+    /// value back into the file. The registers the ABI lets the
+    /// callee clobber are zeroed afterwards: their contents are
+    /// unspecified, and zero keeps a later read from observing a
+    /// stale value as if it were live. A panic in the callee
+    /// propagates: the enclosing frame's unwind table routes it
+    /// exactly like a panic raised at a call site in the asm
+    /// block.
+    fn exec_asm_call(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        arch: &mut [u64; 48],
+        sig: &sparagmos_mir::AsmCallSig,
+    ) -> InterpResult<()> {
+        // Architectural indices: rax rcx rdx rbx rsp rbp rsi rdi
+        // r8..r15 are 0..16; xmm0.. are 16...
+        const SYSV_INT: [usize; 6] = [7, 6, 2, 1, 8, 9];
+        const WIN_INT: [usize; 4] = [1, 2, 8, 9];
+        let mut args: Vec<Value> = Vec::with_capacity(sig.params.len());
+        let (mut next_int, mut next_float) = (0usize, 0usize);
+        for (pos, param) in sig.params.iter().enumerate() {
+            let bits = match (sig.abi, param) {
+                (sparagmos_mir::AsmAbi::SysV64, sparagmos_mir::AsmScalar::Float { .. }) => {
+                    let bits = arch[16 + next_float];
+                    next_float += 1;
+                    bits
+                }
+                (sparagmos_mir::AsmAbi::SysV64, _) => {
+                    let bits = arch[SYSV_INT[next_int]];
+                    next_int += 1;
+                    bits
+                }
+                (sparagmos_mir::AsmAbi::Win64, sparagmos_mir::AsmScalar::Float { .. }) => {
+                    arch[16 + pos]
+                }
+                (sparagmos_mir::AsmAbi::Win64, _) => arch[WIN_INT[pos]],
+            };
+            args.push(asm_scalar_value(bits, param));
+        }
+        let result = self.call_sync(frames, &sig.name, args)?;
+        let mut ret_reg: Option<usize> = None;
+        if let Some(ret) = &sig.ret {
+            let idx = match ret {
+                sparagmos_mir::AsmScalar::Float { .. } => 16,
+                _ => 0,
+            };
+            arch[idx] = asm_scalar_bits(&result, ret)?;
+            ret_reg = Some(idx);
+        }
+        let (gp_clobbers, xmm_clobbers): (&[usize], std::ops::Range<usize>) = match sig.abi {
+            sparagmos_mir::AsmAbi::SysV64 => (&[0, 1, 2, 6, 7, 8, 9, 10, 11], 16..48),
+            sparagmos_mir::AsmAbi::Win64 => (&[0, 1, 2, 8, 9, 10, 11], 16..22),
+        };
+        for &r in gp_clobbers {
+            if Some(r) != ret_reg {
+                arch[r] = 0;
+            }
+        }
+        for i in xmm_clobbers {
+            if Some(i) != ret_reg {
+                arch[i] = 0;
+            }
         }
         Ok(())
     }
@@ -22762,6 +22903,120 @@ fn asm_sign_extend(bits: u64, width: u32) -> u64 {
     }
 }
 
+/// How an executed asm block leaves: through its continuation
+/// or through a label jump.
+enum AsmOutcome {
+    Fallthrough,
+    JumpTo(BasicBlock),
+}
+
+/// The interpreter value of one asm call argument: the register
+/// bits interpreted at the parameter's scalar shape.
+fn asm_scalar_value(bits: u64, scalar: &sparagmos_mir::AsmScalar) -> Value {
+    match scalar {
+        sparagmos_mir::AsmScalar::Int { width, signed } => {
+            let masked = if *width >= 64 {
+                bits
+            } else {
+                bits & ((1u64 << width) - 1)
+            };
+            if *signed {
+                let shift = 64 - width;
+                Value::Int(((masked << shift) as i64 >> shift) as i128)
+            } else {
+                Value::Uint(u128::from(masked))
+            }
+        }
+        sparagmos_mir::AsmScalar::Bool => Value::Bool(bits != 0),
+        sparagmos_mir::AsmScalar::Float { width } => {
+            if *width == 32 {
+                Value::Float(f64::from(f32::from_bits(bits as u32)))
+            } else {
+                Value::Float(f64::from_bits(bits))
+            }
+        }
+    }
+}
+
+/// The register bits of an asm call's return value.
+fn asm_scalar_bits(
+    value: &Value,
+    scalar: &sparagmos_mir::AsmScalar,
+) -> InterpResult<u64> {
+    Ok(match (value, scalar) {
+        (Value::Int(v), _) => *v as u64,
+        (Value::Uint(v), _) => *v as u64,
+        (Value::Bool(b), _) => u64::from(*b),
+        (Value::Float(f), sparagmos_mir::AsmScalar::Float { width: 32 }) => {
+            f32::to_bits(*f as f32) as u64
+        }
+        (Value::Float(f), sparagmos_mir::AsmScalar::Float { .. }) => f.to_bits(),
+        (other, _) => {
+            return Err(InterpError::type_mismatch(
+                "inline asm call return",
+                "integer, bool or float",
+                other.kind_name(),
+            ));
+        }
+    })
+}
+
+/// Read an architectural register at its access width (`h` reads
+/// bits 8..16).
+fn asm_arch_read(arch: &[u64; 48], reg: sparagmos_mir::ArchReg) -> u64 {
+    let bits = arch[reg.index as usize];
+    match (reg.width, reg.high) {
+        (32, _) => bits & 0xffff_ffff,
+        (16, _) => bits & 0xffff,
+        (8, true) => (bits >> 8) & 0xff,
+        (8, false) => bits & 0xff,
+        _ => bits,
+    }
+}
+
+/// Write an architectural register with x86-64 partial-register
+/// semantics: a 32-bit write zero-extends, 8/16-bit writes
+/// preserve the rest, an `h` write lands in bits 8..16.
+fn asm_arch_write(arch: &mut [u64; 48], reg: sparagmos_mir::ArchReg, value: u64) {
+    let slot = &mut arch[reg.index as usize];
+    match (reg.width, reg.high) {
+        (32, _) => *slot = value & 0xffff_ffff,
+        (16, _) => *slot = (*slot & !0xffff) | (value & 0xffff),
+        (8, true) => *slot = (*slot & !0xff00) | ((value & 0xff) << 8),
+        (8, false) => *slot = (*slot & !0xff) | (value & 0xff),
+        _ => *slot = value,
+    }
+}
+
+/// Keep the register file in step with a slot write: an operand
+/// bound to an architectural register writes through to it.
+fn asm_sync_slot_to_arch(
+    slots: &[u64],
+    arch: &mut [u64; 48],
+    arch_written: &mut [bool; 48],
+    regs: &[AsmReg],
+    idx: usize,
+) {
+    if let Some(a) = regs[idx].arch {
+        arch[a as usize] = slots[idx];
+        arch_written[a as usize] = true;
+    }
+}
+
+/// Keep a bound operand's slot in step with a register write.
+fn asm_sync_arch_to_slot(
+    arch: &[u64; 48],
+    slots: &mut [u64],
+    written: &mut [bool],
+    bound: &[Option<usize>; 48],
+    reg: sparagmos_mir::ArchReg,
+) {
+    if let Some(i) = bound[reg.index as usize] {
+        slots[i] = arch[reg.index as usize];
+        written[i] = true;
+    }
+}
+
 /// The bits an asm input value enters its slot with: the value
 /// zero-extended from the operand width. (The bits above the
 /// width are unspecified on hardware — a wider register form
@@ -22852,26 +23107,40 @@ fn asm_instr_width(regs: &[AsmReg], idx: usize, modifier: Option<char>) -> u32 {
 }
 
 /// The value of an instruction source operand.
-fn asm_src_value(slots: &[u64], regs: &[AsmReg], src: &sparagmos_mir::AsmSrc) -> u64 {
+fn asm_src_value(
+    slots: &[u64],
+    regs: &[AsmReg],
+    arch: &[u64; 48],
+    src: &sparagmos_mir::AsmSrc,
+) -> u64 {
     match src {
         sparagmos_mir::AsmSrc::Reg(idx, modifier) => asm_read(slots, regs, *idx, *modifier),
         sparagmos_mir::AsmSrc::Imm(bits) => *bits,
+        sparagmos_mir::AsmSrc::Arch(reg) => asm_arch_read(arch, *reg),
     }
 }
 
-/// Run one classified asm instruction against the slots.
+/// Run one classified asm instruction against the slots and
+/// the architectural register file. Jump and call steps are the
+/// caller's (they transfer control / run a callee); every other
+/// step is straight-line.
+#[allow(clippy::too_many_arguments)]
 fn exec_asm_step(
     slots: &mut [u64],
     written: &mut [bool],
+    arch: &mut [u64; 48],
+    arch_written: &mut [bool; 48],
+    bound: &[Option<usize>; 48],
     regs: &[AsmReg],
     step: &AsmStep,
 ) {
-    use sparagmos_mir::{AsmBinOp, AsmUnOp};
+    use sparagmos_mir::AsmDst;
     match step {
-        AsmStep::Nop | AsmStep::Ret => {}
+        AsmStep::Nop | AsmStep::Ret | AsmStep::Jump { .. } | AsmStep::Call { .. } => {}
         AsmStep::Mov { dst, dst_mod, src } => {
-            let value = asm_src_value(slots, regs, src);
+            let value = asm_src_value(slots, regs, arch, src);
             asm_write(slots, written, regs, *dst, *dst_mod, value);
+            asm_sync_slot_to_arch(slots, arch, arch_written, regs, *dst);
         }
         AsmStep::Bin {
             op,
@@ -22882,35 +23151,90 @@ fn exec_asm_step(
             let width = asm_instr_width(regs, *dst, *dst_mod);
             let mask = asm_width_mask(width);
             let a = asm_read(slots, regs, *dst, *dst_mod) & mask;
-            let b = asm_src_value(slots, regs, src) & mask;
-            let count = (b & if width >= 64 { 63 } else { 31 }) as u32;
-            let result = match op {
-                AsmBinOp::Add => a.wrapping_add(b),
-                AsmBinOp::Sub => a.wrapping_sub(b),
-                AsmBinOp::And => a & b,
-                AsmBinOp::Or => a | b,
-                AsmBinOp::Xor => a ^ b,
-                AsmBinOp::Shl => a << count,
-                AsmBinOp::Shr => a >> count,
-                AsmBinOp::Sar => (asm_sign_extend(a, width) as i64 >> count) as u64,
-            };
+            let b = asm_src_value(slots, regs, arch, src) & mask;
+            let result = asm_bin_result(*op, a, b, width);
             asm_write(slots, written, regs, *dst, *dst_mod, result & mask);
+            asm_sync_slot_to_arch(slots, arch, arch_written, regs, *dst);
         }
         AsmStep::Un { op, dst, dst_mod } => {
             let width = asm_instr_width(regs, *dst, *dst_mod);
             let mask = asm_width_mask(width);
             let a = asm_read(slots, regs, *dst, *dst_mod) & mask;
-            let result = match op {
-                AsmUnOp::Neg => 0u64.wrapping_sub(a),
-                AsmUnOp::Not => !a,
-                AsmUnOp::Inc => a.wrapping_add(1),
-                AsmUnOp::Dec => a.wrapping_sub(1),
-            };
+            let result = asm_un_result(*op, a);
             asm_write(slots, written, regs, *dst, *dst_mod, result & mask);
+            asm_sync_slot_to_arch(slots, arch, arch_written, regs, *dst);
+        }
+        AsmStep::MovArch { dst, src } => {
+            let value = asm_src_value(slots, regs, arch, src);
+            asm_arch_write(arch, *dst, value);
+            arch_written[dst.index as usize] = true;
+            asm_sync_arch_to_slot(arch, slots, written, bound, *dst);
+        }
+        AsmStep::BinArch { op, dst, src } => {
+            let width = dst.width;
+            let mask = asm_width_mask(width);
+            let a = asm_arch_read(arch, *dst) & mask;
+            let b = asm_src_value(slots, regs, arch, src) & mask;
+            let result = asm_bin_result(*op, a, b, width);
+            asm_arch_write(arch, *dst, result & mask);
+            arch_written[dst.index as usize] = true;
+            asm_sync_arch_to_slot(arch, slots, written, bound, *dst);
+        }
+        AsmStep::UnArch { op, dst } => {
+            let width = dst.width;
+            let mask = asm_width_mask(width);
+            let a = asm_arch_read(arch, *dst) & mask;
+            let result = asm_un_result(*op, a);
+            asm_arch_write(arch, *dst, result & mask);
+            arch_written[dst.index as usize] = true;
+            asm_sync_arch_to_slot(arch, slots, written, bound, *dst);
+        }
+        AsmStep::Lea { dst, base, disp } => {
+            let addr = asm_src_value(slots, regs, arch, base).wrapping_add(*disp as u64);
+            match dst {
+                AsmDst::Operand(idx, modifier) => {
+                    asm_write(slots, written, regs, *idx, *modifier, addr);
+                    asm_sync_slot_to_arch(slots, arch, arch_written, regs, *idx);
+                }
+                AsmDst::Arch(reg) => {
+                    asm_arch_write(arch, *reg, addr);
+                    arch_written[reg.index as usize] = true;
+                    asm_sync_arch_to_slot(arch, slots, written, bound, *reg);
+                }
+            }
         }
     }
 }
 
+/// The result of one binary asm operation at `width` bits.
+fn asm_bin_result(op: sparagmos_mir::AsmBinOp, a: u64, b: u64, width: u32) -> u64 {
+    use sparagmos_mir::AsmBinOp;
+    let mask = asm_width_mask(width);
+    let a = a & mask;
+    let b = b & mask;
+    let count = (b & if width >= 64 { 63 } else { 31 }) as u32;
+    match op {
+        AsmBinOp::Add => a.wrapping_add(b),
+        AsmBinOp::Sub => a.wrapping_sub(b),
+        AsmBinOp::And => a & b,
+        AsmBinOp::Or => a | b,
+        AsmBinOp::Xor => a ^ b,
+        AsmBinOp::Shl => a << count,
+        AsmBinOp::Shr => a >> count,
+        AsmBinOp::Sar => (asm_sign_extend(a, width) as i64 >> count) as u64,
+    }
+}
+
+/// The result of one unary asm operation.
+fn asm_un_result(op: sparagmos_mir::AsmUnOp, a: u64) -> u64 {
+    use sparagmos_mir::AsmUnOp;
+    match op {
+        AsmUnOp::Neg => 0u64.wrapping_sub(a),
+        AsmUnOp::Not => !a,
+        AsmUnOp::Inc => a.wrapping_add(1),
+        AsmUnOp::Dec => a.wrapping_sub(1),
+    }
+}
 /// The pointee type of a bare-local pointer operand: a reference
 /// or raw-pointer local with no projection, whose declared type
 /// says what it points at. Anything else (a constant, a projected

@@ -1367,28 +1367,43 @@ impl Conv {
                 real_target: Self::basic_block_id(field(f, "real_target")?)?,
                 unwind: Self::unwind_action(field(f, "unwind")?)?,
             },
-            ("InlineAsm", Payload::Fields(f)) => mir::TerminatorKind::InlineAsm {
-                template: match field(f, "template")? {
-                    Node::Str(s) => s.clone(),
-                    _ => return err("InlineAsm template is not a string"),
-                },
-                operands: {
-                    let mut v = Vec::new();
-                    for a in as_list(field(f, "operands")?)? {
-                        v.push(Self::asm_operand(a)?);
-                    }
-                    v
-                },
-                options: match field(f, "options")? {
-                    Node::Str(s) => s.clone(),
-                    _ => return err("InlineAsm options is not a string"),
-                },
-                destination: match as_opt(field(f, "destination")?)? {
+            ("InlineAsm", Payload::Fields(f)) => {
+                let destination = match as_opt(field(f, "destination")?)? {
                     Some(t) => Some(Self::basic_block_id(t)?),
                     None => None,
-                },
-                unwind: Self::unwind_action(field(f, "unwind")?)?,
-            },
+                };
+                mir::TerminatorKind::InlineAsm {
+                    template: match field(f, "template")? {
+                        Node::Str(s) => s.clone(),
+                        _ => return err("InlineAsm template is not a string"),
+                    },
+                    operands: {
+                        let mut v = Vec::new();
+                        for a in as_list(field(f, "operands")?)? {
+                            v.push(Self::asm_operand(a)?);
+                        }
+                        v
+                    },
+                    options: match field(f, "options")? {
+                        Node::Str(s) => s.clone(),
+                        _ => return err("InlineAsm options is not a string"),
+                    },
+                    destination,
+                    // Optional: dumps written before the field
+                    // existed carry the destination alone.
+                    targets: match f.iter().find(|(name, _)| name == "targets") {
+                        Some((_, v)) => {
+                            let mut ts = Vec::new();
+                            for t in as_list(v)? {
+                                ts.push(Self::basic_block_id(t)?);
+                            }
+                            ts
+                        }
+                        None => destination.into_iter().collect(),
+                    },
+                    unwind: Self::unwind_action(field(f, "unwind")?)?,
+                }
+            }
             ("TailCall", Payload::Fields(f)) => mir::TerminatorKind::TailCall {
                 func: Self::operand(field(f, "func")?)?,
                 args: {
@@ -1428,6 +1443,7 @@ impl Conv {
             "InOut" => mir::AsmOperandKind::InOut,
             "Const" => mir::AsmOperandKind::Const,
             "Sym" => mir::AsmOperandKind::Sym,
+            "Label" => mir::AsmOperandKind::Label,
             other => return unsupported("AsmOperandKind", other),
         };
         Ok(mir::InlineAsmOperand {
@@ -1446,6 +1462,74 @@ impl Conv {
                 Some(v) => Some(Self::place(v)?),
                 None => None,
             },
+            // The extended fields are optional: dumps written
+            // before they existed read as all-`None`.
+            reg_name: Self::opt_string(f, "reg_name")?,
+            static_name: Self::opt_string(f, "static_name")?,
+            label_index: match f.iter().find(|(name, _)| name == "label_index") {
+                Some((_, v)) => match as_opt(v)? {
+                    Some(x) => Some(atom_parse(x, "label_index")?),
+                    None => None,
+                },
+                None => None,
+            },
+            call_sig: match f.iter().find(|(name, _)| name == "call_sig") {
+                Some((_, v)) => match as_opt(v)? {
+                    Some(x) => Some(Self::asm_call_sig(x)?),
+                    None => None,
+                },
+                None => None,
+            },
+        })
+    }
+
+    fn opt_string(f: &[(String, Node)], name: &str) -> Result<Option<String>, DumpError> {
+        match f.iter().find(|(n, _)| n == name) {
+            Some((_, v)) => match as_opt(v)? {
+                Some(Node::Str(s)) => Ok(Some(s.clone())),
+                Some(_) => err(format!("{name} is not a string")),
+                None => Ok(None),
+            },
+            None => Ok(None),
+        }
+    }
+
+    fn asm_call_sig(n: &Node) -> Result<mir::AsmCallSig, DumpError> {
+        let f = fields(n, "AsmCallSig")?;
+        let mut params = Vec::new();
+        for a in as_list(field(f, "params")?)? {
+            params.push(Self::asm_scalar(a)?);
+        }
+        Ok(mir::AsmCallSig {
+            name: match field(f, "name")? {
+                Node::Str(s) => s.clone(),
+                _ => return err("AsmCallSig name is not a string"),
+            },
+            abi: match atom(field(f, "abi")?)? {
+                "SysV64" => mir::AsmAbi::SysV64,
+                "Win64" => mir::AsmAbi::Win64,
+                other => return unsupported("AsmAbi", other),
+            },
+            params,
+            ret: match as_opt(field(f, "ret")?)? {
+                Some(v) => Some(Self::asm_scalar(v)?),
+                None => None,
+            },
+        })
+    }
+
+    fn asm_scalar(n: &Node) -> Result<mir::AsmScalar, DumpError> {
+        let (name, payload) = variant(n)?;
+        Ok(match (name, payload) {
+            ("Bool", Payload::Unit) => mir::AsmScalar::Bool,
+            ("Int", Payload::Fields(f)) => mir::AsmScalar::Int {
+                width: atom_parse(field(f, "width")?, "width")?,
+                signed: as_bool(field(f, "signed")?)?,
+            },
+            ("Float", Payload::Fields(f)) => mir::AsmScalar::Float {
+                width: atom_parse(field(f, "width")?, "width")?,
+            },
+            (other, _) => return unsupported("AsmScalar", other),
         })
     }
 

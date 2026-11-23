@@ -9055,15 +9055,18 @@ let inner = match (&src, target) {
                     let ctx = self.operand_place_ty(body, value);
                     Some(self.convert_operand(body, value, ctx.as_ref())?)
                 }
-                mir::AsmOperandKind::Out | mir::AsmOperandKind::Sym => None,
+                mir::AsmOperandKind::Out
+                | mir::AsmOperandKind::Sym
+                | mir::AsmOperandKind::Label => None,
             };
             let dest = match op.kind {
                 mir::AsmOperandKind::Out | mir::AsmOperandKind::InOut => {
-                    let place = op
-                        .out_place
-                        .as_ref()
-                        .expect("the driver sets out_place for out operands");
-                    Some(self.convert_place(body, place)?)
+                    // A pure clobber (a `clobber_abi` expansion)
+                    // has no place: its slot is inert.
+                    match op.out_place.as_ref() {
+                        Some(place) => Some(self.convert_place(body, place)?),
+                        None => None,
+                    }
                 }
                 _ => None,
             };
@@ -9091,11 +9094,16 @@ let inner = match (&src, target) {
                 Some(mir::Ty::Bool) => ir::AsmRegKind::Bool,
                 _ => ir::AsmRegKind::Unsigned,
             };
+            let arch = op
+                .reg_name
+                .as_deref()
+                .and_then(mir::arch_reg_index);
             regs.push(ir::AsmReg {
                 init,
                 dest,
                 width: op.width,
                 kind,
+                arch,
             });
         }
         Ok(regs)
@@ -9704,6 +9712,7 @@ let inner = match (&src, target) {
                 operands,
                 options,
                 destination,
+                targets,
                 ..
             } => {
                 if mir::inline_asm_is_noop(template, options) {
@@ -9719,6 +9728,7 @@ let inner = match (&src, target) {
                     template,
                     options,
                     operands,
+                    targets,
                     destination.is_some(),
                 ) {
                     if program.steps.is_empty() {
@@ -9737,14 +9747,42 @@ let inner = match (&src, target) {
                             ),
                         }
                     } else {
-                        ir::TerminatorKind::InlineAsm {
-                            regs: self.convert_asm_regs(body, operands)?,
-                            steps: program.steps,
-                            target: if program.returns {
-                                None
-                            } else {
-                                destination.map(|b| ir::BasicBlock(b.index()))
-                            },
+                        // A naked block's return value is read
+                        // out of the register file, so its return
+                        // type must be a plain scalar shape.
+                        let mut ret = None;
+                        let mut shape_ok = true;
+                        if program.returns
+                            && program
+                                .steps
+                                .iter()
+                                .any(|st| !matches!(st, mir::AsmStep::Ret))
+                        {
+                            match asm_return_shape(body) {
+                                Some(shape) => ret = Some(shape),
+                                None => shape_ok = false,
+                            }
+                        }
+                        if shape_ok {
+                            ir::TerminatorKind::InlineAsm {
+                                regs: self.convert_asm_regs(body, operands)?,
+                                steps: program.steps,
+                                target: if program.returns
+                                    || options.contains("NORETURN")
+                                {
+                                    // A noreturn asm-goto leaves
+                                    // through its label jump: no
+                                    // fallthrough continuation.
+                                    None
+                                } else {
+                                    destination.map(|b| ir::BasicBlock(b.index()))
+                                },
+                                ret,
+                            }
+                        } else {
+                            ir::TerminatorKind::Unsupported(format!(
+                                "InlineAsm (template {template:?} is not a no-op)"
+                            ))
                         }
                     }
                 } else {
@@ -11790,4 +11828,39 @@ fn unsize_concrete_pointee<'t>(
             other => return other,
         }
     }
+}
+
+
+/// The return shape of a body whose terminator is a naked asm
+/// block: the interpreter reads the return value out of the
+/// register file's `rax`, so the return type must be a plain
+/// integer, bool or char. Anything else returns `None`.
+fn asm_return_shape(body: &mir::Body) -> Option<ir::AsmRet> {
+    let ty = &body.local_decls.first()?.ty;
+    let (width, kind) = match ty {
+        mir::Ty::Int(it) => (
+            match it {
+                mir::IntTy::I8 => 8,
+                mir::IntTy::I16 => 16,
+                mir::IntTy::I32 => 32,
+                mir::IntTy::I64 | mir::IntTy::Isize => 64,
+                mir::IntTy::I128 => return None,
+            },
+            ir::AsmRegKind::Signed,
+        ),
+        mir::Ty::Uint(it) => (
+            match it {
+                mir::UintTy::U8 => 8,
+                mir::UintTy::U16 => 16,
+                mir::UintTy::U32 => 32,
+                mir::UintTy::U64 | mir::UintTy::Usize => 64,
+                mir::UintTy::U128 => return None,
+            },
+            ir::AsmRegKind::Unsigned,
+        ),
+        mir::Ty::Bool => (8, ir::AsmRegKind::Bool),
+        mir::Ty::Char => (32, ir::AsmRegKind::Unsigned),
+        _ => return None,
+    };
+    Some(ir::AsmRet { width, kind })
 }

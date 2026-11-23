@@ -2700,6 +2700,7 @@ fn asm_term(template: &str, options: &str, destination: Option<u32>) -> mir::Ter
         operands: Vec::new(),
         options: options.to_string(),
         destination: destination.map(mir::BasicBlock),
+        targets: destination.map(mir::BasicBlock).into_iter().collect(),
         unwind: mir::UnwindAction::Continue,
     }
 }
@@ -2739,12 +2740,12 @@ fn inline_asm_noop_templates_step_to_the_destination() {
 
 #[test]
 fn inline_asm_with_real_instructions_is_a_named_error() {
-    // fn f() -> i32 { asm!("mov eax, 1"); return 0 }
+    // fn f() -> i32 { asm!("cpuid"); return 0 }
     let body = mir::Body::new(
         decls(&[i32_ty()]),
         0,
         vec![
-            block(vec![], asm_term("mov eax, 1", "", Some(1))),
+            block(vec![], asm_term("cpuid", "", Some(1))),
             block(vec![], ret()),
         ],
     );
@@ -2774,6 +2775,10 @@ fn asm_op(
         const_bits: None,
         in_value,
         out_place,
+        reg_name: None,
+        static_name: None,
+        label_index: None,
+        call_sig: None,
     }
 }
 
@@ -2787,6 +2792,7 @@ fn asm_prog_term(
         operands,
         options: String::new(),
         destination: destination.map(mir::BasicBlock),
+        targets: destination.map(mir::BasicBlock).into_iter().collect(),
         unwind: mir::UnwindAction::Continue,
     }
 }
