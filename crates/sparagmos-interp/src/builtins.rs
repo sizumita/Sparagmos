@@ -1014,7 +1014,7 @@ pub enum Builtin {
     /// precondition check, a chain the value model answers in
     /// place resolution instead, so the entry point is modelled
     /// here. The storage change is `vec_with_len`'s: growing
-    /// pads with uninitialized elements (sparsely past the
+    /// pads with the element type's uninitialized form (sparsely past the
     /// materialisation limit), and shrinking keeps the tail
     /// elements in storage as spare capacity without dropping
     /// them, exactly as the real `set_len` contract specifies —
@@ -8844,6 +8844,9 @@ impl<'a> Interpreter<'a> {
                     }
                 };
                 let target = self.deref_value(frames, &vals[0])?;
+                let uninit_elem = uninit_elem_value_for_tag(
+                    generic_args.first().map(String::as_str).unwrap_or(""),
+                );
                 self.modify_resolved(frames, &target, |slot| {
                     // The vector's value at the new length (see
                     // `vec_with_len`): materialised up to the
@@ -8866,7 +8869,7 @@ impl<'a> Interpreter<'a> {
                             ));
                         }
                     };
-                    *slot = vec_with_len(elems, new_len);
+                    *slot = vec_with_len(elems, new_len, &uninit_elem);
                     Ok(Value::Unit)
                 })
             }
@@ -18928,8 +18931,10 @@ pub(crate) const MAX_VEC_SET_LEN_ELEMENTS: usize = 1 << 22;
 /// A vector value holding `elems` at declared length `len`:
 /// the plain element aggregate when the declared length is
 /// exactly the stored list — a growth into the materialisation
-/// limit pads with uninitialised slots, as `Vec::set_len`
-/// does — and the sparse form (see `Value::SparseVec`) when
+/// limit pads with `uninit_elem`, the element type's
+/// uninitialised form (see `uninit_elem_value_for_tag`), as
+/// `Vec::set_len` does — and the sparse form (see
+/// `Value::SparseVec`) when
 /// the two differ: past the materialisation limit the length
 /// runs ahead of the stored elements, and on a shrink the
 /// stored elements run ahead of the length. A shrink keeps
@@ -18938,7 +18943,7 @@ pub(crate) const MAX_VEC_SET_LEN_ELEMENTS: usize = 1 << 22;
 /// `pop` reads the element it just un-declared), counted by
 /// the capacity the model reports, and overwritten by the
 /// next append before any new storage is needed.
-pub(crate) fn vec_with_len(mut elems: Vec<Value>, len: usize) -> Value {
+pub(crate) fn vec_with_len(mut elems: Vec<Value>, len: usize, uninit_elem: &Value) -> Value {
     if len == elems.len() {
         Value::Enum {
             variant: 0,
@@ -18950,7 +18955,7 @@ pub(crate) fn vec_with_len(mut elems: Vec<Value>, len: usize) -> Value {
             len: len as u128,
         }
     } else if len <= MAX_VEC_SET_LEN_ELEMENTS {
-        elems.resize(len, Value::Uninit);
+        elems.resize(len, uninit_elem.clone());
         Value::Enum {
             variant: 0,
             fields: elems,
@@ -20586,6 +20591,31 @@ fn uninit_value_for_tag(tag: &str) -> Option<Value> {
         }
     }
     Some(Value::Uninit)
+}
+
+/// The uninitialized form of a value of the type a rendered
+/// tag names, as a `Vec` element slot holds it when the
+/// vector's declared length grows over storage nothing was
+/// written to (see `vec_with_len`): a `MaybeUninit<T>` element
+/// is the union value whose payload slot carries the payload
+/// type's own uninitialized form — the shape the
+/// `MaybeUninit::uninit()` construction materializes, so a
+/// slot the length declares but no write reached reads back
+/// as that value, and using its payload is the uninitialized
+/// read. Every other type's uninitialized form is the bare
+/// `Uninit` marker: reading such a slot is an uninitialized
+/// read, exactly as before.
+pub(crate) fn uninit_elem_value_for_tag(tag: &str) -> Value {
+    let tag = tag.trim();
+    for prefix in ["std::mem::MaybeUninit<", "core::mem::MaybeUninit<"] {
+        if let Some(inner) = generic_first_arg(tag, prefix) {
+            return Value::Enum {
+                variant: 0,
+                fields: vec![uninit_elem_value_for_tag(inner)],
+            };
+        }
+    }
+    Value::Uninit
 }
 
 /// The element values inside a `box_assume_init_into_vec_unsafe`

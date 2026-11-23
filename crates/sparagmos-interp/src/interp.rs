@@ -8708,11 +8708,11 @@ impl<'a> Interpreter<'a> {
                     len: len as u128,
                 };
                 self.slice_elements(frames, &fat)
-                    .map(|(elems, _)| crate::builtins::vec_with_len(elems, len))
+                    .map(|(elems, _)| crate::builtins::vec_with_len(elems, len, &Value::Uninit))
             }
             Some(fat @ Value::FatRef { .. }) => self
                 .slice_elements(frames, &fat)
-                .map(|(elems, _)| crate::builtins::vec_with_len(elems, len)),
+                .map(|(elems, _)| crate::builtins::vec_with_len(elems, len, &Value::Uninit)),
             _ => Err(InterpError::type_mismatch(
                 "Vec value in its real aggregate form",
                 "a buffer pointer in the RawVec fields",
@@ -12931,6 +12931,9 @@ impl<'a> Interpreter<'a> {
             Ok(target) => target,
             Err(e) => return Some(Err(e)),
         };
+        let uninit_elem = vec_elem_tag(body, &base)
+            .map(|tag| crate::builtins::uninit_elem_value_for_tag(&tag))
+            .unwrap_or(Value::Uninit);
         Some(self.modify_resolved(frames, &target, |slot| {
             let elems = match std::mem::replace(slot, Value::Uninit) {
                 Value::Enum { fields, .. } => fields,
@@ -12943,7 +12946,7 @@ impl<'a> Interpreter<'a> {
                     ));
                 }
             };
-            *slot = crate::builtins::vec_with_len(elems, new_len);
+            *slot = crate::builtins::vec_with_len(elems, new_len, &uninit_elem);
             Ok(())
         }))
     }
@@ -16444,6 +16447,35 @@ fn vec_len_slot_base(body: &Body, place: &Place) -> Option<Place> {
     } else {
         None
     }
+}
+
+/// The rendered element type tag of the `Vec` a base place
+/// denotes: the first generic argument of the vector's ADT
+/// name, with the base's type tracked from the local through
+/// reference steps exactly as `vec_len_slot_base` tracks it.
+/// `None` when the type does not resolve to a `Vec` instance.
+fn vec_elem_tag(body: &Body, base: &Place) -> Option<String> {
+    let mut cur_ty = body.local_ty(base.local)?.clone();
+    for elem in &base.projection {
+        match elem {
+            ProjectionElem::Deref => {
+                cur_ty = match cur_ty {
+                    Ty::Ref(pointee) => (*pointee).clone(),
+                    _ => return None,
+                };
+            }
+            _ => return None,
+        }
+    }
+    if !is_vec_adt_ty(&cur_ty) {
+        return None;
+    }
+    let Ty::Adt(name) = cur_ty else {
+        return None;
+    };
+    let open = name.find('<')?;
+    let close = name.rfind('>')?;
+    split_generic_args(&name[open + 1..close]).into_iter().next()
 }
 
 pub(crate) fn project_value(
