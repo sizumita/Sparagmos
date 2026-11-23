@@ -5261,18 +5261,36 @@ fn collect() -> ControlFlow<()> {
     // Monomorphization failures rustc reports around MIR
     // conversion: the recursion limit the demand passes hit while
     // collecting instances (a mono-collection error, so it takes
-    // precedence), and the checks of `sparagmos_driver::mono_check`
-    // over the converted bodies (invalid SIMD intrinsic
-    // instantiations and SIMD layouts, types too big for the
-    // target architecture). A failure here fails the whole
-    // compilation, the way the corresponding rustc error does.
-    // The scan covers the Stable MIR bodies conversion walked
-    // (local seeds, demanded instances, and the reachability
-    // frontier); auxiliary-crate bodies converted by the loop
-    // above are not retained in that set and are not scanned.
+    // precedence), the required-constant evaluation the mono
+    // collector performs over the instances collection resolved
+    // (also a collection-time error, so it comes next), and the
+    // checks of `sparagmos_driver::mono_check` over the converted
+    // bodies (invalid SIMD intrinsic instantiations and SIMD
+    // layouts, types too big for the target architecture). A
+    // failure here fails the whole compilation, the way the
+    // corresponding rustc error does. The body scan covers the
+    // Stable MIR bodies conversion walked (local seeds, demanded
+    // instances, and the reachability frontier); auxiliary-crate
+    // bodies converted by the loop above are not retained in that
+    // set and are not scanned.
     let compile_error = demand_state
         .recursion_limit
         .clone()
+        .or_else(|| {
+            if !COMPILE_VERDICT_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+                return None;
+            }
+            let required_const_roots: Vec<Instance> =
+                demand_state.seen.iter().map(|(_, inst)| *inst).collect();
+            let entry_instance = std::panic::catch_unwind(rustc_public::entry_fn)
+                .ok()
+                .flatten()
+                .and_then(|item| Instance::try_from(item).ok());
+            sparagmos_driver::mono_check::check_required_consts(
+                &required_const_roots,
+                entry_instance,
+            )
+        })
         .or_else(|| sparagmos_driver::mono_check::check_bodies(&alias_sources));
 
     let entry_def_id = entry_point_def_id(&mut conv, &items);
@@ -7579,7 +7597,25 @@ impl Mode {
     fn is_run(self) -> bool {
         matches!(self, Mode::Run | Mode::RunJit)
     }
+
+    /// Modes whose verdict is a compilation outcome (the program
+    /// converts, or fails to compile) rather than an execution
+    /// outcome.
+    fn is_compile_verdict(self) -> bool {
+        matches!(self, Mode::Convert | Mode::JitCompile)
+    }
 }
+
+/// Whether this process's mode judges a compilation verdict, set
+/// once from the parsed mode before the compiler runs and read by
+/// `collect` (which the compiler callback reaches without the
+/// mode at hand). The required-constant check in `mono_check` is
+/// gated on it: in the executing modes the interpreter runs
+/// programs through its own models — including bodies rustc's
+/// collector would reject, and bodies it cannot fetch at all —
+/// and a compilation verdict must not pre-empt execution there.
+static COMPILE_VERDICT_MODE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// The stack size of the thread the driver runs on: the
 /// interpreter's evaluation, projection and value walks are
@@ -7614,6 +7650,10 @@ fn driver_main() {
         _ => Mode::Convert,
     };
     let run_mode = mode.is_run();
+    COMPILE_VERDICT_MODE.store(
+        mode.is_compile_verdict(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let debug_mode = mode == Mode::Debug;
     // The debug entry point compiles and collects exactly like
     // run mode (it executes the same program, under a debugger

@@ -26378,3 +26378,140 @@ fn run_mode_extern_static_field_prefix_slice_first_keeps_full_storage() {
         "d0=10 d1=20 sentinel=7\n",
     );
 }
+
+// ----- Required constants of collected instances (mono collector) -----
+
+const REQUIRED_CONST_DEAD_FN_SRC: &str = r#"
+struct Fail<T>(T);
+impl<T> Fail<T> {
+    const C: () = panic!();
+}
+#[inline(never)]
+fn not_called<T>() {
+    if false {
+        let _ = Fail::<T>::C;
+    }
+}
+#[inline(never)]
+fn called<T>() {
+    if false {
+        not_called::<T>();
+    }
+}
+fn main() {
+    called::<i32>();
+}
+"#;
+
+const REQUIRED_CONST_FNPTR_IN_CONST_SRC: &str = r#"
+struct Late<T>(T);
+impl<T> Late<T> {
+    const FAIL: () = panic!();
+    const FNPTR: fn() = || Self::FAIL;
+}
+#[inline(never)]
+fn not_called<T>() {
+    if false {
+        let _ = Late::<T>::FNPTR;
+    }
+}
+#[inline(never)]
+fn called<T>() {
+    if false {
+        not_called::<T>();
+    }
+}
+fn main() {
+    called::<i32>();
+}
+"#;
+
+const REQUIRED_CONST_UNMENTIONED_SRC: &str = r#"
+struct Fail<T>(T);
+impl<T> Fail<T> {
+    const C: () = panic!();
+}
+#[inline(never)]
+fn not_called<T>() {
+    if false {
+        let _ = Fail::<T>::C;
+    }
+}
+fn main() {}
+"#;
+
+#[test]
+fn convert_mode_required_const_in_dead_mention_is_a_compile_failure() {
+    // rustc's mono collector evaluates the required constants of
+    // every instance it collects, following mentions recorded
+    // before optimization: `called::<i32>` mentions
+    // `not_called::<i32>` from dead code, and that body's required
+    // constant `Fail::<i32>::C` panics in evaluation (E0080), so
+    // the crate fails to compile even though the bad constant is
+    // never demanded by the converted (post-optimization) bodies.
+    let dir = temp_dir("required-const-dead-fn");
+    let src = fixture(&dir, "required_const_dead_fn.rs", REQUIRED_CONST_DEAD_FN_SRC);
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a failing required constant behind a dead-code mention must fail \
+         compilation; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("sparagmos-driver: compilation failed")
+            && stderr.contains("E0080"),
+        "the failure must surface the evaluation error; stderr={stderr}"
+    );
+}
+
+#[test]
+fn convert_mode_required_const_behind_fnptr_const_is_a_compile_failure() {
+    // The failing constant hides one more hop away: evaluating
+    // `Late::<i32>::FNPTR` succeeds and yields a closure pointer,
+    // and the collector collects that closure instance, whose own
+    // required constant `Late::<i32>::FAIL` fails to evaluate.
+    let dir = temp_dir("required-const-fnptr");
+    let src = fixture(
+        &dir,
+        "required_const_fnptr.rs",
+        REQUIRED_CONST_FNPTR_IN_CONST_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a failing required constant behind a function-pointer constant \
+         must fail compilation; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("sparagmos-driver: compilation failed")
+            && stderr.contains("E0080"),
+        "the failure must surface the evaluation error; stderr={stderr}"
+    );
+}
+
+#[test]
+fn convert_mode_required_const_never_mentioned_converts() {
+    // The same failing constant in a generic function that no
+    // collected instance mentions: rustc never collects it, never
+    // evaluates the constant, and the crate compiles. The check
+    // must not fire either — it only walks from the instances
+    // collection actually resolved.
+    let dir = temp_dir("required-const-unmentioned");
+    let src = fixture(
+        &dir,
+        "required_const_unmentioned.rs",
+        REQUIRED_CONST_UNMENTIONED_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a failing required constant in a never-mentioned generic \
+         function must convert; stderr={stderr}"
+    );
+}
