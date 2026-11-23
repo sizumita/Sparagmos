@@ -27282,9 +27282,7 @@ impl<'a> Interpreter<'a> {
             };
             if let Some(address) = address {
                 return match trait_ {
-                    FmtTrait::Pointer | FmtTrait::Debug => {
-                        Ok(pad_width(&format!("0x{address:x}"), options))
-                    }
+                    FmtTrait::Pointer | FmtTrait::Debug => Ok(format_pointer(address, options)),
                     FmtTrait::DebugNoop => Ok(String::new()),
                     _ => Err(unsupported(format!(
                         "{trait_:?} formatting for a pointer that denotes no data"
@@ -28939,6 +28937,40 @@ fn pad_integral(negative: bool, prefix: &str, digits: &str, options: &FmtOptions
         options.fill(),
     );
     format!("{pre}{sign}{prefix}{digits}{post}")
+}
+
+/// core's `Pointer` formatting: the address as lower-case hex
+/// behind an unconditional `0x` prefix, padded by the same rules
+/// as `pad_integral` -- the sign and prefix count toward the
+/// width, the default alignment is Right -- except that
+/// zero-padding (the `0` flag, or the alternate form) inserts
+/// zeros between the prefix and the digits regardless of the
+/// requested alignment or fill, and the alternate form defaults
+/// the width to the full pointer width (the prefix plus two hex
+/// digits per address byte) when no width is given. Precision
+/// plays no part, as for integers.
+fn format_pointer(address: u64, options: &FmtOptions) -> String {
+    let sign = if options.sign_plus() { "+" } else { "" };
+    let digits = format!("{address:x}");
+    let width = match options.width() {
+        Some(w) => w as usize,
+        None if options.alternate() => 2 + 2 * size_of::<usize>(),
+        None => 0,
+    };
+    let total = sign.len() + 2 + digits.len();
+    if total >= width {
+        return format!("{sign}0x{digits}");
+    }
+    let side = width - total;
+    if options.zero_pad() || options.alternate() {
+        return format!("{sign}0x{}{digits}", "0".repeat(side));
+    }
+    let (pre, post) = padding(
+        side,
+        options.align().unwrap_or(Align::Right),
+        options.fill(),
+    );
+    format!("{pre}{sign}0x{digits}{post}")
 }
 
 /// The bit width a type tag names, for two's-complement radix
