@@ -12399,7 +12399,22 @@ fn value_fingerprint(value: &Value) -> u64 {
                 }
             }
         }
-        let (new_state, item) = iterator_next_back_state(&state, self_ty)?;
+        let (new_state, item) = match iterator_next_back_state(&state, self_ty) {
+            Ok(step) => step,
+            Err(e) => {
+                let fields = iterator_fields(&state, self_ty)?;
+                match slice_iter_step_real(self, frames, self_ty, &fields, true) {
+                    Some(step) => {
+                        let (new_fields, result) = step?;
+                        (
+                            rebuild_state(&state, new_fields),
+                            option_payload_opt(result),
+                        )
+                    }
+                    None => return Err(e),
+                }
+            }
+        };
         Ok((
             new_state,
             match item {
@@ -13059,21 +13074,29 @@ fn value_fingerprint(value: &Value) -> u64 {
                 ));
             }
             let (ptr_field, end) = (fields[0].clone(), fields[1].clone());
-            let (Some(cur), Some(last)) = (iter_ptr_index(&ptr_field), iter_ptr_index(&end))
-            else {
+            if let (Some(cur), Some(last)) =
+                (iter_ptr_index(&ptr_field), iter_ptr_index(&end))
+            {
+                if cur < last {
+                    let advanced = iter_ptr_with_index(&ptr_field, cur + 1)
+                        .expect("index step checked");
+                    let item =
+                        iter_ptr_value(&ptr_field).expect("pointer field checked");
+                    let item = btree_pair_item(self_ty, item);
+                    (vec![advanced, end, fields[2].clone()], some_value(item))
+                } else {
+                    (fields, none_value())
+                }
+            } else if let Some(step) =
+                slice_iter_step_real(self, frames, self_ty, &fields, false)
+            {
+                step?
+            } else {
                 return Err(InterpError::type_mismatch(
                     "slice::Iter state",
                     "element pointers into the element snapshot",
                     format!("{} / {}", ptr_field.kind_name(), end.kind_name()),
                 ));
-            };
-            if cur < last {
-                let advanced =
-                    iter_ptr_with_index(&ptr_field, cur + 1).expect("index step checked");
-                let item = iter_ptr_value(&ptr_field).expect("pointer field checked");
-                (vec![advanced, end, fields[2].clone()], some_value(item))
-            } else {
-                (fields, none_value())
             }
         } else if self_ty.starts_with("std::array::IntoIter<")
             || self_ty.starts_with("std::vec::IntoIter<")
@@ -17227,14 +17250,52 @@ fn btree_leaf_parts(fields: &[Value]) -> InterpResult<(usize, Vec<Value>, Vec<Va
             ))
         }
     };
-    if keys.len() < len || values.len() < len {
-        return Err(InterpError::type_mismatch(
+    let keys = btree_fill_elided(keys, len)?;
+    let values = btree_fill_elided(values, len)?;
+    Ok((len, keys, values))
+}
+
+/// Whether a stored slot's value is zero-sized in form: a unit,
+/// an empty aggregate, or a wrapper over one. A zero-sized
+/// element type has exactly one value, and every stored slot
+/// of it has this shape.
+fn btree_zst_shaped(value: &Value) -> bool {
+    match value {
+        Value::Unit => true,
+        Value::Tuple(items) => items.iter().all(btree_zst_shaped),
+        Value::Enum { fields, .. } => fields.iter().all(btree_zst_shaped),
+        _ => false,
+    }
+}
+
+/// Fill a B-tree node's key/value array out to the declared
+/// length. A slot within the length that was never stored is
+/// an elided zero-sized element: the write machinery stores
+/// nothing for a value with no leaves, so a zero-sized element
+/// type (a set's marker value, a unit key) leaves the array
+/// shorter than the length, and every present slot holds the
+/// type's sole value in the same form the missing slots hold.
+/// A short array whose present slots are not all zero-sized
+/// is a genuine hole in the node and stays an error.
+fn btree_fill_elided(mut slots: Vec<Value>, len: usize) -> InterpResult<Vec<Value>> {
+    if slots.len() >= len {
+        return Ok(slots);
+    }
+    let sole = slots.first().cloned();
+    match sole {
+        Some(first) if slots.iter().all(btree_zst_shaped) => {
+            slots.resize(len, first);
+            Ok(slots)
+        }
+        _ => Err(InterpError::type_mismatch(
             "BTree leaf node",
             "key and value arrays covering the declared length",
-            format!("length {len}, {} key slot(s), {} value slot(s)", keys.len(), values.len()),
-        ));
+            format!(
+                "length {len}, {} slot(s) present",
+                slots.len()
+            ),
+        )),
     }
-    Ok((len, keys, values))
 }
 
 /// The payload of a `MaybeUninit` slot in a B-tree node: the
@@ -17251,6 +17312,88 @@ fn btree_maybe_uninit(value: &Value) -> InterpResult<Value> {
             fields,
         } if fields.len() == 1 => Ok(fields[0].clone()),
         other => Ok(other.clone()),
+    }
+}
+
+/// One step of a real-layout `slice::Iter` state whose
+/// pointers are the model's real pointers rather than element
+/// pointers into a snapshot: the state core's own construction
+/// builds when library code forms the iterator itself (the
+/// pointers then denote positions in the pointee's container,
+/// in whatever projection form the pointer machinery produced
+/// -- a field position plus a wrapper entry, a byte offset).
+/// The step is the real iterator's own: the current pointer is
+/// the item, pointer equality is the end, and advancing is the
+/// pointer-offset machinery at the element type's size, which
+/// renders the advanced pointer in the same form the state's
+/// own construction produced for the end pointer. `None` when
+/// the state is not of this shape (a zero-sized element type,
+/// whose end field is a count rather than a pointer, included),
+/// leaving the snapshot reading and its shape error in place.
+fn slice_iter_step_real(
+    interp: &Interpreter,
+    frames: &mut Vec<Frame>,
+    self_ty: &str,
+    fields: &[Value],
+    back: bool,
+) -> Option<InterpResult<(Vec<Value>, Value)>> {
+    if fields.len() != 3 {
+        return None;
+    }
+    let ptr_ref = iter_ptr_value(&fields[0])?;
+    let end_ref = iter_ptr_value(&fields[1])?;
+    let (Value::Ref(ptr_target), Value::Ref(end_target)) = (&ptr_ref, &end_ref)
+    else {
+        return None;
+    };
+    if matches!(ptr_target, RefTarget::Null) || matches!(end_target, RefTarget::Null) {
+        return None;
+    }
+    let elem_tag = first_generic_arg(self_ty)?;
+    let (size, _) = interp.layout_of(elem_tag)?;
+    if size == 0 {
+        return None;
+    }
+    let size = u64::try_from(size).ok()?;
+    let rewrap = |field: &Value, new_ref: Value| -> Value {
+        match field {
+            Value::Enum { variant, fields } if fields.len() == 1 => Value::Enum {
+                variant: *variant,
+                fields: vec![new_ref],
+            },
+            _ => new_ref,
+        }
+    };
+    if ptr_target == end_target {
+        return Some(Ok((fields.to_vec(), none_value())));
+    }
+    if back {
+        let new_end = match interp.ptr_offset_value(frames, end_ref, -1, Some(size), false) {
+            Ok(v) => v,
+            Err(e) => return Some(Err(e)),
+        };
+        let item = new_end.clone();
+        Some(Ok((
+            vec![
+                fields[0].clone(),
+                rewrap(&fields[1], new_end),
+                fields[2].clone(),
+            ],
+            some_value(item),
+        )))
+    } else {
+        let advanced = match interp.ptr_offset_value(frames, ptr_ref.clone(), 1, Some(size), false) {
+            Ok(v) => v,
+            Err(e) => return Some(Err(e)),
+        };
+        Some(Ok((
+            vec![
+                rewrap(&fields[0], advanced),
+                fields[1].clone(),
+                fields[2].clone(),
+            ],
+            some_value(ptr_ref),
+        )))
     }
 }
 
@@ -17397,6 +17540,39 @@ fn slice_iter_bounds(state: &Value, self_ty: &str) -> InterpResult<(usize, usize
     Ok((cur, end))
 }
 
+/// The item of a `btree_map::Iter` step: the snapshot element
+/// is the stored (key, value) pair, and the iterator's item is
+/// the pair of references to the pair's two fields, not a
+/// reference to the pair itself. Every other iterator sharing
+/// the slice-state step (a plain slice iterator over elements,
+/// the key-only and value-only btree iterators, whose snapshots
+/// hold the yielded elements directly) hands out the element
+/// reference as it stands.
+fn btree_pair_item(self_ty: &str, item: Value) -> Value {
+    if !self_ty.starts_with("std::collections::btree_map::Iter<") {
+        return item;
+    }
+    let with_field = |target: &RefTarget, idx: u32| -> Value {
+        let mut target = target.clone();
+        match &mut target {
+            RefTarget::Place { projection, .. }
+            | RefTarget::Static { projection, .. }
+            | RefTarget::Alloc { projection, .. }
+            | RefTarget::Value(_, projection) => {
+                projection.push(RefProj::Field(idx as usize));
+            }
+            RefTarget::Address(_) | RefTarget::Null => {}
+        }
+        Value::Ref(target)
+    };
+    match &item {
+        Value::Ref(target) => {
+            Value::Tuple(vec![with_field(target, 0), with_field(target, 1)])
+        }
+        _ => item,
+    }
+}
+
 /// One back step of a real-layout `slice::Iter` state: yields
 /// the last remaining element reference and pulls the end
 /// pointer back by one element. The front pointer is untouched,
@@ -17421,6 +17597,7 @@ fn step_slice_iter_back(
         let item_field =
             iter_ptr_with_index(&fields[0], end - 1).expect("index step checked");
         let item = iter_ptr_value(&item_field).expect("pointer field checked");
+        let item = btree_pair_item(self_ty, item);
         Ok((
             iterator_state_like(
                 state,

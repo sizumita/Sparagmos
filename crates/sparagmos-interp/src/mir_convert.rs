@@ -6094,7 +6094,23 @@ let inner = match (&src, target) {
                                     )),
                                 }
                             }
-                            None => ir::Rvalue::Unsize(v, ir::UnsizeMeta::Slice),
+                            None => {
+                                let array_len = self
+                                    .operand_place_ty(body, operand)
+                                    .and_then(|src| {
+                                        match unsize_pointee(&src) {
+                                            mir::Ty::Array(
+                                                _,
+                                                mir::ArrayLen::Known(n),
+                                            ) => Some(*n as u64),
+                                            _ => None,
+                                        }
+                                    });
+                                ir::Rvalue::Unsize(
+                                    v,
+                                    ir::UnsizeMeta::Slice { array_len },
+                                )
+                            }
                         }
                     }
                     // This coercion does not change the reference

@@ -879,9 +879,17 @@ impl Rvalue {
 /// (mir_convert): exactly the metadata a real fat pointer carries.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UnsizeMeta {
-    /// Array-to-slice unsizing: the metadata is the element count,
-    /// read off the pointee at run time.
-    Slice,
+    /// Array-to-slice unsizing: the metadata is the element count.
+    /// Conversion records the source array's length when the
+    /// cast's source type names it: the pointee's stored value
+    /// cannot always supply it -- an array field of a partially
+    /// materialised aggregate may never have been written, so
+    /// reading it whole is an uninitialized read, and a partly
+    /// written array's stored form is a prefix shorter than the
+    /// array. The recorded length is authoritative for the
+    /// direct reference case; `None` leaves the length to the
+    /// pointee's stored value, as before.
+    Slice { array_len: Option<u64> },
     /// Sized-to-`dyn` unsizing: the metadata is the vtable, which
     /// this model represents by its identity — the concrete type's
     /// name (as the driver renders it, matching the `Self` spelling

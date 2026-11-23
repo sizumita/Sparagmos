@@ -6934,6 +6934,54 @@ impl<'a> Interpreter<'a> {
                         _ => None,
                     };
                     let resolved = self.deref_value(frames, &value)?;
+                    // A raw allocation block holds its elements
+                    // as a tuple: a dereference of its base
+                    // pointer denotes the first element, not the
+                    // block as a whole, whenever the steps that
+                    // follow address the element itself — the
+                    // dereference is the last step, or a
+                    // structural step (field, downcast, union
+                    // field) follows, which can only address the
+                    // pointee's own structure, never the block's
+                    // tuple. A sequence step (index, subslice)
+                    // instead continues the block's flat
+                    // sequence, so no entry is inserted for it
+                    // and the flat reading the sequence machinery
+                    // relies on is unchanged. The entry is
+                    // inserted before the wrapper peels below so
+                    // they judge the value at the element
+                    // position. Fat pointers are exempt: they
+                    // carry their own projection, so the resolved
+                    // form is never the bare block.
+                    let resolved = if deref_elem0 && matches!(value, Value::Ref(_)) {
+                        let next_is_structural = matches!(
+                            place.projection.get(step_idx + 1),
+                            Some(
+                                ProjectionElem::Field(_)
+                                    | ProjectionElem::Downcast(_)
+                                    | ProjectionElem::UnionField { .. },
+                            )
+                        );
+                        match &resolved {
+                            Resolved::Alloc { id, projection }
+                                if (is_last || next_is_structural)
+                                    && projection.is_empty()
+                                    && self.is_elem_block(*id)
+                                    && matches!(
+                                        self.alloc_base(*id).ok().as_ref(),
+                                        Some(Value::Tuple(_) | Value::Bytes(_))
+                                    ) =>
+                            {
+                                Resolved::Alloc {
+                                    id: *id,
+                                    projection: vec![RefProj::Index(0)],
+                                }
+                            }
+                            _ => resolved,
+                        }
+                    } else {
+                        resolved
+                    };
                     let resolved = match &pointee_ty {
                         Some(pointee) => {
                             self.peel_maybe_uninit_entry(frames, resolved, pointee)
@@ -6967,33 +7015,6 @@ impl<'a> Interpreter<'a> {
                         }
                     };
                     cur_ty = pointee_ty;
-                    // A raw allocation block holds its elements
-                    // as a tuple: a trailing dereference of its
-                    // base pointer denotes the first element,
-                    // not the block as a whole. The block as a
-                    // whole is only reached by a projection that
-                    // continues past the dereference (or by a
-                    // write of a tuple value, which replaces
-                    // it) — the read and write sides agree on
-                    // this. Fat pointers are exempt: dereferencing
-                    // one denotes the whole slice, whose length
-                    // the caller pairs with the base.
-                    if deref_elem0 && is_last && matches!(value, Value::Ref(_)) {
-                        if let Resolved::Alloc { id, projection } = &resolved {
-                            if projection.is_empty()
-                                && self.is_elem_block(*id)
-                                && matches!(
-                                    self.alloc_base(*id).ok().as_ref(),
-                                    Some(Value::Tuple(_) | Value::Bytes(_))
-                                )
-                            {
-                                return Ok(Resolved::Alloc {
-                                    id: *id,
-                                    projection: vec![RefProj::Index(0)],
-                                });
-                            }
-                        }
-                    }
                     resolved
                 }
             };
@@ -7106,8 +7127,12 @@ impl<'a> Interpreter<'a> {
     /// stored enum whose field count is the declared count of
     /// its variant in the type's debug shape is the ADT's value
     /// itself, and only a one-field stored enum whose field is
-    /// itself a complete value of the ADT (an enum carrying its
-    /// variant's declared field count) is a wrapper around it.
+    /// itself a value of the ADT (an enum carrying its variant's
+    /// fields) is a wrapper around it. An aggregate payload may
+    /// be partially materialised -- a prefix of its declared
+    /// fields, the form field-by-field writes through pointers
+    /// leave behind -- and still be the pointee's value, so the
+    /// aggregate arms accept a prefix of the declared count.
     /// A one-field ADT's own value stays ambiguous with its
     /// wrapper and is not entered; a union's fields are read
     /// through union steps, never through this entry.
@@ -7119,8 +7144,8 @@ impl<'a> Interpreter<'a> {
         stored_fields: usize,
     ) -> bool {
         match (pointee, field) {
-            (Ty::Tuple(ts), Value::Tuple(items)) => items.len() == ts.len(),
-            (Ty::Array(_, n), Value::Tuple(items)) => items.len() as u64 == *n,
+            (Ty::Tuple(ts), Value::Tuple(items)) => items.len() <= ts.len(),
+            (Ty::Array(_, n), Value::Tuple(items)) => items.len() as u64 <= *n,
             (Ty::Array(elem, n), Value::Bytes(b)) => {
                 matches!(**elem, Ty::Uint(UintTy::U8)) && b.len() as u64 == *n
             }
@@ -7144,33 +7169,149 @@ impl<'a> Interpreter<'a> {
                     fields: inner_fields,
                 },
             ) => {
-                match self.program.adt_debug_shapes.get(name) {
-                    Some(shape)
-                        if shape.kind
-                            != sparagmos_mir::AdtShapeKind::Union =>
-                    {
-                        // A stored enum whose field count is the
-                        // declared count of its own variant is the
-                        // ADT's value itself, however deep its
-                        // one-field chains run -- never a wrapper.
-                        let own_value = shape
-                            .variants
-                            .get(stored_variant as usize)
-                            .is_some_and(|v| v.fields.len() == stored_fields);
-                        !own_value
-                            && stored_fields == 1
-                            && shape
-                                .variants
-                                .get(*inner_variant as usize)
-                                .is_some_and(|v| {
-                                    v.fields.len() == inner_fields.len()
-                                })
-                    }
-                    _ => false,
+                let Some(shape) = self.debug_shape_for_def(name) else {
+                    return false;
+                };
+                if shape.kind == sparagmos_mir::AdtShapeKind::Union {
+                    return false;
                 }
+                // A stored enum carrying the declared field
+                // count of its own variant is the ADT's complete
+                // value itself, however deep its one-field
+                // chains run -- never a wrapper.
+                let declared = shape.variants.get(stored_variant as usize);
+                if let Some(declared) = declared {
+                    if declared.fields.len() == stored_fields {
+                        return false;
+                    }
+                }
+                if stored_fields != 1 {
+                    return false;
+                }
+                // A one-field stored enum can still be the
+                // ADT's own partially materialised value -- a
+                // prefix holding only its first field -- when
+                // that field fits the declared first field's
+                // type. It is the wrapper only when it cannot
+                // be the ADT's own prefix and its sole field is
+                // itself a plausible value of the ADT.
+                if let Some(declared) = declared {
+                    if let Some(first) = declared.fields.first() {
+                        if self.value_plausible_for_tag(field, &first.ty, 0) {
+                            return false;
+                        }
+                    }
+                }
+                self.plausible_adt_enum(*inner_variant, inner_fields, shape, 0)
             }
             _ => false,
         }
+    }
+
+    /// The recorded debug shape of the ADT definition a type
+    /// name denotes. The table is keyed by the rendered
+    /// instance name, while the interpreter's type names the
+    /// definition alone; the judgments that consult the shape
+    /// here ask only for variant field counts, field type tags
+    /// and the shape kind, which every instance of the
+    /// definition shares, so an instance entry answers for the
+    /// definition when no definition-named entry exists.
+    fn debug_shape_for_def(
+        &self,
+        name: &str,
+    ) -> Option<&sparagmos_mir::AdtDebugShape> {
+        self.program.adt_debug_shapes.get(name).or_else(|| {
+            self.program
+                .adt_debug_shapes
+                .iter()
+                .find(|(key, _)| {
+                    key.strip_prefix(name)
+                        .is_some_and(|rest| rest.starts_with('<'))
+                })
+                .map(|(_, shape)| shape)
+        })
+    }
+
+    /// Whether an enum value is a plausible (complete or
+    /// partially materialised prefix) value of the ADT a debug
+    /// shape describes: the variant is one of the declared
+    /// ones, the fields are a prefix of the variant's declared
+    /// fields, and each present field is plausible for its
+    /// declared field type. The check is conservative: it
+    /// answers `false` only on a clear mismatch, so a value it
+    /// cannot judge counts as plausible.
+    fn plausible_adt_enum(
+        &self,
+        variant: u32,
+        fields: &[Value],
+        shape: &sparagmos_mir::AdtDebugShape,
+        depth: usize,
+    ) -> bool {
+        let Some(declared) = shape.variants.get(variant as usize) else {
+            return false;
+        };
+        if fields.len() > declared.fields.len() {
+            return false;
+        }
+        fields.iter().enumerate().all(|(i, field)| {
+            self.value_plausible_for_tag(field, &declared.fields[i].ty, depth + 1)
+        })
+    }
+
+    /// Whether `value` is plausible as a value of the type a
+    /// debug-shape field tag names (see
+    /// [`Self::plausible_adt_enum`] for the conservatism rule).
+    /// An uninitialized slot is plausible for every type: it
+    /// is the state of any field not yet written.
+    fn value_plausible_for_tag(&self, value: &Value, tag: &str, depth: usize) -> bool {
+        if matches!(value, Value::Uninit) || depth > 4 {
+            return true;
+        }
+        let tag = tag.trim();
+        match tag {
+            "bool" => return matches!(value, Value::Bool(_)),
+            "char" => return matches!(value, Value::Uint(_)),
+            "u8" | "u16" | "u32" | "u64" | "u128" | "usize" => {
+                return matches!(value, Value::Uint(_))
+            }
+            "i8" | "i16" | "i32" | "i64" | "i128" | "isize" => {
+                return matches!(value, Value::Int(_))
+            }
+            "f16" | "f32" | "f64" | "f128" => {
+                return matches!(value, Value::Float(_) | Value::Float128(_))
+            }
+            "str" => return matches!(value, Value::Str(_) | Value::Bytes(_)),
+            "()" => return matches!(value, Value::Unit),
+            _ => {}
+        }
+        if tag.starts_with('(') {
+            return matches!(value, Value::Tuple(_) | Value::Unit);
+        }
+        if tag.starts_with('[') {
+            return matches!(value, Value::Tuple(_) | Value::Bytes(_) | Value::Str(_));
+        }
+        if tag.starts_with('&') || tag.starts_with('*') {
+            return matches!(
+                value,
+                Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. }
+            );
+        }
+        if let Some(shape) = self.program.adt_debug_shapes.get(tag) {
+            if shape.kind == sparagmos_mir::AdtShapeKind::Union {
+                return true;
+            }
+            return match value {
+                Value::Enum { variant, fields } => {
+                    self.plausible_adt_enum(*variant, fields, shape, depth)
+                }
+                Value::Unit => shape
+                    .variants
+                    .iter()
+                    .any(|variant| variant.fields.is_empty()),
+                _ => false,
+            };
+        }
+        true
     }
 
     /// The length carried by the fat pointer a place's final
@@ -7216,6 +7357,16 @@ impl<'a> Interpreter<'a> {
                     if base as u128 + fat_len <= count {
                         return false;
                     }
+                    // The slice does not fit in the container at
+                    // the base index, so the position is not an
+                    // element of that container: the field steps
+                    // after the index select the slice's own
+                    // storage inside the element (an array field
+                    // of a node struct is the canonical case), and
+                    // the position denotes that storage. Composing
+                    // the index into the container's index step
+                    // would address a sibling element instead.
+                    return true;
                 }
             }
         }
@@ -8856,7 +9007,23 @@ impl<'a> Interpreter<'a> {
                 let value = match self.project_value_t(base, projection, &func, &place_desc) {
                     Ok(v) => v,
                     Err(e) => {
-                        if past_unwritten {
+                        // The stored form of an allocation is a
+                        // prefix of its extent: an index step the
+                        // projector bounds against the prefix
+                        // addresses a slot that was never written,
+                        // exactly as `past_unwritten` judges the
+                        // block's own first step. The projector's
+                        // bounds panic measures the prefix, not
+                        // the allocation, so it is an uninitialized
+                        // read here, never a guest bounds
+                        // violation (a guest panic is control
+                        // flow, not a read result).
+                        let prefix_bounds = matches!(
+                            &e,
+                            InterpError::Panic { message, .. }
+                            if message.starts_with("index out of bounds: the len is ")
+                        );
+                        if past_unwritten || prefix_bounds {
                             return self.uninit_read_value(ty, func, place_desc);
                         }
                         return Err(e);
@@ -9058,7 +9225,7 @@ impl<'a> Interpreter<'a> {
                     return Ok(());
                 }
                 let place_desc = format!("static {name}");
-                assign_projected(slot, projection, value, "<static>", &place_desc)
+                assign_projected(slot, projection, value, "<static>", &place_desc, false)
             }
             Resolved::Alloc { id, projection } => {
                 let projection = &self.elem_block_projection(*id, projection);
@@ -9120,7 +9287,7 @@ impl<'a> Interpreter<'a> {
                     }
                 }
                 let place_desc = format!("allocation #{id}");
-                assign_projected(slot, projection, value, "<allocation>", &place_desc)
+                assign_projected(slot, projection, value, "<allocation>", &place_desc, true)
             }
             Resolved::Place {
                 frame_pos,
@@ -9154,7 +9321,7 @@ impl<'a> Interpreter<'a> {
                         local: *local,
                     }
                 })?;
-                assign_projected(slot, projection, value, &func, &place_desc)
+                assign_projected(slot, projection, value, &func, &place_desc, false)
             }
         }
     }
@@ -11426,7 +11593,9 @@ impl<'a> Interpreter<'a> {
     /// `TerminatorKind::CallBuiltin::result_unsize`).
     fn eval_unsize(&self, frames: &[Frame], v: Value, meta: &UnsizeMeta) -> InterpResult<Value> {
         match meta {
-            UnsizeMeta::Slice => self.unsize_to_slice(frames, v),
+            UnsizeMeta::Slice { array_len } => {
+                self.unsize_to_slice(frames, v, *array_len)
+            }
             UnsizeMeta::Dyn {
                 concrete,
                 traits,
@@ -11477,9 +11646,25 @@ impl<'a> Interpreter<'a> {
     /// one) is rewrapped around the unsized pointee, so
     /// `Box<[T; N]>` becomes the same shape a directly built
     /// `Box<[T]>` has.
-    fn unsize_to_slice(&self, frames: &[Frame], v: Value) -> InterpResult<Value> {
+    fn unsize_to_slice(
+        &self,
+        frames: &[Frame],
+        v: Value,
+        array_len: Option<u64>,
+    ) -> InterpResult<Value> {
         match v {
             Value::Ref(_) => {
+                // With the source array's length recorded at
+                // conversion, the fat reference needs nothing
+                // from the pointee's stored value, which may be
+                // unwritten or only partly materialised (see
+                // `UnsizeMeta::Slice`).
+                if let Some(n) = array_len {
+                    return Ok(Value::FatRef {
+                        base: Box::new(v),
+                        len: n as u128,
+                    });
+                }
                 let target = self.deref_value(frames, &v)?;
                 let pointee = self.read_resolved(frames, &target)?;
                 let len = unsized_tail_len(&pointee).ok_or_else(|| {
@@ -11547,7 +11732,7 @@ impl<'a> Interpreter<'a> {
                         fields: vec![pointee],
                     });
                 }
-                let fat = self.unsize_to_slice(frames, pointee)?;
+                let fat = self.unsize_to_slice(frames, pointee, None)?;
                 Ok(Value::Enum {
                     variant,
                     fields: vec![fat],
@@ -11638,12 +11823,14 @@ impl<'a> Interpreter<'a> {
         v: Value,
     ) -> Option<InterpResult<Value>> {
         match v {
-            Value::Ref(_) | Value::FatRef { .. } => Some(self.unsize_to_slice(frames, v)),
+            Value::Ref(_) | Value::FatRef { .. } => {
+                Some(self.unsize_to_slice(frames, v, None))
+            }
             Value::Enum { .. } => {
                 if rc_handle_id(&v).is_some() {
                     return Some(Ok(v));
                 }
-                match self.unsize_to_slice(frames, v) {
+                match self.unsize_to_slice(frames, v, None) {
                     Ok(u) => Some(Ok(u)),
                     Err(_) => None,
                 }
@@ -12162,7 +12349,14 @@ impl<'a> Interpreter<'a> {
     /// the value goes lane by lane over the consecutive elements
     /// at the target, each new lane keeping the wrapper shape of
     /// the element it replaces; anywhere else the store is the
-    /// plain whole-value one.
+    /// plain whole-value one. The lane reading applies only at
+    /// the block's own flat positions: a projection that enters
+    /// a structured element (a field, downcast or union-field
+    /// step) denotes one stored position inside that element,
+    /// not the start of the block's flat sequence, so a store
+    /// there is the plain whole-value one — writing the lanes
+    /// there would append an element step inside the field and
+    /// shred the value it holds.
     fn shaped_store(
         &self,
         frames: &mut Vec<Frame>,
@@ -12170,7 +12364,14 @@ impl<'a> Interpreter<'a> {
         value: Value,
         shape: &ScalarShape,
     ) -> InterpResult<()> {
-        let elem_block = matches!(target, Resolved::Alloc { id, .. } if self.is_elem_block(*id));
+        let elem_block = matches!(target, Resolved::Alloc { id, projection }
+            if self.is_elem_block(*id)
+                && !projection.iter().any(|step| matches!(
+                    step,
+                    RefProj::Field(_)
+                        | RefProj::Downcast(_)
+                        | RefProj::UnionField { .. }
+                )));
         if elem_block {
             if let Ok(bits) = self.flatten_scalar(&value, shape) {
                 let (lane, count) = Self::shape_lanes(shape);
@@ -14873,6 +15074,7 @@ fn assign_projected(
     value: Value,
     func: &str,
     place: &str,
+    grow: bool,
 ) -> InterpResult<()> {
     // The byte-splice pre-passes below read the projection's
     // last step as a byte position inside the value the head
@@ -14895,7 +15097,7 @@ fn assign_projected(
         // written is what makes the position a byte position.
         if disp >= 0 {
             if let Some(byte) = value_as_storage_byte(&value) {
-                if let Ok(head_slot) = navigate_mut(slot, head, func, place) {
+                if let Ok(head_slot) = navigate_mut_grow(slot, head, func, place, grow) {
                     if splice_scalar_storage_byte(head_slot, disp as usize, byte) {
                         return Ok(());
                     }
@@ -14914,14 +15116,14 @@ fn assign_projected(
             _ => (idx, head),
         };
         if let Some(byte) = value_as_storage_byte(&value) {
-            if let Ok(head_slot) = navigate_mut(slot, head, func, place) {
+            if let Ok(head_slot) = navigate_mut_grow(slot, head, func, place, grow) {
                 if splice_scalar_storage_byte(head_slot, idx, byte) {
                     return Ok(());
                 }
             }
         }
     }
-    let target = navigate_mut(slot, projection, func, place)?;
+    let target = navigate_mut_grow(slot, projection, func, place, grow)?;
     *target = value;
     Ok(())
 }
@@ -15357,6 +15559,25 @@ pub(crate) fn navigate_mut<'x>(
     func: &str,
     place: &str,
 ) -> InterpResult<&'x mut Value> {
+    navigate_mut_grow(slot, projection, func, place, false)
+}
+
+/// [`navigate_mut`] with the sequence-growth policy explicit.
+/// Growth -- extending a tuple slot past its stored length
+/// with uninitialized slots on an index write -- is the
+/// sparse-prefix convention for allocation storage, whose
+/// stored form is a prefix of an extent the model does not
+/// record. A place local's stored form is the complete value,
+/// so an index write past its length there is the bounds
+/// violation the guest's own index semantics name; only
+/// allocation writes grow.
+fn navigate_mut_grow<'x>(
+    slot: &'x mut Value,
+    projection: &[RefProj],
+    func: &str,
+    place: &str,
+    grow: bool,
+) -> InterpResult<&'x mut Value> {
     if projection.is_empty() {
         return Ok(slot);
     }
@@ -15377,9 +15598,11 @@ pub(crate) fn navigate_mut<'x>(
         // same sparse shape a union aggregate value has. The slots
         // the write does not touch keep raising
         // `UninitializedRead` when read, so no value is fabricated.
-        // Any other step into an uninitialized place (an index
-        // into an array that was never built) has no honest shape
-        // to materialize and stays an error.
+        // An index step into an uninitialized place is sequence
+        // storage that was never built (an array field of a
+        // partially materialised aggregate): it materializes as
+        // the sparse prefix below. Any other step has no honest
+        // shape to materialize and stays an error.
         match projection.first() {
             Some(RefProj::Field(idx)) | Some(RefProj::UnionField { idx, .. }) => {
                 *slot = Value::Enum {
@@ -15392,6 +15615,29 @@ pub(crate) fn navigate_mut<'x>(
                     variant: *variant,
                     fields: Vec::new(),
                 };
+            }
+            Some(RefProj::Index(idx)) => {
+                // An index write into a never-built slot: the
+                // slot is sequence storage (an array field of a
+                // partially materialised aggregate, written
+                // element-first through a raw pointer, is the
+                // canonical case), and its honest shape is the
+                // sparse prefix the rest of the model uses for
+                // sequence storage -- the slots up to the written
+                // index, all uninitialized -- the same
+                // materialisation an element block's first write
+                // performs in `write_resolved`. Bounded by the
+                // same materialisation limit as a sparse
+                // vector's tail; past it the write stays an
+                // uninitialized error rather than an allocation
+                // that exhausts the host.
+                if *idx >= crate::builtins::MAX_VEC_SET_LEN_ELEMENTS {
+                    return Err(InterpError::UninitializedRead {
+                        func: func.to_string(),
+                        place: place.to_string(),
+                    });
+                }
+                *slot = Value::Tuple(vec![Value::Uninit; *idx + 1]);
             }
             _ => {
                 return Err(InterpError::UninitializedRead {
@@ -15436,11 +15682,11 @@ pub(crate) fn navigate_mut<'x>(
                     *field = Value::Uninit;
                 }
             }
-            navigate_mut(&mut fields[*idx], rest, func, place)
+            navigate_mut_grow(&mut fields[*idx], rest, func, place, grow)
         }
         RefProj::ByteOffset(disp) => {
             if *disp == 0 {
-                navigate_mut(slot, rest, func, place)
+                navigate_mut_grow(slot, rest, func, place, grow)
             } else {
                 Err(InterpError::UnsupportedProjection {
                     kind: format!(
@@ -15455,7 +15701,7 @@ pub(crate) fn navigate_mut<'x>(
                 // `project_value`: a write to field 0 of the
                 // transparent `Path`/`OsStr` wrappers over a
                 // string value lands on the string itself.
-                return navigate_mut(slot, rest, func, place);
+                return navigate_mut_grow(slot, rest, func, place, grow);
             }
             if *idx == 0
                 && matches!(
@@ -15473,7 +15719,7 @@ pub(crate) fn navigate_mut<'x>(
                 // chain, whose one field is the pointer itself)
                 // or of a wrapper over a bare scalar lands on
                 // the held value, which is the slot itself.
-                return navigate_mut(slot, rest, func, place);
+                return navigate_mut_grow(slot, rest, func, place, grow);
             }
             if let Value::Coroutine { fields, .. } = slot {
                 // The state storage grows to the written slot: a
@@ -15483,7 +15729,7 @@ pub(crate) fn navigate_mut<'x>(
                 if fields.len() <= *idx {
                     fields.resize(*idx + 1, Value::Uninit);
                 }
-                return navigate_mut(&mut fields[*idx], rest, func, place);
+                return navigate_mut_grow(&mut fields[*idx], rest, func, place, grow);
             }
             // The field vector of the value in the slot may be
             // sparse or invalidated: a union value covers only
@@ -15500,7 +15746,7 @@ pub(crate) fn navigate_mut<'x>(
                 if fields.len() <= *idx {
                     fields.resize(*idx + 1, Value::Uninit);
                 }
-                return navigate_mut(&mut fields[*idx], rest, func, place);
+                return navigate_mut_grow(&mut fields[*idx], rest, func, place, grow);
             }
             let items = match slot {
                 Value::Tuple(items) => items,
@@ -15517,14 +15763,23 @@ pub(crate) fn navigate_mut<'x>(
                 func: func.to_string(),
                 place: place.to_string(),
             })?;
-            navigate_mut(item, rest, func, place)
+            navigate_mut_grow(item, rest, func, place, grow)
         }
         RefProj::Index(idx) => match slot {
             Value::Tuple(items) => {
+                // A tuple slot is sequence storage (an array or
+                // an element block). Allocation storage grows
+                // past its stored prefix with uninitialized
+                // slots (see `navigate_mut_grow`); anywhere else
+                // the stored length is the value's length and an
+                // index past it is a bounds violation.
                 if *idx >= items.len() {
-                    return Err(index_oob(items.len(), *idx));
+                    if !grow || *idx >= crate::builtins::MAX_VEC_SET_LEN_ELEMENTS {
+                        return Err(index_oob(items.len(), *idx));
+                    }
+                    items.resize(*idx + 1, Value::Uninit);
                 }
-                navigate_mut(&mut items[*idx], rest, func, place)
+                navigate_mut_grow(&mut items[*idx], rest, func, place, grow)
             }
             // A `Vec` value is the aggregate of its elements:
             // indexing the vector's own place writes the element
@@ -15542,11 +15797,11 @@ pub(crate) fn navigate_mut<'x>(
                     let mut full = Vec::with_capacity(rest.len() + 1);
                     full.push(RefProj::Index(*idx));
                     full.extend_from_slice(rest);
-                    navigate_mut(&mut fields[0], &full, func, place)
+                    navigate_mut_grow(&mut fields[0], &full, func, place, grow)
                 } else if *idx >= fields.len() {
                     return Err(index_oob(fields.len(), *idx));
                 } else {
-                    navigate_mut(&mut fields[*idx], rest, func, place)
+                    navigate_mut_grow(&mut fields[*idx], rest, func, place, grow)
                 }
             }
             // A sparse vector value (see `Value::SparseVec`):
@@ -15571,7 +15826,7 @@ pub(crate) fn navigate_mut<'x>(
                 if *idx >= elems.len() {
                     elems.resize(*idx + 1, Value::Uninit);
                 }
-                navigate_mut(&mut elems[*idx], rest, func, place)
+                navigate_mut_grow(&mut elems[*idx], rest, func, place, grow)
             }
             Value::Bytes(b) => {
                 if *idx >= b.len() {
@@ -15615,13 +15870,13 @@ pub(crate) fn navigate_mut<'x>(
                             if target >= items.len() {
                                 return Err(index_oob(items.len(), target));
                             }
-                            navigate_mut(&mut items[target], rest, func, place)
+                            navigate_mut_grow(&mut items[target], rest, func, place, grow)
                         }
                         Value::Enum { fields, .. } => {
                             if target >= fields.len() {
                                 return Err(index_oob(fields.len(), target));
                             }
-                            navigate_mut(&mut fields[target], rest, func, place)
+                            navigate_mut_grow(&mut fields[target], rest, func, place, grow)
                         }
                         other => Err(InterpError::type_mismatch(
                             format!("subslice element write on {place}"),
@@ -15645,7 +15900,7 @@ pub(crate) fn navigate_mut<'x>(
                         len: *inner_len,
                     }];
                     composed.extend_from_slice(&rest[1..]);
-                    navigate_mut(slot, &composed, func, place)
+                    navigate_mut_grow(slot, &composed, func, place, grow)
                 }
                 _ => Err(InterpError::type_mismatch(
                     format!("write through sub-slice on {place}"),
@@ -15688,11 +15943,11 @@ pub(crate) fn navigate_mut<'x>(
                 if state.len() <= idx {
                     state.resize(idx + 1, Value::Uninit);
                 }
-                navigate_mut(&mut state[idx], tail, func, place)
+                navigate_mut_grow(&mut state[idx], tail, func, place, grow)
             }
             // A downcast with no field step after it (a whole-state
             // place) denotes the coroutine value itself.
-            Value::Coroutine { .. } => navigate_mut(slot, rest, func, place),
+            Value::Coroutine { .. } => navigate_mut_grow(slot, rest, func, place, grow),
             Value::Enum {
                 variant: current,
                 fields,
@@ -15711,9 +15966,9 @@ pub(crate) fn navigate_mut<'x>(
                     *current = *variant;
                     fields.clear();
                 }
-                navigate_mut(slot, rest, func, place)
+                navigate_mut_grow(slot, rest, func, place, grow)
             }
-            Value::Tuple(_) if *variant == 0 => navigate_mut(slot, rest, func, place),
+            Value::Tuple(_) if *variant == 0 => navigate_mut_grow(slot, rest, func, place, grow),
             other => Err(InterpError::type_mismatch(
                 format!("downcast write on {place}"),
                 "ADT value",
