@@ -7523,6 +7523,94 @@ impl<'a> Interpreter<'a> {
                             other.kind_name(),
                         )),
                     }
+                } else if target.starts_with("std::boxed::Box<")
+                    && matches!(
+                        generic_first_arg(target, "std::boxed::Box<"),
+                        Some(pt) if is_slice_tag(pt)
+                    )
+                    && (source.starts_with("std::vec::Vec<")
+                        || source.starts_with("alloc::vec::Vec<")
+                        || source.starts_with("std::borrow::Cow<")
+                        || source.starts_with("alloc::borrow::Cow<"))
+                {
+                    // `From<Vec<T>> for Box<[T]>` is
+                    // `Vec::into_boxed_slice` by definition, and
+                    // `From<Cow<'_, [T]>> for Box<[T]>` hands over
+                    // the Cow's owned vector, or a clone of the
+                    // borrowed slice's elements: the pointee is
+                    // the element sequence, not the source value
+                    // itself (boxing the aggregate would leave
+                    // every slice consumer of the box reading the
+                    // source's own fields).
+                    let pointee_ty =
+                        generic_first_arg(target, "std::boxed::Box<").and_then(ty_from_tag);
+                    if source.starts_with("std::borrow::Cow<")
+                        || source.starts_with("alloc::borrow::Cow<")
+                    {
+                        match value {
+                            Value::Enum {
+                                variant,
+                                mut fields,
+                                ..
+                            } if fields.len() == 1 => {
+                                let held = fields.pop().expect("len checked");
+                                if variant == 0 {
+                                    // Borrowed: the held value is
+                                    // a reference to the source
+                                    // slice. `Box::from` clones the
+                                    // elements into the new
+                                    // allocation (the
+                                    // `From<&[T]> for Box<[T]>`
+                                    // semantics), so resolve the
+                                    // reference and box the element
+                                    // snapshot: boxing the reference
+                                    // itself would alias the
+                                    // source, and later writes to
+                                    // it would show through the box.
+                                    let (elements, _len) =
+                                        self.slice_elements(frames, &held)?;
+                                    // The snapshot copies the
+                                    // elements' `Value`
+                                    // representations: an element
+                                    // that owns an allocation (a
+                                    // `Box`, say) would keep
+                                    // sharing it with the source,
+                                    // and a write through the
+                                    // source's element would show
+                                    // through the box. `Box::from`
+                                    // clones every element, so
+                                    // re-own them the way the
+                                    // clone models do (the
+                                    // `slice::to_vec` treatment)
+                                    // before boxing them.
+                                    let elements = elements
+                                        .iter()
+                                        .map(|e| self.clone_owned_value(frames, e))
+                                        .collect::<InterpResult<Vec<_>>>()?;
+                                    self.boxed_slice_value(
+                                        Value::Tuple(elements),
+                                        pointee_ty,
+                                        "From::from to Box<[T]>",
+                                    )
+                                } else {
+                                    // Owned: the held value is
+                                    // the vector.
+                                    self.boxed_slice_value(
+                                        held,
+                                        pointee_ty,
+                                        "From::from to Box<[T]>",
+                                    )
+                                }
+                            }
+                            other => Err(InterpError::type_mismatch(
+                                "From::from to Box<[T]>",
+                                "cow aggregate",
+                                other.kind_name(),
+                            )),
+                        }
+                    } else {
+                        self.boxed_slice_value(value, pointee_ty, "From::from to Box<[T]>")
+                    }
                 } else if target.starts_with("std::boxed::Box<") {
                     // `Box::from(value)` is `Box::new` by definition.
                     let boxed = self.new_box(value);
@@ -8318,47 +8406,8 @@ impl<'a> Interpreter<'a> {
                     .first()
                     .and_then(|tag| ty_from_tag(tag))
                     .map(|elem| Ty::Slice(Box::new(elem)));
-                let boxed = match vals.into_iter().next().expect("arity checked") {
-                    Value::Enum { fields, .. } => {
-                        self.new_box(Value::Tuple(fields))
-                    }
-                    Value::SparseVec { mut elems, len, .. } => {
-                        // The boxed slice holds the declared
-                        // elements: the stored prefix, plus the
-                        // uninitialised tail when the length runs
-                        // past it (materialised up to the same
-                        // limit `Vec::set_len` uses).
-                        let len = usize::try_from(len).map_err(|_| {
-                            unsupported(
-                                "Vec::into_boxed_slice on a vector whose elements are not materialised"
-                                    .to_string(),
-                            )
-                        })?;
-                        if len > elems.len() && len > MAX_VEC_SET_LEN_ELEMENTS {
-                            return Err(unsupported(
-                                "Vec::into_boxed_slice on a vector whose elements are not materialised"
-                                    .to_string(),
-                            ));
-                        }
-                        elems.truncate(len);
-                        if elems.len() < len {
-                            elems.resize(len, Value::Uninit);
-                        }
-                        self.new_box(Value::Tuple(elems))
-                    }
-                    Value::Tuple(items) => self.new_box(Value::Tuple(items)),
-                    other => {
-                        return Err(InterpError::type_mismatch(
-                            "Vec::into_boxed_slice",
-                            "vector value",
-                            other.kind_name(),
-                        ))
-                    }
-                };
-                if let Some(ty) = pointee_ty {
-                    self.record_box_ty(&boxed, ty);
-                }
-                Ok(boxed)
+                let value = vals.into_iter().next().expect("arity checked");
+                self.boxed_slice_value(value, pointee_ty, "Vec::into_boxed_slice")
             }
             Builtin::StringPushStr => {
                 arity(2)?;
@@ -16895,6 +16944,56 @@ fn value_fingerprint(value: &Value) -> u64 {
         })
     }
 
+    /// The `Box<[T]>` a sequence value's elements move into: the
+    /// element tuple in a fresh allocation, with the slice
+    /// pointee type recorded when known. This is the shape
+    /// `Vec::into_boxed_slice` builds and every slice consumer
+    /// of a boxed slice (indexing, iteration, `Debug`, comparison)
+    /// reads, so all construction paths that produce a boxed
+    /// slice go through here. A sparse vector contributes its
+    /// declared elements: the stored prefix, plus the
+    /// uninitialised tail when the length runs past it
+    /// (materialised up to the same limit `Vec::set_len` uses).
+    fn boxed_slice_value(
+        &self,
+        value: Value,
+        pointee_ty: Option<Ty>,
+        context: &'static str,
+    ) -> InterpResult<Value> {
+        let boxed = match value {
+            Value::Enum { fields, .. } => self.new_box(Value::Tuple(fields)),
+            Value::SparseVec { mut elems, len, .. } => {
+                let len = usize::try_from(len).map_err(|_| {
+                    unsupported(format!(
+                        "{context} on a vector whose elements are not materialised"
+                    ))
+                })?;
+                if len > elems.len() && len > MAX_VEC_SET_LEN_ELEMENTS {
+                    return Err(unsupported(format!(
+                        "{context} on a vector whose elements are not materialised"
+                    )));
+                }
+                elems.truncate(len);
+                if elems.len() < len {
+                    elems.resize(len, Value::Uninit);
+                }
+                self.new_box(Value::Tuple(elems))
+            }
+            Value::Tuple(items) => self.new_box(Value::Tuple(items)),
+            other => {
+                return Err(InterpError::type_mismatch(
+                    context,
+                    "vector value",
+                    other.kind_name(),
+                ))
+            }
+        };
+        if let Some(ty) = pointee_ty {
+            self.record_box_ty(&boxed, ty);
+        }
+        Ok(boxed)
+    }
+
     /// Execute `Iterator::collect` / `FromIterator::from_iter`:
     /// drain the modelled `next` state transition into the
     /// collection the call's target generic names. The value
@@ -16950,12 +17049,15 @@ fn value_fingerprint(value: &Value) -> u64 {
                 self.record_box_ty(&boxed, Ty::Str);
                 return Ok(boxed);
             }
-            if first.starts_with('[') {
-                let boxed = self.new_box(Value::Tuple(items));
-                if let Some(ty) = ty_from_tag(first) {
-                    self.record_box_ty(&boxed, ty);
-                }
-                return Ok(boxed);
+            if is_slice_tag(first) {
+                // `FromIterator<T> for Box<[T]>`: the collected
+                // items in a fresh boxed slice, built by the
+                // shared boxed-slice construction.
+                return self.boxed_slice_value(
+                    Value::Tuple(items),
+                    ty_from_tag(first),
+                    "collect into Box<[T]>",
+                );
             }
         }
         if (target.starts_with("std::rc::Rc<")
@@ -29826,6 +29928,31 @@ fn ref_item_element_ty(inner_ty: &str) -> String {
         }
         return String::new();
     }
+}
+
+/// Whether a rendered type tag is a slice type `[T]`, as opposed
+/// to an array type `[T; N]`: the tag is bracketed and carries no
+/// semicolon at its own bracket level. An element type may itself
+/// be an array (`[[i32; 2]]` is a slice of arrays), whose
+/// semicolon sits one level deeper and does not make the outer
+/// type an array.
+fn is_slice_tag(tag: &str) -> bool {
+    let Some(rest) = tag.strip_prefix('[') else {
+        return false;
+    };
+    let Some(inner) = rest.strip_suffix(']') else {
+        return false;
+    };
+    let mut depth = 0i32;
+    for c in inner.chars() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth -= 1,
+            ';' if depth == 0 => return false,
+            _ => {}
+        }
+    }
+    true
 }
 
 fn first_generic_arg(tag: &str) -> Option<&str> {
