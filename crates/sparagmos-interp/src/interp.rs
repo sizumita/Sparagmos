@@ -10023,6 +10023,17 @@ impl<'a> Interpreter<'a> {
                     Value::Enum { fields, .. } if fields.len() == 1 => {
                         Ok(Resolved::Value(fields[0].clone(), Vec::new()))
                     }
+                    // An aggregate-built box base (a
+                    // `Box::from_raw` product): the `Unique`
+                    // sits at field 0 beside the allocator
+                    // field, so the single-field arms above do
+                    // not apply; the data-pointer extraction
+                    // names the pointer the pointee lives
+                    // behind.
+                    Value::Enum { fields, .. } if fields.len() > 1 => {
+                        let ptr = Self::dyn_data_pointer(base);
+                        self.deref_value(frames, &ptr)
+                    }
                     _ => self.deref_value(frames, base),
                 }
             },
