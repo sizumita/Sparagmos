@@ -11833,6 +11833,52 @@ fn run_mode_inline_asm_lateout_aliased_with_input() {
     run_ok("asm-lateout-alias", ASM_LATEOUT_ALIAS_SRC, "42\n");
 }
 
+const ASM_CALL_BOOL_ABI_WIDTH_SRC: &str = r#"
+use std::arch::asm;
+
+pub extern "sysv64" fn choose(x: bool) -> u64 {
+    if x {
+        42
+    } else {
+        43
+    }
+}
+
+fn main() {
+    let out1: u64;
+    let out2: u64;
+    unsafe {
+        asm!(
+            "call {target}",
+            target = sym choose,
+            in("rdi") 0x1_0000_0000u64,
+            lateout("rax") out1,
+        );
+        asm!(
+            "call {target}",
+            target = sym choose,
+            in("rdi") 0x1_0000_0001u64,
+            lateout("rax") out2,
+        );
+    }
+    println!("{out1} {out2}");
+}
+"#;
+
+#[test]
+fn run_mode_asm_call_bool_argument_reads_only_the_abi_byte() {
+    // A boolean argument occupies one byte of its register: the
+    // callee reads only the low byte, and the upper bits are
+    // unspecified incoming state. The first call passes a false
+    // whose upper bits are nonzero (natively 43); the second a
+    // genuine true in the low byte (natively 42).
+    run_ok(
+        "asm-call-bool-width",
+        ASM_CALL_BOOL_ABI_WIDTH_SRC,
+        "43 42\n",
+    );
+}
+
 const ASM_LEA_WRAP_SRC: &str = r#"
 use std::arch::asm;
 fn main() {

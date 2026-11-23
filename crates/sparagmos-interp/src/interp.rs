@@ -22979,7 +22979,12 @@ fn asm_scalar_value(bits: u64, scalar: &sparagmos_mir::AsmScalar) -> Value {
                 Value::Uint(u128::from(masked))
             }
         }
-        sparagmos_mir::AsmScalar::Bool => Value::Bool(bits != 0),
+        // A boolean argument occupies one byte of its register:
+        // the callee reads only the low byte, and the upper bits
+        // are unspecified incoming state. Testing the whole
+        // register would turn a false whose upper bits happen to
+        // be nonzero into true.
+        sparagmos_mir::AsmScalar::Bool => Value::Bool(bits & 0xff != 0),
         sparagmos_mir::AsmScalar::Float { width } => {
             if *width == 32 {
                 Value::Float(f64::from(f32::from_bits(bits as u32)))
