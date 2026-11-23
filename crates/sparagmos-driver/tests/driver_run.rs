@@ -10220,6 +10220,97 @@ fn run_mode_termination_range_from_pathbuf_report() {
     );
 }
 
+const RESULT_ERR_REVERSE_I32_SRC: &str = r#"
+use std::cmp::Reverse;
+
+fn main() -> Result<(), Reverse<i32>> {
+    Err(Reverse(42))
+}
+"#;
+
+const RESULT_ERR_REVERSE_PATHBUF_SRC: &str = r#"
+use std::cmp::Reverse;
+use std::path::PathBuf;
+
+fn main() -> Result<(), Reverse<PathBuf>> {
+    Err(Reverse(PathBuf::from("hello")))
+}
+"#;
+
+const RESULT_ERR_WRAPPING_STRING_SRC: &str = r#"
+use std::num::Wrapping;
+
+fn main() -> Result<(), Wrapping<String>> {
+    Err(Wrapping(String::from("hello")))
+}
+"#;
+
+const RESULT_ERR_WRAPPING_I32_SRC: &str = r#"
+use std::num::Wrapping;
+
+fn main() -> Result<(), Wrapping<i32>> {
+    Err(Wrapping(7))
+}
+"#;
+
+#[test]
+fn run_mode_termination_reverse_wrapping_report() {
+    // The one-field transparent wrappers `Reverse` / `Wrapping`
+    // as a report payload: the rendering matches native, and
+    // the payload's drop glue is accounted for by the held
+    // value's glue (the wrappers have no `Drop` impl of their
+    // own), so the run exits 1 like native instead of failing
+    // the drop accounting after rendering. Paired with
+    // `run_mode_termination_range_from_pathbuf_report`.
+    let dir = temp_dir("termination-reverse-wrapping");
+    let src = fixture(&dir, "err_reverse_i32.rs", RESULT_ERR_REVERSE_I32_SRC);
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(1), "Result::Err(Reverse<i32>)");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Error: Reverse(42)\n"
+    );
+    let src = fixture(
+        &dir,
+        "err_reverse_pathbuf.rs",
+        RESULT_ERR_REVERSE_PATHBUF_SRC,
+    );
+    let out = run_driver(&src);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "Result::Err(Reverse<PathBuf>)"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Error: Reverse(\"hello\")\n"
+    );
+    let src = fixture(
+        &dir,
+        "err_wrapping_string.rs",
+        RESULT_ERR_WRAPPING_STRING_SRC,
+    );
+    let out = run_driver(&src);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "Result::Err(Wrapping<String>)"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Error: \"hello\"\n"
+    );
+    let src = fixture(&dir, "err_wrapping_i32.rs", RESULT_ERR_WRAPPING_I32_SRC);
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(1), "Result::Err(Wrapping<i32>)");
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "Error: 7\n");
+    assert!(
+        out.stdout.is_empty(),
+        "the report writes nothing to stdout: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 const RESULT_OK_EXIT_CODE_SRC: &str = r#"
 fn main() -> Result<std::process::ExitCode, String> {
     Ok(std::process::ExitCode::from(3))
