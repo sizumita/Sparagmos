@@ -1041,12 +1041,13 @@ impl Converter {
     }
 
     /// Record the declared type of a static item. Called by the
-    /// item scan before any conversion: a reference into a static's
-    /// interior is decoded against the static's own type (its seed
-    /// is the full initializer and the reference carries a
-    /// projection into it), and the type query is only safe for
-    /// real items, so it is asked there, never from the constant
-    /// decoder.
+    /// item scan before any conversion, and by the foreign-static
+    /// reference decoder for the statics the scan does not
+    /// enumerate: a reference into a static's interior is decoded
+    /// against the static's own type (its seed is the full
+    /// initializer and the reference carries a projection into
+    /// it), and the type query is only safe for real items, so it
+    /// is asked only at points that hold one.
     pub fn note_static_ty<D: CrateDef>(&mut self, def: &D, ty: rustc_public::ty::Ty) {
         let id = self.crate_def_id(def);
         let mir_ty = self.ty(&ty);
@@ -3830,6 +3831,24 @@ impl Converter {
         depth: usize,
     ) -> Option<sm::ConstValue> {
         let def_id = self.crate_def_id(def);
+        // The item scan does not enumerate foreign statics, so
+        // the declared type is recorded here, at the first decode
+        // that names the static: the interpreter expands a
+        // whole-static reference's seed to the recorded type's
+        // extent, and a fat slice reference's seed in particular
+        // must not be sized by the slice's own (possibly prefix)
+        // length. The query is the one the projection
+        // computations below already make of this definition --
+        // a foreign static is a real item, unlike the anonymous
+        // promoted statics the type query is unsafe for -- and it
+        // is contained the way the item scan contains it.
+        if !self.static_tys.contains_key(&def_id) {
+            if let Ok(ty) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| def.ty()))
+            {
+                self.note_static_ty(def, ty);
+            }
+        }
         match inner.kind() {
             TyKind::RigidTy(RigidTy::Slice(elem)) => {
                 if matches!(elem.kind(), TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8))) {
