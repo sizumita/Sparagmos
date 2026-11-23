@@ -7631,8 +7631,10 @@ let inner = match (&src, target) {
             destination: self.convert_place(body, destination)?,
             target: target.map(|b| ir::BasicBlock(b.index())),
             drop_glue: None,
+            consumed_glue: None,
             cmp_discriminants: None,
             result_unsize: None,
+            unique_elem: None,
         }))
     }
 
