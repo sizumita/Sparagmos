@@ -20150,3 +20150,125 @@ fn run_mode_zip_fold_after_next() {
         "consumers after a modelled next see exactly the remaining items"
     );
 }
+
+const ZST_STRUCT_ITER_SRC: &str = r#"
+struct DropMe;
+impl Drop for DropMe { fn drop(&mut self) { println!("drop"); } }
+struct S { d: DropMe }
+fn main() {
+    let v = vec![S { d: DropMe }, S { d: DropMe }];
+    for s in v {
+        let _ = s;
+        println!("c");
+    }
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_by_value_iteration_drops_zst_struct_elements() {
+    // The loop variable of a by-value iteration over zero-sized
+    // struct elements is never written — the payload move out of
+    // the iterator is a no-op the MIR pipeline deletes — yet each
+    // element's field destructors run at the end of its iteration,
+    // once each, as natively.
+    let dir = temp_dir("zststructiter");
+    let src = fixture(&dir, "zststructiter.rs", ZST_STRUCT_ITER_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "by-value iteration over zero-sized structs must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "c\ndrop\nc\ndrop\ndone\n",
+        "each iterated element's field destructor runs"
+    );
+}
+
+const ZST_ENUM_MATCH_ITER_SRC: &str = r#"
+struct DropMe;
+impl Drop for DropMe { fn drop(&mut self) { println!("drop"); } }
+enum Never {}
+enum CS { Yielded(Never), Complete(DropMe) }
+fn main() {
+    let v = vec![CS::Complete(DropMe), CS::Complete(DropMe)];
+    let mut i = 0;
+    for x in v {
+        match x {
+            CS::Yielded(_) => println!("y"),
+            CS::Complete(_) => println!("{i}"),
+        }
+        i += 1;
+    }
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_match_consumed_zst_enum_elements_drop() {
+    // An enum element consumed by a match in a by-value iteration
+    // still drops its payload when the scrutinee goes out of scope —
+    // for the second element exactly as for the first, even though
+    // the scrutinee local's write was elided as a no-op.
+    let dir = temp_dir("zstenummatchiter");
+    let src = fixture(&dir, "zstenummatchiter.rs", ZST_ENUM_MATCH_ITER_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "match-consumed zero-sized enum iteration must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "0\ndrop\n1\ndrop\ndone\n",
+        "both matched elements' payloads drop"
+    );
+}
+
+const ZST_NESTED_ITER_SRC: &str = r#"
+struct DropMe;
+impl Drop for DropMe { fn drop(&mut self) { println!("drop"); } }
+enum CS<Y, R> { Yielded(Y), Complete(R) }
+enum Never {}
+struct S { v: Vec<CS<Never, DropMe>> }
+fn main() {
+    let outer: Vec<S> = vec![
+        S { v: vec![CS::Complete(DropMe)] },
+        S { v: vec![CS::Complete(DropMe), CS::Complete(DropMe)] },
+    ];
+    for s in outer {
+        for x in s.v {
+            match x {
+                CS::Yielded(_) => println!("y"),
+                CS::Complete(_) => println!("c"),
+            }
+        }
+    }
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_nested_by_value_iteration_drops_zst_payloads() {
+    // Nested by-value iteration whose elements are structs holding
+    // Vecs of zero-sized enums: every element's payload destructor
+    // runs in iteration order, as natively.
+    let dir = temp_dir("zstnestediter");
+    let src = fixture(&dir, "zstnestediter.rs", ZST_NESTED_ITER_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "nested by-value iteration must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "c\ndrop\nc\ndrop\nc\ndrop\ndone\n",
+        "every nested element's payload destructor runs in order"
+    );
+}

@@ -4333,31 +4333,30 @@ impl<'a> Interpreter<'a> {
                 // type still denotes a value for drop glue: optimized
                 // MIR deletes the (no-op) write of a ZST aggregate,
                 // yet the place's destructor must run — it can have
-                // observable effects, such as writing a static. The
-                // synthesized value is only a gate for glue: field
-                // glue beneath a fabricated ADT reads as never-written
-                // and skips, exactly as drop flags dictate.
+                // observable effects, such as writing a static.
                 //
-                // That gate serves a root that *is* the local. A root
-                // addressing a sub-place of the local (a non-empty
-                // projection — the place a `DerefMut` result names,
-                // dropped before the assignment through it) needs the
-                // value at that address instead: the fabricated ADT
-                // has no fields to project through, so the read would
-                // report nothing and the sub-place's destructor would
-                // be skipped even though MIR emitted its drop. A
-                // single-valued type determines that value exactly
+                // A single-valued type determines that value exactly
                 // (conversion records it in `zst_locals`), so read
-                // through it; a type with many values keeps the gate,
-                // and the projection finds nothing, as before.
+                // through it: the local holds the recorded value
+                // whenever it is live, and its full glue — field
+                // destructors included — runs against it, as it
+                // would against a stored value. This holds for a
+                // root that *is* the local and for a root addressing
+                // a sub-place of it alike (a sub-place's read has no
+                // other way through: a fabricated ADT has no fields
+                // to project through, so the read would report
+                // nothing and the sub-place's destructor would be
+                // skipped even though MIR emitted its drop).
+                //
+                // A type with many values keeps the synthesized
+                // gate: a fieldless fabrication under which the
+                // ADT's own destructor still runs, while field glue
+                // beneath it reads as never-written and skips,
+                // exactly as drop flags dictate.
                 let base = if base == Value::Uninit {
-                    if projection.is_empty() {
-                        self.zst_glue_value(frame, *local).unwrap_or(base)
-                    } else {
-                        self.zst_local_value(frame, *local)
-                            .or_else(|| self.zst_glue_value(frame, *local))
-                            .unwrap_or(base)
-                    }
+                    self.zst_local_value(frame, *local)
+                        .or_else(|| self.zst_glue_value(frame, *local))
+                        .unwrap_or(base)
                 } else {
                     base
                 };
