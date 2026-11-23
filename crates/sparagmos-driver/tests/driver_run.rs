@@ -9841,6 +9841,60 @@ fn run_mode_collect_builds_vec_from_iterators() {
     );
 }
 
+const ADAPTER_INTO_ITER_COLLECT_SRC: &str = r#"
+fn main() {
+    let v = vec![5, 12, 7, 20];
+    let out: Vec<i32> = v.into_iter().map(|x| x + 1).collect();
+    println!("map {out:?}");
+    let e: Vec<i32> = Vec::new();
+    let empty: Vec<i32> = e.into_iter().map(|x| x + 1).collect();
+    println!("empty {}", empty.len());
+    let n = vec![1, 2, 3];
+    let nested: Vec<i32> = n.into_iter().map(|x| x * 2).map(|x| x + 10).collect();
+    println!("nested {nested:?}");
+    let t = vec![10, 20, 30, 40, 50];
+    let taken: Vec<i32> = t.into_iter().take(2).collect();
+    println!("take {taken:?}");
+    let r = vec![1, 2, 3, 4];
+    let rev: Vec<i32> = r.into_iter().rev().collect();
+    println!("rev {rev:?}");
+    let w = vec!["a".to_string(), "bb".to_string()];
+    let strs: Vec<String> = w
+        .into_iter()
+        .map(|mut s| {
+            s.push_str("!");
+            s
+        })
+        .collect();
+    println!("strs {strs:?}");
+}
+"#;
+
+#[test]
+fn run_mode_adapter_over_vec_into_iter_collect() {
+    // Adapters over `vec::IntoIter` collect through the
+    // specialized `SpecFromIter::from_iter`, whose body calls
+    // `std::vec::in_place_collect::from_iter_in_place` through a
+    // function-pointer constant — a shape the name-based
+    // collection never sees, so the raw-allocation body was
+    // collected by the const-fn demand pass and ran into the
+    // body-less leaf specializations (`SourceIter::as_inner`
+    // and friends). The call is served by the
+    // `VecFromIterNested` builtin, the entry point's own model
+    // (drain the iterator into a fresh `Vec`).
+    let dir = temp_dir("adapter-into-iter-collect");
+    let src = fixture(&dir, "adaptercollect.rs", ADAPTER_INTO_ITER_COLLECT_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "map [6, 13, 8, 21]\nempty 0\nnested [12, 14, 16]\ntake [10, 20]\nrev [4, 3, 2, 1]\nstrs [\"a!\", \"bb!\"]\n",
+        "stdout={stdout}"
+    );
+}
+
 const ARGS_COLLECT_SRC: &str = r#"
 fn main() {
     let fwd: Vec<String> = std::env::args().collect();

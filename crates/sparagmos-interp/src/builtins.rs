@@ -1059,7 +1059,12 @@ pub enum Builtin {
     /// order, produced here by stepping the iterator with the
     /// same machinery `Iterator::next` uses. This is the entry
     /// every `Iterator::collect::<Vec<_>>` reaches (the
-    /// `SpecFromIter` instance delegates to it).
+    /// `SpecFromIter` instance delegates to it). The registry
+    /// also maps `in_place_collect::from_iter_in_place` -- the
+    /// specialization's in-place entry, whose body drives the
+    /// source vector's raw buffer -- to this model; its
+    /// observable semantics are the same items in the same
+    /// order.
     VecFromIterNested,
     /// `slice::to_vec` / `slice::to_vec_in`: a vector holding a
     /// clone of every element of the slice, in order. The
@@ -2667,6 +2672,21 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
             Builtin::VecExtendTrusted
         }
         "std::vec::spec_from_iter_nested::SpecFromIterNested::from_iter" => {
+            Builtin::VecFromIterNested
+        }
+        // The in-place collect entry the `SpecFromIter`
+        // specialization selects when the iterator's source is a
+        // `Vec` allocation (`SourceIter` + `InPlaceIterable` with
+        // an `AsVecIntoIter` source: `vec::IntoIter` itself and
+        // every adapter forwarding those traits). Its collected
+        // body drives the source allocation's raw buffer through
+        // `SourceIter::as_inner` / `AsVecIntoIter::as_into_iter`,
+        // which the value model does not serve; the observable
+        // semantics are the nested collect's -- the yielded
+        // items, in order, in a fresh vector -- so the same
+        // model serves this entry.
+        "std::vec::in_place_collect::from_iter_in_place"
+        | "alloc::vec::in_place_collect::from_iter_in_place" => {
             Builtin::VecFromIterNested
         }
         _ if canonical.starts_with("std::vec::Vec") && canonical.ends_with(">::capacity") => {

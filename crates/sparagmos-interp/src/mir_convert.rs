@@ -7144,6 +7144,34 @@ let inner = match (&src, target) {
         if self.fmt_foreign_self(&name, func) {
             return None;
         }
+        // The in-place collect entry point (`std::vec::
+        // in_place_collect::from_iter_in_place`) reaches the
+        // program whenever a collected body materializes it as a
+        // function-pointer constant — `SpecFromIter::from_iter`
+        // calls it through exactly that shape, which the driver's
+        // name-based collection never sees as a call target, so
+        // the const-fn demand pass converts its body. That body
+        // drives the raw allocation machinery the value model
+        // does not serve and bottoms out in leaf specialization
+        // calls (`SourceIter::as_inner` and friends) that have
+        // no bodies at all. The builtin is the function's own
+        // semantics in the model — drain the iterator into a
+        // fresh `Vec`; the allocation reuse the real body
+        // performs is unobservable — so it pre-empts the
+        // collected body here, exactly as the registry pre-empts
+        // collection for directly named calls. The same holds
+        // for the nested specialization entry the builtin also
+        // serves.
+        if matches!(
+            crate::builtins::lookup_qualified(
+                &crate::builtins::canonical_name(
+                    name.split(" [").next().unwrap_or(&name),
+                ),
+            ),
+            Some(crate::builtins::Builtin::VecFromIterNested)
+        ) {
+            return None;
+        }
         let Some(plain) = self.unconverted.get(&name) else {
             // A name that is not itself a collected body denotes
             // a trait item the call names directly (the func
@@ -7505,6 +7533,69 @@ let inner = match (&src, target) {
             }
             _ => None,
         }
+    }
+
+    /// A call through a function-pointer constant naming the
+    /// in-place collect entry point (`std::vec::in_place_collect::
+    /// from_iter_in_place`, the entry the `VecFromIterNested`
+    /// builtin serves): `SpecFromIter::from_iter` calls it
+    /// through exactly this shape — the func operand is the
+    /// decoded function-pointer value, not an `FnDef`-typed
+    /// constant — so neither the driver's name-based collection
+    /// nor the direct-call resolution ever sees the callee's
+    /// name, and the call would otherwise dispatch through the
+    /// value to the collected body, whose raw-allocation
+    /// machinery the value model does not serve. The builtin is
+    /// the function's own semantics in the model (drain the
+    /// iterator into a fresh `Vec`; the allocation reuse is
+    /// unobservable), so the call converts to it directly. The
+    /// stepping dispatch key is the iterator argument's own
+    /// type, which is the entry point's last generic argument.
+    fn in_place_collect_terminator(
+        &self,
+        body: &mir::Body,
+        func: &mir::Operand,
+        args: &[mir::Operand],
+        destination: &mir::Place,
+        target: Option<mir::BasicBlock>,
+    ) -> Result<Option<ir::TerminatorKind>, ConvertError> {
+        let mir::Operand::Constant(c) = func else {
+            return Ok(None);
+        };
+        let mir::ConstKind::Value(mir::ConstValue::FnDef(def)) = &c.literal
+        else {
+            return Ok(None);
+        };
+        let Some(name) = self.def_names.get(def) else {
+            return Ok(None);
+        };
+        // A non-first instance is keyed with an instance suffix
+        // (`name [instance]`); the registry is keyed by the plain
+        // definition name.
+        let plain = name.split(" [").next().unwrap_or(name);
+        let canonical = crate::builtins::canonical_name(plain);
+        if !matches!(
+            crate::builtins::lookup_qualified(&canonical),
+            Some(crate::builtins::Builtin::VecFromIterNested)
+        ) || args.len() != 1
+        {
+            return Ok(None);
+        }
+        let Some(iter_ty) = self.operand_place_ty(body, &args[0]) else {
+            return Ok(None);
+        };
+        let iter_tag = crate::builtins::ty_tag(&iter_ty, self.names);
+        let ir_arg = self.convert_operand(body, &args[0], Some(&iter_ty))?;
+        Ok(Some(ir::TerminatorKind::CallBuiltin {
+            name: canonical,
+            generic_args: vec![iter_tag],
+            args: vec![ir_arg],
+            destination: self.convert_place(body, destination)?,
+            target: target.map(|b| ir::BasicBlock(b.index())),
+            drop_glue: None,
+            cmp_discriminants: None,
+            result_unsize: None,
+        }))
     }
 
     /// A direct `Add::add` / `Sub::sub` call whose Self type is
@@ -8208,6 +8299,14 @@ let inner = match (&src, target) {
                     self.drop_call_terminator(body, func, args, *target)
                 {
                     drop_term
+                } else if let Some(term) = self.in_place_collect_terminator(
+                    body,
+                    func,
+                    args,
+                    destination,
+                    *target,
+                )? {
+                    term
                 } else if indirect {
                     let func_ty = self.operand_place_ty(body, func);
                     // A constant callable carries no type of its own;
