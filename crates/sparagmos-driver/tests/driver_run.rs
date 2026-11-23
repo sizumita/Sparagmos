@@ -17444,3 +17444,50 @@ fn run_mode_dyn_one_field_ref_struct_debug() {
         "C { pd: B { ed: A } }\nB { ed: A }\n[B { ed: A }]\n"
     );
 }
+
+const MAYBE_UNINIT_COPY_MOVE_SRC: &str = r#"
+fn main() {
+    let m: std::mem::MaybeUninit<u8> = std::mem::MaybeUninit::uninit();
+    unsafe {
+        let mut b: std::mem::MaybeUninit<u8> = std::mem::MaybeUninit::uninit();
+        std::ptr::copy_nonoverlapping(&m, &mut b, 1);
+        let c = b;
+        std::mem::forget(c);
+    }
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_maybe_uninit_copy_then_move_uninit() {
+    // A `MaybeUninit` value whose payload is uninitialized is
+    // the type's ordinary content: copying it element-wise and
+    // moving the destination place carries the union value
+    // (only a read of the payload itself is an uninitialized
+    // read).
+    run_ok("maybe-uninit-copy-move", MAYBE_UNINIT_COPY_MOVE_SRC, "done\n");
+}
+
+const MAYBE_UNINIT_COPY_DEFINED_SRC: &str = r#"
+fn main() {
+    let m: std::mem::MaybeUninit<u8> = std::mem::MaybeUninit::new(7);
+    unsafe {
+        let mut b: std::mem::MaybeUninit<u8> = std::mem::MaybeUninit::uninit();
+        std::ptr::copy_nonoverlapping(&m, &mut b, 1);
+        let c = b;
+        println!("val={}", c.assume_init());
+    }
+}
+"#;
+
+#[test]
+fn run_mode_maybe_uninit_copy_defined_assume_init() {
+    // The element a `MaybeUninit`-typed copy moves is the union
+    // value, not the bare payload: the destination place keeps
+    // the union form its own `assume_init` reads.
+    run_ok(
+        "maybe-uninit-copy-defined",
+        MAYBE_UNINIT_COPY_DEFINED_SRC,
+        "val=7\n",
+    );
+}

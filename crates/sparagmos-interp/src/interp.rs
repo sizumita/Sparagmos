@@ -2340,12 +2340,20 @@ impl<'a> Interpreter<'a> {
             // read and stays an error.
             match self.zst_local_value(&frame, 0) {
                 Some(v) => value = v,
-                None => {
-                    return Err(InterpError::UninitializedRead {
-                        func: frame.func.clone(),
-                        place: "_0".to_string(),
-                    });
-                }
+                None => match self.maybe_uninit_local_value(&frame, 0) {
+                    // A `MaybeUninit` return place holding the
+                    // bare marker denotes the uninitialized
+                    // union value (see `normalize_for_ty`): the
+                    // payload being uninitialized is the type's
+                    // ordinary content, not an unwritten place.
+                    Some(v) => value = v,
+                    None => {
+                        return Err(InterpError::UninitializedRead {
+                            func: frame.func.clone(),
+                            place: "_0".to_string(),
+                        });
+                    }
+                },
             }
         }
         if frames.len() == stop_depth {
@@ -6439,7 +6447,22 @@ impl<'a> Interpreter<'a> {
                 // the array itself.) Without a known element type
                 // the shape rule applies: a non-aggregate source is
                 // one element, an aggregate source is indexed.
+                // A `MaybeUninit` element is the union value
+                // over its storage (see `maybe_uninit_form`):
+                // the base denotes one element unless it is a
+                // sequence of them, and the element the copy
+                // moves is the union form of the content found,
+                // never the bare payload the wrapper judgement
+                // below peels off for transparent one-field
+                // structs -- peeling a union loses the form its
+                // own readers (the union field read behind
+                // `assume_init`, the whole-place move) require.
+                let mu_elem = matches!(elem, Some(ty) if is_maybe_uninit_ty(ty));
                 let src_single = match elem {
+                    Some(_) if mu_elem => {
+                        !aggregate(&src_base)
+                            && !matches!(src_base, Value::SparseVec { .. })
+                    }
                     Some(ty) => {
                         value_fits_ty(crate::builtins::unwrap_wrapper(&src_base), ty)
                     }
@@ -6447,9 +6470,17 @@ impl<'a> Interpreter<'a> {
                 };
                 let elems: Vec<Value> = if src_single {
                     let mut elems = Vec::with_capacity(n);
-                    elems.push(crate::builtins::unwrap_wrapper(&src_base).clone());
-                    for i in 1..n {
-                        elems.push(self.read_seq_at(frames, &src_target, i)?);
+                    if mu_elem {
+                        elems.push(maybe_uninit_form(src_base.clone()));
+                        for i in 1..n {
+                            let unit = self.read_seq_at(frames, &src_target, i)?;
+                            elems.push(maybe_uninit_form(unit));
+                        }
+                    } else {
+                        elems.push(crate::builtins::unwrap_wrapper(&src_base).clone());
+                        for i in 1..n {
+                            elems.push(self.read_seq_at(frames, &src_target, i)?);
+                        }
                     }
                     elems
                 } else {
@@ -6465,6 +6496,11 @@ impl<'a> Interpreter<'a> {
                             Ok(v) => v,
                             Err(InterpError::UninitializedRead { .. }) => Value::Uninit,
                             Err(e) => return Err(e),
+                        };
+                        let unit = if mu_elem {
+                            maybe_uninit_form(unit)
+                        } else {
+                            unit
                         };
                         elems.push(unit);
                     }
@@ -8583,6 +8619,21 @@ impl<'a> Interpreter<'a> {
         zst_value_of_ty(body.local_ty(Local(local))?)
     }
 
+    /// The value of a `MaybeUninit` local holding the bare
+    /// uninitialized marker: the uninitialized union value (see
+    /// `normalize_for_ty`); `None` for any other local.
+    fn maybe_uninit_local_value(&self, frame: &Frame, local: usize) -> Option<Value> {
+        let body = self.program.get(&frame.func)?;
+        if is_maybe_uninit_ty(body.local_ty(Local(local))?) {
+            Some(Value::Enum {
+                variant: 0,
+                fields: vec![Value::Uninit],
+            })
+        } else {
+            None
+        }
+    }
+
     /// The canonical value of a single-valued field path of a
     /// local (see the note in `read_resolved`); `None` when the
     /// projection is not a pure field path or conversion recorded
@@ -10668,15 +10719,30 @@ impl<'a> Interpreter<'a> {
 
     /// Validate / wrap a value being stored into a typed direct local.
     pub(crate) fn normalize_for_ty(mut value: Value, ty: Option<&Ty>) -> InterpResult<Value> {
-        // Storing the uninitialized marker itself is not a type
-        // mismatch: MIR materialises uninitialised locals with an
-        // assignment of the `Uninit` constant (the storage a
-        // `MaybeUninit` or a union is filled through a pointer
-        // afterwards), and moving a not-yet-initialised local into
-        // another local propagates the same marker. The place simply
-        // holds no value yet; any later read of it still raises
-        // `UninitializedRead`, so nothing is fabricated here.
         if value == Value::Uninit {
+            // A `MaybeUninit` place holding the bare marker
+            // denotes the uninitialized union value: the store
+            // takes the union's canonical form (the field-0
+            // payload skeleton holding the marker), so a
+            // whole-place read or move of the place sees the
+            // union value, while a read of the payload itself
+            // still raises `UninitializedRead` at the union
+            // field read -- the point of use.
+            if matches!(ty, Some(t) if is_maybe_uninit_ty(t)) {
+                return Ok(Value::Enum {
+                    variant: 0,
+                    fields: vec![Value::Uninit],
+                });
+            }
+            // Storing the uninitialized marker itself is not a
+            // type mismatch: MIR materialises uninitialised
+            // locals with an assignment of the `Uninit` constant
+            // (the storage a `MaybeUninit` or a union is filled
+            // through a pointer afterwards), and moving a
+            // not-yet-initialised local into another local
+            // propagates the same marker. The place simply holds
+            // no value yet; any later read of it still raises
+            // `UninitializedRead`, so nothing is fabricated here.
             return Ok(value);
         }
         // A `MaybeUninit` place denotes the payload's own storage:
@@ -16482,6 +16548,40 @@ pub(crate) fn operand_pointee_ty(body: &Body, op: &Operand) -> Option<Ty> {
 /// aggregates, references as resolved pointers. Anything
 /// unrecognised does not fit, so callers fall back to treating
 /// the value by its own shape.
+/// Whether `ty` is a `MaybeUninit` union. A `MaybeUninit`
+/// value's canonical form is the union form -- a one-field
+/// `Enum` holding the payload -- and the payload itself may be
+/// uninitialized: uninitialized content is this type's ordinary
+/// content, not an unwritten place. The places that move
+/// `MaybeUninit` values therefore judge them by this type (see
+/// `normalize_for_ty`, `exec_return` and
+/// `exec_copy_nonoverlapping`), never by whether the payload
+/// happens to be initialized.
+fn is_maybe_uninit_ty(ty: &Ty) -> bool {
+    matches!(
+        ty,
+        Ty::Adt(name)
+            if name.starts_with("std::mem::MaybeUninit")
+                || name.starts_with("core::mem::MaybeUninit")
+    )
+}
+
+/// The canonical union form of a `MaybeUninit` element value:
+/// storage read for a `MaybeUninit` place holds the payload in
+/// whatever form it was stored (the union form itself, the bare
+/// payload a byte-wise write left, or the uninitialized
+/// marker); the value of the `MaybeUninit` place is the union
+/// value over that content.
+fn maybe_uninit_form(value: Value) -> Value {
+    match &value {
+        Value::Enum { variant: 0, fields } if fields.len() == 1 => value,
+        _ => Value::Enum {
+            variant: 0,
+            fields: vec![value],
+        },
+    }
+}
+
 fn value_fits_ty(value: &Value, ty: &Ty) -> bool {
     match (value, ty) {
         (Value::Unit, Ty::Unit) => true,
