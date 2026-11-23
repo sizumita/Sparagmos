@@ -27734,8 +27734,20 @@ impl<'a> Interpreter<'a> {
         value: &Value,
         ty: &str,
     ) -> InterpResult<Option<String>> {
-        let base = tag_base_name(pointee_tag(ty));
-        if base != "CStr" && base != "CString" {
+        // Only the standard library's own C string types take
+        // this path: the tag must be one of their qualified
+        // paths (the defining crate's or the `std` re-export).
+        // A user-defined type that merely shares the base name
+        // keeps its own `Debug` behaviour.
+        let plain = pointee_tag(ty);
+        if !matches!(
+            plain,
+            "std::ffi::CStr"
+                | "core::ffi::CStr"
+                | "alloc::ffi::CStr"
+                | "std::ffi::CString"
+                | "alloc::ffi::CString"
+        ) {
             return Ok(None);
         }
         let Some(bytes) = self.c_string_value_bytes(frames, value)? else {

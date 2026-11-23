@@ -215,6 +215,50 @@ Holder { name: "field str", n: 7 }
     );
 }
 
+const USER_C_STRING_NAMES_SRC: &str = r#"
+#[derive(Debug)]
+struct CString(String);
+
+#[derive(Debug)]
+struct CStr([u8; 3]);
+
+mod ffi {
+    #[derive(Debug)]
+    pub struct CString(pub Vec<u8>);
+}
+
+fn main() {
+    println!("{:?}", CString("hello".to_string()));
+    println!("{:?}", CStr([104, 105, 0]));
+    println!("{:?}", ffi::CString(vec![97, 98]));
+    let opt: Option<CString> = Some(CString("nested".to_string()));
+    println!("{:?}", opt);
+}
+"#;
+
+#[test]
+fn run_mode_debug_format_user_types_named_like_c_strings() {
+    // A user-defined type that merely shares the `CStr` /
+    // `CString` base name keeps its own (derived) Debug form:
+    // the C string formatting path is restricted to the
+    // standard library's qualified type paths. The expected
+    // text is native output.
+    let dir = temp_dir("usercstr");
+    let src = fixture(&dir, "usercstr.rs", USER_C_STRING_NAMES_SRC);
+    let out = run_driver_with_aux_specs(&src, Some("2021"), &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "user types named like C strings must format; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "CString(\"hello\")\nCStr([104, 105, 0])\nCString([97, 98])\nSome(CString(\"nested\"))\n",
+        "user-defined CStr/CString names keep their derived Debug output"
+    );
+}
+
 #[test]
 fn run_mode_silent_program_exits_zero() {
     // A plain computation-only main converts and executes to the end.
