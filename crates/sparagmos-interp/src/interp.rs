@@ -844,10 +844,15 @@ pub struct Interpreter<'a> {
 
 /// The synthetic address of a pointer value (see
 /// [`crate::ir::Rvalue::PtrToInt`]): an FNV-1a hash of the reference
-/// target, mapped into a non-zero, 4096-aligned range. The same
+/// target, mapped into a non-zero, 65536-aligned range. The same
 /// target always yields the same address within a run, so equality,
 /// null and alignment checks on transmuted pointers behave as they
 /// do natively; distinct targets collide only on a hash collision.
+/// The slot size is 2^16, not 2^12, because a place in this model
+/// can carry an alignment that large (`#[repr(align(0x10000))]`):
+/// with 4096-byte slots the address of such a place is a multiple
+/// of 4096 but not of its own alignment, and the compiler's
+/// alignment precondition checks abort the guest.
 /// The hash contributes 44 bits (2^44 aligned slots): truncating
 /// it further makes collisions observable at realistic allocation
 /// counts (a 20-bit truncation collided 4 times among 3,000
@@ -893,7 +898,7 @@ fn address_key(value: &Value) -> Option<String> {
 
 /// Hash an address identity key into the synthetic address
 /// range (see [`synthetic_address`] for the range's contract:
-/// non-zero, 4096-aligned, 44 bits of hash).
+/// non-zero, 65536-aligned, 44 bits of hash).
 fn hash_address_key(key: &str) -> u128 {
     fn fnv1a(bytes: &[u8]) -> u64 {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -904,7 +909,11 @@ fn hash_address_key(key: &str) -> u128 {
         h
     }
     let h = fnv1a(key.as_bytes());
-    0x1_0000_0000u128 + u128::from(h & 0xFF_FFFF_FFFF_F000)
+    // The same 44 hash bits the 4096-slot mapping used, selecting
+    // one of 2^44 slots of 2^16 bytes each: widening the slot
+    // keeps every distinctness property of the field while making
+    // each address a multiple of 2^16 (see [`synthetic_address`]).
+    0x1_0000_0000u128 + u128::from((h >> 12) & 0xFFF_FFFF_FFFF) * 0x1_0000
 }
 
 /// Whether a stored value's tree contains any scalar content
@@ -20011,8 +20020,9 @@ pub(crate) fn float_to_uint(v: f64, bits: u32) -> u128 {
 /// function of the pointer's target: the same target always yields
 /// the same address, distinct targets yield distinct addresses
 /// (up to the mixing hash), and every address is a multiple of
-/// 4096, so the alignment check holds for any alignment a place
-/// in this model can carry. A reference to a constant aggregate
+/// 65536, so the alignment check holds for any alignment up to
+/// 2^16 — the largest a place in this model can carry in practice
+/// (`#[repr(align(0x10000))]`). A reference to a constant aggregate
 /// has no place identity; it shares one reserved address.
 fn synthetic_addr(v: &Value) -> u128 {
     fn mix(h: &mut u128, x: u128) {
@@ -20127,7 +20137,7 @@ fn synthetic_addr(v: &Value) -> u128 {
         _ => {}
     }
     const BASE: u128 = 0x1000_0000_0000;
-    BASE + (h % (1 << 40)) * 4096
+    BASE + (h % (1 << 40)) * 65536
 }
 
 pub(crate) fn eval_cast(v: &Value, ty: &Ty) -> InterpResult<Value> {
