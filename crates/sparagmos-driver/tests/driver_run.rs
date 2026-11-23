@@ -21554,7 +21554,11 @@ fn run_mode_tool_interception_runs_built_binaries() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
-    assert_eq!(stdout, "artifact guest ok\n", "stderr={stderr}");
+    // The guest's one `status()` run (the `b` binary)
+    // inherits the guest's streams, so the binary's own
+    // line stands in the guest's stdout ahead of the
+    // final marker.
+    assert_eq!(stdout, "b args: \nartifact guest ok\n", "stderr={stderr}");
 }
 
 const ARTIFACT_FIDELITY_GUEST_SRC: &str = r#"
@@ -22077,6 +22081,191 @@ fn run_mode_tool_interception_built_binary_fidelity() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
     assert_eq!(stdout, "artifact fidelity guest ok\n", "stderr={stderr}");
+}
+
+
+const STATUS_RELAY_GUEST_SRC: &str = r#"use std::process::Command;
+
+fn main() {
+    let rustc = std::env::args().nth(1).unwrap();
+    let src0 = std::env::args().next().unwrap();
+    let dir = std::path::Path::new(&src0).parent().unwrap().to_path_buf();
+    std::env::set_current_dir(&dir).unwrap();
+    std::fs::write(
+        "p.rs",
+        "fn main() { println!(\"child out\"); eprintln!(\"child err\"); }\n",
+    )
+    .unwrap();
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--out-dir")
+        .arg(".")
+        .arg("p.rs")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    println!("before");
+    let st = Command::new(dir.join("p")).status().unwrap();
+    assert!(st.success(), "status failed");
+    println!("after");
+}"#;
+
+#[test]
+fn run_mode_tool_interception_status_relays_inherited_streams() {
+    let dir = temp_dir("tool-status-relay");
+    let src = fixture(&dir, "status_relay_guest.rs", STATUS_RELAY_GUEST_SRC);
+    let driver = env!("CARGO_BIN_EXE_sparagmos-driver");
+    let out = run_driver_extra(&src, &["--tool-program", driver, "--guest-arg", driver]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    // `status()` inherits the child's streams: the built
+    // program's lines stand in the guest's own streams,
+    // in invocation order around the guest's prints.
+    assert_eq!(stdout, "before\nchild out\nafter\n", "stderr={stderr}");
+    assert_eq!(stderr, "child err\n", "stdout={stdout}");
+}
+
+const FILE_SNAPSHOT_GUEST_SRC: &str = r#"use std::process::Command;
+
+fn main() {
+    let rustc = std::env::args().nth(1).unwrap();
+    let src0 = std::env::args().next().unwrap();
+    let dir = std::path::Path::new(&src0).parent().unwrap().to_path_buf();
+    std::env::set_current_dir(&dir).unwrap();
+    let fbin = dir.join("fbin");
+    std::fs::create_dir_all(&fbin).unwrap();
+    std::fs::write(
+        fbin.join("fprobe.rs"),
+        "fn main() { println!(\"{}\", file!()); }\n",
+    )
+    .unwrap();
+    std::fs::write(fbin.join("other.txt"), "one\n").unwrap();
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--out-dir")
+        .arg(&fbin)
+        .arg(fbin.join("fprobe.rs"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new(fbin.join("fprobe")).output().unwrap();
+    assert!(out.status.success(), "first run failed");
+    println!("first: {}", String::from_utf8(out.stdout).unwrap().trim());
+    // Change a recorded file of the tree (not the root): the
+    // next run converts from the snapshot.
+    std::fs::write(fbin.join("other.txt"), "two\n").unwrap();
+    let out = Command::new(fbin.join("fprobe")).output().unwrap();
+    assert!(out.status.success(), "second run failed");
+    println!("second: {}", String::from_utf8(out.stdout).unwrap().trim());
+}"#;
+
+#[test]
+fn run_mode_tool_interception_snapshot_keeps_source_spellings() {
+    let dir = temp_dir("tool-file-snapshot");
+    let src = fixture(&dir, "file_snapshot_guest.rs", FILE_SNAPSHOT_GUEST_SRC);
+    let driver = env!("CARGO_BIN_EXE_sparagmos-driver");
+    let out = run_driver_extra(&src, &["--tool-program", driver, "--guest-arg", driver]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    // The second run converts from the source snapshot
+    // (the guest rewrote a file of the tree); its
+    // `file!()` spelling stays the recorded source's.
+    let probe = dir.join("fbin").join("fprobe.rs");
+    assert_eq!(
+        stdout,
+        format!("first: {0}\nsecond: {0}\n", probe.display()),
+        "stderr={stderr}"
+    );
+}
+
+const CWD_SEPARATION_GUEST_SRC: &str = r#"use std::process::Command;
+
+fn main() {
+    let rustc = std::env::args().nth(1).unwrap();
+    let src0 = std::env::args().next().unwrap();
+    let dir = std::path::Path::new(&src0).parent().unwrap().to_path_buf();
+    std::env::set_current_dir(&dir).unwrap();
+    std::fs::write(
+        "prog.rs",
+        "extern crate dep; fn main() { println!(\"prog cwd {}\", std::env::current_dir().unwrap().display()); }\n",
+    )
+    .unwrap();
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--extern")
+        .arg("dep=libs/libdep.rlib")
+        .arg("--out-dir")
+        .arg(".")
+        .arg("prog.rs")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let other = dir.join("elsewhere");
+    std::fs::create_dir_all(&other).unwrap();
+    let out = Command::new(dir.join("prog"))
+        .current_dir(&other)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "run failed");
+    println!("ran: {}", String::from_utf8(out.stdout).unwrap().trim());
+}"#;
+
+#[test]
+fn run_mode_tool_interception_artifact_run_separates_directories() {
+    let dir = temp_dir("tool-artifact-cwd");
+    // A prebuilt dependency the run did not produce: a
+    // real rlib from the pinned toolchain's own rustc,
+    // which the guest names by a path relative to its
+    // build directory.
+    let libs = dir.join("libs");
+    std::fs::create_dir_all(&libs).unwrap();
+    let dep = fixture(&dir, "dep.rs", "pub fn f() -> u32 { 7 }\n");
+    let rustc = Path::new(env!("SPARAGMOS_BUILD_SYSROOT"))
+        .join("bin")
+        .join("rustc");
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--crate-type=rlib")
+        .arg("--crate-name")
+        .arg("dep")
+        .arg("-o")
+        .arg(libs.join("libdep.rlib"))
+        .arg(&dep)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "dep build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let src = fixture(&dir, "cwd_guest.rs", CWD_SEPARATION_GUEST_SRC);
+    let driver = env!("CARGO_BIN_EXE_sparagmos-driver");
+    let out = run_driver_extra(&src, &["--tool-program", driver, "--guest-arg", driver]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    // The run re-converts in the build's directory (the
+    // relative `--extern` resolves there) and executes
+    // in the directory the invocation requested.
+    assert_eq!(
+        stdout,
+        format!("ran: prog cwd {}\n", dir.join("elsewhere").display()),
+        "stderr={stderr}"
+    );
 }
 
 const NEVER_BUILT_GUEST_SRC: &str = r#"

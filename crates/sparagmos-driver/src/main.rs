@@ -5808,6 +5808,14 @@ struct ToolArtifact {
     /// execute the program its build produced (see
     /// `ToolRegistry::effective_source`).
     source_tree: SourceTree,
+    /// The working directory of the producing invocation:
+    /// the directory its relative compilation paths (a
+    /// forwarded `--extern` path, a `-L` directory) were
+    /// resolved against when it converted. A later run of
+    /// the artifact re-converts under this directory, not
+    /// the execution's, so those paths denote the same
+    /// files at both times (see `artifact_run`).
+    build_cwd: std::path::PathBuf,
     edition: Option<String>,
     crate_type: Option<String>,
     /// The compilation environment the producing invocation
@@ -5875,6 +5883,7 @@ fn cloned_artifact(a: &ToolArtifact) -> ToolArtifact {
         name: a.name.clone(),
         source: a.source.clone(),
         source_tree: a.source_tree.clone(),
+        build_cwd: a.build_cwd.clone(),
         edition: a.edition.clone(),
         crate_type: a.crate_type.clone(),
         compile_env_clear: a.compile_env_clear,
@@ -5949,6 +5958,32 @@ impl ToolRegistry {
         let path = dir.join(root_name);
         files.insert(source.to_path_buf(), (hash, path.clone()));
         path
+    }
+
+    /// The path-prefix remap a conversion reading the
+    /// source at `source` from its snapshot needs, so the
+    /// converted program's source-location spellings
+    /// (`file!` and its kin) stay the build's: when the
+    /// recorded tree no longer stands intact, the
+    /// conversion reads the materialised snapshot under
+    /// the returned scratch directory, while the build
+    /// read the same relative layout under the recorded
+    /// source's own directory -- the pair to hand rustc as
+    /// `--remap-path-prefix <from>=<to>`. `None` when the
+    /// recorded path itself is read (the intact case,
+    /// whose spellings already are the build's).
+    fn snapshot_remap(
+        &self,
+        source: &std::path::Path,
+        tree: &SourceTree,
+    ) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        if source_tree_intact(source, tree) {
+            return None;
+        }
+        let materialised = self.effective_source_of(source, tree);
+        let from = materialised.parent()?.to_path_buf();
+        let to = source.parent()?.to_path_buf();
+        Some((from, to))
     }
 
     /// One `--aux` spec with its source path routed
@@ -6340,6 +6375,19 @@ fn tool_run(
         None => std::env::current_dir()
             .map_err(|e| format!("tool interception: no working directory: {e}"))?,
     };
+    // A guest-spelled directory is relative to this
+    // process's own working directory (the parent the
+    // child would have inherited it from); make it stand
+    // on its own, so the paths resolved against it -- the
+    // recorded build directory among them -- keep their
+    // meaning wherever they are read back.
+    let cwd = if cwd.is_absolute() {
+        cwd
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("tool interception: no working directory: {e}"))?
+            .join(cwd)
+    };
     let args: Vec<String> = request
         .args
         .iter()
@@ -6663,6 +6711,7 @@ fn tool_run(
                 name: crate_name.clone(),
                 source: input_abs.clone(),
                 source_tree: source_tree.clone(),
+                build_cwd: cwd.clone(),
                 edition: Some(edition.clone()),
                 crate_type,
                 compile_env_clear: request.env_clear,
@@ -6803,6 +6852,17 @@ fn tool_run(
 /// reads see the values it was invoked with and nothing from
 /// the build leaks into them.
 ///
+/// The two working directories are kept apart the same
+/// way: the subprocess is spawned in the producing
+/// invocation's working directory (see
+/// `ToolArtifact::build_cwd`), so the compilation-shaping
+/// arguments it replays -- a forwarded relative `--extern`
+/// path, a `-L` directory -- resolve to the files they
+/// denoted at build time, and the requested execution
+/// directory is handed over as `--guest-cwd`, which the
+/// subprocess enters once its conversion is done, so the
+/// program itself runs where the recipe invoked it.
+///
 /// The subprocess keeps the two stderr channels apart: the
 /// recorded program's own stderr travels through the file
 /// named by `--guest-stderr-file` and is relayed byte for
@@ -6824,6 +6884,17 @@ fn artifact_run(
         Some(dir) => std::path::PathBuf::from(std::ffi::OsString::from_vec(dir.clone())),
         None => std::env::current_dir()
             .map_err(|e| format!("tool interception: no working directory: {e}"))?,
+    };
+    // As in `tool_run`: a guest-spelled directory is
+    // relative to this process's own, and the execution
+    // directory is handed to a subprocess that starts in
+    // the build's directory, so it must stand on its own.
+    let cwd = if cwd.is_absolute() {
+        cwd
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("tool interception: no working directory: {e}"))?
+            .join(cwd)
     };
     let program = String::from_utf8_lossy(&request.program).into_owned();
     // The lookup follows the path the interpreter's spawn
@@ -6920,6 +6991,28 @@ fn artifact_run(
         tail.push("--rustc-arg".to_string());
         tail.push(tok.clone());
     }
+    // A recorded source tree that no longer stands intact
+    // is read from its materialised snapshot under a
+    // scratch directory; remap that directory back to the
+    // recorded source's own directory, so the program's
+    // source-location spellings stay the build's (see
+    // `ToolRegistry::snapshot_remap`). The artifact's own
+    // tree and every pinned dependency's tree take part.
+    let mut remap_trees: Vec<(&std::path::Path, &SourceTree)> =
+        vec![(&artifact.source, &artifact.source_tree)];
+    for pin in &artifact.aux_pins {
+        remap_trees.push((&pin.0, &pin.1));
+    }
+    for (source, tree) in remap_trees {
+        if let Some((from, to)) = registry.snapshot_remap(source, tree) {
+            tail.push("--rustc-arg".to_string());
+            tail.push("--remap-path-prefix".to_string());
+            tail.push("--rustc-arg".to_string());
+            tail.push(format!("{}={}", from.display(), to.display()));
+        }
+    }
+    tail.push("--guest-cwd".to_string());
+    tail.push(cwd.display().to_string());
     tail.push("--guest-stderr-file".to_string());
     tail.push(stderr_path.display().to_string());
     tail.push("--guest-env-file".to_string());
@@ -6933,7 +7026,7 @@ fn artifact_run(
     let outcome = run_convert_subprocess(
         exe,
         &tail,
-        &cwd,
+        &artifact.build_cwd,
         artifact.compile_env_clear,
         &artifact.compile_envs,
     );
@@ -8542,6 +8635,7 @@ fn driver_main() {
     let mut dump_path: Option<String> = None;
     let mut guest_stderr_file: Option<String> = None;
     let mut guest_env_file: Option<String> = None;
+    let mut guest_cwd: Option<String> = None;
     let mut guest_program_name: Option<String> = None;
     let mut edition = "2021".to_string();
     let mut sysroot: Option<String> = None;
@@ -8568,6 +8662,13 @@ fn driver_main() {
                 i += 1;
                 guest_env_file = Some(argv.get(i).cloned().unwrap_or_else(|| {
                     eprintln!("--guest-env-file needs a path");
+                    std::process::exit(2);
+                }));
+            }
+            "--guest-cwd" => {
+                i += 1;
+                guest_cwd = Some(argv.get(i).cloned().unwrap_or_else(|| {
+                    eprintln!("--guest-cwd needs a path");
                     std::process::exit(2);
                 }));
             }
@@ -8963,6 +9064,21 @@ fn driver_main() {
                             );
                             std::process::exit(2);
                         }
+                    }
+                }
+                // A caller reconstructing a run converts in
+                // one directory and executes in another (an
+                // artifact run converts in the build's
+                // directory): it hands the execution
+                // directory over the same way, and the
+                // program enters it now that the conversion
+                // is done (see `artifact_run`).
+                if let Some(dir) = &guest_cwd {
+                    if let Err(e) = std::env::set_current_dir(dir) {
+                        eprintln!(
+                            "sparagmos-driver run: unsupported: cannot enter the guest working directory {dir}: {e}"
+                        );
+                        std::process::exit(2);
                     }
                 }
                 if let Some(path) = &dump_path {

@@ -120,7 +120,8 @@ denominator. Runs on every push to `main` and on manual dispatch.
   (path, source tree, edition, crate type, the
   library bindings -- each pinned to the dependency tree
   the build bound -- and compilation options the producing
-  invocation carried, and the environment it ran under),
+  invocation carried, the environment it ran under, and
+  the directory it ran in),
   leaving a placeholder file
   at the artifact's path -- executable, for a binary -- so the
   recipe's file and spawn checks find it. When the recipe then
@@ -140,7 +141,20 @@ denominator. Runs on every push to `main` and on manual dispatch.
   compilation environment (so `option_env!` and its kin see
   the build's values), and the program itself runs under
   the environment its invocation carried, applied as a
-  complete assignment once the conversion is done. This is a
+  complete assignment once the conversion is done. The
+  re-conversion likewise runs in the producing
+  invocation's working directory, so its relative
+  compilation paths (a forwarded `--extern` path, a `-L`
+  directory) denote the files they denoted at build time,
+  and the program enters its invocation's directory once
+  the conversion is done; a conversion that reads a
+  snapshot remaps the snapshot's directory back to the
+  recorded source's directory, so the program's `file!()`
+  spellings stay the build's. A run through
+  `Command::status()` inherits the recipe's streams, so
+  the program's output stands in them in invocation
+  order; a run through `Command::output()` collects it
+  into the fabricated `Output` instead. This is a
   deliberate reading of "execute the built binary": what is
   judged is the program's input/output behaviour under
   interpretation, not native code generation -- the category

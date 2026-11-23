@@ -6354,8 +6354,19 @@ impl<'a> Interpreter<'a> {
                         // `spawn` itself stays unsupported.
                         if name == "std::process::Command::status" {
                             if let Some(outcome) =
-                                tool_outcome(self.tool_interception(), &state)?
+                                tool_outcome(self.tool_interception(), &state, false)?
                             {
+                                // `status` inherits the child's
+                                // streams (it collects no
+                                // `Output`): what the program
+                                // printed joins the guest's own
+                                // streams here, in invocation
+                                // order, before the status is
+                                // reported.
+                                self.push_output(&String::from_utf8_lossy(&outcome.stdout));
+                                self.push_error_output(&String::from_utf8_lossy(
+                                    &outcome.stderr,
+                                ));
                                 return Ok(ok_result(exit_status_value(
                                     outcome.exit_code,
                                 )));
@@ -6443,7 +6454,7 @@ impl<'a> Interpreter<'a> {
                     .ok_or_else(|| unsupported(format!("call to {name} on a stale command handle")))?;
                 match process_spawn_error(&state) {
                     Some(error) => Ok(err_result(error)),
-                    None => match tool_outcome(self.tool_interception(), &state)? {
+                    None => match tool_outcome(self.tool_interception(), &state, true)? {
                         Some(outcome) => {
                             Ok(ok_result(process_output_value(&outcome)))
                         }
@@ -24800,6 +24811,7 @@ fn io_result_from_host(result: Result<Value, std::io::Error>) -> Value {
 fn tool_outcome(
     interception: Option<&crate::interp::ToolInterception>,
     state: &crate::interp::CommandState,
+    output_captured: bool,
 ) -> InterpResult<Option<crate::interp::ToolRunOutcome>> {
     let Some(interception) = interception else {
         return Ok(None);
@@ -24831,6 +24843,7 @@ fn tool_outcome(
         env_clear: state.env_clear,
         cwd: state.cwd.clone(),
         resolved_program,
+        output_captured,
     };
     match (runner.0)(&request) {
         Ok(outcome) => Ok(Some(outcome)),

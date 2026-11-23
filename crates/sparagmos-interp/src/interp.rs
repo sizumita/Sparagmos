@@ -112,6 +112,16 @@ pub struct ToolRunRequest {
     /// as spelled: it is what the program reads as its
     /// argv[0].
     pub resolved_program: Option<Vec<u8>>,
+    /// Whether the invocation collects the program's output
+    /// (`Command::output`: the streams are piped, and the
+    /// outcome's bytes are the caller's to keep) or inherits
+    /// them (`Command::status`: the streams are the guest's
+    /// own, and the interpreter relays the outcome's bytes
+    /// into them before it reports the status). The runner
+    /// produces the outcome's bytes either way; the mode is
+    /// part of the request so the host side answers for the
+    /// invocation the guest actually made.
+    pub output_captured: bool,
 }
 
 /// The outcome of one tool invocation, from which the fabricated
