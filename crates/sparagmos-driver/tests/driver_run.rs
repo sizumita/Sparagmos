@@ -26748,3 +26748,180 @@ fn convert_mode_required_const_in_coerced_closure_is_a_compile_failure() {
         "the failure must surface the evaluation error; stderr={stderr}"
     );
 }
+
+const REQUIRED_CONST_UNSIZE_DOUBLE_REF_SRC: &str = r#"
+trait Trait {
+    fn method(&self) -> usize;
+}
+struct Fail<T>(T);
+impl<T> Fail<T> {
+    const C: () = panic!();
+}
+struct W<T>(T);
+impl<T> Trait for W<T> {
+    fn method(&self) -> usize {
+        if false {
+            let _ = Fail::<T>::C;
+        }
+        1
+    }
+}
+impl<T> Trait for &W<T> {
+    fn method(&self) -> usize {
+        42
+    }
+}
+fn main() {
+    let w = W(7u8);
+    let d: &dyn Trait = &&w;
+    println!("{}", d.method());
+}
+"#;
+
+#[test]
+fn convert_mode_required_const_behind_sibling_unsize_impl_converts() {
+    // The unsizing cast `&&W<u8>` -> `&dyn Trait` forms the
+    // vtable for `&W<u8>`, whose method carries no required
+    // constants. The sibling implementation for `W<u8>` is never
+    // collected, so its method's failing required constant is
+    // never evaluated and the crate compiles, exactly as under
+    // rustc. (A tail search that peels the cast's source and
+    // target independently strips both source references, forms
+    // the vtable for `W<u8>` instead, and wrongly rejects this.)
+    let dir = temp_dir("required-const-unsize-double-ref");
+    let src = fixture(
+        &dir,
+        "required_const_unsize_double_ref.rs",
+        REQUIRED_CONST_UNSIZE_DOUBLE_REF_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a failing required constant in the sibling impl of an \
+         unsizing cast must convert; stderr={stderr}"
+    );
+}
+
+const REQUIRED_CONST_UNSIZE_DEAD_GENERIC_SRC: &str = r#"
+trait Trait {
+    fn method(&self) -> usize;
+}
+struct Fail<T>(T);
+impl<T> Fail<T> {
+    const C: () = panic!();
+}
+struct W<T>(T);
+impl<T> Trait for W<T> {
+    fn method(&self) -> usize {
+        if false {
+            let _ = Fail::<T>::C;
+        }
+        1
+    }
+}
+impl<T> Trait for &W<T> {
+    fn method(&self) -> usize {
+        42
+    }
+}
+#[inline(never)]
+fn cast_dead<T>(w: &W<T>) {
+    let d: &dyn Trait = &w;
+    println!("{}", d.method());
+}
+#[inline(never)]
+fn caller<T>(w: &W<T>) {
+    if false {
+        cast_dead::<T>(w);
+    }
+}
+fn main() {
+    let w = W(7u8);
+    caller::<u8>(&w);
+    println!("done");
+}
+"#;
+
+#[test]
+fn convert_mode_required_const_behind_sibling_unsize_impl_in_dead_generic_converts() {
+    // The same cast one mention further away: the generic
+    // function holding it is mentioned only from dead code of a
+    // called function, which the walk still follows. The cast
+    // forms the vtable for `&W<u8>`, so the failing required
+    // constant in `W<u8>`'s sibling implementation is never
+    // evaluated and the crate compiles.
+    let dir = temp_dir("required-const-unsize-dead-generic");
+    let src = fixture(
+        &dir,
+        "required_const_unsize_dead_generic.rs",
+        REQUIRED_CONST_UNSIZE_DEAD_GENERIC_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a failing required constant in the sibling impl of an \
+         unsizing cast inside a dead-mentioned generic function \
+         must convert; stderr={stderr}"
+    );
+}
+
+const REQUIRED_CONST_UNSIZE_VTABLE_SRC: &str = r#"
+trait Trait {
+    fn method(&self) -> usize;
+}
+struct Fail<T>(T);
+impl<T> Fail<T> {
+    const C: () = panic!();
+}
+struct W<T>(T);
+impl<T> Trait for W<T> {
+    fn method(&self) -> usize {
+        if false {
+            let _ = Fail::<T>::C;
+        }
+        1
+    }
+}
+impl<T> Trait for &W<T> {
+    fn method(&self) -> usize {
+        42
+    }
+}
+fn main() {
+    let w = W(7u8);
+    let d: &dyn Trait = &w;
+    println!("{}", d.method());
+}
+"#;
+
+#[test]
+fn convert_mode_required_const_behind_unsize_vtable_is_a_compile_failure() {
+    // The direct shape, as a control: `&W<u8>` unsizing to
+    // `&dyn Trait` forms the vtable for `W<u8>` itself, so the
+    // collector collects its method and evaluates its failing
+    // required constant (E0080); the crate fails to compile,
+    // exactly as under rustc.
+    let dir = temp_dir("required-const-unsize-vtable");
+    let src = fixture(
+        &dir,
+        "required_const_unsize_vtable.rs",
+        REQUIRED_CONST_UNSIZE_VTABLE_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a failing required constant behind an unsizing cast's \
+         own vtable must fail compilation; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("sparagmos-driver: compilation failed")
+            && stderr.contains("E0080"),
+        "the failure must surface the evaluation error; stderr={stderr}"
+    );
+}

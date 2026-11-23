@@ -1510,17 +1510,16 @@ impl<'tcx> RequiredConstWalk<'tcx> {
                 // unsized to a trait object, whose vtable's method
                 // instances the collector collects. The cast's
                 // operand types are the pointer types (`&Vec<T>`
-                // unsizing to `&dyn Trait`); the collector's tail
-                // search peels them to the pointee types, and the
-                // peel here does the same for references, raw
-                // pointers and boxes. (The collector also finds
-                // the tails of aggregates whose last field unsizes;
-                // a vtable formed that way is reached here through
-                // the constant value carrying it whenever one was
+                // unsizing to `&dyn Trait`); the tails the vtable
+                // is formed for are found by traversing the two
+                // operand types together, the way the collector's
+                // tail search does (see `find_unsize_tails`). (A
+                // vtable formed through the tail of a custom
+                // unsizing struct is reached here through the
+                // constant value carrying it whenever one was
                 // evaluated, and the remaining shapes only narrow
                 // the check.)
-                let source_ty = peel_unsize_source(tcx, source_ty);
-                let target_ty = peel_unsize_source(tcx, target_ty);
+                let (source_ty, target_ty) = find_unsize_tails(tcx, source_ty, target_ty);
                 if target_ty.is_trait() && !source_ty.is_trait() {
                     if let rustc_middle::ty::Dynamic(data, _) = target_ty.kind() {
                         if let Some(principal) = data.principal() {
@@ -1627,29 +1626,83 @@ impl<'tcx> RequiredConstWalk<'tcx> {
     }
 }
 
-/// Peel the pointer layers of an unsizing cast's operand type to
-/// the pointee type the vtable is formed for (references, raw
-/// pointers, boxes), mirroring the first steps of the collector's
-/// `find_tails_for_unsizing`.
-fn peel_unsize_source<'tcx>(
+/// Find the tails of an unsizing cast's operand types the way the
+/// collector's `find_tails_for_unsizing` does: the source and the
+/// target are traversed together, never independently. One pointer
+/// layer (a reference, a raw pointer or a box) is peeled from both
+/// sides at once, and from there the two types descend in lockstep
+/// (see `unsize_lockstep_tails`) for as long as they keep the same
+/// shape, stopping when they diverge — in particular when the
+/// target reaches the trait object. So `&&W<T>` unsizing to
+/// `&dyn Trait` forms the vtable for `&W<T>`: the traversal stops
+/// with the target at `dyn Trait` after peeling one layer.
+/// Peeling each side on its own would strip both source
+/// references and select the implementation for `W<T>` instead.
+fn find_unsize_tails<'tcx>(
     tcx: rustc_middle::ty::TyCtxt<'tcx>,
-    ty: rustc_middle::ty::Ty<'tcx>,
-) -> rustc_middle::ty::Ty<'tcx> {
-    let mut ty = ty;
+    source_ty: rustc_middle::ty::Ty<'tcx>,
+    target_ty: rustc_middle::ty::Ty<'tcx>,
+) -> (rustc_middle::ty::Ty<'tcx>, rustc_middle::ty::Ty<'tcx>) {
+    let pointees = match (source_ty.kind(), target_ty.kind()) {
+        (
+            &rustc_middle::ty::Ref(_, source_pointee, _),
+            &rustc_middle::ty::Ref(_, target_pointee, _)
+            | &rustc_middle::ty::RawPtr(target_pointee, _),
+        )
+        | (
+            &rustc_middle::ty::RawPtr(source_pointee, _),
+            &rustc_middle::ty::RawPtr(target_pointee, _),
+        ) => Some((source_pointee, target_pointee)),
+        _ => match (source_ty.boxed_ty(), target_ty.boxed_ty()) {
+            (Some(source_boxed), Some(target_boxed)) => Some((source_boxed, target_boxed)),
+            _ => None,
+        },
+    };
+    match pointees {
+        Some((source, target)) => unsize_lockstep_tails(tcx, source, target),
+        None => (source_ty, target_ty),
+    }
+}
+
+/// The lockstep half of the tail search (the collector's
+/// `struct_lockstep_tails_for_codegen`): descend both types
+/// through the tail field of a struct both sides instantiate, or
+/// through the last element of equal-length tuples, for as long
+/// as they keep the same shape.
+fn unsize_lockstep_tails<'tcx>(
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    mut source: rustc_middle::ty::Ty<'tcx>,
+    mut target: rustc_middle::ty::Ty<'tcx>,
+) -> (rustc_middle::ty::Ty<'tcx>, rustc_middle::ty::Ty<'tcx>) {
     loop {
-        match ty.kind() {
-            rustc_middle::ty::Ref(_, inner, _) | rustc_middle::ty::RawPtr(inner, _) => {
-                ty = *inner;
-            }
-            rustc_middle::ty::Adt(def, args) if tcx.lang_items().owned_box() == Some(def.did()) => {
-                let Some(inner) = args.iter().next().and_then(|arg| arg.as_type()) else {
-                    return ty;
+        match (source.kind(), target.kind()) {
+            (
+                &rustc_middle::ty::Adt(source_def, source_args),
+                &rustc_middle::ty::Adt(target_def, target_args),
+            ) if source_def == target_def && source_def.is_struct() => {
+                let Some(field) = source_def.non_enum_variant().tail_opt() else {
+                    break;
                 };
-                ty = inner;
+                source = tcx
+                    .normalize_erasing_regions(fully_monomorphized(), field.ty(tcx, source_args));
+                target = tcx
+                    .normalize_erasing_regions(fully_monomorphized(), field.ty(tcx, target_args));
             }
-            _ => return ty,
+            (&rustc_middle::ty::Tuple(source_tys), &rustc_middle::ty::Tuple(target_tys))
+                if source_tys.len() == target_tys.len() =>
+            {
+                let (Some(&source_last), Some(&target_last)) =
+                    (source_tys.last(), target_tys.last())
+                else {
+                    break;
+                };
+                source = source_last;
+                target = target_last;
+            }
+            _ => break,
         }
     }
+    (source, target)
 }
 
 fn required_const_finding(
