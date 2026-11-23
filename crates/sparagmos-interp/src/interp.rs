@@ -18511,7 +18511,36 @@ pub(crate) fn eval_binary(
     // `self >= origin`, an iterator's `end >= ptr`) are stated
     // on the real order.
     if matches!(op, Eq | Ne | Lt | Le | Gt | Ge | Cmp) {
+        let key = |v: &Value| -> Option<(u128, Option<u128>)> {
+            match v {
+                // The null pointer's address is 0, matching an
+                // address-only pointer holding address 0 (the
+                // synthetic range keeps `PtrToInt` of null itself
+                // non-zero, a model choice the comparison relation
+                // does not inherit).
+                Value::Ref(RefTarget::Null) => Some((0, None)),
+                Value::FatRef { len, .. } => addr_of(v).map(|a| (a, Some(*len))),
+                Value::Ref(_) | Value::FnPtr(_) | Value::DynRef { .. } => {
+                    addr_of(v).map(|a| (a, None))
+                }
+                // A non-capturing closure value is a function
+                // pointer; it compares by its body identity.
+                Value::Closure { .. } => addr_of(v).map(|a| (a, None)),
+                _ => None,
+            }
+        };
+        let ka = key(lhs);
+        let kb = key(rhs);
         let structural = if matches!(op, Eq | Ne) {
+            None
+        } else if ka.is_some() && ka == kb {
+            // Address-identical pointers have no position order
+            // between them: the size-aware resolution maps every
+            // element position of a zero-sized sequence to the
+            // shared base address, so those positions compare
+            // equal, as the address comparison below reports.
+            // The structural order decides only between distinct
+            // addresses into one storage.
             None
         } else {
             structural_ptr_order(lhs, rhs).filter(|ord| {
@@ -18536,25 +18565,7 @@ pub(crate) fn eval_binary(
             };
             return Ok((Value::Bool(v), false));
         }
-        let key = |v: &Value| -> Option<(u128, Option<u128>)> {
-            match v {
-                // The null pointer's address is 0, matching an
-                // address-only pointer holding address 0 (the
-                // synthetic range keeps `PtrToInt` of null itself
-                // non-zero, a model choice the comparison relation
-                // does not inherit).
-                Value::Ref(RefTarget::Null) => Some((0, None)),
-                Value::FatRef { len, .. } => addr_of(v).map(|a| (a, Some(*len))),
-                Value::Ref(_) | Value::FnPtr(_) | Value::DynRef { .. } => {
-                    addr_of(v).map(|a| (a, None))
-                }
-                // A non-capturing closure value is a function
-                // pointer; it compares by its body identity.
-                Value::Closure { .. } => addr_of(v).map(|a| (a, None)),
-                _ => None,
-            }
-        };
-        if let (Some(a), Some(b)) = (key(lhs), key(rhs)) {
+        if let (Some(a), Some(b)) = (ka, kb) {
             let ord = a.cmp(&b);
             if op == Cmp {
                 return Ok((ordering_of(ord), false));

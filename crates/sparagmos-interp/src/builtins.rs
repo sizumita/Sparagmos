@@ -8691,7 +8691,16 @@ impl<'a> Interpreter<'a> {
                         fields: Vec::new(),
                     });
                 }
-                Ok(vec_with_len(vec![Value::Uninit; cap], 0, &Value::Uninit))
+                Ok(vec_with_len(
+                    vec![
+                        uninit_elem_value_for_tag(
+                            generic_args.first().map(String::as_str).unwrap_or(""),
+                        );
+                        cap
+                    ],
+                    0,
+                    &Value::Uninit,
+                ))
             }
             Builtin::VecFromElem => {
                 arity(2)?;
