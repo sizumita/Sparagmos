@@ -12648,7 +12648,9 @@ fn value_fingerprint(value: &Value) -> u64 {
     /// Skip `n` items of an arithmetic range state at
     /// `target` in one arithmetic step — the advance the
     /// specialised `nth` / `advance_by` bodies of `Range` and
-    /// `RangeInclusive` perform in core, which the per-item
+    /// `RangeInclusive` perform in core (for `char` ranges the
+    /// distance and the advance both skip the surrogate gap,
+    /// as `range_count`'s length already does), which the per-item
     /// loop cannot reproduce within the step limit for a
     /// large skip. `Ok(Some(true))` when the skip exhausted
     /// the range (the state is left in exactly the form the
@@ -12715,6 +12717,41 @@ fn value_fingerprint(value: &Value) -> u64 {
                 // without touching the fields.
                 return Ok(Some(true));
             }
+            if range_elem_ty(self_ty) == "char" {
+                // A `char` range's bounds are valid chars, so
+                // neither lies in the surrogate gap; a state
+                // that does is not one this arithmetic serves.
+                if (0xD800..0xE000).contains(&start)
+                    || (0xD800..0xE000).contains(&end)
+                {
+                    return Ok(None);
+                }
+                let Some(count) =
+                    range_count(&fields[0], &fields[1], true, "char")?
+                else {
+                    return Ok(None);
+                };
+                if n >= count {
+                    let new_state = rebuild_state(
+                        &state,
+                        vec![
+                            fields[1].clone(),
+                            fields[1].clone(),
+                            Value::Bool(true),
+                        ],
+                    );
+                    self.write_resolved(frames, target, new_state)?;
+                    return Ok(Some(true));
+                }
+                let new_start =
+                    unbits(&fields[0], char_advance(start, n));
+                let new_state = rebuild_state(
+                    &state,
+                    vec![new_start, fields[1].clone(), Value::Bool(false)],
+                );
+                self.write_resolved(frames, target, new_state)?;
+                return Ok(Some(false));
+            }
             // The item count is `diff + 1`.
             let diff = end.wrapping_sub(start);
             if n > diff {
@@ -12761,6 +12798,36 @@ fn value_fingerprint(value: &Value) -> u64 {
                 );
                 self.write_resolved(frames, target, new_state)?;
                 return Ok(Some(true));
+            }
+            if range_elem_ty(self_ty) == "char" {
+                // See the inclusive arm: valid `char` bounds
+                // never lie in the surrogate gap.
+                if (0xD800..0xE000).contains(&start)
+                    || (0xD800..0xE000).contains(&end)
+                {
+                    return Ok(None);
+                }
+                let Some(count) =
+                    range_count(&fields[0], &fields[1], false, "char")?
+                else {
+                    return Ok(None);
+                };
+                if n >= count {
+                    let new_state = rebuild_state(
+                        &state,
+                        vec![fields[1].clone(), fields[1].clone()],
+                    );
+                    self.write_resolved(frames, target, new_state)?;
+                    return Ok(Some(true));
+                }
+                let new_start =
+                    unbits(&fields[0], char_advance(start, n));
+                let new_state = rebuild_state(
+                    &state,
+                    vec![new_start, fields[1].clone()],
+                );
+                self.write_resolved(frames, target, new_state)?;
+                return Ok(Some(false));
             }
             // The item count is `diff`.
             let diff = end.wrapping_sub(start);
@@ -14131,7 +14198,11 @@ fn value_fingerprint(value: &Value) -> u64 {
             } else {
                 match compare_values(&start, &end)? {
                     Ordering::Less => (
-                        vec![increment(&start)?, end, Value::Bool(false)],
+                        vec![
+                            range_increment(&start, range_elem_ty(self_ty))?,
+                            end,
+                            Value::Bool(false),
+                        ],
                         some_value(start),
                     ),
                     Ordering::Equal => (
@@ -14151,7 +14222,10 @@ fn value_fingerprint(value: &Value) -> u64 {
             }
             let (start, end) = (fields[0].clone(), fields[1].clone());
             match compare_values(&start, &end)? {
-                Ordering::Less => (vec![increment(&start)?, end], some_value(start)),
+                Ordering::Less => (
+                    vec![range_increment(&start, range_elem_ty(self_ty))?, end],
+                    some_value(start),
+                ),
                 _ => (fields, none_value()),
             }
         } else if self_ty.starts_with("std::iter::Empty<") {
@@ -19367,7 +19441,11 @@ fn iterator_next_back_state(
             Ordering::Less => (
                 iterator_state_like(
                     state,
-                    vec![start, decrement(&end)?, Value::Bool(false)],
+                    vec![
+                        start,
+                        range_decrement(&end, range_elem_ty(self_ty))?,
+                        Value::Bool(false),
+                    ],
                 ),
                 Some(end),
             ),
@@ -19389,7 +19467,7 @@ fn iterator_next_back_state(
         let (start, end) = (fields[0].clone(), fields[1].clone());
         return Ok(match compare_values(&start, &end)? {
             Ordering::Less => {
-                let new_end = decrement(&end)?;
+                let new_end = range_decrement(&end, range_elem_ty(self_ty))?;
                 (
                     iterator_state_like(state, vec![start, new_end.clone()]),
                     Some(new_end),
@@ -20267,6 +20345,47 @@ fn decrement(value: &Value) -> InterpResult<Value> {
             "integer",
             other.kind_name(),
         )),
+    }
+}
+
+/// One forward step of a range bound in the element type's
+/// own domain: for `char`, the step skips the surrogate gap
+/// [0xD800, 0xE000) — std's `Step` for `char` never lands in
+/// it — and every other element type steps by one.
+fn range_increment(value: &Value, elem: &str) -> InterpResult<Value> {
+    if elem == "char" {
+        return Ok(match increment(value)? {
+            Value::Uint(0xD800) => Value::Uint(0xE000),
+            Value::Int(0xD800) => Value::Int(0xE000),
+            stepped => stepped,
+        });
+    }
+    increment(value)
+}
+
+/// One backward step of a range bound: the mirror of
+/// [`range_increment`].
+fn range_decrement(value: &Value, elem: &str) -> InterpResult<Value> {
+    if elem == "char" {
+        return Ok(match decrement(value)? {
+            Value::Uint(0xDFFF) => Value::Uint(0xD7FF),
+            Value::Int(0xDFFF) => Value::Int(0xD7FF),
+            stepped => stepped,
+        });
+    }
+    decrement(value)
+}
+
+/// The code point `n` valid chars after `start` in a `char`
+/// range: the raw advance plus the surrogate gap's width
+/// when the advance reaches the gap from below it. `start`
+/// is a valid char, so it never lies in the gap itself.
+fn char_advance(start: u128, n: u128) -> u128 {
+    let advanced = start + n;
+    if start < 0xD800 && advanced >= 0xD800 {
+        advanced + 0x800
+    } else {
+        advanced
     }
 }
 

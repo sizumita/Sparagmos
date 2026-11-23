@@ -20536,6 +20536,88 @@ fn run_mode_iterator_nth_range_advances_directly() {
     );
 }
 
+const NTH_CHAR_RANGE_GAP_SRC: &str = r#"
+fn show(tag: &str, v: Option<char>) {
+    match v {
+        Some(c) => println!("{} Some({})", tag, c as u32),
+        None => println!("{} None", tag),
+    }
+}
+
+fn main() {
+    // The Codex repro: skipping one item of '\u{d7ff}'..'\u{e001}'
+    // must land on '\u{e000}', not on the surrogate 0xD800.
+    show("codex", ('\u{d7ff}'..'\u{e001}').nth(1));
+    show("nth0", ('\u{d7ff}'..'\u{e001}').nth(0));
+    // Exactly the range length (2) and beyond it: no element.
+    show("nth-len", ('\u{d7ff}'..'\u{e001}').nth(2));
+    show("nth-over", ('\u{d7ff}'..'\u{e001}').nth(3));
+    // A range whose raw span crosses the whole gap but holds
+    // one element: '\u{d7ff}'..'\u{e000}'.
+    show("gap1-nth0", ('\u{d7ff}'..'\u{e000}').nth(0));
+    show("gap1-nth1", ('\u{d7ff}'..'\u{e000}').nth(1));
+    // Crossing the gap with a wider skip.
+    show("wide", ('\u{d7f0}'..'\u{e010}').nth(17));
+    // Starting above the gap.
+    show("above", ('\u{e000}'..'\u{e003}').nth(1));
+    // Inclusive ranges across the gap.
+    show("incl-nth1", ('\u{d7ff}'..='\u{e000}').nth(1));
+    show("incl-nth-len", ('\u{d7ff}'..='\u{e000}').nth(2));
+    show("incl-single", ('\u{d7ff}'..='\u{d7ff}').nth(0));
+    show("incl-single-over", ('\u{d7ff}'..='\u{d7ff}').nth(1));
+    // An inclusive range exhausted by a skip stays exhausted
+    // from both ends.
+    let mut ri = '\u{d7ff}'..='\u{e000}';
+    show("incl-exh-nth", ri.nth(5));
+    show("incl-exh-next", ri.next());
+    show("incl-exh-back", ri.next_back());
+    // A skip that lands just below the gap: the item `nth`
+    // returns is '\u{d7ff}', and the following step crosses
+    // the gap.
+    let mut r = '\u{d7fe}'..'\u{e001}';
+    show("land-below", r.nth(1));
+    show("after-nth", r.next());
+    show("after-nth2", r.next());
+    // A skip past the end leaves an exclusive range exhausted.
+    let mut ro = 'a'..'c';
+    show("over-nth", ro.nth(2));
+    show("over-next", ro.next());
+    // Plain char ranges are unchanged.
+    show("normal", ('a'..'f').nth(3));
+    show("normal-incl", ('a'..='f').nth(5));
+    show("normal-incl-over", ('a'..='f').nth(6));
+    // Forward and backward per-item steps cross the gap too.
+    let fwd: Vec<u32> = ('\u{d7ff}'..'\u{e001}').map(|c| c as u32).collect();
+    println!("fwd {:?}", fwd);
+    let back: Vec<u32> = ('\u{d7ff}'..'\u{e001}').rev().map(|c| c as u32).collect();
+    println!("back {:?}", back);
+    let incl: Vec<u32> = ('\u{d7fe}'..='\u{e000}').map(|c| c as u32).collect();
+    println!("incl {:?}", incl);
+    // A large char skip still advances in one step.
+    show("big", ('\0'..='\u{10ffff}').nth(1_000_000));
+}
+"#;
+
+#[test]
+fn run_mode_iterator_nth_char_range_surrogate_gap() {
+    // `nth` on a `Range<char>` / `RangeInclusive<char>`:
+    // the one-step advance and the range's length must both
+    // skip the surrogate gap [0xD800, 0xE000), as
+    // `range_count`'s length already did — the raw
+    // code-point arithmetic returned the invalid char
+    // 0xD800 for ('\u{d7ff}'..'\u{e001}').nth(1) and
+    // served elements past the end of gap-crossing ranges
+    // whose raw span overstates their length. The per-item
+    // steps share the same arithmetic, so the sequences
+    // after a skip (and plain collect / rev) cross the gap
+    // the same way.
+    run_ok(
+        "iterator-nth-char-range-surrogate-gap",
+        NTH_CHAR_RANGE_GAP_SRC,
+        "codex Some(57344)\nnth0 Some(55295)\nnth-len None\nnth-over None\ngap1-nth0 Some(55295)\ngap1-nth1 None\nwide Some(57345)\nabove Some(57345)\nincl-nth1 Some(57344)\nincl-nth-len None\nincl-single Some(55295)\nincl-single-over None\nincl-exh-nth None\nincl-exh-next None\nincl-exh-back None\nland-below Some(55295)\nafter-nth Some(57344)\nafter-nth2 None\nover-nth None\nover-next None\nnormal Some(100)\nnormal-incl Some(102)\nnormal-incl-over None\nfwd [55295, 57344]\nback [57344, 55295]\nincl [55294, 55295, 57344]\nbig Some(1002048)\n",
+    );
+}
+
 const ITER_MUT_RAW_PARTS_SRC: &str = r#"
 use std::slice;
 
