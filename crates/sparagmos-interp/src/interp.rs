@@ -4615,9 +4615,19 @@ impl<'a> Interpreter<'a> {
                             if *len > elems.len() as u128
                                 && !matches!(&*elem, P::Trivial)
                             {
+                                // The representative only judges
+                                // the plan for the tail: the slots
+                                // past the stored prefix were never
+                                // stored at all, so an elided-store
+                                // rescue must not fire for them —
+                                // judge with the element plan itself.
+                                let judge = match &*elem {
+                                    P::Elided { plan, .. } => (**plan).clone(),
+                                    e => e.clone(),
+                                };
                                 let mut sub = path.clone();
                                 sub.push(RefProj::Field(elems.len()));
-                                active.work.push((sub, (*elem).clone()));
+                                active.work.push((sub, judge));
                             }
                             continue;
                         }
@@ -4640,6 +4650,32 @@ impl<'a> Interpreter<'a> {
                                 RefProj::Index(i)
                             });
                             active.work.push((sub, (*elem).clone()));
+                        }
+                    }
+                    P::Elided { value, plan } => {
+                        match self.read_at(frames, &active.root, &path)? {
+                            Some(_) => {
+                                active.work.push((path, *plan));
+                            }
+                            None => {
+                                // The slot reads uninitialised, but
+                                // it is a live sequence element whose
+                                // type has this one value: its store
+                                // was elided, so the element is
+                                // `value` itself. Run the plan
+                                // against it in a nested session
+                                // rooted at the value, the way a
+                                // `mem::drop` of a constant argument
+                                // runs its glue.
+                                let nested = GlueSession {
+                                    root: RefTarget::value(value),
+                                    work: vec![(Vec::new(), *plan)],
+                                    adts: active.adts.clone(),
+                                    completion: GlueCompletion::Resume,
+                                };
+                                suspended.push(std::mem::replace(&mut active, nested));
+                                continue 'sessions;
+                            }
                         }
                     }
                     P::Variants { variants } => {

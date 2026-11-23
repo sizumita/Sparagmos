@@ -1024,6 +1024,24 @@ pub enum DropPlan {
     /// Run `elem` against every element of the array / tuple / `Vec`
     /// value this plan applies to, in index order.
     Each { elem: Box<DropPlan> },
+    /// The glue of one sequence element (an array / slice / `Vec`
+    /// element) whose type has a single value, `value`. The store
+    /// of a zero-sized element is elided in MIR, so a live element
+    /// slot can hold `Uninit` although the element is initialised:
+    /// a sequence's slots are live for exactly the sequence's
+    /// extent — elements leave only through operations that shrink
+    /// the sequence itself — so an uninitialised read at this
+    /// position denotes an elided store, never a move-out.
+    /// Execution runs `plan` against the stored value when one is
+    /// stored, and against `value` (the type's only value) when
+    /// the slot reads uninitialised. Field positions deliberately
+    /// have no such plan: a field slot that reads uninitialised
+    /// was moved out of, as rustc's drop flags say, and a
+    /// coroutine's saved fields rely on exactly that reading.
+    Elided {
+        value: Value,
+        plan: Box<DropPlan>,
+    },
     /// Run `fields[i]` against field `i` of the tuple / ADT value
     /// this plan applies to, in field order. `complete` records that
     /// conversion proved the plan covers every field the value can

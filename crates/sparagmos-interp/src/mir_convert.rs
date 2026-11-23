@@ -900,6 +900,7 @@ fn glue_calls_dtor(glue: &ir::DropGlue, key: &str) -> bool {
             P::Seq(plans) => plans.iter().any(|p| walk(p, glue, key, seen)),
             P::At { plan, .. } => walk(plan, glue, key, seen),
             P::Each { elem } => walk(elem, glue, key, seen),
+            P::Elided { plan, .. } => walk(plan, glue, key, seen),
             P::Fields { fields, .. } => {
                 fields.iter().any(|p| walk(p, glue, key, seen))
             }
@@ -962,6 +963,7 @@ fn drop_glue_edges<'a>(glue: &'a ir::DropGlue, targets: &mut Vec<&'a str>) -> bo
                 true
             }
             ir::DropPlan::Each { elem } => walk(elem, adts, targets, seen),
+            ir::DropPlan::Elided { plan, .. } => walk(plan, adts, targets, seen),
             ir::DropPlan::Fields { fields, .. } => {
                 fields.iter().all(|p| walk(p, adts, targets, seen))
             }
@@ -9198,12 +9200,16 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                 }
                 Some(collapse_fields(fields, true))
             }
-            mir::Ty::Array(elem, _) | mir::Ty::Slice(elem) => match self.plan(elem)? {
-                P::Trivial => Some(P::Trivial),
-                elem_plan => Some(P::Each {
-                    elem: Box::new(elem_plan),
-                }),
-            },
+            mir::Ty::Array(elem, _) | mir::Ty::Slice(elem) => {
+                let elem_plan = self.plan(elem)?;
+                let elem_plan = self.elided_elem_plan(elem, elem_plan);
+                match elem_plan {
+                    P::Trivial => Some(P::Trivial),
+                    elem_plan => Some(P::Each {
+                        elem: Box::new(elem_plan),
+                    }),
+                }
+            }
             mir::Ty::Closure(_, args) => {
                 // A closure's glue is its captures' glue: the last
                 // generic argument is the capture tuple. Anything
@@ -9293,6 +9299,28 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
         }
     }
 
+    /// The drop plan of one sequence element (of an array, a
+    /// slice or a `Vec`), wrapped so the glue of an element whose
+    /// store MIR elided still runs: when the element type has a
+    /// single value, the plan becomes [`ir::DropPlan::Elided`]
+    /// carrying that value. An element type with many values
+    /// keeps its plain plan — an uninitialised slot of such a
+    /// type in a live sequence is not a state this builder
+    /// accounts for, and the read rules keep judging it.
+    fn elided_elem_plan(&mut self, elem_ty: &mir::Ty, plan: ir::DropPlan) -> ir::DropPlan {
+        use ir::DropPlan as P;
+        match plan {
+            P::Trivial => P::Trivial,
+            plan => match self.conv.zst_value(elem_ty, 0) {
+                Some(value) => P::Elided {
+                    value,
+                    plan: Box::new(plan),
+                },
+                None => plan,
+            },
+        }
+    }
+
     fn adt_plan(&mut self, def: mir::DefId, args: &[mir::Ty]) -> Option<ir::DropPlan> {
         use ir::DropPlan as P;
         let conv = self.conv;
@@ -9368,7 +9396,9 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                 return Some(at_field0(inner));
             }
             "std::vec::Vec" => {
-                let elem = self.plan(args.first()?)?;
+                let elem_ty = args.first()?;
+                let elem = self.plan(elem_ty)?;
+                let elem = self.elided_elem_plan(elem_ty, elem);
                 return Some(match elem {
                     P::Trivial => P::Trivial,
                     e => P::Each { elem: Box::new(e) },
@@ -10108,7 +10138,7 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                 plans.push(P::Trivial);
                 continue;
             }
-            plans.push(self.one_variant_fields(def, args, v)?);
+            plans.push(self.one_variant_fields(def, args, v, false)?);
         }
         // When the driver recorded the instance's storage-slot
         // map, the conversion rewrote the body's state-field
@@ -10173,7 +10203,7 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                 plans.push(P::Unknown);
                 continue;
             }
-            plans.push(self.one_variant_fields(def, args, v)?);
+            plans.push(self.one_variant_fields(def, args, v, true)?);
         }
         if plans.len() == 1 {
             Some(plans.pop().expect("one variant"))
@@ -10182,16 +10212,28 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
         }
     }
 
-    /// The field glue of one variant of one ADT.
+    /// The field glue of one variant of one ADT. With
+    /// `shape_fallback`, the driver's shape table — which declares
+    /// every field of the variant with its type — fills in what
+    /// the program's evidence misses. Evidence alone misses a
+    /// variant that is only ever built as a constant: a
+    /// zero-sized value's construction is a constant in MIR, so
+    /// no aggregate statement records its field count and no
+    /// projection records its fields' types, and the variant's
+    /// fields' glue would be planned as nothing at all. Coroutine
+    /// states pass `false`: their fields are evidence-based by
+    /// design, since a saved field can be moved out of before the
+    /// state is dropped.
     fn one_variant_fields(
         &mut self,
         def: mir::DefId,
         args: &[mir::Ty],
         variant: u32,
+        shape_fallback: bool,
     ) -> Option<ir::DropPlan> {
         let conv = self.conv;
         let count = conv.adt_aggregates.get(def, args, variant);
-        let field_count = match count {
+        let evidence_count = match count {
             Some(n) => n,
             None => conv
                 .adt_fields
@@ -10204,6 +10246,13 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                 .max()
                 .unwrap_or(0),
         };
+        let shape_fields = if shape_fallback {
+            conv.instantiated_field_tys(&def, args, variant)
+        } else {
+            None
+        };
+        let field_count =
+            evidence_count.max(shape_fields.as_ref().map_or(0, |tys| tys.len()));
         let mut fields = Vec::with_capacity(field_count);
         for f in 0..field_count as u32 {
             match conv.adt_fields.get(def, args, variant, f) {
@@ -10211,16 +10260,36 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                     let ty = ty.clone();
                     fields.push(self.plan(&ty)?);
                 }
-                None => {
-                    // No projection anywhere records this field's
-                    // type (it is only ever written, e.g. by an
-                    // aggregate with a literal). Its glue is judged
-                    // by the value's own shape at run time.
-                    fields.push(ir::DropPlan::Untyped);
-                }
+                None => match shape_fields
+                    .as_ref()
+                    .and_then(|tys| tys.get(f as usize))
+                {
+                    Some(ty) => {
+                        let ty = ty.clone();
+                        // A field only the shape accounts for:
+                        // plan its glue from the declared type. A
+                        // part the builder cannot account for keeps
+                        // the runtime judgment an unrecorded field
+                        // gets, rather than failing the whole glue.
+                        fields.push(
+                            self.plan(&ty).unwrap_or(ir::DropPlan::Untyped),
+                        );
+                    }
+                    None => {
+                        // No projection anywhere records this
+                        // field's type (it is only ever written,
+                        // e.g. by an aggregate with a literal). Its
+                        // glue is judged by the value's own shape
+                        // at run time.
+                        fields.push(ir::DropPlan::Untyped);
+                    }
+                },
             }
         }
-        Some(collapse_fields(fields, count.is_some()))
+        Some(collapse_fields(
+            fields,
+            count.is_some() || shape_fields.is_some(),
+        ))
     }
 }
 

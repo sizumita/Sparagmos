@@ -19209,3 +19209,77 @@ fn run_mode_zip_double_ended() {
         "the back step drops the longer side's unpaired excess first"
     );
 }
+
+
+// ----- Zero-sized Vec elements' destructors (Lane MH) -------------------------
+
+const ZST_VEC_SRC: &str = r#"
+struct DropMe;
+impl Drop for DropMe { fn drop(&mut self) { println!("drop"); } }
+fn main() {
+    let v = vec![DropMe, DropMe];
+    drop(v);
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_vec_of_zero_sized_elements_drops_them() {
+    // A zero-sized element's store is elided in MIR, so the Vec's
+    // value holds uninitialised slots for live elements; their
+    // destructors still run, once each, as natively.
+    let dir = temp_dir("zstvec");
+    let src = fixture(&dir, "zstvec.rs", ZST_VEC_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "vec! of zero-sized elements must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "drop\ndrop\ndone\n",
+        "both elided elements' destructors run at the Vec's drop"
+    );
+}
+
+const ZST_ENUM_VEC_SRC: &str = r#"
+struct DropMe;
+impl Drop for DropMe { fn drop(&mut self) { println!("drop"); } }
+enum Never {}
+enum CS { Yielded(Never), Complete(DropMe) }
+fn main() {
+    let v = vec![CS::Complete(DropMe)];
+    drop(v);
+    let mut v2: Vec<CS> = Vec::new();
+    v2.push(CS::Complete(DropMe));
+    drop(v2);
+    let x = CS::Complete(DropMe);
+    drop(x);
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_vec_of_zero_sized_enum_elements_drops_them() {
+    // The element type here is zero-sized with a single
+    // inhabitant, so its values are built as constants: no
+    // aggregate statement records the variant's field, yet the
+    // field's destructor runs — for vec! elements, for pushed
+    // elements and for a plain local alike.
+    let dir = temp_dir("zstenumvec");
+    let src = fixture(&dir, "zstenumvec.rs", ZST_ENUM_VEC_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "zero-sized enum element program must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "drop\ndrop\ndrop\ndone\n",
+        "the constant-built elements' and local's destructors all run"
+    );
+}

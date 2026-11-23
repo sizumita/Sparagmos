@@ -410,12 +410,15 @@ fn repeat_of_moved_array_replicates() {
 // ----- typed ZST constants under drop glue -----------------------------------
 //
 // A field written only by a constant operand has no recorded type
-// anywhere (the aggregate scan records field types for place
-// operands only), so its drop plan is `Untyped` and the glue
-// judges the value by shape. A fieldless enum value — which the
-// typed zero-sized constants of group B produce where an untyped
-// unit used to sit — has no contents and must pass; an enum value
-// with a payload must stay an explicit error.
+// in the evidence tables (the aggregate scan records field types
+// for place operands only). Where the driver's shape table
+// declares the field's type, the glue is planned from the
+// declared type like any other field's. A field no table accounts
+// for keeps an `Untyped` plan, judged by the value's shape: a
+// fieldless enum value — which the typed zero-sized constants of
+// group B produce where an untyped unit used to sit — has no
+// contents and must pass; an enum value with a payload must stay
+// an explicit error.
 
 const FIELDLESS: mir::DefId = mir::DefId::new(0, 55);
 const RAW_T: mir::DefId = mir::DefId::new(0, 56);
@@ -492,11 +495,12 @@ fn drop_of_fieldless_enum_field_from_const() {
     assert_eq!(value, Value::Int(7));
 }
 
-/// The conservative half of the rule stays: an enum value WITH a
-/// payload under an untyped plan might hide a destructor in its
-/// contents, so the drop is still an explicit error.
+/// With the field's type declared in the shape table, the drop
+/// is planned from the declared types: the payload here is a
+/// plain string, which has no destructor, so the drop runs (a
+/// native no-op) instead of being judged untyped.
 #[test]
-fn drop_of_payload_enum_field_from_const_still_errors() {
+fn drop_of_payload_enum_field_from_const_with_declared_shape() {
     let main = mir::Body::new(
         decls(&[i32_ty(), adt_ty(RAW_P)]),
         0,
@@ -535,6 +539,42 @@ fn drop_of_payload_enum_field_from_const_still_errors() {
             vec![vec![adt_ty(PAYLOAD_ENUM)]],
         ),
     );
+    prog.add("probe::main", main);
+    let value = interpret_mir(&prog, "probe::main", Vec::new()).expect("main runs");
+    assert_eq!(value, Value::Int(7));
+}
+
+/// The conservative half of the rule stays: when the field's
+/// type is declared nowhere — here neither ADT has a shape
+/// entry — the field keeps an untyped plan, and an enum value
+/// WITH a payload under an untyped plan might hide a destructor
+/// in its contents, so the drop is still an explicit error.
+#[test]
+fn drop_of_payload_enum_field_from_const_still_errors() {
+    let main = mir::Body::new(
+        decls(&[i32_ty(), adt_ty(RAW_P)]),
+        0,
+        vec![
+            block(
+                vec![assign(
+                    place(1),
+                    adt_aggregate(
+                        RAW_P,
+                        vec![adt_const(
+                            0,
+                            vec![mir::ConstValue::Str("x".to_string())],
+                        )],
+                    ),
+                )],
+                drop_term(1, 1),
+            ),
+            block(vec![assign(place(0), mir::Rvalue::Use(const_i32(7)))], ret()),
+        ],
+    );
+    let mut prog = MirProgram::new();
+    prog.fn_names
+        .insert(PAYLOAD_ENUM, "probe::E".to_string());
+    prog.fn_names.insert(RAW_P, "probe::RawP".to_string());
     prog.add("probe::main", main);
     let err = interpret_mir(&prog, "probe::main", Vec::new()).expect_err("payload drop must fail");
     assert!(
