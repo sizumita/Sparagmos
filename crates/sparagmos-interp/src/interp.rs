@@ -51,7 +51,10 @@ pub struct InterpConfig {
     /// invoked as. The driver sets it to the source path it was
     /// handed (the stand-in for the compiled binary's path: a
     /// natively built test binary is invoked by its own path, and
-    /// the source path is the corresponding name in this model).
+    /// the source path is the corresponding name in this model),
+    /// or to the invocation name it was given separately when it
+    /// reconstructs a run under another name (an artifact run:
+    /// the name the recipe invoked the built binary under).
     /// Empty when no invocation path is known; `env::args` then
     /// yields just the guest arguments.
     pub program_path: String,

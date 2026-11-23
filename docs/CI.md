@@ -117,16 +117,27 @@ denominator. Runs on every push to `main` and on manual dispatch.
 - Inside a stage-3 recipe run, the driver's tool interception
   answers the recipe's compiler invocations with its own
   conversion machinery and records each produced artifact
-  (path, source, edition, crate type, and the library bindings
-  and compilation options the producing invocation carried),
+  (path, source and its bytes, edition, crate type, the
+  library bindings and compilation options the producing
+  invocation carried, and the environment it ran under),
   leaving a placeholder file
   at the artifact's path -- executable, for a binary -- so the
   recipe's file and spawn checks find it. When the recipe then
   executes a binary it produced earlier in the same run, the
-  interception answers that too: the recorded source is run
+  interception answers that too: the recorded program is run
   through the driver in run mode with the recorded bindings
   and options and the recipe's arguments, and the fabricated process
-  outcome is the interpreter's exit code and output. This is a
+  outcome is the interpreter's exit code and output. The run
+  is reconstructed from the producing invocation, not from
+  the file system as it later stands: the conversion reads
+  the recorded source (or its recorded bytes, once the
+  recipe has rewritten or deleted the file), the program's
+  argv[0] is the name the recipe invoked it under, the
+  re-conversion runs under the producing invocation's
+  compilation environment (so `option_env!` and its kin see
+  the build's values), and the program itself runs under
+  the environment its invocation carried, applied as a
+  complete assignment once the conversion is done. This is a
   deliberate reading of "execute the built binary": what is
   judged is the program's input/output behaviour under
   interpretation, not native code generation -- the category

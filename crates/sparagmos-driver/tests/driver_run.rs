@@ -21645,6 +21645,123 @@ fn main() {
         "before panic\nthread 'main' panicked: artifact boom\n"
     );
 
+    // The built program's argv[0] is the name it was
+    // invoked under, not the source path the run is
+    // reconstructed from.
+    build(
+        &rustc,
+        "argvprobe",
+        "fn main() { println!(\"argv0={}\", std::env::args().next().unwrap()); }\n",
+        &[],
+    );
+    let expect0 = dir.join("argvprobe");
+    let out = Command::new(&expect0).output().unwrap();
+    assert!(out.status.success(), "running argvprobe failed");
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        format!("argv0={}\n", expect0.display())
+    );
+
+    // The compilation environment and the run environment
+    // are kept apart: `option_env!` sees the value the
+    // build was invoked with, the program's own `env::var`
+    // sees the value it was invoked with, and a variable
+    // set only for the build does not leak into the run.
+    std::fs::write(
+        "envprobe.rs",
+        "fn main() { println!(\"baked={:?} runtime={:?} leak={:?}\", option_env!(\"BUILD_VALUE\"), std::env::var(\"BUILD_VALUE\").unwrap_or_default(), std::env::var(\"BUILD_ONLY\").ok()); }\n",
+    )
+    .unwrap();
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--out-dir")
+        .arg(".")
+        .arg("envprobe.rs")
+        .env("BUILD_VALUE", "old")
+        .env("BUILD_ONLY", "build-secret")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "envprobe build failed");
+    let out = Command::new(dir.join("envprobe"))
+        .env("BUILD_VALUE", "new")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "running envprobe failed");
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "baked=Some(\"old\") runtime=\"new\" leak=None\n"
+    );
+
+    // A built binary denotes the source its build
+    // converted: rewriting the source afterwards does not
+    // change what an earlier artifact runs, and deleting
+    // the source does not orphan it.
+    std::fs::write("ver.rs", "fn main() { println!(\"version 1\"); }\n").unwrap();
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--out-dir")
+        .arg(".")
+        .arg("-o")
+        .arg("ver1")
+        .arg("ver.rs")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "ver1 build failed");
+    std::fs::write("ver.rs", "fn main() { println!(\"version 2\"); }\n").unwrap();
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--out-dir")
+        .arg(".")
+        .arg("-o")
+        .arg("ver2")
+        .arg("ver.rs")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "ver2 build failed");
+    let out = Command::new(dir.join("ver1")).output().unwrap();
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "version 1\n");
+    let out = Command::new(dir.join("ver2")).output().unwrap();
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "version 2\n");
+    build(&rustc, "gone", "fn main() { println!(\"still here\"); }\n", &[]);
+    std::fs::remove_file("gone.rs").unwrap();
+    let out = Command::new(dir.join("gone")).output().unwrap();
+    assert!(out.status.success(), "running gone failed");
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "still here\n");
+
+    // The same holds for a library the binary was built
+    // against: the library's recorded source, not the
+    // file as it later stands, is what the binary's run
+    // converts.
+    std::fs::write("libv.rs", "pub fn f() -> u32 { 1 }\n").unwrap();
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--crate-type=rlib")
+        .arg("--out-dir")
+        .arg(".")
+        .arg("libv.rs")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "libv build failed");
+    std::fs::write(
+        "useslib.rs",
+        "extern crate libv; fn main() { println!(\"lib says {}\", libv::f()); }\n",
+    )
+    .unwrap();
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--extern")
+        .arg("libv=liblibv.rlib")
+        .arg("--out-dir")
+        .arg(".")
+        .arg("useslib.rs")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "useslib build failed");
+    std::fs::write("libv.rs", "pub fn f() -> u32 { 2 }\n").unwrap();
+    let out = Command::new(dir.join("useslib")).output().unwrap();
+    assert!(out.status.success(), "running useslib failed");
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "lib says 1\n");
+
     println!("artifact fidelity guest ok");
 }
 "#;

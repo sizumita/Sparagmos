@@ -5697,8 +5697,24 @@ fn session_overflow_checks(args: &[String]) -> bool {
 struct ToolArtifact {
     name: String,
     source: std::path::PathBuf,
+    /// The source's bytes as they stood when the producing
+    /// invocation converted them: a recipe may rewrite or
+    /// delete the source file after building, and a later run
+    /// of the artifact must still execute the program its
+    /// build produced (see `ToolRegistry::effective_source`).
+    source_snapshot: Vec<u8>,
     edition: Option<String>,
     crate_type: Option<String>,
+    /// The compilation environment the producing invocation
+    /// ran under (its request's environment assignments and
+    /// clear flag): what a later run of the artifact (see
+    /// `artifact_run`) spawns its re-conversion with, so
+    /// compile-time environment reads (`option_env!`, `env!`)
+    /// see the values the build saw, while the interpreted
+    /// program itself runs under the execution request's
+    /// environment.
+    compile_env_clear: bool,
+    compile_envs: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     /// The `--aux` specs the producing invocation itself
     /// carried (its `--extern` bindings, already translated):
     /// what a later run of the artifact (see `artifact_run`)
@@ -5723,6 +5739,29 @@ struct ToolArtifact {
 #[derive(Default)]
 struct ToolRegistry {
     entries: std::sync::Mutex<Vec<(std::path::PathBuf, ToolArtifact)>>,
+    /// Source snapshots materialised to files, keyed by the
+    /// artifact's recorded source path, with the snapshot's
+    /// content hash: a rebuilt artifact at the same path with
+    /// different bytes gets a different file.
+    snapshot_files:
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (u64, std::path::PathBuf)>>,
+}
+
+/// A detached copy of one recorded artifact: the registry
+/// hands these out, so a caller can hold an artifact while
+/// the registry keeps accepting records.
+fn cloned_artifact(a: &ToolArtifact) -> ToolArtifact {
+    ToolArtifact {
+        name: a.name.clone(),
+        source: a.source.clone(),
+        source_snapshot: a.source_snapshot.clone(),
+        edition: a.edition.clone(),
+        crate_type: a.crate_type.clone(),
+        compile_env_clear: a.compile_env_clear,
+        compile_envs: a.compile_envs.clone(),
+        aux_specs: a.aux_specs.clone(),
+        rustc_args: a.rustc_args.clone(),
+    }
 }
 
 impl ToolRegistry {
@@ -5732,14 +5771,79 @@ impl ToolRegistry {
             .unwrap()
             .iter()
             .find(|(p, _)| p == path)
-            .map(|(_, a)| ToolArtifact {
-                name: a.name.clone(),
-                source: a.source.clone(),
-                edition: a.edition.clone(),
-                crate_type: a.crate_type.clone(),
-                aux_specs: a.aux_specs.clone(),
-                rustc_args: a.rustc_args.clone(),
-            })
+            .map(|(_, a)| cloned_artifact(a))
+    }
+
+    /// The source a conversion of `artifact` must read: the
+    /// recorded path itself while the file still holds the
+    /// bytes the build converted (the common case, and the
+    /// one whose `file!` spellings stay the build's), and a
+    /// materialised snapshot of the recorded bytes once the
+    /// recipe has rewritten or deleted the file.
+    fn effective_source(&self, artifact: &ToolArtifact) -> std::path::PathBuf {
+        if std::fs::read(&artifact.source).is_ok_and(|bytes| bytes == artifact.source_snapshot) {
+            return artifact.source.clone();
+        }
+        use std::hash::Hasher as _;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        hasher.write(&artifact.source_snapshot);
+        let hash = hasher.finish();
+        let mut files = self.snapshot_files.lock().unwrap();
+        if let Some((h, path)) = files.get(&artifact.source) {
+            if *h == hash {
+                return path.clone();
+            }
+        }
+        let dir = std::env::temp_dir()
+            .join(format!("sparagmos-artifact-sources-{}", std::process::id()));
+        let file_name = artifact
+            .source
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "source.rs".to_string());
+        let path = dir.join(format!("{hash:016x}-{file_name}"));
+        if std::fs::create_dir_all(&dir).is_ok() {
+            let _ = std::fs::write(&path, &artifact.source_snapshot);
+        }
+        files.insert(artifact.source.clone(), (hash, path.clone()));
+        path
+    }
+
+    /// The recorded artifact whose build converted the
+    /// source at `path`, if any: `--aux` specs name artifacts
+    /// by their source path, where the registry's keys are
+    /// the artifact paths themselves.
+    fn get_by_source(&self, path: &std::path::Path) -> Option<ToolArtifact> {
+        self.entries
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, a)| a.source == path)
+            .map(|(_, a)| cloned_artifact(a))
+    }
+
+    /// One recorded `--aux` spec with its source path routed
+    /// through `effective_source`: the spec keeps the recorded
+    /// name and attributes, but the conversion it feeds reads
+    /// the bytes the named artifact's build converted.
+    fn effective_aux_spec(&self, spec: &str) -> String {
+        let Some((name, rest)) = spec.split_once('=') else {
+            return spec.to_string();
+        };
+        let (path, attrs) = match rest.split_once(';') {
+            Some((p, a)) => (p, format!(";{a}")),
+            None => (rest, String::new()),
+        };
+        match self.get_by_source(std::path::Path::new(path)) {
+            Some(art) => {
+                format!("{}={}{}", name, self.effective_source(&art).display(), attrs)
+            }
+            None => spec.to_string(),
+        }
+    }
+
+    fn effective_aux_specs(&self, specs: &[String]) -> Vec<String> {
+        specs.iter().map(|s| self.effective_aux_spec(s)).collect()
     }
 
     fn record(&self, path: std::path::PathBuf, artifact: ToolArtifact) {
@@ -5756,19 +5860,7 @@ impl ToolRegistry {
             .lock()
             .unwrap()
             .iter()
-            .map(|(p, a)| {
-                (
-                    p.clone(),
-                    ToolArtifact {
-                        name: a.name.clone(),
-                        source: a.source.clone(),
-                        edition: a.edition.clone(),
-                        crate_type: a.crate_type.clone(),
-                        aux_specs: a.aux_specs.clone(),
-                        rustc_args: a.rustc_args.clone(),
-                    },
-                )
-            })
+            .map(|(p, a)| (p.clone(), cloned_artifact(a)))
             .collect()
     }
 }
@@ -5843,7 +5935,8 @@ fn run_convert_subprocess(
     exe: &std::path::Path,
     tail: &[String],
     cwd: &std::path::Path,
-    request: &sparagmos_interp::ToolRunRequest,
+    env_clear: bool,
+    envs: &[(Vec<u8>, Option<Vec<u8>>)],
 ) -> Result<(i32, Vec<u8>, Vec<u8>), String> {
     use std::io::Read as _;
     use std::os::unix::ffi::OsStrExt as _;
@@ -5852,10 +5945,10 @@ fn run_convert_subprocess(
         .current_dir(cwd)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    if request.env_clear {
+    if env_clear {
         cmd.env_clear();
     }
-    for (key, value) in &request.envs {
+    for (key, value) in envs {
         match value {
             Some(v) => {
                 cmd.env(
@@ -5908,6 +6001,77 @@ fn run_convert_subprocess(
     let stdout = out_thread.join().unwrap_or_default();
     let stderr = err_thread.join().unwrap_or_default();
     Ok((status.code().unwrap_or(101), stdout, stderr))
+}
+
+/// Write one complete environment assignment (the environment
+/// an interpreted program is to run under, as `artifact_run`
+/// computed it from the execution request) to `path`, in the
+/// length-prefixed binary form `read_guest_env_file` reads:
+/// a sequence of key/value records, each two u32-LE-length-
+/// prefixed byte strings. The assignment is complete, not a
+/// delta: the reader replaces its whole environment with it,
+/// so no variable from the conversion's environment can leak
+/// into the program's.
+fn write_guest_env_file(
+    path: &std::path::Path,
+    env: &[(Vec<u8>, Vec<u8>)],
+) -> std::io::Result<()> {
+    let mut buf = Vec::new();
+    for (key, value) in env {
+        buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        buf.extend_from_slice(key);
+        buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        buf.extend_from_slice(value);
+    }
+    std::fs::write(path, buf)
+}
+
+/// Read back a file `write_guest_env_file` wrote.
+fn read_guest_env_file(path: &std::path::Path) -> std::io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let buf = std::fs::read(path)?;
+    let mut env = Vec::new();
+    let mut at = 0usize;
+    let take = |buf: &[u8], at: &mut usize| -> std::io::Result<Vec<u8>> {
+        let len = |buf: &[u8], at: &mut usize| -> std::io::Result<usize> {
+            let bytes = buf.get(*at..*at + 4).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "truncated env file")
+            })?;
+            *at += 4;
+            Ok(u32::from_le_bytes(bytes.try_into().unwrap()) as usize)
+        };
+        let n = len(buf, at)?;
+        let bytes = buf.get(*at..*at + n).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "truncated env file")
+        })?;
+        *at += n;
+        Ok(bytes.to_vec())
+    };
+    while at < buf.len() {
+        let key = take(&buf, &mut at)?;
+        let value = take(&buf, &mut at)?;
+        env.push((key, value));
+    }
+    Ok(env)
+}
+
+/// Replace this process's environment with the complete
+/// assignment `env`: the run entry point applies the guest
+/// environment file with this after the conversion is done,
+/// so the interpreted program's environment reads (which the
+/// interpreter answers from the host environment) see the
+/// environment the program was invoked with, not the one its
+/// source was converted under.
+fn apply_guest_env(env: &[(Vec<u8>, Vec<u8>)]) {
+    use std::os::unix::ffi::OsStrExt as _;
+    for (key, _) in std::env::vars_os() {
+        std::env::remove_var(&key);
+    }
+    for (key, value) in env {
+        std::env::set_var(
+            std::ffi::OsStr::from_bytes(key),
+            std::ffi::OsStr::from_bytes(value),
+        );
+    }
 }
 
 /// Answer one intercepted tool invocation (a run-make recipe's
@@ -6088,16 +6252,16 @@ fn tool_run(
             }
         };
         let mut tail = vec![input];
-        for spec in &aux {
+        for spec in registry.effective_aux_specs(&aux) {
             tail.push("--aux".to_string());
-            tail.push(spec.clone());
+            tail.push(spec);
         }
         for tok in &forward {
             tail.push("--rustc-arg".to_string());
             tail.push(tok.clone());
         }
         let (code, _stdout, stderr) =
-            run_convert_subprocess(exe, &tail, &cwd, request)?;
+            run_convert_subprocess(exe, &tail, &cwd, request.env_clear, &request.envs)?;
         let text = child_stream(&stderr);
         return Ok(if code == 0 {
             sparagmos_interp::ToolRunOutcome {
@@ -6128,6 +6292,11 @@ fn tool_run(
             .unwrap_or_else(|| "crate".to_string())
     });
     let source_text = std::fs::read_to_string(&input_abs).unwrap_or_default();
+    // The bytes this build converts, snapshotted into every
+    // artifact it records: the recipe may rewrite or delete
+    // the file once the build returns, and the artifact must
+    // still denote the program this invocation produced.
+    let source_snapshot = std::fs::read(&input_abs).unwrap_or_default();
 
     // Registered artifacts the input declares through
     // `extern crate` items bind too (the driver's session
@@ -6160,9 +6329,9 @@ fn tool_run(
         "--edition".to_string(),
         edition.clone(),
     ];
-    for spec in &aux {
+    for spec in registry.effective_aux_specs(&aux) {
         tail.push("--aux".to_string());
-        tail.push(spec.clone());
+        tail.push(spec);
     }
     for tok in &forward {
         tail.push("--rustc-arg".to_string());
@@ -6172,7 +6341,8 @@ fn tool_run(
         tail.push("--dump".to_string());
         tail.push(dump.display().to_string());
     }
-    let (code, stdout, stderr) = run_convert_subprocess(exe, &tail, &cwd, request)?;
+    let (code, stdout, stderr) =
+        run_convert_subprocess(exe, &tail, &cwd, request.env_clear, &request.envs)?;
 
     // The verdict: exit 0 only when the target crate converted
     // with nothing skipped. The report's target-crate line is
@@ -6239,8 +6409,11 @@ fn tool_run(
             ToolArtifact {
                 name: crate_name.clone(),
                 source: input_abs.clone(),
+                source_snapshot: source_snapshot.clone(),
                 edition: Some(edition.clone()),
                 crate_type,
+                compile_env_clear: request.env_clear,
+                compile_envs: request.envs.clone(),
                 aux_specs: aux.clone(),
                 rustc_args: forward.clone(),
             },
@@ -6355,6 +6528,23 @@ fn tool_run(
 /// the harness keeps sorting those recipes as unsupported
 /// rather than failed.
 ///
+/// The run is reconstructed from what the producing
+/// invocation carried, not from the file system as it now
+/// stands: the source it converts is the recorded path while
+/// that file still holds the build's bytes, and the recorded
+/// snapshot once the recipe has rewritten or deleted it (see
+/// `ToolRegistry::effective_source`); the program's argv[0]
+/// is the name the recipe invoked it under, not the source
+/// path; and the two environments are kept apart -- the
+/// subprocess is spawned under the producing invocation's
+/// compilation environment, so compile-time environment
+/// reads see the build's values, and the execution request's
+/// environment is handed over as a complete assignment the
+/// subprocess applies to itself once the conversion is done
+/// (see `--guest-env-file`), so the program's own environment
+/// reads see the values it was invoked with and nothing from
+/// the build leaks into them.
+///
 /// The subprocess keeps the two stderr channels apart: the
 /// recorded program's own stderr travels through the file
 /// named by `--guest-stderr-file` and is relayed byte for
@@ -6370,6 +6560,7 @@ fn artifact_run(
     registry: &ToolRegistry,
     exe: &std::path::Path,
 ) -> Result<sparagmos_interp::ToolRunOutcome, String> {
+    use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::ffi::OsStringExt as _;
     let cwd: std::path::PathBuf = match &request.cwd {
         Some(dir) => std::path::PathBuf::from(std::ffi::OsString::from_vec(dir.clone())),
@@ -6398,14 +6589,57 @@ fn artifact_run(
         "sparagmos-artifact-stderr-{}-{seq}",
         std::process::id()
     ));
-    let mut tail = vec!["run".to_string(), artifact.source.display().to_string()];
+    // The environment the recorded program runs under, as a
+    // complete assignment: this process's environment (the
+    // guest's own, which the interpreter answers its
+    // environment reads from) with the execution request's
+    // assignments applied -- or, when the request clears the
+    // environment, exactly the request's assignments.
+    let mut guest_env: Vec<(Vec<u8>, Vec<u8>)> = if request.env_clear {
+        Vec::new()
+    } else {
+        std::env::vars_os()
+            .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec()))
+            .collect()
+    };
+    for (key, value) in &request.envs {
+        match value {
+            Some(v) => {
+                if let Some(slot) = guest_env.iter_mut().find(|(k, _)| k == key) {
+                    slot.1 = v.clone();
+                } else {
+                    guest_env.push((key.clone(), v.clone()));
+                }
+            }
+            None => guest_env.retain(|(k, _)| k != key),
+        }
+    }
+    let env_path = std::env::temp_dir().join(format!(
+        "sparagmos-artifact-env-{}-{seq}",
+        std::process::id()
+    ));
+    write_guest_env_file(&env_path, &guest_env).map_err(|e| {
+        format!("tool interception: cannot record the guest environment: {e}")
+    })?;
+    // The name the program reads as its argv[0]: the explicit
+    // argv0 the invocation carried, else the program name as
+    // the recipe spelled it -- never the source path the run
+    // is reconstructed from.
+    let program_name = match &request.argv0 {
+        Some(argv0) => String::from_utf8_lossy(argv0).into_owned(),
+        None => program.clone(),
+    };
+    let mut tail = vec![
+        "run".to_string(),
+        registry.effective_source(&artifact).display().to_string(),
+    ];
     if let Some(edition) = &artifact.edition {
         tail.push("--edition".to_string());
         tail.push(edition.clone());
     }
-    for spec in &artifact.aux_specs {
+    for spec in registry.effective_aux_specs(&artifact.aux_specs) {
         tail.push("--aux".to_string());
-        tail.push(spec.clone());
+        tail.push(spec);
     }
     for tok in &artifact.rustc_args {
         tail.push("--rustc-arg".to_string());
@@ -6413,13 +6647,24 @@ fn artifact_run(
     }
     tail.push("--guest-stderr-file".to_string());
     tail.push(stderr_path.display().to_string());
+    tail.push("--guest-env-file".to_string());
+    tail.push(env_path.display().to_string());
+    tail.push("--guest-program-name".to_string());
+    tail.push(program_name);
     for arg in &request.args {
         tail.push("--guest-arg".to_string());
         tail.push(String::from_utf8_lossy(arg).into_owned());
     }
-    let outcome = run_convert_subprocess(exe, &tail, &cwd, request);
+    let outcome = run_convert_subprocess(
+        exe,
+        &tail,
+        &cwd,
+        artifact.compile_env_clear,
+        &artifact.compile_envs,
+    );
     let guest_stderr = std::fs::read(&stderr_path).unwrap_or_default();
     let _ = std::fs::remove_file(&stderr_path);
+    let _ = std::fs::remove_file(&env_path);
     let (code, stdout, stderr) = outcome?;
     if code == 2 {
         // Exit 2 is both the subprocess's driver-failure code
@@ -6470,11 +6715,15 @@ struct BuiltProgram {
 }
 
 /// Build the interpreter program from a collection and resolve
-/// its entry point. On failure the run-mode error has already
-/// been reported and the `Err` carries the process exit code.
+/// its entry point. `program_name` is the name the entry
+/// invocation presents as argv[0] (the invocation path, which
+/// a caller reconstructing a run may name separately from the
+/// source it converted). On failure the run-mode error has
+/// already been reported and the `Err` carries the process
+/// exit code.
 fn build_program(
     c: &Collected,
-    input: &str,
+    program_name: &str,
     guest_args: &[String],
 ) -> Result<BuiltProgram, i32> {
     let mut program = sparagmos_interp::MirProgram::new();
@@ -6573,7 +6822,7 @@ fn build_program(
     let entry_arg_count = c.bodies[entry_index].1.arg_count;
     let entry_args: Vec<sparagmos_interp::Value> = if entry_arg_count == 2 {
         let mut argv: Vec<sparagmos_interp::Value> = Vec::new();
-        let mut all_args = vec![input.to_string()];
+        let mut all_args = vec![program_name.to_string()];
         all_args.extend(guest_args.iter().cloned());
         for arg in &all_args {
             let mut bytes = arg.as_bytes().to_vec();
@@ -6616,8 +6865,15 @@ fn execute(
     overflow_checks: bool,
     tool_programs: &[String],
     guest_stderr_file: Option<&str>,
+    program_name: Option<&str>,
 ) -> i32 {
-    let built = match build_program(c, input, guest_args) {
+    // The name the program reads as its argv[0]: the input
+    // path by default (the stand-in for the compiled binary's
+    // path), or the name the caller names separately when it
+    // reconstructs a run under a different invocation name
+    // (an artifact run answering a recipe: see `artifact_run`).
+    let program_name = program_name.unwrap_or(input);
+    let built = match build_program(c, program_name, guest_args) {
         Ok(b) => b,
         Err(code) => return code,
     };
@@ -6666,7 +6922,7 @@ fn execute(
     };
     let config = sparagmos_interp::InterpConfig {
         guest_args: guest_args.to_vec(),
-        program_path: input.to_string(),
+        program_path: program_name.to_string(),
         overflow_checks,
         tool_interception,
         ..sparagmos_interp::InterpConfig::default()
@@ -8010,6 +8266,8 @@ fn driver_main() {
     let mut tool_programs: Vec<String> = Vec::new();
     let mut dump_path: Option<String> = None;
     let mut guest_stderr_file: Option<String> = None;
+    let mut guest_env_file: Option<String> = None;
+    let mut guest_program_name: Option<String> = None;
     let mut edition = "2021".to_string();
     let mut sysroot: Option<String> = None;
     let mut rustc_args: Vec<String> = Vec::new();
@@ -8028,6 +8286,20 @@ fn driver_main() {
                 i += 1;
                 guest_stderr_file = Some(argv.get(i).cloned().unwrap_or_else(|| {
                     eprintln!("--guest-stderr-file needs a path");
+                    std::process::exit(2);
+                }));
+            }
+            "--guest-env-file" => {
+                i += 1;
+                guest_env_file = Some(argv.get(i).cloned().unwrap_or_else(|| {
+                    eprintln!("--guest-env-file needs a path");
+                    std::process::exit(2);
+                }));
+            }
+            "--guest-program-name" => {
+                i += 1;
+                guest_program_name = Some(argv.get(i).cloned().unwrap_or_else(|| {
+                    eprintln!("--guest-program-name needs a value");
                     std::process::exit(2);
                 }));
             }
@@ -8397,6 +8669,27 @@ fn driver_main() {
                 ));
             }
             if mode == Mode::Run || mode == Mode::RunJit {
+                // A caller reconstructing a run (an artifact run
+                // answering a recipe) hands the environment the
+                // program was invoked with as a complete
+                // assignment in a file: apply it now that the
+                // conversion is done, so the conversion above
+                // ran under the environment it was spawned with
+                // (the producing invocation's compilation
+                // environment) while the program's own
+                // environment reads see its invocation
+                // environment (see `artifact_run`).
+                if let Some(path) = &guest_env_file {
+                    match read_guest_env_file(std::path::Path::new(path)) {
+                        Ok(env) => apply_guest_env(&env),
+                        Err(e) => {
+                            eprintln!(
+                                "sparagmos-driver run: unsupported: cannot read the guest environment file {path}: {e}"
+                            );
+                            std::process::exit(2);
+                        }
+                    }
+                }
                 if let Some(path) = &dump_path {
                     let text =
                         sparagmos_driver::dump::render(&input, &c.report, &c.bodies, &c.body_def_ids, &c.def_names);
@@ -8415,6 +8708,7 @@ fn driver_main() {
                     overflow_checks,
                     &tool_programs,
                     guest_stderr_file.as_deref(),
+                    guest_program_name.as_deref(),
                 ));
             }
             print_convert_report(&c, &input);
