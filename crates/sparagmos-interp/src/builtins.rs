@@ -19604,7 +19604,10 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         for i in 0..n {
             match self.read_seq_at(frames, &target, i)? {
                 Value::Uint(b) => out.push(b as u8),
-                Value::Int(b) if (0..=255).contains(&b) => out.push(b as u8),
+                // A signed byte element (an `i8` holding a byte
+                // above 127) keeps its bit pattern: the range
+                // runs from -128, not 0, as in `read_c_str`.
+                Value::Int(b) if (-128..=255).contains(&b) => out.push(b as u8),
                 other => {
                     return Err(InterpError::type_mismatch(
                         "compare_bytes element",
