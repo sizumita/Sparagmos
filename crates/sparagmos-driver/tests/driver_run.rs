@@ -11738,6 +11738,144 @@ fn run_mode_enum_tag_byte_write_rewrites_discriminant() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
 }
 
+const PTR_BYTE_VEC_SRC: &str = r#"
+#[derive(Debug, PartialEq)]
+struct Point { x: i32, y: i32 }
+fn main() {
+    // Byte displacement over a Vec's buffer is denominated in
+    // the element type's size: byte_add(8) over a Vec<Point>
+    // lands on element 1, not on element 8.
+    let v: Vec<Point> = vec![
+        Point { x: 1, y: 2 },
+        Point { x: 3, y: 4 },
+        Point { x: 5, y: 6 },
+        Point { x: 7, y: 8 },
+        Point { x: 9, y: 10 },
+        Point { x: 11, y: 12 },
+        Point { x: 13, y: 14 },
+        Point { x: 15, y: 16 },
+        Point { x: 17, y: 18 },
+        Point { x: 19, y: 20 },
+    ];
+    let s: &[Point] = &v;
+    let p = s.as_ptr();
+    unsafe {
+        assert_eq!(&*p.byte_add(8), &Point { x: 3, y: 4 });
+        assert_eq!(&*p.byte_add(16), &Point { x: 5, y: 6 });
+        assert_eq!(p.byte_add(16).offset_from(p), 2);
+        assert_eq!(p.offset_from(p.byte_add(16)), -2);
+        assert!(p.byte_add(8) == p.add(1));
+    }
+    // A write through a byte-displaced pointer lands in the
+    // element the displacement denotes.
+    let mut w: Vec<i32> = vec![10, 20, 30];
+    let sw: &[i32] = &w;
+    unsafe {
+        let q = sw.as_ptr().byte_add(4) as *mut i32;
+        *q = 99;
+    }
+    assert_eq!(w, vec![10, 99, 30]);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_ptr_byte_add_over_vec_elements() {
+    let dir = temp_dir("ptr-byte-vec");
+    let src = fixture(&dir, "ptr_byte_vec.rs", PTR_BYTE_VEC_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "byte_add over Vec elements must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+const PTR_BYTE_VEC_FIELD_SRC: &str = r#"
+#[derive(Debug, PartialEq)]
+struct Point { x: i32, y: i32 }
+struct Holder { v: Vec<Point> }
+fn main() {
+    // The same denomination holds for a Vec held in a struct
+    // field: the position navigates to the field's sequence,
+    // then ranges over its elements.
+    let h = Holder {
+        v: vec![
+            Point { x: 1, y: 100 },
+            Point { x: 2, y: 200 },
+            Point { x: 3, y: 300 },
+            Point { x: 4, y: 400 },
+            Point { x: 5, y: 500 },
+            Point { x: 6, y: 600 },
+            Point { x: 7, y: 700 },
+            Point { x: 8, y: 800 },
+            Point { x: 9, y: 900 },
+            Point { x: 10, y: 1000 },
+        ],
+    };
+    let s: &[Point] = &h.v;
+    let p = s.as_ptr();
+    unsafe {
+        assert_eq!(&*p.byte_add(8), &Point { x: 2, y: 200 });
+    }
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_ptr_byte_add_over_vec_in_struct_field() {
+    let dir = temp_dir("ptr-byte-vec-field");
+    let src = fixture(&dir, "ptr_byte_vec_field.rs", PTR_BYTE_VEC_FIELD_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "byte_add over a Vec in a struct field must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+const PTR_BYTE_VEC_DISPLACED_READ_SRC: &str = r#"
+#[derive(Debug)]
+struct Point { x: i32, y: i32 }
+fn main() {
+    let v: Vec<Point> = vec![Point { x: 1, y: 2 }, Point { x: 3, y: 4 }];
+    let s: &[Point] = &v;
+    unsafe {
+        let b = s.as_ptr().byte_add(4);
+        println!("{:?}", &*b);
+    }
+    println!("unreachable");
+}
+"#;
+
+#[test]
+fn run_mode_ptr_byte_displaced_read_over_vec_is_explicit_unsupported() {
+    // A byte displacement that lands between a Vec's elements
+    // denotes no element: reading through it is an explicit
+    // unsupported error, never the neighbouring element's value.
+    let dir = temp_dir("ptr-byte-vec-displaced");
+    let src = fixture(
+        &dir,
+        "ptr_byte_vec_displaced.rs",
+        PTR_BYTE_VEC_DISPLACED_READ_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "mid-element byte-displaced read over a Vec must be an explicit unsupported; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("displaced"),
+        "the reason names the displacement; stderr={stderr}"
+    );
+}
+
 const PTR_SLICE_SRC: &str = r#"
 fn main() {
     let s: &[i32] = &[10, 20, 30];
@@ -21521,5 +21659,305 @@ fn run_mode_vec_sparse_consumers_after_growth() {
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         "elem 10\nelem 20\nrc [10, 20] len 2\narc [7] len 1\ndeque len 2\nfront Some(10) back Some(20)\npop Some(10)\nwritten \"ABC\"\njoined /a:/b\n"
+    );
+}
+
+const PATH_FMT_SRC: &str = r#"
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug)]
+struct Wrap {
+    p: PathBuf,
+    n: i32,
+}
+
+fn main() {
+    // The Debug of the path / OS-string wrapper types is the
+    // quoted content, not the wrapper structure; width and
+    // precision are not consulted by std's impls.
+    println!("{:?}", PathBuf::from("a/b"));
+    println!("{:?}", Path::new("a/b"));
+    println!("{:?}", OsString::from("os/s"));
+    println!("{:?}", vec![PathBuf::from("x"), PathBuf::from("y/z")]);
+    println!("{:.2?}", PathBuf::from("abcdef"));
+    println!("{:>12?}", PathBuf::from("ab"));
+    println!("{:?}", Wrap { p: PathBuf::from("in/struct"), n: 3 });
+    println!("{:?}", PathBuf::from("a\\b\"c"));
+    println!("{:?}", PathBuf::from(""));
+    println!("path-fmt-ok");
+}
+"#;
+
+#[test]
+fn run_mode_path_and_os_string_debug_formats_content() {
+    let dir = temp_dir("path-fmt");
+    let src = fixture(&dir, "path_fmt.rs", PATH_FMT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "path Debug formatting runs; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "\"a/b\"\n\"a/b\"\n\"os/s\"\n[\"x\", \"y/z\"]\n\"abcdef\"\n\"ab\"\nWrap { p: \"in/struct\", n: 3 }\n\"a\\\\b\\\"c\"\n\"\"\npath-fmt-ok\n",
+        "PathBuf/Path/OsString Debug renders the quoted content like std"
+    );
+}
+
+const PATH_DISPLAY_SRC: &str = r#"
+use std::path::{Path, PathBuf};
+
+fn main() {
+    println!("{}", Path::new("a/b").display());
+    println!("{}", PathBuf::from("dir/file.txt").display());
+    let s = Path::new("x/y").display().to_string();
+    println!("{s}");
+    let pb = PathBuf::from("p/q");
+    println!("{}", pb.display());
+    println!("path-display-ok");
+}
+"#;
+
+#[test]
+fn run_mode_path_display_and_to_string() {
+    let dir = temp_dir("path-display");
+    let src = fixture(&dir, "path_display.rs", PATH_DISPLAY_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "path Display formatting runs; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a/b\ndir/file.txt\nx/y\np/q\npath-display-ok\n",
+        "Path::display renders the path content and to_string converts it"
+    );
+}
+
+const NON_UTF8_PATH_DISPLAY_SRC: &str = r#"
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
+
+fn main() {
+    // A non-UTF-8 `OsString` (built from raw bytes): its
+    // `&OsStr` form is a fat pointer to the byte elements in
+    // this model, and the `OsStr` / `Slice` field projections
+    // inside `OsStr::len` and `Path::display` walk the
+    // one-field wrapper chain over that fat pointer.
+    let s = OsString::from_vec(vec![0x61, 0xff, 0x62]);
+    println!("len={}", s.len());
+    let pb = std::path::PathBuf::from(s);
+    println!("{}", pb.display());
+    println!("len={}", pb.as_os_str().len());
+    println!("non-utf8-path-display-ok");
+}
+"#;
+
+#[test]
+fn run_mode_non_utf8_path_display() {
+    let dir = temp_dir("non-utf8-path-display");
+    let src = fixture(&dir, "non_utf8_path_display.rs", NON_UTF8_PATH_DISPLAY_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "non-UTF-8 path display runs; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "len=3\na\u{fffd}b\nlen=3\nnon-utf8-path-display-ok\n",
+        "display() renders the lossy content and len() reads the byte length"
+    );
+}
+
+const VECDEQUE_DEBUG_SRC: &str = r#"
+use std::collections::VecDeque;
+
+#[derive(Debug)]
+struct Wrap {
+    items: VecDeque<i32>,
+}
+
+fn main() {
+    let mut d: VecDeque<i32> = VecDeque::with_capacity(4);
+    for i in 0..4 { d.push_back(i); }
+    d.pop_front();
+    d.pop_front();
+    d.push_back(4);
+    d.push_back(5);
+    println!("{:?}", d);
+    println!("{:#?}", d);
+    let e: VecDeque<i32> = VecDeque::new();
+    println!("{:?}", e);
+    println!("{:?}", VecDeque::from(vec![7, 8, 9]));
+    println!("{:?}", VecDeque::from([10, 11]));
+    let mut g: VecDeque<String> = VecDeque::new();
+    g.push_back("a".to_string());
+    g.push_front("z".to_string());
+    println!("{:?}", g);
+    let w = Wrap { items: VecDeque::from([3, 1, 4]) };
+    println!("{:?}", w);
+    println!("{:?}", Box::new(VecDeque::from([7])));
+}
+"#;
+
+#[test]
+fn run_mode_vecdeque_debug_list_format() {
+    // A `VecDeque` value is the ring-buffer aggregate (wrapped
+    // head, length, buffer); its `Debug` is the `debug_list` of
+    // the logical element sequence, so the structural fmt engine
+    // renders the sequence, not the aggregate's fields.
+    let dir = temp_dir("vecdeque-debug");
+    let src = fixture(&dir, "vecdeque_debug.rs", VECDEQUE_DEBUG_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "VecDeque Debug program must exit 0; stderr={stderr}"
+    );
+    let expected = "\
+[2, 3, 4, 5]
+[
+    2,
+    3,
+    4,
+    5,
+]
+[]
+[7, 8, 9]
+[10, 11]
+[\"z\", \"a\"]
+Wrap { items: [3, 1, 4] }
+[7]
+";
+    assert_eq!(stdout, expected, "VecDeque Debug output must be the list form");
+}
+
+const PATHBUF_AS_PATH_SRC: &str = r#"
+use std::path::{Path, PathBuf};
+fn main() {
+    let pb = PathBuf::from("abc");
+    let p = pb.as_path();
+    println!("len {}", p.as_os_str().len());
+    println!("eq {}", p == Path::new("abc"));
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_pathbuf_as_path() {
+    run_ok(
+        "pathbuf-as-path",
+        PATHBUF_AS_PATH_SRC,
+        "len 3\neq true\ndone\n",
+    );
+}
+
+const OSSTRING_AS_OS_STR_SRC: &str = r#"
+use std::ffi::OsString;
+fn main() {
+    let s = OsString::from("a/b");
+    println!("len {}", s.as_os_str().len());
+    let b = &s[..];
+    println!("sub {}", b.to_str().unwrap());
+    println!("enc {}", s.as_os_str().as_encoded_bytes().len());
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_osstring_as_os_str_and_index() {
+    run_ok(
+        "osstring-as-os-str",
+        OSSTRING_AS_OS_STR_SRC,
+        "len 3\nsub a/b\nenc 3\ndone\n",
+    );
+}
+
+const VEC_AS_PTR_WRAPPER_SRC: &str = r#"
+struct Holder {
+    v: Vec<u32>,
+}
+fn main() {
+    let h = Holder { v: vec![10, 20, 30] };
+    let p = h.v.as_ptr();
+    unsafe {
+        println!("{} {} {}", *p, *p.add(1), *p.add(2));
+    }
+    let v = vec![1u8, 2, 3];
+    let q = v.as_ptr();
+    unsafe {
+        println!("first {}", *q);
+    }
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_vec_as_ptr_through_wrapper() {
+    run_ok(
+        "vec-as-ptr-wrapper",
+        VEC_AS_PTR_WRAPPER_SRC,
+        "10 20 30\nfirst 1\ndone\n",
+    );
+}
+
+const VEC_DEDUP_LEN_WRITE_SRC: &str = r#"
+fn main() {
+    let mut v = vec![1u8, 1, 2, 2, 3];
+    v.dedup();
+    println!("{:?}", v);
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_vec_dedup_len_slot_write() {
+    run_ok("vec-dedup", VEC_DEDUP_LEN_WRITE_SRC, "[1, 2, 3]\ndone\n");
+}
+
+const VEC_TRUNCATE_LEN_WRITE_SRC: &str = r#"
+fn main() {
+    let mut v = vec![1u8, 1, 2, 2, 3];
+    v.truncate(3);
+    println!("{:?}", v);
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_vec_truncate_len_slot_write() {
+    run_ok(
+        "vec-truncate",
+        VEC_TRUNCATE_LEN_WRITE_SRC,
+        "[1, 1, 2]\ndone\n",
+    );
+}
+
+const CSTR_WITH_NUL_SRC: &str = r#"
+use std::ffi::CString;
+fn main() {
+    let c = CString::new("hello").unwrap();
+    let cs = c.as_c_str();
+    println!("len {}", cs.to_bytes().len());
+    println!("with_nul {:?}", cs.to_bytes_with_nul());
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_cstr_bytes_with_nul() {
+    run_ok(
+        "cstr-with-nul",
+        CSTR_WITH_NUL_SRC,
+        "len 5\nwith_nul [104, 101, 108, 108, 111, 0]\ndone\n",
     );
 }

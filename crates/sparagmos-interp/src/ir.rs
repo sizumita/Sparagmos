@@ -1777,6 +1777,27 @@ pub struct Body {
     pub name: String,
     pub arg_count: usize,
     pub local_tys: Vec<Ty>,
+    /// The element size of each local whose declared type is a
+    /// sequence type — an array's element type, or an ADT's first
+    /// generic argument (a `Vec`'s element type) — indexed by
+    /// local (conversion-computed; see `mir_convert`'s
+    /// `local_elem_size`). The IR types drop an ADT's generic
+    /// arguments, so a byte displacement over a sequence local
+    /// cannot be denominated from the declared type alone; this
+    /// table carries the size conversion computed while the
+    /// arguments were still at hand. Consulted by the
+    /// interpreter's sequence-position judgment (see
+    /// `array_position`). Empty for hand-built bodies.
+    pub local_elem_sizes: Vec<Option<u64>>,
+    /// The element sizes of sequence-typed fields of each
+    /// local, keyed by local, then by the field-index path from
+    /// the local (conversion-computed; see `mir_convert`'s
+    /// `collect_field_elem_sizes`). The field-path companion of
+    /// [`Self::local_elem_sizes`]: a byte displacement over a
+    /// sequence held in a field (a `Vec` in a struct field) is
+    /// denominated in the field type's element size. Empty for
+    /// hand-built bodies.
+    pub field_elem_sizes: Vec<std::collections::HashMap<Vec<usize>, u64>>,
     pub blocks: Vec<BasicBlockData>,
     /// Canonical values of the locals whose declared type is
     /// provably zero-sized, indexed by local (conversion-computed;
@@ -1835,6 +1856,8 @@ impl Body {
             name: name.into(),
             arg_count,
             local_tys,
+            local_elem_sizes: Vec::new(),
+            field_elem_sizes: Vec::new(),
             blocks,
             zst_locals: Vec::new(),
             zst_fields: Vec::new(),
@@ -1926,6 +1949,20 @@ pub struct Program {
     /// the driver. Consulted when a pointer offset over a static
     /// must be denominated in the declared type's element size.
     pub static_tys: std::collections::HashMap<String, Ty>,
+    /// Declared field types of the program's ADT definitions,
+    /// keyed by the ADT's definition name (the tag a [`Ty::Adt`]
+    /// carries): per variant, per field, the field's declared
+    /// type reduced to the skeleton the interpreter's place walks
+    /// can track (see `mir_convert`'s field-type skeleton): `None`
+    /// for a field whose type mentions a generic parameter at its
+    /// head, whose tracked type would differ per instance.
+    /// Consulted by place resolution, whose projections carry no
+    /// types, to know when a walk has reached a modelled `Vec`
+    /// behind wrapper fields (an `OsString`'s buffer field, a
+    /// struct's `Vec` field) whose declared slots the value model
+    /// answers from the element list itself.
+    pub adt_field_tys:
+        std::collections::HashMap<String, Vec<Vec<Option<Ty>>>>,
     /// The guest allocation shims of a program that defines a
     /// `#[global_allocator]`: symbol (`__rust_alloc`,
     /// `__rust_dealloc`, `__rust_realloc`, `__rust_alloc_zeroed`)
