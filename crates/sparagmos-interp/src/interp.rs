@@ -439,6 +439,26 @@ pub(crate) fn is_scalar_value(value: &Value) -> bool {
     )
 }
 
+/// The file-table id a `std::fs::File` handle value carries:
+/// the integer at the bottom of the wrapper chain the file
+/// model builds (`File` -> sys `File` -> `FileDesc` ->
+/// `OwnedFd` -> descriptor), each layer a one-field aggregate.
+/// A value of any other shape is not a modelled handle.
+pub(crate) fn file_handle_id(value: &Value) -> Option<u64> {
+    let mut cur = value;
+    for _ in 0..8 {
+        match cur {
+            Value::Enum { fields, .. } if fields.len() == 1 => {
+                cur = &fields[0];
+            }
+            Value::Int(id) => return Some(*id as u64),
+            Value::Uint(id) => return Some(*id as u64),
+            _ => return None,
+        }
+    }
+    None
+}
+
 pub(crate) fn channel_handle_id(value: &Value) -> Option<u64> {
     match value {
         Value::Enum { fields, .. } if fields.len() == 1 => match &fields[0] {
@@ -807,6 +827,21 @@ pub struct Interpreter<'a> {
     pub(crate) wake_dispatch: std::cell::RefCell<HashMap<u64, WakeDispatch>>,
     /// The id the next created channel gets.
     next_channel: std::cell::RefCell<u64>,
+    /// Open host files of the `std::fs::File` value model (see
+    /// `file_value` in `builtins`): the table holds the real
+    /// `std::fs::File` each guest handle delegates to, keyed by
+    /// the id in the handle value's descriptor slot. Ids start
+    /// at 3 (the standard streams' descriptor numbers) and are
+    /// never reused, so a stale handle can never alias a newer
+    /// file. Interior-mutable for the same reason as the channel
+    /// table; each entry is itself a cell because reads and
+    /// writes need `&mut` access to one file while the table is
+    /// borrowed.
+    files: std::cell::RefCell<
+        HashMap<u64, std::cell::RefCell<std::fs::File>>,
+    >,
+    /// The id the next opened file gets.
+    next_file: std::cell::RefCell<u64>,
     /// Modelled process commands under construction (see
     /// [`CommandState`]), keyed by the id inside the handle
     /// values. Interior-mutable for the same reason as the
@@ -1498,6 +1533,8 @@ impl<'a> Interpreter<'a> {
             channels: std::cell::RefCell::new(HashMap::new()),
             wake_dispatch: std::cell::RefCell::new(HashMap::new()),
             next_channel: std::cell::RefCell::new(1),
+            files: std::cell::RefCell::new(HashMap::new()),
+            next_file: std::cell::RefCell::new(3),
             commands: std::cell::RefCell::new(HashMap::new()),
             next_command: std::cell::RefCell::new(1),
             formatters: std::cell::RefCell::new(HashMap::new()),
@@ -5139,6 +5176,24 @@ impl<'a> Interpreter<'a> {
                             if sender { "sender" } else { "receiver" },
                         );
                     }
+                    P::FileHandleDrop => {
+                        // A moved-out / never-written handle has
+                        // no file to close, exactly like drop
+                        // flags in real MIR.
+                        let Some(value) =
+                            self.read_at(frames, &active.root, &path)?
+                        else {
+                            continue;
+                        };
+                        let Some(id) = file_handle_id(&value) else {
+                            return Err(InterpError::type_mismatch(
+                                "file handle drop glue",
+                                "a std::fs::File handle",
+                                value.kind_name(),
+                            ));
+                        };
+                        self.file_handle_closed(id);
+                    }
                     P::RcHandleDrop { value } => {
                         // A moved-out / never-written handle has no
                         // count to decrement, exactly like drop
@@ -6723,6 +6778,39 @@ impl<'a> Interpreter<'a> {
 
     /// Record a channel handle's drop (see [`ChannelState`]):
     /// `kind` is `"sender"` or `"receiver"`.
+    /// Register a freshly opened host file in the file table
+    /// and return the id the guest handle value carries.
+    pub(crate) fn register_file(&self, file: std::fs::File) -> u64 {
+        let id = *self.next_file.borrow();
+        *self.next_file.borrow_mut() = id + 1;
+        self.files
+            .borrow_mut()
+            .insert(id, std::cell::RefCell::new(file));
+        id
+    }
+
+    /// Run `f` against the host file behind table id `id`;
+    /// `None` when the id names no open file (a handle closed
+    /// already, or one the model never issued).
+    pub(crate) fn with_file<R>(
+        &self,
+        id: u64,
+        f: impl FnOnce(&mut std::fs::File) -> R,
+    ) -> Option<R> {
+        let files = self.files.borrow();
+        let entry = files.get(&id)?;
+        let result = f(&mut entry.borrow_mut());
+        Some(result)
+    }
+
+    /// Close the host file behind table id `id` (the
+    /// `FileHandleDrop` plan's effect): removing the entry drops
+    /// the host `File`, closing the descriptor. An id that names
+    /// no open file is already closed, so there is nothing to do.
+    pub(crate) fn file_handle_closed(&self, id: u64) {
+        self.files.borrow_mut().remove(&id);
+    }
+
     pub(crate) fn channel_handle_dropped(&self, id: u64, kind: &str) {
         if let Some(state) = self.channels.borrow_mut().get_mut(&id) {
             match kind {
@@ -16932,7 +17020,9 @@ impl<'a> Interpreter<'a> {
     /// [`Self::ptr_metadata`]). A value with a dynamically sized
     /// tail — a custom DST struct value, or the array value a
     /// slice pointer names — carries the tail's metadata: the
-    /// last field's metadata, recursively, or the element count.
+    /// metadata of the field that carries the length (searched
+    /// from the last field backwards), recursively, the element
+    /// count, or a sparse vector's own length.
     /// The recursion is gated on the destination being
     /// length-typed: MIR types a sized pointee's metadata as
     /// `()`, so a `usize` destination is exactly the case where
@@ -16970,13 +17060,35 @@ impl<'a> Interpreter<'a> {
             }
             Value::Enum { fields, .. } => {
                 if matches!(dest_ty, Some(Ty::Uint(_))) {
-                    match fields.last() {
-                        Some(last) => {
-                            let last = last.clone();
-                            self.metadata_of_pointee(frames, &last, dest_ty)
+                    // The length lives in whichever field
+                    // carries it: the last field first (a slice
+                    // struct's buffer), then the rest — a
+                    // vector value's length is its first field,
+                    // behind the buffer and capacity fields.
+                    // The first field (from the right) whose
+                    // own metadata is a length wins; a field
+                    // with no length metadata does not stop the
+                    // search.
+                    let mut found = Value::Unit;
+                    for field in fields.iter().rev() {
+                        let field = field.clone();
+                        let meta =
+                            self.metadata_of_pointee(frames, &field, dest_ty)?;
+                        if matches!(meta, Value::Uint(_)) {
+                            found = meta;
+                            break;
                         }
-                        None => Ok(Value::Unit),
                     }
+                    Ok(found)
+                } else {
+                    Ok(Value::Unit)
+                }
+            }
+            // A sparse vector value's own length is its slice
+            // metadata, under the same destination gate.
+            Value::SparseVec { len, .. } => {
+                if matches!(dest_ty, Some(Ty::Uint(_))) {
+                    Ok(Value::Uint(*len))
                 } else {
                     Ok(Value::Unit)
                 }

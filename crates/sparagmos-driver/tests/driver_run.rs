@@ -22495,3 +22495,60 @@ fn run_mode_io_error_custom_payload_drop() {
     );
 }
 
+
+const FILE_MODEL_SRC: &str = r#"
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+
+fn main() {
+    let p = "DATA_PATH";
+    {
+        let mut f = File::create(p).unwrap();
+        f.write_all(b"hello").unwrap();
+        writeln!(f, " {}", 42).unwrap();
+        f.sync_all().unwrap();
+    }
+    let mut f = OpenOptions::new().read(true).write(true).open(p).unwrap();
+    let mut s = String::new();
+    f.read_to_string(&mut s).unwrap();
+    println!("content={s:?}");
+    f.seek(SeekFrom::Start(6)).unwrap();
+    let mut buf = [0u8; 2];
+    f.read_exact(&mut buf).unwrap();
+    println!("at6={:?}", &buf);
+    let mut g = f.try_clone().unwrap();
+    println!("clone pos={}", g.stream_position().unwrap());
+    println!("len={}", f.metadata().unwrap().len());
+    // Open/drop in a loop: the handle's drop plan must close
+    // the host file every iteration, or the loop exhausts the
+    // process's descriptor budget long before it finishes.
+    let mut total = 0usize;
+    for _ in 0..1500 {
+        let mut h = File::open(p).unwrap();
+        let mut b = [0u8; 1];
+        h.read_exact(&mut b).unwrap();
+        total += b[0] as usize;
+    }
+    println!("loop total={total}");
+}
+"#;
+
+#[test]
+fn run_mode_file_handle_value_model() {
+    let dir = temp_dir("file-model");
+    let data = dir.join("data.txt");
+    let src = FILE_MODEL_SRC.replace("DATA_PATH", &data.to_string_lossy());
+    let src_path = fixture(&dir, "file_model.rs", &src);
+    let out = run_driver(&src_path);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "file model case must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "content=\"hello 42\\n\"\nat6=[52, 50]\nclone pos=8\nlen=9\nloop total=156000\n",
+        "file model stdout mismatch; stderr={stderr}"
+    );
+}
