@@ -76,8 +76,15 @@ denominator. Runs on every push to `main` and on manual dispatch.
 - The survey is split into shards
   (`scripts/ci-subset-tools.py shard`, round-robin over path order so
   shards are balanced), and each shard runs as one matrix job with
-  `scripts/rustc-subset-run.py`. A second matrix repeats the pass
-  with `--jit` for metric 4.
+  `scripts/rustc-subset-run.py`. The metric-2(b) pass runs the
+  runner with `--stages all`: stages 1 and 2 plus the stage-3
+  procedure harness, which attempts the `procedure` records
+  (run-make recipes — each recipe runs natively as the oracle, then
+  under the driver with tool interception). A second matrix repeats
+  the pass with `--jit` for metric 4; the JIT pass does not attempt
+  procedure records (the runner never combines stage 3 with
+  `--jit`), so they remain in metric 4's denominator as not
+  attempted.
 - The aggregate job merges the shard results
   (`scripts/ci-subset-tools.py merge`; aggregates are recomputed from
   the merged records), derives metric 3 with
@@ -94,7 +101,16 @@ denominator. Runs on every push to `main` and on manual dispatch.
   from the expectations (survey counts exclude its `env_excluded`
   tests, as the denominator definition does), so a survey
   regenerated through the cache with a different population cannot
-  silently become the official denominator.
+  silently become the official denominator. Attempting the
+  procedure records through stage 3 changes no count here: the
+  denominator stays 24,937 and `procedure` stays 551.
+- The cached source tree's sparse checkout additionally includes
+  `src/tools/run-make-support`, `src/build_helper`, and
+  `src/rustdoc-json-types` (the prepare job widens it before the
+  cache is saved): the stage-3 harness extracts those sources from
+  the tree to build run-make-support. The survey itself is
+  unaffected — it reads only `tests/` and the compiletest /
+  bootstrap sources.
 
 ## Hosted-runner calibration
 
@@ -116,6 +132,11 @@ Hosted runners are smaller and slower than the dev host (4 vCPU,
   values published by CI are therefore not a same-conditions time
   series with the `both` series, and the two are not mixed when
   comparing measurements over time;
+- stage-3 records use the runner's built-in timeouts under both
+  the dev-host and CI conditions (300 s for the native recipe
+  compile and for the native recipe run, 600 s for the driver run,
+  1800 s for the one-time run-make-support build per job); they are
+  not raised through the `SPARAGMOS_*_TIMEOUT` variables;
 - free disk space before measuring and cache the Rust source tree,
   the survey, and cargo build outputs;
 - give every job an explicit `timeout-minutes` below the 6-hour
