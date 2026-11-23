@@ -24,9 +24,10 @@ use rustc_public::abi::{FieldsShape, TagEncoding, VariantsShape};
 use rustc_public::mir;
 use rustc_public::mir::mono::{Instance, InstanceKind};
 use rustc_public::ty::{
-    AdtDef, AdtKind, AliasKind as SmirAliasKind, Allocation, AssocContainer, AssocKind,
-    ClosureKind, ConstantKind, ExistentialPredicate, FloatTy as SmirFloatTy, FnDef, GenericArgKind,
-    GenericArgs, ImplDef, IntTy as SmirIntTy, Region, RegionKind, RigidTy, TermKind, Ty, TyConst,
+    AdtDef, AdtKind, AliasKind as SmirAliasKind, Allocation, AssocContainer, AssocKind, Binder,
+    ClosureKind, ConstantKind, ExistentialPredicate, ExistentialProjection, ExistentialTraitRef,
+    FloatTy as SmirFloatTy, FnDef, FnSig, GenericArgKind, GenericArgs, ImplDef,
+    IntTy as SmirIntTy, Region, RegionKind, RigidTy, TermKind, Ty, TyConst,
     TyConstKind, TyKind, UintTy as SmirUintTy, VariantIdx,
 };
 use rustc_public_bridge::IndexedVal;
@@ -611,34 +612,209 @@ fn ty_mentions_alias(ty: &sm::Ty) -> bool {
 /// the ambient frame leaves unresolved counts as suspect, which
 /// only ever skips a query, never enables one.
 /// Compose an ADT's instance arguments with the ambient
-/// frame's arguments: an argument that is directly a parameter
-/// of the ambient frame is replaced by the ambient frame's
-/// argument for it. The walkers below resolve parameters one
-/// frame deep; composing at every ADT boundary keeps a
-/// parameter chain resolvable across nested generic ADTs (the
-/// `ManuallyDrop<T>` field inside `MaybeUninit<T>` is the
-/// canonical case) without ever enabling a query the one-frame
-/// rule would skip: an argument the ambient frame itself leaves
-/// a parameter stays a parameter, and stays suspect.
+/// frame's arguments: a parameter of the ambient frame,
+/// wherever it appears inside an argument -- directly, or
+/// nested inside another ADT, reference, tuple, or the
+/// like -- is replaced by the ambient frame's argument for
+/// it. The substitution is structural and rebuilds only
+/// the shapes `Ty::from_rigid_kind` constructs; a shape it
+/// cannot rebuild (an alias type, a constant whose
+/// substituted form has no interned identity of its own to
+/// take) keeps its argument unsubstituted, exactly as a
+/// non-parameter argument was always treated. The walkers
+/// below resolve parameters one frame deep; composing at
+/// every ADT boundary keeps a parameter chain resolvable
+/// across nested generic ADTs (the `ManuallyDrop<T>` field
+/// inside `MaybeUninit<T>` is the canonical case) without
+/// ever enabling a query the one-frame rule would skip: an
+/// argument the ambient frame itself leaves a parameter
+/// stays a parameter, and stays suspect.
 fn compose_args(
     args: &rustc_public::ty::GenericArgs,
     ambient: Option<&rustc_public::ty::GenericArgs>,
 ) -> rustc_public::ty::GenericArgs {
-    rustc_public::ty::GenericArgs(
+    let Some(ambient) = ambient else {
+        return args.clone();
+    };
+    substitute_args(args, ambient, 0)
+}
+
+/// `args` with the ambient frame's parameters substituted
+/// throughout, recursively (see `compose_args`).
+fn substitute_args(args: &GenericArgs, ambient: &GenericArgs, depth: usize) -> GenericArgs {
+    GenericArgs(
         args.0
             .iter()
             .map(|a| match a {
-                rustc_public::ty::GenericArgKind::Type(t) => match t.kind() {
-                    TyKind::Param(p) => ambient
-                        .and_then(|amb| amb.0.get(p.index as usize))
-                        .cloned()
-                        .unwrap_or_else(|| a.clone()),
-                    _ => a.clone(),
+                GenericArgKind::Type(t) => GenericArgKind::Type(substitute_ty(t, ambient, depth)),
+                GenericArgKind::Const(c) => match substitute_const(c, ambient, depth) {
+                    Some(c2) => GenericArgKind::Const(c2),
+                    None => a.clone(),
                 },
                 _ => a.clone(),
             })
             .collect(),
     )
+}
+
+/// A type with the ambient frame's parameters substituted
+/// throughout, recursively (see `compose_args`). A shape
+/// that cannot be rebuilt -- an alias, a type whose kind
+/// cannot be asked, nesting past the depth cap -- is
+/// returned unsubstituted.
+fn substitute_ty(ty: &Ty, ambient: &GenericArgs, depth: usize) -> Ty {
+    if depth >= 8 {
+        return *ty;
+    }
+    let Some(kind) = guarded_ty_kind(ty) else {
+        return *ty;
+    };
+    match kind {
+        TyKind::Param(p) => match ambient.0.get(p.index as usize) {
+            Some(GenericArgKind::Type(t)) => *t,
+            _ => *ty,
+        },
+        TyKind::RigidTy(r) => match r {
+            RigidTy::Adt(def, a2) => {
+                Ty::from_rigid_kind(RigidTy::Adt(def, substitute_args(&a2, ambient, depth + 1)))
+            }
+            RigidTy::Ref(region, inner, mutability) => Ty::from_rigid_kind(RigidTy::Ref(
+                region,
+                substitute_ty(&inner, ambient, depth + 1),
+                mutability,
+            )),
+            RigidTy::RawPtr(inner, mutability) => Ty::from_rigid_kind(RigidTy::RawPtr(
+                substitute_ty(&inner, ambient, depth + 1),
+                mutability,
+            )),
+            RigidTy::Slice(inner) => {
+                Ty::from_rigid_kind(RigidTy::Slice(substitute_ty(&inner, ambient, depth + 1)))
+            }
+            RigidTy::Pat(inner, pat) => {
+                Ty::from_rigid_kind(RigidTy::Pat(substitute_ty(&inner, ambient, depth + 1), pat))
+            }
+            RigidTy::Array(elem, len) => match substitute_const(&len, ambient, depth + 1) {
+                Some(len) => Ty::from_rigid_kind(RigidTy::Array(
+                    substitute_ty(&elem, ambient, depth + 1),
+                    len,
+                )),
+                None => *ty,
+            },
+            RigidTy::Tuple(ts) => Ty::from_rigid_kind(RigidTy::Tuple(
+                ts.iter()
+                    .map(|t| substitute_ty(t, ambient, depth + 1))
+                    .collect(),
+            )),
+            RigidTy::FnDef(def, a2) => Ty::from_rigid_kind(RigidTy::FnDef(
+                def,
+                substitute_args(&a2, ambient, depth + 1),
+            )),
+            RigidTy::FnPtr(sig) => {
+                let Binder {
+                    value: fsig,
+                    bound_vars,
+                } = sig;
+                Ty::from_rigid_kind(RigidTy::FnPtr(Binder {
+                    value: FnSig {
+                        inputs_and_output: fsig
+                            .inputs_and_output
+                            .iter()
+                            .map(|t| substitute_ty(t, ambient, depth + 1))
+                            .collect(),
+                        c_variadic: fsig.c_variadic,
+                        safety: fsig.safety,
+                        abi: fsig.abi,
+                    },
+                    bound_vars,
+                }))
+            }
+            RigidTy::Closure(def, a2) => Ty::from_rigid_kind(RigidTy::Closure(
+                def,
+                substitute_args(&a2, ambient, depth + 1),
+            )),
+            RigidTy::Coroutine(def, a2) => Ty::from_rigid_kind(RigidTy::Coroutine(
+                def,
+                substitute_args(&a2, ambient, depth + 1),
+            )),
+            RigidTy::CoroutineClosure(def, a2) => Ty::from_rigid_kind(RigidTy::CoroutineClosure(
+                def,
+                substitute_args(&a2, ambient, depth + 1),
+            )),
+            RigidTy::CoroutineWitness(def, a2) => Ty::from_rigid_kind(RigidTy::CoroutineWitness(
+                def,
+                substitute_args(&a2, ambient, depth + 1),
+            )),
+            RigidTy::Dynamic(preds, region) => Ty::from_rigid_kind(RigidTy::Dynamic(
+                preds
+                    .iter()
+                    .map(|pred| substitute_pred(pred, ambient, depth + 1))
+                    .collect(),
+                region,
+            )),
+            _ => *ty,
+        },
+        _ => *ty,
+    }
+}
+
+/// An existential predicate with the ambient frame's
+/// parameters substituted throughout (see
+/// `substitute_ty`). The binder's own bound variables are
+/// the object type's, not the frame's, and are kept.
+fn substitute_pred(
+    pred: &Binder<ExistentialPredicate>,
+    ambient: &GenericArgs,
+    depth: usize,
+) -> Binder<ExistentialPredicate> {
+    let value = match &pred.value {
+        ExistentialPredicate::Trait(tref) => ExistentialPredicate::Trait(ExistentialTraitRef {
+            def_id: tref.def_id,
+            generic_args: substitute_args(&tref.generic_args, ambient, depth),
+        }),
+        ExistentialPredicate::Projection(p) => {
+            let term = match &p.term {
+                TermKind::Type(t) => TermKind::Type(substitute_ty(t, ambient, depth)),
+                TermKind::Const(c) => match substitute_const(c, ambient, depth) {
+                    Some(c2) => TermKind::Const(c2),
+                    None => TermKind::Const(c.clone()),
+                },
+            };
+            ExistentialPredicate::Projection(ExistentialProjection {
+                def_id: p.def_id,
+                generic_args: substitute_args(&p.generic_args, ambient, depth),
+                term,
+            })
+        }
+        ExistentialPredicate::AutoTrait(def) => ExistentialPredicate::AutoTrait(*def),
+    };
+    Binder {
+        value,
+        bound_vars: pred.bound_vars.clone(),
+    }
+}
+
+/// A constant with the ambient frame's parameters
+/// substituted (see `compose_args`), or `None` when the
+/// substituted form cannot be represented: a substituted
+/// constant needs an interned identity of its own, which
+/// only a constant the frame itself supplies has. An
+/// unevaluated constant whose arguments substitute to
+/// themselves is returned unchanged.
+fn substitute_const(c: &TyConst, ambient: &GenericArgs, depth: usize) -> Option<TyConst> {
+    match c.kind() {
+        TyConstKind::Param(p) => match ambient.0.get(p.index as usize) {
+            Some(GenericArgKind::Const(bound)) => Some(bound.clone()),
+            _ => None,
+        },
+        TyConstKind::Unevaluated(_, args) => {
+            if substitute_args(args, ambient, depth) == *args {
+                Some(c.clone())
+            } else {
+                None
+            }
+        }
+        _ => Some(c.clone()),
+    }
 }
 
 fn adt_may_be_unsized(
@@ -992,8 +1168,7 @@ fn resolve_screen_self_ty(ty: &Ty, ambient: Option<&GenericArgs>, depth: usize) 
 /// type that implementation assigns the item — read from
 /// the implementation's own definition — is the value.
 /// Anything else (no applicable implementation, several
-/// disagreeing, an item with its own generic arguments)
-/// determines nothing and returns `None`.
+/// disagreeing) determines nothing and returns `None`.
 fn projection_resolved_ty(
     alias: &rustc_public::ty::AliasTy,
     ambient: Option<&GenericArgs>,
@@ -1075,10 +1250,14 @@ fn projection_impl_assigned_ty(
     let mut assigned: Option<Ty> = None;
     for impl_def in impls_of_trait(trait_def) {
         let tref = impl_def.trait_impl().value;
-        // A projection carrying arguments beyond its trait
-        // reference's (a generic associated type) has no
-        // value the table alone determines.
-        if alias.args.0.len() != tref.args().0.len() {
+        // A projection carrying fewer arguments than the
+        // trait reference cannot be this implementation's.
+        // Arguments beyond the trait reference's are the
+        // associated item's own -- a generic associated
+        // type's -- and instantiate the item alongside the
+        // implementation's arguments when its assigned type
+        // is read, below.
+        if alias.args.0.len() < tref.args().0.len() {
             continue;
         }
         let mut bindings: HashMap<u32, GenericArgKind> = HashMap::new();
@@ -1114,7 +1293,9 @@ fn projection_impl_assigned_ty(
         // so it is the applicable one; if its assigned
         // type cannot be read, no other implementation's
         // can stand in for it.
-        let args = impl_instantiation_args(&impl_def, &bindings)?;
+        let mut args = impl_instantiation_args(&impl_def, &bindings)?;
+        args.0
+            .extend_from_slice(&alias.args.0[tref.args().0.len()..]);
         let ty = impl_item_assigned_ty(&impl_def, alias, &args)?;
         match assigned {
             None => assigned = Some(ty),

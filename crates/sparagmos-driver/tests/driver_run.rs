@@ -2189,6 +2189,112 @@ fn run_mode_dyn_bound_projection_trait_arg_only_param_runs() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
 }
 
+const DYN_BOUND_PROJECTION_NESTED_ADT_ARG_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Carrier {
+    type Item: Trait + ?Sized;
+}
+struct Wrap<T> {
+    marker: std::marker::PhantomData<T>,
+}
+impl Carrier for Wrap<u32> {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<T: Carrier> {
+    field: <T::Item as Trait>::Assoc,
+}
+struct Outer<T>(Holder<Wrap<T>>)
+where
+    Wrap<T>: Carrier;
+fn main() {
+    let o = Outer::<u32>(Holder::<Wrap<u32>> { field: 42 });
+    println!("{}", o.0.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_nested_adt_arg_runs() {
+    // The holder reaches the screen through another ADT's
+    // field, as `Holder<Wrap<T>>` in `Outer<T>`'s frame.
+    // Composing the holder's arguments with the outer
+    // frame's used to substitute only arguments that are
+    // directly parameters, leaving `Wrap<T>` with the outer
+    // parameter still inside; the implementation matcher
+    // then could not select `Carrier for Wrap<u32>` and the
+    // screen rejected every function using `Outer<u32>`,
+    // including main. Substituting parameters throughout
+    // the nested argument gives the holder `Wrap<u32>`,
+    // whose implementation's binding the field projection
+    // normalizes through -- natively the program prints 42.
+    let dir = temp_dir("dyn-bound-projection-nested-adt-arg");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_nested_adt_arg.rs",
+        DYN_BOUND_PROJECTION_NESTED_ADT_ARG_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the nested-ADT-arg projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_GENERIC_ASSOC_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Carrier {
+    type Item<A>: Trait + ?Sized;
+}
+impl Carrier for () {
+    type Item<A> = dyn Trait<Assoc = A>;
+}
+struct Holder<T: Carrier> {
+    field: <T::Item<u32> as Trait>::Assoc,
+}
+fn take(h: Holder<()>) -> u32 {
+    h.field
+}
+fn main() {
+    let h = Holder::<()> { field: 42 };
+    println!("{}", take(h));
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_generic_assoc_type_runs() {
+    // The intermediate projection is a generic associated
+    // type: `<T::Item<u32> as Trait>::Assoc`. The
+    // projection carries the item's own argument past its
+    // trait reference's, and the implementation matcher
+    // used to skip every implementation on that argument
+    // count alone, resolving nothing, so the screen
+    // rejected the holder and main. Reading the assigned
+    // type with the item's arguments applied reaches
+    // `dyn Trait<Assoc = u32>`, whose binding the outer
+    // projection normalizes through -- natively the program
+    // prints 42.
+    let dir = temp_dir("dyn-bound-projection-generic-assoc");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_generic_assoc.rs",
+        DYN_BOUND_PROJECTION_GENERIC_ASSOC_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the generic-associated-type projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
 const POINTEE_METADATA_PROJECTION_SRC: &str = r#"
 #![feature(ptr_metadata)]
 struct Holder<T: ?Sized> {
