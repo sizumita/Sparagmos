@@ -26168,3 +26168,122 @@ fn run_mode_extern_static_prefix_slice_keeps_full_storage() {
         "e0=10 e1=20\n",
     );
 }
+
+const EXTERN_STATIC_INTERIOR_FIRST_SRC: &str = r#"
+extern "C" {
+    static mut EXT_ARR: [u32; 2];
+}
+const FIRST: *mut u32 = unsafe { &raw mut EXT_ARR[0] };
+fn main() {
+    unsafe {
+        FIRST.write(10);
+        std::ptr::addr_of_mut!(EXT_ARR).cast::<u32>().add(1).write(20);
+        println!("e0={} e1={}", EXT_ARR[0], EXT_ARR[1]);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_extern_static_interior_write_first_keeps_full_storage() {
+    // A constant pointer to one element of a foreign array
+    // static, written through before any whole-static access:
+    // the reference's seed is the static's full initializer, so
+    // the storage it seeds must have the declared array's full
+    // extent -- a later write to the second element is valid
+    // and must observe the first write.
+    run_ok(
+        "extern-static-interior-first",
+        EXTERN_STATIC_INTERIOR_FIRST_SRC,
+        "e0=10 e1=20\n",
+    );
+}
+
+const EXTERN_STATIC_FIELD_SLICE_FIRST_SRC: &str = r#"
+#[repr(C)]
+pub struct Pair {
+    data: [u32; 2],
+    sentinel: u32,
+}
+extern "C" {
+    static mut EXT_PAIR: Pair;
+}
+const S: *mut [u32] = unsafe { &raw mut EXT_PAIR.data };
+fn main() {
+    unsafe {
+        (*S)[0] = 10;
+        std::ptr::addr_of_mut!(EXT_PAIR.data)
+            .cast::<u32>()
+            .add(1)
+            .write(20);
+        std::ptr::addr_of_mut!(EXT_PAIR.sentinel).write(7);
+        println!(
+            "d0={} d1={} sentinel={}",
+            EXT_PAIR.data[0], EXT_PAIR.data[1], EXT_PAIR.sentinel
+        );
+    }
+}
+"#;
+
+#[test]
+fn run_mode_extern_static_field_slice_first_keeps_full_storage() {
+    // A constant slice of an array FIELD of a foreign static,
+    // evaluated before any whole-static access: the projection
+    // is nonempty, but the seed is still the static's full
+    // initializer, so the storage must be seeded with the
+    // declared struct's skeleton. A bare seed left the storage
+    // shapeless: the first write collapsed the field slot to
+    // the written scalar, and the later write to the field's
+    // second element failed with a type mismatch against it.
+    run_ok(
+        "extern-static-field-slice-first",
+        EXTERN_STATIC_FIELD_SLICE_FIRST_SRC,
+        "d0=10 d1=20 sentinel=7\n",
+    );
+}
+
+const EXTERN_STATIC_FIELD_PREFIX_FIRST_SRC: &str = r#"
+#[repr(C)]
+pub struct Pair {
+    data: [u32; 2],
+    sentinel: u32,
+}
+extern "C" {
+    static mut EXT_PAIR: Pair;
+}
+const PFX: *mut [u32] = unsafe {
+    std::ptr::slice_from_raw_parts_mut(
+        std::ptr::addr_of_mut!(EXT_PAIR.data).cast::<u32>(),
+        1,
+    )
+};
+fn main() {
+    unsafe {
+        (*PFX)[0] = 10;
+        std::ptr::addr_of_mut!(EXT_PAIR.data)
+            .cast::<u32>()
+            .add(1)
+            .write(20);
+        std::ptr::addr_of_mut!(EXT_PAIR.sentinel).write(7);
+        println!(
+            "d0={} d1={} sentinel={}",
+            EXT_PAIR.data[0], EXT_PAIR.data[1], EXT_PAIR.sentinel
+        );
+    }
+}
+"#;
+
+#[test]
+fn run_mode_extern_static_field_prefix_slice_first_keeps_full_storage() {
+    // A constant slice covering only a PREFIX of an array
+    // field of a foreign static, evaluated first: the slice's
+    // length bounds only the view it denotes, and the field
+    // projection does not shrink the seed either -- the
+    // storage is the declared struct's full extent, so the
+    // later writes to the field's second element and to the
+    // sibling field are valid.
+    run_ok(
+        "extern-static-field-prefix-first",
+        EXTERN_STATIC_FIELD_PREFIX_FIRST_SRC,
+        "d0=10 d1=20 sentinel=7\n",
+    );
+}
