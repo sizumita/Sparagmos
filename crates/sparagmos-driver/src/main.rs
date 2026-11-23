@@ -849,7 +849,7 @@ struct DeferredFn {
 /// Cap on monomorphic instance bodies collected for generic local
 /// definitions per program, mirroring the reachability
 /// collection's cap for foreign bodies.
-const MAX_LOCAL_INSTANCES: usize = 1024;
+const MAX_LOCAL_INSTANCES: usize = 8192;
 
 /// Depth at which the demand passes report rustc's
 /// monomorphization recursion limit: the number of instances of

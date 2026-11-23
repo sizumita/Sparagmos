@@ -8031,9 +8031,13 @@ impl<'a> Interpreter<'a> {
                     )
                 };
                 let value = vals.into_iter().next().expect("arity checked");
-                // In this value model `String` and `str` data are the
-                // same value; the conversion is the identity on it.
-                if matches!(value, Value::Str(_))
+                // The reflexive impl (`impl<T> From<T> for T`) is
+                // the identity by definition; collected code names
+                // it whenever a generic conversion is instantiated
+                // at equal types.
+                if target == source && !target.is_empty() {
+                    Ok(value)
+                } else if matches!(value, Value::Str(_))
                     && (target == "std::string::String" || target == "str" || target == "&str")
                 {
                     Ok(value)
@@ -8545,6 +8549,21 @@ impl<'a> Interpreter<'a> {
                             value,
                         ],
                     })
+                } else if matches!(value, Value::Str(_))
+                    && [
+                        "std::rc::Rc<",
+                        "alloc::rc::Rc<",
+                        "std::sync::Arc<",
+                        "alloc::sync::Arc<",
+                    ]
+                    .iter()
+                    .any(|prefix| generic_first_arg(target, prefix) == Some("str"))
+                {
+                    // `Rc<str>` / `Arc<str>`: `From<&str>` (and
+                    // `From<String>` / `From<Box<str>>`, whose
+                    // values are the same string in this model): a
+                    // fresh counted handle over the string.
+                    Ok(self.rc_new_handle(value))
                 } else if target == "std::path::PathBuf" {
                     // `PathBuf: From<&str> / From<&Path> /
                     // From<&OsStr> / From<String> / From<OsString>`:
@@ -10474,12 +10493,122 @@ impl<'a> Interpreter<'a> {
                     }
                 };
                 let haystack = text_of(&vals[0])?;
-                let needle = text_of(&vals[1])?;
-                Ok(Value::Bool(match kind {
-                    Builtin::StrContains => haystack.contains(&needle),
-                    Builtin::StrStartsWith => haystack.starts_with(&needle),
-                    _ => haystack.ends_with(&needle),
-                }))
+                // The `Pattern` impls beyond `&str`: a `char`
+                // searches for that one character, a set of
+                // `char`s for any of them, and a predicate
+                // (`FnMut(char) -> bool`, arriving as a function
+                // pointer or a closure) is consulted per
+                // character -- the shapes collected std and
+                // regex code actually pass.
+                enum Needle {
+                    Text(String),
+                    One(char),
+                    Set(Vec<char>),
+                    Pred(Value),
+                }
+                let resolved = self.resolve_value(frames, &vals[1])?;
+                let needle = match resolved {
+                    Value::Str(_) | Value::Bytes(_) => Needle::Text(text_of(&vals[1])?),
+                    Value::Uint(v) => match char::from_u32(v as u32) {
+                        Some(c) => Needle::One(c),
+                        None => {
+                            return Err(InterpError::type_mismatch(
+                                "str pattern argument",
+                                "valid char pattern",
+                                "out-of-range char value",
+                            ))
+                        }
+                    },
+                    Value::FnPtr(_) | Value::Closure { .. } => Needle::Pred(resolved),
+                    ref other => {
+                        // A `&[char]` pattern arrives as a fat
+                        // reference over the character tuple.
+                        match self.slice_elements(frames, &vals[1]) {
+                            Ok((elems, _))
+                                if elems.iter().all(|e| matches!(e, Value::Uint(_))) =>
+                            {
+                                let mut set = Vec::with_capacity(elems.len());
+                                for e in &elems {
+                                    let Value::Uint(v) = e else { unreachable!() };
+                                    match char::from_u32(*v as u32) {
+                                        Some(c) => set.push(c),
+                                        None => {
+                                            return Err(InterpError::type_mismatch(
+                                                "str pattern argument",
+                                                "valid char pattern",
+                                                "out-of-range char value",
+                                            ))
+                                        }
+                                    }
+                                }
+                                Needle::Set(set)
+                            }
+                            _ => {
+                                return Err(InterpError::type_mismatch(
+                                    "str pattern argument",
+                                    "string, char, char set or predicate value",
+                                    other.kind_name(),
+                                ))
+                            }
+                        }
+                    }
+                };
+                let result = match needle {
+                    Needle::Text(t) => match kind {
+                        Builtin::StrContains => haystack.contains(&t),
+                        Builtin::StrStartsWith => haystack.starts_with(&t),
+                        _ => haystack.ends_with(&t),
+                    },
+                    needle => {
+                        // Per-character needles: consult the
+                        // test for the first (contains / starts
+                        // with) or last (ends with) character the
+                        // semantics reach.
+                        let mut test = |c: char| -> InterpResult<bool> {
+                            Ok(match &needle {
+                                Needle::One(n) => c == *n,
+                                Needle::Set(set) => set.contains(&c),
+                                Needle::Pred(pred) => match self.call_callable_sync(
+                                    frames,
+                                    pred,
+                                    None,
+                                    vec![Value::Uint(u128::from(c as u32))],
+                                )? {
+                                    Value::Bool(b) => b,
+                                    ref other => {
+                                        return Err(InterpError::type_mismatch(
+                                            "str pattern predicate",
+                                            "boolean result",
+                                            other.kind_name(),
+                                        ))
+                                    }
+                                },
+                                Needle::Text(_) => unreachable!(),
+                            })
+                        };
+                        match kind {
+                            Builtin::StrContains => {
+                                let mut found = false;
+                                for c in haystack.chars() {
+                                    if test(c)? {
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                found
+                            }
+                            Builtin::StrStartsWith => match haystack.chars().next() {
+                                Some(c) => test(c)?,
+                                None => false,
+                            },
+                            _ => match haystack.chars().next_back() {
+                                Some(c) => test(c)?,
+                                None => false,
+                            },
+                        }
+                    }
+                };
+                Ok(Value::Bool(result))
             }
             Builtin::SliceWindows => {
                 arity(2)?;
@@ -21018,6 +21147,11 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                 Value::Enum { fields, .. } if fields.len() == 1 => {
                     resolved = fields.into_iter().next().expect("length checked");
                 }
+                // A one-byte string read back through a byte
+                // pointer composes the scalar byte (the byte
+                // view's shaped read): the lone byte value at
+                // this position is the one-byte string.
+                Value::Uint(v) if v <= 0xff => return Ok(vec![v as u8]),
                 other => {
                     return Err(InterpError::type_mismatch(
                         "OsStr argument",

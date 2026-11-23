@@ -15078,6 +15078,7 @@ impl<'a> Interpreter<'a> {
             let byte = ((bits >> (8 * k)) & 0xff) as u8;
             match self.splice_storage_byte(&mut base, &layout, pos + k, byte)? {
                 Ok(()) => {}
+                Err(ByteVerdict::Padding(_)) => {}
                 Err(verdict) => {
                     return Some(Err(self.byte_view_error(
                         verdict,
@@ -15243,6 +15244,12 @@ impl<'a> Interpreter<'a> {
         };
         Some(match verdict {
             Ok(()) => Ok(()),
+            // A byte written into padding is discarded: padding
+            // holds no value (the read side symmetrically
+            // yields the indeterminate value for it), and
+            // byte-wise copies over an aggregate write its
+            // padding bytes along with its fields.
+            Err(ByteVerdict::Padding(_)) => Ok(()),
             Err(verdict) => Err(self.byte_view_error(verdict, &func, &place_desc, false)),
         })
     }
