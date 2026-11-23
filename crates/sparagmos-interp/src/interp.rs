@@ -5775,7 +5775,7 @@ impl<'a> Interpreter<'a> {
                                 // data pointer sits at the end of
                                 // the field-0 wrapper chain beside
                                 // the allocator field.
-                                match Self::dyn_data_pointer(other) {
+                                match self.dyn_data_pointer(other) {
                                     Value::Ref(target) => target,
                                     _ => {
                                         return Err(InterpError::type_mismatch(
@@ -10138,7 +10138,15 @@ impl<'a> Interpreter<'a> {
             Value::DynRef { base, .. } => {
                 // A reference-counted base names its pointee in the
                 // allocation store, not inside the handle value.
-                if let Some(id) = rc_handle_id(base) {
+                // The handle reading is licensed by the
+                // allocation's contents (`rc_inner_id`), not by
+                // the base's shape alone: a plain aggregate can
+                // share the handle's shape (a `CString` value is
+                // a one-field aggregate over a one-field box
+                // aggregate over an allocation pointer), and
+                // reading it as a handle would name a position
+                // inside its buffer instead of the value.
+                if let Some(id) = self.rc_inner_id(base) {
                     return Ok(Resolved::Alloc {
                         id,
                         projection: vec![RefProj::Field(2)],
@@ -10165,7 +10173,7 @@ impl<'a> Interpreter<'a> {
                     // names the pointer the pointee lives
                     // behind.
                     Value::Enum { fields, .. } if fields.len() > 1 => {
-                        let ptr = Self::dyn_data_pointer(base);
+                        let ptr = self.dyn_data_pointer(base);
                         self.deref_value(frames, &ptr)
                     }
                     _ => self.deref_value(frames, base),
@@ -17679,8 +17687,14 @@ impl<'a> Interpreter<'a> {
     /// pointer is the pointee slot inside its inner allocation
     /// — the same position `deref_value` resolves for the
     /// handle.
-    pub(crate) fn dyn_data_pointer(base: &Value) -> Value {
-        if let Some(id) = rc_handle_id(base) {
+    pub(crate) fn dyn_data_pointer(&self, base: &Value) -> Value {
+        // The handle reading is licensed by the allocation's
+        // contents (`rc_inner_id`), not by the base's shape
+        // alone: a plain aggregate can share the handle's shape
+        // (a `CString` value, above all), and reading it as a
+        // handle would name a position inside its buffer
+        // instead of the value itself.
+        if let Some(id) = self.rc_inner_id(base) {
             return Value::Ref(RefTarget::Alloc {
                 id,
                 projection: vec![RefProj::Field(2)],
@@ -17781,7 +17795,7 @@ impl<'a> Interpreter<'a> {
                 let value = self.eval_operand(frames, body, op)?;
                 match value {
                     Value::FatRef { base, .. } => Ok((*base).clone()),
-                    Value::DynRef { base, .. } => Ok(Self::dyn_data_pointer(&base)),
+                    Value::DynRef { base, .. } => Ok(self.dyn_data_pointer(&base)),
                     other => Ok(other),
                 }
             }

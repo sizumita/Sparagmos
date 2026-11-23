@@ -24555,3 +24555,140 @@ fn run_mode_ipv4_addr_from_conversions() {
         "from array: 1.2.3.4\nfrom u32: 127.0.0.1\ninto addr: 10.0.0.255\nto u32: 2130706433\nbits: 2130706433\n",
     );
 }
+
+const BUFFER_FIELD_DYN_DEBUG_SRC: &str = r#"
+#[derive(Debug)]
+struct W { b: Box<[u8]> }
+#[derive(Debug)]
+struct S { w: W, n: u32 }
+#[derive(Debug)]
+struct T(W, u32);
+use std::fmt::Debug;
+fn show(d: &dyn Debug) { println!("dyn={:?}", d); }
+fn main() {
+    let s = S { w: W { b: vec![10u8, 20, 30].into_boxed_slice() }, n: 1 };
+    println!("{:?}", s);
+    let t = T(W { b: vec![40u8, 50].into_boxed_slice() }, 2);
+    println!("{:?}", t);
+    show(&s.w);
+    let rc: std::rc::Rc<dyn Debug> = std::rc::Rc::new(vec![7u8, 8]);
+    println!("rc={:?}", rc);
+    let bx: Box<dyn Debug> = Box::new(String::from("boxed"));
+    println!("box={:?}", bx);
+}
+"#;
+
+#[test]
+fn run_mode_buffer_shaped_field_dyn_debug_reads_whole_value() {
+    // A one-field aggregate over a one-field box aggregate over
+    // an allocation pointer (a wrapper around a boxed slice,
+    // the shape a `CString` field also has) shares the value
+    // shape of an `Rc` handle. Shaping such a field's trait
+    // object as a handle would read a byte inside the buffer
+    // instead of the field value; the handle reading is
+    // licensed by the allocation's contents (an `RcInner`
+    // aggregate), so the field formats as the whole value, and
+    // genuine `Rc` / `Box` trait objects keep formatting their
+    // pointees.
+    run_ok(
+        "buffer-field-dyn-debug",
+        BUFFER_FIELD_DYN_DEBUG_SRC,
+        "S { w: W { b: [10, 20, 30] }, n: 1 }\nT(W { b: [40, 50] }, 2)\ndyn=W { b: [10, 20, 30] }\nrc=[7, 8]\nbox=\"boxed\"\n",
+    );
+}
+
+const CSTRING_FIELD_DYN_DEBUG_SRC: &str = r#"
+use std::ffi::CString;
+#[derive(Debug)]
+struct S { name: CString, n: u32 }
+#[derive(Debug)]
+struct T(CString, u32);
+fn main() {
+    let s = S { name: CString::new("hello").unwrap(), n: 42 };
+    let via_struct = format!("{:?}", s);
+    let direct = format!("{:?}", s.name);
+    println!("field_is_value={}", via_struct.contains(&direct));
+    println!("struct_n={}", via_struct.contains("n: 42"));
+    let t = T(CString::new("world").unwrap(), 7);
+    let via_tuple = format!("{:?}", t);
+    let direct_t = format!("{:?}", t.0);
+    println!("tuple_field_is_value={}", via_tuple.contains(&direct_t));
+}
+"#;
+
+#[test]
+fn run_mode_cstring_field_dyn_debug_reads_whole_value() {
+    // The invariant under test is that the field renders as
+    // the `CString` value itself (the same text as formatting
+    // the value directly), never as a single byte of its
+    // buffer; the assertion is phrased over the direct
+    // rendering so it does not depend on how `CString`'s own
+    // `Debug` text is produced.
+    run_ok(
+        "cstring-field-dyn-debug",
+        CSTRING_FIELD_DYN_DEBUG_SRC,
+        "field_is_value=true\nstruct_n=true\ntuple_field_is_value=true\n",
+    );
+}
+
+const HANDLE_DYN_DEBUG_SRC: &str = r#"
+use std::fmt::Debug;
+fn show(d: &dyn Debug) { println!("{:?}", d); }
+#[derive(Debug)]
+struct Holder { rc: std::rc::Rc<String>, bx: Box<Vec<u8>> }
+fn main() {
+    let rc = std::rc::Rc::new(String::from("rcstr"));
+    show(&rc);
+    let rc2: std::rc::Rc<dyn Debug> = std::rc::Rc::new(42u32);
+    println!("{:?}", rc2);
+    let arc: std::sync::Arc<dyn Debug> = std::sync::Arc::new(vec![1u8, 2, 3]);
+    println!("{:?}", arc);
+    let b: Box<dyn Debug> = Box::new(String::from("bx"));
+    println!("{:?}", b);
+    let h = Holder { rc: std::rc::Rc::new("held".to_string()), bx: Box::new(vec![9u8]) };
+    println!("{:?}", h);
+}
+"#;
+
+#[test]
+fn run_mode_handle_dyn_debug_formats_pointee() {
+    // The genuine reference-counted handles: their trait
+    // objects and derived-`Debug` fields format the pointee
+    // the handle names in its inner allocation.
+    run_ok(
+        "handle-dyn-debug",
+        HANDLE_DYN_DEBUG_SRC,
+        "\"rcstr\"\n42\n[1, 2, 3]\n\"bx\"\nHolder { rc: \"held\", bx: [9] }\n",
+    );
+}
+
+const CSTRING_DYN_MEASURE_SRC: &str = r#"
+use std::ffi::CString;
+trait Measure { fn measure(&self) -> usize; }
+impl Measure for CString { fn measure(&self) -> usize { self.as_bytes().len() } }
+struct S { name: CString, n: u32 }
+fn main() {
+    let c = CString::new("hello").unwrap();
+    let d: &dyn Measure = &c;
+    println!("ref_dyn={}", d.measure());
+    let b: Box<dyn Measure> = Box::new(CString::new("world!").unwrap());
+    println!("box_dyn={}", b.measure());
+    let rc: std::rc::Rc<dyn Measure> = std::rc::Rc::new(CString::new("rc").unwrap());
+    println!("rc_dyn={}", rc.measure());
+    let s = S { name: CString::new("field").unwrap(), n: 1 };
+    let d2: &dyn Measure = &s.name;
+    println!("field_dyn={}", d2.measure());
+}
+"#;
+
+#[test]
+fn run_mode_cstring_dyn_method_reads_whole_value() {
+    // Method dispatch through trait objects over a `CString`
+    // (by reference, boxed, reference-counted, and as a struct
+    // field) reads the whole value through the receiver.
+    run_ok(
+        "cstring-dyn-measure",
+        CSTRING_DYN_MEASURE_SRC,
+        "ref_dyn=5\nbox_dyn=6\nrc_dyn=2\nfield_dyn=5\n",
+    );
+}
