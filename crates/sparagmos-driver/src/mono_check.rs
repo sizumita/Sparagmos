@@ -1451,12 +1451,13 @@ impl<'tcx> RequiredConstWalk<'tcx> {
                 return;
             }
         }
-        // Constant operands of the reachable blocks: a function
-        // item or closure used as a plain value is not among the
-        // mentioned items (which record calls, drops, casts and
-        // coercions), but the collector still collects the
-        // instance behind it; and an operand's value can point
-        // into allocations holding further instances and statics.
+        // Constant operands of the reachable blocks: the scan
+        // evaluates each one and chases the value into the
+        // allocations it points at (which can hold further
+        // instances and statics). A function item or closure
+        // used as a plain value is not collected from here; it
+        // is collected through the mentioned items above where
+        // it is actually used as a function.
         let mut scan = OperandScan {
             walk: self,
             instance,
@@ -1780,31 +1781,23 @@ impl<'tcx> rustc_middle::mir::visit::Visitor<'tcx> for OperandScan<'_, 'tcx> {
         let Some(mono_const) = self.walk.monomorphize(self.instance, const_op.const_) else {
             return;
         };
-        // A bare function-item operand is NOT collected: a
-        // function item is a zero-sized value, and merely using
-        // one as a value (passing it to a generic function that
-        // never calls it, storing it, black-boxing it) does not
-        // make the collector codegen its body, so resolving it
-        // as a function pointer here would demand bodies rustc
-        // never collects and fail compilations rustc accepts.
-        // The instances behind function items are collected
-        // where the item is actually used as a function: calls
-        // and coercions to a function pointer are mentioned
-        // items (handled in `visit_mentioned`), and an evaluated
-        // function-pointer value points into a function
-        // allocation, which the evaluation below chases.
-        match mono_const.ty().kind() {
-            rustc_middle::ty::Closure(def_id, args) => {
-                let instance = rustc_middle::ty::Instance::resolve_closure(
-                    tcx,
-                    *def_id,
-                    *args,
-                    rustc_middle::ty::ClosureKind::FnOnce,
-                );
-                self.walk.enqueue(instance);
-            }
-            _ => {}
-        }
+        // A bare function-item or closure operand is NOT
+        // collected: both are plain values (a function item is
+        // zero-sized, and so is a captureless closure), and
+        // merely using one as a value (passing it to a generic
+        // function that never calls it, storing it, black-boxing
+        // it) does not make the collector codegen its body, so
+        // resolving it here would demand bodies rustc never
+        // collects and fail compilations rustc accepts. The
+        // instances behind them are collected where the value
+        // is actually used as a function: a call is a mentioned
+        // item (a closure call names the `Fn`/`FnMut`/`FnOnce`
+        // trait method, whose resolution reaches the closure
+        // instance), a coercion to a function pointer is a
+        // mentioned item too (both handled in
+        // `visit_mentioned`), and an evaluated function-pointer
+        // value points into a function allocation, which the
+        // evaluation below chases.
         if self.walk.finding.is_some() {
             return;
         }

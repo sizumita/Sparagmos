@@ -26615,3 +26615,136 @@ fn convert_mode_required_const_behind_fn_item_value_converts() {
          value must convert; stderr={stderr}"
     );
 }
+const REQUIRED_CONST_BEHIND_UNCALLED_CLOSURE_SRC: &str = r#"
+struct Fail<T>(T);
+impl<T> Fail<T> {
+    const C: () = panic!();
+}
+#[inline(never)]
+fn hold<U>(x: U) {
+    std::hint::black_box(x);
+}
+#[inline(never)]
+fn outer<T>() {
+    hold(|| {
+        if false {
+            let _ = Fail::<T>::C;
+        }
+    });
+}
+fn main() {
+    if false {
+        outer::<i32>();
+    }
+}
+"#;
+
+#[test]
+fn convert_mode_required_const_behind_uncalled_closure_converts() {
+    // Passing a captureless closure as a value to a generic
+    // function that never calls it does not codegen the closure
+    // body: a bare closure constant operand is a zero-sized
+    // value, not a collected item. The walk reaches
+    // `outer::<i32>` through its mention from `main`, but must
+    // not demand the closure instance from the operand, so the
+    // panicking constant in the closure body is never evaluated
+    // and the crate converts, as it does under rustc.
+    let dir = temp_dir("required-const-uncalled-closure");
+    let src = fixture(
+        &dir,
+        "required_const_uncalled_closure.rs",
+        REQUIRED_CONST_BEHIND_UNCALLED_CLOSURE_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a failing required constant behind an uncalled closure \
+         value must convert; stderr={stderr}"
+    );
+}
+
+const REQUIRED_CONST_IN_CALLED_CLOSURE_SRC: &str = r#"
+struct Fail<T>(T);
+impl<T> Fail<T> {
+    const C: () = panic!();
+}
+fn main() {
+    let f = || {
+        let _ = Fail::<i32>::C;
+    };
+    f();
+}
+"#;
+
+#[test]
+fn convert_mode_required_const_in_called_closure_is_a_compile_failure() {
+    // A closure that is actually called IS collected: the call
+    // names the `FnOnce` trait method, whose resolution reaches
+    // the closure instance, and the collector evaluates the
+    // closure body's required constants. `Fail::<i32>::C`
+    // panics in evaluation (E0080), so the crate fails to
+    // compile, exactly as under rustc.
+    let dir = temp_dir("required-const-called-closure");
+    let src = fixture(
+        &dir,
+        "required_const_called_closure.rs",
+        REQUIRED_CONST_IN_CALLED_CLOSURE_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a failing required constant in a called closure must \
+         fail compilation; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("sparagmos-driver: compilation failed")
+            && stderr.contains("E0080"),
+        "the failure must surface the evaluation error; stderr={stderr}"
+    );
+}
+
+const REQUIRED_CONST_IN_COERCED_CLOSURE_SRC: &str = r#"
+struct Fail<T>(T);
+impl<T> Fail<T> {
+    const C: () = panic!();
+}
+fn main() {
+    let f: fn() = || {
+        let _ = Fail::<i32>::C;
+    };
+    std::hint::black_box(f);
+}
+"#;
+
+#[test]
+fn convert_mode_required_const_in_coerced_closure_is_a_compile_failure() {
+    // A closure coerced to a function pointer IS collected:
+    // the coercion is a mentioned item that resolves the
+    // closure instance, and the collector evaluates its
+    // required constants. `Fail::<i32>::C` panics in evaluation
+    // (E0080), so the crate fails to compile, exactly as under
+    // rustc.
+    let dir = temp_dir("required-const-coerced-closure");
+    let src = fixture(
+        &dir,
+        "required_const_coerced_closure.rs",
+        REQUIRED_CONST_IN_COERCED_CLOSURE_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a failing required constant in a closure coerced to a \
+         function pointer must fail compilation; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("sparagmos-driver: compilation failed")
+            && stderr.contains("E0080"),
+        "the failure must surface the evaluation error; stderr={stderr}"
+    );
+}
