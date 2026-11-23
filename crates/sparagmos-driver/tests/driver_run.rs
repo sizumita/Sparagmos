@@ -20063,3 +20063,90 @@ fn run_mode_sparse_tail_in_struct_field_read_by_nested_iteration() {
     );
 }
 
+
+const ZIP_FOLD_SRC: &str = r#"
+fn main() {
+    let a = [1, 2, 3, 4];
+    let b = [10, 20, 30, 40];
+    let f = a.into_iter().zip(b.into_iter()).fold(0, |acc, (x, y)| acc + x * y);
+    println!("fold {}", f);
+    let s: i32 = a.into_iter().zip(b.into_iter()).map(|(x, y)| x + y).sum();
+    println!("sum {}", s);
+    println!("count {}", a.into_iter().zip(b.into_iter()).count());
+    let mut fe = 0;
+    a.into_iter().zip(b.into_iter()).for_each(|(x, y)| fe += x * y);
+    println!("for_each {}", fe);
+    println!("last {:?}", a.into_iter().zip(b.into_iter()).last());
+    println!("vec {}", vec![1, 2, 3].into_iter().zip(vec![10, 20, 30].into_iter()).fold(0, |acc, (x, y)| acc + x * y));
+    println!("uneven {}", (0..3).zip(0..10).fold(0, |acc, (x, y)| acc + x + y));
+    println!("uneven count {}", (0..3).zip(0..10).count());
+}
+"#;
+
+#[test]
+fn run_mode_zip_fold_specialized_consumers() {
+    // `fold` over a `Zip` whose sides are `TrustedRandomAccess`
+    // iterators (array / `vec` into-iterators) resolves to
+    // core's specialized `ZipImpl::fold`, which reads the sides
+    // through `__iterator_get_unchecked` and the state's stored
+    // index/length counters — machinery the modelled state does
+    // not maintain, so the collected body failed (an
+    // `IndexRange` type mismatch) or read uninitialized places.
+    // The driver detects the specialization in the resolved
+    // instance's delegation graph and lets the `Iterator::fold`
+    // builtin serve the call; `sum` / `count` / `for_each` /
+    // `last` reach the same point through their collected
+    // default bodies, which delegate to `fold`.
+    let dir = temp_dir("zip-fold");
+    let src = fixture(&dir, "zip_fold.rs", ZIP_FOLD_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Zip fold/sum/count/for_each over owned iterators must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "fold 300\nsum 110\ncount 4\nfor_each 300\nlast Some((4, 40))\nvec 140\nuneven 6\nuneven count 3\n",
+        "the specialized consumers produce the general fold's results"
+    );
+}
+
+const ZIP_FOLD_MIXED_SRC: &str = r#"
+fn main() {
+    let mut z = [1, 2, 3, 4].into_iter().zip([10, 20, 30, 40].into_iter());
+    println!("first {:?}", z.next());
+    println!("rest {}", z.fold(0, |acc, (x, y)| acc + x + y));
+    let mut z2 = [1, 2, 3, 4].into_iter().zip([10, 20, 30, 40].into_iter());
+    let _ = z2.next();
+    println!("count {}", z2.count());
+    println!("max {:?}", (0..4).zip(10..14).max());
+    println!("reduce {:?}", (0..4).zip(10..14).reduce(|p, q| if q.0 > p.0 { q } else { p }));
+}
+"#;
+
+#[test]
+fn run_mode_zip_fold_after_next() {
+    // Mixed consumption: a modelled `next` step followed by a
+    // specialized consumer. The builtin `next` leaves the Zip
+    // state's specialization counters untouched, so a collected
+    // specialized `fold` afterwards reads a stale length (and,
+    // over `Range` sides, fabricated the one-past-the-end pair
+    // in `max` / `reduce`). Serving `fold` through the builtin
+    // keeps one state discipline for the whole consumption.
+    let dir = temp_dir("zip-fold-mixed");
+    let src = fixture(&dir, "zip_fold_mixed.rs", ZIP_FOLD_MIXED_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Zip next-then-fold must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "first Some((1, 10))\nrest 99\ncount 3\nmax Some((3, 13))\nreduce Some((3, 13))\n",
+        "consumers after a modelled next see exactly the remaining items"
+    );
+}

@@ -373,7 +373,7 @@ pub fn collect_reachable(
             // definition name, so this check is per definition.
             let canonical = sparagmos_interp::builtins::canonical_name(&def_name);
             if sparagmos_interp::builtins::lookup_qualified(&canonical).is_some()
-                && !consumer_instance_needs_body(&canonical, &args)
+                && !consumer_instance_needs_body(&def, &canonical, &args)
                 && !partial_eq_ref_instance_needs_body(&canonical, &args)
             {
                 if builtin_seen.insert(def_id) {
@@ -1079,7 +1079,11 @@ fn walk_closure_ty(ty: &Ty, out: &mut Vec<(ClosureDef, GenericArgs)>) {
 /// faithful execution and conversion prefers it when present.
 /// The iterator type is the call's first generic argument, or
 /// the third for `from_iter` (whose first is the collection).
-fn consumer_instance_needs_body(canonical: &str, args: &GenericArgs) -> bool {
+fn consumer_instance_needs_body(
+    def: &rustc_public::ty::FnDef,
+    canonical: &str,
+    args: &GenericArgs,
+) -> bool {
     // `Index` / `IndexMut`: the builtins read the receiver as a
     // sequence (slices, arrays, `Vec`, `String`), which is the
     // faithful semantics only for those receivers. Any other
@@ -1175,7 +1179,108 @@ fn consumer_instance_needs_body(canonical: &str, args: &GenericArgs) -> bool {
     let Some(GenericArgKind::Type(ty)) = args.0.get(iter_arg) else {
         return false;
     };
-    !iterator_self_modelled(ty)
+    if iterator_self_modelled(ty) {
+        return false;
+    }
+    // A `fold` instance whose body drives the iterator through
+    // the `TrustedRandomAccess` specialization (core's adapter
+    // helpers reach `__iterator_get_unchecked` and read the
+    // sides through stored index/length counters) cannot run on
+    // a modelled adapter state: the state machine maintains no
+    // such counters, and the sides' unchecked-access bodies
+    // address their real layouts, not the model states. The
+    // builtin's fold — the same `next` loop the trait's default
+    // body spells out — is the faithful execution for those
+    // instances, and every other consumer (`count`, `for_each`,
+    // `last`, `sum`, `reduce`, ...) reaches it through its own
+    // collected default body, which delegates to `fold`. The
+    // remaining instances — the default body itself and the
+    // composition overrides that delegate to the inner
+    // iterator's consumers — keep their bodies as today.
+    if canonical == "std::iter::Iterator::fold"
+        && iterator_adapter_modelled(ty)
+        && fold_instance_tra_specialized(def, args)
+    {
+        return false;
+    }
+    true
+}
+
+/// Whether this type is one of the core adapter types whose
+/// state the interpreter's modelled `next` machine steps by
+/// composition (the adapter arms of `next_on_state` in
+/// sparagmos-interp): their states are produced by the builtin
+/// machinery, so a consumer body that bypasses `next` cannot
+/// run on them. Judged by the iterator type's ADT name, as in
+/// `iterator_self_modelled`.
+fn iterator_adapter_modelled(ty: &Ty) -> bool {
+    let Some(TyKind::RigidTy(RigidTy::Adt(def, _))) = guarded_ty_kind(ty) else {
+        return false;
+    };
+    matches!(
+        def.name().as_str(),
+        "std::iter::Chain"
+            | "std::iter::Copied"
+            | "std::iter::Enumerate"
+            | "std::iter::Map"
+            | "std::iter::Rev"
+            | "std::iter::Skip"
+            | "std::iter::SkipWhile"
+            | "std::iter::Take"
+            | "std::iter::Zip"
+    )
+}
+
+/// Whether the resolved `Iterator::fold` instance is served by
+/// core's `TrustedRandomAccess` specialization: the instance
+/// body, followed through the adapter-helper bodies it
+/// delegates to (the `*Impl` / `Spec*` traits under
+/// `core::iter::adapters`), calls an unchecked-access entry
+/// (`__iterator_get_unchecked`, or an adapter's own
+/// `get_unchecked`). Composition overrides delegate to the
+/// inner iterator's trait consumers instead and never reach
+/// those entries. The walk is bounded; any resolution or body
+/// failure answers "not specialized", keeping today's
+/// collection.
+fn fold_instance_tra_specialized(
+    def: &rustc_public::ty::FnDef,
+    args: &GenericArgs,
+) -> bool {
+    let mut queue: VecDeque<(rustc_public::ty::FnDef, GenericArgs)> =
+        VecDeque::from([(def.clone(), args.clone())]);
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut scanned = 0usize;
+    while let Some((d, a)) = queue.pop_front() {
+        if scanned >= 16 {
+            break;
+        }
+        let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Instance::resolve(d, &a)
+        }));
+        let Ok(Ok(inst)) = resolved else {
+            continue;
+        };
+        if !visited.insert(inst.name().to_string()) {
+            continue;
+        }
+        scanned += 1;
+        let Ok(Some(body)) = fetch_body_contained(&inst) else {
+            continue;
+        };
+        for (tdef, targs) in call_targets(&body) {
+            let tname =
+                sparagmos_interp::builtins::canonical_name(&tdef.def_id().name());
+            if tname.contains("__iterator_get_unchecked")
+                || tname.ends_with("::get_unchecked")
+            {
+                return true;
+            }
+            if tname.contains("::adapters::") {
+                queue.push_back((tdef, targs));
+            }
+        }
+    }
+    false
 }
 
 /// Whether a call target naming `PartialEq::eq` / `ne` whose
