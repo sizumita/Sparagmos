@@ -20472,6 +20472,70 @@ fn run_mode_zst_array_iter_nth_count() {
     );
 }
 
+const NTH_SKIPPED_DROP_SRC: &str = r#"
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static DROPS: AtomicUsize = AtomicUsize::new(0);
+
+struct Frag(u32);
+impl Drop for Frag {
+    fn drop(&mut self) {
+        DROPS.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn main() {
+    let mut it = vec![Frag(1), Frag(2), Frag(3)].into_iter();
+    let second = it.nth(1);
+    println!("got {}", second.unwrap().0);
+    println!("drops after nth {}", DROPS.load(Ordering::SeqCst));
+    drop(it);
+    println!("drops after drop(it) {}", DROPS.load(Ordering::SeqCst));
+}
+"#;
+
+#[test]
+fn run_mode_iterator_nth_drops_skipped_items() {
+    // The items `nth` skips are consumed by the skip: the
+    // modelled `nth` runs each skipped item's drop glue
+    // (baked by conversion from the item type) before
+    // stepping on, exactly as core's default body drops the
+    // temporary each `advance_by` iteration yields. Before
+    // the glue ran, the counter read 1 after `nth` (only the
+    // returned item's temporary) and 2 at the end: the
+    // skipped element's destructor never ran, and its slot
+    // in the iterator was already marked consumed, so the
+    // iterator's own drop could not recover it.
+    run_ok(
+        "iterator-nth-drops-skipped-items",
+        NTH_SKIPPED_DROP_SRC,
+        "got 2\ndrops after nth 2\ndrops after drop(it) 3\n",
+    );
+}
+
+const NTH_RANGE_ADVANCE_SRC: &str = r#"
+fn main() {
+    let mut r = 0usize..2_000_000usize;
+    println!("nth {:?}", r.nth(1_500_000));
+    let mut ri = 0usize..=2_000_000usize;
+    println!("incl nth {:?}", ri.nth(1_500_000));
+}
+"#;
+
+#[test]
+fn run_mode_iterator_nth_range_advances_directly() {
+    // An arithmetic range's `nth` advances in one step, as
+    // the specialised body in core does: driving the
+    // modelled `next` transition once per skipped item
+    // spends a step per item and a 1.5M skip exceeds the
+    // default step limit before it can answer.
+    run_ok(
+        "iterator-nth-range-advances-directly",
+        NTH_RANGE_ADVANCE_SRC,
+        "nth Some(1500000)\nincl nth Some(1500000)\n",
+    );
+}
+
 const ITER_MUT_RAW_PARTS_SRC: &str = r#"
 use std::slice;
 

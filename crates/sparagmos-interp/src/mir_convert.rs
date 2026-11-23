@@ -7719,6 +7719,7 @@ let inner = match (&src, target) {
             target: target.map(|b| ir::BasicBlock(b.index())),
             drop_glue: None,
             consumed_glue: None,
+            skipped_glue: None,
             cmp_discriminants: None,
             result_unsize: None,
             unique_elem: None,
@@ -7770,6 +7771,7 @@ let inner = match (&src, target) {
             target: target.map(|b| ir::BasicBlock(b.index())),
             drop_glue: None,
             consumed_glue: None,
+            skipped_glue: None,
             cmp_discriminants: None,
             result_unsize: None,
             unique_elem: None,
@@ -8787,6 +8789,45 @@ let inner = match (&src, target) {
                         }
                         .and_then(|ty| self.drop_glue(ty))
                         .filter(|glue| glue.root != ir::DropPlan::Trivial);
+                        // An `Iterator::nth` call consumes the
+                        // items its skip loop passes over: build
+                        // the item type's glue now (see
+                        // `skipped_glue` in `ir`), so the
+                        // interpreter can run it against each
+                        // skipped item. The item type is the
+                        // destination type's `Option` argument.
+                        // A trivial glue has nothing to run; a
+                        // glue that cannot be accounted for
+                        // keeps the plain call, the treatment
+                        // these calls have always had.
+                        let skipped_glue = if matches!(
+                            kind,
+                            crate::builtins::Builtin::IteratorNth
+                        ) {
+                            self.place_ty(body, destination)
+                                .and_then(|dest_ty| match dest_ty {
+                                    mir::Ty::Adt(def, args) => {
+                                        let name = self
+                                            .names
+                                            .get(&def)
+                                            .or_else(|| {
+                                                self.def_names.get(&def)
+                                            })?;
+                                        if name == "std::option::Option" {
+                                            args.into_iter().next()
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    _ => None,
+                                })
+                                .and_then(|ty| self.drop_glue(&ty))
+                                .filter(|glue| {
+                                    glue.root != ir::DropPlan::Trivial
+                                })
+                        } else {
+                            None
+                        };
                         // A `box_assume_init_into_vec_unsafe` call
                         // asserts its source array is fully
                         // initialized; an element slot that still
@@ -8819,6 +8860,7 @@ let inner = match (&src, target) {
                                 target: target.map(|b| ir::BasicBlock(b.index())),
                                 drop_glue,
                                 consumed_glue,
+                                skipped_glue,
                                 cmp_discriminants,
                                 result_unsize,
                                 unique_elem,

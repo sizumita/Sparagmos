@@ -4091,7 +4091,10 @@ impl<'a> Interpreter<'a> {
     /// `generic_args` are the callee's rendered generic type tags.
     /// `unique_elem` is the conversion-baked element value of a
     /// `box_assume_init_into_vec_unsafe` call (see
-    /// `TerminatorKind::CallBuiltin::unique_elem`).
+    /// `TerminatorKind::CallBuiltin::unique_elem`), and
+    /// `skipped_glue` the conversion-baked item glue of an
+    /// `Iterator::nth` call (see
+    /// `TerminatorKind::CallBuiltin::skipped_glue`).
     pub(crate) fn exec_builtin(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -4101,6 +4104,7 @@ impl<'a> Interpreter<'a> {
         args: &[Operand],
         cmp_discriminants: Option<&[i128]>,
         unique_elem: Option<&Value>,
+        skipped_glue: Option<&crate::ir::DropGlue>,
     ) -> InterpResult<Value> {
         // `Add` / `Sub` on a modelled time type: conversion emits
         // a builtin node only for those calls (see
@@ -4152,7 +4156,7 @@ impl<'a> Interpreter<'a> {
             let stamp = vals.pop().expect("two arguments");
             self.note_panic_stamp(stamp);
         }
-        self.exec_builtin_values(frames, body, args, kind, name, generic_args, vals, cmp_discriminants, unique_elem)
+        self.exec_builtin_values(frames, body, args, kind, name, generic_args, vals, cmp_discriminants, unique_elem, skipped_glue)
     }
 
     /// Execute a builtin whose arguments are already evaluated
@@ -4170,6 +4174,7 @@ impl<'a> Interpreter<'a> {
         vals: Vec<Value>,
         cmp_discriminants: Option<&[i128]>,
         unique_elem: Option<&Value>,
+        skipped_glue: Option<&crate::ir::DropGlue>,
     ) -> InterpResult<Value> {
         let arity = |n: usize| -> InterpResult<()> {
             if vals.len() == n {
@@ -6366,18 +6371,39 @@ impl<'a> Interpreter<'a> {
                         ))
                     }
                 };
-                // `nth` is `advance_by(n)` followed by `next`:
-                // drive the modelled `next` transition `n` times,
-                // discarding the items, then once more for the
-                // result. An iterator that runs out during the
-                // skips is left exhausted and yields `None`,
-                // exactly as the core default body leaves it.
+                // `nth` is `advance_by(n)` followed by `next`.
+                // An arithmetic range advances in one step, as
+                // its specialised body in core does (see
+                // `range_skip_at`); every other iterator drives
+                // the modelled `next` transition `n` times, then
+                // once more for the result. A skipped item is
+                // consumed by the skip: its drop glue (baked by
+                // conversion, see `skipped_glue` in `ir`) runs
+                // before the next step, exactly as the core
+                // default body drops the temporary each
+                // `advance_by` iteration yields. An iterator
+                // that runs out during the skips is left
+                // exhausted and yields `None`, exactly as the
+                // core default body leaves it.
                 let target = self.deref_value(frames, &vals[0])?;
+                if n > 0 {
+                    if let Some(exhausted) =
+                        self.range_skip_at(frames, self_ty, &target, n)?
+                    {
+                        if exhausted {
+                            return Ok(none_value());
+                        }
+                        return self.iterator_next_at(frames, self_ty, &target);
+                    }
+                }
                 for _ in 0..n {
                     self.tick_step()?;
                     let item = self.iterator_next_at(frames, self_ty, &target)?;
-                    if option_payload(item)?.is_none() {
+                    let Some(skipped) = option_payload(item)? else {
                         return Ok(none_value());
+                    };
+                    if let Some(glue) = skipped_glue {
+                        self.drop_value_sync(frames, skipped, glue)?;
                     }
                 }
                 self.iterator_next_at(frames, self_ty, &target)
@@ -12617,6 +12643,145 @@ fn value_fingerprint(value: &Value) -> u64 {
         let (new_state, result) = self.iterator_next_state(frames, self_ty, state)?;
         self.write_resolved(frames, target, new_state)?;
         Ok(result)
+    }
+
+    /// Skip `n` items of an arithmetic range state at
+    /// `target` in one arithmetic step — the advance the
+    /// specialised `nth` / `advance_by` bodies of `Range` and
+    /// `RangeInclusive` perform in core, which the per-item
+    /// loop cannot reproduce within the step limit for a
+    /// large skip. `Ok(Some(true))` when the skip exhausted
+    /// the range (the state is left in exactly the form the
+    /// per-item step machine leaves an exhausted range in, so
+    /// the two accountings cannot disagree), `Ok(Some(false))`
+    /// when items remain (the caller's final step then serves
+    /// the result), and `Ok(None)` when the state is not an
+    /// arithmetic range's, leaving the per-item loop to the
+    /// caller.
+    fn range_skip_at(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        self_ty: &str,
+        target: &Resolved,
+        n: u128,
+    ) -> InterpResult<Option<bool>> {
+        let inclusive = if self_ty.starts_with("std::ops::RangeInclusive<") {
+            true
+        } else if self_ty.starts_with("std::ops::Range<") {
+            false
+        } else {
+            return Ok(None);
+        };
+        let state = self.read_resolved(frames, target)?;
+        let Ok(fields) = iterator_fields(&state, self_ty) else {
+            return Ok(None);
+        };
+        // The bounds as bit patterns: with `start <= end` in
+        // the value's own domain, the difference and the
+        // advance are exact in wrapping arithmetic for both
+        // the signed and the unsigned domain.
+        let bits = |v: &Value| -> Option<u128> {
+            match v {
+                Value::Int(x) => Some(*x as u128),
+                Value::Uint(x) => Some(*x),
+                _ => None,
+            }
+        };
+        let unbits = |start: &Value, bits: u128| -> Value {
+            match start {
+                Value::Int(_) => Value::Int(bits as i128),
+                _ => Value::Uint(bits),
+            }
+        };
+        if inclusive {
+            if fields.len() != 3 {
+                return Ok(None);
+            }
+            if fields[2] == Value::Bool(true) {
+                // Already exhausted: the step machine leaves
+                // the fields untouched and yields `None`.
+                return Ok(Some(true));
+            }
+            if fields[2] != Value::Bool(false) {
+                return Ok(None);
+            }
+            let (Some(start), Some(end)) =
+                (bits(&fields[0]), bits(&fields[1]))
+            else {
+                return Ok(None);
+            };
+            if compare_values(&fields[0], &fields[1])? == Ordering::Greater {
+                // Empty and unflagged: stepping yields `None`
+                // without touching the fields.
+                return Ok(Some(true));
+            }
+            // The item count is `diff + 1`.
+            let diff = end.wrapping_sub(start);
+            if n > diff {
+                // The skip passes the last item, whose own
+                // step leaves [end, end, true].
+                let new_state = rebuild_state(
+                    &state,
+                    vec![
+                        fields[1].clone(),
+                        fields[1].clone(),
+                        Value::Bool(true),
+                    ],
+                );
+                self.write_resolved(frames, target, new_state)?;
+                Ok(Some(true))
+            } else {
+                let new_start =
+                    unbits(&fields[0], start.wrapping_add(n));
+                let new_state = rebuild_state(
+                    &state,
+                    vec![new_start, fields[1].clone(), Value::Bool(false)],
+                );
+                self.write_resolved(frames, target, new_state)?;
+                Ok(Some(false))
+            }
+        } else {
+            if fields.len() != 2 {
+                return Ok(None);
+            }
+            let (Some(start), Some(end)) =
+                (bits(&fields[0]), bits(&fields[1]))
+            else {
+                return Ok(None);
+            };
+            if compare_values(&fields[0], &fields[1])? != Ordering::Less {
+                // Empty: the specialised advance still
+                // leaves the range at its end (a native
+                // `Range { start: 5, end: 3 }` skipped past
+                // reads back with `start == 3`), which the
+                // write below performs.
+                let new_state = rebuild_state(
+                    &state,
+                    vec![fields[1].clone(), fields[1].clone()],
+                );
+                self.write_resolved(frames, target, new_state)?;
+                return Ok(Some(true));
+            }
+            // The item count is `diff`.
+            let diff = end.wrapping_sub(start);
+            if n >= diff {
+                let new_state = rebuild_state(
+                    &state,
+                    vec![fields[1].clone(), fields[1].clone()],
+                );
+                self.write_resolved(frames, target, new_state)?;
+                Ok(Some(true))
+            } else {
+                let new_start =
+                    unbits(&fields[0], start.wrapping_add(n));
+                let new_state = rebuild_state(
+                    &state,
+                    vec![new_start, fields[1].clone()],
+                );
+                self.write_resolved(frames, target, new_state)?;
+                Ok(Some(false))
+            }
+        }
     }
 
     /// `DoubleEndedIterator::next_back`: mutate the iterator in

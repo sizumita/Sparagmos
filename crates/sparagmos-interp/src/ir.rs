@@ -1333,6 +1333,18 @@ pub enum TerminatorKind {
         /// when the iterator's glue is trivial or cannot be
         /// accounted for (the value is then discarded as before).
         consumed_glue: Option<DropGlue>,
+        /// Drop glue of the item type when the callee is
+        /// `Iterator::nth`: the builtin's skip loop consumes
+        /// each skipped item the way core's default body drops
+        /// the temporary each `advance_by` iteration yields, so
+        /// conversion builds the item type's [`DropGlue`] (the
+        /// item type is the destination's `Option` argument)
+        /// and the interpreter runs it against each skipped
+        /// item before stepping on. `None` for every other
+        /// builtin, and when the item's glue is trivial or
+        /// cannot be accounted for (the item is then discarded
+        /// as before).
+        skipped_glue: Option<DropGlue>,
         /// Discriminant values of the comparison's `Self` type,
         /// baked by conversion for the `PartialOrd` / `Ord`
         /// comparison builtins: their structural comparison orders
