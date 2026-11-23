@@ -17587,13 +17587,35 @@ impl<'a> Interpreter<'a> {
     /// shape, then construct the target shape's value from the
     /// same bits.
     /// The lane decomposition of a vector shape: the shape of
-    /// one lane and the lane count, unwrapping one-payload-field
-    /// ADTs to the array they store. A shape that is not (an ADT
-    /// over) an array decomposes to itself as a single lane.
+    /// one lane and the lane count. Where a one-field ADT
+    /// wrapper chain bottoms out decides the element form. Over
+    /// an array the wrappers spread to the array's lanes. Over
+    /// an aggregate record (a struct or tuple payload) the
+    /// wrapper is itself the element: readers address the
+    /// payload through the wrapper's field step, so the slot
+    /// holds the wrapped value whole -- decomposing to the
+    /// payload would write it where the wrapper belongs and
+    /// lose the layer every other reader addresses. Over
+    /// anything else the wrappers are storage-transparent: a
+    /// wrapper around a scalar is stored as the scalar itself
+    /// (a hash table's slots hold bare control bytes, which
+    /// the byte-composing readers require).
     fn shape_lanes(shape: &ScalarShape) -> (ScalarShape, u64) {
         match shape {
-            ScalarShape::AdtField { inner, .. } => Self::shape_lanes(inner),
             ScalarShape::Array(elem, n) => ((**elem).clone(), *n),
+            ScalarShape::AdtField { inner, .. } => {
+                let mut cur = shape;
+                while let ScalarShape::AdtField { inner, .. } = cur {
+                    cur = inner;
+                }
+                match cur {
+                    ScalarShape::Array(elem, n) => ((**elem).clone(), *n),
+                    ScalarShape::AdtFields { .. } | ScalarShape::Fields { .. } => {
+                        (shape.clone(), 1)
+                    }
+                    _ => Self::shape_lanes(inner),
+                }
+            }
             other => (other.clone(), 1),
         }
     }
