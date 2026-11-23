@@ -15805,6 +15805,221 @@ fn value_fingerprint(value: &Value) -> u64 {
             };
             return Ok(hint(a_lower.min(b_lower), upper));
         }
+        // The slice chunk / window family: `Chunks`, `ChunksMut`,
+        // `RChunks`, `RChunksMut` (state [remaining slice, chunk
+        // size]), their `Exact` variants (state [remaining exact
+        // slice, remainder slice, chunk size]) and `Windows` (the
+        // native [tail slice, window size] state, or the `windows`
+        // builtin's [slice, window size, next index] snapshot).
+        // None of these is served by the generic fallback below:
+        // std's `size_hint` for each is exact, and
+        // `ExactSizeIterator::len`'s collected default body
+        // asserts `size_hint`'s upper bound equals its lower
+        // bound, so the trait-default `(0, None)` fallback turned
+        // every `len()` call into a spurious assertion failure
+        // inside core's `assert_eq!`. The counts are std's own
+        // formulas over the remaining slice: ceiling division by
+        // the chunk size (floor division for the exact variants,
+        // whose stored slice holds only whole chunks), and
+        // `remaining - size + 1` for windows once the window fits.
+        // A state shape this arm cannot read is an explicit
+        // error (unsupported, exit 2), never the `(0, None)`
+        // fallback that re-arms the assertion.
+        {
+            let bare_ty = self_ty
+                .strip_prefix("&mut ")
+                .or_else(|| self_ty.strip_prefix('&'))
+                .unwrap_or(self_ty);
+            let is_windows = bare_ty.starts_with("std::slice::Windows<");
+            let is_chunk = [
+                "std::slice::Chunks<",
+                "std::slice::ChunksMut<",
+                "std::slice::RChunks<",
+                "std::slice::RChunksMut<",
+            ]
+            .iter()
+            .any(|prefix| bare_ty.starts_with(prefix));
+            let is_chunk_exact = [
+                "std::slice::ChunksExact<",
+                "std::slice::ChunksExactMut<",
+                "std::slice::RChunksExact<",
+                "std::slice::RChunksExactMut<",
+            ]
+            .iter()
+            .any(|prefix| bare_ty.starts_with(prefix));
+            if is_windows || is_chunk || is_chunk_exact {
+                let fields = iterator_fields(&state, self_ty)?;
+                // A chunk/window size: a plain integer, or a
+                // `NonZero` wrapped in one-field aggregates.
+                fn size_of(f: &Value, self_ty: &str) -> InterpResult<u128> {
+                    let mut cur = f;
+                    loop {
+                        match cur {
+                            Value::Uint(v) => return Ok(*v),
+                            Value::Int(v) if *v >= 0 => return Ok(*v as u128),
+                            Value::Enum { fields, .. } if fields.len() == 1 => {
+                                cur = &fields[0];
+                            }
+                            Value::Tuple(fields) if fields.len() == 1 => {
+                                cur = &fields[0];
+                            }
+                            other => {
+                                return Err(InterpError::type_mismatch(
+                                    format!("size field of {self_ty}"),
+                                    "non-zero integer",
+                                    other.kind_name(),
+                                ))
+                            }
+                        }
+                    }
+                }
+                if is_windows {
+                    let (rem, size) = match fields.len() {
+                        2 => {
+                            let (_, len) =
+                                self.slice_elements_ref(frames, &fields[0])?;
+                            (len, size_of(&fields[1], self_ty)?)
+                        }
+                        3 => {
+                            let (_, len) =
+                                self.slice_elements_ref(frames, &fields[0])?;
+                            let index = match fields[2] {
+                                Value::Uint(v) => v,
+                                ref other => {
+                                    return Err(InterpError::type_mismatch(
+                                        "Windows index",
+                                        "integer",
+                                        other.kind_name(),
+                                    ))
+                                }
+                            };
+                            (
+                                len.saturating_sub(index),
+                                size_of(&fields[1], self_ty)?,
+                            )
+                        }
+                        _ => {
+                            return Err(InterpError::type_mismatch(
+                                "Windows state",
+                                "[slice, window size] or [slice, window size, next index]",
+                                format!("{} field(s)", fields.len()),
+                            ))
+                        }
+                    };
+                    let n = if size == 0 || rem < size {
+                        0
+                    } else {
+                        rem - size + 1
+                    };
+                    return Ok(hint(n, Some(n)));
+                }
+                if is_chunk {
+                    // The shared variants store [remaining slice,
+                    // chunk size]; the `Mut` variants add a
+                    // trailing marker field to that pair (see the
+                    // three-field arm below).
+                    let (rem, size) = match fields.len() {
+                        2 => {
+                            let (_, rem) =
+                                self.slice_elements_ref(frames, &fields[0])?;
+                            (rem, size_of(&fields[1], self_ty)?)
+                        }
+                        3 => {
+                            // The `Mut` states reach here as
+                            // [remaining fat slice, chunk size,
+                            // marker]: the raw slice stays one fat
+                            // value and the size is the middle
+                            // field. (A flattened [pointer, length,
+                            // size] triple would put a non-integer
+                            // marker last instead of an integer
+                            // size; the shape is told apart by the
+                            // last field.)
+                            let marker_last = match &fields[2] {
+                                Value::Unit => true,
+                                Value::Enum { fields, .. } => fields.is_empty(),
+                                _ => false,
+                            };
+                            if marker_last {
+                                let (_, rem) =
+                                    self.slice_elements_ref(frames, &fields[0])?;
+                                (rem, size_of(&fields[1], self_ty)?)
+                            } else {
+                                let rem = match fields[1] {
+                                    Value::Uint(v) => v,
+                                    _ => {
+                                        let (_, rem) = self
+                                            .slice_elements_ref(frames, &fields[0])?;
+                                        rem
+                                    }
+                                };
+                                (rem, size_of(&fields[2], self_ty)?)
+                            }
+                        }
+                        _ => {
+                            return Err(InterpError::type_mismatch(
+                                format!("{self_ty} state"),
+                                "[remaining slice, chunk size]",
+                                format!("{} field(s)", fields.len()),
+                            ))
+                        }
+                    };
+                    if size == 0 {
+                        return Err(unsupported(format!(
+                            "size_hint of {self_ty} with a zero chunk size"
+                        )));
+                    }
+                    let n = rem.div_ceil(size);
+                    return Ok(hint(n, Some(n)));
+                }
+                // The exact variants: the stored slice holds only
+                // whole chunks, so the count is floor division.
+                // The shared variants store [remaining slice,
+                // remainder slice, chunk size]; the `Mut` variants
+                // add a trailing marker field to that triple (the
+                // four-field arm), and a fully flattened raw
+                // fat-pointer form would give five fields.
+                let (rem, size) = match fields.len() {
+                    3 => {
+                        let (_, rem) =
+                            self.slice_elements_ref(frames, &fields[0])?;
+                        (rem, size_of(&fields[2], self_ty)?)
+                    }
+                    4 => {
+                        // The `Mut` exact states: [remaining fat
+                        // slice, remainder fat slice, chunk size,
+                        // marker].
+                        let (_, rem) =
+                            self.slice_elements_ref(frames, &fields[0])?;
+                        (rem, size_of(&fields[2], self_ty)?)
+                    }
+                    5 => {
+                        let rem = match fields[1] {
+                            Value::Uint(v) => v,
+                            _ => {
+                                let (_, rem) =
+                                    self.slice_elements_ref(frames, &fields[0])?;
+                                rem
+                            }
+                        };
+                        (rem, size_of(&fields[4], self_ty)?)
+                    }
+                    _ => {
+                        return Err(InterpError::type_mismatch(
+                            format!("{self_ty} state"),
+                            "[remaining slice, remainder slice, chunk size]",
+                            format!("{} field(s)", fields.len()),
+                        ))
+                    }
+                };
+                if size == 0 {
+                    return Err(unsupported(format!(
+                        "size_hint of {self_ty} with a zero chunk size"
+                    )));
+                }
+                let n = rem / size;
+                return Ok(hint(n, Some(n)));
+            }
+        }
         let fields = iterator_fields(&state, self_ty)?;
         if self_ty.starts_with("std::ops::RangeInclusive<") {
             if fields.len() != 3 {

@@ -15878,6 +15878,118 @@ fn run_mode_windows_displaced_slice_reads_elements() {
     );
 }
 
+const CHUNKS_WINDOWS_LEN_SRC: &str = r#"
+use std::iter::ExactSizeIterator;
+fn main() {
+    let v = [1, 2, 3, 4, 5];
+    println!("c_rem {}", v.chunks(2).len());
+    println!("c_exact {}", v.chunks(5).len());
+    println!("c_big {}", v.chunks(9).len());
+    println!("c_one {}", v.chunks(1).len());
+    println!("w_rem {}", v.windows(3).len());
+    println!("w_exact {}", v.windows(5).len());
+    println!("w_big {}", v.windows(6).len());
+    println!("w_one {}", v.windows(1).len());
+    let e: [i32; 0] = [];
+    println!("c_empty {}", e.chunks(2).len());
+    println!("w_empty {}", e.windows(1).len());
+    println!("ce_empty {}", e.chunks_exact(2).len());
+    println!("hint_c {:?}", v.chunks(2).size_hint());
+    println!("hint_w {:?}", v.windows(3).size_hint());
+    println!("hint_ce {:?}", v.chunks_exact(2).size_hint());
+    let mut w = v.windows(2);
+    let _ = w.next();
+    println!("w_after1 {}", w.len());
+    let _ = w.next();
+    let _ = w.next();
+    let _ = w.next();
+    println!("w_after4 {}", w.len());
+    let mut c = v.chunks(2);
+    let rc = &mut c;
+    println!("refmut_len {}", rc.len());
+    let c2 = v.chunks(3);
+    let r2 = &c2;
+    println!("ref_len {}", r2.len());
+    println!("ce_rem {:?}", v.chunks_exact(2).remainder());
+    println!("rce_rem {:?}", v.rchunks_exact(2).remainder());
+    let vec = vec![10, 20, 30, 40, 50, 60, 70];
+    println!("vec_c {}", vec.chunks(3).len());
+    println!("vec_w {}", vec.windows(4).len());
+    let z = [(), (), (), ()];
+    println!("zst_c {}", z.chunks(3).len());
+    println!("zst_w {}", z.windows(2).len());
+    let s = "hello".as_bytes();
+    println!("bytes_c {}", s.chunks(2).len());
+}
+"#;
+
+#[test]
+fn run_mode_chunks_windows_len() {
+    // `ExactSizeIterator::len` for the slice chunk/window
+    // family: the trait default body asserts `size_hint`'s
+    // upper bound equals its lower bound, and the modelled
+    // `size_hint` answered the trait default `(0, None)` for
+    // these types, so every `len()` call died in core's
+    // `assert_eq!`. The modelled `size_hint` now computes
+    // std's exact counts (ceiling division by the chunk size,
+    // floor for the exact variants, `remaining - size + 1`
+    // for windows), and the outputs below are native
+    // rustc 1.100.0's.
+    let dir = temp_dir("chunks-windows-len");
+    let src = fixture(&dir, "chunks_windows_len.rs", CHUNKS_WINDOWS_LEN_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "chunks/windows len must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "c_rem 3\nc_exact 1\nc_big 1\nc_one 5\nw_rem 3\nw_exact 1\nw_big 0\nw_one 5\nc_empty 0\nw_empty 0\nce_empty 0\nhint_c (3, Some(3))\nhint_w (3, Some(3))\nhint_ce (2, Some(2))\nw_after1 3\nw_after4 0\nrefmut_len 3\nref_len 2\nce_rem [5]\nrce_rem [1]\nvec_c 3\nvec_w 4\nzst_c 2\nzst_w 3\nbytes_c 3\n"
+    );
+}
+
+const CHUNKS_MUT_LEN_SRC: &str = r#"
+use std::iter::ExactSizeIterator;
+fn main() {
+    let v = [1, 2, 3, 4, 5];
+    println!("ce {}", v.chunks_exact(2).len());
+    println!("rce {}", v.rchunks_exact(2).len());
+    println!("rc {}", v.rchunks(2).len());
+    let mut m = [1, 2, 3, 4, 5];
+    println!("cm {}", m.chunks_mut(2).len());
+    let mut m2 = [1, 2, 3, 4, 5];
+    println!("cem {}", m2.chunks_exact_mut(2).len());
+    let mut m3 = [1, 2, 3, 4, 5];
+    println!("rcm {}", m3.rchunks_mut(2).len());
+    let mut m4 = [1, 2, 3, 4, 5];
+    println!("rcem {}", m4.rchunks_exact_mut(2).len());
+}
+"#;
+
+#[test]
+fn run_mode_chunks_mut_and_exact_len() {
+    // The mutable and exact variants of the chunk family
+    // store the remaining slice differently (a raw fat
+    // pointer plus a marker field for the `Mut` shapes), but
+    // `len` is the same count family: ceiling division for
+    // the plain variants, floor division for the exact ones.
+    let dir = temp_dir("chunks-mut-len");
+    let src = fixture(&dir, "chunks_mut_len.rs", CHUNKS_MUT_LEN_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "chunks mut/exact len must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "ce 2\nrce 2\nrc 3\ncm 3\ncem 2\nrcm 3\nrcem 2\n"
+    );
+}
+
 const UFCS_FALLBACK_SRC: &str = r#"
 use std::iter::FromIterator;
 
