@@ -2415,35 +2415,118 @@ fn drop_impl_methods(
         {
             continue;
         }
-        // `<crate::Type<Params> as ...::Drop>::drop`: the key is
-        // the self type's path without its parameter list.
-        // Stripping at the first `<` is wrong for a type defined
-        // inside a function (a cleanup helper is the common
-        // shape): its name is
-        // `<Outer<Args>::method::LocalType<Params> as ...>::drop`,
-        // and the first `<` ends the OUTER type's path, so the
-        // local type's destructor would be demanded for the outer
-        // type -- with the outer type's arguments, an
-        // instantiation the compiler itself rejects. Strip every
-        // balanced `<...>` group instead, which leaves the full
-        // path, function segment included.
-        let Some(rest) = name.strip_prefix('<') else {
+        // `<SELF as ...::Drop>::drop`: the key is the self type's
+        // canonical path (see `drop_type_key`). The self type is
+        // the part of the leading balanced group before its
+        // top-level ` as ` separator -- splitting at the first
+        // ` as ` in the raw name is wrong for a type defined
+        // inside another impl's method (a cleanup guard inside a
+        // `drop` method is the common shape): its name is
+        // `<<OUTER<..> as ..>::method::Local<..> as ..>::drop`,
+        // whose first ` as ` belongs to the OUTER type's group.
+        let Some(inner_end) = balanced_group_end(&name, 0) else {
             continue;
         };
-        let Some((self_part, _)) = rest.split_once(" as ") else {
+        let inner = &name[1..inner_end];
+        let Some(as_pos) = top_level_as_pos(inner) else {
             continue;
         };
-        let mut base = String::with_capacity(self_part.len());
-        let mut depth = 0usize;
-        for ch in self_part.chars() {
-            match ch {
-                '<' => depth += 1,
-                '>' => depth = depth.saturating_sub(1),
-                _ if depth == 0 => base.push(ch),
-                _ => {}
+        let base = drop_type_key(&inner[..as_pos]);
+        out.entry(base).or_insert(f);
+    }
+    out
+}
+
+/// The byte index of the `>` matching the `<` at byte `open`
+/// in `s`, or `None` when the group never closes.
+fn balanced_group_end(s: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, ch) in s.char_indices() {
+        if i < open {
+            continue;
+        }
+        match ch {
+            '<' => depth += 1,
+            '>' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The byte position of the last top-level (outside every
+/// `<...>` group) ` as ` separator in `s`, or `None` when there
+/// is none. A rendered ` as ` separator is the last one at the
+/// top level: the trait path after it contains no separator.
+fn top_level_as_pos(s: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut found = None;
+    let mut offset = 0usize;
+    let mut rest = s;
+    while !rest.is_empty() {
+        if depth == 0 && rest.starts_with(" as ") {
+            found = Some(offset);
+            offset += 4;
+            rest = &rest[4..];
+            continue;
+        }
+        let ch = rest.chars().next().expect("non-empty");
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        offset += ch.len_utf8();
+        rest = &rest[ch.len_utf8()..];
+    }
+    found
+}
+
+/// The key under which a type's `Drop` impl is recorded (by
+/// `drop_impl_methods`) and looked up (by the demand and
+/// certification passes): the type's canonical path, computed
+/// identically from the impl method's self-type rendering and
+/// from a candidate ADT's rendered name. The canonical path is
+/// the rendered path with every `<...>` group removed, except
+/// that a `<X as Trait>` group -- the rendering of a type whose
+/// path passes through an impl, as for a type defined inside
+/// another item's body -- stands for X itself and is replaced
+/// by X's canonical path. Both sides render such a nested type
+/// through the enclosing impl (the ADT as
+/// `<OUTER<..> as ..>::method::Local`, its impl method as
+/// `<<OUTER<..> as ..>::method::Local<..> as ..::Drop>::drop`),
+/// and only the canonical path makes the two renderings meet,
+/// at `OUTER::method::Local`.
+fn drop_type_key(rendered: &str) -> String {
+    let mut out = String::with_capacity(rendered.len());
+    let mut rest = rendered;
+    while !rest.is_empty() {
+        if rest.starts_with('<') {
+            match balanced_group_end(rest, 0) {
+                Some(end) => {
+                    let inner = &rest[1..end];
+                    if let Some(as_pos) = top_level_as_pos(inner) {
+                        out.push_str(&drop_type_key(&inner[..as_pos]));
+                    }
+                    rest = &rest[end + 1..];
+                    continue;
+                }
+                None => {
+                    // An unbalanced group: keep the remainder
+                    // verbatim rather than invent a key.
+                    out.push_str(rest);
+                    break;
+                }
             }
         }
-        out.entry(base).or_insert(f);
+        let ch = rest.chars().next().expect("non-empty");
+        out.push(ch);
+        rest = &rest[ch.len_utf8()..];
     }
     out
 }
@@ -2914,6 +2997,42 @@ fn foreign_fn_defs(krate: &rustc_public::Crate) -> Vec<rustc_public::ty::FnDef> 
 /// deferred definition, and without the credit its placeholder
 /// entry would stand against the conversion even though the
 /// demanded instance was converted here.
+/// The iterator type a call to a modelled consumer of an owned
+/// iterator consumes, or `None` when the callee is not such a
+/// consumer. The type is the callee generic argument the
+/// interpreter's dispatch reads as the iterator type: the first
+/// for the `Iterator` methods, the third for
+/// `FromIterator::from_iter`, the last for the `Vec` from-iter
+/// shim. The modelled consumers drop the iterator inside their
+/// real bodies, so both the demand pass and the certification
+/// pass treat the type as a drop candidate.
+fn consumer_iterator_ty(
+    def: &rustc_public::ty::FnDef,
+    args: &rustc_public::ty::GenericArgs,
+) -> Option<Ty> {
+    let nth = match def.name().as_str() {
+        "std::iter::Iterator::collect"
+        | "std::iter::Iterator::count"
+        | "std::iter::Iterator::fold"
+        | "std::iter::Iterator::for_each" => Some(0),
+        "std::iter::FromIterator::from_iter" => Some(2),
+        "std::vec::spec_from_iter_nested::SpecFromIterNested::from_iter" => None,
+        _ => return None,
+    };
+    let types: Vec<&Ty> = args
+        .0
+        .iter()
+        .filter_map(|a| match a {
+            GenericArgKind::Type(t) => Some(t),
+            _ => None,
+        })
+        .collect();
+    match nth {
+        Some(i) => types.get(i).map(|t| **t),
+        None => types.last().map(|t| **t),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn demand_drop_instances(
     conv: &mut Converter,
@@ -3051,6 +3170,18 @@ fn demand_drop_instances(
                     drop_candidates(&ty, &mut candidates, &mut seen);
                 }
             }
+            // A call to a modelled consumer of an owned iterator
+            // (`collect`, `from_iter`, `fold`, ...) drops the
+            // iterator inside the callee's real body, where no
+            // `Drop` terminator for it exists in any collected
+            // body; the interpreter accounts for that glue when
+            // it converts the call, which needs the same
+            // destructor bodies a terminator would demand.
+            for (def, args) in sparagmos_driver::reach::call_targets(body) {
+                if let Some(ty) = consumer_iterator_ty(&def, &args) {
+                    drop_candidates(&ty, &mut candidates, &mut seen);
+                }
+            }
         }
         // Local types first: the shared cap must not let a
         // foreign destructor crowd out the entry crate's own.
@@ -3079,9 +3210,10 @@ fn demand_drop_instances(
             // every other type the collected body is the glue the
             // builder runs.
             let def_name = def.name();
-            let type_crate = def_name.split("::").next().unwrap_or("");
+            let type_key = drop_type_key(&def_name);
+            let type_crate = type_key.split("::").next().unwrap_or("");
             let impl_fn = if type_crate == local_crate_name {
-                impl_methods.get(&def_name)
+                impl_methods.get(&type_key)
             } else {
                 let methods = foreign_impl_methods.get_or_insert_with(|| {
                     let mut defs = Vec::new();
@@ -3092,7 +3224,7 @@ fn demand_drop_instances(
                     }
                     drop_impl_methods(defs)
                 });
-                methods.get(&def_name)
+                methods.get(&type_key)
             };
             let Some(impl_fn) = impl_fn else {
                 continue;
@@ -3363,6 +3495,16 @@ fn certify_drop_no_impl(
                 drop_candidates(&ty, &mut candidates, &mut seen);
             }
         }
+        // The modelled owned-iterator consumers, with the same
+        // candidate source as the demand pass: the consumed
+        // iterator's glue is built at conversion, and its field
+        // tree is certified (or not) exactly as a dropped
+        // place's would be.
+        for (def, args) in sparagmos_driver::reach::call_targets(body) {
+            if let Some(ty) = consumer_iterator_ty(&def, &args) {
+                drop_candidates(&ty, &mut candidates, &mut seen);
+            }
+        }
     }
     let local_crate_name = rustc_public::local_crate().name;
     let mut scans: std::collections::HashMap<String, Option<std::collections::HashSet<String>>> =
@@ -3382,7 +3524,8 @@ fn certify_drop_no_impl(
         }
         queried += 1;
         let def_name = def.name();
-        let type_crate = def_name.split("::").next().unwrap_or("");
+        let type_key = drop_type_key(&def_name);
+        let type_crate = type_key.split("::").next().unwrap_or("");
         let scan = scans.entry(type_crate.to_string()).or_insert_with(|| {
             if type_crate == local_crate_name.as_str() {
                 Some(local_drop_impl_methods().into_keys().collect())
@@ -3405,7 +3548,7 @@ fn certify_drop_no_impl(
         let Some(impl_names) = scan else {
             continue;
         };
-        if impl_names.contains(&def_name) {
+        if impl_names.contains(&type_key) {
             continue;
         }
         let key = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

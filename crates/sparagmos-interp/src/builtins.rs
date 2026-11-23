@@ -6230,6 +6230,7 @@ impl<'a> Interpreter<'a> {
                         Some(_) => count += 1,
                     }
                 }
+                self.note_consumed_iter_final(state);
                 Ok(Value::Uint(count))
             }
             Builtin::IteratorCollect => {
@@ -8866,7 +8867,7 @@ impl<'a> Interpreter<'a> {
                         ))
                     }
                 }
-                let items = self.drain_iterator(
+                let (items, _) = self.drain_iterator(
                     frames,
                     iter_ty,
                     vals.into_iter().nth(1).expect("arity checked"),
@@ -8882,11 +8883,12 @@ impl<'a> Interpreter<'a> {
                 // type followed by the iterator type, which is
                 // the stepping dispatch key.
                 let iter_ty = generic_args.last().map(String::as_str).unwrap_or("");
-                let items = self.drain_iterator(
+                let (items, final_state) = self.drain_iterator(
                     frames,
                     iter_ty,
                     vals.into_iter().next().expect("arity checked"),
                 )?;
+                self.note_consumed_iter_final(final_state);
                 Ok(Value::Enum {
                     variant: 0,
                     fields: items,
@@ -13825,15 +13827,18 @@ fn value_fingerprint(value: &Value) -> u64 {
     /// Step an iterator value to exhaustion with the
     /// [`Self::iterator_next`] machinery, returning the items in
     /// order. The iterator arrives by value; it is parked in a
-    /// fresh allocation so the place-based machinery can step it.
-    /// Callers consume the iterator, so the parked state is never
-    /// read back.
+    /// fresh allocation so the place-based machinery can step
+    /// it. The iterator's final state is read back from that
+    /// allocation and returned with the items: a consumer whose
+    /// modelled body drops the iterator when it is done hands
+    /// the final state back for that drop (see
+    /// `consumed_iter_final`).
     fn drain_iterator(
         &mut self,
         frames: &mut Vec<Frame>,
         iter_ty: &str,
         iter_value: Value,
-    ) -> InterpResult<Vec<Value>> {
+    ) -> InterpResult<(Vec<Value>, Value)> {
         let id = self.alloc_insert(iter_value);
         let iter_ref = Value::Ref(RefTarget::Alloc {
             id,
@@ -13858,7 +13863,8 @@ fn value_fingerprint(value: &Value) -> u64 {
                 }
             }
         }
-        Ok(items)
+        let final_state = self.alloc_value(id).unwrap_or(Value::Uninit);
+        Ok((items, final_state))
     }
 
     /// The `(lower, upper)` bounds of an inner iterator
@@ -14654,6 +14660,7 @@ fn value_fingerprint(value: &Value) -> u64 {
                 Some(item) => items.push(item),
             }
         }
+        self.note_consumed_iter_final(state);
         if target.starts_with("std::vec::Vec<") || target.starts_with("alloc::vec::Vec<") {
             return Ok(Value::Enum {
                 variant: 0,
@@ -14756,6 +14763,7 @@ fn value_fingerprint(value: &Value) -> u64 {
                 accum = result;
             }
         }
+        self.note_consumed_iter_final(state);
         Ok(accum)
     }
 

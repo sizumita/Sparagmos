@@ -7278,6 +7278,7 @@ let inner = match (&src, target) {
             destination: self.convert_place(body, destination)?,
             target: target.map(|b| ir::BasicBlock(b.index())),
             drop_glue: None,
+            consumed_glue: None,
             cmp_discriminants: None,
             result_unsize: None,
         }))
@@ -8147,6 +8148,36 @@ let inner = match (&src, target) {
                         } else {
                             None
                         };
+                        // A modelled consumer of an owned
+                        // iterator drops the iterator inside the
+                        // callee's real body: build the iterator
+                        // type's glue now (see `consumed_glue` in
+                        // `ir`), so the interpreter can run it
+                        // against the iterator's final state. The
+                        // iterator type is the callee generic
+                        // argument the interpreter's dispatch
+                        // reads as the iterator type. A trivial
+                        // glue has nothing to run; a glue that
+                        // cannot be accounted for keeps the plain
+                        // call, the treatment these calls have
+                        // always had.
+                        let consumed_glue = match kind {
+                            crate::builtins::Builtin::IteratorCollect
+                            | crate::builtins::Builtin::IteratorCount
+                            | crate::builtins::Builtin::IteratorFold
+                            | crate::builtins::Builtin::IteratorForEach => {
+                                raw_generic_args.first()
+                            }
+                            crate::builtins::Builtin::FromIteratorFromIter => {
+                                raw_generic_args.get(2)
+                            }
+                            crate::builtins::Builtin::VecFromIterNested => {
+                                raw_generic_args.last()
+                            }
+                            _ => None,
+                        }
+                        .and_then(|ty| self.drop_glue(ty))
+                        .filter(|glue| glue.root != ir::DropPlan::Trivial);
                         if unaccountable_drop {
                             ir::TerminatorKind::Unsupported(
                                 "Call to std::mem::drop (drop glue cannot be accounted for)"
@@ -8160,6 +8191,7 @@ let inner = match (&src, target) {
                                 destination: self.convert_place(body, destination)?,
                                 target: target.map(|b| ir::BasicBlock(b.index())),
                                 drop_glue,
+                                consumed_glue,
                                 cmp_discriminants,
                                 result_unsize,
                             }
@@ -8887,15 +8919,41 @@ fn is_dtor_name(name: &str, adt_name: &str) -> bool {
         let Some(head) = suffix else {
             continue;
         };
-        let head = head.to_string();
-        let head = head.as_str();
-        if head == format!("<{adt_name}") {
+        // The head must be exactly the ADT's own rendering:
+        // `<{adt_name}` or `<{adt_name}<args>` with the argument
+        // group balanced and closing at the head's very end. A
+        // type defined inside the ADT's own items renders
+        // `<{adt_name}<..>::method::Local<..>`: its head also
+        // starts with `<{adt_name}<` and ends with `>`, but the
+        // first group closes long before the end — and the
+        // nested type's destructor is not the ADT's, so the
+        // resemblance must not attribute it to the ADT.
+        let Some(rest) = head.strip_prefix(&format!("<{adt_name}")) else {
+            continue;
+        };
+        if rest.is_empty() {
             return true;
         }
-        if let Some(args) = head.strip_prefix(&format!("<{adt_name}<")) {
-            if args.ends_with('>') {
-                return true;
+        if !rest.starts_with('<') {
+            continue;
+        }
+        let mut depth = 0usize;
+        let mut closes_at_end = false;
+        for (i, ch) in rest.char_indices() {
+            match ch {
+                '<' => depth += 1,
+                '>' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        closes_at_end = i == rest.len() - 1;
+                        break;
+                    }
+                }
+                _ => {}
             }
+        }
+        if closes_at_end {
+            return true;
         }
     }
     false

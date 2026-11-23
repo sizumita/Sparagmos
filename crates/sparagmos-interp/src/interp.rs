@@ -802,6 +802,16 @@ pub struct Interpreter<'a> {
     decoded: std::cell::RefCell<
         std::collections::HashMap<usize, std::rc::Rc<crate::decode::DecodedBody>>,
     >,
+    /// The final state of the owned iterator a consumer builtin
+    /// (`collect`, `from_iter`, `fold`, ...) has just driven to
+    /// exhaustion, handed to the `CallBuiltin` execution so it
+    /// can run the drop glue conversion attached to the call
+    /// against it (the callee's real body drops the iterator
+    /// when it is done with it). Set by the consumer builtins on
+    /// their success path only; cleared before every builtin
+    /// call and taken by the caller afterwards, so a state can
+    /// never leak into an unrelated call.
+    consumed_iter_final: std::cell::RefCell<Option<Value>>,
 }
 
 /// The synthetic address of a pointer value (see
@@ -1078,6 +1088,7 @@ impl<'a> Interpreter<'a> {
             va_lists: std::cell::RefCell::new(HashMap::new()),
             next_va_list: std::cell::RefCell::new(1),
             allocs: std::cell::RefCell::new(HashMap::new()),
+            consumed_iter_final: std::cell::RefCell::new(None),
             elem_blocks: std::cell::RefCell::new(std::collections::HashSet::new()),
             next_alloc: std::cell::Cell::new(1),
             decoded: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -1994,6 +2005,7 @@ impl<'a> Interpreter<'a> {
                     destination,
                     target,
                     drop_glue,
+                    consumed_glue,
                     cmp_discriminants,
                     result_unsize,
                 } => {
@@ -2089,6 +2101,7 @@ impl<'a> Interpreter<'a> {
                                 }
                             }
                         }
+                        *self.consumed_iter_final.borrow_mut() = None;
                         let mut result = self.exec_builtin(
                             frames,
                             body,
@@ -2097,6 +2110,8 @@ impl<'a> Interpreter<'a> {
                             args,
                             cmp_discriminants.as_deref(),
                         )?;
+                        let consumed_final =
+                            self.consumed_iter_final.borrow_mut().take();
                         // A `From` / `Into` conversion into a
                         // `Box<dyn Trait>` returns the plain box
                         // aggregate from the modelled conversion;
@@ -2113,7 +2128,42 @@ impl<'a> Interpreter<'a> {
                                 if name == "std::string::String::with_capacity" {
                                     self.record_string_buffer(frames, body, destination);
                                 }
-                                Self::jump(frames, body, *bb)?;
+                                // A modelled consumer of an owned
+                                // iterator drops the iterator at
+                                // the end of the callee's real
+                                // body: run the glue conversion
+                                // attached to the call against the
+                                // final state the builtin handed
+                                // back, exactly like a `Drop`
+                                // terminator for that value (the
+                                // glue run jumps to the target, or
+                                // suspends and resumes there).
+                                match (consumed_glue, consumed_final) {
+                                    (Some(glue), Some(final_state)) => {
+                                        // The final state is parked
+                                        // in the allocation store
+                                        // first: a destructor body
+                                        // writes back into its
+                                        // receiver (a `mem::take` of
+                                        // a field is the common
+                                        // shape), which a bare value
+                                        // root cannot accept, while
+                                        // an allocation is the same
+                                        // mutable storage a place
+                                        // root denotes.
+                                        let id = self.alloc_insert(final_state);
+                                        let root = RefTarget::Alloc {
+                                            id,
+                                            projection: Vec::new(),
+                                        };
+                                        let work =
+                                            vec![(Vec::new(), glue.root.clone())];
+                                        self.run_drop_glue(
+                                            frames, root, work, &glue.adts, *bb,
+                                        )?;
+                                    }
+                                    _ => Self::jump(frames, body, *bb)?,
+                                }
                             }
                             None => {
                                 return Err(InterpError::MissingContinuation {
@@ -5983,6 +6033,18 @@ impl<'a> Interpreter<'a> {
         self.next_alloc.set(id + 1);
         self.allocs.borrow_mut().insert(id, value);
         id
+    }
+
+    /// Record the final state of the owned iterator a consumer
+    /// builtin has just driven to exhaustion (see the
+    /// `consumed_iter_final` field).
+    pub(crate) fn note_consumed_iter_final(&self, state: Value) {
+        *self.consumed_iter_final.borrow_mut() = Some(state);
+    }
+
+    /// The current value held in allocation `id`, if it is live.
+    pub(crate) fn alloc_value(&self, id: u64) -> Option<Value> {
+        self.allocs.borrow().get(&id).cloned()
     }
 
     pub(crate) fn new_box(&self, pointee: Value) -> Value {
@@ -17045,6 +17107,105 @@ fn ordering_of(ord: std::cmp::Ordering) -> Value {
     }
 }
 
+/// The position order of two pointers into the same storage,
+/// or `None` when the two targets do not denote positions of
+/// one storage in a comparable way. The targets must share a
+/// storage root (the same place, static, allocation, or equal
+/// constant base value) and a common projection prefix; the
+/// first step on which they differ must then be positional on
+/// both sides -- an element index or sub-slice offset (element
+/// units), or a byte displacement (byte units) -- which decides
+/// the order, as one element's storage wholly precedes the
+/// next's whatever the remaining steps denote. A side whose
+/// projection ends at the common prefix denotes the shared
+/// position itself, position zero of the sequence the other
+/// side steps into. Steps that are not positional (a field, a
+/// downcast) and mixed units leave the order to the caller.
+fn structural_ptr_order(lhs: &Value, rhs: &Value) -> Option<std::cmp::Ordering> {
+    fn target_of(v: &Value) -> Option<&RefTarget> {
+        match v {
+            Value::Ref(t) => Some(t),
+            Value::FatRef { base, .. } => match &**base {
+                Value::Ref(t) => Some(t),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    let (pa, pb): (&[RefProj], &[RefProj]) = match (target_of(lhs)?, target_of(rhs)?) {
+        (
+            RefTarget::Place {
+                frame: fa,
+                local: la,
+                projection: pa,
+            },
+            RefTarget::Place {
+                frame: fb,
+                local: lb,
+                projection: pb,
+            },
+        ) if fa == fb && la == lb => (pa, pb),
+        (
+            RefTarget::Static {
+                name: na,
+                projection: pa,
+            },
+            RefTarget::Static {
+                name: nb,
+                projection: pb,
+            },
+        ) if na == nb => (pa, pb),
+        (
+            RefTarget::Alloc {
+                id: ia,
+                projection: pa,
+            },
+            RefTarget::Alloc {
+                id: ib,
+                projection: pb,
+            },
+        ) if ia == ib => (pa, pb),
+        (RefTarget::Value(va, pa), RefTarget::Value(vb, pb)) if va == vb => (pa, pb),
+        _ => return None,
+    };
+    let mut n = 0;
+    while n < pa.len() && n < pb.len() && pa[n] == pb[n] {
+        n += 1;
+    }
+    let (ra, rb) = (&pa[n..], &pb[n..]);
+    if ra.is_empty() && rb.is_empty() {
+        return Some(std::cmp::Ordering::Equal);
+    }
+    // The position a remainder denotes within the sequence the
+    // common prefix ends at: `None` for an empty remainder (the
+    // shared position itself, zero in the other side's units),
+    // else the first step's displacement and its unit (element
+    // steps and byte steps are not comparable to each other).
+    fn position(rem: &[RefProj]) -> Option<Option<(i128, bool)>> {
+        match rem.first() {
+            None => Some(None),
+            Some(RefProj::Index(i)) => {
+                i128::try_from(*i).ok().map(|p| Some((p, false)))
+            }
+            Some(RefProj::Subslice { offset, .. }) => {
+                i128::try_from(*offset).ok().map(|p| Some((p, false)))
+            }
+            Some(RefProj::ByteOffset(d)) => Some(Some((*d, true))),
+            _ => None,
+        }
+    }
+    let (pos_a, pos_b) = match (position(ra)?, position(rb)?) {
+        (Some(a), Some(b)) => (a, b),
+        (Some(a), None) => (a, (0, a.1)),
+        (None, Some(b)) => ((0, b.1), b),
+        (None, None) => return None,
+    };
+    if pos_a.1 != pos_b.1 {
+        return None;
+    }
+    Some(pos_a.0.cmp(&pos_b.0))
+}
+
 pub(crate) fn eval_binary(
     op: BinOp,
     lhs: &Value,
@@ -17303,8 +17464,41 @@ pub(crate) fn eval_binary(
     // synthetic-address model (the same identity `PtrToInt`
     // exposes); a fat pointer's equality also compares the
     // metadata word (its length). Ordering is defined on the
-    // synthetic addresses, which is deterministic within a run.
+    // synthetic addresses, which is deterministic within a run --
+    // except between two pointers into the same storage, whose
+    // order is their structural position order (see
+    // `structural_ptr_order`): the synthetic address hashes the
+    // whole target, projections included, so it orders two
+    // positions of one buffer arbitrarily, while the guest's
+    // pointer preconditions (`offset_from_unsigned`'s
+    // `self >= origin`, an iterator's `end >= ptr`) are stated
+    // on the real order.
     if matches!(op, Eq | Ne | Lt | Le | Gt | Ge | Cmp) {
+        let structural = if matches!(op, Eq | Ne) {
+            None
+        } else {
+            structural_ptr_order(lhs, rhs).filter(|ord| {
+                // For `Ord::cmp`, an equal position reached by
+                // different projections keeps the address order
+                // below, so `cmp` stays consistent with the
+                // identity equality; the relational operators
+                // take the position order as it stands.
+                op != Cmp || *ord != std::cmp::Ordering::Equal
+            })
+        };
+        if let Some(ord) = structural {
+            if op == Cmp {
+                return Ok((ordering_of(ord), false));
+            }
+            let v = match op {
+                Lt => ord == std::cmp::Ordering::Less,
+                Le => ord != std::cmp::Ordering::Greater,
+                Gt => ord == std::cmp::Ordering::Greater,
+                Ge => ord != std::cmp::Ordering::Less,
+                _ => unreachable!(),
+            };
+            return Ok((Value::Bool(v), false));
+        }
         let key = |v: &Value| -> Option<(u128, Option<u128>)> {
             match v {
                 // The null pointer's address is 0, matching an

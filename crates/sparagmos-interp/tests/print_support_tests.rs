@@ -628,6 +628,7 @@ fn run_steps(local_tys: Vec<Ty>, steps: Vec<Step>) -> String {
                         destination: Place::from_index(dest),
                         target: Some(target),
                         drop_glue: None,
+                        consumed_glue: None,
                         cmp_discriminants: None,
                         result_unsize: None,
                     },
