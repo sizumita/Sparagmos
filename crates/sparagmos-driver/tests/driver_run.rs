@@ -21078,3 +21078,81 @@ fn run_mode_libc_strtol_nonnull_endptr_is_explicit_error() {
         "the refusal names the endptr model limit; stderr={stderr}"
     );
 }
+// ----- modelled handle values under declared-type drop glue ---------
+// Drop glue built from a declared type can name a handle at a
+// position where a builtin model keeps a scalar stand-in: the
+// thread model's `Thread` value is an id, although the declared
+// type's field is an `Arc`. Dropping a struct that holds such a
+// value runs the handle plan against the id; a scalar holds no
+// count, so the drop completes (and the struct's own destructor
+// still runs). A real handle aggregate in the same position is
+// still released.
+
+const THREAD_HOLDER_SRC: &str = r#"
+struct ThreadHolder(std::thread::Thread);
+
+struct Observed(std::thread::Thread);
+impl Drop for Observed {
+    fn drop(&mut self) {
+        println!("observed");
+    }
+}
+
+fn main() {
+    let h = ThreadHolder(std::thread::current());
+    drop(h);
+    let o = Observed(std::thread::current());
+    drop(o);
+    let same = std::thread::current().id() == std::thread::current().id();
+    println!("same {same}");
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_thread_value_in_struct_field_drops() {
+    let dir = temp_dir("thread-holder-drop");
+    let src = fixture(&dir, "thread_holder.rs", THREAD_HOLDER_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "dropping a struct holding a modelled Thread value must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "observed\nsame true\ndone\n",
+        "the struct destructor runs and the modelled handle drop is inert"
+    );
+}
+
+const ARC_HOLDER_SRC: &str = r#"
+use std::sync::Arc;
+struct Holder(Arc<u32>);
+fn main() {
+    let a = Arc::new(7u32);
+    let h = Holder(a.clone());
+    println!("during {}", Arc::strong_count(&a));
+    drop(h);
+    println!("after {}", Arc::strong_count(&a));
+}
+"#;
+
+#[test]
+fn run_mode_arc_handle_in_struct_field_still_releases() {
+    let dir = temp_dir("arc-holder-drop");
+    let src = fixture(&dir, "arc_holder.rs", ARC_HOLDER_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "dropping a struct holding a real Arc must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "during 2\nafter 1\n",
+        "a real handle aggregate in a struct field is still released"
+    );
+}
