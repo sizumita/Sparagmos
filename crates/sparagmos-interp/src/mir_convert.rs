@@ -4469,6 +4469,41 @@ impl<'a> Converter<'a> {
         self.ptr_chain_operand(body, &next_operand, &field_v, fdef, fargs)
     }
 
+    /// Whether the pointer chain of the ADT `def` (see
+    /// [`Self::chain_field`]) bottoms out at a thin pointer:
+    /// every layer is a single-payload struct whose chain
+    /// field is either a thin pointer or the next layer of
+    /// the chain — the owning-pointer shape (`Box` is a
+    /// `Unique` plus an allocator, a `Unique` is a `NonNull`
+    /// plus a `PhantomData`, a `NonNull` is a `NonZero` over
+    /// the pointer itself). A transmute from a thin pointer
+    /// into such an ADT rebuilds the owner around the
+    /// pointer (see the reverse-transmute arm in
+    /// `convert_transmute`).
+    fn ptr_chain_reaches_thin_ptr(
+        &self,
+        def: &mir::AdtDefId,
+        args: &[mir::Ty],
+    ) -> bool {
+        let mut cur = mir::Ty::Adt(def.clone(), args.to_vec());
+        // A type-level walk over a finite chain of wrapper
+        // types; the depth cap only guards against a
+        // (nonsensical) self-nesting wrapper type.
+        for _ in 0..32 {
+            let mir::Ty::Adt(def, args) = &cur else {
+                return false;
+            };
+            let Some((_, field_ty)) = self.chain_field(def, args) else {
+                return false;
+            };
+            if is_thin_ptr_ty(&field_ty) {
+                return true;
+            }
+            cur = field_ty;
+        }
+        false
+    }
+
     /// Whether both types are pointers (a reference or a raw
     /// pointer) to byte-string DSTs: `str`, a `[u8]` slice,
     /// `std::ffi::OsStr` (or its sys representation type
@@ -5187,6 +5222,32 @@ let inner = match (&src, target) {
                     }
                 } else {
                     unsupported()
+                }
+            }
+            // Thin pointer -> owning-pointer chain (the
+            // reverse of the ADT -> thin pointer chain arm
+            // above): the target's pointer chain bottoms out
+            // at a thin pointer, so the pointer becomes the
+            // owner's value. In this model an owning pointer's
+            // value is the allocation pointer in a one-field
+            // aggregate — the shape `Box::new` itself
+            // produces — whatever the chain's depth (`Box`
+            // over `Unique` over `NonNull` over `NonZero` over
+            // the pointer), so the result is that aggregate
+            // around the pointer operand. This is the
+            // `transmute::<*mut T, Box<T>>` shape. Targets with
+            // a transparent wrapper shape keep the arm below:
+            // their zero-sized fills are part of their value.
+            (Some(s), mir::Ty::Adt(def, args))
+                if is_thin_ptr_ty(s)
+                    && self.wrapper_shape(def, args).is_none()
+                    && self.ptr_chain_reaches_thin_ptr(def, args) =>
+            {
+                ir::Rvalue::AggregateAdt {
+                    variant: 0,
+                    operands: vec![v.clone()],
+                    field_index: None,
+                    units_from: None,
                 }
             }
             // Pointer -> transparent wrapper struct: wrap the

@@ -5919,6 +5919,39 @@ fn run_mode_transmute_box_to_raw_pointer() {
     run_ok("transmute-box", TRANSMUTE_BOX_SRC, "42 43\n");
 }
 
+const TRANSMUTE_RAW_TO_BOX_SRC: &str = r#"
+use std::sync::atomic::{AtomicUsize, Ordering};
+static DROPS: AtomicUsize = AtomicUsize::new(0);
+struct D(u32);
+impl Drop for D {
+    fn drop(&mut self) { DROPS.fetch_add(1, Ordering::SeqCst); }
+}
+fn main() {
+    let p: *mut D = Box::into_raw(Box::new(D(41)));
+    let mut b: Box<D> = unsafe { std::mem::transmute(p) };
+    b.0 += 1;
+    println!("{}", b.0);
+    drop(b);
+    println!("drops={}", DROPS.load(Ordering::SeqCst));
+    let p2: *mut D = Box::into_raw(Box::new(D(7)));
+    let b2: Box<D> = unsafe { std::mem::transmute(p2) };
+    let p3: *mut D = unsafe { std::mem::transmute(b2) };
+    let b3: Box<D> = unsafe { std::mem::transmute(p3) };
+    println!("{}", b3.0);
+    drop(b3);
+    println!("drops={}", DROPS.load(Ordering::SeqCst));
+}
+"#;
+
+#[test]
+fn run_mode_transmute_raw_pointer_to_box() {
+    run_ok(
+        "transmute-raw-to-box",
+        TRANSMUTE_RAW_TO_BOX_SRC,
+        "42\ndrops=1\n7\ndrops=2\n",
+    );
+}
+
 const TRANSMUTE_CONSTANTS_SRC: &str = r#"
 fn main() {
     let a: u32 = unsafe { std::mem::transmute(1.5f32) };
