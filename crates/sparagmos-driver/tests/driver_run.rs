@@ -6560,6 +6560,50 @@ fn run_mode_from_box_dyn_error_zst_payload_drop() {
     );
 }
 
+const BOX_DYN_ERROR_FROM_RAW_DROP_SRC: &str = r#"
+use std::error::Error;
+use std::fmt;
+#[derive(Debug)]
+struct MyErr { code: i32 }
+impl fmt::Display for MyErr {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "err {}", self.code) }
+}
+impl Error for MyErr {}
+impl Drop for MyErr {
+    fn drop(&mut self) { println!("dropping MyErr {}", self.code); }
+}
+fn main() {
+    let b: Box<dyn Error> = Box::new(MyErr { code: 13 });
+    let raw = Box::into_raw(b);
+    let b2 = unsafe { Box::from_raw(raw) };
+    println!("rebuilt the box");
+    drop(b2);
+    println!("end of main");
+}
+"#;
+
+#[test]
+fn run_mode_box_dyn_error_from_raw_drop() {
+    // A trait-object box rebuilt by `Box::from_raw` is an
+    // aggregate chain around the fat pointer, not the
+    // builtin-built surface: its drop plan must descend field
+    // 0 of each wrapper layer to the `DynRef` at the chain's
+    // bottom and run the payload glue from there.
+    let dir = temp_dir("box-dyn-error-from-raw");
+    let src = fixture(&dir, "box_dyn_error_from_raw.rs", BOX_DYN_ERROR_FROM_RAW_DROP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "dropping a Box<dyn Error> rebuilt by from_raw must run the payload destructor; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "rebuilt the box\ndropping MyErr 13\nend of main\n"
+    );
+}
+
 const FROM_BOX_DYN_FN_CAPTURE_SRC: &str = r#"
 struct S { v: i32, w: i32 }
 impl Drop for S {
@@ -18277,6 +18321,66 @@ fn run_mode_io_error_simple_message_display_and_debug() {
         "failed to fill whole buffer | Error { kind: UnexpectedEof, message: \"failed to fill whole buffer\" } | UnexpectedEof\n\
          Err(Error { kind: UnexpectedEof, message: \"failed to fill whole buffer\" })\n\
          failed to write whole buffer | Error { kind: WriteZero, message: \"failed to write whole buffer\" } | WriteZero\n"
+    );
+}
+
+const IO_ERROR_INTO_INNER_SRC: &str = r#"
+use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static DROPS: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug)]
+struct Counted { code: i32 }
+impl fmt::Display for Counted {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "counted {}", self.code) }
+}
+impl std::error::Error for Counted {}
+impl Drop for Counted {
+    fn drop(&mut self) {
+        DROPS.fetch_add(1, Ordering::SeqCst);
+        println!("dropping Counted {}", self.code);
+    }
+}
+
+fn main() {
+    let e = std::io::Error::new(std::io::ErrorKind::InvalidInput, Counted { code: 5 });
+    match e.into_inner() {
+        Some(boxed) => {
+            println!("got inner");
+            println!("drops before box drop: {}", DROPS.load(Ordering::SeqCst));
+            drop(boxed);
+            println!("drops after box drop: {}", DROPS.load(Ordering::SeqCst));
+        }
+        None => println!("no inner"),
+    }
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_io_error_into_inner_drops_payload_once() {
+    // `io::Error::into_inner` rebuilds the payload's
+    // `Box<dyn Error + Send + Sync>` with `Box::from_raw` over
+    // the pointer the packed representation carried. Reading
+    // the pointee back through that cast descends the pointer
+    // wrappers (`Box` over `Unique` over the raw pointer, each
+    // carrying trailing zero-sized fields), and dropping the
+    // rebuilt box reaches the `DynRef` at the bottom of the
+    // same wrapper chain - the payload destructor runs exactly
+    // once, when the box drops, not inside `into_inner`.
+    let dir = temp_dir("io-error-into-inner");
+    let src = fixture(&dir, "io_error_into_inner.rs", IO_ERROR_INTO_INNER_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "got inner\n\
+         drops before box drop: 0\n\
+         dropping Counted 5\n\
+         drops after box drop: 1\n\
+         done\n"
     );
 }
 
