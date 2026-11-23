@@ -17900,6 +17900,37 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         }
     }
 
+    /// The string a `String`'s vector in its element form
+    /// denotes: the elements are the bytes themselves, each
+    /// possibly holding the `MaybeUninit` union form the
+    /// buffer's spare-capacity region stores (see
+    /// `string_from_real_aggregate`). Any other shape returns
+    /// `None`.
+    fn string_from_element_form(&self, vec: &Value) -> Option<String> {
+        let (elems, len): (&[Value], usize) = match vec {
+            Value::Enum { fields, .. } => (fields, fields.len()),
+            Value::SparseVec { elems, len } => {
+                (elems, usize::try_from(*len).ok()?)
+            }
+            _ => return None,
+        };
+        let mut bytes = Vec::with_capacity(len);
+        for elem in elems.iter().take(len) {
+            let elem = match elem {
+                Value::Enum { variant: 0, fields } if fields.len() == 1 => {
+                    &fields[0]
+                }
+                other => other,
+            };
+            match elem {
+                Value::Uint(b) if *b <= 0xFF => bytes.push(*b as u8),
+                Value::Int(b) if (0..=255).contains(b) => bytes.push(*b as u8),
+                _ => return None,
+            }
+        }
+        String::from_utf8(bytes).ok()
+    }
+
     /// The string a `String` value in its real aggregate form
     /// denotes: the one-field wrapper around a `Vec<u8>` in its
     /// real aggregate form (`[RawVec, len]`, see
@@ -17923,7 +17954,11 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
             return Ok(None);
         }
         let Some((buf, len)) = vec_real_aggregate_parts(&fields[0]) else {
-            return Ok(None);
+            // The vector may equally arrive in its element
+            // form (the shape the return-boundary translation
+            // produces): its elements are the string's bytes
+            // directly.
+            return Ok(self.string_from_element_form(&fields[0]));
         };
         if len == 0 {
             return Ok(Some(String::new()));
@@ -17960,9 +17995,19 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         let target = self.deref_value(frames, ptr)?;
         let mut bytes = Vec::with_capacity(len);
         for i in 0..len {
-            match self.read_seq_at(frames, &target, i)? {
-                Value::Uint(b) if b <= 0xFF => bytes.push(b as u8),
-                Value::Int(b) if (0..=255).contains(&b) => bytes.push(b as u8),
+            let elem = self.read_seq_at(frames, &target, i)?;
+            // A byte stored through the buffer's union view
+            // (the spare-capacity region a `join` fills is
+            // `MaybeUninit<u8>`-typed) keeps the union's
+            // one-field form; the region reads as the byte it
+            // holds, like every reader of such a region.
+            let elem = match &elem {
+                Value::Enum { variant: 0, fields } if fields.len() == 1 => &fields[0],
+                _ => &elem,
+            };
+            match elem {
+                Value::Uint(b) if *b <= 0xFF => bytes.push(*b as u8),
+                Value::Int(b) if (0..=255).contains(b) => bytes.push(*b as u8),
                 _ => return Ok(None),
             }
         }

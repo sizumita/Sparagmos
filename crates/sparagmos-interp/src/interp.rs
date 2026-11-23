@@ -7813,16 +7813,21 @@ impl<'a> Interpreter<'a> {
                         // the stored elements, spare capacity
                         // included, so the answer does not move
                         // when the length does.
-                        let count = crate::builtins::vec_stored_len(
-                            &self.read_resolved(frames, &cur)?,
-                        )
-                        .ok_or_else(|| {
-                            InterpError::type_mismatch(
-                                format!("capacity of {place}"),
-                                "vector value",
-                                "value without element storage",
-                            )
-                        })?;
+                        let held = self.read_resolved(frames, &cur)?;
+                        let count = match Self::real_vec_cap(&held) {
+                            // A vector in its real aggregate
+                            // form holds the capacity in the
+                            // `RawVecInner` slot itself.
+                            Some(cap) => cap,
+                            None => crate::builtins::vec_stored_len(&held)
+                                .ok_or_else(|| {
+                                    InterpError::type_mismatch(
+                                        format!("capacity of {place}"),
+                                        "vector value",
+                                        "value without element storage",
+                                    )
+                                })?,
+                        };
                         buf_depth = 0;
                         buf_base = None;
                         cur_ty = Some(Ty::Uint(UintTy::Usize));
@@ -7860,16 +7865,22 @@ impl<'a> Interpreter<'a> {
                     } else if *idx == 1
                         && cur_ty.as_ref().is_some_and(is_vec_adt_ty)
                     {
-                        let count = self
-                            .read_resolved(frames, &cur)?
-                            .len()
-                            .ok_or_else(|| {
+                        let held = self.read_resolved(frames, &cur)?;
+                        let count = match crate::builtins::vec_real_aggregate_parts(
+                            &held,
+                        ) {
+                            // A vector in its real aggregate
+                            // form holds the length in the slot
+                            // itself.
+                            Some((_, len)) => len as u128,
+                            None => held.len().ok_or_else(|| {
                                 InterpError::type_mismatch(
                                     format!("length of {place}"),
                                     "vector value",
                                     "value without a length",
                                 )
-                            })?;
+                            })?,
+                        };
                         cur_ty = Some(Ty::Uint(UintTy::Usize));
                         Resolved::Value(Value::Uint(count), Vec::new())
                     } else if *idx == 0 && cur_ty.is_none() && root_is_path_chain {
@@ -8568,6 +8579,13 @@ impl<'a> Interpreter<'a> {
         frames: &[Frame],
         base: &Resolved,
     ) -> InterpResult<Resolved> {
+        if let Ok(held) = self.read_resolved(frames, base) {
+            if crate::builtins::vec_real_aggregate_parts(&held).is_some() {
+                if let Some(ptr) = Self::real_vec_buffer_ptr(&held) {
+                    return Ok(Resolved::Value(ptr, Vec::new()));
+                }
+            }
+        }
         let target = match base {
             Resolved::Place {
                 frame_pos,
@@ -9199,6 +9217,60 @@ impl<'a> Interpreter<'a> {
     /// the result is the vector value at that length (see
     /// `crate::builtins::vec_with_len`). `None` when the value
     /// is not in the real form.
+    pub(crate) fn real_vec_buffer_ptr(value: &Value) -> Option<Value> {
+        let (buf, _) = crate::builtins::vec_real_aggregate_parts(value)?;
+        let Value::Enum {
+            fields: buf_fields, ..
+        } = &buf
+        else {
+            return None;
+        };
+        let Value::Enum {
+            fields: inner, ..
+        } = buf_fields.first()?
+        else {
+            return None;
+        };
+        match inner.first()? {
+            Value::Enum { fields, .. } if fields.len() == 1 => match &fields[0] {
+                v @ (Value::Ref(_) | Value::FatRef { .. }) => Some(v.clone()),
+                _ => None,
+            },
+            v @ (Value::Ref(_) | Value::FatRef { .. }) => Some(v.clone()),
+            _ => None,
+        }
+    }
+
+    /// The capacity a vector value in its real aggregate
+    /// form stores in its `RawVecInner` slot (the one-field
+    /// `UsizeNoHighBit` wrapper around the count), or `None`
+    /// for any other shape.
+    pub(crate) fn real_vec_cap(value: &Value) -> Option<u128> {
+        let (buf, _) = crate::builtins::vec_real_aggregate_parts(value)?;
+        let Value::Enum {
+            fields: buf_fields, ..
+        } = &buf
+        else {
+            return None;
+        };
+        let Value::Enum {
+            fields: inner, ..
+        } = buf_fields.first()?
+        else {
+            return None;
+        };
+        match inner.get(1)? {
+            Value::Uint(n) => Some(*n),
+            Value::Int(n) if *n >= 0 => Some(*n as u128),
+            Value::Enum { fields, .. } if fields.len() == 1 => match &fields[0] {
+                Value::Uint(n) => Some(*n),
+                Value::Int(n) if *n >= 0 => Some(*n as u128),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     pub(crate) fn vec_from_real_form(
         &self,
         frames: &[Frame],
@@ -13460,6 +13532,28 @@ impl<'a> Interpreter<'a> {
             Ok(None) => return None,
             Err(e) => return Some(Err(e)),
         };
+        // A vector in its real aggregate form holds the
+        // buffer bookkeeping in the `RawVec` fields
+        // themselves: the store lands on the field the chain
+        // steps name, and the element-list translation below
+        // does not apply.
+        if let Ok(held) = self.read_resolved(frames, &base) {
+            if crate::builtins::vec_real_aggregate_parts(&held).is_some() {
+                let steps = steps.to_vec();
+                let value = value.clone();
+                return Some(self.modify_resolved(frames, &base, move |slot| {
+                    if aggregate_buf_slot_write(slot, &steps, &value) {
+                        Ok(())
+                    } else {
+                        Err(InterpError::type_mismatch(
+                            "Vec buffer slot write",
+                            "real aggregate vector value",
+                            slot.kind_name(),
+                        ))
+                    }
+                }));
+            }
+        }
         match slot {
             Slot::Ptr => Some(Ok(())),
             Slot::Cap => {
@@ -13530,6 +13624,20 @@ impl<'a> Interpreter<'a> {
             .map(|tag| crate::builtins::uninit_elem_value_for_tag(&tag))
             .unwrap_or(Value::Uninit);
         Some(self.modify_resolved(frames, &target, |slot| {
+            // A vector in its real aggregate form (`[RawVec,
+            // len]`, the shape a converted body builds with an
+            // aggregate assignment) holds the length in the
+            // slot itself: the store lands on that field, and
+            // the elements (which live behind the buffer
+            // pointer) are untouched. The element-list form
+            // takes the `vec_with_len` translation below.
+            if let Some((buf, _)) = crate::builtins::vec_real_aggregate_parts(slot) {
+                *slot = Value::Enum {
+                    variant: 0,
+                    fields: vec![buf, Value::Uint(new_len as u128)],
+                };
+                return Ok(());
+            }
             let elems = match std::mem::replace(slot, Value::Uninit) {
                 Value::Enum { fields, .. } => fields,
                 Value::SparseVec { elems, .. } => elems,
@@ -17097,6 +17205,51 @@ fn cap_value_count(value: &Value) -> Option<usize> {
 /// reference steps exactly as `resolve_place_mode` tracks it
 /// (any other step ends the tracking, so the slot is only
 /// recognised in the direct shapes collected std bodies use).
+/// Store `value` into the buffer bookkeeping field of a
+/// vector value in its real aggregate form, following the
+/// chain `steps` (the field steps after the dereference that
+/// entered the buffer wrapper chain): from the vector value
+/// the steps name the `RawVec` field, the `RawVecInner`
+/// inside it, and the pointer (field 0) or capacity
+/// (field 1) slot inside that, through the one-field
+/// wrappers around each. `false` when the value does not
+/// have the shape the steps denote.
+fn aggregate_buf_slot_write(
+    slot: &mut Value,
+    steps: &[ProjectionElem],
+    value: &Value,
+) -> bool {
+    fn field_mut<'a>(v: &'a mut Value, idx: usize) -> Option<&'a mut Value> {
+        match v {
+            Value::Enum { fields, .. } => fields.get_mut(idx),
+            _ => None,
+        }
+    }
+    fn walk<'a>(v: &'a mut Value, idxs: &[usize]) -> Option<&'a mut Value> {
+        match idxs.split_first() {
+            None => Some(v),
+            Some((idx, tail)) => walk(field_mut(v, *idx)?, tail),
+        }
+    }
+    // The vector's `RawVec` field and the `RawVecInner`
+    // inside it precede the steps, which are the inner's
+    // own field steps (see `write_vec_buf_slot`).
+    let mut idxs: Vec<usize> = vec![0, 0];
+    for step in steps {
+        let ProjectionElem::Field(idx) = step else {
+            return false;
+        };
+        idxs.push(*idx);
+    }
+    match walk(slot, &idxs) {
+        Some(cur) => {
+            *cur = value.clone();
+            true
+        }
+        None => false,
+    }
+}
+
 fn vec_len_slot_base(body: &Body, place: &Place) -> Option<Place> {
     let (last, prefix) = place.projection.split_last()?;
     if !matches!(last, ProjectionElem::Field(1)) {
