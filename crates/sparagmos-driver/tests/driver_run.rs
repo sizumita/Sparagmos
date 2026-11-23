@@ -12074,6 +12074,93 @@ fn run_mode_iterator_collect_names_unmodelled_targets() {
     );
 }
 
+const ARRAY_INTO_ITER_COLLECT_SRC: &str = r#"
+use std::collections::VecDeque;
+use std::rc::Rc;
+use std::sync::Arc;
+fn main() {
+    let v: Vec<i32> = [1, 2, 3].into_iter().collect();
+    let s: String = ['a', 'b'].into_iter().collect();
+    println!("v={v:?} s={s}");
+    let b: Box<[i32]> = [4, 5, 6].into_iter().collect();
+    let bs: Box<str> = ['h', 'i'].into_iter().collect();
+    println!("b={b:?} bs={bs}");
+    let r: Rc<[i32]> = [10, 20, 30].into_iter().collect();
+    let r2 = r.clone();
+    println!("r={} {} {}", r[2], r2.len(), Rc::strong_count(&r));
+    let a: Arc<[String]> = ["x".to_string(), "yy".to_string()].into_iter().collect();
+    println!("a={} {}", a.len(), a[1]);
+    let mut d: VecDeque<i32> = [7, 8].into_iter().collect();
+    d.push_back(9);
+    let front = d.pop_front();
+    println!("d={d:?} f={front:?}");
+    let empty: Rc<[i32]> = [].into_iter().collect();
+    let from_arr: Rc<[i32]> = Rc::from([3, 1]);
+    let from_arc: Arc<[i32]> = Arc::from([2, 4]);
+    println!("e={} fa={from_arr:?} fc={from_arc:?}", empty.len());
+}
+"#;
+
+#[test]
+fn run_mode_array_into_iter_collect_into_boxed_and_counted_slices() {
+    // `array::IntoIter` is a modelled iterator, so its `collect`
+    // reaches the runtime's collect model directly (unlike a
+    // slice iterator, whose collected std body can build these
+    // targets itself). The boxed and counted slice targets take
+    // the shapes the `into_boxed_slice` / counted-slice `From`
+    // models build, and the deque the `From`-conversion
+    // aggregate; each collected value must then behave like the
+    // native one (indexing, clone counts, mutation, drops).
+    let dir = temp_dir("array_into_iter_collect");
+    let src = fixture(&dir, "case.rs", ARRAY_INTO_ITER_COLLECT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "array IntoIter collect into boxed/counted/deque targets runs; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "v=[1, 2, 3] s=ab\nb=[4, 5, 6] bs=hi\nr=30 3 2\na=2 yy\nd=[8, 9] f=Some(7)\ne=0 fa=[3, 1] fc=[2, 4]\n"
+    );
+}
+
+const ARRAY_INTO_ITER_COLLECT_PARTIAL_SRC: &str = r#"
+use std::iter::FromIterator;
+use std::rc::Rc;
+fn main() {
+    let b = Box::from_iter([4, 5].into_iter());
+    println!("{:?}", b);
+    let mut it = [1, 2, 3, 4].into_iter();
+    let _ = it.next();
+    let r: Rc<[i32]> = it.collect();
+    println!("{:?}", r);
+    let v = Vec::from_iter(['x', 'y'].into_iter());
+    println!("{:?}", v);
+}
+"#;
+
+#[test]
+fn run_mode_array_into_iter_collect_partial_and_from_iter() {
+    // The `FromIterator::from_iter` entry reaches the same
+    // collect model, and a partially consumed array iterator
+    // collects only its remaining elements.
+    let dir = temp_dir("array_into_iter_collect_partial");
+    let src = fixture(&dir, "case.rs", ARRAY_INTO_ITER_COLLECT_PARTIAL_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "from_iter and partially consumed array IntoIter collect run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[4, 5]\n[2, 3, 4]\n['x', 'y']\n"
+    );
+}
+
 // ----- IntoIterator::into_iter runtime support (Lane DT) ---------------------
 
 const VEC_BY_VALUE_SRC: &str = r#"
