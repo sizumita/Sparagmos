@@ -18805,3 +18805,50 @@ fn run_mode_nounwind_from_str_panic_message() {
         "no fmt coercion failure masks the message: {stderr}"
     );
 }
+
+const SLICE_JOIN_SRC: &str = r#"
+fn main() {
+    // `slice::join` builds its `String` through
+    // `join_generic_copy`: a `Vec<u8>` in its real aggregate
+    // form, filled through raw-pointer copies, returned as a
+    // `String`. Its core UB checks (`ptr::offset_from_unsigned`
+    // preconditions) compare positions of one allocation, and
+    // the result denotes its string through the buffer.
+    let parts: &[&str] = &["a", "bb", "ccc"];
+    let s = parts.join("-");
+    println!("{}", s);
+    println!("{:?}", s);
+    println!("len={} lt={}", s.len(), s < "b".to_string());
+    assert_eq!(s, "a-bb-ccc");
+    let e: &[&str] = &[];
+    println!("[{}]", e.join("-"));
+    let one: &[&str] = &["x"];
+    println!("{}", one.join("---"));
+    let v = vec!["p".to_string(), "q".to_string()];
+    println!("{}", v.join("::"));
+    println!("{}", parts.concat());
+    println!("{}", s.to_uppercase());
+}
+"#;
+
+#[test]
+fn run_mode_slice_join() {
+    let dir = temp_dir("slice-join");
+    let src = fixture(&dir, "slice_join.rs", SLICE_JOIN_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "slice::join must run without a UB-check failure; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a-bb-ccc\n\"a-bb-ccc\"\nlen=8 lt=true\n[]\nx\np::q\nabbccc\nA-BB-CCC\n",
+        "the joined string reads back through its real aggregate form"
+    );
+    assert!(
+        !stderr.contains("offset_from_unsigned"),
+        "no UB-check message fires: {stderr}"
+    );
+}

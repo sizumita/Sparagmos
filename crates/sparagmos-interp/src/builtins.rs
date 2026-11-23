@@ -15034,6 +15034,19 @@ fn value_fingerprint(value: &Value) -> u64 {
                 _ => self.elems_equal(frames, &ea, &eb),
             };
         }
+        // A `String` in its real aggregate form denotes the
+        // string its buffer holds (see
+        // `string_from_real_aggregate`): against a string side
+        // it compares as that string.
+        for (side, other) in [(&*a, &*b), (&*b, &*a)] {
+            if let Some(text) = self.string_from_real_aggregate(frames, side)? {
+                return Ok(match other {
+                    Value::Str(y) => text == *y,
+                    Value::Bytes(y) => text.as_bytes() == y.as_slice(),
+                    _ => false,
+                });
+            }
+        }
         Ok(match (&*a, &*b) {
             (Value::Ref(RefTarget::Null), Value::Ref(RefTarget::Null)) => true,
             // Address-only pointers compare by address; address 0
@@ -15227,6 +15240,20 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         }
         let a = self.resolve_ref(frames, a)?;
         let b = self.resolve_ref(frames, b)?;
+        // A `String` in its real aggregate form denotes the
+        // string its buffer holds (see
+        // `string_from_real_aggregate`): against a string side
+        // it orders as that string.
+        for (side, other, flip) in [(&*a, &*b, false), (&*b, &*a, true)] {
+            if let Some(text) = self.string_from_real_aggregate(frames, side)? {
+                let ord = match other {
+                    Value::Str(y) => text.as_bytes().cmp(y.as_bytes()),
+                    Value::Bytes(y) => text.as_bytes().cmp(y.as_slice()),
+                    _ => continue,
+                };
+                return Ok(Some(if flip { ord.reverse() } else { ord }));
+            }
+        }
         Ok(match (&*a, &*b) {
             (Value::Unit, Value::Unit) => Some(Ordering::Equal),
             (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)),
@@ -16867,13 +16894,91 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
     }
 
     fn resolve_string(&self, frames: &[Frame], value: &Value) -> InterpResult<String> {
-        match self.resolve_value(frames, value)? {
+        let resolved = self.resolve_value(frames, value)?;
+        match resolved {
             Value::Str(s) => Ok(s),
-            other => Err(InterpError::type_mismatch(
-                "string argument",
-                "string data",
-                other.kind_name(),
-            )),
+            ref other => {
+                if let Some(text) = self.string_from_real_aggregate(frames, other)? {
+                    return Ok(text);
+                }
+                Err(InterpError::type_mismatch(
+                    "string argument",
+                    "string data",
+                    other.kind_name(),
+                ))
+            }
+        }
+    }
+
+    /// The string a `String` value in its real aggregate form
+    /// denotes: the one-field wrapper around a `Vec<u8>` in its
+    /// real aggregate form (`[RawVec, len]`, see
+    /// `vec_real_aggregate_parts`), whose buffer the converted
+    /// library bodies filled through raw-pointer copies — the
+    /// shape `slice::join` / `concat` build through
+    /// `join_generic_copy` and hand back as a `String`. The bytes
+    /// are the buffer pointer's elements, read through the
+    /// pointer model like any other bulk-memory source. Any
+    /// other shape returns `None` and leaves the caller's
+    /// ordinary judgement to stand.
+    fn string_from_real_aggregate(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+    ) -> InterpResult<Option<String>> {
+        let Value::Enum { fields, .. } = value else {
+            return Ok(None);
+        };
+        if fields.len() != 1 {
+            return Ok(None);
+        }
+        let Some((buf, len)) = vec_real_aggregate_parts(&fields[0]) else {
+            return Ok(None);
+        };
+        if len == 0 {
+            return Ok(Some(String::new()));
+        }
+        // The buffer value is the `RawVec` aggregate: its first
+        // field is the `RawVecInner` triple, whose first field is
+        // the one-field `NonNull` wrapper around the data pointer.
+        let Value::Enum {
+            fields: buf_fields, ..
+        } = &buf
+        else {
+            return Ok(None);
+        };
+        let Some(Value::Enum {
+            fields: inner_fields,
+            ..
+        }) = buf_fields.first()
+        else {
+            return Ok(None);
+        };
+        let Some(Value::Enum {
+            fields: ptr_fields, ..
+        }) = inner_fields.first()
+        else {
+            return Ok(None);
+        };
+        if ptr_fields.len() != 1 {
+            return Ok(None);
+        }
+        let ptr = &ptr_fields[0];
+        if !matches!(ptr, Value::Ref(_)) {
+            return Ok(None);
+        }
+        let target = self.deref_value(frames, ptr)?;
+        let mut bytes = Vec::with_capacity(len);
+        for i in 0..len {
+            match self.read_seq_at(frames, &target, i)? {
+                Value::Uint(b) if b <= 0xFF => bytes.push(b as u8),
+                Value::Int(b) if (0..=255).contains(&b) => bytes.push(b as u8),
+                _ => return Ok(None),
+            }
+        }
+        match String::from_utf8(bytes) {
+            Ok(text) => Ok(Some(text)),
+            Err(_) => Ok(None),
         }
     }
 
@@ -22904,6 +23009,23 @@ impl<'a> Interpreter<'a> {
         if matches!(value, Value::Ref(_)) {
             let pointee = self.resolve_value(frames, value)?;
             return self.format_value(frames, &pointee, trait_, ty, options, indent);
+        }
+        // A `String` in its real aggregate form (see
+        // `string_from_real_aggregate`) formats as the string it
+        // denotes, for every trait `String` / `str` formatting
+        // defines.
+        if matches!(trait_, FmtTrait::Display | FmtTrait::Debug) {
+            let plain = pointee_tag(ty);
+            if plain == "std::string::String" || plain == "alloc::string::String" {
+                if let Value::Enum { .. } = value {
+                    if let Some(text) = self.string_from_real_aggregate(frames, value)? {
+                        let decoded = Value::Str(text);
+                        return self.format_value(
+                            frames, &decoded, trait_, ty, options, indent,
+                        );
+                    }
+                }
+            }
         }
         if let Value::FatRef { base, .. } = value {
             // A slice value: only Debug is defined for it (a list).
