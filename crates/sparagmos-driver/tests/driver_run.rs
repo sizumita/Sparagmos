@@ -25072,3 +25072,105 @@ fn run_mode_cstring_dyn_method_reads_whole_value() {
         "ref_dyn=5\nbox_dyn=6\nrc_dyn=2\nfield_dyn=5\n",
     );
 }
+
+const TRANSMUTE_TUPLE_FIELD_SRC: &str = r#"
+#[repr(C, packed)]
+struct S {
+    a: (u8, u16, u8),
+    b: u8,
+}
+
+fn main() {
+    let bytes: [u8; 5] = [0x34, 0x12, 0x56, 0x78, 0x9a];
+    let s: S = unsafe { std::mem::transmute(bytes) };
+    let a = s.a;
+    let b = s.b;
+    println!("{} {} {} {}", a.0, a.1, a.2, b);
+}
+"#;
+
+#[test]
+fn run_mode_transmute_tuple_field_at_recorded_offsets() {
+    // A tuple field of a packed struct transmuted from a
+    // byte array: the tuple's storage order is the
+    // compiler's choice (here the `u16` sits first, at
+    // offset 0), so the field's fields are read at the
+    // tuple's recorded layout offsets, not in declaration
+    // order.
+    run_ok(
+        "transmute-tuple-field",
+        TRANSMUTE_TUPLE_FIELD_SRC,
+        "86 4660 120 154\n",
+    );
+}
+
+const TRANSMUTE_TUPLE_LAYOUT_SRC: &str = r#"
+fn main() {
+    let b4: [u8; 4] = [0x34, 0x12, 0x56, 0x78];
+    let t: (u8, u16, u8) = unsafe { std::mem::transmute(b4) };
+    println!("{} {} {}", t.0, t.1, t.2);
+    let back: [u8; 4] = unsafe { std::mem::transmute(t) };
+    println!("{:?}", back);
+    let v: u64 = 0x1122_3344_5566_7788;
+    let p: (u8, u32) = unsafe { std::mem::transmute(v) };
+    println!("{} {}", p.0, p.1);
+    let v2: u64 = unsafe { std::mem::transmute(p) };
+    println!("{:x}", v2);
+    let nb: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+    let n: ((u8, u32), u8) = unsafe { std::mem::transmute(nb) };
+    println!("{} {} {}", (n.0).0, (n.0).1, n.1);
+}
+"#;
+
+#[test]
+fn run_mode_transmute_tuple_at_recorded_offsets() {
+    // Bare tuples transmuted to and from byte arrays and
+    // integers at their recorded layout offsets: a
+    // reordered tuple (`(u8, u16, u8)` stores its `u16`
+    // first), a padded tuple (`(u8, u32)` spans eight
+    // bytes, its pattern the full `u64` width in both
+    // directions), and a nested tuple read field by field.
+    run_ok(
+        "transmute-tuple-layout",
+        TRANSMUTE_TUPLE_LAYOUT_SRC,
+        "86 4660 120\n[52, 18, 86, 120]\n136 287454020\n1122334400000088\n1 134678021 9\n",
+    );
+}
+
+const TRANSMUTE_ENUM_TUPLE_PAYLOAD_SRC: &str = r#"
+#[repr(u8)]
+enum E {
+    A((u8, u16, u8)),
+    B(u32),
+}
+
+fn main() {
+    let e = E::A((0x56, 0x1234, 0x78));
+    let bytes: [u8; 8] = unsafe { std::mem::transmute(e) };
+    let back: E = unsafe { std::mem::transmute(bytes) };
+    match back {
+        E::A(t) => println!("A {} {} {}", t.0, t.1, t.2),
+        E::B(v) => println!("B {}", v),
+    }
+    let e2 = E::B(0xdeadbeef);
+    let bytes2: [u8; 8] = unsafe { std::mem::transmute(e2) };
+    let back2: E = unsafe { std::mem::transmute(bytes2) };
+    match back2 {
+        E::A(t) => println!("A {} {} {}", t.0, t.1, t.2),
+        E::B(v) => println!("B {:x}", v),
+    }
+}
+"#;
+
+#[test]
+fn run_mode_transmute_enum_tuple_payload() {
+    // A direct-tag enum whose one variant carries a
+    // tuple: the tuple payload is rebuilt at its recorded
+    // layout offsets when the enum is reconstructed from
+    // its bytes, for both variants.
+    run_ok(
+        "transmute-enum-tuple-payload",
+        TRANSMUTE_ENUM_TUPLE_PAYLOAD_SRC,
+        "A 86 4660 120\nB deadbeef\n",
+    );
+}

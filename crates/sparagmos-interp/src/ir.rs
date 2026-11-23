@@ -617,11 +617,23 @@ pub enum ScalarShape {
     /// fat-value table, which construction consults before
     /// fabricating a pointer from the words alone.
     FatPtr(FatMeta),
-    /// Several scalar shapes side by side in declaration
-    /// order: field `i` occupies the bits after all preceding
-    /// fields. A tuple flattens field by field and
-    /// construction builds the tuple of the fields' values.
-    Fields(Vec<ScalarShape>),
+    /// Several scalar shapes side by side at verified bit
+    /// offsets within a storage of `total_bits` bits: a
+    /// tuple's fields, in declaration order, each field's
+    /// bit pattern sitting at its paired bit offset — the
+    /// field's recorded layout offset times eight (see
+    /// `TupleLayouts` in `sparagmos-mir`). A tuple's storage
+    /// order is the compiler's choice (fields may be
+    /// reordered, padding inserted), so the offsets are part
+    /// of the shape: flattening places each field's pattern
+    /// at its offset, bits no field accounts for (padding)
+    /// flatten as zero, and construction reads each field's
+    /// pattern from its offset and builds the tuple of the
+    /// fields' values in declaration order.
+    Fields {
+        total_bits: u32,
+        fields: Vec<(u32, ScalarShape)>,
+    },
     /// A fieldless enum: the whole bit pattern is the
     /// variant's discriminant, held in a tag of `bits` width.
     /// Flattening yields the discriminant's bit pattern in
@@ -650,9 +662,7 @@ impl ScalarShape {
             ScalarShape::TaggedEnum { total_bits, .. } => *total_bits,
             ScalarShape::FieldlessEnum { bits, .. } => *bits,
             ScalarShape::FatPtr(_) => 128,
-            ScalarShape::Fields(fields) => {
-                fields.iter().map(|f| f.bits()).sum()
-            }
+            ScalarShape::Fields { total_bits, .. } => *total_bits,
         }
     }
 }

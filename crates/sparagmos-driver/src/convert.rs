@@ -120,6 +120,14 @@ pub struct Converter {
     /// through the field spans recorded here. Filled from the
     /// same layout query as `adt_layouts`.
     pub adt_field_layouts: sm::AdtFieldLayouts,
+    /// Storage layouts of the monomorphic tuple types
+    /// converted so far, keyed by the tuple type's rendered
+    /// name (see `sm::TupleLayouts`). Handed to the
+    /// interpreter with the converted program: its scalar
+    /// shape of a tuple reads the fields at the recorded
+    /// offsets. Filled from the same layout query as
+    /// `adt_layouts`.
+    pub tuple_layouts: sm::TupleLayouts,
     /// Direct discriminant tag layouts of the monomorphic
     /// enum instances converted so far, keyed like
     /// `adt_layouts` (see `sm::AdtTagLayouts`). Handed to the
@@ -956,6 +964,7 @@ impl Converter {
             adt_discriminants: sm::AdtDiscriminants::new(),
             adt_layouts: sm::AdtLayouts::new(),
             adt_field_layouts: sm::AdtFieldLayouts::new(),
+            tuple_layouts: sm::TupleLayouts::new(),
             adt_tag_layouts: sm::AdtTagLayouts::new(),
             mat_plans: HashMap::new(),
             coroutine_layouts: sm::CoroutineLayouts::new(),
@@ -4260,7 +4269,7 @@ impl Converter {
 
     fn ty_inner(&mut self, ty: &rustc_public::ty::Ty) -> sm::Ty {
         match ty.kind() {
-            TyKind::RigidTy(r) => self.rigid_ty(&r),
+            TyKind::RigidTy(r) => self.rigid_ty(ty, &r),
             TyKind::Alias(kind, alias) => {
                 let k = match kind {
                     SmirAliasKind::Projection => sm::AliasKind::Projection,
@@ -4568,6 +4577,16 @@ impl Converter {
             let mut row = Vec::with_capacity(offsets.len());
             for (field, &off) in fields.iter().zip(offsets.iter()) {
                 let fty = field.ty_with_args(args);
+                // A tuple field type's own storage layout is
+                // recorded as well, through the conversion
+                // hook that records every tuple type a body
+                // mentions: the interpreter's scalar shape of
+                // the field reads the tuple's fields at the
+                // recorded offsets, and the instantiated
+                // tuple type may occur in no body.
+                if matches!(fty.kind(), TyKind::RigidTy(RigidTy::Tuple(_))) {
+                    let _ = self.ty(&fty);
+                }
                 // A field type mentioning a coroutine is never
                 // queried: computing such a type's layout can
                 // drive the compiler into the coroutine's own
@@ -4904,6 +4923,76 @@ impl Converter {
             key,
             (shape.size.bytes() as u64, shape.abi_align),
         );
+    }
+
+    /// Record the compiler-computed storage layout of one
+    /// monomorphic tuple type under its rendered name, once
+    /// per distinct type (see `sm::TupleLayouts`): the
+    /// tuple's total storage size and each field's (offset,
+    /// size) in declaration order, from the same layout
+    /// query the ADT path uses. A tuple's storage order is
+    /// the compiler's choice — fields may be reordered and
+    /// padding inserted — so the interpreter's scalar shape
+    /// of a tuple is built from this record, never from
+    /// declaration order. Types the query cannot answer
+    /// (generic parameters among the elements, unsized
+    /// elements) are skipped under the same containment as
+    /// the ADT path: the query is caught, and the type
+    /// simply gets no entry. A type mentioning a coroutine
+    /// is not asked at all, exactly as in
+    /// `record_field_layouts`: computing such a type's
+    /// layout can drive the compiler into the coroutine's
+    /// own destructor-shim construction, which is not
+    /// total. The mention is judged on the converted type,
+    /// never on the compiler's: asking the compiler's type
+    /// for its kind is itself the question that panics for
+    /// coroutine-closure types (see `guarded_ty_kind`), and
+    /// this recorder runs inside type conversion, where
+    /// such a panic would take the whole body with it.
+    fn record_tuple_layout(
+        &mut self,
+        ty: &rustc_public::ty::Ty,
+        elem_tys: &[rustc_public::ty::Ty],
+        converted: &sm::Ty,
+    ) {
+        if !self.layout_attempted_tys.insert(*ty) {
+            return;
+        }
+        let key = self.layout_key(converted);
+        if !self.layout_attempted.insert(key.clone()) {
+            return;
+        }
+        if converted_mentions_coroutine(converted) {
+            return;
+        }
+        let layout =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ty.layout()));
+        let Ok(Ok(layout)) = layout else {
+            return;
+        };
+        let shape = layout.shape();
+        if shape.is_unsized() {
+            return;
+        }
+        let FieldsShape::Arbitrary { offsets } = &shape.fields else {
+            return;
+        };
+        if offsets.len() != elem_tys.len() {
+            return;
+        }
+        let mut spans = Vec::with_capacity(elem_tys.len());
+        for (elem_ty, off) in elem_tys.iter().zip(offsets.iter()) {
+            let queried = std::panic::catch_unwind(
+                std::panic::AssertUnwindSafe(|| elem_ty.layout()),
+            );
+            let Ok(Ok(elayout)) = queried else { return };
+            spans.push((
+                off.bytes() as u64,
+                elayout.shape().size.bytes() as u64,
+            ));
+        }
+        self.tuple_layouts
+            .insert(key, (shape.size.bytes() as u64, spans));
     }
 
     /// Record the storage-slot map of one monomorphic coroutine
@@ -5282,7 +5371,7 @@ impl Converter {
         })
     }
 
-    fn rigid_ty(&mut self, r: &RigidTy) -> sm::Ty {
+    fn rigid_ty(&mut self, ty: &rustc_public::ty::Ty, r: &RigidTy) -> sm::Ty {
         match r {
             RigidTy::Bool => sm::Ty::Bool,
             RigidTy::Char => sm::Ty::Char,
@@ -5374,7 +5463,12 @@ impl Converter {
                 let d = self.crate_def_id(def);
                 sm::Ty::CoroutineWitness(d, self.type_args(args))
             }
-            RigidTy::Tuple(elems) => sm::Ty::Tuple(elems.iter().map(|t| self.ty(t)).collect()),
+            RigidTy::Tuple(elems) => {
+                let converted =
+                    sm::Ty::Tuple(elems.iter().map(|t| self.ty(t)).collect());
+                self.record_tuple_layout(ty, elems, &converted);
+                converted
+            }
             RigidTy::Pat(inner, _) => {
                 // A pattern type is a refinement of its base
                 // type with the same representation, so it
@@ -5687,6 +5781,38 @@ fn uint_ty_size(t: &SmirUintTy) -> Option<usize> {
 /// slices, references and pointer wrappers). See the guard in
 /// `Converter::record_field_layouts`: such a type's layout is
 /// never queried for a field size.
+/// Whether a converted type mentions a coroutine (or a
+/// coroutine closure, which converts to the same form)
+/// anywhere inside it. The converted-side counterpart of
+/// `ty_mentions_coroutine`, for screens that run inside
+/// type conversion itself: asking the compiler's type for
+/// its kind is the question that panics for
+/// coroutine-closure types (see `guarded_ty_kind`), so a
+/// recorder hooked into conversion must judge the mention
+/// from the converted form alone.
+fn converted_mentions_coroutine(ty: &sm::Ty) -> bool {
+    match ty {
+        sm::Ty::Coroutine(..) | sm::Ty::CoroutineWitness(..) => true,
+        sm::Ty::Adt(_, args) | sm::Ty::Closure(_, args) | sm::Ty::FnDef(_, args) => {
+            args.iter().any(converted_mentions_coroutine)
+        }
+        sm::Ty::Alias(_, _, args) => args.iter().any(converted_mentions_coroutine),
+        sm::Ty::Array(elem, _) | sm::Ty::Slice(elem) | sm::Ty::Pat(elem, _) => {
+            converted_mentions_coroutine(elem)
+        }
+        sm::Ty::Ref(_, inner, _) | sm::Ty::RawPtr(inner, _) => {
+            converted_mentions_coroutine(inner)
+        }
+        sm::Ty::Tuple(items) => items.iter().any(converted_mentions_coroutine),
+        sm::Ty::FnPtr(sig) => {
+            sig.inputs.iter().any(converted_mentions_coroutine)
+                || converted_mentions_coroutine(&sig.output)
+        }
+        sm::Ty::Dynamic(_, inner, _) => converted_mentions_coroutine(inner),
+        _ => false,
+    }
+}
+
 fn ty_mentions_coroutine(ty: &rustc_public::ty::Ty) -> bool {
     use rustc_public::ty::{GenericArgKind, RigidTy, TyKind};
     fn args_mention(args: &rustc_public::ty::GenericArgs) -> bool {

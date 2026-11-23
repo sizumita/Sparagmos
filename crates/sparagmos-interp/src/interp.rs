@@ -17401,14 +17401,16 @@ impl<'a> Interpreter<'a> {
                 }
                 Ok(out)
             }
-            (ScalarShape::Fields(fields), Value::Tuple(items))
+            (ScalarShape::Fields { fields, .. }, Value::Tuple(items))
                 if items.len() == fields.len() =>
             {
                 let mut out = 0u128;
-                let mut offset = 0u32;
-                for (item, field) in items.iter().zip(fields.iter()) {
-                    out |= self.flatten_scalar(item, field)? << offset;
-                    offset += field.bits();
+                for (item, (offset, field)) in
+                    items.iter().zip(fields.iter())
+                {
+                    out |= (self.flatten_scalar(item, field)?
+                        & bit_mask(field.bits()))
+                        << offset;
                 }
                 Ok(out)
             }
@@ -17582,13 +17584,11 @@ impl<'a> Interpreter<'a> {
                     }
                 }
             }
-            ScalarShape::Fields(fields) => {
+            ScalarShape::Fields { fields, .. } => {
                 let mut items = Vec::with_capacity(fields.len());
-                let mut offset = 0u32;
-                for field in fields {
+                for (offset, field) in fields {
                     let part = (bits >> offset) & bit_mask(field.bits());
                     items.push(self.construct_scalar(part, field)?);
-                    offset += field.bits();
                 }
                 Ok(Value::Tuple(items))
             }

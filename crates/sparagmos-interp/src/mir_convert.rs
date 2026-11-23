@@ -116,6 +116,13 @@ pub struct MirProgram {
     /// (see [`mir::AdtFieldLayouts`]). Consulted by the
     /// interpreter's byte view of an ADT value's storage.
     pub adt_field_layouts: mir::AdtFieldLayouts,
+    /// Storage layouts of the monomorphic tuple types in
+    /// the program, as recorded by the driver (see
+    /// [`mir::TupleLayouts`]). Consulted when a tuple's
+    /// scalar shape is built: a tuple's fields sit at the
+    /// compiler's chosen offsets, so the shape is sound
+    /// only at the recorded ones.
+    pub tuple_layouts: mir::TupleLayouts,
     /// Direct discriminant tag layouts of the monomorphic
     /// enum instances in the program, as recorded by the
     /// driver (see [`mir::AdtTagLayouts`]). Consulted by the
@@ -2108,6 +2115,9 @@ struct Converter<'a> {
     /// Per-variant field layouts of the program's ADT
     /// instances (see `MirProgram`).
     adt_field_layouts: &'a mir::AdtFieldLayouts,
+    /// Storage layouts of the program's tuple types (see
+    /// `MirProgram`).
+    tuple_layouts: &'a mir::TupleLayouts,
     /// Direct tag layouts of the program's enum instances
     /// (see `MirProgram`).
     adt_tag_layouts: &'a mir::AdtTagLayouts,
@@ -2255,6 +2265,7 @@ impl<'a> Converter<'a> {
             coroutine_layouts: &program.coroutine_layouts,
             adt_layouts: &program.adt_layouts,
             adt_field_layouts: &program.adt_field_layouts,
+            tuple_layouts: &program.tuple_layouts,
             adt_tag_layouts: &program.adt_tag_layouts,
             drop_trivial_adts: &program.drop_trivial_adts,
             drop_no_impl_adts: &program.drop_no_impl_adts,
@@ -3694,8 +3705,8 @@ impl<'a> Converter<'a> {
     fn shape_contains_ptr(shape: &ir::ScalarShape) -> bool {
         match shape {
             ir::ScalarShape::Ptr | ir::ScalarShape::FatPtr(_) => true,
-            ir::ScalarShape::Fields(fields) => {
-                fields.iter().any(Self::shape_contains_ptr)
+            ir::ScalarShape::Fields { fields, .. } => {
+                fields.iter().any(|(_, s)| Self::shape_contains_ptr(s))
             }
             ir::ScalarShape::Array(elem, _) => Self::shape_contains_ptr(elem),
             ir::ScalarShape::AdtField { inner, .. } => Self::shape_contains_ptr(inner),
@@ -6524,26 +6535,44 @@ let inner = match (&src, target) {
                 }
                 Some(S::Array(Box::new(elem), *n))
             }
-            // A tuple of scalar-shaped elements flattens field
-            // by field in declaration order.
+            // A tuple of scalar-shaped elements: the fields
+            // sit at the offsets of the tuple's recorded
+            // layout — the compiler may reorder a tuple's
+            // fields and insert padding, so declaration
+            // order is not the storage order and a shape is
+            // sound only at the recorded offsets. Every
+            // field must be scalar-shaped at exactly its
+            // recorded span's width (see
+            // [`Self::field_shape_at_span`]) and the spans
+            // must not overlap; a tuple type with no
+            // recorded layout has no shape.
             mir::Ty::Tuple(ts) => {
                 if ts.is_empty() {
                     return None;
                 }
-                let mut fields = Vec::with_capacity(ts.len());
-                let mut total = 0u32;
-                for t in ts {
-                    let s = self.scalar_shape(t, depth + 1)?;
-                    total = total.checked_add(s.bits())?;
-                    if total > 128 {
-                        return None;
-                    }
-                    fields.push(s);
-                }
-                if total == 0 {
+                let tag = crate::builtins::ty_tag(ty, self.names);
+                let (size, spans) = self.tuple_layouts.get(&tag)?;
+                let size = *size;
+                if size == 0 || size > 16 || spans.len() != ts.len() {
                     return None;
                 }
-                Some(S::Fields(fields))
+                let mut fields = Vec::with_capacity(ts.len());
+                let mut taken: Vec<(u64, u64)> = Vec::new();
+                for (t, &(off, span)) in ts.iter().zip(spans.iter()) {
+                    if span == 0 || off + span > size {
+                        return None;
+                    }
+                    if taken.iter().any(|(o, s)| off < o + s && *o < off + span) {
+                        return None;
+                    }
+                    taken.push((off, span));
+                    let s = self.field_shape_at_span(t, span, depth)?;
+                    fields.push(((off * 8) as u32, s));
+                }
+                Some(S::Fields {
+                    total_bits: (size * 8) as u32,
+                    fields,
+                })
             }
             mir::Ty::Adt(def, args) => {
                 // A `MaybeUninit<T>` value holds its payload at
