@@ -9284,10 +9284,12 @@ impl<'a> Interpreter<'a> {
     /// enum is a `MaybeUninit` wrapper around the pointee rather
     /// than the position's own value. For an ADT pointee a
     /// stored enum whose field count is the declared count of
-    /// its variant in the type's debug shape is the ADT's value
-    /// itself, and only a one-field stored enum whose field is
-    /// itself a value of the ADT (an enum carrying its variant's
-    /// fields) is a wrapper around it. An aggregate payload may
+    /// its variant in the type's debug shape, with a first field
+    /// that fits that variant's declared first field, is the
+    /// ADT's value itself, and only a one-field stored enum
+    /// whose field is itself a value of the ADT (an enum
+    /// carrying its variant's fields) is a wrapper around it.
+    /// An aggregate payload may
     /// be partially materialised -- a prefix of its declared
     /// fields, the form field-by-field writes through pointers
     /// leave behind -- and still be the pointee's value, so the
@@ -9328,20 +9330,60 @@ impl<'a> Interpreter<'a> {
                     fields: inner_fields,
                 },
             ) => {
-                let Some(shape) = self.debug_shape_for_def(name) else {
+                // The pointee type names the definition alone,
+                // while the recorded shapes are per instance and
+                // their field types differ across instances, so
+                // no single recorded instance can be identified
+                // as the one the position holds. The refusals
+                // below therefore run over every recorded
+                // instance: a stored enum that is any instance's
+                // own value is that instance's value, never a
+                // wrapper, and a field's incompatibility with one
+                // instance's declared field is not wrapper
+                // evidence while another instance's field fits
+                // it. (Judging by one arbitrary instance misread
+                // a genuine `G<E>` value as a wrapper whenever
+                // the pick landed on `G<u32>`.)
+                let shapes = self.debug_shapes_for_def(name);
+                if shapes.is_empty() {
                     return false;
-                };
-                if shape.kind == sparagmos_mir::AdtShapeKind::Union {
+                }
+                if shapes
+                    .iter()
+                    .any(|shape| shape.kind == sparagmos_mir::AdtShapeKind::Union)
+                {
                     return false;
                 }
                 // A stored enum carrying the declared field
-                // count of its own variant is the ADT's complete
-                // value itself, however deep its one-field
-                // chains run -- never a wrapper.
-                let declared = shape.variants.get(stored_variant as usize);
-                if let Some(declared) = declared {
-                    if declared.fields.len() == stored_fields {
-                        return false;
+                // count of its own variant, with a first field
+                // that fits the variant's declared first field,
+                // is the ADT's complete value itself, however
+                // deep its one-field chains run -- never a
+                // wrapper. The field fit is part of the
+                // evidence: the stored variant index of a
+                // wrapper is the union's field index, not a
+                // variant of the pointee at all, and it can
+                // coincide with a one-field variant of the
+                // pointee (a `MaybeUninit<E>` payload read back
+                // through an `E` pointer, where `E`'s first
+                // variant takes one field of another type) --
+                // there the stored field, itself a complete
+                // value of the pointee, cannot be the declared
+                // field's value, and the wrapper reading below
+                // decides. Judging by the first field is
+                // enough: a stored enum with more fields is
+                // refused as a wrapper by the next check either
+                // way.
+                for shape in &shapes {
+                    let declared = shape.variants.get(stored_variant as usize);
+                    if let Some(declared) = declared {
+                        if declared.fields.len() == stored_fields
+                            && declared.fields.first().is_some_and(|first| {
+                                self.value_plausible_for_tag(field, &first.ty, 0)
+                            })
+                        {
+                            return false;
+                        }
                     }
                 }
                 if stored_fields != 1 {
@@ -9352,16 +9394,22 @@ impl<'a> Interpreter<'a> {
                 // prefix holding only its first field -- when
                 // that field fits the declared first field's
                 // type. It is the wrapper only when it cannot
-                // be the ADT's own prefix and its sole field is
-                // itself a plausible value of the ADT.
-                if let Some(declared) = declared {
-                    if let Some(first) = declared.fields.first() {
-                        if self.value_plausible_for_tag(field, &first.ty, 0) {
-                            return false;
+                // be the ADT's own prefix under any recorded
+                // instance and its sole field is itself a
+                // plausible value of the ADT under one of them.
+                for shape in &shapes {
+                    let declared = shape.variants.get(stored_variant as usize);
+                    if let Some(declared) = declared {
+                        if let Some(first) = declared.fields.first() {
+                            if self.value_plausible_for_tag(field, &first.ty, 0) {
+                                return false;
+                            }
                         }
                     }
                 }
-                self.plausible_adt_enum(*inner_variant, inner_fields, shape, 0)
+                shapes.iter().any(|shape| {
+                    self.plausible_adt_enum(*inner_variant, inner_fields, shape, 0)
+                })
             }
             _ => false,
         }
@@ -9371,10 +9419,13 @@ impl<'a> Interpreter<'a> {
     /// name denotes. The table is keyed by the rendered
     /// instance name, while the interpreter's type names the
     /// definition alone; the judgments that consult the shape
-    /// here ask only for variant field counts, field type tags
-    /// and the shape kind, which every instance of the
-    /// definition shares, so an instance entry answers for the
-    /// definition when no definition-named entry exists.
+    /// here ask only for variant field counts and the shape
+    /// kind, which every instance of the definition shares, so
+    /// an instance entry answers for the definition when no
+    /// definition-named entry exists. Judgments that turn on a
+    /// field's *type* cannot use this pick -- field types
+    /// differ across instances -- and must consider every
+    /// recorded instance through `debug_shapes_for_def`.
     fn debug_shape_for_def(
         &self,
         name: &str,
@@ -9389,6 +9440,32 @@ impl<'a> Interpreter<'a> {
                 })
                 .map(|(_, shape)| shape)
         })
+    }
+
+    /// Every recorded debug shape of the ADT definition a type
+    /// name denotes: the definition-named entry, when one
+    /// exists, plus every instance entry. See
+    /// `debug_shape_for_def` for why judgments that turn on
+    /// field types must consult them all.
+    fn debug_shapes_for_def(
+        &self,
+        name: &str,
+    ) -> Vec<&sparagmos_mir::AdtDebugShape> {
+        let mut shapes = Vec::new();
+        if let Some(shape) = self.program.adt_debug_shapes.get(name) {
+            shapes.push(shape);
+        }
+        shapes.extend(
+            self.program
+                .adt_debug_shapes
+                .iter()
+                .filter(|(key, _)| {
+                    key.strip_prefix(name)
+                        .is_some_and(|rest| rest.starts_with('<'))
+                })
+                .map(|(_, shape)| shape),
+        );
+        shapes
     }
 
     /// Whether an enum value is a plausible (complete or

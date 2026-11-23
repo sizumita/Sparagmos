@@ -8015,6 +8015,107 @@ fn run_mode_box_new_uninit_assume_init_reads_payload() {
     );
 }
 
+const BOX_MAYBEUNINIT_ENUM_SRC: &str = r#"
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum E { A(u32), B(u16) }
+fn main() {
+    let mut b = Box::new(std::mem::MaybeUninit::<E>::uninit());
+    unsafe {
+        b.as_mut_ptr().write(E::B(0x1234));
+        assert_eq!(*b.assume_init(), E::B(0x1234));
+    }
+    let mut c = Box::new(std::mem::MaybeUninit::<E>::uninit());
+    unsafe {
+        c.as_mut_ptr().write(E::A(7));
+        let c2 = c.assume_init();
+        match *c2 {
+            E::A(x) => assert_eq!(x, 7),
+            E::B(_) => panic!("wrong variant"),
+        }
+        let p = Box::into_raw(c2);
+        assert_eq!(*p, E::A(7));
+        drop(Box::from_raw(p));
+    }
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_box_maybeuninit_enum_assume_init_reads_payload() {
+    // `Box<MaybeUninit<E>>` where `E`'s first variant takes one
+    // field: the wrapper's field count coincides with that
+    // variant's declared count, so the entry judgment at the
+    // retargeted dereference must rest on the stored field's
+    // fit for the declared field type -- the payload (a complete
+    // `E` value) cannot be a `u32`, so the stored enum is the
+    // wrapper and the reads address the payload.
+    let dir = temp_dir("box-maybeuninit-enum-assume-init");
+    let src = fixture(&dir, "box_maybeuninit_enum.rs", BOX_MAYBEUNINIT_ENUM_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Box<MaybeUninit<enum>> assume_init reads must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+const BOX_MAYBEUNINIT_ENUM_CONTROLS_SRC: &str = r#"
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum E { A(u32), B(u16) }
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum G { A(E), B(u8) }
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum H { Only(u32) }
+fn main() {
+    // A genuine `G::A(E::B(..))` value: the stored enum has the
+    // wrapper's shape, but its field fits the declared field
+    // type, so it stays the position's own value.
+    let g = Box::new(G::A(E::B(0x1234)));
+    assert_eq!(*g, G::A(E::B(0x1234)));
+    // A one-field enum through `MaybeUninit` storage peels, and
+    // the same value stored directly does not double-peel.
+    let h = Box::new(H::Only(3));
+    assert_eq!(*h, H::Only(3));
+    let mut h2 = Box::new(std::mem::MaybeUninit::<H>::uninit());
+    unsafe {
+        h2.as_mut_ptr().write(H::Only(3));
+        assert_eq!(*h2.assume_init(), H::Only(3));
+    }
+    // Reading the box as `MaybeUninit<E>` keeps the union value.
+    let mut m = Box::new(std::mem::MaybeUninit::<E>::uninit());
+    unsafe {
+        m.as_mut_ptr().write(E::B(0x1234));
+        let mu: std::mem::MaybeUninit<E> = *m;
+        assert_eq!(mu.assume_init(), E::B(0x1234));
+    }
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_box_maybeuninit_enum_entry_controls() {
+    // The controls around the `MaybeUninit` entry judgment for
+    // enum payloads: a nested enum value that merely looks like
+    // a wrapper is not entered, a one-field enum payload is
+    // entered, and a `MaybeUninit`-typed read is never entered.
+    let dir = temp_dir("box-maybeuninit-enum-controls");
+    let src = fixture(
+        &dir,
+        "box_maybeuninit_enum_controls.rs",
+        BOX_MAYBEUNINIT_ENUM_CONTROLS_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "MaybeUninit entry control cases must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
 const BOX_DYN_TUPLE_PAYLOAD_SRC: &str = r#"
 trait G { fn get(&self) -> i32; }
 struct M(i32);
