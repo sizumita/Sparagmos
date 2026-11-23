@@ -419,6 +419,26 @@ pub(crate) struct CommandState {
 
 /// The channel id carried by an mpsc handle value, if the value
 /// has the handle shape (a one-field aggregate holding the id).
+/// Whether a value is a scalar: a boolean, an integer or a
+/// float. A scalar never holds a handle's count, so a scalar
+/// found where a handle's drop glue runs is a builtin-modelled
+/// stand-in for the handle -- the thread model's `Thread` value
+/// is an id, although the declared type's field is an `Arc` --
+/// and its release is not count-based. Drop glue built from a
+/// declared type (the shape-table fallback for a variant no
+/// projection evidences) can name a handle at such a position;
+/// the model's scalar there has nothing to release.
+pub(crate) fn is_scalar_value(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Bool(_)
+            | Value::Int(_)
+            | Value::Uint(_)
+            | Value::Float(_)
+            | Value::Float128(_)
+    )
+}
+
 pub(crate) fn channel_handle_id(value: &Value) -> Option<u64> {
     match value {
         Value::Enum { fields, .. } if fields.len() == 1 => match &fields[0] {
@@ -5005,6 +5025,13 @@ impl<'a> Interpreter<'a> {
                         let Some(value) = self.read_at(frames, &active.root, &path)? else {
                             continue;
                         };
+                        // A scalar here is a modelled stand-in for
+                        // the handle, not a handle value: it holds
+                        // no count to decrement (see
+                        // `is_scalar_value`).
+                        if is_scalar_value(&value) {
+                            continue;
+                        }
                         let Some(id) = channel_handle_id(&value) else {
                             return Err(InterpError::type_mismatch(
                                 "channel handle drop glue",
@@ -5024,6 +5051,13 @@ impl<'a> Interpreter<'a> {
                         let Some(handle) = self.read_at(frames, &active.root, &path)? else {
                             continue;
                         };
+                        // A scalar here is a modelled stand-in for
+                        // the handle, not a handle value: it holds
+                        // no count to decrement (see
+                        // `is_scalar_value`).
+                        if is_scalar_value(&handle) {
+                            continue;
+                        }
                         let id = match rc_handle_id(&handle)
                             .or_else(|| raw_waker_alloc_id(&handle))
                         {
