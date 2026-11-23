@@ -140,6 +140,61 @@ jobs:
         with:
           toolchain: 1.100.0
           components: rustc-dev
+          # Install the same target set as the dev host's pinned
+          # toolchain: the subset runner screens a record's
+          # compile-flags --target against the sysroot's installed
+          # targets (installed_targets() in rustc-subset-run.py),
+          # and a known triple with no installed std is reported
+          # as "not attempted (compile-flags)" while staying in
+          # the denominator. With only the host target installed,
+          # 209 compile-check records were never attempted.
+          targets: >-
+            aarch64-apple-darwin,
+            aarch64-pc-windows-gnullvm,
+            aarch64-pc-windows-msvc,
+            aarch64-unknown-fuchsia,
+            aarch64-unknown-linux-gnu,
+            aarch64-unknown-none,
+            aarch64-unknown-none-softfloat,
+            arm-unknown-linux-gnueabi,
+            arm64ec-pc-windows-msvc,
+            armv5te-unknown-linux-gnueabi,
+            armv7-unknown-linux-gnueabihf,
+            armv7r-none-eabihf,
+            i586-unknown-linux-gnu,
+            i686-pc-windows-gnu,
+            i686-pc-windows-msvc,
+            i686-unknown-linux-gnu,
+            loongarch32-unknown-none,
+            loongarch64-unknown-linux-gnu,
+            nvptx64-nvidia-cuda,
+            powerpc-unknown-linux-gnu,
+            powerpc64-unknown-linux-gnu,
+            powerpc64le-unknown-linux-gnu,
+            riscv32i-unknown-none-elf,
+            riscv32im-unknown-none-elf,
+            riscv32imc-unknown-none-elf,
+            riscv64gc-unknown-linux-gnu,
+            riscv64imac-unknown-none-elf,
+            s390x-unknown-linux-gnu,
+            sparc64-unknown-linux-gnu,
+            sparcv9-sun-solaris,
+            thumbv6m-none-eabi,
+            thumbv7em-none-eabihf,
+            thumbv8m.main-none-eabi,
+            thumbv8m.main-none-eabihf,
+            wasm32-unknown-emscripten,
+            wasm32-unknown-unknown,
+            wasm32-wasip1,
+            x86_64-apple-darwin,
+            x86_64-fortanix-unknown-sgx,
+            x86_64-pc-windows-gnu,
+            x86_64-pc-windows-msvc,
+            x86_64-unknown-linux-gnu,
+            x86_64-unknown-linux-gnux32,
+            x86_64-unknown-linux-musl,
+            x86_64-unknown-none,
+            x86_64-unknown-uefi
 
       - name: Cache rust source tree and survey
         uses: actions/cache@v4
