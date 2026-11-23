@@ -636,21 +636,53 @@ fn compose_args(
     let Some(ambient) = ambient else {
         return args.clone();
     };
-    substitute_args(args, ambient, 0)
+    substitute_args(args, ambient, 0, false)
+}
+
+/// Compose arguments for the projection screen's field
+/// walk (see `compose_args`), additionally resolving a
+/// projection argument through the screen's own evidence
+/// (see `projection_resolved_ty`) before it crosses the
+/// ADT boundary. A projection argument's parameters belong
+/// to the enclosing frame: carried into the ADT's frame
+/// unresolved, they are read against that frame instead --
+/// the alias's own self parameter resolving to the very
+/// argument that carries it, until the depth cap gives
+/// up. Resolving it here, with the enclosing frame still
+/// in hand, substitutes the type the evidence assigns it;
+/// a projection the evidence does not determine is left
+/// as it was, exactly as `compose_args` leaves it.
+fn compose_screen_args(
+    args: &rustc_public::ty::GenericArgs,
+    ambient: Option<&rustc_public::ty::GenericArgs>,
+) -> rustc_public::ty::GenericArgs {
+    let Some(ambient) = ambient else {
+        return args.clone();
+    };
+    substitute_args(args, ambient, 0, true)
 }
 
 /// `args` with the ambient frame's parameters substituted
 /// throughout, recursively (see `compose_args`).
-fn substitute_args(args: &GenericArgs, ambient: &GenericArgs, depth: usize) -> GenericArgs {
+fn substitute_args(
+    args: &GenericArgs,
+    ambient: &GenericArgs,
+    depth: usize,
+    resolve_aliases: bool,
+) -> GenericArgs {
     GenericArgs(
         args.0
             .iter()
             .map(|a| match a {
-                GenericArgKind::Type(t) => GenericArgKind::Type(substitute_ty(t, ambient, depth)),
-                GenericArgKind::Const(c) => match substitute_const(c, ambient, depth) {
-                    Some(c2) => GenericArgKind::Const(c2),
-                    None => a.clone(),
-                },
+                GenericArgKind::Type(t) => {
+                    GenericArgKind::Type(substitute_ty(t, ambient, depth, resolve_aliases))
+                }
+                GenericArgKind::Const(c) => {
+                    match substitute_const(c, ambient, depth, resolve_aliases) {
+                        Some(c2) => GenericArgKind::Const(c2),
+                        None => a.clone(),
+                    }
+                }
                 _ => a.clone(),
             })
             .collect(),
@@ -659,10 +691,11 @@ fn substitute_args(args: &GenericArgs, ambient: &GenericArgs, depth: usize) -> G
 
 /// A type with the ambient frame's parameters substituted
 /// throughout, recursively (see `compose_args`). A shape
-/// that cannot be rebuilt -- an alias, a type whose kind
-/// cannot be asked, nesting past the depth cap -- is
-/// returned unsubstituted.
-fn substitute_ty(ty: &Ty, ambient: &GenericArgs, depth: usize) -> Ty {
+/// that cannot be rebuilt -- an alias the resolution
+/// leaves undetermined (see `compose_screen_args`), a
+/// type whose kind cannot be asked, nesting past the
+/// depth cap -- is returned unsubstituted.
+fn substitute_ty(ty: &Ty, ambient: &GenericArgs, depth: usize, resolve_aliases: bool) -> Ty {
     if depth >= 8 {
         return *ty;
     }
@@ -675,39 +708,46 @@ fn substitute_ty(ty: &Ty, ambient: &GenericArgs, depth: usize) -> Ty {
             _ => *ty,
         },
         TyKind::RigidTy(r) => match r {
-            RigidTy::Adt(def, a2) => {
-                Ty::from_rigid_kind(RigidTy::Adt(def, substitute_args(&a2, ambient, depth + 1)))
-            }
+            RigidTy::Adt(def, a2) => Ty::from_rigid_kind(RigidTy::Adt(
+                def,
+                substitute_args(&a2, ambient, depth + 1, resolve_aliases),
+            )),
             RigidTy::Ref(region, inner, mutability) => Ty::from_rigid_kind(RigidTy::Ref(
                 region,
-                substitute_ty(&inner, ambient, depth + 1),
+                substitute_ty(&inner, ambient, depth + 1, resolve_aliases),
                 mutability,
             )),
             RigidTy::RawPtr(inner, mutability) => Ty::from_rigid_kind(RigidTy::RawPtr(
-                substitute_ty(&inner, ambient, depth + 1),
+                substitute_ty(&inner, ambient, depth + 1, resolve_aliases),
                 mutability,
             )),
-            RigidTy::Slice(inner) => {
-                Ty::from_rigid_kind(RigidTy::Slice(substitute_ty(&inner, ambient, depth + 1)))
+            RigidTy::Slice(inner) => Ty::from_rigid_kind(RigidTy::Slice(substitute_ty(
+                &inner,
+                ambient,
+                depth + 1,
+                resolve_aliases,
+            ))),
+            RigidTy::Pat(inner, pat) => Ty::from_rigid_kind(RigidTy::Pat(
+                substitute_ty(&inner, ambient, depth + 1, resolve_aliases),
+                pat,
+            )),
+            RigidTy::Array(elem, len) => {
+                match substitute_const(&len, ambient, depth + 1, resolve_aliases) {
+                    Some(len) => Ty::from_rigid_kind(RigidTy::Array(
+                        substitute_ty(&elem, ambient, depth + 1, resolve_aliases),
+                        len,
+                    )),
+                    None => *ty,
+                }
             }
-            RigidTy::Pat(inner, pat) => {
-                Ty::from_rigid_kind(RigidTy::Pat(substitute_ty(&inner, ambient, depth + 1), pat))
-            }
-            RigidTy::Array(elem, len) => match substitute_const(&len, ambient, depth + 1) {
-                Some(len) => Ty::from_rigid_kind(RigidTy::Array(
-                    substitute_ty(&elem, ambient, depth + 1),
-                    len,
-                )),
-                None => *ty,
-            },
             RigidTy::Tuple(ts) => Ty::from_rigid_kind(RigidTy::Tuple(
                 ts.iter()
-                    .map(|t| substitute_ty(t, ambient, depth + 1))
+                    .map(|t| substitute_ty(t, ambient, depth + 1, resolve_aliases))
                     .collect(),
             )),
             RigidTy::FnDef(def, a2) => Ty::from_rigid_kind(RigidTy::FnDef(
                 def,
-                substitute_args(&a2, ambient, depth + 1),
+                substitute_args(&a2, ambient, depth + 1, resolve_aliases),
             )),
             RigidTy::FnPtr(sig) => {
                 let Binder {
@@ -719,7 +759,7 @@ fn substitute_ty(ty: &Ty, ambient: &GenericArgs, depth: usize) -> Ty {
                         inputs_and_output: fsig
                             .inputs_and_output
                             .iter()
-                            .map(|t| substitute_ty(t, ambient, depth + 1))
+                            .map(|t| substitute_ty(t, ambient, depth + 1, resolve_aliases))
                             .collect(),
                         c_variadic: fsig.c_variadic,
                         safety: fsig.safety,
@@ -730,29 +770,41 @@ fn substitute_ty(ty: &Ty, ambient: &GenericArgs, depth: usize) -> Ty {
             }
             RigidTy::Closure(def, a2) => Ty::from_rigid_kind(RigidTy::Closure(
                 def,
-                substitute_args(&a2, ambient, depth + 1),
+                substitute_args(&a2, ambient, depth + 1, resolve_aliases),
             )),
             RigidTy::Coroutine(def, a2) => Ty::from_rigid_kind(RigidTy::Coroutine(
                 def,
-                substitute_args(&a2, ambient, depth + 1),
+                substitute_args(&a2, ambient, depth + 1, resolve_aliases),
             )),
             RigidTy::CoroutineClosure(def, a2) => Ty::from_rigid_kind(RigidTy::CoroutineClosure(
                 def,
-                substitute_args(&a2, ambient, depth + 1),
+                substitute_args(&a2, ambient, depth + 1, resolve_aliases),
             )),
             RigidTy::CoroutineWitness(def, a2) => Ty::from_rigid_kind(RigidTy::CoroutineWitness(
                 def,
-                substitute_args(&a2, ambient, depth + 1),
+                substitute_args(&a2, ambient, depth + 1, resolve_aliases),
             )),
             RigidTy::Dynamic(preds, region) => Ty::from_rigid_kind(RigidTy::Dynamic(
                 preds
                     .iter()
-                    .map(|pred| substitute_pred(pred, ambient, depth + 1))
+                    .map(|pred| substitute_pred(pred, ambient, depth + 1, resolve_aliases))
                     .collect(),
                 region,
             )),
             _ => *ty,
         },
+        TyKind::Alias(SmirAliasKind::Projection, alias) if resolve_aliases => {
+            // A projection argument belongs to the
+            // enclosing frame (see `compose_screen_args`):
+            // substitute the type the screen's own
+            // evidence assigns it, completed with the
+            // same frame. A projection the evidence does
+            // not determine is left unsubstituted.
+            match projection_resolved_ty(&alias, Some(ambient), depth + 1) {
+                Some(resolved) => substitute_ty(&resolved, ambient, depth + 1, resolve_aliases),
+                None => *ty,
+            }
+        }
         _ => *ty,
     }
 }
@@ -765,23 +817,26 @@ fn substitute_pred(
     pred: &Binder<ExistentialPredicate>,
     ambient: &GenericArgs,
     depth: usize,
+    resolve_aliases: bool,
 ) -> Binder<ExistentialPredicate> {
     let value = match &pred.value {
         ExistentialPredicate::Trait(tref) => ExistentialPredicate::Trait(ExistentialTraitRef {
             def_id: tref.def_id,
-            generic_args: substitute_args(&tref.generic_args, ambient, depth),
+            generic_args: substitute_args(&tref.generic_args, ambient, depth, resolve_aliases),
         }),
         ExistentialPredicate::Projection(p) => {
             let term = match &p.term {
-                TermKind::Type(t) => TermKind::Type(substitute_ty(t, ambient, depth)),
-                TermKind::Const(c) => match substitute_const(c, ambient, depth) {
+                TermKind::Type(t) => {
+                    TermKind::Type(substitute_ty(t, ambient, depth, resolve_aliases))
+                }
+                TermKind::Const(c) => match substitute_const(c, ambient, depth, resolve_aliases) {
                     Some(c2) => TermKind::Const(c2),
                     None => TermKind::Const(c.clone()),
                 },
             };
             ExistentialPredicate::Projection(ExistentialProjection {
                 def_id: p.def_id,
-                generic_args: substitute_args(&p.generic_args, ambient, depth),
+                generic_args: substitute_args(&p.generic_args, ambient, depth, resolve_aliases),
                 term,
             })
         }
@@ -800,14 +855,19 @@ fn substitute_pred(
 /// only a constant the frame itself supplies has. An
 /// unevaluated constant whose arguments substitute to
 /// themselves is returned unchanged.
-fn substitute_const(c: &TyConst, ambient: &GenericArgs, depth: usize) -> Option<TyConst> {
+fn substitute_const(
+    c: &TyConst,
+    ambient: &GenericArgs,
+    depth: usize,
+    resolve_aliases: bool,
+) -> Option<TyConst> {
     match c.kind() {
         TyConstKind::Param(p) => match ambient.0.get(p.index as usize) {
             Some(GenericArgKind::Const(bound)) => Some(bound.clone()),
             _ => None,
         },
         TyConstKind::Unevaluated(_, args) => {
-            if substitute_args(args, ambient, depth) == *args {
+            if substitute_args(args, ambient, depth, resolve_aliases) == *args {
                 Some(c.clone())
             } else {
                 None
@@ -1440,6 +1500,31 @@ fn match_impl_self_ty(
                             .zip(tts.iter())
                             .all(|(i, t)| match_impl_self_ty(i, t, ambient, bindings, depth))
                 }
+                (RigidTy::FnPtr(isig), RigidTy::FnPtr(tsig)) => {
+                    // A generic implementation for a
+                    // function pointer (`impl<A> Trait
+                    // for fn(A)`) matches a concrete
+                    // pointer type signature by
+                    // signature: the calling convention
+                    // must agree exactly, and each input
+                    // and the output match the way self
+                    // types match, binding the
+                    // implementation's parameters. The
+                    // signatures' own bound variables are
+                    // their late-bound lifetimes, which
+                    // the type match does not turn on.
+                    let iv = isig.skip_binder();
+                    let tv = tsig.skip_binder();
+                    iv.c_variadic == tv.c_variadic
+                        && iv.safety == tv.safety
+                        && iv.abi == tv.abi
+                        && iv.inputs_and_output.len() == tv.inputs_and_output.len()
+                        && iv
+                            .inputs_and_output
+                            .iter()
+                            .zip(tv.inputs_and_output.iter())
+                            .all(|(i, t)| match_impl_self_ty(i, t, ambient, bindings, depth))
+                }
                 _ => false,
             }
         }
@@ -1565,7 +1650,7 @@ fn projection_screen_ty(
         }
         TyKind::RigidTy(r) => match r {
             RigidTy::Adt(def, a2) => {
-                let composed = compose_args(&a2, ambient);
+                let composed = compose_screen_args(&a2, ambient);
                 projection_screen_args(&a2, ambient, depth + 1).or_else(|| {
                     def.variants().iter().find_map(|variant| {
                         variant.fields().iter().find_map(|field| {

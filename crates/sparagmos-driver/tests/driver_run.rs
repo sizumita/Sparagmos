@@ -2295,6 +2295,107 @@ fn run_mode_dyn_bound_projection_generic_assoc_type_runs() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
 }
 
+const DYN_BOUND_PROJECTION_FN_PTR_IMPL_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Carrier {
+    type Item: Trait + ?Sized;
+}
+impl<A> Carrier for fn(A) {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<T: Carrier> {
+    field: <T::Item as Trait>::Assoc,
+}
+fn take(h: Holder<fn(u8)>) -> u32 {
+    h.field
+}
+fn main() {
+    let h = Holder::<fn(u8)> { field: 42 };
+    println!("{}", take(h));
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_fn_ptr_impl_runs() {
+    // The intermediate projection's item is assigned by a
+    // generic implementation for a function pointer:
+    // `impl<A> Carrier for fn(A)`. Matching the
+    // implementation's self type against the concrete
+    // `fn(u8)` used to fail the initial equality check and
+    // reach the unsupported-shape fallback, resolving
+    // nothing, so the screen rejected the holder and main.
+    // Matching function-pointer signatures structurally
+    // binds `A := u8` and reaches `dyn Trait<Assoc = u32>`,
+    // whose binding the outer projection normalizes
+    // through -- natively the program prints 42.
+    let dir = temp_dir("dyn-bound-projection-fn-ptr-impl");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_fn_ptr_impl.rs",
+        DYN_BOUND_PROJECTION_FN_PTR_IMPL_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the fn-ptr-impl projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_ALIAS_ADT_ARG_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Carrier {
+    type Item: Trait + ?Sized;
+}
+impl Carrier for () {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<U: Trait + ?Sized> {
+    field: U::Assoc,
+}
+struct Outer<T: Carrier>(Holder<T::Item>);
+fn main() {
+    let o = Outer::<()>(Holder { field: 42 });
+    println!("{}", o.0.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_alias_adt_arg_runs() {
+    // An ADT argument that is itself a projection:
+    // `Outer<T: Carrier>(Holder<T::Item>)`. The alias's
+    // parameters belong to the enclosing frame; composing
+    // the holder's arguments used to carry `T::Item`
+    // across the ADT boundary unresolved, where resolving
+    // its self parameter against the holder's frame read
+    // the very argument carrying it, until the depth cap
+    // gave up and the screen rejected main. Resolving the
+    // projection through the screen's own evidence before
+    // the crossing substitutes `dyn Trait<Assoc = u32>`,
+    // whose binding the field projection normalizes
+    // through -- natively the program prints 42.
+    let dir = temp_dir("dyn-bound-projection-alias-adt-arg");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_alias_adt_arg.rs",
+        DYN_BOUND_PROJECTION_ALIAS_ADT_ARG_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the alias-ADT-arg projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
 const POINTEE_METADATA_PROJECTION_SRC: &str = r#"
 #![feature(ptr_metadata)]
 struct Holder<T: ?Sized> {
