@@ -6688,8 +6688,24 @@ impl<'a> Interpreter<'a> {
                 // bytes (it would walk the storage array's lanes
                 // as elements). Only whole structured values are
                 // rerouted; every other shape keeps the element
-                // path below.
-                if n > 1 {
+                // path below. The reroute is only for copies
+                // whose elements are bytes: when the element type
+                // is known and is not a byte type, the count
+                // counts elements, and a structured element value
+                // at either end is one of the elements being
+                // copied -- treating it as a byte tree would
+                // patch the first element with the following
+                // elements' leading bytes and drop the rest (the
+                // shifted tail of a `Vec::insert` of one-field
+                // wrapper elements).
+                let byte_granular = match elem {
+                    None => true,
+                    Some(ty) => matches!(
+                        ty,
+                        Ty::Uint(UintTy::U8) | Ty::Int(IntTy::I8)
+                    ),
+                };
+                if n > 1 && byte_granular {
                     let dst_tree = self
                         .read_resolved(frames, &dst_target)
                         .ok()
@@ -6901,29 +6917,35 @@ impl<'a> Interpreter<'a> {
                     };
                     let mut elems = elems.into_iter();
                     let first = elems.next().expect("count is nonzero");
-                    // The rewrap applies only to a first
-                    // element the source side produced by
-                    // unwrapping (`src_single`): that value is
-                    // the element's core, and the destination
-                    // position's own wrapper chain is rebuilt
-                    // around it. An element the sequence path
-                    // read is the whole element value already;
-                    // wrapping it in the destination's chain
-                    // would nest the element inside itself.
-                    // The rewrap applies only to a first
-                    // element the source side produced by
-                    // unwrapping (`src_single`): that value is
-                    // the element's core, and the destination
-                    // position's own wrapper chain is rebuilt
-                    // around it. An element the sequence path
-                    // read is the whole element value already;
-                    // wrapping it in the destination's chain
-                    // would nest the element inside itself.
+                    // Whether the incoming first element replaces
+                    // the destination value outright. Only an
+                    // element the source side peeled out of a
+                    // wrapper chain (`src_single`) is ever
+                    // rewrapped: it arrived as the chain's core and
+                    // belongs back inside the wrapper shape the
+                    // destination carries. An element read whole
+                    // from its sequence IS the destination element,
+                    // and wrapping it would store the element
+                    // inside itself. When the destination is a
+                    // whole local, its declared type decides
+                    // whether the peeled core needs the rewrap (a
+                    // matching type means the core already is the
+                    // element). A projected place (an array
+                    // element, a vector buffer slot) has no
+                    // declared type here, so a peeled element is
+                    // rewrapped into the old element's shape --
+                    // the shifted tail of a `Vec::insert`, and the
+                    // form a sort's temporary takes, seen through
+                    // the element's own wrapper chain.
+                    let cur_is_element = match &dst_place_ty {
+                        Some(_) => dst_place_ty.as_ref() == elem || !src_single,
+                        None => match elem {
+                            Some(_) => !src_single,
+                            None => true,
+                        },
+                    };
                     let stored = match &dst_current {
-                        Some(cur)
-                            if src_single
-                                && dst_place_ty.as_ref() != elem =>
-                        {
+                        Some(cur) if !cur_is_element => {
                             self.copy_rewrap(cur, first)
                         }
                         _ => first,

@@ -18710,3 +18710,57 @@ fn run_mode_vec_set_len_plain_uninit_read() {
         "grown slot read must be an uninitialised read; stderr={stderr}"
     );
 }
+const VEC_INSERT_WRAPPER_ELEM_SRC: &str = r#"
+struct D(&'static str);
+impl Drop for D {
+    fn drop(&mut self) { println!("drop {}", self.0); }
+}
+struct N(i32);
+fn main() {
+    let mut v: Vec<D> = Vec::with_capacity(1);
+    v.push(D("a"));
+    v.push(D("b"));
+    v.push(D("c"));
+    v.insert(1, D("x"));
+    for d in v.iter() { println!("elem {}", d.0); }
+    drop(v);
+    let mut n: Vec<N> = Vec::with_capacity(8);
+    n.push(N(1)); n.push(N(2)); n.push(N(3));
+    n.insert(1, N(9));
+    for e in n.iter() { println!("num {}", e.0); }
+    let mut a = [D("a"), D("b"), D("c"), D("?")];
+    unsafe {
+        let p = a.as_mut_ptr();
+        std::ptr::copy(p.add(1), p.add(2), 2);
+    }
+    for d in a.iter() { println!("arr {}", d.0); }
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_vec_insert_one_field_wrapper_elements() {
+    // The shift inside `Vec::insert` is an element copy
+    // (`ptr::copy` over the buffer), and its elements here are
+    // one-field wrapper structs. The copy must move the
+    // elements whole: a wrapper over a scalar is not a byte
+    // tree to patch with the following elements' bytes, and a
+    // wrapper over a fat pointer is not a wrapper place to
+    // rewrap the incoming element inside. Shifted elements
+    // read back exactly, fields and drops included, as does a
+    // direct `ptr::copy` over an array of the same elements.
+    let dir = temp_dir("vecinsertwrapper");
+    let src = fixture(&dir, "vecinsertwrapper.rs", VEC_INSERT_WRAPPER_ELEM_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Vec::insert of one-field wrapper elements must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "elem a\nelem x\nelem b\nelem c\ndrop a\ndrop x\ndrop b\ndrop c\nnum 1\nnum 9\nnum 2\nnum 3\narr a\narr b\narr b\narr c\ndone\ndrop a\ndrop b\ndrop b\ndrop c\n"
+    );
+}
+
