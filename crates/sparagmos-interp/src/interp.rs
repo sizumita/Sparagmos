@@ -10536,11 +10536,7 @@ impl<'a> Interpreter<'a> {
                         // read here, never a guest bounds
                         // violation (a guest panic is control
                         // flow, not a read result).
-                        let prefix_bounds = matches!(
-                            &e,
-                            InterpError::Panic { message, .. }
-                            if message.starts_with("index out of bounds: the len is ")
-                        );
+                        let prefix_bounds = is_index_oob_error(&e);
                         if past_unwritten || prefix_bounds {
                             return self.uninit_read_value(ty, func, place_desc);
                         }
@@ -12576,10 +12572,7 @@ impl<'a> Interpreter<'a> {
             // access re-validates, so a read there reports the
             // same panic and a write extends the aggregate, as
             // `navigate_mut`'s element arms provide.
-            Err(InterpError::Panic { ref message, .. })
-                if message.starts_with("index out of bounds: the len is ") =>
-            {
-            }
+            Err(ref e) if is_index_oob_error(e) => {}
             Err(e) => return Err(e),
         }
         let mut projection = head.to_vec();
@@ -15900,6 +15893,27 @@ enum StorageByte {
 /// model holds no storage there. That is an explicit error in the
 /// model's terms, never a fabricated guest panic: the guest
 /// indexed nothing.
+/// Whether an error is a projection bounds failure naming a
+/// position past the stored value — the failure `index_oob`
+/// reports. Position-judging consumers (the append point a tail
+/// write targets in `seq_element_target`, an allocation's
+/// unwritten prefix slot in `read_resolved`) discriminate on
+/// this failure: the position still denotes its slot, whatever
+/// form the failure takes. The explicit projection error is the
+/// current form; the guest-panic form predates it, and the
+/// modelled index operations still raise that form directly.
+fn is_index_oob_error(e: &InterpError) -> bool {
+    match e {
+        InterpError::Panic { message, .. } => {
+            message.starts_with("index out of bounds: the len is ")
+        }
+        InterpError::UnsupportedProjection { kind } => {
+            kind.contains("past the end of the stored value")
+        }
+        _ => false,
+    }
+}
+
 fn index_oob(len: usize, index: usize) -> InterpError {
     InterpError::UnsupportedProjection {
         kind: format!(
