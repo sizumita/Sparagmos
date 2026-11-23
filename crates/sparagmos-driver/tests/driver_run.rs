@@ -2327,6 +2327,80 @@ fn run_mode_vec_insert_positions_with_growth() {
     );
 }
 
+const BOX_VEC_GROW_SRC: &str = r#"
+struct D(&'static str);
+impl Drop for D {
+    fn drop(&mut self) {
+        println!("drop {}", self.0);
+    }
+}
+fn main() {
+    let mut b: Box<Vec<D>> = Box::new(Vec::with_capacity(2));
+    b.push(D("a"));
+    b.push(D("b"));
+    b.insert(1, D("x"));
+    b.reserve(16);
+    for d in b.iter() {
+        println!("elem {}", d.0);
+    }
+    drop(b);
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_box_vec_insert_and_reserve_with_growth() {
+    // Growing a `Vec` that is the whole content of a `Box`
+    // allocation through the collected `insert` / `reserve`
+    // bodies: the vector's buffer pointer is derived from the
+    // vector place inside the box's allocation, and the
+    // reallocation must not free or move the box's storage --
+    // the elements and their drop order land exactly as
+    // natively and the box stays live throughout.
+    let dir = temp_dir("boxvecgrow");
+    let src = fixture(&dir, "boxvecgrow.rs", BOX_VEC_GROW_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Box<Vec> growth must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "elem a\nelem x\nelem b\ndrop a\ndrop x\ndrop b\ndone\n"
+    );
+}
+
+const BOX_BOX_VEC_GROW_SRC: &str = r#"
+fn main() {
+    let mut b: Box<Box<Vec<i32>>> = Box::new(Box::new(Vec::with_capacity(2)));
+    b.push(1);
+    b.push(2);
+    b.push(3);
+    b.insert(1, 9);
+    println!("{:?}", b);
+}
+"#;
+
+#[test]
+fn run_mode_box_box_vec_insert_with_growth() {
+    // The same growth through two owning wrappers: the inner
+    // vector's buffer pointer denotes a position inside the
+    // inner box's stored value, never a wrapper allocation's
+    // base.
+    let dir = temp_dir("boxboxvecgrow");
+    let src = fixture(&dir, "boxboxvecgrow.rs", BOX_BOX_VEC_GROW_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Box<Box<Vec>> growth must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "[1, 9, 2, 3]\n");
+}
+
 const VEC_INSERT_RESERVED_SRC: &str = r#"
 fn main() {
     let mut v: Vec<i32> = Vec::with_capacity(16);

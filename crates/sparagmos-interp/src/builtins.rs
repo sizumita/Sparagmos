@@ -10439,7 +10439,7 @@ impl<'a> Interpreter<'a> {
                 arity(3)?;
                 let ptr = unwrap_wrapper(&vals[0]);
                 if let Value::Ref(RefTarget::Alloc { id, projection }) = ptr {
-                    if crate::interp::projection_is_base(projection) {
+                    if self.alloc_ptr_is_base(*id, projection) {
                         self.free_alloc(*id);
                     }
                 }
@@ -10461,7 +10461,7 @@ impl<'a> Interpreter<'a> {
                 let ptr = unwrap_wrapper(&vals[0]).clone();
                 let content = match &ptr {
                     Value::Ref(RefTarget::Alloc { id, projection })
-                        if crate::interp::projection_is_base(projection) =>
+                        if self.alloc_ptr_is_base(*id, projection) =>
                     {
                         let old = self.alloc_base(*id)?;
                         self.free_alloc(*id);
@@ -10508,7 +10508,7 @@ impl<'a> Interpreter<'a> {
                 arity(1)?;
                 let ptr = unwrap_wrapper(&vals[0]);
                 if let Value::Ref(RefTarget::Alloc { id, projection }) = ptr {
-                    if crate::interp::projection_is_base(projection) {
+                    if self.alloc_ptr_is_base(*id, projection) {
                         self.free_alloc(*id);
                     }
                 }
@@ -10520,7 +10520,7 @@ impl<'a> Interpreter<'a> {
                 let ptr = unwrap_wrapper(&vals[0]).clone();
                 let content = match &ptr {
                     Value::Ref(RefTarget::Alloc { id, projection })
-                        if crate::interp::projection_is_base(projection) =>
+                        if self.alloc_ptr_is_base(*id, projection) =>
                     {
                         let old = self.alloc_base(*id)?;
                         self.free_alloc(*id);

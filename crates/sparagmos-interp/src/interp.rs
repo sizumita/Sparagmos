@@ -14825,6 +14825,25 @@ pub(crate) fn projection_is_base(projection: &[RefProj]) -> bool {
         .all(|s| matches!(s, RefProj::Index(0) | RefProj::ByteOffset(0)))
 }
 
+impl<'a> Interpreter<'a> {
+    /// Whether a pointer into allocation `id` denotes the
+    /// allocation's own base for the allocation family (a free,
+    /// or a realloc's move-out of the old block): the projection
+    /// must consist of zero steps only, and a nonempty zero-step
+    /// projection denotes the base only when the allocation is a
+    /// raw element block. In a value-holding allocation the same
+    /// step denotes a position inside the stored value -- the
+    /// first element of a stored `Vec` value's buffer, reached
+    /// through the owning wrapper around it -- whose storage is
+    /// the value's own, not the allocation's, so freeing or
+    /// moving the allocation under it would destroy the wrapper's
+    /// storage instead of the buffer's.
+    pub(crate) fn alloc_ptr_is_base(&self, id: u64, projection: &[RefProj]) -> bool {
+        projection_is_base(projection)
+            && (projection.is_empty() || self.is_elem_block(id))
+    }
+}
+
 fn projection_ends_at_element(projection: &[RefProj]) -> bool {
     let mut pos = projection.len();
     while pos > 0 {
