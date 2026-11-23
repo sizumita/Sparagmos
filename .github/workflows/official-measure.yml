@@ -130,7 +130,9 @@ jobs:
       - name: Restore rust source tree
         uses: actions/cache@v4
         with:
-          path: ${{ env.RUST_SURVEY_DIR }}
+          path: |
+            ${{ env.RUST_SURVEY_DIR }}
+            ${{ env.SURVEY_JSON }}
           key: rust-survey-1.100.0-v1
           fail-on-cache-miss: true
 
@@ -168,7 +170,7 @@ jobs:
   measure-jit:
     name: measure (jit) shard ${{ matrix.shard }}
     needs: prepare
-    if: ${{ inputs.run_jit != false }}
+    if: ${{ github.event_name == 'push' || inputs.run_jit }}
     runs-on: ubuntu-latest
     timeout-minutes: 330
     strategy:
@@ -200,7 +202,9 @@ jobs:
       - name: Restore rust source tree
         uses: actions/cache@v4
         with:
-          path: ${{ env.RUST_SURVEY_DIR }}
+          path: |
+            ${{ env.RUST_SURVEY_DIR }}
+            ${{ env.SURVEY_JSON }}
           key: rust-survey-1.100.0-v1
           fail-on-cache-miss: true
 
@@ -268,14 +272,24 @@ jobs:
       - name: Restore rust source tree
         uses: actions/cache@v4
         with:
-          path: ${{ env.RUST_SURVEY_DIR }}
+          path: |
+            ${{ env.RUST_SURVEY_DIR }}
+            ${{ env.SURVEY_JSON }}
           key: rust-survey-1.100.0-v1
           fail-on-cache-miss: true
 
       - name: Download shard results
         uses: actions/download-artifact@v4
         with:
-          pattern: subset-*-shard-*
+          pattern: subset-shard-*
+          path: ${{ runner.temp }}/shards
+          merge-multiple: true
+
+      - name: Download JIT shard results
+        if: ${{ needs.measure-jit.result == 'success' }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: subset-jit-shard-*
           path: ${{ runner.temp }}/shards
           merge-multiple: true
 

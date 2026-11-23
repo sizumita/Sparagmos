@@ -79,7 +79,8 @@ jobs:
         id: cfg
         env:
           GH_TOKEN: ${{ github.token }}
-          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          GH_REPO: ${{ github.repository }}
           INPUT_KEYWORDS: ${{ inputs.keywords }}
           INPUT_PR: ${{ inputs.pr_number }}
           INPUT_HEAD: ${{ inputs.head_ref }}
@@ -94,16 +95,17 @@ jobs:
             head_ref="$INPUT_HEAD"
             base_ref="$INPUT_BASE"
             if [ -n "$pr_number" ]; then
-              read -r pr_head pr_base <<<"$(gh pr view "$pr_number" \
+              pr_refs="$(gh pr view "$pr_number" \
                 --json headRefOid,baseRefName \
                 --jq '.headRefOid + " " + .baseRefName')"
+              read -r pr_head pr_base <<<"$pr_refs"
               head_ref="${head_ref:-$pr_head}"
               base_ref="${base_ref:-$pr_base}"
             fi
             head_ref="${head_ref:-${{ github.sha }}}"
             base_ref="${base_ref:-main}"
           else
-            keywords="$(echo "$LABELS" | tr ',' '\n' | grep '^flip-diff:' | head -1 | sed 's/^flip-diff://')"
+            keywords="$(echo "$LABELS_JSON" | jq -r '[.[] | select(startswith("flip-diff:"))][0] // "" | ltrimstr("flip-diff:")')"
             pr_number="$PR_NUMBER"
             head_ref="$PR_HEAD_SHA"
             base_ref="$PR_BASE_SHA"
