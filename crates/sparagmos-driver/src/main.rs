@@ -174,6 +174,10 @@ struct Collected {
     /// monomorphic ADT instances, for the interpreter (see
     /// `Converter::adt_field_layouts`).
     adt_field_layouts: sparagmos_mir::AdtFieldLayouts,
+    /// Direct discriminant tag layouts of the converted
+    /// monomorphic enum instances, for the interpreter (see
+    /// `Converter::adt_tag_layouts`).
+    adt_tag_layouts: sparagmos_mir::AdtTagLayouts,
     /// Storage-slot maps of the converted monomorphic coroutine
     /// instances, for the interpreter (see
     /// `Converter::coroutine_layouts`).
@@ -4931,6 +4935,7 @@ fn collect() -> ControlFlow<()> {
         compile_error,
         adt_layouts: conv.adt_layouts.clone(),
         adt_field_layouts: conv.adt_field_layouts.clone(),
+        adt_tag_layouts: conv.adt_tag_layouts.clone(),
         coroutine_layouts: conv.coroutine_layouts.clone(),
         adt_shapes: conv.adt_shapes.clone(),
         adt_debug_shapes: conv.adt_debug_shapes.clone(),
@@ -5780,6 +5785,7 @@ fn build_program(
     program.adt_discriminants = c.adt_discriminants.clone();
     program.adt_layouts = c.adt_layouts.clone();
     program.adt_field_layouts = c.adt_field_layouts.clone();
+    program.adt_tag_layouts = c.adt_tag_layouts.clone();
     program.coroutine_layouts = c.coroutine_layouts.clone();
     program.adt_shapes = c.adt_shapes.clone();
     program.adt_debug_shapes = c.adt_debug_shapes.clone();

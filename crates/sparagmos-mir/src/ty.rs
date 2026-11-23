@@ -99,6 +99,33 @@ pub type AdtLayouts = std::collections::HashMap<String, (u64, u64)>;
 /// to read.
 pub type AdtFieldLayouts = std::collections::HashMap<String, Vec<Vec<(u64, u64)>>>;
 
+/// The stored discriminant tag of one monomorphic enum
+/// instance whose layout uses the direct tag encoding: the
+/// tag is an integer scalar of `size` bytes at byte offset
+/// `offset` in the value's storage, and variant `v` is stored
+/// with the tag value `discriminants[v]`, held as a bit
+/// pattern (the stored bytes are its low `size` bytes,
+/// little-endian). Keyed by the rendered instance name, like
+/// [`AdtLayouts`]. Only enums with a direct tag get an entry:
+/// a niche-encoded enum has no tag storage of its own (its
+/// discriminant lives inside a payload field's value range,
+/// see [`AdtNiches`]), and a single-variant enum stores no
+/// tag at all. The interpreter's byte view reads a byte in
+/// the tag span as the discriminant's own byte and splices a
+/// write there back into the value's variant.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EnumTag {
+    /// Byte offset of the tag within the enum's storage.
+    pub offset: u64,
+    /// Width in bytes of the stored tag scalar.
+    pub size: u64,
+    /// Discriminant value of each variant, by variant index.
+    pub discriminants: Vec<u128>,
+}
+
+/// Per-instance direct tag layouts, keyed like [`AdtLayouts`].
+pub type AdtTagLayouts = std::collections::HashMap<String, EnumTag>;
+
 /// The storage-slot map of one monomorphic coroutine instance:
 /// which slot of the interpreter's flat coroutine field vector
 /// each state field of the compiler's state-machine layout lives

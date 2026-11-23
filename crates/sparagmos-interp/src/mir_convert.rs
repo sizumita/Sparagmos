@@ -116,6 +116,11 @@ pub struct MirProgram {
     /// (see [`mir::AdtFieldLayouts`]). Consulted by the
     /// interpreter's byte view of an ADT value's storage.
     pub adt_field_layouts: mir::AdtFieldLayouts,
+    /// Direct discriminant tag layouts of the monomorphic
+    /// enum instances in the program, as recorded by the
+    /// driver (see [`mir::AdtTagLayouts`]). Consulted by the
+    /// interpreter's byte view of an enum value's storage.
+    pub adt_tag_layouts: mir::AdtTagLayouts,
     /// Storage-slot maps of the program's monomorphic coroutine
     /// instances, as recorded by the driver (see
     /// `mir::CoroutineLayouts`). Consulted when a place projects
@@ -629,6 +634,7 @@ fn convert_all(
     failures.retain(|key, _| !out.functions.contains_key(key));
     out.adt_layouts = program.adt_layouts.clone();
     out.adt_field_layouts = program.adt_field_layouts.clone();
+    out.adt_tag_layouts = program.adt_tag_layouts.clone();
     out.adt_debug_shapes = program.adt_debug_shapes.clone();
     out.env_debug_shapes = program.env_debug_shapes.clone();
     out.alloc_shims = conv.alloc_shims.clone();

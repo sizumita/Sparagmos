@@ -9038,10 +9038,13 @@ impl<'a> Interpreter<'a> {
     // ADT field (through the per-variant field spans of
     // `Program::adt_field_layouts`), and the byte it lands in is
     // read or spliced there. The view judges a position only
-    // when every step is determined by recorded layout: a
-    // position in the padding between an ADT's fields, or one
-    // outside the value's storage, is an explicit error, and a
-    // position whose layout is not recorded (a tuple's interior,
+    // when every step is determined by recorded layout: an
+    // enum's tag position (through `Program::adt_tag_layouts`)
+    // is the discriminant's own bytes, a position in the
+    // padding between an ADT's fields reads as the model's
+    // indeterminate value and refuses a write, one outside the
+    // value's storage is an explicit error, and a position
+    // whose layout is not recorded (a tuple's interior,
     // an ADT with no field-layout entry, an allocation's raw
     // bytes) is left to the existing paths unchanged. Composing
     // the position from the base — never decomposing it into an
@@ -9266,13 +9269,15 @@ impl<'a> Interpreter<'a> {
     /// storage under `layout` (see the byte view above).
     /// `None` when the position's layout is not fully recorded
     /// (the caller then keeps the existing path); a judged
-    /// position answers `Ok` or the verdict it meets.
+    /// position answers the byte it holds — a definite byte of
+    /// the storage, or the indeterminate byte of a padding
+    /// position — or the verdict it meets.
     fn storage_byte(
         &self,
         value: &Value,
         layout: &ByteLayout,
         pos: usize,
-    ) -> Option<Result<u8, ByteVerdict>> {
+    ) -> Option<Result<StorageByte, ByteVerdict>> {
         if *value == Value::Uninit {
             return Some(Err(ByteVerdict::Uninit));
         }
@@ -9298,7 +9303,7 @@ impl<'a> Interpreter<'a> {
                     (ByteScalar::Float(FloatTy::F128), Value::Float128(bits)) => *bits,
                     _ => return None,
                 };
-                Some(Ok((bits >> (8 * pos)) as u8))
+                Some(Ok(StorageByte::Byte((bits >> (8 * pos)) as u8)))
             }
             ByteLayout::Seq(elem, elem_size, count) => {
                 if *elem_size == 0 {
@@ -9321,7 +9326,7 @@ impl<'a> Interpreter<'a> {
                             ) =>
                     {
                         match bytes.get(pos) {
-                            Some(b) => Some(Ok(*b)),
+                            Some(b) => Some(Ok(StorageByte::Byte(*b))),
                             None => Some(Err(ByteVerdict::Outside(pos))),
                         }
                     }
@@ -9333,7 +9338,7 @@ impl<'a> Interpreter<'a> {
                             ) =>
                     {
                         match text.as_bytes().get(pos) {
-                            Some(b) => Some(Ok(*b)),
+                            Some(b) => Some(Ok(StorageByte::Byte(*b))),
                             None => Some(Err(ByteVerdict::Outside(pos))),
                         }
                     }
@@ -9357,7 +9362,31 @@ impl<'a> Interpreter<'a> {
                     }
                 }
                 let Some((f, field_off)) = hit else {
-                    return Some(Err(ByteVerdict::Padding(pos)));
+                    // No field covers the position: an enum's
+                    // tag span holds the discriminant's own
+                    // bytes, a position past the value's storage
+                    // is outside it, and anything else inside
+                    // the storage is padding, whose byte has
+                    // no definite value.
+                    if let Some(tag) = self.program().adt_tag_layouts.get(name) {
+                        let (tag_off, tag_size) =
+                            (tag.offset as usize, tag.size as usize);
+                        if tag_size > 0
+                            && pos >= tag_off
+                            && pos < tag_off + tag_size
+                        {
+                            let discr =
+                                *tag.discriminants.get(*variant as usize)?;
+                            let byte = (discr >> (8 * (pos - tag_off))) as u8;
+                            return Some(Ok(StorageByte::Byte(byte)));
+                        }
+                    }
+                    if let Some(total) = self.byte_layout_size(layout) {
+                        if pos >= total {
+                            return Some(Err(ByteVerdict::Outside(pos)));
+                        }
+                    }
+                    return Some(Ok(StorageByte::Padding));
                 };
                 let field = fields.get(f)?;
                 let tag = self.adt_field_tag(name, *variant as usize, f)?;
@@ -9530,6 +9559,25 @@ impl<'a> Interpreter<'a> {
                     }
                 }
                 let Some((f, field_off)) = hit else {
+                    // No field covers the position: an enum's
+                    // tag span is the discriminant's own
+                    // storage, spliced as such; anything else
+                    // is padding, which has no storage to
+                    // splice into.
+                    if let Some(tag) =
+                        self.program().adt_tag_layouts.get(name).cloned()
+                    {
+                        let (tag_off, tag_size) =
+                            (tag.offset as usize, tag.size as usize);
+                        if tag_size > 0
+                            && pos >= tag_off
+                            && pos < tag_off + tag_size
+                        {
+                            return self.splice_tag_byte(
+                                slot, name, &tag, pos, byte,
+                            );
+                        }
+                    }
                     return Some(Err(ByteVerdict::Padding(pos)));
                 };
                 let tag = self.adt_field_tag(name, variant as usize, f)?;
@@ -9544,6 +9592,83 @@ impl<'a> Interpreter<'a> {
                 self.splice_storage_byte(field, &field_layout, pos - field_off, byte)
             }
         }
+    }
+
+    /// Splice `byte` into the stored discriminant tag of
+    /// the enum value in `slot` (the write side of the tag
+    /// span; see [`Self::storage_byte`] for the read side).
+    /// The tag's bytes are the discriminant value's own, so
+    /// the splice recomputes the value the tag names. A
+    /// result naming the current variant changes nothing
+    /// else — the value model stores no separate tag. A
+    /// result naming another variant re-forms the value as
+    /// that variant over the same storage: the new variant's
+    /// fields start uninitialised and every definite byte of
+    /// the old storage outside the tag is spliced into them,
+    /// so a field the two variants share storage with keeps
+    /// its bytes and a field over old padding or unwritten
+    /// storage stays uninitialised. A result naming no
+    /// variant, or a re-formation whose bytes the view
+    /// cannot all judge, declines (`None`): the model cannot
+    /// hold an enum value for a discriminant no variant has.
+    fn splice_tag_byte(
+        &self,
+        slot: &mut Value,
+        name: &str,
+        tag: &sparagmos_mir::EnumTag,
+        pos: usize,
+        byte: u8,
+    ) -> Option<Result<(), ByteVerdict>> {
+        let Value::Enum { variant, .. } = &*slot else {
+            return None;
+        };
+        let cur = *variant as usize;
+        let size = tag.size as usize;
+        let off = tag.offset as usize;
+        let mask: u128 = if size >= 16 {
+            u128::MAX
+        } else {
+            (1u128 << (8 * size)) - 1
+        };
+        let cur_bits = tag.discriminants.get(cur)? & mask;
+        let shift = 8 * (pos - off);
+        let new_bits =
+            (cur_bits & !(0xffu128 << shift)) | (u128::from(byte) << shift);
+        let target = tag
+            .discriminants
+            .iter()
+            .position(|d| d & mask == new_bits)?;
+        if target == cur {
+            return Some(Ok(()));
+        }
+        let layout = ByteLayout::Adt(name.to_string());
+        let total = self.byte_layout_size(&layout)?;
+        let old = slot.clone();
+        let rows = self.program().adt_field_layouts.get(name)?;
+        let new_row = rows.get(target)?;
+        let mut reformed = Value::Enum {
+            variant: target as u32,
+            fields: vec![Value::Uninit; new_row.len()],
+        };
+        for p in 0..total {
+            if p >= off && p < off + size {
+                // The tag itself: correct by construction.
+                continue;
+            }
+            let b = match self.storage_byte(&old, &layout, p)? {
+                Ok(StorageByte::Byte(b)) => b,
+                Ok(StorageByte::Padding) => continue,
+                Err(ByteVerdict::Uninit) => continue,
+                Err(_) => return None,
+            };
+            match self.splice_storage_byte(&mut reformed, &layout, p, b)? {
+                Ok(()) => {}
+                Err(ByteVerdict::Padding(_)) => {}
+                Err(_) => return None,
+            }
+        }
+        *slot = reformed;
+        Some(Ok(()))
     }
 
     /// The error a judged byte-view verdict reports.
@@ -9632,6 +9757,10 @@ impl<'a> Interpreter<'a> {
     /// shape — the same composition `read_punned_int` performs
     /// for a type-punned pointer. `None` when the byte view
     /// does not judge the target or any of the load's bytes.
+    /// A load whose bytes are all indeterminate (padding)
+    /// answers the indeterminate value itself; a load only
+    /// partly over indeterminate bytes has no honest scalar
+    /// to construct and is not judged.
     fn byte_view_shaped_load(
         &self,
         frames: &[Frame],
@@ -9643,12 +9772,20 @@ impl<'a> Interpreter<'a> {
             return None;
         }
         let mut bits: u128 = 0;
+        let mut indet = 0usize;
         for k in 0..width {
             match self.byte_view_read(frames, target, k as i128, false)? {
                 Ok(Value::Uint(b)) => bits |= (b & 0xff) << (8 * k),
+                Ok(Value::Uninit) => indet += 1,
                 Ok(_) => return None,
                 Err(e) => return Some(Err(e)),
             }
+        }
+        if indet > 0 {
+            if indet == width {
+                return Some(Ok(Value::Uninit));
+            }
+            return None;
         }
         Some(self.construct_scalar(bits, shape))
     }
@@ -9699,9 +9836,17 @@ impl<'a> Interpreter<'a> {
         }
         let layout = self.byte_layout_of_ty(&base_ty)?;
         let mut bits: u128 = 0;
+        let mut indet = 0usize;
         for k in 0..width {
             match self.storage_byte(&base, &layout, pos + k)? {
-                Ok(byte) => bits |= u128::from(byte) << (8 * k),
+                Ok(StorageByte::Byte(byte)) => {
+                    bits |= u128::from(byte) << (8 * k)
+                }
+                // A composition over padding bytes: wholly
+                // indeterminate bytes compose the indeterminate
+                // value; a partly indeterminate composition
+                // has no honest scalar and is not judged.
+                Ok(StorageByte::Padding) => indet += 1,
                 Err(verdict) => {
                     return Some(Err(self.byte_view_error(
                         verdict,
@@ -9711,6 +9856,12 @@ impl<'a> Interpreter<'a> {
                     )))
                 }
             }
+        }
+        if indet > 0 {
+            if indet == width {
+                return Some(Ok(Value::Uninit));
+            }
+            return None;
         }
         Some(self.construct_scalar(bits, shape))
     }
@@ -9884,7 +10035,13 @@ impl<'a> Interpreter<'a> {
             return None;
         }
         match self.storage_byte(&base, &layout, pos)? {
-            Ok(byte) => Some(Ok(Value::Uint(u128::from(byte)))),
+            Ok(StorageByte::Byte(byte)) => {
+                Some(Ok(Value::Uint(u128::from(byte))))
+            }
+            // A padding byte has no definite value: the read
+            // yields the model's indeterminate value, which a
+            // later use judges like any uninitialised read.
+            Ok(StorageByte::Padding) => Some(Ok(Value::Uninit)),
             Err(verdict) => {
                 Some(Err(self.byte_view_error(verdict, &func, &place_desc, true)))
             }
@@ -12985,12 +13142,29 @@ enum ByteVerdict {
     Uninit,
     /// The position is outside the value's storage.
     Outside(usize),
-    /// The position falls in the padding between an ADT's
-    /// fields: it has no byte to read.
+    /// A write position falls in the padding between an
+    /// ADT's fields: it has no storage to splice into. (A
+    /// read of a padding position is not a verdict: it
+    /// answers the indeterminate byte, see [`StorageByte`].)
     Padding(usize),
     /// A byte write into a `char` field assembled a value that
     /// is not a `char`.
     InvalidChar(u32),
+}
+
+/// What a judged byte-view position holds (see
+/// `Interpreter::storage_byte`).
+#[derive(Clone, Copy, Debug)]
+enum StorageByte {
+    /// A definite byte of the value's storage: a scalar's own
+    /// byte, a field's byte, or an enum tag's byte.
+    Byte(u8),
+    /// A byte of an ADT's padding: the position is inside the
+    /// value's storage but covered by no field and no tag, so
+    /// it has no definite value. A read of it yields the value
+    /// model's indeterminate value rather than an error or a
+    /// fabricated byte.
+    Padding,
 }
 
 fn index_oob(len: usize, index: usize) -> InterpError {

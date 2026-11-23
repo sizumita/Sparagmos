@@ -120,6 +120,14 @@ pub struct Converter {
     /// through the field spans recorded here. Filled from the
     /// same layout query as `adt_layouts`.
     pub adt_field_layouts: sm::AdtFieldLayouts,
+    /// Direct discriminant tag layouts of the monomorphic
+    /// enum instances converted so far, keyed like
+    /// `adt_layouts` (see `sm::AdtTagLayouts`). Handed to the
+    /// interpreter with the converted program: its byte view
+    /// reads and writes an enum's tag span as the
+    /// discriminant's own bytes. Filled from the same layout
+    /// query as `adt_layouts`.
+    pub adt_tag_layouts: sm::AdtTagLayouts,
     /// Storage-slot maps of the monomorphic coroutine instances
     /// converted so far, keyed like `adt_layouts` (see
     /// `sm::CoroutineLayouts`). Handed to the interpreter with the
@@ -929,6 +937,7 @@ impl Converter {
             adt_discriminants: sm::AdtDiscriminants::new(),
             adt_layouts: sm::AdtLayouts::new(),
             adt_field_layouts: sm::AdtFieldLayouts::new(),
+            adt_tag_layouts: sm::AdtTagLayouts::new(),
             coroutine_layouts: sm::CoroutineLayouts::new(),
             coroutine_slots_attempted: std::collections::HashSet::new(),
             layout_attempted: std::collections::HashSet::new(),
@@ -3925,6 +3934,7 @@ impl Converter {
             (shape.size.bytes() as u64, shape.abi_align),
         );
         self.record_field_layouts(def, args, &shape, &key);
+        self.record_tag_layout(def, &shape, &key);
     }
 
     /// Record the per-variant field byte layout of one ADT
@@ -4018,6 +4028,65 @@ impl Converter {
             out[*v] = row;
         }
         self.adt_field_layouts.insert(key.to_string(), out);
+    }
+
+    /// Record the direct discriminant tag layout of one
+    /// enum instance (see `sm::AdtTagLayouts`) from the
+    /// layout `record_layout` already queried. Only a
+    /// multi-variant enum with the direct tag encoding
+    /// stores a tag: its offset is the tag field's offset in
+    /// the layout's top-level field list, and its width is
+    /// the tag scalar's own (the stored tag can be narrower
+    /// than the enum's discriminant type). Each variant's
+    /// discriminant value is recorded as the bit pattern
+    /// the tag stores. An instance whose discriminant
+    /// values cannot be read gets no entry.
+    fn record_tag_layout(
+        &mut self,
+        def: &AdtDef,
+        shape: &rustc_public::abi::LayoutShape,
+        key: &str,
+    ) {
+        use rustc_public::abi::{FieldsShape, TagEncoding, VariantsShape};
+        if def.kind() != AdtKind::Enum {
+            return;
+        }
+        let VariantsShape::Multiple {
+            tag,
+            tag_encoding: TagEncoding::Direct,
+            tag_field,
+            ..
+        } = &shape.variants
+        else {
+            return;
+        };
+        let FieldsShape::Arbitrary { offsets } = &shape.fields else {
+            return;
+        };
+        let Some(tag_off) = offsets.get(*tag_field) else {
+            return;
+        };
+        let Some((tag_size, _)) = tag_scalar_size_signed(tag) else {
+            return;
+        };
+        if tag_size == 0 || tag_size > 16 {
+            return;
+        }
+        let mut discriminants = Vec::with_capacity(def.num_variants());
+        for i in 0..def.num_variants() {
+            let d = def
+                .discriminant_for_variant(rustc_public::ty::VariantIdx::to_val(i));
+            let Some(v) = discr_value(&d) else { return };
+            discriminants.push(v as u128);
+        }
+        self.adt_tag_layouts.insert(
+            key.to_string(),
+            sm::EnumTag {
+                offset: tag_off.bytes() as u64,
+                size: tag_size as u64,
+                discriminants,
+            },
+        );
     }
 
     /// Record the niche discriminant encoding of one

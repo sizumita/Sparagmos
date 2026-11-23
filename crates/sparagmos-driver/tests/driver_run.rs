@@ -10551,6 +10551,97 @@ fn run_mode_ptr_byte_displaced_reads_match_native() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
 }
 
+const ENUM_TAG_BYTE_READ_SRC: &str = r#"
+enum E { A(u32), B(u16) }
+enum SE { A = -2, B = 3 }
+fn main() {
+    let a = E::A(0x11223344);
+    let b = E::B(0x1234);
+    unsafe {
+        let pa = &a as *const E as *const u8;
+        assert_eq!(*pa, 0);
+        assert_eq!(*pa.add(1), 0);
+        assert_eq!(*pa.add(4), 0x44);
+        let pb = &b as *const E as *const u8;
+        assert_eq!(*pb, 1);
+        assert_eq!(*pb.add(2), 0x34);
+        // A padding byte (offset 2 of A) loads as the model's
+        // indeterminate value: carried, never fabricated, and
+        // never an error at the read itself.
+        let _pad = *pa.add(2);
+        let sa = SE::A;
+        assert_eq!(*(&sa as *const SE as *const u8), 0xfe);
+        let sb = SE::B;
+        assert_eq!(*(&sb as *const SE as *const u8), 3);
+    }
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_enum_tag_byte_reads_match_native() {
+    // A byte pointer at an enum's storage reads the tag span as
+    // the discriminant's own bytes (Lane MI, #247): the recorded
+    // tag layout answers the positions the field rows do not
+    // cover, and padding positions answer the indeterminate
+    // value instead of the explicit error the byte view raised
+    // before the tag layout was recorded.
+    let dir = temp_dir("enum-tag-byte-read");
+    let src = fixture(&dir, "enum_tag_byte_read.rs", ENUM_TAG_BYTE_READ_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "enum tag byte reads must run with native values; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+const ENUM_TAG_BYTE_WRITE_SRC: &str = r#"
+enum E { A(u32), B(u16) }
+enum E2 { A(u32), B(u32) }
+fn main() {
+    let mut e = E::A(0x11223344);
+    unsafe { *(&mut e as *mut E as *mut u8) = 1; }
+    assert!(matches!(e, E::B(_)));
+    let mut e2 = E::B(0x1234);
+    unsafe { *(&mut e2 as *mut E as *mut u8) = 0; }
+    assert!(matches!(e2, E::A(_)));
+    // Shared payload storage: the bytes survive the flip.
+    let mut s = E2::A(0x11223344);
+    unsafe { *(&mut s as *mut E2 as *mut u8) = 1; }
+    match s {
+        E2::B(v) => assert_eq!(v, 0x11223344),
+        E2::A(_) => panic!("tag write must flip the variant"),
+    }
+    // A two-byte store over the tag span.
+    let mut w = E::A(0x11223344);
+    unsafe { *(&mut w as *mut E as *mut u16) = 1; }
+    assert!(matches!(w, E::B(_)));
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_enum_tag_byte_write_rewrites_discriminant() {
+    // A byte write into the tag span rewrites the discriminant
+    // (Lane MI, #247): when the spliced tag names another
+    // variant the value is re-formed as that variant, carrying
+    // the storage bytes the two variants share, so a branch on
+    // the rewritten value takes the native arm.
+    let dir = temp_dir("enum-tag-byte-write");
+    let src = fixture(&dir, "enum_tag_byte_write.rs", ENUM_TAG_BYTE_WRITE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "enum tag byte writes must flip the variant; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
 const PTR_SLICE_SRC: &str = r#"
 fn main() {
     let s: &[i32] = &[10, 20, 30];

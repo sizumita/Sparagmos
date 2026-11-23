@@ -1558,6 +1558,13 @@ pub struct Program {
     /// ADT value's storage resolves raw byte pointer positions
     /// through the field spans recorded here.
     pub adt_field_layouts: sparagmos_mir::AdtFieldLayouts,
+    /// Direct discriminant tag layouts of the program's
+    /// monomorphic enum instances, keyed like `adt_layouts`,
+    /// as recorded by the driver (see
+    /// `sparagmos_mir::AdtTagLayouts`). The byte view of an
+    /// enum value's storage reads and writes the tag span
+    /// recorded here as the discriminant's own bytes.
+    pub adt_tag_layouts: sparagmos_mir::AdtTagLayouts,
     /// Derived-`Debug` shapes of the program's monomorphic ADT
     /// instances, keyed by the rendered instance name (the type
     /// tag the formatter sees), as recorded by the driver (see
