@@ -2488,6 +2488,54 @@ fn run_mode_dyn_bound_projection_nested_const_arg_runs() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
 }
 
+const DYN_BOUND_PROJECTION_LIFETIME_ARG_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Carrier<'a> {
+    type Item: Trait + ?Sized;
+}
+impl Carrier<'static> for () {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<'a, T: Carrier<'a>> {
+    field: <<T as Carrier<'a>>::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<'static, ()> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_lifetime_arg_runs() {
+    // The intermediate projection's trait reference
+    // passes the enclosing lifetime parameter:
+    // `Carrier<'a>` with `'a` Holder's own parameter.
+    // Matching the implementation `Carrier<'static> for
+    // ()` compared `'static` against the unresolved `'a`
+    // directly, found no implementation, and the screen
+    // rejected the holder and main. Resolving the target
+    // lifetime through the ambient frame first reaches
+    // `dyn Trait<Assoc = u32>`, whose binding the outer
+    // projection normalizes through -- natively the
+    // program prints 42.
+    let dir = temp_dir("dyn-bound-projection-lifetime-arg");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_lifetime_arg.rs",
+        DYN_BOUND_PROJECTION_LIFETIME_ARG_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the lifetime-arg projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
 const DYN_BOUND_PROJECTION_ASSOC_DEFAULT_SRC: &str = r#"
 #![feature(associated_type_defaults)]
 trait Trait {

@@ -1627,13 +1627,57 @@ fn match_impl_arg(
             match_impl_const(ic, tc, ambient, bindings, depth)
         }
         (GenericArgKind::Lifetime(iregion), GenericArgKind::Lifetime(tregion)) => {
+            // The target region is written in the frame
+            // the screen is walking, so a lifetime
+            // parameter there is first resolved through
+            // the ambient frame -- the lifetime form of
+            // the resolution the constant match performs
+            // for its target (see `match_impl_const`) --
+            // and a parameter the ambient frame leaves
+            // unresolved stays a parameter.
+            let resolved;
+            let tregion = match &tregion.kind {
+                RegionKind::ReEarlyParam(param) => {
+                    match ambient.and_then(|a| a.0.get(param.index as usize)) {
+                        Some(GenericArgKind::Lifetime(bound)) => {
+                            resolved = bound.clone();
+                            &resolved
+                        }
+                        _ => tregion,
+                    }
+                }
+                _ => tregion,
+            };
             match &iregion.kind {
                 RegionKind::ReEarlyParam(param) => bind_impl_arg(
                     bindings,
                     param.index,
                     GenericArgKind::Lifetime(tregion.clone()),
                 ),
-                _ => iregion == tregion,
+                // A lifetime never decides which type an
+                // implementation assigns the item -- the
+                // instantiation reads lifetimes as erased
+                // (see `impl_instantiation_args`), and
+                // the type match ignores the regions
+                // inside types the same way -- so a
+                // comparison the regions leave
+                // inconclusive (an erased region on
+                // either side, a target parameter the
+                // ambient frame does not resolve) is not
+                // a mismatch: the implementation stays a
+                // candidate and the assigned-type
+                // agreement check decides. Two concrete
+                // regions must still agree.
+                _ => {
+                    iregion == tregion
+                        || matches!(iregion.kind, RegionKind::ReErased)
+                        || matches!(
+                            tregion.kind,
+                            RegionKind::ReErased
+                                | RegionKind::ReEarlyParam(_)
+                                | RegionKind::ReBound(..)
+                        )
+                }
             }
         }
         _ => false,
