@@ -6201,8 +6201,16 @@ impl<'a> Interpreter<'a> {
     /// displaced position is a byte position here; a displaced
     /// read anywhere else (a wider element load) stays the
     /// explicit projection error `project_value` raises.
-    fn read_bulk_base(&self, frames: &[Frame], target: &Resolved) -> InterpResult<Value> {
-        match self.read_resolved(frames, target) {
+    /// `elem` is the operation's element type when the call
+    /// site knows it; it judges the uninitialized outcome as
+    /// in [`read_resolved_typed`].
+    fn read_bulk_base(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        elem: Option<&Ty>,
+    ) -> InterpResult<Value> {
+        match self.read_resolved_typed(frames, target, elem) {
             Ok(v) => Ok(v),
             Err(e) => {
                 // A byte-displaced aggregate target: the byte
@@ -6434,7 +6442,7 @@ impl<'a> Interpreter<'a> {
                         Value::Tuple(_) | Value::FatRef { .. } | Value::Bytes(_) | Value::Str(_)
                     )
                 };
-                let src_base = self.read_bulk_base(frames, &src_target)?;
+                let src_base = self.read_bulk_base(frames, &src_target, elem)?;
                 // The elements are values of the element type. When
                 // that type is known and the value found at the
                 // source IS one element -- possibly inside a
@@ -7520,24 +7528,59 @@ impl<'a> Interpreter<'a> {
     /// `RefCell`s), and a detached `Resolved::Value` is itself a
     /// copy, so those arms yield an owned value — exactly what
     /// `read_resolved` returns. Errors are identical.
+    /// The outcome of a resolved read that found nothing but
+    /// the uninitialized marker: at a `MaybeUninit` place the
+    /// marker IS the value -- the uninitialized union value,
+    /// the payload being uninitialized being that type's
+    /// ordinary content (a read of the payload itself still
+    /// raises at its own point of use, exactly as the payload
+    /// of a written `MaybeUninit::uninit()` value does). At
+    /// any other place the read stays the
+    /// `UninitializedRead` the untyped layer reports.
+    fn uninit_read_value(
+        &self,
+        ty: Option<&Ty>,
+        func: String,
+        place: String,
+    ) -> InterpResult<Value> {
+        match ty {
+            Some(t) if is_maybe_uninit_ty(t) => Ok(maybe_uninit_form(Value::Uninit)),
+            _ => Err(InterpError::UninitializedRead { func, place }),
+        }
+    }
+
     pub(crate) fn read_resolved_ref<'x>(
         &self,
         frames: &'x [Frame],
         target: &Resolved,
     ) -> InterpResult<Cow<'x, Value>> {
+        self.read_resolved_ref_typed(frames, target, None)
+    }
+
+    /// [`read_resolved_ref`] with the declared type of the
+    /// place being read (see [`read_resolved_typed`]).
+    pub(crate) fn read_resolved_ref_typed<'x>(
+        &self,
+        frames: &'x [Frame],
+        target: &Resolved,
+        ty: Option<&Ty>,
+    ) -> InterpResult<Cow<'x, Value>> {
         match target {
             Resolved::Value(base, projection) => {
                 let value = self.value_target_value(base, projection)?;
                 if value == Value::Uninit {
-                    return Err(InterpError::UninitializedRead {
-                        func: "<constant>".to_string(),
-                        place: "constant aggregate".to_string(),
-                    });
+                    return self
+                        .uninit_read_value(
+                            ty,
+                            "<constant>".to_string(),
+                            "constant aggregate".to_string(),
+                        )
+                        .map(Cow::Owned);
                 }
                 Ok(Cow::Owned(value))
             }
             Resolved::Static { .. } | Resolved::Alloc { .. } => {
-                Ok(Cow::Owned(self.read_resolved(frames, target)?))
+                Ok(Cow::Owned(self.read_resolved_typed(frames, target, ty)?))
             }
             Resolved::Place {
                 frame_pos,
@@ -7551,7 +7594,7 @@ impl<'a> Interpreter<'a> {
                     .iter()
                     .any(|step| matches!(step, RefProj::UnionField { .. }))
                 {
-                    return Ok(Cow::Owned(self.read_resolved(frames, target)?));
+                    return Ok(Cow::Owned(self.read_resolved_typed(frames, target, ty)?));
                 }
                 let frame = &frames[*frame_pos];
                 let base = frame.locals.get(*local).ok_or_else(|| {
@@ -7569,14 +7612,17 @@ impl<'a> Interpreter<'a> {
                     if let Some(zst) = self.zst_local_value(frame, *local) {
                         let value = project_value(zst, projection, &frame.func, &place_desc)?;
                         if value == Value::Uninit {
-                            return Err(InterpError::UninitializedRead {
-                                func: frame.func.clone(),
-                                place: if projection.is_empty() {
-                                    describe_resolved(*local, projection)
-                                } else {
-                                    place_desc
-                                },
-                            });
+                            return self
+                                .uninit_read_value(
+                                    ty,
+                                    frame.func.clone(),
+                                    if projection.is_empty() {
+                                        describe_resolved(*local, projection)
+                                    } else {
+                                        place_desc
+                                    },
+                                )
+                                .map(Cow::Owned);
                         }
                         return Ok(Cow::Owned(value));
                     }
@@ -7590,14 +7636,17 @@ impl<'a> Interpreter<'a> {
                         match self.zst_field_value(frame, *local, projection) {
                             Some(v) => return Ok(Cow::Owned(v)),
                             None => {
-                                return Err(InterpError::UninitializedRead {
-                                    func: frame.func.clone(),
-                                    place: if projection.is_empty() {
-                                        describe_resolved(*local, projection)
-                                    } else {
-                                        place_desc
-                                    },
-                                });
+                                return self
+                                    .uninit_read_value(
+                                        ty,
+                                        frame.func.clone(),
+                                        if projection.is_empty() {
+                                            describe_resolved(*local, projection)
+                                        } else {
+                                            place_desc
+                                        },
+                                    )
+                                    .map(Cow::Owned);
                             }
                         }
                     }
@@ -8468,14 +8517,32 @@ impl<'a> Interpreter<'a> {
         frames: &[Frame],
         target: &Resolved,
     ) -> InterpResult<Value> {
+        self.read_resolved_typed(frames, target, None)
+    }
+
+    /// [`read_resolved`] with the declared type of the place
+    /// being read, when the caller knows it (a MIR place read
+    /// passes its place's type; a bulk copy passes its element
+    /// type). The type judges only the uninitialized outcome:
+    /// a read that finds nothing but the uninitialized marker
+    /// at a `MaybeUninit` place yields that type's value (see
+    /// [`Self::uninit_read_value`]); every other outcome --
+    /// values and errors alike -- is the untyped read's.
+    pub(crate) fn read_resolved_typed(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        ty: Option<&Ty>,
+    ) -> InterpResult<Value> {
         match target {
             Resolved::Value(base, projection) => {
                 let value = self.value_target_value(base, projection)?;
                 if value == Value::Uninit {
-                    return Err(InterpError::UninitializedRead {
-                        func: "<constant>".to_string(),
-                        place: "constant aggregate".to_string(),
-                    });
+                    return self.uninit_read_value(
+                        ty,
+                        "<constant>".to_string(),
+                        "constant aggregate".to_string(),
+                    );
                 }
                 Ok(value)
             }
@@ -8488,10 +8555,7 @@ impl<'a> Interpreter<'a> {
                 let place_desc = format!("static {name}");
                 let value = self.project_value_t(base, projection, &func, &place_desc)?;
                 if value == Value::Uninit {
-                    return Err(InterpError::UninitializedRead {
-                        func,
-                        place: place_desc,
-                    });
+                    return self.uninit_read_value(ty, func, place_desc);
                 }
                 Ok(value)
             }
@@ -8524,19 +8588,13 @@ impl<'a> Interpreter<'a> {
                     Ok(v) => v,
                     Err(e) => {
                         if past_unwritten {
-                            return Err(InterpError::UninitializedRead {
-                                func,
-                                place: place_desc,
-                            });
+                            return self.uninit_read_value(ty, func, place_desc);
                         }
                         return Err(e);
                     }
                 };
                 if value == Value::Uninit {
-                    return Err(InterpError::UninitializedRead {
-                        func,
-                        place: place_desc,
-                    });
+                    return self.uninit_read_value(ty, func, place_desc);
                 }
                 Ok(value)
             }
@@ -8586,14 +8644,15 @@ impl<'a> Interpreter<'a> {
                         match self.zst_field_value(frame, *local, projection) {
                             Some(v) => v,
                             None => {
-                                return Err(InterpError::UninitializedRead {
-                                    func: frame.func.clone(),
-                                    place: if projection.is_empty() {
+                                return self.uninit_read_value(
+                                    ty,
+                                    frame.func.clone(),
+                                    if projection.is_empty() {
                                         describe_resolved(*local, projection)
                                     } else {
                                         place_desc
                                     },
-                                });
+                                );
                             }
                         }
                     }
@@ -10669,10 +10728,16 @@ impl<'a> Interpreter<'a> {
         place: &Place,
     ) -> InterpResult<Value> {
         let target = self.resolve_place(frames, body, place)?;
+        // The place's declared type, when the local's declared
+        // type alone determines it: it judges the byte view
+        // below and the read's uninitialized outcome (a
+        // `MaybeUninit` place's uninitialized content is its
+        // ordinary value; see `read_resolved_typed`).
+        let place_ty = self.place_result_ty(body, place);
         // A direct deref of a byte pointer (the place's own type
         // is one byte wide) into a byte-displaced target: the
         // byte view of the base value's storage owns the read.
-        if let Some(ty) = self.place_result_ty(body, place) {
+        if let Some(ty) = &place_ty {
             if matches!(
                 ty,
                 Ty::Uint(UintTy::U8) | Ty::Int(IntTy::I8) | Ty::Bool
@@ -10689,7 +10754,9 @@ impl<'a> Interpreter<'a> {
         // (every element of a vector, for a single indexed read).
         // Results and errors are identical (see
         // `read_resolved_ref`).
-        Ok(self.read_resolved_ref(frames, &target)?.into_owned())
+        Ok(self
+            .read_resolved_ref_typed(frames, &target, place_ty.as_ref())?
+            .into_owned())
     }
 
     pub(crate) fn write_place(
@@ -11693,6 +11760,7 @@ impl<'a> Interpreter<'a> {
         frames: &[Frame],
         target: &Resolved,
         shape: &ScalarShape,
+        ty: Option<&Ty>,
     ) -> InterpResult<Value> {
         let elem_block = matches!(target, Resolved::Alloc { id, .. } if self.is_elem_block(*id));
         // A byte-displaced place/static target: the load's
@@ -11702,8 +11770,16 @@ impl<'a> Interpreter<'a> {
         if let Some(view) = self.byte_view_shaped_load(frames, target, shape) {
             return view;
         }
-        match self.read_resolved(frames, target) {
+        match self.read_resolved_typed(frames, target, ty) {
             Ok(v) => {
+                // A `MaybeUninit` load whose storage reads back as
+                // the union form (an uninitialized slot, or a union
+                // stored whole) is the union value itself.
+                if matches!(ty, Some(t) if is_maybe_uninit_ty(t))
+                    && matches!(&v, Value::Enum { fields, .. } if fields.len() == 1)
+                {
+                    return Ok(v);
+                }
                 if let Ok(bits) = self.flatten_scalar(&v, shape) {
                     return self.construct_scalar(bits, shape);
                 }
@@ -12566,7 +12642,8 @@ impl<'a> Interpreter<'a> {
             }
             Rvalue::ShapedLoad(place, shape) => {
                 let target = self.resolve_place(frames, body, place)?;
-                self.shaped_load(frames, &target, shape)
+                let place_ty = self.place_result_ty(body, place);
+                self.shaped_load(frames, &target, shape, place_ty.as_ref())
             }
             Rvalue::PtrOffset(ptr_op, count_op, baked_size, count_width) => {
                 let base = self.eval_operand(frames, body, ptr_op)?;

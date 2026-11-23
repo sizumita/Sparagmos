@@ -17491,3 +17491,117 @@ fn run_mode_maybe_uninit_copy_defined_assume_init() {
         "val=7\n",
     );
 }
+
+const MAYBE_UNINIT_ALLOC_READ_SRC: &str = r#"
+fn main() {
+    unsafe {
+        let layout = std::alloc::Layout::new::<std::mem::MaybeUninit<u8>>();
+        let p = std::alloc::alloc(layout) as *mut std::mem::MaybeUninit<u8>;
+        if p.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        let b: std::mem::MaybeUninit<u8> = std::ptr::read(p);
+        std::mem::forget(b);
+        std::alloc::dealloc(p as *mut u8, layout);
+    }
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_maybe_uninit_ptr_read_unwritten_alloc() {
+    // A `MaybeUninit` place inside a raw allocation no write has
+    // ever touched holds the union's uninitialized form, the
+    // type's ordinary content: `ptr::read` of it succeeds (only
+    // reading the payload itself is an uninitialized read).
+    run_ok(
+        "maybe-uninit-alloc-read",
+        MAYBE_UNINIT_ALLOC_READ_SRC,
+        "done\n",
+    );
+}
+
+const MAYBE_UNINIT_ALLOC_READ_WRITTEN_SRC: &str = r#"
+fn main() {
+    unsafe {
+        let layout = std::alloc::Layout::new::<std::mem::MaybeUninit<u8>>();
+        let p = std::alloc::alloc(layout) as *mut std::mem::MaybeUninit<u8>;
+        if p.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        std::ptr::write(p, std::mem::MaybeUninit::new(41));
+        let b: std::mem::MaybeUninit<u8> = std::ptr::read(p);
+        println!("val={}", b.assume_init());
+        std::alloc::dealloc(p as *mut u8, layout);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_maybe_uninit_ptr_read_written_alloc() {
+    // The same read over storage a write did fill assembles the
+    // payload the write stored.
+    run_ok(
+        "maybe-uninit-alloc-read-written",
+        MAYBE_UNINIT_ALLOC_READ_WRITTEN_SRC,
+        "val=41\n",
+    );
+}
+
+const PLAIN_ALLOC_READ_UNWRITTEN_SRC: &str = r#"
+fn main() {
+    unsafe {
+        let layout = std::alloc::Layout::new::<u8>();
+        let p = std::alloc::alloc(layout) as *mut u8;
+        if p.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        let b: u8 = std::ptr::read(p);
+        println!("val={}", b);
+        std::alloc::dealloc(p, layout);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_ptr_read_unwritten_alloc_plain_payload_errors() {
+    // The unwritten-allocation allowance is the `MaybeUninit`
+    // type's, not the read's: a plain payload type read from
+    // never-written storage stays an uninitialized read.
+    let dir = temp_dir("plain-alloc-read-unwritten");
+    let src = fixture(&dir, "case.rs", PLAIN_ALLOC_READ_UNWRITTEN_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr={stderr}");
+    assert!(
+        stderr.contains("uninitialized"),
+        "plain payload read must be an uninitialised read; stderr={stderr}"
+    );
+}
+
+const MAYBE_UNINIT_ALLOC_READ_ASSUME_SRC: &str = r#"
+fn main() {
+    unsafe {
+        let layout = std::alloc::Layout::new::<std::mem::MaybeUninit<u8>>();
+        let p = std::alloc::alloc(layout) as *mut std::mem::MaybeUninit<u8>;
+        if p.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        let b: std::mem::MaybeUninit<u8> = std::ptr::read(p);
+        println!("val={}", b.assume_init());
+        std::alloc::dealloc(p as *mut u8, layout);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_maybe_uninit_ptr_read_then_assume_init_errors() {
+    // Reading the union out of unwritten storage succeeds, but
+    // the value is still uninitialized: using its payload through
+    // `assume_init` fails instead of fabricating a byte.
+    let dir = temp_dir("maybe-uninit-alloc-read-assume");
+    let src = fixture(&dir, "case.rs", MAYBE_UNINIT_ALLOC_READ_ASSUME_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr={stderr}");
+}
