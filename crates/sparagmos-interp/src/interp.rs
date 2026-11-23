@@ -11002,9 +11002,9 @@ impl<'a> Interpreter<'a> {
         }
         let array_pos = match static_name {
             Some(name) => self.static_array_position(name, &projection),
-            None => self.array_position(frames, place, &projection),
+            None => self.array_position(frames, place, &projection, base),
         };
-        if let Some((cur, elem)) = array_pos {
+        if let Some((prefix, cur, elem)) = array_pos {
             if elem == 0 && total == 0 {
                 // A zero-sized element type: the position is
                 // denominated in elements alone (the byte
@@ -11013,50 +11013,52 @@ impl<'a> Interpreter<'a> {
                 // the same form the byte case below returns.
                 let idx = cur + count;
                 if idx >= 0 {
-                    return Ok(if idx == 0 && projection.is_empty() {
-                        Vec::new()
-                    } else {
-                        vec![RefProj::Index(usize::try_from(idx).map_err(|_| {
-                            InterpError::UnsupportedRvalue {
+                    let mut out = projection[..prefix].to_vec();
+                    if !(idx == 0 && projection.is_empty()) {
+                        out.push(RefProj::Index(usize::try_from(idx).map_err(
+                            |_| InterpError::UnsupportedRvalue {
                                 kind: "pointer offset: element index out of range"
                                     .to_string(),
-                            }
-                        })?)]
-                    });
+                            },
+                        )?));
+                    }
+                    return Ok(out);
                 }
             }
             if elem > 0 {
                 if let Some(byte_pos) = cur.checked_mul(elem).and_then(|b| b.checked_add(total)) {
                     if byte_pos >= 0 && byte_pos % elem == 0 {
                         let idx = byte_pos / elem;
-                        // The result keeps the input's form: an
-                        // index projection denotes the element
-                        // itself, while an empty projection denotes
-                        // the array place as a whole — different
-                        // positions in this model, even at index 0.
-                        return Ok(if idx == 0 && projection.is_empty() {
-                            Vec::new()
-                        } else {
-                            vec![RefProj::Index(usize::try_from(idx).map_err(|_| {
-                                InterpError::UnsupportedRvalue {
+                        // The result keeps the input's form: the
+                        // steps that navigate to the sequence are
+                        // preserved, and an index projection
+                        // denotes the element itself, while an
+                        // empty projection denotes the sequence
+                        // place as a whole — different positions
+                        // in this model, even at index 0.
+                        let mut out = projection[..prefix].to_vec();
+                        if !(idx == 0 && projection.is_empty()) {
+                            out.push(RefProj::Index(usize::try_from(idx).map_err(
+                                |_| InterpError::UnsupportedRvalue {
                                     kind: "pointer offset: element index out of range"
                                         .to_string(),
-                                }
-                            })?)]
-                        });
+                                },
+                            )?));
+                        }
+                        return Ok(out);
                     }
                 }
             }
         }
         // When the declared type cannot judge the position (the
-        // target is not an array place), the value's own shape can:
+        // target is not a sequence place), the value's own shape can:
         // a displacement over an element aggregate (a tuple, or an
         // ADT value whose fields are its elements, as a `Vec` value
         // is) in whole units of the offset's element size denotes
         // the element at that index, exactly as the array case
-        // above. The array verdict governs whenever it applies, so
-        // a byte displacement into a typed array is never
-        // reinterpreted this way.
+        // above. The declared-type verdict governs whenever it
+        // applies, so a byte displacement into a typed sequence is
+        // never reinterpreted this way.
         if array_pos.is_none()
             && !self.byte_view_covers(frames, place, static_name, &projection, base)
         {
@@ -11372,36 +11374,101 @@ impl<'a> Interpreter<'a> {
         Some(out)
     }
 
-    /// The array position a place target denotes, when it is
+    /// The sequence position a place target denotes, when it is
     /// directly determinable from the target local's declared
-    /// type: the local is an array and the projection is empty
-    /// (the array base, element 0) or a single index into it.
-    /// Returns the current element index and the element size.
+    /// type: the projection ranges over a sequence the local
+    /// holds — the local itself (an array, or a sequence ADT
+    /// whose value is its element sequence), or a sequence-typed
+    /// field of it — and ends at the sequence base (element 0)
+    /// or at a single index into it. Returns the number of
+    /// leading steps that navigate to the sequence (a field
+    /// path), the current element index, and the element size.
     fn array_position(
         &self,
         frames: &[Frame],
         place: Option<(u64, usize)>,
         projection: &[RefProj],
-    ) -> Option<(i128, i128)> {
+        base: Option<&Value>,
+    ) -> Option<(usize, i128, i128)> {
         let (frame_id, local) = place?;
         let frame = &frames[self.frame_pos(frames, frame_id).ok()?];
         let body = self.program().functions.get(&frame.func)?;
+        // Split the projection into a leading field path and an
+        // optional trailing index step: the steps that navigate
+        // to the sequence, then the position within it.
+        let mut path: Vec<usize> = Vec::new();
+        let mut steps = projection;
+        while let Some((RefProj::Field(f), rest)) = steps.split_first() {
+            path.push(*f);
+            steps = rest;
+        }
+        let cur = match steps {
+            [] => None,
+            [RefProj::Index(i)] => Some(i128::try_from(*i).ok()?),
+            _ => return None,
+        };
+        if !path.is_empty() {
+            // A sequence held in a field: the position must end
+            // at an element of it (a bare field projection
+            // denotes the sequence value itself, whose positions
+            // are denominated in the field type's own size, not
+            // its element size). The element size is the one
+            // conversion recorded for the field path, and the
+            // value held at the path must actually be the
+            // element container, as for the local case below.
+            let cur = cur?;
+            let elem = body
+                .field_elem_sizes
+                .get(local)
+                .and_then(|sizes| sizes.get(&path))
+                .copied()?;
+            let field_steps: Vec<RefProj> =
+                path.iter().map(|f| RefProj::Field(*f)).collect();
+            let held = self.value_target_value(base?, &field_steps).ok()?;
+            if !matches!(
+                held,
+                Value::Tuple(_) | Value::Enum { .. } | Value::SparseVec { .. }
+            ) {
+                return None;
+            }
+            return Some((path.len(), cur, i128::from(elem)));
+        }
         let elem = match body.local_tys.get(local)? {
             Ty::Array(elem, _) => self.ty_size(elem)?,
+            Ty::Adt(_) => {
+                // A sequence ADT (a `Vec` above all): the value
+                // the local holds is its element sequence, so a
+                // position over it is denominated in the element
+                // size conversion recorded for the local (see
+                // `ir::Body::local_elem_sizes`; the IR type drops
+                // the generic arguments the size is computed
+                // from). The held value must actually be the
+                // element container (a tuple of elements, an ADT
+                // value whose fields are its elements, a sparse
+                // vector): a sequence ADT in any other held shape
+                // (a reference into it, an uninitialised slot)
+                // denotes no element position.
+                if !matches!(
+                    base,
+                    Some(
+                        Value::Tuple(_)
+                            | Value::Enum { .. }
+                            | Value::SparseVec { .. }
+                    )
+                ) {
+                    return None;
+                }
+                body.local_elem_sizes.get(local).copied().flatten()?
+            }
             _ => return None,
         };
-        let cur = match projection {
-            [] => 0,
-            [RefProj::Index(i)] => i128::try_from(*i).ok()?,
-            _ => return None,
-        };
-        Some((cur, i128::from(elem)))
+        Some((0, cur.unwrap_or(0), i128::from(elem)))
     }
 
     /// The array position a projection over the static `name`
     /// denotes, from the static's declared type as the driver
-    /// recorded it in the program: the current element index
-    /// and the element size in bytes, in the same form
+    /// recorded it in the program: the current element index and
+    /// the element size in bytes, in the same form
     /// [`Self::array_position`] answers for a local. `None` when
     /// the static has no recorded type (a foreign item) or its
     /// declared type is not an array.
@@ -11409,7 +11476,7 @@ impl<'a> Interpreter<'a> {
         &self,
         name: &str,
         projection: &[RefProj],
-    ) -> Option<(i128, i128)> {
+    ) -> Option<(usize, i128, i128)> {
         let elem = match self.program().static_tys.get(name)? {
             Ty::Array(elem, _) => self.ty_size(elem)?,
             _ => return None,
@@ -11419,7 +11486,7 @@ impl<'a> Interpreter<'a> {
             [RefProj::Index(i)] => i128::try_from(*i).ok()?,
             _ => return None,
         };
-        Some((cur, i128::from(elem)))
+        Some((0, cur, i128::from(elem)))
     }
 
     /// The value a `Resolved::Value` target denotes: its base

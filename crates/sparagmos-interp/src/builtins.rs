@@ -11440,6 +11440,19 @@ fn value_fingerprint(value: &Value) -> u64 {
                 if d % size != 0 {
                     return None;
                 }
+                // A byte displacement carried past an index
+                // step composes with it: the pair denotes the
+                // element the displacement lands on, under the
+                // same base key the plain index step denotes,
+                // so a byte-advanced pointer and the element
+                // pointer it lands on measure against each
+                // other (and against a plain index pointer).
+                if let Some((RefProj::Index(i), rest)) = rest.split_last() {
+                    return Some((
+                        format!("{base}|{}", key(rest)),
+                        *i as i128 + d / size,
+                    ));
+                }
                 return Some((format!("{base}|{}", key(rest)), d / size));
             }
             // Otherwise the position is the projection's element

@@ -1742,6 +1742,27 @@ pub struct Body {
     pub name: String,
     pub arg_count: usize,
     pub local_tys: Vec<Ty>,
+    /// The element size of each local whose declared type is a
+    /// sequence type — an array's element type, or an ADT's first
+    /// generic argument (a `Vec`'s element type) — indexed by
+    /// local (conversion-computed; see `mir_convert`'s
+    /// `local_elem_size`). The IR types drop an ADT's generic
+    /// arguments, so a byte displacement over a sequence local
+    /// cannot be denominated from the declared type alone; this
+    /// table carries the size conversion computed while the
+    /// arguments were still at hand. Consulted by the
+    /// interpreter's sequence-position judgment (see
+    /// `array_position`). Empty for hand-built bodies.
+    pub local_elem_sizes: Vec<Option<u64>>,
+    /// The element sizes of sequence-typed fields of each
+    /// local, keyed by local, then by the field-index path from
+    /// the local (conversion-computed; see `mir_convert`'s
+    /// `collect_field_elem_sizes`). The field-path companion of
+    /// [`Self::local_elem_sizes`]: a byte displacement over a
+    /// sequence held in a field (a `Vec` in a struct field) is
+    /// denominated in the field type's element size. Empty for
+    /// hand-built bodies.
+    pub field_elem_sizes: Vec<std::collections::HashMap<Vec<usize>, u64>>,
     pub blocks: Vec<BasicBlockData>,
     /// Canonical values of the locals whose declared type is
     /// provably zero-sized, indexed by local (conversion-computed;
@@ -1800,6 +1821,8 @@ impl Body {
             name: name.into(),
             arg_count,
             local_tys,
+            local_elem_sizes: Vec::new(),
+            field_elem_sizes: Vec::new(),
             blocks,
             zst_locals: Vec::new(),
             zst_fields: Vec::new(),

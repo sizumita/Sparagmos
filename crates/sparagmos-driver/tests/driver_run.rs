@@ -11670,6 +11670,144 @@ fn run_mode_enum_tag_byte_write_rewrites_discriminant() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
 }
 
+const PTR_BYTE_VEC_SRC: &str = r#"
+#[derive(Debug, PartialEq)]
+struct Point { x: i32, y: i32 }
+fn main() {
+    // Byte displacement over a Vec's buffer is denominated in
+    // the element type's size: byte_add(8) over a Vec<Point>
+    // lands on element 1, not on element 8.
+    let v: Vec<Point> = vec![
+        Point { x: 1, y: 2 },
+        Point { x: 3, y: 4 },
+        Point { x: 5, y: 6 },
+        Point { x: 7, y: 8 },
+        Point { x: 9, y: 10 },
+        Point { x: 11, y: 12 },
+        Point { x: 13, y: 14 },
+        Point { x: 15, y: 16 },
+        Point { x: 17, y: 18 },
+        Point { x: 19, y: 20 },
+    ];
+    let s: &[Point] = &v;
+    let p = s.as_ptr();
+    unsafe {
+        assert_eq!(&*p.byte_add(8), &Point { x: 3, y: 4 });
+        assert_eq!(&*p.byte_add(16), &Point { x: 5, y: 6 });
+        assert_eq!(p.byte_add(16).offset_from(p), 2);
+        assert_eq!(p.offset_from(p.byte_add(16)), -2);
+        assert!(p.byte_add(8) == p.add(1));
+    }
+    // A write through a byte-displaced pointer lands in the
+    // element the displacement denotes.
+    let mut w: Vec<i32> = vec![10, 20, 30];
+    let sw: &[i32] = &w;
+    unsafe {
+        let q = sw.as_ptr().byte_add(4) as *mut i32;
+        *q = 99;
+    }
+    assert_eq!(w, vec![10, 99, 30]);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_ptr_byte_add_over_vec_elements() {
+    let dir = temp_dir("ptr-byte-vec");
+    let src = fixture(&dir, "ptr_byte_vec.rs", PTR_BYTE_VEC_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "byte_add over Vec elements must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+const PTR_BYTE_VEC_FIELD_SRC: &str = r#"
+#[derive(Debug, PartialEq)]
+struct Point { x: i32, y: i32 }
+struct Holder { v: Vec<Point> }
+fn main() {
+    // The same denomination holds for a Vec held in a struct
+    // field: the position navigates to the field's sequence,
+    // then ranges over its elements.
+    let h = Holder {
+        v: vec![
+            Point { x: 1, y: 100 },
+            Point { x: 2, y: 200 },
+            Point { x: 3, y: 300 },
+            Point { x: 4, y: 400 },
+            Point { x: 5, y: 500 },
+            Point { x: 6, y: 600 },
+            Point { x: 7, y: 700 },
+            Point { x: 8, y: 800 },
+            Point { x: 9, y: 900 },
+            Point { x: 10, y: 1000 },
+        ],
+    };
+    let s: &[Point] = &h.v;
+    let p = s.as_ptr();
+    unsafe {
+        assert_eq!(&*p.byte_add(8), &Point { x: 2, y: 200 });
+    }
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_ptr_byte_add_over_vec_in_struct_field() {
+    let dir = temp_dir("ptr-byte-vec-field");
+    let src = fixture(&dir, "ptr_byte_vec_field.rs", PTR_BYTE_VEC_FIELD_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "byte_add over a Vec in a struct field must run; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+const PTR_BYTE_VEC_DISPLACED_READ_SRC: &str = r#"
+#[derive(Debug)]
+struct Point { x: i32, y: i32 }
+fn main() {
+    let v: Vec<Point> = vec![Point { x: 1, y: 2 }, Point { x: 3, y: 4 }];
+    let s: &[Point] = &v;
+    unsafe {
+        let b = s.as_ptr().byte_add(4);
+        println!("{:?}", &*b);
+    }
+    println!("unreachable");
+}
+"#;
+
+#[test]
+fn run_mode_ptr_byte_displaced_read_over_vec_is_explicit_unsupported() {
+    // A byte displacement that lands between a Vec's elements
+    // denotes no element: reading through it is an explicit
+    // unsupported error, never the neighbouring element's value.
+    let dir = temp_dir("ptr-byte-vec-displaced");
+    let src = fixture(
+        &dir,
+        "ptr_byte_vec_displaced.rs",
+        PTR_BYTE_VEC_DISPLACED_READ_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "mid-element byte-displaced read over a Vec must be an explicit unsupported; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("displaced"),
+        "the reason names the displacement; stderr={stderr}"
+    );
+}
+
 const PTR_SLICE_SRC: &str = r#"
 fn main() {
     let s: &[i32] = &[10, 20, 30];

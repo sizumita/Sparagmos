@@ -2227,6 +2227,25 @@ impl<'a> Converter<'a> {
         None
     }
 
+    /// The element size of a local's declared type when the
+    /// type is a sequence type: an array's element type, or an
+    /// ADT's first generic argument (a `Vec`'s element type —
+    /// the argument the value model holds the ADT's elements
+    /// under). Recorded on the converted body (see
+    /// `ir::Body::local_elem_sizes`) because the IR type drops
+    /// the generic arguments the size is computed from.
+    fn local_elem_size(&self, ty: &mir::Ty) -> Option<u64> {
+        let elem = match ty {
+            mir::Ty::Array(elem, _) => elem,
+            mir::Ty::Adt(_, args) => args.first()?,
+            _ => return None,
+        };
+        match self.ty_layout(elem) {
+            Some((size, _)) if size > 0 => Some(size as u64),
+            _ => None,
+        }
+    }
+
     fn convert_body(&self, func: &MirFunction, key: &str) -> Result<ir::Body, ConvertError> {
         let body = &func.body;
         let mut local_tys = Vec::with_capacity(body.local_decls.len());
@@ -2276,6 +2295,27 @@ impl<'a> Converter<'a> {
             blocks.push(self.convert_block(body, bb)?);
         }
         let mut out = ir::Body::new(key.to_string(), body.arg_count, local_tys, blocks);
+        out.local_elem_sizes = body
+            .local_decls
+            .iter()
+            .map(|decl| self.local_elem_size(&decl.ty))
+            .collect();
+        out.field_elem_sizes = body
+            .local_decls
+            .iter()
+            .map(|decl| {
+                let mut sizes = std::collections::HashMap::new();
+                let mut budget = 4096usize;
+                self.collect_field_elem_sizes(
+                    &decl.ty,
+                    &mut Vec::new(),
+                    &mut sizes,
+                    0,
+                    &mut budget,
+                );
+                sizes
+            })
+            .collect();
         out.source_lines = body
             .source_lines
             .iter()
@@ -2466,6 +2506,55 @@ impl<'a> Converter<'a> {
     /// projection paths of `ty` into `out`, keyed by path (see
     /// `ir::Body::zst_fields`). Structs, unions and tuples expose
     /// their fields under bare field projections; an enum's fields
+    /// Record the element size of every sequence-typed field
+    /// reachable from `ty` through struct and tuple fields, by
+    /// field-index path (see `ir::Body::field_elem_sizes`). The
+    /// walk mirrors `collect_zst_fields`: enum payloads are not
+    /// entered (their positions carry a downcast step the
+    /// sequence judgment does not read), and the walk is depth-
+    /// and budget-bounded like that one.
+    fn collect_field_elem_sizes(
+        &self,
+        ty: &mir::Ty,
+        path: &mut Vec<usize>,
+        out: &mut std::collections::HashMap<Vec<usize>, u64>,
+        depth: u32,
+        budget: &mut usize,
+    ) {
+        if depth > 8 || *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+        let mut ty = ty.clone();
+        while let mir::Ty::Pat(inner, _) = ty {
+            ty = *inner;
+        }
+        let fields: Vec<mir::Ty> = match &ty {
+            mir::Ty::Tuple(ts) => ts.clone(),
+            mir::Ty::Adt(def, args) => {
+                let Some(shape) = self.adt_shapes.get(def) else {
+                    return;
+                };
+                if shape.kind == mir::AdtShapeKind::Enum {
+                    return;
+                }
+                match self.instantiated_field_tys(def, args, 0) {
+                    Some(fields) => fields,
+                    None => return,
+                }
+            }
+            _ => return,
+        };
+        for (i, field_ty) in fields.iter().enumerate() {
+            path.push(i);
+            if let Some(size) = self.local_elem_size(field_ty) {
+                out.insert(path.clone(), size);
+            }
+            self.collect_field_elem_sizes(field_ty, path, out, depth + 1, budget);
+            path.pop();
+        }
+    }
+
     /// sit behind a downcast step, so each variant's fields are
     /// collected under that variant's downcast step. The runtime
     /// lookup only consults a recorded path after projection
