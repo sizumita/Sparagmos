@@ -486,6 +486,15 @@ pub enum Builtin {
     /// types override `count` with pointer machinery over the
     /// remaining items; the observable result is the same count.)
     IteratorCount,
+    /// `std::iter::Iterator::nth(&mut iter, n)`: skip `n` items
+    /// through the modelled `next` state transition and take the
+    /// next one. (Several iterator types override `nth` or
+    /// `advance_by` with pointer machinery over the remaining
+    /// items — `slice::Iter`'s zero-sized-element path reads the
+    /// end pointer's own bits as the remaining count, a
+    /// representation the value model does not reproduce; the
+    /// observable result is the same item.)
+    IteratorNth,
     /// `std::iter::Iterator::fold(iter, init, f)`: the core
     /// default body is a `next` loop applying `f` per item;
     /// modelled by driving the `next` state transition and
@@ -2303,6 +2312,7 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         | "core::iter::DoubleEndedIterator::next_back" => Builtin::IteratorNextBack,
         "std::iter::Iterator::size_hint" => Builtin::IteratorSizeHint,
         "std::iter::Iterator::count" => Builtin::IteratorCount,
+        "std::iter::Iterator::nth" => Builtin::IteratorNth,
         "std::iter::Iterator::fold" => Builtin::IteratorFold,
         "std::iter::Iterator::for_each" => Builtin::IteratorForEach,
         "std::iter::Iterator::collect" => Builtin::IteratorCollect,
@@ -4081,7 +4091,10 @@ impl<'a> Interpreter<'a> {
     /// `generic_args` are the callee's rendered generic type tags.
     /// `unique_elem` is the conversion-baked element value of a
     /// `box_assume_init_into_vec_unsafe` call (see
-    /// `TerminatorKind::CallBuiltin::unique_elem`).
+    /// `TerminatorKind::CallBuiltin::unique_elem`), and
+    /// `skipped_glue` the conversion-baked item glue of an
+    /// `Iterator::nth` call (see
+    /// `TerminatorKind::CallBuiltin::skipped_glue`).
     pub(crate) fn exec_builtin(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -4091,6 +4104,7 @@ impl<'a> Interpreter<'a> {
         args: &[Operand],
         cmp_discriminants: Option<&[i128]>,
         unique_elem: Option<&Value>,
+        skipped_glue: Option<&crate::ir::DropGlue>,
     ) -> InterpResult<Value> {
         // `Add` / `Sub` on a modelled time type: conversion emits
         // a builtin node only for those calls (see
@@ -4142,7 +4156,7 @@ impl<'a> Interpreter<'a> {
             let stamp = vals.pop().expect("two arguments");
             self.note_panic_stamp(stamp);
         }
-        self.exec_builtin_values(frames, body, args, kind, name, generic_args, vals, cmp_discriminants, unique_elem)
+        self.exec_builtin_values(frames, body, args, kind, name, generic_args, vals, cmp_discriminants, unique_elem, skipped_glue)
     }
 
     /// Execute a builtin whose arguments are already evaluated
@@ -4160,6 +4174,7 @@ impl<'a> Interpreter<'a> {
         vals: Vec<Value>,
         cmp_discriminants: Option<&[i128]>,
         unique_elem: Option<&Value>,
+        skipped_glue: Option<&crate::ir::DropGlue>,
     ) -> InterpResult<Value> {
         let arity = |n: usize| -> InterpResult<()> {
             if vals.len() == n {
@@ -6342,6 +6357,56 @@ impl<'a> Interpreter<'a> {
                 }
                 self.note_consumed_iter_final(state);
                 Ok(Value::Uint(count))
+            }
+            Builtin::IteratorNth => {
+                arity(2)?;
+                let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
+                let n = match &vals[1] {
+                    Value::Uint(v) => *v,
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            "Iterator::nth count",
+                            "unsigned integer",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                // `nth` is `advance_by(n)` followed by `next`.
+                // An arithmetic range advances in one step, as
+                // its specialised body in core does (see
+                // `range_skip_at`); every other iterator drives
+                // the modelled `next` transition `n` times, then
+                // once more for the result. A skipped item is
+                // consumed by the skip: its drop glue (baked by
+                // conversion, see `skipped_glue` in `ir`) runs
+                // before the next step, exactly as the core
+                // default body drops the temporary each
+                // `advance_by` iteration yields. An iterator
+                // that runs out during the skips is left
+                // exhausted and yields `None`, exactly as the
+                // core default body leaves it.
+                let target = self.deref_value(frames, &vals[0])?;
+                if n > 0 {
+                    if let Some(exhausted) =
+                        self.range_skip_at(frames, self_ty, &target, n)?
+                    {
+                        if exhausted {
+                            return Ok(none_value());
+                        }
+                        return self.iterator_next_at(frames, self_ty, &target);
+                    }
+                }
+                for _ in 0..n {
+                    self.tick_step()?;
+                    let item = self.iterator_next_at(frames, self_ty, &target)?;
+                    let Some(skipped) = option_payload(item)? else {
+                        return Ok(none_value());
+                    };
+                    if let Some(glue) = skipped_glue {
+                        self.drop_value_sync(frames, skipped, glue)?;
+                    }
+                }
+                self.iterator_next_at(frames, self_ty, &target)
             }
             Builtin::IteratorCollect => {
                 arity(1)?;
@@ -8978,7 +9043,23 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::SliceIter => {
                 arity(1)?;
-                let (elems, _) = self.slice_elements(frames, &vals[0])?;
+                let (elems, _) = match self.slice_elements(frames, &vals[0]) {
+                    Ok(elems) => elems,
+                    Err(err) => {
+                        // A slice over an address-only pointer
+                        // has no elements in the value model —
+                        // unless the element type has a single
+                        // value, in which case every element is
+                        // that value and no storage is needed to
+                        // produce them.
+                        let elem_tag =
+                            generic_args.first().map(String::as_str).unwrap_or("");
+                        match self.storageless_slice_elements(frames, &vals[0], elem_tag) {
+                            Some(elems) => elems,
+                            None => return Err(err),
+                        }
+                    }
+                };
                 Ok(slice_iter_value(elems))
             }
             Builtin::BTreeIter => {
@@ -12564,6 +12645,145 @@ fn value_fingerprint(value: &Value) -> u64 {
         Ok(result)
     }
 
+    /// Skip `n` items of an arithmetic range state at
+    /// `target` in one arithmetic step — the advance the
+    /// specialised `nth` / `advance_by` bodies of `Range` and
+    /// `RangeInclusive` perform in core, which the per-item
+    /// loop cannot reproduce within the step limit for a
+    /// large skip. `Ok(Some(true))` when the skip exhausted
+    /// the range (the state is left in exactly the form the
+    /// per-item step machine leaves an exhausted range in, so
+    /// the two accountings cannot disagree), `Ok(Some(false))`
+    /// when items remain (the caller's final step then serves
+    /// the result), and `Ok(None)` when the state is not an
+    /// arithmetic range's, leaving the per-item loop to the
+    /// caller.
+    fn range_skip_at(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        self_ty: &str,
+        target: &Resolved,
+        n: u128,
+    ) -> InterpResult<Option<bool>> {
+        let inclusive = if self_ty.starts_with("std::ops::RangeInclusive<") {
+            true
+        } else if self_ty.starts_with("std::ops::Range<") {
+            false
+        } else {
+            return Ok(None);
+        };
+        let state = self.read_resolved(frames, target)?;
+        let Ok(fields) = iterator_fields(&state, self_ty) else {
+            return Ok(None);
+        };
+        // The bounds as bit patterns: with `start <= end` in
+        // the value's own domain, the difference and the
+        // advance are exact in wrapping arithmetic for both
+        // the signed and the unsigned domain.
+        let bits = |v: &Value| -> Option<u128> {
+            match v {
+                Value::Int(x) => Some(*x as u128),
+                Value::Uint(x) => Some(*x),
+                _ => None,
+            }
+        };
+        let unbits = |start: &Value, bits: u128| -> Value {
+            match start {
+                Value::Int(_) => Value::Int(bits as i128),
+                _ => Value::Uint(bits),
+            }
+        };
+        if inclusive {
+            if fields.len() != 3 {
+                return Ok(None);
+            }
+            if fields[2] == Value::Bool(true) {
+                // Already exhausted: the step machine leaves
+                // the fields untouched and yields `None`.
+                return Ok(Some(true));
+            }
+            if fields[2] != Value::Bool(false) {
+                return Ok(None);
+            }
+            let (Some(start), Some(end)) =
+                (bits(&fields[0]), bits(&fields[1]))
+            else {
+                return Ok(None);
+            };
+            if compare_values(&fields[0], &fields[1])? == Ordering::Greater {
+                // Empty and unflagged: stepping yields `None`
+                // without touching the fields.
+                return Ok(Some(true));
+            }
+            // The item count is `diff + 1`.
+            let diff = end.wrapping_sub(start);
+            if n > diff {
+                // The skip passes the last item, whose own
+                // step leaves [end, end, true].
+                let new_state = rebuild_state(
+                    &state,
+                    vec![
+                        fields[1].clone(),
+                        fields[1].clone(),
+                        Value::Bool(true),
+                    ],
+                );
+                self.write_resolved(frames, target, new_state)?;
+                Ok(Some(true))
+            } else {
+                let new_start =
+                    unbits(&fields[0], start.wrapping_add(n));
+                let new_state = rebuild_state(
+                    &state,
+                    vec![new_start, fields[1].clone(), Value::Bool(false)],
+                );
+                self.write_resolved(frames, target, new_state)?;
+                Ok(Some(false))
+            }
+        } else {
+            if fields.len() != 2 {
+                return Ok(None);
+            }
+            let (Some(start), Some(end)) =
+                (bits(&fields[0]), bits(&fields[1]))
+            else {
+                return Ok(None);
+            };
+            if compare_values(&fields[0], &fields[1])? != Ordering::Less {
+                // Empty: the specialised advance still
+                // leaves the range at its end (a native
+                // `Range { start: 5, end: 3 }` skipped past
+                // reads back with `start == 3`), which the
+                // write below performs.
+                let new_state = rebuild_state(
+                    &state,
+                    vec![fields[1].clone(), fields[1].clone()],
+                );
+                self.write_resolved(frames, target, new_state)?;
+                return Ok(Some(true));
+            }
+            // The item count is `diff`.
+            let diff = end.wrapping_sub(start);
+            if n >= diff {
+                let new_state = rebuild_state(
+                    &state,
+                    vec![fields[1].clone(), fields[1].clone()],
+                );
+                self.write_resolved(frames, target, new_state)?;
+                Ok(Some(true))
+            } else {
+                let new_start =
+                    unbits(&fields[0], start.wrapping_add(n));
+                let new_state = rebuild_state(
+                    &state,
+                    vec![new_start, fields[1].clone()],
+                );
+                self.write_resolved(frames, target, new_state)?;
+                Ok(Some(false))
+            }
+        }
+    }
+
     /// `DoubleEndedIterator::next_back`: mutate the iterator in
     /// place through the `&mut` argument and return the `Option`
     /// value — the mirror of [`Self::iterator_next`].
@@ -14073,54 +14293,88 @@ fn value_fingerprint(value: &Value) -> u64 {
                 self.next_back_on_state(frames, inner_ty, fields[0].clone())?;
             (vec![new_inner], item)
         } else if self_ty.starts_with("std::slice::IterMut<") {
-            // The state is the real field layout (see
-            // `slice_iter_value`): (ptr, end, marker) with element
-            // pointers into the container's own storage — the
-            // layout the real `iter_mut` body builds and the state
-            // `IntoIterator` builds for the `&mut` containers.
-            // `next` hands out the current pointer itself as the
-            // `&mut T` item and advances it by one element.
+            // Two state shapes: the [container, next index,
+            // length] state `IntoIterator` builds for `&mut Vec`
+            // / `&mut [T; N]` / `&mut [T]` (the element handed
+            // out is a reference to the element's place in the
+            // container's own storage), and the real field layout
+            // (ptr, end, marker) — see `slice_iter_value` — the
+            // collected `<[T]>::iter_mut` body builds over a
+            // raw-parts slice and the state `IntoIterator` builds
+            // for the `&mut` containers. `next` hands out the
+            // current pointer itself as the `&mut T` item and
+            // advances it by one element.
             if fields.len() != 3 {
                 return Err(InterpError::type_mismatch(
                     "slice::IterMut state",
-                    "[ptr, end, marker]",
+                    "[container, next index, length] or [ptr, end, marker]",
                     format!("{} field(s)", fields.len()),
                 ));
             }
-            let (ptr_field, end) = (fields[0].clone(), fields[1].clone());
-            if let Some(remaining) = iter_zst_remaining(&fields) {
-                // The zero-sized form: the end field is the
-                // remaining length as a provenance-free address
-                // and the front pointer never moves; each step
-                // hands it out again and decrements the length.
-                if remaining == 0 {
-                    return Ok((state.clone(), none_value()));
+            if let (Value::Uint(idx), Value::Uint(len)) = (&fields[1], &fields[2]) {
+                let (idx, len) = (*idx, *len);
+                if idx < len {
+                    let elem =
+                        self.iter_mut_element_ref(frames, &fields[0], idx as usize)?;
+                    (
+                        vec![
+                            fields[0].clone(),
+                            Value::Uint(idx + 1),
+                            Value::Uint(len),
+                        ],
+                        some_value(elem),
+                    )
+                } else {
+                    (fields, none_value())
                 }
-                let item = iter_ptr_value(&ptr_field).expect("front pointer checked");
-                let new_end = Value::Ref(RefTarget::Address(remaining - 1));
-                return Ok((
-                    rebuild_state(
-                        state,
-                        vec![fields[0].clone(), new_end, fields[2].clone()],
-                    ),
-                    some_value(item),
-                ));
-            }
-            let (Some(cur), Some(last)) = (iter_ptr_index(&ptr_field), iter_ptr_index(&end))
-            else {
-                return Err(InterpError::type_mismatch(
-                    "slice::IterMut state",
-                    "element pointers into the container storage",
-                    format!("{} / {}", ptr_field.kind_name(), end.kind_name()),
-                ));
-            };
-            if cur < last {
-                let advanced =
-                    iter_ptr_with_index(&ptr_field, cur + 1).expect("index step checked");
-                let item = iter_ptr_value(&ptr_field).expect("pointer field checked");
-                (vec![advanced, end, fields[2].clone()], some_value(item))
             } else {
-                (fields, none_value())
+                let (ptr_field, end) = (fields[0].clone(), fields[1].clone());
+                if let (Some(cur), Some(last)) =
+                    (iter_ptr_index(&ptr_field), iter_ptr_index(&end))
+                {
+                    if cur < last {
+                        let advanced = iter_ptr_with_index(&ptr_field, cur + 1)
+                            .expect("index step checked");
+                        let item = iter_ptr_value(&ptr_field)
+                            .expect("pointer field checked");
+                        (
+                            vec![advanced, end, fields[2].clone()],
+                            some_value(item),
+                        )
+                    } else {
+                        (fields, none_value())
+                    }
+                } else if let Some(step) =
+                    slice_iter_step_real(self, frames, self_ty, &fields, false)
+                {
+                    step?
+                } else if let Some(remaining) = iter_zst_remaining(&fields) {
+                    // The zero-sized form the real-layout step
+                    // above declines: the end field is the
+                    // remaining length as a provenance-free
+                    // address and the front pointer never moves;
+                    // each step hands it out again and decrements
+                    // the length.
+                    if remaining == 0 {
+                        return Ok((state.clone(), none_value()));
+                    }
+                    let item =
+                        iter_ptr_value(&ptr_field).expect("front pointer checked");
+                    let new_end = Value::Ref(RefTarget::Address(remaining - 1));
+                    return Ok((
+                        rebuild_state(
+                            state,
+                            vec![fields[0].clone(), new_end, fields[2].clone()],
+                        ),
+                        some_value(item),
+                    ));
+                } else {
+                    return Err(InterpError::type_mismatch(
+                        "slice::IterMut state",
+                        "element pointers into the element snapshot",
+                        format!("{} / {}", ptr_field.kind_name(), end.kind_name()),
+                    ));
+                }
             }
         } else if self_ty.starts_with("std::iter::Once<") {
             // `Once` is a one-field struct wrapping an `Option`:
@@ -16620,6 +16874,35 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         }
     }
 
+    /// The elements of a slice whose base pointer is address-only
+    /// (a `from_raw_parts` slice over an integer address: the
+    /// model holds no storage behind it), when the element type
+    /// has a single value (see [`single_value_for_tag`]): every
+    /// element of such a slice is that value, so the elements
+    /// exist without storage. `None` for every other shape — the
+    /// caller keeps its original error. The length is bounded by
+    /// the same materialisation limit [`slice_elements`] applies,
+    /// since the result is a materialised element list.
+    fn storageless_slice_elements(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+        elem_tag: &str,
+    ) -> Option<(Vec<Value>, u128)> {
+        let resolved = self.resolve_value(frames, value).ok()?;
+        let Value::FatRef { base, len } = &resolved else {
+            return None;
+        };
+        if !matches!(&**base, Value::Ref(RefTarget::Address(_))) {
+            return None;
+        }
+        if *len > MAX_VEC_SET_LEN_ELEMENTS as u128 {
+            return None;
+        }
+        let elem = single_value_for_tag(elem_tag)?;
+        Some((vec![elem; *len as usize], *len))
+    }
+
     /// The borrowing form of [`slice_elements`]: the same elements
     /// and length, but the element storage is lent out of the
     /// resolved value wherever it is already materialised, so a
@@ -17639,10 +17922,12 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
     /// borrowing the denoted data wherever it is already
     /// materialised: the borrowing form of [`resolve_value`], with
     /// the same results and errors. The shapes that denote no data
-    /// (null and address-only pointers) and a fat pointer over a
-    /// self-contained element tuple (a slice constant, a
-    /// materialised sub-slice — dereferencing it would yield
-    /// itself, so following it would spin) resolve to themselves.
+    /// (null and address-only pointers) and a fat pointer whose
+    /// base is self-contained (an element tuple — a slice constant,
+    /// a materialised sub-slice — or a sparse sequence) or denotes
+    /// no data (an address-only pointer: a `from_raw_parts` slice)
+    /// resolve to themselves: dereferencing any of those yields
+    /// the fat pointer itself, so following it would spin.
     pub(crate) fn resolve_ref<'x>(
         &self,
         frames: &'x [Frame],
@@ -17652,7 +17937,23 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         loop {
             let follows = match &*cur {
                 Value::Ref(RefTarget::Null) | Value::Ref(RefTarget::Address(_)) => false,
-                Value::FatRef { base, .. } if matches!(&**base, Value::Tuple(_)) => false,
+                // The fat pointers `deref_value` resolves to
+                // themselves: a self-contained base (an element
+                // aggregate, a sparse sequence) or an
+                // address-only base, which has no pointee to
+                // reach. The guard here must name exactly the
+                // shapes `deref_value` names, or following such
+                // a pointer spins.
+                Value::FatRef { base, .. }
+                    if matches!(
+                        &**base,
+                        Value::Tuple(_)
+                            | Value::SparseVec { .. }
+                            | Value::Ref(RefTarget::Address(_))
+                    ) =>
+                {
+                    false
+                }
                 Value::Ref(_) | Value::FatRef { .. } => true,
                 _ => false,
             };
@@ -18772,6 +19073,7 @@ pub fn iterator_next_modelled(self_ty: &str) -> bool {
     self_ty.starts_with("std::ops::Range<")
         || self_ty.starts_with("std::ops::RangeInclusive<")
         || self_ty.starts_with("std::slice::Iter<")
+        || self_ty.starts_with("std::slice::IterMut<")
         || self_ty.starts_with("std::collections::btree_set::Iter<")
         || self_ty.starts_with("std::collections::btree_map::Iter<")
         || self_ty.starts_with("std::collections::btree_map::Keys<")
@@ -18793,6 +19095,20 @@ pub fn iterator_next_modelled(self_ty: &str) -> bool {
         || self_ty_is(self_ty, "core::str::Chars")
         || self_ty_is(self_ty, "std::str::Bytes")
         || self_ty_is(self_ty, "core::str::Bytes")
+}
+
+/// Whether the modelled iterator consumers (`nth`, `count`,
+/// `fold`, `for_each`, `collect`) serve this type: exactly
+/// the types the modelled `next` state machine serves. The
+/// consumers must agree with the state machine's accounting:
+/// core's consumer bodies are folds over `next` whose pointer
+/// arithmetic the value model does not reproduce for the
+/// real-layout state (a zero-sized element's remaining count
+/// is carried in the end pointer's own bits), so a consumer
+/// that ran its collected body after a modelled `nth` would
+/// recount items the state machine already skipped.
+pub fn iterator_consumer_modelled(self_ty: &str) -> bool {
+    iterator_next_modelled(self_ty)
 }
 
 /// Whether the modelled `DoubleEndedIterator::next_back` step
@@ -19301,10 +19617,6 @@ fn slice_iter_step_real(
     }
     let elem_tag = first_generic_arg(self_ty)?;
     let (size, _) = interp.layout_of(elem_tag)?;
-    if size == 0 {
-        return None;
-    }
-    let size = u64::try_from(size).ok()?;
     let rewrap = |field: &Value, new_ref: Value| -> Value {
         match field {
             Value::Enum { variant, fields } if fields.len() == 1 => Value::Enum {
@@ -19317,6 +19629,84 @@ fn slice_iter_step_real(
     if ptr_target == end_target {
         return Some(Ok((fields.to_vec(), none_value())));
     }
+    if size == 0 {
+        // A zero-sized element type: core's own representation
+        // encodes the remaining count in the pointer pair itself
+        // (the end pointer is the start pointer plus the length,
+        // in address units — for a ZST the pointer is
+        // meaningless, so the count is what it carries). Only an
+        // address-only pair carries the count that way in this
+        // model: a storage-backed pair's positions are projection
+        // indices, which `slice_iter_bounds` reads. Any other
+        // pair keeps the shape error the caller reports for it.
+        if let RefTarget::Address(end_addr) = end_target {
+            // The mixed pair the collected `iter` / `iter_mut`
+            // bodies build for a zero-sized element type: the
+            // current pointer still projects into the element
+            // storage (its trailing `Index` step is the current
+            // position), while the end pointer is the terminal
+            // element index carried as an address — core's
+            // construction stores the length itself in the end
+            // pointer for a ZST, the pointer being meaningless.
+            // The remaining count is the distance from the
+            // current index to that terminal index.
+            if let Some(i) = iter_ptr_index(&ptr_ref) {
+                let end = *end_addr as usize;
+                if i >= end {
+                    return Some(Ok((fields.to_vec(), none_value())));
+                }
+                if back {
+                    let new_end = Value::Ref(RefTarget::Address((end - 1) as u64));
+                    let item = iter_ptr_with_index(&ptr_ref, end - 1)?;
+                    return Some(Ok((
+                        vec![
+                            fields[0].clone(),
+                            rewrap(&fields[1], new_end),
+                            fields[2].clone(),
+                        ],
+                        some_value(item),
+                    )));
+                }
+                let advanced = iter_ptr_with_index(&ptr_ref, i + 1)?;
+                return Some(Ok((
+                    vec![
+                        rewrap(&fields[0], advanced),
+                        fields[1].clone(),
+                        fields[2].clone(),
+                    ],
+                    some_value(ptr_ref),
+                )));
+            }
+            return None;
+        }
+        let (RefTarget::Address(cur), RefTarget::Address(end)) = (ptr_target, end_target)
+        else {
+            return None;
+        };
+        let (cur, end) = (*cur, *end);
+        if back {
+            let new_end = Value::Ref(RefTarget::Address(end.wrapping_sub(1)));
+            let item = new_end.clone();
+            return Some(Ok((
+                vec![
+                    fields[0].clone(),
+                    rewrap(&fields[1], new_end),
+                    fields[2].clone(),
+                ],
+                some_value(item),
+            )));
+        }
+        let advanced = Value::Ref(RefTarget::Address(cur.wrapping_add(1)));
+        return Some(Ok((
+            vec![
+                rewrap(&fields[0], advanced),
+                fields[1].clone(),
+                fields[2].clone(),
+            ],
+            some_value(ptr_ref),
+        )));
+    }
+    let size = u64::try_from(size).ok()?;
     if back {
         let new_end = match interp.ptr_offset_value(frames, end_ref, -1, Some(size), false) {
             Ok(v) => v,
@@ -23149,6 +23539,46 @@ fn fresh_hash_keys() -> (u64, u64) {
         z ^ (z >> 31)
     };
     (next(), next())
+}
+
+/// The single value of a type with exactly one inhabitant,
+/// from its rendered tag: the unit type, tuples and arrays of
+/// single-value types, and `PhantomData`. Any other tag —
+/// including zero-sized types with several values (an enum with
+/// two unit variants, `Option<()>`), whose elements a
+/// storageless slice could not faithfully invent — answers
+/// `None`.
+fn single_value_for_tag(tag: &str) -> Option<Value> {
+    let tag = tag.trim();
+    match tag {
+        "()" => return Some(Value::Unit),
+        _ if tag.starts_with("std::marker::PhantomData<") => {
+            return Some(Value::Enum {
+                variant: 0,
+                fields: Vec::new(),
+            });
+        }
+        _ => {}
+    }
+    if tag.len() > 2 && tag.starts_with('(') && tag.ends_with(')') {
+        let inner = &tag[1..tag.len() - 1];
+        let mut vals = Vec::new();
+        for part in split_top_level(inner) {
+            vals.push(single_value_for_tag(part)?);
+        }
+        return Some(Value::Tuple(vals));
+    }
+    if tag.starts_with('[') && tag.ends_with(']') {
+        let inner = &tag[1..tag.len() - 1];
+        let (elem, n) = inner.rsplit_once(';')?;
+        let n: usize = n.trim().parse().ok()?;
+        if n > 4096 {
+            return None;
+        }
+        let elem = single_value_for_tag(elem.trim())?;
+        return Some(Value::Tuple(vec![elem; n]));
+    }
+    None
 }
 
 fn default_value_for_tag(tag: &str) -> Option<Value> {

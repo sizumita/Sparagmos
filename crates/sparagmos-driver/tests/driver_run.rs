@@ -20386,3 +20386,180 @@ fn run_mode_sparse_nested_array_prefix_is_not_a_tuple_wrapper() {
         "row [11, 22]\nelem 22\nvia_row_ptr 22\nwritten [11, 99]\nvia_row_ptr_after 99\n",
     );
 }
+
+const ZST_RAW_SLICE_ITER_SRC: &str = r#"
+use std::slice;
+
+fn foo<T>(v: &[T]) -> Option<&[T]> {
+    let mut it = v.iter();
+    for _ in 0..5 {
+        let _ = it.next();
+    }
+    Some(it.as_slice())
+}
+
+fn foo_mut<T>(v: &mut [T]) -> Option<&mut [T]> {
+    let mut it = v.iter_mut();
+    for _ in 0..5 {
+        let _ = it.next();
+    }
+    Some(it.into_slice())
+}
+
+fn main() {
+    let slice: &[()] = unsafe { slice::from_raw_parts(-5isize as *const (), 10) };
+    println!("len {}", slice.len());
+    println!("count {}", slice.iter().count());
+    let mut it = slice.iter();
+    println!("nth some {}", it.nth(5).is_some());
+    println!("rest {}", it.count());
+    println!("foo some {}", foo(slice).is_some());
+    let slice: &mut [()] = unsafe { slice::from_raw_parts_mut(-5isize as *mut (), 10) };
+    println!("mcount {}", slice.iter_mut().count());
+    {
+        let mut it = slice.iter_mut();
+        println!("mnth some {}", it.nth(5).is_some());
+        println!("mrest {}", it.count());
+    }
+    println!("foo_mut some {}", foo_mut(slice).is_some());
+}
+"#;
+
+#[test]
+fn run_mode_zst_raw_slice_iterators() {
+    // A slice of zero-sized elements over a raw-parts pointer
+    // at the edge of the address space: the iterator's end
+    // pointer carries the remaining count in its own bits, a
+    // representation the collected core bodies read through
+    // pointer-to-integer puns the value model does not
+    // reproduce. Iteration is served by the modelled `next`
+    // state machine (whose address-pair step synthesises the
+    // elements), and the consumers (`count`, `nth`) are served
+    // by the same machine so the accounting cannot disagree.
+    // This program used to spin forever in `slice_elements`
+    // (the fat pointer over the raw address resolved to
+    // itself).
+    run_ok(
+        "zst-raw-slice-iterators",
+        ZST_RAW_SLICE_ITER_SRC,
+        "len 10\ncount 10\nnth some true\nrest 4\nfoo some true\nmcount 10\nmnth some true\nmrest 4\nfoo_mut some true\n",
+    );
+}
+
+const ZST_ARRAY_ITER_NTH_SRC: &str = r#"
+fn main() {
+    let a = [(), (), (), (), (), (), (), (), (), ()];
+    println!("count {}", a.iter().count());
+    let mut it = a.iter();
+    println!("nth some {}", it.nth(5).is_some());
+    println!("rest {}", it.count());
+    let mut m = [(), (), (), ()];
+    println!("mcount {}", m.iter_mut().count());
+}
+"#;
+
+#[test]
+fn run_mode_zst_array_iter_nth_count() {
+    // `nth` on a zero-sized snapshot iterator: core's body
+    // reads the end pointer's bits as the remaining count
+    // through a `*mut usize` pun, which the value model cannot
+    // serve; the modelled `nth` drives the `next` transition
+    // instead.
+    run_ok(
+        "zst-array-iter-nth-count",
+        ZST_ARRAY_ITER_NTH_SRC,
+        "count 10\nnth some true\nrest 4\nmcount 4\n",
+    );
+}
+
+const NTH_SKIPPED_DROP_SRC: &str = r#"
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static DROPS: AtomicUsize = AtomicUsize::new(0);
+
+struct Frag(u32);
+impl Drop for Frag {
+    fn drop(&mut self) {
+        DROPS.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn main() {
+    let mut it = vec![Frag(1), Frag(2), Frag(3)].into_iter();
+    let second = it.nth(1);
+    println!("got {}", second.unwrap().0);
+    println!("drops after nth {}", DROPS.load(Ordering::SeqCst));
+    drop(it);
+    println!("drops after drop(it) {}", DROPS.load(Ordering::SeqCst));
+}
+"#;
+
+#[test]
+fn run_mode_iterator_nth_drops_skipped_items() {
+    // The items `nth` skips are consumed by the skip: the
+    // modelled `nth` runs each skipped item's drop glue
+    // (baked by conversion from the item type) before
+    // stepping on, exactly as core's default body drops the
+    // temporary each `advance_by` iteration yields. Before
+    // the glue ran, the counter read 1 after `nth` (only the
+    // returned item's temporary) and 2 at the end: the
+    // skipped element's destructor never ran, and its slot
+    // in the iterator was already marked consumed, so the
+    // iterator's own drop could not recover it.
+    run_ok(
+        "iterator-nth-drops-skipped-items",
+        NTH_SKIPPED_DROP_SRC,
+        "got 2\ndrops after nth 2\ndrops after drop(it) 3\n",
+    );
+}
+
+const NTH_RANGE_ADVANCE_SRC: &str = r#"
+fn main() {
+    let mut r = 0usize..2_000_000usize;
+    println!("nth {:?}", r.nth(1_500_000));
+    let mut ri = 0usize..=2_000_000usize;
+    println!("incl nth {:?}", ri.nth(1_500_000));
+}
+"#;
+
+#[test]
+fn run_mode_iterator_nth_range_advances_directly() {
+    // An arithmetic range's `nth` advances in one step, as
+    // the specialised body in core does: driving the
+    // modelled `next` transition once per skipped item
+    // spends a step per item and a 1.5M skip exceeds the
+    // default step limit before it can answer.
+    run_ok(
+        "iterator-nth-range-advances-directly",
+        NTH_RANGE_ADVANCE_SRC,
+        "nth Some(1500000)\nincl nth Some(1500000)\n",
+    );
+}
+
+const ITER_MUT_RAW_PARTS_SRC: &str = r#"
+use std::slice;
+
+fn main() {
+    let mut v = vec![10, 20, 30, 40];
+    let ptr = v.as_mut_ptr();
+    let s: &mut [i32] = unsafe { slice::from_raw_parts_mut(ptr, 4) };
+    let mut it = s.iter_mut();
+    println!("first {:?}", it.next());
+    let out = it.into_slice();
+    println!("rest {:?}", out);
+}
+"#;
+
+#[test]
+fn run_mode_slice_iter_mut_raw_parts_next() {
+    // `next` on the real field layout (ptr, end, marker) the
+    // collected `<[T]>::iter_mut` body builds over a raw-parts
+    // slice: the state machine's `IterMut` arm used to serve
+    // only the [container, index, length] state `IntoIterator`
+    // builds, and reported this shape as a type mismatch.
+    run_ok(
+        "slice-iter-mut-raw-parts-next",
+        ITER_MUT_RAW_PARTS_SRC,
+        "first Some(10)\nrest [20, 30, 40]\n",
+    );
+}

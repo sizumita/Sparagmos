@@ -241,6 +241,13 @@ enum GlueCompletion {
     /// panic (in `Interpreter::glue_unwind_panic`) continues
     /// unwinding instead of control returning to the owner frame.
     UnwindCleanup,
+    /// The session runs synchronously inside a builtin (see
+    /// `Interpreter::drop_value_sync`): there is no owner frame
+    /// to jump to, so when the work runs out the session simply
+    /// ends, and a destructor call runs to completion on the
+    /// spot (through `call_to_completion`) instead of
+    /// suspending the session.
+    Sync,
 }
 
 /// A place fully resolved against the frame stack: either a concrete
@@ -2465,6 +2472,7 @@ impl<'a> Interpreter<'a> {
                     target,
                     drop_glue,
                     consumed_glue,
+                    skipped_glue,
                     cmp_discriminants,
                     result_unsize,
                     unique_elem,
@@ -2570,6 +2578,7 @@ impl<'a> Interpreter<'a> {
                             args,
                             cmp_discriminants.as_deref(),
                             unique_elem.as_ref(),
+                            skipped_glue.as_ref(),
                         )?;
                         let consumed_final =
                             self.consumed_iter_final.borrow_mut().take();
@@ -3157,6 +3166,7 @@ impl<'a> Interpreter<'a> {
             arg_values,
             None,
             None,
+            None,
         )?;
         match target {
             Some(bb) => {
@@ -3680,6 +3690,7 @@ impl<'a> Interpreter<'a> {
                     &canonical,
                     &generic_args,
                     arg_values,
+                    None,
                     None,
                     None,
                 );
@@ -4583,6 +4594,38 @@ impl<'a> Interpreter<'a> {
         self.run_glue_session(frames, session, Vec::new())
     }
 
+    /// Run the drop glue of a detached value to completion,
+    /// synchronously: a builtin that consumes a value the guest
+    /// would have dropped (an item `Iterator::nth` skips, say)
+    /// owes the value's destructor before it steps on. The
+    /// value is parked in the allocation store first, as for a
+    /// consumed iterator's final state: a destructor body
+    /// writes back into its receiver, which a bare value root
+    /// cannot accept. The session's `Sync` completion runs
+    /// each destructor call to completion on the spot; a
+    /// destructor that panics propagates as the builtin's own
+    /// panic, exactly as a panicking destructor propagates
+    /// out of the guest operation that consumed the value.
+    pub(crate) fn drop_value_sync(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        value: Value,
+        glue: &crate::ir::DropGlue,
+    ) -> InterpResult<()> {
+        let id = self.alloc_insert(value);
+        let root = RefTarget::Alloc {
+            id,
+            projection: Vec::new(),
+        };
+        let session = GlueSession {
+            root,
+            work: vec![(Vec::new(), glue.root.clone())],
+            adts: glue.adts.clone(),
+            completion: GlueCompletion::Sync,
+        };
+        self.run_glue_session(frames, session, Vec::new())
+    }
+
     /// Run one glue session (and, below it, any sessions suspended
     /// under it) until the outermost session completes or a
     /// destructor call suspends the run.
@@ -4593,6 +4636,12 @@ impl<'a> Interpreter<'a> {
         mut suspended: Vec<GlueSession>,
     ) -> InterpResult<()> {
         use crate::ir::DropPlan as P;
+        // A session begun as `Sync` (a builtin consuming a
+        // value) runs its destructor calls to completion
+        // instead of suspending: the flag is captured here, at
+        // the outermost session, and covers the nested
+        // sessions this run stacks below it.
+        let sync_dtors = matches!(active.completion, GlueCompletion::Sync);
         'sessions: loop {
             while let Some((path, plan)) = active.work.pop() {
                 self.tick()?;
@@ -5542,7 +5591,6 @@ impl<'a> Interpreter<'a> {
                             ));
                         }
                         let target_ref = self.extend_ref(frames, &active.root, &path)?;
-                        let mut locals = vec![Value::Uninit; local_count];
                         // A `pin_drop` destructor takes
                         // `Pin<&mut Self>`, and `Pin` is a one-field
                         // aggregate in this value model (the shape
@@ -5551,7 +5599,7 @@ impl<'a> Interpreter<'a> {
                         // body's own `Deref` for `Pin` resolves
                         // through the pointee and unwraps the wrong
                         // field.
-                        locals[1] = if func.ends_with(">::pin_drop") {
+                        let dtor_arg = if func.ends_with(">::pin_drop") {
                             Value::Enum {
                                 variant: 0,
                                 fields: vec![Value::Ref(target_ref)],
@@ -5559,6 +5607,23 @@ impl<'a> Interpreter<'a> {
                         } else {
                             Value::Ref(target_ref)
                         };
+                        if sync_dtors {
+                            // A synchronous session has no owner
+                            // block to resume at: run the
+                            // destructor to completion now, as
+                            // the builtins run the guest code
+                            // they drive. A panic in it
+                            // propagates as the consuming
+                            // builtin's own panic.
+                            self.call_to_completion(
+                                frames,
+                                &func,
+                                vec![dtor_arg],
+                            )?;
+                            continue;
+                        }
+                        let mut locals = vec![Value::Uninit; local_count];
+                        locals[1] = dtor_arg;
                         let frame_id = self.fresh_frame_id();
                         self.drop_continuations.push(DropContinuation {
                             callee_frame: frame_id,
@@ -5598,6 +5663,7 @@ impl<'a> Interpreter<'a> {
                 },
                 GlueCompletion::Jump(target) => Some(target),
                 GlueCompletion::UnwindCleanup => None,
+                GlueCompletion::Sync => None,
             };
             // A finishing session releases the dropped place
             // exactly as a completed drop does: the place is dead,
@@ -5641,7 +5707,10 @@ impl<'a> Interpreter<'a> {
             // reference-counted pointee's glue, rooted at the
             // allocation's value field) keep the storage: their
             // enclosing session still owns it.
-            if matches!(active.completion, GlueCompletion::Jump(_)) {
+            if matches!(
+                active.completion,
+                GlueCompletion::Jump(_) | GlueCompletion::Sync
+            ) {
                 if let RefTarget::Alloc { id, projection } = &active.root {
                     if projection.is_empty() {
                         self.allocs.borrow_mut().insert(*id, Value::Uninit);
@@ -5718,6 +5787,11 @@ impl<'a> Interpreter<'a> {
                         }
                     }
                 }
+            }
+            if matches!(active.completion, GlueCompletion::Sync) {
+                // A synchronous session simply ends: no owner
+                // frame to jump to, no stashed panic to resume.
+                return Ok(());
             }
             match finishing_target {
                 Some(target) => {

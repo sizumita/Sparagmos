@@ -7198,6 +7198,21 @@ let inner = match (&src, target) {
         if Self::vec_from_iter_nested_entry(&name) {
             return None;
         }
+        // An iterator consumer (`count` / `fold` / `for_each` /
+        // `collect` / `nth`) over a type the modelled `next`
+        // state machine serves is not bound to a body either,
+        // even when one is stored under the trait item's plain
+        // name: that body is core's default or specialised
+        // implementation, whose pointer arithmetic over the
+        // remaining items the value model does not reproduce
+        // (a zero-sized element's remaining count is carried in
+        // the end pointer's own bits), while the builtin drives
+        // the same state machine `next` is served by, so the
+        // two accountings cannot disagree about how many items
+        // a sequence of calls consumed.
+        if self.consumer_builtin_preempts(func) {
+            return None;
+        }
         let Some(plain) = self.unconverted.get(&name) else {
             // A name that is not itself a collected body denotes
             // a trait item the call names directly (the func
@@ -7275,6 +7290,37 @@ let inner = match (&src, target) {
         })
     }
 
+    /// Whether the external/builtin conversion below would
+    /// serve this call with one of the iterator-consumer
+    /// builtins (`count` / `fold` / `for_each` / `collect` /
+    /// `nth`) over an iterator type the modelled `next` state
+    /// machine serves: those calls are the builtin's, even when
+    /// a body is stored under the trait item's name (see
+    /// `resolve_body_callee`).
+    fn consumer_builtin_preempts(&self, func: &mir::Operand) -> bool {
+        let Some((name, _, raw_generic_args)) = self.resolve_external_callee(func)
+        else {
+            return false;
+        };
+        let canonical = crate::builtins::canonical_name(&name);
+        let Some(kind) = crate::builtins::lookup_qualified(&canonical) else {
+            return false;
+        };
+        let iter_ty = match kind {
+            crate::builtins::Builtin::IteratorCount
+            | crate::builtins::Builtin::IteratorFold
+            | crate::builtins::Builtin::IteratorForEach
+            | crate::builtins::Builtin::IteratorCollect
+            | crate::builtins::Builtin::IteratorNth => raw_generic_args.first(),
+            _ => return false,
+        };
+        let Some(iter_ty) = iter_ty else {
+            return false;
+        };
+        let tag = crate::builtins::ty_tag(iter_ty, self.names);
+        crate::builtins::iterator_consumer_modelled(&tag)
+    }
+
     /// Whether a call to one of the iterator-consumer builtins
     /// (`Iterator::count` / `fold` / `for_each` / `collect`,
     /// `FromIterator::from_iter`) should be served by the
@@ -7300,6 +7346,7 @@ let inner = match (&src, target) {
             crate::builtins::Builtin::FromIteratorFromIter => raw_generic_args.get(2),
             crate::builtins::Builtin::IteratorNextBack => raw_generic_args.first(),
             crate::builtins::Builtin::IteratorNext => raw_generic_args.first(),
+            crate::builtins::Builtin::IteratorNth => raw_generic_args.first(),
             crate::builtins::Builtin::IntoIter => raw_generic_args.first(),
             _ => return false,
         };
@@ -7325,6 +7372,13 @@ let inner = match (&src, target) {
         let modelled = match kind {
             crate::builtins::Builtin::IteratorNextBack => {
                 crate::builtins::iterator_next_back_modelled(&tag)
+            }
+            crate::builtins::Builtin::IteratorCount
+            | crate::builtins::Builtin::IteratorFold
+            | crate::builtins::Builtin::IteratorForEach
+            | crate::builtins::Builtin::IteratorCollect
+            | crate::builtins::Builtin::IteratorNth => {
+                crate::builtins::iterator_consumer_modelled(&tag)
             }
             _ => crate::builtins::iterator_next_modelled(&tag),
         };
@@ -7665,6 +7719,7 @@ let inner = match (&src, target) {
             target: target.map(|b| ir::BasicBlock(b.index())),
             drop_glue: None,
             consumed_glue: None,
+            skipped_glue: None,
             cmp_discriminants: None,
             result_unsize: None,
             unique_elem: None,
@@ -7716,6 +7771,7 @@ let inner = match (&src, target) {
             target: target.map(|b| ir::BasicBlock(b.index())),
             drop_glue: None,
             consumed_glue: None,
+            skipped_glue: None,
             cmp_discriminants: None,
             result_unsize: None,
             unique_elem: None,
@@ -8733,6 +8789,45 @@ let inner = match (&src, target) {
                         }
                         .and_then(|ty| self.drop_glue(ty))
                         .filter(|glue| glue.root != ir::DropPlan::Trivial);
+                        // An `Iterator::nth` call consumes the
+                        // items its skip loop passes over: build
+                        // the item type's glue now (see
+                        // `skipped_glue` in `ir`), so the
+                        // interpreter can run it against each
+                        // skipped item. The item type is the
+                        // destination type's `Option` argument.
+                        // A trivial glue has nothing to run; a
+                        // glue that cannot be accounted for
+                        // keeps the plain call, the treatment
+                        // these calls have always had.
+                        let skipped_glue = if matches!(
+                            kind,
+                            crate::builtins::Builtin::IteratorNth
+                        ) {
+                            self.place_ty(body, destination)
+                                .and_then(|dest_ty| match dest_ty {
+                                    mir::Ty::Adt(def, args) => {
+                                        let name = self
+                                            .names
+                                            .get(&def)
+                                            .or_else(|| {
+                                                self.def_names.get(&def)
+                                            })?;
+                                        if name == "std::option::Option" {
+                                            args.into_iter().next()
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    _ => None,
+                                })
+                                .and_then(|ty| self.drop_glue(&ty))
+                                .filter(|glue| {
+                                    glue.root != ir::DropPlan::Trivial
+                                })
+                        } else {
+                            None
+                        };
                         // A `box_assume_init_into_vec_unsafe` call
                         // asserts its source array is fully
                         // initialized; an element slot that still
@@ -8765,6 +8860,7 @@ let inner = match (&src, target) {
                                 target: target.map(|b| ir::BasicBlock(b.index())),
                                 drop_glue,
                                 consumed_glue,
+                                skipped_glue,
                                 cmp_discriminants,
                                 result_unsize,
                                 unique_elem,
