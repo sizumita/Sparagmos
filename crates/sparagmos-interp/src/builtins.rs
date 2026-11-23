@@ -6029,7 +6029,7 @@ impl<'a> Interpreter<'a> {
                 let path = std::env::current_exe().map_err(|e| {
                     unsupported(format!("current_exe is not available in this run: {e}"))
                 })?;
-                Ok(ok_result(path_buf_value(&path)))
+                Ok(ok_result(pathbuf_value(&host_path_bytes(&path))))
             }
             Builtin::ProcessId => {
                 arity(0)?;
@@ -7004,18 +7004,18 @@ impl<'a> Interpreter<'a> {
                 arity(0)?;
                 Ok(io_result_from_host(
                     std::env::current_dir()
-                        .map(|dir| path_buf_value(&dir)),
+                        .map(|dir| pathbuf_value(&host_path_bytes(&dir))),
                 ))
             }
             Builtin::EnvTempDir => {
                 arity(0)?;
-                Ok(path_buf_value(&std::env::temp_dir()))
+                Ok(pathbuf_value(&host_path_bytes(&std::env::temp_dir())))
             }
             Builtin::EnvHomeDir => {
                 arity(0)?;
                 Ok(match std::env::home_dir() {
                     Some(dir) => {
-                        some_value(path_buf_value(&dir))
+                        some_value(pathbuf_value(&host_path_bytes(&dir)))
                     }
                     None => none_value(),
                 })
@@ -16132,37 +16132,7 @@ fn value_fingerprint(value: &Value) -> u64 {
     }
 
     fn path_bytes(&self, frames: &[Frame], value: &Value) -> InterpResult<Vec<u8>> {
-        match value {
-            Value::Str(text) => Ok(text.clone().into_bytes()),
-            Value::Bytes(bytes) => Ok(bytes.clone()),
-            Value::FatRef { .. } => {
-                let (items, _) = self.slice_elements(frames, value)?;
-                let mut out = Vec::with_capacity(items.len());
-                for item in items {
-                    match item {
-                        Value::Uint(b) => out.push(b as u8),
-                        other => {
-                            return Err(InterpError::type_mismatch(
-                                "path bytes",
-                                "byte elements",
-                                other.kind_name(),
-                            ))
-                        }
-                    }
-                }
-                Ok(out)
-            }
-            Value::Ref(_) => {
-                let target = self.deref_value(frames, value)?;
-                let stored = self.read_resolved(frames, &target)?;
-                self.path_bytes(frames, &stored)
-            }
-            other => Err(InterpError::type_mismatch(
-                "path argument",
-                "path (fat pointer) value",
-                other.kind_name(),
-            )),
-        }
+        Ok(self.path_bytes_of(frames, value)?.0)
     }
 
     /// The file-table id of the `std::fs::File` handle a
@@ -23217,18 +23187,6 @@ fn process_spawn_error(state: &crate::interp::CommandState) -> Option<Value> {
     match resolve_program(state) {
         Ok(()) => None,
         Err(code) => Some(io_os_error_value(code)),
-    }
-}
-
-/// A `PathBuf` value holding `path`: the path is the string
-/// data itself, wrapped in the `OsString` field.
-fn path_buf_value(path: &std::path::Path) -> Value {
-    Value::Enum {
-        variant: 0,
-        fields: vec![Value::Enum {
-            variant: 0,
-            fields: vec![Value::Str(path.to_string_lossy().into_owned())],
-        }],
     }
 }
 
