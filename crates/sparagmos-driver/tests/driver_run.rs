@@ -6918,6 +6918,54 @@ fn run_mode_box_sized_field_read_write_through_deref() {
     );
 }
 
+const BOX_NEW_UNINIT_ASSUME_INIT_SRC: &str = r#"
+use std::mem::MaybeUninit;
+struct P { x: u32, y: u32 }
+fn main() {
+    let mut b: Box<MaybeUninit<(u32, u32)>> = Box::new_uninit();
+    unsafe { b.as_mut_ptr().write((11, 22)); }
+    let mut b = unsafe { b.assume_init() };
+    println!("{} {}", b.0, b.1);
+    b.0 = 99;
+    println!("{} {}", b.0, b.1);
+    let mut a: Box<MaybeUninit<[u32; 3]>> = Box::new_uninit();
+    unsafe { a.as_mut_ptr().write([7, 8, 9]); }
+    let a = unsafe { a.assume_init() };
+    println!("{} {} {}", a[0], a[1], a[2]);
+    let mut p: Box<MaybeUninit<P>> = Box::new_uninit();
+    unsafe { p.as_mut_ptr().write(P { x: 5, y: 6 }); }
+    let p = unsafe { p.assume_init() };
+    println!("{} {}", p.x, p.y);
+}
+"#;
+
+#[test]
+fn run_mode_box_new_uninit_assume_init_reads_payload() {
+    // `Box::new_uninit` + `write` + `assume_init`: the payload
+    // was written through the wrapper-entering `as_mut_ptr`
+    // pointer, and `assume_init`'s transmute retargets the box
+    // without the entry step, so the reads and writes through
+    // the retargeted box must still address the payload --
+    // tuple fields, array elements and struct fields alike.
+    let dir = temp_dir("box-new-uninit-assume-init");
+    let src = fixture(
+        &dir,
+        "box_new_uninit_assume_init.rs",
+        BOX_NEW_UNINIT_ASSUME_INIT_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Box::new_uninit + assume_init payload access must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "11 22\n99 22\n7 8 9\n5 6\n"
+    );
+}
+
 const BOX_DYN_TUPLE_PAYLOAD_SRC: &str = r#"
 trait G { fn get(&self) -> i32; }
 struct M(i32);

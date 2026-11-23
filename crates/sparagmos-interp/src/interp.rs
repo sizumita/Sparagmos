@@ -6761,6 +6761,15 @@ impl<'a> Interpreter<'a> {
             local: place.local.0,
             projection: Vec::new(),
         };
+        // The declared type of the position `cur` has reached,
+        // tracked alongside the walk for the steps the IR type
+        // alone types (tuple fields, array elements, reference
+        // pointees). An ADT field step loses it: the interpreter
+        // keeps no field-type table for ADT instances, so the
+        // type is unknown from there on. The dereference arm
+        // consults it for the `MaybeUninit` entry decision (see
+        // `peel_maybe_uninit_entry`).
+        let mut cur_ty: Option<Ty> = body.local_ty(place.local).cloned();
         // The length a `Deref` step through a fat pointer carries:
         // dereferencing a sub-slice reference reaches the base
         // place, whose own length is longer, so the fat length is
@@ -6773,10 +6782,16 @@ impl<'a> Interpreter<'a> {
             cur = match elem {
                 ProjectionElem::Field(idx) => {
                     fat_cap = None;
+                    cur_ty = match &cur_ty {
+                        Some(Ty::Tuple(ts)) => ts.get(*idx as usize).cloned(),
+                        Some(Ty::Array(elem, _)) => Some((**elem).clone()),
+                        _ => None,
+                    };
                     self.project_step(frames, cur, RefProj::Field(*idx), body, place)?
                 }
                 ProjectionElem::UnionField { idx, table } => {
                     fat_cap = None;
+                    cur_ty = None;
                     self.project_step(
                         frames,
                         cur,
@@ -6799,6 +6814,12 @@ impl<'a> Interpreter<'a> {
                         }
                     }
                     fat_cap = None;
+                    cur_ty = match &cur_ty {
+                        Some(Ty::Array(elem, _)) | Some(Ty::Slice(elem)) => {
+                            Some((**elem).clone())
+                        }
+                        _ => None,
+                    };
                     match via_fat.then(|| compose_fat_index(&cur, idx)).flatten() {
                         Some(composed) => composed,
                         None => {
@@ -6826,6 +6847,12 @@ impl<'a> Interpreter<'a> {
                         !self.deref_denotes_storage(frames, &cur, cap)
                     });
                     fat_cap = None;
+                    cur_ty = match &cur_ty {
+                        Some(Ty::Array(elem, _)) | Some(Ty::Slice(elem)) => {
+                            Some((**elem).clone())
+                        }
+                        _ => None,
+                    };
                     let idx = if *from_end {
                         len.checked_sub(*offset as u128).ok_or_else(|| {
                             index_oob(len as usize, *offset as usize)
@@ -6873,6 +6900,12 @@ impl<'a> Interpreter<'a> {
                     };
                     fat_cap = None;
                     let (offset, sub_len) = subslice_offset_len(*from, *to, *from_end, len)?;
+                    cur_ty = match &cur_ty {
+                        Some(Ty::Array(elem, _)) | Some(Ty::Slice(elem)) => {
+                            Some(Ty::Slice(elem.clone()))
+                        }
+                        _ => None,
+                    };
                     self.project_step(
                         frames,
                         cur,
@@ -6889,12 +6922,49 @@ impl<'a> Interpreter<'a> {
                     self.project_step(frames, cur, RefProj::Downcast(*variant), body, place)?
                 }
                 ProjectionElem::Deref => {
+                    let pointee_ty = match &cur_ty {
+                        Some(Ty::Ref(inner)) => Some((**inner).clone()),
+                        _ => None,
+                    };
                     let value = self.read_resolved(frames, &cur)?;
                     fat_cap = match &value {
                         Value::FatRef { len, .. } => Some(*len),
                         _ => None,
                     };
                     let resolved = self.deref_value(frames, &value)?;
+                    let resolved = match &pointee_ty {
+                        Some(pointee) => {
+                            self.peel_maybe_uninit_entry(frames, resolved, pointee)
+                        }
+                        None => {
+                            // A dereference of an ADT-typed
+                            // place (a `Box` local) carries no
+                            // pointee type in this walk. When the
+                            // next step indexes, the position must
+                            // be array storage, whose own value
+                            // form is a tuple/byte block -- never a
+                            // one-field enum -- so a one-field enum
+                            // there is a wrapper layer the index
+                            // would otherwise consume as an
+                            // element (see `peel_wrapper_for_index`).
+                            let next_is_index = matches!(
+                                place.projection.get(step_idx + 1),
+                                Some(
+                                    ProjectionElem::Index(_)
+                                        | ProjectionElem::ConstantIndex { .. }
+                                        | ProjectionElem::Subslice { .. },
+                                )
+                            );
+                            if next_is_index
+                                && matches!(cur_ty, Some(Ty::Adt(..)))
+                            {
+                                self.peel_wrapper_for_index(frames, resolved)
+                            } else {
+                                resolved
+                            }
+                        }
+                    };
+                    cur_ty = pointee_ty;
                     // A raw allocation block holds its elements
                     // as a tuple: a trailing dereference of its
                     // base pointer denotes the first element,
@@ -6927,6 +6997,178 @@ impl<'a> Interpreter<'a> {
             };
         }
         Ok(cur)
+    }
+
+    /// The `MaybeUninit` entry a dereference crosses when the
+    /// pointer's declared pointee is the payload type but the
+    /// storage at the resolved position still carries the
+    /// union's wrapper layer.
+    ///
+    /// The storage keeps the wrapper form whenever the payload
+    /// was written through a pointer whose own projection enters
+    /// the wrapper first (the `as_mut_ptr` cast appends that
+    /// entry step), and pointers that reach the same allocation
+    /// without the entry step -- the transmute-retargeted box
+    /// `Box::assume_init` produces is the canonical case -- then
+    /// read the wrapper itself where the payload is expected.
+    /// The dereference is the one place that knows both sides:
+    /// the declared pointee from the projection walk and the
+    /// stored value at the resolved position. When the stored
+    /// value is an enum whose first field is the pointee's
+    /// value form, the resolution descends the entry step, so
+    /// reads, writes, moves and drops all address the payload.
+    ///
+    /// The descent is refused whenever the wrapper reading could
+    /// be the position's own value: a `MaybeUninit` pointee is
+    /// read as the wrapper by definition; a one-field ADT's own
+    /// value is indistinguishable from the wrapper form (its
+    /// debug shape reports one field), as is a union's; a slice
+    /// pointee is never entered here. An unreadable or absent
+    /// stored value keeps the unentered resolution, so error
+    /// behaviour on uninitialised storage is unchanged.
+    fn peel_maybe_uninit_entry(
+        &self,
+        frames: &[Frame],
+        resolved: Resolved,
+        pointee: &Ty,
+    ) -> Resolved {
+        if matches!(pointee, Ty::Adt(name)
+            if name.starts_with("std::mem::MaybeUninit")
+                || name.starts_with("core::mem::MaybeUninit"))
+        {
+            return resolved;
+        }
+        let Ok(stored) = self.read_resolved(frames, &resolved) else {
+            return resolved;
+        };
+        let Value::Enum { variant, fields } = &stored else {
+            return resolved;
+        };
+        // The payload sits in the wrapper's first field. A
+        // union skeleton can leave further member slots behind
+        // it (an array payload's skeleton materialises both
+        // `MaybeUninit` members, and the payload write replaces
+        // only the first), so for a non-ADT pointee the entry
+        // decision rests on the first field alone: at a position
+        // whose declared type is not itself an ADT, an enum
+        // value is never the position's own value -- it is the
+        // wrapper layer. For an ADT pointee the stored enum may
+        // BE the ADT's own value, so the descent requires the
+        // stricter wrapper evidence of `wrapper_payload_matches`:
+        // a one-field stored enum whose field is itself the
+        // ADT's complete value form.
+        let Some(field) = fields.first() else {
+            return resolved;
+        };
+        if !self.wrapper_payload_matches(field, *variant, pointee, fields.len()) {
+            return resolved;
+        }
+        enter_wrapper_field(resolved)
+    }
+
+    /// The `MaybeUninit` entry for the dereference of an
+    /// ADT-typed place (a `Box` local) directly followed by an
+    /// index-like step, where the walk carries no pointee type:
+    /// the indexed position is array storage, and array storage's
+    /// own value form in this model is a tuple or byte block, so
+    /// an enum whose first field is one of those at the resolved
+    /// position can only be the wrapper layer (a
+    /// `Box<MaybeUninit<[T; N]>>` retargeted by `assume_init`'s
+    /// transmute). Without the entry the index step reads the
+    /// wrapper's sole field -- the whole array -- as element 0.
+    fn peel_wrapper_for_index(
+        &self,
+        frames: &[Frame],
+        resolved: Resolved,
+    ) -> Resolved {
+        let Ok(stored) = self.read_resolved(frames, &resolved) else {
+            return resolved;
+        };
+        let Value::Enum { fields, .. } = &stored else {
+            return resolved;
+        };
+        let Some(field) = fields.first() else {
+            return resolved;
+        };
+        if !matches!(field, Value::Tuple(_) | Value::Bytes(_)) {
+            return resolved;
+        }
+        enter_wrapper_field(resolved)
+    }
+
+    /// Whether `field`, the first field of the value stored at
+    /// a dereferenced position, is the value form of the
+    /// declared pointee type -- the evidence that the stored
+    /// enum is a `MaybeUninit` wrapper around the pointee rather
+    /// than the position's own value. For an ADT pointee a
+    /// stored enum whose field count is the declared count of
+    /// its variant in the type's debug shape is the ADT's value
+    /// itself, and only a one-field stored enum whose field is
+    /// itself a complete value of the ADT (an enum carrying its
+    /// variant's declared field count) is a wrapper around it.
+    /// A one-field ADT's own value stays ambiguous with its
+    /// wrapper and is not entered; a union's fields are read
+    /// through union steps, never through this entry.
+    fn wrapper_payload_matches(
+        &self,
+        field: &Value,
+        stored_variant: u32,
+        pointee: &Ty,
+        stored_fields: usize,
+    ) -> bool {
+        match (pointee, field) {
+            (Ty::Tuple(ts), Value::Tuple(items)) => items.len() == ts.len(),
+            (Ty::Array(_, n), Value::Tuple(items)) => items.len() as u64 == *n,
+            (Ty::Array(elem, n), Value::Bytes(b)) => {
+                matches!(**elem, Ty::Uint(UintTy::U8)) && b.len() as u64 == *n
+            }
+            (Ty::Uint(_), Value::Uint(_)) => true,
+            (Ty::Int(_), Value::Int(_)) => true,
+            (Ty::Bool, Value::Bool(_)) => true,
+            (Ty::Float(_), Value::Float(_) | Value::Float128(_)) => true,
+            (Ty::Unit, Value::Unit) => true,
+            (
+                Ty::Ref(_),
+                Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. },
+            ) => true,
+            (Ty::Str, Value::Str(_) | Value::Bytes(_)) => true,
+            (Ty::FnPtr | Ty::FnDef(_), Value::FnPtr(_)) => true,
+            (Ty::Closure(..), Value::Closure { .. }) => true,
+            (Ty::Coroutine(..), Value::Coroutine { .. }) => true,
+            (
+                Ty::Adt(name),
+                Value::Enum {
+                    variant: inner_variant,
+                    fields: inner_fields,
+                },
+            ) => {
+                match self.program.adt_debug_shapes.get(name) {
+                    Some(shape)
+                        if shape.kind
+                            != sparagmos_mir::AdtShapeKind::Union =>
+                    {
+                        // A stored enum whose field count is the
+                        // declared count of its own variant is the
+                        // ADT's value itself, however deep its
+                        // one-field chains run -- never a wrapper.
+                        let own_value = shape
+                            .variants
+                            .get(stored_variant as usize)
+                            .is_some_and(|v| v.fields.len() == stored_fields);
+                        !own_value
+                            && stored_fields == 1
+                            && shape
+                                .variants
+                                .get(*inner_variant as usize)
+                                .is_some_and(|v| {
+                                    v.fields.len() == inner_fields.len()
+                                })
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
     }
 
     /// The length carried by the fat pointer a place's final
@@ -13406,6 +13648,46 @@ fn entered_element_container(cur: &Resolved) -> Option<(Resolved, usize)> {
         }
     }
     None
+}
+
+/// A resolved target descended through a one-field wrapper's
+/// entry step: the `Field(0)` a `MaybeUninit` (or like wrapper)
+/// layer adds between a pointer and its payload, appended to
+/// whichever store the target denotes.
+fn enter_wrapper_field(resolved: Resolved) -> Resolved {
+    let entered = RefProj::Field(0);
+    match resolved {
+        Resolved::Place {
+            frame_pos,
+            local,
+            mut projection,
+        } => {
+            projection.push(entered);
+            Resolved::Place {
+                frame_pos,
+                local,
+                projection,
+            }
+        }
+        Resolved::Alloc {
+            id,
+            mut projection,
+        } => {
+            projection.push(entered);
+            Resolved::Alloc { id, projection }
+        }
+        Resolved::Static {
+            name,
+            mut projection,
+        } => {
+            projection.push(entered);
+            Resolved::Static { name, projection }
+        }
+        Resolved::Value(base, mut projection) => {
+            projection.push(entered);
+            Resolved::Value(base, projection)
+        }
+    }
 }
 
 fn compose_fat_index(cur: &Resolved, idx: usize) -> Option<Resolved> {

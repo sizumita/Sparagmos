@@ -1218,6 +1218,25 @@ fn scalar_leaf_is_int(shape: &ir::ScalarShape) -> bool {
     }
 }
 
+/// Whether a scalar shape carries a thin pointer anywhere in
+/// its payload: the pointer is a place identity in this model,
+/// not a bit pattern, so a shape containing one cannot be
+/// reinterpreted bit-wise without losing what the pointer
+/// denotes.
+fn scalar_shape_has_ptr_leaf(shape: &ir::ScalarShape) -> bool {
+    match shape {
+        ir::ScalarShape::Ptr => true,
+        ir::ScalarShape::AdtField { inner, .. } => {
+            scalar_shape_has_ptr_leaf(inner)
+        }
+        ir::ScalarShape::NicheEnum { inner, .. } => {
+            scalar_shape_has_ptr_leaf(inner)
+        }
+        ir::ScalarShape::Array(elem, _) => scalar_shape_has_ptr_leaf(elem),
+        _ => false,
+    }
+}
+
 fn is_thin_ptr_ty(ty: &mir::Ty) -> bool {
     match ty {
         mir::Ty::RawPtr(pointee, _) | mir::Ty::Ref(_, pointee, _) => !matches!(
@@ -4291,17 +4310,44 @@ impl<'a> Converter<'a> {
         // result this does not reproduce (fieldless enums carry
         // no scalar shape, and the bare pointer pairs are claimed
         // by their own arms before this one is reached).
+        let shape_to = self.scalar_shape(target, 0);
+        let shape_from = match &src {
+            Some(s) => self.scalar_shape(s, 0),
+            // A constant operand carries no place type; its
+            // shape comes from the constant itself (see
+            // `constant_scalar_shape`).
+            None => shape_to
+                .as_ref()
+                .and_then(|t| self.constant_scalar_shape(v, t.bits())),
+        };
+        // A transmute between two ADTs of identical scalar
+        // shape whose shape carries a thin pointer: the value's
+        // only payload is the pointer itself, whose place
+        // identity a bit reinterpretation would reduce to an
+        // address-only reference that no longer reads the
+        // pointee (the same reason the bare-pointer pairs below
+        // stay with their specialised arms). The two sides
+        // interpret the stored value identically -- the wrapper
+        // layers add no representation of their own in this
+        // model, and the pointee type lives in the destination's
+        // declared type -- so the value carries over unchanged.
+        // `Box<MaybeUninit<T>>` -> `Box<T>`, the transmute
+        // `Box::assume_init` performs, is the canonical case:
+        // reinterpretation rebuilt the box aggregate around the
+        // pointer's synthetic address, and every later read of
+        // the pointee missed the allocation.
+        let ptr_identity = matches!(
+            (&src, target),
+            (Some(mir::Ty::Adt(..)), mir::Ty::Adt(..))
+        ) && match (&shape_from, &shape_to) {
+            (Some(from), Some(to)) => {
+                from == to && scalar_shape_has_ptr_leaf(from)
+            }
+            _ => false,
+        };
         let generic = {
-            let to = self.scalar_shape(target, 0);
-            let from = match &src {
-                Some(s) => self.scalar_shape(s, 0),
-                // A constant operand carries no place type; its
-                // shape comes from the constant itself (see
-                // `constant_scalar_shape`).
-                None => to
-                    .as_ref()
-                    .and_then(|t| self.constant_scalar_shape(v, t.bits())),
-            };
+            let to = shape_to.clone();
+            let from = shape_from.clone();
             match (from, to) {
                 (Some(from), Some(to))
                     if from.bits() == to.bits() && from.bits() > 0 =>
@@ -4501,6 +4547,11 @@ let inner = match (&src, target) {
             // Integer -> thin pointer: an address-only reference.
             (_, t) if src_is_int && is_thin_ptr_ty(t) => {
                 ir::Rvalue::IntToPtr(v.clone())
+            }
+            // ADT -> ADT of identical pointer-carrying shape:
+            // the value itself (see `ptr_identity` above).
+            (Some(mir::Ty::Adt(..)), mir::Ty::Adt(..)) if ptr_identity => {
+                ir::Rvalue::Use(v.clone())
             }
             // Scalar-shaped -> scalar-shaped of the same width:
             // the bit-level reinterpretation (float <-> integer
