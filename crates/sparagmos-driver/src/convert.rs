@@ -83,6 +83,27 @@ pub fn drop_glue_lang_item_defined() -> bool {
         .is_some()
 }
 
+/// Whether the static `def` is a foreign static (an item of an
+/// `extern` block). A foreign static has no initializer by
+/// construction, and asking the compiler to evaluate one ICEs
+/// inside the typeck query ("can't type-check body of ..."):
+/// evaluating a static initializer goes through the item's MIR
+/// body, which a foreign item does not have. The ICE diagnostic
+/// poisons the whole compilation even when the panic itself is
+/// contained, so the evaluation must not be attempted — callers
+/// handle the storage without it (a reference decoded against
+/// an uninitialized seed, or no decode at all).
+/// Outside a compilation callback there is no context to ask;
+/// the static is reported non-foreign, preserving the caller's
+/// plain behavior.
+fn static_is_foreign(def: &mir::mono::StaticDef) -> bool {
+    let Some(tcx) = compiler_tcx() else {
+        return false;
+    };
+    let internal = rustc_public::rustc_internal::internal(tcx, def.def_id());
+    tcx.is_foreign_item(internal)
+}
+
 /// Per-run converter state (DefId assignment) plus per-function error bag.
 pub struct Converter {
     def_ids: HashMap<rustc_public::DefId, u32>,
@@ -1020,12 +1041,13 @@ impl Converter {
     }
 
     /// Record the declared type of a static item. Called by the
-    /// item scan before any conversion: a reference into a static's
-    /// interior is decoded against the static's own type (its seed
-    /// is the full initializer and the reference carries a
-    /// projection into it), and the type query is only safe for
-    /// real items, so it is asked there, never from the constant
-    /// decoder.
+    /// item scan before any conversion, and by the foreign-static
+    /// reference decoder for the statics the scan does not
+    /// enumerate: a reference into a static's interior is decoded
+    /// against the static's own type (its seed is the full
+    /// initializer and the reference carries a projection into
+    /// it), and the type query is only safe for real items, so it
+    /// is asked only at points that hold one.
     pub fn note_static_ty<D: CrateDef>(&mut self, def: &D, ty: rustc_public::ty::Ty) {
         let id = self.crate_def_id(def);
         let mir_ty = self.ty(&ty);
@@ -1057,6 +1079,9 @@ impl Converter {
         let Ok(def) = mir::mono::StaticDef::try_from(item.clone()) else {
             return;
         };
+        if static_is_foreign(&def) {
+            return;
+        }
         let Ok(alloc) = def.eval_initializer() else {
             return;
         };
@@ -3637,6 +3662,9 @@ impl Converter {
                 Some(sm::ConstValue::Ref(Box::new(block)))
             }
             mir::alloc::GlobalAlloc::Static(def) => {
+                if static_is_foreign(&def) {
+                    return None;
+                }
                 let init = def.eval_initializer().ok()?;
                 let block = self.decode_erased_alloc(&init, target_off, depth + 1)?;
                 Some(sm::ConstValue::Ref(Box::new(block)))
@@ -3777,6 +3805,95 @@ impl Converter {
         }
     }
 
+    /// Decode a reference whose provenance names a foreign
+    /// static (an item of an `extern` block). A foreign static
+    /// has no initializer to decode — asking the compiler for
+    /// one ICEs (see `static_is_foreign`) — so the reference
+    /// denotes the static's program-level storage with an
+    /// uninitialized seed: address-only uses (the common case:
+    /// `addr_of!`, raw-pointer casts, comparisons) observe the
+    /// storage's identity, writes through a mutable reference
+    /// land in the store like any other static's, and reads of
+    /// never-written storage meet the interpreter's
+    /// uninitialized-read error instead of an invented value.
+    /// A pointee whose decoded form IS the contents (a `str`)
+    /// cannot be represented this way and stays undecodable,
+    /// as does a slice reference whose backing array cannot be
+    /// located in the static's declared type (see
+    /// `static_slice_path`).
+    fn decode_foreign_static_ref(
+        &mut self,
+        def: &mir::mono::StaticDef,
+        inner: &rustc_public::ty::Ty,
+        alloc: &Allocation,
+        offset: usize,
+        target_off: usize,
+        depth: usize,
+    ) -> Option<sm::ConstValue> {
+        let def_id = self.crate_def_id(def);
+        // The item scan does not enumerate foreign statics, so
+        // the declared type is recorded here, at the first decode
+        // that names the static: the interpreter expands a
+        // whole-static reference's seed to the recorded type's
+        // extent, and a fat slice reference's seed in particular
+        // must not be sized by the slice's own (possibly prefix)
+        // length. The query is the one the projection
+        // computations below already make of this definition --
+        // a foreign static is a real item, unlike the anonymous
+        // promoted statics the type query is unsafe for -- and it
+        // is contained the way the item scan contains it.
+        if !self.static_tys.contains_key(&def_id) {
+            if let Ok(ty) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| def.ty()))
+            {
+                self.note_static_ty(def, ty);
+            }
+        }
+        match inner.kind() {
+            TyKind::RigidTy(RigidTy::Slice(elem)) => {
+                if matches!(elem.kind(), TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8))) {
+                    return None;
+                }
+                let count = read_uint_at(alloc, offset + PTR_SIZE, PTR_SIZE)? as usize;
+                // The projection names the slice's backing array
+                // inside the static's declared type (the whole
+                // array, an array field, an array element): an
+                // empty projection for a field's array would make
+                // the slice view index the static's whole value
+                // instead of the field. A slice whose backing
+                // array cannot be located stays undecodable.
+                let projection =
+                    self.static_slice_path(&def.ty(), target_off, &elem, count, depth)?;
+                Some(sm::ConstValue::StaticRef {
+                    def: def_id,
+                    value: Box::new(sm::ConstValue::Uninit),
+                    projection,
+                    len: Some(count as u64),
+                })
+            }
+            TyKind::RigidTy(RigidTy::Str) => None,
+            _ => {
+                // The projection is computed exactly as for a
+                // non-foreign static, at offset zero too: a
+                // pointer to the first element or field of an
+                // aggregate static denotes that sub-value, not
+                // the whole static (an empty projection would
+                // make a write through the pointer replace the
+                // complete storage). `static_offset_path` yields
+                // the empty path itself when the pointee IS the
+                // whole static.
+                let projection =
+                    self.static_offset_path(&def.ty(), target_off, inner, depth)?;
+                Some(sm::ConstValue::StaticRef {
+                    def: def_id,
+                    value: Box::new(sm::ConstValue::Uninit),
+                    projection,
+                    len: None,
+                })
+            }
+        }
+    }
+
     fn decode_ref(
         &mut self,
         inner: &rustc_public::ty::Ty,
@@ -3840,6 +3957,10 @@ impl Converter {
             // and writes through the program-level statics store
             // instead of a per-constant snapshot.
             mir::alloc::GlobalAlloc::Static(def) => {
+                if static_is_foreign(&def) {
+                    return self
+                        .decode_foreign_static_ref(&def, inner, alloc, offset, target_off, depth);
+                }
                 let init = def.eval_initializer().ok()?;
                 (init, Some(def))
             }
@@ -4185,6 +4306,140 @@ impl Converter {
             }
             _ => None,
         }
+    }
+
+    /// The projection path from the base of a value of type
+    /// `ty` to the array at byte offset `off` whose element type
+    /// is `elem` and whose length is `count` \u2014 the backing
+    /// array of a fat slice reference into a static's storage.
+    /// The descent mirrors `static_offset_path`, with the array
+    /// itself as the leaf: a slice starting at an array's base
+    /// and fitting inside it denotes that array (the empty path;
+    /// the reference's length word bounds the view), and an
+    /// array element that is itself the backing array is
+    /// reached through a constant index.
+    fn static_slice_path(
+        &mut self,
+        ty: &rustc_public::ty::Ty,
+        off: usize,
+        elem: &rustc_public::ty::Ty,
+        count: usize,
+        depth: usize,
+    ) -> Option<Vec<sm::PlaceElem>> {
+        if depth > MAX_CONST_DEPTH {
+            return None;
+        }
+        match ty.kind() {
+            TyKind::RigidTy(RigidTy::Array(arr_elem, arr_len)) => {
+                if arr_elem == *elem && off == 0 {
+                    // The slice starts at this array's base and
+                    // denotes the array itself when it fits.
+                    if count as u64 <= arr_len.eval_target_usize().ok()? {
+                        return Some(Vec::new());
+                    }
+                    return None;
+                }
+                // An array element that is itself the backing
+                // array, reached at its own offset.
+                let stride = arr_elem.layout().ok()?.shape().size.bytes() as usize;
+                if stride == 0 || off % stride != 0 {
+                    return None;
+                }
+                let idx = off / stride;
+                let total =
+                    ty.layout().ok()?.shape().size.bytes() as usize / stride;
+                if idx >= total {
+                    return None;
+                }
+                let mut rest =
+                    self.static_slice_path(&arr_elem, 0, elem, count, depth + 1)?;
+                let mut path = vec![sm::PlaceElem::ConstantIndex {
+                    offset: idx as u64,
+                    min_length: total as u64,
+                    from_end: false,
+                }];
+                path.append(&mut rest);
+                Some(path)
+            }
+            TyKind::RigidTy(RigidTy::Adt(def, args)) => match def.kind() {
+                AdtKind::Struct => {
+                    let variant = def.variant(VariantIdx::to_val(0))?;
+                    let offsets = arbitrary_offsets(ty)?;
+                    let fields: Vec<(rustc_public::ty::Ty, usize)> = variant
+                        .fields()
+                        .iter()
+                        .map(|f| f.ty_with_args(&args))
+                        .zip(offsets)
+                        .collect();
+                    let (i, fty, mut rest) =
+                        self.record_slice_path(&fields, off, elem, count, depth)?;
+                    let mut path = vec![sm::PlaceElem::Field(i as u32, self.ty(&fty))];
+                    path.append(&mut rest);
+                    Some(path)
+                }
+                AdtKind::Union => {
+                    let variant = def.variant(VariantIdx::to_val(0))?;
+                    let fields: Vec<(rustc_public::ty::Ty, usize)> = variant
+                        .fields()
+                        .iter()
+                        .map(|f| (f.ty_with_args(&args), 0))
+                        .collect();
+                    let (i, fty, mut rest) =
+                        self.record_slice_path(&fields, off, elem, count, depth)?;
+                    let mut path = vec![sm::PlaceElem::Field(i as u32, self.ty(&fty))];
+                    path.append(&mut rest);
+                    Some(path)
+                }
+                AdtKind::Enum => None,
+            },
+            TyKind::RigidTy(RigidTy::Tuple(elems)) => {
+                let offsets = arbitrary_offsets(ty)?;
+                let fields: Vec<(rustc_public::ty::Ty, usize)> =
+                    elems.iter().cloned().zip(offsets).collect();
+                let (i, fty, mut rest) =
+                    self.record_slice_path(&fields, off, elem, count, depth)?;
+                let mut path = vec![sm::PlaceElem::Field(i as u32, self.ty(&fty))];
+                path.append(&mut rest);
+                Some(path)
+            }
+            _ => None,
+        }
+    }
+
+    /// Find the record field (type and byte offset within the
+    /// record) that contains `off` and from which the backing
+    /// array of a slice reference (element type `elem`, length
+    /// `count`) is reachable, returning the field index, the
+    /// field's type, and the remaining path from that field.
+    /// Mirrors `record_offset_path`, with `static_slice_path`
+    /// as the reachability test.
+    fn record_slice_path(
+        &mut self,
+        fields: &[(rustc_public::ty::Ty, usize)],
+        off: usize,
+        elem: &rustc_public::ty::Ty,
+        count: usize,
+        depth: usize,
+    ) -> Option<(usize, rustc_public::ty::Ty, Vec<sm::PlaceElem>)> {
+        for (i, (fty, foff)) in fields.iter().enumerate() {
+            if *foff > off {
+                continue;
+            }
+            let size = fty.layout().ok()?.shape().size.bytes() as usize;
+            // A field contains `off` when it starts at or before
+            // it and ends after it; a zero-sized field contains
+            // only its own offset.
+            let contains = if size == 0 { *foff == off } else { off < foff + size };
+            if !contains {
+                continue;
+            }
+            if let Some(rest) =
+                self.static_slice_path(fty, off - foff, elem, count, depth + 1)
+            {
+                return Some((i, fty.clone(), rest));
+            }
+        }
+        None
     }
 
     /// Find the record field (type and byte offset within the

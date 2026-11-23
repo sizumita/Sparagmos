@@ -25875,3 +25875,415 @@ fn run_mode_transmute_niche_range_wraps_at_shifted_scalar() {
         "2 1 1344\n0 65114\n",
     );
 }
+
+
+
+const EXTERN_STATIC_CONVERT_SRC: &str = r#"
+pub mod inner {
+    extern "C" {
+        pub static GLOBAL1: u8;
+        pub static mut GLOBAL2: u32;
+        pub static GLOBAL3: [u8; 1];
+    }
+    pub fn call() {
+        let _a = std::ptr::addr_of!(GLOBAL1);
+        let _b = std::ptr::addr_of_mut!(GLOBAL2);
+        let _c = std::ptr::addr_of!(GLOBAL3);
+    }
+}
+fn main() { inner::call(); }
+"#;
+
+#[test]
+fn convert_mode_extern_static_reference_converts() {
+    // A foreign static (an `extern` block item) has no
+    // initializer; asking the compiler to evaluate one ICEs
+    // inside the typeck query and used to crash the whole
+    // conversion (exit 101). The conversion must instead
+    // complete, with the reference denoting the static's
+    // program-level storage.
+    let dir = temp_dir("extern-static-convert");
+    let src = fixture(&dir, "case.rs", EXTERN_STATIC_CONVERT_SRC);
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "conversion must complete; stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("internal compiler error"),
+        "no compiler ICE may be involved; stderr={stderr}"
+    );
+    let main_line = stdout
+        .lines()
+        .find(|l| l.contains("::main:"))
+        .expect("summary lists main");
+    assert!(
+        main_line.contains("[converted]"),
+        "main is converted: {main_line}"
+    );
+    let target = stdout
+        .lines()
+        .find(|l| l.starts_with("target-crate converted:"))
+        .expect("summary reports the target crate counts");
+    assert!(
+        target.contains("skipped: 0"),
+        "the target crate converts completely: {target}"
+    );
+}
+
+const EXTERN_STATIC_INIT_SRC: &str = r#"
+extern "C" { static EXT_STAT: u32; }
+static R: &u32 = unsafe { &EXT_STAT };
+fn main() {
+    println!("nonnull={}", !std::ptr::addr_of!(*R).is_null());
+    println!("same={}", std::ptr::addr_of!(*R) == std::ptr::addr_of!(EXT_STAT));
+}
+"#;
+
+#[test]
+fn convert_mode_extern_static_in_static_initializer_converts() {
+    // The same reference reached through another static's
+    // initializer allocation (the shape of a vtable or a
+    // pointer table naming an extern static).
+    let dir = temp_dir("extern-static-init");
+    let src = fixture(&dir, "case.rs", EXTERN_STATIC_INIT_SRC);
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "conversion must complete; stderr={stderr}"
+    );
+    let target = stdout
+        .lines()
+        .find(|l| l.starts_with("target-crate converted:"))
+        .expect("summary reports the target crate counts");
+    assert!(
+        target.contains("skipped: 0"),
+        "the target crate converts completely: {target}"
+    );
+}
+
+#[test]
+fn run_mode_extern_static_initializer_reference_resolves() {
+    run_ok(
+        "extern-static-init-run",
+        EXTERN_STATIC_INIT_SRC,
+        "nonnull=true\nsame=true\n",
+    );
+}
+
+const EXTERN_STATIC_RUN_SRC: &str = r#"
+extern "C" {
+    static EXT_STAT: u32;
+    static mut EXT_MUT: u32;
+}
+fn main() {
+    let a = std::ptr::addr_of!(EXT_STAT);
+    let b = std::ptr::addr_of!(EXT_STAT);
+    println!("same={} nonnull={}", a == b, !a.is_null());
+    unsafe {
+        std::ptr::addr_of_mut!(EXT_MUT).write(42);
+        println!("roundtrip={}", std::ptr::addr_of!(EXT_MUT).read());
+    }
+}
+"#;
+
+#[test]
+fn run_mode_extern_static_address_identity_and_roundtrip() {
+    // The storage identity is observable (same address, not
+    // null) and the guest's own writes read back, even though
+    // the static's initial contents are not the interpreter's
+    // to invent.
+    run_ok(
+        "extern-static-run",
+        EXTERN_STATIC_RUN_SRC,
+        "same=true nonnull=true\nroundtrip=42\n",
+    );
+}
+
+const EXTERN_STATIC_READ_SRC: &str = r#"
+extern "C" { static EXT_STAT: u32; }
+fn main() {
+    let v = unsafe { std::ptr::addr_of!(EXT_STAT).read() };
+    println!("value={}", v);
+}
+"#;
+
+#[test]
+fn run_mode_extern_static_unwritten_read_is_explicit_error() {
+    // Reading storage the guest never wrote must meet the
+    // explicit uninitialized-read error, not a fabricated
+    // value and not a crash.
+    let dir = temp_dir("extern-static-read");
+    let src = fixture(&dir, "case.rs", EXTERN_STATIC_READ_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "the read is an explicit unsupported outcome; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("read of uninitialized place static"),
+        "the error names the uninitialized static read; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("EXT_STAT"),
+        "the error names the static; stderr={stderr}"
+    );
+}
+
+const EXTERN_STATIC_FIRST_ELEM_SRC: &str = r#"
+extern "C" {
+    static mut EXT_ARR: [u32; 2];
+}
+const FIRST: *mut u32 = unsafe { &raw mut EXT_ARR[0] };
+fn main() {
+    unsafe {
+        std::ptr::addr_of_mut!(EXT_ARR).write([10, 20]);
+        FIRST.write(33);
+        println!("e0={} e1={}", EXT_ARR[0], EXT_ARR[1]);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_extern_static_first_element_write_preserves_rest() {
+    // A constant pointer to the FIRST element of an aggregate
+    // foreign static has byte offset zero, but it denotes that
+    // element, not the whole static: the projection must say so,
+    // or a write through the pointer replaces the complete
+    // storage and the other element is lost.
+    run_ok(
+        "extern-static-first-elem",
+        EXTERN_STATIC_FIRST_ELEM_SRC,
+        "e0=33 e1=20\n",
+    );
+}
+
+const EXTERN_STATIC_SLICE_FIELD_SRC: &str = r#"
+#[repr(C)]
+pub struct Pair {
+    data: [u32; 2],
+    sentinel: u32,
+}
+extern "C" {
+    static mut EXT_PAIR: Pair;
+}
+const S: *mut [u32] = unsafe { &raw mut EXT_PAIR.data };
+fn main() {
+    unsafe {
+        std::ptr::addr_of_mut!(EXT_PAIR).write(Pair { data: [10, 20], sentinel: 7 });
+        (*S)[1] = 33;
+        println!(
+            "d0={} d1={} sentinel={}",
+            EXT_PAIR.data[0], EXT_PAIR.data[1], EXT_PAIR.sentinel
+        );
+    }
+}
+"#;
+
+#[test]
+fn run_mode_extern_static_slice_field_write_hits_field() {
+    // A constant slice pointer to an array FIELD of a foreign
+    // static: the field sits at byte offset zero, but the slice
+    // denotes the field's array, not the whole static. The
+    // projection must name the field, or a write through the
+    // slice indexes the static's whole value and lands on the
+    // wrong element (here it silently corrupted `sentinel`).
+    run_ok(
+        "extern-static-slice-field",
+        EXTERN_STATIC_SLICE_FIELD_SRC,
+        "d0=10 d1=33 sentinel=7\n",
+    );
+}
+
+const EXTERN_STATIC_SLICE_OFFSET_FIELD_SRC: &str = r#"
+#[repr(C)]
+pub struct Pair2 {
+    sentinel: u32,
+    data: [u32; 2],
+}
+extern "C" {
+    static mut EXT_PAIR2: Pair2;
+}
+const S2: *mut [u32] = unsafe { &raw mut EXT_PAIR2.data };
+fn main() {
+    unsafe {
+        std::ptr::addr_of_mut!(EXT_PAIR2).write(Pair2 { sentinel: 7, data: [10, 20] });
+        (*S2)[0] = 33;
+        println!(
+            "d0={} d1={} sentinel={}",
+            EXT_PAIR2.data[0], EXT_PAIR2.data[1], EXT_PAIR2.sentinel
+        );
+    }
+}
+"#;
+
+#[test]
+fn run_mode_extern_static_slice_offset_field_write_hits_field() {
+    // The same shape with the array field at a nonzero byte
+    // offset: the slice reference decodes with the field's
+    // projection instead of staying undecodable.
+    run_ok(
+        "extern-static-slice-offset-field",
+        EXTERN_STATIC_SLICE_OFFSET_FIELD_SRC,
+        "d0=33 d1=20 sentinel=7\n",
+    );
+}
+
+const EXTERN_STATIC_PREFIX_SLICE_SRC: &str = r#"
+extern "C" {
+    static mut EXT_ARR: [u32; 2];
+}
+const PREFIX: *mut [u32] =
+    unsafe { std::ptr::slice_from_raw_parts_mut(std::ptr::addr_of_mut!(EXT_ARR).cast::<u32>(), 1) };
+fn main() {
+    unsafe {
+        (*PREFIX)[0] = 10;
+        std::ptr::addr_of_mut!(EXT_ARR).cast::<u32>().add(1).write(20);
+        println!("e0={} e1={}", EXT_ARR[0], EXT_ARR[1]);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_extern_static_prefix_slice_keeps_full_storage() {
+    // A constant slice covering only a PREFIX of a foreign
+    // array static, evaluated before any whole-static access:
+    // the slice's length bounds the view it denotes, never the
+    // static's storage, so seeding the storage from this
+    // reference must still give it the declared array's full
+    // extent -- a later write to the second element is valid
+    // and must not fail a bounds check against a one-element
+    // stored value.
+    run_ok(
+        "extern-static-prefix-slice",
+        EXTERN_STATIC_PREFIX_SLICE_SRC,
+        "e0=10 e1=20\n",
+    );
+}
+
+const EXTERN_STATIC_INTERIOR_FIRST_SRC: &str = r#"
+extern "C" {
+    static mut EXT_ARR: [u32; 2];
+}
+const FIRST: *mut u32 = unsafe { &raw mut EXT_ARR[0] };
+fn main() {
+    unsafe {
+        FIRST.write(10);
+        std::ptr::addr_of_mut!(EXT_ARR).cast::<u32>().add(1).write(20);
+        println!("e0={} e1={}", EXT_ARR[0], EXT_ARR[1]);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_extern_static_interior_write_first_keeps_full_storage() {
+    // A constant pointer to one element of a foreign array
+    // static, written through before any whole-static access:
+    // the reference's seed is the static's full initializer, so
+    // the storage it seeds must have the declared array's full
+    // extent -- a later write to the second element is valid
+    // and must observe the first write.
+    run_ok(
+        "extern-static-interior-first",
+        EXTERN_STATIC_INTERIOR_FIRST_SRC,
+        "e0=10 e1=20\n",
+    );
+}
+
+const EXTERN_STATIC_FIELD_SLICE_FIRST_SRC: &str = r#"
+#[repr(C)]
+pub struct Pair {
+    data: [u32; 2],
+    sentinel: u32,
+}
+extern "C" {
+    static mut EXT_PAIR: Pair;
+}
+const S: *mut [u32] = unsafe { &raw mut EXT_PAIR.data };
+fn main() {
+    unsafe {
+        (*S)[0] = 10;
+        std::ptr::addr_of_mut!(EXT_PAIR.data)
+            .cast::<u32>()
+            .add(1)
+            .write(20);
+        std::ptr::addr_of_mut!(EXT_PAIR.sentinel).write(7);
+        println!(
+            "d0={} d1={} sentinel={}",
+            EXT_PAIR.data[0], EXT_PAIR.data[1], EXT_PAIR.sentinel
+        );
+    }
+}
+"#;
+
+#[test]
+fn run_mode_extern_static_field_slice_first_keeps_full_storage() {
+    // A constant slice of an array FIELD of a foreign static,
+    // evaluated before any whole-static access: the projection
+    // is nonempty, but the seed is still the static's full
+    // initializer, so the storage must be seeded with the
+    // declared struct's skeleton. A bare seed left the storage
+    // shapeless: the first write collapsed the field slot to
+    // the written scalar, and the later write to the field's
+    // second element failed with a type mismatch against it.
+    run_ok(
+        "extern-static-field-slice-first",
+        EXTERN_STATIC_FIELD_SLICE_FIRST_SRC,
+        "d0=10 d1=20 sentinel=7\n",
+    );
+}
+
+const EXTERN_STATIC_FIELD_PREFIX_FIRST_SRC: &str = r#"
+#[repr(C)]
+pub struct Pair {
+    data: [u32; 2],
+    sentinel: u32,
+}
+extern "C" {
+    static mut EXT_PAIR: Pair;
+}
+const PFX: *mut [u32] = unsafe {
+    std::ptr::slice_from_raw_parts_mut(
+        std::ptr::addr_of_mut!(EXT_PAIR.data).cast::<u32>(),
+        1,
+    )
+};
+fn main() {
+    unsafe {
+        (*PFX)[0] = 10;
+        std::ptr::addr_of_mut!(EXT_PAIR.data)
+            .cast::<u32>()
+            .add(1)
+            .write(20);
+        std::ptr::addr_of_mut!(EXT_PAIR.sentinel).write(7);
+        println!(
+            "d0={} d1={} sentinel={}",
+            EXT_PAIR.data[0], EXT_PAIR.data[1], EXT_PAIR.sentinel
+        );
+    }
+}
+"#;
+
+#[test]
+fn run_mode_extern_static_field_prefix_slice_first_keeps_full_storage() {
+    // A constant slice covering only a PREFIX of an array
+    // field of a foreign static, evaluated first: the slice's
+    // length bounds only the view it denotes, and the field
+    // projection does not shrink the seed either -- the
+    // storage is the declared struct's full extent, so the
+    // later writes to the field's second element and to the
+    // sibling field are valid.
+    run_ok(
+        "extern-static-field-prefix-first",
+        EXTERN_STATIC_FIELD_PREFIX_FIRST_SRC,
+        "d0=10 d1=20 sentinel=7\n",
+    );
+}
