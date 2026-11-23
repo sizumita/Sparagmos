@@ -19273,3 +19273,80 @@ fn run_mode_vec_of_zero_sized_enum_elements_drops_them() {
         "the constant-built elements' and local's destructors all run"
     );
 }
+
+const CLONED_SRC: &str = r#"
+fn main() {
+    let v = vec![1, 2, 3];
+    for x in v.iter().cloned() {
+        print!("{} ", x);
+    }
+    println!();
+    let c: Vec<i32> = v.iter().cloned().collect();
+    println!("collect={c:?}");
+    println!("count={}", v.iter().cloned().count());
+    let mut it = v.iter().cloned();
+    println!("hint={:?}", it.size_hint());
+    println!("next={:?}", it.next());
+    println!("next_back={:?}", it.next_back());
+    let words = vec![String::from("a"), String::from("bb")];
+    for s in words.iter().cloned() {
+        print!("{}:{} ", s, s.len());
+    }
+    println!();
+    let w: Vec<String> = words.iter().cloned().collect();
+    println!("{w:?}");
+}
+"#;
+
+#[test]
+fn run_mode_cloned_iteration() {
+    let dir = temp_dir("cloned-iteration");
+    let src = fixture(&dir, "cloned_iteration.rs", CLONED_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Cloned over slice iterators must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "1 2 3 \ncollect=[1, 2, 3]\ncount=3\nhint=(3, Some(3))\nnext=Some(1)\nnext_back=Some(3)\na:1 bb:2 \n[\"a\", \"bb\"]\n",
+        "stderr={stderr}"
+    );
+}
+
+const CLONED_HANDLES_SRC: &str = r#"
+use std::rc::Rc;
+fn main() {
+    let v: Vec<Rc<i32>> = vec![Rc::new(1), Rc::new(2)];
+    println!("before: {} {}", Rc::strong_count(&v[0]), Rc::strong_count(&v[1]));
+    let w: Vec<Rc<i32>> = v.iter().cloned().collect();
+    println!("after: {} {}", Rc::strong_count(&v[0]), Rc::strong_count(&v[1]));
+    println!("vals: {} {}", w[0], w[1]);
+    drop(w);
+    println!("dropped: {}", Rc::strong_count(&v[0]));
+    let boxes: Vec<Box<i32>> = vec![Box::new(10), Box::new(20)];
+    let mut clones: Vec<Box<i32>> = boxes.iter().cloned().collect();
+    *clones[0] = 99;
+    println!("orig {} clone {}", boxes[0], clones[0]);
+}
+"#;
+
+#[test]
+fn run_mode_cloned_handle_elements() {
+    let dir = temp_dir("cloned-handles");
+    let src = fixture(&dir, "cloned_handles.rs", CLONED_HANDLES_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Cloned over Rc/Box elements must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "before: 1 1\nafter: 2 2\nvals: 1 2\ndropped: 1\norig 10 clone 99\n",
+        "stderr={stderr}"
+    );
+}

@@ -1375,7 +1375,7 @@ fn iterator_back_modelled(ty: &Ty) -> bool {
         // `len` body, which for a pointer-pair state such as
         // `slice::Iter`'s is not executable; the builtin
         // computes it from the modelled size hint instead.)
-        "std::iter::Enumerate" | "std::iter::Copied" | "std::iter::Map" => {
+        "std::iter::Enumerate" | "std::iter::Copied" | "std::iter::Cloned" | "std::iter::Map" => {
             first_type_arg(&args).is_some_and(iterator_back_modelled)
         }
         // A `Zip`'s back step composes the two sides' back

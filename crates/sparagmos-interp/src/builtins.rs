@@ -6072,6 +6072,7 @@ impl<'a> Interpreter<'a> {
                     || self_ty.starts_with("std::iter::Map<")
                     || self_ty.starts_with("std::iter::Enumerate<")
                     || self_ty.starts_with("std::iter::Copied<")
+                    || self_ty.starts_with("std::iter::Cloned<")
                     || self_ty.starts_with("std::iter::Take<")
                     || self_ty.starts_with("std::iter::Skip<")
                     || self_ty.starts_with("std::iter::Chain<")
@@ -8373,146 +8374,8 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::CloneClone => {
                 arity(1)?;
-                // Cloning an mpsc handle creates another live
-                // handle: the channel's handle count must move
-                // with it, or disconnection would be observed
-                // while a clone still lives.
                 let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
-                let chan_kind = if self_ty.starts_with("std::sync::mpsc::Sender<")
-                    || self_ty.starts_with("std::sync::mpsc::SyncSender<")
-                {
-                    Some("sender")
-                } else if self_ty.starts_with("std::sync::mpsc::Receiver<") {
-                    Some("receiver")
-                } else {
-                    None
-                };
-                match &vals[0] {
-                    // `&self`: the clone is a copy of the pointee
-                    // value (which may itself be a reference value
-                    // when `Self` is a reference type).
-                    Value::Ref(_) => {
-                        let target = self.deref_value(frames, &vals[0])?;
-                        let value = self.read_resolved(frames, &target)?;
-                        // A `VaList` clone is C `va_copy`: a second
-                        // list over the same arguments with its own
-                        // cursor, not another handle on the same
-                        // cursor.
-                        if let Value::VaList(id) = value {
-                            return self.va_list_duplicate(id);
-                        }
-                        // A `Waker` / `LocalWaker` clone is not
-                        // a value copy: a waker built by
-                        // `from_raw` clones through its
-                        // `RawWakerVTable` clone entry (which is
-                        // where the reference count moves), and
-                        // the modelled `From` waker clones the
-                        // handle it carries.
-                        if self_ty == "std::task::Waker"
-                            || self_ty == "std::task::LocalWaker"
-                        {
-                            return self.clone_waker_value(frames, &value, name);
-                        }
-                        // A `Box` clone owns a fresh allocation
-                        // holding a clone of the pointee: copying
-                        // the box value itself would alias the
-                        // source allocation, so writes through the
-                        // clone would rewrite the original (and the
-                        // two boxes would free the same storage).
-                        // The pointee is cloned by
-                        // `clone_owned_value`, the same value-copy
-                        // reading this builtin applies everywhere,
-                        // with owned boxes re-allocated at every
-                        // level.
-                        if self_ty.starts_with("std::boxed::Box<") {
-                            if let Some((id, projection)) = box_alloc_pointer(&value) {
-                                let pointee = self.read_resolved(
-                                    frames,
-                                    &Resolved::Alloc { id, projection },
-                                )?;
-                                let cloned = self.clone_owned_value(frames, &pointee)?;
-                                return Ok(self.new_box(cloned));
-                            }
-                        }
-                        // A cloned container owns its elements: a
-                        // `Vec` value's fields are its elements in
-                        // this model, and a tuple's / array's fields
-                        // likewise, so the elements go through the
-                        // same owned clone (a `Vec<Box<T>>` clone
-                        // must not alias the source's boxes).
-                        let value = if self_ty.starts_with("std::vec::Vec<")
-                            || self_ty.starts_with("alloc::vec::Vec<")
-                        {
-                            match value {
-                                Value::Enum { variant, fields } => Value::Enum {
-                                    variant,
-                                    fields: fields
-                                        .iter()
-                                        .map(|f| self.clone_owned_value(frames, f))
-                                        .collect::<InterpResult<Vec<_>>>()?,
-                                },
-                                // A sparse vector's stored
-                                // elements clone the same way;
-                                // its unmaterialised tail has
-                                // nothing to clone.
-                                Value::SparseVec { elems, len } => {
-                                    Value::SparseVec {
-                                        elems: elems
-                                            .iter()
-                                            .map(|f| {
-                                                self.clone_owned_value(frames, f)
-                                            })
-                                            .collect::<InterpResult<Vec<_>>>()?,
-                                        len,
-                                    }
-                                }
-                                other => other,
-                            }
-                        } else if (self_ty.starts_with('(') || self_ty.starts_with('['))
-                            && matches!(value, Value::Tuple(_))
-                        {
-                            match value {
-                                Value::Tuple(items) => Value::Tuple(
-                                    items
-                                        .iter()
-                                        .map(|f| self.clone_owned_value(frames, f))
-                                        .collect::<InterpResult<Vec<_>>>()?,
-                                ),
-                                other => other,
-                            }
-                        } else {
-                            value
-                        };
-                        if let (Some(kind), Some(id)) =
-                            (chan_kind, channel_handle_id(&value))
-                        {
-                            self.channel_handle_cloned(id, kind);
-                        }
-                        // Cloning a reference-counted handle makes
-                        // another live handle on the same
-                        // allocation: the count the converted
-                        // bodies read must move with it, or
-                        // uniqueness (`Rc::get_mut`, the counts,
-                        // drop) would be observed wrong.
-                        if self_ty.starts_with("std::rc::Rc<")
-                            || self_ty.starts_with("std::sync::Arc<")
-                        {
-                            if let Some(id) = rc_handle_id(&value) {
-                                self.rc_inc_strong(id)?;
-                            }
-                        } else if self_ty.starts_with("std::rc::Weak<")
-                            || self_ty.starts_with("std::sync::Weak<")
-                        {
-                            if let Some(id) = rc_handle_id(&value) {
-                                self.rc_inc_weak(id)?;
-                            }
-                        }
-                        Ok(value)
-                    }
-                    // A fat pointer clones as the pointer itself
-                    // (slices are `Clone` through their reference).
-                    other => Ok(other.clone()),
-                }
+                self.clone_modelled_value(frames, self_ty, name, &vals[0])
             }
             Builtin::DefaultDefault => {
                 arity(0)?;
@@ -11746,6 +11609,166 @@ fn value_fingerprint(value: &Value) -> u64 {
     /// seconds; the carry is checked, as in std).
 
 
+    /// The model's `Clone::clone`: the clone of the value
+    /// the `&self` argument denotes, or of the argument
+    /// itself when it is not a plain reference (a fat pointer
+    /// clones as the pointer it is). `self_ty` is the cloned
+    /// type's tag; the cases keyed on it (the mpsc and
+    /// reference-counted handle counts, the `Box` / `Vec`
+    /// owned clones, the waker clone) are the ones a
+    /// `Clone::clone` call observes. The `Cloned` iterator
+    /// adapter's steps serve their item through this same
+    /// clone, under the element tag the inner iterator's tag
+    /// spells (empty when it does not: the tag-keyed cases
+    /// then stay silent and the value-driven ones apply).
+    fn clone_modelled_value(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        self_ty: &str,
+        name: &str,
+        arg: &Value,
+    ) -> InterpResult<Value> {
+        // Cloning an mpsc handle creates another live
+        // handle: the channel's handle count must move
+        // with it, or disconnection would be observed
+        // while a clone still lives.
+        let chan_kind = if self_ty.starts_with("std::sync::mpsc::Sender<")
+            || self_ty.starts_with("std::sync::mpsc::SyncSender<")
+        {
+            Some("sender")
+        } else if self_ty.starts_with("std::sync::mpsc::Receiver<") {
+            Some("receiver")
+        } else {
+            None
+        };
+        match arg {
+            // `&self`: the clone is a copy of the pointee
+            // value (which may itself be a reference value
+            // when `Self` is a reference type).
+            Value::Ref(_) => {
+                let target = self.deref_value(frames, arg)?;
+                let value = self.read_resolved(frames, &target)?;
+                // A `VaList` clone is C `va_copy`: a second
+                // list over the same arguments with its own
+                // cursor, not another handle on the same
+                // cursor.
+                if let Value::VaList(id) = value {
+                    return self.va_list_duplicate(id);
+                }
+                // A `Waker` / `LocalWaker` clone is not
+                // a value copy: a waker built by
+                // `from_raw` clones through its
+                // `RawWakerVTable` clone entry (which is
+                // where the reference count moves), and
+                // the modelled `From` waker clones the
+                // handle it carries.
+                if self_ty == "std::task::Waker"
+                    || self_ty == "std::task::LocalWaker"
+                {
+                    return self.clone_waker_value(frames, &value, name);
+                }
+                // A `Box` clone owns a fresh allocation
+                // holding a clone of the pointee: copying
+                // the box value itself would alias the
+                // source allocation, so writes through the
+                // clone would rewrite the original (and the
+                // two boxes would free the same storage).
+                // The pointee is cloned by
+                // `clone_owned_value`, the same value-copy
+                // reading this builtin applies everywhere,
+                // with owned boxes re-allocated at every
+                // level.
+                if self_ty.starts_with("std::boxed::Box<") {
+                    if let Some((id, projection)) = box_alloc_pointer(&value) {
+                        let pointee = self.read_resolved(
+                            frames,
+                            &Resolved::Alloc { id, projection },
+                        )?;
+                        let cloned = self.clone_owned_value(frames, &pointee)?;
+                        return Ok(self.new_box(cloned));
+                    }
+                }
+                // A cloned container owns its elements: a
+                // `Vec` value's fields are its elements in
+                // this model, and a tuple's / array's fields
+                // likewise, so the elements go through the
+                // same owned clone (a `Vec<Box<T>>` clone
+                // must not alias the source's boxes).
+                let value = if self_ty.starts_with("std::vec::Vec<")
+                    || self_ty.starts_with("alloc::vec::Vec<")
+                {
+                    match value {
+                        Value::Enum { variant, fields } => Value::Enum {
+                            variant,
+                            fields: fields
+                                .iter()
+                                .map(|f| self.clone_owned_value(frames, f))
+                                .collect::<InterpResult<Vec<_>>>()?,
+                        },
+                        // A sparse vector's stored
+                        // elements clone the same way;
+                        // its unmaterialised tail has
+                        // nothing to clone.
+                        Value::SparseVec { elems, len } => {
+                            Value::SparseVec {
+                                elems: elems
+                                    .iter()
+                                    .map(|f| {
+                                        self.clone_owned_value(frames, f)
+                                    })
+                                    .collect::<InterpResult<Vec<_>>>()?,
+                                len,
+                            }
+                        }
+                        other => other,
+                    }
+                } else if (self_ty.starts_with('(') || self_ty.starts_with('['))
+                    && matches!(value, Value::Tuple(_))
+                {
+                    match value {
+                        Value::Tuple(items) => Value::Tuple(
+                            items
+                                .iter()
+                                .map(|f| self.clone_owned_value(frames, f))
+                                .collect::<InterpResult<Vec<_>>>()?,
+                        ),
+                        other => other,
+                    }
+                } else {
+                    value
+                };
+                if let (Some(kind), Some(id)) =
+                    (chan_kind, channel_handle_id(&value))
+                {
+                    self.channel_handle_cloned(id, kind);
+                }
+                // Cloning a reference-counted handle makes
+                // another live handle on the same
+                // allocation: the count the converted
+                // bodies read must move with it, or
+                // uniqueness (`Rc::get_mut`, the counts,
+                // drop) would be observed wrong.
+                if self_ty.starts_with("std::rc::Rc<")
+                    || self_ty.starts_with("std::sync::Arc<")
+                {
+                    if let Some(id) = rc_handle_id(&value) {
+                        self.rc_inc_strong(id)?;
+                    }
+                } else if self_ty.starts_with("std::rc::Weak<")
+                    || self_ty.starts_with("std::sync::Weak<")
+                {
+                    if let Some(id) = rc_handle_id(&value) {
+                        self.rc_inc_weak(id)?;
+                    }
+                }
+                Ok(value)
+            }
+            // A fat pointer clones as the pointer itself
+            // (slices are `Clone` through their reference).
+            other => Ok(other.clone()),
+        }
+    }
+
     /// Clone an owned value the way this module's `Clone::clone`
     /// model does: a value copy, except that a built box (the
     /// one-field aggregate holding an allocation pointer — the
@@ -12707,6 +12730,35 @@ fn value_fingerprint(value: &Value) -> u64 {
                 Some(x) => {
                     let copied = self.resolve_value(frames, &x)?;
                     Ok((rebuild_state(&state, vec![new_inner]), some_value(copied)))
+                }
+            };
+        }
+        if self_ty.starts_with("std::iter::Cloned<") {
+            // The back step of a `Cloned` is the inner back
+            // step with the yielded reference cloned, exactly
+            // as the front step.
+            let fields = iterator_fields(&state, self_ty)?;
+            if fields.len() != 1 {
+                return Err(InterpError::type_mismatch(
+                    "Cloned state",
+                    "[iterator]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let inner_ty = first_generic_arg(self_ty).unwrap_or("");
+            let (new_inner, item) =
+                self.next_back_on_state(frames, inner_ty, fields[0].clone())?;
+            return match option_payload_opt(item) {
+                None => Ok((rebuild_state(&state, vec![new_inner]), none_value())),
+                Some(x) => {
+                    let elem_ty = ref_item_element_ty(inner_ty);
+                    let cloned = self.clone_modelled_value(
+                        frames,
+                        &elem_ty,
+                        "std::clone::Clone::clone",
+                        &x,
+                    )?;
+                    Ok((rebuild_state(&state, vec![new_inner]), some_value(cloned)))
                 }
             };
         }
@@ -13994,6 +14046,34 @@ fn value_fingerprint(value: &Value) -> u64 {
                     (vec![new_inner], some_value(copied))
                 }
             }
+        } else if self_ty.starts_with("std::iter::Cloned<") {
+            // `Cloned` is (inner iterator): the step is the
+            // inner step with the yielded reference cloned --
+            // core's `Cloned::next` is the inner step composed
+            // with `Clone::clone`, so the item is the model's
+            // clone of the element the reference denotes.
+            if fields.len() != 1 {
+                return Err(InterpError::type_mismatch(
+                    "Cloned state",
+                    "[iterator]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let inner_ty = first_generic_arg(self_ty).unwrap_or("");
+            let (new_inner, item) = self.next_on_state(frames, inner_ty, &fields[0])?;
+            match option_payload_opt(item) {
+                None => (vec![new_inner], none_value()),
+                Some(x) => {
+                    let elem_ty = ref_item_element_ty(inner_ty);
+                    let cloned = self.clone_modelled_value(
+                        frames,
+                        &elem_ty,
+                        "std::clone::Clone::clone",
+                        &x,
+                    )?;
+                    (vec![new_inner], some_value(cloned))
+                }
+            }
         } else if self_ty.starts_with("std::iter::SkipWhile<") {
             // `SkipWhile` is (inner iterator, done flag,
             // predicate) — core's own field layout: the
@@ -14447,6 +14527,30 @@ fn value_fingerprint(value: &Value) -> u64 {
                     format!("{} field(s)", fields.len()),
                 ));
             }
+            let inner_ref = Value::Ref(RefTarget::value(fields[0].clone()));
+            return self.iterator_size_hint(frames, inner_ty, &inner_ref);
+        }
+        if self_ty.starts_with("std::iter::Copied<")
+            || self_ty.starts_with("std::iter::Cloned<")
+        {
+            // `Copied::size_hint` and `Cloned::size_hint` are
+            // the inner iterator's hint, unchanged: both
+            // adapters yield exactly the inner iterator's
+            // items, in order.
+            let fields = iterator_fields(&state, self_ty)?;
+            if fields.len() != 1 {
+                let label = if self_ty.starts_with("std::iter::Copied<") {
+                    "Copied state"
+                } else {
+                    "Cloned state"
+                };
+                return Err(InterpError::type_mismatch(
+                    label,
+                    "[inner iterator]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let inner_ty = first_generic_arg(self_ty).unwrap_or("");
             let inner_ref = Value::Ref(RefTarget::value(fields[0].clone()));
             return self.iterator_size_hint(frames, inner_ty, &inner_ref);
         }
@@ -18158,6 +18262,7 @@ pub fn iterator_next_back_modelled(self_ty: &str) -> bool {
     // These adapters' back steps compose the inner back step.
     if self_ty.starts_with("std::iter::Enumerate<")
         || self_ty.starts_with("std::iter::Copied<")
+        || self_ty.starts_with("std::iter::Cloned<")
         || self_ty.starts_with("std::iter::Map<")
     {
         return first_generic_arg(self_ty).is_some_and(iterator_next_back_modelled);
@@ -25021,6 +25126,40 @@ fn tag_group_inner(tag: &str, open: usize) -> Option<&str> {
 
 /// The first generic argument of a rendered tag
 /// (`Vec<Point, Global>` -> `Point`), if it has a `<...>` list.
+/// The element tag of the reference a reference-yielding
+/// iterator's tag names as its item: `std::slice::Iter<T>`
+/// and `std::option::Iter<T>` spell it directly, and the
+/// adapters that pass the item through unchanged (`Filter`,
+/// `Rev`, `Take`, `Skip`, `StepBy`, `Fuse`, `Peekable`, and
+/// `Chain`'s first side) forward their inner iterator's.
+/// Empty when the tag does not spell it -- a `Map`'s item
+/// is its closure's return type, which the tag does not
+/// carry.
+fn ref_item_element_ty(inner_ty: &str) -> String {
+    let mut ty = inner_ty;
+    loop {
+        if ty.starts_with("std::slice::Iter<") || ty.starts_with("std::option::Iter<") {
+            return first_generic_arg(ty).unwrap_or("").to_string();
+        }
+        if ty.starts_with("std::iter::Filter<")
+            || ty.starts_with("std::iter::Rev<")
+            || ty.starts_with("std::iter::Take<")
+            || ty.starts_with("std::iter::Skip<")
+            || ty.starts_with("std::iter::StepBy<")
+            || ty.starts_with("std::iter::Fuse<")
+            || ty.starts_with("std::iter::Peekable<")
+            || ty.starts_with("std::iter::Chain<")
+        {
+            match first_generic_arg(ty) {
+                Some(inner) => ty = inner,
+                None => return String::new(),
+            }
+            continue;
+        }
+        return String::new();
+    }
+}
+
 fn first_generic_arg(tag: &str) -> Option<&str> {
     let open = tag.find('<')?;
     let inner = tag_group_inner(tag, open)?;
