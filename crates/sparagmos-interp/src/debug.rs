@@ -1567,7 +1567,7 @@ fn render_pretty_gdb(
                 // render from the stored elements plus the
                 // uninitialised tail.
                 let (elems, declared) = match &pointee {
-                    Value::SparseVec { elems, len } => {
+                    Value::SparseVec { elems, len, .. } => {
                         (elems.clone(), *len)
                     }
                     _ => {
@@ -1645,7 +1645,7 @@ fn render_printer_adt(
                 // render from the stored elements plus the
                 // uninitialised tail, bounded like any long
                 // vector's.
-                Value::SparseVec { elems, len } => {
+                Value::SparseVec { elems, len, .. } => {
                     let head = format!("Vec(size={len})");
                     if *len == 0 {
                         Some(head)

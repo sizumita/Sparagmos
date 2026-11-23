@@ -2515,6 +2515,81 @@ fn run_mode_vec_with_capacity_push_and_reserve() {
 }
 
 
+const VEC_HUGE_CAPACITY_SRC: &str = r#"
+fn main() {
+    let n: usize = (1 << 22) + 5;
+    let v: Vec<std::mem::MaybeUninit<u8>> = Vec::with_capacity(n);
+    println!("len {} cap {}", v.len(), v.capacity());
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_vec_with_capacity_past_materialisation_limit() {
+    // A `with_capacity` request past the materialisation limit
+    // stores no elements, but the requested capacity is the
+    // vector's storage and stays in the value's account: the
+    // reported capacity is the requested one, as natively —
+    // not the zero stored elements.
+    let dir = temp_dir("vechugecapacity");
+    let src = fixture(&dir, "vechugecapacity.rs", VEC_HUGE_CAPACITY_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "huge with_capacity must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "len 0 cap 4194309\ndone\n",
+        "the requested capacity past the limit is reported as natively"
+    );
+}
+
+const VEC_HUGE_SET_LEN_POP_SRC: &str = r#"
+fn main() {
+    let n: usize = (1 << 22) + 5;
+    let mut v: Vec<std::mem::MaybeUninit<u8>> = Vec::with_capacity(n);
+    unsafe {
+        v.set_len(n);
+        match v.pop() {
+            Some(b) => {
+                std::mem::forget(b);
+                println!("popped len {}", v.len());
+            }
+            None => println!("none"),
+        }
+    }
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_vec_huge_set_len_pop() {
+    // `Vec::pop` decrements the length and then asserts the
+    // new length is below the capacity. On a vector grown by
+    // `set_len` to the requested capacity, the accounted
+    // capacity is the full request, so the assertion holds as
+    // natively; a capacity collapsed onto the declared length
+    // would make the decremented length equal it and trip the
+    // assertion.
+    let dir = temp_dir("vechugesetlenpop");
+    let src = fixture(&dir, "vechugesetlenpop.rs", VEC_HUGE_SET_LEN_POP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "pop on a huge set_len-grown vector must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "popped len 4194308\ndone\n",
+        "pop returns the tail slot and the decremented length, as natively"
+    );
+}
+
 const STRING_WITH_CAPACITY_SRC: &str = r#"
 fn main() {
     let mut s = String::with_capacity(16);

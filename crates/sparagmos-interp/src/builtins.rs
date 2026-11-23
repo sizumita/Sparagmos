@@ -7873,7 +7873,7 @@ impl<'a> Interpreter<'a> {
                     Value::Enum { fields, .. } => {
                         Ok(self.new_box(Value::Tuple(fields)))
                     }
-                    Value::SparseVec { mut elems, len } => {
+                    Value::SparseVec { mut elems, len, .. } => {
                         // The boxed slice holds the declared
                         // elements: the stored prefix, plus the
                         // uninitialised tail when the length runs
@@ -8740,9 +8740,13 @@ impl<'a> Interpreter<'a> {
                 // vector holding that many uninitialised slots,
                 // so growth within the capacity does not happen,
                 // exactly as the real allocation behaves. A
-                // capacity past the materialisation limit keeps
-                // the empty vector: its storage cannot be
-                // accounted element by element.
+                // capacity past the materialisation limit cannot
+                // be held element by element: the sparse form
+                // accounts it as its `cap` over an empty stored
+                // prefix instead, so the capacity the vector
+                // reports — and the spare-capacity room guest
+                // code relies on — is the requested extent, not
+                // zero.
                 if vals.len() != 1 && vals.len() != 2 {
                     return Err(InterpError::type_mismatch(
                         format!("builtin {name}"),
@@ -8757,10 +8761,17 @@ impl<'a> Interpreter<'a> {
                     }
                     _ => 0,
                 };
-                if cap == 0 || cap > MAX_VEC_SET_LEN_ELEMENTS {
+                if cap == 0 {
                     return Ok(Value::Enum {
                         variant: 0,
                         fields: Vec::new(),
+                    });
+                }
+                if cap > MAX_VEC_SET_LEN_ELEMENTS {
+                    return Ok(Value::SparseVec {
+                        elems: Vec::new(),
+                        len: 0,
+                        cap: cap as u128,
                     });
                 }
                 Ok(vec_with_len(
@@ -8772,6 +8783,7 @@ impl<'a> Interpreter<'a> {
                     ],
                     0,
                     &Value::Uninit,
+                    cap as u128,
                 ))
             }
             Builtin::VecFromElem => {
@@ -8893,16 +8905,23 @@ impl<'a> Interpreter<'a> {
                 let target = self.deref_value(frames, &vals[0])?;
                 self.modify_resolved(frames, &target, |slot| {
                     let mut rebuild = None;
-                    if let Value::SparseVec { elems, len } = slot {
+                    if let Value::SparseVec { elems, len, cap } = slot {
+                        // The shrink drops the spare storage past
+                        // the target capacity: stored slots and
+                        // the accounted extent alike (a shrink
+                        // never grows the account, whatever
+                        // minimum the caller names).
                         let keep = (*len).max(min_cap);
                         if (elems.len() as u128) > keep {
                             elems.truncate(keep as usize);
-                            if keep == *len {
-                                rebuild = Some(Value::Enum {
-                                    variant: 0,
-                                    fields: std::mem::take(elems),
-                                });
-                            }
+                        }
+                        if keep == *len && (elems.len() as u128) == keep {
+                            rebuild = Some(Value::Enum {
+                                variant: 0,
+                                fields: std::mem::take(elems),
+                            });
+                        } else {
+                            *cap = keep.min(*cap).max(elems.len() as u128);
                         }
                     }
                     if let Some(value) = rebuild {
@@ -8939,6 +8958,7 @@ impl<'a> Interpreter<'a> {
                     // keeps the tail elements in storage without
                     // dropping them, exactly as the real `set_len`
                     // contract specifies.
+                    let prev_cap = vec_stored_len(slot).unwrap_or(0);
                     let elems = match std::mem::replace(slot, Value::Uninit) {
                         Value::Enum { fields, .. } => fields,
                         Value::SparseVec { elems, .. } => elems,
@@ -8950,7 +8970,7 @@ impl<'a> Interpreter<'a> {
                             ));
                         }
                     };
-                    *slot = vec_with_len(elems, new_len, &uninit_elem);
+                    *slot = vec_with_len(elems, new_len, &uninit_elem, prev_cap);
                     Ok(Value::Unit)
                 })
             }
@@ -11810,16 +11830,26 @@ fn value_fingerprint(value: &Value) -> u64 {
                         // A sparse vector's stored
                         // elements clone the same way;
                         // its unmaterialised tail has
-                        // nothing to clone.
-                        Value::SparseVec { elems, len } => {
+                        // nothing to clone. The clone is
+                        // a fresh allocation of exactly
+                        // the declared length (as
+                        // `Vec::clone` allocates), so it
+                        // accounts its length - the
+                        // source's spare capacity does
+                        // not carry over.
+                        Value::SparseVec { elems, len, .. } => {
+                            let cloned = elems
+                                .iter()
+                                .map(|f| {
+                                    self.clone_owned_value(frames, f)
+                                })
+                                .collect::<InterpResult<Vec<_>>>()?;
+                            let cap =
+                                len.max(cloned.len() as u128);
                             Value::SparseVec {
-                                elems: elems
-                                    .iter()
-                                    .map(|f| {
-                                        self.clone_owned_value(frames, f)
-                                    })
-                                    .collect::<InterpResult<Vec<_>>>()?,
+                                elems: cloned,
                                 len,
+                                cap,
                             }
                         }
                         other => other,
@@ -16891,7 +16921,7 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                     );
                 }
             }
-            Value::SparseVec { elems, len } => {
+            Value::SparseVec { elems, len, .. } => {
                 self.rescue_elided_snapshot(frame, local, path, elems);
                 // The virtual tail: the slots the declared
                 // length runs past the stored prefix denote the
@@ -18370,7 +18400,7 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
             Value::Enum {
                 variant: 0, fields, ..
             } => (fields, fields.len()),
-            Value::SparseVec { elems, len } => {
+            Value::SparseVec { elems, len, .. } => {
                 (elems, usize::try_from(*len).ok()?)
             }
             _ => return None,
@@ -18870,6 +18900,39 @@ pub(crate) fn vec_real_aggregate_parts(value: &Value) -> Option<(Value, usize)> 
         return None;
     }
     Some((fields[0].clone(), len as usize))
+}
+
+/// The capacity a real-form `RawVec` buffer value declares:
+/// the `RawVecInner` triple's middle field (the
+/// `UsizeNoHighBit` capacity, a one-field wrapper around the
+/// count). `None` when the buffer does not have that shape.
+pub(crate) fn vec_real_aggregate_cap(buf: &Value) -> Option<u128> {
+    let Value::Enum {
+        fields: buf_fields, ..
+    } = buf
+    else {
+        return None;
+    };
+    let Value::Enum {
+        fields: inner_fields,
+        ..
+    } = buf_fields.first()?
+    else {
+        return None;
+    };
+    if inner_fields.len() != 3 {
+        return None;
+    }
+    fn count_of(value: &Value) -> Option<u128> {
+        match value {
+            Value::Uint(n) => Some(*n),
+            Value::Int(n) if *n >= 0 => Some(*n as u128),
+            Value::Enum { fields, .. } if fields.len() == 1 => count_of(&fields[0]),
+            Value::Tuple(items) if items.len() == 1 => count_of(&items[0]),
+            _ => None,
+        }
+    }
+    count_of(&inner_fields[1])
 }
 
 /// A `RawVec` buffer value over the element block pointer
@@ -20974,27 +21037,59 @@ pub(crate) const MAX_VEC_SET_LEN_ELEMENTS: usize = 1 << 22;
 /// `pop` reads the element it just un-declared), counted by
 /// the capacity the model reports, and overwritten by the
 /// next append before any new storage is needed.
-pub(crate) fn vec_with_len(mut elems: Vec<Value>, len: usize, uninit_elem: &Value) -> Value {
+///
+/// `prev_cap` is the storage extent the value being rebuilt
+/// accounted (see `vec_stored_len`): the rebuilt value keeps
+/// accounting at least that much storage — a length change
+/// alone never shrinks the allocation a `with_capacity`
+/// established — so the result takes the sparse form
+/// whenever the accounted extent runs past the stored list,
+/// even when length and stored list meet again.
+pub(crate) fn vec_with_len(
+    mut elems: Vec<Value>,
+    len: usize,
+    uninit_elem: &Value,
+    prev_cap: u128,
+) -> Value {
+    let cap = prev_cap.max(len as u128).max(elems.len() as u128);
     if len == elems.len() {
-        Value::Enum {
-            variant: 0,
-            fields: elems,
+        if cap == len as u128 {
+            Value::Enum {
+                variant: 0,
+                fields: elems,
+            }
+        } else {
+            Value::SparseVec {
+                elems,
+                len: len as u128,
+                cap,
+            }
         }
     } else if len < elems.len() {
         Value::SparseVec {
             elems,
             len: len as u128,
+            cap,
         }
     } else if len <= MAX_VEC_SET_LEN_ELEMENTS {
         elems.resize(len, uninit_elem.clone());
-        Value::Enum {
-            variant: 0,
-            fields: elems,
+        if cap == len as u128 {
+            Value::Enum {
+                variant: 0,
+                fields: elems,
+            }
+        } else {
+            Value::SparseVec {
+                elems,
+                len: len as u128,
+                cap,
+            }
         }
     } else {
         Value::SparseVec {
             elems,
             len: len as u128,
+            cap,
         }
     }
 }
@@ -21003,7 +21098,9 @@ pub(crate) fn vec_with_len(mut elems: Vec<Value>, len: usize, uninit_elem: &Valu
 /// number of element slots the value accounts for — the stored
 /// list's length, or the declared length when it runs past the
 /// stored list (the unmaterialised tail is allocation the
-/// model accounts without holding element by element). Every
+/// model accounts without holding element by element), or the
+/// extent a `with_capacity` requested past the materialisation
+/// limit, which the sparse form records as its `cap`. Every
 /// capacity question in the model gives this answer (the
 /// `Vec::capacity` builtin and the buffer chain's capacity
 /// slot in place resolution alike): the element storage is
@@ -21011,7 +21108,7 @@ pub(crate) fn vec_with_len(mut elems: Vec<Value>, len: usize, uninit_elem: &Valu
 pub(crate) fn vec_stored_len(value: &Value) -> Option<u128> {
     match value {
         Value::Enum { fields, .. } => Some(fields.len() as u128),
-        Value::SparseVec { elems, len } => Some((*len).max(elems.len() as u128)),
+        Value::SparseVec { elems, cap, .. } => Some((*cap).max(elems.len() as u128)),
         _ => None,
     }
 }
@@ -21021,7 +21118,11 @@ pub(crate) fn vec_stored_len(value: &Value) -> Option<u128> {
 /// capacity a length shrink left behind) are overwritten in
 /// order and the rest extend the storage, so length and
 /// storage grow together and the value takes the plain
-/// aggregate form when they meet again. A vector whose
+/// aggregate form when they meet again — unless the accounted
+/// capacity still runs past the stored list, which only the
+/// sparse form records. Appends past the accounted capacity
+/// extend the account with the storage, as the plain form's
+/// appends do. A vector whose
 /// declared length runs past its stored elements cannot take
 /// appends — the new elements would land past the stored
 /// region — and stays the explicit error it was.
@@ -21037,12 +21138,17 @@ fn vec_append_in_place(
         }
         Value::SparseVec { .. } => {
             let value = std::mem::replace(slot, Value::Uninit);
-            let Value::SparseVec { mut elems, len } = value else {
+            let Value::SparseVec {
+                mut elems,
+                len,
+                cap,
+            } = value
+            else {
                 unreachable!("matched sparse vector above")
             };
             let cur_len = usize::try_from(len).unwrap_or(usize::MAX);
             if cur_len > elems.len() {
-                *slot = Value::SparseVec { elems, len };
+                *slot = Value::SparseVec { elems, len, cap };
                 return Err(unsupported(format!(
                     "{op} on a vector whose elements are not materialised"
                 )));
@@ -21056,7 +21162,8 @@ fn vec_append_in_place(
                 }
                 l += 1;
             }
-            *slot = if l == elems.len() {
+            let cap = cap.max(l as u128).max(elems.len() as u128);
+            *slot = if l == elems.len() && cap == l as u128 {
                 Value::Enum {
                     variant: 0,
                     fields: elems,
@@ -21065,6 +21172,7 @@ fn vec_append_in_place(
                 Value::SparseVec {
                     elems,
                     len: l as u128,
+                    cap,
                 }
             };
             Ok(())
@@ -21536,10 +21644,13 @@ impl<'a> SliceElems<'a> {
     pub(crate) fn sub_snapshot(&self, start: usize, end: usize) -> Value {
         match self {
             SliceElems::Sparse { stored, .. } if end > stored.len() => {
-                Value::SparseVec {
-                    elems: stored[start.min(stored.len())..].to_vec(),
-                    len: (end - start) as u128,
-                }
+                // The snapshot is a fresh value, not the
+                // vector itself: it accounts exactly the
+                // range it denotes, no capacity beyond it.
+                let elems = stored[start.min(stored.len())..].to_vec();
+                let len = (end - start) as u128;
+                let cap = len.max(elems.len() as u128);
+                Value::SparseVec { elems, len, cap }
             }
             _ => Value::Tuple((start..end).map(|i| self.at(i)).collect()),
         }
@@ -22335,7 +22446,7 @@ fn elements_of<'a>(value: Cow<'a, Value>) -> InterpResult<SliceElems<'a>> {
         Cow::Borrowed(v) => Ok(match v {
             Value::Tuple(items) => SliceElems::Values(Cow::Borrowed(items)),
             Value::Enum { fields, .. } => SliceElems::Values(Cow::Borrowed(fields)),
-            Value::SparseVec { elems, len } => SliceElems::Sparse {
+            Value::SparseVec { elems, len, .. } => SliceElems::Sparse {
                 stored: Cow::Borrowed(elems),
                 len: usize::try_from(*len).unwrap_or(usize::MAX),
             },
@@ -22352,7 +22463,7 @@ fn elements_of<'a>(value: Cow<'a, Value>) -> InterpResult<SliceElems<'a>> {
         Cow::Owned(v) => Ok(match v {
             Value::Tuple(items) => SliceElems::Values(Cow::Owned(items)),
             Value::Enum { fields, .. } => SliceElems::Values(Cow::Owned(fields)),
-            Value::SparseVec { elems, len } => SliceElems::Sparse {
+            Value::SparseVec { elems, len, .. } => SliceElems::Sparse {
                 stored: Cow::Owned(elems),
                 len: usize::try_from(len).unwrap_or(usize::MAX),
             },
@@ -22386,7 +22497,7 @@ fn value_elements(value: &Value) -> InterpResult<Vec<Value>> {
         // leaves) yields its declared elements; one whose
         // length runs past the stored elements has no element
         // list to hand out.
-        Value::SparseVec { elems, len } => {
+        Value::SparseVec { elems, len, .. } => {
             let len = usize::try_from(*len).unwrap_or(usize::MAX);
             if len > elems.len() {
                 return Err(InterpError::type_mismatch(
@@ -25394,7 +25505,7 @@ impl<'a> Interpreter<'a> {
                 let text = self.format_arguments(frames, inner, indent)?;
                 Ok(pad_width(&text, options))
             }
-            Value::SparseVec { elems, len } => {
+            Value::SparseVec { elems, len, .. } => {
                 // A vector value in sparse form (see
                 // `Value::SparseVec`) formats as the list of its
                 // declared elements, exactly as the plain
