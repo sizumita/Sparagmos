@@ -937,3 +937,185 @@ fn lldb_static_print_names_the_variable_in_its_typed_line() {
         run.transcript
     );
 }
+
+// ---------------------------------------------------------------------------
+// Projected primitive type names (a field / element / pointee
+// step must keep the concrete primitive type the shape table
+// recorded, not collapse it to a width-less descriptor) and the
+// `length` resolution order (a recorded field of that name wins
+// over the sequence pseudo-field).
+// ---------------------------------------------------------------------------
+
+fn whatis(expr: &str) -> DebugCommand {
+    DebugCommand::WhatIs(DebugPrint {
+        expr: expr.to_string(),
+        format: None,
+    })
+}
+
+#[test]
+fn whatis_of_projected_primitives_keeps_the_concrete_name() {
+    let mut s = session(aggregate_program());
+    s.set_breakpoint("test.rs", 3);
+    let run = s.run_script(
+        vec![
+            DebugCommand::Run,
+            whatis("p.x"),
+            whatis("a[0]"),
+            whatis("t.0"),
+        ],
+        DebugDialect::Gdb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    assert_eq!(
+        run.transcript
+            .iter()
+            .filter(|l| *l == "type = i32")
+            .count(),
+        3,
+        "transcript: {:?}",
+        run.transcript
+    );
+}
+
+#[test]
+fn whatis_of_a_dereferenced_pointee_keeps_the_concrete_name() {
+    let p = program_with_vars(vec![DebugVarEntry {
+        name: "r".to_string(),
+        source: DebugVar::Constant(Constant::Ref(Box::new(Constant::Int(42)))),
+        is_char: false,
+        ty: Some("&i32".to_string()),
+        lines: (2, 2),
+    }]);
+    let mut s = session(p);
+    s.set_breakpoint("test.rs", 3);
+    let run = s.run_script(
+        vec![DebugCommand::Run, whatis("*r")],
+        DebugDialect::Gdb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    assert!(
+        run.transcript.iter().any(|l| l == "type = i32"),
+        "transcript: {:?}",
+        run.transcript
+    );
+}
+
+/// A struct with an ordinary field named `length` and a float
+/// field: `test::Bag { length: i32, ratio: f64 }`.
+fn named_length_program() -> Program {
+    use sparagmos_mir::{AdtDebugField, AdtDebugShape, AdtDebugVariant, AdtShapeKind};
+    let mut body = Body::new(
+        "main",
+        0,
+        vec![Ty::Unit, Ty::Adt("test::Bag".to_string())],
+        vec![
+            BasicBlockData::new(
+                vec![Statement::assign(
+                    Place::from_index(1),
+                    Rvalue::AggregateAdt {
+                        variant: 0,
+                        operands: vec![
+                            Operand::const_int(7),
+                            Operand::Constant(Constant::Float(2.5)),
+                        ],
+                        field_index: None,
+                        units_from: None,
+                    },
+                )],
+                TerminatorKind::Goto { target: BasicBlock(1) },
+            ),
+            BasicBlockData::new(
+                vec![Statement::assign(
+                    Place::from_index(0),
+                    Rvalue::Use(Operand::const_unit()),
+                )],
+                TerminatorKind::Return,
+            ),
+        ],
+    );
+    body.source_lines = vec![
+        BlockSourceLines { statements: vec![line(2)], terminator: line(2) },
+        BlockSourceLines { statements: vec![line(3)], terminator: line(3) },
+    ];
+    body.debug_vars = vec![DebugVarEntry {
+        name: "b".to_string(),
+        source: DebugVar::Place(1, vec![]),
+        is_char: false,
+        ty: Some("test::Bag".to_string()),
+        lines: (2, 2),
+    }];
+    let mut p = Program::new();
+    p.add_function(body);
+    p.source_files = vec!["test.rs".to_string()];
+    p.adt_debug_shapes.insert(
+        "test::Bag".to_string(),
+        AdtDebugShape {
+            kind: AdtShapeKind::Struct,
+            variants: vec![AdtDebugVariant {
+                name: "Bag".to_string(),
+                fields: vec![
+                    AdtDebugField {
+                        name: Some("length".to_string()),
+                        ty: "i32".to_string(),
+                    },
+                    AdtDebugField {
+                        name: Some("ratio".to_string()),
+                        ty: "f64".to_string(),
+                    },
+                ],
+            }],
+        },
+    );
+    p
+}
+
+#[test]
+fn length_named_field_wins_over_the_sequence_pseudo_field() {
+    let mut s = session(named_length_program());
+    s.set_breakpoint("test.rs", 3);
+    let run = s.run_script(
+        vec![DebugCommand::Run, print("b.length"), whatis("b.length")],
+        DebugDialect::Gdb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    for want in ["$1 = 7", "type = i32"] {
+        assert!(
+            run.transcript.iter().any(|l| l == want),
+            "missing `{want}` in {:?}",
+            run.transcript
+        );
+    }
+}
+
+#[test]
+fn whatis_of_a_float_field_keeps_the_concrete_name() {
+    let mut s = session(named_length_program());
+    s.set_breakpoint("test.rs", 3);
+    let run = s.run_script(
+        vec![DebugCommand::Run, whatis("b.ratio")],
+        DebugDialect::Gdb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    assert!(
+        run.transcript.iter().any(|l| l == "type = f64"),
+        "transcript: {:?}",
+        run.transcript
+    );
+}
+
+#[test]
+fn length_pseudo_field_still_reads_a_sequence() {
+    let mut s = session(constant_sequence_program());
+    s.set_breakpoint("test.rs", 3);
+    let run = s.run_script(
+        vec![DebugCommand::Run, print("slice.length")],
+        DebugDialect::Gdb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    assert!(
+        run.transcript.iter().any(|l| l == "$1 = 3"),
+        "transcript: {:?}",
+        run.transcript
+    );
+}
