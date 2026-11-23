@@ -2214,19 +2214,25 @@ impl<'a> Converter<'a> {
     }
 
     /// Collect the canonical values of the single-valued field
-    /// paths of `ty` into `out`, keyed by field-index path (see
+    /// paths of `ty` into `out`, keyed by projection path (see
     /// `ir::Body::zst_fields`). Structs, unions and tuples expose
     /// their fields under bare field projections; an enum's fields
-    /// sit behind a downcast step, which the runtime lookup does
-    /// not follow, so enum fields are not collected. The walk is
-    /// depth- and size-capped: it serves the shallow paths MIR
-    /// actually projects (a wrapper or two around a zero-sized
-    /// field), not arbitrary recursive types.
+    /// sit behind a downcast step, so each variant's fields are
+    /// collected under that variant's downcast step. The runtime
+    /// lookup only consults a recorded path after projection
+    /// itself walked it and came back uninitialized — a downcast
+    /// to a variant the stored value does not hold fails as a
+    /// type mismatch, never as uninitialized — so a path recorded
+    /// under one variant's downcast is only ever used for a value
+    /// that actually holds that variant. The walk is depth- and
+    /// size-capped: it serves the shallow paths MIR actually
+    /// projects (a wrapper or two around a zero-sized field), not
+    /// arbitrary recursive types.
     fn collect_zst_fields(
         &self,
         ty: &mir::Ty,
-        path: &mut Vec<usize>,
-        out: &mut std::collections::HashMap<Vec<usize>, Value>,
+        path: &mut Vec<ir::ZstPathStep>,
+        out: &mut std::collections::HashMap<Vec<ir::ZstPathStep>, Value>,
         depth: u32,
         budget: &mut usize,
     ) {
@@ -2245,6 +2251,29 @@ impl<'a> Converter<'a> {
                     return;
                 };
                 if shape.kind == mir::AdtShapeKind::Enum {
+                    for vi in 0..shape.variants.len() {
+                        let Some(fields) =
+                            self.instantiated_field_tys(def, args, vi as u32)
+                        else {
+                            continue;
+                        };
+                        if *budget == 0 {
+                            return;
+                        }
+                        *budget -= 1;
+                        path.push(ir::ZstPathStep::Downcast(vi));
+                        self.collect_zst_field_list(
+                            &fields,
+                            path,
+                            out,
+                            depth + 1,
+                            budget,
+                        );
+                        path.pop();
+                        if out.len() > 4096 {
+                            return;
+                        }
+                    }
                     return;
                 }
                 match self.instantiated_field_tys(def, args, 0) {
@@ -2254,8 +2283,23 @@ impl<'a> Converter<'a> {
             }
             _ => return,
         };
+        self.collect_zst_field_list(&fields, path, out, depth, budget);
+    }
+
+    /// Record the single-valued values of one field list (a
+    /// struct's, a union's, a tuple's, or one enum variant's
+    /// fields) under `path`, recursing into each field's own
+    /// sub-paths.
+    fn collect_zst_field_list(
+        &self,
+        fields: &[mir::Ty],
+        path: &mut Vec<ir::ZstPathStep>,
+        out: &mut std::collections::HashMap<Vec<ir::ZstPathStep>, Value>,
+        depth: u32,
+        budget: &mut usize,
+    ) {
         for (i, field_ty) in fields.iter().enumerate() {
-            path.push(i);
+            path.push(ir::ZstPathStep::Field(i));
             if let Some(v) = self.zst_value(field_ty, 0) {
                 out.insert(path.clone(), v);
             }

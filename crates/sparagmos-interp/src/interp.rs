@@ -9131,8 +9131,8 @@ impl<'a> Interpreter<'a> {
 
     /// The canonical value of a single-valued field path of a
     /// local (see the note in `read_resolved`); `None` when the
-    /// projection is not a pure field path or conversion recorded
-    /// no single-valued value for it.
+    /// projection is not a pure field/downcast path or conversion
+    /// recorded no single-valued value for it.
     pub(crate) fn zst_field_value(
         &self,
         frame: &Frame,
@@ -9145,10 +9145,19 @@ impl<'a> Interpreter<'a> {
         let mut path = Vec::with_capacity(projection.len());
         for step in projection {
             match step {
-                RefProj::Field(idx) => path.push(*idx),
+                RefProj::Field(idx) => path.push(ZstPathStep::Field(*idx)),
                 // Union fields sit in the same per-parent index
                 // space the conversion-side walk records.
-                RefProj::UnionField { idx, .. } => path.push(*idx),
+                RefProj::UnionField { idx, .. } => {
+                    path.push(ZstPathStep::Field(*idx))
+                }
+                // A downcast step selects the variant whose
+                // fields the following steps address; the walk
+                // records each variant's fields under its
+                // downcast (see `collect_zst_fields`).
+                RefProj::Downcast(variant) => {
+                    path.push(ZstPathStep::Downcast(*variant as usize))
+                }
                 _ => return None,
             }
         }
