@@ -1052,8 +1052,10 @@ fn impls_of_trait(trait_def: rustc_public::DefId) -> Vec<ImplDef> {
 /// The type the applicable implementation assigns a
 /// projection's item, read from the implementation table:
 /// the implementations of the projection's trait whose
-/// self type matches the projection's resolved self type
-/// (see `match_impl_self_ty`) must agree on one assigned
+/// whole trait reference matches the projection's — the
+/// self type against the projection's resolved self type,
+/// the remaining arguments against the projection's own
+/// (see `match_impl_self_ty`) — must agree on one assigned
 /// type, read from the matching implementation's own
 /// definition through the compiler context. The query
 /// posed is the definition query for the item's type,
@@ -1089,10 +1091,29 @@ fn projection_impl_assigned_ty(
         ) {
             continue;
         }
-        // An implementation matches the self type, so it
-        // is the applicable one; if its assigned type
-        // cannot be read, no other implementation's can
-        // stand in for it.
+        // Matching the self type alone does not identify
+        // the implementation: a trait can be implemented
+        // for the same self type at several of its own
+        // argument instantiations (`Carrier<u8> for ()`
+        // beside `Carrier<bool> for ()`), each assigning
+        // the item a different type. The trait reference's
+        // remaining arguments must match the projection's
+        // too, binding implementation parameters that
+        // appear only in those positions.
+        if !tref
+            .args()
+            .0
+            .iter()
+            .skip(1)
+            .zip(alias.args.0.iter().skip(1))
+            .all(|(i, t)| match_impl_arg(i, t, ambient, &mut bindings, depth + 1))
+        {
+            continue;
+        }
+        // An implementation matches the trait reference,
+        // so it is the applicable one; if its assigned
+        // type cannot be read, no other implementation's
+        // can stand in for it.
         let args = impl_instantiation_args(&impl_def, &bindings)?;
         let ty = impl_item_assigned_ty(&impl_def, alias, &args)?;
         match assigned {
@@ -1261,25 +1282,38 @@ fn match_impl_args(
             .0
             .iter()
             .zip(targs.0.iter())
-            .all(|(i, t)| match (i, t) {
-                (GenericArgKind::Type(it), GenericArgKind::Type(tt)) => {
-                    match_impl_self_ty(it, tt, ambient, bindings, depth)
-                }
-                (GenericArgKind::Const(ic), GenericArgKind::Const(tc)) => {
-                    match_impl_const(ic, tc, bindings)
-                }
-                (GenericArgKind::Lifetime(iregion), GenericArgKind::Lifetime(tregion)) => {
-                    match &iregion.kind {
-                        RegionKind::ReEarlyParam(param) => bind_impl_arg(
-                            bindings,
-                            param.index,
-                            GenericArgKind::Lifetime(tregion.clone()),
-                        ),
-                        _ => iregion == tregion,
-                    }
-                }
-                _ => false,
-            })
+            .all(|(i, t)| match_impl_arg(i, t, ambient, bindings, depth))
+}
+
+/// Whether one generic argument of an implementation
+/// matches the corresponding target argument (see
+/// `match_impl_args`).
+fn match_impl_arg(
+    iarg: &GenericArgKind,
+    targ: &GenericArgKind,
+    ambient: Option<&GenericArgs>,
+    bindings: &mut HashMap<u32, GenericArgKind>,
+    depth: usize,
+) -> bool {
+    match (iarg, targ) {
+        (GenericArgKind::Type(it), GenericArgKind::Type(tt)) => {
+            match_impl_self_ty(it, tt, ambient, bindings, depth)
+        }
+        (GenericArgKind::Const(ic), GenericArgKind::Const(tc)) => {
+            match_impl_const(ic, tc, bindings)
+        }
+        (GenericArgKind::Lifetime(iregion), GenericArgKind::Lifetime(tregion)) => {
+            match &iregion.kind {
+                RegionKind::ReEarlyParam(param) => bind_impl_arg(
+                    bindings,
+                    param.index,
+                    GenericArgKind::Lifetime(tregion.clone()),
+                ),
+                _ => iregion == tregion,
+            }
+        }
+        _ => false,
+    }
 }
 
 /// Whether an implementation's constant argument matches

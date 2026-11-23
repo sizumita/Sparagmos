@@ -2043,6 +2043,152 @@ fn run_mode_dyn_bound_projection_through_chained_alias_runs() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
 }
 
+const DYN_BOUND_PROJECTION_TRAIT_ARGS_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Carrier<A> {
+    type Item: Trait + ?Sized;
+}
+impl Carrier<u8> for () {
+    type Item = dyn Trait<Assoc = u32>;
+}
+impl Carrier<bool> for () {
+    type Item = dyn Trait<Assoc = u64>;
+}
+struct Holder<T: Carrier<u8>> {
+    field: <<T as Carrier<u8>>::Item as Trait>::Assoc,
+}
+fn take(h: Holder<()>) -> u32 {
+    h.field
+}
+fn main() {
+    let h = Holder::<()> { field: 42 };
+    println!("{}", take(h));
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_trait_args_select_impl_runs() {
+    // The intermediate projection's trait is implemented
+    // for the same self type at two of its own argument
+    // instantiations, assigning the item different trait
+    // objects. Matching only the self type reads both
+    // implementations, finds their assigned types in
+    // disagreement, and resolves nothing, so the screen
+    // rejects the holder and main. Matching the whole
+    // trait reference selects the `Carrier<u8>`
+    // implementation, whose binding the outer projection
+    // normalizes through -- natively the program prints 42.
+    let dir = temp_dir("dyn-bound-projection-trait-args");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_trait_args.rs",
+        DYN_BOUND_PROJECTION_TRAIT_ARGS_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the trait-args projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_TRAIT_ARGS_OTHER_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Carrier<A> {
+    type Item: Trait + ?Sized;
+}
+impl Carrier<u8> for () {
+    type Item = dyn Trait<Assoc = u32>;
+}
+impl Carrier<bool> for () {
+    type Item = dyn Trait<Assoc = u64>;
+}
+struct Holder<T: Carrier<bool>> {
+    field: <<T as Carrier<bool>>::Item as Trait>::Assoc,
+}
+fn take(h: Holder<()>) -> u64 {
+    h.field
+}
+fn main() {
+    let h = Holder::<()> { field: 42 };
+    println!("{}", take(h));
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_trait_args_other_impl_runs() {
+    // The same pair of implementations, projected at the
+    // other trait argument: the `Carrier<bool>`
+    // implementation is the applicable one, and its
+    // `u64` binding is what the field holds.
+    let dir = temp_dir("dyn-bound-projection-trait-args-other");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_trait_args_other.rs",
+        DYN_BOUND_PROJECTION_TRAIT_ARGS_OTHER_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the other-trait-args projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_TRAIT_ARG_PARAM_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Carrier<A> {
+    type Item: Trait + ?Sized;
+}
+impl<A> Carrier<A> for () {
+    type Item = dyn Trait<Assoc = A>;
+}
+struct Holder<T: Carrier<u8>> {
+    field: <<T as Carrier<u8>>::Item as Trait>::Assoc,
+}
+fn take(h: Holder<()>) -> u8 {
+    h.field
+}
+fn main() {
+    let h = Holder::<()> { field: 42 };
+    println!("{}", take(h));
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_trait_arg_only_param_runs() {
+    // The implementation's parameter appears only in the
+    // trait reference's own arguments, never in the self
+    // type: matching those arguments binds it from the
+    // projection's (`A := u8`), and the assigned type is
+    // read with that binding, reaching `dyn Trait<Assoc =
+    // u8>` -- natively the program prints 42.
+    let dir = temp_dir("dyn-bound-projection-trait-arg-param");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_trait_arg_param.rs",
+        DYN_BOUND_PROJECTION_TRAIT_ARG_PARAM_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the trait-arg-param projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
 const POINTEE_METADATA_PROJECTION_SRC: &str = r#"
 #![feature(ptr_metadata)]
 struct Holder<T: ?Sized> {
