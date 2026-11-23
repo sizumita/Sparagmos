@@ -183,6 +183,21 @@ pub(crate) struct Frame {
     /// by conversion onto the `CallTrait` terminator. `None` for
     /// every other frame.
     call_once_env_drop: Option<(RefTarget, crate::ir::DropGlue)>,
+    /// The architectural register state of the asm block whose
+    /// `call` step entered this frame (see
+    /// `Interpreter::pending_asm_incoming`): when this frame's
+    /// function is a naked body, its register file starts from
+    /// this state, as a native `call` preserves every register
+    /// the callee does not overwrite — including registers the
+    /// argument seedings do not supply, which the calling block
+    /// may have established deliberately (an explicit-register
+    /// `in` operand the callee's body reads). The second array
+    /// records which registers that state actually established,
+    /// so reads of never-established registers keep their usual
+    /// treatment (notably the incoming-`rsp` rejection). `None`
+    /// for frames entered any other way: their naked blocks
+    /// start from a zeroed file defined only by the seedings.
+    incoming_asm: Option<([u64; 48], [bool; 48])>,
 }
 
 /// Drop glue suspended while a destructor body runs. A `Drop`
@@ -766,6 +781,13 @@ pub struct Interpreter<'a> {
     /// panic's cleanup (see `GlueCompletion::UnwindCleanup`):
     /// taken back when the session's work runs out.
     glue_unwind_panic: Option<(String, Option<PanicPayload>)>,
+    /// The architectural register state an asm `call` step hands
+    /// to the frame its call creates: set by `exec_asm_call` for
+    /// the duration of the callee's `call_sync` when the callee
+    /// is a naked body, and taken by `start_detached_call` into
+    /// the new frame (see `Frame::incoming_asm`). `None` at
+    /// every other time.
+    pending_asm_incoming: Option<([u64; 48], [bool; 48])>,
     /// The guest's panic hook, installed by `std::panic::set_hook`
     /// (the boxed `dyn Fn` value as the guest handed it over);
     /// `None` is the default hook, which this runtime does not
@@ -1573,6 +1595,7 @@ impl<'a> Interpreter<'a> {
             error_output: String::new(),
             drop_continuations: Vec::new(),
             glue_unwind_panic: None,
+            pending_asm_incoming: None,
             resume_signaled: false,
             panic_hook: std::cell::RefCell::new(None),
             last_panic_stamp: std::cell::RefCell::new(None),
@@ -1766,6 +1789,7 @@ impl<'a> Interpreter<'a> {
             unwind_payload: None,
             in_cleanup: false,
             call_once_env_drop: None,
+            incoming_asm: None,
         }];
         let result = self.drive_frames(&mut frames, 0);
         // The termination report applies here: after the entry
@@ -3055,8 +3079,15 @@ impl<'a> Interpreter<'a> {
                     ret,
                     arg_seeds,
                 } => {
-                    let outcome =
-                        self.exec_inline_asm(frames, body, regs, steps, *ret, arg_seeds)?;
+                    let outcome = self.exec_inline_asm(
+                        frames,
+                        body,
+                        regs,
+                        steps,
+                        *ret,
+                        arg_seeds,
+                        target.is_none(),
+                    )?;
                     match outcome {
                         AsmOutcome::JumpTo(block) => {
                             Self::jump(frames, body, block)?;
@@ -3086,6 +3117,9 @@ impl<'a> Interpreter<'a> {
     /// destination untouched — its value is unspecified, and
     /// leaving the place alone keeps a later read an explicit
     /// uninitialized error rather than a fabricated zero.
+    /// A naked block entered through an asm `call` step instead
+    /// starts from the calling block's register file (see
+    /// `Frame::incoming_asm`).
     fn exec_inline_asm(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -3094,6 +3128,7 @@ impl<'a> Interpreter<'a> {
         steps: &[AsmStep],
         ret: Option<AsmRet>,
         arg_seeds: &[AsmArgSeed],
+        naked_shape: bool,
     ) -> InterpResult<AsmOutcome> {
         let mut slots: Vec<u64> = Vec::with_capacity(regs.len());
         for reg in regs {
@@ -3115,6 +3150,21 @@ impl<'a> Interpreter<'a> {
         // and the operand's slot in step as the program runs.
         let mut arch = [0u64; 48];
         let mut arch_written = [false; 48];
+        // A naked block entered through an asm `call` step starts
+        // from the calling block's register file: the `call`
+        // preserves the state the caller established, including
+        // registers no argument seeding supplies. The argument
+        // seedings below then restate the argument registers
+        // from the frame's locals, which hold the very values
+        // the caller placed in those registers.
+        if naked_shape && body.blocks.len() == 1 {
+            if let Some((incoming, incoming_written)) =
+                frames.last().and_then(|frame| frame.incoming_asm)
+            {
+                arch = incoming;
+                arch_written = incoming_written;
+            }
+        }
         // A naked block's incoming state: the enclosing function's
         // arguments, which `naked_asm!` receives through the
         // function's ABI rather than through operands, are seeded
@@ -3169,7 +3219,7 @@ impl<'a> Interpreter<'a> {
                     break;
                 }
                 AsmStep::Call { sig } => {
-                    self.exec_asm_call(frames, &mut arch, sig)?;
+                    self.exec_asm_call(frames, &mut arch, &arch_written, sig)?;
                     // The call may have rewritten any register:
                     // resync the slots of bound operands with the
                     // register file's post-call state.
@@ -3246,6 +3296,7 @@ impl<'a> Interpreter<'a> {
         &mut self,
         frames: &mut Vec<Frame>,
         arch: &mut [u64; 48],
+        arch_written: &[bool; 48],
         sig: &sparagmos_mir::AsmCallSig,
     ) -> InterpResult<()> {
         // Architectural indices: rax rcx rdx rbx rsp rbp rsi rdi
@@ -3273,7 +3324,33 @@ impl<'a> Interpreter<'a> {
             };
             args.push(asm_scalar_value(bits, param));
         }
-        let result = self.call_sync(frames, &sig.name, args)?;
+        // A naked callee's register file starts from this
+        // block's architectural state: a native `call` preserves
+        // every register, and the block may have established
+        // values in registers the callee's argument seeding does
+        // not supply (an explicit `in("r10")` the callee's body
+        // reads). Stash the state for the frame the call creates
+        // and restore the previous value afterwards, so nested
+        // asm calls compose. Non-naked callees run their own
+        // code before any asm block of theirs, so for them the
+        // state is not forwarded.
+        let callee_is_naked = self.program.get(&sig.name).is_some_and(|b| {
+            b.blocks.len() == 1
+                && matches!(
+                    &b.blocks[0].terminator,
+                    TerminatorKind::InlineAsm { target: None, .. }
+                )
+        });
+        let saved_incoming = if callee_is_naked {
+            self.pending_asm_incoming.replace((*arch, *arch_written))
+        } else {
+            None
+        };
+        let result = self.call_sync(frames, &sig.name, args);
+        if callee_is_naked {
+            self.pending_asm_incoming = saved_incoming;
+        }
+        let result = result?;
         let mut ret_reg: Option<usize> = None;
         if let Some(ret) = &sig.ret {
             let idx = match ret {
@@ -4021,6 +4098,7 @@ impl<'a> Interpreter<'a> {
             unwind_payload: None,
             in_cleanup: false,
             call_once_env_drop: None,
+            incoming_asm: None,
         });
         Ok(())
     }
@@ -4081,6 +4159,7 @@ impl<'a> Interpreter<'a> {
                 locals[idx] = stamp;
             }
         }
+        let incoming_asm = self.pending_asm_incoming.take();
         let id = self.fresh_frame_id();
         frames.push(Frame {
             id,
@@ -4093,6 +4172,7 @@ impl<'a> Interpreter<'a> {
             unwind_payload: None,
             in_cleanup: false,
             call_once_env_drop: None,
+            incoming_asm,
         });
         Ok(())
     }
@@ -5584,6 +5664,7 @@ impl<'a> Interpreter<'a> {
                                         unwind_payload: None,
                                         in_cleanup: false,
             call_once_env_drop: None,
+            incoming_asm: None,
                                     });
                                     return Ok(());
                                 }
@@ -5790,6 +5871,7 @@ impl<'a> Interpreter<'a> {
                             unwind_payload: None,
                             in_cleanup: false,
             call_once_env_drop: None,
+            incoming_asm: None,
                         });
                         return Ok(());
                     }
@@ -6181,6 +6263,7 @@ impl<'a> Interpreter<'a> {
                             unwind_payload: None,
                             in_cleanup: false,
             call_once_env_drop: None,
+            incoming_asm: None,
                         });
                         return Ok(());
                     }

@@ -11982,6 +11982,98 @@ fn run_mode_naked_fn_incoming_rsp_read_is_a_named_error() {
     );
 }
 
+const ASM_SYM_NAKED_SRC: &str = r#"
+use std::arch::{asm, naked_asm};
+
+#[unsafe(naked)]
+pub extern "sysv64" fn read_r10() -> u64 {
+    naked_asm!("mov rax, r10", "ret");
+}
+
+#[unsafe(naked)]
+pub extern "sysv64" fn add_r10(x: u64) -> u64 {
+    naked_asm!("mov rax, rdi", "add rax, r10", "ret");
+}
+
+fn main() {
+    let out1: u64;
+    let out2: u64;
+    unsafe {
+        asm!(
+            "call {target}",
+            target = sym read_r10,
+            in("r10") 42u64,
+            lateout("rax") out1,
+        );
+        asm!(
+            "mov rdi, {inp}",
+            "call {target}",
+            inp = in(reg) 41u64,
+            target = sym add_r10,
+            in("r10") 100u64,
+            lateout("rax") out2,
+        );
+    }
+    println!("{out1} {out2}");
+}
+"#;
+
+#[test]
+fn run_mode_asm_sym_call_to_naked_fn_forwards_caller_registers() {
+    // A `sym` call into a naked function preserves the calling
+    // block's architectural register state: the callee's body
+    // reads `r10`, a register no argument seeding supplies,
+    // whose value the caller established with an explicit
+    // `in("r10")` operand. The second callee also takes an
+    // argument: its argument register is seeded from the
+    // argument as usual, and the forwarded `r10` composes with
+    // it. Natively this prints `42 141`.
+    run_ok("asm-sym-naked", ASM_SYM_NAKED_SRC, "42 141\n");
+}
+
+const ASM_SYM_NAKED_RSP_SRC: &str = r#"
+use std::arch::{asm, naked_asm};
+
+#[unsafe(naked)]
+pub extern "sysv64" fn read_rsp() -> u64 {
+    naked_asm!("mov rax, rsp", "and rax, 15", "ret");
+}
+
+fn main() {
+    let out: u64;
+    unsafe {
+        asm!(
+            "call {target}",
+            target = sym read_rsp,
+            lateout("rax") out,
+        );
+    }
+    println!("{out}");
+}
+"#;
+
+#[test]
+fn run_mode_asm_sym_call_to_naked_fn_rsp_read_stays_a_named_error() {
+    // Forwarding the calling block's register state does not
+    // fabricate an incoming stack pointer for the callee: the
+    // caller never established `rsp`, so the naked callee's
+    // read of it stays the named error (exit 2), exactly as
+    // for a naked function called from Rust code.
+    let dir = temp_dir("asm-sym-naked-rsp");
+    let src = fixture(&dir, "case.rs", ASM_SYM_NAKED_RSP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a forwarded read of the incoming stack pointer must exit two; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("stack pointer"),
+        "the reason names the incoming stack pointer: {stderr}"
+    );
+}
+
 #[test]
 fn convert_mode_inline_asm_outside_class_converts() {
     // The same out-of-class block converts in full: conversion is
