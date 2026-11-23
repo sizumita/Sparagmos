@@ -3113,7 +3113,9 @@ impl<'a> Converter<'a> {
             statements.push(self.convert_statement(body, stmt)?);
         }
         let terminator = match &bb.terminator {
-            Some(term) => self.convert_terminator(body, &term.kind, fn_abi)?,
+            Some(term) => {
+                self.convert_terminator(body, &term.kind, fn_abi, !bb.statements.is_empty())?
+            }
             None => ir::TerminatorKind::Unsupported("missing terminator".to_string()),
         };
         Ok(ir::BasicBlockData::new(statements, terminator))
@@ -9127,6 +9129,7 @@ let inner = match (&src, target) {
         body: &mir::Body,
         kind: &mir::TerminatorKind,
         fn_abi: Option<&mir::Abi>,
+        block_has_statements: bool,
     ) -> Result<ir::TerminatorKind, ConvertError> {
         use mir::TerminatorKind as T;
         Ok(match kind {
@@ -9766,15 +9769,41 @@ let inner = match (&src, target) {
                         // type must be a plain scalar shape.
                         let mut ret = None;
                         let mut shape_ok = true;
-                        if program.returns
-                            && program
+                        if program.returns {
+                            let bare_ret = !program
                                 .steps
                                 .iter()
-                                .any(|st| !matches!(st, mir::AsmStep::Ret))
-                        {
+                                .any(|st| !matches!(st, mir::AsmStep::Ret));
                             match asm_return_shape(body) {
-                                Some(shape) => ret = Some(shape),
-                                None => shape_ok = false,
+                                Some(shape) => {
+                                    // A bare-`ret` block reads
+                                    // nothing of its own: the
+                                    // register the caller
+                                    // established is the result, so
+                                    // a scalar return takes the
+                                    // shape — but only when the
+                                    // block is the naked body
+                                    // itself, which carries no
+                                    // statements. A `ret` block
+                                    // reached after statements ends
+                                    // the function with the return
+                                    // place as the body left it.
+                                    if !bare_ret || !block_has_statements {
+                                        ret = Some(shape);
+                                    }
+                                }
+                                None => {
+                                    // A body whose steps run before
+                                    // the `ret` reads the return
+                                    // register as its result, so a
+                                    // return type with no scalar
+                                    // shape keeps it outside the
+                                    // class. A bare-`ret` body with
+                                    // a unit return needs no shape.
+                                    if !bare_ret {
+                                        shape_ok = false;
+                                    }
+                                }
                             }
                         }
                         // A naked block's parameters arrive in

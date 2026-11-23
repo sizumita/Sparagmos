@@ -3167,16 +3167,15 @@ impl<'a> Interpreter<'a> {
         // A naked block entered through an asm `call` step starts
         // from the calling block's register file: the `call`
         // preserves the state the caller established, including
-        // registers no argument seeding supplies. The argument
-        // seedings below then restate the argument registers
-        // from the frame's locals, which hold the very values
-        // the caller placed in those registers.
+        // registers no argument seeding supplies.
+        let mut forwarded_written: Option<[bool; 48]> = None;
         if naked_shape && body.blocks.len() == 1 {
             if let Some((incoming, incoming_written)) =
                 frames.last().and_then(|frame| frame.incoming_asm)
             {
                 arch = incoming;
                 arch_written = incoming_written;
+                forwarded_written = Some(incoming_written);
             }
         }
         // A naked block's incoming state: the enclosing function's
@@ -3184,8 +3183,20 @@ impl<'a> Interpreter<'a> {
         // function's ABI rather than through operands, are seeded
         // into the registers the ABI passes them in. (A naked
         // block has no operands, so nothing below overwrites the
-        // seedings; for other blocks the list is empty.)
+        // seedings; for other blocks the list is empty.) A
+        // register the forwarded state actually established keeps
+        // that raw content: the frame's locals hold the argument
+        // narrowed to its declared scalar (the value the call
+        // assembled), while the body reads the register itself,
+        // whose bits above the scalar's width are the caller's
+        // own and observable. Seeding therefore supplies only the
+        // registers the forwarded state did not establish, and
+        // every register when there is no forwarded state (a call
+        // from Rust code, where the locals are the only source).
         for seed in arg_seeds {
+            if forwarded_written.is_some_and(|w| w[seed.arch as usize]) {
+                continue;
+            }
             let value = frames
                 .last()
                 .expect("frame")
@@ -3423,9 +3434,10 @@ impl<'a> Interpreter<'a> {
             // whatever the callee does not overwrite, and
             // zeroing the clobber set would fabricate values
             // for registers the body demonstrably wrote. The
-            // return-value scatter below still runs afterwards,
-            // so the return register keeps the normalization
-            // the declared return scalar prescribes.
+            // return-value scatter below still runs afterwards
+            // for a return register the body did not establish;
+            // one it did establish keeps its raw bits (see the
+            // scatter).
             for r in 0..48 {
                 if out_written[r] {
                     arch[r] = out_arch[r];
@@ -3438,7 +3450,24 @@ impl<'a> Interpreter<'a> {
                 sparagmos_mir::AsmScalar::Float { .. } => 16,
                 _ => 0,
             };
-            arch[idx] = asm_scalar_bits(&result, ret)?;
+            // A naked callee's outgoing state, when available,
+            // is the return register's content: the merge above
+            // has already placed the bits the body established,
+            // and the registers it never touched keep this
+            // block's own state — a native `call` to a naked body
+            // preserves whatever the body does not overwrite,
+            // including a bare-`ret` body, whose return register
+            // still holds what the caller placed in it. An output
+            // of the calling block bound to that register observes
+            // the register itself, whose content may be wider
+            // than the declared return scalar (a `u8` callee's
+            // `rax` read back into a `u64` output). The narrowed
+            // Rust value is the call's result, not the register's
+            // content, so the scatter applies only when there is
+            // no outgoing state (a non-naked callee).
+            if outgoing.is_none() {
+                arch[idx] = asm_scalar_bits(&result, ret)?;
+            }
             ret_reg = Some(idx);
         }
         if outgoing.is_none() {

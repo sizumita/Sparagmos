@@ -2810,6 +2810,75 @@ fn naked_fn_parameters_are_seeded_from_the_frame_arguments() {
     );
 }
 
+#[test]
+fn naked_fn_parameters_are_seeded_with_a_sysv64_recorded_abi() {
+    // The driver records `extern "sysv64"` in its raw form
+    // (`SysV64 { .. }`): the same SysV64 family as `extern "C"`,
+    // so the argument local is seeded into rdi exactly as above.
+    const F_DEF: mir::DefId = mir::DefId::new(0, 78);
+    let mut prog = MirProgram::new();
+    prog.add_with_def_id("f", F_DEF, naked_identity_body());
+    prog.fn_abis.insert(
+        F_DEF,
+        mir::Abi::Other("SysV64 { unwind: false }".to_string()),
+    );
+    assert_eq!(
+        interpret_mir(&prog, "f", vec![Value::Uint(42)]).expect("naked identity runs"),
+        Value::Uint(42)
+    );
+}
+
+#[test]
+fn naked_fn_signed_return_is_read_at_the_return_shape() {
+    // fn f() -> i64 { naked_asm!("mov rax, -1", "ret") }: the
+    // return place is assigned from the register file directly,
+    // with no `write_place` normalization in between, so the
+    // bits are read as the declared type's two's-complement
+    // value: -1, not the zero-extended 2^64 - 1.
+    let body = mir::Body::new(
+        decls(&[i64_ty()]),
+        0,
+        vec![block(
+            vec![],
+            asm_prog_term("mov rax, -1\nret", vec![], None),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("f", body);
+    assert_eq!(
+        interpret_mir(&prog, "f", vec![]).expect("naked body runs"),
+        Value::Int(-1)
+    );
+}
+
+#[test]
+fn naked_fn_incoming_rsp_read_is_a_named_error() {
+    // fn f() -> u64 { naked_asm!("mov rax, rsp", "and rax, 15",
+    // "ret") }: the incoming stack pointer is not modelled, so
+    // the read is a named error rather than a computation with
+    // the fabricated zero the register file starts with.
+    let body = mir::Body::new(
+        decls(&[u64_ty()]),
+        0,
+        vec![block(
+            vec![],
+            asm_prog_term("mov rax, rsp\nand rax, 15\nret", vec![], None),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.add("f", body);
+    match interpret_mir(&prog, "f", vec![]) {
+        Err(MirRunError::Interp(InterpError::UnsupportedTerminator { kind })) => {
+            assert!(
+                kind.contains("stack pointer"),
+                "error names the incoming stack pointer: {kind}"
+            );
+        }
+        Err(e) => panic!("expected UnsupportedTerminator for the rsp read, got {e}"),
+        Ok(v) => panic!("expected UnsupportedTerminator for the rsp read, got {v:?}"),
+    }
+}
+
 // ----- InlineAsm: the evaluable register class executes (Lane GI) -----
 
 fn asm_op(

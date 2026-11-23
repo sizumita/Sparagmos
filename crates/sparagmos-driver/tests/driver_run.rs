@@ -12159,6 +12159,126 @@ fn run_mode_asm_sym_call_to_naked_fn_preserves_untouched_registers() {
     );
 }
 
+const ASM_SYM_NAKED_WIDE_ARG_SRC: &str = r#"
+use std::arch::{asm, naked_asm};
+
+#[unsafe(naked)]
+pub extern "sysv64" fn helper(x: u8) -> u64 {
+    naked_asm!("mov rax, rdi", "ret");
+}
+
+fn main() {
+    let out: u64;
+    unsafe {
+        asm!(
+            "call {target}",
+            target = sym helper,
+            in("rdi") 0x1_0000_0001u64,
+            lateout("rax") out,
+        );
+    }
+    println!("{out}");
+}
+"#;
+
+#[test]
+fn run_mode_asm_sym_call_to_naked_fn_keeps_forwarded_argument_bits() {
+    // The caller establishes rdi at full width; the callee's
+    // parameter is a u8, but its body reads the register itself,
+    // whose upper bits are the caller's and observable: argument
+    // seeding supplies only the registers the forwarded state
+    // did not establish, so it cannot narrow this one. Natively
+    // this prints `4294967297`.
+    run_ok(
+        "asm-sym-naked-wide-arg",
+        ASM_SYM_NAKED_WIDE_ARG_SRC,
+        "4294967297\n",
+    );
+}
+
+const ASM_SYM_NAKED_WIDE_RET_SRC: &str = r#"
+use std::arch::{asm, naked_asm};
+
+#[unsafe(naked)]
+pub extern "sysv64" fn helper() -> u8 {
+    naked_asm!("mov rax, 0x100000001", "ret");
+}
+
+fn main() {
+    let y: u64;
+    unsafe {
+        asm!(
+            "call {target}",
+            target = sym helper,
+            lateout("rax") y,
+        );
+    }
+    println!("{y}");
+}
+"#;
+
+#[test]
+fn run_mode_asm_sym_call_to_naked_fn_keeps_raw_return_register() {
+    // The callee's declared return is a u8, but the calling
+    // block's output reads rax itself at u64 width: the
+    // callee's outgoing register state is the register's
+    // content, and the narrowed Rust return value must not be
+    // scattered over it. Natively this prints `4294967297`.
+    run_ok(
+        "asm-sym-naked-wide-ret",
+        ASM_SYM_NAKED_WIDE_RET_SRC,
+        "4294967297\n",
+    );
+}
+
+const ASM_SYM_NAKED_BARE_RET_SRC: &str = r#"
+use std::arch::{asm, naked_asm};
+
+#[unsafe(naked)]
+pub extern "sysv64" fn id_u64() -> u64 {
+    naked_asm!("ret");
+}
+
+#[unsafe(naked)]
+pub extern "sysv64" fn id_u8() -> u8 {
+    naked_asm!("ret");
+}
+
+fn main() {
+    let a: u64;
+    let b: u64;
+    unsafe {
+        asm!(
+            "call {target}",
+            target = sym id_u64,
+            inout("rax") 42u64 => a,
+        );
+        asm!(
+            "call {target}",
+            target = sym id_u8,
+            inout("rax") 0x1_0000_0001u64 => b,
+        );
+    }
+    println!("{a} {b}");
+}
+"#;
+
+#[test]
+fn run_mode_asm_sym_call_to_bare_ret_naked_fn_reads_the_return_register() {
+    // A bare-`ret` naked body returns whatever the caller left
+    // in the return register: the scalar return shape is read
+    // from the register file even though the body has no steps
+    // before the `ret`, and the register itself is preserved
+    // across the call at full width — the u8 callee's upper
+    // bits are the caller's. Natively this prints
+    // `42 4294967297`.
+    run_ok(
+        "asm-sym-naked-bare-ret",
+        ASM_SYM_NAKED_BARE_RET_SRC,
+        "42 4294967297\n",
+    );
+}
+
 #[test]
 fn convert_mode_inline_asm_outside_class_converts() {
     // The same out-of-class block converts in full: conversion is
