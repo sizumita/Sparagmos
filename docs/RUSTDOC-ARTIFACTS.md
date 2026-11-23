@@ -50,11 +50,13 @@ scripts/build-rustdoc-artifacts.sh all   # phase1 + phase2 + harvest
 
 Prerequisites: the `1.100.0` toolchain with the `rustc-dev` and
 `rust-src` components, and the full extracted Rust source tree
-(the script reads `SRC_DIR`, default `~/rust-src-1.100.0`, and
-writes the tree to `OUT_DIR`, default
+(the script reads `RUST_SRC_DIR`, default `~/rust-src-1.100.0`,
+and writes the tree to `RUSTDOC_ARTIFACTS_DIR`, default
 `~/rustdoc-artifacts-1.100.0`). Re-running from a clean state
 reproduces the same tree: the sorted artifact file list and
-`MANIFEST.txt` are identical across clean rebuilds.
+`MANIFEST.txt` are identical across clean rebuilds. The harvest
+step can also be re-run over an existing tree: artifacts already
+in place are skipped and stale ones are replaced.
 
 How it works:
 

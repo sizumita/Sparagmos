@@ -271,11 +271,20 @@ for src in sorted(chosen):
     dst = os.path.join(out, base)
     # Hardlink when possible (same filesystem): the tree then costs
     # no extra space while the build target exists, and stays valid
-    # after the target directory is removed.
-    try:
-        os.link(src, dst)
-    except OSError:
-        shutil.copy2(src, dst)
+    # after the target directory is removed. The harvest is
+    # idempotent: a destination that already is this artifact (the
+    # hardlink an earlier run created) is left in place, and a stale
+    # destination left by an older build is replaced, so re-running
+    # never requires deleting the output tree by hand.
+    if os.path.exists(dst) and os.path.samefile(src, dst):
+        pass
+    else:
+        if os.path.lexists(dst):
+            os.unlink(dst)
+        try:
+            os.link(src, dst)
+        except OSError:
+            shutil.copy2(src, dst)
     total += os.path.getsize(dst)
     externs.append(f"{chosen[src]}={dst}")
 with open(os.path.join(out, "externs.txt"), "w") as f:
