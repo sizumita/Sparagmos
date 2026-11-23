@@ -14760,24 +14760,7 @@ impl<'a> Interpreter<'a> {
     fn place_result_ty(&self, body: &Body, place: &Place) -> Option<Ty> {
         let mut ty = body.local_ty(place.local)?.clone();
         for elem in &place.projection {
-            ty = match (elem, &ty) {
-                (ProjectionElem::Deref, Ty::Ref(inner)) => (**inner).clone(),
-                (ProjectionElem::Field(i), Ty::Tuple(ts)) => ts.get(*i)?.clone(),
-                (ProjectionElem::Index(_), Ty::Array(elem, _)) => (**elem).clone(),
-                (ProjectionElem::Index(_), Ty::Slice(elem)) => (**elem).clone(),
-                (ProjectionElem::ConstantIndex { .. }, Ty::Array(elem, _)) => {
-                    (**elem).clone()
-                }
-                (ProjectionElem::ConstantIndex { .. }, Ty::Slice(elem)) => (**elem).clone(),
-                (ProjectionElem::Downcast(_), t) => t.clone(),
-                (ProjectionElem::Subslice { .. }, Ty::Array(elem, _)) => {
-                    Ty::Array(elem.clone(), 0)
-                }
-                (ProjectionElem::Subslice { .. }, Ty::Slice(elem)) => {
-                    Ty::Slice(elem.clone())
-                }
-                _ => return None,
-            };
+            ty = projection_step_ty(&ty, elem)?;
         }
         Some(ty)
     }
@@ -18511,7 +18494,8 @@ impl<'a> Interpreter<'a> {
             }
             Rvalue::Cast(operand, ty) => {
                 let v = self.eval_operand(frames, body, operand)?;
-                eval_cast(&v, cast_src_ty(body, operand), ty)
+                let src_ty = cast_src_ty(body, operand);
+                eval_cast(&v, src_ty.as_ref(), ty)
             }
             Rvalue::Unsize(operand, meta) => {
                 let v = self.eval_operand(frames, body, operand)?;
@@ -23137,18 +23121,57 @@ fn synthetic_addr(v: &Value) -> u128 {
     BASE + (h % (1 << 40)) * 65536
 }
 
-/// The declared type of a cast's source operand, when it is cheaply
-/// known: a projection-less local's declared type. Anything else
-/// leaves the source width unknown to `eval_cast` (its float arms
-/// then keep the stored form, which is the exact widening of the
-/// source value).
-pub(crate) fn cast_src_ty<'a>(body: &'a Body, operand: &'a Operand) -> Option<&'a Ty> {
-    match operand {
-        Operand::Copy(place) | Operand::Move(place) if place.projection.is_empty() => {
-            body.local_ty(place.local)
+/// One step of the declared-type walk over a projection: the
+/// type of the value denoted after applying `elem` to a value of
+/// type `ty`, when the local's declared type alone determines
+/// it. This is the step set `place_result_ty` judges by.
+fn projection_step_ty(ty: &Ty, elem: &ProjectionElem) -> Option<Ty> {
+    match (elem, ty) {
+        (ProjectionElem::Deref, Ty::Ref(inner)) => Some((**inner).clone()),
+        (ProjectionElem::Field(i), Ty::Tuple(ts)) => ts.get(*i).cloned(),
+        (ProjectionElem::Index(_), Ty::Array(elem, _)) => Some((**elem).clone()),
+        (ProjectionElem::Index(_), Ty::Slice(elem)) => Some((**elem).clone()),
+        (ProjectionElem::ConstantIndex { .. }, Ty::Array(elem, _)) => {
+            Some((**elem).clone())
         }
-        // A constant operand records no type in this IR, so its
-        // width stays unknown.
+        (ProjectionElem::ConstantIndex { .. }, Ty::Slice(elem)) => {
+            Some((**elem).clone())
+        }
+        (ProjectionElem::Downcast(_), t) => Some(t.clone()),
+        (ProjectionElem::Subslice { .. }, Ty::Array(elem, _)) => {
+            Some(Ty::Array(elem.clone(), 0))
+        }
+        (ProjectionElem::Subslice { .. }, Ty::Slice(elem)) => {
+            Some(Ty::Slice(elem.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// The declared type of the value a cast's source place denotes,
+/// walked over the place's own projection: a tuple field, an
+/// array element and a dereferenced pointer (a reference and a
+/// raw pointer share the `Ty::Ref` representation) all name
+/// their element / pointee type, so a cast from such a place is
+/// a genuine conversion at that width, not a transport of the
+/// base local's stored form. `None` when a step's type is not
+/// determined by the local's declared type alone (a field of an
+/// ADT, a deref of an ADT-typed local such as a `Box`).
+pub(crate) fn cast_place_ty(body: &Body, place: &Place) -> Option<Ty> {
+    let mut ty = body.local_ty(place.local)?.clone();
+    for elem in &place.projection {
+        ty = projection_step_ty(&ty, elem)?;
+    }
+    Some(ty)
+}
+
+/// The declared type of a cast's source operand. A constant
+/// operand records no type in this IR, so its width stays
+/// unknown to `eval_cast` (its float arms then keep the stored
+/// form, which is the exact widening of the source value).
+pub(crate) fn cast_src_ty(body: &Body, operand: &Operand) -> Option<Ty> {
+    match operand {
+        Operand::Copy(place) | Operand::Move(place) => cast_place_ty(body, place),
         _ => None,
     }
 }
