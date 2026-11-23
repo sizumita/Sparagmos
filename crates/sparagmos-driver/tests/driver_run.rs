@@ -26515,3 +26515,103 @@ fn convert_mode_required_const_never_mentioned_converts() {
          function must convert; stderr={stderr}"
     );
 }
+
+const REQUIRED_CONST_BEHIND_UNREACHABLE_SRC: &str = r#"
+struct Fail<T>(T);
+impl<T> Fail<T> {
+    const C: () = panic!();
+}
+fn leaf<T>() {
+    if false {
+        let _ = Fail::<T>::C;
+    }
+}
+fn bad<T>() {
+    if false {
+        leaf::<T>();
+    }
+}
+fn unused() {
+    bad::<i32>();
+}
+fn main() {}
+"#;
+
+#[test]
+fn convert_mode_required_const_behind_unreachable_caller_converts() {
+    // `bad::<i32>` is demanded by conversion only because the
+    // unreachable private function `unused` calls it; the mono
+    // collector never roots it, so it never reaches `leaf::<i32>`
+    // and never evaluates the panicking constant. rustc compiles
+    // the crate, and the check must not fire either: its roots are
+    // the collector's roots, not every instance conversion
+    // demanded. (The constant sits one mention hop behind the
+    // demanded instance because conversion itself materializes the
+    // constants of the bodies it converts; what is exercised here
+    // is that the check does not start from `bad` at all.)
+    let dir = temp_dir("required-const-unreachable");
+    let src = fixture(
+        &dir,
+        "required_const_unreachable.rs",
+        REQUIRED_CONST_BEHIND_UNREACHABLE_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a failing required constant reachable only from an \
+         unreachable function must convert; stderr={stderr}"
+    );
+}
+
+const REQUIRED_CONST_BEHIND_FN_ITEM_VALUE_SRC: &str = r#"
+struct Fail<T>(T);
+impl<T> Fail<T> {
+    const C: () = panic!();
+}
+fn bad<T>() {
+    if false {
+        let _ = Fail::<T>::C;
+    }
+}
+#[inline(never)]
+fn hold<U>(x: U) {
+    std::hint::black_box(x);
+}
+#[inline(never)]
+fn outer<T>() {
+    hold(bad::<T>);
+}
+fn main() {
+    if false {
+        outer::<i32>();
+    }
+}
+"#;
+
+#[test]
+fn convert_mode_required_const_behind_fn_item_value_converts() {
+    // Passing the function item `bad::<T>` as a value to a generic
+    // function that never calls it does not reify a function
+    // pointer and does not codegen `bad`'s body: a bare `FnDef`
+    // constant operand is a zero-sized function-item value, not a
+    // collected item. The walk reaches `outer::<i32>` through its
+    // mention from `main`, but must not demand `bad::<i32>` from
+    // the operand, so the panicking constant is never evaluated
+    // and the crate converts, as it does under rustc.
+    let dir = temp_dir("required-const-fn-item-value");
+    let src = fixture(
+        &dir,
+        "required_const_fn_item_value.rs",
+        REQUIRED_CONST_BEHIND_FN_ITEM_VALUE_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a failing required constant behind a bare function-item \
+         value must convert; stderr={stderr}"
+    );
+}

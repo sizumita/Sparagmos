@@ -36,6 +36,7 @@
 
 extern crate rustc_attr_ir;
 extern crate rustc_driver;
+extern crate rustc_hir;
 extern crate rustc_interface;
 extern crate rustc_middle;
 extern crate rustc_public_bridge;

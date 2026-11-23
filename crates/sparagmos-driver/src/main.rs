@@ -5262,7 +5262,7 @@ fn collect() -> ControlFlow<()> {
     // conversion: the recursion limit the demand passes hit while
     // collecting instances (a mono-collection error, so it takes
     // precedence), the required-constant evaluation the mono
-    // collector performs over the instances collection resolved
+    // collector performs over the instances it collects
     // (also a collection-time error, so it comes next), and the
     // checks of `sparagmos_driver::mono_check` over the converted
     // bodies (invalid SIMD intrinsic instantiations and SIMD
@@ -5280,16 +5280,7 @@ fn collect() -> ControlFlow<()> {
             if !COMPILE_VERDICT_MODE.load(std::sync::atomic::Ordering::Relaxed) {
                 return None;
             }
-            let required_const_roots: Vec<Instance> =
-                demand_state.seen.iter().map(|(_, inst)| *inst).collect();
-            let entry_instance = std::panic::catch_unwind(rustc_public::entry_fn)
-                .ok()
-                .flatten()
-                .and_then(|item| Instance::try_from(item).ok());
-            sparagmos_driver::mono_check::check_required_consts(
-                &required_const_roots,
-                entry_instance,
-            )
+            sparagmos_driver::mono_check::check_required_consts()
         })
         .or_else(|| sparagmos_driver::mono_check::check_bodies(&alias_sources));
 

@@ -1142,8 +1142,9 @@ fn fully_monomorphized<'tcx>() -> rustc_middle::ty::TypingEnv<'tcx> {
 /// `tests/ui/consts/required-consts` family). This check replays
 /// the collector's walk over the compiler's internal bodies —
 /// which keep both the required constants and the mentioned items
-/// from before optimization — starting from the instances the
-/// demand passes resolved and the crate's entry point.
+/// from before optimization — starting from the same roots
+/// the collector itself starts from (see
+/// `RequiredConstWalk::collect_roots`).
 ///
 /// Only a positively reported evaluation error is a finding: a
 /// constant that stays too generic after substitution, an instance
@@ -1155,7 +1156,7 @@ fn fully_monomorphized<'tcx>() -> rustc_middle::ty::TypingEnv<'tcx> {
 /// in practice — the same emission that fails the compilation
 /// under rustc; the returned string is the driver's own record of
 /// the finding.)
-pub fn check_required_consts(roots: &[Instance], entry: Option<Instance>) -> Option<String> {
+pub fn check_required_consts() -> Option<String> {
     let tcx = crate::convert::compiler_tcx()?;
     let mut walk = RequiredConstWalk {
         tcx,
@@ -1164,14 +1165,7 @@ pub fn check_required_consts(roots: &[Instance], entry: Option<Instance>) -> Opt
         queue: std::collections::VecDeque::new(),
         finding: None,
     };
-    if let Some(entry) = entry {
-        let instance = rustc_public::rustc_internal::internal(tcx, &entry);
-        walk.enqueue(instance);
-    }
-    for root in roots {
-        let instance = rustc_public::rustc_internal::internal(tcx, root);
-        walk.enqueue(instance);
-    }
+    walk.collect_roots();
     walk.run();
     walk.finding
 }
@@ -1218,6 +1212,106 @@ impl<'tcx> RequiredConstWalk<'tcx> {
         }
         if self.visited.insert(instance) {
             self.queue.push_back(instance);
+        }
+    }
+
+    /// Seed the walk with the roots the monomorphization
+    /// collector itself starts from (`RootCollector` in
+    /// rustc_monomorphize, under the lazy collection strategy —
+    /// the eager strategy is selected only by `-Zlink-dead-code`,
+    /// which the driver does not pass):
+    ///
+    /// - the crate's entry point, when it has one;
+    /// - every non-generic local function the reachability
+    ///   analysis marks as a root — the entry point, exported and
+    ///   `#[used]` functions, and the non-generic functions they
+    ///   reference — plus functions carrying the internal-symbol
+    ///   flags the collector also treats as roots;
+    /// - every local static: collecting a static evaluates its
+    ///   initializer, and a non-nested static's type also gets
+    ///   its drop glue collected.
+    ///
+    /// The instances the driver's own demand passes resolved are
+    /// NOT roots. Conversion translates every local body,
+    /// reachable or not, so a demand originating in an
+    /// unreferenced private function would seed the walk with an
+    /// instance rustc never collects, and a failing constant
+    /// inside it would fail a compilation rustc accepts.
+    /// Everything the collector does collect is reached from
+    /// these roots by the mention walk, exactly as in the
+    /// compiler.
+    fn collect_roots(&mut self) {
+        let tcx = self.tcx;
+        if let Some((entry_def_id, _)) = tcx.entry_fn(()) {
+            self.enqueue(rustc_middle::ty::Instance::mono(tcx, entry_def_id));
+        }
+        for local_def_id in tcx.iter_local_def_id() {
+            if self.finding.is_some() {
+                return;
+            }
+            let def_id = local_def_id.to_def_id();
+            // The root queries can panic on exotic items; a
+            // panic abandons that root, never the check (the
+            // same discipline as the per-instance walk in `run`).
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Foreign items (the contents of `extern`
+                // blocks) are never roots: the collector's item
+                // visitor does not process them, an extern
+                // function has no body to collect, and an extern
+                // static has no initializer to evaluate (asking
+                // for one is an internal compiler error).
+                if tcx.is_foreign_item(def_id) {
+                    return;
+                }
+                match tcx.def_kind(def_id) {
+                    rustc_hir::def::DefKind::Fn | rustc_hir::def::DefKind::AssocFn => {
+                        if tcx.generics_of(def_id).requires_monomorphization(tcx) {
+                            return;
+                        }
+                        let flags = tcx.codegen_fn_attrs(def_id).flags;
+                        if tcx.is_reachable_non_generic(def_id)
+                            || flags.intersects(
+                                rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags::RUSTC_STD_INTERNAL_SYMBOL
+                                    | rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags::EXTERNALLY_IMPLEMENTABLE_ITEM,
+                            )
+                        {
+                            self.enqueue(rustc_middle::ty::Instance::mono(tcx, def_id));
+                        }
+                    }
+                    rustc_hir::def::DefKind::Static { nested, .. } => {
+                        self.collect_root_static(def_id, nested);
+                    }
+                    _ => {}
+                }
+            }));
+        }
+    }
+
+    /// Collect one root static the way the collector visits a
+    /// `MonoItem::Static`: evaluate its initializer and follow
+    /// the allocations it points into (an evaluation error
+    /// reported there is the same failure class as a required
+    /// constant's), and collect the drop glue of a non-nested
+    /// static's type.
+    fn collect_root_static(&mut self, def_id: rustc_span::def_id::DefId, nested: bool) {
+        let tcx = self.tcx;
+        if !nested {
+            let instance = rustc_middle::ty::Instance::mono(tcx, def_id);
+            let ty = instance.ty(tcx, fully_monomorphized());
+            let glue = rustc_middle::ty::Instance::resolve_drop_glue(tcx, ty);
+            self.enqueue(glue);
+        }
+        match tcx.eval_static_initializer(def_id) {
+            Ok(alloc) => self.chase_allocation(alloc),
+            Err(rustc_middle::mir::interpret::ErrorHandled::Reported(..)) => {
+                self.finding = Some(format!(
+                    "initializer of static `{}` failed to evaluate \
+                     (rustc reports the evaluation error during \
+                     monomorphization collection)",
+                    tcx.def_path_str(def_id)
+                ));
+            }
+            Err(rustc_middle::mir::interpret::ErrorHandled::TooGeneric(_)) => {}
         }
     }
 
@@ -1492,13 +1586,28 @@ impl<'tcx> RequiredConstWalk<'tcx> {
             GlobalAlloc::TypeId { .. } => {}
             GlobalAlloc::Memory(alloc) => self.chase_allocation(alloc),
             GlobalAlloc::VTable(ty, dyn_ty) => {
-                let alloc_id = self.tcx.vtable_allocation((
-                    ty,
-                    dyn_ty
-                        .principal()
-                        .map(|principal| self.tcx.instantiate_bound_regions_with_erased(principal)),
-                ));
-                self.chase_alloc(alloc_id);
+                // Collect the vtable's method instances the way
+                // the collector does for a vtable allocation
+                // (`create_mono_items_for_vtable_methods`): the
+                // entries of the principal trait, plus the drop
+                // glue when the type needs dropping. (Chasing the
+                // vtable allocation itself cannot reach them: the
+                // allocation id is the one this very call is
+                // visiting, so the visited set would turn the
+                // chase away.)
+                if let Some(principal) = dyn_ty.principal() {
+                    let principal = self.tcx.instantiate_bound_regions_with_erased(principal);
+                    let trait_ref = principal.with_self_ty(self.tcx, ty);
+                    for entry in self.tcx.vtable_entries(trait_ref) {
+                        if let rustc_middle::ty::VtblEntry::Method(instance) = entry {
+                            self.enqueue(*instance);
+                        }
+                    }
+                    if ty.needs_drop(self.tcx, fully_monomorphized()) {
+                        let glue = rustc_middle::ty::Instance::resolve_drop_glue(self.tcx, ty);
+                        self.enqueue(glue);
+                    }
+                }
             }
         }
     }
@@ -1671,19 +1780,20 @@ impl<'tcx> rustc_middle::mir::visit::Visitor<'tcx> for OperandScan<'_, 'tcx> {
         let Some(mono_const) = self.walk.monomorphize(self.instance, const_op.const_) else {
             return;
         };
+        // A bare function-item operand is NOT collected: a
+        // function item is a zero-sized value, and merely using
+        // one as a value (passing it to a generic function that
+        // never calls it, storing it, black-boxing it) does not
+        // make the collector codegen its body, so resolving it
+        // as a function pointer here would demand bodies rustc
+        // never collects and fail compilations rustc accepts.
+        // The instances behind function items are collected
+        // where the item is actually used as a function: calls
+        // and coercions to a function pointer are mentioned
+        // items (handled in `visit_mentioned`), and an evaluated
+        // function-pointer value points into a function
+        // allocation, which the evaluation below chases.
         match mono_const.ty().kind() {
-            rustc_middle::ty::FnDef(def_id, args) => {
-                if let Some(args) = args.no_bound_vars() {
-                    if let Some(instance) = rustc_middle::ty::Instance::resolve_for_fn_ptr(
-                        tcx,
-                        fully_monomorphized(),
-                        *def_id,
-                        args,
-                    ) {
-                        self.walk.enqueue(instance);
-                    }
-                }
-            }
             rustc_middle::ty::Closure(def_id, args) => {
                 let instance = rustc_middle::ty::Instance::resolve_closure(
                     tcx,
