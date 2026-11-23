@@ -774,6 +774,369 @@ fn ty_may_be_unsized(
     }
 }
 
+/// The recorded reason for a definition the conversion does
+/// not pose the compiler's monomorphizing queries for,
+/// because its types mention a trait projection that cannot
+/// normalize in a fully-monomorphized typing environment
+/// (see [`unnormalizable_projection_in_instance`]). The
+/// constant-item accounting in the binary recognizes this
+/// prefix when it re-accounts a screened constant definition
+/// as not demanded, the way it does for a definition that
+/// fails only on its own parameters.
+pub const UNNORMALIZABLE_PROJECTION_REASON: &str =
+    "mentions a projection that does not normalize in a \
+     monomorphized typing environment";
+
+thread_local! {
+    /// The traits that have at least one implementation in
+    /// the running compilation, built once (see
+    /// `trait_has_impls`).
+    static TRAITS_WITH_IMPLS: std::cell::RefCell<
+        Option<HashSet<rustc_public::DefId>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// Whether `trait_def` has at least one implementation in
+/// the running compilation. Building the table enumerates
+/// `all_trait_impls` and instantiates each impl's trait
+/// reference, which neither substitutes nor normalizes, so
+/// it poses no query the projection screen exists to avoid.
+fn trait_has_impls(trait_def: rustc_public::DefId) -> bool {
+    TRAITS_WITH_IMPLS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let set = cache.get_or_insert_with(|| {
+            let mut set: HashSet<rustc_public::DefId> = HashSet::new();
+            for impl_def in rustc_public::all_trait_impls() {
+                set.insert(impl_def.trait_impl().value.def_id.def_id());
+            }
+            set
+        });
+        set.contains(&trait_def)
+    })
+}
+
+/// Whether the projection `alias` cannot normalize in a
+/// fully-monomorphized typing environment. The one judgment
+/// the implementation table decides for every self type: the
+/// projection's trait has no implementation at all, in any
+/// crate of the compilation. No instantiation of a
+/// definition mentioning the projection can satisfy its
+/// bounds then, so the projection normalizes for no self
+/// type — parameter, concrete, or otherwise.
+///
+/// Nothing else is judged. Whether an implementation
+/// *covers* a concrete self type is not decidable from the
+/// table alone: a `dyn` self type normalizes through its
+/// own existential projection predicate, closures and
+/// coroutines implement the `Fn` family and `Future`
+/// through compiler-synthesized implementations with no
+/// `impl` item, and a conditional implementation's bounds
+/// are not the table's to check. A screen that guessed at
+/// coverage would refuse queries rustc answers fine.
+fn projection_cannot_normalize(alias: &rustc_public::ty::AliasTy) -> bool {
+    let Some(trait_def) = alias.def_id.def_id().parent() else {
+        return false;
+    };
+    !trait_has_impls(trait_def)
+}
+
+/// Walk a type for a projection that cannot normalize (see
+/// [`projection_cannot_normalize`]), returning the recorded
+/// reason for the first one found. The walk mirrors
+/// `ty_sizedness`'s discipline: declared field types through
+/// ADT boundaries, parameters resolved one frame deep
+/// through the ambient arguments (see `compose_args`), a
+/// depth cap, and no compiler query beyond the kind
+/// questions the guarded form answers — the walk itself
+/// never poses the normalization it screens for. A type the
+/// walk cannot judge (an unaskable kind, an unresolved
+/// parameter) counts as no finding.
+fn projection_screen_ty(
+    ty: &Ty,
+    ambient: Option<&GenericArgs>,
+    depth: usize,
+) -> Option<String> {
+    if depth >= 8 {
+        return None;
+    }
+    let kind = guarded_ty_kind(ty)?;
+    match kind {
+        TyKind::Alias(alias_kind, alias) => {
+            if alias_kind == SmirAliasKind::Projection
+                && projection_cannot_normalize(&alias)
+            {
+                return Some(format!(
+                    "{UNNORMALIZABLE_PROJECTION_REASON}: \
+                     {alias:?}'s trait has no implementation"
+                ));
+            }
+            projection_screen_args(&alias.args, ambient, depth + 1)
+        }
+        TyKind::RigidTy(r) => match r {
+            RigidTy::Adt(def, a2) => {
+                let composed = compose_args(&a2, ambient);
+                projection_screen_args(&a2, ambient, depth + 1).or_else(|| {
+                    def.variants().iter().find_map(|variant| {
+                        variant.fields().iter().find_map(|field| {
+                            projection_screen_ty(
+                                &field.ty(),
+                                Some(&composed),
+                                depth + 1,
+                            )
+                        })
+                    })
+                })
+            }
+            RigidTy::Ref(_, inner, _)
+            | RigidTy::RawPtr(inner, _)
+            | RigidTy::Slice(inner)
+            | RigidTy::Pat(inner, _) => {
+                projection_screen_ty(&inner, ambient, depth + 1)
+            }
+            RigidTy::Array(elem, len) => {
+                projection_screen_ty(&elem, ambient, depth + 1).or_else(|| {
+                    projection_screen_const(&len, ambient, depth + 1)
+                })
+            }
+            RigidTy::Tuple(ts) => ts
+                .iter()
+                .find_map(|t| projection_screen_ty(t, ambient, depth + 1)),
+            RigidTy::FnDef(_, a2) => {
+                projection_screen_args(&a2, ambient, depth + 1).or_else(|| {
+                    ty.kind().fn_sig().and_then(|sig| {
+                        sig.skip_binder()
+                            .inputs_and_output
+                            .iter()
+                            .find_map(|t| {
+                                projection_screen_ty(t, None, depth + 1)
+                            })
+                    })
+                })
+            }
+            RigidTy::FnPtr(sig) => sig
+                .skip_binder()
+                .inputs_and_output
+                .iter()
+                .find_map(|t| projection_screen_ty(t, ambient, depth + 1)),
+            RigidTy::Closure(_, a2)
+            | RigidTy::Coroutine(_, a2)
+            | RigidTy::CoroutineWitness(_, a2) => {
+                projection_screen_args(&a2, ambient, depth + 1)
+            }
+            RigidTy::Dynamic(preds, _) => preds.iter().find_map(|pred| {
+                match &pred.value {
+                    ExistentialPredicate::Trait(tref) => {
+                        projection_screen_args(
+                            &tref.generic_args,
+                            ambient,
+                            depth + 1,
+                        )
+                    }
+                    ExistentialPredicate::Projection(pred) => {
+                        projection_screen_args(
+                            &pred.generic_args,
+                            ambient,
+                            depth + 1,
+                        )
+                    }
+                    ExistentialPredicate::AutoTrait(_) => None,
+                }
+            }),
+            _ => None,
+        },
+        TyKind::Param(p) => {
+            match ambient.and_then(|a| a.0.get(p.index as usize)) {
+                Some(GenericArgKind::Type(t)) => {
+                    projection_screen_ty(t, None, depth + 1)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Walk generic arguments for a projection that cannot
+/// normalize (see `projection_screen_ty`).
+fn projection_screen_args(
+    args: &GenericArgs,
+    ambient: Option<&GenericArgs>,
+    depth: usize,
+) -> Option<String> {
+    if depth >= 8 {
+        return None;
+    }
+    args.0.iter().find_map(|arg| match arg {
+        GenericArgKind::Type(t) => projection_screen_ty(t, ambient, depth),
+        GenericArgKind::Const(c) => projection_screen_const(c, ambient, depth),
+        GenericArgKind::Lifetime(_) => None,
+    })
+}
+
+/// Walk a constant for a projection that cannot normalize
+/// (see `projection_screen_ty`): only an unevaluated
+/// constant's arguments can mention one.
+fn projection_screen_const(
+    c: &rustc_public::ty::TyConst,
+    ambient: Option<&GenericArgs>,
+    depth: usize,
+) -> Option<String> {
+    if depth >= 8 {
+        return None;
+    }
+    match c.kind() {
+        TyConstKind::Unevaluated(_, args) => {
+            projection_screen_args(&args, ambient, depth)
+        }
+        _ => None,
+    }
+}
+
+/// Run a screen question under the containment
+/// `guarded_ty_kind` applies to kind questions. The screen
+/// asks questions some types cannot answer — an async
+/// closure instance's type cannot be asked at all, and an
+/// instance constant's evaluation can be too generic — and
+/// those questions panic with one of rustc_public's known
+/// unimplemented conversions. Such a panic means the
+/// question has no answer the screen can use, so the screen
+/// has no opinion; the panic hook's record of it is
+/// consumed, so no outer containment mistakes it for its
+/// own. Any other panic is resumed: the screen must never
+/// paper over an unrelated compiler failure.
+fn screen_question<T>(question: impl FnOnce() -> Option<T>) -> Option<T> {
+    clear_captured_panic();
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(question)) {
+        Ok(answer) => answer,
+        Err(payload) => {
+            if stable_mir_panic_reason(&*payload).is_some() {
+                let _ = take_captured_panic();
+                return None;
+            }
+            // The payload of a panic that crossed the bridge
+            // is opaque, so the hook's record of the same
+            // panic — taken after the slot was cleared above,
+            // hence this very panic's — is the witness that
+            // identifies it.
+            match take_captured_panic() {
+                Some(record) if record.contains("FIXME(async_closures)") => {
+                    None
+                }
+                other => {
+                    if let Some(record) = other {
+                        record_captured_panic(record);
+                    }
+                    std::panic::resume_unwind(payload)
+                }
+            }
+        }
+    }
+}
+
+/// Whether posing the compiler's monomorphizing queries
+/// for this instance — materializing its body through
+/// `Instance::body`, or resolving one of its associated
+/// items during conversion — would ask the compiler to
+/// normalize a trait projection that cannot normalize in a
+/// fully-monomorphized typing environment, returning the
+/// recorded reason if so.
+///
+/// Both queries normalize under
+/// `TypingEnv::fully_monomorphized` (reveal-all, no caller
+/// bounds) through the non-trying
+/// `normalize_erasing_regions`, whose failure is a delayed
+/// bug: the diagnostic is stored and flushed at the end of
+/// the run, so the compilation is poisoned even where the
+/// panic itself is contained. The query must not be posed.
+/// rustc's own monomorphization collector never poses it
+/// either: it instantiates only definitions demanded by
+/// other instantiated code, and a projection no
+/// implementation covers can never be demanded by a
+/// compilable program — the definitions that mention one
+/// (a function taking the projection as an argument, a
+/// constructor whose field it is, a generic constant whose
+/// body resolves a call through it) are exactly the
+/// definitions that stay uninstantiated. The screen is
+/// structural: it walks the instance's type (for a
+/// function, its signature with the arguments applied), its
+/// generic arguments, and the declared field types of the
+/// ADTs those mention, and reports the first projection
+/// whose trait has no implementation at all (see
+/// `projection_cannot_normalize`).
+pub fn unnormalizable_projection_in_instance(
+    inst: &Instance,
+) -> Option<String> {
+    screen_question(|| {
+        projection_screen_ty(&inst.ty(), None, 0)
+            .or_else(|| projection_screen_args(&inst.args(), None, 0))
+    })
+}
+
+/// Whether a body mentions a projection that cannot
+/// normalize (see [`unnormalizable_projection_in_instance`]),
+/// returning the recorded reason for the first one found.
+/// The body is a definition body — fetched without
+/// normalization — and the danger is inside its conversion:
+/// resolving an associated call whose arguments mention
+/// such a projection poses the normalization (an anonymous
+/// constant inside a generic function, calling an
+/// associated function through a projection over the
+/// function's own parameter, is the known shape). The walk
+/// covers the locals' types and the call terminators'
+/// operand types; a call's callee constant carries the
+/// call's generic arguments in its function type.
+pub fn unnormalizable_projection_in_body(
+    body: &mir::Body,
+) -> Option<String> {
+    screen_question(|| unnormalizable_projection_in_body_walk(body))
+}
+
+fn unnormalizable_projection_in_body_walk(
+    body: &mir::Body,
+) -> Option<String> {
+    for local in body.locals() {
+        if let Some(reason) = projection_screen_ty(&local.ty, None, 0) {
+            return Some(reason);
+        }
+    }
+    for block in &body.blocks {
+        if let mir::TerminatorKind::Call { func, args, .. } =
+            &block.terminator.kind
+        {
+            for op in std::iter::once(func).chain(args.iter()) {
+                let reason = match op {
+                    mir::Operand::Constant(c) => {
+                        projection_screen_ty(&c.const_.ty(), None, 0)
+                            .or_else(|| match c.const_.kind() {
+                                ConstantKind::Ty(tc) => {
+                                    projection_screen_const(&tc, None, 0)
+                                }
+                                ConstantKind::Unevaluated(uneval) => {
+                                    projection_screen_args(
+                                        &uneval.args,
+                                        None,
+                                        0,
+                                    )
+                                }
+                                _ => None,
+                            })
+                    }
+                    mir::Operand::RuntimeChecks(_) => None,
+                    mir::Operand::Copy(place) | mir::Operand::Move(place) => {
+                        place.ty(body.locals()).ok().and_then(|ty| {
+                            projection_screen_ty(&ty, None, 0)
+                        })
+                    }
+                };
+                if reason.is_some() {
+                    return reason;
+                }
+            }
+        }
+    }
+    None
+}
+
 /// The cardinality of a type's value set, for the zero-sized
 /// constant synthesis in `Converter::unique_const_value`.
 enum UniqueConst {
@@ -1107,6 +1470,16 @@ fn instance_item_body(
 ) -> Option<mir::Body> {
     with_body_materialization(key, || match inst {
         Some(inst) if matches!(inst.kind, InstanceKind::Item) => {
+            // An instance whose types mention a projection
+            // that does not normalize: fetching its body
+            // would pose that normalization and poison the
+            // compilation (see
+            // `unnormalizable_projection_in_instance`). Fall
+            // back to the definition body, the way a missing
+            // instance body does.
+            if unnormalizable_projection_in_instance(&inst).is_some() {
+                return def_body();
+            }
             inst.body().or_else(def_body)
         }
         Some(_) => None,
@@ -1117,6 +1490,7 @@ fn instance_item_body(
 impl Converter {
     pub fn new() -> Self {
         TY_MENTIONS_PARAM_CACHE.with(|cache| cache.borrow_mut().clear());
+        TRAITS_WITH_IMPLS.with(|cache| *cache.borrow_mut() = None);
         crate::reach::clear_expanded_size_cache();
         Self {
             def_ids: HashMap::new(),

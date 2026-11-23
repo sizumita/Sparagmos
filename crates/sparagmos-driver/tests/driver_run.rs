@@ -1665,6 +1665,134 @@ fn summary_mode_undemanded_coroutine_is_not_demanded() {
     );
 }
 
+const UNNORMALIZABLE_PROJECTION_FN_SRC: &str = r#"
+trait Trait {
+    type Type;
+}
+struct Extern;
+fn f<'a>(_: <&'a Extern as Trait>::Type) where &'a Extern: Trait {}
+fn main() { println!("hi"); }
+"#;
+
+#[test]
+fn summary_mode_unnormalizable_projection_fn_is_not_demanded() {
+    // A function whose argument type is a trait projection
+    // no implementation covers: materializing its body would
+    // ask the compiler to normalize the projection in a
+    // monomorphized typing environment, which ICEs the whole
+    // conversion (a delayed bug, uncontainable). Nothing
+    // demands the function — rustc's monomorphization
+    // collector never instantiates it either — so it is
+    // accounted not demanded with the screen's reason, and
+    // the rest of the crate still converts.
+    let dir = temp_dir("projection-fn-undemanded");
+    let src = fixture(
+        &dir,
+        "projection_fn_undemanded.rs",
+        UNNORMALIZABLE_PROJECTION_FN_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("::f"))
+        .expect("summary lists the projection-argument function");
+    assert!(
+        line.contains("NOT DEMANDED") && line.contains("does not normalize"),
+        "the projection-argument function is not demanded: {line}"
+    );
+    let main_line = stdout
+        .lines()
+        .find(|l| l.contains("::main"))
+        .expect("summary lists main");
+    assert!(
+        main_line.contains("[converted]"),
+        "main still converts: {main_line}"
+    );
+}
+
+const UNNORMALIZABLE_PROJECTION_CTOR_SRC: &str = r#"
+#![feature(trivial_bounds)]
+#![allow(trivial_bounds)]
+pub trait Foo {
+    type Assoc;
+}
+pub struct Bar;
+pub struct Baz(<Bar as Foo>::Assoc)
+where
+    Bar: Foo;
+fn main() { println!("hi"); }
+"#;
+
+#[test]
+fn summary_mode_unnormalizable_projection_ctor_is_converted() {
+    // A tuple struct whose field is a projection no
+    // implementation covers: the constructor's signature
+    // carries the projection, so materializing its body
+    // would ICE the conversion the same way. An undemanded
+    // constructor is accounted converted (the accounting
+    // undemanded generic constructors get), and the crate
+    // still converts.
+    let dir = temp_dir("projection-ctor");
+    let src = fixture(
+        &dir,
+        "projection_ctor.rs",
+        UNNORMALIZABLE_PROJECTION_CTOR_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("::Baz"))
+        .expect("summary lists the projection-field constructor");
+    assert!(
+        line.contains("[converted]"),
+        "the undemanded projection-field constructor is converted: {line}"
+    );
+}
+
+const UNNORMALIZABLE_PROJECTION_CONST_SRC: &str = r#"
+#![feature(const_trait_impl, generic_const_exprs)]
+#![allow(incomplete_features)]
+const trait Trait {
+    type Assoc: [const] Trait;
+    fn func() -> i32;
+}
+struct Type<const N: i32>;
+fn unqualified<T: const Trait>() -> Type<{ T::Assoc::func() }> {
+    Type
+}
+fn main() { println!("hi"); }
+"#;
+
+#[test]
+fn summary_mode_unnormalizable_projection_const_is_not_demanded() {
+    // An anonymous constant inside a generic function, whose
+    // body resolves an associated call through a projection
+    // over the function's own parameter: converting the
+    // constant would pose that normalization during
+    // resolution and ICE. The constant is a generic
+    // definition nothing demands (monomorphized bodies that
+    // use it carry its evaluated value), so it is accounted
+    // not demanded with the screen's reason.
+    let dir = temp_dir("projection-const-undemanded");
+    let src = fixture(
+        &dir,
+        "projection_const_undemanded.rs",
+        UNNORMALIZABLE_PROJECTION_CONST_SRC,
+    );
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("{constant#0}"))
+        .expect("summary lists the anonymous constant");
+    assert!(
+        line.contains("NOT DEMANDED") && line.contains("does not normalize"),
+        "the projection constant is not demanded: {line}"
+    );
+}
+
 const COROUTINE_ONLY_CALLER_SRC: &str = r#"
 fn helper<T: Copy>(v: T) -> T { v }
 fn main() {

@@ -318,6 +318,14 @@ struct Record {
 fn fetch_body_contained(
     inst: &Instance,
 ) -> Result<Option<mir::Body>, &'static str> {
+    // An instance whose types mention a projection that
+    // does not normalize: fetching its body would pose that
+    // normalization and poison the compilation (see
+    // `crate::convert::unnormalizable_projection_in_instance`).
+    // Record it body-less with the screen's reason instead.
+    if crate::convert::unnormalizable_projection_in_instance(inst).is_some() {
+        return Err(crate::convert::UNNORMALIZABLE_PROJECTION_REASON);
+    }
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::convert::with_body_materialization(&inst.name(), || inst.body())
     })) {
@@ -472,6 +480,12 @@ pub fn collect_reachable(
                         RecordKind::NoBody {
                             reason: "collection limit reached".to_string(),
                         }
+                    } else if let Some(reason) =
+                        crate::convert::unnormalizable_projection_in_instance(
+                            &inst,
+                        )
+                    {
+                        RecordKind::NoBody { reason }
                     } else if let Some(cbody) = crate::convert::with_body_materialization(
                         &inst.name(),
                         || inst.body(),

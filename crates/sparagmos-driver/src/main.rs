@@ -483,6 +483,17 @@ fn convert_body_isolated(
 fn fetch_instance_body(
     inst: &Instance,
 ) -> Result<Option<rustc_public::mir::Body>, String> {
+    // An instance whose types mention a projection that
+    // does not normalize: fetching its body would pose that
+    // normalization and poison the compilation (see
+    // `unnormalizable_projection_in_instance`). Refuse the
+    // fetch by name instead; the caller records the named
+    // demand failure.
+    if let Some(reason) =
+        sparagmos_driver::convert::unnormalizable_projection_in_instance(inst)
+    {
+        return Err(reason);
+    }
     guard_stable_mir_query(&inst.name(), || inst.body())
 }
 
@@ -4531,6 +4542,30 @@ fn collect() -> ControlFlow<()> {
                         match guard_stable_mir_query(&item.name(), || item.body()) {
                             Ok(Some(body)) => {
                                 let report_idx = report.functions.len();
+                                // A constant whose body mentions
+                                // a projection that does not
+                                // normalize: resolving the
+                                // associated calls inside its
+                                // conversion would pose that
+                                // normalization and poison the
+                                // compilation (see
+                                // `unnormalizable_projection_in_body`).
+                                // Skip the conversion with the
+                                // named reason; the accounting
+                                // below re-accounts it not
+                                // demanded, like a constant that
+                                // fails only on its own
+                                // parameters —
+                                // monomorphized bodies that use
+                                // the constant carry its
+                                // evaluated value, so no
+                                // converted body needs this
+                                // definition body.
+                                if let Some(reason) =
+                                    sparagmos_driver::convert::unnormalizable_projection_in_body(&body)
+                                {
+                                    skip_fn(&mut report, &name, reason);
+                                } else {
                                 convert_local_body(
                                     &mut conv,
                                     &mut report,
@@ -4542,6 +4577,7 @@ fn collect() -> ControlFlow<()> {
                                     def_id,
                                     body,
                                 );
+                                }
                                 // A conversion that fails only on
                                 // the constant's own parameters has
                                 // met the generic definition itself,
@@ -4560,6 +4596,12 @@ fn collect() -> ControlFlow<()> {
                                 // definition body, the way a generic
                                 // function definition nothing demands
                                 // is not part of the program either.
+                                // The projection screen's reason
+                                // is the same shape: the
+                                // definition's own types mention a
+                                // projection no monomorphization
+                                // could normalize, so nothing can
+                                // demand the definition either.
                                 // Account it `NotDemanded`, keeping
                                 // the parameter record; a failure
                                 // with any other reason mixed in
@@ -4575,6 +4617,9 @@ fn collect() -> ControlFlow<()> {
                                                         "ConstantKind::Param(",
                                                     ) || r
                                                         == "ConstantKind::Bound"
+                                                        || r.starts_with(
+                                                            sparagmos_driver::convert::UNNORMALIZABLE_PROJECTION_REASON,
+                                                        )
                                                 }) =>
                                         {
                                             Some(
@@ -4617,6 +4662,53 @@ fn collect() -> ControlFlow<()> {
                 }
             },
         };
+        // A definition whose types mention a projection that
+        // does not normalize in a monomorphized environment:
+        // fetching its instance body would pose exactly that
+        // normalization and poison the compilation (a delayed
+        // bug, uncontainable — see
+        // `unnormalizable_projection_in_instance`). rustc's
+        // monomorphization collector never instantiates such
+        // a definition either (no compilable program can
+        // demand it), so defer it like a generic definition
+        // and let the demand accounting below decide: an
+        // undemanded constructor is accounted converted, any
+        // other undemanded definition not demanded, and a
+        // demanded one fails by name at the demand fetch.
+        // The screen covers the instance's signature and
+        // arguments; the definition body (fetched without
+        // normalization) extends it to the body's locals and
+        // call targets.
+        let unnormalizable =
+            sparagmos_driver::convert::unnormalizable_projection_in_instance(
+                &instance,
+            )
+            .or_else(|| match guard_stable_mir_query(&name, || item.body()) {
+                Ok(Some(def_body)) => {
+                    sparagmos_driver::convert::unnormalizable_projection_in_body(
+                        &def_body,
+                    )
+                }
+                _ => None,
+            });
+        if let Some(reason) = unnormalizable {
+            let mut reasons = BTreeMap::new();
+            reasons.insert(reason, 1);
+            deferred.push(DeferredFn {
+                def: item.def_id(),
+                name: name.clone(),
+                report_idx: report.functions.len(),
+                ctor: matches!(item.kind(), ItemKind::Ctor(..)),
+            });
+            report.functions.push(FnReport {
+                name,
+                blocks: 0,
+                locals: 0,
+                arg_count: 0,
+                outcome: FnOutcome::Skipped { reasons },
+            });
+            continue;
+        }
         let body = match guard_stable_mir_query(&instance.name(), || instance.body()) {
             Ok(Some(body)) => body,
             Ok(None) => {
