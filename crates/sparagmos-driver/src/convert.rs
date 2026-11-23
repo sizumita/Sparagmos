@@ -4993,8 +4993,8 @@ impl Converter {
 
     /// Record the derived-`Debug` shape of one monomorphic ADT
     /// instance under its rendered instance name, once per distinct
-    /// instance (see `sm::AdtDebugShapes`). Only struct and enum
-    /// instances with no remaining generic parameters get an entry:
+    /// instance (see `sm::AdtDebugShapes`). Only instances with
+    /// no remaining generic parameters get an entry:
     /// a parameter would render into a field tag that names no real
     /// type, and the instance's own tag would collide across
     /// instantiations.
@@ -5020,7 +5020,7 @@ impl Converter {
         let kind = match def.kind() {
             AdtKind::Struct => sm::AdtShapeKind::Struct,
             AdtKind::Enum => sm::AdtShapeKind::Enum,
-            AdtKind::Union => return,
+            AdtKind::Union => sm::AdtShapeKind::Union,
         };
         if ty_has_param(converted) || self.debug_shape_depth >= 16 {
             return;
