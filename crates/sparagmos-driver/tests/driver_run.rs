@@ -23934,6 +23934,41 @@ fn run_mode_error_downcast_by_value() {
     );
 }
 
+const ERROR_DOWNCAST_REBOX_FMT_SRC: &str = r#"
+use std::error::Error;
+use std::fmt;
+#[derive(Debug)]
+struct MyErr { code: u32 }
+impl fmt::Display for MyErr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "my err {}", self.code) }
+}
+impl Error for MyErr {}
+fn main() {
+    let boxed: Box<dyn Error> = Box::new(MyErr { code: 7 });
+    let b = boxed.downcast::<MyErr>().unwrap();
+    let e: Box<dyn Error> = b;
+    println!("display: {}", e);
+    println!("debug: {:?}", e);
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_error_downcast_rebox_formats_as_dyn() {
+    // Formatting the trait object a by-value downcast rebuilt:
+    // the sized box the downcast produces is an aggregate-built
+    // box (its `Unique` at field 0 beside the allocator field),
+    // so the rebuilt `Box<dyn Error>`'s data pointer denotes the
+    // payload through that aggregate. Its `Display` / `Debug`
+    // are the concrete type's, reached through the box aggregate
+    // the way dereferencing the same base reaches the payload.
+    run_ok(
+        "error-downcast-rebox-fmt",
+        ERROR_DOWNCAST_REBOX_FMT_SRC,
+        "display: my err 7\ndebug: MyErr { code: 7 }\ndone\n",
+    );
+}
+
 const TO_STRING_DISPLAY_SHAPES_SRC: &str = r#"
 use std::error::Error;
 use std::fmt;

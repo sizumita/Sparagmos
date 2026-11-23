@@ -27518,6 +27518,22 @@ impl<'a> Interpreter<'a> {
                     }
                 }
                 let pointee = self.resolve_value(frames, base)?;
+                // An aggregate-built box base (a `Box::from_raw`
+                // product, or the sized box a downcast rebuilds)
+                // holds its `Unique` at field 0 beside the
+                // allocator field, so the resolved base is the box
+                // aggregate itself, not the pointee: name the
+                // pointee through the data-pointer extraction,
+                // the same extraction `deref_value` applies to
+                // this base shape.
+                let pointee = if matches!(
+                    base.as_ref(),
+                    Value::Enum { fields, .. } if fields.len() > 1
+                ) {
+                    Self::dyn_data_pointer(base)
+                } else {
+                    pointee
+                };
                 // The base is the data pointer in the shape the
                 // sized value had: a `Box<dyn Trait>` base is the
                 // box aggregate (a one-field wrapper around the
