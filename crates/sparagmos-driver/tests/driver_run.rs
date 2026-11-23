@@ -1471,6 +1471,173 @@ fn run_mode_mem_drop_runs_destructors() {
     );
 }
 
+// ----- Box pointee move-out (Lane MQ) ----------------------------------------
+
+const BOX_MOVE_OUT_ZST_SRC: &str = r#"
+struct DropMe;
+impl Drop for DropMe { fn drop(&mut self) { println!("drop"); } }
+fn main() {
+    let b = Box::new(DropMe);
+    let _d = *b;
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_box_pointee_move_out_drops_once_zst() {
+    // Moving the pointee out of a box leaves the box an empty
+    // shell: the moved value's destructor runs once (at its own
+    // scope end), and the box's own drop — which drop elaboration
+    // emits as the `Drop::drop` method call — only releases the
+    // allocation. The pointee is a ZST here, so the move itself
+    // leaves no statement in the converted body at all.
+    let dir = temp_dir("boxmovezst");
+    let src = fixture(&dir, "boxmovezst.rs", BOX_MOVE_OUT_ZST_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "box move-out program must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "done\ndrop\n",
+        "the moved-out pointee drops exactly once"
+    );
+}
+
+const BOX_MOVE_OUT_SCALAR_SRC: &str = r#"
+struct DropMe(u32);
+impl Drop for DropMe { fn drop(&mut self) { println!("drop {}", self.0); } }
+fn main() {
+    let b = Box::new(DropMe(7));
+    let _d = *b;
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_box_pointee_move_out_drops_once_scalar() {
+    // The non-ZST form of the move-out: the pointee load is a
+    // shaped load converted from a move, which clears the
+    // pointee's slot in the box's allocation, and the box's
+    // method-call drop is the shell step only.
+    let dir = temp_dir("boxmovescalar");
+    let src = fixture(&dir, "boxmovescalar.rs", BOX_MOVE_OUT_SCALAR_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "box move-out program must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "done\ndrop 7\n",
+        "the moved-out pointee drops exactly once, with its value intact"
+    );
+}
+
+const BOX_MOVE_OUT_SCOPE_SRC: &str = r#"
+struct DropMe;
+impl Drop for DropMe { fn drop(&mut self) { println!("drop"); } }
+fn main() {
+    let _d;
+    {
+        let b = Box::new(DropMe);
+        _d = *b;
+    }
+    println!("mid");
+}
+"#;
+
+#[test]
+fn run_mode_box_pointee_move_out_scope_order() {
+    // The emptied box drops at the inner scope's end, silently;
+    // the moved-out value drops at the outer scope's end.
+    let dir = temp_dir("boxmovescope");
+    let src = fixture(&dir, "boxmovescope.rs", BOX_MOVE_OUT_SCOPE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "box move-out program must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "mid\ndrop\n",
+        "the empty box drops silently before the moved value drops"
+    );
+}
+
+const BOX_PARTIAL_MOVE_OUT_SRC: &str = r#"
+struct A(u32);
+impl Drop for A { fn drop(&mut self) { println!("drop A {}", self.0); } }
+struct B(u32);
+impl Drop for B { fn drop(&mut self) { println!("drop B {}", self.0); } }
+struct P { a: A, b: B }
+fn main() {
+    let bx = Box::new(P { a: A(1), b: B(2) });
+    let _a = bx.a;
+    println!("end");
+}
+"#;
+
+#[test]
+fn run_mode_box_pointee_partial_move_out_drops_rest_once() {
+    // A field moved out of the pointee drops at its own scope
+    // end; the field that stayed is dropped by the elaborated
+    // field drop, and the box's method-call drop is the shell
+    // step only — neither field's destructor runs twice.
+    let dir = temp_dir("boxpartialmove");
+    let src = fixture(&dir, "boxpartialmove.rs", BOX_PARTIAL_MOVE_OUT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "partial move-out program must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "end\ndrop A 1\ndrop B 2\n",
+        "each field drops exactly once"
+    );
+}
+
+const BOX_NO_MOVE_OUT_SRC: &str = r#"
+struct DropMe;
+impl Drop for DropMe { fn drop(&mut self) { println!("drop"); } }
+fn main() {
+    let _b = Box::new(DropMe);
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_box_drop_without_move_out_still_drops_pointee() {
+    // The plain scope-end drop of a box (the `Drop` terminator
+    // form, no move-out anywhere) still runs the pointee's
+    // destructor exactly once: the shell-only glue applies to
+    // the method-call form only.
+    let dir = temp_dir("boxnomove");
+    let src = fixture(&dir, "boxnomove.rs", BOX_NO_MOVE_OUT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "plain box program must run to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "done\ndrop\n",
+        "an unmoved box still drops its pointee"
+    );
+}
+
 
 // ----- Box<dyn Fn> drop timing (Lane EV) --------------------------------------
 

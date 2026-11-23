@@ -804,7 +804,14 @@ pub enum Rvalue {
     /// in a raw element block whose elements are the lanes'
     /// storage (a byte buffer read as a vector), the value is
     /// assembled from the consecutive elements at the place.
-    ShapedLoad(Place, ScalarShape),
+    /// The `bool` records whether the MIR operand this load was
+    /// converted from was a move: a shaped load is still a move
+    /// when the operand says so, and execution clears the source
+    /// place after loading, exactly as a plain move of the place
+    /// does — the value left behind in the source (a box's
+    /// pointee, say) must read as moved out of, or drop glue
+    /// reaching it later runs on it a second time.
+    ShapedLoad(Place, ScalarShape, bool),
     /// A pointer offset (`BinaryOp::Offset`: `ptr.offset` /
     /// `ptr.add` / `ptr.sub` and the `byte_add` family after their
     /// cast to an element pointer): the first operand's pointer

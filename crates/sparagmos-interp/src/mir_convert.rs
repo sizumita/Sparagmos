@@ -6277,6 +6277,7 @@ let inner = match (&src, target) {
                         return Ok(ir::Rvalue::ShapedLoad(
                             self.convert_place(body, place)?,
                             shape,
+                            matches!(op, mir::Operand::Move(_)),
                         ));
                     }
                 }
@@ -7594,6 +7595,17 @@ let inner = match (&src, target) {
     /// `Drop` terminator for the same place reads it as
     /// uninitialised and runs no glue a second time.
     ///
+    /// A `Box` call is the exception in the other direction: the
+    /// box's method body is only the shell step (it releases the
+    /// allocation; the pointee's destruction is the compiler's,
+    /// done before the method runs), and drop elaboration emits
+    /// this call form exactly when the pointee has been moved
+    /// out of the box — the parts that remain are dropped by
+    /// their own `Drop` terminators. The glue the conversion
+    /// builds for a box call is therefore the trivial plan: the
+    /// session rooted at the box place still releases the
+    /// allocation and clears the place, and no pointee glue runs.
+    ///
     /// One exception: when the dropped type's own glue routes
     /// its destructor step through the very body this call
     /// resolves to, the collected body IS that step and the call
@@ -7693,6 +7705,28 @@ let inner = match (&src, target) {
                 return None;
             }
         }
+        // The `Box` shell step (see the doc comment): the
+        // method body only releases the allocation, so the glue
+        // is the trivial plan — the session rooted at the box
+        // place releases the allocation and clears the place,
+        // and no pointee glue runs.
+        let glue = if let mir::Ty::Adt(def, _) = &self_ty {
+            let is_box = self
+                .names
+                .get(def)
+                .or_else(|| self.def_names.get(def))
+                .is_some_and(|n| n == "std::boxed::Box");
+            if is_box {
+                ir::DropGlue {
+                    root: ir::DropPlan::Trivial,
+                    adts: Vec::new(),
+                }
+            } else {
+                glue
+            }
+        } else {
+            glue
+        };
         let arg_place = match &args[0] {
             mir::Operand::Copy(place) | mir::Operand::Move(place) => place.clone(),
             _ => return None,

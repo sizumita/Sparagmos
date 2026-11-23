@@ -15561,10 +15561,31 @@ impl<'a> Interpreter<'a> {
                 let value = self.eval_operand(frames, body, operand)?;
                 self.reinterpret_value(&value, src, dst)
             }
-            Rvalue::ShapedLoad(place, shape) => {
+            Rvalue::ShapedLoad(place, shape, moved) => {
                 let target = self.resolve_place(frames, body, place)?;
                 let place_ty = self.place_result_ty(body, place);
-                self.shaped_load(frames, &target, shape, place_ty.as_ref())
+                let value =
+                    self.shaped_load(frames, &target, shape, place_ty.as_ref())?;
+                if *moved {
+                    // A move leaves the source place
+                    // uninitialised, exactly as a plain move of
+                    // the same place does in `eval_operand`: the
+                    // value now lives only in the destination,
+                    // and drop glue reaching the source later (a
+                    // box's pointee glue, say) finds nothing to
+                    // run a second time. A target that resolved
+                    // to a value (a constant aggregate) has no
+                    // storage to clear.
+                    match &target {
+                        Resolved::Place { .. }
+                        | Resolved::Static { .. }
+                        | Resolved::Alloc { .. } => {
+                            self.write_resolved(frames, &target, Value::Uninit)?;
+                        }
+                        Resolved::Value(..) => {}
+                    }
+                }
+                Ok(value)
             }
             Rvalue::PtrOffset(ptr_op, count_op, baked_size, count_width) => {
                 let base = self.eval_operand(frames, body, ptr_op)?;
