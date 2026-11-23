@@ -11391,6 +11391,70 @@ fn run_mode_exact_size_len_modelled_family_and_bodies() {
     );
 }
 
+const EXACT_SIZE_LEN_REF_WRAPPER_SRC: &str = r#"
+use std::iter::ExactSizeIterator;
+fn len_of<I: ExactSizeIterator>(it: I) -> usize { it.len() }
+fn main() {
+    let a = [10, 20, 30, 40];
+    let mut it = a.iter();
+    let r = &mut it;
+    println!("mut0 {}", ExactSizeIterator::len(&r));
+    r.next();
+    r.next();
+    println!("mut1 {}", ExactSizeIterator::len(&r));
+    let mut it2 = a.iter();
+    let mut r2 = &mut it2;
+    let rr = &mut r2;
+    println!("dbl0 {}", ExactSizeIterator::len(&rr));
+    let mut it3 = a.iter();
+    println!("gen0 {}", len_of(&mut it3));
+    it3.next();
+    println!("gen1 {}", len_of(&mut it3));
+    let z = [(), (), (), (), ()];
+    let mut zit = z.iter();
+    let zr = &mut zit;
+    println!("zst0 {}", ExactSizeIterator::len(&zr));
+    zr.next();
+    println!("zst1 {}", ExactSizeIterator::len(&zr));
+    let mut b = [1, 2, 3];
+    let mut mit = b.iter_mut();
+    let mr = &mut mit;
+    println!("itermut0 {}", ExactSizeIterator::len(&mr));
+    mr.next();
+    println!("itermut1 {}", ExactSizeIterator::len(&mr));
+    let mut it4 = a.iter();
+    let br = it4.by_ref();
+    println!("byref0 {}", br.len());
+    println!("byref1 {}", it4.len());
+}
+"#;
+
+#[test]
+fn run_mode_exact_size_len_reference_wrapper_forwards() {
+    // A reference-wrapper `Self` (`&mut I`, the one reference
+    // form implementing the trait) is not the modelled
+    // builtin's to serve: core's blanket body for `&mut I` is
+    // collected and forwards to the inner call, which the
+    // builtin then serves with the iterator type itself.
+    // Peeling the reference in the modelled predicate
+    // preempted that body, and the builtin — dereferencing
+    // its receiver only once — found a reference where the
+    // iterator state belongs ("expected ADT value, found
+    // reference"). The ZST case pins that the forwarded
+    // inner call still reaches the modelled builtin.
+    let dir = temp_dir("exact-size-len-ref-wrapper");
+    let src = fixture(&dir, "exactlenref.rs", EXACT_SIZE_LEN_REF_WRAPPER_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "mut0 4\nmut1 2\ndbl0 4\ngen0 4\ngen1 3\nzst0 5\nzst1 4\nitermut0 3\nitermut1 2\nbyref0 4\nbyref1 4\n",
+        "stdout={stdout}"
+    );
+}
+
 const CATCH_UNWIND_O3_DATA_SRC: &str = r#"
 #[inline(never)]
 fn boom() { std::panic::resume_unwind(Box::new(7i32)); }

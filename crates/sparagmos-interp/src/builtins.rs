@@ -20784,11 +20784,19 @@ pub fn hash_collection_tag(self_ty: &str) -> bool {
 /// Every other type's `len` keeps its collected body (the
 /// trait default, which delegates to `size_hint`, or the
 /// type's own override).
+///
+/// A reference-wrapper `Self` (`&mut I`, the one reference
+/// form that implements the trait) is deliberately not
+/// modelled here: core's blanket body for `&mut I` is
+/// collected — the reach-side predicate likewise names
+/// only the bare ADT — and forwards to the inner call,
+/// which re-enters with the iterator type itself, the same
+/// arrangement as the modelled `next` (see
+/// `iterator_next_modelled`). Peeling the reference here
+/// would preempt that body while the builtin's receiver
+/// chase dereferences only once, leaving a reference where
+/// the iterator state belongs.
 pub fn iterator_len_modelled(self_ty: &str) -> bool {
-    let self_ty = self_ty
-        .strip_prefix("&mut ")
-        .or_else(|| self_ty.strip_prefix('&'))
-        .unwrap_or(self_ty);
     self_ty.starts_with("std::slice::Iter<")
         || self_ty.starts_with("std::slice::IterMut<")
         || self_ty.starts_with("std::collections::btree_set::Iter<")
