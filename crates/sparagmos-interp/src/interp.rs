@@ -3142,6 +3142,24 @@ impl<'a> Interpreter<'a> {
                 }
             }
         }
+        // An output operand bound to a register the incoming
+        // state already initialized — seeded by an aliased input
+        // operand above, or by a naked block's argument seeds —
+        // starts from that state: a step that reads the operand
+        // observes the register's content, and the operand's
+        // value is defined even if no step writes the register
+        // (the `lateout` shape: with `in("rax") 42` and
+        // `lateout("rax") y`, y holds 42 when the program never
+        // writes rax).
+        for (i, reg) in regs.iter().enumerate() {
+            if reg.init.is_none() {
+                if let Some(a) = reg.arch {
+                    if arch_written[a as usize] {
+                        slots[i] = arch[a as usize];
+                    }
+                }
+            }
+        }
         let mut written = vec![false; regs.len()];
         let mut outcome = AsmOutcome::Fallthrough;
         for step in steps {
@@ -3175,10 +3193,24 @@ impl<'a> Interpreter<'a> {
         }
         for (i, reg) in regs.iter().enumerate() {
             let Some(dest) = &reg.dest else { continue };
-            if !written[i] && reg.init.is_none() {
-                continue;
-            }
-            let value = asm_output_value(slots[i], reg);
+            // An explicit-register operand's value is the final
+            // content of its register: the register file is kept
+            // in step with the operand slots as the program runs,
+            // and it also carries incoming state no step touched —
+            // an aliased input's seed, which an output bound to
+            // the same register observes. A register that was
+            // never seeded or written leaves the destination
+            // untouched, like an unwritten slot output below.
+            let bits = match reg.arch {
+                Some(a) if arch_written[a as usize] => arch[a as usize],
+                _ => {
+                    if !written[i] && reg.init.is_none() {
+                        continue;
+                    }
+                    slots[i]
+                }
+            };
+            let value = asm_output_value(bits, reg);
             self.write_place(frames, body, dest, value)?;
         }
         if matches!(outcome, AsmOutcome::Fallthrough) {
@@ -23210,7 +23242,19 @@ fn exec_asm_step(
             asm_sync_arch_to_slot(arch, slots, written, bound, *dst);
         }
         AsmStep::Lea { dst, base, disp } => {
-            let addr = asm_src_value(slots, regs, arch, base).wrapping_add(*disp as u64);
+            // The effective address wraps at the address size —
+            // the width of the base register form — before the
+            // destination write extends it: `lea rax, [ecx + 1]`
+            // with ecx at 2^32 - 1 yields zero, not 2^32.
+            let addr_width = match base {
+                sparagmos_mir::AsmSrc::Reg(idx, modifier) => {
+                    asm_instr_width(regs, *idx, *modifier)
+                }
+                sparagmos_mir::AsmSrc::Arch(reg) => reg.width,
+                sparagmos_mir::AsmSrc::Imm(_) => 64,
+            };
+            let addr = asm_src_value(slots, regs, arch, base).wrapping_add(*disp as u64)
+                & asm_width_mask(addr_width);
             match dst {
                 AsmDst::Operand(idx, modifier) => {
                     asm_write(slots, written, regs, *idx, *modifier, addr);

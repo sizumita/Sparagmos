@@ -11814,6 +11814,46 @@ fn run_mode_inline_asm_outside_class_is_named_error() {
     );
 }
 
+const ASM_LATEOUT_ALIAS_SRC: &str = r#"
+use std::arch::asm;
+fn main() {
+    let y: u64;
+    unsafe {
+        asm!("mov rcx, rax", in("rax") 42u64, lateout("rax") y, out("rcx") _);
+    }
+    println!("{y}");
+}
+"#;
+
+#[test]
+fn run_mode_inline_asm_lateout_aliased_with_input() {
+    // The template never writes rax, but the lateout bound to
+    // it still observes the incoming content the aliased input
+    // seeded: natively y == 42.
+    run_ok("asm-lateout-alias", ASM_LATEOUT_ALIAS_SRC, "42\n");
+}
+
+const ASM_LEA_WRAP_SRC: &str = r#"
+use std::arch::asm;
+fn main() {
+    let y: u64;
+    let z: u64;
+    unsafe {
+        asm!("lea {0}, [ecx + 1]", out(reg) y, in("rcx") 0xffff_ffffu64);
+        asm!("lea {0}, [rcx + 1]", out(reg) z, in("rcx") 0xffff_ffffu64);
+    }
+    println!("{y} {z}");
+}
+"#;
+
+#[test]
+fn run_mode_inline_asm_lea_wraps_at_address_size() {
+    // The 32-bit base form wraps the effective address at 32
+    // bits before it is zero-extended into the destination (0);
+    // the 64-bit base form keeps the full sum (2^32).
+    run_ok("asm-lea-wrap", ASM_LEA_WRAP_SRC, "0 4294967296\n");
+}
+
 #[test]
 fn convert_mode_inline_asm_outside_class_converts() {
     // The same out-of-class block converts in full: conversion is

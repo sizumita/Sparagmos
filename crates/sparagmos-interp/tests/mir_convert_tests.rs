@@ -3132,6 +3132,131 @@ fn inline_asm_memory_operand_is_a_named_error() {
     }
 }
 
+fn asm_op_named(
+    kind: mir::AsmOperandKind,
+    width: u32,
+    in_value: Option<mir::Operand>,
+    out_place: Option<mir::Place>,
+    reg_name: &str,
+) -> mir::InlineAsmOperand {
+    mir::InlineAsmOperand {
+        kind,
+        reg_class: false,
+        width,
+        const_bits: None,
+        in_value,
+        out_place,
+        reg_name: Some(reg_name.to_string()),
+        static_name: None,
+        label_index: None,
+        call_sig: None,
+    }
+}
+
+#[test]
+fn inline_asm_lateout_aliased_with_input_observes_the_seed() {
+    // asm!("mov rcx, rax", in("rax") 42u64, lateout("rax") y,
+    //      out("rcx") _): the template never writes rax, but the
+    // lateout still observes the register's incoming content —
+    // natively y == 42. (The driver reads a `lateout` as a plain
+    // Out operand; the register name is the operand's identity,
+    // at its 16-bit base form in the raw representation.)
+    // _1: u64 = 42 (the input's value), _2: u64 (y), _3: u64
+    // (the discarded rcx output).
+    let body = mir::Body::new(
+        decls(&[u64_ty(), u64_ty(), u64_ty(), u64_ty()]),
+        0,
+        vec![
+            block(
+                vec![assign(place(1), mir::Rvalue::Use(const_u64(42)))],
+                asm_prog_term(
+                    "mov rcx, rax",
+                    vec![
+                        asm_op_named(mir::AsmOperandKind::In, 64, Some(copy(1)), None, "ax"),
+                        asm_op_named(mir::AsmOperandKind::Out, 64, None, Some(place(2)), "ax"),
+                        asm_op_named(mir::AsmOperandKind::Out, 64, None, Some(place(3)), "cx"),
+                    ],
+                    Some(1),
+                ),
+            ),
+            block(vec![assign(place(0), mir::Rvalue::Use(copy(2)))], ret()),
+        ],
+    );
+    assert_eq!(run_asm_body("f", body), Value::Uint(42));
+}
+
+#[test]
+fn inline_asm_lea_wraps_at_the_base_address_size() {
+    // lea {0}, [ecx + 1] with rcx = 0xffff_ffff: the effective
+    // address wraps at the base form's 32-bit address size
+    // before it is zero-extended into the 64-bit destination —
+    // natively 0, not 2^32.
+    // _1: u64 = 0xffff_ffff (bound to rcx), _2: u64 (the result).
+    let body32 = mir::Body::new(
+        decls(&[u64_ty(), u64_ty(), u64_ty()]),
+        0,
+        vec![
+            block(
+                vec![assign(place(1), mir::Rvalue::Use(const_u64(0xffff_ffff)))],
+                asm_prog_term(
+                    "lea {0}, [ecx + 1]",
+                    vec![
+                        asm_op(mir::AsmOperandKind::Out, 64, None, Some(place(2))),
+                        asm_op_named(mir::AsmOperandKind::In, 64, Some(copy(1)), None, "cx"),
+                    ],
+                    Some(1),
+                ),
+            ),
+            block(vec![assign(place(0), mir::Rvalue::Use(copy(2)))], ret()),
+        ],
+    );
+    assert_eq!(run_asm_body("lea32", body32), Value::Uint(0));
+
+    // The 64-bit base form keeps the full sum: [rcx + 1] at the
+    // same incoming value yields 2^32.
+    let body64 = mir::Body::new(
+        decls(&[u64_ty(), u64_ty(), u64_ty()]),
+        0,
+        vec![
+            block(
+                vec![assign(place(1), mir::Rvalue::Use(const_u64(0xffff_ffff)))],
+                asm_prog_term(
+                    "lea {0}, [rcx + 1]",
+                    vec![
+                        asm_op(mir::AsmOperandKind::Out, 64, None, Some(place(2))),
+                        asm_op_named(mir::AsmOperandKind::In, 64, Some(copy(1)), None, "cx"),
+                    ],
+                    Some(1),
+                ),
+            ),
+            block(vec![assign(place(0), mir::Rvalue::Use(copy(2)))], ret()),
+        ],
+    );
+    assert_eq!(run_asm_body("lea64", body64), Value::Uint(0x1_0000_0000));
+
+    // A placeholder base at the `:e` modifier is a 32-bit
+    // address form too: [{1:e} + 1] wraps the same way.
+    let body_ph = mir::Body::new(
+        decls(&[u64_ty(), u64_ty(), u64_ty()]),
+        0,
+        vec![
+            block(
+                vec![assign(place(1), mir::Rvalue::Use(const_u64(0xffff_ffff)))],
+                asm_prog_term(
+                    "lea {0}, [{1:e} + 1]",
+                    vec![
+                        asm_op(mir::AsmOperandKind::Out, 64, None, Some(place(2))),
+                        asm_op(mir::AsmOperandKind::In, 64, Some(copy(1)), None),
+                    ],
+                    Some(1),
+                ),
+            ),
+            block(vec![assign(place(0), mir::Rvalue::Use(copy(2)))], ret()),
+        ],
+    );
+    assert_eq!(run_asm_body("lea_ph", body_ph), Value::Uint(0));
+}
+
 // ----- transmute: the honestly representable shapes (Lane DN) ----------------
 
 fn ref_i32_ty() -> mir::Ty {
