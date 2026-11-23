@@ -21575,6 +21575,90 @@ fn io_error_tagged_word(value: &Value) -> Option<u64> {
     }
 }
 
+/// The `(kind, message)` an `std::io::Error` value in the
+/// `SimpleMessage` representation carries, when the value holds
+/// it in the shape guest code builds: the `&'static
+/// SimpleMessage` was stored through the repr's type-erased
+/// `NonNull<()>` slot, so the value tree's unique erased-constant
+/// leaf is the message struct's allocation, preserved exactly by
+/// the driver (see `Value::ErasedBlock`). A tree with zero or
+/// several erased leaves is not this representation.
+fn io_error_simple_message(value: &Value) -> Option<(u32, String)> {
+    let (bytes, relocs) = erased_constant_leaf(value)?;
+    decode_simple_message(bytes, relocs)
+}
+
+/// The unique type-erased constant block at the bottom of a
+/// value tree (the same uniqueness discipline
+/// `io_error_tagged_word` applies to address leaves): the block
+/// a reference denotes when its declared pointee type was
+/// zero-sized and the driver preserved the allocation verbatim.
+fn erased_constant_leaf(value: &Value) -> Option<(&[Option<u8>], &[(u32, Value)])> {
+    match value {
+        Value::Ref(RefTarget::Value(inner, _)) => match inner.as_ref() {
+            Value::ErasedBlock { bytes, relocs } => Some((bytes, relocs)),
+            _ => None,
+        },
+        Value::Enum { fields, .. } | Value::Tuple(fields) => {
+            let mut found = None;
+            for field in fields {
+                if let Some(leaf) = erased_constant_leaf(field) {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some(leaf);
+                }
+            }
+            found
+        }
+        _ => None,
+    }
+}
+
+/// Decode a `core::io::error::SimpleMessage` from its preserved
+/// allocation bytes. The layout is the one the layout query
+/// reports for the type on this target: the `message: &'static
+/// str` fat pointer first (its data pointer is the relocation at
+/// offset 0, its length the word at offset 8), then the `kind:
+/// ErrorKind` discriminant byte at offset 16, in a 24-byte
+/// block. Every field is cross-checked (the length against the
+/// string block's byte count, the discriminant against the kind
+/// table, the bytes as UTF-8), so a block that is not a
+/// `SimpleMessage` in this layout does not decode.
+fn decode_simple_message(bytes: &[Option<u8>], relocs: &[(u32, Value)]) -> Option<(u32, String)> {
+    if bytes.len() != 24 {
+        return None;
+    }
+    let mut len_word = [0u8; 8];
+    for (i, b) in bytes[8..16].iter().enumerate() {
+        len_word[i] = (*b)?;
+    }
+    let len = u64::from_le_bytes(len_word);
+    let kind = bytes[16]? as u32;
+    error_kind_name(kind)?;
+    let (_, data_ref) = relocs.iter().find(|(offset, _)| *offset == 0)?;
+    let data = erased_constant_bytes(data_ref)?;
+    if data.len() as u64 != len {
+        return None;
+    }
+    String::from_utf8(data).ok().map(|message| (kind, message))
+}
+
+/// The byte content a preserved-constant reference denotes: a
+/// fully-initialised erased block (the shape of a string
+/// literal's allocation), a byte string, or a string value.
+fn erased_constant_bytes(value: &Value) -> Option<Vec<u8>> {
+    match value {
+        Value::Ref(RefTarget::Value(inner, _)) => erased_constant_bytes(inner),
+        Value::ErasedBlock { bytes, relocs } if relocs.is_empty() => {
+            bytes.iter().copied().collect()
+        }
+        Value::Bytes(bytes) => Some(bytes.clone()),
+        Value::Str(text) => Some(text.clone().into_bytes()),
+        _ => None,
+    }
+}
+
 /// The platform's message text for an OS error code: the text
 /// the C library's `strerror` gives for it, which is exactly
 /// what std's native `format_os_error` writes. Read through the
@@ -25867,7 +25951,7 @@ impl<'a> Interpreter<'a> {
         // decoded representation (and, for OS errors, of the
         // platform's message text), produced here like the other
         // std shapes the structural engine models.
-        if let Some(text) = self.format_io_error(value, trait_, ty, options) {
+        if let Some(text) = self.format_io_error(value, trait_, ty, options, indent) {
             return Ok(text);
         }
         // The standard pointer wrappers (`Box`, `Rc`, `Arc`)
@@ -25918,16 +26002,24 @@ impl<'a> Interpreter<'a> {
     /// `{message} (os error {code})` and debugs as
     /// `Os { code, kind, message }`; a kind-only (simple) error
     /// displays as the kind's message and debugs as
-    /// `Kind({kind})`; a kind displays as its message. The
-    /// `Custom` and `SimpleMessage` representations hold a
-    /// pointer the value model does not resolve here, so those
-    /// keep the existing behaviour (`None`).
+    /// `Kind({kind})`; a kind displays as its message; a
+    /// `SimpleMessage` error displays as its message and debugs
+    /// as `Error { kind, message }`, decoded from the preserved
+    /// constant block the guest stored through the erased slot.
+    /// The `Custom` representation holds a pointer the value
+    /// model does not resolve here, so it keeps the existing
+    /// behaviour (`None`). Under `{:#?}` the `Debug` forms take
+    /// the multi-line layout of core's `debug_struct` /
+    /// `debug_tuple` rendering, with fields at `indent + 4` and
+    /// the closing delimiter at `indent`, like the derived form
+    /// in `format_debug_adt`.
     fn format_io_error(
         &self,
         value: &Value,
         trait_: FmtTrait,
         ty: &str,
         options: &FmtOptions,
+        indent: usize,
     ) -> Option<String> {
         let plain = pointee_tag(ty);
         if plain == "std::io::ErrorKind" || plain == "core::io::ErrorKind" {
@@ -25942,6 +26034,24 @@ impl<'a> Interpreter<'a> {
         if plain != "std::io::Error" && plain != "core::io::Error" {
             return None;
         }
+        if let Some((kind, message)) = io_error_simple_message(value) {
+            return match trait_ {
+                FmtTrait::Display => Some(pad_str(&message, options)),
+                FmtTrait::Debug => {
+                    let name = error_kind_name(kind)?;
+                    Some(debug_struct_text(
+                        "Error",
+                        &[
+                            ("kind", name.to_string()),
+                            ("message", format!("{message:?}")),
+                        ],
+                        options,
+                        indent,
+                    ))
+                }
+                _ => None,
+            };
+        }
         let word = io_error_tagged_word(value)?;
         let payload = (word >> 32) as u32;
         match (trait_, word & 0b11) {
@@ -25955,19 +26065,22 @@ impl<'a> Interpreter<'a> {
             (FmtTrait::Debug, 0b10) => {
                 let code = payload as i32;
                 let kind = error_kind_name(decode_error_kind_unix(code))?;
-                Some(pad_width(
-                    &format!(
-                        "Os {{ code: {code}, kind: {kind}, message: \"{}\" }}",
-                        os_error_message(code)
-                    ),
+                Some(debug_struct_text(
+                    "Os",
+                    &[
+                        ("code", code.to_string()),
+                        ("kind", kind.to_string()),
+                        ("message", format!("\"{}\"", os_error_message(code))),
+                    ],
                     options,
+                    indent,
                 ))
             }
             (FmtTrait::Display, 0b11) => {
                 error_kind_message(payload).map(|m| pad_str(m, options))
             }
             (FmtTrait::Debug, 0b11) => error_kind_name(payload)
-                .map(|name| pad_width(&format!("Kind({name})"), options)),
+                .map(|name| debug_tuple_text("Kind", &[name.to_string()], options, indent)),
             _ => None,
         }
     }
@@ -26790,6 +26903,66 @@ fn padding(n: usize, align: Align, fill: char) -> (String, String) {
             (one(pre), one(n - pre))
         }
     }
+}
+
+/// `Debug` rendering of a named struct whose field texts are
+/// already rendered: the compact `Name { a: x, b: y }` form
+/// (width padding applied), or, under `{:#?}`, the multi-line
+/// layout the derived form in `format_debug_adt` produces —
+/// fields at `indent + 4`, the closing brace at `indent`, no
+/// width padding. Handwritten core `Debug` impls built on
+/// `debug_struct` (the `std::io::Error` representations) render
+/// through this so the two modes never disagree on the fields.
+fn debug_struct_text(
+    name: &str,
+    fields: &[(&str, String)],
+    options: &FmtOptions,
+    indent: usize,
+) -> String {
+    if options.alternate() {
+        let inner = indent + 4;
+        let pad = " ".repeat(inner);
+        let mut out = String::new();
+        out.push_str(name);
+        out.push_str(" {\n");
+        for (field_name, text) in fields {
+            out.push_str(&pad);
+            out.push_str(field_name);
+            out.push_str(": ");
+            out.push_str(text);
+            out.push_str(",\n");
+        }
+        out.push_str(&" ".repeat(indent));
+        out.push('}');
+        return out;
+    }
+    let parts: Vec<String> = fields
+        .iter()
+        .map(|(field_name, text)| format!("{field_name}: {text}"))
+        .collect();
+    pad_width(&format!("{name} {{ {} }}", parts.join(", ")), options)
+}
+
+/// `Debug` rendering of a tuple struct with pre-rendered item
+/// texts: `Name(x, y)` compactly, or the multi-line form under
+/// `{:#?}`, mirroring `debug_struct_text`.
+fn debug_tuple_text(name: &str, items: &[String], options: &FmtOptions, indent: usize) -> String {
+    if options.alternate() {
+        let inner = indent + 4;
+        let pad = " ".repeat(inner);
+        let mut out = String::new();
+        out.push_str(name);
+        out.push_str("(\n");
+        for text in items {
+            out.push_str(&pad);
+            out.push_str(text);
+            out.push_str(",\n");
+        }
+        out.push_str(&" ".repeat(indent));
+        out.push(')');
+        return out;
+    }
+    pad_width(&format!("{name}({})", items.join(", ")), options)
 }
 
 /// core `Formatter::pad`: precision truncates to that many chars,

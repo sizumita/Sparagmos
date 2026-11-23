@@ -208,18 +208,15 @@ fn main() {
 fn read_exact_eof_kind_and_raw_os_error() {
     // The error value itself — an erased `SimpleMessage`
     // allocation — survives conversion: its kind and raw OS
-    // error read back exactly. Rendering the error's `Display`
-    // is a separate, still-open formatting gap (the erased
-    // message text is not decoded yet), so the run stops there
-    // with the named unsupported error after printing the two
-    // lines above.
+    // error read back exactly, and its `Display` renders the
+    // message text decoded from the preserved constant block
+    // (OJ, #299).
     let (stdout, stderr, status) = run_fixture("read_exact_eof", READ_EXACT_RS);
-    assert_eq!(stdout, "kind: UnexpectedEof\nraw: None\n");
-    assert_eq!(status.code(), Some(2), "stderr={stderr}");
-    assert!(
-        stderr.contains("Display formatting for an ADT value"),
-        "stderr={stderr}"
+    assert_eq!(
+        stdout,
+        "kind: UnexpectedEof\nraw: None\ndisplay: failed to fill whole buffer\n"
     );
+    assert_eq!(status.code(), Some(0), "stderr={stderr}");
 }
 
 const IDENTITY_ROUND_TRIP_RS: &str = r#"
@@ -337,4 +334,40 @@ fn recursive_type_cast_converts() {
         "a cast to a recursive type must convert; stderr={stderr}"
     );
     run_ok("recursive_cast_run", RECURSIVE_CAST_RS, "v=3\n");
+}
+
+const PRETTY_DEBUG_RS: &str = r#"
+use std::io::{self, Read};
+
+fn main() {
+    let data: &[u8] = &[1, 2, 3];
+    let mut buf = [0u8; 8];
+    let mut slice = data;
+    let err = slice.read_exact(&mut buf).unwrap_err();
+    println!("pretty={:#?}", err);
+    println!("plain={:?}", err);
+    let res: io::Result<()> = Err(err);
+    println!("nested={:#?}", res);
+    let e2 = io::Error::from_raw_os_error(2);
+    println!("os pretty={:#?}", e2);
+    let e3 = io::Error::from(io::ErrorKind::NotFound);
+    println!("kind pretty={:#?}", e3);
+}
+"#;
+
+#[test]
+fn io_error_pretty_debug_uses_multiline_layout() {
+    // core renders the `io::Error` representations through
+    // `debug_struct` / `debug_tuple`, so under `{:#?}` they
+    // take the multi-line layout — fields indented one level
+    // past the error's own nesting, the closing delimiter at
+    // the error's indent — while `{:?}` stays the compact
+    // one-line form. The structural formatter must propagate
+    // the current indentation into the error's fields instead
+    // of always emitting the compact form.
+    run_ok(
+        "io_error_pretty_debug",
+        PRETTY_DEBUG_RS,
+        "pretty=Error {\n    kind: UnexpectedEof,\n    message: \"failed to fill whole buffer\",\n}\nplain=Error { kind: UnexpectedEof, message: \"failed to fill whole buffer\" }\nnested=Err(\n    Error {\n        kind: UnexpectedEof,\n        message: \"failed to fill whole buffer\",\n    },\n)\nos pretty=Os {\n    code: 2,\n    kind: NotFound,\n    message: \"No such file or directory\",\n}\nkind pretty=Kind(\n    NotFound,\n)\n",
+    );
 }
