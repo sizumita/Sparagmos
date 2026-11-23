@@ -1302,6 +1302,15 @@ pub enum DropPlan {
     /// and dropping the receiver for its senders. A moved-out
     /// handle has no count to decrement.
     ChannelHandleDrop { sender: bool },
+    /// Close the host file behind the `std::fs::File` handle
+    /// value this plan applies to (the interpreter's file model,
+    /// see the file table in `interp.rs`): the guest value is the
+    /// public wrapper chain (`File` -> sys `File` -> `FileDesc`
+    /// -> `OwnedFd`) whose descriptor slot holds the file
+    /// table's id, and dropping the handle removes that entry,
+    /// closing the host file exactly as the real descriptor's
+    /// close does. A moved-out handle has no file to close.
+    FileHandleDrop,
     /// Drop one strong handle of a reference-counted allocation
     /// (the `Rc` / `Arc` destructor in the interpreter's allocation
     /// model, see `RefTarget::Alloc`): decrement the allocation's

@@ -1052,6 +1052,8 @@ fn drop_glue_edges<'a>(glue: &'a ir::DropGlue, targets: &mut Vec<&'a str>) -> bo
             // Releasing a RefCell borrow calls no destructor body.
             ir::DropPlan::RefCellRelease { .. } => true,
             ir::DropPlan::ChannelHandleDrop { .. } => true,
+            // Closing a file handle calls no destructor body.
+            ir::DropPlan::FileHandleDrop => true,
             // Releasing a weak reference calls no destructor body.
             ir::DropPlan::RcWeakRelease => true,
             // A waker's release is chosen from the value at run
@@ -8166,6 +8168,82 @@ let inner = match (&src, target) {
         }))
     }
 
+    /// A direct call to a `std::io::Read` / `Write` / `Seek`
+    /// method whose Self type is `std::fs::File`, or to one of
+    /// `File`'s inherent handle methods, converts to a builtin
+    /// node: those operations act on the interpreter's host file
+    /// table (see `exec_file_io` in `builtins`). The trait names
+    /// are deliberately absent from the builtin registry, so
+    /// reach still collects the other receivers' bodies (a
+    /// `&[u8]` reader's `read`, a `Cursor`'s `seek`); only a call
+    /// whose Self is exactly `File` (or a reference to it) is
+    /// diverted here. The inherent names are `File`'s own, so no
+    /// Self check is needed for them.
+    fn file_io_terminator(
+        &self,
+        body: &mir::Body,
+        func: &mir::Operand,
+        args: &[mir::Operand],
+        destination: &mir::Place,
+        target: Option<mir::BasicBlock>,
+    ) -> Result<Option<ir::TerminatorKind>, ConvertError> {
+        let Some((name, generic_args, _raw)) = self.resolve_external_callee(func) else {
+            return Ok(None);
+        };
+        let canonical = crate::builtins::canonical_name(&name);
+        const TRAIT_METHODS: &[&str] = &[
+            "std::io::Read::read",
+            "std::io::Read::read_exact",
+            "std::io::Read::read_to_end",
+            "std::io::Read::read_to_string",
+            "std::io::Read::read_buf",
+            "std::io::Read::read_buf_exact",
+            "std::io::Write::write",
+            "std::io::Write::write_all",
+            "std::io::Write::flush",
+            "std::io::Seek::seek",
+            "std::io::Seek::rewind",
+            "std::io::Seek::stream_position",
+        ];
+        const INHERENT_METHODS: &[&str] = &[
+            "std::fs::File::metadata",
+            "std::fs::File::try_clone",
+            "std::fs::File::sync_all",
+            "std::fs::File::sync_data",
+            "std::fs::File::set_len",
+        ];
+        let diverted = if TRAIT_METHODS.contains(&canonical.as_str()) {
+            let self_ty = generic_args.first().map(String::as_str).unwrap_or("");
+            let self_ty = self_ty
+                .strip_prefix("&mut ")
+                .or_else(|| self_ty.strip_prefix("&"))
+                .unwrap_or(self_ty);
+            self_ty == "std::fs::File"
+        } else {
+            INHERENT_METHODS.contains(&canonical.as_str())
+        };
+        if !diverted {
+            return Ok(None);
+        }
+        let mut ir_args = Vec::with_capacity(args.len());
+        for arg in args.iter() {
+            ir_args.push(self.convert_operand(body, arg, None)?);
+        }
+        Ok(Some(ir::TerminatorKind::CallBuiltin {
+            name: canonical,
+            generic_args,
+            args: ir_args,
+            destination: self.convert_place(body, destination)?,
+            target: target.map(|b| ir::BasicBlock(b.index())),
+            drop_glue: None,
+            consumed_glue: None,
+            skipped_glue: None,
+            cmp_discriminants: None,
+            result_unsize: None,
+            unique_elem: None,
+        }))
+    }
+
     /// Whether this call's func operand names an `Fn`-family trait
     /// method (`Fn::call`, `FnMut::call_mut`, `FnOnce::call_once` in
     /// their `std::ops` / `core::ops` spellings): returns the call
@@ -8845,6 +8923,14 @@ let inner = match (&src, target) {
                         target: target.map(|b| ir::BasicBlock(b.index())),
                     }
                 } else if let Some(term) = self.time_add_sub_terminator(
+                    body,
+                    func,
+                    args,
+                    destination,
+                    *target,
+                )? {
+                    term
+                } else if let Some(term) = self.file_io_terminator(
                     body,
                     func,
                     args,
@@ -10539,6 +10625,18 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
             // fields and no `Drop` impl.
             "std::cell::BorrowError" | "core::cell::BorrowError" => {
                 return Some(P::Trivial)
+            }
+            // The `std::fs::File` wrapper chain (`File` -> sys
+            // `File` -> `FileDesc` -> `OwnedFd`): the value is a
+            // file-table id in the descriptor slot, and the
+            // destructor's only observable effect — closing the
+            // host file — is the interpreter's file-handle drop
+            // plan. Every layer of the chain takes the same plan:
+            // glue for a value of any layer (a `File` field of a
+            // guest struct, a bare `OwnedFd`) closes its file.
+            "std::fs::File" | "std::sys::fs::unix::File"
+            | "std::sys::fd::unix::FileDesc" | "std::os::fd::OwnedFd" => {
+                return Some(P::FileHandleDrop)
             }
             // mpsc handles: the value is the channel id, and the
             // destructor's only observable effect — the shared
