@@ -8948,11 +8948,9 @@ impl<'a> Interpreter<'a> {
         projection: &[RefProj],
         elem_size: Option<u64>,
         disp: Option<i128>,
+        count: i128,
     ) -> Option<InterpResult<Vec<RefProj>>> {
         let size = elem_size?;
-        if size == 0 {
-            return None;
-        }
         if !self.is_elem_block(id) {
             return None;
         }
@@ -8985,10 +8983,22 @@ impl<'a> Interpreter<'a> {
             return Some(Ok(vec![RefProj::ByteOffset(total)]));
         }
         let size_i = i128::from(size);
-        if total % size_i != 0 {
-            return None;
-        }
-        let steps = total / size_i;
+        // A zero-sized element type denominates its positions
+        // in elements alone: the byte displacement is always
+        // zero, so the offset's element count is the step
+        // count (and a nonzero byte total is no element
+        // position at all).
+        let steps = if size_i == 0 {
+            if total != 0 {
+                return None;
+            }
+            count
+        } else {
+            if total % size_i != 0 {
+                return None;
+            }
+            total / size_i
+        };
         let idx = match base {
             [] => steps,
             [RefProj::Index(j)] => i128::try_from(*j).ok()?.checked_add(steps)?,
@@ -9137,6 +9147,7 @@ impl<'a> Interpreter<'a> {
                     disp,
                     elem_size,
                     base,
+                    count,
                 )?;
                 Ok(RefTarget::Place {
                     frame,
@@ -9161,6 +9172,7 @@ impl<'a> Interpreter<'a> {
                     disp,
                     elem_size,
                     base.as_ref(),
+                    count,
                 )?;
                 Ok(RefTarget::Static { name, projection })
             }
@@ -9175,7 +9187,7 @@ impl<'a> Interpreter<'a> {
                 // is attempted and the displacement is carried,
                 // as for a static.
                 if let Some(absorbed) =
-                    self.alloc_offset_absorb(id, &projection, elem_size, disp)
+                    self.alloc_offset_absorb(id, &projection, elem_size, disp, count)
                 {
                     return absorbed.map(|projection| RefTarget::Alloc { id, projection });
                 }
@@ -9188,6 +9200,7 @@ impl<'a> Interpreter<'a> {
                     disp,
                     elem_size,
                     base.as_ref(),
+                    count,
                 )?;
                 Ok(RefTarget::Alloc { id, projection })
             }
@@ -9237,6 +9250,7 @@ impl<'a> Interpreter<'a> {
                         disp,
                         elem_size,
                         Some(&v),
+                        count,
                     )?;
                     Ok(RefTarget::Value(v, projection))
                 }
@@ -9320,9 +9334,12 @@ impl<'a> Interpreter<'a> {
         }
     }
 
-    /// Advance a place/static target's projection by a byte
-    /// displacement (`disp`, in bytes; `None` when the offset's
-    /// element size is unknown). When the target denotes an element
+    /// Advance a place/static target's projection by an offset:
+    /// `disp` is the byte displacement (`None` when the offset's
+    /// element size is unknown) and `count` the offset in
+    /// elements, which denominates the advance for a zero-sized
+    /// element type, whose byte displacement is always zero.
+    /// When the target denotes an element
     /// of an array place (or the array place itself) and the total
     /// displacement lands exactly on an element boundary, it is
     /// absorbed into the index projection, so reads and writes
@@ -9350,6 +9367,7 @@ impl<'a> Interpreter<'a> {
         disp: Option<i128>,
         elem_size: Option<u64>,
         base: Option<&Value>,
+        count: i128,
     ) -> InterpResult<Vec<RefProj>> {
         // A displacement already carried on the target accumulates
         // into this one: the combination is what decides
@@ -9369,7 +9387,7 @@ impl<'a> Interpreter<'a> {
                 })
             }
         };
-        if total == 0 {
+        if total == 0 && count == 0 {
             return Ok(projection);
         }
         let array_pos = match static_name {
@@ -9377,6 +9395,26 @@ impl<'a> Interpreter<'a> {
             None => self.array_position(frames, place, &projection),
         };
         if let Some((cur, elem)) = array_pos {
+            if elem == 0 && total == 0 {
+                // A zero-sized element type: the position is
+                // denominated in elements alone (the byte
+                // displacement is always zero), so the index
+                // advances by the offset's element count, in
+                // the same form the byte case below returns.
+                let idx = cur + count;
+                if idx >= 0 {
+                    return Ok(if idx == 0 && projection.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![RefProj::Index(usize::try_from(idx).map_err(|_| {
+                            InterpError::UnsupportedRvalue {
+                                kind: "pointer offset: element index out of range"
+                                    .to_string(),
+                            }
+                        })?)]
+                    });
+                }
+            }
             if elem > 0 {
                 if let Some(byte_pos) = cur.checked_mul(elem).and_then(|b| b.checked_add(total)) {
                     if byte_pos >= 0 && byte_pos % elem == 0 {
@@ -9413,15 +9451,65 @@ impl<'a> Interpreter<'a> {
             && !self.byte_view_covers(frames, place, static_name, &projection, base)
         {
             if let Some(base) = base {
-                if let Some(absorbed) =
-                    self.absorb_displacement(base, &projection, total, elem_size)
-                {
+                if let Some(absorbed) = self.absorb_displacement(
+                    base,
+                    &projection,
+                    total,
+                    elem_size,
+                    count,
+                ) {
                     return Ok(absorbed);
                 }
             }
         }
+        if total == 0 {
+            // Only an element-count offset over a zero-sized
+            // element type reaches here (a zero byte total with
+            // a nonzero count): no rule above could absorb it,
+            // and the count has no byte denomination to carry,
+            // so the structural position stands unchanged.
+            return Ok(projection);
+        }
         projection.push(RefProj::ByteOffset(total));
         Ok(projection)
+    }
+
+    /// The element index a pointer offset moves a sequence
+    /// position to: the position `index` advanced by the
+    /// offset. For a nonzero element size the offset is
+    /// denominated in bytes (`total`, the accumulated byte
+    /// displacement) and must land exactly on an element
+    /// boundary. For a zero-sized element type the byte
+    /// displacement is always zero and the positions are
+    /// denominated in elements alone, so the index advances
+    /// by the offset's element count (`off_count`) -- the
+    /// same rule the `RefTarget::Value` arm of
+    /// `offset_target` applies to constant aggregates
+    /// ("whatever the element size"). A nonzero byte total
+    /// over a zero-sized element type denominates no element
+    /// position.
+    fn offset_elem_index(
+        index: i128,
+        total: i128,
+        size: i128,
+        off_count: i128,
+    ) -> Option<i128> {
+        if size > 0 {
+            let byte_pos = index.checked_mul(size)?.checked_add(total)?;
+            if byte_pos < 0 || byte_pos % size != 0 {
+                return None;
+            }
+            Some(byte_pos / size)
+        } else {
+            if total != 0 {
+                return None;
+            }
+            let new_index = index.checked_add(off_count)?;
+            if new_index < 0 {
+                return None;
+            }
+            Some(new_index)
+        }
     }
 
     /// Absorb a byte displacement into an element index over the
@@ -9461,11 +9549,9 @@ impl<'a> Interpreter<'a> {
         projection: &[RefProj],
         total: i128,
         elem_size: Option<u64>,
+        off_count: i128,
     ) -> Option<Vec<RefProj>> {
         let size = i128::from(elem_size?);
-        if size <= 0 {
-            return None;
-        }
         // Navigate to the container the position sits in. A
         // sub-slice step descends into the sub-aggregate it
         // denotes (materialised on the side; the walk only reads
@@ -9604,11 +9690,8 @@ impl<'a> Interpreter<'a> {
                     }
                     _ => return None,
                 };
-                let byte_pos = snap_index.checked_mul(size)?.checked_add(total)?;
-                if byte_pos < 0 || byte_pos % size != 0 {
-                    return None;
-                }
-                let new_index = byte_pos / size;
+                let new_index =
+                    Self::offset_elem_index(*snap_index, total, size, off_count)?;
                 if new_index > count {
                     return None;
                 }
@@ -9664,11 +9747,7 @@ impl<'a> Interpreter<'a> {
             }
             _ => return None,
         };
-        let byte_pos = index.checked_mul(size)?.checked_add(total)?;
-        if byte_pos < 0 || byte_pos % size != 0 {
-            return None;
-        }
-        let new_index = byte_pos / size;
+        let new_index = Self::offset_elem_index(index, total, size, off_count)?;
         if new_index > count {
             return None;
         }
