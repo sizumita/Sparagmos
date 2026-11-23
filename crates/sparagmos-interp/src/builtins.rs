@@ -25951,7 +25951,7 @@ impl<'a> Interpreter<'a> {
         // decoded representation (and, for OS errors, of the
         // platform's message text), produced here like the other
         // std shapes the structural engine models.
-        if let Some(text) = self.format_io_error(value, trait_, ty, options) {
+        if let Some(text) = self.format_io_error(value, trait_, ty, options, indent) {
             return Ok(text);
         }
         // The standard pointer wrappers (`Box`, `Rc`, `Arc`)
@@ -26008,13 +26008,18 @@ impl<'a> Interpreter<'a> {
     /// constant block the guest stored through the erased slot.
     /// The `Custom` representation holds a pointer the value
     /// model does not resolve here, so it keeps the existing
-    /// behaviour (`None`).
+    /// behaviour (`None`). Under `{:#?}` the `Debug` forms take
+    /// the multi-line layout of core's `debug_struct` /
+    /// `debug_tuple` rendering, with fields at `indent + 4` and
+    /// the closing delimiter at `indent`, like the derived form
+    /// in `format_debug_adt`.
     fn format_io_error(
         &self,
         value: &Value,
         trait_: FmtTrait,
         ty: &str,
         options: &FmtOptions,
+        indent: usize,
     ) -> Option<String> {
         let plain = pointee_tag(ty);
         if plain == "std::io::ErrorKind" || plain == "core::io::ErrorKind" {
@@ -26034,9 +26039,14 @@ impl<'a> Interpreter<'a> {
                 FmtTrait::Display => Some(pad_str(&message, options)),
                 FmtTrait::Debug => {
                     let name = error_kind_name(kind)?;
-                    Some(pad_width(
-                        &format!("Error {{ kind: {name}, message: {message:?} }}"),
+                    Some(debug_struct_text(
+                        "Error",
+                        &[
+                            ("kind", name.to_string()),
+                            ("message", format!("{message:?}")),
+                        ],
                         options,
+                        indent,
                     ))
                 }
                 _ => None,
@@ -26055,19 +26065,22 @@ impl<'a> Interpreter<'a> {
             (FmtTrait::Debug, 0b10) => {
                 let code = payload as i32;
                 let kind = error_kind_name(decode_error_kind_unix(code))?;
-                Some(pad_width(
-                    &format!(
-                        "Os {{ code: {code}, kind: {kind}, message: \"{}\" }}",
-                        os_error_message(code)
-                    ),
+                Some(debug_struct_text(
+                    "Os",
+                    &[
+                        ("code", code.to_string()),
+                        ("kind", kind.to_string()),
+                        ("message", format!("\"{}\"", os_error_message(code))),
+                    ],
                     options,
+                    indent,
                 ))
             }
             (FmtTrait::Display, 0b11) => {
                 error_kind_message(payload).map(|m| pad_str(m, options))
             }
             (FmtTrait::Debug, 0b11) => error_kind_name(payload)
-                .map(|name| pad_width(&format!("Kind({name})"), options)),
+                .map(|name| debug_tuple_text("Kind", &[name.to_string()], options, indent)),
             _ => None,
         }
     }
@@ -26890,6 +26903,66 @@ fn padding(n: usize, align: Align, fill: char) -> (String, String) {
             (one(pre), one(n - pre))
         }
     }
+}
+
+/// `Debug` rendering of a named struct whose field texts are
+/// already rendered: the compact `Name { a: x, b: y }` form
+/// (width padding applied), or, under `{:#?}`, the multi-line
+/// layout the derived form in `format_debug_adt` produces —
+/// fields at `indent + 4`, the closing brace at `indent`, no
+/// width padding. Handwritten core `Debug` impls built on
+/// `debug_struct` (the `std::io::Error` representations) render
+/// through this so the two modes never disagree on the fields.
+fn debug_struct_text(
+    name: &str,
+    fields: &[(&str, String)],
+    options: &FmtOptions,
+    indent: usize,
+) -> String {
+    if options.alternate() {
+        let inner = indent + 4;
+        let pad = " ".repeat(inner);
+        let mut out = String::new();
+        out.push_str(name);
+        out.push_str(" {\n");
+        for (field_name, text) in fields {
+            out.push_str(&pad);
+            out.push_str(field_name);
+            out.push_str(": ");
+            out.push_str(text);
+            out.push_str(",\n");
+        }
+        out.push_str(&" ".repeat(indent));
+        out.push('}');
+        return out;
+    }
+    let parts: Vec<String> = fields
+        .iter()
+        .map(|(field_name, text)| format!("{field_name}: {text}"))
+        .collect();
+    pad_width(&format!("{name} {{ {} }}", parts.join(", ")), options)
+}
+
+/// `Debug` rendering of a tuple struct with pre-rendered item
+/// texts: `Name(x, y)` compactly, or the multi-line form under
+/// `{:#?}`, mirroring `debug_struct_text`.
+fn debug_tuple_text(name: &str, items: &[String], options: &FmtOptions, indent: usize) -> String {
+    if options.alternate() {
+        let inner = indent + 4;
+        let pad = " ".repeat(inner);
+        let mut out = String::new();
+        out.push_str(name);
+        out.push_str("(\n");
+        for text in items {
+            out.push_str(&pad);
+            out.push_str(text);
+            out.push_str(",\n");
+        }
+        out.push_str(&" ".repeat(indent));
+        out.push(')');
+        return out;
+    }
+    pad_width(&format!("{name}({})", items.join(", ")), options)
 }
 
 /// core `Formatter::pad`: precision truncates to that many chars,
