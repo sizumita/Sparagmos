@@ -18369,3 +18369,97 @@ fn run_mode_vec_drain_collect() {
         "taken=[2, 3]\nall=[10, 20, 30]\n",
     );
 }
+
+const NESTED_VEC_POP_SRC: &str = r#"
+fn main() {
+    let mut v = vec![vec![1, 2], vec![4]];
+    let x = v[0].pop();
+    println!("{:?} {:?}", v, x);
+}
+"#;
+
+#[test]
+fn run_mode_nested_vec_pop_after_shrink() {
+    // A collected method (`pop`) on a vector element reached
+    // through an index projection: `pop` shrinks the element
+    // in place, so the element takes the sparse form, and the
+    // body's own reads of the element's elements (through the
+    // buffer pointer the method forms) must range inside the
+    // element, not compose into positions of the outer vector.
+    run_ok(
+        "nested-vec-pop",
+        NESTED_VEC_POP_SRC,
+        "[[1], [4]] Some(2)\n",
+    );
+}
+
+const NESTED_VEC_INSERT_SRC: &str = r#"
+fn main() {
+    let mut v = vec![vec![1, 2], vec![4]];
+    v.insert(1, vec![3]);
+    println!("{:?}", v);
+    v[0].insert(1, 9);
+    println!("{:?}", v);
+}
+"#;
+
+#[test]
+fn run_mode_nested_vec_insert_after_outer_insert() {
+    // After the outer vector's own collected `insert` leaves
+    // it in the sparse form, a collected `insert` on one of its
+    // elements forms its mutable receiver through `IndexMut`
+    // over the outer place: the sparse form is the same element
+    // aggregate as the plain form and is addressable the same
+    // way.
+    run_ok(
+        "nested-vec-insert",
+        NESTED_VEC_INSERT_SRC,
+        "[[1, 2], [3], [4]]\n[[1, 9, 2], [3], [4]]\n",
+    );
+}
+
+const NESTED_VEC_SET_LEN_READS_SRC: &str = r#"
+fn main() {
+    let mut v = vec![vec![1, 2], vec![4]];
+    unsafe { v[0].set_len(1); }
+    println!("len={}", v[0].len());
+    println!("e={}", v[0][0]);
+    println!("{:?}", v);
+}
+"#;
+
+#[test]
+fn run_mode_nested_vec_reads_after_set_len() {
+    // `set_len` rewrites the element's declared length in
+    // place, leaving the sparse form behind; element reads
+    // through the index projection then denote the element's
+    // own elements.
+    run_ok(
+        "nested-vec-set-len",
+        NESTED_VEC_SET_LEN_READS_SRC,
+        "len=1\ne=1\n[[1], [4]]\n",
+    );
+}
+
+const NESTED_VEC_PUSH_TRUNC_SRC: &str = r#"
+fn main() {
+    let mut w = vec![vec![vec![7, 8]], vec![vec![3]]];
+    w.truncate(1);
+    w[0][0].push(10);
+    println!("{:?}", w);
+}
+"#;
+
+#[test]
+fn run_mode_nested_vec_push_after_outer_truncate() {
+    // With the outer vector in the sparse form (after
+    // `truncate`), a method on a doubly-indexed element forms
+    // its receiver through the outer element position: the
+    // steps nest into the element rather than composing into
+    // the outer vector's positions.
+    run_ok(
+        "nested-vec-push-trunc",
+        NESTED_VEC_PUSH_TRUNC_SRC,
+        "[[[7, 8, 10]]]\n",
+    );
+}

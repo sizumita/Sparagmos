@@ -15505,7 +15505,15 @@ fn compose_projection(
                     // element access over them (a `Vec` value's
                     // elements, above all): a following index
                     // step ranges inside it, exactly as for a
-                    // tuple, so the run does not compose.
+                    // tuple, so the run does not compose. The
+                    // sparse form of a vector value is the same
+                    // element aggregate (only its declared
+                    // length differs from the stored list), so
+                    // it nests the same way: a `Vec` whose
+                    // length was rewritten in place (a `pop`'s
+                    // shrink, a `set_len`) must not have the
+                    // steps into its elements composed into
+                    // positions of the sequence holding it.
                     if !matches!(
                         element,
                         Value::Tuple(_)
@@ -15513,6 +15521,7 @@ fn compose_projection(
                             | Value::Bytes(_)
                             | Value::Str(_)
                             | Value::Enum { .. }
+                            | Value::SparseVec { .. }
                     ) {
                         let merged = match subslice {
                             Some((offset, len)) => RefProj::Subslice {

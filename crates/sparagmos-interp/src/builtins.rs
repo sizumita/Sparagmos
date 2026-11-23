@@ -9149,8 +9149,14 @@ impl<'a> Interpreter<'a> {
                             // (ADT aggregate) elements are both
                             // addressable through an index projection:
                             // the projection layer reads and writes
-                            // `RefProj::Index` on both shapes.
-                            Value::Tuple(_) | Value::Enum { .. } => {
+                            // `RefProj::Index` on both shapes. A
+                            // vector in its sparse form (declared
+                            // length below the stored list) is the
+                            // same element aggregate and is
+                            // addressable the same way.
+                            Value::Tuple(_)
+                            | Value::Enum { .. }
+                            | Value::SparseVec { .. } => {
                                 let mut projection = projection;
                                 projection.push(RefProj::Index(idx));
                                 let frame_id = frames[frame_pos].id;
@@ -9197,7 +9203,9 @@ impl<'a> Interpreter<'a> {
                             }
                         }
                         match base {
-                            Value::Tuple(_) | Value::Enum { .. } => {
+                            Value::Tuple(_)
+                            | Value::Enum { .. }
+                            | Value::SparseVec { .. } => {
                                 let mut projection = projection;
                                 projection.push(RefProj::Index(idx));
                                 Ok(Value::Ref(RefTarget::Static { name, projection }))
