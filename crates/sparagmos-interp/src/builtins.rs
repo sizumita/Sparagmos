@@ -16608,6 +16608,23 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         }
         let a = self.resolve_ref(frames, a)?;
         let b = self.resolve_ref(frames, b)?;
+        // A vector value in its sparse form (declared length
+        // below the stored elements: the spare capacity a
+        // growth or a shrink leaves behind) orders by its
+        // logical element sequence, as the type's own `Ord`
+        // does: the storage past the length is not part of the
+        // value, so a sparse vector and the plain aggregate
+        // form of the same elements order as those elements.
+        // A sparse vector whose length runs past its stored
+        // elements has no element list to compare and keeps
+        // the structural comparison below.
+        if matches!(&*a, Value::SparseVec { .. })
+            || matches!(&*b, Value::SparseVec { .. })
+        {
+            if let (Ok(ea), Ok(eb)) = (value_elements(&a), value_elements(&b)) {
+                return self.seq_cmp(frames, &ea, &eb);
+            }
+        }
         // A `String` in its real aggregate form denotes the
         // string its buffer holds (see
         // `string_from_real_aggregate`): against a string side

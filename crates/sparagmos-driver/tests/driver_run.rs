@@ -21322,3 +21322,66 @@ fn run_mode_vec_zero_sized_element_capacity() {
     );
 }
 
+const VEC_SPARSE_ORDERING_SRC: &str = r#"
+use std::cmp::Ordering;
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct Wrap(Vec<i32>);
+
+fn main() {
+    let mut v: Vec<i32> = Vec::new();
+    v.push(1);
+    println!("self le {} cmp {:?}", v <= v, v.cmp(&v));
+    println!("partial {:?}", v.partial_cmp(&v));
+
+    let mut a: Vec<i32> = Vec::new();
+    a.push(1);
+    a.push(3);
+    let mut b: Vec<i32> = Vec::new();
+    b.push(1);
+    b.push(2);
+    b.push(9);
+    println!("a<b {} a>b {} a==b {}", a < b, a > b, a == b);
+    println!("a cmp {:?}", a.cmp(&b));
+
+    let lit = vec![1, 3];
+    println!("a==lit {} a<=lit {} a>=lit {}", a == lit, a <= lit, a >= lit);
+    let lit2 = vec![1, 4];
+    println!("a<lit2 {} a cmp lit2 {:?}", a < lit2, a.cmp(&lit2));
+
+    let mut short: Vec<i32> = Vec::new();
+    short.push(1);
+    println!("short<a {} short cmp a {:?}", short < a, short.cmp(&a));
+
+    let w1 = Wrap(a.clone());
+    let w2 = Wrap(vec![1, 3]);
+    println!("wrap cmp {:?}", w1.cmp(&w2));
+    let _ = Ordering::Equal;
+}
+"#;
+
+#[test]
+fn run_mode_vec_sparse_ordering_after_growth() {
+    // A push that leaves spare capacity puts the vector in
+    // its sparse form (declared length below the stored
+    // elements); ordering -- `PartialOrd`, `cmp`,
+    // `partial_cmp`, and derived `Ord` over a field holding
+    // such a vector -- compares the declared elements only,
+    // exactly as equality does, against sparse and plain
+    // forms alike. The spare storage past the length is not
+    // part of the value and never enters the comparison.
+    let dir = temp_dir("vecsparseord");
+    let src = fixture(&dir, "vecsparseord.rs", VEC_SPARSE_ORDERING_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "ordering of spare-capacity vectors must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "self le true cmp Equal\npartial Some(Equal)\na<b false a>b true a==b false\na cmp Greater\na==lit true a<=lit true a>=lit true\na<lit2 true a cmp lit2 Less\nshort<a true short cmp a Less\nwrap cmp Equal\n"
+    );
+}
+
