@@ -34,7 +34,7 @@
 //! projections.
 
 use crate::interp::{Frame, Interpreter};
-use crate::ir::{Body, Program, SourceLine, Ty};
+use crate::ir::{Body, FloatTy, IntTy, Program, SourceLine, Ty, UintTy};
 use crate::value::{RefProj, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -1187,7 +1187,25 @@ fn deref_if_pointer(
         .read_resolved(frames, &resolved)
         .map_err(|e| e.to_string())?;
     let next = match desc {
-        Some(Desc::Ref(inner)) => Some(*inner),
+        Some(Desc::Ref(inner)) => {
+            // A pointer whose pointee the value model holds as
+            // a sequence aggregate (a slice's base pointer: its
+            // deref yields the whole element tuple) describes
+            // the sequence, not the single element its type
+            // names -- the descriptor follows the value, so an
+            // index step through it reads the element descriptor
+            // from the sequence form.
+            if matches!(pointee, Value::Tuple(_))
+                && !matches!(
+                    inner.as_ref(),
+                    Desc::Slice(_) | Desc::Array(..) | Desc::Tuple(_)
+                )
+            {
+                Some(Desc::Slice(inner))
+            } else {
+                Some(*inner)
+            }
+        }
         Some(Desc::Adt(tag)) => {
             smart_pointer_pointee(&tag).map(|t| Desc::from_tag(&t))
         }
@@ -1246,6 +1264,48 @@ fn sequence_length(
     }
 }
 
+/// Whether the value's recorded shape — after the implicit
+/// dereference a field step performs — has a field of `name`:
+/// the ADT shape's active variant, or a closure environment's
+/// captures. A recorded field wins over a pseudo-field of the
+/// same name (a struct may perfectly well declare a field
+/// called `length`).
+fn has_recorded_field(
+    interp: &Interpreter,
+    frames: &[Frame],
+    value: &Value,
+    desc: &Option<Desc>,
+    name: &str,
+) -> bool {
+    let Ok((value, desc)) =
+        deref_if_pointer(interp, frames, value.clone(), desc.clone())
+    else {
+        return false;
+    };
+    let Some(Desc::Adt(tag)) = &desc else {
+        return false;
+    };
+    if let Some(shape) = interp.program().adt_debug_shapes.get(tag) {
+        let variant = match &value {
+            Value::Enum { variant, .. } => *variant as usize,
+            _ => 0,
+        };
+        if let Some(vshape) = shape.variants.get(variant) {
+            if vshape.fields.iter().any(|f| f.name.as_deref() == Some(name)) {
+                return true;
+            }
+        }
+    }
+    if matches!(value, Value::Closure { .. }) {
+        if let Some(shape) = interp.program().env_debug_shapes.get(tag) {
+            if shape.upvars.iter().any(|f| f.name.as_deref() == Some(name)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Apply one named-field step (`.name`) to a value: the fat
 /// pointer pseudo-fields (`length`, `data_ptr`), then — after
 /// an implicit dereference — the active variant's named field
@@ -1259,9 +1319,9 @@ fn apply_field_name(
     name: &str,
     expr_text: &str,
 ) -> Result<(Value, Option<Desc>), String> {
-    if name == "length" {
+    if name == "length" && !has_recorded_field(interp, frames, &value, &desc, name) {
         let len = sequence_length(interp, frames, &value, desc.as_ref())?;
-        return Ok((Value::Uint(len), Some(Desc::Int(false))));
+        return Ok((Value::Uint(len), Some(Desc::Int("usize"))));
     }
     if name == "data_ptr" {
         if let Value::FatRef { base, .. } = &value {
@@ -1331,6 +1391,34 @@ fn apply_field_name(
     Err(format!("no field `{name}` in `{expr_text}`"))
 }
 
+/// The element aggregate a cast to an array/slice type views:
+/// unwrap fat pointers and references until the pointee value
+/// itself. A sub-slice's data pointer can denote a reference
+/// to a materialised fat-pointer value (the sub-slice built as
+/// a standalone value, then referenced), so the unwrapping
+/// recurses through that layer too.
+fn cast_pointee_elements(
+    interp: &Interpreter,
+    frames: &[Frame],
+    value: Value,
+) -> Result<Value, String> {
+    match value {
+        Value::FatRef { base, .. } => {
+            cast_pointee_elements(interp, frames, (*base).clone())
+        }
+        Value::Ref(_) | Value::DynRef { .. } => {
+            let resolved = interp
+                .deref_value(frames, &value)
+                .map_err(|e| e.to_string())?;
+            let read = interp
+                .read_resolved(frames, &resolved)
+                .map_err(|e| e.to_string())?;
+            cast_pointee_elements(interp, frames, read)
+        }
+        other => Ok(other),
+    }
+}
+
 /// Apply a cast step (`as *const [T; N]` and kin): a pointer
 /// cast retargets the descriptor; an array cast views the
 /// pointee's elements as an array value (the form the slice
@@ -1341,31 +1429,20 @@ fn apply_cast(
     value: Value,
     target: Desc,
 ) -> Result<(Value, Option<Desc>), String> {
+    // A cast spelled as a pointer to an array/slice (`as *const
+    // [T; N]`) is the array cast below: the pointer layer is
+    // the spelling, not a value layer.
+    let target = match target {
+        Desc::Ref(inner)
+            if matches!(*inner, Desc::Array(..) | Desc::Slice(_)) =>
+        {
+            *inner
+        }
+        other => other,
+    };
     match target {
         Desc::Array(_, _) | Desc::Slice(_) => {
-            let pointee = match &value {
-                Value::FatRef { base, .. } => match &**base {
-                    Value::Tuple(items) => Value::Tuple(items.clone()),
-                    Value::Ref(_) | Value::DynRef { .. } => {
-                        let resolved = interp
-                            .deref_value(frames, base)
-                            .map_err(|e| e.to_string())?;
-                        interp
-                            .read_resolved(frames, &resolved)
-                            .map_err(|e| e.to_string())?
-                    }
-                    other => other.clone(),
-                },
-                Value::Ref(_) | Value::DynRef { .. } => {
-                    let resolved = interp
-                        .deref_value(frames, &value)
-                        .map_err(|e| e.to_string())?;
-                    interp
-                        .read_resolved(frames, &resolved)
-                        .map_err(|e| e.to_string())?
-                }
-                other => other.clone(),
-            };
+            let pointee = cast_pointee_elements(interp, frames, value)?;
             Ok((pointee, Some(target)))
         }
         other => Ok((value, Some(other))),
@@ -1721,7 +1798,9 @@ fn desc_type_name(desc: &Desc) -> Option<String> {
         Desc::Adt(tag) => dwarf_type_name(tag),
         Desc::Closure(name) | Desc::Coroutine(name) => name.clone(),
         Desc::FnPtr => "*mut fn ()".to_string(),
-        Desc::Int(_) | Desc::Float | Desc::Unknown => return None,
+        Desc::Int(name) => name.to_string(),
+        Desc::Float(name) => name.to_string(),
+        Desc::Unknown => return None,
     })
 }
 
@@ -2067,9 +2146,14 @@ enum Desc {
     Unit,
     Bool,
     Char,
-    /// An integer type; the flag is its signedness.
-    Int(bool),
-    Float,
+    /// An integer type, by its canonical name (`i32`, `u8`,
+    /// ...): the concrete name, not just the signedness, so a
+    /// type query over a projected value (a field, an element, a
+    /// pointee) can print the primitive type it was projected
+    /// from.
+    Int(&'static str),
+    /// A floating-point type, by its canonical name.
+    Float(&'static str),
     Str,
     Tuple(Vec<Desc>),
     Array(Box<Desc>, u64),
@@ -2086,14 +2170,48 @@ enum Desc {
     Unknown,
 }
 
+/// The canonical name of a signed integer type.
+fn int_ty_name(ty: IntTy) -> &'static str {
+    match ty {
+        IntTy::I8 => "i8",
+        IntTy::I16 => "i16",
+        IntTy::I32 => "i32",
+        IntTy::I64 => "i64",
+        IntTy::I128 => "i128",
+        IntTy::Isize => "isize",
+    }
+}
+
+/// The canonical name of an unsigned integer type.
+fn uint_ty_name(ty: UintTy) -> &'static str {
+    match ty {
+        UintTy::U8 => "u8",
+        UintTy::U16 => "u16",
+        UintTy::U32 => "u32",
+        UintTy::U64 => "u64",
+        UintTy::U128 => "u128",
+        UintTy::Usize => "usize",
+    }
+}
+
+/// The canonical name of a floating-point type.
+fn float_ty_name(ty: FloatTy) -> &'static str {
+    match ty {
+        FloatTy::F16 => "f16",
+        FloatTy::F32 => "f32",
+        FloatTy::F64 => "f64",
+        FloatTy::F128 => "f128",
+    }
+}
+
 impl Desc {
     fn from_ir(ty: &Ty) -> Desc {
         match ty {
             Ty::Unit => Desc::Unit,
             Ty::Bool => Desc::Bool,
-            Ty::Int(_) => Desc::Int(true),
-            Ty::Uint(_) => Desc::Int(false),
-            Ty::Float(_) => Desc::Float,
+            Ty::Int(t) => Desc::Int(int_ty_name(*t)),
+            Ty::Uint(t) => Desc::Int(uint_ty_name(*t)),
+            Ty::Float(t) => Desc::Float(float_ty_name(*t)),
             Ty::Tuple(ts) => Desc::Tuple(ts.iter().map(Desc::from_ir).collect()),
             Ty::Never => Desc::Unknown,
             Ty::Adt(name) => Desc::Adt(name.clone()),
@@ -2118,13 +2236,22 @@ impl Desc {
             "bool" => return Desc::Bool,
             "char" => return Desc::Char,
             "str" => return Desc::Str,
-            "i8" | "i16" | "i32" | "i64" | "i128" | "isize" => {
-                return Desc::Int(true)
-            }
-            "u8" | "u16" | "u32" | "u64" | "u128" | "usize" => {
-                return Desc::Int(false)
-            }
-            "f16" | "f32" | "f64" | "f128" => return Desc::Float,
+            "i8" => return Desc::Int("i8"),
+            "i16" => return Desc::Int("i16"),
+            "i32" => return Desc::Int("i32"),
+            "i64" => return Desc::Int("i64"),
+            "i128" => return Desc::Int("i128"),
+            "isize" => return Desc::Int("isize"),
+            "u8" => return Desc::Int("u8"),
+            "u16" => return Desc::Int("u16"),
+            "u32" => return Desc::Int("u32"),
+            "u64" => return Desc::Int("u64"),
+            "u128" => return Desc::Int("u128"),
+            "usize" => return Desc::Int("usize"),
+            "f16" => return Desc::Float("f16"),
+            "f32" => return Desc::Float("f32"),
+            "f64" => return Desc::Float("f64"),
+            "f128" => return Desc::Float("f128"),
             "!" => return Desc::Unknown,
             _ => {}
         }
@@ -2232,7 +2359,7 @@ fn render_vec_lldb(
         parts.push(format!("[{i}] = {v}"));
     }
     if parts.is_empty() {
-        Some("size=0 {}".to_string())
+        Some("size=0".to_string())
     } else {
         Some(format!("size={} {{ {} }}", fields.len(), parts.join(" ")))
     }
@@ -2545,7 +2672,7 @@ fn render_gdb(
             render_env_gdb(interp, value, desc, depth)
         }
         Value::Uninit => match desc {
-            Some(Desc::Int(_)) | Some(Desc::Float) => Some("0".to_string()),
+            Some(Desc::Int(_)) | Some(Desc::Float(_)) => Some("0".to_string()),
             Some(Desc::Bool) => Some("false".to_string()),
             _ => None,
         },
@@ -3373,15 +3500,15 @@ fn render_lldb_provider_line(
                     )?;
                     parts.push(format!("[{i}] = {v}"));
                 }
-                let children = if parts.is_empty() {
-                    "{}".to_string()
+                if parts.is_empty() {
+                    Some(format!("({ty}) {expr} = size={size}"))
                 } else {
-                    format!("{{ {} }}", parts.join(" "))
-                };
-                Some(format!(
-                    "({ty}) {expr} = size={} {children}",
-                    size
-                ))
+                    let children = format!("{{ {} }}", parts.join(" "));
+                    Some(format!(
+                        "({ty}) {expr} = size={} {children}",
+                        size
+                    ))
+                }
             }
             Desc::Str => {
                 let resolved = interp.deref_value(frames, value).ok()?;
@@ -3534,7 +3661,7 @@ fn render_lldb_compact(
         }
         Value::Str(s) => Some(format!("\"{}\"", escape_str(s))),
         Value::Uninit => match desc {
-            Some(Desc::Int(_)) | Some(Desc::Float) => Some("0".to_string()),
+            Some(Desc::Int(_)) | Some(Desc::Float(_)) => Some("0".to_string()),
             Some(Desc::Bool) => Some("false".to_string()),
             _ => None,
         },
