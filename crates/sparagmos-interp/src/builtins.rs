@@ -15617,7 +15617,8 @@ fn value_fingerprint(value: &Value) -> u64 {
         let target = self.deref_value(frames, ref_arg)?;
         let state = self.read_resolved(frames, &target)?;
         let elem_tag = first_generic_arg(self_ty).unwrap_or("");
-        let (_, remaining) = self.slice_iter_front_and_remaining(&state, self_ty, elem_tag)?;
+        let (_, remaining) =
+            self.slice_iter_front_and_remaining(frames, &state, self_ty, elem_tag)?;
         Ok(Value::Uint(u128::from(remaining)))
     }
 
@@ -15643,7 +15644,7 @@ fn value_fingerprint(value: &Value) -> u64 {
             arg.clone()
         };
         let (front, remaining) =
-            self.slice_iter_front_and_remaining(&state, "slice iterator", elem_tag)?;
+            self.slice_iter_front_and_remaining(frames, &state, "slice iterator", elem_tag)?;
         Ok(Value::FatRef {
             base: Box::new(front),
             len: u128::from(remaining),
@@ -15663,8 +15664,22 @@ fn value_fingerprint(value: &Value) -> u64 {
     /// units (in address units for a zero-sized element,
     /// whose step advances the address itself). Any other
     /// unrecognised shape keeps the bounds reading's error.
+    ///
+    /// Before either reading, a pair denoting two positions
+    /// in the same storage is measured directly with the
+    /// `offset_from` distance (`pointer_distance`): that
+    /// reading composes a trailing byte offset past an index
+    /// step into the position it denotes, which the bounds
+    /// reading's index extraction silently drops — the shape
+    /// a real-pointer iterator over a scalar-backed slice
+    /// takes (an `IterMut` over `slice::from_mut(&mut x)`,
+    /// whose front denotes the scalar place itself and whose
+    /// end denotes that same place one element further on).
+    /// Wherever the distance reading applies to a pair the
+    /// bounds reading also serves, the two agree.
     fn slice_iter_front_and_remaining(
         &self,
+        frames: &[Frame],
         state: &Value,
         self_ty: &str,
         elem_tag: &str,
@@ -15684,6 +15699,13 @@ fn value_fingerprint(value: &Value) -> u64 {
                 fields[0].kind_name(),
             )
         })?;
+        if let Some(end_ptr) = iter_ptr_value(&fields[1]) {
+            if let Some(remaining) =
+                self.slice_iter_pointer_distance(frames, &front, &end_ptr, elem_tag)
+            {
+                return Ok((front, remaining));
+            }
+        }
         match slice_iter_bounds(state, self_ty) {
             Ok((cur, end)) => Ok((front, end.saturating_sub(cur) as u64)),
             Err(bounds_err) => {
@@ -15712,6 +15734,28 @@ fn value_fingerprint(value: &Value) -> u64 {
                 Ok((front, remaining))
             }
         }
+    }
+
+    /// The remaining element count of a slice-iterator state
+    /// whose front and end pointers denote two positions in
+    /// the same storage, measured with the `offset_from`
+    /// distance reading (`pointer_distance`) over the resolved
+    /// pointers; `None` when either pointer denotes no storage
+    /// position (an address-only or null pointer), when the
+    /// two denote unrelated storage, or when the end does not
+    /// lie at or past the front.
+    fn slice_iter_pointer_distance(
+        &self,
+        frames: &[Frame],
+        front: &Value,
+        end: &Value,
+        elem_tag: &str,
+    ) -> Option<u64> {
+        let front = self.deref_value(frames, front).ok()?;
+        let end = self.deref_value(frames, end).ok()?;
+        let args = [elem_tag.to_string()];
+        let distance = self.pointer_distance(&end, &front, &args).ok()??;
+        u64::try_from(distance).ok()
     }
 
     /// `Iterator::size_hint` for the modelled iterators: the

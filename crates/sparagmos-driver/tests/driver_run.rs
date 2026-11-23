@@ -11455,6 +11455,48 @@ fn run_mode_exact_size_len_reference_wrapper_forwards() {
     );
 }
 
+const SLICE_ITER_MUT_SCALAR_BACKED_SRC: &str = r#"
+use std::iter::ExactSizeIterator;
+fn main() {
+    let mut x = 41i32;
+    let mut it = std::slice::from_mut(&mut x).iter_mut();
+    println!("len {}", ExactSizeIterator::len(&it));
+    println!("view {}", it.as_slice().len());
+    let rest = it.into_slice();
+    println!("rest {}", rest.len());
+    let mut w = 900u64;
+    let itw = std::slice::from_mut(&mut w).iter_mut();
+    println!("wlen {}", ExactSizeIterator::len(&itw));
+    println!("wview {}", itw.as_slice().len());
+}
+"#;
+
+#[test]
+fn run_mode_slice_iter_mut_scalar_backed_len() {
+    // PR #387, Codex round 2: over a scalar-backed slice
+    // (`slice::from_mut(&mut x)`), the iterator's front
+    // pointer denotes the scalar place while the end pointer
+    // denotes the same place with a trailing
+    // `ByteOffset(size_of::<T>())`. The index reading of the
+    // unified bounds drops that offset and reports an empty
+    // iterator, and the snapshot-address fallback cannot read
+    // a storage-backed pair at all, so the modelled `len`
+    // and slice views failed instead of returning the
+    // one-element result. They now read the pair's distance
+    // through the same storage-backed offset reading as
+    // `offset_from` before falling back to the bounds.
+    let dir = temp_dir("slice-iter-mut-scalar-backed");
+    let src = fixture(&dir, "case.rs", SLICE_ITER_MUT_SCALAR_BACKED_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout, "len 1\nview 1\nrest 1\nwlen 1\nwview 1\n",
+        "stdout={stdout}"
+    );
+}
+
 const CATCH_UNWIND_O3_DATA_SRC: &str = r#"
 #[inline(never)]
 fn boom() { std::panic::resume_unwind(Box::new(7i32)); }
