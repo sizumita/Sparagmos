@@ -997,34 +997,37 @@ pub enum Builtin {
     /// unsupported error rather than a guessed verdict.
     VecTryReserve,
     /// `Vec::shrink_to_fit(&mut vec)` / `Vec::shrink_to(&mut vec,
-    /// min_capacity)`: no-ops. Shrinking changes only the
-    /// allocation's capacity, which the value model does not
-    /// represent and no modelled operation can observe
-    /// (`Vec::capacity` is the explicit `VecCapacity` error,
-    /// growth is the `VecReserve` no-op). The collected bodies
+    /// min_capacity)`: drop the spare storage past the target
+    /// capacity (the length itself for `shrink_to_fit`, the
+    /// larger of the length and `min_capacity` for `shrink_to`).
+    /// Capacity in this model is the extent of the element
+    /// storage a vector value holds (see `vec_stored_len`), so
+    /// shrinking is the one capacity change the model performs;
+    /// growth stays the `VecReserve` no-op. The collected bodies
     /// project the RawVec struct's fields off the abstract
     /// aggregate and fail, so the entry points are modelled here.
     VecShrink,
-    /// `Vec::set_len(&mut vec, new_len)`: resize the element
-    /// list to `new_len`, padding with uninitialized elements
-    /// when growing. The collected body first reads the
-    /// capacity through the `RawVec` fields for its UB
-    /// precondition check, and capacity is not represented in
-    /// this value model (the same reason `Vec::capacity` is
-    /// the explicit `VecCapacity` error), so the entry point
-    /// is modelled here. Shrinking forgets the tail elements
-    /// without dropping them, exactly as the real `set_len`
-    /// contract specifies.
+    /// `Vec::set_len(&mut vec, new_len)`: declare the vector's
+    /// length to be `new_len`. The collected body first reads
+    /// the capacity through the `RawVec` fields for its UB
+    /// precondition check, a chain the value model answers in
+    /// place resolution instead, so the entry point is modelled
+    /// here. The storage change is `vec_with_len`'s: growing
+    /// pads with uninitialized elements (sparsely past the
+    /// materialisation limit), and shrinking keeps the tail
+    /// elements in storage as spare capacity without dropping
+    /// them, exactly as the real `set_len` contract specifies —
+    /// the slots stay reachable through the buffer pointer and
+    /// count toward the capacity the model reports.
     VecSetLen,
     /// `Vec::as_ptr(&vec)` / `Vec::as_mut_ptr(&mut vec)`: the
-    /// buffer pointer, which in this value model is the receiver
-    /// reference retargeted at the vector's first element (the
-    /// same value the slice deref's data pointer denotes). The
+    /// receiver reference retargeted at the first element. The
     /// collected bodies walk the `RawVec` / `Unique` / `NonNull`
-    /// field chain off the abstract aggregate, where the first
-    /// field is the first element, so they read an element value
-    /// as the pointer (or fail on it); the entry points are
-    /// modelled here like the other RawVec-field readers.
+    /// wrapper chain, which the value model does not hold; the
+    /// pointer they produce is the buffer pointer, which in
+    /// this model is a reference to the vector place's first
+    /// element — the same target the buffer chain in place
+    /// resolution denotes.
     VecAsPtr,
     /// `Vec::extend_trusted(&mut vec, iter)`: append every item
     /// the iterator yields. The collected body is the TrustedLen
@@ -1059,11 +1062,13 @@ pub enum Builtin {
     /// clone (`clone_owned_value`), the same treatment
     /// `Clone::clone` receives.
     SliceToVec,
-    /// `Vec::capacity(&vec)`: not modelled. Capacity has no
-    /// representation in the value model, and returning the length
-    /// would be observably wrong, so the call fails with an
-    /// explicit error naming the function (rather than projecting
-    /// the abstract value as if it had the std layout).
+    /// `Vec::capacity(&vec)`: the extent of the element
+    /// storage the value holds (see `vec_stored_len`) — the
+    /// allocation this model can name. The collected body
+    /// projects the `RawVec` capacity field off the abstract
+    /// aggregate and fails, so the entry point is modelled
+    /// here; the buffer chain's capacity slot in place
+    /// resolution gives the same answer.
     VecCapacity,
     /// `core::slice::<impl [T]>::iter(&slice)`: a slice iterator state
     /// (element snapshot + next index), the shape `Iterator::next`
@@ -6025,6 +6030,8 @@ impl<'a> Interpreter<'a> {
                     || self_ty.starts_with("std::array::IntoIter<")
                     || self_ty.starts_with("std::vec::IntoIter<")
                     || self_ty.starts_with("alloc::vec::IntoIter<")
+                    || self_ty.starts_with("std::vec::Drain<")
+                    || self_ty.starts_with("alloc::vec::Drain<")
                     || self_ty.starts_with("std::option::IntoIter<")
                     || self_ty.starts_with("std::option::Iter<")
                     || self_ty.starts_with("std::option::IterMut<")
@@ -7660,6 +7667,30 @@ impl<'a> Interpreter<'a> {
                     Value::Enum { fields, .. } => {
                         Ok(self.new_box(Value::Tuple(fields)))
                     }
+                    Value::SparseVec { mut elems, len } => {
+                        // The boxed slice holds the declared
+                        // elements: the stored prefix, plus the
+                        // uninitialised tail when the length runs
+                        // past it (materialised up to the same
+                        // limit `Vec::set_len` uses).
+                        let len = usize::try_from(len).map_err(|_| {
+                            unsupported(
+                                "Vec::into_boxed_slice on a vector whose elements are not materialised"
+                                    .to_string(),
+                            )
+                        })?;
+                        if len > elems.len() && len > MAX_VEC_SET_LEN_ELEMENTS {
+                            return Err(unsupported(
+                                "Vec::into_boxed_slice on a vector whose elements are not materialised"
+                                    .to_string(),
+                            ));
+                        }
+                        elems.truncate(len);
+                        if elems.len() < len {
+                            elems.resize(len, Value::Uninit);
+                        }
+                        Ok(self.new_box(Value::Tuple(elems)))
+                    }
                     Value::Tuple(items) => Ok(self.new_box(Value::Tuple(items))),
                     other => Err(InterpError::type_mismatch(
                         "Vec::into_boxed_slice",
@@ -8580,22 +8611,9 @@ impl<'a> Interpreter<'a> {
                 arity(2)?;
                 let target = self.deref_value(frames, &vals[0])?;
                 let (elems, _) = self.slice_elements(frames, &vals[1])?;
-                self.modify_resolved(frames, &target, |slot| match slot {
-                    Value::Enum { fields, .. } => {
-                        fields.extend(elems.iter().cloned());
-                        Ok(Value::Unit)
-                    }
-                    // The appended elements would land past the
-                    // unmaterialised region, as for `Vec::push`.
-                    Value::SparseVec { .. } => Err(unsupported(
-                        "Vec::extend_from_slice on a vector whose elements are not materialised"
-                            .to_string(),
-                    )),
-                    other => Err(InterpError::type_mismatch(
-                        "Vec::extend_from_slice",
-                        "vector value",
-                        other.kind_name(),
-                    )),
+                self.modify_resolved(frames, &target, |slot| {
+                    vec_append_in_place(slot, &elems, "Vec::extend_from_slice")?;
+                    Ok(Value::Unit)
                 })
             }
             Builtin::VecPush => {
@@ -8604,23 +8622,9 @@ impl<'a> Interpreter<'a> {
                 let mut vals = vals.into_iter();
                 let _ = vals.next();
                 let elem = vals.next().expect("arity checked");
-                self.modify_resolved(frames, &target, |slot| match slot {
-                    Value::Enum { fields, .. } => {
-                        fields.push(elem);
-                        Ok(Value::Unit)
-                    }
-                    // The pushed element would land past the
-                    // unmaterialised region, which only
-                    // materialising that region could store.
-                    Value::SparseVec { .. } => Err(unsupported(
-                        "Vec::push on a vector whose elements are not materialised"
-                            .to_string(),
-                    )),
-                    other => Err(InterpError::type_mismatch(
-                        "Vec::push",
-                        "vector value",
-                        other.kind_name(),
-                    )),
+                self.modify_resolved(frames, &target, |slot| {
+                    vec_append_in_place(slot, &[elem], "Vec::push")?;
+                    Ok(Value::Unit)
                 })
             }
             Builtin::VecLen | Builtin::VecIsEmpty => {
@@ -8749,8 +8753,11 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::VecShrink => {
                 // `shrink_to_fit` passes one argument, `shrink_to`
-                // two; neither changes anything the value model can
-                // observe (see the variant's documentation).
+                // two (receiver, minimum capacity). The shrink
+                // drops the spare storage past the target capacity
+                // — the storage a length shrink left behind (see
+                // `vec_with_len`) — and leaves the length and its
+                // elements untouched.
                 if vals.len() != 1 && vals.len() != 2 {
                     return Err(InterpError::type_mismatch(
                         format!("builtin {name}"),
@@ -8758,7 +8765,41 @@ impl<'a> Interpreter<'a> {
                         format!("{} argument(s)", vals.len()),
                     ));
                 }
-                Ok(Value::Unit)
+                let min_cap = if vals.len() == 2 {
+                    match vals[1] {
+                        Value::Uint(n) => n,
+                        Value::Int(n) if n >= 0 => n as u128,
+                        ref other => {
+                            return Err(InterpError::type_mismatch(
+                                format!("builtin {name}"),
+                                "minimum capacity (usize)",
+                                other.kind_name(),
+                            ));
+                        }
+                    }
+                } else {
+                    0
+                };
+                let target = self.deref_value(frames, &vals[0])?;
+                self.modify_resolved(frames, &target, |slot| {
+                    let mut rebuild = None;
+                    if let Value::SparseVec { elems, len } = slot {
+                        let keep = (*len).max(min_cap);
+                        if (elems.len() as u128) > keep {
+                            elems.truncate(keep as usize);
+                            if keep == *len {
+                                rebuild = Some(Value::Enum {
+                                    variant: 0,
+                                    fields: std::mem::take(elems),
+                                });
+                            }
+                        }
+                    }
+                    if let Some(value) = rebuild {
+                        *slot = value;
+                    }
+                    Ok(Value::Unit)
+                })
             }
             Builtin::VecSetLen => {
                 arity(2)?;
@@ -8782,8 +8823,8 @@ impl<'a> Interpreter<'a> {
                     // `Vec::with_capacity(1_000_000_000)` +
                     // `set_len` idiom) declares its length
                     // instead of exhausting the host. Shrinking
-                    // forgets the tail elements without dropping
-                    // them, exactly as the real `set_len`
+                    // keeps the tail elements in storage without
+                    // dropping them, exactly as the real `set_len`
                     // contract specifies.
                     let elems = match std::mem::replace(slot, Value::Uninit) {
                         Value::Enum { fields, .. } => fields,
@@ -8815,14 +8856,8 @@ impl<'a> Interpreter<'a> {
                 // is the stepping dispatch key.
                 let iter_ty = generic_args.last().map(String::as_str).unwrap_or("");
                 let target = self.deref_value(frames, &vals[0])?;
-                let mut fields = match self.read_resolved(frames, &target)? {
-                    Value::Enum { fields, .. } => fields,
-                    Value::SparseVec { .. } => {
-                        return Err(unsupported(
-                            "Vec::extend_trusted on a vector whose elements are not materialised"
-                                .to_string(),
-                        ));
-                    }
+                match self.read_resolved(frames, &target)? {
+                    Value::Enum { .. } | Value::SparseVec { .. } => {}
                     ref other => {
                         return Err(InterpError::type_mismatch(
                             "Vec::extend_trusted",
@@ -8830,22 +8865,16 @@ impl<'a> Interpreter<'a> {
                             other.kind_name(),
                         ))
                     }
-                };
+                }
                 let items = self.drain_iterator(
                     frames,
                     iter_ty,
                     vals.into_iter().nth(1).expect("arity checked"),
                 )?;
-                fields.extend(items);
-                self.write_resolved(
-                    frames,
-                    &target,
-                    Value::Enum {
-                        variant: 0,
-                        fields,
-                    },
-                )?;
-                Ok(Value::Unit)
+                self.modify_resolved(frames, &target, |slot| {
+                    vec_append_in_place(slot, &items, "Vec::extend_trusted")?;
+                    Ok(Value::Unit)
+                })
             }
             Builtin::VecFromIterNested => {
                 arity(1)?;
@@ -8863,10 +8892,20 @@ impl<'a> Interpreter<'a> {
                     fields: items,
                 })
             }
-            Builtin::VecCapacity => Err(unsupported(
-                "Vec::capacity is not runtime-supported (capacity is not represented in the value model)"
-                    .to_string(),
-            )),
+            Builtin::VecCapacity => {
+                arity(1)?;
+                // Only the storage extent is read: resolve by
+                // borrowing, as `Vec::len` does.
+                let value = self.resolve_ref(frames, &vals[0])?;
+                let cap = vec_stored_len(&value).ok_or_else(|| {
+                    InterpError::type_mismatch(
+                        "Vec::capacity",
+                        "vector value",
+                        value.kind_name(),
+                    )
+                })?;
+                Ok(Value::Uint(cap))
+            }
             Builtin::SliceToVec => {
                 // `to_vec` takes the slice alone; `to_vec_in`
                 // takes the allocator handle after it (a
@@ -12238,6 +12277,11 @@ fn value_fingerprint(value: &Value) -> u64 {
         self_ty: &str,
         state: Value,
     ) -> InterpResult<(Value, Value)> {
+        if self_ty.starts_with("std::vec::Drain<")
+            || self_ty.starts_with("alloc::vec::Drain<")
+        {
+            return self.drain_next_state(frames, state, true);
+        }
         if self_ty.starts_with("std::path::Components") {
             // The back step of the state `Builtin::PathComponents`
             // builds, replaying the host's parsing (see
@@ -12500,12 +12544,126 @@ fn value_fingerprint(value: &Value) -> u64 {
     /// `collect`, `for_each`) drive it directly over the owned
     /// iterator value they receive, performing exactly the
     /// sequence of `next` calls the core default bodies perform.
+    /// One step of a `vec::Drain`: the state is the drain's
+    /// real field layout — `[tail_start, tail_len, iter, vec]`,
+    /// where `iter` is the slice iterator over the drained range
+    /// in the source vector's storage (its pointers carry the
+    /// range as trailing `Index` steps into that storage) and
+    /// `vec` is the `NonNull` back to the source vector. A step
+    /// reads the element at the iterator's current pointer (the
+    /// `ptr::read` the drain's own `next` performs), marks the
+    /// storage slot uninitialized — the element has moved out —
+    /// and advances the pointer (or retreats the end, for
+    /// `next_back`). The source vector's length stays at the
+    /// range start the drain's creation set, and the drain's
+    /// own destructor body performs the tail move when the
+    /// drain value is dropped, exactly as it does natively.
+    fn drain_next_state(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        state: Value,
+        from_back: bool,
+    ) -> InterpResult<(Value, Value)> {
+        let Value::Enum {
+            variant,
+            fields: drain,
+        } = &state
+        else {
+            return Err(InterpError::type_mismatch(
+                "Drain state",
+                "the drain's field layout",
+                state.kind_name(),
+            ));
+        };
+        if drain.len() != 4 {
+            return Err(InterpError::type_mismatch(
+                "Drain state",
+                "[tail_start, tail_len, iter, vec]",
+                format!("{} field(s)", drain.len()),
+            ));
+        }
+        let Value::Enum {
+            variant: iter_variant,
+            fields: iter,
+        } = &drain[2]
+        else {
+            return Err(InterpError::type_mismatch(
+                "Drain state",
+                "a slice iterator in the iter field",
+                drain[2].kind_name(),
+            ));
+        };
+        if iter.len() < 2 {
+            return Err(InterpError::type_mismatch(
+                "Drain state",
+                "a slice iterator with pointer and end",
+                format!("{} field(s)", iter.len()),
+            ));
+        }
+        let (ptr_field, end_field) = (iter[0].clone(), iter[1].clone());
+        let (Some(cur), Some(last)) =
+            (iter_ptr_index(&ptr_field), iter_ptr_index(&end_field))
+        else {
+            return Err(InterpError::type_mismatch(
+                "Drain state",
+                "element pointers into the source vector's storage",
+                format!(
+                    "{} / {}",
+                    ptr_field.kind_name(),
+                    end_field.kind_name()
+                ),
+            ));
+        };
+        if cur >= last {
+            return Ok((state, none_value()));
+        }
+        let (step_field, at) = if from_back {
+            (end_field.clone(), last - 1)
+        } else {
+            (ptr_field.clone(), cur)
+        };
+        let Some(ptr_value) = iter_ptr_value(&step_field) else {
+            return Err(InterpError::type_mismatch(
+                "Drain state",
+                "an element pointer in the stepped field",
+                step_field.kind_name(),
+            ));
+        };
+        let target = self.deref_value(frames, &ptr_value)?;
+        let item = self.read_resolved(frames, &target)?;
+        self.write_resolved(frames, &target, Value::Uninit)?;
+        let stepped = iter_ptr_with_index(&step_field, if from_back { last - 1 } else { cur + 1 })
+            .expect("index step checked");
+        let mut iter = iter.clone();
+        if from_back {
+            iter[1] = stepped;
+        } else {
+            iter[0] = stepped;
+        }
+        let mut drain = drain.clone();
+        drain[2] = Value::Enum {
+            variant: *iter_variant,
+            fields: iter,
+        };
+        let new_state = Value::Enum {
+            variant: *variant,
+            fields: drain,
+        };
+        let _ = at;
+        Ok((new_state, some_value(item)))
+    }
+
     pub(crate) fn iterator_next_state(
         &mut self,
         frames: &mut Vec<Frame>,
         self_ty: &str,
         state: Value,
     ) -> InterpResult<(Value, Value)> {
+        if self_ty.starts_with("std::vec::Drain<")
+            || self_ty.starts_with("alloc::vec::Drain<")
+        {
+            return self.drain_next_state(frames, state, false);
+        }
         if self_ty.starts_with("std::sync::mpsc::Iter<") {
             // The state holds the receiver handle; iteration is
             // `recv` until the channel disconnects.
@@ -15320,7 +15478,7 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         Ok(())
     }
 
-    fn slice_elements(
+    pub(crate) fn slice_elements(
         &self,
         frames: &[Frame],
         value: &Value,
@@ -16905,7 +17063,7 @@ fn unwrap_newtype(value: Value) -> Value {
 /// as the fields) does not qualify: its second field is an
 /// element, never a bare length beside a `RawVec`-shaped first
 /// field.
-fn vec_real_aggregate_parts(value: &Value) -> Option<(Value, usize)> {
+pub(crate) fn vec_real_aggregate_parts(value: &Value) -> Option<(Value, usize)> {
     let Value::Enum { fields, .. } = value else {
         return None;
     };
@@ -18697,17 +18855,28 @@ fn is_count_cell(value: &Value) -> bool {
 pub(crate) const MAX_VEC_SET_LEN_ELEMENTS: usize = 1 << 22;
 
 /// A vector value holding `elems` at declared length `len`:
-/// the plain element aggregate when the whole length is
-/// materialised — a growth into the materialisation limit pads
-/// with uninitialised slots, as `Vec::set_len` does — and the
-/// sparse form (see `Value::SparseVec`) past it, which declares
-/// the length the stored elements do not cover.
+/// the plain element aggregate when the declared length is
+/// exactly the stored list — a growth into the materialisation
+/// limit pads with uninitialised slots, as `Vec::set_len`
+/// does — and the sparse form (see `Value::SparseVec`) when
+/// the two differ: past the materialisation limit the length
+/// runs ahead of the stored elements, and on a shrink the
+/// stored elements run ahead of the length. A shrink keeps
+/// the tail in storage: those slots are the vector's spare
+/// capacity — still reachable through the buffer pointer (a
+/// `pop` reads the element it just un-declared), counted by
+/// the capacity the model reports, and overwritten by the
+/// next append before any new storage is needed.
 pub(crate) fn vec_with_len(mut elems: Vec<Value>, len: usize) -> Value {
-    if len <= elems.len() {
-        elems.truncate(len);
+    if len == elems.len() {
         Value::Enum {
             variant: 0,
             fields: elems,
+        }
+    } else if len < elems.len() {
+        Value::SparseVec {
+            elems,
+            len: len as u128,
         }
     } else if len <= MAX_VEC_SET_LEN_ELEMENTS {
         elems.resize(len, Value::Uninit);
@@ -18720,6 +18889,84 @@ pub(crate) fn vec_with_len(mut elems: Vec<Value>, len: usize) -> Value {
             elems,
             len: len as u128,
         }
+    }
+}
+
+/// The capacity a vector value's storage represents: the
+/// number of element slots the value accounts for — the stored
+/// list's length, or the declared length when it runs past the
+/// stored list (the unmaterialised tail is allocation the
+/// model accounts without holding element by element). Every
+/// capacity question in the model gives this answer (the
+/// `Vec::capacity` builtin and the buffer chain's capacity
+/// slot in place resolution alike): the element storage is
+/// exactly the allocation the model holds.
+pub(crate) fn vec_stored_len(value: &Value) -> Option<u128> {
+    match value {
+        Value::Enum { fields, .. } => Some(fields.len() as u128),
+        Value::SparseVec { elems, len } => Some((*len).max(elems.len() as u128)),
+        _ => None,
+    }
+}
+
+/// Append `items` to the vector value in `slot`, in place:
+/// slots the storage already holds past the length (the spare
+/// capacity a length shrink left behind) are overwritten in
+/// order and the rest extend the storage, so length and
+/// storage grow together and the value takes the plain
+/// aggregate form when they meet again. A vector whose
+/// declared length runs past its stored elements cannot take
+/// appends — the new elements would land past the stored
+/// region — and stays the explicit error it was.
+fn vec_append_in_place(
+    slot: &mut Value,
+    items: &[Value],
+    op: &str,
+) -> InterpResult<()> {
+    match slot {
+        Value::Enum { fields, .. } => {
+            fields.extend(items.iter().cloned());
+            Ok(())
+        }
+        Value::SparseVec { .. } => {
+            let value = std::mem::replace(slot, Value::Uninit);
+            let Value::SparseVec { mut elems, len } = value else {
+                unreachable!("matched sparse vector above")
+            };
+            let cur_len = usize::try_from(len).unwrap_or(usize::MAX);
+            if cur_len > elems.len() {
+                *slot = Value::SparseVec { elems, len };
+                return Err(unsupported(format!(
+                    "{op} on a vector whose elements are not materialised"
+                )));
+            }
+            let mut l = cur_len;
+            for item in items {
+                if l < elems.len() {
+                    elems[l] = item.clone();
+                } else {
+                    elems.push(item.clone());
+                }
+                l += 1;
+            }
+            *slot = if l == elems.len() {
+                Value::Enum {
+                    variant: 0,
+                    fields: elems,
+                }
+            } else {
+                Value::SparseVec {
+                    elems,
+                    len: l as u128,
+                }
+            };
+            Ok(())
+        }
+        other => Err(InterpError::type_mismatch(
+            op,
+            "vector value",
+            other.kind_name(),
+        )),
     }
 }
 
@@ -19988,6 +20235,22 @@ fn value_elements(value: &Value) -> InterpResult<Vec<Value>> {
             .iter()
             .map(|byte| Value::Uint(*byte as u128))
             .collect(),
+        // A sparse vector whose storage covers its declared
+        // length (the spare-capacity form a length shrink
+        // leaves) yields its declared elements; one whose
+        // length runs past the stored elements has no element
+        // list to hand out.
+        Value::SparseVec { elems, len } => {
+            let len = usize::try_from(*len).unwrap_or(usize::MAX);
+            if len > elems.len() {
+                return Err(InterpError::type_mismatch(
+                    "slice elements",
+                    "aggregate, byte or string value",
+                    "vector value with an unmaterialised tail",
+                ));
+            }
+            elems[..len].to_vec()
+        }
         other => {
             return Err(InterpError::type_mismatch(
                 "slice elements",
@@ -22823,6 +23086,30 @@ impl<'a> Interpreter<'a> {
             Value::FmtArguments(inner) => {
                 let text = self.format_arguments(frames, inner, indent)?;
                 Ok(pad_width(&text, options))
+            }
+            Value::SparseVec { elems, len } => {
+                // A vector value in sparse form (see
+                // `Value::SparseVec`) formats as the list of its
+                // declared elements, exactly as the plain
+                // aggregate form does through `format_debug_adt`:
+                // the stored elements up to the length, with an
+                // unmaterialised tail padded as the uninitialised
+                // slots it denotes (bounded by the same
+                // materialisation limit as `Vec::set_len`; past
+                // it the list cannot be produced and stays an
+                // explicit error). The spare-capacity tail past
+                // the length is not part of the list.
+                let declared = usize::try_from(*len).unwrap_or(usize::MAX);
+                if declared > elems.len() && declared > MAX_VEC_SET_LEN_ELEMENTS {
+                    return Err(unsupported(
+                        "Debug formatting of a vector whose elements are not materialised"
+                            .to_string(),
+                    ));
+                }
+                let mut fields: Vec<Value> =
+                    elems.iter().take(declared).cloned().collect();
+                fields.resize(declared, Value::Uninit);
+                self.format_debug_adt(frames, 0, &fields, ty, options, indent)
             }
             Value::Enum { variant, fields } => {
                 self.format_debug_adt(frames, *variant, fields, ty, options, indent)

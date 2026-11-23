@@ -18039,5 +18039,113 @@ fn run_mode_pathbuf_ptr_swap() {
         "pathbuf-ptr-swap",
         PATHBUF_PTR_SWAP_SRC,
         "copied: d/e\nswapped 0: o\nswapped 1: m/n\nstrings: world hello\npathbuf-ptr-swap-ok\n",
+const VEC_POP_AFTER_SHRINK_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<i32> = Vec::with_capacity(16);
+    v.push(1);
+    v.push(2);
+    v.shrink_to_fit();
+    println!("shrunk len={}", v.len());
+    match v.pop() {
+        Some(x) => println!("popped {}", x),
+        None => println!("none"),
+    }
+    println!("after len={}", v.len());
+    match v.pop() {
+        Some(x) => println!("popped {}", x),
+        None => println!("none"),
+    }
+    println!("final len={} empty={}", v.len(), v.is_empty());
+}
+"#;
+
+#[test]
+fn run_mode_vec_pop_after_shrink() {
+    // `pop`'s collected body reads the length slot, writes the
+    // decremented length back, reads the capacity slot for its
+    // `assert_unchecked(len < capacity)`, and reads the element
+    // at the new length through the buffer pointer: the length
+    // write must not destroy the element it is about to read,
+    // and the capacity answer must stay the storage extent
+    // across the write (see the vec length/storage rule in
+    // `vec_with_len`).
+    run_ok(
+        "vec-pop-after-shrink",
+        VEC_POP_AFTER_SHRINK_SRC,
+        "shrunk len=2\npopped 2\nafter len=1\npopped 1\nfinal len=0 empty=true\n",
+    );
+}
+
+const VEC_APPEND_TAIL_SRC: &str = r#"
+fn main() {
+    let mut a = vec![1, 2];
+    let mut b = vec![3, 4, 5];
+    a.append(&mut b);
+    println!("a={:?} len={} cap={}", a, a.len(), a.capacity());
+    println!("b={:?} len={}", b, b.len());
+    println!("a[0]={} a[3]={} a[4]={}", a[0], a[3], a[4]);
+}
+"#;
+
+#[test]
+fn run_mode_vec_append_tail() {
+    // `append`'s collected body copies the source elements
+    // through the destination's buffer pointer at the old
+    // length and only then writes the length slot: the raw
+    // writes extend the storage without moving the declared
+    // length, and the final length write lands on the extended
+    // storage.
+    run_ok(
+        "vec-append-tail",
+        VEC_APPEND_TAIL_SRC,
+        "a=[1, 2, 3, 4, 5] len=5 cap=5\nb=[] len=0\na[0]=1 a[3]=4 a[4]=5\n",
+    );
+}
+
+const VEC_SPLIT_OFF_SRC: &str = r#"
+fn main() {
+    let mut v = vec![1, 2, 3, 4, 5, 6];
+    v.truncate(3);
+    println!("trunc v={:?} len={}", v, v.len());
+    let mut w = vec![1, 2, 3, 4, 5];
+    let tail = w.split_off(2);
+    println!("w={:?} tail={:?}", w, tail);
+}
+"#;
+
+#[test]
+fn run_mode_vec_split_off() {
+    // `split_off` builds its result in the real aggregate form
+    // inside its body (an inlined `with_capacity_in`, `set_len`,
+    // and a raw copy into the buffer allocation): the value
+    // translates to the element form as it returns to the
+    // caller (see `vec_from_real_form`).
+    run_ok(
+        "vec-split-off",
+        VEC_SPLIT_OFF_SRC,
+        "trunc v=[1, 2, 3] len=3\nw=[1, 2] tail=[3, 4, 5]\n",
+    );
+}
+
+const VEC_DRAIN_COLLECT_SRC: &str = r#"
+fn main() {
+    let mut v = vec![1, 2, 3, 4, 5];
+    let taken: Vec<i32> = v.drain(1..3).collect();
+    println!("taken={:?}", taken);
+    let mut u = vec![10, 20, 30];
+    let all: Vec<i32> = u.drain(..).collect();
+    println!("all={:?}", all);
+}
+"#;
+
+#[test]
+fn run_mode_vec_drain_collect() {
+    // A drain's iteration steps its slice iterator through the
+    // source vector's storage (see `drain_next_state`); the
+    // collected elements are the drained range.
+    run_ok(
+        "vec-drain-collect",
+        VEC_DRAIN_COLLECT_SRC,
+        "taken=[2, 3]\nall=[10, 20, 30]\n",
     );
 }

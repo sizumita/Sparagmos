@@ -297,15 +297,25 @@ pub enum Value {
     },
     /// An ADT value: variant index + field values.
     Enum { variant: u32, fields: Vec<Value> },
-    /// A `Vec` value whose declared length runs past the element
-    /// list the value model materialises: `elems` holds the
-    /// stored elements and every slot from `elems.len()` up to
-    /// `len` is uninitialised — the shape a `Vec::set_len`
-    /// growth past the materialisation limit produces (the
-    /// element list is stored value by value, so an astronomical
-    /// length is not a value this model can hold element by
-    /// element). The unmaterialised slots behave exactly like
-    /// the uninitialised slots a materialised `set_len` leaves:
+    /// A `Vec` value whose declared length differs from the
+    /// element list the value model materialises, in either
+    /// direction. `elems` holds the stored elements. When `len`
+    /// runs past them — the shape a `Vec::set_len` growth past
+    /// the materialisation limit produces (the element list is
+    /// stored value by value, so an astronomical length is not
+    /// a value this model can hold element by element) — every
+    /// slot from `elems.len()` up to `len` is uninitialised.
+    /// When the stored elements run past `len` — the shape a
+    /// length shrink (`set_len`, a length-slot write) produces —
+    /// the tail past `len` is the vector's spare capacity: the
+    /// slots keep their values and stay reachable as storage
+    /// (through the buffer pointer, and as the slots the next
+    /// append overwrites), but they are not elements: length
+    /// questions, slice views, equality and the drop glue all
+    /// stop at `len`, and the capacity the model reports is
+    /// the storage extent, `max(len, elems.len())`. The
+    /// unmaterialised slots behave exactly like the
+    /// uninitialised slots a materialised `set_len` leaves:
     /// reading one is an uninitialised read, dropping one is a
     /// no-op, and only the length, the stored elements, and
     /// bounded prefixes of the whole are observable.

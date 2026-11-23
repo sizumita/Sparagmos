@@ -2825,14 +2825,15 @@ fn vec_from_elem_repeats_the_element() {
 }
 
 #[test]
-fn vec_capacity_is_an_explicit_error() {
-    // fn main() { _1 = Vec::new(); _3 = Vec::capacity(&_1); }
-    // Capacity has no representation in the value model, so the
-    // call fails with an explicit error naming the function instead
-    // of projecting the abstract value as if it had the std layout.
+fn vec_capacity_answers_the_storage_extent() {
+    // fn main() -> usize { _1 = Vec::new(); _0 = Vec::capacity(&_1); }
+    // Capacity is the storage the value model holds for the
+    // vector (see `vec_stored_len`): a fresh vector holds no
+    // storage, so the answer is 0 — the same answer the RawVec
+    // capacity slot reads inside collected bodies give.
     let body = mir::Body::new(
         decls(&[
-            mir::Ty::unit(),             // _0
+            usize_ty(),                  // _0
             vec_i32_ty(),                // _1 vec
             ref_ty(vec_i32_ty(), false), // _2 &vec
             usize_ty(),                  // _3 capacity
@@ -2844,20 +2845,11 @@ fn vec_capacity_is_an_explicit_error() {
                 vec![assign(place(2), ref_rvalue(1, false))],
                 call(fndef(VEC_CAPACITY, vec![i32_ty()]), vec![move_(2)], 3, 2),
             ),
-            block(vec![], ret()),
+            block(vec![assign(place(0), mir::Rvalue::Use(copy(3)))], ret()),
         ],
     );
-    let err = interpret_mir(&program(body), "main", vec![])
-        .expect_err("Vec::capacity must fail explicitly");
-    match err {
-        MirRunError::Interp(InterpError::UnsupportedTerminator { kind }) => {
-            assert!(
-                kind.contains("Vec::capacity is not runtime-supported"),
-                "error names the function: {kind}"
-            );
-        }
-        other => panic!("expected an explicit unsupported error, got {other:?}"),
-    }
+    let value = interpret_mir(&program(body), "main", vec![]).expect("run");
+    assert_eq!(value, Value::Uint(0));
 }
 
 fn field_place(idx: u32, fields: &[(u32, mir::Ty)]) -> mir::Place {

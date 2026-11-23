@@ -2394,6 +2394,25 @@ impl<'a> Interpreter<'a> {
                 name: caller_name.clone(),
             }
         })?;
+        // A `Vec` return value assembled in its real aggregate
+        // form inside the callee (the shape an inlined
+        // `with_capacity_in` leaves in `split_off`: the elements
+        // live behind the buffer pointer, in the allocation the
+        // pointer denotes): the callee's own reads of the value
+        // used the real fields, but every consumer in the caller
+        // reads the element form the value model holds a vector
+        // as, so the value translates as it crosses (see
+        // `vec_from_real_form`).
+        if let Some(callee_body) = self.program.get(&frame.func) {
+            if matches!(
+                callee_body.local_ty(Local(0)),
+                Some(ty @ Ty::Adt(_)) if is_vec_adt_ty(ty)
+            ) {
+                if let Some(translated) = self.vec_from_real_form(frames, &value) {
+                    value = translated?;
+                }
+            }
+        }
         self.write_place(frames, caller_body, &dest, value)?;
         match resume {
             Some(bb) => {
@@ -4229,9 +4248,16 @@ impl<'a> Interpreter<'a> {
                             continue;
                         };
                         if let Value::SparseVec { elems, len } = &value {
-                            // The stored elements drop one by one,
-                            // as a materialised vector's do. The
-                            // unmaterialised tail is all
+                            // The declared elements drop one by
+                            // one, as a materialised vector's do.
+                            // The stored tail past the declared
+                            // length is spare capacity: its slots
+                            // hold values that were already moved
+                            // out or un-declared (a `pop`'s
+                            // element, a `set_len` shrink's tail),
+                            // which must not be dropped a second
+                            // time. The unmaterialised tail past
+                            // the stored elements is all
                             // uninitialised slots, whose glue is a
                             // no-op under the read rules (a plan
                             // applied at a never-written slot finds
@@ -4239,7 +4265,9 @@ impl<'a> Interpreter<'a> {
                             // tail index judges the plan for the
                             // whole tail instead of walking it slot
                             // by slot.
-                            for i in (0..elems.len()).rev() {
+                            let declared =
+                                usize::try_from(*len).unwrap_or(usize::MAX);
+                            for i in (0..elems.len().min(declared)).rev() {
                                 let mut sub = path.clone();
                                 sub.push(RefProj::Field(i));
                                 active.work.push((sub, (*elem).clone()));
@@ -6998,30 +7026,50 @@ impl<'a> Interpreter<'a> {
                         // chain: still no storage to denote.
                         buf_depth += 1;
                         cur
-                    } else if buf_depth > 0 && *idx == 1 {
+                    } else if buf_depth == 2 && *idx == 1 {
                         // The buffer's capacity slot, read
                         // through the chain (an inlined
                         // `Vec::capacity`, e.g. in a `set_len`
-                        // precondition check): capacity is not
-                        // represented in the value model (see
-                        // `Builtin::VecCapacity`), and the
-                        // element list is exactly the allocation
-                        // the model holds, so the count the list
-                        // has is the only capacity it can name.
-                        let count = self
-                            .read_resolved(frames, &cur)?
-                            .len()
-                            .ok_or_else(|| {
-                                InterpError::type_mismatch(
-                                    format!("capacity of {place}"),
-                                    "vector value",
-                                    "value without a length",
-                                )
-                            })?;
+                        // precondition check): the capacity the
+                        // model reports is the extent of the
+                        // element storage it holds (see
+                        // `crate::builtins::vec_stored_len`) —
+                        // the stored elements, spare capacity
+                        // included, so the answer does not move
+                        // when the length does.
+                        let count = crate::builtins::vec_stored_len(
+                            &self.read_resolved(frames, &cur)?,
+                        )
+                        .ok_or_else(|| {
+                            InterpError::type_mismatch(
+                                format!("capacity of {place}"),
+                                "vector value",
+                                "value without element storage",
+                            )
+                        })?;
                         buf_depth = 0;
                         buf_base = None;
                         cur_ty = Some(Ty::Uint(UintTy::Usize));
                         Resolved::Value(Value::Uint(count), Vec::new())
+                    } else if buf_depth > 0 && *idx >= 1 {
+                        // The chain's remaining fields are the
+                        // zero-sized allocator and phantom
+                        // markers (`RawVec`'s phantom field at
+                        // depth 1, `RawVecInner`'s allocator at
+                        // depth 2): the value model holds no
+                        // storage for them, and the only value
+                        // they can take is the empty aggregate
+                        // every zero-sized value takes.
+                        buf_depth = 0;
+                        buf_base = None;
+                        cur_ty = None;
+                        Resolved::Value(
+                            Value::Enum {
+                                variant: 0,
+                                fields: Vec::new(),
+                            },
+                            Vec::new(),
+                        )
                     } else if *idx == 0
                         && cur_ty.as_ref().is_some_and(is_vec_adt_ty)
                     {
@@ -7033,7 +7081,9 @@ impl<'a> Interpreter<'a> {
                         buf_depth = 1;
                         cur_ty = None;
                         cur
-                    } else if *idx == 1 && cur_ty.as_ref().is_some_and(is_vec_adt_ty) {
+                    } else if *idx == 1
+                        && cur_ty.as_ref().is_some_and(is_vec_adt_ty)
+                    {
                         let count = self
                             .read_resolved(frames, &cur)?
                             .len()
@@ -7071,6 +7121,7 @@ impl<'a> Interpreter<'a> {
                         }
                     } else {
                         buf_depth = 0;
+                        buf_base = None;
                         cur_ty = match &cur_ty {
                             Some(Ty::Tuple(ts)) => ts.get(*idx as usize).cloned(),
                             Some(Ty::Array(elem, _)) => Some((**elem).clone()),
@@ -7081,6 +7132,7 @@ impl<'a> Interpreter<'a> {
                 }
                 ProjectionElem::UnionField { idx, table } => {
                     buf_depth = 0;
+                    buf_base = None;
                     cur_ty = None;
                     fat_cap = None;
                     fat_elem_string = None;
@@ -7097,6 +7149,7 @@ impl<'a> Interpreter<'a> {
                 }
                 ProjectionElem::Index(local) => {
                     buf_depth = 0;
+                    buf_base = None;
                     cur_ty = None;
                     let idx = self.read_index_local(frames, body, *local, place)?;
                     let via_fat = fat_cap.is_some_and(|cap| {
@@ -7124,6 +7177,7 @@ impl<'a> Interpreter<'a> {
                 }
                 ProjectionElem::ConstantIndex { offset, from_end } => {
                     buf_depth = 0;
+                    buf_base = None;
                     cur_ty = None;
                     // The length the index is bounded by: the fat
                     // length when the place was reached through a
@@ -7181,6 +7235,7 @@ impl<'a> Interpreter<'a> {
                 }
                 ProjectionElem::Subslice { from, to, from_end } => {
                     buf_depth = 0;
+                    buf_base = None;
                     cur_ty = None;
                     // The range is resolved against the length the
                     // base place currently has: the fat length when
@@ -7222,6 +7277,7 @@ impl<'a> Interpreter<'a> {
                 }
                 ProjectionElem::Downcast(variant) => {
                     buf_depth = 0;
+                    buf_base = None;
                     cur_ty = None;
                     fat_cap = None;
                     fat_elem_string = None;
@@ -7765,7 +7821,7 @@ impl<'a> Interpreter<'a> {
         frames: &[Frame],
         cur: &Resolved,
         fat_len: u128,
-        elem_string: Option<bool>,
+        _elem_string: Option<bool>,
     ) -> bool {
         // A position that ends at one element of a container,
         // entered through whole-value entry steps (the shape a
@@ -7798,25 +7854,24 @@ impl<'a> Interpreter<'a> {
                 }
             }
         }
-        let value = match self.read_resolved(frames, cur) {
-            Ok(value) => value,
-            Err(_) => return false,
-        };
-        // A string value at the position is one element when the
-        // slice's elements are string carriers, and the slice's
-        // own byte storage when its elements are bytes: the
-        // declared element type decides, because the value's
-        // byte length cannot (a one-byte string element in a
-        // one-element subslice has the same length as the
-        // slice, and reads as its storage by the count below).
-        if matches!(value, Value::Str(_)) {
-            match elem_string {
-                Some(true) => return false,
-                Some(false) => return true,
-                None => {}
-            }
+        match self.read_resolved(frames, cur) {
+            // The position denotes the slice's storage only when
+            // the value there is the aggregate whose elements the
+            // slice ranges over. A fat pointer or string value at
+            // the position is one *element* of the slice (a
+            // `Vec<&str>` element is itself a fat pointer whose
+            // own length can coincide with the slice's): its
+            // `len()` reports the length it carries, not a
+            // storage element count, and judging by it appended a
+            // second index step that read into the element.
+            Ok(
+                value @ (Value::Tuple(_)
+                | Value::Enum { .. }
+                | Value::SparseVec { .. }),
+            ) => value.len() == Some(fat_len),
+            Ok(_) => false,
+            Err(_) => false,
         }
-        value.len() == Some(fat_len)
     }
 
     pub(crate) fn fat_deref_len(
@@ -8249,6 +8304,83 @@ impl<'a> Interpreter<'a> {
     /// resolves); a fat pointer loses its metadata, as the cast's
     /// result is a thin pointer; null and address-only pointers
     /// denote no element and pass through unchanged.
+    /// A `Vec` value assembled in its real aggregate form
+    /// ([buffer, length], see `crate::builtins::vec_real_aggregate_parts`)
+    /// translated to the element form every consumer reads:
+    /// the elements are the ones the buffer pointer denotes,
+    /// read through it as a slice of the declared length, and
+    /// the result is the vector value at that length (see
+    /// `crate::builtins::vec_with_len`). `None` when the value
+    /// is not in the real form.
+    pub(crate) fn vec_from_real_form(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+    ) -> Option<InterpResult<Value>> {
+        let (buf, len) = crate::builtins::vec_real_aggregate_parts(value)?;
+        // The buffer's pointer: the `RawVec`'s inner triple
+        // (`RawVecInner`) holds it in a `NonNull` wrapper at
+        // field 0.
+        let ptr = (|| {
+            let Value::Enum {
+                fields: buf_fields, ..
+            } = &buf
+            else {
+                return None;
+            };
+            let Value::Enum {
+                fields: inner, ..
+            } = buf_fields.first()?
+            else {
+                return None;
+            };
+            match inner.first()? {
+                Value::Enum { fields, .. } if fields.len() == 1 => {
+                    Some(fields[0].clone())
+                }
+                v @ (Value::Ref(_) | Value::FatRef { .. }) => Some(v.clone()),
+                _ => None,
+            }
+        })();
+        // A zero-length vector's elements are no elements,
+        // whatever its buffer pointer denotes (a dangling
+        // address-only pointer an allocator model handed out
+        // for a `with_capacity` buffer has no pointee to read).
+        if len == 0 {
+            return Some(Ok(Value::Enum {
+                variant: 0,
+                fields: Vec::new(),
+            }));
+        }
+        // Reading the elements can fail for a buffer the model
+        // does not hold (an address-only allocation): the
+        // translation then declines — the caller keeps the real
+        // form, exactly as it would have without the
+        // translation — instead of failing the return.
+        let result = match ptr {
+            Some(p @ Value::Ref(_)) => {
+                let fat = Value::FatRef {
+                    base: Box::new(p),
+                    len: len as u128,
+                };
+                self.slice_elements(frames, &fat)
+                    .map(|(elems, _)| crate::builtins::vec_with_len(elems, len))
+            }
+            Some(fat @ Value::FatRef { .. }) => self
+                .slice_elements(frames, &fat)
+                .map(|(elems, _)| crate::builtins::vec_with_len(elems, len)),
+            _ => Err(InterpError::type_mismatch(
+                "Vec value in its real aggregate form",
+                "a buffer pointer in the RawVec fields",
+                "no pointer value",
+            )),
+        };
+        match result {
+            Ok(value) => Some(Ok(value)),
+            Err(_) => None,
+        }
+    }
+
     pub(crate) fn ptr_first_elem_value(
         &self,
         frames: &[Frame],
@@ -9245,6 +9377,7 @@ impl<'a> Interpreter<'a> {
                         cur = match cur {
                             Value::Tuple(items) => items.get(*idx)?,
                             Value::Enum { fields, .. } => fields.get(*idx)?,
+                            Value::SparseVec { elems, .. } => elems.get(*idx)?,
                             Value::Coroutine { fields, .. } => fields.get(*idx)?,
                             Value::Closure { env, .. } => env.get(*idx)?,
                             _ => return None,
@@ -9275,6 +9408,9 @@ impl<'a> Interpreter<'a> {
                     Value::Tuple(items) => i128::try_from(items.len()).ok()?,
                     Value::Enum { fields, .. } => {
                         i128::try_from(fields.len()).ok()?
+                    }
+                    Value::SparseVec { elems, len } => {
+                        i128::try_from((*len).max(elems.len() as u128)).ok()?
                     }
                     Value::Bytes(b) => {
                         if size != 1 {
@@ -9328,6 +9464,14 @@ impl<'a> Interpreter<'a> {
         let count: i128 = match container {
             Value::Tuple(items) => i128::try_from(items.len()).ok()?,
             Value::Enum { fields, .. } => i128::try_from(fields.len()).ok()?,
+            // A vector value in sparse form is an element
+            // container whose extent is its storage (see
+            // `Value::SparseVec`): a displacement in whole
+            // element units denotes the element at that index,
+            // spare-capacity slots included.
+            Value::SparseVec { elems, len } => {
+                i128::try_from((*len).max(elems.len() as u128)).ok()?
+            }
             Value::Bytes(b) => {
                 if size != 1 {
                     return None;
@@ -11536,22 +11680,26 @@ impl<'a> Interpreter<'a> {
         let Some((&RefProj::Index(start), head)) = projection.split_last() else {
             return Ok(None);
         };
-        // A string value at the position continues the sequence
-        // inside itself only when the sequence ranges over the
-        // string's own bytes; with a string-carrier element type
-        // the string IS one element, and the sequence continues
-        // at its siblings.
-        let str_is_element = elem.is_some_and(|ty| elem_is_string_carrier(ty));
         match self.read_resolved(frames, target) {
-            Ok(v)
-                if matches!(
-                    v,
-                    Value::Tuple(_) | Value::FatRef { .. } | Value::Bytes(_)
-                ) || (matches!(v, Value::Str(_)) && !str_is_element) =>
-            {
-                return Ok(None);
-            }
+            // Whatever value sits at the position — a structured
+            // element included — the target denotes that element
+            // of the outer sequence: the composed index below is
+            // the sequence access. (Reading *into* the element
+            // instead hands a bulk copy the element's first
+            // component: a vector of tuples built from an array
+            // stored the first leaf where the tuple belonged.)
             Ok(_) | Err(InterpError::UninitializedRead { .. }) => {}
+            // A position one past the container's end — the
+            // append point a tail write targets (a `Vec::append`
+            // copy's destination) — reads as an index panic.
+            // The position still denotes its slot: the composed
+            // access re-validates, so a read there reports the
+            // same panic and a write extends the aggregate, as
+            // `navigate_mut`'s element arms provide.
+            Err(InterpError::Panic { ref message, .. })
+                if message.starts_with("index out of bounds: the len is ") =>
+            {
+            }
             Err(e) => return Err(e),
         }
         let mut projection = head.to_vec();
@@ -11769,8 +11917,13 @@ impl<'a> Interpreter<'a> {
     /// is not storage in the element-list value, so the write
     /// applies the `Vec::set_len` storage change (see
     /// `crate::builtins::vec_with_len`) to the vector place
-    /// itself. `None` when the place is not a length slot (or
-    /// the value is not an integer length).
+    /// itself: the declared length changes and the stored
+    /// elements stay — the tail past the new length is spare
+    /// capacity a later append overwrites, and a reader through
+    /// the buffer pointer (the `pop` body reading the element
+    /// it just un-declared) still reaches it. `None` when the
+    /// place is not a length slot (or the value is not an
+    /// integer length).
     fn write_vec_len_slot(
         &self,
         frames: &mut Vec<Frame>,
@@ -14441,51 +14594,6 @@ fn elem_is_string_carrier(elem: &Ty) -> bool {
     }
 }
 
-/// Whether the type is a `Vec` ADT instance, under either its
-/// `std` or its `alloc` spelling.
-fn is_vec_adt_ty(ty: &Ty) -> bool {
-    match ty {
-        Ty::Adt(name) => {
-            name == "std::vec::Vec"
-                || name == "alloc::vec::Vec"
-                || name.starts_with("std::vec::Vec<")
-                || name.starts_with("alloc::vec::Vec<")
-        }
-        _ => false,
-    }
-}
-
-/// The base place of the vector itself when `place` denotes a
-/// `Vec`'s length slot: a final `Field(1)` step whose base is
-/// `Vec`-typed, with the type tracked from the local through
-/// reference steps exactly as `resolve_place_mode` tracks it
-/// (any other step ends the tracking, so the slot is only
-/// recognised in the direct shapes collected std bodies use).
-fn vec_len_slot_base(body: &Body, place: &Place) -> Option<Place> {
-    let (last, prefix) = place.projection.split_last()?;
-    if !matches!(last, ProjectionElem::Field(1)) {
-        return None;
-    }
-    let mut cur_ty = body.local_ty(place.local)?.clone();
-    for elem in prefix {
-        match elem {
-            ProjectionElem::Deref => {
-                cur_ty = match cur_ty {
-                    Ty::Ref(pointee) => (*pointee).clone(),
-                    _ => return None,
-                };
-            }
-            _ => return None,
-        }
-    }
-    if is_vec_adt_ty(&cur_ty) {
-        let mut base = place.clone();
-        base.projection = prefix.to_vec();
-        Some(base)
-    } else {
-        None
-    }
-}
 
 /// Whether a value is a leaf-data aggregate: an aggregate
 /// whose fields are all scalars — a byte buffer's stored
@@ -15229,6 +15337,52 @@ pub(crate) fn ptr_cast_units_value(value: Value, from_size: u64) -> Value {
     }
 }
 
+/// Whether the type is a `Vec` ADT instance, under either its
+/// `std` or its `alloc` spelling.
+pub(crate) fn is_vec_adt_ty(ty: &Ty) -> bool {
+    match ty {
+        Ty::Adt(name) => {
+            name == "std::vec::Vec"
+                || name == "alloc::vec::Vec"
+                || name.starts_with("std::vec::Vec<")
+                || name.starts_with("alloc::vec::Vec<")
+        }
+        _ => false,
+    }
+}
+
+/// The base place of the vector itself when `place` denotes a
+/// `Vec`'s length slot: a final `Field(1)` step whose base is
+/// `Vec`-typed, with the type tracked from the local through
+/// reference steps exactly as `resolve_place_mode` tracks it
+/// (any other step ends the tracking, so the slot is only
+/// recognised in the direct shapes collected std bodies use).
+fn vec_len_slot_base(body: &Body, place: &Place) -> Option<Place> {
+    let (last, prefix) = place.projection.split_last()?;
+    if !matches!(last, ProjectionElem::Field(1)) {
+        return None;
+    }
+    let mut cur_ty = body.local_ty(place.local)?.clone();
+    for elem in prefix {
+        match elem {
+            ProjectionElem::Deref => {
+                cur_ty = match cur_ty {
+                    Ty::Ref(pointee) => (*pointee).clone(),
+                    _ => return None,
+                };
+            }
+            _ => return None,
+        }
+    }
+    if is_vec_adt_ty(&cur_ty) {
+        let mut base = place.clone();
+        base.projection = prefix.to_vec();
+        Some(base)
+    } else {
+        None
+    }
+}
+
 pub(crate) fn project_value(
     value: Value,
     projection: &[RefProj],
@@ -15453,15 +15607,17 @@ pub(crate) fn project_value(
                 // a field step addresses an element, as the drop
                 // glue's per-element walk addresses a materialised
                 // vector's elements — the stored elements read as
-                // themselves, the unmaterialised tail as the
-                // uninitialised slots it denotes, and past the
-                // declared length the step finds no slot, as a
+                // themselves (the spare-capacity tail past the
+                // declared length included: it is storage the
+                // vector still holds), the unmaterialised tail as
+                // the uninitialised slots it denotes, and past
+                // the storage the step finds no slot, as a
                 // materialised aggregate's missing field does not.
                 Value::SparseVec {
                     ref elems,
                     len,
                 } => {
-                    if *idx as u128 >= len {
+                    if *idx as u128 >= len.max(elems.len() as u128) {
                         return Err(InterpError::UninitializedRead {
                             func: func.to_string(),
                             place: place.to_string(),
@@ -15505,17 +15661,22 @@ pub(crate) fn project_value(
                     project_value((**base).clone(), &[RefProj::Index(*idx)], func, place)?
                 }
                 // A sparse vector value (see `Value::SparseVec`):
-                // the stored elements read as themselves, the
+                // the stored elements read as themselves (the
+                // spare-capacity tail past the declared length
+                // included, as for the field step above), the
                 // unmaterialised tail as the uninitialised slots
-                // it denotes, and past the declared length the
-                // index is out of bounds, as for the materialised
-                // aggregate.
+                // it denotes, and past the storage the index is
+                // out of bounds, as for the materialised
+                // aggregate. (A slice read is bounded by its fat
+                // length before it delegates here, so the wider
+                // storage bound does not widen slice reads.)
                 Value::SparseVec {
                     ref elems,
                     len,
                 } => {
-                    if *idx as u128 >= len {
-                        return Err(index_oob(len as usize, *idx));
+                    let extent = len.max(elems.len() as u128);
+                    if *idx as u128 >= extent {
+                        return Err(index_oob(extent as usize, *idx));
                     }
                     elems
                         .get(*idx)
@@ -15945,11 +16106,13 @@ pub(crate) fn project_value_ref<'a>(
                     })?,
                     // A sparse vector value, as in
                     // `project_value`: a field step addresses an
-                    // element; the unmaterialised tail has no
-                    // storage to lend, so the walk continues into
-                    // an owned uninitialised slot.
+                    // element (the spare-capacity tail past the
+                    // declared length is stored storage and lends
+                    // as the rest does); the unmaterialised tail
+                    // has no storage to lend, so the walk
+                    // continues into an owned uninitialised slot.
                     Value::SparseVec { elems, len } => {
-                        if *idx as u128 >= *len {
+                        if *idx as u128 >= (*len).max(elems.len() as u128) {
                             return Err(InterpError::UninitializedRead {
                                 func: func.to_string(),
                                 place: place.to_string(),
@@ -16092,12 +16255,14 @@ pub(crate) fn project_value_ref<'a>(
                     }
                 }
                 // A sparse vector value, as in `project_value`:
-                // the stored elements lend their storage, the
-                // unmaterialised tail continues into an owned
-                // uninitialised slot.
+                // the stored elements lend their storage (the
+                // spare-capacity tail past the declared length
+                // included), the unmaterialised tail continues
+                // into an owned uninitialised slot.
                 Value::SparseVec { elems, len } => {
-                    if *idx as u128 >= *len {
-                        return Err(index_oob(*len as usize, *idx));
+                    let extent = (*len).max(elems.len() as u128);
+                    if *idx as u128 >= extent {
+                        return Err(index_oob(extent as usize, *idx));
                     }
                     match elems.get(*idx) {
                         Some(v) => {
@@ -16549,8 +16714,49 @@ fn navigate_mut_grow<'x>(
             }
             // A `Vec` value is the aggregate of its elements:
             // indexing the vector's own place writes the element
-            // field (the read direction in `project_value`).
-            Value::Enum { fields, .. } => {
+            // field (the read direction in `project_value`). A
+            // write at the index one past the last element is
+            // the append point — the tail write a `Vec::append`
+            // performs through the buffer pointer before it
+            // declares the new length. It grows the STORAGE
+            // only: the value first takes the sparse form (see
+            // `Value::SparseVec`), whose declared length the
+            // write leaves untouched, and the sparse arm below
+            // performs the write — a length is only ever
+            // declared by the length bookkeeping (a length-slot
+            // write, `set_len`, the modelled appends), never by
+            // a raw write, and the read direction stays bounded
+            // by the declared length for the same reason. The
+            // single-array-field pun is exempt: its index steps
+            // range over the field's elements, not the
+            // aggregate's.
+            Value::Enum { .. } => {
+                let append_point = match slot {
+                    Value::Enum { fields, .. } => {
+                        *idx == fields.len()
+                            && !(fields.len() == 1
+                                && matches!(
+                                    fields[0],
+                                    Value::Tuple(_) | Value::Bytes(_)
+                                ))
+                    }
+                    _ => false,
+                };
+                if append_point {
+                    let value = std::mem::replace(slot, Value::Uninit);
+                    let Value::Enum { fields, .. } = value else {
+                        unreachable!("append point checked above")
+                    };
+                    let len = fields.len();
+                    *slot = Value::SparseVec {
+                        elems: fields,
+                        len: len as u128,
+                    };
+                    return navigate_mut(slot, projection, func, place);
+                }
+                let Value::Enum { fields, .. } = slot else {
+                    unreachable!("enum arm")
+                };
                 if fields.len() == 1
                     && matches!(
                         fields[0],
@@ -16571,18 +16777,26 @@ fn navigate_mut_grow<'x>(
                 }
             }
             // A sparse vector value (see `Value::SparseVec`):
-            // a write to a stored element navigates into it; a
-            // write into the unmaterialised tail materialises
-            // the gap with uninitialised slots up to the written
-            // index — bounded by the same materialisation limit
-            // as `Vec::set_len`, past which the write stays an
+            // a write to a stored element navigates into it —
+            // including a spare-capacity slot past the declared
+            // length (the tail writes a `Vec::append` performs
+            // before it declares the new length) and the slot
+            // one past the stored end, which extends the storage
+            // by the one element being written; a write into
+            // the unmaterialised tail materialises the gap with
+            // uninitialised slots up to the written index —
+            // bounded by the same materialisation limit as
+            // `Vec::set_len`, past which the write stays an
             // explicit error rather than an allocation that
             // exhausts the host.
             Value::SparseVec { elems, len } => {
-                if *idx as u128 >= *len {
-                    return Err(index_oob(*len as usize, *idx));
+                if *idx as u128 >= *len && *idx > elems.len() {
+                    let extent = (*len).max(elems.len() as u128);
+                    return Err(index_oob(extent as usize, *idx));
                 }
-                if *idx >= crate::builtins::MAX_VEC_SET_LEN_ELEMENTS {
+                if *idx >= elems.len()
+                    && *idx >= crate::builtins::MAX_VEC_SET_LEN_ELEMENTS
+                {
                     return Err(InterpError::UnsupportedProjection {
                         kind: format!(
                             "index write at {idx} into a vector whose elements are not materialised"
