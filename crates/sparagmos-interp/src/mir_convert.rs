@@ -9418,6 +9418,23 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                 let elem = self.plan(args.first()?)?;
                 return Some(owned_iter_plan(elem));
             }
+            "std::collections::btree_set::IntoIter"
+            | "alloc::collections::btree_set::IntoIter" => {
+                // The modelled state is the element snapshot plus
+                // the next index, like `vec::IntoIter` (see
+                // `owned_iter_plan`).
+                let elem = self.plan(args.first()?)?;
+                return Some(owned_iter_plan(elem));
+            }
+            "std::collections::btree_map::IntoIter"
+            | "alloc::collections::btree_map::IntoIter" => {
+                // The snapshot's elements are `(key, value)`
+                // tuples; their glue is the two components'.
+                let key = self.plan(args.first()?)?;
+                let value = self.plan(args.get(1)?)?;
+                let elem = collapse_fields(vec![key, value], true);
+                return Some(owned_iter_plan(elem));
+            }
             // Borrowing iterators own nothing: the references (and,
             // for `IterMut`, the container snapshot) inside the
             // modelled state are not owned values, and the real
@@ -9428,6 +9445,14 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
             | "std::slice::IterMut" | "core::slice::IterMut"
             | "std::str::Chars" | "core::str::Chars"
             | "std::str::Bytes" | "core::str::Bytes"
+            | "std::collections::btree_set::Iter"
+            | "alloc::collections::btree_set::Iter"
+            | "std::collections::btree_map::Iter"
+            | "alloc::collections::btree_map::Iter"
+            | "std::collections::btree_map::Keys"
+            | "alloc::collections::btree_map::Keys"
+            | "std::collections::btree_map::Values"
+            | "alloc::collections::btree_map::Values"
             | "std::iter::Empty" | "core::iter::Empty" => return Some(P::Trivial),
             "std::path::Components" => {
                 // The modelled state is the path's byte string

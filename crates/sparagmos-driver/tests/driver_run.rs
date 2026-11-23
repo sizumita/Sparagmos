@@ -2309,6 +2309,97 @@ fn main() {
 }
 "#;
 
+const BTREE_BORROWED_ITER_SRC: &str = r#"
+use std::collections::{BTreeMap, BTreeSet};
+fn main() {
+    let s: BTreeSet<i32> = BTreeSet::new();
+    let m: BTreeMap<i32, i32> = BTreeMap::new();
+    let mut n = 0;
+    for _x in &s {
+        n += 1;
+    }
+    for (_k, _v) in &m {
+        n += 1;
+    }
+    for _x in s.iter() {
+        n += 1;
+    }
+    for _kv in m.iter() {
+        n += 1;
+    }
+    for _k in m.keys() {
+        n += 1;
+    }
+    for _v in m.values() {
+        n += 1;
+    }
+    println!("count {}", n);
+    println!("hint {:?}", s.iter().size_hint());
+    let mut it = m.iter();
+    println!("back none {}", it.next_back().is_none());
+}
+"#;
+
+#[test]
+fn run_mode_btree_borrowed_iteration() {
+    // Borrowed iteration over the B-tree collections:
+    // `IntoIterator` for `&BTreeSet` / `&BTreeMap` and the
+    // `iter` / `keys` / `values` methods yield iterators over an
+    // element snapshot walked from the tree's node storage. An
+    // empty tree's snapshot is empty, so every form yields
+    // nothing; a non-empty tree cannot be built yet (insertion
+    // itself is blocked by the raw-pointer write path), so the
+    // empty forms are the reachable surface.
+    let dir = temp_dir("btreeborrowediter");
+    let src = fixture(&dir, "btreeborrowediter.rs", BTREE_BORROWED_ITER_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "iterating &BTreeSet / &BTreeMap must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "count 0\nhint (0, Some(0))\nback none true\n"
+    );
+}
+
+const BTREE_OWNED_ITER_SRC: &str = r#"
+use std::collections::{BTreeMap, BTreeSet};
+fn main() {
+    let s: BTreeSet<i32> = BTreeSet::new();
+    let mut n = 0;
+    for _x in s {
+        n += 1;
+    }
+    let m: BTreeMap<i32, i32> = BTreeMap::new();
+    for _kv in m {
+        n += 1;
+    }
+    println!("owned {}", n);
+}
+"#;
+
+#[test]
+fn run_mode_btree_owned_iteration() {
+    // By-value iteration consumes the collection into the
+    // owning-iterator snapshot state; dropping the partially or
+    // fully consumed iterator afterwards drops exactly the
+    // unyielded snapshot elements (the drop plan entry for the
+    // btree `IntoIter` types).
+    let dir = temp_dir("btreeownediter");
+    let src = fixture(&dir, "btreeownediter.rs", BTREE_OWNED_ITER_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "iterating a BTreeSet / BTreeMap by value must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "owned 0\n");
+}
+
 #[test]
 fn run_mode_ref_vec_iteration() {
     // `for x in &v` goes through `IntoIterator::into_iter` for
