@@ -9373,6 +9373,107 @@ fn run_mode_termination_result_delegates_and_renders_live() {
     );
 }
 
+const RESULT_ERR_PANICKING_DEBUG_SRC: &str = r#"
+use std::fmt;
+struct Boom;
+impl fmt::Debug for Boom {
+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        panic!("fmt exploded");
+    }
+}
+fn main() -> Result<(), Boom> {
+    Err(Boom)
+}
+"#;
+
+const RESULT_ERR_EXITING_DEBUG_SRC: &str = r#"
+use std::fmt;
+struct Exiter;
+impl fmt::Debug for Exiter {
+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        std::process::exit(7);
+    }
+}
+fn main() -> Result<(), Exiter> {
+    Err(Exiter)
+}
+"#;
+
+const RESULT_ERR_TLS_DTOR_ORDER_SRC: &str = r#"
+use std::cell::RefCell;
+struct Guard;
+impl Drop for Guard {
+    fn drop(&mut self) {
+        eprintln!("tls dtor ran");
+    }
+}
+thread_local! {
+    static GUARD: RefCell<Option<Guard>> = RefCell::new(None);
+}
+fn main() -> Result<(), String> {
+    GUARD.with(|g| *g.borrow_mut() = Some(Guard));
+    Err("boom".to_string())
+}
+"#;
+
+const RESULT_ERR_TLS_READING_DEBUG_SRC: &str = r#"
+use std::cell::RefCell;
+use std::fmt;
+thread_local! {
+    static VAL: RefCell<Option<String>> = RefCell::new(None);
+}
+struct E;
+impl fmt::Debug for E {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = VAL.with(|v| v.borrow().clone());
+        write!(f, "val={s:?}")
+    }
+}
+fn main() -> Result<(), E> {
+    VAL.with(|v| *v.borrow_mut() = Some("alive".to_string()));
+    Err(E)
+}
+"#;
+
+#[test]
+fn run_mode_termination_report_guest_outcomes_and_tls_order() {
+    // The report's rendering is guest execution: a panic inside
+    // the `Err` payload's `Debug` body is the run's outcome (the
+    // guest-panic exit, reported like any guest panic), and a
+    // `process::exit` there passes its code through -- neither
+    // collapses into the report's own failure exit with a
+    // structural stand-in for the payload. The report also
+    // applies before the entry thread's TLS destructors run, so
+    // its line precedes destructor output in stderr, and a
+    // `Debug` body that reads TLS still sees it alive.
+    let dir = temp_dir("termination-report-outcomes");
+    let src = fixture(&dir, "err_panicking_debug.rs", RESULT_ERR_PANICKING_DEBUG_SRC);
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(101), "panic in Debug::fmt");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "thread 'main' panicked: fmt exploded\n"
+    );
+    let src = fixture(&dir, "err_exiting_debug.rs", RESULT_ERR_EXITING_DEBUG_SRC);
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(7), "process::exit in Debug::fmt");
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+    let src = fixture(&dir, "err_tls_dtor_order.rs", RESULT_ERR_TLS_DTOR_ORDER_SRC);
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(1), "Err with TLS destructor");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Error: \"boom\"\ntls dtor ran\n"
+    );
+    let src = fixture(&dir, "err_tls_reading_debug.rs", RESULT_ERR_TLS_READING_DEBUG_SRC);
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(1), "Debug::fmt reads TLS");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Error: val=Some(\"alive\")\n"
+    );
+}
+
 const LIBTEST_SRC: &str = r#"
 #[test]
 fn alpha() { assert_eq!(1 + 1, 2); }

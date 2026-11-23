@@ -6442,7 +6442,7 @@ fn execute(
             _ => None,
         }
     };
-    let (run, termination_error) = sparagmos_interp::interpret_mir_captured_with_report(
+    let run = sparagmos_interp::interpret_mir_captured_with_report(
         &program,
         &entry,
         entry_args,
@@ -6502,17 +6502,17 @@ fn execute(
                 .and_then(|ty| result_report(c, &program.fn_names, ty, value))
             {
                 Some(TerminationReport::Code(code)) => code,
-                Some(TerminationReport::Error(payload, _)) => {
-                    match &termination_error {
-                        Some(text) => eprintln!("Error: {text}"),
-                        // The payload does not render even
-                        // against the executing interpreter's
-                        // state (it reaches into the run's
-                        // frames); the report's exit code
-                        // stands, with the value's structural
-                        // form standing in for the Debug text.
-                        None => eprintln!("Error: {payload}"),
-                    }
+                Some(TerminationReport::Error(..)) => {
+                    // The report's `Error: ...` line is already
+                    // in the captured stderr, written by the
+                    // interpreter that executed the entry at the
+                    // report's native position -- after the
+                    // entry returned, before its thread's TLS
+                    // destructors ran (with the value's
+                    // structural form standing in when the
+                    // payload does not render even against the
+                    // live state). Only the exit code remains
+                    // to apply.
                     1
                 }
                 None => {

@@ -1652,6 +1652,29 @@ impl<'a> Interpreter<'a> {
 
     /// Run `entry` with `args` and return the value of its return place.
     pub fn run(&mut self, entry: &str, args: Vec<Value>) -> InterpResult<Value> {
+        self.run_with_report(entry, args, |_, _| Ok(None))
+    }
+
+    /// Like [`Interpreter::run`], but when the entry returns
+    /// normally, `report` is applied to the returned value before
+    /// the entry thread's TLS destructors run -- the native
+    /// order, in which `lang_start` applies a `Termination`
+    /// report first and the thread's TLS teardown follows (and
+    /// the only point at which a report rendering that itself
+    /// touches TLS still sees that TLS alive). The text the
+    /// report returns joins the guest's stderr at that point, so
+    /// it precedes whatever the destructors print. A guest
+    /// outcome the report itself produces -- a panic in a
+    /// `Debug` body it executes, a `std::process::exit` --
+    /// replaces the entry's result, exactly as it replaces the
+    /// report's own outcome natively; the destructors still run,
+    /// as they do for the entry's own outcomes.
+    pub fn run_with_report(
+        &mut self,
+        entry: &str,
+        args: Vec<Value>,
+        report: impl FnOnce(&mut Self, &Value) -> InterpResult<Option<String>>,
+    ) -> InterpResult<Value> {
         self.steps = 0;
         self.next_frame_id = 0;
         self.output.clear();
@@ -1686,6 +1709,20 @@ impl<'a> Interpreter<'a> {
             call_once_env_drop: None,
         }];
         let result = self.drive_frames(&mut frames, 0);
+        // The termination report applies here: after the entry
+        // has returned, before its thread's TLS teardown (see
+        // [`Interpreter::run_with_report`]).
+        let result = match result {
+            Ok(value) => match report(self, &value) {
+                Ok(Some(text)) => {
+                    self.push_error_output(&text);
+                    Ok(value)
+                }
+                Ok(None) => Ok(value),
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e),
+        };
         // Program exit runs the entry thread's registered TLS
         // destructors (the registrations wrap
         // `__cxa_thread_atexit`, whose entries run at exit),

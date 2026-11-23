@@ -1205,7 +1205,7 @@ pub fn interpret_mir_captured_with_config(
     args: Vec<Value>,
     config: crate::InterpConfig,
 ) -> CapturedRun {
-    interpret_mir_captured_impl(program, entry, args, config, |_| None).0
+    interpret_mir_captured_impl(program, entry, args, config, |_| None)
 }
 
 /// Like [`interpret_mir_captured_with_config`], but when the
@@ -1213,21 +1213,25 @@ pub fn interpret_mir_captured_with_config(
 /// returned value while the interpreter that executed the entry
 /// is still alive: it names the value a `Termination` report
 /// must render (the `Err` payload of a `Result` entry) and the
-/// type tag to render it under, and the payload's `Debug` text
-/// is rendered by that interpreter -- whose allocation store
-/// and statics the payload may point into -- before the run's
-/// state is discarded. The rendered text is returned alongside
-/// the captured run: `None` when `report` names nothing, or
-/// when the payload does not render even against the live state
-/// (it reaches into the run's frames); the caller still applies
-/// the report's exit code.
+/// type tag to render it under. The payload's `Debug` text is
+/// rendered by that interpreter -- whose allocation store and
+/// statics the payload may point into -- and the report's
+/// `Error: ...` line joins the captured stderr at the report's
+/// native position: after the entry returns, before the entry
+/// thread's TLS destructors run. A guest outcome the rendering
+/// itself produces (a panic in the payload's `Debug` body, a
+/// `std::process::exit`) becomes the run's result, as it does
+/// natively; a payload that does not render even against the
+/// live state (it reaches into the run's frames) stands in with
+/// its structural form. The caller still applies the report's
+/// exit code.
 pub fn interpret_mir_captured_with_report(
     program: &MirProgram,
     entry: &str,
     args: Vec<Value>,
     config: crate::InterpConfig,
     report: impl FnOnce(&Value) -> Option<(Value, String)>,
-) -> (CapturedRun, Option<String>) {
+) -> CapturedRun {
     interpret_mir_captured_impl(program, entry, args, config, report)
 }
 
@@ -1237,49 +1241,71 @@ fn interpret_mir_captured_impl(
     args: Vec<Value>,
     config: crate::InterpConfig,
     report: impl FnOnce(&Value) -> Option<(Value, String)>,
-) -> (CapturedRun, Option<String>) {
+) -> CapturedRun {
     match convert_all(program) {
         Ok((ir_program, failures)) => {
             // The entry function's own conversion failure is a
             // whole-run failure with no guest output, as before.
             if let Some(e) = failures.get(entry) {
-                return (
-                    CapturedRun {
-                        result: Err(MirRunError::from(e.clone())),
-                        stdout: String::new(),
-                        stderr: String::new(),
-                    },
-                    None,
-                );
+                return CapturedRun {
+                    result: Err(MirRunError::from(e.clone())),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                };
             }
             let mut interp = Interpreter::with_config(&ir_program, config);
-            let result = interp.run(entry, args).map_err(MirRunError::from);
             // The termination report renders against the live
             // interpreter, before its allocations and statics go
-            // away with it.
-            let rendered = match &result {
-                Ok(value) => report(value)
-                    .and_then(|(payload, tag)| interp.format_debug_detached(&payload, &tag).ok()),
-                Err(_) => None,
-            };
-            (
-                CapturedRun {
-                    result,
-                    stdout: interp.output().to_string(),
-                    stderr: interp.error_output().to_string(),
-                },
-                rendered,
-            )
-        }
-        Err(e) => (
+            // away with it and before the entry thread's TLS
+            // destructors run (see
+            // [`Interpreter::run_with_report`]).
+            let result = interp
+                .run_with_report(entry, args, |interp, value| {
+                    let Some((payload, tag)) = report(value) else {
+                        return Ok(None);
+                    };
+                    match interp.format_debug_detached(&payload, &tag) {
+                        Ok(text) => Ok(Some(format!("Error: {text}\n"))),
+                        // A guest outcome of the rendering itself
+                        // (a panic, an abort, a `process::exit`
+                        // in the payload's `Debug` body) is the
+                        // run's outcome, not a rendering failure.
+                        Err(e) if is_guest_outcome(&e) => Err(e),
+                        // The payload does not render even
+                        // against the live state (it reaches into
+                        // the run's frames): its structural form
+                        // stands in, at the report's own position
+                        // in the captured stderr.
+                        Err(_) => Ok(Some(format!("Error: {payload}\n"))),
+                    }
+                })
+                .map_err(MirRunError::from);
             CapturedRun {
-                result: Err(MirRunError::from(e)),
-                stdout: String::new(),
-                stderr: String::new(),
-            },
-            None,
-        ),
+                result,
+                stdout: interp.output().to_string(),
+                stderr: interp.error_output().to_string(),
+            }
+        }
+        Err(e) => CapturedRun {
+            result: Err(MirRunError::from(e)),
+            stdout: String::new(),
+            stderr: String::new(),
+        },
     }
+}
+
+/// Whether an interpreter error is a *guest* outcome -- the
+/// guest's own control flow reaching the top of a run (a panic,
+/// a panic that may not unwind, a `std::process::exit`) --
+/// rather than an interpreter/oracle failure. A guest outcome
+/// is observable program behavior wherever it occurs, including
+/// inside a `Termination` report's rendering; an oracle failure
+/// is not, and never replaces a run's result.
+fn is_guest_outcome(e: &InterpError) -> bool {
+    matches!(
+        e,
+        InterpError::Panic { .. } | InterpError::Abort { .. } | InterpError::ProcessExit { .. }
+    )
 }
 
 /// Convert `program` and open a debugger session on `entry`
