@@ -26136,3 +26136,35 @@ fn run_mode_extern_static_slice_offset_field_write_hits_field() {
         "d0=33 d1=20 sentinel=7\n",
     );
 }
+
+const EXTERN_STATIC_PREFIX_SLICE_SRC: &str = r#"
+extern "C" {
+    static mut EXT_ARR: [u32; 2];
+}
+const PREFIX: *mut [u32] =
+    unsafe { std::ptr::slice_from_raw_parts_mut(std::ptr::addr_of_mut!(EXT_ARR).cast::<u32>(), 1) };
+fn main() {
+    unsafe {
+        (*PREFIX)[0] = 10;
+        std::ptr::addr_of_mut!(EXT_ARR).cast::<u32>().add(1).write(20);
+        println!("e0={} e1={}", EXT_ARR[0], EXT_ARR[1]);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_extern_static_prefix_slice_keeps_full_storage() {
+    // A constant slice covering only a PREFIX of a foreign
+    // array static, evaluated before any whole-static access:
+    // the slice's length bounds the view it denotes, never the
+    // static's storage, so seeding the storage from this
+    // reference must still give it the declared array's full
+    // extent -- a later write to the second element is valid
+    // and must not fail a bounds check against a one-element
+    // stored value.
+    run_ok(
+        "extern-static-prefix-slice",
+        EXTERN_STATIC_PREFIX_SLICE_SRC,
+        "e0=10 e1=20\n",
+    );
+}

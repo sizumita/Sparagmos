@@ -2159,6 +2159,9 @@ struct Converter<'a> {
     /// Link symbols of the program's instances (see
     /// `MirProgram::link_symbols`).
     link_symbols: &'a HashMap<mir::DefId, String>,
+    /// Declared types of the program's statics (see
+    /// `MirProgram::static_tys`).
+    static_tys: &'a mir::StaticTys,
     /// The bodies a body-less extern declaration can bind to,
     /// by link symbol: symbol -> program key, holding only the
     /// symbols exactly one converted body exports (a symbol
@@ -2274,6 +2277,7 @@ impl<'a> Converter<'a> {
             local_crate,
             alloc_shims,
             link_symbols: &program.link_symbols,
+            static_tys: &program.static_tys,
             link_exports,
             impl_targets: None,
             unconverted: HashMap::new(),
@@ -4537,25 +4541,41 @@ impl<'a> Converter<'a> {
                 // shapeless value and element reads fail as
                 // uninitialized-place reads. When this reference
                 // denotes the static whole (empty projection), the
-                // pointee context IS the seed's type -- the
-                // declared type for a thin reference, and for a fat
-                // slice reference the array type the slice covers,
-                // rebuilt from the element type and the carried
-                // length -- so give the seed the declared type's
-                // skeleton exactly as the thread-local table does
-                // for its seeds. An interior reference's seed is
-                // still the full initializer, whose type this
+                // seed is a value of the static's declared type:
+                // the recorded declared type when the driver has
+                // it, and otherwise the pointee context -- the
+                // declared type itself for a thin reference, and
+                // for a fat slice reference the array type the
+                // slice covers, rebuilt from the element type and
+                // the carried length. The recorded type must win
+                // for a slice reference: the slice's length bounds
+                // only the view it denotes, never the storage, so
+                // a seed rebuilt from the length of a prefix slice
+                // evaluated first would shrink the storage to the
+                // slice's extent, and a later whole-static access
+                // would fail its bounds check against elements the
+                // slice never claimed. Give the seed the declared
+                // type's skeleton exactly as the thread-local table
+                // does for its seeds. An interior reference's seed
+                // is still the full initializer, whose type this
                 // conversion does not know, so it keeps the bare
                 // form.
                 let seed = if projection.is_empty() {
-                    let seed_ty = match (inner_ctx, len) {
-                        (Some(ty), None) => Some(ty.clone()),
-                        (Some(mir::Ty::Slice(elem)), Some(n)) => Some(mir::Ty::Array(
-                            elem.clone(),
-                            mir::ArrayLen::Known(*n),
-                        )),
-                        (Some(ty @ mir::Ty::Array(..)), Some(_)) => Some(ty.clone()),
-                        _ => None,
+                    let seed_ty = match self.static_tys.get(def) {
+                        Some(ty) => Some(ty.clone()),
+                        None => match (inner_ctx, len) {
+                            (Some(ty), None) => Some(ty.clone()),
+                            (Some(mir::Ty::Slice(elem)), Some(n)) => {
+                                Some(mir::Ty::Array(
+                                    elem.clone(),
+                                    mir::ArrayLen::Known(*n),
+                                ))
+                            }
+                            (Some(ty @ mir::Ty::Array(..)), Some(_)) => {
+                                Some(ty.clone())
+                            }
+                            _ => None,
+                        },
                     };
                     match seed_ty {
                         Some(ty) => self.expand_uninit_constant(&seed, &ty, 0),
