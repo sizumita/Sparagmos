@@ -4520,6 +4520,88 @@ fn main() {
 }
 "#;
 
+const BOXED_SLICE_FROM_VEC_SRC: &str = r#"
+#[derive(Debug)]
+struct P {
+    x: i32,
+}
+
+fn main() {
+    // `From<Vec<T>> for Box<[T]>` is `Vec::into_boxed_slice`:
+    // the pointee is the element sequence, so every slice
+    // consumer of the box sees the elements.
+    let b: Box<[i32]> = Box::from(vec![4, 5, 6]);
+    println!("{:?}", b);
+    println!("{}", b.len());
+    println!("{}", b[0] + b[2]);
+    for x in b.iter() {
+        println!("{}", x);
+    }
+    // `Into` resolves to the same conversion.
+    let c: Box<[i32]> = vec![7, 8].into();
+    println!("{:?}", c);
+    // Clone, comparison and pretty Debug see the elements too.
+    let d = b.clone();
+    println!("{} {}", b == d, b < c);
+    println!("{:#?}", b);
+    // ADT elements keep their derived Debug.
+    let e: Box<[P]> = Box::from(vec![P { x: 1 }, P { x: 2 }]);
+    println!("{:?}", e);
+    // `into_vec` hands back a working vector.
+    let mut v = b.into_vec();
+    v.push(9);
+    v.sort();
+    println!("{:?}", v);
+    // `From<Cow<'_, [T]>>` hands over the Cow's contents: the
+    // owned vector's elements, or a clone of the borrowed
+    // slice's elements.
+    let cow: std::borrow::Cow<[i32]> = std::borrow::Cow::Owned(vec![11, 12]);
+    let f: Box<[i32]> = Box::from(cow);
+    println!("{:?}", f);
+    let v2 = vec![10, 20, 30, 40];
+    let cow2: std::borrow::Cow<[i32]> = std::borrow::Cow::Borrowed(&v2[1..3]);
+    let g: Box<[i32]> = Box::from(cow2);
+    println!("{:?}", g);
+    println!("boxed from vec ok");
+}
+"#;
+
+const BOXED_SLICE_FROM_BORROWED_COW_SRC: &str = r#"
+use std::borrow::Cow;
+
+fn main() {
+    // `From<Cow<'_, [T]>> for Box<[T]>` clones the borrowed
+    // slice's elements into the new allocation: mutating the
+    // source afterwards must not show through the box.
+    let mut src = [1, 2, 3];
+    let b: Box<[i32]> = Box::from(Cow::Borrowed(&src[..]));
+    src[0] = 99;
+    println!("array: {} {:?} {}", b[0], b, b.len());
+
+    let mut v = vec![10, 20, 30];
+    let c: Box<[i32]> = Box::from(Cow::Borrowed(&v[..]));
+    v[1] = 77;
+    println!("vec: {} {:?}", c[1], c);
+
+    let mut w = vec![5, 6, 7, 8];
+    let d: Box<[i32]> = Box::from(Cow::Borrowed(&w[1..3]));
+    w[2] = 66;
+    println!("sub: {} {:?}", d[1], d);
+}
+"#;
+
+const BOXED_SLICE_COLLECT_SRC: &str = r#"
+fn main() {
+    let b: Box<[i32]> = (0..5).collect();
+    println!("{:?}", b);
+    let s: Box<[String]> = ["a", "bb"].iter().map(|x| x.to_string()).collect();
+    println!("{:?}", s);
+    let e: Box<[i32]> = std::iter::empty().collect();
+    println!("{:?} {}", e, e.len());
+    println!("boxed collect ok");
+}
+"#;
+
 const BYTES_MATCH_SRC: &str = r#"
 fn main() {
     match *b"abc" {
@@ -4636,6 +4718,61 @@ fn run_mode_boxed_slice_unsize() {
         "Box<[T; N]> to Box<[T]> unsizing must work; stderr={stderr}"
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "unsize ok\n");
+}
+
+#[test]
+fn run_mode_boxed_slice_from_vec() {
+    let dir = temp_dir("boxed-from-vec");
+    let src = fixture(&dir, "boxed_from_vec.rs", BOXED_SLICE_FROM_VEC_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Box<[T]> from Vec must convert and format like into_boxed_slice; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[4, 5, 6]\n3\n10\n4\n5\n6\n[7, 8]\ntrue true\n[\n    4,\n    5,\n    6,\n]\n[P { x: 1 }, P { x: 2 }]\n[4, 5, 6, 9]\n[11, 12]\n[20, 30]\nboxed from vec ok\n"
+    );
+}
+
+#[test]
+fn run_mode_boxed_slice_from_borrowed_cow_clones_elements() {
+    let dir = temp_dir("boxed-from-borrowed-cow");
+    let src = fixture(
+        &dir,
+        "boxed_from_borrowed_cow.rs",
+        BOXED_SLICE_FROM_BORROWED_COW_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Box<[T]> from a borrowed Cow must clone the elements; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "array: 1 [1, 2, 3] 3\nvec: 20 [10, 20, 30]\nsub: 7 [6, 7]\n"
+    );
+}
+
+#[test]
+fn run_mode_boxed_slice_collect() {
+    let dir = temp_dir("boxed-collect");
+    let src = fixture(&dir, "boxed_collect.rs", BOXED_SLICE_COLLECT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "collect into Box<[T]> must work; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[0, 1, 2, 3, 4]\n[\"a\", \"bb\"]\n[] 0\nboxed collect ok\n"
+    );
 }
 
 #[test]
