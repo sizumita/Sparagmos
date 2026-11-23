@@ -5282,6 +5282,75 @@ fn run_mode_f16_constants_execute() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "1.75\n3\n");
 }
 
+const F16_NAN_SRC: &str = r##"#![feature(f16)]
+fn emit(x: f16) {
+    println!("{}", x.to_bits());
+    println!("{}", x.floor().to_bits());
+    println!("{}", x.abs().to_bits());
+    println!("{}", (x as f32).to_bits());
+    println!("{}", (-x).to_bits());
+}
+fn main() {
+    emit(f16::from_bits(0x7c01));
+    emit(f16::from_bits(0x7e01));
+    emit(f16::from_bits(0xfc01));
+    emit(f16::from_bits(0xfe00));
+    emit(f16::from_bits(0x7dff));
+    let s = f32::from_bits(0x7f800001);
+    println!("{}", s.to_bits());
+    println!("{}", (s as f16).to_bits());
+}
+"##;
+
+#[test]
+fn run_mode_f16_nan_transport() {
+    // NaN bit patterns survive f16 transport: `from_bits` /
+    // `to_bits` and place copies are the identity, the bit
+    // operations (`abs`, negation) preserve a signaling NaN, the
+    // arithmetic operations (`floor`) quiet it with its payload
+    // kept, and the widening cast to `f32` preserves it (the
+    // native values below were measured on the pinned toolchain).
+    let dir = temp_dir("f16nan");
+    let src = fixture(&dir, "f16nan.rs", F16_NAN_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "f16 NaN program must run to completion; stderr={stderr}"
+    );
+    let expected = "\
+31745
+32257
+31745
+2139103232
+64513
+32257
+32257
+32257
+2143297536
+65025
+64513
+65025
+31745
+4286586880
+31745
+65024
+65024
+32256
+4290772992
+32256
+32255
+32767
+32255
+2143281152
+65023
+2139095041
+32256
+";
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+}
+
 #[test]
 fn run_mode_null_and_fn_pointer_constants_execute() {
     let dir = temp_dir("nullptr");

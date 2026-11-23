@@ -246,20 +246,7 @@ fn ptr_pointee(t: &mir::Ty) -> Option<&mir::Ty> {
 }
 
 pub(crate) fn f16_to_f64(bits: u16) -> f64 {
-    let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
-    let exp = ((bits >> 10) & 0x1f) as i32;
-    let frac = (bits & 0x3ff) as f64;
-    let v = match exp {
-        0 => frac * 2f64.powi(-24),
-        31 => {
-            if frac == 0.0 {
-                return sign * f64::INFINITY;
-            }
-            return f64::NAN;
-        }
-        e => (1024.0 + frac) * 2f64.powi(e - 25),
-    };
-    sign * v
+    crate::f128::f16_bits_to_f64(bits)
 }
 
 impl MirProgram {

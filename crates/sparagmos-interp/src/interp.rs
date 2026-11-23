@@ -15740,7 +15740,17 @@ impl<'a> Interpreter<'a> {
                 Ok(Value::Float(round_to_f16(*v)))
             }
             (Some(Ty::Float(FloatTy::F32)), Value::Float(v)) => {
-                Ok(Value::Float((*v as f32) as f64))
+                if v.is_nan() {
+                    // The rounding above would quiet a signaling
+                    // NaN; a place holds the value's exact form,
+                    // so narrow and re-widen through the bit-exact
+                    // pair instead.
+                    Ok(Value::Float(crate::f128::f32_bits_to_f64_exact(
+                        crate::f128::f64_to_f32_bits_exact(*v),
+                    )))
+                } else {
+                    Ok(Value::Float((*v as f32) as f64))
+                }
             }
             (Some(Ty::Float(FloatTy::F64)), Value::Float(_)) => Ok(value),
             (Some(Ty::Float(FloatTy::F128)), Value::Float128(_)) => Ok(value),
@@ -17561,7 +17571,7 @@ impl<'a> Interpreter<'a> {
             }
             (ScalarShape::Float { bits }, Value::Float(f)) => Ok(match bits {
                 16 => u128::from(f64_to_f16_bits(*f)),
-                32 => u128::from((*f as f32).to_bits()),
+                32 => u128::from(crate::f128::f64_to_f32_bits_exact(*f)),
                 _ => u128::from(f.to_bits()),
             }),
             (ScalarShape::Bool, Value::Bool(b)) => Ok(u128::from(*b)),
@@ -18501,7 +18511,7 @@ impl<'a> Interpreter<'a> {
             }
             Rvalue::Cast(operand, ty) => {
                 let v = self.eval_operand(frames, body, operand)?;
-                eval_cast(&v, ty)
+                eval_cast(&v, cast_src_ty(body, operand), ty)
             }
             Rvalue::Unsize(operand, meta) => {
                 let v = self.eval_operand(frames, body, operand)?;
@@ -18661,7 +18671,7 @@ impl<'a> Interpreter<'a> {
                                 )
                             })?
                         };
-                        eval_cast(&Value::Int(discr), ty)
+                        eval_cast(&Value::Int(discr), None, ty)
                     }
                     other => Err(InterpError::type_mismatch(
                         "enum-to-integer transmute",
@@ -19941,7 +19951,7 @@ fn tree_to_bytes(value: &Value, total: usize) -> Option<Vec<u8>> {
             Value::Int(i) => (*i as u128) & bit_mask(width),
             Value::Uint(u) => *u & bit_mask(width),
             Value::Float(f) => match width {
-                32 => u128::from((*f as f32).to_bits()),
+                32 => u128::from(crate::f128::f64_to_f32_bits_exact(*f)),
                 _ => u128::from(f.to_bits()),
             },
             Value::Bool(b) => u128::from(*b),
@@ -22879,8 +22889,17 @@ fn f64_to_f16_bits(v: f64) -> u16 {
     let exp = ((bits >> 52) & 0x7ff) as i64;
     let mant = bits & ((1u64 << 52) - 1);
     if exp == 0x7ff {
-        // Infinity / NaN (a NaN keeps a nonzero payload marker).
-        return sign | 0x7c00 | if mant != 0 { 0x0200 } else { 0 };
+        // Infinity / NaN. A NaN keeps its sign and the top-aligned
+        // payload of its `f64` storage form (an `f16` NaN is stored
+        // as its exact widening, so this recovers the pattern bit
+        // for bit, signaling NaNs included); a payload entirely
+        // below the `f16` window keeps the quiet marker so the
+        // result stays a NaN.
+        if mant == 0 {
+            return sign | 0x7c00;
+        }
+        let payload = (mant >> 42) as u16;
+        return sign | 0x7c00 | if payload == 0 { 0x0200 } else { payload };
     }
     let e = exp - 1023;
     if e > 15 {
@@ -23118,7 +23137,23 @@ fn synthetic_addr(v: &Value) -> u128 {
     BASE + (h % (1 << 40)) * 65536
 }
 
-pub(crate) fn eval_cast(v: &Value, ty: &Ty) -> InterpResult<Value> {
+/// The declared type of a cast's source operand, when it is cheaply
+/// known: a projection-less local's declared type. Anything else
+/// leaves the source width unknown to `eval_cast` (its float arms
+/// then keep the stored form, which is the exact widening of the
+/// source value).
+pub(crate) fn cast_src_ty<'a>(body: &'a Body, operand: &'a Operand) -> Option<&'a Ty> {
+    match operand {
+        Operand::Copy(place) | Operand::Move(place) if place.projection.is_empty() => {
+            body.local_ty(place.local)
+        }
+        // A constant operand records no type in this IR, so its
+        // width stays unknown.
+        _ => None,
+    }
+}
+
+pub(crate) fn eval_cast(v: &Value, src_ty: Option<&Ty>, ty: &Ty) -> InterpResult<Value> {
     match ty {
         Ty::Int(it) => {
             // A float source saturates; it does not wrap like an
@@ -23218,9 +23253,60 @@ pub(crate) fn eval_cast(v: &Value, ty: &Ty) -> InterpResult<Value> {
                 (Value::Uint(a), FloatTy::F16) => round_to_f16(*a as f64),
                 (Value::Uint(a), FloatTy::F32) => (*a as f32) as f64,
                 (Value::Uint(a), FloatTy::F64) => *a as f64,
-                (Value::Float(a), FloatTy::F16) => round_to_f16(*a),
-                (Value::Float(a), FloatTy::F32) => (*a as f32) as f64,
-                (Value::Float(a), FloatTy::F64) => *a,
+                (Value::Float(a), FloatTy::F16) => {
+                    if a.is_nan()
+                        && matches!(
+                            src_ty,
+                            Some(Ty::Float(FloatTy::F32)) | Some(Ty::Float(FloatTy::F64))
+                        )
+                    {
+                        // A narrowing conversion carries the payload
+                        // across top-aligned and quiets the NaN, as
+                        // the hardware conversion does; the result is
+                        // stored as the exact widening of that `f16`
+                        // pattern.
+                        let bits = a.to_bits();
+                        let sign = if bits >> 63 != 0 { 0x8000u16 } else { 0 };
+                        let payload = ((bits >> 42) & 0x3ff) as u16;
+                        f128::f16_bits_to_f64(sign | 0x7c00 | payload | 0x0200)
+                    } else {
+                        round_to_f16(*a)
+                    }
+                }
+                (Value::Float(a), FloatTy::F32) => {
+                    if matches!(
+                        src_ty,
+                        Some(Ty::Float(FloatTy::F16)) | Some(Ty::Float(FloatTy::F32))
+                    ) {
+                        // Widening `f16` to `f32` (or an `f32`
+                        // identity cast): the stored form already
+                        // is the exact widening at the target width,
+                        // NaN payloads included — the native
+                        // conversion preserves a signaling NaN here
+                        // rather than quieting it, which the host
+                        // `f64` -> `f32` conversion would not.
+                        *a
+                    } else {
+                        (*a as f32) as f64
+                    }
+                }
+                (Value::Float(a), FloatTy::F64) => {
+                    // A widening conversion from `f16` / `f32` quiets
+                    // a NaN, as the hardware conversion does; the sign
+                    // and the top-aligned payload are preserved. The
+                    // stored form is the exact widening, so only the
+                    // quiet bit changes.
+                    if a.is_nan()
+                        && matches!(
+                            src_ty,
+                            Some(Ty::Float(FloatTy::F16)) | Some(Ty::Float(FloatTy::F32))
+                        )
+                    {
+                        f64::from_bits(a.to_bits() | (1u64 << 51))
+                    } else {
+                        *a
+                    }
+                }
                 (other, _) => {
                     return Err(InterpError::type_mismatch(
                         "cast",

@@ -60,8 +60,8 @@ use std::rc::Rc;
 
 use crate::error::{InterpError, InterpResult};
 use crate::interp::{
-    describe_resolved, eval_binary, eval_cast, eval_unary, navigate_mut, operand_pointee_ty,
-    project_value, Frame, Interpreter,
+    cast_src_ty, describe_resolved, eval_binary, eval_cast, eval_unary, navigate_mut,
+    operand_pointee_ty, project_value, Frame, Interpreter,
 };
 use crate::ir::{
     BasicBlock, BinOp, Body, Constant, Local, Operand, Place, ProjectionElem, Rvalue, Statement,
@@ -807,7 +807,14 @@ impl<'a> Interpreter<'a> {
             }
             DRvalue::Cast(src, ty) => {
                 let v = self.eval_src(frames, body, src)?;
-                eval_cast(&v, ty)
+                let src_ty = match src {
+                    DSrc::Local(local) | DSrc::MoveLocal(local) => {
+                        body.local_ty(Local(*local as usize))
+                    }
+                    DSrc::Operand(operand) => cast_src_ty(body, operand),
+                    _ => None,
+                };
+                eval_cast(&v, src_ty, ty)
             }
             DRvalue::Len(dplace, place) => {
                 let value = self.read_dplace(frames, body, dplace)?;
@@ -887,7 +894,7 @@ impl<'a> Interpreter<'a> {
                                 )
                             })?
                         };
-                        eval_cast(&Value::Int(discr), ty)
+                        eval_cast(&Value::Int(discr), None, ty)
                     }
                     other => Err(InterpError::type_mismatch(
                         "enum-to-integer transmute",
