@@ -8026,17 +8026,9 @@ impl<'a> Interpreter<'a> {
                 let target = self.resolve_place(frames, body, place)?;
                 // The shaped store's fallthrough is a projected
                 // assignment like any other: it takes the place's
-                // type evidence with it (see `write_place`).
-                let place_ty = self.place_result_ty(body, place);
+                // root type evidence with it (see `write_place`).
                 let root_ty = self.resolved_root_ty(body, place);
-                self.shaped_store(
-                    frames,
-                    &target,
-                    value,
-                    shape,
-                    place_ty.as_ref(),
-                    root_ty.as_ref(),
-                )
+                self.shaped_store(frames, &target, value, shape, root_ty.as_ref())
             }
             StatementKind::SetDiscriminant { place, variant } => {
                 let target = self.resolve_place(frames, body, place)?;
@@ -13130,35 +13122,6 @@ impl<'a> Interpreter<'a> {
     /// at a `MaybeUninit` place yields that type's value (see
     /// [`Self::uninit_read_value`]); every other outcome --
     /// values and errors alike -- is the untyped read's.
-    /// Whether the value the *direct* (unrewritten) projection
-    /// reads from an element block's base is plausible for the
-    /// type declared for the place: evidence that the stored
-    /// element is a genuine value of that type -- a one-field
-    /// ADT around an aggregate is a real field, not a
-    /// transparent wrapper the place's spelling fails to enter
-    /// -- so the pointee field-0 rewrite must not fire. A
-    /// position that cannot be read, or a caller without a
-    /// declared type, is not evidence and keeps the rewrite.
-    /// With `must_be_present`, an unwritten slot is not evidence
-    /// either: a first write into wrapper storage is exactly
-    /// what the rewrite addresses.
-    fn elem_block_direct_plausible(
-        &self,
-        base: &Value,
-        projection: &[RefProj],
-        ty: Option<&Ty>,
-        must_be_present: bool,
-    ) -> bool {
-        let Some(ty) = ty else { return false };
-        match project_value(base.clone(), projection, "<allocation>", "element block") {
-            Ok(direct) => {
-                (!must_be_present || direct != Value::Uninit)
-                    && self.value_plausible_for_ty(&direct, ty, 0)
-            }
-            Err(_) => false,
-        }
-    }
-
     pub(crate) fn read_resolved_typed(
         &self,
         frames: &[Frame],
@@ -13193,25 +13156,6 @@ impl<'a> Interpreter<'a> {
             Resolved::Alloc { id, projection } => {
                 let projection = &self.elem_block_projection(*id, projection);
                 let base = self.alloc_base(*id)?;
-                let projection = &if self.is_elem_block(*id) {
-                    let rewritten = pointee_field0_rewrite(&base, projection);
-                    // The rewrite presumes the stored element
-                    // carries transparent-wrapper layers the
-                    // place's spelling does not enter. When the
-                    // direct projection already yields a value
-                    // plausible for the place's declared type,
-                    // the stored element is a genuine value of
-                    // that type and the direct projection stands.
-                    if rewritten != *projection
-                        && self.elem_block_direct_plausible(&base, projection, ty, false)
-                    {
-                        projection.clone()
-                    } else {
-                        rewritten
-                    }
-                } else {
-                    projection.clone()
-                };
                 let func = frames
                     .last()
                     .map(|f| f.func.clone())
@@ -13507,26 +13451,22 @@ impl<'a> Interpreter<'a> {
         target: &Resolved,
         value: Value,
     ) -> InterpResult<()> {
-        self.write_resolved_typed(frames, target, value, None, None)
+        self.write_resolved_typed(frames, target, value, None)
     }
 
     /// [`Self::write_resolved`] with the caller's type evidence:
-    /// `place_ty`, the declared type of the place the target
-    /// denotes, gates the element-block field-0 rewrite (see
-    /// `elem_block_direct_plausible`); `root_ty`, the declared
-    /// type of the value at the target's root (for an allocation
-    /// target, its pointee type), is walked alongside the
-    /// projected assignment so the navigation's wrapper
-    /// judgments can consult the declared types (see
-    /// `wrapper_descent_sanctioned`). Callers without evidence
-    /// use `write_resolved`, whose judgments are the shape-only
-    /// ones.
+    /// `root_ty`, the declared type of the value at the target's
+    /// root (for an allocation target, its pointee type), is
+    /// walked alongside the projected assignment so the
+    /// navigation's wrapper judgments can consult the declared
+    /// types (see `wrapper_descent_sanctioned`). Callers without
+    /// evidence use `write_resolved`, whose judgments are the
+    /// shape-only ones.
     pub(crate) fn write_resolved_typed(
         &self,
         frames: &mut Vec<Frame>,
         target: &Resolved,
         value: Value,
-        place_ty: Option<&Ty>,
         root_ty: Option<&Ty>,
     ) -> InterpResult<()> {
         match target {
@@ -13559,27 +13499,6 @@ impl<'a> Interpreter<'a> {
             }
             Resolved::Alloc { id, projection } => {
                 let projection = &self.elem_block_projection(*id, projection);
-                let projection = &if self.is_elem_block(*id) {
-                    let base = self.alloc_base(*id).unwrap_or(Value::Uninit);
-                    let rewritten = pointee_field0_rewrite(&base, projection);
-                    // As in `read_resolved_typed`: when the slot
-                    // the direct projection addresses already
-                    // holds a value plausible for the place's
-                    // declared type, the stored element is a
-                    // genuine value of that type and the write
-                    // belongs at the direct address. An unwritten
-                    // slot is not evidence, so presence is
-                    // required here.
-                    if rewritten != *projection
-                        && self.elem_block_direct_plausible(&base, projection, place_ty, true)
-                    {
-                        projection.clone()
-                    } else {
-                        rewritten
-                    }
-                } else {
-                    projection.clone()
-                };
                 let mut store = self.allocs.borrow_mut();
                 let slot = store
                     .get_mut(id)
@@ -15833,13 +15752,7 @@ impl<'a> Interpreter<'a> {
             }
         }
         let root_ty = self.resolved_root_ty(body, place);
-        self.write_resolved_typed(
-            frames,
-            &target,
-            value,
-            place_ty.as_ref(),
-            root_ty.as_ref(),
-        )
+        self.write_resolved_typed(frames, &target, value, root_ty.as_ref())
     }
 
     /// A write to a `Vec`'s buffer bookkeeping slots through a
@@ -17872,7 +17785,6 @@ impl<'a> Interpreter<'a> {
         target: &Resolved,
         value: Value,
         shape: &ScalarShape,
-        place_ty: Option<&Ty>,
         root_ty: Option<&Ty>,
     ) -> InterpResult<()> {
         let elem_block = matches!(target, Resolved::Alloc { id, projection }
@@ -17908,7 +17820,7 @@ impl<'a> Interpreter<'a> {
         if let Some(view) = self.byte_view_shaped_store(frames, target, &value, shape) {
             return view;
         }
-        self.write_resolved_typed(frames, target, value, place_ty, root_ty)
+        self.write_resolved_typed(frames, target, value, root_ty)
     }
 
     fn reinterpret_value(
@@ -21044,52 +20956,6 @@ fn projection_enters_coroutine(root: &Value, projection: &[RefProj], func: &str)
     }
     false
 }
-/// Rewrite a terminal `Field(0)` step that addresses a field of a
-/// pointee whose storage acquired transparent-wrapper layers when
-/// it was materialised through projected writes (a
-/// `Box::new_uninit` pointee written through `as_mut_ptr` carries
-/// the `MaybeUninit` wrapper as one-field `Enum` layers around the
-/// payload aggregate). A direct pointer formed after
-/// `assume_init` spells the payload's field 0 with a single
-/// `Field(0)`, which is also the wrapper's only in-range field, so
-/// the step must first enter each wrapper layer, exactly as the
-/// wrapped pointer form spells it. Only allocation storage is
-/// rewritten: locals and statics hold genuine one-field aggregates
-/// whose field 0 is a real field. The rewrite applies only when
-/// the value at the head of the projection really is such a
-/// wrapper chain ending at a multi-field aggregate.
-fn pointee_field0_rewrite(root: &Value, projection: &[RefProj]) -> Vec<RefProj> {
-    let Some((RefProj::Field(0), head)) = projection.split_last() else {
-        return projection.to_vec();
-    };
-    let Ok(at) = project_value(root.clone(), head, "<pointee>", "field0 rewrite")
-    else {
-        return projection.to_vec();
-    };
-    let mut levels = 0usize;
-    let mut cur = &at;
-    while let Value::Enum { fields, .. } = cur {
-        if fields.len() != 1
-            || !wrapper_payload(&fields[0])
-        {
-            break;
-        }
-        levels += 1;
-        cur = &fields[0];
-    }
-    let reaches_struct =
-        matches!(cur, Value::Enum { fields, .. } if fields.len() >= 2);
-    if levels == 0 || !reaches_struct {
-        return projection.to_vec();
-    }
-    let mut out = head.to_vec();
-    for _ in 0..levels {
-        out.push(RefProj::Field(0));
-    }
-    out.push(RefProj::Field(0));
-    out
-}
-
 pub(crate) fn project_value(
     value: Value,
     projection: &[RefProj],

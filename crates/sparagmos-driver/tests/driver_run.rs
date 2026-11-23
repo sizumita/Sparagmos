@@ -34043,3 +34043,57 @@ fn run_mode_dyn_ptr_equality_compares_vtable_identity() {
         "eq_ab=false eq_ac=true\ndirect_ab=false direct_ac=true\neq_xy=false eq_xz=true\nnull_a=true null_x=false\naddr_x=0x1000\n"
     );
 }
+const BTREE_ITER_WRAPPER_PTR_SRC: &str = r#"
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+fn main() {
+    let mut m: BTreeMap<i32, i32> = BTreeMap::new();
+    m.insert(1, 10);
+    m.insert(2, 20);
+    println!("count={}", m.iter().count());
+    let mut c: BTreeMap<Cow<'static, str>, usize> = BTreeMap::new();
+    assert!(c.insert(Cow::Borrowed("foo"), 42).is_none());
+    assert!(c.insert(Cow::Owned("foo".to_string()), 43).is_some());
+    println!("len={} count={}", c.len(), c.iter().count());
+    println!("get={:?}", c.get("foo"));
+}
+"#;
+
+#[test]
+fn run_mode_btree_map_iter_reads_leaf_nodes() {
+    // Iterating a BTreeMap walks its leaf nodes through the
+    // node pointer stored in the root's NodeRef: the pointer
+    // enters the node's `MaybeUninit` storage layer with its
+    // field-0 step, and the stored element at that address is
+    // the leaf aggregate itself ([parent, parent index,
+    // length, keys, values]). The read must land on the
+    // aggregate the pointer addresses, not descend one field
+    // further into the leaf's parent slot.
+    run_ok(
+        "btree-iter-wrapper-ptr",
+        BTREE_ITER_WRAPPER_PTR_SRC,
+        "count=2\nlen=1 count=1\nget=Some(43)\n",
+    );
+}
+
+const BTREE_ZST_ITER_SRC: &str = r#"
+use std::collections::BTreeMap;
+#[derive(Eq, Hash, Debug, Ord, PartialEq, PartialOrd)]
+struct Zst;
+fn main() {
+    let mut m: BTreeMap<Zst, ()> = BTreeMap::new();
+    m.insert(Zst, ());
+    m.insert(Zst, ());
+    println!("len={} count={}", m.len(), m.iter().count());
+    println!("get={}", m.get(&Zst).is_some());
+}
+"#;
+
+#[test]
+fn run_mode_btree_map_zst_iter_count() {
+    // A zero-sized key/value BTreeMap: the leaf walk reads the
+    // node through the same wrapper-entering node pointer as
+    // the sized case, and the elided ZST slots fill out to the
+    // declared length.
+    run_ok("btree-zst-iter", BTREE_ZST_ITER_SRC, "len=1 count=1\nget=true\n");
+}
