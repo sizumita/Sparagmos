@@ -453,6 +453,29 @@ pub(crate) fn box_alloc_pointer(value: &Value) -> Option<(u64, Vec<RefProj>)> {
     }
 }
 
+/// The allocation pointer stored at the bottom of a
+/// pointer-wrapper aggregate chain: the `Box` / `Unique` /
+/// `NonNull` aggregates std code builds in MIR, where field 0
+/// of each wrapper is the next wrapper down (the remaining
+/// fields are the zero-sized phantom and allocator fields) and
+/// the chain bottoms out at the stored pointer. A box value
+/// built by the `Box::new` builtin is the degenerate chain: a
+/// one-field aggregate holding the pointer directly.
+pub(crate) fn wrapper_alloc_pointer(value: &Value) -> Option<(u64, Vec<RefProj>)> {
+    let mut cur = value;
+    loop {
+        match cur {
+            Value::Ref(RefTarget::Alloc { id, projection }) => {
+                return Some((*id, projection.clone()));
+            }
+            Value::Enum { fields, .. } if !fields.is_empty() => {
+                cur = &fields[0];
+            }
+            _ => return None,
+        }
+    }
+}
+
 /// The allocation id a reference-counted handle value names,
 /// if the value has the handle shape: an aggregate (the `Rc` /
 /// `Arc` / `Weak` struct) whose first field is a one-field
@@ -6640,20 +6663,22 @@ impl<'a> Interpreter<'a> {
         // A built box (see `Interpreter::new_box`) holds its
         // pointee in the allocation store, not in the aggregate:
         // when the operand value is the box aggregate itself, or
-        // the allocation pointer stored in its field 0 (or in a
-        // one-field pointer wrapper above it), the pointee place
+        // the allocation pointer stored at the bottom of the
+        // pointer-wrapper chain above it, the pointee place
         // is the allocation itself. Naming the allocation keeps
         // the extracted pointer valid after this frame is gone
         // and makes every copy of the box extract the same
         // pointer — the two properties of a real heap pointer
         // this cast exists to expose.
         if let Ok(value) = self.read_resolved(frames, &operand_target) {
-            let alloc = box_alloc_pointer(&value).or_else(|| match &value {
-                Value::Ref(RefTarget::Alloc { id, projection }) => {
-                    Some((*id, projection.clone()))
-                }
-                _ => None,
-            });
+            let alloc = box_alloc_pointer(&value)
+                .or_else(|| wrapper_alloc_pointer(&value))
+                .or_else(|| match &value {
+                    Value::Ref(RefTarget::Alloc { id, projection }) => {
+                        Some((*id, projection.clone()))
+                    }
+                    _ => None,
+                });
             if let Some((id, projection)) = alloc {
                 return Some((
                     operand_target,
@@ -10937,6 +10962,53 @@ impl<'a> Interpreter<'a> {
                 inner = field;
             }
         }
+        // A tuple place whose value arrives as a one-field
+        // wrapper aggregate: a tuple's own value form is the
+        // tuple itself, never an aggregate, so a one-field
+        // aggregate around a tuple of the declared arity is a
+        // transparent storage wrapper (the `MaybeUninit` /
+        // `ManuallyDrop` payload slot) the value crossed on its
+        // way through raw storage -- the storage a
+        // `Box::new_in` writes through a `*mut MaybeUninit<T>`
+        // and a pointee-typed read takes back out. The store
+        // unwraps it: the aggregate counterpart of the scalar
+        // and array unwraps above.
+        if let Some(Ty::Tuple(elems)) = ty {
+            let arity = elems.len();
+            if let Value::Enum {
+                variant: 0,
+                fields,
+            } = &value
+            {
+                if fields.len() == 1 {
+                    if let Value::Tuple(items) = &fields[0] {
+                        if items.len() == arity {
+                            value = fields[0].clone();
+                        }
+                    }
+                }
+            }
+        }
+        // A `String` place holds string data: the model's
+        // `String` value form is the data itself, never an
+        // aggregate (a field-built `String` aggregate holds its
+        // `Vec<u8>` field, not string data). A one-field
+        // wrapper aggregate around string data is therefore a
+        // transparent storage wrapper of the same kind, and the
+        // store unwraps it.
+        if let Some(Ty::Adt(name)) = ty {
+            if name == "std::string::String" || name == "alloc::string::String" {
+                if let Value::Enum {
+                    variant: 0,
+                    fields,
+                } = &value
+                {
+                    if fields.len() == 1 && matches!(fields[0], Value::Str(_)) {
+                        value = fields[0].clone();
+                    }
+                }
+            }
+        }
         match (ty, &value) {
             (Some(Ty::Bool), Value::Bool(_))
             | (Some(Ty::Unit), Value::Unit)
@@ -11889,8 +11961,174 @@ impl<'a> Interpreter<'a> {
         src: &ScalarShape,
         dst: &ScalarShape,
     ) -> InterpResult<Value> {
+        // A pointer leaf the two shapes line up on is the same
+        // pointer on both sides, not a bit pattern: flattening
+        // it to its synthetic address and constructing an
+        // address-only pointer back severs it from the
+        // allocation it names, and the pointee becomes
+        // unreachable. The `assume_init` transmute
+        // (`Box<MaybeUninit<T>, A>` to `Box<T, A>`) is the
+        // canonical case: the box aggregate is identical on both
+        // sides, only the pointee type changes. Where the shapes
+        // line up structurally, walk them together and carry
+        // pointer leaves across as the values they are; every
+        // other shape pair goes through the bit pattern, which
+        // is also what a genuine pointer <-> integer transmute
+        // means.
+        if let Some(v) = self.reinterpret_preserving(value, src, dst) {
+            return Ok(v);
+        }
         let bits = self.flatten_scalar(value, src)?;
         self.construct_scalar(bits, dst)
+    }
+
+    /// The value of shape `dst` that is `value` (of shape
+    /// `src`) with every pointer leaf carried across unchanged,
+    /// or `None` when the two shapes do not line up
+    /// structurally around a pointer leaf (the caller then
+    /// reinterprets through the bit pattern). A non-pointer
+    /// value at a pointer leaf also yields `None`, so the bit
+    /// path keeps reporting it as the type mismatch it is.
+    fn reinterpret_preserving(
+        &self,
+        value: &Value,
+        src: &ScalarShape,
+        dst: &ScalarShape,
+    ) -> Option<Value> {
+        match (src, dst) {
+            (ScalarShape::Ptr, ScalarShape::Ptr) => match value {
+                Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. } => {
+                    Some(value.clone())
+                }
+                _ => None,
+            },
+            (
+                ScalarShape::AdtField {
+                    index: si,
+                    count: sc,
+                    inner: sinner,
+                    ..
+                },
+                ScalarShape::AdtField {
+                    index: di,
+                    count: dc,
+                    fill: dfill,
+                    inner: dinner,
+                },
+            ) if si == di && sc == dc => {
+                match value {
+                    Value::Enum { variant, fields } => {
+                        let payload = fields.get(*si as usize)?;
+                        let payload =
+                            self.reinterpret_preserving(payload, sinner, dinner)?;
+                        let mut fields = fields.clone();
+                        fields[*si as usize] = payload;
+                        Some(Value::Enum {
+                            variant: *variant,
+                            fields,
+                        })
+                    }
+                    // The storage form: the payload value itself
+                    // where the aggregate would sit (the same
+                    // convention `flatten_scalar` encodes). The
+                    // result is re-wrapped in the target
+                    // aggregate, whose remaining fields are the
+                    // baked-in fill constants.
+                    _ => {
+                        let payload =
+                            self.reinterpret_preserving(value, sinner, dinner)?;
+                        let mut fields = vec![Value::Uninit; *dc];
+                        for (i, c) in dfill {
+                            fields[*i as usize] = self.eval_constant(c).ok()?;
+                        }
+                        fields[*di as usize] = payload;
+                        Some(Value::Enum {
+                            variant: 0,
+                            fields,
+                        })
+                    }
+                }
+            }
+            // Unwrapping one side: the payload of a wrapper
+            // shape reinterpreted as the bare target shape (and
+            // the reverse, wrapping).
+            (
+                ScalarShape::AdtField {
+                    index,
+                    inner,
+                    ..
+                },
+                _,
+            ) => {
+                let payload = match value {
+                    Value::Enum { fields, .. } => fields.get(*index as usize)?,
+                    _ => value,
+                };
+                self.reinterpret_preserving(payload, inner, dst)
+            }
+            (
+                _,
+                ScalarShape::AdtField {
+                    index,
+                    count,
+                    fill,
+                    inner,
+                },
+            ) => {
+                let payload = self.reinterpret_preserving(value, src, inner)?;
+                let mut fields = vec![Value::Uninit; *count];
+                for (i, c) in fill {
+                    fields[*i as usize] = self.eval_constant(c).ok()?;
+                }
+                fields[*index as usize] = payload;
+                Some(Value::Enum {
+                    variant: 0,
+                    fields,
+                })
+            }
+            (
+                ScalarShape::NicheEnum {
+                    inner: sinner,
+                    untagged_variant: suv,
+                    niche_variants: snv,
+                    niche_start: sns,
+                },
+                ScalarShape::NicheEnum {
+                    inner: dinner,
+                    untagged_variant: duv,
+                    niche_variants: dnv,
+                    niche_start: dns,
+                },
+            ) if suv == duv && snv == dnv && sns == dns => match value {
+                Value::Enum { variant, fields } if variant == suv => {
+                    let payload = fields.first()?;
+                    let payload =
+                        self.reinterpret_preserving(payload, sinner, dinner)?;
+                    let mut fields = fields.clone();
+                    fields[0] = payload;
+                    Some(Value::Enum {
+                        variant: *variant,
+                        fields,
+                    })
+                }
+                Value::Enum { .. } => Some(value.clone()),
+                _ => None,
+            },
+            (
+                ScalarShape::Array(selem, sn),
+                ScalarShape::Array(delem, dn),
+            ) if sn == dn => match value {
+                Value::Tuple(items) if items.len() as u64 == *sn => {
+                    let mut out = Vec::with_capacity(items.len());
+                    for item in items {
+                        out.push(self.reinterpret_preserving(item, selem, delem)?);
+                    }
+                    Some(Value::Tuple(out))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// The bit pattern of `value` read through `shape`

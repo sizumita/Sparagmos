@@ -21253,6 +21253,27 @@ impl<'a> Interpreter<'a> {
         options: &FmtOptions,
         indent: usize,
     ) -> InterpResult<String> {
+        // A one-field wrapper aggregate around string data,
+        // formatted as a `String`: the storage form a
+        // `MaybeUninit` payload slot leaves in raw storage (a
+        // `Box::new_in` pointee read back through its
+        // reference), where the model's `String` value is the
+        // data itself. The wrapper is transparent to the
+        // type's own formatting, exactly as it is to a typed
+        // place's store (see `normalize_for_ty`).
+        if let Value::Enum {
+            variant: 0,
+            fields,
+        } = value
+        {
+            if fields.len() == 1 && matches!(fields[0], Value::Str(_)) {
+                let plain = pointee_tag(ty);
+                if plain == "std::string::String" || plain == "alloc::string::String" {
+                    let field = fields[0].clone();
+                    return self.format_value(frames, &field, trait_, ty, options, indent);
+                }
+            }
+        }
         // References format as their pointee for every trait here.
         if matches!(value, Value::Ref(_)) {
             let pointee = self.resolve_value(frames, value)?;
