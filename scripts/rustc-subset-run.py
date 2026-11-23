@@ -133,9 +133,23 @@ from typing import NamedTuple, Optional
 TOOLCHAIN = "1.100.0"
 DENOMINATOR = 24937  # metric 2(b) denominator at tag 1.100.0 (COVERAGE.md)
 
-NATIVE_COMPILE_TIMEOUT = 60
-NATIVE_RUN_TIMEOUT = 30
-DRIVER_TIMEOUT = 60
+
+def _env_timeout(name, default):
+    """Per-record timeout override from the environment.
+
+    CI runners are slower than the dev host, so the workflows raise
+    the timeouts through SPARAGMOS_*_TIMEOUT variables; with nothing
+    set, the historical defaults apply unchanged.
+    """
+    try:
+        return int(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
+NATIVE_COMPILE_TIMEOUT = _env_timeout("SPARAGMOS_NATIVE_COMPILE_TIMEOUT", 60)
+NATIVE_RUN_TIMEOUT = _env_timeout("SPARAGMOS_NATIVE_RUN_TIMEOUT", 30)
+DRIVER_TIMEOUT = _env_timeout("SPARAGMOS_DRIVER_TIMEOUT", 60)
 
 # ---------------------------------------------------------------------------
 # Header directive parsing
@@ -3531,7 +3545,7 @@ def fill_result_revisions(rec, header, revs, path, driver_bin, out,
 # require, and the aggregates report how many records (and how many
 # stage-2 passes) carry them, so the unverified remainder is explicit.
 
-CONVERT_TIMEOUT = 60
+CONVERT_TIMEOUT = _env_timeout("SPARAGMOS_CONVERT_TIMEOUT", 60)
 
 _UI_SUCCESS_DIRECTIVES = ("check-pass", "build-pass")
 _UI_FAILURE_DIRECTIVES = ("check-fail", "build-fail")

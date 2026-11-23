@@ -1,0 +1,331 @@
+name: Official Measurement
+
+# The official full-subset measurement (the "both" series): the whole
+# 24,937-record denominator of metric 2(b), metric 3 derived from the
+# subset results with scripts/std-coverage.py, and metric 4 measured
+# with the runner's --jit mode. This replaces the manual run on the
+# dev host; nothing about the official measurement is run by hand.
+#
+# A single hosted job cannot hold the whole measurement inside the
+# 6-hour job limit with headroom, so the survey is split into shards
+# (scripts/ci-subset-tools.py shard, round-robin over path order) and
+# each shard runs as one matrix job. The aggregate job merges the
+# shard results (aggregates are recomputed from the merged records)
+# and publishes the three metrics to the job summary.
+#
+# Runs on every push to main and on manual dispatch. The dispatch
+# inputs allow a smaller shard count or skipping the JIT pass for a
+# trial run.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      shards:
+        description: "Number of shards per measurement pass"
+        required: true
+        default: "8"
+      run_jit:
+        description: "Also measure metric 4 (--jit)"
+        type: boolean
+        required: true
+        default: true
+
+permissions:
+  contents: read
+
+# Official measurements never overlap each other.
+concurrency:
+  group: official-measure
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_SURVEY_DIR: ${{ github.workspace }}/../rust-1.100.0-survey
+  SURVEY_JSON: ${{ github.workspace }}/../subset-survey.json
+  # Hosted CPUs are slower than the dev host; per-record timeouts are
+  # raised above the runner defaults (60s) so heavy records do not
+  # fall over purely on CPU speed.
+  SPARAGMOS_NATIVE_COMPILE_TIMEOUT: "240"
+  SPARAGMOS_NATIVE_RUN_TIMEOUT: "60"
+  SPARAGMOS_DRIVER_TIMEOUT: "240"
+  SPARAGMOS_CONVERT_TIMEOUT: "240"
+  SHARDS: ${{ inputs.shards || '8' }}
+
+jobs:
+  prepare:
+    name: prepare survey
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      shard-list: ${{ steps.list.outputs.value }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache rust source tree and survey
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.RUST_SURVEY_DIR }}
+            ${{ env.SURVEY_JSON }}
+          key: rust-survey-1.100.0-v1
+
+      - name: Fetch rust tree and generate survey (on cache miss)
+        run: |
+          if [ ! -d "$RUST_SURVEY_DIR" ]; then
+            python3 scripts/rustc-subset-survey.py --fetch \
+              --rust-dir "$RUST_SURVEY_DIR" --json "$SURVEY_JSON"
+          elif [ ! -f "$SURVEY_JSON" ]; then
+            python3 scripts/rustc-subset-survey.py \
+              --rust-dir "$RUST_SURVEY_DIR" --json "$SURVEY_JSON"
+          fi
+          ls -la "$SURVEY_JSON"
+
+      - name: Upload survey
+        uses: actions/upload-artifact@v4
+        with:
+          name: subset-survey
+          path: ${{ env.SURVEY_JSON }}
+          retention-days: 7
+
+      - name: Compute shard list
+        id: list
+        run: |
+          value="$(python3 -c "import json,os; print(json.dumps(list(range(int(os.environ['SHARDS'])))))")"
+          echo "value=$value" >> "$GITHUB_OUTPUT"
+
+  measure:
+    name: measure shard ${{ matrix.shard }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.prepare.outputs.shard-list) }}
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h / | tail -1
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.100.0 with rustc-dev
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.100.0
+          components: rustc-dev
+
+      - name: Cache cargo registry and driver target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            crates/sparagmos-driver -> target
+
+      - name: Restore rust source tree
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.RUST_SURVEY_DIR }}
+          key: rust-survey-1.100.0-v1
+          fail-on-cache-miss: true
+
+      - name: Download survey
+        uses: actions/download-artifact@v4
+        with:
+          name: subset-survey
+          path: ${{ runner.temp }}
+
+      - name: Build driver
+        env:
+          RUSTC_BOOTSTRAP: "1"
+        run: cargo build --manifest-path crates/sparagmos-driver/Cargo.toml
+
+      - name: Run shard
+        run: |
+          python3 scripts/ci-subset-tools.py shard \
+            --survey "$RUNNER_TEMP/subset-survey.json" \
+            --count "$SHARDS" --index "${{ matrix.shard }}" \
+            --out "$RUNNER_TEMP/shard-survey.json"
+          python3 scripts/rustc-subset-run.py \
+            --survey-json "$RUNNER_TEMP/shard-survey.json" \
+            --rust-dir "$RUST_SURVEY_DIR" \
+            --driver-bin "$GITHUB_WORKSPACE/crates/sparagmos-driver/target/debug/sparagmos-driver" \
+            --out "$RUNNER_TEMP/subset-shard-${{ matrix.shard }}.json" \
+            --jobs 2
+
+      - name: Upload shard result
+        uses: actions/upload-artifact@v4
+        with:
+          name: subset-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/subset-shard-${{ matrix.shard }}.json
+          retention-days: 30
+
+  measure-jit:
+    name: measure (jit) shard ${{ matrix.shard }}
+    needs: prepare
+    if: ${{ inputs.run_jit != false }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.prepare.outputs.shard-list) }}
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h / | tail -1
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.100.0 with rustc-dev
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.100.0
+          components: rustc-dev
+
+      - name: Cache cargo registry and driver target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            crates/sparagmos-driver -> target
+
+      - name: Restore rust source tree
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.RUST_SURVEY_DIR }}
+          key: rust-survey-1.100.0-v1
+          fail-on-cache-miss: true
+
+      - name: Download survey
+        uses: actions/download-artifact@v4
+        with:
+          name: subset-survey
+          path: ${{ runner.temp }}
+
+      - name: Build driver
+        env:
+          RUSTC_BOOTSTRAP: "1"
+        run: cargo build --manifest-path crates/sparagmos-driver/Cargo.toml
+
+      - name: Run shard (jit)
+        run: |
+          python3 scripts/ci-subset-tools.py shard \
+            --survey "$RUNNER_TEMP/subset-survey.json" \
+            --count "$SHARDS" --index "${{ matrix.shard }}" \
+            --out "$RUNNER_TEMP/shard-survey.json"
+          python3 scripts/rustc-subset-run.py --jit \
+            --survey-json "$RUNNER_TEMP/shard-survey.json" \
+            --rust-dir "$RUST_SURVEY_DIR" \
+            --driver-bin "$GITHUB_WORKSPACE/crates/sparagmos-driver/target/debug/sparagmos-driver" \
+            --out "$RUNNER_TEMP/subset-jit-shard-${{ matrix.shard }}.json" \
+            --jobs 2
+
+      - name: Upload shard result
+        uses: actions/upload-artifact@v4
+        with:
+          name: subset-jit-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/subset-jit-shard-${{ matrix.shard }}.json
+          retention-days: 30
+
+  aggregate:
+    name: aggregate metrics
+    needs: [measure, measure-jit]
+    if: >-
+      always() && needs.measure.result == 'success' &&
+      (needs.measure-jit.result == 'success' || needs.measure-jit.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h / | tail -1
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.100.0 with rustc-dev
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.100.0
+          components: rustc-dev
+
+      - name: Cache cargo registry and driver target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            crates/sparagmos-driver -> target
+
+      - name: Restore rust source tree
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.RUST_SURVEY_DIR }}
+          key: rust-survey-1.100.0-v1
+          fail-on-cache-miss: true
+
+      - name: Download shard results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: subset-*-shard-*
+          path: ${{ runner.temp }}/shards
+          merge-multiple: true
+
+      - name: Merge subset results (metric 2(b))
+        run: |
+          python3 scripts/ci-subset-tools.py merge \
+            --out "$RUNNER_TEMP/subset-merged.json" \
+            --summary "$RUNNER_TEMP/metric2b.md" \
+            "$RUNNER_TEMP"/shards/subset-shard-*.json
+          cat "$RUNNER_TEMP/metric2b.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build driver (for std coverage)
+        env:
+          RUSTC_BOOTSTRAP: "1"
+        run: cargo build --manifest-path crates/sparagmos-driver/Cargo.toml
+
+      - name: Metric 3 (std coverage)
+        run: |
+          python3 scripts/std-coverage.py \
+            --results-json "$RUNNER_TEMP/subset-merged.json" \
+            --rust-dir "$RUST_SURVEY_DIR" \
+            --driver-bin "$GITHUB_WORKSPACE/crates/sparagmos-driver/target/debug/sparagmos-driver" \
+            --out "$RUNNER_TEMP/std-coverage.json" \
+            --jobs 2 --timeout 240
+          python3 - "$RUNNER_TEMP/std-coverage.json" >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          import json, sys
+          agg = json.load(open(sys.argv[1]))["aggregate"]
+          pct = round(100.0 * agg["rate"], 3)
+          print("## Metric 3\n")
+          print(f"**{agg['executable']}/{agg['denominator']} = {pct}%** "
+                f"(strict: {agg['executable_strict']}, "
+                f"{round(100.0 * agg['rate_strict'], 3)}%)\n")
+          EOF
+
+      - name: Merge JIT results (metric 4)
+        if: ${{ needs.measure-jit.result == 'success' }}
+        run: |
+          python3 scripts/ci-subset-tools.py merge \
+            --out "$RUNNER_TEMP/subset-jit-merged.json" \
+            --summary "$RUNNER_TEMP/metric4.md" \
+            "$RUNNER_TEMP"/shards/subset-jit-shard-*.json
+          cat "$RUNNER_TEMP/metric4.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload merged results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: official-measurement-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/subset-merged.json
+            ${{ runner.temp }}/subset-jit-merged.json
+            ${{ runner.temp }}/std-coverage.json
+          retention-days: 90
