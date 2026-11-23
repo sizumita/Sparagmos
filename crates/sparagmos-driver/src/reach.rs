@@ -1378,6 +1378,21 @@ fn iterator_back_modelled(ty: &Ty) -> bool {
         "std::iter::Enumerate" | "std::iter::Copied" | "std::iter::Map" => {
             first_type_arg(&args).is_some_and(iterator_back_modelled)
         }
+        // A `Zip`'s back step composes the two sides' back
+        // steps, so it is modelled exactly when both sides'
+        // are.
+        "std::iter::Zip" => {
+            let mut type_args = args.0.iter().filter_map(|arg| match arg {
+                GenericArgKind::Type(ty) => Some(ty),
+                _ => None,
+            });
+            match (type_args.next(), type_args.next()) {
+                (Some(a), Some(b)) => {
+                    iterator_back_modelled(a) && iterator_back_modelled(b)
+                }
+                _ => false,
+            }
+        }
         _ => false,
     }
 }

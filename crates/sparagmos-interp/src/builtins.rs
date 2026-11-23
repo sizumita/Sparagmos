@@ -6075,6 +6075,7 @@ impl<'a> Interpreter<'a> {
                     || self_ty.starts_with("std::iter::Take<")
                     || self_ty.starts_with("std::iter::Skip<")
                     || self_ty.starts_with("std::iter::Chain<")
+                    || self_ty.starts_with("std::iter::Zip<")
                     || self_ty.starts_with("std::iter::SkipWhile<")
                     || self_ty.starts_with("std::iter::Once<")
                     || self_ty.starts_with("std::path::Components")
@@ -12830,6 +12831,89 @@ fn value_fingerprint(value: &Value) -> u64 {
                 }
             }
         }
+        if self_ty.starts_with("std::iter::Zip<") {
+            // `Zip`'s back step pairs the two sides from the
+            // back, front-aligned: the longer side first drops
+            // its unpaired excess from the back, then both
+            // sides step back once — core's general `next_back`,
+            // whose contract needs both sides' exact lengths
+            // (the `ExactSizeIterator` bound on the impl), so
+            // an inexact size hint on either side is an
+            // explicit unsupported error. The state's index /
+            // len counters belong to the random-access
+            // specialization and are carried untouched, as in
+            // the front step.
+            let fields = iterator_fields(&state, self_ty)?;
+            if fields.len() != 4 {
+                return Err(InterpError::type_mismatch(
+                    "Zip state",
+                    "[iterator, iterator, index, len]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let type_args = generic_args_of(self_ty);
+            let first_ty = type_args.first().map(String::as_str).unwrap_or("");
+            let second_ty = type_args.get(1).map(String::as_str).unwrap_or("");
+            let exact_len = |this: &mut Self,
+                             frames: &mut Vec<Frame>,
+                             ty: &str,
+                             state: &Value|
+             -> InterpResult<u128> {
+                let (lower, upper) = this.size_hint_parts(frames, ty, state.clone())?;
+                match upper {
+                    Some(u) if u == lower => Ok(lower),
+                    _ => Err(unsupported(format!(
+                        "DoubleEndedIterator::next_back for {self_ty} needs both \
+                         inner iterators' exact lengths, which a size hint does \
+                         not give"
+                    ))),
+                }
+            };
+            let a_sz = exact_len(self, frames, first_ty, &fields[0])?;
+            let b_sz = exact_len(self, frames, second_ty, &fields[1])?;
+            let mut first = fields[0].clone();
+            let mut second = fields[1].clone();
+            for _ in 0..a_sz.saturating_sub(b_sz) {
+                let (new_first, _) =
+                    self.next_back_on_state(frames, first_ty, first)?;
+                first = new_first;
+            }
+            for _ in 0..b_sz.saturating_sub(a_sz) {
+                let (new_second, _) =
+                    self.next_back_on_state(frames, second_ty, second)?;
+                second = new_second;
+            }
+            let (new_first, first_item) =
+                self.next_back_on_state(frames, first_ty, first)?;
+            let (new_second, second_item) =
+                self.next_back_on_state(frames, second_ty, second)?;
+            let result = match (
+                option_payload_opt(first_item),
+                option_payload_opt(second_item),
+            ) {
+                (Some(x), Some(y)) => some_value(Value::Tuple(vec![x, y])),
+                (None, None) => none_value(),
+                _ => {
+                    return Err(unsupported(format!(
+                        "DoubleEndedIterator::next_back for {self_ty}: the two \
+                         sides report equal exact lengths but stepped \
+                         differently"
+                    )))
+                }
+            };
+            return Ok((
+                rebuild_state(
+                    &state,
+                    vec![
+                        new_first,
+                        new_second,
+                        fields[2].clone(),
+                        fields[3].clone(),
+                    ],
+                ),
+                result,
+            ));
+        }
         let (new_state, item) = match iterator_next_back_state(&state, self_ty) {
             Ok(step) => step,
             Err(e) => {
@@ -14140,6 +14224,51 @@ fn value_fingerprint(value: &Value) -> u64 {
                 }
             }
             (vec![first, second], result)
+        } else if self_ty.starts_with("std::iter::Zip<") {
+            // `Zip` is (first iterator, second iterator,
+            // index, len): the two counters belong to core's
+            // random-access specialization, which the modelled
+            // step does not use — the general `next` this arm
+            // mirrors leaves them untouched, stepping the first
+            // iterator and, only when it yields, the second;
+            // the step yields the pair when both yield. When
+            // the first is exhausted the second is not stepped
+            // at all; when the second is exhausted the first's
+            // item is consumed and lost — core's `next` drops
+            // it the same way.
+            if fields.len() != 4 {
+                return Err(InterpError::type_mismatch(
+                    "Zip state",
+                    "[iterator, iterator, index, len]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let type_args = generic_args_of(self_ty);
+            let first_ty = type_args.first().map(String::as_str).unwrap_or("");
+            let second_ty = type_args.get(1).map(String::as_str).unwrap_or("");
+            let counters = vec![fields[2].clone(), fields[3].clone()];
+            let (new_first, first_item) =
+                self.next_on_state(frames, first_ty, &fields[0])?;
+            match option_payload_opt(first_item) {
+                None => (
+                    [vec![new_first, fields[1].clone()], counters].concat(),
+                    none_value(),
+                ),
+                Some(x) => {
+                    let (new_second, second_item) =
+                        self.next_on_state(frames, second_ty, &fields[1])?;
+                    match option_payload_opt(second_item) {
+                        None => (
+                            [vec![new_first, new_second], counters].concat(),
+                            none_value(),
+                        ),
+                        Some(y) => (
+                            [vec![new_first, new_second], counters].concat(),
+                            some_value(Value::Tuple(vec![x, y])),
+                        ),
+                    }
+                }
+            }
         } else {
             return Err(unsupported(format!(
                 "Iterator::next for {self_ty} is not runtime-supported"
@@ -14391,6 +14520,36 @@ fn value_fingerprint(value: &Value) -> u64 {
                 };
             }
             return Ok(hint(lower, upper));
+        }
+        if self_ty.starts_with("std::iter::Zip<") {
+            // `Zip::size_hint` pairs the two sides' hints: the
+            // lower bound is the smaller of the two lower
+            // bounds; the upper bound is the smaller of the two
+            // when both are known, the known one when only one
+            // side knows its upper bound, and unknown only when
+            // both are.
+            let fields = iterator_fields(&state, self_ty)?;
+            if fields.len() != 4 {
+                return Err(InterpError::type_mismatch(
+                    "Zip state",
+                    "[iterator, iterator, index, len]",
+                    format!("{} field(s)", fields.len()),
+                ));
+            }
+            let type_args = generic_args_of(self_ty);
+            let first_ty = type_args.first().map(String::as_str).unwrap_or("");
+            let second_ty = type_args.get(1).map(String::as_str).unwrap_or("");
+            let (a_lower, a_upper) =
+                self.size_hint_parts(frames, first_ty, fields[0].clone())?;
+            let (b_lower, b_upper) =
+                self.size_hint_parts(frames, second_ty, fields[1].clone())?;
+            let upper = match (a_upper, b_upper) {
+                (Some(x), Some(y)) => Some(x.min(y)),
+                (Some(x), None) => Some(x),
+                (None, Some(y)) => Some(y),
+                (None, None) => None,
+            };
+            return Ok(hint(a_lower.min(b_lower), upper));
         }
         let fields = iterator_fields(&state, self_ty)?;
         if self_ty.starts_with("std::ops::RangeInclusive<") {
@@ -18002,6 +18161,14 @@ pub fn iterator_next_back_modelled(self_ty: &str) -> bool {
         || self_ty.starts_with("std::iter::Map<")
     {
         return first_generic_arg(self_ty).is_some_and(iterator_next_back_modelled);
+    }
+    // A `Zip`'s back step composes the two sides' back steps,
+    // so it is modelled exactly when both sides' are.
+    if self_ty.starts_with("std::iter::Zip<") {
+        let args = generic_args_of(self_ty);
+        return args.len() >= 2
+            && iterator_next_back_modelled(&args[0])
+            && iterator_next_back_modelled(&args[1]);
     }
     false
 }

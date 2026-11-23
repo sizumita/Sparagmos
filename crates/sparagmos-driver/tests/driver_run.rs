@@ -19117,3 +19117,79 @@ fn run_mode_slice_join_closure_constant_converts() {
         "join completed: {stderr}"
     );
 }
+
+const ZIP_SRC: &str = r#"
+fn main() {
+    let a = [1, 2, 3];
+    let b = [10, 20, 30, 40];
+    for (x, y) in a.iter().zip(b.iter()) {
+        println!("{} {}", x, y);
+    }
+    let v: Vec<(&i32, &i32)> = a.iter().zip(b.iter()).collect();
+    println!("collected {}", v.len());
+    println!("count {}", a.iter().zip(b.iter()).count());
+    for ((x, y), w) in a.iter().zip(b.iter()).zip([100, 200, 300].iter()) {
+        println!("{} {} {}", x, y, w);
+    }
+    let s: i32 = a.iter().zip(b.iter()).map(|(x, y)| x + y).sum();
+    println!("sum {}", s);
+    for (x, y) in std::iter::zip([1, 2], [3, 4]) {
+        println!("arr {} {}", x, y);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_zip_iteration() {
+    let dir = temp_dir("zip-iteration");
+    let src = fixture(&dir, "zip_iteration.rs", ZIP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Zip over slice iterators and by-value arrays must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "1 10\n2 20\n3 30\ncollected 3\ncount 3\n1 10 100\n2 20 200\n3 30 300\nsum 66\narr 1 3\narr 2 4\n",
+        "pairs are yielded front-aligned up to the shorter side"
+    );
+}
+
+const ZIP_DOUBLE_ENDED_SRC: &str = r#"
+fn main() {
+    let a = [1, 2, 3, 4];
+    let b = [10, 20, 30];
+    let mut z = a.iter().zip(b.iter());
+    println!("hint {:?}", z.size_hint());
+    println!("back {:?}", z.next_back());
+    println!("next {:?}", z.next());
+    println!("back {:?}", z.next_back());
+    println!("back {:?}", z.next_back());
+    println!("len {}", a.iter().zip(b.iter()).len());
+    let mut z2 = std::iter::zip([1, 2, 3], [7, 8, 9, 10]);
+    println!("mix {:?}", z2.next_back());
+    println!("mix {:?}", z2.next());
+    println!("mix {:?}", z2.next_back());
+    println!("mix {:?}", z2.next());
+}
+"#;
+
+#[test]
+fn run_mode_zip_double_ended() {
+    let dir = temp_dir("zip-double-ended");
+    let src = fixture(&dir, "zip_double_ended.rs", ZIP_DOUBLE_ENDED_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Zip next_back with unequal lengths must run; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "hint (3, Some(3))\nback Some((3, 30))\nnext Some((1, 10))\nback Some((2, 20))\nback None\nlen 3\nmix Some((3, 9))\nmix Some((1, 7))\nmix Some((2, 8))\nmix None\n",
+        "the back step drops the longer side's unpaired excess first"
+    );
+}
