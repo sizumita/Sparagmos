@@ -204,6 +204,9 @@ struct Collected {
     /// (see `Converter::adt_instance_shapes`).
     adt_instance_shapes: sparagmos_mir::AdtInstanceShapes,
     adt_niches: sparagmos_mir::AdtNiches,
+    /// Materialisation plans for pointer-cast pointee types,
+    /// for the interpreter (see `Converter::mat_plans`).
+    mat_plans: std::collections::HashMap<String, sparagmos_interp::ir::MatPlan>,
     /// ADT instantiations whose drop glue the compiler certifies
     /// empty, for the interpreter (see `certify_drop_trivial`).
     drop_trivial_adts: std::collections::HashSet<String>,
@@ -5296,6 +5299,7 @@ fn collect() -> ControlFlow<()> {
         static_tys: conv.static_tys_mir.clone(),
         adt_instance_shapes: conv.adt_instance_shapes.clone(),
         adt_niches: conv.adt_niches.clone(),
+        mat_plans: conv.mat_plans.clone(),
         drop_trivial_adts,
         drop_no_impl_adts,
         dtor_bodies,
@@ -6146,6 +6150,7 @@ fn build_program(
     program.static_tys = c.static_tys.clone();
     program.adt_instance_shapes = c.adt_instance_shapes.clone();
     program.adt_niches = c.adt_niches.clone();
+    program.mat_plans = c.mat_plans.clone();
     program.drop_trivial_adts = c.drop_trivial_adts.clone();
     program.drop_no_impl_adts = c.drop_no_impl_adts.clone();
     program.dtor_bodies = c.dtor_bodies.clone();

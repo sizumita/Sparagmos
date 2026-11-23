@@ -181,6 +181,7 @@ fn build_with_table(
         static_tys: Default::default(),
         adt_instance_shapes: Default::default(),
         adt_niches: Default::default(),
+        mat_plans: Default::default(),
         source_files: Default::default(),
         drop_trivial_adts: Default::default(),
         drop_no_impl_adts: Default::default(),

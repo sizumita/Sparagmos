@@ -13,6 +13,10 @@
 //! - [`Value::Bytes`] is raw byte data: byte-array constants such as
 //!   the `&[u8; N]` pieces template that `core::fmt` passes to
 //!   `Arguments::new`.
+//! - [`Value::ErasedBlock`] is a type-erased constant allocation: the
+//!   bytes and provenance relocations of a constant whose reference
+//!   declares a zero-sized pointee, preserved exactly until a pointer
+//!   cast materialises the block into the cast target's type.
 //! - [`Value::Ref`] is a reference (or raw pointer) resolved at
 //!   creation time to the frame, local and constant projection it
 //!   points at. Frames carry unique ids so a reference stays valid
@@ -271,6 +275,19 @@ pub enum Value {
     Str(String),
     /// Raw bytes (byte-array constants, e.g. fmt pieces templates).
     Bytes(Vec<u8>),
+    /// A type-erased constant allocation, not yet materialised
+    /// into a type (see `crate::ir::Constant::ErasedAlloc`): the
+    /// block's bytes verbatim, plus the values its provenance
+    /// relocations decoded to. The block is the pointee's
+    /// identity - two references to the same constant block are
+    /// equal, as for [`RefTarget::Value`] snapshots - and the
+    /// only operation on it is materialisation by a pointer
+    /// cast (see `crate::ir::Rvalue::Materialize`); reading it
+    /// as any other kind of value is an explicit error.
+    ErasedBlock {
+        bytes: Vec<Option<u8>>,
+        relocs: Vec<(u32, Value)>,
+    },
     /// A reference or raw pointer.
     Ref(RefTarget),
     /// A fat pointer (slice reference): base + element count.
@@ -418,6 +435,7 @@ impl Value {
             Value::Tuple(_) => "tuple",
             Value::Str(_) => "string",
             Value::Bytes(_) => "bytes",
+            Value::ErasedBlock { .. } => "erased constant block",
             Value::Ref(_) => "reference",
             Value::FatRef { .. } => "slice reference",
             Value::DynRef { .. } => "dyn reference",
@@ -558,6 +576,9 @@ impl fmt::Display for Value {
             }
             Value::Str(s) => write!(f, "{s:?}"),
             Value::Bytes(b) => write!(f, "b\"{}\"", String::from_utf8_lossy(b)),
+            Value::ErasedBlock { bytes, .. } => {
+                write!(f, "<erased block ({} bytes)>", bytes.len())
+            }
             Value::Ref(target) => write!(f, "&({target})"),
             Value::FatRef { len, .. } => write!(f, "&[_; {len}]"),
             Value::DynRef { traits, .. } => {

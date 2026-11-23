@@ -160,6 +160,13 @@ pub struct MirProgram {
     /// `mir::AdtNiches`). Consulted when a transmute involves
     /// a niche-encoded enum such as `Option<NonZero<T>>`.
     pub adt_niches: mir::AdtNiches,
+    /// Materialisation plans for the pointee types of the
+    /// program's pointer casts, as recorded by the driver (see
+    /// `sparagmos_interp::ir::MatPlan`), keyed by the pointee
+    /// type's `Debug` rendering. Consulted when a pointer cast
+    /// is converted: a cast whose operand may be a type-erased
+    /// constant allocation becomes a materialising cast.
+    pub mat_plans: HashMap<String, ir::MatPlan>,
     /// The source-file table the bodies' source lines index into
     /// (see `mir::Body::source_lines`), as recorded by the driver.
     /// Handed to the interpreter program for the debugger
@@ -657,6 +664,7 @@ fn convert_all(
     let (mut out, mut failures) = convert_each(&conv, program, &keys);
     out.union_tables = conv.union_tables.clone();
     out.async_closure_captures = conv.async_closure_captures.clone();
+    out.mat_plans = conv.mat_table.clone();
     // Joint fixpoint of conversion, cleanliness and the
     // builtin-served set. Each round recomputes, from the merged
     // program so far:
@@ -1909,6 +1917,13 @@ struct Converter<'a> {
     /// a pure function of the program, so every conversion round
     /// computes the same table.
     async_closure_captures: HashMap<String, Vec<bool>>,
+    /// Materialisation plans of the program (see
+    /// [`MirProgram::mat_plans`]), interned in `Converter::new`
+    /// into `mat_table` in sorted-key order: every conversion
+    /// round interns the same table, so the indices baked into
+    /// converted casts agree across rounds.
+    mat_table_ids: HashMap<String, usize>,
+    mat_table: Vec<ir::MatPlan>,
 }
 
 impl<'a> Converter<'a> {
@@ -1978,9 +1993,12 @@ impl<'a> Converter<'a> {
             union_tables: Vec::new(),
             union_table_ids: Vec::new(),
             async_closure_captures: HashMap::new(),
+            mat_table_ids: HashMap::new(),
+            mat_table: Vec::new(),
         };
         conv.compute_union_tables(program);
         conv.compute_async_closure_captures(program);
+        conv.intern_mat_plans(program);
         conv
     }
 
@@ -2052,6 +2070,49 @@ impl<'a> Converter<'a> {
     /// an index step's the element). The closure is a pure
     /// function of the program, so every conversion round
     /// interns the same tables in the same order.
+    /// Intern the program's materialisation plans (see
+    /// [`MirProgram::mat_plans`]) in sorted-key order. The
+    /// interned set is a pure function of the program, so every
+    /// conversion round interns the same table in the same
+    /// order.
+    fn intern_mat_plans(&mut self, program: &MirProgram) {
+        let mut keys: Vec<&String> = program.mat_plans.keys().collect();
+        keys.sort();
+        for key in keys {
+            let idx = self.mat_table.len();
+            self.mat_table.push(program.mat_plans[key].clone());
+            self.mat_table_ids.insert(key.clone(), idx);
+        }
+    }
+
+    /// The materialisation plan index for a cast target type,
+    /// when the driver recorded a plan for its pointee and the
+    /// pointee is a type a materialised value can be read as
+    /// (not an unsized or `dyn` pointee, whose cast keeps the
+    /// metadata word instead).
+    fn mat_plan_index(&self, target: &mir::Ty) -> Option<usize> {
+        if std::env::var_os("NT_DISABLE_MAT").is_some() {
+            return None;
+        }
+        let pointee = ptr_pointee(target)?;
+        if matches!(
+            pointee,
+            mir::Ty::Slice(_) | mir::Ty::Str | mir::Ty::Dynamic(..)
+        ) || self.pointee_is_byte_string_dst(pointee)
+        {
+            return None;
+        }
+        // A zero-sized pointee: the cast is the identity. The
+        // erased block such a pointer denotes keeps its bytes
+        // for a later cast to a sized type; materialising it
+        // into the zero-sized type's value would discard them.
+        if let Some((0, _)) = self.ty_layout(pointee) {
+            return None;
+        }
+        let key = format!("{pointee:?}");
+        self.mat_table_ids.get(&key).copied()
+    }
+
     fn compute_union_tables(&mut self, program: &MirProgram) {
         let mut visited: Vec<mir::Ty> = Vec::new();
         let mut worklist: Vec<mir::Ty> = Vec::new();
@@ -4020,6 +4081,20 @@ impl<'a> Converter<'a> {
                 };
                 ir::Constant::Ref(Box::new(self.convert_const_value(inner, inner_ctx)?))
             }
+            mir::ConstValue::ErasedAlloc { bytes, relocs } => {
+                // The block's relocations are reference values in
+                // their own right (a nested block, a function
+                // value, an address); each converts with no type
+                // context, exactly as the driver decoded it.
+                let mut converted = Vec::with_capacity(relocs.len());
+                for (off, value) in relocs {
+                    converted.push((*off, self.convert_const_value(value, None)?));
+                }
+                ir::Constant::ErasedAlloc {
+                    bytes: bytes.clone(),
+                    relocs: converted,
+                }
+            }
             mir::ConstValue::StaticRef {
                 def,
                 value,
@@ -5408,6 +5483,16 @@ let inner = match (&src, target) {
             if let Some(from) = self.transmute_units_from(src.as_ref(), target) {
                 return ir::Rvalue::PtrCastUnits(op.clone(), from);
             }
+            // A pointer-carrying transmute whose target pointee
+            // has a recorded materialisation plan (and whose
+            // denomination the units rewrite above does not
+            // change): a type-erased constant allocation operand
+            // materialises into the target type, exactly as for
+            // the `PtrToPtr` cast conversion. Every other operand
+            // keeps the identity the arms above decided.
+            if let Some(idx) = self.mat_plan_index(target) {
+                return ir::Rvalue::Materialize(op.clone(), idx);
+            }
         }
         inner
     }
@@ -6580,7 +6665,18 @@ let inner = match (&src, target) {
                                 mir::Ty::Slice(_) | mir::Ty::Str | mir::Ty::Dynamic(..)
                             ) && !self.pointee_is_byte_string_dst(p)
                         }) {
-                            ir::Rvalue::DataPtr(v)
+                            // A cast to a pointee type with a
+                            // recorded materialisation plan: a
+                            // type-erased constant allocation
+                            // operand materialises into the
+                            // target type; every other operand
+                            // keeps the `DataPtr` behaviour.
+                            match self.mat_plan_index(target) {
+                                Some(idx) => ir::Rvalue::Materialize(v, idx),
+                                None => ir::Rvalue::DataPtr(v),
+                            }
+                        } else if let Some(idx) = self.mat_plan_index(target) {
+                            ir::Rvalue::Materialize(v, idx)
                         } else {
                             ir::Rvalue::Use(v)
                         }

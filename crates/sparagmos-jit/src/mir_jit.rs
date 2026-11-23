@@ -3917,6 +3917,9 @@ impl<'a> FnLower<'a> {
             mir::ConstValue::ByRef { .. } => {
                 return Err(self.err("by-reference constant"));
             }
+            mir::ConstValue::ErasedAlloc { .. } => {
+                return Err(self.err("erased-allocation constant"));
+            }
             mir::ConstValue::IntPtr(_) => {
                 return Err(self.err("address pointer constant"));
             }
