@@ -1787,6 +1787,32 @@ pub enum FloatOp {
     Max,
     ToBits,
     FromBits,
+    Exp,
+    Exp2,
+    ExpM1,
+    Ln,
+    Ln1p,
+    Log,
+    Log2,
+    Log10,
+    Sin,
+    Cos,
+    Tan,
+    Asin,
+    Acos,
+    Atan,
+    Atan2,
+    SinCos,
+    Sinh,
+    Cosh,
+    Tanh,
+    Asinh,
+    Acosh,
+    Atanh,
+    Cbrt,
+    Hypot,
+    MulAdd,
+    DivEuclid,
 }
 
 /// One integer bit intrinsic operation, selected by the
@@ -3402,8 +3428,7 @@ pub fn lookup_qualified(canonical: &str) -> Option<Builtin> {
 /// ...) to its builtin. The methods live partly in `core` and partly
 /// in `std`; both prefixes name the same inherent impls, so either is
 /// accepted for every modelled method. A float method this registry
-/// does not model (e.g. `sin_cos`, which returns a tuple) stays an
-/// explicit unsupported call.
+/// does not model stays an explicit unsupported call.
 fn float_method(canonical: &str) -> Option<Builtin> {
     if let Some(rest) = canonical
         .strip_prefix("core::f128::<impl f128>::")
@@ -3459,6 +3484,32 @@ fn float_method_named(method: &str) -> Option<FloatOp> {
         "powf" => O::Powf,
         "min" => O::Min,
         "max" => O::Max,
+        "exp" => O::Exp,
+        "exp2" => O::Exp2,
+        "exp_m1" => O::ExpM1,
+        "ln" => O::Ln,
+        "ln_1p" => O::Ln1p,
+        "log" => O::Log,
+        "log2" => O::Log2,
+        "log10" => O::Log10,
+        "sin" => O::Sin,
+        "cos" => O::Cos,
+        "tan" => O::Tan,
+        "asin" => O::Asin,
+        "acos" => O::Acos,
+        "atan" => O::Atan,
+        "atan2" => O::Atan2,
+        "sin_cos" => O::SinCos,
+        "sinh" => O::Sinh,
+        "cosh" => O::Cosh,
+        "tanh" => O::Tanh,
+        "asinh" => O::Asinh,
+        "acosh" => O::Acosh,
+        "atanh" => O::Atanh,
+        "cbrt" => O::Cbrt,
+        "hypot" => O::Hypot,
+        "mul_add" => O::MulAdd,
+        "div_euclid" => O::DivEuclid,
         "to_bits" => O::ToBits,
         "from_bits" => O::FromBits,
         _ => return None,
@@ -3581,7 +3632,35 @@ fn exec_float128_method(
         }
         O::Min => Value::Float128(f128::min(x, as_bits(&vals[1])?)),
         O::Max => Value::Float128(f128::max(x, as_bits(&vals[1])?)),
-        O::Powf | O::ToDegrees | O::ToRadians => {
+        O::Exp
+        | O::Exp2
+        | O::ExpM1
+        | O::Ln
+        | O::Ln1p
+        | O::Log
+        | O::Log2
+        | O::Log10
+        | O::Sin
+        | O::Cos
+        | O::Tan
+        | O::Asin
+        | O::Acos
+        | O::Atan
+        | O::Atan2
+        | O::SinCos
+        | O::Sinh
+        | O::Cosh
+        | O::Tanh
+        | O::Asinh
+        | O::Acosh
+        | O::Atanh
+        | O::Cbrt
+        | O::Hypot
+        | O::MulAdd
+        | O::DivEuclid
+        | O::Powf
+        | O::ToDegrees
+        | O::ToRadians => {
             return Err(unsupported(format!(
                 "f128 method {name} is not runtime-supported"
             )));
@@ -3637,10 +3716,17 @@ fn exec_float16_method(
         };
         return Ok(Value::Float(f16_bits_to_f64(bits as u16)));
     }
-    arity(if matches!(op, O::Powi | O::Powf | O::Min | O::Max) {
-        2
-    } else {
-        1
+    arity(match op {
+        O::MulAdd => 3,
+        O::Powi
+        | O::Powf
+        | O::Min
+        | O::Max
+        | O::Log
+        | O::Atan2
+        | O::Hypot
+        | O::DivEuclid => 2,
+        _ => 1,
     })?;
     let x = as_float(&vals[0])?;
     let round = |r: f64| Value::Float(f16_bits_to_f64(f64_to_f16_bits(r)));
@@ -3660,6 +3746,35 @@ fn exec_float16_method(
         O::Fract => round(x.fract()),
         O::Recip => round(x.recip()),
         O::Signum => round(x.signum()),
+        O::Exp => round(x.exp()),
+        O::Exp2 => round(x.exp2()),
+        O::ExpM1 => round(x.exp_m1()),
+        O::Ln => round(x.ln()),
+        O::Ln1p => round(x.ln_1p()),
+        O::Log2 => round(x.log2()),
+        O::Log10 => round(x.log10()),
+        O::Sin => round(x.sin()),
+        O::Cos => round(x.cos()),
+        O::Tan => round(x.tan()),
+        O::Asin => round(x.asin()),
+        O::Acos => round(x.acos()),
+        O::Atan => round(x.atan()),
+        O::Sinh => round(x.sinh()),
+        O::Cosh => round(x.cosh()),
+        O::Tanh => round(x.tanh()),
+        O::Asinh => round(x.asinh()),
+        O::Acosh => round(x.acosh()),
+        O::Atanh => round(x.atanh()),
+        O::Cbrt => round(x.cbrt()),
+        O::SinCos => {
+            let (s, c) = x.sin_cos();
+            Value::Tuple(vec![round(s), round(c)])
+        }
+        O::Log => round(x.log(as_float(&vals[1])?)),
+        O::Atan2 => round(x.atan2(as_float(&vals[1])?)),
+        O::Hypot => round(x.hypot(as_float(&vals[1])?)),
+        O::DivEuclid => round(x.div_euclid(as_float(&vals[1])?)),
+        O::MulAdd => round(x.mul_add(as_float(&vals[1])?, as_float(&vals[2])?)),
         O::ToDegrees => round(x.to_degrees()),
         O::ToRadians => round(x.to_radians()),
         O::ToBits => Value::Uint(f64_to_f16_bits(x) as u128),
@@ -3739,10 +3854,17 @@ fn exec_float_method(
             f64::from_bits(bits as u64)
         }));
     }
-    arity(if matches!(op, O::Powi | O::Powf | O::Min | O::Max) {
-        2
-    } else {
-        1
+    arity(match op {
+        O::MulAdd => 3,
+        O::Powi
+        | O::Powf
+        | O::Min
+        | O::Max
+        | O::Log
+        | O::Atan2
+        | O::Hypot
+        | O::DivEuclid => 2,
+        _ => 1,
     })?;
     let x = as_float(&vals[0])?;
     macro_rules! unary {
@@ -3781,6 +3903,76 @@ fn exec_float_method(
         O::Signum => Value::Float(unary!(signum)),
         O::ToDegrees => Value::Float(unary!(to_degrees)),
         O::ToRadians => Value::Float(unary!(to_radians)),
+        O::Exp => Value::Float(unary!(exp)),
+        O::Exp2 => Value::Float(unary!(exp2)),
+        O::ExpM1 => Value::Float(unary!(exp_m1)),
+        O::Ln => Value::Float(unary!(ln)),
+        O::Ln1p => Value::Float(unary!(ln_1p)),
+        O::Log2 => Value::Float(unary!(log2)),
+        O::Log10 => Value::Float(unary!(log10)),
+        O::Sin => Value::Float(unary!(sin)),
+        O::Cos => Value::Float(unary!(cos)),
+        O::Tan => Value::Float(unary!(tan)),
+        O::Asin => Value::Float(unary!(asin)),
+        O::Acos => Value::Float(unary!(acos)),
+        O::Atan => Value::Float(unary!(atan)),
+        O::Sinh => Value::Float(unary!(sinh)),
+        O::Cosh => Value::Float(unary!(cosh)),
+        O::Tanh => Value::Float(unary!(tanh)),
+        O::Asinh => Value::Float(unary!(asinh)),
+        O::Acosh => Value::Float(unary!(acosh)),
+        O::Atanh => Value::Float(unary!(atanh)),
+        O::Cbrt => Value::Float(unary!(cbrt)),
+        O::SinCos => {
+            let (s, c) = if f32_width {
+                let (s, c) = (x as f32).sin_cos();
+                (s as f64, c as f64)
+            } else {
+                x.sin_cos()
+            };
+            Value::Tuple(vec![Value::Float(s), Value::Float(c)])
+        }
+        O::Log => {
+            let y = as_float(&vals[1])?;
+            Value::Float(if f32_width {
+                (x as f32).log(y as f32) as f64
+            } else {
+                x.log(y)
+            })
+        }
+        O::Atan2 => {
+            let y = as_float(&vals[1])?;
+            Value::Float(if f32_width {
+                (x as f32).atan2(y as f32) as f64
+            } else {
+                x.atan2(y)
+            })
+        }
+        O::Hypot => {
+            let y = as_float(&vals[1])?;
+            Value::Float(if f32_width {
+                (x as f32).hypot(y as f32) as f64
+            } else {
+                x.hypot(y)
+            })
+        }
+        O::DivEuclid => {
+            let y = as_float(&vals[1])?;
+            Value::Float(if f32_width {
+                (x as f32).div_euclid(y as f32) as f64
+            } else {
+                x.div_euclid(y)
+            })
+        }
+        O::MulAdd => {
+            let a = as_float(&vals[1])?;
+            let b = as_float(&vals[2])?;
+            Value::Float(if f32_width {
+                (x as f32).mul_add(a as f32, b as f32) as f64
+            } else {
+                x.mul_add(a, b)
+            })
+        }
         O::ToBits => Value::Uint(if f32_width {
             (x as f32).to_bits() as u128
         } else {

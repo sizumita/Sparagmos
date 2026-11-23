@@ -7283,10 +7283,26 @@ impl<'a> FnLower<'a> {
                         | builtins::FloatOp::Powf
                         | builtins::FloatOp::Min
                         | builtins::FloatOp::Max
+                        | builtins::FloatOp::Log
+                        | builtins::FloatOp::Atan2
+                        | builtins::FloatOp::Hypot
+                        | builtins::FloatOp::DivEuclid
                 );
-                if args.len() != if binary { 2 } else { 1 } {
+                let arity = if op == builtins::FloatOp::MulAdd {
+                    3
+                } else if binary {
+                    2
+                } else {
+                    1
+                };
+                if args.len() != arity {
                     return Err(self.err("float method with wrong arity"));
                 }
+                let z = if op == builtins::FloatOp::MulAdd {
+                    IrOperand::Value(self.operand_value(&args[2], &float_ty)?)
+                } else {
+                    IrOperand::Const(0)
+                };
                 let (x, y) = if op == builtins::FloatOp::FromBits {
                     let bits_ty = if is32 {
                         mir::Ty::Uint(mir::UintTy::U32)
@@ -7299,7 +7315,7 @@ impl<'a> FnLower<'a> {
                     )
                 } else {
                     let recv = self.operand_value(&args[0], &float_ty)?;
-                    let y = if binary {
+                    let y = if binary || op == builtins::FloatOp::MulAdd {
                         let y_ty = if op == builtins::FloatOp::Powi {
                             mir::Ty::Int(mir::IntTy::I32)
                         } else {
@@ -7312,18 +7328,27 @@ impl<'a> FnLower<'a> {
                     (recv, y)
                 };
                 let (dst_loc, dst, count) = self.builtin_destination(destination)?;
-                if count != 1 {
-                    return Err(self.err("float method destination is not one word"));
-                }
+                let second = if op == builtins::FloatOp::SinCos {
+                    if count != 2 {
+                        return Err(self.err("sin_cos destination is not two words"));
+                    }
+                    Some(dst + 1)
+                } else {
+                    if count != 1 {
+                        return Err(self.err("float method destination is not one word"));
+                    }
+                    None
+                };
                 self.emit_host_call(
                     builtins::HOST_FLOAT_METHOD,
                     dst,
-                    None,
+                    second,
                     vec![
                         IrOperand::Value(x),
                         y,
                         IrOperand::Const(op.code() as i64),
                         IrOperand::Const(is32 as i64),
+                        z,
                     ],
                 );
                 self.finish_builtin_call(&dst_loc, dst, target, true);
