@@ -7632,10 +7632,11 @@ impl<'a> Interpreter<'a> {
                     || target.starts_with("std::sync::Arc<"))
                     && (source.starts_with("std::vec::Vec<")
                         || source.starts_with("&[")
-                        || source.starts_with("&mut ["))
+                        || source.starts_with("&mut [")
+                        || source.starts_with('['))
                 {
-                    // `Rc<[T]>: From<Vec<T>>` / `From<&[T]>` (and
-                    // the `Arc` twins): a fresh counted handle
+                    // `Rc<[T]>: From<Vec<T>>` / `From<&[T]>` /
+                    // `From<[T; N]>` (and the `Arc` twins): a fresh counted handle
                     // over the element sequence. The slice
                     // pointee lives in the allocation store as
                     // the element tuple, the shape every slice
@@ -16857,12 +16858,18 @@ fn value_fingerprint(value: &Value) -> u64 {
     /// Execute `Iterator::collect` / `FromIterator::from_iter`:
     /// drain the modelled `next` state transition into the
     /// collection the call's target generic names. The value
-    /// model has a native shape for two targets: a `Vec` is its
-    /// element list, and a `String` is accumulated text (chars
-    /// arrive as code-point integers, string items as string
-    /// values or references to them). Every other target is
-    /// named in an explicit unsupported error rather than
-    /// approximated.
+    /// model has a native shape for each supported target: a
+    /// `Vec` is its element list, a `String` is accumulated text
+    /// (chars arrive as code-point integers, string items as
+    /// string values or references to them), a boxed slice is a
+    /// box over the element tuple and a boxed `str` a box over
+    /// the accumulated text (the shapes `Vec::into_boxed_slice`
+    /// and `String::into_boxed_str` build), an `Rc` / `Arc`
+    /// slice is a fresh counted handle over the element tuple
+    /// (the shape the counted-slice `From` model builds), and a
+    /// `VecDeque` is the aggregate `vec_deque_from_value`
+    /// assembles. Every other target is named in an explicit
+    /// unsupported error rather than approximated.
     fn exec_collect(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -16888,38 +16895,89 @@ fn value_fingerprint(value: &Value) -> u64 {
             });
         }
         if target == "std::string::String" || target == "alloc::string::String" {
-            let mut out = String::new();
-            for item in items {
-                match item {
-                    Value::Uint(cp) => {
-                        let c = char::from_u32(cp as u32).ok_or_else(|| {
-                            InterpError::type_mismatch(
-                                "collect into String",
-                                "valid char code point",
-                                format!("{cp}"),
-                            )
-                        })?;
-                        out.push(c);
-                    }
-                    Value::Str(s) => out.push_str(&s),
-                    Value::Ref(_) => {
-                        let s = self.resolve_string(frames, &item)?;
-                        out.push_str(&s);
-                    }
-                    other => {
-                        return Err(InterpError::type_mismatch(
-                            "collect into String",
-                            "char or string item",
-                            other.kind_name(),
-                        ));
-                    }
-                }
-            }
+            let out = self.collect_items_to_string(frames, items, "collect into String")?;
             return Ok(Value::Str(out));
+        }
+        if target.starts_with("std::boxed::Box<") || target.starts_with("alloc::boxed::Box<") {
+            let Some(first) = first_generic_arg(target) else {
+                return Err(unsupported(format!(
+                    "collect into {target} is not runtime-supported"
+                )));
+            };
+            if first == "str" {
+                let out = self.collect_items_to_string(frames, items, "collect into Box<str>")?;
+                let boxed = self.new_box(Value::Str(out));
+                self.record_box_ty(&boxed, Ty::Str);
+                return Ok(boxed);
+            }
+            if first.starts_with('[') {
+                let boxed = self.new_box(Value::Tuple(items));
+                if let Some(ty) = ty_from_tag(first) {
+                    self.record_box_ty(&boxed, ty);
+                }
+                return Ok(boxed);
+            }
+        }
+        if (target.starts_with("std::rc::Rc<")
+            || target.starts_with("alloc::rc::Rc<")
+            || target.starts_with("std::sync::Arc<")
+            || target.starts_with("alloc::sync::Arc<"))
+            && first_generic_arg(target).is_some_and(|first| first.starts_with('['))
+        {
+            return Ok(self.rc_new_handle(Value::Tuple(items)));
+        }
+        if target.starts_with("std::collections::VecDeque<") {
+            return self.vec_deque_from_value(
+                frames,
+                Value::Enum {
+                    variant: 0,
+                    fields: items,
+                },
+            );
         }
         Err(unsupported(format!(
             "collect into {target} is not runtime-supported"
         )))
+    }
+
+    /// Accumulate collected items into text, the way the
+    /// `String` (and boxed-`str`) `FromIterator` impls do: char
+    /// items arrive as code-point integers, string items as
+    /// string values or references to them.
+    fn collect_items_to_string(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        items: Vec<Value>,
+        context: &str,
+    ) -> InterpResult<String> {
+        let mut out = String::new();
+        for item in items {
+            match item {
+                Value::Uint(cp) => {
+                    let c = char::from_u32(cp as u32).ok_or_else(|| {
+                        InterpError::type_mismatch(
+                            context,
+                            "valid char code point",
+                            format!("{cp}"),
+                        )
+                    })?;
+                    out.push(c);
+                }
+                Value::Str(s) => out.push_str(&s),
+                Value::Ref(_) => {
+                    let s = self.resolve_string(frames, &item)?;
+                    out.push_str(&s);
+                }
+                other => {
+                    return Err(InterpError::type_mismatch(
+                        context,
+                        "char or string item",
+                        other.kind_name(),
+                    ));
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Execute `Iterator::fold` / `Iterator::for_each`: drive
