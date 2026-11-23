@@ -10830,29 +10830,11 @@ impl<'a> Interpreter<'a> {
     /// pointers denote no field and pass through unchanged.
     pub(crate) fn ptr_field_value(
         &self,
-        frames: &mut Vec<Frame>,
+        frames: &[Frame],
         body: &Body,
         value: Value,
         depth: u32,
     ) -> InterpResult<Value> {
-        // A wrapper-entry cast over an array / slice of wrappers
-        // (`*const [MaybeUninit<T>]` to `*const [T]`, what
-        // `assume_init_ref` performs) enters every element's
-        // wrapper, not the first element's alone: when the
-        // pointer denotes the elements' own storage (the array
-        // value, a tuple of one-field wrapper values), the entry
-        // rewrites the elements in place and the pointer itself
-        // is unchanged -- the same in-place convention
-        // `rewrite_slice_elems` applies. A pointer whose base
-        // denotes one entered element (the sub-slice / offset
-        // form) keeps the field-0 entry on the base below.
-        if depth > 0 {
-            if let Some(unchanged) =
-                self.ptr_field_rewrite_array_elems(frames, &value, depth)?
-            {
-                return Ok(unchanged);
-            }
-        }
         match value {
             Value::Ref(RefTarget::Place {
                 frame,
@@ -10930,106 +10912,6 @@ impl<'a> Interpreter<'a> {
         }
     }
 
-    /// The in-place element rewrite a wrapper-entry pointer
-    /// cast over an array / slice of wrappers denotes (see
-    /// [`Self::ptr_field_value`]): `Some` (the pointer,
-    /// unchanged) when the pointer denotes the elements' own
-    /// storage and every spanned element holds the wrapper
-    /// form; `None` when the cast is not of that shape.
-    fn ptr_field_rewrite_array_elems(
-        &self,
-        frames: &mut Vec<Frame>,
-        value: &Value,
-        depth: u32,
-    ) -> InterpResult<Option<Value>> {
-        let (resolved, count) = match value {
-            Value::FatRef { base, len } => {
-                let Ok(count) = usize::try_from(*len) else {
-                    return Ok(None);
-                };
-                (self.deref_value(frames, base)?, count)
-            }
-            Value::Ref(_) => {
-                let resolved = self.deref_value(frames, value)?;
-                let count = match self.read_resolved(frames, &resolved) {
-                    Ok(v) => match v.len() {
-                        Some(n) => match usize::try_from(n) {
-                            Ok(n) => n,
-                            Err(_) => return Ok(None),
-                        },
-                        None => return Ok(None),
-                    },
-                    Err(_) => return Ok(None),
-                };
-                (resolved, count)
-            }
-            _ => return Ok(None),
-        };
-        if count == 0 || matches!(resolved, Resolved::Value(..)) {
-            return Ok(None);
-        }
-        let pointee = match self.read_resolved(frames, &resolved) {
-            Ok(v) => v,
-            Err(_) => return Ok(None),
-        };
-        let Value::Tuple(items) = &pointee else {
-            return Ok(None);
-        };
-        if items.len() < count {
-            return Ok(None);
-        }
-        // Every spanned element must hold the wrapper form (a
-        // one-field aggregate, or an uninitialised slot, which
-        // has no representation to change); anything else means
-        // the pointer does not denote an array of wrappers and
-        // the field-0 entry on the base decides, as before.
-        let mut unwrapped: Vec<Value> = Vec::with_capacity(count);
-        for item in &items[..count] {
-            let mut elem = item.clone();
-            for _ in 0..depth {
-                match elem {
-                    Value::Enum { fields, .. } if fields.len() == 1 => {
-                        elem = fields.into_iter().next().expect("one field");
-                    }
-                    Value::Uninit => break,
-                    _ => return Ok(None),
-                }
-            }
-            unwrapped.push(elem);
-        }
-        for (i, new) in unwrapped.into_iter().enumerate() {
-            if new == items[i] {
-                continue;
-            }
-            let mut projection = match &resolved {
-                Resolved::Place { projection, .. }
-                | Resolved::Static { projection, .. }
-                | Resolved::Alloc { projection, .. } => projection.clone(),
-                Resolved::Value(..) => unreachable!("excluded above"),
-            };
-            projection.push(RefProj::Index(i));
-            let target = match &resolved {
-                Resolved::Place {
-                    frame_pos, local, ..
-                } => Resolved::Place {
-                    frame_pos: *frame_pos,
-                    local: *local,
-                    projection,
-                },
-                Resolved::Static { name, .. } => Resolved::Static {
-                    name: name.clone(),
-                    projection,
-                },
-                Resolved::Alloc { id, .. } => Resolved::Alloc {
-                    id: *id,
-                    projection,
-                },
-                Resolved::Value(..) => unreachable!("excluded above"),
-            };
-            self.write_resolved(frames, &target, new)?;
-        }
-        Ok(Some(value.clone()))
-    }
 
     /// The pointer an array / slice / `str` to element cast
     /// produces (see [`Rvalue::PtrFirstElem`]): the operand pointer
