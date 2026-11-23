@@ -2785,6 +2785,201 @@ fn run_mode_vec_with_capacity_push_and_reserve() {
 }
 
 
+const VEC_RESIZE_GROW_SRC: &str = r#"
+fn main() {
+    let mut v = vec![1, 2, 3];
+    v.resize(6, 9);
+    println!("{:?} len={} cap={}", v, v.len(), v.capacity());
+    let mut w: Vec<i32> = Vec::new();
+    w.resize(4, 7);
+    println!("{:?} len={} cap={}", w, w.len(), w.capacity());
+}
+"#;
+
+#[test]
+fn run_mode_vec_resize_grows_with_fill() {
+    // `Vec::resize` growth runs through `extend_with`, whose
+    // `SetLenOnDrop` guard holds a `&mut` to the vector's length
+    // slot and writes the filled length back through it on drop:
+    // the write must land on the vector itself (it used to fail
+    // with "expected mutable place, found constant aggregate"
+    // because the length-slot reference denoted a detached value).
+    let dir = temp_dir("vecresizegrow");
+    let src = fixture(&dir, "vecresizegrow.rs", VEC_RESIZE_GROW_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "vec resize growth must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[1, 2, 3, 9, 9, 9] len=6 cap=6\n[7, 7, 7, 7] len=4 cap=4\n",
+        "grown vectors hold the fill values with native len/cap"
+    );
+}
+
+const VEC_RESIZE_REGROW_SRC: &str = r#"
+fn main() {
+    let mut v = vec![1, 2, 3, 4, 5];
+    v.resize(2, 0);
+    println!("{:?} len={} cap={}", v, v.len(), v.capacity());
+    v.resize(3, 42);
+    println!("{:?} len={} cap={}", v, v.len(), v.capacity());
+}
+"#;
+
+#[test]
+fn run_mode_vec_resize_regrows_within_capacity() {
+    // Shrinking then growing back inside the reserved capacity
+    // takes the same length-slot write path with no reservation
+    // in between: the regrown slot is filled, the length and the
+    // (unchanged) capacity answer natively.
+    let dir = temp_dir("vecresizeregrow");
+    let src = fixture(&dir, "vecresizeregrow.rs", VEC_RESIZE_REGROW_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "shrink-then-regrow must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[1, 2] len=2 cap=5\n[1, 2, 42] len=3 cap=5\n",
+        "regrowth within capacity fills and reports natively"
+    );
+}
+
+const VEC_RESIZE_PAYLOAD_SRC: &str = r#"
+#[derive(Debug, Clone)]
+struct P {
+    a: i32,
+    b: i32,
+}
+fn main() {
+    let mut s = vec!["a".to_string()];
+    s.resize(4, "x".to_string());
+    println!("{:?} len={}", s, s.len());
+    let mut p = vec![P { a: 1, b: 2 }];
+    p.resize(3, P { a: 7, b: 8 });
+    println!("{:?} len={}", p, p.len());
+}
+"#;
+
+#[test]
+fn run_mode_vec_resize_grows_clone_payloads() {
+    // The fill value is cloned per new slot: heap (`String`) and
+    // aggregate (struct) payloads grow through the same path and
+    // read back exactly.
+    let dir = temp_dir("vecresizepayload");
+    let src = fixture(&dir, "vecresizepayload.rs", VEC_RESIZE_PAYLOAD_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "resize of payload vectors must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[\"a\", \"x\", \"x\", \"x\"] len=4\n[P { a: 1, b: 2 }, P { a: 7, b: 8 }, P { a: 7, b: 8 }] len=3\n",
+        "cloned fill payloads read back exactly"
+    );
+}
+
+const VEC_RESIZE_PANIC_SRC: &str = r#"
+use std::sync::atomic::{AtomicUsize, Ordering};
+static CLONES: AtomicUsize = AtomicUsize::new(0);
+#[derive(Debug)]
+struct Bomb(i32);
+impl Clone for Bomb {
+    fn clone(&self) -> Self {
+        let n = CLONES.fetch_add(1, Ordering::SeqCst);
+        if n >= 1 {
+            panic!("clone boom");
+        }
+        Bomb(self.0)
+    }
+}
+impl Drop for Bomb {
+    fn drop(&mut self) {
+        println!("drop {}", self.0);
+    }
+}
+fn main() {
+    let mut v = vec![Bomb(1)];
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        v.resize(5, Bomb(9));
+    }));
+    println!("caught={} len={}", r.is_err(), v.len());
+    println!(
+        "vals: {}",
+        v.iter().map(|b| b.0.to_string()).collect::<Vec<_>>().join(",")
+    );
+}
+"#;
+
+#[test]
+fn run_mode_vec_resize_clone_panic_sets_partial_len() {
+    // When a fill clone panics mid-growth, the `SetLenOnDrop`
+    // guard still runs during the unwind and publishes the
+    // partial length: the elements written so far stay in the
+    // vector (and drop at scope end), the unwritten slots do
+    // not appear.
+    let dir = temp_dir("vecresizepanic");
+    let src = fixture(&dir, "vecresizepanic.rs", VEC_RESIZE_PANIC_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a caught clone panic must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "drop 9\ncaught=true len=2\nvals: 1,9\ndrop 1\ndrop 9\n",
+        "the guard publishes the partial length on unwind"
+    );
+}
+
+const VEC_RESIZE_SPARE_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<i32> = Vec::with_capacity(100);
+    v.push(1);
+    v.push(2);
+    v.resize(50, 7);
+    println!("len={} cap={} sum={}", v.len(), v.capacity(), v.iter().sum::<i32>());
+    v.resize(10, 0);
+    println!("len={} cap={}", v.len(), v.capacity());
+    v.resize(60, 3);
+    println!("len={} cap={} sum={}", v.len(), v.capacity(), v.iter().sum::<i32>());
+}
+"#;
+
+#[test]
+fn run_mode_vec_resize_uses_spare_capacity() {
+    // Growth into a large spare capacity, a shrink, and a
+    // regrowth past the previous length all stay inside the
+    // original allocation: capacity never moves and the sums
+    // cover exactly the declared elements.
+    let dir = temp_dir("vecresizespare");
+    let src = fixture(&dir, "vecresizespare.rs", VEC_RESIZE_SPARE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "resize within spare capacity must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "len=50 cap=100 sum=339\nlen=10 cap=100\nlen=60 cap=100 sum=209\n",
+        "spare-capacity growth/shrink/regrowth answers natively"
+    );
+}
+
 const VEC_HUGE_CAPACITY_SRC: &str = r#"
 fn main() {
     let n: usize = (1 << 22) + 5;
