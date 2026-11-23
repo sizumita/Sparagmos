@@ -15811,6 +15811,45 @@ fn value_fingerprint(value: &Value) -> u64 {
                 });
             }
         }
+        // The same denotation for a `String` whose vector is
+        // in its element form. Unlike the aggregate loop
+        // above this never decides against a side that yields
+        // no string: two element-form values (an `OsString`
+        // has the same shape) keep the structural comparison
+        // below unless both sides yield their bytes.
+        for (side, other) in [(&*a, &*b), (&*b, &*a)] {
+            let text = match side {
+                Value::Enum {
+                    variant: 0,
+                    fields,
+                } if fields.len() == 1 => {
+                    self.string_from_element_form(&fields[0])
+                }
+                _ => None,
+            };
+            if let Some(text) = text {
+                match other {
+                    Value::Str(y) => return Ok(text == *y),
+                    Value::Bytes(y) => {
+                        return Ok(text.as_bytes() == y.as_slice())
+                    }
+                    Value::Enum {
+                        variant: 0,
+                        fields,
+                    } if fields.len() == 1 => {
+                        if let Some(other_text) =
+                            self.string_from_real_aggregate(frames, other)?
+                                .or_else(|| {
+                                    self.string_from_element_form(&fields[0])
+                                })
+                        {
+                            return Ok(text == other_text);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         Ok(match (&*a, &*b) {
             (Value::Ref(RefTarget::Null), Value::Ref(RefTarget::Null)) => true,
             // Address-only pointers compare by address; address 0
@@ -16009,7 +16048,24 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         // `string_from_real_aggregate`): against a string side
         // it orders as that string.
         for (side, other, flip) in [(&*a, &*b, false), (&*b, &*a, true)] {
-            if let Some(text) = self.string_from_real_aggregate(frames, side)? {
+            // The element form of the same value (the shape
+            // the return-boundary translation produces) reads
+            // the same way, but only against a string side:
+            // the shortcut never decides a comparison between
+            // two aggregate-shaped values.
+            let text = match self.string_from_real_aggregate(frames, side)? {
+                Some(text) => Some(text),
+                None => match side {
+                    Value::Enum {
+                        variant: 0,
+                        fields,
+                    } if fields.len() == 1 => {
+                        self.string_from_element_form(&fields[0])
+                    }
+                    _ => None,
+                },
+            };
+            if let Some(text) = text {
                 let ord = match other {
                     Value::Str(y) => text.as_bytes().cmp(y.as_bytes()),
                     Value::Bytes(y) => text.as_bytes().cmp(y.as_slice()),
@@ -17891,6 +17947,25 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                 if let Some(text) = self.string_from_real_aggregate(frames, other)? {
                     return Ok(text);
                 }
+                // The vector may equally arrive in its element
+                // form (the shape the return-boundary
+                // translation produces). This coercion is only
+                // reached where a string is expected, so the
+                // shape is read as the string it denotes; the
+                // shape-sniffing comparisons use
+                // `string_from_real_aggregate` alone and are
+                // unaffected.
+                if let Value::Enum {
+                    variant: 0,
+                    fields,
+                } = other
+                {
+                    if fields.len() == 1 {
+                        if let Some(text) = self.string_from_element_form(&fields[0]) {
+                            return Ok(text);
+                        }
+                    }
+                }
                 Err(InterpError::type_mismatch(
                     "string argument",
                     "string data",
@@ -17908,7 +17983,14 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
     /// `None`.
     fn string_from_element_form(&self, vec: &Value) -> Option<String> {
         let (elems, len): (&[Value], usize) = match vec {
-            Value::Enum { fields, .. } => (fields, fields.len()),
+            // A vector is a struct: its value carries variant
+            // 0. (A one-field wrapper around an empty or
+            // small aggregate of any other variant — an
+            // `Option` payload, say — has a similar outline
+            // and is not a byte vector.)
+            Value::Enum {
+                variant: 0, fields, ..
+            } => (fields, fields.len()),
             Value::SparseVec { elems, len } => {
                 (elems, usize::try_from(*len).ok()?)
             }
@@ -17954,11 +18036,7 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
             return Ok(None);
         }
         let Some((buf, len)) = vec_real_aggregate_parts(&fields[0]) else {
-            // The vector may equally arrive in its element
-            // form (the shape the return-boundary translation
-            // produces): its elements are the string's bytes
-            // directly.
-            return Ok(self.string_from_element_form(&fields[0]));
+            return Ok(None);
         };
         if len == 0 {
             return Ok(Some(String::new()));
@@ -24259,8 +24337,19 @@ impl<'a> Interpreter<'a> {
         if matches!(trait_, FmtTrait::Display | FmtTrait::Debug) {
             let plain = pointee_tag(ty);
             if plain == "std::string::String" || plain == "alloc::string::String" {
-                if let Value::Enum { .. } = value {
-                    if let Some(text) = self.string_from_real_aggregate(frames, value)? {
+                if let Value::Enum {
+                    variant: 0,
+                    fields,
+                } = value
+                {
+                    let text = match self.string_from_real_aggregate(frames, value)? {
+                        Some(text) => Some(text),
+                        None => match fields.first() {
+                            Some(vec) => self.string_from_element_form(vec),
+                            None => None,
+                        },
+                    };
+                    if let Some(text) = text {
                         let decoded = Value::Str(text);
                         return self.format_value(
                             frames, &decoded, trait_, ty, options, indent,
