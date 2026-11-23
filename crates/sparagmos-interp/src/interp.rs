@@ -2170,6 +2170,7 @@ impl<'a> Interpreter<'a> {
                     consumed_glue,
                     cmp_discriminants,
                     result_unsize,
+                    unique_elem,
                 } => {
                     if let Some(glue) = drop_glue {
                         // `std::mem::drop` with the dropped type's glue
@@ -2271,6 +2272,7 @@ impl<'a> Interpreter<'a> {
                             generic_args,
                             args,
                             cmp_discriminants.as_deref(),
+                            unique_elem.as_ref(),
                         )?;
                         let consumed_final =
                             self.consumed_iter_final.borrow_mut().take();
@@ -2857,6 +2859,7 @@ impl<'a> Interpreter<'a> {
             generic_args,
             arg_values,
             None,
+            None,
         )?;
         match target {
             Some(bb) => {
@@ -3380,6 +3383,7 @@ impl<'a> Interpreter<'a> {
                     &canonical,
                     &generic_args,
                     arg_values,
+                    None,
                     None,
                 );
             }
@@ -9522,7 +9526,7 @@ impl<'a> Interpreter<'a> {
     fn field_walk_ty(&self, cur: &WalkTy, variant: u32, idx: usize) -> Option<WalkTy> {
         match cur {
             WalkTy::Ty(Ty::Tuple(ts)) => ts.get(idx).map(|t| WalkTy::Ty(t.clone())),
-            WalkTy::Ty(Ty::Adt(name)) => self.adt_field_tag(name, variant, idx).map(WalkTy::Tag),
+            WalkTy::Ty(Ty::Adt(name)) => self.adt_instance_field_tag(name, variant, idx).map(WalkTy::Tag),
             WalkTy::Tag(tag) => {
                 let tag = tag.trim();
                 if tag.starts_with('(') && tag.ends_with(')') {
@@ -9531,7 +9535,7 @@ impl<'a> Interpreter<'a> {
                         .get(idx)
                         .map(|part| WalkTy::Tag((*part).to_string()))
                 } else {
-                    self.adt_field_tag(tag, variant, idx).map(WalkTy::Tag)
+                    self.adt_instance_field_tag(tag, variant, idx).map(WalkTy::Tag)
                 }
             }
             _ => None,
@@ -9541,7 +9545,7 @@ impl<'a> Interpreter<'a> {
     /// The rendered type tag of field `idx` of variant
     /// `variant` of the ADT instance `name`, from the program's
     /// debug-shape table.
-    fn adt_field_tag(&self, name: &str, variant: u32, idx: usize) -> Option<String> {
+    fn adt_instance_field_tag(&self, name: &str, variant: u32, idx: usize) -> Option<String> {
         let key = self.adt_instance_key(name)?;
         let shape = self.program().adt_debug_shapes.get(&key)?;
         let variant = shape

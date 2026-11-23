@@ -18576,3 +18576,54 @@ fn run_mode_sized_pointer_positions_stay_distinct() {
         "eq0 true\neq1 false\nne12 true\nordered true\nrefl true\ndone\n"
     );
 }
+const VEC_ZST_SHIFT_SRC: &str = r#"
+struct D;
+impl Drop for D {
+    fn drop(&mut self) {
+        println!("drop D");
+    }
+}
+fn main() {
+    let mut u: Vec<()> = vec![(), ()];
+    u.insert(0, ());
+    println!("ulen {}", u.len());
+    u.remove(0);
+    println!("ulen {}", u.len());
+    let mut v = vec![D, D];
+    v.insert(1, D);
+    println!("len {}", v.len());
+    v.remove(0);
+    println!("len {}", v.len());
+    drop(v);
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_vec_macro_zst_elements_shift() {
+    // The `vec![...]` list form over zero-sized elements: rustc
+    // elides the element writes into the `Box::new_uninit`
+    // buffer (a zero-sized write is a no-op), so the slots the
+    // interpreter's `box_assume_init_into_vec_unsafe` model
+    // reads still hold the uninitialized marker. Conversion
+    // bakes the element type's one value into the call and the
+    // model materializes the unwritten slots from it, so the
+    // shift operations (`insert` / `remove`, which copy the
+    // buffer's elements) read real elements and the destructors
+    // run in order, byte for byte as natively.
+    let dir = temp_dir("veczstshift");
+    let src = fixture(&dir, "veczstshift.rs", VEC_ZST_SHIFT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "vec! of ZST elements must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "ulen 3\nulen 2\nlen 3\ndrop D\nlen 2\ndrop D\ndrop D\ndone\n",
+        "vec! ZST elements shift and drop exactly as natively"
+    );
+}
+

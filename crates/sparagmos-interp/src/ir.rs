@@ -1285,6 +1285,18 @@ pub enum TerminatorKind {
         /// `DynRef` carrying the concrete type's drop glue.
         /// `None` for every other builtin call.
         result_unsize: Option<UnsizeMeta>,
+        /// The one value of the element type of a
+        /// `box_assume_init_into_vec_unsafe` source array, baked
+        /// by conversion when that type has exactly one value:
+        /// the call asserts the array is fully initialized, so
+        /// an element slot that still holds the uninitialized
+        /// marker is one whose write rustc elided (a zero-sized
+        /// value's write is a no-op), and the builtin
+        /// materializes such slots from this value. `None` for
+        /// every other builtin call, and when the element type
+        /// has many values (an unwritten slot is then a genuine
+        /// uninitialized read).
+        unique_elem: Option<Value>,
     },
     /// Drop the value at a place, running its `glue` (converted
     /// destructor calls and field glue; see `mir_convert`), and

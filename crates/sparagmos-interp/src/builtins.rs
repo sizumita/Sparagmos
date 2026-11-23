@@ -4031,6 +4031,9 @@ fn checked_time_sub(base: TimePair, dur: TimePair, _system: bool) -> Option<Time
 impl<'a> Interpreter<'a> {
     /// Execute one `CallBuiltin` terminator. `name` is canonical;
     /// `generic_args` are the callee's rendered generic type tags.
+    /// `unique_elem` is the conversion-baked element value of a
+    /// `box_assume_init_into_vec_unsafe` call (see
+    /// `TerminatorKind::CallBuiltin::unique_elem`).
     pub(crate) fn exec_builtin(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -4039,6 +4042,7 @@ impl<'a> Interpreter<'a> {
         generic_args: &[String],
         args: &[Operand],
         cmp_discriminants: Option<&[i128]>,
+        unique_elem: Option<&Value>,
     ) -> InterpResult<Value> {
         // `Add` / `Sub` on a modelled time type: conversion emits
         // a builtin node only for those calls (see
@@ -4090,7 +4094,7 @@ impl<'a> Interpreter<'a> {
             let stamp = vals.pop().expect("two arguments");
             self.note_panic_stamp(stamp);
         }
-        self.exec_builtin_values(frames, body, args, kind, name, generic_args, vals, cmp_discriminants)
+        self.exec_builtin_values(frames, body, args, kind, name, generic_args, vals, cmp_discriminants, unique_elem)
     }
 
     /// Execute a builtin whose arguments are already evaluated
@@ -4107,6 +4111,7 @@ impl<'a> Interpreter<'a> {
         generic_args: &[String],
         vals: Vec<Value>,
         cmp_discriminants: Option<&[i128]>,
+        unique_elem: Option<&Value>,
     ) -> InterpResult<Value> {
         let arity = |n: usize| -> InterpResult<()> {
             if vals.len() == n {
@@ -8586,7 +8591,13 @@ impl<'a> Interpreter<'a> {
                         match assume_init_elements(pointee) {
                             Some(elems) => Ok(Value::Enum {
                                 variant: 0,
-                                fields: elems,
+                                fields: match unique_elem {
+                                    Some(canonical) => elems
+                                        .into_iter()
+                                        .map(|elem| fill_uninit(elem, canonical))
+                                        .collect(),
+                                    None => elems,
+                                },
                             }),
                             None => Err(InterpError::type_mismatch(
                                 "box_assume_init_into_vec_unsafe",
@@ -20593,6 +20604,48 @@ fn assume_init_elements(pointee: Value) -> Option<Vec<Value>> {
             fields.into_iter().find_map(assume_init_elements)
         }
         _ => None,
+    }
+}
+
+/// Fill the unwritten slots of `value` from the one value of
+/// its type: a slot holding the uninitialized marker takes
+/// the corresponding part of `canonical`, containers recurse
+/// where both sides have the same shape, and a written leaf
+/// is kept as it stands. This is the materialization a
+/// `box_assume_init_into_vec_unsafe` call performs: the call
+/// asserts the source array is fully initialized, so a slot
+/// still holding the marker is one whose write was elided
+/// because the value occupies no bytes.
+fn fill_uninit(value: Value, canonical: &Value) -> Value {
+    match (value, canonical) {
+        (Value::Uninit, _) => canonical.clone(),
+        (Value::Tuple(fields), Value::Tuple(canon)) if fields.len() == canon.len() => {
+            Value::Tuple(
+                fields
+                    .into_iter()
+                    .zip(canon.iter())
+                    .map(|(field, c)| fill_uninit(field, c))
+                    .collect(),
+            )
+        }
+        (
+            Value::Enum {
+                variant,
+                fields,
+            },
+            Value::Enum {
+                variant: cvariant,
+                fields: canon,
+            },
+        ) if variant == *cvariant && fields.len() == canon.len() => Value::Enum {
+            variant,
+            fields: fields
+                .into_iter()
+                .zip(canon.iter())
+                .map(|(field, c)| fill_uninit(field, c))
+                .collect(),
+        },
+        (other, _) => other,
     }
 }
 

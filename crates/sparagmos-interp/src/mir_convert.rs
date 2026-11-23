@@ -2213,6 +2213,27 @@ impl<'a> Converter<'a> {
         }
     }
 
+    /// The one value of the element type of a
+    /// `box_assume_init_into_vec_unsafe` argument
+    /// (`Box<MaybeUninit<[T; N]>>`), when the element type has
+    /// exactly one value: the element the source array's
+    /// elided writes would have stored in each unwritten slot.
+    /// `None` when the element type has many values (an
+    /// unwritten slot is then a genuine uninitialized read, as
+    /// before) or the argument's shape is not the expected
+    /// box-of-array.
+    fn into_vec_elem_value(&self, body: &mir::Body, arg: &mir::Operand) -> Option<Value> {
+        fn array_elem(ty: &mir::Ty) -> Option<&mir::Ty> {
+            match ty {
+                mir::Ty::Array(elem, _) => Some(elem),
+                mir::Ty::Adt(_, args) => args.iter().find_map(array_elem),
+                _ => None,
+            }
+        }
+        let ty = self.operand_place_ty(body, arg)?;
+        self.zst_value(array_elem(&ty)?, 0)
+    }
+
     /// Collect the canonical values of the single-valued
     /// projection paths of `ty` into `out`, keyed by path (see
     /// `ir::Body::zst_fields`). Structs, unions and tuples expose
@@ -7281,6 +7302,7 @@ let inner = match (&src, target) {
             consumed_glue: None,
             cmp_discriminants: None,
             result_unsize: None,
+            unique_elem: None,
         }))
     }
 
@@ -8178,6 +8200,24 @@ let inner = match (&src, target) {
                         }
                         .and_then(|ty| self.drop_glue(ty))
                         .filter(|glue| glue.root != ir::DropPlan::Trivial);
+                        // A `box_assume_init_into_vec_unsafe` call
+                        // asserts its source array is fully
+                        // initialized; an element slot that still
+                        // holds the uninitialized marker is one
+                        // whose write was elided because the
+                        // element type has exactly one value. Bake
+                        // that value while the type is at hand
+                        // (see `into_vec_elem_value`); the builtin
+                        // materializes the unwritten slots from
+                        // it.
+                        let unique_elem = if kind
+                            == crate::builtins::Builtin::BoxAssumeInitIntoVec
+                        {
+                            args.first()
+                                .and_then(|arg| self.into_vec_elem_value(body, arg))
+                        } else {
+                            None
+                        };
                         if unaccountable_drop {
                             ir::TerminatorKind::Unsupported(
                                 "Call to std::mem::drop (drop glue cannot be accounted for)"
@@ -8194,6 +8234,7 @@ let inner = match (&src, target) {
                                 consumed_glue,
                                 cmp_discriminants,
                                 result_unsize,
+                                unique_elem,
                             }
                         }
                     } else if args.first().is_some_and(|a| {
