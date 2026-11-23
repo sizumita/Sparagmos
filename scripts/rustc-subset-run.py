@@ -38,7 +38,13 @@ the test's directives (see the stage-2 section below). Tests with
 auxiliary crates are attempted in stage 2 the same way: the aux
 crates are resolved and forwarded with `--aux`, and conversion
 completeness is judged on the target crate's own functions, so
-auxiliary bodies do not count against it. Everything
+auxiliary bodies do not count against it. Stage 3 covers the
+nature="procedure" population (the run-make recipes): each recipe
+is compiled and run natively as the oracle, then run under the
+driver with tool interception, where the recipe's compiler
+invocations are answered by the driver's own conversion machinery
+(see the stage-3 section below). The official metric-2(b)
+measurement runs all three stages (`--stages all`). Everything
 else in the denominator is reported as not attempted, with a reason;
 unattempted and failed tests alike count against the overall
 metric-2(b) rate, whose denominator is always the full subset
@@ -104,7 +110,10 @@ unsupported is a non-pass, never a pass. Records the JIT harness
 has no attempt for at all (nature procedure / exec-debugger /
 rustdoc, and everything else outside the two stages) are carried
 through as not attempted and count against the metric-4 rate,
-exactly as they count against metric 2(b).
+exactly as they count against metric 2(b). Stage 3 is never
+combined with `--jit`: metric 4 has no procedure attempt, so a
+`--jit` run carries procedure records as not attempted even when
+`--stages all` is given.
 
 Usage:
     python3 scripts/rustc-subset-run.py \
@@ -4913,7 +4922,12 @@ def main():
     args.rust_dir = args.rust_dir.resolve()
     stage1_on = args.stages in ("1", "both", "all")
     stage2_on = args.stages in ("2", "both", "all")
-    stage3_on = args.stages in ("3", "all")
+    # Stage 3 is never combined with --jit: metric 4 judges the
+    # exec / compile-check stages on the JIT path and has no
+    # procedure attempt, so under --jit the procedure records are
+    # carried as not attempted instead of being judged through the
+    # (interpreter) stage-3 harness.
+    stage3_on = args.stages in ("3", "all") and not args.jit
 
     global _HOST_FACTS
     _HOST_FACTS = ToolchainFacts()

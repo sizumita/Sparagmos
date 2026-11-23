@@ -6,6 +6,12 @@ name: Official Measurement
 # with the runner's --jit mode. This replaces the manual run on the
 # dev host; nothing about the official measurement is run by hand.
 #
+# The metric-2(b) pass runs all three runner stages (--stages all):
+# stage 3 attempts the procedure records (the run-make recipes)
+# through the runner's procedure harness. The metric-4 (--jit) pass
+# does not attempt procedure records; they stay in its denominator
+# as not attempted, exactly as before.
+#
 # A single hosted job cannot hold the whole measurement inside the
 # 6-hour job limit with headroom, so the survey is split into shards
 # (scripts/ci-subset-tools.py shard, round-robin over path order) and
@@ -70,7 +76,7 @@ jobs:
           path: |
             ${{ env.RUST_SURVEY_DIR }}
             ${{ env.SURVEY_JSON }}
-          key: rust-survey-1.100.0-v1
+          key: rust-survey-1.100.0-v2
 
       - name: Fetch rust tree and generate survey (on cache miss)
         run: |
@@ -81,6 +87,16 @@ jobs:
             python3 scripts/rustc-subset-survey.py \
               --rust-dir "$RUST_SURVEY_DIR" --json "$SURVEY_JSON"
           fi
+          # The stage-3 harness extracts the run-make-support
+          # sources from the tree (git archive in
+          # rustc-subset-run.py), so the cached tree must carry
+          # their blobs: widen the sparse checkout beyond the
+          # survey's own set before the cache is saved. src/stage0,
+          # also extracted, is a file directly under src/ and is
+          # already included by the cone-mode parent rules.
+          git -C "$RUST_SURVEY_DIR" sparse-checkout add \
+            src/tools/run-make-support src/build_helper \
+            src/rustdoc-json-types
           ls -la "$SURVEY_JSON"
 
       - name: Upload survey
@@ -188,7 +204,7 @@ jobs:
           path: |
             ${{ env.RUST_SURVEY_DIR }}
             ${{ env.SURVEY_JSON }}
-          key: rust-survey-1.100.0-v1
+          key: rust-survey-1.100.0-v2
           fail-on-cache-miss: true
 
       - name: Download survey
@@ -202,6 +218,9 @@ jobs:
           RUSTC_BOOTSTRAP: "1"
         run: cargo build --manifest-path crates/sparagmos-driver/Cargo.toml
 
+      # --stages all: stages 1+2 plus the stage-3 procedure
+      # harness, so the procedure records are attempted in the
+      # official metric-2(b) pass.
       - name: Run shard
         run: |
           python3 scripts/ci-subset-tools.py shard \
@@ -213,6 +232,7 @@ jobs:
             --rust-dir "$RUST_SURVEY_DIR" \
             --driver-bin "$GITHUB_WORKSPACE/crates/sparagmos-driver/target/debug/sparagmos-driver" \
             --out "$RUNNER_TEMP/subset-shard-${{ matrix.shard }}.json" \
+            --stages all \
             --jobs 2
 
       - name: Upload shard result
@@ -315,7 +335,7 @@ jobs:
           path: |
             ${{ env.RUST_SURVEY_DIR }}
             ${{ env.SURVEY_JSON }}
-          key: rust-survey-1.100.0-v1
+          key: rust-survey-1.100.0-v2
           fail-on-cache-miss: true
 
       - name: Download survey
@@ -329,6 +349,9 @@ jobs:
           RUSTC_BOOTSTRAP: "1"
         run: cargo build --manifest-path crates/sparagmos-driver/Cargo.toml
 
+      # No --stages here: the JIT pass keeps the default stages
+      # (1+2). Metric 4 does not attempt procedure records, and the
+      # runner refuses stage 3 under --jit in any case.
       - name: Run shard (jit)
         run: |
           python3 scripts/ci-subset-tools.py shard \
@@ -385,7 +408,7 @@ jobs:
           path: |
             ${{ env.RUST_SURVEY_DIR }}
             ${{ env.SURVEY_JSON }}
-          key: rust-survey-1.100.0-v1
+          key: rust-survey-1.100.0-v2
           fail-on-cache-miss: true
 
       - name: Download shard results
