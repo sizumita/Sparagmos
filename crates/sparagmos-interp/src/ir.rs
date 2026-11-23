@@ -326,8 +326,12 @@ pub enum Constant {
     Int(i128),
     Uint(u128),
     /// A floating-point constant, stored widened to `f64` (an `f32`
-    /// value widens exactly, so nothing is lost).
-    Float(f64),
+    /// value widens exactly, so nothing is lost). The source width
+    /// travels with the widened value: a cast that consumes the
+    /// constant directly is a genuine conversion at that width --
+    /// its NaN rules consult the source type -- not a transport of
+    /// the stored form.
+    Float(f64, FloatTy),
     /// An `f128` constant: the raw IEEE 754 binary128 bit pattern.
     Float128(u128),
     /// String data (a `str` / `&str` constant).

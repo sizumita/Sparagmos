@@ -4657,11 +4657,18 @@ impl<'a> Converter<'a> {
     ) -> Result<ir::Constant, ConvertError> {
         match scalar {
             mir::Scalar::Float { bits, ty } => match ty {
-                mir::FloatTy::F16 => Ok(ir::Constant::Float(f16_to_f64(*bits as u16))),
-                mir::FloatTy::F32 => {
-                    Ok(ir::Constant::Float(f32::from_bits(*bits as u32) as f64))
-                }
-                mir::FloatTy::F64 => Ok(ir::Constant::Float(f64::from_bits(*bits as u64))),
+                mir::FloatTy::F16 => Ok(ir::Constant::Float(
+                    f16_to_f64(*bits as u16),
+                    ir::FloatTy::F16,
+                )),
+                mir::FloatTy::F32 => Ok(ir::Constant::Float(
+                    f32::from_bits(*bits as u32) as f64,
+                    ir::FloatTy::F32,
+                )),
+                mir::FloatTy::F64 => Ok(ir::Constant::Float(
+                    f64::from_bits(*bits as u64),
+                    ir::FloatTy::F64,
+                )),
                 mir::FloatTy::F128 => Ok(ir::Constant::Float128(*bits)),
             },
             mir::Scalar::Ptr { .. } => Err(ConvertError::UnsupportedConstant {
@@ -7137,7 +7144,7 @@ let inner = match (&src, target) {
                 bits: width,
                 signed: false,
             }),
-            ir::Constant::Float(_) => match width {
+            ir::Constant::Float(..) => match width {
                 16 | 32 | 64 => Some(S::Float { bits: width }),
                 _ => None,
             },
@@ -7168,7 +7175,7 @@ let inner = match (&src, target) {
                         bits: ew,
                         signed: false,
                     },
-                    ir::Constant::Float(_) => match ew {
+                    ir::Constant::Float(..) => match ew {
                         16 | 32 | 64 => S::Float { bits: ew },
                         _ => return None,
                     },
@@ -7189,8 +7196,8 @@ let inner = match (&src, target) {
                                 ir::Constant::Uint(_)
                             )
                             | (
-                                ir::Constant::Float(_),
-                                ir::Constant::Float(_)
+                                ir::Constant::Float(..),
+                                ir::Constant::Float(..)
                             )
                             | (ir::Constant::Bool(_), ir::Constant::Bool(_))
                     )

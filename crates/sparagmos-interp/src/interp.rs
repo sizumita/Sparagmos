@@ -16275,7 +16275,7 @@ impl<'a> Interpreter<'a> {
             Constant::Bool(b) => Value::Bool(*b),
             Constant::Int(v) => Value::Int(*v),
             Constant::Uint(v) => Value::Uint(*v),
-            Constant::Float(v) => Value::Float(*v),
+            Constant::Float(v, _) => Value::Float(*v),
             Constant::Float128(bits) => Value::Float128(*bits),
             Constant::VTablePtr(id) => Value::Ref(RefTarget::Address(*id)),
             Constant::FatPtr { addr, meta } => Value::FatRef {
@@ -23165,13 +23165,28 @@ pub(crate) fn cast_place_ty(body: &Body, place: &Place) -> Option<Ty> {
     Some(ty)
 }
 
-/// The declared type of a cast's source operand. A constant
-/// operand records no type in this IR, so its width stays
-/// unknown to `eval_cast` (its float arms then keep the stored
-/// form, which is the exact widening of the source value).
+/// The source type a constant records for itself, when it
+/// records one: a float constant keeps its own width beside the
+/// widened stored value (see `Constant::Float`). Other constants
+/// record no width in this IR.
+pub(crate) fn constant_ty(c: &Constant) -> Option<Ty> {
+    match c {
+        Constant::Float(_, ty) => Some(Ty::Float(*ty)),
+        Constant::Float128(_) => Some(Ty::Float(FloatTy::F128)),
+        _ => None,
+    }
+}
+
+/// The declared type of a cast's source operand: a place source
+/// resolves through the place's declared type (see
+/// [`cast_place_ty`]); a constant source answers with the type
+/// the constant itself records (see [`constant_ty`]). Without a
+/// source type, `eval_cast`'s float arms keep the stored form,
+/// which is the exact widening of the source value.
 pub(crate) fn cast_src_ty(body: &Body, operand: &Operand) -> Option<Ty> {
     match operand {
         Operand::Copy(place) | Operand::Move(place) => cast_place_ty(body, place),
+        Operand::Constant(c) => constant_ty(c),
         _ => None,
     }
 }

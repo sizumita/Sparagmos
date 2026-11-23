@@ -12,6 +12,7 @@ use std::collections::HashMap;
 
 use sparagmos_interp::builtins::{canonical_name, lookup};
 use sparagmos_interp::mir_convert::{interpret_mir, interpret_mir_captured, MirProgram};
+use sparagmos_interp::ir::FloatTy;
 use sparagmos_interp::{
     BasicBlock, BasicBlockData, Body, Constant, InterpError, Interpreter, MirRunError, Operand,
     Place, Program, Rvalue, Statement, TerminatorKind, Ty, Value,
@@ -952,7 +953,7 @@ fn f32_ir_ty() -> Ty {
 fn fmt_display_f64() {
     let out = print_one(
         f64_ir_ty(),
-        Rvalue::Use(Operand::Constant(Constant::Float(3.5))),
+        Rvalue::Use(Operand::Constant(Constant::Float(3.5, FloatTy::F64))),
         "core::fmt::rt::Argument::new_display",
         "f64",
         vec![192, 0],
@@ -966,7 +967,10 @@ fn fmt_display_f32_narrows_before_formatting() {
     // must render the f32 value ("0.1"), not the widened digits.
     let out = print_one(
         f32_ir_ty(),
-        Rvalue::Use(Operand::Constant(Constant::Float(0.1f32 as f64))),
+        Rvalue::Use(Operand::Constant(Constant::Float(
+            0.1f32 as f64,
+            FloatTy::F32,
+        ))),
         "core::fmt::rt::Argument::new_display",
         "f32",
         vec![192, 0],
@@ -978,7 +982,7 @@ fn fmt_display_f32_narrows_before_formatting() {
 fn fmt_debug_f64_keeps_point_zero() {
     let out = print_one(
         f64_ir_ty(),
-        Rvalue::Use(Operand::Constant(Constant::Float(2.0))),
+        Rvalue::Use(Operand::Constant(Constant::Float(2.0, FloatTy::F64))),
         "core::fmt::rt::Argument::new_debug",
         "f64",
         vec![192, 0],
@@ -991,7 +995,7 @@ fn fmt_float_precision() {
     // "{:.2}" of 3.14159: precision field only.
     let out = print_one(
         f64_ir_ty(),
-        Rvalue::Use(Operand::Constant(Constant::Float(3.14159))),
+        Rvalue::Use(Operand::Constant(Constant::Float(3.14159, FloatTy::F64))),
         "core::fmt::rt::Argument::new_display",
         "f64",
         vec![0xC4, 2, 0, 0],
@@ -1010,7 +1014,7 @@ fn fmt_float_zero_pad_and_width() {
     template.push(0);
     let out = print_one(
         f64_ir_ty(),
-        Rvalue::Use(Operand::Constant(Constant::Float(3.14159))),
+        Rvalue::Use(Operand::Constant(Constant::Float(3.14159, FloatTy::F64))),
         "core::fmt::rt::Argument::new_display",
         "f64",
         template,
@@ -1022,7 +1026,7 @@ fn fmt_float_zero_pad_and_width() {
 fn fmt_float_lower_exp() {
     let out = print_one(
         f64_ir_ty(),
-        Rvalue::Use(Operand::Constant(Constant::Float(314.159))),
+        Rvalue::Use(Operand::Constant(Constant::Float(314.159, FloatTy::F64))),
         "core::fmt::rt::Argument::new_lower_exp",
         "f64",
         vec![192, 0],

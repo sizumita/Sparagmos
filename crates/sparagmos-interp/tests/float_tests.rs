@@ -589,3 +589,87 @@ fn cast_array_elem_f32_to_f16_quiets_snan() {
     );
     assert_float_bits(v, 0x7ff8_0400_0000_0000);
 }
+
+// ----- constant cast sources (PR #419 Codex follow-up, round 2) -----
+
+#[test]
+fn cast_const_f64_to_f16_quiets_snan() {
+    // A cast that consumes an `f64` constant directly is a genuine
+    // narrowing: the signaling NaN is quieted with its payload
+    // carried across (native `f64` sNaN -> `f16` = 0x7e01), exactly
+    // as when the identical value is read from a local. It must not
+    // be transported bit-exactly (0x7c01) just because the operand
+    // was never materialized in a local.
+    let v = run(
+        "cast_const_f64_f16",
+        &[f16_ty()],
+        vec![assign(
+            place(0),
+            mir::Rvalue::Cast(
+                mir::CastKind::FloatToFloat,
+                const_f64(f64::from_bits(0x7ff0_0400_0000_0000)),
+                f16_ty(),
+            ),
+        )],
+    );
+    assert_float_bits(v, 0x7ff8_0400_0000_0000);
+}
+
+#[test]
+fn cast_const_f32_to_f16_quiets_snan() {
+    // The same narrowing from an `f32` constant consumed directly.
+    let v = run(
+        "cast_const_f32_f16",
+        &[f16_ty()],
+        vec![assign(
+            place(0),
+            mir::Rvalue::Cast(
+                mir::CastKind::FloatToFloat,
+                const_f32(f32::from_bits(0x7f80_2000)),
+                f16_ty(),
+            ),
+        )],
+    );
+    assert_float_bits(v, 0x7ff8_0400_0000_0000);
+}
+
+#[test]
+fn cast_const_f16_to_f32_preserves_snan() {
+    // Widening an `f16` signaling NaN constant to `f32` preserves
+    // it (native: 0x7f802000); the cast must know the constant's
+    // source is `f16`, not host-convert the stored `f64` form
+    // (which would quiet it to 0x7fc02000).
+    let v = run(
+        "cast_const_f16_f32",
+        &[f32_ty()],
+        vec![assign(
+            place(0),
+            mir::Rvalue::Cast(
+                mir::CastKind::FloatToFloat,
+                const_f16_bits(0x7c01),
+                f32_ty(),
+            ),
+        )],
+    );
+    assert_float_bits(v, 0x7ff0_0400_0000_0000);
+}
+
+#[test]
+fn cast_const_f16_to_f64_quiets_snan() {
+    // Widening an `f16` signaling NaN constant to `f64` sets the
+    // quiet bit (native materialized cast), as it does for a local
+    // or projected source.
+    let v = run(
+        "cast_const_f16_f64",
+        &[f64_ty()],
+        vec![assign(
+            place(0),
+            mir::Rvalue::Cast(
+                mir::CastKind::FloatToFloat,
+                const_f16_bits(0x7c01),
+                f64_ty(),
+            ),
+        )],
+    );
+    assert_float_bits(v, 0x7ff8_0400_0000_0000);
+}
