@@ -22715,3 +22715,93 @@ fn main() {
     println!("ok");
 }
 "#;
+
+#[test]
+fn run_mode_box_array_byte_ptr_cast_back_matches_native() {
+    // A byte pointer advanced into a `Box<[u32; 3]>` is
+    // absorbed as an index denominated by the allocation's
+    // recorded element type (Lane OC, #292); casting it back
+    // to `*const u32` must not redenominate that index by the
+    // byte pointer's units -- the cast does not move the
+    // address. Before the cast-side fix, the index was
+    // rewritten as a one- or two-byte offset and the reads
+    // answered the elements' shifted bytes.
+    let dir = temp_dir("box-array-byte-ptr-cast-back");
+    let src = fixture(&dir, "box_array_byte_ptr_cast_back.rs", BOX_ARRAY_BYTE_PTR_CAST_BACK_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "byte pointer cast back over a boxed array must run with native values; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "20\n30\n20\n30\n");
+}
+
+const BOX_ARRAY_BYTE_PTR_CAST_BACK_SRC: &str = r#"
+fn main() {
+    let b: Box<[u32; 3]> = Box::new([10, 20, 30]);
+    let p = &*b as *const [u32; 3] as *const u8;
+    unsafe {
+        let r = p.add(4) as *const u32;
+        println!("{}", *r);
+        let r2 = p.add(8) as *const u32;
+        println!("{}", *r2);
+    }
+    // The same denomination over a boxed slice (a recorded
+    // slice type).
+    let bs = vec![10u32, 20, 30].into_boxed_slice();
+    let q = bs.as_ptr() as *const u8;
+    unsafe {
+        let r = q.add(4) as *const u32;
+        println!("{}", *r);
+        let r2 = q.add(8) as *const u32;
+        println!("{}", *r2);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_box_transparent_wrapper_cast_read_matches_native() {
+    // Reading a boxed transparent wrapper's payload through a
+    // raw pointer cast to the payload type: the allocation's
+    // recorded ADT type must not refuse the payload entry --
+    // the stored form is a wrapper layer around the payload,
+    // at the payload's own width and at byte width alike.
+    // (The recorded type still judges byte positions of a
+    // genuine enum's storage; see
+    // `run_mode_box_enum_tag_byte_view_matches_native`.)
+    let dir = temp_dir("box-transparent-wrapper-cast-read");
+    let src = fixture(
+        &dir,
+        "box_transparent_wrapper_cast_read.rs",
+        BOX_TRANSPARENT_WRAPPER_CAST_READ_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "transparent wrapper payload reads through casts must run with native values; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+const BOX_TRANSPARENT_WRAPPER_CAST_READ_SRC: &str = r#"
+#[repr(transparent)]
+struct W<T>(T);
+
+fn main() {
+    let b: Box<W<u32>> = Box::new(W(42));
+    let p = &*b as *const W<u32> as *const u32;
+    let v = unsafe { *p };
+    assert_eq!(v, 42);
+    // The payload at byte width: a single-field struct's
+    // storage is its field's, with no tag span in front.
+    let b2: Box<W<u8>> = Box::new(W(0x5a));
+    let bp = &*b2 as *const W<u8> as *const u8;
+    let byte = unsafe { *bp };
+    assert_eq!(byte, 0x5a);
+    println!("ok");
+}
+"#;

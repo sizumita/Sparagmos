@@ -7131,6 +7131,45 @@ impl<'a> Interpreter<'a> {
         self.alloc_tys.borrow().get(&id).cloned()
     }
 
+    /// Whether the indices over allocation `id` are denominated
+    /// by the type its creation point recorded (see the
+    /// `alloc_tys` field): the recorded type is a sequence, so
+    /// an index names an element of that sequence -- exactly as
+    /// an index over a static array is denominated by the
+    /// static's recorded type -- not a count of the units of
+    /// whatever pointer currently denotes the position. The
+    /// recorded element size must be known and nonzero, the
+    /// same conditions under which
+    /// [`Self::alloc_typed_offset_absorb`] denominates a
+    /// displacement by it.
+    pub(crate) fn alloc_index_is_typed(&self, id: u64) -> bool {
+        match self.alloc_ty(id) {
+            Some(Ty::Array(elem, _)) | Some(Ty::Slice(elem)) => {
+                matches!(self.ty_size(&elem), Some(size) if size > 0)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the ADT `name` (a recorded allocation type, with
+    /// generic arguments dropped as `Ty::Adt` carries them) is a
+    /// single-field struct: a wrapper whose stored form is one
+    /// layer around its one field at every width, never the
+    /// position's own multi-part value. The instance's debug
+    /// shape answers it (see `debug_shape_for_def`, which
+    /// resolves the monomorphic instance of a bare name); an
+    /// ADT with no recorded shape is not judged a wrapper.
+    fn adt_is_single_field_wrapper(&self, name: &str) -> bool {
+        match self.debug_shape_for_def(name) {
+            Some(shape) => {
+                shape.kind == sparagmos_mir::AdtShapeKind::Struct
+                    && shape.variants.len() == 1
+                    && shape.variants[0].fields.len() == 1
+            }
+            None => false,
+        }
+    }
+
     pub(crate) fn new_box(&self, pointee: Value) -> Value {
         let id = self.alloc_insert(pointee);
         Value::Enum {
@@ -9080,9 +9119,32 @@ impl<'a> Interpreter<'a> {
             Resolved::Alloc { id, projection }
                 if projection.is_empty() =>
             {
-                self.alloc_ty(*id).is_some_and(|ty| {
-                    matches!(ty, Ty::Adt(_)) && !is_maybe_uninit_ty(&ty)
-                })
+                // The record outranks the stored form only at a
+                // byte-shaped position: a byte pointee denotes
+                // the ADT's own storage (an enum's tag span,
+                // which the byte view prices from the recorded
+                // type), and there a stored enum's first field
+                // is indistinguishable from a payload's first
+                // byte. A wider pointee names a value inside
+                // the storage -- a wrapper's payload, read
+                // through a pointer cast -- whose entry the
+                // stored-form evidence below judges, as it does
+                // for positions without a record; and a
+                // single-field struct's record never outranks,
+                // because its stored form is a wrapper layer
+                // around its one field at every width.
+                let byte_position = matches!(
+                    pointee,
+                    Ty::Uint(UintTy::U8) | Ty::Int(IntTy::I8) | Ty::Bool
+                );
+                byte_position
+                    && self.alloc_ty(*id).is_some_and(|ty| match &ty {
+                        Ty::Adt(name) => {
+                            !is_maybe_uninit_ty(&ty)
+                                && !self.adt_is_single_field_wrapper(name)
+                        }
+                        _ => false,
+                    })
             }
             _ => false,
         };
@@ -17447,7 +17509,11 @@ impl<'a> Interpreter<'a> {
                 if let Some((from_size, payload_pos)) = units_from {
                     if let Some(field) = fields.get_mut(*payload_pos) {
                         let taken = std::mem::replace(field, Value::Unit);
-                        *field = ptr_cast_units_value(taken, *from_size);
+                        *field = ptr_cast_units_value(
+                            taken,
+                            *from_size,
+                            &|id| self.alloc_index_is_typed(id),
+                        );
                     }
                 }
                 // A `MaybeUninit::new(v)` construction (the union's
@@ -17562,7 +17628,11 @@ impl<'a> Interpreter<'a> {
             }
             Rvalue::PtrCastUnits(operand, from_size) => {
                 let value = self.eval_operand(frames, body, operand)?;
-                Ok(ptr_cast_units_value(value, *from_size))
+                Ok(ptr_cast_units_value(
+                    value,
+                    *from_size,
+                    &|id| self.alloc_index_is_typed(id),
+                ))
             }
             Rvalue::PtrArrayBase(operand) => {
                 let value = self.eval_operand(frames, body, operand)?;
@@ -19145,7 +19215,11 @@ fn fat_base_first_element(base: Value) -> Value {
 /// position in any unit), an index whose byte position does
 /// not fit — passes through unchanged: the position is the
 /// same, only its denomination was ambiguous.
-pub(crate) fn ptr_cast_units_value(value: Value, from_size: u64) -> Value {
+pub(crate) fn ptr_cast_units_value(
+    value: Value,
+    from_size: u64,
+    typed_alloc: &dyn Fn(u64) -> bool,
+) -> Value {
     fn rescale(projection: &mut Vec<RefProj>, from_size: u64) {
         if let Some(RefProj::Index(k)) = projection.last() {
             let k = *k;
@@ -19161,26 +19235,31 @@ pub(crate) fn ptr_cast_units_value(value: Value, from_size: u64) -> Value {
     }
     match value {
         Value::Ref(target) => Value::Ref(match target {
-            // Only an allocation target's index is denominated
-            // in the pointer's own pointee units: a raw block
-            // has no declared element type, so the projection
-            // the pointer carries is the only denomination in
-            // play. A place, static or value target's index
+            // Only a raw allocation block's index is
+            // denominated in the pointer's own pointee units:
+            // a raw block has no declared element type, so the
+            // projection the pointer carries is the only
+            // denomination in play. An allocation whose
+            // recorded declared type is a sequence denominates
+            // its indices itself (see `alloc_index_is_typed`),
+            // as a place, static or value target's index
             // belongs to the declared aggregate it projects
-            // into (an array local's element index), which a
-            // pointer cast does not redenominate.
+            // into (an array local's element index); a pointer
+            // cast redenominates neither.
             RefTarget::Alloc { id, mut projection } => {
-                rescale(&mut projection, from_size);
+                if !typed_alloc(id) {
+                    rescale(&mut projection, from_size);
+                }
                 RefTarget::Alloc { id, projection }
             }
             other => other,
         }),
         Value::FatRef { base, len } => Value::FatRef {
-            base: Box::new(ptr_cast_units_value(*base, from_size)),
+            base: Box::new(ptr_cast_units_value(*base, from_size, typed_alloc)),
             len,
         },
         Value::DynRef { base, concrete, traits, drop_glue } => Value::DynRef {
-            base: Box::new(ptr_cast_units_value(*base, from_size)),
+            base: Box::new(ptr_cast_units_value(*base, from_size, typed_alloc)),
             concrete,
             traits,
             drop_glue,
