@@ -1205,7 +1205,9 @@ fn deref_if_pointer(
         .read_resolved(frames, &resolved)
         .map_err(|e| e.to_string())?;
     let next = match desc {
-        Some(Desc::Ref(inner)) => {
+        Some(
+            Desc::Ref(inner) | Desc::RefMut(inner) | Desc::PtrConst(inner) | Desc::PtrMut(inner),
+        ) => {
             // A pointer whose pointee the value model holds as
             // a sequence aggregate (a slice's base pointer: its
             // deref yields the whole element tuple) describes
@@ -1447,6 +1449,172 @@ fn cast_pointee_elements(
     }
 }
 
+/// The byte width of a scalar descriptor's layout, for the
+/// scalar families a byte reinterpretation can express.
+/// Half- and quad-precision floats are excluded: their values
+/// do not survive this runtime's `f64` transport bit-exactly,
+/// so a reinterpretation through them is rejected instead.
+fn desc_scalar_width(desc: &Desc) -> Option<usize> {
+    Some(match desc {
+        Desc::Int(name) => match *name {
+            "i8" | "u8" => 1,
+            "i16" | "u16" => 2,
+            "i32" | "u32" => 4,
+            "i64" | "u64" | "isize" | "usize" => 8,
+            "i128" | "u128" => 16,
+            _ => return None,
+        },
+        Desc::Float("f32") => 4,
+        Desc::Float("f64") => 8,
+        Desc::Bool => 1,
+        Desc::Char => 4,
+        _ => return None,
+    })
+}
+
+/// A scalar value's little-endian storage bytes, at the
+/// width its descriptor declares.
+fn scalar_value_bytes(value: &Value, desc: &Desc) -> Option<Vec<u8>> {
+    let width = desc_scalar_width(desc)?;
+    Some(match (value, desc) {
+        (Value::Int(v), Desc::Int(_)) => v.to_le_bytes()[..width].to_vec(),
+        (Value::Uint(v), Desc::Int(_)) => v.to_le_bytes()[..width].to_vec(),
+        (Value::Uint(v), Desc::Char) => (*v as u32).to_le_bytes().to_vec(),
+        (Value::Float(v), Desc::Float("f32")) => {
+            (*v as f32).to_bits().to_le_bytes().to_vec()
+        }
+        (Value::Float(v), Desc::Float("f64")) => {
+            v.to_bits().to_le_bytes().to_vec()
+        }
+        (Value::Bool(b), Desc::Bool) => vec![*b as u8],
+        _ => return None,
+    })
+}
+
+/// A scalar value read back from its little-endian storage
+/// bytes under a target descriptor.
+fn scalar_value_from_bytes(bytes: &[u8], desc: &Desc) -> Option<Value> {
+    match desc {
+        Desc::Int(name) => {
+            let mut buf = [0u8; 16];
+            buf[..bytes.len()].copy_from_slice(bytes);
+            let raw = u128::from_le_bytes(buf);
+            if name.starts_with('i') {
+                let shift = 128 - (bytes.len() as u32) * 8;
+                let v = raw as i128;
+                Some(Value::Int((v << shift) >> shift))
+            } else {
+                Some(Value::Uint(raw))
+            }
+        }
+        Desc::Float("f32") => {
+            let bits = u32::from_le_bytes(bytes.try_into().ok()?);
+            Some(Value::Float(f32::from_bits(bits) as f64))
+        }
+        Desc::Float("f64") => {
+            let bits = u64::from_le_bytes(bytes.try_into().ok()?);
+            Some(Value::Float(f64::from_bits(bits)))
+        }
+        Desc::Bool => Some(Value::Bool(bytes[0] != 0)),
+        Desc::Char => {
+            let raw = u32::from_le_bytes(bytes.try_into().ok()?);
+            char::from_u32(raw).map(|_| Value::Uint(raw as u128))
+        }
+        _ => None,
+    }
+}
+
+/// The element descriptor a cast's source value carries: the
+/// pointee array/slice element of the source descriptor, or
+/// `u8` for a byte-form pointee.
+fn cast_source_elem(pointee: &Value, source: Option<&Desc>) -> Option<Desc> {
+    if matches!(pointee, Value::Bytes(_)) {
+        return Some(Desc::Int("u8"));
+    }
+    let desc = source?;
+    let inner = pointer_pointee(desc).unwrap_or(desc);
+    match inner {
+        Desc::Array(elem, _) | Desc::Slice(elem) => Some((**elem).clone()),
+        _ => None,
+    }
+}
+
+/// Reinterpret a cast pointee's elements through a different
+/// target element type, comparing byte counts rather than
+/// element counts. Returns `None` when no reinterpretation
+/// applies (the element type is unchanged, or the source
+/// element type is not recorded), and `Some` of the
+/// reinterpreted value -- or of an explicit error for a
+/// change the scalar layouts cannot express -- otherwise.
+/// `count` is the target array's length; a slice target
+/// reinterprets the whole storage.
+fn reinterpret_cast(
+    pointee: &Value,
+    source: Option<&Desc>,
+    target_elem: &Desc,
+    count: Option<u64>,
+) -> Option<Result<Value, String>> {
+    let source_elem = cast_source_elem(pointee, source)?;
+    if source_elem == *target_elem {
+        return None;
+    }
+    let items: Vec<Value> = match pointee {
+        Value::Tuple(items) => items.clone(),
+        Value::Bytes(bytes) => bytes
+            .iter()
+            .map(|b| Value::Uint(*b as u128))
+            .collect(),
+        _ => return None,
+    };
+    let unsupported = || {
+        format!(
+            "cast changing element type from {} to {} is not supported",
+            desc_type_name(&source_elem).unwrap_or_else(|| "?".into()),
+            desc_type_name(target_elem).unwrap_or_else(|| "?".into()),
+        )
+    };
+    let mut bytes = Vec::new();
+    for item in &items {
+        match scalar_value_bytes(item, &source_elem) {
+            Some(bs) => bytes.extend(bs),
+            None => return Some(Err(unsupported())),
+        }
+    }
+    let Some(width) = desc_scalar_width(target_elem) else {
+        return Some(Err(unsupported()));
+    };
+    let take = match count {
+        Some(n) => {
+            if bytes.len() < (n as usize) * width {
+                return Some(Err(format!(
+                    "cast to an array of {n} elements over {} bytes of backing storage",
+                    bytes.len()
+                )));
+            }
+            n as usize
+        }
+        None => {
+            if bytes.len() % width != 0 {
+                return Some(Err(format!(
+                    "cast of {} bytes of backing storage to a slice of {}-byte elements",
+                    bytes.len(),
+                    width
+                )));
+            }
+            bytes.len() / width
+        }
+    };
+    let mut out = Vec::with_capacity(take);
+    for i in 0..take {
+        let chunk = &bytes[i * width..(i + 1) * width];
+        match scalar_value_from_bytes(chunk, target_elem) {
+            Some(v) => out.push(v),
+            None => return Some(Err(unsupported())),
+        }
+    }
+    Some(Ok(Value::Tuple(out)))
+}
+
 /// Apply a cast step (`as *const [T; N]` and kin): a pointer
 /// cast retargets the descriptor; an array cast views the
 /// pointee's elements as an array value (the form the slice
@@ -1455,13 +1623,14 @@ fn apply_cast(
     interp: &Interpreter,
     frames: &[Frame],
     value: Value,
+    source: Option<&Desc>,
     target: Desc,
 ) -> Result<(Value, Option<Desc>), String> {
     // A cast spelled as a pointer to an array/slice (`as *const
     // [T; N]`) is the array cast below: the pointer layer is
     // the spelling, not a value layer.
     let target = match target {
-        Desc::Ref(inner)
+        Desc::Ref(inner) | Desc::RefMut(inner) | Desc::PtrConst(inner) | Desc::PtrMut(inner)
             if matches!(*inner, Desc::Array(..) | Desc::Slice(_)) =>
         {
             *inner
@@ -1469,8 +1638,16 @@ fn apply_cast(
         other => other,
     };
     match target {
-        Desc::Array(_, n) => {
+        Desc::Array(target_elem, n) => {
             let pointee = cast_pointee_elements(interp, frames, value)?;
+            // A cast that changes the element type reinterprets
+            // the backing storage through the target element
+            // layout (the reading a native debugger applies);
+            // a change the scalar layouts cannot express is an
+            // explicit error rather than a wrong value.
+            if let Some(reinterpreted) = reinterpret_cast(&pointee, source, &target_elem, Some(n)) {
+                return Ok((reinterpreted?, Some(Desc::Array(target_elem, n))));
+            }
             // The cast views the backing elements through the
             // target type: a shorter array sees only its first
             // elements (and a later index step bounds against
@@ -1490,11 +1667,14 @@ fn apply_cast(
                 }
                 other => other,
             };
-            Ok((pointee, Some(target)))
+            Ok((pointee, Some(Desc::Array(target_elem, n))))
         }
-        Desc::Slice(_) => {
+        Desc::Slice(target_elem) => {
             let pointee = cast_pointee_elements(interp, frames, value)?;
-            Ok((pointee, Some(target)))
+            if let Some(reinterpreted) = reinterpret_cast(&pointee, source, &target_elem, None) {
+                return Ok((reinterpreted?, Some(Desc::Slice(target_elem))));
+            }
+            Ok((pointee, Some(Desc::Slice(target_elem))))
         }
         other => Ok((value, Some(other))),
     }
@@ -1529,7 +1709,12 @@ fn evaluate_expr(
                     .read_resolved(frames, &resolved)
                     .map_err(|e| e.to_string())?;
                 ev.desc = match ev.desc {
-                    Some(Desc::Ref(inner)) => Some(*inner),
+                    Some(
+                        Desc::Ref(inner)
+                        | Desc::RefMut(inner)
+                        | Desc::PtrConst(inner)
+                        | Desc::PtrMut(inner),
+                    ) => Some(*inner),
                     Some(Desc::Adt(tag)) => {
                         smart_pointer_pointee(&tag).map(|t| Desc::from_tag(&t))
                     }
@@ -1603,7 +1788,13 @@ fn evaluate_expr(
                 ev.char = false;
             }
             ExprStep::Cast(target) => {
-                let (v, d) = apply_cast(interp, frames, ev.value, target.clone())?;
+                let (v, d) = apply_cast(
+                    interp,
+                    frames,
+                    ev.value,
+                    ev.desc.as_ref(),
+                    target.clone(),
+                )?;
                 ev.value = v;
                 ev.desc = d;
                 ev.char = false;
@@ -1751,15 +1942,21 @@ fn lldb_format_scalar(
     desc: Option<&Desc>,
     formats: LldbFormats,
 ) -> Option<String> {
-    let format = match tag {
-        Some("char") => formats.char_format,
-        Some("i8") => formats.i8_format,
-        Some("u8") => formats.u8_format,
+    // The registered type's width: an unsigned rendering is
+    // the unsigned reading of the value's stored bytes, so a
+    // sign-extended negative value must be masked back to the
+    // width of the type the format was registered for.
+    let (format, width) = match tag {
+        Some("char") => (formats.char_format, 32),
+        Some("i8") => (formats.i8_format, 8),
+        Some("u8") => (formats.u8_format, 8),
         _ => match desc {
-            Some(Desc::Char) => formats.char_format,
-            _ => None,
+            Some(Desc::Char) => (formats.char_format, 32),
+            _ => (None, 0),
         },
-    }?;
+    };
+    let format = format?;
+    let mask: u128 = (1u128 << width) - 1;
     let v: i128 = match value {
         Value::Int(v) => *v,
         Value::Uint(v) => *v as i128,
@@ -1767,12 +1964,12 @@ fn lldb_format_scalar(
     };
     Some(match format {
         LldbNumFormat::Decimal => format!("{v}"),
-        LldbNumFormat::Unsigned => format!("{}", v as u128),
+        LldbNumFormat::Unsigned => format!("{}", (v as u128) & mask),
         LldbNumFormat::Hex => {
             if v < 0 {
                 return None;
             }
-            format!("0x{:x}", v as u128)
+            format!("0x{:x}", (v as u128) & mask)
         }
     })
 }
@@ -1857,6 +2054,9 @@ fn desc_type_name(desc: &Desc) -> Option<String> {
         }
         Desc::Slice(elem) => format!("[{}]", desc_type_name(elem)?),
         Desc::Ref(inner) => format!("&{}", desc_type_name(inner)?),
+        Desc::RefMut(inner) => format!("&mut {}", desc_type_name(inner)?),
+        Desc::PtrConst(inner) => format!("*const {}", desc_type_name(inner)?),
+        Desc::PtrMut(inner) => format!("*mut {}", desc_type_name(inner)?),
         Desc::Adt(tag) => dwarf_type_name(tag),
         Desc::Closure(name) | Desc::Coroutine(name) => name.clone(),
         Desc::FnPtr => "*mut fn ()".to_string(),
@@ -1866,12 +2066,26 @@ fn desc_type_name(desc: &Desc) -> Option<String> {
     })
 }
 
+/// The pointee descriptor of a pointer-family descriptor
+/// (shared or mutable reference, raw const or mutable
+/// pointer); `None` for any other descriptor.
+fn pointer_pointee(desc: &Desc) -> Option<&Desc> {
+    match desc {
+        Desc::Ref(inner) | Desc::RefMut(inner) | Desc::PtrConst(inner) | Desc::PtrMut(inner) => {
+            Some(inner)
+        }
+        _ => None,
+    }
+}
+
 /// The descriptor past the implicit dereference a field or
 /// index step performs: a reference's pointee, a smart
 /// pointer's pointee, anything else unchanged.
 fn desc_through_pointer(desc: Desc) -> Desc {
     match desc {
-        Desc::Ref(inner) => *inner,
+        Desc::Ref(inner) | Desc::RefMut(inner) | Desc::PtrConst(inner) | Desc::PtrMut(inner) => {
+            *inner
+        }
         Desc::Adt(tag) => smart_pointer_pointee(&tag)
             .map(|t| Desc::from_tag(&t))
             .unwrap_or(Desc::Adt(tag)),
@@ -1913,7 +2127,10 @@ fn type_field_name_desc(
     match name {
         "length" => Some(Desc::Int("usize")),
         "data_ptr" => match desc {
-            Desc::Ref(inner) => match inner.as_ref() {
+            Desc::Ref(inner)
+            | Desc::RefMut(inner)
+            | Desc::PtrConst(inner)
+            | Desc::PtrMut(inner) => match inner.as_ref() {
                 Desc::Slice(elem) => Some(Desc::Ref(elem.clone())),
                 _ => None,
             },
@@ -1940,7 +2157,15 @@ fn type_only_value(
     let mut desc = base.desc.clone();
     for step in &expr.steps {
         desc = match (step, desc) {
-            (ExprStep::Deref, Some(Desc::Ref(inner))) => Some(*inner),
+            (
+                ExprStep::Deref,
+                Some(
+                    Desc::Ref(inner)
+                    | Desc::RefMut(inner)
+                    | Desc::PtrConst(inner)
+                    | Desc::PtrMut(inner),
+                ),
+            ) => Some(*inner),
             (ExprStep::Deref, Some(Desc::Adt(tag))) => {
                 smart_pointer_pointee(&tag).map(|t| Desc::from_tag(&t))
             }
@@ -1961,6 +2186,9 @@ fn type_only_value(
             }
             (ExprStep::Cast(target), _) => Some(match target.clone() {
                 Desc::Ref(inner)
+                | Desc::RefMut(inner)
+                | Desc::PtrConst(inner)
+                | Desc::PtrMut(inner)
                     if matches!(*inner, Desc::Array(..) | Desc::Slice(_)) =>
                 {
                     *inner
@@ -2360,6 +2588,14 @@ enum Desc {
     Array(Box<Desc>, u64),
     Slice(Box<Desc>),
     Ref(Box<Desc>),
+    /// A mutable reference (`&mut T`): the qualifier is part
+    /// of the recorded type, so it is carried separately from
+    /// a shared reference.
+    RefMut(Box<Desc>),
+    /// A raw const pointer (`*const T`).
+    PtrConst(Box<Desc>),
+    /// A raw mutable pointer (`*mut T`).
+    PtrMut(Box<Desc>),
     /// An ADT instance, by its rendered type tag (the key of the
     /// program's debug-shape table).
     Adt(String),
@@ -2457,16 +2693,16 @@ impl Desc {
             _ => {}
         }
         if let Some(rest) = tag.strip_prefix("&mut ") {
-            return Desc::Ref(Box::new(Desc::from_tag(rest)));
+            return Desc::RefMut(Box::new(Desc::from_tag(rest)));
         }
         if let Some(rest) = tag.strip_prefix('&') {
             return Desc::Ref(Box::new(Desc::from_tag(rest)));
         }
-        if let Some(rest) = tag
-            .strip_prefix("*const ")
-            .or_else(|| tag.strip_prefix("*mut "))
-        {
-            return Desc::Ref(Box::new(Desc::from_tag(rest)));
+        if let Some(rest) = tag.strip_prefix("*const ") {
+            return Desc::PtrConst(Box::new(Desc::from_tag(rest)));
+        }
+        if let Some(rest) = tag.strip_prefix("*mut ") {
+            return Desc::PtrMut(Box::new(Desc::from_tag(rest)));
         }
         if tag.starts_with('(') && tag.ends_with(')') {
             let inner = &tag[1..tag.len() - 1];
@@ -2863,7 +3099,12 @@ fn render_gdb(
             // has no value form for the address to stand for.
             if matches!(
                 desc,
-                Some(Desc::Ref(inner)) if matches!(inner.as_ref(), Desc::Unit)
+                Some(
+                    Desc::Ref(inner)
+                    | Desc::RefMut(inner)
+                    | Desc::PtrConst(inner)
+                    | Desc::PtrMut(inner)
+                ) if matches!(inner.as_ref(), Desc::Unit)
             ) {
                 return Some(format!("(*mut ()) 0x{addr:x}"));
             }

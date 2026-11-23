@@ -28574,3 +28574,131 @@ fn debug_mode_union_tuple_field_uses_compiler_layout() {
         );
     }
 }
+
+fn debug_driver_lldb(dir: &Path, src: &Path, script: &str) -> Output {
+    let script_path = dir.join("session.script");
+    std::fs::write(&script_path, script).unwrap();
+    Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("debug")
+        .arg(src)
+        .arg("--edition")
+        .arg("2021")
+        .arg("--debug-script")
+        .arg(&script_path)
+        .arg("--debug-dialect")
+        .arg("lldb")
+        .output()
+        .expect("failed to run sparagmos-driver")
+}
+
+const DEBUG_CAST_REINTERPRET_SRC: &str = r#"fn main() {
+    let a: [u32; 1] = [1065353216];
+    let r: &[u32; 1] = &a;
+    zzz();
+    let _ = r;
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_cast_reinterprets_array_elements() {
+    // A pointer cast that changes the array element type
+    // reinterprets the backing storage through the target
+    // element layout, comparing byte counts rather than
+    // element counts; a target the storage cannot fill, and
+    // a change the scalar layouts cannot express, are
+    // explicit errors rather than wrong values.
+    let dir = temp_dir("debug-cast-reinterpret");
+    let src = fixture(&dir, "cast_reinterpret.rs", DEBUG_CAST_REINTERPRET_SRC);
+    let out = debug_driver(
+        &dir,
+        &src,
+        "break 4\nrun\nprint *(r as *const [f32; 1])\nprint *(r as *const [u16; 2])\nprint *(r as *const [f32])\nprint *(r as *const [f32; 2])\nprint *(r as *const [f16; 2])\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in [
+        "$1 = [1]",
+        "$2 = [0, 16256]",
+        "$3 = [1]",
+        "cast to an array of 2 elements over 4 bytes of backing storage",
+        "cast changing element type from u32 to f16 is not supported",
+    ] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+}
+
+const DEBUG_PTR_QUALIFIERS_SRC: &str = r#"struct S { p: *mut i32, q: *const i32 }
+struct R<'a> { r: &'a mut i32 }
+fn main() {
+    let mut x = 5i32;
+    let t: (*const i32,) = (&x as *const i32,);
+    let s = S { p: &mut x as *mut i32, q: &x as *const i32 };
+    let rr = R { r: &mut x };
+    zzz();
+    let _ = (t, s, rr);
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_whatis_preserves_pointer_qualifiers() {
+    // A projected pointer or reference value reports its
+    // recorded type with its qualifier: `*const`, `*mut`
+    // and `&mut` do not collapse into a shared `&`.
+    let dir = temp_dir("debug-ptr-qualifiers");
+    let src = fixture(&dir, "ptr_qualifiers.rs", DEBUG_PTR_QUALIFIERS_SRC);
+    let out = debug_driver(
+        &dir,
+        &src,
+        "break 8\nrun\nwhatis t.0\nwhatis s.p\nwhatis s.q\nwhatis rr.r\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in ["type = *const i32", "type = *mut i32", "type = &mut i32"] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("type = &i32"),
+        "pointer qualifiers must not collapse into a shared reference: {stdout}"
+    );
+}
+
+const DEBUG_LLDB_UNSIGNED_SRC: &str = r#"fn main() {
+    let b: i8 = -1;
+    zzz();
+    let _ = b;
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_lldb_unsigned_format_masks_to_type_width() {
+    // An lldb unsigned format registration renders the
+    // unsigned reading of the value's stored bytes: an
+    // `i8` holding -1 prints as 255, not as the 128-bit
+    // sign-extension of the interpreter's scalar.
+    let dir = temp_dir("debug-lldb-unsigned");
+    let src = fixture(&dir, "lldb_unsigned.rs", DEBUG_LLDB_UNSIGNED_SRC);
+    let out = debug_driver_lldb(
+        &dir,
+        &src,
+        "type-format unsigned i8\nbreak 3\nrun\nprint b\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    assert!(
+        stdout.contains("(i8) b = 255"),
+        "unsigned format must mask to the i8 width: {stdout}"
+    );
+    assert!(
+        !stdout.contains("340282366920938463463374607431768211455"),
+        "unsigned format must not print the 128-bit sign-extension: {stdout}"
+    );
+}

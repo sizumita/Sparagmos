@@ -139,7 +139,14 @@ pub fn ty_tag(ty: &mir::Ty, names: &HashMap<mir::DefId, String>) -> String {
             };
             format!("&{m}{}", ty_tag(inner, names))
         }
-        T::RawPtr(inner, _) => format!("*const {}", ty_tag(inner, names)),
+        T::RawPtr(inner, mutability) => {
+            let m = if matches!(mutability, mir::Mutability::Mut) {
+                "mut"
+            } else {
+                "const"
+            };
+            format!("*{m} {}", ty_tag(inner, names))
+        }
         T::Adt(def, args) | T::Closure(def, args) => {
             // A closure type is identified by its definition's
             // name plus its generic arguments (the upvars tuple
