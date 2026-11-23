@@ -23808,3 +23808,63 @@ fn run_mode_join_payload_into_raw_cast_reads_whole_struct() {
         "fields: 33 44\n",
     );
 }
+
+const IPV4_DISPLAY_SRC: &str = r#"
+use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
+fn main() {
+    let a = Ipv4Addr::new(192, 168, 0, 1);
+    println!("display: {}", a);
+    println!("debug: {:?}", a);
+    println!("alt debug: {:#?}", a);
+    println!("localhost: {}", Ipv4Addr::LOCALHOST);
+    println!("unspecified: {:?}", Ipv4Addr::UNSPECIFIED);
+    println!("broadcast: {}", Ipv4Addr::BROADCAST);
+    println!("padded: [{:>15}]", a);
+    println!("precision: [{:.3}]", a);
+    println!("to_string: {}", a.to_string());
+    println!("formatted: {}", format!("{}", Ipv4Addr::new(9, 8, 7, 6)));
+    println!("ipaddr: {} {:?}", IpAddr::V4(a), IpAddr::V4(a));
+    println!("socket: {} {:?}", SocketAddrV4::new(a, 8080), SocketAddrV4::new(a, 8080));
+    println!("predicates: {} {}", a.is_private(), Ipv4Addr::LOCALHOST.is_loopback());
+    println!("octets: {:?}", a.octets());
+}
+"#;
+
+#[test]
+fn run_mode_ipv4_addr_display_and_debug() {
+    // `Ipv4Addr`'s `Display` is the dotted-decimal text and
+    // core defines its `Debug` as the same text (not the
+    // derived struct form); width / precision go through
+    // `Formatter::pad`. The address constants materialise in
+    // the same shape, and `IpAddr::V4` / `SocketAddrV4`
+    // forward to it.
+    run_ok(
+        "ipv4-display",
+        IPV4_DISPLAY_SRC,
+        "display: 192.168.0.1\ndebug: 192.168.0.1\nalt debug: 192.168.0.1\nlocalhost: 127.0.0.1\nunspecified: 0.0.0.0\nbroadcast: 255.255.255.255\npadded: [    192.168.0.1]\nprecision: [192]\nto_string: 192.168.0.1\nformatted: 9.8.7.6\nipaddr: 192.168.0.1 192.168.0.1\nsocket: 192.168.0.1:8080 192.168.0.1:8080\npredicates: true true\noctets: [192, 168, 0, 1]\n",
+    );
+}
+
+const IPV4_FROM_CONVERSIONS_SRC: &str = r#"
+use std::net::Ipv4Addr;
+fn main() {
+    println!("from array: {}", Ipv4Addr::from([1u8, 2, 3, 4]));
+    println!("from u32: {}", Ipv4Addr::from(0x7f000001u32));
+    println!("into addr: {}", <Ipv4Addr as From<[u8; 4]>>::from([10u8, 0, 0, 255]));
+    let a = Ipv4Addr::new(127, 0, 0, 1);
+    println!("to u32: {}", u32::from(a));
+    println!("bits: {}", a.to_bits());
+}
+"#;
+
+#[test]
+fn run_mode_ipv4_addr_from_conversions() {
+    // The `From` conversions between `Ipv4Addr`, `[u8; 4]`
+    // and `u32` (big-endian) build / read the same octet
+    // shape the formatter renders.
+    run_ok(
+        "ipv4-from",
+        IPV4_FROM_CONVERSIONS_SRC,
+        "from array: 1.2.3.4\nfrom u32: 127.0.0.1\ninto addr: 10.0.0.255\nto u32: 2130706433\nbits: 2130706433\n",
+    );
+}

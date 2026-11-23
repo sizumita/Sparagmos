@@ -7666,6 +7666,46 @@ impl<'a> Interpreter<'a> {
                         }
                     };
                     Ok(self.rc_new_handle(Value::Tuple(elements)))
+                } else if target == "std::net::Ipv4Addr"
+                    && (source == "[u8; 4]" || source == "u32")
+                {
+                    // `Ipv4Addr: From<[u8; 4]>` is the octets
+                    // themselves; `From<u32>` is the big-endian
+                    // encoding of the octets. The result is the
+                    // address value in its declared shape (a
+                    // one-field aggregate over the octet array).
+                    let octets = if source == "u32" {
+                        match value {
+                            Value::Uint(v) => Some((v as u32).to_be_bytes()),
+                            Value::Int(v) => Some((v as u32).to_be_bytes()),
+                            _ => None,
+                        }
+                    } else {
+                        ipv4_octets(&value)
+                    };
+                    match octets {
+                        Some(octets) => Ok(ipv4_value(octets)),
+                        None => Err(InterpError::type_mismatch(
+                            "From::from to Ipv4Addr",
+                            "octet array or u32 value",
+                            value.kind_name(),
+                        )),
+                    }
+                } else if target == "u32"
+                    && (source == "std::net::Ipv4Addr" || source == "core::net::Ipv4Addr")
+                {
+                    // The reverse conversion: `u32::from(addr)`
+                    // is the big-endian encoding of the octets.
+                    match ipv4_octets(&value) {
+                        Some(octets) => {
+                            Ok(Value::Uint(u128::from(u32::from_be_bytes(octets))))
+                        }
+                        None => Err(InterpError::type_mismatch(
+                            "From::from from Ipv4Addr",
+                            "an Ipv4Addr value",
+                            value.kind_name(),
+                        )),
+                    }
                 } else if target == "std::path::PathBuf" {
                     // `PathBuf: From<&str> / From<&Path> /
                     // From<&OsStr> / From<String> / From<OsString>`:
@@ -27512,6 +27552,15 @@ impl<'a> Interpreter<'a> {
         if let Some(text) = self.format_io_error(value, trait_, ty, options, indent) {
             return Ok(text);
         }
+        // `std::net` address values (`Ipv4Addr`, `IpAddr`,
+        // `SocketAddrV4`, `SocketAddr`): their `Display` and
+        // `Debug` are a fixed function of the stored octets
+        // (and port), produced here like the other std shapes
+        // the structural engine models. `Debug` for these
+        // types is defined as the `Display` text in core.
+        if let Some(text) = format_net_addr(value, trait_, ty, options) {
+            return Ok(text);
+        }
         // The standard pointer wrappers (`Box`, `Rc`, `Arc`)
         // forward their `Display` and `Debug` to the pointee:
         // format the pointee with the element type as the tag.
@@ -28843,6 +28892,125 @@ fn debug_tuple_text(name: &str, items: &[String], options: &FmtOptions, indent: 
         return out;
     }
     pad_width(&format!("{name}({})", items.join(", ")), options)
+}
+
+/// The octets an `Ipv4Addr` value holds, through whichever
+/// representation the value model gave it: the declared shape
+/// (a one-field aggregate over the `[u8; 4]` array), the array
+/// or a four-field aggregate directly, a byte string, or the
+/// big-endian `u32` encoding. `None` for any other shape.
+fn ipv4_octets(value: &Value) -> Option<[u8; 4]> {
+    fn byte(value: &Value) -> Option<u8> {
+        match value {
+            Value::Uint(v) => u8::try_from(*v).ok(),
+            Value::Int(v) => u8::try_from(*v).ok(),
+            Value::Enum { fields, .. } if fields.len() == 1 => byte(&fields[0]),
+            Value::Tuple(items) if items.len() == 1 => byte(&items[0]),
+            _ => None,
+        }
+    }
+    match value {
+        Value::Enum { fields, .. } if fields.len() == 1 => ipv4_octets(&fields[0]),
+        Value::Enum { fields, .. } if fields.len() == 4 => Some([
+            byte(&fields[0])?,
+            byte(&fields[1])?,
+            byte(&fields[2])?,
+            byte(&fields[3])?,
+        ]),
+        Value::Tuple(items) if items.len() == 1 => ipv4_octets(&items[0]),
+        Value::Tuple(items) if items.len() == 4 => Some([
+            byte(&items[0])?,
+            byte(&items[1])?,
+            byte(&items[2])?,
+            byte(&items[3])?,
+        ]),
+        Value::Bytes(bytes) if bytes.len() == 4 => Some([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        Value::Uint(v) => u32::try_from(*v).ok().map(u32::to_be_bytes),
+        Value::Int(v) => u32::try_from(*v).ok().map(u32::to_be_bytes),
+        _ => None,
+    }
+}
+
+/// An `Ipv4Addr` value in its declared shape: a one-field
+/// aggregate over the octet array (the shape `Ipv4Addr::new`
+/// and the address constants materialise in this model).
+fn ipv4_value(octets: [u8; 4]) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![Value::Tuple(
+            octets.iter().map(|b| Value::Uint(u128::from(*b))).collect(),
+        )],
+    }
+}
+
+/// The port a `SocketAddrV4` field holds: a bare `u16` scalar,
+/// possibly behind one-field wrappers.
+fn net_port(value: &Value) -> Option<u16> {
+    match value {
+        Value::Uint(v) => u16::try_from(*v).ok(),
+        Value::Int(v) => u16::try_from(*v).ok(),
+        Value::Enum { fields, .. } if fields.len() == 1 => net_port(&fields[0]),
+        Value::Tuple(items) if items.len() == 1 => net_port(&items[0]),
+        _ => None,
+    }
+}
+
+/// `Display` / `Debug` text for the `std::net` address types
+/// whose rendering is a fixed function of the stored value:
+/// `Ipv4Addr` in dotted-decimal, `IpAddr` forwarding to the
+/// address it holds, and `SocketAddrV4` / `SocketAddr` as
+/// `{ip}:{port}`. Core defines `Debug` for these types as the
+/// `Display` text, and both go through `Formatter::pad`, so
+/// width / alignment / fill / precision apply to the composed
+/// text (`pad_str`). IPv6 variants are not modelled here and
+/// keep the existing behaviour (`None`).
+fn format_net_addr(
+    value: &Value,
+    trait_: FmtTrait,
+    ty: &str,
+    options: &FmtOptions,
+) -> Option<String> {
+    if !matches!(trait_, FmtTrait::Display | FmtTrait::Debug) {
+        return None;
+    }
+    let dotted = |octets: [u8; 4]| {
+        format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3])
+    };
+    let socket_v4 = |fields: &[Value]| -> Option<String> {
+        if fields.len() != 2 {
+            return None;
+        }
+        let ip = dotted(ipv4_octets(&fields[0])?);
+        let port = net_port(&fields[1])?;
+        Some(format!("{ip}:{port}"))
+    };
+    let plain = pointee_tag(ty);
+    let text = match plain {
+        "std::net::Ipv4Addr" | "core::net::Ipv4Addr" => dotted(ipv4_octets(value)?),
+        "std::net::IpAddr" | "core::net::IpAddr" => match value {
+            Value::Enum {
+                variant: 0,
+                fields,
+            } if fields.len() == 1 => dotted(ipv4_octets(&fields[0])?),
+            _ => return None,
+        },
+        "std::net::SocketAddrV4" | "core::net::SocketAddrV4" => match value {
+            Value::Enum { fields, .. } => socket_v4(fields)?,
+            _ => return None,
+        },
+        "std::net::SocketAddr" | "core::net::SocketAddr" => match value {
+            Value::Enum {
+                variant: 0,
+                fields,
+            } if fields.len() == 1 => match &fields[0] {
+                Value::Enum { fields, .. } => socket_v4(fields)?,
+                _ => return None,
+            },
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(pad_str(&text, options))
 }
 
 /// core `Formatter::pad`: precision truncates to that many chars,
