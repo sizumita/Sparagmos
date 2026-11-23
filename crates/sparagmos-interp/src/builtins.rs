@@ -622,11 +622,12 @@ pub enum Builtin {
     /// `str::as_bytes(&str) -> &[u8]`: a byte view of the string
     /// data.
     StrAsBytes,
-    /// `str::chars(&str)`: a char iterator state (the char values
-    /// plus the next index), the shape `Iterator::next` consumes
-    /// for `std::str::Chars`.
+    /// `str::chars(&str)`: a `std::str::Chars` value in its
+    /// real shape (see `str_chars_value`), the shape
+    /// `Iterator::next` consumes for `std::str::Chars`.
     StrChars,
-    /// `str::bytes(&str)`: a byte iterator state, the shape
+    /// `str::bytes(&str)`: a `std::str::Bytes` value in its
+    /// real shape (see `str_bytes_value`), the shape
     /// `Iterator::next` consumes for `std::str::Bytes`.
     StrBytes,
     /// `str::make_ascii_uppercase(&mut str)` /
@@ -7958,14 +7959,12 @@ impl<'a> Interpreter<'a> {
             Builtin::StrChars => {
                 arity(1)?;
                 let s = self.resolve_string(frames, &vals[0])?;
-                let items = s
-                    .chars()
-                    .map(|c| Value::Uint(c as u32 as u128))
+                let bytes = s
+                    .as_bytes()
+                    .iter()
+                    .map(|b| Value::Uint(*b as u128))
                     .collect();
-                Ok(Value::Enum {
-                    variant: 0,
-                    fields: vec![Value::Tuple(items), Value::Uint(0)],
-                })
+                Ok(str_chars_value(bytes))
             }
             Builtin::StrMakeAsciiCase(upper) => {
                 arity(1)?;
@@ -7989,15 +7988,12 @@ impl<'a> Interpreter<'a> {
             Builtin::StrBytes => {
                 arity(1)?;
                 let s = self.resolve_string(frames, &vals[0])?;
-                let items = s
+                let bytes = s
                     .as_bytes()
                     .iter()
                     .map(|b| Value::Uint(*b as u128))
                     .collect();
-                Ok(Value::Enum {
-                    variant: 0,
-                    fields: vec![Value::Tuple(items), Value::Uint(0)],
-                })
+                Ok(str_bytes_value(bytes))
             }
             Builtin::StrTrim(side) => {
                 arity(1)?;
@@ -14274,16 +14270,29 @@ fn value_fingerprint(value: &Value) -> u64 {
                     format!("{} / {}", ptr_field.kind_name(), end.kind_name()),
                 ));
             }
+        } else if self_ty_is(self_ty, "std::str::Chars")
+            || self_ty_is(self_ty, "core::str::Chars")
+            || self_ty_is(self_ty, "std::str::Bytes")
+            || self_ty_is(self_ty, "core::str::Bytes")
+        {
+            // The state is the real wrapper shape the `chars` /
+            // `bytes` builtins build (see `str_chars_value` /
+            // `str_bytes_value`): the step is computed on the
+            // wrapped byte-slice iterator (see `step_str_iter`).
+            let (new_state, item) = step_str_iter(state, self_ty, false)?;
+            (
+                iterator_fields(&new_state, self_ty)?,
+                match item {
+                    Some(value) => some_value(value),
+                    None => none_value(),
+                },
+            )
         } else if self_ty.starts_with("std::array::IntoIter<")
             || self_ty.starts_with("std::vec::IntoIter<")
             || self_ty.starts_with("alloc::vec::IntoIter<")
             || self_ty.starts_with("std::option::IntoIter<")
             || self_ty.starts_with("std::collections::btree_set::IntoIter<")
             || self_ty.starts_with("std::collections::btree_map::IntoIter<")
-            || self_ty_is(self_ty, "std::str::Chars")
-            || self_ty_is(self_ty, "core::str::Chars")
-            || self_ty_is(self_ty, "std::str::Bytes")
-            || self_ty_is(self_ty, "core::str::Bytes")
         {
             if fields.len() != 2 {
                 return Err(InterpError::type_mismatch(
@@ -14318,10 +14327,8 @@ fn value_fingerprint(value: &Value) -> u64 {
                 // out of the iterator's storage: mark the slot
                 // uninitialized in the new state, so the state's
                 // drop glue (which walks the element tuple) does
-                // not drop it a second time. `Chars` / `Bytes`
-                // elements carry no glue, so their snapshots keep
-                // the elements. (`slice::Iter` is stepped by its
-                // own real-layout arm above.)
+                // not drop it a second time. (`slice::Iter` is
+                // stepped by its own real-layout arm above.)
                 let items = if self_ty.starts_with("std::array::IntoIter<")
                     || self_ty.starts_with("std::vec::IntoIter<")
                     || self_ty.starts_with("alloc::vec::IntoIter<")
@@ -15252,51 +15259,35 @@ fn value_fingerprint(value: &Value) -> u64 {
             let n = end.saturating_sub(cur) as u128;
             return Ok(hint(n, Some(n)));
         }
+        if self_ty_is(self_ty, "std::str::Chars")
+            || self_ty_is(self_ty, "core::str::Chars")
+            || self_ty_is(self_ty, "std::str::Bytes")
+            || self_ty_is(self_ty, "core::str::Bytes")
+        {
+            // The remaining byte count is the wrapped byte
+            // iterator's remaining length, read off its pointer
+            // pair. `Bytes::size_hint` is that count exactly;
+            // std's `Chars::size_hint` bounds the char count by
+            // it: a char is at most 4 bytes, so the lower bound
+            // is the byte count divided by 4 rounded up.
+            let inner = str_iter_inner(&state, self_ty)?;
+            let (cur, end) = slice_iter_bounds(&inner, self_ty)?;
+            let bytes = end.saturating_sub(cur) as u128;
+            if self_ty_is(self_ty, "std::str::Chars")
+                || self_ty_is(self_ty, "core::str::Chars")
+            {
+                return Ok(hint(bytes.div_ceil(4), Some(bytes)));
+            }
+            return Ok(hint(bytes, Some(bytes)));
+        }
         if self_ty.starts_with("std::array::IntoIter<")
             || self_ty.starts_with("std::vec::IntoIter<")
             || self_ty.starts_with("alloc::vec::IntoIter<")
             || self_ty.starts_with("std::collections::btree_set::IntoIter<")
             || self_ty.starts_with("std::collections::btree_map::IntoIter<")
-            || self_ty_is(self_ty, "std::str::Chars")
-            || self_ty_is(self_ty, "core::str::Chars")
-            || self_ty_is(self_ty, "std::str::Bytes")
-            || self_ty_is(self_ty, "core::str::Bytes")
         {
             let (items, idx) = owned_iter_parts(&state, self_ty)?;
             let remaining = &items[idx.min(items.len())..];
-            if self_ty_is(self_ty, "std::str::Chars")
-                || self_ty_is(self_ty, "core::str::Chars")
-            {
-                // std's `Chars::size_hint`: the remaining byte
-                // count bounds the char count from above, and a
-                // char is at most 4 bytes, so the lower bound is
-                // the byte count divided by 4 rounded up. The
-                // state holds the decoded code points, so the
-                // remaining byte count is exact.
-                let mut bytes: u128 = 0;
-                for item in remaining {
-                    bytes += match item {
-                        Value::Uint(cp) => char::from_u32(*cp as u32)
-                            .map(|c| c.len_utf8() as u128)
-                            .ok_or_else(|| {
-                                InterpError::type_mismatch(
-                                    "Chars state",
-                                    "char code points",
-                                    format!("code point {cp}"),
-                                )
-                            })?,
-                        Value::Str(text) => text.len() as u128,
-                        other => {
-                            return Err(InterpError::type_mismatch(
-                                "Chars state",
-                                "char values",
-                                other.kind_name(),
-                            ))
-                        }
-                    };
-                }
-                return Ok(hint(bytes.div_ceil(4), Some(bytes)));
-            }
             let n = remaining.len() as u128;
             return Ok(hint(n, Some(n)));
         }
@@ -19489,16 +19480,19 @@ fn iterator_next_back_state(
     {
         return step_slice_iter_back(state, self_ty);
     }
+    if self_ty_is(self_ty, "std::str::Chars")
+        || self_ty_is(self_ty, "core::str::Chars")
+        || self_ty_is(self_ty, "std::str::Bytes")
+        || self_ty_is(self_ty, "core::str::Bytes")
+    {
+        return step_str_iter(state, self_ty, true);
+    }
     if self_ty.starts_with("std::array::IntoIter<")
         || self_ty.starts_with("std::vec::IntoIter<")
         || self_ty.starts_with("alloc::vec::IntoIter<")
         || self_ty.starts_with("std::option::IntoIter<")
         || self_ty.starts_with("std::collections::btree_set::IntoIter<")
         || self_ty.starts_with("std::collections::btree_map::IntoIter<")
-        || self_ty_is(self_ty, "std::str::Chars")
-        || self_ty_is(self_ty, "core::str::Chars")
-        || self_ty_is(self_ty, "std::str::Bytes")
-        || self_ty_is(self_ty, "core::str::Bytes")
     {
         return step_owned_iter_back(state, self_ty);
     }
@@ -20183,6 +20177,235 @@ fn step_slice_iter_back(
     } else {
         Ok((state.clone(), None))
     }
+}
+
+/// The `core::str::Bytes` value over a string's bytes, in the
+/// struct's real shape: `Bytes(Copied<slice::Iter<u8>>)` — the
+/// one field is a `Copied` adapter holding the `slice::Iter<u8>`
+/// over the byte snapshot, in the real field layout
+/// `slice_iter_value` builds. The shape matters beyond the
+/// builtins: core's converted bodies for the iterator's methods
+/// project the fields and hand the innermost state to
+/// `slice::Iter` methods, so a fabricated (snapshot, cursor)
+/// state in its place hands the container value where an
+/// iterator state is expected and the run dies at that seam.
+fn str_bytes_value(bytes: Vec<Value>) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![Value::Enum {
+            variant: 0,
+            fields: vec![slice_iter_value(bytes)],
+        }],
+    }
+}
+
+/// The `core::str::Chars` value over a string's bytes, in the
+/// struct's real shape: `Chars { iter }`, where the field is
+/// the `slice::Iter<u8>` over the byte snapshot directly, in
+/// the real field layout `slice_iter_value` builds.
+fn str_chars_value(bytes: Vec<Value>) -> Value {
+    Value::Enum {
+        variant: 0,
+        fields: vec![slice_iter_value(bytes)],
+    }
+}
+
+fn self_ty_is_str_chars(self_ty: &str) -> bool {
+    self_ty_is(self_ty, "std::str::Chars") || self_ty_is(self_ty, "core::str::Chars")
+}
+
+fn self_ty_is_str_bytes(self_ty: &str) -> bool {
+    self_ty_is(self_ty, "std::str::Bytes") || self_ty_is(self_ty, "core::str::Bytes")
+}
+
+/// The byte-slice iterator state a `str::Chars` / `str::Bytes`
+/// state wraps: one wrapper layer down for `Chars` (its field
+/// is the byte-slice iterator itself), two for `Bytes` (through
+/// the `Copied` adapter) — see `str_chars_value` /
+/// `str_bytes_value`.
+fn str_iter_inner(state: &Value, self_ty: &str) -> InterpResult<Value> {
+    let fields = iterator_fields(state, self_ty)?;
+    if fields.len() != 1 {
+        return Err(InterpError::type_mismatch(
+            format!("{self_ty} state"),
+            "a one-field wrapper around a byte-slice iterator",
+            format!("{} field(s)", fields.len()),
+        ));
+    }
+    let inner = fields.into_iter().next().expect("one field checked");
+    if self_ty_is_str_chars(self_ty) {
+        return Ok(inner);
+    }
+    let inner_fields = iterator_fields(&inner, self_ty)?;
+    if inner_fields.len() != 1 {
+        return Err(InterpError::type_mismatch(
+            format!("{self_ty} state"),
+            "a one-field wrapper around a byte-slice iterator",
+            format!("{} field(s)", inner_fields.len()),
+        ));
+    }
+    Ok(inner_fields.into_iter().next().expect("one field checked"))
+}
+
+/// A `str::Chars` / `str::Bytes` state with `state`'s wrapper
+/// shapes and `new_inner` as the wrapped byte-slice iterator
+/// state: the rebuild the str-iterator steps perform.
+fn str_iter_rewrap(state: &Value, self_ty: &str, new_inner: Value) -> InterpResult<Value> {
+    let fields = iterator_fields(state, self_ty)?;
+    if fields.len() != 1 {
+        return Err(InterpError::type_mismatch(
+            format!("{self_ty} state"),
+            "a one-field wrapper around a byte-slice iterator",
+            format!("{} field(s)", fields.len()),
+        ));
+    }
+    if self_ty_is_str_chars(self_ty) {
+        return Ok(iterator_state_like(state, vec![new_inner]));
+    }
+    let rebuilt_inner = iterator_state_like(&fields[0], vec![new_inner]);
+    Ok(iterator_state_like(state, vec![rebuilt_inner]))
+}
+
+/// The byte elements of the snapshot a real-layout slice
+/// iterator state points into (see `slice_iter_value`): the
+/// producers' pointers denote a value snapshot whose elements
+/// are the bytes themselves.
+fn slice_iter_snapshot_bytes(state: &Value, self_ty: &str) -> InterpResult<Vec<u8>> {
+    let fields = iterator_fields(state, self_ty)?;
+    if fields.len() != 3 {
+        return Err(InterpError::type_mismatch(
+            "slice::Iter state",
+            "[ptr, end, marker]",
+            format!("{} field(s)", fields.len()),
+        ));
+    }
+    let ptr = iter_ptr_value(&fields[0]).ok_or_else(|| {
+        InterpError::type_mismatch(
+            format!("{self_ty} state"),
+            "an element pointer into a value snapshot",
+            fields[0].kind_name(),
+        )
+    })?;
+    let items = match &ptr {
+        Value::Ref(RefTarget::Value(snapshot, _)) => match &**snapshot {
+            Value::Tuple(items) => items.clone(),
+            other => {
+                return Err(InterpError::type_mismatch(
+                    format!("{self_ty} state"),
+                    "a value snapshot of bytes",
+                    other.kind_name(),
+                ))
+            }
+        },
+        other => {
+            return Err(InterpError::type_mismatch(
+                format!("{self_ty} state"),
+                "an element pointer into a value snapshot",
+                other.kind_name(),
+            ))
+        }
+    };
+    let mut bytes = Vec::with_capacity(items.len());
+    for item in &items {
+        match item {
+            Value::Uint(v) => bytes.push(u8::try_from(*v).map_err(|_| {
+                InterpError::type_mismatch(
+                    format!("{self_ty} state"),
+                    "byte values",
+                    format!("integer {v}"),
+                )
+            })?),
+            other => {
+                return Err(InterpError::type_mismatch(
+                    format!("{self_ty} state"),
+                    "byte values",
+                    other.kind_name(),
+                ))
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+/// One step of a `str::Chars` / `str::Bytes` state, from the
+/// front (`from_back == false`) or the back: the step runs on
+/// the wrapped byte-slice iterator — a `Bytes` step moves one
+/// byte, a `Chars` step moves one UTF-8 encoded char, decoded
+/// with the host's own UTF-8 rules from the byte snapshot the
+/// state's pointers denote. The string the iterator was built
+/// from is valid UTF-8 and a `Chars` state's pointers only ever
+/// rest on char boundaries, exactly as the real iterators
+/// maintain, so the decode cannot fail on a state the producers
+/// built.
+fn step_str_iter(
+    state: &Value,
+    self_ty: &str,
+    from_back: bool,
+) -> InterpResult<(Value, Option<Value>)> {
+    let inner = str_iter_inner(state, self_ty)?;
+    let (cur, end) = slice_iter_bounds(&inner, self_ty)?;
+    if cur >= end {
+        return Ok((state.clone(), None));
+    }
+    let bytes = slice_iter_snapshot_bytes(&inner, self_ty)?;
+    // Only a `Chars` step decodes: its pointers rest on char
+    // boundaries, so the remaining range is valid UTF-8. A
+    // `Bytes` step moves a single byte and never decodes — its
+    // pointers routinely rest inside a char.
+    let text = if self_ty_is_str_chars(self_ty) {
+        Some(std::str::from_utf8(&bytes[cur..end]).map_err(|_| {
+            InterpError::type_mismatch(
+                format!("{self_ty} state"),
+                "valid UTF-8 between the iterator's pointers",
+                "invalid UTF-8",
+            )
+        })?)
+    } else {
+        None
+    };
+    let fields = iterator_fields(&inner, self_ty)?;
+    let (item, new_inner) = if from_back {
+        let (item, width) = if self_ty_is_str_chars(self_ty) {
+            let c = text
+                .expect("chars step decoded")
+                .chars()
+                .next_back()
+                .expect("range checked non-empty");
+            (Value::Uint(c as u32 as u128), c.len_utf8())
+        } else {
+            (Value::Uint(bytes[end - 1] as u128), 1)
+        };
+        let new_end =
+            iter_ptr_with_index(&fields[1], end - width).expect("index step checked");
+        (
+            item,
+            iterator_state_like(
+                &inner,
+                vec![fields[0].clone(), new_end, fields[2].clone()],
+            ),
+        )
+    } else {
+        let (item, width) = if self_ty_is_str_chars(self_ty) {
+            let c = text
+                .expect("chars step decoded")
+                .chars()
+                .next()
+                .expect("range checked non-empty");
+            (Value::Uint(c as u32 as u128), c.len_utf8())
+        } else {
+            (Value::Uint(bytes[cur] as u128), 1)
+        };
+        let new_ptr =
+            iter_ptr_with_index(&fields[0], cur + width).expect("index step checked");
+        (
+            item,
+            iterator_state_like(
+                &inner,
+                vec![new_ptr, fields[1].clone(), fields[2].clone()],
+            ),
+        )
+    };
+    Ok((str_iter_rewrap(state, self_ty, new_inner)?, Some(item)))
 }
 
 fn iterator_fields(state: &Value, self_ty: &str) -> InterpResult<Vec<Value>> {

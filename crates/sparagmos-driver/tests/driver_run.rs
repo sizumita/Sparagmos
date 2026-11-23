@@ -10010,6 +10010,46 @@ fn run_mode_size_hint_reports_std_values() {
     );
 }
 
+const STR_ITER_WRAPPER_SRC: &str = r#"
+fn main() {
+    let b = "aé€b".bytes();
+    println!("len {}", b.len());
+    let mut b2 = "aé€b".bytes();
+    b2.next();
+    b2.next_back();
+    println!("len {}", b2.len());
+    let mut it = "aé€b".chars();
+    println!("{:?}", it.next());
+    println!("{:?}", it.next_back());
+    println!("{:?}", it.next());
+    println!("{:?}", it.next_back());
+    println!("{:?}", it.next());
+    let cs: Vec<char> = "aé€b".chars().rev().collect();
+    println!("{cs:?}");
+}
+"#;
+
+#[test]
+fn run_mode_str_iter_states_use_the_real_wrapper_shape() {
+    // The `str::Chars` / `str::Bytes` states are the structs'
+    // real shapes (Chars { slice::Iter }, Bytes(Copied<slice::
+    // Iter>)): `ExactSizeIterator::len` for `Bytes` is a
+    // collected core body that reads that layout off the state,
+    // and it must agree with the modelled front/back steps at
+    // every point.
+    let dir = temp_dir("str-iter-wrapper");
+    let src = fixture(&dir, "striterwrapper.rs", STR_ITER_WRAPPER_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "len 7\nlen 5\nSome('a')\nSome('b')\nSome('é')\nSome('€')\nNone\n['b', '€', 'é', 'a']\n",
+        "stdout={stdout}"
+    );
+}
+
 const SIZE_HINT_DEFAULT_SRC: &str = r#"
 struct Thing<'a>(&'a str);
 impl<'a> Iterator for Thing<'a> {
