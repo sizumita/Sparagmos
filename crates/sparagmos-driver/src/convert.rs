@@ -6121,16 +6121,24 @@ impl Converter {
                 // one of the trait bounds (`Trait<N = 101>`):
                 // it folds into that trait's name as a generic
                 // argument rather than standing as a bound of
-                // its own.
-                let mut names: Vec<String> = Vec::new();
+                // its own. Each entry keeps the trait path it
+                // was rendered from beside the rendered name:
+                // folding a binding rewrites the rendered name
+                // (`Trait` becomes `Trait<A=u8>`), so matching
+                // a later binding of the same trait against the
+                // rendered names would miss the entry and stand
+                // the binding up as a separate bound.
+                let mut names: Vec<(String, String)> = Vec::new();
                 let mut bindings: Vec<(String, String, String)> = Vec::new();
                 for b in bounds.iter() {
                     match &b.value {
                         rustc_public::ty::ExistentialPredicate::Trait(t) => {
-                            names.push(t.def_id.name());
+                            let name = t.def_id.name();
+                            names.push((name.clone(), name));
                         }
                         rustc_public::ty::ExistentialPredicate::AutoTrait(d) => {
-                            names.push(d.name());
+                            let name = d.name();
+                            names.push((name.clone(), name));
                         }
                         rustc_public::ty::ExistentialPredicate::Projection(p) => {
                             let item = p.def_id.name();
@@ -6141,15 +6149,18 @@ impl Converter {
                                     assoc.to_string(),
                                     term,
                                 )),
-                                None => names.push(item),
+                                None => names.push((item.clone(), item)),
                             }
                         }
                     }
                 }
                 for (trait_path, assoc, term) in bindings {
                     let binding = format!("{assoc}={term}");
-                    match names.iter_mut().find(|n| n.as_str() == trait_path) {
-                        Some(slot) => {
+                    match names
+                        .iter_mut()
+                        .find(|(base, _)| base == &trait_path)
+                    {
+                        Some((_, slot)) => {
                             if slot.ends_with('>') {
                                 slot.insert_str(
                                     slot.len() - 1,
@@ -6159,9 +6170,16 @@ impl Converter {
                                 *slot = format!("{slot}<{binding}>");
                             }
                         }
-                        None => names.push(format!("{trait_path}<{binding}>")),
+                        None => names.push((
+                            trait_path.clone(),
+                            format!("{trait_path}<{binding}>"),
+                        )),
                     }
                 }
+                let names = names
+                    .into_iter()
+                    .map(|(_, rendered)| rendered)
+                    .collect();
                 sm::Ty::Dynamic(names, Box::new(sm::Ty::unit()), sm::Region::Erased)
             }
             RigidTy::Closure(def, args) => {

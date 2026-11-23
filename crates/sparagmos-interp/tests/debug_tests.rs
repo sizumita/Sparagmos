@@ -1119,3 +1119,113 @@ fn length_pseudo_field_still_reads_a_sequence() {
         run.transcript
     );
 }
+
+/// A program whose main builds a union value through one
+/// field: `let u = test::U { bits: 0x3f800000 }` for
+/// `union U { bits: u32, value: f32 }`. The value model
+/// stores only the written field, so reading the other
+/// field reinterprets that storage.
+fn union_program() -> Program {
+    use sparagmos_mir::{AdtDebugField, AdtDebugShape, AdtDebugVariant, AdtShapeKind};
+    let mut body = Body::new(
+        "main",
+        0,
+        vec![Ty::Unit, Ty::Adt("test::U".to_string())],
+        vec![
+            BasicBlockData::new(
+                vec![Statement::assign(
+                    Place::from_index(1),
+                    Rvalue::AggregateAdt {
+                        variant: 0,
+                        operands: vec![Operand::const_uint(1065353216)],
+                        field_index: None,
+                        units_from: None,
+                    },
+                )],
+                TerminatorKind::Goto { target: BasicBlock(1) },
+            ),
+            BasicBlockData::new(
+                vec![Statement::assign(
+                    Place::from_index(0),
+                    Rvalue::Use(Operand::const_unit()),
+                )],
+                TerminatorKind::Return,
+            ),
+        ],
+    );
+    body.source_lines = vec![
+        BlockSourceLines {
+            statements: vec![line(2)],
+            terminator: line(2),
+        },
+        BlockSourceLines {
+            statements: vec![line(3)],
+            terminator: line(3),
+        },
+    ];
+    body.debug_vars = vec![DebugVarEntry {
+        name: "u".to_string(),
+        source: DebugVar::Place(1, vec![]),
+        is_char: false,
+        ty: Some("test::U".to_string()),
+        lines: (2, 2),
+    }];
+    let mut p = Program::new();
+    p.add_function(body);
+    p.source_files = vec!["test.rs".to_string()];
+    p.adt_debug_shapes.insert(
+        "test::U".to_string(),
+        AdtDebugShape {
+            kind: AdtShapeKind::Union,
+            variants: vec![AdtDebugVariant {
+                name: "U".to_string(),
+                fields: vec![
+                    AdtDebugField {
+                        name: Some("bits".to_string()),
+                        ty: "u32".to_string(),
+                    },
+                    AdtDebugField {
+                        name: Some("value".to_string()),
+                        ty: "f32".to_string(),
+                    },
+                ],
+            }],
+        },
+    );
+    p
+}
+
+#[test]
+fn union_field_print_reinterprets_the_stored_field() {
+    // Inspecting one field of a union agrees with printing
+    // the whole union: the field the program did not write
+    // reads through the written field's storage instead of
+    // reporting an uninitialized read.
+    let mut s = session(union_program());
+    s.set_breakpoint("test.rs", 3);
+    let run = s.run_script(
+        vec![
+            DebugCommand::Run,
+            print("u"),
+            print("u.value"),
+            print("u.bits"),
+            whatis("u.value"),
+            whatis("u.bits"),
+        ],
+        DebugDialect::Gdb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    for want in [
+        "$1 = test::U {bits: 1065353216, value: 1}",
+        "$2 = 1",
+        "$3 = 1065353216",
+        "type = f32",
+        "type = u32",
+    ] {
+        assert!(
+            run.transcript.iter().any(|l| l == want),
+            "missing `{want}` in {:?}",
+            run.transcript
+        );
+    }
+}

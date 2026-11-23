@@ -28296,3 +28296,95 @@ fn run_mode_strip_bytes_default() {
         "StripBytes::default() must be the initial strip state; stderr={stderr}"
     );
 }
+fn debug_driver(dir: &Path, src: &Path, script: &str) -> Output {
+    let script_path = dir.join("session.script");
+    std::fs::write(&script_path, script).unwrap();
+    Command::new(env!("CARGO_BIN_EXE_sparagmos-driver"))
+        .arg("debug")
+        .arg(src)
+        .arg("--edition")
+        .arg("2021")
+        .arg("--debug-script")
+        .arg(&script_path)
+        .arg("--debug-dialect")
+        .arg("gdb")
+        .output()
+        .expect("failed to run sparagmos-driver")
+}
+const DEBUG_UNION_SRC: &str = r#"union U { bits: u32, value: f32 }
+fn main() {
+    let u = U { bits: 0x3f800000 };
+    zzz();
+}
+fn zzz() {}
+"#;
+#[test]
+fn debug_mode_union_field_read_reinterprets_storage() {
+    // A union stores only the written field; printing the
+    // other field reinterprets that storage (the reading the
+    // whole-union print applies) instead of reporting an
+    // uninitialized read.
+    let dir = temp_dir("debug-union");
+    let src = fixture(&dir, "union_field.rs", DEBUG_UNION_SRC);
+    let out = debug_driver(
+        &dir,
+        &src,
+        "break 4\nrun\nprint u\nprint u.value\nprint u.bits\nwhatis u.value\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in [
+        "{bits: 1065353216, value: 1}",
+        "$2 = 1",
+        "$3 = 1065353216",
+        "type = f32",
+    ] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("uninitialized"),
+        "union field read must not report an uninitialized read: {stdout}"
+    );
+}
+const DEBUG_DYN_BINDINGS_SRC: &str = r#"trait Tr {
+    type A;
+    type B;
+    fn get(&self) -> u8;
+}
+struct S;
+impl Tr for S {
+    type A = u8;
+    type B = u16;
+    fn get(&self) -> u8 { 7 }
+}
+fn main() {
+    let s = S;
+    let d: &dyn Tr<A = u8, B = u16> = &s;
+    zzz();
+    let _z = d.get();
+}
+fn zzz() {}
+"#;
+#[test]
+fn debug_mode_dyn_two_bindings_stay_on_one_trait() {
+    // Two associated-type bindings of one trait fold into
+    // that trait's name (`Tr<A=u8, B=u16>`); the second
+    // binding must not stand up as a separate bound
+    // (`Tr<A=u8> + Tr<B=u16>`).
+    let dir = temp_dir("debug-dyn-bindings");
+    let src = fixture(&dir, "dyn_bindings.rs", DEBUG_DYN_BINDINGS_SRC);
+    let out = debug_driver(&dir, &src, "break 15\nrun\nwhatis d\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    assert!(
+        stdout.contains("type = &dyn dyn_bindings::Tr<A=u8, B=u16>"),
+        "bindings must combine on one trait: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Tr<A=u8> +"),
+        "second binding must not become a separate bound: {stdout}"
+    );
+}

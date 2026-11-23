@@ -1362,6 +1362,16 @@ fn apply_field_name(
                     .position(|f| f.name.as_deref() == Some(name))
                 {
                     let next = Desc::from_tag(&vshape.fields[index].ty);
+                    // A union stores only the written field;
+                    // reading another field reinterprets that
+                    // storage through the requested field's
+                    // type, the reading whole-union printing
+                    // applies.
+                    if let Some(reinterpreted) =
+                        union_projected_field(interp, desc.as_ref(), &value, index)
+                    {
+                        return Ok((reinterpreted, Some(next)));
+                    }
                     let projected = crate::interp::project_value(
                         value,
                         &[RefProj::Field(index)],
@@ -1497,13 +1507,24 @@ fn evaluate_expr(
                     .desc
                     .as_ref()
                     .and_then(|d| field_desc(interp, d, &ev.value, *index));
-                ev.value = crate::interp::project_value(
-                    ev.value,
-                    &[RefProj::Field(*index)],
-                    "debugger",
-                    expr_text,
-                )
-                .map_err(|e| e.to_string())?;
+                // A union field read reinterprets the stored
+                // field's storage (see `apply_field_name`);
+                // any other value projects directly.
+                ev.value = match union_projected_field(
+                    interp,
+                    ev.desc.as_ref(),
+                    &ev.value,
+                    *index,
+                ) {
+                    Some(reinterpreted) => reinterpreted,
+                    None => crate::interp::project_value(
+                        ev.value,
+                        &[RefProj::Field(*index)],
+                        "debugger",
+                        expr_text,
+                    )
+                    .map_err(|e| e.to_string())?,
+                };
                 ev.desc = next;
                 ev.char = false;
             }
@@ -2917,6 +2938,53 @@ fn union_field_values(
         .iter()
         .map(|f| value_from_union_bytes(&bytes, &f.ty))
         .collect()
+}
+
+/// One field of a union value, read the way
+/// [`union_field_values`] reads every field: the stored
+/// field's bytes reinterpreted as the requested field's
+/// type.
+fn union_field_value(
+    shape_fields: &[sparagmos_mir::AdtDebugField],
+    value: &Value,
+    index: usize,
+) -> Option<Value> {
+    let fields: &[Value] = match value {
+        Value::Enum { fields, .. } => fields,
+        Value::Tuple(fields) => fields,
+        _ => return None,
+    };
+    union_field_values(shape_fields, fields)?
+        .into_iter()
+        .nth(index)
+}
+
+/// The value of one field of the ADT value a descriptor
+/// names, when that ADT is a union: the field read through
+/// the storage reinterpretation above, so inspecting a
+/// field agrees with printing its containing union. `None`
+/// for non-ADT descriptors, non-union shapes, and storage
+/// the reinterpretation cannot read (the caller then
+/// projects directly).
+fn union_projected_field(
+    interp: &Interpreter,
+    desc: Option<&Desc>,
+    value: &Value,
+    index: usize,
+) -> Option<Value> {
+    let Desc::Adt(tag) = desc? else {
+        return None;
+    };
+    let shape = interp.program().adt_debug_shapes.get(tag)?;
+    if !matches!(shape.kind, sparagmos_mir::AdtShapeKind::Union) {
+        return None;
+    }
+    let variant = match value {
+        Value::Enum { variant, .. } => *variant as usize,
+        _ => 0,
+    };
+    let vshape = shape.variants.get(variant)?;
+    union_field_value(&vshape.fields, value, index)
 }
 
 /// lldb's expanded-children form of a `NonZero` value: the
