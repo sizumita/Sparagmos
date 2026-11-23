@@ -15717,6 +15717,53 @@ fn run_mode_wrapping_fmt_forwards_to_inner() {
     );
 }
 
+const SATURATING_FMT_SRC: &str = r#"
+use std::num::Saturating;
+#[derive(Debug)]
+struct Holder { s: Saturating<i32> }
+fn main() {
+    println!("{:?}", Saturating(5i32));
+    println!("{:?}", Saturating(-5i32));
+    println!("{:#?}", Saturating(5i32));
+    println!("{:?}", Saturating(18446744073709551615u64));
+    println!("{:?}", Saturating(vec![1, 2, 3]));
+    println!("{:#?}", Saturating(vec![1, 2]));
+    println!("{:?}", Saturating("hi"));
+    println!("{:?}", Saturating(Some(3)));
+    println!("{:?}", (Saturating(1), Saturating(2)));
+    println!("{:?}", Holder { s: Saturating(7) });
+    println!("{:#?}", Holder { s: Saturating(7) });
+    println!("{}", Saturating(5i32));
+    println!("{:x}", Saturating(255u32));
+    println!("{:X}", Saturating(255u32));
+    println!("{:o}", Saturating(8u32));
+    println!("{:b}", Saturating(5u32));
+    println!("{:>8}", Saturating(42i32));
+    println!("{:08}", Saturating(42i32));
+    println!("{:+}", Saturating(42i32));
+    println!("{:#x}", Saturating(255u32));
+    println!("{:?}", Saturating(2.5f64));
+    println!("{}", Saturating(2.5f64));
+    println!("{:?}", Saturating('c'));
+    println!("{}", Saturating('c'));
+}
+"#;
+
+#[test]
+fn run_mode_saturating_fmt_forwards_to_inner() {
+    // Core's fmt impls for `std::num::Saturating<T>` forward
+    // to the inner value's own impl, exactly like `Wrapping`:
+    // the wrapper's name never appears, for `Debug` (plain
+    // and alternate) as for `Display` and the radix traits,
+    // the formatting options pass through unchanged, at the
+    // top level and in a derived `Debug` field.
+    run_ok(
+        "saturating-fmt",
+        SATURATING_FMT_SRC,
+        "5\n-5\n5\n18446744073709551615\n[1, 2, 3]\n[\n    1,\n    2,\n]\n\"hi\"\nSome(3)\n(1, 2)\nHolder { s: 7 }\nHolder {\n    s: 7,\n}\n5\nff\nFF\n10\n101\n      42\n00000042\n+42\n0xff\n2.5\n2.5\n'c'\nc\n",
+    );
+}
+
 const SIMD_CAST_SRC: &str = r#"
 #![feature(repr_simd, core_intrinsics)]
 #[repr(simd)]
