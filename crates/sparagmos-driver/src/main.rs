@@ -6863,6 +6863,19 @@ fn tool_run(
 /// subprocess enters once its conversion is done, so the
 /// program itself runs where the recipe invoked it.
 ///
+/// The lookup path the interpreter's spawn resolution
+/// settled on is read against the directory that
+/// resolution ran in -- this process's own working
+/// directory -- not the execution directory: the
+/// resolution already applied the child's directory to a
+/// spelled path (and a relative `PATH` entry is relative
+/// to the searching process), so standing it on the
+/// execution directory would apply the child's directory
+/// twice. The guest arguments travel to the subprocess as
+/// command-line strings, so an argument that is not valid
+/// UTF-8 cannot be carried unchanged and makes the
+/// invocation unsupported instead of lossy.
+///
 /// The subprocess keeps the two stderr channels apart: the
 /// recorded program's own stderr travels through the file
 /// named by `--guest-stderr-file` and is relayed byte for
@@ -6910,7 +6923,17 @@ fn artifact_run(
             if resolved.is_absolute() {
                 resolved
             } else {
-                cwd.join(resolved)
+                // The resolution settled this path against
+                // this process's own working directory (the
+                // directory the interpreter's spawn search
+                // ran in), not the execution directory: a
+                // spelling like `sub/./prog` already carries
+                // the child's directory, and standing it on
+                // the execution directory would apply that
+                // directory twice.
+                std::env::current_dir()
+                    .map_err(|e| format!("tool interception: no working directory: {e}"))?
+                    .join(resolved)
             }
         }
         None => absolutize(&cwd, &program),
@@ -7019,7 +7042,17 @@ fn artifact_run(
     tail.push(env_path.display().to_string());
     tail.push("--guest-program-name".to_string());
     tail.push(program_name);
+    // The arguments travel as command-line strings, and
+    // the interpreter's argument model holds text: an
+    // argument that is not valid UTF-8 cannot be carried
+    // without changing its bytes, so the invocation is
+    // unsupported rather than silently lossy.
     for arg in &request.args {
+        if std::str::from_utf8(arg).is_err() {
+            return Err(format!(
+                "tool interception: running artifact `{program}`: a guest argument is not valid UTF-8, which the run cannot carry unchanged"
+            ));
+        }
         tail.push("--guest-arg".to_string());
         tail.push(String::from_utf8_lossy(arg).into_owned());
     }

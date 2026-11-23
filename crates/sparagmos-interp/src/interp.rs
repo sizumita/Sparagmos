@@ -465,6 +465,22 @@ pub(crate) struct FmtBuilderState {
     pub result_ok: bool,
 }
 
+/// One stream's `Stdio` configuration, as the guest set it
+/// on a command (see [`CommandState::stdout_stdio`]): the
+/// routing an invocation's outcome bytes get for that
+/// stream.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum StdioConfig {
+    Inherit,
+    Null,
+    Piped,
+    /// A configuration the value model does not decode (the
+    /// file-descriptor form and anything unrecognized): an
+    /// invocation carrying one is reported unsupported
+    /// rather than run with a guessed routing.
+    Unmodelled,
+}
+
 #[derive(Clone)]
 pub(crate) struct CommandState {
     /// The program path as passed to `Command::new` (raw bytes:
@@ -486,6 +502,13 @@ pub(crate) struct CommandState {
     /// byte (std rejects such commands at spawn with an
     /// `InvalidInput` error).
     pub saw_nul: bool,
+    /// The `Stdio` configuration set for the child's stdout,
+    /// when the guest set one; `None` keeps the entry point's
+    /// default (inherit for `status`, piped for `output`).
+    pub stdout_stdio: Option<StdioConfig>,
+    /// The `Stdio` configuration set for the child's stderr;
+    /// see `stdout_stdio`.
+    pub stderr_stdio: Option<StdioConfig>,
 }
 
 /// The channel id carried by an mpsc handle value, if the value

@@ -22303,6 +22303,245 @@ fn run_mode_tool_interception_unproduced_program_stays_unsupported() {
     );
 }
 
+const RELATIVE_CHILD_DIR_GUEST_SRC: &str = r#"use std::process::Command;
+
+fn main() {
+    let rustc = std::env::args().nth(1).unwrap();
+    let src0 = std::env::args().next().unwrap();
+    let dir = std::path::Path::new(&src0).parent().unwrap().to_path_buf();
+    std::env::set_current_dir(&dir).unwrap();
+    std::fs::create_dir_all("sub").unwrap();
+    std::fs::write("sub/prog.rs", "fn main() { println!(\"child five\"); }\n").unwrap();
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--out-dir")
+        .arg("sub")
+        .arg("sub/prog.rs")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new("./prog").current_dir("sub").output().unwrap();
+    assert!(out.status.success(), "run failed");
+    println!("got: {}", String::from_utf8(out.stdout).unwrap().trim());
+}"#;
+
+#[test]
+fn run_mode_tool_interception_relative_child_dir_resolves_once() {
+    let dir = temp_dir("tool-relative-child-dir");
+    let src = fixture(
+        &dir,
+        "relative_child_dir_guest.rs",
+        RELATIVE_CHILD_DIR_GUEST_SRC,
+    );
+    let driver = env!("CARGO_BIN_EXE_sparagmos-driver");
+    let out = run_driver_extra(&src, &["--tool-program", driver, "--guest-arg", driver]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    // The spawn resolution applies the child's directory
+    // to the spelled `./prog` once: the artifact lookup
+    // stands the resolved `sub/./prog` on the directory the
+    // resolution ran in, not on the execution directory
+    // (which would look under `sub/sub/`).
+    assert_eq!(stdout, "got: child five\n", "stderr={stderr}");
+}
+
+const STDIO_NULL_GUEST_SRC: &str = r#"use std::process::{Command, Stdio};
+
+fn main() {
+    let rustc = std::env::args().nth(1).unwrap();
+    let src0 = std::env::args().next().unwrap();
+    let dir = std::path::Path::new(&src0).parent().unwrap().to_path_buf();
+    std::env::set_current_dir(&dir).unwrap();
+    std::fs::write(
+        "p.rs",
+        "fn main() { println!(\"child out\"); eprintln!(\"child err\"); }\n",
+    )
+    .unwrap();
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--out-dir")
+        .arg(".")
+        .arg("p.rs")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    println!("before");
+    let st = Command::new(dir.join("p"))
+        .stdout(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let st = Command::new(dir.join("p"))
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(st.success());
+    println!("after");
+}"#;
+
+#[test]
+fn run_mode_tool_interception_status_honors_stdio_null() {
+    let dir = temp_dir("tool-stdio-null");
+    let src = fixture(&dir, "stdio_null_guest.rs", STDIO_NULL_GUEST_SRC);
+    let driver = env!("CARGO_BIN_EXE_sparagmos-driver");
+    let out = run_driver_extra(&src, &["--tool-program", driver, "--guest-arg", driver]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    // Each `status()` call relays only the stream it
+    // inherits: the stdout-nulled call contributes its
+    // stderr line, the stderr-nulled call its stdout line,
+    // and the nulled streams' bytes appear nowhere.
+    assert_eq!(stdout, "before\nchild out\nafter\n", "stderr={stderr}");
+    assert_eq!(stderr, "child err\n", "stdout={stdout}");
+}
+
+const STDIO_OUTPUT_GUEST_SRC: &str = r#"use std::process::{Command, Stdio};
+
+fn main() {
+    let rustc = std::env::args().nth(1).unwrap();
+    let src0 = std::env::args().next().unwrap();
+    let dir = std::path::Path::new(&src0).parent().unwrap().to_path_buf();
+    std::env::set_current_dir(&dir).unwrap();
+    std::fs::write(
+        "p.rs",
+        "fn main() { println!(\"child out\"); eprintln!(\"child err\"); }\n",
+    )
+    .unwrap();
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--out-dir")
+        .arg(".")
+        .arg("p.rs")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new(dir.join("p"))
+        .stdout(Stdio::inherit())
+        .output()
+        .unwrap();
+    println!(
+        "inherit collected stdout: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    println!(
+        "inherit collected stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new(dir.join("p"))
+        .stderr(Stdio::null())
+        .output()
+        .unwrap();
+    println!(
+        "null collected stdout: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    println!(
+        "null collected stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new(dir.join("p"))
+        .stdout(Stdio::piped())
+        .output()
+        .unwrap();
+    println!(
+        "piped collected stdout: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}"#;
+
+#[test]
+fn run_mode_tool_interception_output_honors_stdio_overrides() {
+    let dir = temp_dir("tool-stdio-output");
+    let src = fixture(&dir, "stdio_output_guest.rs", STDIO_OUTPUT_GUEST_SRC);
+    let driver = env!("CARGO_BIN_EXE_sparagmos-driver");
+    let out = run_driver_extra(&src, &["--tool-program", driver, "--guest-arg", driver]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    // Under `output()`, an inherited stream joins the
+    // guest's own stream instead of the `Output`, a nulled
+    // stream is neither collected nor shown, and an
+    // explicit pipe collects as the default does.
+    assert_eq!(
+        stdout,
+        "child out\n\
+         inherit collected stdout: \"\"\n\
+         inherit collected stderr: \"child err\\n\"\n\
+         null collected stdout: \"child out\\n\"\n\
+         null collected stderr: \"\"\n\
+         piped collected stdout: \"child out\\n\"\n",
+        "stderr={stderr}"
+    );
+    assert_eq!(stderr, "", "stdout={stdout}");
+}
+
+const NON_UTF8_ARG_GUEST_SRC: &str = r#"use std::os::unix::ffi::OsStringExt;
+use std::process::Command;
+
+fn main() {
+    let rustc = std::env::args().nth(1).unwrap();
+    let src0 = std::env::args().next().unwrap();
+    let dir = std::path::Path::new(&src0).parent().unwrap().to_path_buf();
+    std::env::set_current_dir(&dir).unwrap();
+    std::fs::write(
+        "p.rs",
+        "fn main() { println!(\"child ran\"); }\n",
+    )
+    .unwrap();
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--out-dir")
+        .arg(".")
+        .arg("p.rs")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let arg = std::ffi::OsString::from_vec(vec![b'a', 0xff, b'b']);
+    let out = Command::new(dir.join("p")).arg(arg).output().unwrap();
+    assert!(out.status.success(), "run failed");
+    println!("arg guest unexpectedly ran the program");
+}"#;
+
+#[test]
+fn run_mode_tool_interception_non_utf8_argument_is_unsupported() {
+    let dir = temp_dir("tool-non-utf8-arg");
+    let src = fixture(&dir, "non_utf8_arg_guest.rs", NON_UTF8_ARG_GUEST_SRC);
+    let driver = env!("CARGO_BIN_EXE_sparagmos-driver");
+    let out = run_driver_extra(&src, &["--tool-program", driver, "--guest-arg", driver]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The argument's bytes cannot be carried to the run
+    // unchanged, so the invocation is unsupported with the
+    // reason named -- never run with a lossy replacement.
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("a guest argument is not valid UTF-8"),
+        "stderr={stderr}"
+    );
+}
+
 const ENV_GUEST_SRC: &str = r#"
 fn main() {
     assert!(std::env::var_os("SPARAGMOS_NO_SUCH_VAR").is_none());
