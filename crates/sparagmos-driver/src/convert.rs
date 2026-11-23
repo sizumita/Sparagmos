@@ -3846,11 +3846,17 @@ impl Converter {
             }
             TyKind::RigidTy(RigidTy::Str) => None,
             _ => {
-                let projection = if target_off == 0 {
-                    Vec::new()
-                } else {
-                    self.static_offset_path(&def.ty(), target_off, inner, depth)?
-                };
+                // The projection is computed exactly as for a
+                // non-foreign static, at offset zero too: a
+                // pointer to the first element or field of an
+                // aggregate static denotes that sub-value, not
+                // the whole static (an empty projection would
+                // make a write through the pointer replace the
+                // complete storage). `static_offset_path` yields
+                // the empty path itself when the pointee IS the
+                // whole static.
+                let projection =
+                    self.static_offset_path(&def.ty(), target_off, inner, depth)?;
                 Some(sm::ConstValue::StaticRef {
                     def: def_id,
                     value: Box::new(sm::ConstValue::Uninit),

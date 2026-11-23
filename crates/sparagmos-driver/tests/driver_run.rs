@@ -26037,3 +26037,31 @@ fn run_mode_extern_static_unwritten_read_is_explicit_error() {
         "the error names the static; stderr={stderr}"
     );
 }
+
+const EXTERN_STATIC_FIRST_ELEM_SRC: &str = r#"
+extern "C" {
+    static mut EXT_ARR: [u32; 2];
+}
+const FIRST: *mut u32 = unsafe { &raw mut EXT_ARR[0] };
+fn main() {
+    unsafe {
+        std::ptr::addr_of_mut!(EXT_ARR).write([10, 20]);
+        FIRST.write(33);
+        println!("e0={} e1={}", EXT_ARR[0], EXT_ARR[1]);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_extern_static_first_element_write_preserves_rest() {
+    // A constant pointer to the FIRST element of an aggregate
+    // foreign static has byte offset zero, but it denotes that
+    // element, not the whole static: the projection must say so,
+    // or a write through the pointer replaces the complete
+    // storage and the other element is lost.
+    run_ok(
+        "extern-static-first-elem",
+        EXTERN_STATIC_FIRST_ELEM_SRC,
+        "e0=33 e1=20\n",
+    );
+}
