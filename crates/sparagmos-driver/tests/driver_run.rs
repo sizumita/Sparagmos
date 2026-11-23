@@ -5458,6 +5458,22 @@ fn run_mode_transmute_wrapper_adts() {
     );
 }
 
+const TRANSMUTE_BOX_SRC: &str = r#"
+fn inp() -> u32 { let mut s = 0u32; let mut i = 0; while i < 41 { s += 1; i += 1; } s }
+fn main() {
+    let n = inp();
+    let p: *mut u32 = unsafe { std::mem::transmute(Box::new(n)) };
+    unsafe { *p += 1; }
+    let q: *const u32 = unsafe { std::mem::transmute(Box::new(n + 2)) };
+    println!("{} {}", unsafe { *p }, unsafe { *q });
+}
+"#;
+
+#[test]
+fn run_mode_transmute_box_to_raw_pointer() {
+    run_ok("transmute-box", TRANSMUTE_BOX_SRC, "42 43\n");
+}
+
 const TRANSMUTE_CONSTANTS_SRC: &str = r#"
 fn main() {
     let a: u32 = unsafe { std::mem::transmute(1.5f32) };

@@ -4147,15 +4147,50 @@ impl<'a> Converter<'a> {
 
     // ----- transmute casts ---------------------------------------------------
 
+    /// The field of a struct that carries its pointer chain:
+    /// the unique field whose type is not a zero-sized type
+    /// with a uniquely determined value. The remaining fields
+    /// are fills in the sense of [`Self::wrapper_shape`]:
+    /// they carry no information, so the chain field alone is
+    /// the struct's payload. `Some((index, ty))`, or `None`
+    /// when the ADT is not a single-variant struct or has
+    /// zero / more than one non-fill field.
+    fn chain_field(
+        &self,
+        def: &mir::AdtDefId,
+        args: &[mir::Ty],
+    ) -> Option<(usize, mir::Ty)> {
+        let shape = self.adt_shapes.get(def)?;
+        if shape.kind != mir::AdtShapeKind::Struct || shape.variants.len() != 1 {
+            return None;
+        }
+        let fields = self.instantiated_field_tys(def, args, 0)?;
+        let mut chain: Option<(usize, mir::Ty)> = None;
+        for (i, fty) in fields.iter().enumerate() {
+            if self.zst_value(fty, 0).is_some() {
+                continue;
+            }
+            if chain.is_some() {
+                return None;
+            }
+            chain = Some((i, fty.clone()));
+        }
+        chain
+    }
+
     /// The operand denoting the thin pointer at the bottom of
-    /// a chain of one-field ADTs (the `NonNull` shape:
+    /// a chain of ADTs (the `NonNull` shape:
     /// `NonNull { pointer: NonZero<*const T> }` — the payload
     /// hides behind the `NonZero` newtype, one layer deeper
     /// than the transparent wrappers `wrapper_shape` matches,
     /// whose payload field must be the pointer itself). Each
-    /// layer must be a struct with exactly one field; the chain
-    /// ends at the first field that is itself a thin pointer.
-    /// `None` for any other shape.
+    /// layer must be a struct with exactly one non-fill field
+    /// (see [`Self::chain_field`]): the owning pointers are
+    /// such chains carrying extra zero-sized fields — `Box`
+    /// is a `Unique` plus an allocator, and `Unique` is a
+    /// `NonNull` plus a `PhantomData`. The chain ends at the
+    /// first field that is itself a thin pointer. `None` for
+    /// any other shape.
     fn ptr_chain_operand(
         &self,
         body: &mir::Body,
@@ -4164,8 +4199,9 @@ impl<'a> Converter<'a> {
         def: &mir::AdtDefId,
         args: &[mir::Ty],
     ) -> Option<ir::Operand> {
-        let field_ty = self.single_field_ty(def, args)?;
-        let field_v = self.field_operand(body, operand, v, 0, &field_ty)?;
+        let (index, field_ty) = self.chain_field(def, args)?;
+        let field_v =
+            self.field_operand(body, operand, v, index as u32, &field_ty)?;
         if is_thin_ptr_ty(&field_ty) {
             return Some(field_v);
         }
@@ -4178,7 +4214,8 @@ impl<'a> Converter<'a> {
         // converted value instead).
         let next_operand = match operand.place() {
             Some(place) => {
-                let place = place.clone().field(0, field_ty.clone());
+                let place =
+                    place.clone().field(index as u32, field_ty.clone());
                 match operand {
                     mir::Operand::Move(_) => mir::Operand::Move(place),
                     _ => mir::Operand::Copy(place),
@@ -4715,7 +4752,9 @@ let inner = match (&src, target) {
             }
             // ADT -> thin pointer through the same chain: the
             // pointer at the bottom of the chain itself (what
-            // `NonNull::as_ptr()` computes).
+            // `NonNull::as_ptr()` computes, and what a
+            // `Box<T>` -> `*mut T` transmute reads out of the
+            // box's `Unique` field).
             (Some(mir::Ty::Adt(def, args)), t)
                 if is_thin_ptr_ty(t)
                     && self
