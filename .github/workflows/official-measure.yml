@@ -42,8 +42,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_SURVEY_DIR: ${{ github.workspace }}/../rust-1.100.0-survey
-  SURVEY_JSON: ${{ github.workspace }}/../subset-survey.json
+  RUST_SURVEY_DIR: ${{ github.workspace }}/.ci/rust-1.100.0-survey
+  SURVEY_JSON: ${{ github.workspace }}/.ci/subset-survey.json
   # Hosted CPUs are slower than the dev host; per-record timeouts are
   # raised above the runner defaults (60s) so heavy records do not
   # fall over purely on CPU speed.
