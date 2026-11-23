@@ -9284,10 +9284,12 @@ impl<'a> Interpreter<'a> {
     /// enum is a `MaybeUninit` wrapper around the pointee rather
     /// than the position's own value. For an ADT pointee a
     /// stored enum whose field count is the declared count of
-    /// its variant in the type's debug shape is the ADT's value
-    /// itself, and only a one-field stored enum whose field is
-    /// itself a value of the ADT (an enum carrying its variant's
-    /// fields) is a wrapper around it. An aggregate payload may
+    /// its variant in the type's debug shape, with a first field
+    /// that fits that variant's declared first field, is the
+    /// ADT's value itself, and only a one-field stored enum
+    /// whose field is itself a value of the ADT (an enum
+    /// carrying its variant's fields) is a wrapper around it.
+    /// An aggregate payload may
     /// be partially materialised -- a prefix of its declared
     /// fields, the form field-by-field writes through pointers
     /// leave behind -- and still be the pointee's value, so the
@@ -9335,12 +9337,32 @@ impl<'a> Interpreter<'a> {
                     return false;
                 }
                 // A stored enum carrying the declared field
-                // count of its own variant is the ADT's complete
-                // value itself, however deep its one-field
-                // chains run -- never a wrapper.
+                // count of its own variant, with a first field
+                // that fits the variant's declared first field,
+                // is the ADT's complete value itself, however
+                // deep its one-field chains run -- never a
+                // wrapper. The field fit is part of the
+                // evidence: the stored variant index of a
+                // wrapper is the union's field index, not a
+                // variant of the pointee at all, and it can
+                // coincide with a one-field variant of the
+                // pointee (a `MaybeUninit<E>` payload read back
+                // through an `E` pointer, where `E`'s first
+                // variant takes one field of another type) --
+                // there the stored field, itself a complete
+                // value of the pointee, cannot be the declared
+                // field's value, and the wrapper reading below
+                // decides. Judging by the first field is
+                // enough: a stored enum with more fields is
+                // refused as a wrapper by the next check either
+                // way.
                 let declared = shape.variants.get(stored_variant as usize);
                 if let Some(declared) = declared {
-                    if declared.fields.len() == stored_fields {
+                    if declared.fields.len() == stored_fields
+                        && declared.fields.first().is_some_and(|first| {
+                            self.value_plausible_for_tag(field, &first.ty, 0)
+                        })
+                    {
                         return false;
                     }
                 }
