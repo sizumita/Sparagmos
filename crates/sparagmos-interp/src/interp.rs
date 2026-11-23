@@ -7046,9 +7046,17 @@ impl<'a> Interpreter<'a> {
     /// read as the wrapper by definition; a one-field ADT's own
     /// value is indistinguishable from the wrapper form (its
     /// debug shape reports one field), as is a union's; a slice
-    /// pointee is never entered here. An unreadable or absent
-    /// stored value keeps the unentered resolution, so error
-    /// behaviour on uninitialised storage is unchanged.
+    /// pointee is never entered here. The descent is also refused
+    /// when the position's own declared type -- recorded for a
+    /// place that is its home local itself and for a static --
+    /// is an ADT other than `MaybeUninit` itself: an enum stored
+    /// at such a position is that ADT's own value, and a
+    /// differently-typed pointer reaching it (a byte view of an
+    /// enum's storage is the canonical case) reinterprets the
+    /// storage rather than addressing a wrapper's payload. An
+    /// unreadable or absent stored value keeps the unentered
+    /// resolution, so error behaviour on uninitialised storage
+    /// is unchanged.
     fn peel_maybe_uninit_entry(
         &self,
         frames: &[Frame],
@@ -7059,6 +7067,40 @@ impl<'a> Interpreter<'a> {
             if name.starts_with("std::mem::MaybeUninit")
                 || name.starts_with("core::mem::MaybeUninit"))
         {
+            return resolved;
+        }
+        // The position's own declared type, where the model
+        // records it, outranks the stored form: a place with no
+        // projection is its home local itself, whose declared
+        // type the home body's table carries, and a static's
+        // declared type is in the program's table. When that
+        // type is an ADT other than `MaybeUninit` itself, an
+        // enum stored at the position is that ADT's own value,
+        // never a wrapper layer. Positions whose home type the
+        // model does not record (allocations, projected places)
+        // keep the stored-form evidence below.
+        let home_is_foreign_adt = match &resolved {
+            Resolved::Place {
+                frame_pos,
+                local,
+                projection,
+            } if projection.is_empty() => frames
+                .get(*frame_pos)
+                .and_then(|f| self.program.get(&f.func))
+                .and_then(|b| b.local_ty(Local(*local)))
+                .is_some_and(|ty| {
+                    matches!(ty, Ty::Adt(_)) && !is_maybe_uninit_ty(ty)
+                }),
+            Resolved::Static { name, projection }
+                if projection.is_empty() =>
+            {
+                self.program.static_tys.get(name).is_some_and(|ty| {
+                    matches!(ty, Ty::Adt(_)) && !is_maybe_uninit_ty(ty)
+                })
+            }
+            _ => false,
+        };
+        if home_is_foreign_adt {
             return resolved;
         }
         let Ok(stored) = self.read_resolved(frames, &resolved) else {
@@ -7072,10 +7114,11 @@ impl<'a> Interpreter<'a> {
         // it (an array payload's skeleton materialises both
         // `MaybeUninit` members, and the payload write replaces
         // only the first), so for a non-ADT pointee the entry
-        // decision rests on the first field alone: at a position
-        // whose declared type is not itself an ADT, an enum
-        // value is never the position's own value -- it is the
-        // wrapper layer. For an ADT pointee the stored enum may
+        // decision rests on the first field alone: the gate
+        // above has already refused the positions whose own
+        // declared type is a foreign ADT, so at the positions
+        // that reach here an enum value is the wrapper layer.
+        // For an ADT pointee the stored enum may
         // BE the ADT's own value, so the descent requires the
         // stricter wrapper evidence of `wrapper_payload_matches`:
         // a one-field stored enum whose field is itself the
