@@ -1563,11 +1563,14 @@ impl<'tcx> RequiredConstWalk<'tcx> {
             GlobalAlloc::Static(def_id) => {
                 // A static the collector reaches is code-generated,
                 // which evaluates its initializer; an evaluation
-                // error there is the same class of failure.
-                // Thread-local statics are initialized lazily and
-                // are not evaluated by the collector, so they are
-                // left alone.
-                if self.tcx.is_thread_local_static(def_id) {
+                // error there is the same class of failure. A
+                // foreign static (an `extern` block item) is never
+                // collected and has no initializer to evaluate
+                // (asking for one is an internal compiler error),
+                // so it is left alone, as are thread-local statics,
+                // whose initialization is lazy and likewise not
+                // evaluated by the collector.
+                if self.tcx.is_foreign_item(def_id) || self.tcx.is_thread_local_static(def_id) {
                     return;
                 }
                 match self.tcx.eval_static_initializer(def_id) {
