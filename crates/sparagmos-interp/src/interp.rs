@@ -18501,6 +18501,21 @@ pub(crate) fn project_value(
                 // exactly the string's representation, so the
                 // step yields the value unchanged.
                 Value::Bytes(_) if *idx == 0 => value,
+                // The same wrapper chain over a slice value: a
+                // fat pointer in this model *is* the slice it
+                // denotes (a `&OsStr` over non-UTF-8 bytes is a
+                // fat pointer to the byte elements, the shape
+                // `sub_path_value` builds), and the wrappers std
+                // layers over a slice (`OsStr` over its `Slice`,
+                // `Slice` over its `[u8]`, `Path` over its
+                // `OsStr`) are one-field chains whose only field
+                // is that slice, so a field-0 step yields the fat
+                // pointer unchanged, exactly as the string and
+                // byte-string forms above. (A field step on a fat
+                // pointer only ever arrives through such a
+                // wrapper chain: a plain slice place takes index
+                // steps, never field steps.)
+                Value::FatRef { .. } if *idx == 0 => value,
                 // A one-field wrapper over a scalar whose storage
                 // the model holds as the bare scalar (a control
                 // byte reached through a byte-string constant:
@@ -19192,8 +19207,14 @@ pub(crate) fn project_value_ref<'a>(
                     // The byte-string wrapper chain, as in
                     // `project_value`: field 0 of the transparent
                     // `Path`/`OsStr`/`CStr` wrappers over a string
-                    // value is the string itself.
-                    Value::Str(_) | Value::Bytes(_) if *idx == 0 => cur,
+                    // value is the string itself, and over a fat
+                    // pointer (the non-UTF-8 form of the same
+                    // values) it is the fat pointer itself.
+                    Value::Str(_) | Value::Bytes(_) | Value::FatRef { .. }
+                        if *idx == 0 =>
+                    {
+                        cur
+                    }
                     Value::FmtArguments(_) => {
                         // The modelled `fmt::Arguments` fields are
                         // synthesized values, not storage (see the
@@ -19607,11 +19628,18 @@ fn navigate_mut_grow<'x>(
             }
         }
         RefProj::Field(idx) => {
-            if *idx == 0 && matches!(slot, Value::Str(_) | Value::Bytes(_)) {
+            if *idx == 0
+                && matches!(
+                    slot,
+                    Value::Str(_) | Value::Bytes(_) | Value::FatRef { .. }
+                )
+            {
                 // The byte-string wrapper chain, as in
                 // `project_value`: a write to field 0 of the
                 // transparent `Path`/`OsStr` wrappers over a
-                // string value lands on the string itself.
+                // string value lands on the string itself, and
+                // over a fat pointer (the non-UTF-8 form of the
+                // same values) on the fat pointer itself.
                 return navigate_mut_grow(slot, rest, func, place, grow);
             }
             if *idx == 0

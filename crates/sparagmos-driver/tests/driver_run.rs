@@ -21532,3 +21532,40 @@ fn run_mode_path_display_and_to_string() {
         "Path::display renders the path content and to_string converts it"
     );
 }
+
+const NON_UTF8_PATH_DISPLAY_SRC: &str = r#"
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
+
+fn main() {
+    // A non-UTF-8 `OsString` (built from raw bytes): its
+    // `&OsStr` form is a fat pointer to the byte elements in
+    // this model, and the `OsStr` / `Slice` field projections
+    // inside `OsStr::len` and `Path::display` walk the
+    // one-field wrapper chain over that fat pointer.
+    let s = OsString::from_vec(vec![0x61, 0xff, 0x62]);
+    println!("len={}", s.len());
+    let pb = std::path::PathBuf::from(s);
+    println!("{}", pb.display());
+    println!("len={}", pb.as_os_str().len());
+    println!("non-utf8-path-display-ok");
+}
+"#;
+
+#[test]
+fn run_mode_non_utf8_path_display() {
+    let dir = temp_dir("non-utf8-path-display");
+    let src = fixture(&dir, "non_utf8_path_display.rs", NON_UTF8_PATH_DISPLAY_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "non-UTF-8 path display runs; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "len=3\na\u{fffd}b\nlen=3\nnon-utf8-path-display-ok\n",
+        "display() renders the lossy content and len() reads the byte length"
+    );
+}
