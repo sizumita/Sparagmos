@@ -4472,7 +4472,7 @@ impl Converter {
                 else {
                     return None;
                 };
-                if arr_elem != *elem
+                if !Self::ty_eq_ignoring_regions(&arr_elem, elem)
                     || arr_len.eval_target_usize().ok()? != count as u64
                 {
                     return None;
@@ -4503,6 +4503,82 @@ impl Converter {
         })
     }
 
+    /// Whether two types denote the same type up to their
+    /// region (lifetime) arguments. A static's declared type
+    /// carries the `'static` region where the pointee type of a
+    /// pointer at the static carries the erased region, so plain
+    /// equality misses references that denote the static whole
+    /// (a `*mut &i64` at a `static mut R: &i64`): the reference
+    /// then degrades to a snapshot of the initializer and writes
+    /// through it are rejected as constant-aggregate writes.
+    /// Regions never affect a value's storage shape, so the
+    /// projection paths computed for one spelling hold for the
+    /// other.
+    fn ty_eq_ignoring_regions(a: &Ty, b: &Ty) -> bool {
+        if a == b {
+            return true;
+        }
+        match (a.kind(), b.kind()) {
+            (
+                TyKind::RigidTy(RigidTy::Ref(_, ea, ma)),
+                TyKind::RigidTy(RigidTy::Ref(_, eb, mb)),
+            ) => ma == mb && Self::ty_eq_ignoring_regions(&ea, &eb),
+            (
+                TyKind::RigidTy(RigidTy::RawPtr(ea, ma)),
+                TyKind::RigidTy(RigidTy::RawPtr(eb, mb)),
+            ) => ma == mb && Self::ty_eq_ignoring_regions(&ea, &eb),
+            (
+                TyKind::RigidTy(RigidTy::Slice(ea)),
+                TyKind::RigidTy(RigidTy::Slice(eb)),
+            ) => Self::ty_eq_ignoring_regions(&ea, &eb),
+            (
+                TyKind::RigidTy(RigidTy::Array(ea, la)),
+                TyKind::RigidTy(RigidTy::Array(eb, lb)),
+            ) => {
+                Self::ty_eq_ignoring_regions(&ea, &eb)
+                    && format!("{la:?}") == format!("{lb:?}")
+            }
+            (
+                TyKind::RigidTy(RigidTy::Tuple(ea)),
+                TyKind::RigidTy(RigidTy::Tuple(eb)),
+            ) => {
+                ea.len() == eb.len()
+                    && ea
+                        .iter()
+                        .zip(eb.iter())
+                        .all(|(x, y)| Self::ty_eq_ignoring_regions(x, y))
+            }
+            (
+                TyKind::RigidTy(RigidTy::Adt(da, aa)),
+                TyKind::RigidTy(RigidTy::Adt(db, ab)),
+            ) => da == db && Self::generic_args_eq_ignoring_regions(&aa, &ab),
+            (
+                TyKind::RigidTy(RigidTy::FnDef(da, aa)),
+                TyKind::RigidTy(RigidTy::FnDef(db, ab)),
+            ) => da == db && Self::generic_args_eq_ignoring_regions(&aa, &ab),
+            _ => false,
+        }
+    }
+
+    /// The argument-wise companion of
+    /// [`Self::ty_eq_ignoring_regions`]: lifetime arguments are
+    /// ignored, type arguments recurse, and constant arguments
+    /// compare by their rendered form (a mismatch keeps the
+    /// caller's fallback, as before).
+    fn generic_args_eq_ignoring_regions(a: &GenericArgs, b: &GenericArgs) -> bool {
+        a.0.len() == b.0.len()
+            && a.0.iter().zip(b.0.iter()).all(|(x, y)| match (x, y) {
+                (GenericArgKind::Type(ta), GenericArgKind::Type(tb)) => {
+                    Self::ty_eq_ignoring_regions(ta, tb)
+                }
+                (GenericArgKind::Lifetime(_), GenericArgKind::Lifetime(_)) => true,
+                (GenericArgKind::Const(ca), GenericArgKind::Const(cb)) => {
+                    format!("{ca:?}") == format!("{cb:?}")
+                }
+                _ => false,
+            })
+    }
+
     /// The projection path from the base of a value of type `ty`
     /// to the sub-value at byte offset `off`, when that sub-value
     /// has type `inner`: layout-guided descent through struct and
@@ -4520,7 +4596,7 @@ impl Converter {
         if depth > MAX_CONST_DEPTH {
             return None;
         }
-        if off == 0 && ty == inner {
+        if off == 0 && Self::ty_eq_ignoring_regions(ty, inner) {
             return Some(Vec::new());
         }
         match ty.kind() {
@@ -5445,6 +5521,43 @@ impl Converter {
     /// rendering against the layout name table, which is kept in
     /// sync with `def_names` (the interpreter renders call-site
     /// tags against the same names).
+    /// Render the term of an existential projection predicate
+    /// — the `101` of `Trait<N = 101>`, the type of
+    /// `Trait<Item = u8>` — as it appears in the type's name.
+    fn existential_term(&mut self, term: &rustc_public::ty::TermKind) -> String {
+        use rustc_public::ty::TermKind;
+        match term {
+            TermKind::Type(t) => {
+                let converted = self.ty(t);
+                self.layout_key(&converted)
+            }
+            TermKind::Const(c) => match c.kind() {
+                rustc_public::ty::TyConstKind::Value(ty, alloc) => {
+                    match self.const_from_alloc(&ty, &alloc) {
+                        sm::ConstValue::Scalar(sm::Scalar::Int { data, size }) => {
+                            if matches!(
+                                guarded_ty_kind(&ty),
+                                Some(TyKind::RigidTy(RigidTy::Int(_)))
+                            ) {
+                                let shift = 128 - u32::from(size) * 8;
+                                format!("{}", ((data << shift) as i128) >> shift)
+                            } else {
+                                format!("{data}")
+                            }
+                        }
+                        sm::ConstValue::Bool(b) => b.to_string(),
+                        sm::ConstValue::Char(ch) => format!("'{ch}'"),
+                        sm::ConstValue::Str(s) => format!("{s:?}"),
+                        _ => "<const>".to_string(),
+                    }
+                }
+                rustc_public::ty::TyConstKind::Param(p) => p.name.clone(),
+                rustc_public::ty::TyConstKind::Unevaluated(def, _) => def.name(),
+                _ => "<const>".to_string(),
+            },
+        }
+    }
+
     fn layout_key(&mut self, converted: &sm::Ty) -> String {
         while self.layout_names.len() < self.def_names.len() {
             let index = self.layout_names.len();
@@ -6003,18 +6116,52 @@ impl Converter {
                 sm::Ty::FnPtr(Box::new(s))
             }
             RigidTy::Dynamic(bounds, _) => {
-                let names = bounds
-                    .iter()
-                    .map(|b| match &b.value {
+                // The bounds as name strings. A projection
+                // predicate is an associated-item binding of
+                // one of the trait bounds (`Trait<N = 101>`):
+                // it folds into that trait's name as a generic
+                // argument rather than standing as a bound of
+                // its own.
+                let mut names: Vec<String> = Vec::new();
+                let mut bindings: Vec<(String, String, String)> = Vec::new();
+                for b in bounds.iter() {
+                    match &b.value {
                         rustc_public::ty::ExistentialPredicate::Trait(t) => {
-                            t.def_id.name()
+                            names.push(t.def_id.name());
                         }
-                        rustc_public::ty::ExistentialPredicate::AutoTrait(d) => d.name(),
+                        rustc_public::ty::ExistentialPredicate::AutoTrait(d) => {
+                            names.push(d.name());
+                        }
                         rustc_public::ty::ExistentialPredicate::Projection(p) => {
-                            format!("{:?}", p.def_id.def_id())
+                            let item = p.def_id.name();
+                            let term = self.existential_term(&p.term);
+                            match item.rsplit_once("::") {
+                                Some((trait_path, assoc)) => bindings.push((
+                                    trait_path.to_string(),
+                                    assoc.to_string(),
+                                    term,
+                                )),
+                                None => names.push(item),
+                            }
                         }
-                    })
-                    .collect();
+                    }
+                }
+                for (trait_path, assoc, term) in bindings {
+                    let binding = format!("{assoc}={term}");
+                    match names.iter_mut().find(|n| n.as_str() == trait_path) {
+                        Some(slot) => {
+                            if slot.ends_with('>') {
+                                slot.insert_str(
+                                    slot.len() - 1,
+                                    &format!(", {binding}"),
+                                );
+                            } else {
+                                *slot = format!("{slot}<{binding}>");
+                            }
+                        }
+                        None => names.push(format!("{trait_path}<{binding}>")),
+                    }
+                }
                 sm::Ty::Dynamic(names, Box::new(sm::Ty::unit()), sm::Region::Erased)
             }
             RigidTy::Closure(def, args) => {

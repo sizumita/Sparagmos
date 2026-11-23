@@ -3053,6 +3053,11 @@ class DebuggerHarnessTests(unittest.TestCase):
         # A run with guest arguments still starts the session.
         self.assertEqual(
             run.translate_debugger_command("gdb", "run 7"), "run")
+        # A formatted print written with a space (`print /x`).
+        self.assertEqual(
+            run.translate_debugger_command(
+                "gdb", "print /x *(_ptr as *const u64)"),
+            "print/x *(_ptr as *const u64)")
         # Call expressions and printf stay outside the scope.
         self.assertIsNone(
             run.translate_debugger_command("gdb", "print fun(45, true)"))
@@ -3085,17 +3090,48 @@ class DebuggerHarnessTests(unittest.TestCase):
         self.assertEqual(
             run.translate_debugger_command("lldb", "fr v empty_string"),
             "v empty_string")
-        # Format registrations are session-shaping comments.
+        # A format registration for a type outside the char
+        # family stays a session-shaping comment.
         self.assertEqual(
             run.translate_debugger_command(
-                "lldb", "type format add -f decimal char"),
-            "# inert: type format add -f decimal char")
+                "lldb", "type format add -f decimal i32"),
+            "# inert: type format add -f decimal i32")
         # The repr pseudo-command and frame navigation.
         self.assertEqual(
             run.translate_debugger_command("lldb", "repr slice"),
             "repr slice")
         self.assertEqual(
             run.translate_debugger_command("lldb", "up"), "up")
+        # A decimal-formatted print is the plain print.
+        self.assertEqual(
+            run.translate_debugger_command("lldb", "v/d noPadding8"),
+            "v noPadding8")
+        self.assertIsNone(
+            run.translate_debugger_command("lldb", "v/x x"))
+        # The `b` breakpoint abbreviation, by file:line and by
+        # (quoted) function path.
+        self.assertEqual(
+            run.translate_debugger_command("lldb", "b cross_crate_spans.rs:12"),
+            "break-at cross_crate_spans.rs:12")
+        self.assertEqual(
+            run.translate_debugger_command(
+                "lldb", 'b "constant_ordering_prologue::binding"'),
+            "break-fn constant_ordering_prologue::binding")
+        # Char-family format registrations become type-format
+        # script lines, one per named type.
+        self.assertEqual(
+            run.translate_debugger_command(
+                "lldb", "type format add --format hex char"),
+            "type-format hex char")
+        self.assertEqual(
+            run.translate_debugger_command(
+                "lldb", 'type format add -f d i8 char "signed char"'),
+            "type-format dec i8\ntype-format dec char\n"
+            "type-format dec signed char")
+        self.assertEqual(
+            run.translate_debugger_command(
+                "lldb", "type format add -f decimal char"),
+            "type-format dec char")
 
     def test_variant_skipping(self):
         h = run.Header("//@ ignore-gdb\nfn main() {}\n")

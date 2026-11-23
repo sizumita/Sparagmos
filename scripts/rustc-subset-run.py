@@ -2751,7 +2751,7 @@ def _translate_gdb_command(cmd):
         return f"{head} {rest if rest else '-'}"
     if cmd == "info locals":
         return "info-locals"
-    m = re.match(r"^(?:print|p)(?:/([a-z]))?\s+(.+)$", cmd)
+    m = re.match(r"^(?:print|p)\s*(?:/([a-z]))?\s+(.+)$", cmd)
     if m:
         fmt, expr = m.group(1), m.group(2).strip()
         if fmt is not None and fmt not in "dxtcu":
@@ -2782,11 +2782,29 @@ def _translate_lldb_command(cmd):
     if cmd.startswith("settings set "):
         return f"# inert: {cmd}"
     if cmd.startswith("type format add"):
-        # A display-format registration: it shapes how lldb
-        # renders values of the named type, but the session's
-        # renderers have no per-type format table; the commands
-        # in the suite register formats for scalar types whose
-        # checks the default renderings are measured against.
+        # A display-format registration for a char-family
+        # type: the session's format table (see the driver's
+        # `type-format` script lines) renders values of the
+        # type through the format. Registrations naming other
+        # types, or formats outside the numeric set, stay
+        # session-shaping comments.
+        m = re.match(
+            r"^type format add\s+(?:--format|-f)\s+(\S+)\s+(.+)$", cmd)
+        if m:
+            fmt_word, types_text = m.group(1), m.group(2)
+            fmt = {"d": "dec", "decimal": "dec", "u": "unsigned",
+                   "x": "hex", "hex": "hex"}.get(fmt_word)
+            if fmt is not None:
+                types = re.findall(r"'([^']*)'|\"([^\"]*)\"|(\S+)",
+                                   types_text)
+                lines = []
+                for single, double, bare in types:
+                    ty = single or double or bare
+                    if ty in ("char", "i8", "u8", "signed char",
+                              "unsigned char"):
+                        lines.append(f"type-format {fmt} {ty}")
+                if lines:
+                    return "\n".join(lines)
         return f"# inert: {cmd}"
     if cmd == "frame select":
         return "show-line"
@@ -2805,11 +2823,34 @@ def _translate_lldb_command(cmd):
         if not _debugger_expr_ok(expr):
             return None
         return f"whatis {expr}"
+    m = re.match(r"^b\s+(.+)$", cmd)
+    if m:
+        # lldb's `b` abbreviation of `breakpoint set`: by
+        # file:line, or by function path (the suite quotes the
+        # path form).
+        arg = m.group(1).strip().strip('"').strip("'")
+        fm = re.match(r"^(.+\.rs):(\d+)$", arg)
+        if fm:
+            return f"break-at {fm.group(1)}:{fm.group(2)}"
+        if re.fullmatch(_DEBUGGER_IDENT + r"(?:::" + _DEBUGGER_IDENT + r")+", arg):
+            return f"break-fn {arg}"
+        return None
     m = re.match(r"^(?:fr|frame)\s+(?:v|variable|var)\s+(.+)$", cmd)
     if m:
         expr = m.group(1).strip()
         if expr.startswith("-"):
             return None
+        if not _debugger_expr_ok(expr):
+            return None
+        return f"v {expr}"
+    m = re.match(r"^(?:v|print|p)/([a-z])\s+(.+)$", cmd)
+    if m:
+        # A formatted print: the decimal forms are the
+        # session's own renderings; other formats are outside
+        # the attempted scope.
+        if m.group(1) not in "du":
+            return None
+        expr = m.group(2).strip()
         if not _debugger_expr_ok(expr):
             return None
         return f"v {expr}"
@@ -2954,6 +2995,22 @@ def _fill_result_debugger(rec, rust_dir, driver_bin, out, td):
             out["reason"] = "; ".join(skip_reasons)
             out["bucket"] = "out of environment"
         return
+    # The session executes pass-disabled MIR (the session args
+    # append `-Zmir-opt-level=0` below): a record that declares
+    # a revision written against that same reduced pipeline
+    # (its compile-flags disable MIR passes) is judged on that
+    # revision -- the default-pipeline revision describes a
+    # binary whose stepping the session's pipeline does not
+    # produce (the stepping tests' two revisions exist
+    # precisely to separate the two pipelines' stop lines).
+    if len(applicable) > 1:
+        def _pipeline_reduced(view):
+            flags = " ".join(view.values("compile-flags"))
+            return ("mir-enable-passes=-" in flags
+                    or "mir-opt-level=0" in flags)
+        reduced = [a for a in applicable if _pipeline_reduced(a[1])]
+        if reduced:
+            applicable = reduced
 
     def assembly(view, revision):
         """The revision's driver-invocation assembly, put

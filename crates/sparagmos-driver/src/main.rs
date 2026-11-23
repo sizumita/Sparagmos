@@ -6664,6 +6664,9 @@ fn execute(
 ///                  pretty printers (the harness emits this for
 ///                  gdb sessions whose test does not opt out with
 ///                  `disable-gdb-pretty-printers`)
+/// type-format <dec|unsigned|hex> <type>
+///                  an lldb `type format add` registration for
+///                  a char-family type (repeatable)
 /// run              start (the session start; at most one, first)
 /// continue         resume to the next breakpoint
 /// next             step over
@@ -6696,6 +6699,7 @@ fn execute_debug(
     overflow_checks: bool,
     script_path: Option<&str>,
     dialect_name: &str,
+    hide_locals: bool,
 ) -> i32 {
     let Some(script_path) = script_path else {
         eprintln!("sparagmos-driver debug: --debug-script is required");
@@ -6757,6 +6761,10 @@ fn execute_debug(
     for name in &parsed.break_fns {
         session.set_fn_breakpoint(name);
     }
+    for (ty, format) in &parsed.lldb_formats {
+        session.set_lldb_format(ty, *format);
+    }
+    session.set_hide_locals(hide_locals);
     session.set_pretty_printers(pretty_printers);
     // Register the source text of every file the converted
     // program references, not just the main input: a session
@@ -6791,6 +6799,8 @@ struct ParsedDebugScript {
     commands: Vec<sparagmos_interp::DebugCommand>,
     /// Whether gdb prints render through the pretty printers.
     pretty_printers: bool,
+    /// lldb type-format registrations: (type name, format).
+    lldb_formats: Vec<(String, sparagmos_interp::LldbNumFormat)>,
 }
 
 /// Parse a debugger session script (see [`execute_debug`]) into
@@ -6802,6 +6812,7 @@ fn parse_debug_script(text: &str) -> Result<ParsedDebugScript, String> {
     let mut break_fns = Vec::new();
     let mut commands = Vec::new();
     let mut pretty_printers = false;
+    let mut lldb_formats = Vec::new();
     for (lineno, raw) in text.lines().enumerate() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -6818,6 +6829,20 @@ fn parse_debug_script(text: &str) -> Result<ParsedDebugScript, String> {
                     return Err(bad("`pretty-printers` takes no argument"));
                 }
                 pretty_printers = true;
+            }
+            "type-format" => {
+                let (fmt, ty) = rest
+                    .split_once(char::is_whitespace)
+                    .ok_or_else(|| bad(&format!("bad type-format `{rest}`")))?;
+                let format = match fmt {
+                    "dec" => sparagmos_interp::LldbNumFormat::Decimal,
+                    "unsigned" => sparagmos_interp::LldbNumFormat::Unsigned,
+                    "hex" => sparagmos_interp::LldbNumFormat::Hex,
+                    other => {
+                        return Err(bad(&format!("unknown type format `{other}`")));
+                    }
+                };
+                lldb_formats.push((ty.trim().to_string(), format));
             }
             "break" => {
                 let n: u32 = rest
@@ -6904,6 +6929,7 @@ fn parse_debug_script(text: &str) -> Result<ParsedDebugScript, String> {
         break_fns,
         commands,
         pretty_printers,
+        lldb_formats,
     })
 }
 
@@ -8155,6 +8181,17 @@ fn driver_main() {
                 std::process::exit(if exec_mode { 2 } else { 1 });
             }
             if debug_mode {
+                // Limited debug info (`-C debuginfo=0` or `=1`,
+                // in joined or split form) carries no variable
+                // information; the session models that for
+                // `info locals`.
+                let hide_locals = args.iter().any(|a| {
+                    matches!(
+                        a.as_str(),
+                        "debuginfo=0" | "debuginfo=1" | "-Cdebuginfo=0"
+                            | "-Cdebuginfo=1"
+                    )
+                });
                 std::process::exit(execute_debug(
                     &c,
                     &input,
@@ -8162,6 +8199,7 @@ fn driver_main() {
                     overflow_checks,
                     debug_script.as_deref(),
                     &debug_dialect,
+                    hide_locals,
                 ));
             }
             if mode == Mode::Run || mode == Mode::RunJit {

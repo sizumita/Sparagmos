@@ -546,3 +546,394 @@ fn gdb_without_pretty_printers_keeps_raw_vec_form() {
         run.transcript
     );
 }
+
+// ---------------------------------------------------------------------------
+// The D2 band: statics (before and after `run`), type queries,
+// the `repr` pseudo-command, named-field steps, function
+// breakpoints, the info listings, and lldb type formats.
+// ---------------------------------------------------------------------------
+
+fn typed_scalar_program() -> Program {
+    program_with_vars(vec![DebugVarEntry {
+        name: "x".to_string(),
+        source: DebugVar::Place(1, vec![]),
+        is_char: false,
+        ty: Some("i64".to_string()),
+        lines: (2, 2),
+    }])
+}
+
+#[test]
+fn whatis_reports_the_recorded_type() {
+    let mut s = session(typed_scalar_program());
+    s.set_breakpoint("test.rs", 3);
+    let run = s.run_script(
+        vec![
+            DebugCommand::Run,
+            DebugCommand::WhatIs(DebugPrint {
+                expr: "x".to_string(),
+                format: None,
+            }),
+        ],
+        DebugDialect::Gdb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    assert!(
+        run.transcript.iter().any(|l| l == "type = i64"),
+        "transcript: {:?}",
+        run.transcript
+    );
+}
+
+#[test]
+fn whatis_of_a_function_pointer_uses_the_raw_pointer_spelling() {
+    // A function pointer's recorded tag is the type's kind
+    // name (`FnPtr`); gdb spells the type as a raw pointer to
+    // the unit-signature function.
+    let p = program_with_vars(vec![DebugVarEntry {
+        name: "f".to_string(),
+        source: DebugVar::Constant(Constant::Int(0)),
+        is_char: false,
+        ty: Some("FnPtr".to_string()),
+        lines: (2, 2),
+    }]);
+    let mut s = session(p);
+    s.set_breakpoint("test.rs", 3);
+    let run = s.run_script(
+        vec![
+            DebugCommand::Run,
+            DebugCommand::WhatIs(DebugPrint {
+                expr: "f".to_string(),
+                format: None,
+            }),
+        ],
+        DebugDialect::Gdb,
+    );
+    assert!(
+        run.transcript.iter().any(|l| l == "type = *mut fn ()"),
+        "transcript: {:?}",
+        run.transcript
+    );
+}
+
+#[test]
+fn ptype_of_a_struct_prints_its_layout() {
+    let mut s = session(aggregate_program());
+    s.set_breakpoint("test.rs", 3);
+    let run = s.run_script(
+        vec![
+            DebugCommand::Run,
+            DebugCommand::Ptype(DebugPrint {
+                expr: "p".to_string(),
+                format: None,
+            }),
+        ],
+        DebugDialect::Gdb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    for want in [
+        "type = struct test::Point {",
+        "    i32 x,",
+        "    i32 y,",
+        "}",
+    ] {
+        assert!(
+            run.transcript.iter().any(|l| l == want),
+            "missing `{want}` in {:?}",
+            run.transcript
+        );
+    }
+}
+
+#[test]
+fn repr_reports_ok_for_a_renderable_variable() {
+    let mut s = session(typed_scalar_program());
+    s.set_breakpoint("test.rs", 3);
+    let run = s.run_script(
+        vec![DebugCommand::Run, DebugCommand::Repr("x".to_string())],
+        DebugDialect::Gdb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    assert!(
+        run.transcript.iter().any(|l| l == "x: Ok"),
+        "transcript: {:?}",
+        run.transcript
+    );
+}
+
+#[test]
+fn named_field_step_prints_the_field() {
+    let mut s = session(aggregate_program());
+    s.set_breakpoint("test.rs", 3);
+    let run = s.run_script(
+        vec![DebugCommand::Run, print("p.x"), print("p.y")],
+        DebugDialect::Gdb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    for want in ["$1 = 10", "$2 = 20"] {
+        assert!(
+            run.transcript.iter().any(|l| l == want),
+            "missing `{want}` in {:?}",
+            run.transcript
+        );
+    }
+}
+
+/// A program whose main mentions a static (the mention is
+/// what seeds the debugger's static store), with the static's
+/// declared type recorded the way the converter records it.
+fn static_program() -> Program {
+    let mut body = Body::new(
+        "main",
+        0,
+        vec![Ty::Unit, Ty::Ref(Box::new(Ty::i64()))],
+        vec![
+            BasicBlockData::new(
+                vec![Statement::assign(
+                    Place::from_index(1),
+                    Rvalue::Use(Operand::Constant(Constant::StaticRef {
+                        name: "test::COUNTER".to_string(),
+                        value: Box::new(Constant::Int(7)),
+                        projection: vec![],
+                        len: None,
+                    })),
+                )],
+                TerminatorKind::Goto { target: BasicBlock(1) },
+            ),
+            BasicBlockData::new(
+                vec![Statement::assign(
+                    Place::from_index(0),
+                    Rvalue::Use(Operand::const_unit()),
+                )],
+                TerminatorKind::Return,
+            ),
+        ],
+    );
+    body.source_lines = vec![
+        BlockSourceLines { statements: vec![line(2)], terminator: line(2) },
+        BlockSourceLines { statements: vec![line(3)], terminator: line(3) },
+    ];
+    let mut p = Program::new();
+    p.add_function(body);
+    p.source_files = vec!["test.rs".to_string()];
+    p.static_debug_tags
+        .insert("test::COUNTER".to_string(), "i64".to_string());
+    p
+}
+
+#[test]
+fn static_prints_before_run_at_its_initial_value() {
+    // A print ahead of `run` reads the static at its initial
+    // value, by its path or by its plain name alike.
+    let mut s = session(static_program());
+    let run = s.run_script(
+        vec![print("test::COUNTER"), print("COUNTER"), DebugCommand::Run],
+        DebugDialect::Gdb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    assert!(
+        run.transcript.iter().any(|l| l == "$1 = 7"),
+        "transcript: {:?}",
+        run.transcript
+    );
+    assert!(
+        run.transcript.iter().any(|l| l == "$2 = 7"),
+        "transcript: {:?}",
+        run.transcript
+    );
+}
+
+#[test]
+fn info_functions_lists_bodies_in_both_declaration_forms() {
+    let mut s = session(typed_scalar_program());
+    let run = s.run_script(
+        vec![
+            DebugCommand::InfoFunctions { pattern: None, quiet: true },
+            DebugCommand::InfoFunctions { pattern: None, quiet: false },
+        ],
+        DebugDialect::Gdb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    for want in ["static fn main();", "fn main();"] {
+        assert!(
+            run.transcript.iter().any(|l| l == want),
+            "missing `{want}` in {:?}",
+            run.transcript
+        );
+    }
+}
+
+#[test]
+fn info_locals_lists_live_locals_and_honours_limited_debuginfo() {
+    let mut s = session(typed_scalar_program());
+    s.set_breakpoint("test.rs", 3);
+    let run = s.run_script(
+        vec![DebugCommand::Run, DebugCommand::InfoLocals],
+        DebugDialect::Gdb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    assert!(
+        run.transcript.iter().any(|l| l == "x = 42"),
+        "transcript: {:?}",
+        run.transcript
+    );
+
+    let mut s = session(typed_scalar_program());
+    s.set_hide_locals(true);
+    s.set_breakpoint("test.rs", 3);
+    let run = s.run_script(
+        vec![DebugCommand::Run, DebugCommand::InfoLocals],
+        DebugDialect::Gdb,
+    );
+    assert!(
+        run.transcript.iter().any(|l| l == "No locals."),
+        "transcript: {:?}",
+        run.transcript
+    );
+}
+
+/// main (lines 2-3) calls helper (lines 5-6) and returns.
+fn two_function_program() -> Program {
+    let mut main = Body::new(
+        "main",
+        0,
+        vec![Ty::Unit, Ty::Unit],
+        vec![
+            BasicBlockData::new(
+                vec![],
+                TerminatorKind::Call {
+                    func: "test::helper".to_string(),
+                    args: vec![],
+                    destination: Place::from_index(1),
+                    target: Some(BasicBlock(1)),
+                },
+            ),
+            BasicBlockData::new(
+                vec![Statement::assign(
+                    Place::from_index(0),
+                    Rvalue::Use(Operand::const_unit()),
+                )],
+                TerminatorKind::Return,
+            ),
+        ],
+    );
+    main.source_lines = vec![
+        BlockSourceLines { statements: vec![], terminator: line(2) },
+        BlockSourceLines { statements: vec![line(3)], terminator: line(3) },
+    ];
+    let mut helper = Body::new(
+        "test::helper",
+        0,
+        vec![Ty::Unit],
+        vec![BasicBlockData::new(
+            vec![Statement::assign(
+                Place::from_index(0),
+                Rvalue::Use(Operand::const_unit()),
+            )],
+            TerminatorKind::Return,
+        )],
+    );
+    helper.source_lines = vec![BlockSourceLines {
+        statements: vec![line(5)],
+        terminator: line(5),
+    }];
+    let mut p = Program::new();
+    p.add_function(main);
+    p.add_function(helper);
+    p.source_files = vec!["test.rs".to_string()];
+    p
+}
+
+fn two_function_session() -> DebugSession {
+    let mut s = DebugSession::new(
+        two_function_program(),
+        "main".to_string(),
+        vec![],
+        InterpConfig::default(),
+    );
+    s.set_source_text(
+        "test.rs",
+        "fn main() {\n    helper();\n}\n\nfn helper() {\n    zzz();\n}\n",
+    );
+    s
+}
+
+#[test]
+fn function_breakpoint_stops_at_the_callees_first_line() {
+    let mut s = two_function_session();
+    s.set_fn_breakpoint("test::helper");
+    let run = s.run_script(vec![DebugCommand::Run], DebugDialect::Gdb);
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    assert!(
+        run.transcript.iter().any(|l| l.starts_with("5\t")),
+        "transcript: {:?}",
+        run.transcript
+    );
+}
+
+#[test]
+fn frame_up_emits_the_callers_line() {
+    let mut s = two_function_session();
+    s.set_fn_breakpoint("test::helper");
+    let run = s.run_script(
+        vec![DebugCommand::Run, DebugCommand::FrameUp],
+        DebugDialect::Gdb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    // After `up`, the shown line is main's call line (line 2).
+    let stop = run
+        .transcript
+        .iter()
+        .position(|l| l.starts_with("5\t"))
+        .expect("the helper stop line");
+    assert!(
+        run.transcript[stop + 1..].iter().any(|l| l.starts_with("2\t")),
+        "transcript: {:?}",
+        run.transcript
+    );
+}
+
+#[test]
+fn lldb_hex_format_registration_renders_an_i8_in_hex() {
+    use sparagmos_interp::LldbNumFormat;
+    let p = program_with_vars(vec![DebugVarEntry {
+        name: "b".to_string(),
+        source: DebugVar::Constant(Constant::Int(111)),
+        is_char: false,
+        ty: Some("i8".to_string()),
+        lines: (2, 2),
+    }]);
+    let mut s = session(p);
+    s.set_lldb_format("i8", LldbNumFormat::Hex);
+    s.set_breakpoint("test.rs", 3);
+    let run = s.run_script(
+        vec![DebugCommand::Run, print("b")],
+        DebugDialect::Lldb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    assert!(
+        run.transcript.iter().any(|l| l == "= 0x6f"),
+        "transcript: {:?}",
+        run.transcript
+    );
+}
+
+#[test]
+fn lldb_static_print_names_the_variable_in_its_typed_line() {
+    // lldb's `(Type) name = value` head line for a static
+    // printed by path: the checks that name the variable
+    // anchor on it.
+    let mut s = session(static_program());
+    let run = s.run_script(
+        vec![print("test::COUNTER"), DebugCommand::Run],
+        DebugDialect::Lldb,
+    );
+    assert!(run.outcome.is_ok(), "outcome: {:?}", run.outcome);
+    assert!(
+        run.transcript
+            .iter()
+            .any(|l| l == "(i64) test::COUNTER = 7"),
+        "transcript: {:?}",
+        run.transcript
+    );
+}

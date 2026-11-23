@@ -156,6 +156,49 @@ enum StopPlan {
     Done,
 }
 
+/// A numeric display format an lldb `type format add` command
+/// registered for one of the char-family types (lldb renders a
+/// value of a registered type through the format instead of
+/// the type's own form).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LldbNumFormat {
+    /// Signed decimal (`-f d` / `--format decimal`).
+    Decimal,
+    /// Unsigned decimal (`-f u`).
+    Unsigned,
+    /// Hexadecimal (`-f x` / `--format hex`).
+    Hex,
+}
+
+/// The session's lldb type-format registrations, restricted to
+/// the char family — the only types the debuginfo suite
+/// registers formats for: Rust `char` (lldb's `char`), `i8`
+/// (lldb's `signed char`), and `u8` (lldb's `unsigned char`).
+/// A registration for any of a type's names sets the whole
+/// slot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LldbFormats {
+    pub char_format: Option<LldbNumFormat>,
+    pub i8_format: Option<LldbNumFormat>,
+    pub u8_format: Option<LldbNumFormat>,
+}
+
+impl LldbFormats {
+    /// Register one format for the type named `ty` (any of the
+    /// names the suite uses for a char-family type, Rust or C
+    /// spelling). Names outside the char family are ignored:
+    /// no suite registration names another type, and the
+    /// renderers consult only these slots.
+    pub fn register(&mut self, ty: &str, format: LldbNumFormat) {
+        match ty {
+            "char" => self.char_format = Some(format),
+            "i8" | "signed char" => self.i8_format = Some(format),
+            "u8" | "unsigned char" => self.u8_format = Some(format),
+            _ => {}
+        }
+    }
+}
+
 /// The debugger state the drive loop consults. Installed on the
 /// interpreter for the length of one session run.
 pub(crate) struct DebugControl {
@@ -215,6 +258,13 @@ pub(crate) struct DebugControl {
     /// a static evaluates to reach its storage before the
     /// program itself has touched it.
     static_seeds: HashMap<String, crate::ir::Constant>,
+    /// The session's lldb type-format registrations.
+    lldb_formats: LldbFormats,
+    /// Whether the program was compiled with limited debug
+    /// info (`-C debuginfo=1` or lower): the binary then
+    /// carries no variable information, and `info locals`
+    /// reports none.
+    hide_locals: bool,
 }
 
 /// A debugger session over one converted program.
@@ -227,6 +277,8 @@ pub struct DebugSession {
     fn_breakpoints: Vec<String>,
     source_text: HashMap<u32, Vec<String>>,
     pretty_printers: bool,
+    lldb_formats: LldbFormats,
+    hide_locals: bool,
 }
 
 impl DebugSession {
@@ -245,7 +297,23 @@ impl DebugSession {
             fn_breakpoints: Vec::new(),
             source_text: HashMap::new(),
             pretty_printers: false,
+            lldb_formats: LldbFormats::default(),
+            hide_locals: false,
         }
+    }
+
+    /// Register an lldb type format for a char-family type
+    /// (lldb `type format add`): values of the type render
+    /// through the format for the rest of the session.
+    pub fn set_lldb_format(&mut self, ty: &str, format: LldbNumFormat) {
+        self.lldb_formats.register(ty, format);
+    }
+
+    /// Mark the program as compiled with limited debug info:
+    /// `info locals` then reports no locals (see
+    /// [`DebugControl::hide_locals`]).
+    pub fn set_hide_locals(&mut self, hide: bool) {
+        self.hide_locals = hide;
     }
 
     /// Set a function breakpoint (gdb `break <fn-path>`): the
@@ -331,6 +399,8 @@ impl DebugSession {
             source_text: std::mem::take(&mut self.source_text),
             dialect,
             pretty_printers: self.pretty_printers,
+            lldb_formats: self.lldb_formats,
+            hide_locals: self.hide_locals,
         };
         let mut interp = Interpreter::with_config(&self.program, self.config.clone());
         // Commands ahead of the session's first `run` are
@@ -1202,10 +1272,20 @@ fn apply_field_name(
                 },
                 _ => None,
             };
-            return Ok((
-                (**base).clone(),
-                elem.map(|e| Desc::Ref(Box::new(e))),
-            ));
+            // The base of a fat reference built from a constant
+            // (a slice constant's element tuple) is the aggregate
+            // itself, not a reference to it; a `data_ptr` is a
+            // pointer, so the aggregate is wrapped the way the
+            // runtime's own slice values carry it.
+            let base = (**base).clone();
+            let base = match base {
+                Value::Ref(_)
+                | Value::FatRef { .. }
+                | Value::DynRef { .. }
+                | Value::FnPtr(_) => base,
+                other => Value::Ref(crate::value::RefTarget::value(other)),
+            };
+            return Ok((base, elem.map(|e| Desc::Ref(Box::new(e)))));
         }
     }
     let (value, desc) = deref_if_pointer(interp, frames, value, desc)?;
@@ -1406,6 +1486,7 @@ fn evaluate_print(
     print: &DebugPrint,
 ) -> Result<EvaluatedPrint, String> {
     let ev = evaluate_expr(interp, ctl, frames, &print.expr)?;
+    let tyname = expr_type_name(&ev);
     let (value, desc, char) = (ev.value, ev.desc, ev.char);
     // The lldb synthetic-child providers' summary lines for
     // the sequence and counted-handle types (the forms the
@@ -1466,6 +1547,40 @@ fn evaluate_print(
         }
     };
     lldb.extend(lldb_lines_extra);
+    // An lldb `type format add` registration for the printed
+    // value's own type replaces the value's rendering with the
+    // registered numeric format (see [`lldb_format_scalar`]).
+    if let Some(formatted) =
+        lldb_format_scalar(&value, ev.tag.as_deref(), desc.as_ref(), ctl.lldb_formats)
+    {
+        if let Some(first) = lldb.first_mut() {
+            if first.starts_with("= ") {
+                *first = format!("= {formatted}");
+            }
+        }
+    }
+    // lldb's `(Type) name = value` head line, for a print whose
+    // rendering is the bare summary form: checks that name the
+    // printed variable — statics printed by path, in
+    // particular — anchor on the name, which the bare form
+    // omits.
+    if parse_expr(&print.expr)
+        .map(|e| e.steps.is_empty())
+        .unwrap_or(false)
+    {
+        if let Some(first) = lldb.first().cloned() {
+            if let Some(compact) = first.strip_prefix("= ") {
+                if let Some(tyname) = &tyname {
+                    lldb.push(format!(
+                        "({}) {} = {}",
+                        lldb_type_name(tyname),
+                        print.expr,
+                        compact
+                    ));
+                }
+            }
+        }
+    }
     Ok(EvaluatedPrint {
         gdb: if ctl.pretty_printers && print.format.is_none() {
             render_pretty_gdb(
@@ -1484,13 +1599,91 @@ fn evaluate_print(
     })
 }
 
+/// The rendering an lldb type-format registration prescribes
+/// for a printed scalar, when the session registered a format
+/// for the value's own type. The registration is keyed by type
+/// name; the evaluated value's recorded tag names its type
+/// exactly at the top level of a print, which is where the
+/// debuginfo suite's registrations bite (a `char`'s descriptor
+/// also survives expression steps, and is consulted as well).
+fn lldb_format_scalar(
+    value: &Value,
+    tag: Option<&str>,
+    desc: Option<&Desc>,
+    formats: LldbFormats,
+) -> Option<String> {
+    let format = match tag {
+        Some("char") => formats.char_format,
+        Some("i8") => formats.i8_format,
+        Some("u8") => formats.u8_format,
+        _ => match desc {
+            Some(Desc::Char) => formats.char_format,
+            _ => None,
+        },
+    }?;
+    let v: i128 = match value {
+        Value::Int(v) => *v,
+        Value::Uint(v) => *v as i128,
+        _ => return None,
+    };
+    Some(match format {
+        LldbNumFormat::Decimal => format!("{v}"),
+        LldbNumFormat::Unsigned => format!("{}", v as u128),
+        LldbNumFormat::Hex => {
+            if v < 0 {
+                return None;
+            }
+            format!("0x{:x}", v as u128)
+        }
+    })
+}
+
+/// A `core::num::NonZero<T>` value unwrapped to its scalar:
+/// the type's DWARF form is the primitive itself carrying a
+/// validity range, and both debuggers print the bare scalar.
+/// The value arrives as nested one-field wrappers — the
+/// `NonZeroInner` associated type hides the primitive one
+/// layer down, behind a type alias the debug-shape table
+/// cannot resolve — so unwrapping follows the value's own
+/// one-field layers until a scalar bottoms out. Returns the
+/// scalar and the descriptor of the `NonZero`'s argument.
+fn nonzero_scalar(
+    value: &Value,
+    desc: Option<&Desc>,
+) -> Option<(Value, Desc)> {
+    let Some(Desc::Adt(tag)) = desc else {
+        return None;
+    };
+    if tag_base_name(tag) != "NonZero" {
+        return None;
+    }
+    let inner = first_generic_arg(tag)?;
+    let mut cur = value.clone();
+    loop {
+        match cur {
+            Value::Enum { fields, .. } if fields.len() == 1 => {
+                cur = fields.into_iter().next().unwrap();
+            }
+            Value::Tuple(fields) if fields.len() == 1 => {
+                cur = fields.into_iter().next().unwrap();
+            }
+            Value::Int(_) | Value::Uint(_) => {
+                return Some((cur, Desc::from_tag(&inner)));
+            }
+            _ => return None,
+        }
+    }
+}
+
 /// The declared type name of an evaluated expression, as a
 /// type query (`whatis`) prints it: the recorded type tag in
 /// its DWARF (definition-path) form when the conversion
 /// recorded one, else the name rebuilt from the rendering
 /// descriptor.
 fn expr_type_name(ev: &EvaluatedValue) -> Option<String> {
-    if matches!(ev.desc, Some(Desc::FnPtr)) {
+    if matches!(ev.desc, Some(Desc::FnPtr))
+        || matches!(&ev.tag, Some(tag) if tag == "FnPtr")
+    {
         // A function pointer's tag is the type's kind name,
         // not a signature; gdb spells the type as a raw
         // pointer to the unit-signature function.
@@ -1558,7 +1751,29 @@ fn render_type_query(
     // reference appearing as the raw pointer the environment
     // stores.
     if let Some(Desc::Adt(tag)) = &ev.desc {
-        if let Some(shape) = interp.program().env_debug_shapes.get(tag) {
+        // The shape table's key may carry the closure's
+        // generic arguments or not, depending on how the
+        // conversion recorded the environment; try the
+        // recorded tag, then its argument-stripped form, then
+        // the shape whose DWARF name is the tag's environment
+        // name (`{closure#N}` spelled `{closure_env#N}`).
+        let bare = tag.split('<').next().unwrap_or(tag);
+        let env_shape = interp
+            .program()
+            .env_debug_shapes
+            .get(tag)
+            .or_else(|| interp.program().env_debug_shapes.get(bare))
+            .or_else(|| {
+                let want = bare
+                    .replace("::{closure#", "::{closure_env#")
+                    .replace("::{coroutine#", "::{coroutine_env#");
+                interp
+                    .program()
+                    .env_debug_shapes
+                    .values()
+                    .find(|shape| shape.dwarf_name == want)
+            });
+        if let Some(shape) = env_shape {
             if shape.upvars.is_empty() {
                 return vec![format!("type = struct {}", shape.dwarf_name)];
             }
@@ -1576,6 +1791,20 @@ fn render_type_query(
             }
             lines.push("}".to_string());
             return lines;
+        }
+        // No recorded environment shape: a closure value whose
+        // environment is empty has the bare struct form under
+        // its environment name (the conversion records no
+        // shape for a capture-less environment).
+        if let Value::Closure { env, .. } = &ev.value {
+            if env.is_empty() {
+                let dwarf = bare
+                    .replace("::{closure#", "::{closure_env#")
+                    .replace("::{coroutine#", "::{coroutine_env#");
+                if dwarf != bare {
+                    return vec![format!("type = struct {dwarf}")];
+                }
+            }
         }
         if let Some(shape) = interp.program().adt_debug_shapes.get(tag) {
             if shape.kind == sparagmos_mir::AdtShapeKind::Struct {
@@ -1738,22 +1967,36 @@ fn render_info_functions(
         let Some(body) = program.get(name) else {
             continue;
         };
-        if quiet {
+        // The declaration gdb's full-debuginfo listing prints:
+        // the signature form, with the return type omitted for
+        // the unit and never types (both print as no return).
+        let signature = {
             let args: Vec<String> = (1..=body.arg_count)
                 .filter_map(|i| body.local_tys.get(i).map(ir_ty_name))
                 .collect();
             let ret = match body.local_tys.first() {
-                Some(Ty::Unit) | None => String::new(),
+                Some(Ty::Unit) | Some(Ty::Never) | None => String::new(),
                 Some(ty) => format!(" -> {}", ir_ty_name(ty)),
             };
-            lines.push(format!(
+            format!(
                 "static fn {}({}){};",
                 dwarf_type_name(name),
                 args.join(", "),
                 ret
-            ));
+            )
+        };
+        if quiet {
+            lines.push(signature);
         } else {
+            // The plain listing's declaration form depends on
+            // the debug info the binary carries: with full
+            // debuginfo gdb prints the DWARF declaration
+            // (`static fn ...`), with line-only info the
+            // symbol-table form (`fn ...`). Both are candidate
+            // lines, as elsewhere in the renderers.
             lines.push(format!("fn {}();", dwarf_type_name(name)));
+            lines.push(format!("static fn {}();", dwarf_type_name(name)));
+            lines.push(signature);
         }
     }
     lines
@@ -1767,6 +2010,10 @@ fn render_info_locals(
     ctl: &DebugControl,
     frames: &[Frame],
 ) -> Vec<String> {
+    if ctl.hide_locals {
+        // Limited debug info carries no variable information.
+        return vec!["No locals.".to_string()];
+    }
     let Some(frame) =
         frames.get(frames.len().saturating_sub(1 + ctl.selected_frame))
     else {
@@ -2210,6 +2457,9 @@ fn render_gdb(
     if depth > MAX_RENDER_DEPTH {
         return None;
     }
+    if let Some((scalar, inner)) = nonzero_scalar(value, desc) {
+        return render_gdb(interp, &scalar, Some(&inner), top_char, format, depth);
+    }
     match value {
         Value::Bool(_)
         | Value::Unit
@@ -2280,6 +2530,15 @@ fn render_gdb(
         | Value::DynRef { .. }
         | Value::FnPtr(_) => {
             let addr = crate::interp::synthetic_address(value)?;
+            // A pointer to the unit type prints with its type
+            // in cast form (`(*mut ()) 0x...`): the unit type
+            // has no value form for the address to stand for.
+            if matches!(
+                desc,
+                Some(Desc::Ref(inner)) if matches!(inner.as_ref(), Desc::Unit)
+            ) {
+                return Some(format!("(*mut ()) 0x{addr:x}"));
+            }
             Some(format!("0x{addr:x}"))
         }
         Value::Closure { .. } | Value::Coroutine { .. } => {
@@ -2292,6 +2551,276 @@ fn render_gdb(
         },
         _ => None,
     }
+}
+
+/// The byte width of an integer type tag, when the tag names
+/// one.
+fn int_ty_width(ty: &str) -> Option<usize> {
+    match ty {
+        "i8" | "u8" => Some(1),
+        "i16" | "u16" => Some(2),
+        "i32" | "u32" => Some(4),
+        "i64" | "u64" | "isize" | "usize" => Some(8),
+        "i128" | "u128" => Some(16),
+        _ => None,
+    }
+}
+
+fn align_up(v: usize, align: usize) -> usize {
+    (v + align - 1) / align.max(1) * align.max(1)
+}
+
+/// The (size, alignment) a debugger field type tag describes,
+/// for the scalar, tuple and array types a union's fields take:
+/// the layout the byte reinterpretation of a union value's
+/// storage follows (declaration order, each element at its
+/// natural alignment, as the compiler lays these types out).
+fn tag_layout(ty: &str) -> Option<(usize, usize)> {
+    let ty = ty.trim();
+    let scalar = match ty {
+        "bool" | "i8" | "u8" => Some((1, 1)),
+        "char" => Some((4, 4)),
+        "i16" | "u16" | "f16" => Some((2, 2)),
+        "i32" | "u32" | "f32" => Some((4, 4)),
+        "i64" | "u64" | "f64" | "isize" | "usize" => Some((8, 8)),
+        "i128" | "u128" | "f128" => Some((16, 16)),
+        _ => None,
+    };
+    if let Some(s) = scalar {
+        return Some(s);
+    }
+    if ty.starts_with('(') && ty.ends_with(')') {
+        let inner = &ty[1..ty.len() - 1];
+        if inner.trim().is_empty() {
+            return Some((0, 1));
+        }
+        let mut size = 0usize;
+        let mut align = 1usize;
+        for part in split_top_level(inner) {
+            let (esize, ealign) = tag_layout(&part)?;
+            align = align.max(ealign);
+            size = align_up(size, ealign) + esize;
+        }
+        return Some((align_up(size, align), align));
+    }
+    if ty.starts_with('[') && ty.ends_with(']') {
+        let inner = &ty[1..ty.len() - 1];
+        let (elem, len) = inner.rsplit_once(';')?;
+        let n: usize = len.trim().parse().ok()?;
+        let (esize, ealign) = tag_layout(elem)?;
+        let stride = align_up(esize, ealign);
+        return Some((stride * n, ealign));
+    }
+    None
+}
+
+/// Serialize a value as the little-endian bytes of its type
+/// (see [`tag_layout`]): the storage a union field of that type
+/// occupies. Types with no byte form here (references, ADT
+/// fields, strings) make the whole reinterpretation fail, and
+/// the union keeps the unrenderable form.
+fn value_to_union_bytes(value: &Value, ty: &str) -> Option<Vec<u8>> {
+    let ty = ty.trim();
+    match ty {
+        "bool" => match value {
+            Value::Bool(b) => Some(vec![*b as u8]),
+            _ => None,
+        },
+        "char" => match value {
+            Value::Uint(v) => Some((*v as u32).to_le_bytes().to_vec()),
+            Value::Int(v) => Some((*v as u32).to_le_bytes().to_vec()),
+            _ => None,
+        },
+        "f32" => match value {
+            Value::Float(f) => Some((*f as f32).to_bits().to_le_bytes().to_vec()),
+            _ => None,
+        },
+        "f64" => match value {
+            Value::Float(f) => Some(f.to_bits().to_le_bytes().to_vec()),
+            _ => None,
+        },
+        "f128" => match value {
+            Value::Float128(bits) => Some(bits.to_le_bytes().to_vec()),
+            _ => None,
+        },
+        _ if int_ty_width(ty).is_some() => {
+            let width = int_ty_width(ty)?;
+            let bits = match value {
+                Value::Int(v) => *v as u128,
+                Value::Uint(v) => *v,
+                _ => return None,
+            };
+            Some(bits.to_le_bytes()[..width].to_vec())
+        }
+        _ if ty.starts_with('(') && ty.ends_with(')') => {
+            let Value::Tuple(items) = value else {
+                return None;
+            };
+            let inner = &ty[1..ty.len() - 1];
+            if inner.trim().is_empty() {
+                return Some(Vec::new());
+            }
+            let parts = split_top_level(inner);
+            if parts.len() != items.len() {
+                return None;
+            }
+            let mut out = Vec::new();
+            for (item, part) in items.iter().zip(parts.iter()) {
+                let (_, ealign) = tag_layout(part)?;
+                let pad = align_up(out.len(), ealign) - out.len();
+                out.resize(out.len() + pad, 0);
+                out.extend(value_to_union_bytes(item, part)?);
+            }
+            Some(out)
+        }
+        _ if ty.starts_with('[') && ty.ends_with(']') => {
+            let Value::Tuple(items) = value else {
+                return None;
+            };
+            let inner = &ty[1..ty.len() - 1];
+            let (elem, _) = inner.rsplit_once(';')?;
+            let (esize, ealign) = tag_layout(elem)?;
+            let stride = align_up(esize, ealign);
+            let mut out = Vec::new();
+            for item in items {
+                let bytes = value_to_union_bytes(item, elem)?;
+                out.extend_from_slice(&bytes);
+                out.resize(out.len() + (stride - bytes.len()), 0);
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// Read a value of a union field's type back from the field's
+/// little-endian storage bytes (see [`value_to_union_bytes`]).
+fn value_from_union_bytes(bytes: &[u8], ty: &str) -> Option<Value> {
+    let ty = ty.trim();
+    match ty {
+        "bool" => Some(Value::Bool(bytes.first().copied()? != 0)),
+        "char" => {
+            let v = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?);
+            Some(Value::Uint(u128::from(v)))
+        }
+        "f32" => {
+            let bits = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?);
+            Some(Value::Float(f32::from_bits(bits) as f64))
+        }
+        "f64" => {
+            let bits = u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?);
+            Some(Value::Float(f64::from_bits(bits)))
+        }
+        "f128" => {
+            let bits = u128::from_le_bytes(bytes.get(..16)?.try_into().ok()?);
+            Some(Value::Float128(bits))
+        }
+        _ if int_ty_width(ty).is_some() => {
+            let width = int_ty_width(ty)?;
+            let raw = bytes.get(..width)?;
+            let mut buf = [0u8; 16];
+            buf[..width].copy_from_slice(raw);
+            let bits = u128::from_le_bytes(buf);
+            if ty.starts_with('i') {
+                let shift = 128 - width * 8;
+                Some(Value::Int(((bits << shift) as i128) >> shift))
+            } else {
+                Some(Value::Uint(bits))
+            }
+        }
+        _ if ty.starts_with('(') && ty.ends_with(')') => {
+            let inner = &ty[1..ty.len() - 1];
+            if inner.trim().is_empty() {
+                return Some(Value::Tuple(Vec::new()));
+            }
+            let mut items = Vec::new();
+            let mut off = 0usize;
+            for part in split_top_level(inner) {
+                let (esize, ealign) = tag_layout(&part)?;
+                off = align_up(off, ealign);
+                items.push(value_from_union_bytes(
+                    bytes.get(off..off + esize)?,
+                    &part,
+                )?);
+                off += esize;
+            }
+            Some(Value::Tuple(items))
+        }
+        _ if ty.starts_with('[') && ty.ends_with(']') => {
+            let inner = &ty[1..ty.len() - 1];
+            let (elem, len) = inner.rsplit_once(';')?;
+            let n: usize = len.trim().parse().ok()?;
+            let (esize, ealign) = tag_layout(elem)?;
+            let stride = align_up(esize, ealign);
+            let mut items = Vec::with_capacity(n);
+            for i in 0..n {
+                items.push(value_from_union_bytes(
+                    bytes.get(i * stride..i * stride + esize)?,
+                    elem,
+                )?);
+            }
+            Some(Value::Tuple(items))
+        }
+        _ => None,
+    }
+}
+
+/// The values of every declared field of a union value: the
+/// value model stores only the written field (the slots before
+/// it uninitialised, the slots after it absent), while a
+/// debugger reads every field from the same storage, so the
+/// stored field's bytes are reinterpreted through each declared
+/// field's type.
+fn union_field_values(
+    shape_fields: &[sparagmos_mir::AdtDebugField],
+    fields: &[Value],
+) -> Option<Vec<Value>> {
+    let stored = fields.iter().rposition(|f| !matches!(f, Value::Uninit))?;
+    let stored_ty = &shape_fields.get(stored)?.ty;
+    let mut bytes = value_to_union_bytes(&fields[stored], stored_ty)?;
+    let size = shape_fields
+        .iter()
+        .map(|f| tag_layout(&f.ty).map(|(s, _)| s))
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    bytes.resize(size, 0);
+    shape_fields
+        .iter()
+        .map(|f| value_from_union_bytes(&bytes, &f.ty))
+        .collect()
+}
+
+/// lldb's expanded-children form of a `NonZero` value: the
+/// scalar summary is the value itself, and the children are the
+/// two one-field wrappers the DWARF describes (the struct's
+/// field 0 holding the inner validity wrapper holding the
+/// scalar), the inner one in compact form: `{ 0 = {0:11} }`.
+/// The recorded debug shape does not describe those wrappers
+/// (the value arrives already unwrapped for the summary), so
+/// the form is synthesized from the wrapper structure itself.
+fn nonzero_lldb_expanded(
+    interp: &Interpreter,
+    value: &Value,
+    desc: Option<&Desc>,
+) -> Option<String> {
+    let (scalar, inner) = nonzero_scalar(value, desc)?;
+    let wrapper = match value {
+        Value::Enum { fields, .. } if fields.len() == 1 => &fields[0],
+        Value::Tuple(fields) if fields.len() == 1 => &fields[0],
+        _ => return None,
+    };
+    let inner_fields: &[Value] = match wrapper {
+        Value::Enum { fields, .. } => fields,
+        Value::Tuple(fields) => fields,
+        _ => return None,
+    };
+    if inner_fields.len() != 1 || inner_fields[0] != scalar {
+        return None;
+    }
+    let text = render_lldb_compact(interp, &scalar, Some(&inner), false, true, 1)?;
+    Some(format!("{{ 0 = {{0:{text}}} }}"))
 }
 
 /// Render one ADT value in gdb form (see [`render_gdb`]).
@@ -2308,6 +2837,20 @@ fn render_adt_gdb(
     // itself, which is the table's key.
     let tag = &dwarf_type_name(tag);
     let vshape = shape.variants.get(variant as usize)?;
+    if matches!(shape.kind, sparagmos_mir::AdtShapeKind::Union) {
+        // A union value stores only the written field; every
+        // declared field is read back from the same storage
+        // (see `union_field_values`).
+        let values = union_field_values(&vshape.fields, fields)?;
+        let mut parts = Vec::with_capacity(values.len());
+        for (i, v) in values.iter().enumerate() {
+            let name = vshape.fields[i].name.as_deref()?;
+            let d = Desc::from_tag(&vshape.fields[i].ty);
+            let r = render_gdb(interp, v, Some(&d), false, None, depth + 1)?;
+            parts.push(format!("{name}: {r}"));
+        }
+        return Some(format!("{tag} {{{}}}", parts.join(", ")));
+    }
     if vshape.fields.len() != fields.len() {
         return None;
     }
@@ -2919,6 +3462,16 @@ fn render_lldb_compact(
     if depth > MAX_RENDER_DEPTH {
         return None;
     }
+    if let Some((scalar, inner)) = nonzero_scalar(value, desc) {
+        return render_lldb_compact(
+            interp,
+            &scalar,
+            Some(&inner),
+            top_char,
+            nested,
+            depth,
+        );
+    }
     match value {
         Value::Bool(_)
         | Value::Unit
@@ -3000,6 +3553,17 @@ fn render_adt_lldb_compact(
     depth: usize,
 ) -> Option<String> {
     let vshape = shape.variants.get(variant as usize)?;
+    if matches!(shape.kind, sparagmos_mir::AdtShapeKind::Union) {
+        let values = union_field_values(&vshape.fields, fields)?;
+        let mut parts = Vec::with_capacity(values.len());
+        for (i, v) in values.iter().enumerate() {
+            let name = vshape.fields[i].name.as_deref()?;
+            let d = Desc::from_tag(&vshape.fields[i].ty);
+            let r = render_lldb_compact(interp, v, Some(&d), false, true, depth + 1)?;
+            parts.push(format!("{name}:{r}"));
+        }
+        return Some(format!("{{{}}}", parts.join(", ")));
+    }
     if vshape.fields.len() != fields.len() {
         return None;
     }
@@ -3094,6 +3658,20 @@ fn render_lldb_expanded(
     desc: Option<&Desc>,
     depth: usize,
 ) -> Option<String> {
+    lldb_expanded_pairs(interp, value, desc, depth)
+        .map(|pairs| format!("{{ {} }}", pairs.join(" ")))
+}
+
+/// The `name = value` pairs of an aggregate's expanded
+/// children form (see [`render_lldb_expanded`]), unjoined:
+/// the parenthesised comma-joined form lldb prints for a
+/// sequence's children is built from the same pairs.
+fn lldb_expanded_pairs(
+    interp: &Interpreter,
+    value: &Value,
+    desc: Option<&Desc>,
+    depth: usize,
+) -> Option<Vec<String>> {
     if depth > MAX_RENDER_DEPTH {
         return None;
     }
@@ -3117,7 +3695,7 @@ fn render_lldb_expanded(
                 let v = render_lldb_sub(interp, field, Some(&d), depth + 1)?;
                 pairs.push(format!("{name} = {v}"));
             }
-            Some(format!("{{ {} }}", pairs.join(" ")))
+            Some(pairs)
         }
         Value::Tuple(fields) => {
             if fields.is_empty() {
@@ -3144,7 +3722,7 @@ fn render_lldb_expanded(
                 let v = render_lldb_sub(interp, field, d, depth + 1)?;
                 pairs.push(format!("{name} = {v}"));
             }
-            Some(format!("{{ {} }}", pairs.join(" ")))
+            Some(pairs)
         }
         _ => None,
     }
@@ -3398,8 +3976,14 @@ fn render_lldb_lines(
             lldb_type_name(&dwarf_type_name(tag))
         );
         lines.push(first.clone());
+        if let Some(expanded) = nonzero_lldb_expanded(interp, value, desc) {
+            lines.push(format!("{first} {expanded}"));
+        }
         if let Some(expanded) = render_lldb_expanded(interp, value, desc, 0) {
             lines.push(format!("{first} {expanded}"));
+        }
+        if let Some(pairs) = lldb_expanded_pairs(interp, value, desc, 0) {
+            lines.push(format!("{first} ({})", pairs.join(", ")));
         }
         if let Some((head, pairs)) = named_field_values(interp, value, desc) {
             let colon = pairs
@@ -3419,6 +4003,9 @@ fn render_lldb_lines(
         lines.push(format!("= {compact}"));
         if let Some(expanded) = render_lldb_expanded(interp, value, desc, 0) {
             lines.push(format!("= {compact} {expanded}"));
+        }
+        if let Some(pairs) = lldb_expanded_pairs(interp, value, desc, 0) {
+            lines.push(format!("= {compact} ({})", pairs.join(", ")));
         }
     }
     lines
@@ -3534,9 +4121,10 @@ fn render_scalar(
                 return Some(match dialect {
                     DebugDialect::Gdb => format!("{} '{}'", v, escape_char(c)),
                     // lldb's char summary: the code point in
-                    // `U+XXXX` form, then the character itself.
+                    // `U+0xXXXXXXXX` form, then the character
+                    // itself.
                     DebugDialect::Lldb => {
-                        format!("U+{:04X} U'{}'", v, escape_char(c))
+                        format!("U+0x{:08X} U'{}'", v, escape_char(c))
                     }
                 });
             }
