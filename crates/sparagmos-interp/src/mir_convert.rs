@@ -455,6 +455,85 @@ fn body_is_closure_body(body: &mir::Body) -> bool {
 /// receiver value. A concrete ADT `Self` instead names a
 /// hand-written `Fn` impl, whose collected shim body the
 /// direct resolution should keep.
+/// The coroutine-closure aggregate that creates local `local`'s
+/// value in `body`, if the body creates it: the closure's
+/// definition and the types of its captures (the upvars tuple of
+/// the aggregate's generic arguments). A coroutine-closure type
+/// is recorded by the driver as the unit placeholder (its kind
+/// is unaskable through Stable MIR), so the aggregate that
+/// creates the value is the one place a body's conversion can
+/// learn what the value is.
+fn coroutine_closure_creation(
+    body: &mir::Body,
+    local: usize,
+) -> Option<(mir::DefId, Vec<mir::Ty>)> {
+    for bb in &body.basic_blocks {
+        for stmt in &bb.statements {
+            let mir::StatementKind::Assign(pair) = &stmt.kind else {
+                continue;
+            };
+            let (place, rv) = &**pair;
+            if place.local.index() != local || !place.projection.is_empty() {
+                continue;
+            }
+            let mir::Rvalue::Aggregate(kind, _) = rv else {
+                continue;
+            };
+            let mir::AggregateKind::CoroutineClosure {
+                def,
+                generic_args,
+            } = &**kind
+            else {
+                continue;
+            };
+            let upvars = match generic_args.iter().rev().nth(1) {
+                Some(mir::Ty::Tuple(ts)) => ts.clone(),
+                _ => Vec::new(),
+            };
+            return Some((*def, upvars));
+        }
+    }
+    None
+}
+
+/// The per-capture "taken by reference" flags of an async
+/// closure, from its creation aggregate's generic arguments:
+/// the upvars tuple (second-to-last) gives the environment's
+/// field types, and the by-reference signature (last, a
+/// fn-pointer type whose output is the tuple of the types the
+/// closure's coroutine borrows for a call) gives each capture's
+/// borrowed type. A capture whose borrowed type is a reference
+/// TO its environment type was taken by value - the call borrows
+/// the environment field itself. Any other capture was taken by
+/// reference - the environment field is itself a reference, and
+/// the call reborrows it. `None` when the arguments do not have
+/// the expected shape.
+fn async_capture_by_ref(generic_args: &[mir::Ty]) -> Option<Vec<bool>> {
+    let upvars = match generic_args.iter().rev().nth(1) {
+        Some(mir::Ty::Tuple(ts)) => ts,
+        _ => return None,
+    };
+    let borrowed = match generic_args.last() {
+        Some(mir::Ty::FnPtr(sig)) => match &*sig.output {
+            mir::Ty::Tuple(ts) => ts,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if upvars.len() != borrowed.len() {
+        return None;
+    }
+    Some(
+        upvars
+            .iter()
+            .zip(borrowed.iter())
+            .map(|(env_ty, borrowed_ty)| {
+                !matches!(borrowed_ty, mir::Ty::Ref(_, inner, _) if &**inner == env_ty)
+            })
+            .collect(),
+    )
+}
+
 fn fn_self_is_closure_or_dyn(ty: &mir::Ty) -> bool {
     match ty {
         mir::Ty::Closure(..) | mir::Ty::Dynamic(..) => true,
@@ -577,6 +656,7 @@ fn convert_all(
     let conv = Converter::new(program, &keys);
     let (mut out, mut failures) = convert_each(&conv, program, &keys);
     out.union_tables = conv.union_tables.clone();
+    out.async_closure_captures = conv.async_closure_captures.clone();
     // Joint fixpoint of conversion, cleanliness and the
     // builtin-served set. Each round recomputes, from the merged
     // program so far:
@@ -1818,6 +1898,12 @@ struct Converter<'a> {
     union_tables: Vec<Vec<Option<ir::ScalarShape>>>,
     /// Union instance -> index into `union_tables`.
     union_table_ids: Vec<(mir::AdtDefId, Vec<mir::Ty>, usize)>,
+    /// Per-capture "taken by reference" flags of the program's
+    /// async closures (see [`ir::Program::async_closure_captures`]),
+    /// computed in `Converter::new` from the creation aggregates:
+    /// a pure function of the program, so every conversion round
+    /// computes the same table.
+    async_closure_captures: HashMap<String, Vec<bool>>,
 }
 
 impl<'a> Converter<'a> {
@@ -1886,8 +1972,10 @@ impl<'a> Converter<'a> {
             unconverted: HashMap::new(),
             union_tables: Vec::new(),
             union_table_ids: Vec::new(),
+            async_closure_captures: HashMap::new(),
         };
         conv.compute_union_tables(program);
+        conv.compute_async_closure_captures(program);
         conv
     }
 
@@ -1915,6 +2003,38 @@ impl<'a> Converter<'a> {
             .get(def)
             .map(|shape| shape.kind == mir::AdtShapeKind::Union)
             .unwrap_or(false)
+    }
+
+    /// Record the per-capture "taken by reference" flags of
+    /// every async closure the program creates (see
+    /// [`async_capture_by_ref`]), keyed by the closure's program
+    /// key - the key the created `Value::Closure` carries.
+    fn compute_async_closure_captures(&mut self, program: &MirProgram) {
+        for func in &program.functions {
+            for bb in &func.body.basic_blocks {
+                for stmt in &bb.statements {
+                    let mir::StatementKind::Assign(pair) = &stmt.kind else {
+                        continue;
+                    };
+                    let (_, rv) = &**pair;
+                    let mir::Rvalue::Aggregate(kind, _) = rv else {
+                        continue;
+                    };
+                    let mir::AggregateKind::CoroutineClosure {
+                        def,
+                        generic_args,
+                    } = &**kind
+                    else {
+                        continue;
+                    };
+                    if let Some(flags) = async_capture_by_ref(generic_args) {
+                        self.async_closure_captures
+                            .entry(self.body_key(def))
+                            .or_insert(flags);
+                    }
+                }
+            }
+        }
     }
 
     /// Intern the scalar-shape tables of every union instance a
@@ -2046,6 +2166,44 @@ impl<'a> Converter<'a> {
         let mut local_tys = Vec::with_capacity(body.local_decls.len());
         for (i, decl) in body.local_decls.iter().enumerate() {
             local_tys.push(self.convert_ty(&decl.ty, &format!("local _{i} of `{key}`"))?);
+        }
+        // A local whose type is a coroutine-closure type arrives
+        // with the unit placeholder as its declared type (the
+        // driver cannot ask that type's kind through Stable MIR;
+        // see `guarded_ty_kind` in the driver). The one statement
+        // that creates such a value - the coroutine-closure
+        // aggregate assigned to the bare local - names the
+        // closure's definition and captures, so the local's type
+        // is the closure type the aggregate describes, exactly as
+        // a plain closure local's declared type names its own.
+        for bb in &body.basic_blocks {
+            for stmt in &bb.statements {
+                let mir::StatementKind::Assign(pair) = &stmt.kind else {
+                    continue;
+                };
+                let (place, rv) = &**pair;
+                if !place.projection.is_empty() {
+                    continue;
+                }
+                let mir::Rvalue::Aggregate(kind, ops) = rv else {
+                    continue;
+                };
+                let mir::AggregateKind::CoroutineClosure {
+                    def,
+                    generic_args,
+                } = &**kind
+                else {
+                    continue;
+                };
+                let upvars = match generic_args.iter().rev().nth(1) {
+                    Some(mir::Ty::Tuple(ts)) => ts.len(),
+                    _ => ops.len(),
+                };
+                let idx = place.local.index();
+                if idx < local_tys.len() {
+                    local_tys[idx] = ir::Ty::Closure(self.body_key(def), upvars);
+                }
+            }
         }
         let mut blocks = Vec::with_capacity(body.basic_blocks.len());
         for bb in &body.basic_blocks {
@@ -6638,6 +6796,30 @@ let inner = match (&src, target) {
                         operands: fields,
                     }
                 }
+                mir::AggregateKind::CoroutineClosure { def, generic_args } => {
+                    // An async closure's creation aggregate: the
+                    // value is the closure environment, exactly as
+                    // for a plain closure - what differs is only
+                    // how a call on it is dispatched (the AsyncFn
+                    // family creates the coroutine the closure's
+                    // captures feed). The generic arguments pack
+                    // the tail as [kind, signature, upvars tuple,
+                    // by-reference captures fn-pointer], so the
+                    // upvars tuple is the second-to-last argument
+                    // (a plain closure's is the last).
+                    let upvar_tys: Vec<mir::Ty> = match generic_args.iter().rev().nth(1) {
+                        Some(mir::Ty::Tuple(ts)) => ts.clone(),
+                        _ => Vec::new(),
+                    };
+                    let mut fields = Vec::with_capacity(ops.len());
+                    for (i, op) in ops.iter().enumerate() {
+                        fields.push(self.convert_operand(body, op, upvar_tys.get(i))?);
+                    }
+                    ir::Rvalue::ClosureAggregate {
+                        def: self.body_key(def),
+                        operands: fields,
+                    }
+                }
                 mir::AggregateKind::Coroutine { def, generic_args } => {
                     // The creation aggregate fills the unresumed
                     // state's fields: the upvars. Their declared
@@ -7554,7 +7736,21 @@ let inner = match (&src, target) {
                 let value_keyed = trait_call
                     .1
                     .first()
-                    .is_some_and(fn_self_is_closure_or_dyn);
+                    .is_some_and(fn_self_is_closure_or_dyn)
+                    // The `AsyncFn` family is implemented only by
+                    // async closure values, so the callable is the
+                    // receiver value itself. The check above cannot
+                    // see it: the call's `Self` type is a
+                    // coroutine-closure type, which the driver
+                    // records as the unit placeholder (its kind is
+                    // unaskable through Stable MIR), so the kind of
+                    // the call is the witness instead.
+                    || matches!(
+                        trait_call.0,
+                        ir::FnCallKind::AsyncCall
+                            | ir::FnCallKind::AsyncCallMut
+                            | ir::FnCallKind::AsyncCallOnce
+                    );
                 if mis_keyed || value_keyed {
                     Some(FnResolution::Trait(
                         trait_call.0,
@@ -7590,6 +7786,15 @@ let inner = match (&src, target) {
             }
             "std::ops::FnOnce::call_once" | "core::ops::FnOnce::call_once" => {
                 ir::FnCallKind::CallOnce
+            }
+            "std::ops::AsyncFn::async_call" | "core::ops::AsyncFn::async_call" => {
+                ir::FnCallKind::AsyncCall
+            }
+            "std::ops::AsyncFnMut::async_call_mut"
+            | "core::ops::AsyncFnMut::async_call_mut" => ir::FnCallKind::AsyncCallMut,
+            "std::ops::AsyncFnOnce::async_call_once"
+            | "core::ops::AsyncFnOnce::async_call_once" => {
+                ir::FnCallKind::AsyncCallOnce
             }
             _ => return None,
         };
@@ -7995,11 +8200,27 @@ let inner = match (&src, target) {
                 } else if let Some(name) = self.fn_trait_or_direct(func, args.len()) {
                     match name {
                         FnResolution::Trait(kind, raw_generic_args, stamped) => {
-                            let receiver = self.convert_operand(
-                                body,
-                                &args[0],
-                                raw_generic_args.first(),
-                            )?;
+                            // An `AsyncFn` call's receiver is typed
+                            // by nothing the conversion can use: its
+                            // `Self` generic argument is the
+                            // coroutine-closure type the driver
+                            // records as the unit placeholder, and
+                            // typing the receiver operand by it
+                            // would misread the reference the
+                            // operand names. The operand's own
+                            // place type types it instead.
+                            let receiver_ty = if matches!(
+                                kind,
+                                ir::FnCallKind::AsyncCall
+                                    | ir::FnCallKind::AsyncCallMut
+                                    | ir::FnCallKind::AsyncCallOnce
+                            ) {
+                                None
+                            } else {
+                                raw_generic_args.first()
+                            };
+                            let receiver =
+                                self.convert_operand(body, &args[0], receiver_ty)?;
                             let tuple = self
                                 .convert_operand(body, &args[1], raw_generic_args.get(1))?;
                             // The stamp is carried for a direct or
@@ -8019,11 +8240,48 @@ let inner = match (&src, target) {
                             } else {
                                 None
                             };
+                            // The capture count of the coroutine
+                            // an `AsyncFn` call creates: the
+                            // future type's last generic argument
+                            // is the coroutine's upvars tuple - the
+                            // state-0 fields the creation aggregate
+                            // writes - and the fields begin with
+                            // the call arguments, so the captures
+                            // are what remains.
+                            let async_captures = if matches!(
+                                kind,
+                                ir::FnCallKind::AsyncCall
+                                    | ir::FnCallKind::AsyncCallMut
+                                    | ir::FnCallKind::AsyncCallOnce
+                            ) {
+                                let arg_count = match raw_generic_args.get(1) {
+                                    Some(mir::Ty::Tuple(ts)) => ts.len(),
+                                    _ => 0,
+                                };
+                                self.place_ty(body, destination)
+                                    .and_then(|t| match t {
+                                        mir::Ty::Coroutine(_, cargs) => {
+                                            match cargs.last() {
+                                                Some(mir::Ty::Tuple(ts)) => {
+                                                    Some(ts.len())
+                                                }
+                                                _ => None,
+                                            }
+                                        }
+                                        _ => None,
+                                    })
+                                    .and_then(|fields| {
+                                        fields.checked_sub(arg_count)
+                                    })
+                            } else {
+                                None
+                            };
                             ir::TerminatorKind::CallTrait {
                                 kind,
                                 receiver,
                                 args: tuple,
                                 stamp,
+                                async_captures,
                                 receiver_glue: if matches!(
                                     kind,
                                     ir::FnCallKind::CallOnce
@@ -8356,9 +8614,30 @@ let inner = match (&src, target) {
                 }
             }
             T::Drop { place, target, .. } => {
-                let glue = self
-                    .place_ty(body, place)
-                    .and_then(|t| self.drop_glue(&t));
+                let glue = self.place_ty(body, place).and_then(|t| {
+                    // A coroutine-closure value's place type is
+                    // the unit placeholder, whose glue is trivial;
+                    // the value's own glue is its captures' glue.
+                    // When the place is the bare local this body's
+                    // coroutine-closure aggregate created, plan it
+                    // from the aggregate, exactly as a plain
+                    // closure type's glue is planned from its
+                    // capture tuple.
+                    if place.projection.is_empty()
+                        && matches!(&t, mir::Ty::Tuple(ts) if ts.is_empty())
+                    {
+                        if let Some((def, upvars)) =
+                            coroutine_closure_creation(body, place.local.index())
+                        {
+                            let closure_ty =
+                                mir::Ty::Closure(def, vec![mir::Ty::Tuple(upvars)]);
+                            if let Some(glue) = self.drop_glue(&closure_ty) {
+                                return Some(glue);
+                            }
+                        }
+                    }
+                    self.drop_glue(&t)
+                });
                 match glue {
                     Some(glue) => ir::TerminatorKind::Drop {
                         place: self.convert_place(body, place)?,

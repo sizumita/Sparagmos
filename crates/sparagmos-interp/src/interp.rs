@@ -1764,7 +1764,7 @@ impl<'a> Interpreter<'a> {
         let mut cached: Option<(u64, &Body, std::rc::Rc<crate::decode::DecodedBody>)> =
             None;
         let mut func_name = String::new();
-        loop {
+        'drive: loop {
             let (block_idx, stmt_idx) = {
                 let frame = frames
                     .last()
@@ -1963,9 +1963,173 @@ impl<'a> Interpreter<'a> {
                     args,
                     stamp,
                     receiver_glue,
+                    async_captures,
                     destination,
                     target,
                 } => {
+                    // The `AsyncFn` family: the call runs no body.
+                    // It creates the async closure's coroutine -
+                    // the value the compiler's shim body for the
+                    // call constructs - with the coroutine's
+                    // state-0 fields in the shim's own order: the
+                    // call arguments first, then the captures. The
+                    // captures' shape is the call kind: references
+                    // into the closure's environment for
+                    // `async_call` / `async_call_mut` (the future
+                    // borrows the closure), the environment's
+                    // fields themselves for `async_call_once` (the
+                    // future owns them). The coroutine body the
+                    // future's `poll` runs is found through the
+                    // future's own type at the poll site, exactly
+                    // as for an async block's coroutine.
+                    if matches!(
+                        kind,
+                        FnCallKind::AsyncCall
+                            | FnCallKind::AsyncCallMut
+                            | FnCallKind::AsyncCallOnce
+                    ) {
+                        let args_value = self.eval_operand(frames, body, &args)?;
+                        let mut fields = match args_value {
+                            Value::Tuple(items) => items,
+                            Value::Unit => Vec::new(),
+                            other => {
+                                return Err(InterpError::type_mismatch(
+                                    "AsyncFn trait call arguments",
+                                    "argument tuple",
+                                    other.kind_name(),
+                                ));
+                            }
+                        };
+                        match kind {
+                            FnCallKind::AsyncCallOnce => {
+                                let value =
+                                    self.eval_operand(frames, body, receiver)?;
+                                match value {
+                                    Value::Closure { env, .. } => {
+                                        fields.extend(env);
+                                    }
+                                    // A zero-sized async closure
+                                    // is a value whose local is
+                                    // never assigned; it
+                                    // materialises as the unit
+                                    // value (its declared type is
+                                    // the placeholder). Its
+                                    // captures are all zero-sized
+                                    // too: the environment the
+                                    // coroutine takes is one unit
+                                    // field per capture the layout
+                                    // records.
+                                    Value::Unit => {
+                                        let n = async_captures.unwrap_or(0);
+                                        fields.extend(
+                                            std::iter::repeat_n(Value::Unit, n),
+                                        );
+                                    }
+                                    other => {
+                                        return Err(InterpError::type_mismatch(
+                                            "AsyncFnOnce::async_call_once receiver",
+                                            "async closure value",
+                                            other.kind_name(),
+                                        ));
+                                    }
+                                }
+                            }
+                            _ => {
+                                let recv =
+                                    self.eval_operand(frames, body, receiver)?;
+                                let resolved = self.deref_value(&frames, &recv)?;
+                                let value = self.read_resolved(&frames, &resolved)?;
+                                match value {
+                                    // A zero-sized async closure
+                                    // behind the reference, as in
+                                    // the `async_call_once` arm
+                                    // above: each capture's field
+                                    // is a reference to the
+                                    // zero-sized capture value,
+                                    // which materialises as the
+                                    // unit value.
+                                    Value::Unit => {
+                                        let n = async_captures.unwrap_or(0);
+                                        for _ in 0..n {
+                                            fields.push(Value::Ref(
+                                                RefTarget::value(Value::Unit),
+                                            ));
+                                        }
+                                    }
+                                    Value::Closure { def, env } => {
+                                        for (i, field) in env.iter().enumerate() {
+                                            // A capture taken into
+                                            // the closure by
+                                            // reference: the
+                                            // environment field is
+                                            // the reference itself,
+                                            // and the coroutine's
+                                            // field is that
+                                            // reference reborrowed -
+                                            // the field's own
+                                            // value. Any other
+                                            // capture: the field is
+                                            // a reference to the
+                                            // environment field.
+                                            let by_ref = self
+                                                .program
+                                                .async_closure_captures
+                                                .get(&def)
+                                                .and_then(|flags| {
+                                                    flags.get(i).copied()
+                                                });
+                                            let field_ref = match by_ref {
+                                                Some(true) => Some(field.clone()),
+                                                Some(false) => {
+                                                    ref_to_field(&recv, i)
+                                                }
+                                                None => {
+                                                    if matches!(
+                                                        field,
+                                                        Value::Ref(_)
+                                                            | Value::FatRef { .. }
+                                                    ) {
+                                                        Some(field.clone())
+                                                    } else {
+                                                        ref_to_field(&recv, i)
+                                                    }
+                                                }
+                                            };
+                                            let Some(field_ref) = field_ref
+                                            else {
+                                                return Err(InterpError::type_mismatch(
+                                                    "AsyncFn::async_call receiver",
+                                                    "reference to an async closure value",
+                                                    recv.kind_name(),
+                                                ));
+                                            };
+                                            fields.push(field_ref);
+                                        }
+                                    }
+                                    other => {
+                                        return Err(InterpError::type_mismatch(
+                                            "AsyncFn::async_call receiver",
+                                            "async closure value",
+                                            other.kind_name(),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        let future = Value::Coroutine {
+                            variant: 0,
+                            fields,
+                            saved: Vec::new(),
+                        };
+                        let Some(bb) = target else {
+                            return Err(InterpError::MissingContinuation {
+                                func: func_name.clone(),
+                            });
+                        };
+                        self.write_place(frames, body, destination, future)?;
+                        Self::jump(frames, body, *bb)?;
+                        continue 'drive;
+                    }
                     // The caller-location stamp the conversion
                     // carried on this edge (a track-caller
                     // closure called directly or through a
@@ -2011,6 +2175,15 @@ impl<'a> Interpreter<'a> {
                     let mut env_consumed = false;
                     let mut env_unwrapped = false;
                     let (callable, env_ref) = match kind {
+                        // Every `AsyncFn` call completed in the
+                        // branch at the top of this arm (it creates
+                        // the coroutine and jumps); none reaches the
+                        // body-call dispatch below.
+                        FnCallKind::AsyncCall
+                        | FnCallKind::AsyncCallMut
+                        | FnCallKind::AsyncCallOnce => {
+                            unreachable!("AsyncFn calls complete above")
+                        }
                         FnCallKind::CallOnce => {
                             let (value, env_ref) = self.eval_callable(&frames, body, receiver)?;
                             let (value, env_ref) =
@@ -2185,9 +2358,9 @@ impl<'a> Interpreter<'a> {
                         && dyn_concrete.is_some()
                     {
                         let idx = match kind {
-                            FnCallKind::Call => 0,
-                            FnCallKind::CallMut => 1,
-                            FnCallKind::CallOnce => 2,
+                            FnCallKind::Call | FnCallKind::AsyncCall => 0,
+                            FnCallKind::CallMut | FnCallKind::AsyncCallMut => 1,
+                            FnCallKind::CallOnce | FnCallKind::AsyncCallOnce => 2,
                         };
                         match &self.program.fn_shim_locations[idx] {
                             Some(c) => Some(self.eval_constant(c)?),
@@ -3933,6 +4106,9 @@ impl<'a> Interpreter<'a> {
             FnCallKind::Call => ("std::ops::Fn", "call"),
             FnCallKind::CallMut => ("std::ops::FnMut", "call_mut"),
             FnCallKind::CallOnce => ("std::ops::FnOnce", "call_once"),
+            FnCallKind::AsyncCall => ("std::ops::AsyncFn", "async_call"),
+            FnCallKind::AsyncCallMut => ("std::ops::AsyncFnMut", "async_call_mut"),
+            FnCallKind::AsyncCallOnce => ("std::ops::AsyncFnOnce", "async_call_once"),
         };
         let impl_name = self.scan_virtual_impl(concrete, trait_path, method)?;
         let wants_ref = matches!(
@@ -19561,6 +19737,30 @@ fn default_hook_value() -> Value {
 /// Whether a hook value is the default-hook marker.
 fn is_default_hook(value: &Value) -> bool {
     matches!(value, Value::DynRef { concrete, .. } if concrete == "std::panic::default_hook")
+}
+
+/// A reference to field `idx` of the value `recv` references:
+/// the same target with one more field projection. `None` when
+/// `recv` is not a reference a field can be taken of. This is
+/// the reference the `AsyncFn` coroutine creation forms for each
+/// capture: the future's upvar for capture `i` is a reference to
+/// the closure environment's field `i`, exactly as the
+/// compiler's shim body forms it with `&((*env).i)`.
+fn ref_to_field(recv: &Value, idx: usize) -> Option<Value> {
+    let Value::Ref(target) = recv else {
+        return None;
+    };
+    let mut target = target.clone();
+    match &mut target {
+        RefTarget::Place { projection, .. }
+        | RefTarget::Value(_, projection)
+        | RefTarget::Static { projection, .. }
+        | RefTarget::Alloc { projection, .. } => {
+            projection.push(RefProj::Field(idx));
+        }
+        RefTarget::Null | RefTarget::Address(_) => return None,
+    }
+    Some(Value::Ref(target))
 }
 
 fn ref_shaped_receiver(value: Value) -> Value {

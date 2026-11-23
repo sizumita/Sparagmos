@@ -280,38 +280,28 @@ fn run_mode_tail_call_body_is_skipped_and_call_exits_two() {
 
 
 #[test]
-fn run_mode_async_closure_call_exits_two_with_named_reason() {
-    // A body that mentions a coroutine-closure (async closure)
-    // type converts (the type question is guarded; see the
-    // driver_bodies async-closure tests), but *calling* the
-    // closure goes through the `AsyncFn::async_call` shim, whose
-    // body is not collected: run mode reports that call under
-    // the usual contract — exit 2, the unconverted callee named,
-    // no conversion panic and no process panic.
+fn run_mode_async_closure_call_runs() {
+    // Calling an async closure goes through the `AsyncFn` trait
+    // dispatch: the call creates the closure's coroutine (the
+    // value the compiler's shim body would construct) and the
+    // program runs to completion - the created future here is
+    // simply never polled. (Before Lane MJ this call was the
+    // unsupported case this test pinned; the end-to-end behaviour
+    // of the dispatch is covered by the driver_async_closure
+    // tests.)
     let dir = temp_dir("asyncclosure");
     let src = fixture(&dir, "asyncclosure.rs", ASYNC_CLOSURE_CALL_SRC);
     let out = run_driver(&src);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         out.status.code(),
-        Some(2),
-        "calling an async closure is unsupported (exit 2), not a process panic; stderr={stderr}"
+        Some(0),
+        "calling an async closure runs; stderr={stderr}"
     );
     assert!(
-        stderr.contains("std::ops::AsyncFn::async_call"),
-        "the reason names the unconverted shim: {stderr}"
-    );
-    assert!(
-        stderr.contains("no converted body"),
-        "the reason names the unconverted body: {stderr}"
-    );
-    assert!(
-        !stderr.contains("conversion panicked"),
-        "the failure is a named unsupported call, not a conversion panic: {stderr}"
-    );
-    assert!(
-        !stderr.contains("RUST_BACKTRACE"),
-        "the default panic dump is suppressed, the message is reported as the reason: {stderr}"
+        out.stdout.is_empty(),
+        "the program prints nothing: {:?}",
+        String::from_utf8_lossy(&out.stdout)
     );
 }
 

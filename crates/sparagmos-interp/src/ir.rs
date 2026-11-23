@@ -986,6 +986,20 @@ pub enum FnCallKind {
     /// `FnOnce::call_once`: the receiver is the callable value
     /// itself, consumed by the call.
     CallOnce,
+    /// `AsyncFn::async_call`: the receiver is a shared reference to
+    /// an async closure; the call creates the closure's coroutine
+    /// with the captures borrowed shared from the environment.
+    AsyncCall,
+    /// `AsyncFnMut::async_call_mut`: the receiver is a unique
+    /// reference to an async closure; the call creates the
+    /// closure's coroutine with the captures borrowed uniquely
+    /// from the environment.
+    AsyncCallMut,
+    /// `AsyncFnOnce::async_call_once`: the receiver is the async
+    /// closure value itself, consumed by the call; the call
+    /// creates the closure's coroutine with the environment's
+    /// fields moved into it as the captures.
+    AsyncCallOnce,
 }
 
 /// Drop glue for one dropped value, built by `mir_convert` from the
@@ -1215,10 +1229,11 @@ pub enum TerminatorKind {
         target: Option<BasicBlock>,
     },
     /// A call through the `Fn` / `FnMut` / `FnOnce` trait methods
-    /// (`std::ops::Fn::call` and siblings), in the shape rustc MIR
-    /// emits for calling a closure: the receiver is the callable
-    /// (a reference to it for `call` / `call_mut`, the value itself
-    /// for `call_once`) and `args` evaluates to the argument tuple.
+    /// (`std::ops::Fn::call` and siblings) or the `AsyncFn` family,
+    /// in the shape rustc MIR emits for calling a closure: the
+    /// receiver is the callable (a reference to it for `call` /
+    /// `call_mut`, the value itself for `call_once`) and `args`
+    /// evaluates to the argument tuple.
     CallTrait {
         kind: FnCallKind,
         receiver: Operand,
@@ -1244,6 +1259,19 @@ pub enum TerminatorKind {
         /// for `call` / `call_mut`, and for a `call_once` whose
         /// glue cannot be accounted for.
         receiver_glue: Option<DropGlue>,
+        /// For an `AsyncFn`-family call, the number of captures in
+        /// the created coroutine's state-0 layout: the future
+        /// type's upvars tuple (its last generic argument) counts
+        /// the state-0 fields, and the fields begin with the call
+        /// arguments, so the captures are what remains. The
+        /// interpreter needs it only when the closure value is a
+        /// zero-sized phantom - a local that is never assigned,
+        /// whose captures are all zero-sized themselves: the count
+        /// is then the only trace of them, and each such capture's
+        /// field is fabricated from it. `None` for the `Fn` family,
+        /// and when the future's type names no upvars tuple (a
+        /// generic body's projection).
+        async_captures: Option<usize>,
         destination: Place,
         target: Option<BasicBlock>,
     },
@@ -1673,6 +1701,16 @@ pub struct Program {
     /// allocation the program makes. Empty when the program has
     /// no custom allocator.
     pub alloc_shims: std::collections::HashMap<String, String>,
+    /// Per-capture "taken by reference" flags of the program's
+    /// async closures, keyed by the closure's program key (the
+    /// key a `Value::Closure` carries): entry `i` is true when
+    /// capture `i` was taken into the closure by reference, so
+    /// the environment's field `i` is itself a reference and an
+    /// `AsyncFn` call reborrows it into the created coroutine;
+    /// false when the capture was taken by value, so the call
+    /// borrows the environment field itself. Recorded by
+    /// conversion from the creation aggregates.
+    pub async_closure_captures: HashMap<String, Vec<bool>>,
     pub functions: HashMap<String, Body>,
     /// Functions that exist in the source program but whose bodies
     /// could not be converted, keyed by name, with the reason
