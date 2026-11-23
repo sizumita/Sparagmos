@@ -4611,6 +4611,50 @@ impl<'a> Converter<'a> {
         self.ptr_chain_operand(body, &next_operand, &field_v, fdef, fargs)
     }
 
+    /// The field index at which the pointer chain of the
+    /// ADT `def` (see [`Self::chain_field`]) enters its first
+    /// layer, when a thin pointer transmuted into the ADT
+    /// can be rebuilt faithfully: every layer is a
+    /// single-payload struct whose chain field is either a
+    /// thin pointer or the next layer of the chain — the
+    /// owning-pointer shape (`Box` is a `Unique` plus an
+    /// allocator, a `Unique` is a `NonNull` plus a
+    /// `PhantomData`, a `NonNull` is a `NonZero` over the
+    /// pointer itself) — and every layer below the first
+    /// chains through its field 0. The first layer's index
+    /// is the one the rebuilt value must place the pointer
+    /// at (see the reverse-transmute arm in
+    /// `convert_transmute`); the deeper layers are read
+    /// through the stored pointer itself, the model's
+    /// wrapper-chain convention (a field-0 step on a pointer
+    /// value yields the pointer), so only field-0 layers may
+    /// sit below the first. A chain entering a deeper layer
+    /// at a non-zero field would need an aggregate nested
+    /// inside an operand, which the IR does not express:
+    /// `None` here keeps such a transmute an explicit
+    /// unsupported instead of building a value whose fields
+    /// were never constructed.
+    fn ptr_chain_entry_index(&self, def: &mir::AdtDefId, args: &[mir::Ty]) -> Option<usize> {
+        let (entry, mut field_ty) = self.chain_field(def, args)?;
+        // A type-level walk over a finite chain of wrapper
+        // types; the depth cap only guards against a
+        // (nonsensical) self-nesting wrapper type.
+        for _ in 0..32 {
+            if is_thin_ptr_ty(&field_ty) {
+                return Some(entry);
+            }
+            let mir::Ty::Adt(def, args) = &field_ty else {
+                return None;
+            };
+            let (index, next_ty) = self.chain_field(def, args)?;
+            if index != 0 {
+                return None;
+            }
+            field_ty = next_ty;
+        }
+        None
+    }
+
     /// Whether both types are pointers (a reference or a raw
     /// pointer) to byte-string DSTs: `str`, a `[u8]` slice,
     /// `std::ffi::OsStr` (or its sys representation type
@@ -5329,6 +5373,71 @@ let inner = match (&src, target) {
                     }
                 } else {
                     unsupported()
+                }
+            }
+            // Thin pointer -> owning-pointer chain (the
+            // reverse of the ADT -> thin pointer chain arm
+            // above): the target's pointer chain bottoms out
+            // at a thin pointer, so the pointer becomes the
+            // owner's value. When the chain enters the target
+            // at field 0, that value is the allocation pointer
+            // in a one-field aggregate — the shape `Box::new`
+            // itself produces, whatever the chain's depth
+            // (`Box` over `Unique` over `NonNull` over
+            // `NonZero` over the pointer) — and the consumers
+            // of an owning pointer (the drop glue, the
+            // chain-walking pointer extraction) are built
+            // around that shape, so it is kept exactly. When
+            // the chain enters at a later field (a zero-sized
+            // field sits before the payload), no model
+            // constructor produces the value, so the first
+            // layer is built in full instead: the pointer at
+            // the chain field's own index and the zero-sized
+            // fields' unique values at theirs, the pointer
+            // standing in for the field-0 layers below it, as
+            // it does throughout the model's wrapper chains.
+            // This is the `transmute::<*mut T, Box<T>>` shape
+            // and its nested-wrapper kin. Targets with a
+            // transparent wrapper shape keep the arm below:
+            // their zero-sized fills are part of their value.
+            (Some(s), mir::Ty::Adt(def, args))
+                if is_thin_ptr_ty(s)
+                    && self.wrapper_shape(def, args).is_none()
+                    && self.ptr_chain_entry_index(def, args).is_some() =>
+            {
+                let entry = self
+                    .ptr_chain_entry_index(def, args)
+                    .expect("guard checked");
+                if entry == 0 {
+                    ir::Rvalue::AggregateAdt {
+                        variant: 0,
+                        operands: vec![v.clone()],
+                        field_index: None,
+                        units_from: None,
+                    }
+                } else {
+                    let fields = match self.instantiated_field_tys(def, args, 0) {
+                        Some(fields) => fields,
+                        None => return unsupported(),
+                    };
+                    let mut operands = Vec::with_capacity(fields.len());
+                    for (i, fty) in fields.iter().enumerate() {
+                        if i == entry {
+                            operands.push(v.clone());
+                        } else {
+                            let fill = self.zst_value(fty, 0).and_then(|zv| value_to_constant(&zv));
+                            match fill {
+                                Some(c) => operands.push(ir::Operand::Constant(c)),
+                                None => return unsupported(),
+                            }
+                        }
+                    }
+                    ir::Rvalue::AggregateAdt {
+                        variant: 0,
+                        operands,
+                        field_index: None,
+                        units_from: None,
+                    }
                 }
             }
             // Pointer -> transparent wrapper struct: wrap the

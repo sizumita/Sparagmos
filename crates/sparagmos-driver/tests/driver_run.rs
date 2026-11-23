@@ -5919,6 +5919,108 @@ fn run_mode_transmute_box_to_raw_pointer() {
     run_ok("transmute-box", TRANSMUTE_BOX_SRC, "42 43\n");
 }
 
+const TRANSMUTE_RAW_TO_BOX_SRC: &str = r#"
+use std::sync::atomic::{AtomicUsize, Ordering};
+static DROPS: AtomicUsize = AtomicUsize::new(0);
+struct D(u32);
+impl Drop for D {
+    fn drop(&mut self) { DROPS.fetch_add(1, Ordering::SeqCst); }
+}
+fn main() {
+    let p: *mut D = Box::into_raw(Box::new(D(41)));
+    let mut b: Box<D> = unsafe { std::mem::transmute(p) };
+    b.0 += 1;
+    println!("{}", b.0);
+    drop(b);
+    println!("drops={}", DROPS.load(Ordering::SeqCst));
+    let p2: *mut D = Box::into_raw(Box::new(D(7)));
+    let b2: Box<D> = unsafe { std::mem::transmute(p2) };
+    let p3: *mut D = unsafe { std::mem::transmute(b2) };
+    let b3: Box<D> = unsafe { std::mem::transmute(p3) };
+    println!("{}", b3.0);
+    drop(b3);
+    println!("drops={}", DROPS.load(Ordering::SeqCst));
+}
+"#;
+
+#[test]
+fn run_mode_transmute_raw_pointer_to_box() {
+    run_ok(
+        "transmute-raw-to-box",
+        TRANSMUTE_RAW_TO_BOX_SRC,
+        "42\ndrops=1\n7\ndrops=2\n",
+    );
+}
+
+const TRANSMUTE_RAW_TO_ZST_FIRST_WRAPPER_SRC: &str = r#"
+#[repr(transparent)]
+struct Inner(*mut u32);
+#[repr(C)]
+struct Outer((), Inner);
+fn main() {
+    let mut x: u32 = 42;
+    let p = &mut x as *mut u32;
+    let outer: Outer = unsafe { std::mem::transmute(p) };
+    let q = outer.1.0;
+    unsafe { *q += 1; }
+    println!("{}", x);
+    let outer2: Outer = unsafe { std::mem::transmute(q) };
+    println!("{}", unsafe { *outer2.1.0 });
+}
+"#;
+
+#[test]
+fn run_mode_transmute_raw_pointer_to_wrapper_with_leading_zst() {
+    // The pointer chain enters the target at field 1 (a
+    // zero-sized field sits before the payload layer), so
+    // the rebuilt value must hold the pointer at that index
+    // with the zero-sized field's value beside it — not in a
+    // one-field aggregate at field 0, where reading `.1.0`
+    // finds a field that was never constructed.
+    run_ok(
+        "transmute-raw-to-zst-first-wrapper",
+        TRANSMUTE_RAW_TO_ZST_FIRST_WRAPPER_SRC,
+        "43\n43\n",
+    );
+}
+
+const TRANSMUTE_DEEP_ZST_CHAIN_SRC: &str = r#"
+#[repr(C)]
+struct Inner2((), *mut u32);
+#[repr(C)]
+struct Outer2(Inner2, ());
+fn main() {
+    let mut x: u32 = 42;
+    let p = &mut x as *mut u32;
+    let outer: Outer2 = unsafe { std::mem::transmute(p) };
+    let q = outer.0.1;
+    unsafe { *q += 1; }
+    println!("{}", x);
+}
+"#;
+
+#[test]
+fn run_mode_transmute_deep_zst_chain_is_explicit_unsupported() {
+    // The chain enters a deeper layer at a non-zero field;
+    // rebuilding it would need an aggregate nested inside
+    // an operand, which the IR does not express. The
+    // transmute stays an explicit unsupported instead of
+    // building a value whose fields were never constructed.
+    let dir = temp_dir("transmute-deep-zst-chain");
+    let src = fixture(&dir, "case.rs", TRANSMUTE_DEEP_ZST_CHAIN_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "deep non-zero chain transmute must be a named unsupported; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("Cast Transmute"),
+        "stderr must name the transmute; stderr={stderr}"
+    );
+}
+
 const TRANSMUTE_CONSTANTS_SRC: &str = r#"
 fn main() {
     let a: u32 = unsafe { std::mem::transmute(1.5f32) };
