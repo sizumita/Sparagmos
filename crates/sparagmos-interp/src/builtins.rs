@@ -27593,7 +27593,7 @@ impl<'a> Interpreter<'a> {
                     base.as_ref(),
                     Value::Enum { fields, .. } if fields.len() > 1
                 ) {
-                    Self::dyn_data_pointer(base)
+                    self.dyn_data_pointer(base)
                 } else {
                     pointee
                 };
