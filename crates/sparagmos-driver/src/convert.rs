@@ -817,12 +817,16 @@ fn trait_has_impls(trait_def: rustc_public::DefId) -> bool {
 
 /// Whether the projection `alias` cannot normalize in a
 /// fully-monomorphized typing environment. The one judgment
-/// the implementation table decides for every self type: the
-/// projection's trait has no implementation at all, in any
-/// crate of the compilation. No instantiation of a
-/// definition mentioning the projection can satisfy its
-/// bounds then, so the projection normalizes for no self
-/// type — parameter, concrete, or otherwise.
+/// the implementation table decides: the projection's trait
+/// has no implementation at all, in any crate of the
+/// compilation. No instantiation of a definition mentioning
+/// the projection can satisfy its bounds then, so the
+/// projection normalizes for no self type — parameter,
+/// concrete, or otherwise — with one exception the screen
+/// checks separately: a trait-object self type, whose own
+/// existential projection predicate binds the item and so
+/// normalizes the projection without any implementation
+/// (see `dyn_binding_normalizes`).
 ///
 /// Nothing else is judged. Whether an implementation
 /// *covers* a concrete self type is not decidable from the
@@ -838,6 +842,61 @@ fn projection_cannot_normalize(alias: &rustc_public::ty::AliasTy) -> bool {
         return false;
     };
     !trait_has_impls(trait_def)
+}
+
+/// Whether the projection `alias` normalizes through an
+/// existential associated-type binding of its self type:
+/// the self type, resolved through the ambient arguments
+/// the way the screen's walk resolves a parameter, is a
+/// trait object whose predicates bind this very associated
+/// item (`dyn Trait<Assoc = Term>`). Such a projection
+/// normalizes to the binding's term in a fully-monomorphized
+/// environment even though the trait has no implementation
+/// at all — the object type itself carries the equality —
+/// so the absence of implementations is no proof it cannot
+/// normalize, and the screen must not reject it. Any other
+/// shape — an unresolved parameter, a non-object self type,
+/// an object binding a different item of the trait — leaves
+/// the implementation-table judgment in force.
+fn dyn_binding_normalizes(
+    alias: &rustc_public::ty::AliasTy,
+    ambient: Option<&GenericArgs>,
+    depth: usize,
+) -> bool {
+    // A projection's generic arguments are its trait
+    // reference's, whose first argument is the self type.
+    let Some(GenericArgKind::Type(self_ty)) = alias.args.0.first() else {
+        return false;
+    };
+    let mut resolved: &Ty = self_ty;
+    let mut depth = depth;
+    loop {
+        let Some(kind) = guarded_ty_kind(resolved) else {
+            return false;
+        };
+        match kind {
+            TyKind::Param(param) => {
+                match ambient.and_then(|a| a.0.get(param.index as usize)) {
+                    Some(GenericArgKind::Type(t)) => resolved = t,
+                    _ => return false,
+                }
+                depth += 1;
+                if depth >= 8 {
+                    return false;
+                }
+            }
+            TyKind::RigidTy(RigidTy::Dynamic(preds, _)) => {
+                return preds.iter().any(|pred| {
+                    matches!(
+                        &pred.value,
+                        ExistentialPredicate::Projection(p)
+                            if p.def_id.def_id() == alias.def_id.def_id()
+                    )
+                });
+            }
+            _ => return false,
+        }
+    }
 }
 
 /// Walk a type for a projection that cannot normalize (see
@@ -864,6 +923,7 @@ fn projection_screen_ty(
         TyKind::Alias(alias_kind, alias) => {
             if alias_kind == SmirAliasKind::Projection
                 && projection_cannot_normalize(&alias)
+                && !dyn_binding_normalizes(&alias, ambient, depth)
             {
                 return Some(format!(
                     "{UNNORMALIZABLE_PROJECTION_REASON}: \

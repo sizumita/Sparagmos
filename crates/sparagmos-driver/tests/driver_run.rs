@@ -1793,6 +1793,111 @@ fn summary_mode_unnormalizable_projection_const_is_not_demanded() {
     );
 }
 
+const DYN_BOUND_PROJECTION_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+struct Holder<T: Trait + ?Sized> {
+    field: T::Assoc,
+}
+fn take(h: Holder<dyn Trait<Assoc = u32>>) -> u32 {
+    h.field
+}
+fn main() {
+    let h = Holder::<dyn Trait<Assoc = u32>> { field: 42 };
+    println!("{}", take(h));
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_holder_runs() {
+    // A projection whose trait has no implementation at all
+    // still normalizes when its self type is a trait object
+    // binding the item (`dyn Trait<Assoc = u32>`): the
+    // object type carries the equality itself. The
+    // unnormalizable-projection screen must not reject the
+    // holder's constructor, the function taking the holder,
+    // or the main holding one as a local — natively the
+    // program prints 42.
+    let dir = temp_dir("dyn-bound-projection");
+    let src = fixture(&dir, "dyn_bound_projection.rs", DYN_BOUND_PROJECTION_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the dyn-bound projection program runs; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "42\n",
+        "the bound field value reaches the print"
+    );
+}
+
+const DYN_BOUND_SECOND_ITEM_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+    type Other;
+}
+struct Holder<T: Trait + ?Sized> {
+    field: T::Other,
+}
+fn main() {
+    let h = Holder::<dyn Trait<Assoc = u8, Other = u32>> { field: 7 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_second_item_runs() {
+    // The screen's exemption is per associated item: the
+    // projected item here is `Other`, bound by the object's
+    // second predicate, not the first.
+    let dir = temp_dir("dyn-bound-second-item");
+    let src = fixture(&dir, "dyn_bound_second_item.rs", DYN_BOUND_SECOND_ITEM_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the second bound item's projection runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
+}
+
+const DYN_BOUND_SUPERTRAIT_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+trait Sub: Trait {}
+struct Holder<T: Trait + ?Sized> {
+    field: T::Assoc,
+}
+fn main() {
+    let h = Holder::<dyn Sub<Assoc = u32>> { field: 9 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_supertrait_runs() {
+    // The binding names the supertrait's item: the object's
+    // predicates elaborate `Sub`'s binding into a projection
+    // predicate for `Trait::Assoc`, which is the item the
+    // holder's field projects.
+    let dir = temp_dir("dyn-bound-supertrait");
+    let src = fixture(&dir, "dyn_bound_supertrait.rs", DYN_BOUND_SUPERTRAIT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the supertrait-bound projection runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "9\n");
+}
+
 const COROUTINE_ONLY_CALLER_SRC: &str = r#"
 fn helper<T: Copy>(v: T) -> T { v }
 fn main() {
