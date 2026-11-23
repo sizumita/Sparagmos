@@ -865,6 +865,15 @@ fn stop_line_text(ctl: &DebugControl, line: u32, text: &str) -> String {
 /// its crate root; a body key may carry a longer prefix for
 /// items the conversion names through their impl).
 fn fn_name_matches(body_name: &str, pattern: &str) -> bool {
+    // A body's later instances carry the driver's instance
+    // suffix (`test::helper [test::helper::<i32>]`, see
+    // `collect_local_instances` in the driver): the breakpoint
+    // names the definition, so the suffix is stripped before
+    // matching, or every instance after the first is missed.
+    let body_name = match body_name.split_once(" [") {
+        Some((head, _)) if body_name.ends_with(']') => head,
+        _ => body_name,
+    };
     if body_name == pattern {
         return true;
     }
@@ -874,6 +883,15 @@ fn fn_name_matches(body_name: &str, pattern: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// The source position a frame is suspended at: the position
+/// of the statement (or terminator) it is about to execute —
+/// for a caller frame, its suspended call line.
+fn frame_position(interp: &Interpreter, frame: &Frame) -> Option<SourceLine> {
+    let body = interp.program().get(&frame.func)?;
+    let (block, stmt) = frame.current_block_stmt();
+    position(body, block, stmt)
 }
 
 /// Emit the selected frame's current source line into the
@@ -1451,7 +1469,30 @@ fn apply_cast(
         other => other,
     };
     match target {
-        Desc::Array(_, _) | Desc::Slice(_) => {
+        Desc::Array(_, n) => {
+            let pointee = cast_pointee_elements(interp, frames, value)?;
+            // The cast views the backing elements through the
+            // target type: a shorter array sees only its first
+            // elements (and a later index step bounds against
+            // them, as it projects this value), and a target
+            // longer than the backing holds is an error rather
+            // than a short read.
+            let pointee = match pointee {
+                Value::Tuple(mut items) => {
+                    if (items.len() as u64) < n {
+                        return Err(format!(
+                            "cast to an array of {n} elements over a value holding {}",
+                            items.len()
+                        ));
+                    }
+                    items.truncate(n as usize);
+                    Value::Tuple(items)
+                }
+                other => other,
+            };
+            Ok((pointee, Some(target)))
+        }
+        Desc::Slice(_) => {
             let pointee = cast_pointee_elements(interp, frames, value)?;
             Ok((pointee, Some(target)))
         }
@@ -1825,6 +1866,122 @@ fn desc_type_name(desc: &Desc) -> Option<String> {
     })
 }
 
+/// The descriptor past the implicit dereference a field or
+/// index step performs: a reference's pointee, a smart
+/// pointer's pointee, anything else unchanged.
+fn desc_through_pointer(desc: Desc) -> Desc {
+    match desc {
+        Desc::Ref(inner) => *inner,
+        Desc::Adt(tag) => smart_pointer_pointee(&tag)
+            .map(|t| Desc::from_tag(&t))
+            .unwrap_or(Desc::Adt(tag)),
+        other => other,
+    }
+}
+
+/// The descriptor of a named field, from the recorded shapes
+/// alone (the type-only counterpart of `apply_field_name`):
+/// an ADT variant's or closure environment's recorded field,
+/// then the pseudo-fields (`length`, `data_ptr`).
+fn type_field_name_desc(
+    interp: &Interpreter,
+    desc: &Desc,
+    name: &str,
+) -> Option<Desc> {
+    if let Desc::Adt(tag) = desc {
+        if let Some(shape) = interp.program().adt_debug_shapes.get(tag) {
+            if let Some(vshape) = shape.variants.first() {
+                if let Some(field) = vshape
+                    .fields
+                    .iter()
+                    .find(|f| f.name.as_deref() == Some(name))
+                {
+                    return Some(Desc::from_tag(&field.ty));
+                }
+            }
+        }
+        if let Some(shape) = interp.program().env_debug_shapes.get(tag) {
+            if let Some(field) = shape
+                .upvars
+                .iter()
+                .find(|f| f.name.as_deref() == Some(name))
+            {
+                return Some(Desc::from_tag(&field.ty));
+            }
+        }
+    }
+    match name {
+        "length" => Some(Desc::Int("usize")),
+        "data_ptr" => match desc {
+            Desc::Ref(inner) => match inner.as_ref() {
+                Desc::Slice(elem) => Some(Desc::Ref(elem.clone())),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// An evaluated form of an expression for a type query,
+/// resolved from the recorded types alone: the base variable's
+/// descriptor walked through the expression's steps, with no
+/// pointee ever read. The value is a placeholder; only the
+/// descriptor (and, for a step-free expression, the recorded
+/// tag) carries information.
+fn type_only_value(
+    interp: &Interpreter,
+    ctl: &DebugControl,
+    frames: &[Frame],
+    expr_text: &str,
+) -> Option<EvaluatedValue> {
+    let expr = parse_expr(expr_text).ok()?;
+    let base = resolve_base(interp, ctl, frames, &expr).ok()?;
+    let mut desc = base.desc.clone();
+    for step in &expr.steps {
+        desc = match (step, desc) {
+            (ExprStep::Deref, Some(Desc::Ref(inner))) => Some(*inner),
+            (ExprStep::Deref, Some(Desc::Adt(tag))) => {
+                smart_pointer_pointee(&tag).map(|t| Desc::from_tag(&t))
+            }
+            (ExprStep::Deref, other) => other,
+            (ExprStep::Field(index), Some(d)) => {
+                let d = desc_through_pointer(d);
+                field_desc(interp, &d, &Value::Uninit, *index)
+            }
+            (ExprStep::FieldName(name), Some(d)) => {
+                let d = desc_through_pointer(d);
+                type_field_name_desc(interp, &d, name)
+            }
+            (ExprStep::Index(_), Some(d)) => {
+                match desc_through_pointer(d) {
+                    Desc::Array(elem, _) | Desc::Slice(elem) => Some(*elem),
+                    _ => None,
+                }
+            }
+            (ExprStep::Cast(target), _) => Some(match target.clone() {
+                Desc::Ref(inner)
+                    if matches!(*inner, Desc::Array(..) | Desc::Slice(_)) =>
+                {
+                    *inner
+                }
+                other => other,
+            }),
+            (_, None) => None,
+        };
+    }
+    Some(EvaluatedValue {
+        value: Value::Uninit,
+        desc,
+        char: base.char,
+        tag: if expr.steps.is_empty() {
+            base.tag.clone()
+        } else {
+            None
+        },
+    })
+}
+
 /// Render one type query (gdb `whatis`, or `ptype` with
 /// `layout`): the `type = <name>` head line, plus — for
 /// `ptype` over an aggregate shape — the shape's field lines
@@ -1838,7 +1995,14 @@ fn render_type_query(
 ) -> Vec<String> {
     let ev = match evaluate_expr(interp, ctl, frames, &print.expr) {
         Ok(ev) => ev,
-        Err(e) => return vec![format!("type = <error: {e}>")],
+        Err(e) => match type_only_value(interp, ctl, frames, &print.expr) {
+            // A type query needs no value: when the value
+            // evaluation fails (a null pointer's pointee, say),
+            // the type still resolves from the recorded tags
+            // and projection metadata alone.
+            Some(ev) => ev,
+            None => return vec![format!("type = <error: {e}>")],
+        },
     };
     let Some(name) = expr_type_name(&ev) else {
         return vec!["type = <unknown>".to_string()];
@@ -2107,7 +2271,7 @@ fn render_info_functions(
 /// each, or `No locals.` when none are.
 fn render_info_locals(
     interp: &Interpreter,
-    ctl: &DebugControl,
+    ctl: &mut DebugControl,
     frames: &[Frame],
 ) -> Vec<String> {
     if ctl.hide_locals {
@@ -2122,6 +2286,20 @@ fn render_info_locals(
     let Some(body) = interp.program().get(&frame.func) else {
         return vec!["No locals.".to_string()];
     };
+    // The lookup position is the selected frame's own (the
+    // derivation `frame_position` makes): the stop position
+    // belongs to the innermost frame, so resolving an outer
+    // frame's variables against it scopes them by the callee's
+    // line — a caller local declared after the callee's stop
+    // line but before the call would be filtered out. The
+    // position is installed for the whole listing, so the name
+    // resolution inside the evaluations scopes consistently.
+    let saved_pos = ctl.current_pos;
+    if ctl.selected_frame != 0 {
+        if let Some(pos) = frame_position(interp, frame) {
+            ctl.current_pos = Some((pos.file, pos.line));
+        }
+    }
     let at_line = ctl.current_pos.map(|(_, line)| line).unwrap_or(0);
     let mut seen: Vec<String> = Vec::new();
     let mut lines = Vec::new();
@@ -2141,11 +2319,13 @@ fn render_info_locals(
             }
         }
     }
-    if lines.is_empty() {
+    let lines = if lines.is_empty() {
         vec!["No locals.".to_string()]
     } else {
         lines
-    }
+    };
+    ctl.current_pos = saved_pos;
+    lines
 }
 
 // ---------------------------------------------------------------------------
@@ -2721,8 +2901,8 @@ fn align_up(v: usize, align: usize) -> usize {
 /// The (size, alignment) a debugger field type tag describes,
 /// for the scalar, tuple and array types a union's fields take:
 /// the layout the byte reinterpretation of a union value's
-/// storage follows (declaration order, each element at its
-/// natural alignment, as the compiler lays these types out).
+/// storage follows (a tuple's fields sit at the compiler's
+/// own offsets — see [`tuple_field_layout`]).
 fn tag_layout(ty: &str) -> Option<(usize, usize)> {
     let ty = ty.trim();
     let scalar = match ty {
@@ -2742,14 +2922,9 @@ fn tag_layout(ty: &str) -> Option<(usize, usize)> {
         if inner.trim().is_empty() {
             return Some((0, 1));
         }
-        let mut size = 0usize;
-        let mut align = 1usize;
-        for part in split_top_level(inner) {
-            let (esize, ealign) = tag_layout(&part)?;
-            align = align.max(ealign);
-            size = align_up(size, ealign) + esize;
-        }
-        return Some((align_up(size, align), align));
+        let parts = split_top_level(inner);
+        let (_, size, align) = tuple_field_layout(&parts)?;
+        return Some((size, align));
     }
     if ty.starts_with('[') && ty.ends_with(']') {
         let inner = &ty[1..ty.len() - 1];
@@ -2758,6 +2933,113 @@ fn tag_layout(ty: &str) -> Option<(usize, usize)> {
         let (esize, ealign) = tag_layout(elem)?;
         let stride = align_up(esize, ealign);
         return Some((stride * n, ealign));
+    }
+    None
+}
+
+/// The byte layout of a tuple type's fields: each field's
+/// offset (in declaration order), the total size and the
+/// alignment. This is the compiler's own layout for a tuple —
+/// the `rustc_abi` univariant layout under the tuple's
+/// `MaybeUnsized` kind: the last field stays last (it is the
+/// unsizing tail), and the remaining fields are stably sorted
+/// by a group key, `trailing_zeros(max(align, size))`, capped
+/// by the largest head alignment when one of them carries a
+/// niche, with the larger niche preferred inside a group.
+/// Verified against the pinned toolchain's `offset_of!`
+/// layouts over scalar, array and nested-tuple shapes,
+/// niches included.
+fn tuple_field_layout(parts: &[String]) -> Option<(Vec<usize>, usize, usize)> {
+    let layouts: Vec<(usize, usize)> = parts
+        .iter()
+        .map(|p| tag_layout(p))
+        .collect::<Option<Vec<_>>>()?;
+    let n = parts.len();
+    if n == 0 {
+        return Some((Vec::new(), 0, 1));
+    }
+    let niches: Vec<Option<(u64, usize)>> =
+        parts.iter().map(|p| tag_niche(p)).collect();
+    let head = n - 1;
+    let largest_niche = niches[..head]
+        .iter()
+        .flatten()
+        .map(|(available, _)| *available)
+        .max()
+        .unwrap_or(0);
+    let max_head_align = layouts[..head]
+        .iter()
+        .map(|(_, align)| *align)
+        .max()
+        .unwrap_or(1);
+    let group_key = |i: usize| -> u64 {
+        let (size, align) = layouts[i];
+        let key = u64::from(align.max(size).trailing_zeros());
+        if largest_niche > 0 {
+            key.min(u64::from(max_head_align.trailing_zeros()))
+        } else {
+            key
+        }
+    };
+    let mut order: Vec<usize> = (0..head).collect();
+    order.sort_by_key(|&i| {
+        let (niche_size, niche_offset) = niches[i].unwrap_or((0, 0));
+        (std::cmp::Reverse(group_key(i)), !niche_size, niche_offset)
+    });
+    order.push(head);
+    let mut offsets = vec![0usize; n];
+    let mut offset = 0usize;
+    let mut align = 1usize;
+    for i in order {
+        let (size, field_align) = layouts[i];
+        offset = align_up(offset, field_align);
+        offsets[i] = offset;
+        offset += size;
+        align = align.max(field_align);
+    }
+    Some((offsets, align_up(offset, align), align))
+}
+
+/// The largest niche a debugger field type's values leave
+/// unused, as (the number of unused values, the niche's offset
+/// within the type), for the types whose layout ordering a
+/// niche steers: `bool` and `char`, and aggregates containing
+/// them. Anything else has no niche here.
+fn tag_niche(ty: &str) -> Option<(u64, usize)> {
+    let ty = ty.trim();
+    match ty {
+        // A `bool` leaves every byte but 0 and 1 unused.
+        "bool" => return Some((254, 0)),
+        // A `char` leaves the `u32` values above the last
+        // scalar value unused, plus the surrogate range.
+        "char" => return Some(((1u64 << 32) - (0x11_0000 - 0x800), 0)),
+        _ => {}
+    }
+    if ty.starts_with('(') && ty.ends_with(')') {
+        let inner = &ty[1..ty.len() - 1];
+        if inner.trim().is_empty() {
+            return None;
+        }
+        let parts = split_top_level(inner);
+        let (offsets, _, _) = tuple_field_layout(&parts)?;
+        let mut best: Option<(u64, usize)> = None;
+        for (i, part) in parts.iter().enumerate() {
+            if let Some((available, inner_offset)) = tag_niche(part) {
+                if best.is_none_or(|(b, _)| available > b) {
+                    best = Some((available, offsets[i] + inner_offset));
+                }
+            }
+        }
+        return best;
+    }
+    if ty.starts_with('[') && ty.ends_with(']') {
+        let inner = &ty[1..ty.len() - 1];
+        let (elem, len) = inner.rsplit_once(';')?;
+        if len.trim().parse::<usize>().ok()? == 0 {
+            return None;
+        }
+        // An array's niche is its first element's.
+        return tag_niche(elem).map(|(available, _)| (available, 0));
     }
     None
 }
@@ -2812,12 +3094,14 @@ fn value_to_union_bytes(value: &Value, ty: &str) -> Option<Vec<u8>> {
             if parts.len() != items.len() {
                 return None;
             }
-            let mut out = Vec::new();
-            for (item, part) in items.iter().zip(parts.iter()) {
-                let (_, ealign) = tag_layout(part)?;
-                let pad = align_up(out.len(), ealign) - out.len();
-                out.resize(out.len() + pad, 0);
-                out.extend(value_to_union_bytes(item, part)?);
+            // The fields sit at the compiler's tuple offsets,
+            // which are not the declaration order (see
+            // `tuple_field_layout`).
+            let (offsets, size, _) = tuple_field_layout(&parts)?;
+            let mut out = vec![0u8; size];
+            for (i, (item, part)) in items.iter().zip(parts.iter()).enumerate() {
+                let bytes = value_to_union_bytes(item, part)?;
+                out[offsets[i]..offsets[i] + bytes.len()].copy_from_slice(&bytes);
             }
             Some(out)
         }
@@ -2881,16 +3165,15 @@ fn value_from_union_bytes(bytes: &[u8], ty: &str) -> Option<Value> {
             if inner.trim().is_empty() {
                 return Some(Value::Tuple(Vec::new()));
             }
-            let mut items = Vec::new();
-            let mut off = 0usize;
-            for part in split_top_level(inner) {
-                let (esize, ealign) = tag_layout(&part)?;
-                off = align_up(off, ealign);
+            let parts = split_top_level(inner);
+            let (offsets, _, _) = tuple_field_layout(&parts)?;
+            let mut items = Vec::with_capacity(parts.len());
+            for (i, part) in parts.iter().enumerate() {
+                let (esize, _) = tag_layout(part)?;
                 items.push(value_from_union_bytes(
-                    bytes.get(off..off + esize)?,
-                    &part,
+                    bytes.get(offsets[i]..offsets[i] + esize)?,
+                    part,
                 )?);
-                off += esize;
             }
             Some(Value::Tuple(items))
         }

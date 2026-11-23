@@ -28388,3 +28388,189 @@ fn debug_mode_dyn_two_bindings_stay_on_one_trait() {
         "second binding must not become a separate bound: {stdout}"
     );
 }
+
+const DEBUG_FN_BP_SRC: &str = r#"fn helper<T: Copy>(x: T) -> T { x }
+fn main() {
+    let a = helper(1i32);
+    let b = helper(2u8);
+    zzz();
+    let _ = (a, b);
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_fn_breakpoint_stops_in_every_instance() {
+    // The driver names a generic function's later instances
+    // `helper [helper::<u8>]`; a function breakpoint names
+    // the definition, so it must stop in every instance, not
+    // just the first.
+    let dir = temp_dir("debug-fn-bp");
+    let src = fixture(&dir, "fnbp.rs", DEBUG_FN_BP_SRC);
+    let out = debug_driver(
+        &dir,
+        &src,
+        "break-fn helper\nrun\nprint x\ncontinue\nprint x\ncontinue\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    assert!(
+        stdout.contains("$1 = 1"),
+        "first instance stop missing: {stdout}"
+    );
+    assert!(
+        stdout.contains("$2 = 2"),
+        "second instance stop missing: {stdout}"
+    );
+}
+
+const DEBUG_LOCALS_FRAMES_SRC: &str = r#"fn deep() {
+    let d = 1;
+    marker();
+    let _ = d;
+}
+fn marker() {}
+fn main() {
+    let x = 42;
+    deep();
+    let _ = x;
+}
+"#;
+
+#[test]
+fn debug_mode_info_locals_uses_selected_frame_position() {
+    // After `up`, the caller's locals are scoped by the
+    // caller's own position (its suspended call line), not by
+    // the callee's stop line: `x` is declared before the call
+    // but on a later line than the callee stopped on, and it
+    // must still list.
+    let dir = temp_dir("debug-locals-frames");
+    let src = fixture(&dir, "locals_frames.rs", DEBUG_LOCALS_FRAMES_SRC);
+    let out = debug_driver(
+        &dir,
+        &src,
+        "break 3\nrun\nup\ninfo-locals\ndown\ninfo-locals\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    assert!(
+        stdout.contains("x = 42"),
+        "caller local missing after `up`: {stdout}"
+    );
+    assert!(
+        stdout.contains("d = 1"),
+        "callee local missing after `down`: {stdout}"
+    );
+}
+
+const DEBUG_NULL_PTR_SRC: &str = r#"fn main() {
+    let p: *const i32 = std::ptr::null();
+    let q: *mut f64 = std::ptr::null_mut();
+    zzz();
+    let _ = (p, q);
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_whatis_through_null_pointer_resolves_the_type() {
+    // A type query reads no pointee: `whatis *p` over a null
+    // pointer still names the pointee type, resolved from the
+    // recorded type alone.
+    let dir = temp_dir("debug-null-ptr");
+    let src = fixture(&dir, "null_ptr.rs", DEBUG_NULL_PTR_SRC);
+    let out = debug_driver(
+        &dir,
+        &src,
+        "break 4\nrun\nwhatis *p\nptype *p\nwhatis *q\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    assert!(
+        stdout.contains("type = i32"),
+        "whatis *p must name i32: {stdout}"
+    );
+    assert!(
+        stdout.contains("type = f64"),
+        "whatis *q must name f64: {stdout}"
+    );
+    assert!(
+        !stdout.contains("<error"),
+        "type query must not surface the dereference error: {stdout}"
+    );
+}
+
+const DEBUG_CAST_LEN_SRC: &str = r#"fn main() {
+    let a: [i32; 3] = [1, 2, 3];
+    let r: &[i32; 3] = &a;
+    zzz();
+    let _ = r;
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_cast_to_shorter_array_limits_the_view() {
+    // A cast to a shorter array type views only that many of
+    // the backing elements (indexing bounds against the cast
+    // length), and a cast to a longer array than the backing
+    // holds is an error rather than a short read.
+    let dir = temp_dir("debug-cast-len");
+    let src = fixture(&dir, "cast_len.rs", DEBUG_CAST_LEN_SRC);
+    let out = debug_driver(
+        &dir,
+        &src,
+        "break 4\nrun\nprint *(r as *const [i32; 2])\nprint *(r as *const [i32; 2])[2]\nprint *(r as *const [i32; 5])\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    assert!(
+        stdout.contains("$1 = [1, 2]"),
+        "shorter cast must limit the elements: {stdout}"
+    );
+    assert!(
+        !stdout.contains("[1, 2, 3]"),
+        "the cast view must not show the whole backing array: {stdout}"
+    );
+    assert!(
+        stdout.contains("<error"),
+        "out-of-view index and over-long cast must error: {stdout}"
+    );
+}
+
+const DEBUG_UNION_TUPLE_SRC: &str = r#"union U { a: u64, b: (u8, u32, u8) }
+union V { a: u64, b: (u8, u8, u32) }
+union W { a: u32, b: (u8, bool, u8) }
+fn main() {
+    let u = U { a: 0x030100000002 };
+    let v = V { a: 0x0000000300000201 };
+    let w = W { a: 0x00090701 };
+    zzz();
+    let _ = (u, v, w);
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_union_tuple_field_uses_compiler_layout() {
+    // A union's tuple field is reinterpreted at the
+    // compiler's tuple offsets, not in declaration order:
+    // `(u8, u32, u8)` places the `u32` first, `(u8, u8, u32)`
+    // keeps its tail last, and `(u8, bool, u8)` moves the
+    // niche-carrying `bool` ahead of the plain `u8`.
+    let dir = temp_dir("debug-union-tuple");
+    let src = fixture(&dir, "union_tuple.rs", DEBUG_UNION_TUPLE_SRC);
+    let out = debug_driver(
+        &dir,
+        &src,
+        "break 8\nrun\nprint u\nprint u.b\nprint v.b\nprint w.b\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in ["b: (1, 2, 3)", "$2 = (1, 2, 3)", "$3 = (1, 2, 3)", "$4 = (7, true, 9)"] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+}
