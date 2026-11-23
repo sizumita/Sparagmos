@@ -815,3 +815,89 @@ fn impl_resolution_skips_impl_bodies_calling_unconvertible_helpers() {
     let value = interpret_mir(&prog, "main", Vec::new()).expect("main runs");
     assert_eq!(value, Value::Bool(true));
 }
+
+// ----- data-pointer extraction over an inline box base ----------------------
+
+const PAIR_TY: mir::DefId = mir::DefId::new(0, 26);
+
+fn pair_ty() -> mir::Ty {
+    mir::Ty::Adt(PAIR_TY, Vec::new())
+}
+
+/// Casting a trait object whose base is the one-field box
+/// aggregate that holds its payload inline (the shape the
+/// panic-cleanup and thread-join models fabricate for a caught
+/// payload) to the concrete pointer type must yield a data
+/// pointer denoting the payload as a whole: reading the
+/// payload's fields through it reads the payload, not a
+/// position inside it.
+#[test]
+fn data_ptr_cast_over_inline_box_base_denotes_whole_payload() {
+    // fn main() -> i32 {
+    //   _1 = Pair { 11, 22 }
+    //   _2 = Box { _1 }                       (the box aggregate)
+    //   _3 = _2 as Box<dyn Any>               (Unsize)
+    //   _4 = BoxDerefTransmute(_3.0)          (*const dyn Any)
+    //   _5 = _4 as *const Pair                (PtrToPtr: data pointer)
+    //   _0 = (*_5).1 + (*_5).0
+    // }
+    let main = mir::Body::new(
+        decls(&[
+            i32_ty(),
+            pair_ty(),
+            box_ty(pair_ty()),
+            box_ty(dyn_ty("std::any::Any")),
+            mir::Ty::RawPtr(Box::new(dyn_ty("std::any::Any")), mir::Mutability::Not),
+            mir::Ty::RawPtr(Box::new(pair_ty()), mir::Mutability::Not),
+        ]),
+        0,
+        vec![block(
+            vec![
+                assign(
+                    place(1),
+                    adt_aggregate(PAIR_TY, vec![const_i32(11), const_i32(22)]),
+                ),
+                assign(place(2), adt_aggregate(BOX_TY, vec![move_(1)])),
+                assign(place(3), unsize(move_(2), box_ty(dyn_ty("std::any::Any")))),
+                assign(
+                    place(4),
+                    mir::Rvalue::Cast(
+                        mir::CastKind::BoxDerefTransmute,
+                        mir::Operand::Copy(
+                            place(3)
+                                .field(0, mir::Ty::Adt(UNIQUE_TY, vec![dyn_ty("std::any::Any")])),
+                        ),
+                        mir::Ty::RawPtr(Box::new(dyn_ty("std::any::Any")), mir::Mutability::Not),
+                    ),
+                ),
+                assign(
+                    place(5),
+                    mir::Rvalue::Cast(
+                        mir::CastKind::PtrToPtr,
+                        move_(4),
+                        mir::Ty::RawPtr(Box::new(pair_ty()), mir::Mutability::Not),
+                    ),
+                ),
+                assign(
+                    place(0),
+                    mir::Rvalue::BinaryOp(
+                        mir::BinOp::Add,
+                        Box::new((
+                            mir::Operand::Copy(place(5).deref().field(1, i32_ty())),
+                            mir::Operand::Copy(place(5).deref().field(0, i32_ty())),
+                        )),
+                    ),
+                ),
+            ],
+            ret(),
+        )],
+    );
+    let mut prog = base_program();
+    prog.fn_names.insert(PAIR_TY, "probe::Pair".to_string());
+    prog.add("main", main);
+
+    assert_eq!(
+        interpret_mir(&prog, "main", Vec::new()).expect("main runs"),
+        Value::Int(33)
+    );
+}

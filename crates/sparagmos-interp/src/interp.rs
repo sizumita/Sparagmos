@@ -5712,11 +5712,22 @@ impl<'a> Interpreter<'a> {
                             }
                             Value::Ref(target) => target.clone(),
                             other => {
-                                return Err(InterpError::type_mismatch(
-                                    "drop glue",
-                                    "a box aggregate or reference dyn data pointer",
-                                    other.kind_name(),
-                                ));
+                                // An aggregate-built box base
+                                // (`Box::from_raw`'s product, a
+                                // by-value downcast's result): the
+                                // data pointer sits at the end of
+                                // the field-0 wrapper chain beside
+                                // the allocator field.
+                                match Self::dyn_data_pointer(other) {
+                                    Value::Ref(target) => target,
+                                    _ => {
+                                        return Err(InterpError::type_mismatch(
+                                            "drop glue",
+                                            "a box aggregate or reference dyn data pointer",
+                                            other.kind_name(),
+                                        ));
+                                    }
+                                }
                             }
                         };
                         let nested = GlueSession {
@@ -10011,6 +10022,17 @@ impl<'a> Interpreter<'a> {
                     }
                     Value::Enum { fields, .. } if fields.len() == 1 => {
                         Ok(Resolved::Value(fields[0].clone(), Vec::new()))
+                    }
+                    // An aggregate-built box base (a
+                    // `Box::from_raw` product): the `Unique`
+                    // sits at field 0 beside the allocator
+                    // field, so the single-field arms above do
+                    // not apply; the data-pointer extraction
+                    // names the pointer the pointee lives
+                    // behind.
+                    Value::Enum { fields, .. } if fields.len() > 1 => {
+                        let ptr = Self::dyn_data_pointer(base);
+                        self.deref_value(frames, &ptr)
                     }
                     _ => self.deref_value(frames, base),
                 }
@@ -17402,6 +17424,109 @@ impl<'a> Interpreter<'a> {
         })
     }
 
+    /// The thin data pointer a trait-object value denotes: the
+    /// pointer word of the fat pointer, with the metadata
+    /// dropped (the extraction a cast from a `dyn` pointer to a
+    /// sized pointer performs). The base a `DynRef` records is
+    /// the data pointer in the shape the sized value had: a
+    /// reference base is the pointer itself; a box-shaped base
+    /// holds it in its field-0 wrapper chain, or holds the
+    /// pointee itself as the only field of a one-field box; an
+    /// upcast chain (a box whose field is itself a `DynRef`)
+    /// unwraps one layer at a time; a slice base unwraps to its
+    /// own data pointer. A reference-counted handle's data
+    /// pointer is the pointee slot inside its inner allocation
+    /// — the same position `deref_value` resolves for the
+    /// handle.
+    pub(crate) fn dyn_data_pointer(base: &Value) -> Value {
+        if let Some(id) = rc_handle_id(base) {
+            return Value::Ref(RefTarget::Alloc {
+                id,
+                projection: vec![RefProj::Field(2)],
+            });
+        }
+        // The outermost aggregate decides what the base is (the
+        // discrimination `deref_value` applies to a `DynRef`
+        // base). A one-field aggregate whose only field is an
+        // allocation pointer is a built box, and that pointer is
+        // the data pointer. A one-field aggregate holding any
+        // other value holds the pointee itself inline — the
+        // shape the panic-cleanup and thread-join models
+        // fabricate for a caught payload, and the shape an
+        // aggregate-built sized box has — so the data pointer
+        // denotes that field's slot and the walk stops there:
+        // descending further would name a position inside the
+        // payload, not the payload. Any other aggregate is a
+        // pointer wrapper (`Unique`, `NonNull`, an
+        // aggregate-built `Box` with its `Unique` at field 0
+        // beside the allocator field): follow its field 0 until
+        // the walk reaches the pointer itself, or a value stored
+        // inline at the position the walk reached. An upcast or
+        // slice layer restarts the walk at the value it denotes,
+        // which is a self-contained value in this model.
+        let mut root = base.clone();
+        let mut cur = base.clone();
+        let mut path: Vec<RefProj> = Vec::new();
+        loop {
+            // The aggregate forms the walk descends, as a field
+            // list: an ADT value or a tuple value.
+            let fields = match &cur {
+                Value::Enum { fields, .. } if !fields.is_empty() => Some(fields.clone()),
+                Value::Tuple(items) if !items.is_empty() => Some(items.clone()),
+                _ => None,
+            };
+            if let Some(fields) = fields {
+                if path.is_empty() && fields.len() == 1 {
+                    match &fields[0] {
+                        // A built box: its only field is the
+                        // allocation pointer, which is the data
+                        // pointer itself.
+                        Value::Ref(RefTarget::Alloc { .. }) => {
+                            return fields[0].clone();
+                        }
+                        // An upcast layer sits in the box: keep
+                        // walking from the value it denotes.
+                        Value::DynRef { .. } | Value::FatRef { .. } => {
+                            cur = fields[0].clone();
+                            continue;
+                        }
+                        // An inline pointee: the field is the
+                        // payload itself, so the data pointer
+                        // denotes that field's slot in the base.
+                        _ => {
+                            return Value::Ref(RefTarget::Value(
+                                Box::new(root),
+                                vec![RefProj::Field(0)],
+                            ));
+                        }
+                    }
+                }
+                path.push(RefProj::Field(0));
+                cur = fields[0].clone();
+                continue;
+            }
+            match cur {
+                Value::DynRef { base, .. } | Value::FatRef { base, .. } => {
+                    root = (*base).clone();
+                    cur = (*base).clone();
+                    path.clear();
+                }
+                Value::Ref(_) => return cur,
+                other => {
+                    // The pointee is stored inline in the base
+                    // value (an aggregate-shaped box): the data
+                    // pointer denotes the position the walk
+                    // reached inside that value.
+                    return if path.is_empty() {
+                        other
+                    } else {
+                        Value::Ref(RefTarget::Value(Box::new(root), path))
+                    };
+                }
+            }
+        }
+    }
+
     pub(crate) fn eval_rvalue(
         &self,
         frames: &mut Vec<Frame>,
@@ -17415,6 +17540,7 @@ impl<'a> Interpreter<'a> {
                 let value = self.eval_operand(frames, body, op)?;
                 match value {
                     Value::FatRef { base, .. } => Ok((*base).clone()),
+                    Value::DynRef { base, .. } => Ok(Self::dyn_data_pointer(&base)),
                     other => Ok(other),
                 }
             }
@@ -20707,6 +20833,18 @@ fn navigate_mut_grow<'x>(
             }
         }
         RefProj::Field(idx) => {
+            if let Value::DynRef { base, .. } = slot {
+                if is_rc_arc_handle(base) {
+                    // A reference-counted handle in trait-object
+                    // form, as in `project_value`: the step applies
+                    // to the handle aggregate the base holds, whose
+                    // field 0 is its `ptr`.
+                    let Value::DynRef { base, .. } = slot else {
+                        unreachable!("shape checked by the guard")
+                    };
+                    return navigate_mut_grow(base, projection, func, place, grow);
+                }
+            }
             if *idx == 0
                 && matches!(
                     slot,
@@ -20725,6 +20863,7 @@ fn navigate_mut_grow<'x>(
                 && matches!(
                     slot,
                     Value::Ref(_)
+                        | Value::DynRef { .. }
                         | Value::Int(_)
                         | Value::Uint(_)
                         | Value::Float(_)
@@ -20734,9 +20873,12 @@ fn navigate_mut_grow<'x>(
                 // The one-field wrapper chains `project_value`
                 // reads through: a write to field 0 of a thin
                 // pointer value (a `Box`'s `Unique`/`NonNull`
-                // chain, whose one field is the pointer itself)
-                // or of a wrapper over a bare scalar lands on
-                // the held value, which is the slot itself.
+                // chain, whose one field is the pointer itself),
+                // of a trait-object pointer (the `DynRef` *is*
+                // the box's pointer field, metadata included, as
+                // in `project_value`), or of a wrapper over a
+                // bare scalar lands on the held value, which is
+                // the slot itself.
                 return navigate_mut_grow(slot, rest, func, place, grow);
             }
             if let Value::Coroutine { fields, .. } = slot {
