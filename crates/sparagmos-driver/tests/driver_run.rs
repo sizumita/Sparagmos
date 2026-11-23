@@ -34264,6 +34264,92 @@ fn run_mode_str_pattern_predicate_drops_by_value_captures() {
     );
 }
 
+const STR_PATTERN_PRED_REF_CHAIN_SRC: &str = r#"
+fn main() {
+    let mut n = 0;
+    let mut pred = move |_| { n += 1; n == 2 };
+    let mut borrowed = &mut pred;
+    let a = "b".contains(&mut borrowed);
+    let b = "b".contains(&mut borrowed);
+    let c = "b".contains(&mut borrowed);
+    println!("{a} {b} {c}");
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_predicate_reference_chain() {
+    // The pattern may be a reference to a reference to the
+    // closure (`&mut borrowed`, where `borrowed: &mut pred`):
+    // the environment reference must denote the closure's own
+    // storage -- the innermost reference of the chain -- or
+    // the closure body's capture projections read the
+    // intermediate reference as a capture and the counter's
+    // increment fails as a type mismatch. The counter lives
+    // in the caller's closure, so it advances across the
+    // three calls and only the second sees it reach 2.
+    run_ok(
+        "str-pattern-pred-ref-chain",
+        STR_PATTERN_PRED_REF_CHAIN_SRC,
+        "false true false\n",
+    );
+}
+
+const STR_PATTERN_PRED_REF_CHAIN_VARIANTS_SRC: &str = r#"
+use std::rc::Rc;
+
+fn main() {
+    let mut n = 0;
+    let mut pred = move |_| {
+        n += 1;
+        n == 2
+    };
+    let mut b1 = &mut pred;
+    let mut b2 = &mut b1;
+    let a = "b".contains(&mut b2);
+    let b = "b".contains(&mut b2);
+    println!("three-layer: {a} {b}");
+    let pred2 = |c: char| c == 'b';
+    let borrowed2 = &pred2;
+    let c = "b".contains(&borrowed2);
+    let d = "z".contains(&borrowed2);
+    println!("shared-chain: {c} {d}");
+    let rc = Rc::new(1);
+    let rc2 = rc.clone();
+    let mut pred3 = move |_: char| {
+        let _ = &rc2;
+        true
+    };
+    let mut borrowed3 = &mut pred3;
+    let e = "ab".contains(&mut borrowed3);
+    println!("chain-borrowed: {e} count={}", Rc::strong_count(&rc));
+    drop(pred3);
+    println!("after owner drop: count={}", Rc::strong_count(&rc));
+    let mut k = 0;
+    let mut pred4 = move |_| {
+        k += 1;
+        k == 1
+    };
+    let mut borrowed4 = &mut pred4;
+    let f = "ab".starts_with(&mut borrowed4);
+    let g = "ab".ends_with(&mut borrowed4);
+    println!("chain-sw-ew: {f} {g}");
+}
+"#;
+
+#[test]
+fn run_mode_str_pattern_predicate_reference_chain_variants() {
+    // A three-layer chain, a shared-reference chain over a
+    // plain `Fn` closure, a chain through `starts_with` /
+    // `ends_with`, and a predicate borrowed through a chain
+    // keeping its owner: the call does not drop its captures,
+    // so the `Rc` count only falls when the owner drops it.
+    run_ok(
+        "str-pattern-pred-ref-chain-variants",
+        STR_PATTERN_PRED_REF_CHAIN_VARIANTS_SRC,
+        "three-layer: false true\nshared-chain: true false\nchain-borrowed: true count=2\nafter owner drop: count=1\nchain-sw-ew: true false\n",
+    );
+}
+
 const OS_STR_ELEMENT_BASE_SRC: &str = r#"
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;

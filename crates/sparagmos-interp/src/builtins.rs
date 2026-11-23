@@ -10599,6 +10599,15 @@ impl<'a> Interpreter<'a> {
                         // closure -- the arrangement the
                         // place-based iterator predicates use
                         // with their predicate field's storage.
+                        // The reference may also sit one or
+                        // more layers away from the closure: a
+                        // pattern like `&mut borrowed`, where
+                        // `borrowed: &mut pred`, hands the
+                        // search a reference to the place
+                        // holding the reference to the closure,
+                        // and the chain is followed to the
+                        // innermost reference, which denotes
+                        // the closure's storage itself.
                         // (A reference to a value snapshot is
                         // not storage, and falls through to the
                         // by-value arrangement.) A predicate
@@ -10618,7 +10627,48 @@ impl<'a> Interpreter<'a> {
                                 Value::Ref(target)
                                     if !matches!(target, RefTarget::Value(..)) =>
                                 {
-                                    Some(vals[1].clone())
+                                    // Follow the chain one layer
+                                    // at a time: each layer's
+                                    // stored value, when it is
+                                    // itself a reference to
+                                    // storage, is the next
+                                    // environment candidate, and
+                                    // the last one denotes the
+                                    // closure's own storage. A
+                                    // layer that is a value
+                                    // snapshot denotes no
+                                    // storage, and the chain
+                                    // then falls through to the
+                                    // by-value arrangement.
+                                    let mut env = vals[1].clone();
+                                    let mut reaches_storage = true;
+                                    loop {
+                                        let stop = match &env {
+                                            Value::Ref(RefTarget::Null)
+                                            | Value::Ref(RefTarget::Address(_)) => true,
+                                            Value::Ref(_) => false,
+                                            _ => true,
+                                        };
+                                        if stop {
+                                            break;
+                                        }
+                                        match self.read_ref_once(frames, &env) {
+                                            Ok(Value::Ref(inner)) => {
+                                                if matches!(inner, RefTarget::Value(..)) {
+                                                    reaches_storage = false;
+                                                    break;
+                                                }
+                                                env = Value::Ref(inner);
+                                            }
+                                            Ok(_) => break,
+                                            Err(_) => break,
+                                        }
+                                    }
+                                    if reaches_storage {
+                                        Some(env)
+                                    } else {
+                                        None
+                                    }
                                 }
                                 _ => None,
                             },
