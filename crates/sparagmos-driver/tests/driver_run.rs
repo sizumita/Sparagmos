@@ -227,6 +227,47 @@ fn main() {
 }
 "#;
 
+const COMPLETED_FUTURE_DROP_SRC: &str = r#"
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll, Waker};
+
+fn poll_once<F: Future>(fut: F) -> Poll<F::Output> {
+    let mut fut = Box::pin(fut);
+    let mut cx = Context::from_waker(Waker::noop());
+    Pin::as_mut(&mut fut).poll(&mut cx)
+}
+
+struct Guard(&'static str);
+impl Drop for Guard {
+    fn drop(&mut self) {
+        println!("dropped {}", self.0);
+    }
+}
+
+fn main() {
+    {
+        let g = Guard("block-capture");
+        let fut = async move {
+            let _ = &g;
+            5
+        };
+        drop(fut);
+        println!("block future dropped");
+    }
+    let g = Guard("block-done");
+    let fut = async move {
+        let _ = &g;
+        6
+    };
+    match poll_once(fut) {
+        Poll::Ready(v) => println!("ready: {}", v),
+        Poll::Pending => println!("pending"),
+    }
+    println!("end of main");
+}
+"#;
+
 const LOG_SYNTAX_SRC: &str = r#"
 #![feature(log_syntax)]
 fn main() {
@@ -302,6 +343,32 @@ fn run_mode_async_closure_call_runs() {
         out.stdout.is_empty(),
         "the program prints nothing: {:?}",
         String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+
+#[test]
+fn run_mode_completed_future_drops_capture_once() {
+    // A completed async block's capture is dropped by the
+    // coroutine body itself when it completes (the body's own
+    // `Drop` terminator on the state field), and dropping the
+    // completed future afterwards must not drop it a second
+    // time: the body's drop leaves the state cell dead, and the
+    // future's glue finds nothing left there. An unpolled future
+    // still drops its capture exactly once, through its glue.
+    let dir = temp_dir("completed_future_drop");
+    let src = fixture(&dir, "completed_future_drop.rs", COMPLETED_FUTURE_DROP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the program runs to completion; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "dropped block-capture\nblock future dropped\ndropped block-done\nready: 6\nend of main\n",
+        "each capture drops exactly once"
     );
 }
 

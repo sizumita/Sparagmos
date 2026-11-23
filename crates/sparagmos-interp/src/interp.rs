@@ -5646,6 +5646,31 @@ impl<'a> Interpreter<'a> {
                 if let RefTarget::Alloc { id, projection } = &active.root {
                     if projection.is_empty() {
                         self.allocs.borrow_mut().insert(*id, Value::Uninit);
+                    } else if let Some(stored) = self.alloc_value_snapshot(id) {
+                        // A projected cell is cleared only when it
+                        // is part of a coroutine's state: a
+                        // coroutine body drops its upvars in place
+                        // through the state pointer when it
+                        // completes (or as cleanup when it panics),
+                        // and the future's own glue reaching the
+                        // same cell afterwards must find nothing
+                        // left to drop a second time. The coroutine
+                        // glue is the only later reader of state
+                        // cells and reads an uninitialised cell as
+                        // already moved out. Any other projected
+                        // cell keeps its value: an in-place drop
+                        // through a pointer leaves the storage
+                        // readable to the model's other readers,
+                        // exactly as the whole-place treatment
+                        // below has always assumed.
+                        let func = frames.last().map(|f| f.func.as_str()).unwrap_or("");
+                        if projection_enters_coroutine(&stored, projection, func) {
+                            let resolved = Resolved::Alloc {
+                                id: *id,
+                                projection: projection.clone(),
+                            };
+                            self.write_resolved(frames, &resolved, Value::Uninit)?;
+                        }
                     }
                 }
             }
@@ -5655,12 +5680,43 @@ impl<'a> Interpreter<'a> {
                 projection,
             } = &active.root
             {
-                if projection.is_empty()
-                    && frames.last().map(|f| f.id) == Some(*frame)
-                {
-                    let frame_pos = self.frame_pos(frames, *frame)?;
-                    if let Some(slot) = frames[frame_pos].locals.get_mut(*local) {
-                        *slot = Value::Uninit;
+                if projection.is_empty() {
+                    if frames.last().map(|f| f.id) == Some(*frame) {
+                        let frame_pos = self.frame_pos(frames, *frame)?;
+                        if let Some(slot) = frames[frame_pos].locals.get_mut(*local) {
+                            *slot = Value::Uninit;
+                        }
+                    }
+                } else if matches!(active.completion, GlueCompletion::Jump(_)) {
+                    // The coroutine-state rule above, for a
+                    // coroutine stored in a frame local (an
+                    // unboxed future, polled through a mutable
+                    // reference to the local): the body's in-place
+                    // upvar drop leaves the state cell dead for
+                    // the future's own glue. Unlike the
+                    // whole-place treatment above, this applies
+                    // from any frame: the session completing the
+                    // drop usually runs inside the coroutine
+                    // body's own frame, above the owner's, and a
+                    // state cell's only later reader is the
+                    // future's glue, which runs against the local
+                    // wherever it lives. A root frame that has
+                    // already left the stack has no cell to clear.
+                    if let Ok(frame_pos) = self.frame_pos(frames, *frame) {
+                        let stored = frames[frame_pos]
+                            .locals
+                            .get(*local)
+                            .cloned()
+                            .unwrap_or(Value::Uninit);
+                        let func = frames.last().map(|f| f.func.as_str()).unwrap_or("");
+                        if projection_enters_coroutine(&stored, projection, func) {
+                            let resolved = Resolved::Place {
+                                frame_pos,
+                                local: *local,
+                                projection: projection.clone(),
+                            };
+                            self.write_resolved(frames, &resolved, Value::Uninit)?;
+                        }
                     }
                 }
             }
@@ -11216,6 +11272,14 @@ impl<'a> Interpreter<'a> {
             }),
             _ => None,
         }
+    }
+
+    /// A cloned snapshot of an allocation's stored value, with
+    /// the store's borrow released before the caller continues
+    /// (a borrow taken in an `if let` scrutinee would otherwise
+    /// outlive the branch and block the caller's next write).
+    fn alloc_value_snapshot(&self, id: &u64) -> Option<Value> {
+        self.allocs.borrow().get(id).cloned()
     }
 
     pub(crate) fn write_resolved(
@@ -17036,6 +17100,23 @@ fn vec_elem_tag(body: &Body, base: &Place) -> Option<String> {
     let open = name.find('<')?;
     let close = name.rfind('>')?;
     split_generic_args(&name[open + 1..close]).into_iter().next()
+}
+
+/// Whether some strict prefix of `projection` lands on a
+/// coroutine value inside `root`: the remaining steps then
+/// address cells of that coroutine's state (its upvars and
+/// state-saved locals), whose only later readers are the
+/// coroutine's own drop glue. A prefix that cannot be walked
+/// (an uninitialised or mismatched intermediate) answers no.
+fn projection_enters_coroutine(root: &Value, projection: &[RefProj], func: &str) -> bool {
+    for end in 0..projection.len() {
+        match project_value(root.clone(), &projection[..end], func, "<drop glue>") {
+            Ok(Value::Coroutine { .. }) => return true,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 pub(crate) fn project_value(
