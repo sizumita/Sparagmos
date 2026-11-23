@@ -16449,15 +16449,98 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
     ) {
         match value {
             Value::Tuple(items) => {
-                self.rescue_elided_snapshot(frame, local, path, items)
+                self.rescue_elided_snapshot(frame, local, path, items);
+                // A tuple's items sit under field steps (an
+                // array's elements, rescued above, sit under an
+                // index step instead; the recorded paths say
+                // which of the two a given list is).
+                if self.zst_recorded_branches(frame, local, path).0 {
+                    self.rescue_elided_fields(frame, local, path, items);
+                }
             }
-            Value::Enum { fields, .. } => {
-                self.rescue_elided_snapshot(frame, local, path, fields)
+            Value::Enum { variant, fields } => {
+                self.rescue_elided_snapshot(frame, local, path, fields);
+                // The same field list is a struct's fields under
+                // plain field steps, or an enum variant's fields
+                // under the downcast that selects the variant;
+                // descend along whichever the recorded paths
+                // take from here. (A modelled `Vec` value's
+                // elements, rescued above, sit under an index
+                // step instead.)
+                let (field_below, downcast_below) =
+                    self.zst_recorded_branches(frame, local, path);
+                if field_below {
+                    self.rescue_elided_fields(frame, local, path, fields);
+                }
+                if downcast_below {
+                    let mut variant_path = path.to_vec();
+                    variant_path.push(RefProj::Downcast(*variant));
+                    self.rescue_elided_fields(
+                        frame,
+                        local,
+                        &variant_path,
+                        fields,
+                    );
+                }
             }
-            Value::SparseVec { elems, .. } => {
-                self.rescue_elided_snapshot(frame, local, path, elems)
+            Value::SparseVec { elems, len } => {
+                self.rescue_elided_snapshot(frame, local, path, elems);
+                // The virtual tail: the slots the declared
+                // length runs past the stored prefix denote the
+                // element type's single value when conversion
+                // recorded one, exactly as an elided stored slot
+                // does. A snapshot detached from the place has
+                // no later keyed rescue to read them through, so
+                // they are materialised here, within the bound
+                // an owned materialisation enforces; past the
+                // bound (or with nothing recorded) the tail
+                // stays the uninitialised slots it denotes.
+                let declared = *len;
+                if declared > elems.len() as u128
+                    && declared <= MAX_VEC_SET_LEN_ELEMENTS as u128
+                {
+                    let mut elem_path = path.to_vec();
+                    elem_path.push(RefProj::Index(0));
+                    if let Some(canonical) =
+                        self.zst_field_value(frame, local, &elem_path)
+                    {
+                        elems.resize(declared as usize, canonical);
+                    }
+                }
             }
             _ => {}
+        }
+    }
+
+    /// [`Self::rescue_elided_snapshot`] along field steps: the
+    /// fields of an aggregate value at `path` -- a struct's or
+    /// tuple's fields under their field steps, or one enum
+    /// variant's fields with the downcast already in `path`. A
+    /// field whose type has a single value denotes that value,
+    /// which conversion recorded under the field's step, so a
+    /// field that reaches the snapshot as an uninitialised slot
+    /// is replaced by it; a field that is itself an aggregate
+    /// or a sequence is rescued the same way beneath its step.
+    /// Nothing is replaced at a path conversion recorded
+    /// nothing for.
+    fn rescue_elided_fields(
+        &self,
+        frame: &Frame,
+        local: usize,
+        path: &[RefProj],
+        fields: &mut [Value],
+    ) {
+        for (i, field) in fields.iter_mut().enumerate() {
+            let mut field_path = path.to_vec();
+            field_path.push(RefProj::Field(i));
+            if *field == Value::Uninit {
+                if let Some(canonical) =
+                    self.zst_field_value(frame, local, &field_path)
+                {
+                    *field = canonical;
+                }
+            }
+            self.rescue_elided_value(frame, local, &field_path, field);
         }
     }
 

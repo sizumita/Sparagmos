@@ -19845,3 +19845,123 @@ fn run_mode_nested_vec_of_zero_sized_enum_elements_read_by_iteration() {
     );
 }
 
+const VEC_ZST_ENUM_STRUCT_FIELD_ITER_SRC: &str = r#"
+struct DropMe;
+impl Drop for DropMe { fn drop(&mut self) { println!("drop"); } }
+enum CS<Y, R> { Yielded(Y), Complete(R) }
+enum Never {}
+struct S { v: Vec<CS<Never, DropMe>> }
+fn main() {
+    let outer: Vec<S> = vec![
+        S { v: vec![CS::Complete(DropMe)] },
+        S { v: vec![CS::Complete(DropMe), CS::Complete(DropMe)] },
+    ];
+    for s in &outer {
+        for x in &s.v { match x { CS::Yielded(_) => println!("y"), CS::Complete(_) => println!("c") } }
+    }
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_vec_of_struct_with_zero_sized_enum_vec_field_read_by_iteration() {
+    // The inner `Vec` sits in a field of the outer snapshot's
+    // elements: the recorded path crosses a field step between
+    // the two index steps, and the snapshot rescue follows it,
+    // so the inner iteration reads the `Complete` variant
+    // exactly as natively.
+    let dir = temp_dir("veczstenumstructfielditer");
+    let src = fixture(&dir, "veczstenumstructfielditer.rs", VEC_ZST_ENUM_STRUCT_FIELD_ITER_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "iterating a struct field's vec! of zero-sized enum elements must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "c\nc\nc\ndone\ndrop\ndrop\ndrop\n",
+        "zero-sized enum elements behind a struct field denote their single value"
+    );
+}
+
+const VEC_ZST_ENUM_TUPLE_FIELD_ITER_SRC: &str = r#"
+struct DropMe;
+impl Drop for DropMe { fn drop(&mut self) { println!("drop"); } }
+enum CS<Y, R> { Yielded(Y), Complete(R) }
+enum Never {}
+fn main() {
+    let outer: Vec<(Vec<CS<Never, DropMe>>, u32)> = vec![
+        (vec![CS::Complete(DropMe)], 7),
+        (vec![CS::Complete(DropMe), CS::Complete(DropMe)], 8),
+    ];
+    for t in &outer {
+        println!("n={}", t.1);
+        for x in &t.0 { match x { CS::Yielded(_) => println!("y"), CS::Complete(_) => println!("c") } }
+    }
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_vec_of_tuple_with_zero_sized_enum_vec_field_read_by_iteration() {
+    // The same field crossing with a tuple element: the `Vec`
+    // sits under the tuple's first field step.
+    let dir = temp_dir("veczstenumtuplefielditer");
+    let src = fixture(&dir, "veczstenumtuplefielditer.rs", VEC_ZST_ENUM_TUPLE_FIELD_ITER_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "iterating a tuple field's vec! of zero-sized enum elements must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "n=7\nc\nn=8\nc\nc\ndone\ndrop\ndrop\ndrop\n",
+        "zero-sized enum elements behind a tuple field denote their single value"
+    );
+}
+
+const SPARSE_TAIL_STRUCT_FIELD_ITER_SRC: &str = r#"
+struct DropMe;
+impl Drop for DropMe { fn drop(&mut self) { println!("drop"); } }
+enum CS<Y, R> { Yielded(Y), Complete(R) }
+enum Never {}
+struct S { v: Vec<CS<Never, DropMe>> }
+fn main() {
+    let mut inner: Vec<CS<Never, DropMe>> = Vec::new();
+    unsafe { inner.set_len(2); }
+    let outer: Vec<S> = vec![S { v: inner }];
+    for s in &outer {
+        for x in &s.v { match x { CS::Yielded(_) => println!("y"), CS::Complete(_) => println!("c") } }
+    }
+    println!("done");
+}
+"#;
+
+#[test]
+fn run_mode_sparse_tail_in_struct_field_read_by_nested_iteration() {
+    // The inner `Vec`'s declared length runs past its stored
+    // elements (a `set_len` growth): the virtual tail denotes
+    // the element type's single value, and the snapshot rescue
+    // materialises it behind the struct field's step, so the
+    // nested iteration reads the `Complete` variant exactly as
+    // natively.
+    let dir = temp_dir("sparsetailstructfielditer");
+    let src = fixture(&dir, "sparsetailstructfielditer.rs", SPARSE_TAIL_STRUCT_FIELD_ITER_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "iterating a sparse vec! behind a struct field must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "c\nc\ndone\ndrop\ndrop\n",
+        "a sparse tail behind a struct field denotes the element type's single value"
+    );
+}
+

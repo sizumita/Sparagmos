@@ -11200,6 +11200,16 @@ impl<'a> Interpreter<'a> {
         if projection.is_empty() {
             return None;
         }
+        let path = Self::zst_path_of(projection)?;
+        let body = self.program.get(&frame.func)?;
+        body.zst_fields.get(local)?.get(&path).cloned()
+    }
+
+    /// A projection path as the canonical-value path the
+    /// conversion-side walk records (see `Body::zst_fields`);
+    /// `None` when the projection is not a pure
+    /// field/index/downcast path.
+    fn zst_path_of(projection: &[RefProj]) -> Option<Vec<ZstPathStep>> {
         let mut path = Vec::with_capacity(projection.len());
         for step in projection {
             match step {
@@ -11223,8 +11233,49 @@ impl<'a> Interpreter<'a> {
                 _ => return None,
             }
         }
-        let body = self.program.get(&frame.func)?;
-        body.zst_fields.get(local)?.get(&path).cloned()
+        Some(path)
+    }
+
+    /// The kinds of step conversion recorded beneath a
+    /// projection path of a local: whether any recorded
+    /// canonical-value path continues from `projection` with a
+    /// field step, and whether any continues with a downcast
+    /// step. The snapshot rescue (see `builtins`) descends into
+    /// a detached aggregate value's fields only along the steps
+    /// the recorded paths actually take from the value's path:
+    /// the value alone does not say whether its field list is a
+    /// sequence's elements, a struct's fields or an enum
+    /// variant's fields, but the recorded paths do.
+    pub(crate) fn zst_recorded_branches(
+        &self,
+        frame: &Frame,
+        local: usize,
+        projection: &[RefProj],
+    ) -> (bool, bool) {
+        let Some(path) = Self::zst_path_of(projection) else {
+            return (false, false);
+        };
+        let Some(body) = self.program.get(&frame.func) else {
+            return (false, false);
+        };
+        let Some(fields) = body.zst_fields.get(local) else {
+            return (false, false);
+        };
+        let mut field = false;
+        let mut downcast = false;
+        for key in fields.keys() {
+            if key.len() > path.len() && key[..path.len()] == path[..] {
+                match key[path.len()] {
+                    ZstPathStep::Field(_) => field = true,
+                    ZstPathStep::Downcast(_) => downcast = true,
+                    ZstPathStep::Index => {}
+                }
+                if field && downcast {
+                    break;
+                }
+            }
+        }
+        (field, downcast)
     }
 
     /// The value of a never-written local of an evidently
