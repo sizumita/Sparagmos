@@ -1,0 +1,224 @@
+name: Flip Diff
+
+# Runs the metric-2(b) subset runner over a topical population with the
+# base driver and the head driver, and reports gains and losses. This
+# automates the flip-diff check the lanes run on the dev host: pick a
+# population by path keywords, run both drivers over it, and compare
+# per-record verdicts (a record passes when its bucket is empty). The
+# full official measurement is the Official Measurement workflow, not
+# this one.
+#
+# Triggering:
+# - Add a label named `flip-diff:<kw1+kw2+...>` to a pull request; the
+#   keywords are matched as substrings of the test paths. (`+` is the
+#   separator because label names cannot contain commas.)
+# - Or run the workflow manually (workflow_dispatch). The dispatch
+#   form takes the target explicitly (a PR number, or a head ref plus
+#   a base ref), so it also works for pull requests whose branch does
+#   not carry this workflow file yet: the measurement scripts are
+#   taken from the ref the workflow was dispatched on, and only the
+#   code under test comes from the target ref.
+#
+# The result lands in the job summary and, when a PR is known, as a
+# comment on the PR. The job does not fail on losses: whether a loss
+# blocks a merge is the integrator's call (some flips are known flakes
+# and are arbitrated case by case).
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      keywords:
+        description: "Comma-separated path substrings for the population"
+        required: true
+      pr_number:
+        description: "PR to measure and comment on (optional; resolves head/base from the PR)"
+        required: false
+        default: ""
+      head_ref:
+        description: "Head ref to measure (optional; overrides pr_number's head)"
+        required: false
+        default: ""
+      base_ref:
+        description: "Base ref to compare against (optional; default: the PR's base, else main)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# Subset runs stay serialised across the whole repository: two
+# flip-diff jobs never measure at the same time.
+concurrency:
+  group: flip-diff
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_SURVEY_DIR: ${{ github.workspace }}/../rust-1.100.0-survey
+  SURVEY_JSON: ${{ github.workspace }}/../subset-survey.json
+  # Hosted CPUs are slower than the dev host; per-record timeouts are
+  # raised above the runner defaults (60s) so heavy records do not
+  # fall over purely on CPU speed.
+  SPARAGMOS_NATIVE_COMPILE_TIMEOUT: "240"
+  SPARAGMOS_NATIVE_RUN_TIMEOUT: "60"
+  SPARAGMOS_DRIVER_TIMEOUT: "240"
+  SPARAGMOS_CONVERT_TIMEOUT: "240"
+
+jobs:
+  flip-diff:
+    name: flip-diff
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(join(github.event.pull_request.labels.*.name, ','), 'flip-diff:')
+    steps:
+      - name: Resolve target (keywords, head, base, PR)
+        id: cfg
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          GH_REPO: ${{ github.repository }}
+          INPUT_KEYWORDS: ${{ inputs.keywords }}
+          INPUT_PR: ${{ inputs.pr_number }}
+          INPUT_HEAD: ${{ inputs.head_ref }}
+          INPUT_BASE: ${{ inputs.base_ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            keywords="$INPUT_KEYWORDS"
+            pr_number="$INPUT_PR"
+            head_ref="$INPUT_HEAD"
+            base_ref="$INPUT_BASE"
+            if [ -n "$pr_number" ]; then
+              pr_refs="$(gh pr view "$pr_number" \
+                --json headRefOid,baseRefName \
+                --jq '.headRefOid + " " + .baseRefName')"
+              read -r pr_head pr_base <<<"$pr_refs"
+              head_ref="${head_ref:-$pr_head}"
+              base_ref="${base_ref:-$pr_base}"
+            fi
+            head_ref="${head_ref:-${{ github.sha }}}"
+            base_ref="${base_ref:-main}"
+          else
+            keywords="$(echo "$LABELS_JSON" | jq -r '[.[] | select(startswith("flip-diff:"))][0] // "" | ltrimstr("flip-diff:") | gsub("\\+"; ",")')"
+            pr_number="$PR_NUMBER"
+            head_ref="$PR_HEAD_SHA"
+            base_ref="$PR_BASE_SHA"
+          fi
+          if [ -z "$keywords" ]; then
+            echo "::error::no flip-diff keywords resolved (label flip-diff:<kw1+kw2+...> or dispatch input required)"
+            exit 1
+          fi
+          echo "keywords=$keywords" >> "$GITHUB_OUTPUT"
+          echo "head_ref=$head_ref" >> "$GITHUB_OUTPUT"
+          echo "base_ref=$base_ref" >> "$GITHUB_OUTPUT"
+          echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+          echo "keywords: $keywords; head: $head_ref; base: $base_ref; pr: $pr_number"
+
+      - name: Checkout target head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.cfg.outputs.head_ref }}
+          fetch-depth: 0
+
+      # The workflow scripts are checked out after the target head:
+      # a checkout into the workspace root cleans the workspace and
+      # would delete a scripts checkout made before it.
+      - name: Checkout workflow scripts
+        uses: actions/checkout@v4
+        with:
+          path: .wf
+
+      - name: Install Rust 1.100.0 with rustc-dev
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.100.0
+          components: rustc-dev
+
+      - name: Cache rust source tree and survey
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.RUST_SURVEY_DIR }}
+            ${{ env.SURVEY_JSON }}
+          key: rust-survey-1.100.0-v1
+
+      - name: Fetch rust tree and generate survey (on cache miss)
+        run: |
+          if [ ! -d "$RUST_SURVEY_DIR" ]; then
+            python3 .wf/scripts/rustc-subset-survey.py --fetch \
+              --rust-dir "$RUST_SURVEY_DIR" --json "$SURVEY_JSON"
+          elif [ ! -f "$SURVEY_JSON" ]; then
+            python3 .wf/scripts/rustc-subset-survey.py \
+              --rust-dir "$RUST_SURVEY_DIR" --json "$SURVEY_JSON"
+          fi
+          ls -la "$SURVEY_JSON"
+
+      - name: Build topical population
+        run: |
+          python3 .wf/scripts/ci-subset-tools.py filter \
+            --survey "$SURVEY_JSON" \
+            --keywords "${{ steps.cfg.outputs.keywords }}" \
+            --out "$RUNNER_TEMP/population.json"
+
+      - name: Build head driver
+        env:
+          RUSTC_BOOTSTRAP: "1"
+        run: cargo build --manifest-path crates/sparagmos-driver/Cargo.toml
+
+      - name: Build base driver
+        env:
+          RUSTC_BOOTSTRAP: "1"
+        run: |
+          git worktree add "$RUNNER_TEMP/base-tree" "${{ steps.cfg.outputs.base_ref }}"
+          cargo build --manifest-path "$RUNNER_TEMP/base-tree/crates/sparagmos-driver/Cargo.toml"
+
+      - name: Run subset with base driver
+        run: |
+          python3 .wf/scripts/rustc-subset-run.py \
+            --survey-json "$RUNNER_TEMP/population.json" \
+            --rust-dir "$RUST_SURVEY_DIR" \
+            --driver-bin "$RUNNER_TEMP/base-tree/crates/sparagmos-driver/target/debug/sparagmos-driver" \
+            --out "$RUNNER_TEMP/base-results.json" \
+            --jobs 2
+
+      - name: Run subset with head driver
+        run: |
+          python3 .wf/scripts/rustc-subset-run.py \
+            --survey-json "$RUNNER_TEMP/population.json" \
+            --rust-dir "$RUST_SURVEY_DIR" \
+            --driver-bin "$GITHUB_WORKSPACE/crates/sparagmos-driver/target/debug/sparagmos-driver" \
+            --out "$RUNNER_TEMP/head-results.json" \
+            --jobs 2
+
+      - name: Diff and report
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.cfg.outputs.pr_number }}
+        run: |
+          python3 .wf/scripts/ci-subset-tools.py diff \
+            --base "$RUNNER_TEMP/base-results.json" \
+            --head "$RUNNER_TEMP/head-results.json" \
+            --summary "$RUNNER_TEMP/flip-summary.md" | tee "$RUNNER_TEMP/flip.txt"
+          cat "$RUNNER_TEMP/flip-summary.md" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$PR_NUMBER" ]; then
+            gh pr comment "$PR_NUMBER" --body-file "$RUNNER_TEMP/flip-summary.md"
+          fi
+
+      - name: Upload result JSONs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flip-diff-results-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/base-results.json
+            ${{ runner.temp }}/head-results.json
+            ${{ runner.temp }}/population.json
+          retention-days: 30

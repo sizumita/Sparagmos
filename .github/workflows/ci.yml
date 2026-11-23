@@ -63,6 +63,16 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace
 
+      # The measurement scripts under scripts/ carry their own unit
+      # tests (verdict logic of the subset runner, std coverage, the
+      # run-make / rustdoc / debugger runners). They are plain unit
+      # tests with stubbed process sides, so they run on the Python
+      # that ships with the runner image plus pytest.
+      - name: Test scripts (pytest)
+        run: |
+          python3 -m pip install --quiet pytest
+          python3 -m pytest scripts/ -q
+
       # Formatting is advisory for now: the tree is not yet fmt-clean
       # (e.g. crates/sparagmos-harness/src/dump_parse.rs at dfce498),
       # and reformatting belongs to the lanes that own those files.
