@@ -210,6 +210,7 @@ pub enum FloatOp {
     Hypot,
     MulAdd,
     DivEuclid,
+    RemEuclid,
 }
 
 impl FloatOp {
@@ -270,6 +271,7 @@ impl FloatOp {
             46 => O::Hypot,
             47 => O::MulAdd,
             48 => O::DivEuclid,
+            49 => O::RemEuclid,
             _ => return None,
         })
     }
@@ -536,6 +538,7 @@ fn float_method_named(method: &str) -> Option<FloatOp> {
         "hypot" => O::Hypot,
         "mul_add" => O::MulAdd,
         "div_euclid" => O::DivEuclid,
+        "rem_euclid" => O::RemEuclid,
         _ => return None,
     };
     Some(op)
@@ -1780,6 +1783,7 @@ fn float_method_f64(op: FloatOp, x: i64, y: i64, z: i64) -> i64 {
             f64::from_bits(z as u64),
         )),
         O::DivEuclid => bits(v.div_euclid(f64::from_bits(y as u64))),
+        O::RemEuclid => bits(v.rem_euclid(f64::from_bits(y as u64))),
     }
 }
 
@@ -1840,6 +1844,7 @@ fn float_method_f32(op: FloatOp, x: i64, y: i64, z: i64) -> i64 {
             f32::from_bits(z as u32),
         )),
         O::DivEuclid => bits(v.div_euclid(f32::from_bits(y as u32))),
+        O::RemEuclid => bits(v.rem_euclid(f32::from_bits(y as u32))),
     }
 }
 

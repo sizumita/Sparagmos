@@ -7287,6 +7287,7 @@ impl<'a> FnLower<'a> {
                         | builtins::FloatOp::Atan2
                         | builtins::FloatOp::Hypot
                         | builtins::FloatOp::DivEuclid
+                        | builtins::FloatOp::RemEuclid
                 );
                 let arity = if op == builtins::FloatOp::MulAdd {
                     3

@@ -28,6 +28,7 @@ fn main() {
     println!("{} {}", 1000.0f64.log10(), 1024.0f64.log2());
     println!("{} {}", 3.0f64.hypot(4.0), 1.0f64.atan2(2.0));
     println!("{} {}", 100.0f64.log(10.0), (-7.5f64).div_euclid(2.0));
+    println!("{} {}", (-7.5f64).rem_euclid(2.0), 7.5f32.rem_euclid(-2.0f32));
     println!("{} {}", 1.5f64.mul_add(2.0, 0.5), 1.5f64.acosh());
     let (s, co) = 0.7f64.sin_cos();
     println!("{} {}", s, co);
