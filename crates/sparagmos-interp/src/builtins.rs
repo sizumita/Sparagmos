@@ -1016,6 +1016,16 @@ pub enum Builtin {
     /// without dropping them, exactly as the real `set_len`
     /// contract specifies.
     VecSetLen,
+    /// `Vec::as_ptr(&vec)` / `Vec::as_mut_ptr(&mut vec)`: the
+    /// buffer pointer, which in this value model is the receiver
+    /// reference retargeted at the vector's first element (the
+    /// same value the slice deref's data pointer denotes). The
+    /// collected bodies walk the `RawVec` / `Unique` / `NonNull`
+    /// field chain off the abstract aggregate, where the first
+    /// field is the first element, so they read an element value
+    /// as the pointer (or fail on it); the entry points are
+    /// modelled here like the other RawVec-field readers.
+    VecAsPtr,
     /// `Vec::extend_trusted(&mut vec, iter)`: append every item
     /// the iterator yields. The collected body is the TrustedLen
     /// fast path (`SpecFromIter::from_iter` reaches it for every
@@ -2611,6 +2621,11 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
         }
         _ if canonical.starts_with("std::vec::Vec") && canonical.ends_with(">::set_len") => {
             Builtin::VecSetLen
+        }
+        _ if canonical.starts_with("std::vec::Vec")
+            && (canonical.ends_with(">::as_ptr") || canonical.ends_with(">::as_mut_ptr")) =>
+        {
+            Builtin::VecAsPtr
         }
         _ if canonical.starts_with("std::vec::Vec")
             && canonical.ends_with(">::extend_trusted") =>
@@ -8785,6 +8800,14 @@ impl<'a> Interpreter<'a> {
                     Ok(Value::Unit)
                 })
             }
+            Builtin::VecAsPtr => {
+                arity(1)?;
+                // The receiver reference retargeted at the first
+                // element: the pointer every buffer consumer
+                // (offsets, copies, reads) resolves against the
+                // vector's element aggregate.
+                self.ptr_first_elem_value(frames, body, vals[0].clone(), None)
+            }
             Builtin::VecExtendTrusted => {
                 arity(2)?;
                 // The callee's generic arguments are the Vec's own
@@ -14203,10 +14226,66 @@ fn value_fingerprint(value: &Value) -> u64 {
         if !generic_args.is_empty() || vals.len() != 2 {
             return false;
         }
-        vals.iter().all(|v| {
+        if vals.iter().all(|v| {
             self.resolve_value(frames, v)
                 .is_ok_and(|resolved| is_pathbuf_value(&resolved))
-        })
+        }) {
+            return true;
+        }
+        // The reference form of the same signal: a `&Path`
+        // operand (the shape a generic adapter inside a
+        // library body passes, e.g. the less-than closure a
+        // slice sort derives from `Ord`) is a fat pointer
+        // whose base target was reached through the path
+        // wrapper chain — the two leading `Field(0)` steps
+        // (`PathBuf`'s `OsString` field, then its buffer
+        // field) the `as_path` formation appends. A byte
+        // slice's fat pointer is formed from a vector place
+        // or a constant directly and carries no such descent.
+        vals.iter().all(|v| self.operand_is_path_ref(frames, v))
+    }
+
+    /// Whether a comparison operand denotes a path through
+    /// references: unwrapping reference layers reaches a fat
+    /// pointer whose base target's projection opens with the
+    /// two `Field(0)` steps of the path wrapper chain (see
+    /// [`Self::comparison_is_path`]).
+    fn operand_is_path_ref(&self, frames: &[Frame], value: &Value) -> bool {
+        let mut cur = value.clone();
+        for _ in 0..4 {
+            match cur {
+                Value::Ref(_) => {
+                    let Ok(target) = self.deref_value(frames, &cur) else {
+                        return false;
+                    };
+                    let Ok(stored) = self.read_resolved(frames, &target) else {
+                        return false;
+                    };
+                    cur = stored;
+                }
+                Value::FatRef { base, .. } => {
+                    let Value::Ref(target) = &*base else {
+                        return false;
+                    };
+                    let projection = match target {
+                        RefTarget::Place { projection, .. } => projection,
+                        RefTarget::Value(_, projection) => projection,
+                        RefTarget::Static { projection, .. } => projection,
+                        RefTarget::Alloc { projection, .. } => projection,
+                        _ => return false,
+                    };
+                    return matches!(
+                        projection.first(),
+                        Some(RefProj::Field(0))
+                    ) && matches!(
+                        projection.get(1),
+                        Some(RefProj::Field(0))
+                    );
+                }
+                _ => return false,
+            }
+        }
+        false
     }
 
     /// The bytes of a path argument: a path value is a fat
@@ -18623,7 +18702,7 @@ pub(crate) const MAX_VEC_SET_LEN_ELEMENTS: usize = 1 << 22;
 /// with uninitialised slots, as `Vec::set_len` does — and the
 /// sparse form (see `Value::SparseVec`) past it, which declares
 /// the length the stored elements do not cover.
-fn vec_with_len(mut elems: Vec<Value>, len: usize) -> Value {
+pub(crate) fn vec_with_len(mut elems: Vec<Value>, len: usize) -> Value {
     if len <= elems.len() {
         elems.truncate(len);
         Value::Enum {

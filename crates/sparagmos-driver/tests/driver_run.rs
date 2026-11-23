@@ -17883,3 +17883,161 @@ fn run_mode_assume_init_slice_mut_writes_addressed_elements() {
         "e0=(1, 2) e1=(99, 4) e2=(5, 6) e3=(7, 66)\n",
     );
 }
+
+const VEC_STRING_SORT_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<String> = vec![
+        "banana".to_string(),
+        "apple".to_string(),
+        "cherry".to_string(),
+        "apple".to_string(),
+    ];
+    v.sort();
+    for s in &v { println!("sorted: {s}"); }
+    v.reverse();
+    for s in &v { println!("reversed: {s}"); }
+    v.sort_unstable();
+    for s in &v { println!("unstable: {s}"); }
+    println!("binsearch apple: {:?}", v.binary_search(&"apple".to_string()));
+    v.dedup();
+    for s in &v { println!("dedup: {s}"); }
+    let mut refs: Vec<&str> = vec!["pear", "fig", "plum", "fig"];
+    refs.sort();
+    for s in &refs { println!("refs: {s}"); }
+    let mut w: Vec<String> = vec!["a".to_string(), "bb".to_string(), "ccc".to_string()];
+    w.sort_by_key(|s| s.len());
+    for s in &w { println!("by len: {s}"); }
+    println!("vec-string-sort-ok");
+}
+"#;
+
+#[test]
+fn run_mode_vec_string_sort() {
+    run_ok(
+        "vec-string-sort",
+        VEC_STRING_SORT_SRC,
+        "sorted: apple\nsorted: apple\nsorted: banana\nsorted: cherry\nreversed: cherry\nreversed: banana\nreversed: apple\nreversed: apple\nunstable: apple\nunstable: apple\nunstable: banana\nunstable: cherry\nbinsearch apple: Ok(1)\ndedup: apple\ndedup: banana\ndedup: cherry\nrefs: fig\nrefs: fig\nrefs: pear\nrefs: plum\nby len: a\nby len: bb\nby len: ccc\nvec-string-sort-ok\n",
+    );
+}
+
+const PATHBUF_DEDUP_SRC: &str = r#"
+use std::path::PathBuf;
+
+fn main() {
+    let mut v: Vec<PathBuf> = vec![
+        PathBuf::from("a/b"),
+        PathBuf::from("a/b"),
+        PathBuf::from("c"),
+        PathBuf::from("a-b"),
+        PathBuf::from("a-b"),
+        PathBuf::from("a-b"),
+        PathBuf::from("d/e"),
+        PathBuf::from("c"),
+    ];
+    v.dedup();
+    println!("after len: {}", v.len());
+    for p in &v {
+        println!("item: {}", p.to_str().unwrap());
+    }
+    // Path equality is component-wise: "a//b", "a/./b" and
+    // "a/b/" are the same path as "a/b".
+    let mut w: Vec<PathBuf> = vec![
+        PathBuf::from("a/b"),
+        PathBuf::from("a//b"),
+        PathBuf::from("a/./b"),
+        PathBuf::from("a/b/"),
+    ];
+    w.dedup();
+    println!("normalised dedup len: {}", w.len());
+    println!("pathbuf-dedup-ok");
+}
+"#;
+
+#[test]
+fn run_mode_pathbuf_dedup() {
+    run_ok(
+        "pathbuf-dedup",
+        PATHBUF_DEDUP_SRC,
+        "after len: 5\nitem: a/b\nitem: c\nitem: a-b\nitem: d/e\nitem: c\nnormalised dedup len: 1\npathbuf-dedup-ok\n",
+    );
+}
+
+const PATH_MIXED_CMP_SRC: &str = r#"
+use std::path::{Path, PathBuf};
+
+fn generic_lt<T: PartialOrd>(a: T, b: T) -> bool { a < b }
+
+fn main() {
+    let buf_ab = PathBuf::from("a/b");
+    let buf_a_b = PathBuf::from("a-b");
+    let p_ab: &Path = Path::new("a/b");
+    assert!(buf_ab.as_path() < buf_a_b.as_path());
+    assert!(p_ab < &buf_a_b);
+    assert!(&buf_ab.as_path() < &buf_a_b);
+    assert!(buf_ab.as_path() == p_ab);
+    assert!(generic_lt(buf_ab.as_path(), buf_a_b.as_path()));
+    assert!(generic_lt(&buf_ab, &buf_a_b));
+    assert_eq!(std::cmp::min(buf_ab.as_path(), buf_a_b.as_path()), p_ab);
+    // A sort through the generic Ord adapter keeps component
+    // order ("a/b" < "a-b" component-wise, not byte-wise).
+    let mut v: Vec<&Path> = vec![buf_a_b.as_path(), buf_ab.as_path()];
+    v.sort();
+    assert!(v[0] == p_ab);
+    let mut w: Vec<PathBuf> = vec![
+        PathBuf::from("a/b"),
+        PathBuf::from("c"),
+        PathBuf::from("a/b"),
+        PathBuf::from("a-b"),
+        PathBuf::from("c"),
+    ];
+    w.sort();
+    w.dedup();
+    assert_eq!(w.len(), 3);
+    assert_eq!(w[0].to_str().unwrap(), "a/b");
+    assert_eq!(w[1].to_str().unwrap(), "a-b");
+    assert_eq!(w[2].to_str().unwrap(), "c");
+    println!("path-mixed-cmp-ok");
+}
+"#;
+
+#[test]
+fn run_mode_path_mixed_cmp() {
+    run_ok("path-mixed-cmp", PATH_MIXED_CMP_SRC, "path-mixed-cmp-ok\n");
+}
+
+const PATHBUF_PTR_SWAP_SRC: &str = r#"
+use std::path::PathBuf;
+
+fn main() {
+    // A raw-pointer element copy (the shift a dedup performs)
+    // and a raw-pointer swap must move the whole element
+    // value, wrapper chain included.
+    let mut v: Vec<PathBuf> = vec![PathBuf::from("a/b"), PathBuf::from("c"), PathBuf::from("d/e")];
+    unsafe {
+        let base = v.as_mut_ptr();
+        std::ptr::copy_nonoverlapping(base.add(2), base.add(1), 1);
+    }
+    println!("copied: {}", v[1].to_str().unwrap());
+    let mut u: Vec<PathBuf> = vec![PathBuf::from("m/n"), PathBuf::from("o")];
+    unsafe {
+        std::ptr::swap(u.as_mut_ptr(), u.as_mut_ptr().add(1));
+    }
+    println!("swapped 0: {}", u[0].to_str().unwrap());
+    println!("swapped 1: {}", u[1].to_str().unwrap());
+    let mut s: Vec<String> = vec!["hello".to_string(), "world".to_string()];
+    unsafe {
+        std::ptr::swap(s.as_mut_ptr(), s.as_mut_ptr().add(1));
+    }
+    println!("strings: {} {}", s[0], s[1]);
+    println!("pathbuf-ptr-swap-ok");
+}
+"#;
+
+#[test]
+fn run_mode_pathbuf_ptr_swap() {
+    run_ok(
+        "pathbuf-ptr-swap",
+        PATHBUF_PTR_SWAP_SRC,
+        "copied: d/e\nswapped 0: o\nswapped 1: m/n\nstrings: world hello\npathbuf-ptr-swap-ok\n",
+    );
+}

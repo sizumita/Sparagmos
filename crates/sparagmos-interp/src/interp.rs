@@ -6120,6 +6120,11 @@ impl<'a> Interpreter<'a> {
             }
             StatementKind::ShapedStore { place, value, shape } => {
                 let value = self.eval_operand(frames, body, value)?;
+                if let Some(written) =
+                    self.write_vec_len_slot(frames, body, place, &value)
+                {
+                    return written;
+                }
                 let target = self.resolve_place(frames, body, place)?;
                 self.shaped_store(frames, &target, value, shape)
             }
@@ -6320,6 +6325,52 @@ impl<'a> Interpreter<'a> {
     /// non-overlapping contract forbids, and which makes the shared
     /// implementation a correct `memmove` for `ptr::copy`).
     ///
+    /// The copy machinery's wrapper unwrap: like
+    /// `builtins::unwrap_wrapper`, but the descent stops at a
+    /// leaf-data aggregate (an aggregate of scalars — a byte
+    /// buffer's stored form), which is the element's core, not
+    /// one more wrapper layer. A one-element buffer has
+    /// exactly the one-field shape a wrapper layer has (a
+    /// one-byte path's byte list is the case that matters:
+    /// descending into it mistakes the buffer for a wrapper
+    /// and the byte inside for the element's core). The
+    /// general `unwrap_wrapper` keeps its unconditional
+    /// descent: its other callers (the atomic operations, the
+    /// pointer unwraps) unwrap genuine scalar wrappers whose
+    /// payload field is a one-field scalar aggregate.
+    fn copy_unwrap<'v>(&self, value: &'v Value) -> &'v Value {
+        let mut current = value;
+        while let Value::Enum {
+            variant: 0,
+            fields,
+        } = current
+        {
+            if fields.len() != 1 || is_leaf_data_aggregate(&fields[0]) {
+                break;
+            }
+            current = &fields[0];
+        }
+        current
+    }
+
+    /// The write-side mirror of [`Self::copy_unwrap`]: rebuild
+    /// `current`'s wrapper chain around a new core, stopping
+    /// the descent at the same leaf-data boundary.
+    fn copy_rewrap(&self, current: &Value, core: Value) -> Value {
+        match current {
+            Value::Enum {
+                variant: 0,
+                fields,
+            } if fields.len() == 1 && !is_leaf_data_aggregate(&fields[0]) => {
+                Value::Enum {
+                    variant: 0,
+                    fields: vec![self.copy_rewrap(&fields[0], core)],
+                }
+            }
+            _ => core,
+        }
+    }
+
     /// `elem` is the copy's element type when the call site knows
     /// it (both call paths take it from the pointer operands'
     /// declared types); with `None` the copy reads the element
@@ -6413,7 +6464,7 @@ impl<'a> Interpreter<'a> {
                                 let mut bytes = Vec::with_capacity(n);
                                 let mut all_bytes = true;
                                 for i in 0..n {
-                                    match self.read_seq_at(frames, &src_target, i) {
+                                    match self.read_seq_at_with_elem(frames, &src_target, i, elem) {
                                         Ok(v) => match seq_byte(&v) {
                                             Some(b) => bytes.push(b),
                                             None => {
@@ -6495,7 +6546,7 @@ impl<'a> Interpreter<'a> {
                             && !matches!(src_base, Value::SparseVec { .. })
                     }
                     Some(ty) => {
-                        value_fits_ty(crate::builtins::unwrap_wrapper(&src_base), ty)
+                        value_fits_ty(self.copy_unwrap(&src_base), ty)
                     }
                     None => n == 1 && !aggregate(&src_base),
                 };
@@ -6504,13 +6555,13 @@ impl<'a> Interpreter<'a> {
                     if mu_elem {
                         elems.push(maybe_uninit_form(src_base.clone()));
                         for i in 1..n {
-                            let unit = self.read_seq_at(frames, &src_target, i)?;
+                            let unit = self.read_seq_at_with_elem(frames, &src_target, i, elem)?;
                             elems.push(maybe_uninit_form(unit));
                         }
                     } else {
-                        elems.push(crate::builtins::unwrap_wrapper(&src_base).clone());
+                        elems.push(self.copy_unwrap(&src_base).clone());
                         for i in 1..n {
-                            elems.push(self.read_seq_at(frames, &src_target, i)?);
+                            elems.push(self.read_seq_at_with_elem(frames, &src_target, i, elem)?);
                         }
                     }
                     elems
@@ -6523,7 +6574,7 @@ impl<'a> Interpreter<'a> {
                         // spans model slots that carry no value
                         // (the block's element occupies one slot;
                         // its byte size counts the rest).
-                        let unit = match self.read_seq_at(frames, &src_target, i) {
+                        let unit = match self.read_seq_at_with_elem(frames, &src_target, i, elem) {
                             Ok(v) => v,
                             Err(InterpError::UninitializedRead { .. }) => Value::Uninit,
                             Err(e) => return Err(e),
@@ -6551,7 +6602,7 @@ impl<'a> Interpreter<'a> {
                         Some(cur) => {
                             !aggregate(cur)
                                 || value_fits_ty(
-                                    crate::builtins::unwrap_wrapper(cur),
+                                    self.copy_unwrap(cur),
                                     ty,
                                 )
                         }
@@ -6589,19 +6640,40 @@ impl<'a> Interpreter<'a> {
                     };
                     let mut elems = elems.into_iter();
                     let first = elems.next().expect("count is nonzero");
+                    // The rewrap applies only to a first
+                    // element the source side produced by
+                    // unwrapping (`src_single`): that value is
+                    // the element's core, and the destination
+                    // position's own wrapper chain is rebuilt
+                    // around it. An element the sequence path
+                    // read is the whole element value already;
+                    // wrapping it in the destination's chain
+                    // would nest the element inside itself.
+                    // The rewrap applies only to a first
+                    // element the source side produced by
+                    // unwrapping (`src_single`): that value is
+                    // the element's core, and the destination
+                    // position's own wrapper chain is rebuilt
+                    // around it. An element the sequence path
+                    // read is the whole element value already;
+                    // wrapping it in the destination's chain
+                    // would nest the element inside itself.
                     let stored = match &dst_current {
-                        Some(cur) if dst_place_ty.as_ref() != elem => {
-                            crate::builtins::rewrap_like(cur, first)
+                        Some(cur)
+                            if src_single
+                                && dst_place_ty.as_ref() != elem =>
+                        {
+                            self.copy_rewrap(cur, first)
                         }
                         _ => first,
                     };
                     self.write_resolved(frames, &dst_target, stored)?;
                     for (i, value) in elems.enumerate() {
-                        self.write_seq_at(frames, &dst_target, i + 1, value)?;
+                        self.write_seq_at_with_elem(frames, &dst_target, i + 1, value, elem)?;
                     }
                 } else {
                     for (i, value) in elems.into_iter().enumerate() {
-                        self.write_seq_at(frames, &dst_target, i, value)?;
+                        self.write_seq_at_with_elem(frames, &dst_target, i, value, elem)?;
                     }
                 }
                 Ok(())
@@ -6776,22 +6848,242 @@ impl<'a> Interpreter<'a> {
         // kept alongside and applied to the immediately following
         // index step (the only step it can bound).
         let mut fat_cap: Option<u128> = None;
+        // Whether the fat pointer's elements are string carriers
+        // (see `fat_slice_elem_is_string_carrier`), read from the
+        // place's declared type at the `Deref` step and consumed
+        // by the same following index step as `fat_cap`.
+        let mut fat_elem_string: Option<bool> = None;
+        // The declared type of the value `cur` currently denotes,
+        // tracked from the place's local type through reference
+        // steps (field and index steps end the tracking: the
+        // program carries no field-type table to continue it).
+        // Its one consumer is the `Field` arm's `Vec` length
+        // slot.
+        let mut cur_ty: Option<Ty> = body.local_ty(place.local).cloned();
+        // A walk inside a `Vec`'s buffer wrapper chain (the
+        // `Field(0)` steps an inlined `Vec::as_mut_ptr` takes
+        // through `RawVec` / `Unique` / `NonNull`): none of the
+        // wrappers is storage in the value model, so the steps
+        // do not move `cur`; the walk's end (or a `Deref` step)
+        // completes the chain as the buffer pointer itself (see
+        // `buf_chain_pointer`). `buf_base` is the vector place's
+        // target the chain started from.
+        let mut buf_base: Option<Resolved> = None;
+        let mut buf_depth = 0usize;
+        // A `Field(0)` step that landed on a byte-vector-shaped
+        // value (an `Enum` of byte elements: the stored form of
+        // a `Vec<u8>` the type tracking could not reach, e.g.
+        // the buffer inside a `PathBuf`'s wrapper chain) whose
+        // meaning depends on the next step: a further `Field(0)`
+        // enters the buffer wrapper chain with this step as the
+        // vector's buffer field, a `Field(1)` reads its length
+        // slot, and anything else appends the step as the plain
+        // field access it is. Holds the target from before the
+        // step; the step itself is not appended yet.
+        let mut pending_vec: Option<Resolved> = None;
+        // The pending detection above serves one descent: a
+        // path buffer reached through its wrapper chain
+        // (`PathBuf` / `Path` / `OsString` / `OsStr` locals,
+        // whose buffer the declared types cannot follow past
+        // the first field step). It is gated on the place's
+        // root type: a byte-vector-shaped value is also a
+        // legitimate intermediate of unrelated place walks
+        // (a hash table's control-byte buffer, a byte block's
+        // storage), and hijacking those walks into a buffer
+        // chain misresolves them.
+        let root_is_path_chain = {
+            // The root type, through any reference layers (the
+            // walk may start from a `&PathBuf` / `&OsString`
+            // local and deref into the chain).
+            let mut root_ty = body.local_ty(place.local);
+            while let Some(Ty::Ref(inner)) = root_ty {
+                root_ty = Some(inner);
+            }
+            matches!(
+                root_ty,
+                Some(Ty::Adt(name))
+                    if name.contains("::path::Path")
+                        || name.contains("::ffi::OsStr")
+            )
+        };
         let projection_len = place.projection.len();
         for (step_idx, elem) in place.projection.iter().enumerate() {
             let is_last = step_idx + 1 == projection_len;
+            // A pending byte-vector step (see the state above)
+            // is decided by the step that follows it; a
+            // non-field step makes it the plain field access it
+            // is, appended before this step is processed.
+            if pending_vec.is_some()
+                && !matches!(elem, ProjectionElem::Field(_))
+            {
+                let pending = pending_vec.take().expect("checked");
+                cur = self.project_step(
+                    frames,
+                    pending,
+                    RefProj::Field(0),
+                    body,
+                    place,
+                )?;
+            }
             cur = match elem {
                 ProjectionElem::Field(idx) => {
                     fat_cap = None;
-                    cur_ty = match &cur_ty {
-                        Some(Ty::Tuple(ts)) => ts.get(*idx as usize).cloned(),
-                        Some(Ty::Array(elem, _)) => Some((**elem).clone()),
-                        _ => None,
-                    };
-                    self.project_step(frames, cur, RefProj::Field(*idx), body, place)?
+                    fat_elem_string = None;
+                    // The length slot of a `Vec` (field 1) read
+                    // directly, the shape an inlined `Vec::len`
+                    // inside a collected std body takes
+                    // (`dedup_by`, `pop`, ...): the value model
+                    // holds a `Vec` as its element list, so the
+                    // slot is not storage in the value — the read
+                    // is the element count itself, answered as a
+                    // value target.
+                    if let Some(pending) = pending_vec.take() {
+                        if *idx == 0 {
+                            // The pending step was the vector's
+                            // buffer field; this step is a
+                            // wrapper step of its chain.
+                            let base = self.project_step(
+                                frames,
+                                pending,
+                                RefProj::Field(0),
+                                body,
+                                place,
+                            )?;
+                            buf_base = Some(base.clone());
+                            buf_depth = 2;
+                            base
+                        } else if *idx == 1 {
+                            // The pending vector's length slot.
+                            let vec_target = self.project_step(
+                                frames,
+                                pending,
+                                RefProj::Field(0),
+                                body,
+                                place,
+                            )?;
+                            let count = self
+                                .read_resolved(frames, &vec_target)?
+                                .len()
+                                .ok_or_else(|| {
+                                    InterpError::type_mismatch(
+                                        format!("length of {place}"),
+                                        "vector value",
+                                        "value without a length",
+                                    )
+                                })?;
+                            cur_ty = Some(Ty::Uint(UintTy::Usize));
+                            Resolved::Value(Value::Uint(count), Vec::new())
+                        } else {
+                            // A plain field access after all:
+                            // append the pending step, then this
+                            // one.
+                            let stepped = self.project_step(
+                                frames,
+                                pending,
+                                RefProj::Field(0),
+                                body,
+                                place,
+                            )?;
+                            cur_ty = None;
+                            self.project_step(
+                                frames,
+                                stepped,
+                                RefProj::Field(*idx),
+                                body,
+                                place,
+                            )?
+                        }
+                    } else if buf_depth > 0 && *idx == 0 {
+                        // A further wrapper step of the buffer
+                        // chain: still no storage to denote.
+                        buf_depth += 1;
+                        cur
+                    } else if buf_depth > 0 && *idx == 1 {
+                        // The buffer's capacity slot, read
+                        // through the chain (an inlined
+                        // `Vec::capacity`, e.g. in a `set_len`
+                        // precondition check): capacity is not
+                        // represented in the value model (see
+                        // `Builtin::VecCapacity`), and the
+                        // element list is exactly the allocation
+                        // the model holds, so the count the list
+                        // has is the only capacity it can name.
+                        let count = self
+                            .read_resolved(frames, &cur)?
+                            .len()
+                            .ok_or_else(|| {
+                                InterpError::type_mismatch(
+                                    format!("capacity of {place}"),
+                                    "vector value",
+                                    "value without a length",
+                                )
+                            })?;
+                        buf_depth = 0;
+                        buf_base = None;
+                        cur_ty = Some(Ty::Uint(UintTy::Usize));
+                        Resolved::Value(Value::Uint(count), Vec::new())
+                    } else if *idx == 0
+                        && cur_ty.as_ref().is_some_and(is_vec_adt_ty)
+                    {
+                        // The buffer field of a `Vec`: enter the
+                        // wrapper chain (see the state declared
+                        // above). The step denotes the `RawVec`,
+                        // which the value model does not hold.
+                        buf_base = Some(cur.clone());
+                        buf_depth = 1;
+                        cur_ty = None;
+                        cur
+                    } else if *idx == 1 && cur_ty.as_ref().is_some_and(is_vec_adt_ty) {
+                        let count = self
+                            .read_resolved(frames, &cur)?
+                            .len()
+                            .ok_or_else(|| {
+                                InterpError::type_mismatch(
+                                    format!("length of {place}"),
+                                    "vector value",
+                                    "value without a length",
+                                )
+                            })?;
+                        cur_ty = Some(Ty::Uint(UintTy::Usize));
+                        Resolved::Value(Value::Uint(count), Vec::new())
+                    } else if *idx == 0 && cur_ty.is_none() && root_is_path_chain {
+                        // The type tracking has no type for this
+                        // step (a wrapper descent the program's
+                        // tables cannot follow): if the step
+                        // lands on a byte-vector-shaped value, it
+                        // may be a vector's buffer field whose
+                        // chain the following steps walk — hold
+                        // the step pending (see the state above)
+                        // instead of appending it.
+                        let stepped = self.project_step(
+                            frames,
+                            cur.clone(),
+                            RefProj::Field(0),
+                            body,
+                            place,
+                        )?;
+                        match self.read_resolved(frames, &stepped) {
+                            Ok(v) if is_byte_vec_value(&v) => {
+                                pending_vec = Some(cur.clone());
+                                cur
+                            }
+                            _ => stepped,
+                        }
+                    } else {
+                        buf_depth = 0;
+                        cur_ty = match &cur_ty {
+                            Some(Ty::Tuple(ts)) => ts.get(*idx as usize).cloned(),
+                            Some(Ty::Array(elem, _)) => Some((**elem).clone()),
+                            _ => None,
+                        };
+                        self.project_step(frames, cur, RefProj::Field(*idx), body, place)?
+                    }
                 }
                 ProjectionElem::UnionField { idx, table } => {
-                    fat_cap = None;
+                    buf_depth = 0;
                     cur_ty = None;
+                    fat_cap = None;
+                    fat_elem_string = None;
                     self.project_step(
                         frames,
                         cur,
@@ -6804,9 +7096,11 @@ impl<'a> Interpreter<'a> {
                     )?
                 }
                 ProjectionElem::Index(local) => {
+                    buf_depth = 0;
+                    cur_ty = None;
                     let idx = self.read_index_local(frames, body, *local, place)?;
                     let via_fat = fat_cap.is_some_and(|cap| {
-                        !self.deref_denotes_storage(frames, &cur, cap)
+                        !self.deref_denotes_storage(frames, &cur, cap, fat_elem_string)
                     });
                     if let Some(cap) = fat_cap {
                         if idx as u128 >= cap {
@@ -6814,6 +7108,7 @@ impl<'a> Interpreter<'a> {
                         }
                     }
                     fat_cap = None;
+                    fat_elem_string = None;
                     cur_ty = match &cur_ty {
                         Some(Ty::Array(elem, _)) | Some(Ty::Slice(elem)) => {
                             Some((**elem).clone())
@@ -6828,6 +7123,8 @@ impl<'a> Interpreter<'a> {
                     }
                 }
                 ProjectionElem::ConstantIndex { offset, from_end } => {
+                    buf_depth = 0;
+                    cur_ty = None;
                     // The length the index is bounded by: the fat
                     // length when the place was reached through a
                     // fat pointer (the value resolved at an
@@ -6844,9 +7141,10 @@ impl<'a> Interpreter<'a> {
                         })?,
                     };
                     let via_fat = fat_cap.is_some_and(|cap| {
-                        !self.deref_denotes_storage(frames, &cur, cap)
+                        !self.deref_denotes_storage(frames, &cur, cap, fat_elem_string)
                     });
                     fat_cap = None;
+                    fat_elem_string = None;
                     cur_ty = match &cur_ty {
                         Some(Ty::Array(elem, _)) | Some(Ty::Slice(elem)) => {
                             Some((**elem).clone())
@@ -6882,6 +7180,8 @@ impl<'a> Interpreter<'a> {
                     }
                 }
                 ProjectionElem::Subslice { from, to, from_end } => {
+                    buf_depth = 0;
+                    cur_ty = None;
                     // The range is resolved against the length the
                     // base place currently has: the fat length when
                     // the base was reached through a fat deref,
@@ -6901,6 +7201,7 @@ impl<'a> Interpreter<'a> {
                         })?,
                     };
                     fat_cap = None;
+                    fat_elem_string = None;
                     let (offset, sub_len) = subslice_offset_len(*from, *to, *from_end, len)?;
                     cur_ty = match &cur_ty {
                         Some(Ty::Array(elem, _)) | Some(Ty::Slice(elem)) => {
@@ -6920,7 +7221,10 @@ impl<'a> Interpreter<'a> {
                     )?
                 }
                 ProjectionElem::Downcast(variant) => {
+                    buf_depth = 0;
+                    cur_ty = None;
                     fat_cap = None;
+                    fat_elem_string = None;
                     self.project_step(frames, cur, RefProj::Downcast(*variant), body, place)?
                 }
                 ProjectionElem::Deref => {
@@ -6928,9 +7232,29 @@ impl<'a> Interpreter<'a> {
                         Some(Ty::Ref(inner)) => Some((**inner).clone()),
                         _ => None,
                     };
+                    // A dereference through the buffer pointer
+                    // completes the wrapper chain first: the
+                    // value read here is the pointee the pointer
+                    // denotes, not the vector's element list.
+                    if buf_depth > 0 {
+                        if let Some(base) = buf_base.take() {
+                            cur = self.buf_chain_pointer(frames, &base)?;
+                        }
+                        buf_depth = 0;
+                    }
                     let value = self.read_resolved(frames, &cur)?;
                     fat_cap = match &value {
                         Value::FatRef { len, .. } => Some(*len),
+                        _ => None,
+                    };
+                    fat_elem_string = match &value {
+                        Value::FatRef { .. } if step_idx == 0 => body
+                            .local_ty(place.local)
+                            .and_then(fat_slice_elem_is_string_carrier),
+                        _ => None,
+                    };
+                    cur_ty = match cur_ty {
+                        Some(Ty::Ref(pointee)) => Some((*pointee).clone()),
                         _ => None,
                     };
                     let resolved = self.deref_value(frames, &value)?;
@@ -7018,6 +7342,18 @@ impl<'a> Interpreter<'a> {
                     resolved
                 }
             };
+        }
+        // A pending byte-vector step the walk ends on is the
+        // plain field access it is.
+        if let Some(pending) = pending_vec.take() {
+            cur = self.project_step(frames, pending, RefProj::Field(0), body, place)?;
+        }
+        // A walk that ends inside the buffer wrapper chain
+        // denotes the buffer pointer itself.
+        if buf_depth > 0 {
+            if let Some(base) = buf_base.take() {
+                cur = self.buf_chain_pointer(frames, &base)?;
+            }
         }
         Ok(cur)
     }
@@ -7357,6 +7693,54 @@ impl<'a> Interpreter<'a> {
         true
     }
 
+    /// The target a place walk inside a `Vec`'s buffer wrapper
+    /// chain denotes (see `resolve_place_mode`): the chain's
+    /// steps walk `RawVec` / `Unique` / `NonNull` wrappers
+    /// around the buffer pointer, none of which is storage in
+    /// the value model, so the denoted place is the pointer
+    /// itself — a reference to the vector place's first element,
+    /// the same target `Vec::as_ptr` produces — as a value
+    /// target.
+    fn buf_chain_pointer(
+        &self,
+        frames: &[Frame],
+        base: &Resolved,
+    ) -> InterpResult<Resolved> {
+        let target = match base {
+            Resolved::Place {
+                frame_pos,
+                local,
+                projection,
+            } => {
+                let mut projection = projection.clone();
+                projection.push(RefProj::Index(0));
+                RefTarget::place(frames[*frame_pos].id, *local, projection)
+            }
+            Resolved::Static { name, projection } => {
+                let mut projection = projection.clone();
+                projection.push(RefProj::Index(0));
+                RefTarget::Static {
+                    name: name.clone(),
+                    projection,
+                }
+            }
+            Resolved::Alloc { id, projection } => {
+                let mut projection = projection.clone();
+                projection.push(RefProj::Index(0));
+                RefTarget::Alloc {
+                    id: *id,
+                    projection,
+                }
+            }
+            Resolved::Value(base_value, projection) => {
+                let mut projection = projection.clone();
+                projection.push(RefProj::Index(0));
+                RefTarget::Value(Box::new(base_value.clone()), projection)
+            }
+        };
+        Ok(Resolved::Value(Value::Ref(target), Vec::new()))
+    }
+
     /// The length carried by the fat pointer a place's final
     /// `Deref` step traverses (`(*p)` where `p` holds a fat
     /// reference), when there is one. Resolving that place reaches
@@ -7381,6 +7765,7 @@ impl<'a> Interpreter<'a> {
         frames: &[Frame],
         cur: &Resolved,
         fat_len: u128,
+        elem_string: Option<bool>,
     ) -> bool {
         // A position that ends at one element of a container,
         // entered through whole-value entry steps (the shape a
@@ -7413,10 +7798,25 @@ impl<'a> Interpreter<'a> {
                 }
             }
         }
-        match self.read_resolved(frames, cur) {
-            Ok(value) => value.len() == Some(fat_len),
-            Err(_) => false,
+        let value = match self.read_resolved(frames, cur) {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+        // A string value at the position is one element when the
+        // slice's elements are string carriers, and the slice's
+        // own byte storage when its elements are bytes: the
+        // declared element type decides, because the value's
+        // byte length cannot (a one-byte string element in a
+        // one-element subslice has the same length as the
+        // slice, and reads as its storage by the count below).
+        if matches!(value, Value::Str(_)) {
+            match elem_string {
+                Some(true) => return false,
+                Some(false) => return true,
+                None => {}
+            }
         }
+        value.len() == Some(fat_len)
     }
 
     pub(crate) fn fat_deref_len(
@@ -7854,6 +8254,7 @@ impl<'a> Interpreter<'a> {
         frames: &[Frame],
         body: &Body,
         value: Value,
+        elem_string: Option<bool>,
     ) -> InterpResult<Value> {
         match value {
             Value::Ref(RefTarget::Place {
@@ -7899,11 +8300,11 @@ impl<'a> Interpreter<'a> {
                         }
                     };
                     if ends_at_element
-                        && !self.deref_denotes_storage(frames, &resolved, len)
+                        && !self.deref_denotes_storage(frames, &resolved, len, elem_string)
                     {
                         Ok(*base)
                     } else {
-                        self.ptr_first_elem_value(frames, body, *base)
+                        self.ptr_first_elem_value(frames, body, *base, elem_string)
                     }
                 }
                 Value::Tuple(_) | Value::Bytes(_) | Value::Str(_) => Ok(Value::Ref(
@@ -9620,7 +10021,22 @@ impl<'a> Interpreter<'a> {
         target: &Resolved,
         index: usize,
     ) -> InterpResult<Value> {
-        match self.seq_element_target(frames, target, index)? {
+        self.read_seq_at_with_elem(frames, target, index, None)
+    }
+
+    /// [`Self::read_seq_at`] with the sequence's element type,
+    /// when the caller knows it (a bulk copy's declared pointee
+    /// type): a string element's stored value is the string
+    /// data itself, which the untyped access cannot tell from
+    /// the string's own byte storage.
+    pub(crate) fn read_seq_at_with_elem(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        index: usize,
+        elem: Option<&Ty>,
+    ) -> InterpResult<Value> {
+        match self.seq_element_target(frames, target, index, elem)? {
             Some(target) => self.read_resolved(frames, &target),
             None => {
                 if let Some(scalar) = self.seq_scalar(frames, target)? {
@@ -9649,7 +10065,20 @@ impl<'a> Interpreter<'a> {
         index: usize,
         value: Value,
     ) -> InterpResult<()> {
-        match self.seq_element_target(frames, target, index)? {
+        self.write_seq_at_with_elem(frames, target, index, value, None)
+    }
+
+    /// [`Self::write_seq_at`] with the sequence's element type
+    /// (see [`Self::read_seq_at_with_elem`]).
+    pub(crate) fn write_seq_at_with_elem(
+        &self,
+        frames: &mut Vec<Frame>,
+        target: &Resolved,
+        index: usize,
+        value: Value,
+        elem: Option<&Ty>,
+    ) -> InterpResult<()> {
+        match self.seq_element_target(frames, target, index, elem)? {
             Some(target) => self.write_resolved(frames, &target, value),
             None => {
                 if let Some(scalar) = self.seq_scalar(frames, target)? {
@@ -10991,6 +11420,7 @@ impl<'a> Interpreter<'a> {
         frames: &[Frame],
         target: &Resolved,
         index: usize,
+        elem: Option<&Ty>,
     ) -> InterpResult<Option<Resolved>> {
         // A byte-denominated allocation target (see
         // `elem_block_projection`) reads its elements at the
@@ -11106,15 +11536,18 @@ impl<'a> Interpreter<'a> {
         let Some((&RefProj::Index(start), head)) = projection.split_last() else {
             return Ok(None);
         };
+        // A string value at the position continues the sequence
+        // inside itself only when the sequence ranges over the
+        // string's own bytes; with a string-carrier element type
+        // the string IS one element, and the sequence continues
+        // at its siblings.
+        let str_is_element = elem.is_some_and(|ty| elem_is_string_carrier(ty));
         match self.read_resolved(frames, target) {
             Ok(v)
                 if matches!(
                     v,
-                    Value::Tuple(_)
-                        | Value::FatRef { .. }
-                        | Value::Bytes(_)
-                        | Value::Str(_)
-                ) =>
+                    Value::Tuple(_) | Value::FatRef { .. } | Value::Bytes(_)
+                ) || (matches!(v, Value::Str(_)) && !str_is_element) =>
             {
                 return Ok(None);
             }
@@ -11308,6 +11741,9 @@ impl<'a> Interpreter<'a> {
         place: &Place,
         value: Value,
     ) -> InterpResult<()> {
+        if let Some(written) = self.write_vec_len_slot(frames, body, place, &value) {
+            return written;
+        }
         let target = self.resolve_place_mode(frames, body, place, false)?;
         // A direct deref of a byte pointer (see `read_place`):
         // the byte view of the base value's storage owns the
@@ -11324,6 +11760,49 @@ impl<'a> Interpreter<'a> {
             }
         }
         self.write_resolved(frames, &target, value)
+    }
+
+    /// A write to a `Vec`'s length slot, when `place` denotes
+    /// one (see `vec_len_slot_base`): the shape an inlined
+    /// `Vec::len` mutation takes (e.g. `pop`'s `self.len -= 1`,
+    /// or a shaped store of the length in `dedup_by`). The slot
+    /// is not storage in the element-list value, so the write
+    /// applies the `Vec::set_len` storage change (see
+    /// `crate::builtins::vec_with_len`) to the vector place
+    /// itself. `None` when the place is not a length slot (or
+    /// the value is not an integer length).
+    fn write_vec_len_slot(
+        &self,
+        frames: &mut Vec<Frame>,
+        body: &Body,
+        place: &Place,
+        value: &Value,
+    ) -> Option<InterpResult<()>> {
+        let base = vec_len_slot_base(body, place)?;
+        let new_len = match value {
+            Value::Uint(n) => usize::try_from(*n).ok()?,
+            Value::Int(n) if *n >= 0 => usize::try_from(*n).ok()?,
+            _ => return None,
+        };
+        let target = match self.resolve_place(frames, body, &base) {
+            Ok(target) => target,
+            Err(e) => return Some(Err(e)),
+        };
+        Some(self.modify_resolved(frames, &target, |slot| {
+            let elems = match std::mem::replace(slot, Value::Uninit) {
+                Value::Enum { fields, .. } => fields,
+                Value::SparseVec { elems, .. } => elems,
+                other => {
+                    return Err(InterpError::type_mismatch(
+                        "Vec length slot write",
+                        "vector value",
+                        other.kind_name(),
+                    ));
+                }
+            };
+            *slot = crate::builtins::vec_with_len(elems, new_len);
+            Ok(())
+        }))
     }
 
     /// Validate / wrap a value being stored into a typed direct local.
@@ -13234,11 +13713,24 @@ impl<'a> Interpreter<'a> {
             Rvalue::PtrFieldFirstElem(operand, depth) => {
                 let value = self.eval_operand(frames, body, operand)?;
                 let value = self.ptr_field_value(frames, body, value, *depth)?;
-                self.ptr_first_elem_value(frames, body, value)
+                self.ptr_first_elem_value(frames, body, value, None)
             }
             Rvalue::PtrFirstElem(operand) => {
                 let value = self.eval_operand(frames, body, operand)?;
-                self.ptr_first_elem_value(frames, body, value)
+                // The operand's declared type, when it is a bare
+                // local: it carries the slice's element type the
+                // storage judgment in `ptr_first_elem_value`
+                // needs (see `fat_slice_elem_is_string_carrier`).
+                let elem_string = match operand {
+                    Operand::Copy(place) | Operand::Move(place)
+                        if place.projection.is_empty() =>
+                    {
+                        body.local_ty(place.local)
+                            .and_then(fat_slice_elem_is_string_carrier)
+                    }
+                    _ => None,
+                };
+                self.ptr_first_elem_value(frames, body, value, elem_string)
             }
             Rvalue::PtrCastUnits(operand, from_size) => {
                 let value = self.eval_operand(frames, body, operand)?;
@@ -13913,6 +14405,133 @@ fn projection_ends_at_element(projection: &[RefProj]) -> bool {
 /// denotes element `k` of the container the index step ranges
 /// over, entered the way every element of that container is.
 /// Any other shape answers `None`.
+/// Whether the elements of the fat pointer type `ty` (a
+/// reference to a slice, or to `str`) are string carriers: an
+/// element whose stored value is the string data itself (a
+/// `String` value or an `&str` value, both stored as
+/// [`Value::Str`]). `Some(false)` for a byte slice and for
+/// `str` itself, whose elements are the string's own bytes, so
+/// a string value at the base position is the slice's storage.
+/// `None` when the type does not say.
+fn fat_slice_elem_is_string_carrier(ty: &Ty) -> Option<bool> {
+    let pointee = match ty {
+        Ty::Ref(pointee) => pointee,
+        _ => return None,
+    };
+    match &**pointee {
+        Ty::Str => Some(false),
+        Ty::Slice(elem) => match &**elem {
+            Ty::Adt(name) if is_string_adt_name(name) => Some(true),
+            Ty::Ref(inner) if matches!(&**inner, Ty::Str) => Some(true),
+            Ty::Uint(UintTy::U8) | Ty::Int(IntTy::I8) => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether a bulk sequence's element type is a string carrier
+/// (see `fat_slice_elem_is_string_carrier`): an element whose
+/// stored value is the string data itself.
+fn elem_is_string_carrier(elem: &Ty) -> bool {
+    match elem {
+        Ty::Adt(name) => is_string_adt_name(name),
+        Ty::Ref(pointee) => matches!(&**pointee, Ty::Str),
+        _ => false,
+    }
+}
+
+/// Whether the type is a `Vec` ADT instance, under either its
+/// `std` or its `alloc` spelling.
+fn is_vec_adt_ty(ty: &Ty) -> bool {
+    match ty {
+        Ty::Adt(name) => {
+            name == "std::vec::Vec"
+                || name == "alloc::vec::Vec"
+                || name.starts_with("std::vec::Vec<")
+                || name.starts_with("alloc::vec::Vec<")
+        }
+        _ => false,
+    }
+}
+
+/// The base place of the vector itself when `place` denotes a
+/// `Vec`'s length slot: a final `Field(1)` step whose base is
+/// `Vec`-typed, with the type tracked from the local through
+/// reference steps exactly as `resolve_place_mode` tracks it
+/// (any other step ends the tracking, so the slot is only
+/// recognised in the direct shapes collected std bodies use).
+fn vec_len_slot_base(body: &Body, place: &Place) -> Option<Place> {
+    let (last, prefix) = place.projection.split_last()?;
+    if !matches!(last, ProjectionElem::Field(1)) {
+        return None;
+    }
+    let mut cur_ty = body.local_ty(place.local)?.clone();
+    for elem in prefix {
+        match elem {
+            ProjectionElem::Deref => {
+                cur_ty = match cur_ty {
+                    Ty::Ref(pointee) => (*pointee).clone(),
+                    _ => return None,
+                };
+            }
+            _ => return None,
+        }
+    }
+    if is_vec_adt_ty(&cur_ty) {
+        let mut base = place.clone();
+        base.projection = prefix.to_vec();
+        Some(base)
+    } else {
+        None
+    }
+}
+
+/// Whether a value is a leaf-data aggregate: an aggregate
+/// whose fields are all scalars — a byte buffer's stored
+/// form, a scalar array's. Such a value is data, not a
+/// wrapper around data (see `Interpreter::copy_unwrap`).
+fn is_leaf_data_aggregate(value: &Value) -> bool {
+    fn scalar(v: &Value) -> bool {
+        matches!(
+            v,
+            Value::Int(_) | Value::Uint(_) | Value::Float(_) | Value::Bool(_)
+        )
+    }
+    match value {
+        Value::Enum { fields, .. } => {
+            !fields.is_empty() && fields.iter().all(scalar)
+        }
+        Value::Tuple(items) => !items.is_empty() && items.iter().all(scalar),
+        _ => false,
+    }
+}
+
+/// Whether a value has the stored shape of a `Vec<u8>`: the
+/// element-list aggregate whose elements are all bytes. (An
+/// empty aggregate has no elements to judge by and is not
+/// claimed: the wrapper chains this shape detection serves
+/// always run over a buffer the program filled first, and an
+/// empty buffer's chain denotes a dangling pointer nothing
+/// reads through.)
+fn is_byte_vec_value(value: &Value) -> bool {
+    match value {
+        Value::Enum { variant: 0, fields } => {
+            !fields.is_empty()
+                && fields
+                    .iter()
+                    .all(|f| matches!(f, Value::Uint(n) if *n <= 0xFF))
+        }
+        _ => false,
+    }
+}
+
+/// Whether the ADT name is the string type, under either its
+/// `std` or its `alloc` spelling.
+fn is_string_adt_name(name: &str) -> bool {
+    name == "std::string::String" || name == "alloc::string::String"
+}
+
 fn entered_element_container(cur: &Resolved) -> Option<(Resolved, usize)> {
     let projection: &[RefProj] = match cur {
         Resolved::Place { projection, .. }
@@ -17621,6 +18240,21 @@ fn value_fits_ty(value: &Value, ty: &Ty) -> bool {
         }
         (Value::Enum { .. }, Ty::Adt(_)) => true,
         (Value::Str(_), Ty::Str) => true,
+        // A string value is the value model's representation of
+        // the `String` ADT itself (the owned buffer's contents,
+        // with no separate aggregate): a `Str` value under an
+        // ADT-typed position is one `String` element, not a byte
+        // sequence to index into. No other ADT is represented by
+        // a bare `Str`, so the arm cannot bless a value of the
+        // wrong type in a well-typed program.
+        (Value::Str(_), Ty::Adt(_)) => true,
+        // The same representation serves an `&str` value stored
+        // in an aggregate: the element is the string data,
+        // re-formed as a reference by the declared type on
+        // ordinary reads.
+        (Value::Str(_), Ty::Ref(pointee)) if matches!(&**pointee, Ty::Str) => {
+            true
+        }
         (Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. }, Ty::Ref(_)) => {
             true
         }
