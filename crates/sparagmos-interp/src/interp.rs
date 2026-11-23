@@ -7282,7 +7282,24 @@ impl<'a> Interpreter<'a> {
                     };
                     let stored = match &dst_current {
                         Some(cur) if !cur_is_element => {
-                            self.copy_rewrap(cur, first)
+                            // The slot's current form is the
+                            // authority for its representation: an
+                            // incoming value that already carries
+                            // that form (the element read from a
+                            // sibling slot of the same buffer) is
+                            // stored as it stands, and only a value
+                            // arriving as the wrapped core is
+                            // rebuilt into the slot's wrapper chain.
+                            // Rebuilding unconditionally would wrap
+                            // a whole element in a second copy of
+                            // itself whenever the element type is a
+                            // one-field aggregate (a `Vec<E>` tail
+                            // shift's first element).
+                            if crate::builtins::same_wrapper_form(cur, &first) {
+                                first
+                            } else {
+                                self.copy_rewrap(cur, first)
+                            }
                         }
                         _ => first,
                     };

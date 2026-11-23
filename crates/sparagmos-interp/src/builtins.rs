@@ -19222,6 +19222,35 @@ pub(crate) fn unwrap_wrapper(value: &Value) -> &Value {
     current
 }
 
+/// Whether `value` already carries the wrapper-chain form of
+/// `current`: the same number of one-field `Enum` layers over a
+/// core of the same kind. A store into a wrapper-shaped slot
+/// uses it to tell a whole element in the slot's own
+/// representation (stored as it stands) from the wrapped core a
+/// pointer into the wrapper denotes (rebuilt by
+/// [`rewrap_like`]).
+pub(crate) fn same_wrapper_form(current: &Value, value: &Value) -> bool {
+    fn form(v: &Value) -> (usize, &Value) {
+        let mut depth = 0;
+        let mut core = v;
+        while let Value::Enum {
+            variant: 0,
+            fields,
+        } = core
+        {
+            if fields.len() != 1 {
+                break;
+            }
+            depth += 1;
+            core = &fields[0];
+        }
+        (depth, core)
+    }
+    let (d1, c1) = form(current);
+    let (d2, c2) = form(value);
+    d1 == d2 && c1.kind_name() == c2.kind_name()
+}
+
 /// Rebuild the wrapper chain `current` carries around a new core
 /// value: the mirror of [`unwrap_wrapper`] for writes, so a cell
 /// place keeps its aggregate shape with the new scalar inside.

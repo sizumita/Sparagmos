@@ -2369,6 +2369,84 @@ fn run_mode_vec_shrink_to_fit_and_shrink_to() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "len 3\nlen 4\n");
 }
 
+const VEC_REMOVE_ADT_SRC: &str = r#"
+struct E(i32);
+impl Drop for E {
+    fn drop(&mut self) {
+        println!("drop E({})", self.0);
+    }
+}
+fn main() {
+    // `Vec::remove` shifts the tail with one `ptr::copy` of ADT
+    // elements: every shifted element must land whole, in order.
+    let mut v: Vec<E> = (0..6).map(E).collect();
+    let x = v.remove(1);
+    println!("removed {:?}", x.0);
+    std::mem::forget(x);
+    println!("v={:?}", v.iter().map(|e| e.0).collect::<Vec<_>>());
+    // A shorter tail (a two-element shift) and a two-field
+    // element take the same copy.
+    let mut w: Vec<E> = (0..4).map(E).collect();
+    let y = w.remove(1);
+    std::mem::forget(y);
+    println!("w={:?}", w.iter().map(|e| e.0).collect::<Vec<_>>());
+}
+"#;
+
+#[test]
+fn run_mode_vec_remove_shifts_adt_elements_whole() {
+    let dir = temp_dir("vec-remove-adt");
+    let src = fixture(&dir, "vec_remove_adt.rs", VEC_REMOVE_ADT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Vec::remove over ADT elements must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "removed 1\nv=[0, 2, 3, 4, 5]\nw=[0, 2, 3]\ndrop E(0)\ndrop E(2)\ndrop E(3)\ndrop E(0)\ndrop E(2)\ndrop E(3)\ndrop E(4)\ndrop E(5)\n"
+    );
+}
+
+const ARRAY_PTR_COPY_ADT_SRC: &str = r#"
+struct E(i32);
+fn main() {
+    // The element copy behind `Vec::insert`'s right shift and
+    // `Vec::remove`'s left shift, directly over an array of ADT
+    // elements: elements move whole, never byte-composed.
+    let mut a: [E; 6] = [E(0), E(1), E(2), E(3), E(4), E(5)];
+    unsafe {
+        let p = a.as_mut_ptr();
+        std::ptr::copy(p.add(2), p.add(1), 4);
+    }
+    assert_eq!((a[0].0, a[1].0, a[2].0, a[3].0, a[4].0, a[5].0), (0, 2, 3, 4, 5, 5));
+    let mut b: [E; 6] = [E(0), E(1), E(2), E(3), E(4), E(5)];
+    unsafe {
+        let p = b.as_mut_ptr();
+        std::ptr::copy(p.add(1), p.add(2), 4);
+        std::ptr::write(p.add(1), E(99));
+    }
+    assert_eq!((b[0].0, b[1].0, b[2].0, b[3].0, b[4].0, b[5].0), (0, 99, 1, 2, 3, 4));
+    println!("array-copy ok");
+}
+"#;
+
+#[test]
+fn run_mode_ptr_copy_over_adt_array_elements() {
+    let dir = temp_dir("array-ptr-copy-adt");
+    let src = fixture(&dir, "array_ptr_copy_adt.rs", ARRAY_PTR_COPY_ADT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "ptr::copy over ADT elements must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "array-copy ok\n");
+}
+
 const REF_VEC_ITER_SRC: &str = r#"
 fn main() {
     let v = vec![10, 20, 30];
