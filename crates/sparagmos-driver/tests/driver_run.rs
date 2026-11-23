@@ -9305,6 +9305,74 @@ fn run_mode_termination_result_report() {
     );
 }
 
+const RESULT_OK_EXIT_CODE_SRC: &str = r#"
+fn main() -> Result<std::process::ExitCode, String> {
+    Ok(std::process::ExitCode::from(3))
+}
+"#;
+
+const RESULT_NESTED_ERR_SRC: &str = r#"
+fn main() -> Result<Result<(), String>, String> {
+    Ok(Err("inner".to_string()))
+}
+"#;
+
+const RESULT_NESTED_OK_SRC: &str = r#"
+fn main() -> Result<Result<(), String>, String> {
+    println!("deep");
+    Ok(Ok(()))
+}
+"#;
+
+const RESULT_NESTED_EXIT_CODE_SRC: &str = r#"
+fn main() -> Result<Result<std::process::ExitCode, String>, String> {
+    Ok(Ok(std::process::ExitCode::from(5)))
+}
+"#;
+
+const RESULT_ERR_RC_SRC: &str = r#"
+fn main() -> Result<(), std::rc::Rc<String>> {
+    Err(std::rc::Rc::new(String::from("boom")))
+}
+"#;
+
+#[test]
+fn run_mode_termination_result_delegates_and_renders_live() {
+    // `Result<T, E>::report` delegates `Ok` to `T::report`: an
+    // `ExitCode` payload yields its code (not an unconditional
+    // 0), and a nested `Result` recurses -- its own `Err`
+    // prints and fails, its own `Ok(ExitCode)` yields the code.
+    // An `Err` payload that points into the run's allocations
+    // (an `Rc`) renders its actual Debug text, not the value's
+    // structural form: the report is rendered by the interpreter
+    // that executed the entry, before its state is discarded.
+    let dir = temp_dir("termination-delegate");
+    let src = fixture(&dir, "ok_exit_code.rs", RESULT_OK_EXIT_CODE_SRC);
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(3), "Ok(ExitCode::from(3))");
+    let src = fixture(&dir, "nested_err.rs", RESULT_NESTED_ERR_SRC);
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(1), "Ok(Err(..))");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Error: \"inner\"\n"
+    );
+    let src = fixture(&dir, "nested_ok.rs", RESULT_NESTED_OK_SRC);
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(0), "Ok(Ok(()))");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "deep\n");
+    let src = fixture(&dir, "nested_exit_code.rs", RESULT_NESTED_EXIT_CODE_SRC);
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(5), "Ok(Ok(ExitCode::from(5)))");
+    let src = fixture(&dir, "err_rc.rs", RESULT_ERR_RC_SRC);
+    let out = run_driver(&src);
+    assert_eq!(out.status.code(), Some(1), "Err(Rc<String>)");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Error: \"boom\"\n"
+    );
+}
+
 const LIBTEST_SRC: &str = r#"
 #[test]
 fn alpha() { assert_eq!(1 + 1, 2); }

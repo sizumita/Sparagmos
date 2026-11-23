@@ -1205,44 +1205,81 @@ pub fn interpret_mir_captured_with_config(
     args: Vec<Value>,
     config: crate::InterpConfig,
 ) -> CapturedRun {
+    interpret_mir_captured_impl(program, entry, args, config, |_| None).0
+}
+
+/// Like [`interpret_mir_captured_with_config`], but when the
+/// entry returns normally, `report` is consulted with the
+/// returned value while the interpreter that executed the entry
+/// is still alive: it names the value a `Termination` report
+/// must render (the `Err` payload of a `Result` entry) and the
+/// type tag to render it under, and the payload's `Debug` text
+/// is rendered by that interpreter -- whose allocation store
+/// and statics the payload may point into -- before the run's
+/// state is discarded. The rendered text is returned alongside
+/// the captured run: `None` when `report` names nothing, or
+/// when the payload does not render even against the live state
+/// (it reaches into the run's frames); the caller still applies
+/// the report's exit code.
+pub fn interpret_mir_captured_with_report(
+    program: &MirProgram,
+    entry: &str,
+    args: Vec<Value>,
+    config: crate::InterpConfig,
+    report: impl FnOnce(&Value) -> Option<(Value, String)>,
+) -> (CapturedRun, Option<String>) {
+    interpret_mir_captured_impl(program, entry, args, config, report)
+}
+
+fn interpret_mir_captured_impl(
+    program: &MirProgram,
+    entry: &str,
+    args: Vec<Value>,
+    config: crate::InterpConfig,
+    report: impl FnOnce(&Value) -> Option<(Value, String)>,
+) -> (CapturedRun, Option<String>) {
     match convert_all(program) {
         Ok((ir_program, failures)) => {
             // The entry function's own conversion failure is a
             // whole-run failure with no guest output, as before.
             if let Some(e) = failures.get(entry) {
-                return CapturedRun {
-                    result: Err(MirRunError::from(e.clone())),
-                    stdout: String::new(),
-                    stderr: String::new(),
-                };
+                return (
+                    CapturedRun {
+                        result: Err(MirRunError::from(e.clone())),
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    },
+                    None,
+                );
             }
             let mut interp = Interpreter::with_config(&ir_program, config);
             let result = interp.run(entry, args).map_err(MirRunError::from);
-            CapturedRun {
-                result,
-                stdout: interp.output().to_string(),
-                stderr: interp.error_output().to_string(),
-            }
+            // The termination report renders against the live
+            // interpreter, before its allocations and statics go
+            // away with it.
+            let rendered = match &result {
+                Ok(value) => report(value)
+                    .and_then(|(payload, tag)| interp.format_debug_detached(&payload, &tag).ok()),
+                Err(_) => None,
+            };
+            (
+                CapturedRun {
+                    result,
+                    stdout: interp.output().to_string(),
+                    stderr: interp.error_output().to_string(),
+                },
+                rendered,
+            )
         }
-        Err(e) => CapturedRun {
-            result: Err(MirRunError::from(e)),
-            stdout: String::new(),
-            stderr: String::new(),
-        },
+        Err(e) => (
+            CapturedRun {
+                result: Err(MirRunError::from(e)),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+            None,
+        ),
     }
-}
-
-/// The `Debug` rendering of a `Termination` entry's `Err`
-/// payload, as `Termination::report` prints it (`Error: {err:?}`):
-/// rendered by a fresh interpreter over the converted program,
-/// since the run that produced the value has ended. `None` when
-/// the payload does not render detached from that run (it points
-/// into the run's frames or allocations); the caller still
-/// applies the report's exit code.
-pub fn termination_error_debug(program: &MirProgram, value: &Value, ty: &str) -> Option<String> {
-    let (ir_program, _) = convert_all(program).ok()?;
-    let mut interp = Interpreter::new(&ir_program);
-    interp.format_debug_detached(value, ty).ok()
 }
 
 /// Convert `program` and open a debugger session on `entry`
