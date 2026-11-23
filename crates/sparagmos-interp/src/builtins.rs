@@ -4731,29 +4731,17 @@ impl<'a> Interpreter<'a> {
                         // `Write for Vec<u8>` appends the formatted
                         // bytes to the vector.
                         let target = self.deref_value(frames, &vals[0])?;
-                        let state = self.read_resolved(frames, &target)?;
-                        match state {
-                            Value::Enum {
-                                variant,
-                                mut fields,
-                            } => {
-                                fields.extend(
-                                    text.bytes().map(|b| Value::Uint(b as u128)),
-                                );
-                                self.write_resolved(
-                                    frames,
-                                    &target,
-                                    Value::Enum { variant, fields },
-                                )?;
-                            }
-                            ref other => {
-                                return Err(InterpError::type_mismatch(
-                                    "Write::write_fmt for Vec<u8>",
-                                    "vector value",
-                                    other.kind_name(),
-                                ))
-                            }
-                        }
+                        let mut state = self.read_resolved(frames, &target)?;
+                        let items: Vec<Value> = text
+                            .bytes()
+                            .map(|b| Value::Uint(b as u128))
+                            .collect();
+                        vec_append_in_place(
+                            &mut state,
+                            &items,
+                            "Write::write_fmt for Vec<u8>",
+                        )?;
+                        self.write_resolved(frames, &target, state)?;
                     }
                     _ => {
                         return Err(unsupported(format!(
@@ -6316,9 +6304,14 @@ impl<'a> Interpreter<'a> {
                 {
                     // A by-value `Vec` iterates as `vec::IntoIter`:
                     // the element snapshot plus the next index (the
-                    // vector value's fields are its elements).
+                    // vector value's fields are its elements; the
+                    // sparse form a growth or a shrink leaves
+                    // behind contributes its declared elements).
                     match value {
                         Value::Enum { fields, .. } => Ok(owned_iter_state(fields)),
+                        v @ Value::SparseVec { .. } => {
+                            Ok(owned_iter_state(value_elements(&v)?))
+                        }
                         ref other => Err(InterpError::type_mismatch(
                             "IntoIterator::into_iter for a Vec",
                             "vector value",
@@ -6639,6 +6632,10 @@ impl<'a> Interpreter<'a> {
                     match value {
                         Value::Enum { fields, .. } => (
                             owned_iter_state(fields),
+                            self_ty.replacen("Vec<", "IntoIter<", 1),
+                        ),
+                        v @ Value::SparseVec { .. } => (
+                            owned_iter_state(value_elements(&v)?),
                             self_ty.replacen("Vec<", "IntoIter<", 1),
                         ),
                         other => {
@@ -7400,6 +7397,7 @@ impl<'a> Interpreter<'a> {
                     let elements = match resolved {
                         Value::Enum { fields, .. } => fields,
                         Value::Tuple(items) => items,
+                        v @ Value::SparseVec { .. } => value_elements(&v)?,
                         Value::FatRef { base, .. } => match *base {
                             Value::Tuple(items) => items,
                             other => {
@@ -18847,6 +18845,7 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         let elements = match resolved {
             Value::Enum { fields, .. } => fields,
             Value::Tuple(items) => items,
+            v @ Value::SparseVec { .. } => value_elements(&v)?,
             Value::FatRef { base, .. } => match *base {
                 Value::Tuple(items) => items,
                 other => {

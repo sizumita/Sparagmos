@@ -21385,3 +21385,73 @@ fn run_mode_vec_sparse_ordering_after_growth() {
     );
 }
 
+const VEC_SPARSE_CONSUMERS_SRC: &str = r#"
+use std::collections::VecDeque;
+use std::io::Write;
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::Arc;
+
+fn main() {
+    let mut v = Vec::new();
+    v.push(10);
+    v.push(20);
+    for x in v {
+        println!("elem {x}");
+    }
+
+    let mut v = Vec::new();
+    v.push(10);
+    v.push(20);
+    let r: Rc<[i32]> = v.into();
+    println!("rc {:?} len {}", r, r.len());
+    let mut w = Vec::new();
+    w.push(7);
+    let a: Arc<[i32]> = w.into();
+    println!("arc {:?} len {}", a, a.len());
+
+    let mut v = Vec::new();
+    v.push(10);
+    v.push(20);
+    let mut d: VecDeque<i32> = v.into();
+    println!("deque len {}", d.len());
+    println!("front {:?} back {:?}", d.front(), d.back());
+    println!("pop {:?}", d.pop_front());
+
+    let mut bytes: Vec<u8> = Vec::new();
+    bytes.push(65u8);
+    write!(bytes, "BC").unwrap();
+    println!("written {:?}", String::from_utf8(bytes).unwrap());
+
+    let mut paths = Vec::new();
+    paths.push(PathBuf::from("/a"));
+    paths.push(PathBuf::from("/b"));
+    let joined = std::env::join_paths(paths).unwrap();
+    println!("joined {}", joined.to_string_lossy());
+}
+"#;
+
+#[test]
+fn run_mode_vec_sparse_consumers_after_growth() {
+    // Consumers of a vector the growth path left in its
+    // sparse form take its declared elements, exactly as
+    // equality and ordering do: owning iteration, the
+    // counted-slice conversions (`Rc<[T]>` / `Arc<[T]>`),
+    // the `VecDeque` conversion, a formatted write into a
+    // byte vector, and `join_paths` over a by-value vector.
+    // The spare storage past the length is not part of the
+    // value and never reaches any of them.
+    let dir = temp_dir("vecsparseuse");
+    let src = fixture(&dir, "vecsparseuse.rs", VEC_SPARSE_CONSUMERS_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "consumers of spare-capacity vectors must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "elem 10\nelem 20\nrc [10, 20] len 2\narc [7] len 1\ndeque len 2\nfront Some(10) back Some(20)\npop Some(10)\nwritten \"ABC\"\njoined /a:/b\n"
+    );
+}
