@@ -897,6 +897,24 @@ pub struct Interpreter<'a> {
     /// contents, a materialised constant), where the same
     /// pointer denotes the value itself.
     elem_blocks: std::cell::RefCell<std::collections::HashSet<u64>>,
+    /// Targets of thin pointers that have been exposed as
+    /// integers (a `PtrToInt` rvalue, or a scalar transmute
+    /// flattening through a pointer shape), keyed by the
+    /// synthetic address the exposure produced. Materialising a
+    /// pointer from an integer (an `IntToPtr` rvalue, the
+    /// wrapped forms, scalar construction through a pointer
+    /// shape) restores the recorded target for an address this
+    /// table holds, so a pointer -> integer -> pointer round
+    /// trip recovers the original target -- a rebuilt `Box`
+    /// dereferences to its pointee again -- instead of an
+    /// address-only pointer that denotes no readable place. An
+    /// address the table does not hold materialises as
+    /// [`RefTarget::Address`], as before. Only thin pointers
+    /// ([`Value::Ref`]) are recorded: a fat pointer's metadata
+    /// has no integer form to round-trip through. Entries are
+    /// never removed; allocation ids are never reused, so a
+    /// stale entry can never alias a later allocation.
+    exposed_targets: std::cell::RefCell<std::collections::HashMap<u64, RefTarget>>,
     /// The id the next created allocation gets.
     next_alloc: std::cell::Cell<u64>,
     /// Pre-decoded bodies for the run loop (see [`crate::decode`]),
@@ -1547,6 +1565,9 @@ impl<'a> Interpreter<'a> {
             consumed_iter_final: std::cell::RefCell::new(None),
             address_owners: std::cell::RefCell::new(HashMap::new()),
             elem_blocks: std::cell::RefCell::new(std::collections::HashSet::new()),
+            exposed_targets: std::cell::RefCell::new(
+                std::collections::HashMap::new(),
+            ),
             next_alloc: std::cell::Cell::new(1),
             decoded: std::cell::RefCell::new(std::collections::HashMap::new()),
             adt_instance_keys: std::cell::RefCell::new(HashMap::new()),
@@ -16711,7 +16732,10 @@ impl<'a> Interpreter<'a> {
                 }
             }
             (ScalarShape::Ptr, _) => match synthetic_address(value) {
-                Some(addr) => Ok(addr & bit_mask(64)),
+                Some(addr) => {
+                    self.note_exposed_target(addr as u64, value);
+                    Ok(addr & bit_mask(64))
+                }
                 None => Err(InterpError::type_mismatch(
                     "transmute",
                     "a pointer value",
@@ -16842,9 +16866,7 @@ impl<'a> Interpreter<'a> {
                 32 => f64::from(f32::from_bits(bits as u32)),
                 _ => f64::from_bits(bits as u64),
             })),
-            ScalarShape::Ptr => {
-                Ok(Value::Ref(RefTarget::Address(bits as u64)))
-            }
+            ScalarShape::Ptr => Ok(self.materialized_ptr(bits as u64)),
             ScalarShape::Bool => Ok(Value::Bool(bits != 0)),
             ScalarShape::Char => match char::from_u32(bits as u32) {
                 Some(c) => Ok(Value::Uint(u128::from(c as u32))),
@@ -17099,9 +17121,35 @@ impl<'a> Interpreter<'a> {
 
     // ----- rvalues -----------------------------------------------------------
 
-    /// The wrapper ADT value holding the address-only pointer
-    /// for `addr` in its payload field, with the unique values
-    /// in its zero-sized fields: the result of the
+    /// Record the target of a thin pointer value being exposed
+    /// as the integer `addr` (see the `exposed_targets` field).
+    /// Address-only and null pointers record nothing: their
+    /// integer form already denotes all they are.
+    pub(crate) fn note_exposed_target(&self, addr: u64, value: &Value) {
+        if let Value::Ref(target) = value {
+            if !matches!(target, RefTarget::Address(_) | RefTarget::Null) {
+                self.exposed_targets
+                    .borrow_mut()
+                    .insert(addr, target.clone());
+            }
+        }
+    }
+
+    /// The pointer value materialised from the integer `addr`:
+    /// the target recorded when that address was exposed (see
+    /// [`Self::note_exposed_target`]), or an address-only
+    /// pointer for an address that was never exposed.
+    pub(crate) fn materialized_ptr(&self, addr: u64) -> Value {
+        if let Some(target) = self.exposed_targets.borrow().get(&addr) {
+            return Value::Ref(target.clone());
+        }
+        Value::Ref(RefTarget::Address(addr))
+    }
+
+    /// The wrapper ADT value holding the pointer materialised
+    /// from `addr` (see [`Self::materialized_ptr`]) in its
+    /// payload field, with the unique values in its zero-sized
+    /// fields: the result of the
     /// integer/enum-to-pointer-wrapper transmutes.
     fn ptr_wrapped_value(
         &self,
@@ -17111,7 +17159,7 @@ impl<'a> Interpreter<'a> {
         fill: &[(u32, Constant)],
     ) -> InterpResult<Value> {
         let mut fields = vec![Value::Uninit; field_count];
-        fields[payload_index as usize] = Value::Ref(RefTarget::Address(addr));
+        fields[payload_index as usize] = self.materialized_ptr(addr);
         for (index, constant) in fill {
             fields[*index as usize] = self.eval_constant(constant)?;
         }
@@ -17304,7 +17352,10 @@ impl<'a> Interpreter<'a> {
                 let value = self.eval_operand(frames, body, operand)?;
                 let leaf = operand_pointee_ty(body, operand);
                 match self.pointer_address(frames, &value, leaf.as_ref()) {
-                    Some(addr) => Ok(Value::Uint(addr)),
+                    Some(addr) => {
+                        self.note_exposed_target(addr as u64, &value);
+                        Ok(Value::Uint(addr))
+                    }
                     None => Err(InterpError::TypeMismatch {
                         context: "pointer-to-integer transmute".to_string(),
                         expected: "a pointer value".to_string(),
@@ -17357,8 +17408,8 @@ impl<'a> Interpreter<'a> {
             Rvalue::IntToPtr(operand) => {
                 let value = self.eval_operand(frames, body, operand)?;
                 match value {
-                    Value::Int(i) => Ok(Value::Ref(RefTarget::Address(i as u64))),
-                    Value::Uint(u) => Ok(Value::Ref(RefTarget::Address(u as u64))),
+                    Value::Int(i) => Ok(self.materialized_ptr(i as u64)),
+                    Value::Uint(u) => Ok(self.materialized_ptr(u as u64)),
                     other => Err(InterpError::type_mismatch(
                         "integer-to-pointer transmute",
                         "an integer value",
