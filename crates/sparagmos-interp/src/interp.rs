@@ -3188,7 +3188,7 @@ impl<'a> Interpreter<'a> {
                     &bound,
                     regs,
                     step,
-                ),
+                )?,
             }
         }
         for (i, reg) in regs.iter().enumerate() {
@@ -23013,6 +23013,35 @@ fn asm_scalar_bits(
     })
 }
 
+/// The register-file index of the stack pointer (the layout
+/// `ArchReg::index` documents: 0..16 are rax, rcx, rdx, rbx,
+/// rsp, rbp, rsi, rdi, r8..=r15).
+const ARCH_RSP: usize = 4;
+
+/// Reject a read of the incoming stack pointer. A read of
+/// `rsp` before the program itself has written it observes the
+/// *incoming* value — the one the caller's frame layout fixes
+/// (natively it points at the return address the call pushed).
+/// The register model does not represent that state: the file
+/// starts at zero and no seed supplies it, since arguments
+/// never arrive in `rsp`. Returning the fabricated zero would
+/// silently compute with a wrong stack pointer, so the read is
+/// a named unsupported until the incoming stack state is
+/// modelled. A program that establishes its own `rsp` first
+/// (recorded in `arch_written`) reads that value normally.
+fn check_incoming_rsp_read(
+    arch_written: &[bool; 48],
+    reg: sparagmos_mir::ArchReg,
+) -> InterpResult<()> {
+    if reg.index as usize == ARCH_RSP && !arch_written[ARCH_RSP] {
+        return Err(InterpError::UnsupportedTerminator {
+            kind: "InlineAsm (read of the incoming stack pointer `rsp`, which is not modelled)"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Read an architectural register at its access width (`h` reads
 /// bits 8..16).
 fn asm_arch_read(arch: &[u64; 48], reg: sparagmos_mir::ArchReg) -> u64 {
@@ -23095,7 +23124,16 @@ fn asm_input_bits(value: &Value, reg: &AsmReg) -> InterpResult<u64> {
 fn asm_output_value(bits: u64, reg: &AsmReg) -> Value {
     let masked = bits & asm_width_mask(reg.width);
     match reg.kind {
-        AsmRegKind::Signed => Value::Int(asm_sign_extend(masked, reg.width) as i128),
+        // The sign-extended bits are the value's two's-complement
+        // form: reinterpret them as a signed 64-bit integer before
+        // widening to i128. Casting the u64 straight to i128
+        // would zero-extend, turning -1 into 2^64 - 1 — a wrong
+        // result wherever the value is consumed without a
+        // further type normalization (a naked function's return
+        // place is assigned directly, with no `write_place`).
+        AsmRegKind::Signed => {
+            Value::Int((asm_sign_extend(masked, reg.width) as i64) as i128)
+        }
         AsmRegKind::Unsigned => Value::Uint(u128::from(masked)),
         AsmRegKind::Bool => Value::Bool(masked != 0),
     }
@@ -23158,17 +23196,25 @@ fn asm_instr_width(regs: &[AsmReg], idx: usize, modifier: Option<char>) -> u32 {
     }
 }
 
-/// The value of an instruction source operand.
+/// The value of an instruction source operand. An architectural
+/// source is a register read: reading the incoming stack
+/// pointer is rejected (see `check_incoming_rsp_read`).
 fn asm_src_value(
     slots: &[u64],
     regs: &[AsmReg],
     arch: &[u64; 48],
+    arch_written: &[bool; 48],
     src: &sparagmos_mir::AsmSrc,
-) -> u64 {
+) -> InterpResult<u64> {
     match src {
-        sparagmos_mir::AsmSrc::Reg(idx, modifier) => asm_read(slots, regs, *idx, *modifier),
-        sparagmos_mir::AsmSrc::Imm(bits) => *bits,
-        sparagmos_mir::AsmSrc::Arch(reg) => asm_arch_read(arch, *reg),
+        sparagmos_mir::AsmSrc::Reg(idx, modifier) => {
+            Ok(asm_read(slots, regs, *idx, *modifier))
+        }
+        sparagmos_mir::AsmSrc::Imm(bits) => Ok(*bits),
+        sparagmos_mir::AsmSrc::Arch(reg) => {
+            check_incoming_rsp_read(arch_written, *reg)?;
+            Ok(asm_arch_read(arch, *reg))
+        }
     }
 }
 
@@ -23185,12 +23231,12 @@ fn exec_asm_step(
     bound: &[Option<usize>; 48],
     regs: &[AsmReg],
     step: &AsmStep,
-) {
+) -> InterpResult<()> {
     use sparagmos_mir::AsmDst;
     match step {
         AsmStep::Nop | AsmStep::Ret | AsmStep::Jump { .. } | AsmStep::Call { .. } => {}
         AsmStep::Mov { dst, dst_mod, src } => {
-            let value = asm_src_value(slots, regs, arch, src);
+            let value = asm_src_value(slots, regs, arch, arch_written, src)?;
             asm_write(slots, written, regs, *dst, *dst_mod, value);
             asm_sync_slot_to_arch(slots, arch, arch_written, regs, *dst);
         }
@@ -23203,7 +23249,7 @@ fn exec_asm_step(
             let width = asm_instr_width(regs, *dst, *dst_mod);
             let mask = asm_width_mask(width);
             let a = asm_read(slots, regs, *dst, *dst_mod) & mask;
-            let b = asm_src_value(slots, regs, arch, src) & mask;
+            let b = asm_src_value(slots, regs, arch, arch_written, src)? & mask;
             let result = asm_bin_result(*op, a, b, width);
             asm_write(slots, written, regs, *dst, *dst_mod, result & mask);
             asm_sync_slot_to_arch(slots, arch, arch_written, regs, *dst);
@@ -23217,7 +23263,7 @@ fn exec_asm_step(
             asm_sync_slot_to_arch(slots, arch, arch_written, regs, *dst);
         }
         AsmStep::MovArch { dst, src } => {
-            let value = asm_src_value(slots, regs, arch, src);
+            let value = asm_src_value(slots, regs, arch, arch_written, src)?;
             asm_arch_write(arch, *dst, value);
             arch_written[dst.index as usize] = true;
             asm_sync_arch_to_slot(arch, slots, written, bound, *dst);
@@ -23225,8 +23271,9 @@ fn exec_asm_step(
         AsmStep::BinArch { op, dst, src } => {
             let width = dst.width;
             let mask = asm_width_mask(width);
+            check_incoming_rsp_read(arch_written, *dst)?;
             let a = asm_arch_read(arch, *dst) & mask;
-            let b = asm_src_value(slots, regs, arch, src) & mask;
+            let b = asm_src_value(slots, regs, arch, arch_written, src)? & mask;
             let result = asm_bin_result(*op, a, b, width);
             asm_arch_write(arch, *dst, result & mask);
             arch_written[dst.index as usize] = true;
@@ -23235,6 +23282,7 @@ fn exec_asm_step(
         AsmStep::UnArch { op, dst } => {
             let width = dst.width;
             let mask = asm_width_mask(width);
+            check_incoming_rsp_read(arch_written, *dst)?;
             let a = asm_arch_read(arch, *dst) & mask;
             let result = asm_un_result(*op, a);
             asm_arch_write(arch, *dst, result & mask);
@@ -23253,7 +23301,8 @@ fn exec_asm_step(
                 sparagmos_mir::AsmSrc::Arch(reg) => reg.width,
                 sparagmos_mir::AsmSrc::Imm(_) => 64,
             };
-            let addr = asm_src_value(slots, regs, arch, base).wrapping_add(*disp as u64)
+            let addr = asm_src_value(slots, regs, arch, arch_written, base)?
+                .wrapping_add(*disp as u64)
                 & asm_width_mask(addr_width);
             match dst {
                 AsmDst::Operand(idx, modifier) => {
@@ -23268,6 +23317,7 @@ fn exec_asm_step(
             }
         }
     }
+    Ok(())
 }
 
 /// The result of one binary asm operation at `width` bits.

@@ -11854,6 +11854,88 @@ fn run_mode_inline_asm_lea_wraps_at_address_size() {
     run_ok("asm-lea-wrap", ASM_LEA_WRAP_SRC, "0 4294967296\n");
 }
 
+const ASM_NAKED_SIGNED_RET_SRC: &str = r#"
+use std::arch::naked_asm;
+
+#[unsafe(naked)]
+pub extern "sysv64" fn neg_one64() -> i64 {
+    naked_asm!("mov rax, -1", "ret");
+}
+
+#[unsafe(naked)]
+pub extern "sysv64" fn neg_one32() -> i32 {
+    naked_asm!("mov eax, -1", "ret");
+}
+
+#[unsafe(naked)]
+pub extern "sysv64" fn neg_one16() -> i16 {
+    naked_asm!("mov ax, -1", "ret");
+}
+
+#[unsafe(naked)]
+pub extern "sysv64" fn neg_one8() -> i8 {
+    naked_asm!("mov al, -1", "ret");
+}
+
+fn main() {
+    println!(
+        "{} {} {} {}",
+        neg_one64(),
+        neg_one32(),
+        neg_one16(),
+        neg_one8()
+    );
+}
+"#;
+
+#[test]
+fn run_mode_naked_fn_signed_return_values() {
+    // A naked body's return value is the register content read
+    // at the return type's shape: a signed type reads the bits
+    // as two's complement at its width, so each body above
+    // returns -1 — natively `-1 -1 -1 -1`.
+    run_ok(
+        "asm-naked-signed-ret",
+        ASM_NAKED_SIGNED_RET_SRC,
+        "-1 -1 -1 -1\n",
+    );
+}
+
+const ASM_NAKED_RSP_SRC: &str = r#"
+use std::arch::naked_asm;
+
+#[unsafe(naked)]
+pub extern "sysv64" fn alignment() -> u64 {
+    naked_asm!("mov rax, rsp", "and rax, 15", "ret");
+}
+
+fn main() {
+    println!("{}", alignment());
+}
+"#;
+
+#[test]
+fn run_mode_naked_fn_incoming_rsp_read_is_a_named_error() {
+    // The incoming `rsp` is fixed by the caller's frame layout
+    // (natively this body returns 8, for the return address on
+    // the stack); the register model does not represent it, so
+    // reading it is a named error — exit 2 — rather than a
+    // computation with a fabricated zero stack pointer.
+    let dir = temp_dir("asm-naked-rsp");
+    let src = fixture(&dir, "case.rs", ASM_NAKED_RSP_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a read of the incoming stack pointer must exit two; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("stack pointer"),
+        "the reason names the incoming stack pointer: {stderr}"
+    );
+}
+
 #[test]
 fn convert_mode_inline_asm_outside_class_converts() {
     // The same out-of-class block converts in full: conversion is

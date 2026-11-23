@@ -3257,6 +3257,97 @@ fn inline_asm_lea_wraps_at_the_base_address_size() {
     assert_eq!(run_asm_body("lea_ph", body_ph), Value::Uint(0));
 }
 
+#[test]
+fn naked_fn_signed_return_is_sign_extended_from_the_return_width() {
+    // A naked body returns whatever it left in rax, read at the
+    // function's return shape: for a signed return type the
+    // register bits are the value's two's-complement form at
+    // that width, so `mov rax, -1` in an i64 body is -1 — not
+    // the zero-extended 2^64 - 1 the raw u64 bits widen to when
+    // they are cast straight to i128.
+    for (template, ty, expected) in [
+        ("mov rax, -1\nret", i64_ty(), -1i128),
+        ("mov eax, -1\nret", i32_ty(), -1),
+        ("mov ax, -1\nret", i16_ty(), -1),
+        ("mov al, -1\nret", i8_ty(), -1),
+        ("mov eax, -128\nret", i32_ty(), -128),
+        ("mov eax, 127\nret", i32_ty(), 127),
+    ] {
+        let body = mir::Body::new(
+            decls(&[ty]),
+            0,
+            vec![block(vec![], asm_prog_term(template, vec![], None))],
+        );
+        assert_eq!(
+            run_asm_body("neg", body),
+            Value::Int(expected),
+            "template {template:?}"
+        );
+    }
+}
+
+#[test]
+fn naked_fn_read_of_the_incoming_stack_pointer_is_a_named_error() {
+    // The incoming `rsp` is fixed by the caller's frame layout;
+    // the register model does not represent it (the register
+    // file starts at zero and no seed supplies it — arguments
+    // never arrive in `rsp`), so a naked body that reads it
+    // before establishing its own value is a named error rather
+    // than a program that computes with a fabricated zero stack
+    // pointer. Natively `mov rax, rsp; and rax, 15` yields 8
+    // (the return address occupies the top of the stack).
+    for template in [
+        "mov rax, rsp\nand rax, 15\nret",
+        "sub rsp, 8\nmov rax, rsp\nret",
+        "lea rax, [rsp + 8]\nret",
+    ] {
+        let body = mir::Body::new(
+            decls(&[u64_ty()]),
+            0,
+            vec![block(vec![], asm_prog_term(template, vec![], None))],
+        );
+        let mut prog = MirProgram::new();
+        prog.add("f", body);
+        match interpret_mir(&prog, "f", vec![]) {
+            Err(MirRunError::Interp(InterpError::UnsupportedTerminator { kind })) => {
+                assert!(
+                    kind.contains("stack pointer"),
+                    "error names the incoming stack pointer: {kind}"
+                );
+            }
+            Err(e) => panic!("expected UnsupportedTerminator for the rsp read, got {e}"),
+            Ok(v) => panic!("expected UnsupportedTerminator for the rsp read, got {v:?}"),
+        }
+    }
+}
+
+#[test]
+fn naked_fn_read_of_a_self_written_stack_pointer_runs() {
+    // A naked body that establishes its own `rsp` value first
+    // reads that value back: only the *incoming* stack pointer
+    // is unmodelled.
+    const F_DEF: mir::DefId = mir::DefId::new(0, 78);
+    let body = mir::Body::new(
+        decls(&[u64_ty(), u64_ty()]),
+        1,
+        vec![block(
+            vec![],
+            asm_prog_term(
+                "mov rax, rdi\nmov rsp, rax\nmov rax, rsp\nret",
+                vec![],
+                None,
+            ),
+        )],
+    );
+    let mut prog = MirProgram::new();
+    prog.add_with_def_id("f", F_DEF, body);
+    prog.fn_abis.insert(F_DEF, mir::Abi::C);
+    assert_eq!(
+        interpret_mir(&prog, "f", vec![Value::Uint(42)]).expect("self-written rsp runs"),
+        Value::Uint(42)
+    );
+}
+
 // ----- transmute: the honestly representable shapes (Lane DN) ----------------
 
 fn ref_i32_ty() -> mir::Ty {
