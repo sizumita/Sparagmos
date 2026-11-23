@@ -11177,6 +11177,26 @@ impl<'c, 'a> DropGlueBuilder<'c, 'a> {
                 let inner = self.plan(args.first()?)?;
                 return Some(at_field0(inner));
             }
+            "std::cmp::Reverse"
+            | "core::cmp::Reverse"
+            | "std::num::Wrapping"
+            | "core::num::Wrapping"
+            | "std::num::Saturating"
+            | "core::num::Saturating" => {
+                // One-field transparent wrappers with no `Drop`
+                // impl of their own: dropping the wrapper drops
+                // the held value, exactly as dropping the held
+                // value itself would (`at_field0` collapses a
+                // trivial inner plan). These types are named here
+                // because the generic path below refuses a foreign
+                // ADT whose impl the name table cannot rule out,
+                // and a `Termination` report payload is dropped by
+                // glue the interpreter synthesizes for it -- no
+                // body drops the payload, so the driver scan that
+                // certifies dropped types never certifies them.
+                let inner = self.plan(args.first()?)?;
+                return Some(at_field0(inner));
+            }
             "std::pin::Pin" | "core::pin::Pin" | "std::pin::PinMacroHelper" => {
                 // `Pin<P>` has no destructor of its own (it is a
                 // transparent newtype with no `Drop` impl); dropping
