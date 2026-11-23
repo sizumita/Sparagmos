@@ -21455,3 +21455,80 @@ fn run_mode_vec_sparse_consumers_after_growth() {
         "elem 10\nelem 20\nrc [10, 20] len 2\narc [7] len 1\ndeque len 2\nfront Some(10) back Some(20)\npop Some(10)\nwritten \"ABC\"\njoined /a:/b\n"
     );
 }
+
+const PATH_FMT_SRC: &str = r#"
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug)]
+struct Wrap {
+    p: PathBuf,
+    n: i32,
+}
+
+fn main() {
+    // The Debug of the path / OS-string wrapper types is the
+    // quoted content, not the wrapper structure; width and
+    // precision are not consulted by std's impls.
+    println!("{:?}", PathBuf::from("a/b"));
+    println!("{:?}", Path::new("a/b"));
+    println!("{:?}", OsString::from("os/s"));
+    println!("{:?}", vec![PathBuf::from("x"), PathBuf::from("y/z")]);
+    println!("{:.2?}", PathBuf::from("abcdef"));
+    println!("{:>12?}", PathBuf::from("ab"));
+    println!("{:?}", Wrap { p: PathBuf::from("in/struct"), n: 3 });
+    println!("{:?}", PathBuf::from("a\\b\"c"));
+    println!("{:?}", PathBuf::from(""));
+    println!("path-fmt-ok");
+}
+"#;
+
+#[test]
+fn run_mode_path_and_os_string_debug_formats_content() {
+    let dir = temp_dir("path-fmt");
+    let src = fixture(&dir, "path_fmt.rs", PATH_FMT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "path Debug formatting runs; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "\"a/b\"\n\"a/b\"\n\"os/s\"\n[\"x\", \"y/z\"]\n\"abcdef\"\n\"ab\"\nWrap { p: \"in/struct\", n: 3 }\n\"a\\\\b\\\"c\"\n\"\"\npath-fmt-ok\n",
+        "PathBuf/Path/OsString Debug renders the quoted content like std"
+    );
+}
+
+const PATH_DISPLAY_SRC: &str = r#"
+use std::path::{Path, PathBuf};
+
+fn main() {
+    println!("{}", Path::new("a/b").display());
+    println!("{}", PathBuf::from("dir/file.txt").display());
+    let s = Path::new("x/y").display().to_string();
+    println!("{s}");
+    let pb = PathBuf::from("p/q");
+    println!("{}", pb.display());
+    println!("path-display-ok");
+}
+"#;
+
+#[test]
+fn run_mode_path_display_and_to_string() {
+    let dir = temp_dir("path-display");
+    let src = fixture(&dir, "path_display.rs", PATH_DISPLAY_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "path Display formatting runs; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a/b\ndir/file.txt\nx/y\np/q\npath-display-ok\n",
+        "Path::display renders the path content and to_string converts it"
+    );
+}

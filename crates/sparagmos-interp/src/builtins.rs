@@ -8641,10 +8641,31 @@ impl<'a> Interpreter<'a> {
                     Value::FmtArguments(ref args) => {
                         Ok(Value::Str(self.format_arguments(frames, args, 0)?))
                     }
-                    ref other => Err(unsupported(format!(
-                        "ToString::to_string for {self_ty} (a {}) is not runtime-supported",
-                        other.kind_name()
-                    ))),
+                    ref other => {
+                        // `to_string` is `Display` formatting with
+                        // the default options: an ADT value whose
+                        // type's `Display` the fmt engine serves
+                        // (a collected body, or one of the std
+                        // shapes it models) converts through it.
+                        // Anything else keeps the unsupported
+                        // error.
+                        if matches!(other, Value::Enum { .. }) {
+                            if let Ok(text) = self.format_value(
+                                frames,
+                                other,
+                                FmtTrait::Display,
+                                self_ty,
+                                &FmtOptions::new(),
+                                0,
+                            ) {
+                                return Ok(Value::Str(text));
+                            }
+                        }
+                        Err(unsupported(format!(
+                            "ToString::to_string for {self_ty} (a {}) is not runtime-supported",
+                            other.kind_name()
+                        )))
+                    }
                 }
             }
             Builtin::BoxNew => {
@@ -26276,6 +26297,14 @@ impl<'a> Interpreter<'a> {
         if let Some(text) = self.format_cow(frames, value, trait_, ty, options, indent)? {
             return Ok(text);
         }
+        // The std byte-string wrapper types (`PathBuf`, `Path`,
+        // `OsString`, `OsStr`) define their `Debug` over the
+        // string content they hold, and the `std::path::Display`
+        // helper defines its `Display` as the lossy content:
+        // render the extracted bytes.
+        if let Some(text) = self.format_string_content(frames, value, trait_, ty, options)? {
+            return Ok(text);
+        }
         // A guest `fmt` implementation body, when the program
         // collected one for this type, is the faithful
         // formatting: run it against a captured `Formatter`
@@ -26515,6 +26544,100 @@ impl<'a> Interpreter<'a> {
         Ok(Some(self.format_value(
             frames, &field, trait_, &inner_ty, options, indent,
         )?))
+    }
+
+    /// Formatting for the std byte-string wrapper types whose
+    /// fmt impls std defines directly over the held bytes. A
+    /// transparent wrapper around string data — `PathBuf` around
+    /// `OsString` around the byte buffer, `Path` / `OsStr` as the
+    /// unsized forms — debugs as the content itself: quoted, with
+    /// non-UTF-8 bytes escaped, exactly the rendering the host's
+    /// `OsStr` `Debug` produces (std's impls write the content
+    /// directly and do not consult width or precision). The
+    /// `std::path::Display<'_>` helper that `Path::display`
+    /// returns displays as the lossy content. `None` when the
+    /// type is not one of these or the value holds no
+    /// extractable bytes, in which case the existing behaviour
+    /// stands.
+    fn format_string_content(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        value: &Value,
+        trait_: FmtTrait,
+        ty: &str,
+        options: &FmtOptions,
+    ) -> InterpResult<Option<String>> {
+        let plain = pointee_tag(ty);
+        let head = plain.split('<').next().unwrap_or(plain).trim();
+        match head {
+            "std::path::PathBuf"
+            | "std::path::Path"
+            | "std::ffi::OsString"
+            | "std::ffi::OsStr" => {
+                if trait_ != FmtTrait::Debug {
+                    return Ok(None);
+                }
+                let Some(bytes) = self.string_content_bytes(frames, value) else {
+                    return Ok(None);
+                };
+                use std::os::unix::ffi::OsStrExt as _;
+                Ok(Some(format!("{:?}", std::ffi::OsStr::from_bytes(&bytes))))
+            }
+            "std::path::Display" => {
+                if trait_ != FmtTrait::Display {
+                    return Ok(None);
+                }
+                let Value::Enum { fields, .. } = value else {
+                    return Ok(None);
+                };
+                let [field] = fields.as_slice() else {
+                    return Ok(None);
+                };
+                let field = field.clone();
+                let Some(bytes) = self.string_content_bytes(frames, &field) else {
+                    return Ok(None);
+                };
+                Ok(Some(pad_str(&String::from_utf8_lossy(&bytes), options)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The bytes a path / OS-string value holds, through
+    /// whichever representation the value model gave it: an
+    /// owned wrapper aggregate, a string value, or a fat
+    /// reference over byte storage.
+    fn string_content_bytes(&self, frames: &[Frame], value: &Value) -> Option<Vec<u8>> {
+        if let Ok(bytes) = self.os_str_bytes(frames, value) {
+            return Some(bytes);
+        }
+        if let Ok(bytes) = self.path_bytes(frames, value) {
+            return Some(bytes);
+        }
+        // A reference to the data may itself sit inside
+        // one-field wrappers (the shape the field of a
+        // `std::path::Display` takes): unwrap those layers,
+        // resolving references as they surface, and retry the
+        // extraction at each step.
+        let mut current = value.clone();
+        for _ in 0..8 {
+            match current {
+                Value::Enum { fields, .. } if fields.len() == 1 => {
+                    current = fields.into_iter().next().expect("length checked");
+                }
+                Value::Ref(_) | Value::FatRef { .. } => {
+                    current = self.resolve_value(frames, &current).ok()?;
+                }
+                _ => return None,
+            }
+            if let Ok(bytes) = self.os_str_bytes(frames, &current) {
+                return Some(bytes);
+            }
+            if let Ok(bytes) = self.path_bytes(frames, &current) {
+                return Some(bytes);
+            }
+        }
+        None
     }
 
     fn format_display(
