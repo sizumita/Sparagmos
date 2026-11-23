@@ -14916,7 +14916,7 @@ fn value_fingerprint(value: &Value) -> u64 {
         }
         let (ptr_field, end_field) = (iter[0].clone(), iter[1].clone());
         let (Some(cur), Some(last)) =
-            (iter_ptr_index(&ptr_field), iter_ptr_index(&end_field))
+            (iter_ptr_index(&ptr_field, None), iter_ptr_index(&end_field, None))
         else {
             return Err(InterpError::type_mismatch(
                 "Drain state",
@@ -15661,9 +15661,11 @@ fn value_fingerprint(value: &Value) -> u64 {
                 ));
             }
             let (ptr_field, end) = (fields[0].clone(), fields[1].clone());
-            if let (Some(cur), Some(last)) =
-                (iter_ptr_index(&ptr_field), iter_ptr_index(&end))
-            {
+            let elem_size = slice_iter_elem_size(self_ty);
+            if let (Some(cur), Some(last)) = (
+                iter_ptr_index(&ptr_field, elem_size),
+                iter_ptr_index(&end, elem_size),
+            ) {
                 if cur < last {
                     let advanced = iter_ptr_with_index(&ptr_field, cur + 1)
                         .expect("index step checked");
@@ -15825,8 +15827,9 @@ fn value_fingerprint(value: &Value) -> u64 {
                 }
             } else {
                 let (ptr_field, end) = (fields[0].clone(), fields[1].clone());
+                let elem_size = slice_iter_elem_size(self_ty);
                 if let (Some(cur), Some(last)) =
-                    (iter_ptr_index(&ptr_field), iter_ptr_index(&end))
+                    (iter_ptr_index(&ptr_field, elem_size), iter_ptr_index(&end, elem_size))
                 {
                     if cur < last {
                         let advanced = iter_ptr_with_index(&ptr_field, cur + 1)
@@ -18356,7 +18359,7 @@ fn value_fingerprint(value: &Value) -> u64 {
     /// of the logical range was never written -- not a state a
     /// well-formed deque reaches). The buffer's physical layout
     /// is not part of the sequence.
-    fn vec_deque_elements(
+    pub(crate) fn vec_deque_elements(
         &self,
         value: &Value,
     ) -> InterpResult<Option<Vec<Value>>> {
@@ -22622,7 +22625,7 @@ fn slice_iter_step_real(
             // pointer for a ZST, the pointer being meaningless.
             // The remaining count is the distance from the
             // current index to that terminal index.
-            if let Some(i) = iter_ptr_index(&ptr_ref) {
+            if let Some(i) = iter_ptr_index(&ptr_ref, None) {
                 let end = *end_addr as usize;
                 if i >= end {
                     return Some(Ok((fields.to_vec(), none_value())));
@@ -22799,7 +22802,7 @@ fn iter_zst_bounds(fields: &[Value]) -> Option<(u64, u64)> {
     if matches!(ptr, Value::Ref(RefTarget::Address(_))) {
         return None;
     }
-    let cur = iter_ptr_index(fields.first()?).unwrap_or(0) as u64;
+    let cur = iter_ptr_index(fields.first()?, None).unwrap_or(0) as u64;
     Some((cur, end))
 }
 
@@ -22812,13 +22815,80 @@ fn iter_zst_remaining(fields: &[Value]) -> Option<u64> {
     Some(end.saturating_sub(cur))
 }
 
-/// The element index a slice-iterator pointer denotes: the
-/// trailing `Index` step of its target's projection, if it has
-/// one.
-fn iter_ptr_index(value: &Value) -> Option<usize> {
+/// The size of a `slice::Iter`'s element type, as the
+/// iterator's type parameter names it, for the types whose
+/// size the name alone fixes (the scalar and pointer types).
+/// An ADT element's size is not derivable from the name here;
+/// a byte displacement over such an element stays unjudged
+/// (a displacement-free element pointer is judged by its
+/// trailing element step alone).
+fn slice_iter_elem_size(self_ty: &str) -> Option<u64> {
+    let elem = first_generic_param(self_ty)?;
+    let elem = elem.trim();
+    Some(match elem {
+        "bool" | "i8" | "u8" => 1,
+        "i16" | "u16" => 2,
+        "i32" | "u32" | "f32" | "char" => 4,
+        "i64" | "u64" | "f64" | "isize" | "usize" => 8,
+        "i128" | "u128" => 16,
+        "()" => 0,
+        _ => {
+            let pointee = elem
+                .strip_prefix("&mut ")
+                .or_else(|| elem.strip_prefix('&'))
+                .or_else(|| elem.strip_prefix("*const "))
+                .or_else(|| elem.strip_prefix("*mut "));
+            match pointee {
+                Some(rest)
+                    if rest.starts_with('[')
+                        || rest == "str"
+                        || rest.starts_with("dyn ") =>
+                {
+                    16
+                }
+                Some(_) => 8,
+                None => return None,
+            }
+        }
+    })
+}
+
+/// The position of the element step in a pointer projection:
+/// the last `Index` or `Field` step, with only whole-value
+/// entry steps (a transparent wrapper's field 0, a downcast)
+/// after it. Any other trailing step means the projection does
+/// not end at an element position.
+fn elem_step_pos(projection: &[RefProj]) -> Option<usize> {
+    let mut pos = projection.len();
+    while pos > 0 {
+        match projection[pos - 1] {
+            RefProj::Field(0) | RefProj::Downcast(_) => pos -= 1,
+            RefProj::Index(_) | RefProj::Field(_) => return Some(pos - 1),
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// The element index a slice-iterator pointer denotes. Two
+/// forms occur. The states the builtins build point into a
+/// value snapshot, the projection a lone trailing `Index`
+/// step. The states guest code builds (core's `Iter::new`,
+/// inlined into its caller as an aggregate) point into the
+/// sequence's own storage: the projection ends at an element
+/// step -- an `Index` step into the element sequence or a
+/// `Field` step onto an array element, possibly followed by
+/// whole-value entry steps into that element (the wrapper
+/// entry a `MaybeUninit` element cast leaves) -- optionally
+/// followed by the byte displacement the caller's pointer
+/// arithmetic added, which counts further elements in units
+/// of the element size (a zero element size counts bytes
+/// directly, the zero-sized element convention; an unknown
+/// size leaves a displaced pointer unjudged).
+fn iter_ptr_index(value: &Value, elem_size: Option<u64>) -> Option<usize> {
     if let Value::Enum { fields, .. } = value {
         if fields.len() == 1 {
-            return iter_ptr_index(&fields[0]);
+            return iter_ptr_index(&fields[0], elem_size);
         }
     }
     let projection = match value {
@@ -22828,18 +22898,29 @@ fn iter_ptr_index(value: &Value) -> Option<usize> {
         Value::Ref(RefTarget::Value(_, projection)) => projection,
         _ => return None,
     };
-    element_position(projection)
+    let (steps, bytes) = match projection.last() {
+        Some(RefProj::ByteOffset(n)) if *n >= 0 => {
+            (&projection[..projection.len() - 1], *n as u64)
+        }
+        _ => (projection.as_slice(), 0),
+    };
+    let base = match steps.get(elem_step_pos(steps)?) {
+        Some(RefProj::Index(i)) => *i,
+        Some(RefProj::Field(f)) => *f,
+        _ => return None,
+    };
+    if bytes == 0 {
+        return Some(base);
+    }
+    match elem_size {
+        Some(0) => base.checked_add(usize::try_from(bytes).ok()?),
+        Some(size) if bytes % size == 0 => {
+            base.checked_add(usize::try_from(bytes / size).ok()?)
+        }
+        _ => None,
+    }
 }
 
-/// The element position a sequence pointer denotes: the last
-/// `Index` step of its projection (tuple-stored sequences;
-/// wrapper-entry steps into the element itself may follow it),
-/// or — for an enum-stored sequence, whose elements are the
-/// ADT's fields — the trailing `Field` step when the projection
-/// carries no `Index` step at all.
-fn element_position(projection: &[RefProj]) -> Option<usize> {
-    element_position_step(projection).map(|(_, i)| i)
-}
 
 /// The element position a projection denotes, as the
 /// (step index, element index) pair: the last `Index` step, or
@@ -22863,8 +22944,11 @@ fn element_position_step(projection: &[RefProj]) -> Option<(usize, usize)> {
     }
 }
 
-/// The same element pointer with its trailing `Index` step set
-/// to `idx`.
+/// The same element pointer with its element step set to
+/// `idx`: the element step (see `elem_step_pos`) takes the new
+/// index, whole-value entry steps after it are kept, and a
+/// trailing byte displacement (part of the old position, not
+/// of the base) is dropped.
 fn iter_ptr_with_index(value: &Value, idx: usize) -> Option<Value> {
     if let Value::Enum { variant, fields } = value {
         if fields.len() == 1 {
@@ -22877,24 +22961,16 @@ fn iter_ptr_with_index(value: &Value, idx: usize) -> Option<Value> {
     }
     fn with_index(projection: &[RefProj], idx: usize) -> Option<Vec<RefProj>> {
         let mut projection = projection.to_vec();
-        // The element position `element_position` reads: the
-        // last `Index` step, or the trailing `Field` step of an
-        // enum-stored sequence.
-        if let Some(step) = projection
-            .iter_mut()
-            .rev()
-            .find(|step| matches!(step, RefProj::Index(_)))
-        {
-            *step = RefProj::Index(idx);
-            return Some(projection);
+        if matches!(projection.last(), Some(RefProj::ByteOffset(_))) {
+            projection.pop();
         }
-        match projection.last_mut() {
-            Some(RefProj::Field(i)) => {
-                *i = idx;
-                Some(projection)
-            }
-            _ => None,
+        let pos = elem_step_pos(&projection)?;
+        match &mut projection[pos] {
+            RefProj::Index(i) => *i = idx,
+            RefProj::Field(f) => *f = idx,
+            _ => return None,
         }
+        Some(projection)
     }
     match value {
         Value::Ref(RefTarget::Place {
@@ -22943,8 +23019,11 @@ fn slice_iter_bounds(state: &Value, self_ty: &str) -> InterpResult<(usize, usize
         // them.
         return Ok((cur as usize, end as usize));
     }
-    let (Some(cur), Some(end)) = (iter_ptr_index(&fields[0]), iter_ptr_index(&fields[1]))
-    else {
+    let elem_size = slice_iter_elem_size(self_ty);
+    let (Some(cur), Some(end)) = (
+        iter_ptr_index(&fields[0], elem_size),
+        iter_ptr_index(&fields[1], elem_size),
+    ) else {
         return Err(InterpError::type_mismatch(
             "slice::Iter state",
             "element pointers into the element snapshot",
@@ -23022,7 +23101,7 @@ fn step_slice_iter_back(
                 _ => raw,
             }
         };
-        if iter_ptr_index(&fields[0]).is_some() {
+        if iter_ptr_index(&fields[0], None).is_some() {
             // The mixed zero-sized form (see `iter_zst_bounds`):
             // the end field is the terminal index the front
             // step's index advance is measured against, so the

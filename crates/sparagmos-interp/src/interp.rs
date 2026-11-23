@@ -601,6 +601,27 @@ pub(crate) fn alignment_value(align: u128) -> Value {
     Value::Uint(align)
 }
 
+/// The pointer a chain of one-field pointer wrappers holds:
+/// the innermost field of a chain of single-field aggregates
+/// (`NonNull` inside `Unique`, a `Box` inside its owner
+/// wrapper), when that field is a pointer value. `None` when
+/// the chain ends in anything else.
+pub(crate) fn ptr_wrapper_pointer(value: &Value) -> Option<Value> {
+    let mut cur = value;
+    loop {
+        match cur {
+            Value::Enum { fields, .. } if fields.len() == 1 => match &fields[0] {
+                p @ (Value::Ref(_)
+                | Value::FatRef { .. }
+                | Value::DynRef { .. }) => return Some(p.clone()),
+                inner @ Value::Enum { .. } => cur = inner,
+                _ => return None,
+            },
+            _ => return None,
+        }
+    }
+}
+
 pub(crate) fn box_alloc_pointer(value: &Value) -> Option<(u64, Vec<RefProj>)> {
     match value {
         Value::Enum { fields, .. } if fields.len() == 1 => match &fields[0] {
@@ -6536,9 +6557,18 @@ impl<'a> Interpreter<'a> {
             // store -- ids are never reused, so nothing can observe
             // the difference within a run.)
             if let Ok(Some(value)) = self.read_at(frames, &active.root, &[]) {
-                if let Some((id, _)) = box_alloc_pointer(&value) {
-                    self.note_box_free(frames, &value);
-                    self.free_alloc(id);
+                // Only a box-shaped value whose pointer denotes
+                // the allocation's base owns the allocation: a
+                // one-field struct holding a reference into
+                // another value's storage (a drop guard's `&mut`
+                // field, say) has the same value shape but owns
+                // nothing, and freeing its pointee would cut the
+                // owner's storage from under it.
+                if let Some((id, projection)) = box_alloc_pointer(&value) {
+                    if projection_is_base(&projection) {
+                        self.note_box_free(frames, &value);
+                        self.free_alloc(id);
+                    }
                 }
             }
             // The place is cleared only when it is a local of the
@@ -10800,11 +10830,29 @@ impl<'a> Interpreter<'a> {
     /// pointers denote no field and pass through unchanged.
     pub(crate) fn ptr_field_value(
         &self,
-        frames: &[Frame],
+        frames: &mut Vec<Frame>,
         body: &Body,
         value: Value,
         depth: u32,
     ) -> InterpResult<Value> {
+        // A wrapper-entry cast over an array / slice of wrappers
+        // (`*const [MaybeUninit<T>]` to `*const [T]`, what
+        // `assume_init_ref` performs) enters every element's
+        // wrapper, not the first element's alone: when the
+        // pointer denotes the elements' own storage (the array
+        // value, a tuple of one-field wrapper values), the entry
+        // rewrites the elements in place and the pointer itself
+        // is unchanged -- the same in-place convention
+        // `rewrite_slice_elems` applies. A pointer whose base
+        // denotes one entered element (the sub-slice / offset
+        // form) keeps the field-0 entry on the base below.
+        if depth > 0 {
+            if let Some(unchanged) =
+                self.ptr_field_rewrite_array_elems(frames, &value, depth)?
+            {
+                return Ok(unchanged);
+            }
+        }
         match value {
             Value::Ref(RefTarget::Place {
                 frame,
@@ -10880,6 +10928,107 @@ impl<'a> Interpreter<'a> {
                 other.kind_name(),
             )),
         }
+    }
+
+    /// The in-place element rewrite a wrapper-entry pointer
+    /// cast over an array / slice of wrappers denotes (see
+    /// [`Self::ptr_field_value`]): `Some` (the pointer,
+    /// unchanged) when the pointer denotes the elements' own
+    /// storage and every spanned element holds the wrapper
+    /// form; `None` when the cast is not of that shape.
+    fn ptr_field_rewrite_array_elems(
+        &self,
+        frames: &mut Vec<Frame>,
+        value: &Value,
+        depth: u32,
+    ) -> InterpResult<Option<Value>> {
+        let (resolved, count) = match value {
+            Value::FatRef { base, len } => {
+                let Ok(count) = usize::try_from(*len) else {
+                    return Ok(None);
+                };
+                (self.deref_value(frames, base)?, count)
+            }
+            Value::Ref(_) => {
+                let resolved = self.deref_value(frames, value)?;
+                let count = match self.read_resolved(frames, &resolved) {
+                    Ok(v) => match v.len() {
+                        Some(n) => match usize::try_from(n) {
+                            Ok(n) => n,
+                            Err(_) => return Ok(None),
+                        },
+                        None => return Ok(None),
+                    },
+                    Err(_) => return Ok(None),
+                };
+                (resolved, count)
+            }
+            _ => return Ok(None),
+        };
+        if count == 0 || matches!(resolved, Resolved::Value(..)) {
+            return Ok(None);
+        }
+        let pointee = match self.read_resolved(frames, &resolved) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        let Value::Tuple(items) = &pointee else {
+            return Ok(None);
+        };
+        if items.len() < count {
+            return Ok(None);
+        }
+        // Every spanned element must hold the wrapper form (a
+        // one-field aggregate, or an uninitialised slot, which
+        // has no representation to change); anything else means
+        // the pointer does not denote an array of wrappers and
+        // the field-0 entry on the base decides, as before.
+        let mut unwrapped: Vec<Value> = Vec::with_capacity(count);
+        for item in &items[..count] {
+            let mut elem = item.clone();
+            for _ in 0..depth {
+                match elem {
+                    Value::Enum { fields, .. } if fields.len() == 1 => {
+                        elem = fields.into_iter().next().expect("one field");
+                    }
+                    Value::Uninit => break,
+                    _ => return Ok(None),
+                }
+            }
+            unwrapped.push(elem);
+        }
+        for (i, new) in unwrapped.into_iter().enumerate() {
+            if new == items[i] {
+                continue;
+            }
+            let mut projection = match &resolved {
+                Resolved::Place { projection, .. }
+                | Resolved::Static { projection, .. }
+                | Resolved::Alloc { projection, .. } => projection.clone(),
+                Resolved::Value(..) => unreachable!("excluded above"),
+            };
+            projection.push(RefProj::Index(i));
+            let target = match &resolved {
+                Resolved::Place {
+                    frame_pos, local, ..
+                } => Resolved::Place {
+                    frame_pos: *frame_pos,
+                    local: *local,
+                    projection,
+                },
+                Resolved::Static { name, .. } => Resolved::Static {
+                    name: name.clone(),
+                    projection,
+                },
+                Resolved::Alloc { id, .. } => Resolved::Alloc {
+                    id: *id,
+                    projection,
+                },
+                Resolved::Value(..) => unreachable!("excluded above"),
+            };
+            self.write_resolved(frames, &target, new)?;
+        }
+        Ok(Some(value.clone()))
     }
 
     /// The pointer an array / slice / `str` to element cast
@@ -16144,23 +16293,18 @@ impl<'a> Interpreter<'a> {
             // fieldless (niche) variant value carries no pointer
             // to read, so it stays a mismatch rather than
             // fabricating one.
-            // A pointer-shaped ADT value (`NonNull`, `Unique`)
-            // written to a raw-pointer or reference place: MIR
-            // moves these transparent wrappers into pointer
-            // places verbatim (the `Allocator::deallocate` body
-            // passes its `NonNull<u8>` straight to
-            // `__rust_dealloc`), and the pointer the wrapper
-            // holds is the value the place denotes.
-            (Some(Ty::Ref(_)), Value::Enum { fields, .. })
-                if fields.len() == 1
-                    && matches!(
-                        fields[0],
-                        Value::Ref(_)
-                            | Value::FatRef { .. }
-                            | Value::DynRef { .. }
-                    ) =>
+            // A pointer-shaped ADT value (`NonNull`, `Unique`,
+            // a `Box` inside its owner wrapper) written to a
+            // raw-pointer or reference place: MIR moves these
+            // transparent wrappers into pointer places verbatim
+            // (the `Allocator::deallocate` body passes its
+            // `NonNull<u8>` straight to `__rust_dealloc`), and
+            // the pointer the wrapper chain holds is the value
+            // the place denotes.
+            (Some(Ty::Ref(_)), Value::Enum { .. })
+                if ptr_wrapper_pointer(&value).is_some() =>
             {
-                Ok(fields[0].clone())
+                Ok(ptr_wrapper_pointer(&value).expect("guard checked"))
             }
             (Some(Ty::Str), Value::Str(_)) => Ok(value),
             (Some(Ty::Array(_, n)), Value::Tuple(items)) if items.len() as u64 == *n => Ok(value),
@@ -16204,11 +16348,13 @@ impl<'a> Interpreter<'a> {
             {
                 Ok(value)
             }
-            (Some(expected), other) => Err(InterpError::type_mismatch(
-                "assignment",
-                format!("{expected:?}"),
-                other.kind_name(),
-            )),
+            (Some(expected), other) => {
+                Err(InterpError::type_mismatch(
+                    "assignment",
+                    format!("{expected:?}"),
+                    other.kind_name(),
+                ))
+            }
         }
     }
 
@@ -19720,7 +19866,13 @@ fn projection_ends_at_element(projection: &[RefProj]) -> bool {
     let mut pos = projection.len();
     while pos > 0 {
         match projection[pos - 1] {
-            RefProj::Field(_) | RefProj::Downcast(_) => pos -= 1,
+            // A whole-value entry step enters a transparent
+            // wrapper's only field (or downcasts to the entered
+            // variant); any other field step selects a genuine
+            // field of the element the index step denotes (a
+            // node's key array, say), and the position denotes
+            // that field's value, not the element.
+            RefProj::Field(0) | RefProj::Downcast(_) => pos -= 1,
             RefProj::Index(_) => return true,
             _ => return false,
         }
@@ -19830,10 +19982,11 @@ fn entered_element_container(cur: &Resolved) -> Option<(Resolved, usize)> {
     let mut entered = false;
     while pos > 0 {
         match projection[pos - 1] {
-            RefProj::Field(_) | RefProj::Downcast(_) => {
+            RefProj::Field(0) | RefProj::Downcast(_) => {
                 entered = true;
                 pos -= 1;
             }
+            RefProj::Field(_) => return None,
             RefProj::Index(k) => {
                 if !entered {
                     return None;
@@ -19972,7 +20125,14 @@ fn compose_fat_index(cur: &Resolved, idx: usize) -> Option<Resolved> {
         let mut pos = projection.len();
         loop {
             match projection.get(pos.wrapping_sub(1)) {
-                Some(RefProj::Field(_)) | Some(RefProj::Downcast(_)) => {
+                // Only a whole-value entry step (a transparent
+                // wrapper's field 0, a downcast) can follow the
+                // element index here; any other field step selects
+                // a field of the element the index denotes (a
+                // node's key array, say), and composing the new
+                // index into that outer index would denote the
+                // field itself rather than its element.
+                Some(RefProj::Field(0)) | Some(RefProj::Downcast(_)) => {
                     pos -= 1;
                 }
                 Some(RefProj::Index(_)) => {
