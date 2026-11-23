@@ -1558,6 +1558,12 @@ fn scalar_shape_has_ptr_leaf(shape: &ir::ScalarShape) -> bool {
         ir::ScalarShape::NicheEnum { inner, .. } => {
             scalar_shape_has_ptr_leaf(inner)
         }
+        ir::ScalarShape::AdtFields { fields, .. } => fields
+            .iter()
+            .any(|(_, _, s)| scalar_shape_has_ptr_leaf(s)),
+        ir::ScalarShape::TaggedEnum { variants, .. } => variants
+            .iter()
+            .any(|v| v.fields.iter().any(|(_, _, s)| scalar_shape_has_ptr_leaf(s))),
         ir::ScalarShape::Array(elem, _) => scalar_shape_has_ptr_leaf(elem),
         _ => false,
     }
@@ -2099,6 +2105,12 @@ struct Converter<'a> {
     coroutine_layouts: &'a mir::CoroutineLayouts,
     /// ADT instance layouts of the program (see `MirProgram`).
     adt_layouts: &'a mir::AdtLayouts,
+    /// Per-variant field layouts of the program's ADT
+    /// instances (see `MirProgram`).
+    adt_field_layouts: &'a mir::AdtFieldLayouts,
+    /// Direct tag layouts of the program's enum instances
+    /// (see `MirProgram`).
+    adt_tag_layouts: &'a mir::AdtTagLayouts,
     /// ADT instantiations with compiler-certified empty drop
     /// glue (see `MirProgram::drop_trivial_adts`).
     drop_trivial_adts: &'a std::collections::HashSet<String>,
@@ -2242,6 +2254,8 @@ impl<'a> Converter<'a> {
             adt_niches: &program.adt_niches,
             coroutine_layouts: &program.coroutine_layouts,
             adt_layouts: &program.adt_layouts,
+            adt_field_layouts: &program.adt_field_layouts,
+            adt_tag_layouts: &program.adt_tag_layouts,
             drop_trivial_adts: &program.drop_trivial_adts,
             drop_no_impl_adts: &program.drop_no_impl_adts,
             dtor_bodies: &program.dtor_bodies,
@@ -3686,6 +3700,12 @@ impl<'a> Converter<'a> {
             ir::ScalarShape::Array(elem, _) => Self::shape_contains_ptr(elem),
             ir::ScalarShape::AdtField { inner, .. } => Self::shape_contains_ptr(inner),
             ir::ScalarShape::NicheEnum { inner, .. } => Self::shape_contains_ptr(inner),
+            ir::ScalarShape::AdtFields { fields, .. } => fields
+                .iter()
+                .any(|(_, _, s)| Self::shape_contains_ptr(s)),
+            ir::ScalarShape::TaggedEnum { variants, .. } => variants
+                .iter()
+                .any(|v| v.fields.iter().any(|(_, _, s)| Self::shape_contains_ptr(s))),
             _ => false,
         }
     }
@@ -4966,6 +4986,85 @@ impl<'a> Converter<'a> {
         }
     }
 
+    /// The rvalue for a `Transmute` cast from a byte-subslice
+    /// place to an integer: the compiler's transmute validity
+    /// checks (inserted under debug assertions) reinterpret
+    /// the input through its byte-array form and read a chunk
+    /// of it back as an integer — `copy _33[0..2] as u16`,
+    /// where `_33` is the input transmuted to
+    /// `[MaybeUninit<u8>; 4]`. The operand must be a place
+    /// whose last projection is a literal subslice (`from_end`
+    /// false) of exactly the integer's byte width, over a
+    /// byte element (`u8` / `i8`, or `MaybeUninit` of one);
+    /// the cast is then the array-of-bytes reinterpretation
+    /// of the subslice's value, whose elements the place
+    /// read yields in order.
+    fn subslice_to_int_rvalue(
+        &self,
+        operand: &mir::Operand,
+        v: &ir::Operand,
+        src: &Option<mir::Ty>,
+        target: &mir::Ty,
+    ) -> Option<ir::Rvalue> {
+        let (signed, bits) = match target {
+            mir::Ty::Int(it) => (true, it.bits()),
+            mir::Ty::Uint(ut) => (false, ut.bits()),
+            _ => return None,
+        };
+        let mir::Ty::Slice(elem) = src.as_ref()? else {
+            return None;
+        };
+        let byte_shape = ir::ScalarShape::Int {
+            bits: 8,
+            signed: false,
+        };
+        let elem_shape = match elem.as_ref() {
+            mir::Ty::Uint(mir::UintTy::U8)
+            | mir::Ty::Int(mir::IntTy::I8) => byte_shape,
+            mir::Ty::Adt(def, args)
+                if self.is_maybe_uninit(def)
+                    && args.len() == 1
+                    && matches!(
+                        args[0],
+                        mir::Ty::Uint(mir::UintTy::U8)
+                            | mir::Ty::Int(mir::IntTy::I8)
+                    ) =>
+            {
+                ir::ScalarShape::AdtField {
+                    index: 0,
+                    count: 1,
+                    fill: Vec::new(),
+                    inner: Box::new(byte_shape),
+                }
+            }
+            _ => return None,
+        };
+        let place = match operand {
+            mir::Operand::Copy(p) | mir::Operand::Move(p) => p,
+            _ => return None,
+        };
+        let Some(mir::PlaceElem::Subslice {
+            from,
+            to,
+            from_end,
+        }) = place.projection.last()
+        else {
+            return None;
+        };
+        if *from_end {
+            return None;
+        }
+        let len = to.checked_sub(*from)?;
+        if len == 0 || len * 8 != u64::from(bits) {
+            return None;
+        }
+        Some(ir::Rvalue::Reinterpret(
+            v.clone(),
+            ir::ScalarShape::Array(Box::new(elem_shape), len),
+            ir::ScalarShape::Int { bits, signed },
+        ))
+    }
+
     /// Convert a `CastKind::Transmute` rvalue: `operand` is the
     /// MIR operand, `v` its converted IR form, `target` the cast's
     /// target type. Only the shapes this value model can
@@ -4997,11 +5096,17 @@ impl<'a> Converter<'a> {
     ///   uniquely determined by its type;
     /// * scalar-shaped -> scalar-shaped of the same total width
     ///   ([`ir::Rvalue::Reinterpret`]): integers, floats, `bool`
-    ///   and `char` in any combination, arrays of scalars, and
-    ///   one-payload-field ADTs over those, and niche-encoded
-    ///   enums over a scalar or thin-pointer payload
-    ///   (`Option<NonNull<T>>`) — the bit-level
-    ///   reinterpretation `transmute` means there;
+    ///   and `char` in any combination, arrays of scalars,
+    ///   one-payload-field ADTs over those, multi-field structs
+    ///   whose scalar fields sit at their recorded layout
+    ///   offsets (a packed struct transmuted to a byte array),
+    ///   direct-tag enums whose variants' fields sit at theirs,
+    ///   and niche-encoded enums over a scalar or thin-pointer
+    ///   payload (`Option<NonNull<T>>`), over a fieldless-enum
+    ///   payload, or over a wider payload field holding the
+    ///   niche scalar in a sub-window (an enum whose payload
+    ///   is itself an enum) — the bit-level reinterpretation
+    ///   `transmute` means there;
     /// * pointer <-> pointer over byte-string DST pointees
     ///   (`str`, `[u8]`, `OsStr`, `Path` in any combination);
     /// * fat pointer <-> fat pointer, and fat pointer <->
@@ -5046,9 +5151,11 @@ impl<'a> Converter<'a> {
     ///   first and the pointer decisions above run on it.
     ///
     /// Every other shape — aggregate <-> aggregate byte
-    /// reinterpretation beyond one payload field, fat pointers,
-    /// enums with payloads beyond the niche-encoded shape —
-    /// stays [`ir::Rvalue::Unsupported`]:
+    /// reinterpretation whose fields the recorded layouts
+    /// cannot account for scalar by scalar, fat pointers
+    /// outside the fat-pointer shape, enums whose encoding
+    /// is neither a recorded direct tag nor a recorded
+    /// niche — stays [`ir::Rvalue::Unsupported`]:
     /// the model has no flat byte memory to reinterpret through.
     fn convert_transmute(
         &self,
@@ -5233,6 +5340,16 @@ impl<'a> Converter<'a> {
                 _ => None,
             }
         };
+        // A byte-subslice place transmuted to an integer (the
+        // compiler's transmute validity checks read the
+        // input's bytes this way): the slice source carries
+        // no scalar shape, so the generic path above cannot
+        // see it.
+        if let Some(rv) =
+            self.subslice_to_int_rvalue(operand, v, &src, target)
+        {
+            return rv;
+        }
         // One-payload wrapper crossings, decided ahead of the
         // shape arms below: a one-field struct (or a
         // `MaybeUninit`) transmuted to exactly its payload type
@@ -6460,7 +6577,10 @@ let inner = match (&src, target) {
                     {
                         return Some(s);
                     }
-                    return self.fieldless_enum_shape(def);
+                    if let Some(s) = self.fieldless_enum_shape(def) {
+                        return Some(s);
+                    }
+                    return self.tagged_enum_shape(def, args, shape, depth);
                 }
                 let fields = self.instantiated_field_tys(def, args, 0)?;
                 // A single array field whose length is a const
@@ -6504,6 +6624,26 @@ let inner = match (&src, target) {
                         }
                     }
                 }
+                // Several scalar-shaped fields: the
+                // whole-storage shape at the recorded layout
+                // offsets (a packed struct transmuted to a
+                // byte array is the canonical case). The
+                // one-payload loop below cannot describe it,
+                // and where this fails no other arm can
+                // either, so its result is final.
+                if fields
+                    .iter()
+                    .filter(|fty| {
+                        matches!(
+                            self.scalar_shape(fty, depth + 1),
+                            Some(fs) if fs.bits() > 0
+                        )
+                    })
+                    .count()
+                    >= 2
+                {
+                    return self.adt_fields_shape(def, args, &fields, depth);
+                }
                 let mut payload: Option<(u32, ir::ScalarShape)> = None;
                 let mut fill = Vec::new();
                 for (i, fty) in fields.iter().enumerate() {
@@ -6536,14 +6676,21 @@ let inner = match (&src, target) {
     /// enum whose layout stores the discriminant in the
     /// invalid values of its one payload field (see
     /// `mir::EnumNiche`), such as `Option<NonZero<T>>`. The
-    /// shape applies only when the recorded encoding is
-    /// exactly the one this value model reinterprets through:
-    /// the niche scalar is the payload field itself (offset 0
-    /// and the field's own width), the payload variant
-    /// carries exactly that one field, and every other
-    /// variant is fieldless and niche-encoded. Anything else
-    /// — a niche inside a wider field, several payload
-    /// variants — has no shape and stays unsupported.
+    /// payload variant must carry exactly that one field and
+    /// every other variant must be fieldless and
+    /// niche-encoded. The niche scalar is usually the
+    /// payload field itself (the window is the field's whole
+    /// pattern); it can also be a sub-window of a wider
+    /// payload field — the payload is then itself a tagged
+    /// enum whose tag is the niche — when the recorded
+    /// layouts confirm the field spans the enum's whole
+    /// storage at offset 0, so the shape's pattern is the
+    /// field's pattern. A fieldless-enum payload takes its
+    /// shape at the niche scalar's own width, the width its
+    /// tag is stored at. Anything else — several payload
+    /// variants, a niche scalar reaching outside the
+    /// payload field's pattern — has no shape and stays
+    /// unsupported.
     fn niche_enum_shape(
         &self,
         def: &mir::AdtDefId,
@@ -6553,9 +6700,6 @@ let inner = match (&src, target) {
     ) -> Option<ir::ScalarShape> {
         let tag = crate::builtins::ty_tag(&mir::Ty::Adt(*def, args.to_vec()), self.names);
         let niche = self.adt_niches.get(&tag)?;
-        if niche.niche_offset != 0 {
-            return None;
-        }
         let (first, last) = niche.niche_variants;
         let niche_count = last.checked_sub(first)? + 1;
         if shape.variants.len() as u32 != niche_count + 1 {
@@ -6577,8 +6721,67 @@ let inner = match (&src, target) {
         let [fty] = fields.as_slice() else {
             return None;
         };
-        let inner = self.scalar_shape(fty, depth + 1)?;
-        if inner.bits() == 0 || inner.bits() != niche.tag_bits {
+        // The payload field's own shape: the field's shape
+        // when its width is the niche scalar's, a wider
+        // field whose pattern holds the scalar in a
+        // sub-window (sound only when the field spans the
+        // enum's whole storage at offset 0), or — for a
+        // fieldless-enum field — that enum's shape at the
+        // scalar's width (the width its tag is stored at,
+        // not the width inferred from its discriminant
+        // range), provided the discriminants' patterns at
+        // that width stay distinct.
+        let inner = match self.scalar_shape(fty, depth + 1) {
+            Some(s) if s.bits() == niche.tag_bits => s,
+            Some(s) if s.bits() > niche.tag_bits => {
+                if !self.niche_field_spans_enum(
+                    def,
+                    args,
+                    niche.untagged_variant,
+                ) {
+                    return None;
+                }
+                s
+            }
+            _ => {
+                let mir::Ty::Adt(fdef, _) = fty else {
+                    return None;
+                };
+                let discriminants =
+                    self.fieldless_enum_discriminants(fdef)?;
+                let mask = if niche.tag_bits >= 128 {
+                    u128::MAX
+                } else {
+                    (1u128 << niche.tag_bits) - 1
+                };
+                let mut seen = std::collections::HashSet::new();
+                if discriminants.is_empty()
+                    || !discriminants
+                        .iter()
+                        .all(|d| seen.insert((*d as u128) & mask))
+                {
+                    return None;
+                }
+                ir::ScalarShape::FieldlessEnum {
+                    bits: niche.tag_bits,
+                    discriminants,
+                }
+            }
+        };
+        if inner.bits() == 0 {
+            return None;
+        }
+        let niche_shift = (niche.niche_offset * 8) as u32;
+        if niche_shift + niche.tag_bits > inner.bits() {
+            return None;
+        }
+        if niche_shift > 0
+            && !self.niche_field_spans_enum(
+                def,
+                args,
+                niche.untagged_variant,
+            )
+        {
             return None;
         }
         Some(ir::ScalarShape::NicheEnum {
@@ -6586,6 +6789,232 @@ let inner = match (&src, target) {
             untagged_variant: niche.untagged_variant,
             niche_variants: niche.niche_variants,
             niche_start: niche.niche_start,
+            niche_shift,
+            niche_bits: niche.tag_bits,
+        })
+    }
+
+    /// Whether the payload field of the niche-encoded enum
+    /// instance `def`/`args` spans the instance's whole
+    /// storage at offset 0, per the recorded layouts: the
+    /// condition under which the shape's bit pattern is the
+    /// payload field's own pattern, so a niche scalar inside
+    /// the field is a sub-window of the pattern.
+    fn niche_field_spans_enum(
+        &self,
+        def: &mir::AdtDefId,
+        args: &[mir::Ty],
+        untagged_variant: u32,
+    ) -> bool {
+        let tag = crate::builtins::ty_tag(
+            &mir::Ty::Adt(*def, args.to_vec()),
+            self.names,
+        );
+        let Some((size, _)) = self.adt_layouts.get(&tag) else {
+            return false;
+        };
+        let Some(layouts) = self.adt_field_layouts.get(&tag) else {
+            return false;
+        };
+        let Some(v) = layouts.get(untagged_variant as usize) else {
+            return false;
+        };
+        v.len() == 1 && v[0].0 == 0 && v[0].1 == *size
+    }
+
+    /// The scalar shape of a field whose recorded storage
+    /// span is `span` bytes: the field's own shape when it
+    /// accounts for exactly the span's bits, or — for a
+    /// fieldless enum field, whose inferred shape width
+    /// follows its discriminant range — that shape at the
+    /// span's width, the width its tag is stored at,
+    /// provided the discriminants' patterns at that width
+    /// stay distinct.
+    fn field_shape_at_span(
+        &self,
+        fty: &mir::Ty,
+        span: u64,
+        depth: u32,
+    ) -> Option<ir::ScalarShape> {
+        let want = (span * 8) as u32;
+        if want == 0 || want > 128 {
+            return None;
+        }
+        if let Some(s) = self.scalar_shape(fty, depth + 1) {
+            if s.bits() == want {
+                return Some(s);
+            }
+        }
+        let mir::Ty::Adt(fdef, _) = fty else {
+            return None;
+        };
+        let discriminants = self.fieldless_enum_discriminants(fdef)?;
+        if discriminants.is_empty() {
+            return None;
+        }
+        let mask = if want == 128 {
+            u128::MAX
+        } else {
+            (1u128 << want) - 1
+        };
+        let mut seen = std::collections::HashSet::new();
+        if !discriminants
+            .iter()
+            .all(|d| seen.insert((*d as u128) & mask))
+        {
+            return None;
+        }
+        Some(ir::ScalarShape::FieldlessEnum {
+            bits: want,
+            discriminants,
+        })
+    }
+
+    /// The scalar shape of a single-variant ADT (a struct)
+    /// with several scalar-shaped fields, at the fields'
+    /// recorded layout offsets: every field must be
+    /// scalar-shaped at exactly its storage span's width
+    /// (see [`Self::field_shape_at_span`]) or zero-sized
+    /// with a uniquely determined value, the fields' spans
+    /// must not overlap, and the instance's layout must be
+    /// recorded. Bits no field accounts for (padding)
+    /// flatten as zero and are ignored on construction.
+    fn adt_fields_shape(
+        &self,
+        def: &mir::AdtDefId,
+        args: &[mir::Ty],
+        fields: &[mir::Ty],
+        depth: u32,
+    ) -> Option<ir::ScalarShape> {
+        let tag = crate::builtins::ty_tag(
+            &mir::Ty::Adt(*def, args.to_vec()),
+            self.names,
+        );
+        let (size, _) = *self.adt_layouts.get(&tag)?;
+        if size == 0 || size > 16 {
+            return None;
+        }
+        let layouts = self.adt_field_layouts.get(&tag)?;
+        if layouts.len() != 1 {
+            return None;
+        }
+        let vlayout = &layouts[0];
+        if vlayout.len() != fields.len() {
+            return None;
+        }
+        let mut out_fields = Vec::new();
+        let mut fill = Vec::new();
+        let mut spans: Vec<(u64, u64)> = Vec::new();
+        for (i, fty) in fields.iter().enumerate() {
+            let (off, fsize) = vlayout[i];
+            if fsize == 0 {
+                let zv = self.zst_value(fty, 0)?;
+                fill.push((i as u32, value_to_constant(&zv)?));
+                continue;
+            }
+            if off + fsize > size {
+                return None;
+            }
+            let fs = self.field_shape_at_span(fty, fsize, depth)?;
+            if spans
+                .iter()
+                .any(|(o, s)| off < o + s && *o < off + fsize)
+            {
+                return None;
+            }
+            spans.push((off, fsize));
+            out_fields.push((i as u32, (off * 8) as u32, fs));
+        }
+        if out_fields.len() < 2 {
+            return None;
+        }
+        Some(ir::ScalarShape::AdtFields {
+            total_bits: (size * 8) as u32,
+            count: fields.len(),
+            fill,
+            fields: out_fields,
+        })
+    }
+
+    /// The scalar shape of a direct-tag enum instance: the
+    /// recorded tag (offset, width, per-variant
+    /// discriminants) plus each variant's scalar-shaped
+    /// fields at their recorded layout offsets. Every
+    /// variant's fields must be scalar-shaped at exactly
+    /// their storage spans (see
+    /// [`Self::field_shape_at_span`]) or zero-sized with a
+    /// uniquely determined value, and no field span may
+    /// overlap the tag's span or another field's.
+    fn tagged_enum_shape(
+        &self,
+        def: &mir::AdtDefId,
+        args: &[mir::Ty],
+        shape: &mir::AdtShape,
+        depth: u32,
+    ) -> Option<ir::ScalarShape> {
+        let tag = crate::builtins::ty_tag(
+            &mir::Ty::Adt(*def, args.to_vec()),
+            self.names,
+        );
+        let etag = self.adt_tag_layouts.get(&tag)?;
+        let (size, _) = *self.adt_layouts.get(&tag)?;
+        if size == 0
+            || size > 16
+            || etag.size == 0
+            || etag.offset + etag.size > size
+        {
+            return None;
+        }
+        if etag.discriminants.len() != shape.variants.len() {
+            return None;
+        }
+        let layouts = self.adt_field_layouts.get(&tag)?;
+        if layouts.len() != shape.variants.len() {
+            return None;
+        }
+        let mut variants = Vec::with_capacity(shape.variants.len());
+        for v in 0..shape.variants.len() {
+            let ftys = self.instantiated_field_tys(def, args, v as u32)?;
+            let vlayout = &layouts[v];
+            if vlayout.len() != ftys.len() {
+                return None;
+            }
+            let mut out_fields = Vec::new();
+            let mut fill = Vec::new();
+            let mut spans: Vec<(u64, u64)> =
+                vec![(etag.offset, etag.size)];
+            for (i, fty) in ftys.iter().enumerate() {
+                let (off, fsize) = vlayout[i];
+                if fsize == 0 {
+                    let zv = self.zst_value(fty, 0)?;
+                    fill.push((i as u32, value_to_constant(&zv)?));
+                    continue;
+                }
+                if off + fsize > size {
+                    return None;
+                }
+                let fs = self.field_shape_at_span(fty, fsize, depth)?;
+                if spans
+                    .iter()
+                    .any(|(o, s)| off < o + s && *o < off + fsize)
+                {
+                    return None;
+                }
+                spans.push((off, fsize));
+                out_fields.push((i as u32, (off * 8) as u32, fs));
+            }
+            variants.push(ir::TaggedVariantShape {
+                count: ftys.len(),
+                fill,
+                fields: out_fields,
+            });
+        }
+        Some(ir::ScalarShape::TaggedEnum {
+            total_bits: (size * 8) as u32,
+            tag_offset: (etag.offset * 8) as u32,
+            tag_bits: (etag.size * 8) as u32,
+            discriminants: etag.discriminants.clone(),
+            variants,
         })
     }
 

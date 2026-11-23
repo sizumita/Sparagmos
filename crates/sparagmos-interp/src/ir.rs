@@ -484,6 +484,19 @@ pub enum FatMeta {
     Vtable,
 }
 
+/// One variant of a [`ScalarShape::TaggedEnum`]: the
+/// variant's scalar-shaped fields as `(field index, bit
+/// offset, shape)` triples at their recorded layout
+/// offsets, its zero-sized fields baked in as `fill`
+/// constants for construction, and `count`, the variant's
+/// total field count.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaggedVariantShape {
+    pub count: usize,
+    pub fill: Vec<(u32, Constant)>,
+    pub fields: Vec<(u32, u32, ScalarShape)>,
+}
+
 /// One side of a scalar `Transmute` reinterpretation
 /// ([`Rvalue::Reinterpret`]): how a value of this shape flattens
 /// to a bit pattern (little-endian, the x86_64 target's order)
@@ -540,14 +553,59 @@ pub enum ScalarShape {
     /// (`untagged_variant`) stores its single field's own bit
     /// pattern (the `inner` shape), and the fieldless variants
     /// `niche_variants.0..=niche_variants.1` are stored as
-    /// `niche_start + (variant - niche_variants.0)` in that
-    /// same field — the encoding `Option<NonZero<T>>` and its
-    /// kin use for their discriminant.
+    /// `niche_start + (variant - niche_variants.0)` in the
+    /// `niche_bits`-wide window at bit offset `niche_shift`
+    /// of that pattern — the encoding `Option<NonZero<T>>`
+    /// and its kin use for their discriminant. The window is
+    /// the whole pattern (shift 0, the payload field's own
+    /// width) when the niche scalar is the payload field
+    /// itself; it is a sub-window when the payload field is
+    /// wider than the niche scalar — an enum whose payload
+    /// is itself an enum stores the outer discriminant in
+    /// the payload's own tag.
     NicheEnum {
         inner: Box<ScalarShape>,
         untagged_variant: u32,
         niche_variants: (u32, u32),
         niche_start: u128,
+        niche_shift: u32,
+        niche_bits: u32,
+    },
+    /// A single-variant ADT (a struct) with several
+    /// scalar-shaped fields: field `index`'s bit pattern
+    /// sits at bit offset `offset` of the whole pattern (the
+    /// field's recorded layout offset times eight); the
+    /// remaining fields are zero-sized with uniquely
+    /// determined values, baked in as `fill` constants for
+    /// construction and ignored when flattening. `count` is
+    /// the ADT's total field count and `total_bits` its
+    /// whole storage width; bits no field accounts for
+    /// (padding) flatten as zero and are ignored on
+    /// construction. The encoding a packed struct transmuted
+    /// to a byte array uses.
+    AdtFields {
+        total_bits: u32,
+        count: usize,
+        fill: Vec<(u32, Constant)>,
+        fields: Vec<(u32, u32, ScalarShape)>,
+    },
+    /// A direct-tag enum: the discriminant is stored as a
+    /// `tag_bits`-wide integer at bit offset `tag_offset`,
+    /// holding the bit pattern `discriminants[variant]` for
+    /// each variant, and each variant's scalar-shaped fields
+    /// sit at their recorded layout offsets (see
+    /// [`TaggedVariantShape`]). `total_bits` is the enum's
+    /// whole storage width; bits no field accounts for
+    /// (padding) flatten as zero and are ignored on
+    /// construction. Construction rejects a tag pattern no
+    /// variant has, the same contract as the fieldless-enum
+    /// shape.
+    TaggedEnum {
+        total_bits: u32,
+        tag_offset: u32,
+        tag_bits: u32,
+        discriminants: Vec<u128>,
+        variants: Vec<TaggedVariantShape>,
     },
     /// A fat pointer: two words, the data pointer in the low
     /// word and the metadata in the high word. The data word
@@ -588,6 +646,8 @@ impl ScalarShape {
             ScalarShape::Array(elem, n) => elem.bits() * (*n as u32),
             ScalarShape::AdtField { inner, .. } => inner.bits(),
             ScalarShape::NicheEnum { inner, .. } => inner.bits(),
+            ScalarShape::AdtFields { total_bits, .. } => *total_bits,
+            ScalarShape::TaggedEnum { total_bits, .. } => *total_bits,
             ScalarShape::FieldlessEnum { bits, .. } => *bits,
             ScalarShape::FatPtr(_) => 128,
             ScalarShape::Fields(fields) => {
