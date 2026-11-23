@@ -7384,7 +7384,30 @@ impl Mode {
     }
 }
 
+/// The stack size of the thread the driver runs on: the
+/// interpreter's evaluation, projection and value walks are
+/// host-recursive, so a guest program with thousands of live
+/// frames (each frame costing a chain of host calls) overflows
+/// the default main-thread stack long before it reaches the
+/// interpreter's own frame limit. The reservation is virtual;
+/// pages are committed only as the stack actually grows.
+const DRIVER_STACK_SIZE: usize = 8 * 1024 * 1024 * 1024;
+
 fn main() {
+    let worker = std::thread::Builder::new()
+        .name("sparagmos-driver".to_string())
+        .stack_size(DRIVER_STACK_SIZE)
+        .spawn(driver_main)
+        .expect("sparagmos-driver: failed to spawn the driver thread");
+    if worker.join().is_err() {
+        // The worker panicked: a driver crash, which the exit
+        // contract reports as 101.
+        eprintln!("sparagmos-driver: internal error: driver thread panicked");
+        std::process::exit(101);
+    }
+}
+
+fn driver_main() {
     let argv: Vec<String> = std::env::args().collect();
     let mode = match argv.get(1).map(|a| a.as_str()) {
         Some("run") => Mode::Run,

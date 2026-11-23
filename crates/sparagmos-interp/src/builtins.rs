@@ -27266,6 +27266,32 @@ impl<'a> Interpreter<'a> {
                 }
             }
         }
+        // A non-data pointer (null, or a pointer known only by
+        // its address) denotes no value to resolve to: the
+        // generic reference arm below would resolve it to itself
+        // and recurse without bound. The pointer value itself is
+        // its only formatting: `Pointer` prints it, and `Debug`
+        // for a raw pointer is defined as the same address text.
+        // Every other trait is an explicit error (raw pointers
+        // implement no `Display` / radix formatting).
+        if let Value::Ref(target) = value {
+            let address = match target {
+                RefTarget::Null => Some(0),
+                RefTarget::Address(addr) => Some(*addr),
+                _ => None,
+            };
+            if let Some(address) = address {
+                return match trait_ {
+                    FmtTrait::Pointer | FmtTrait::Debug => {
+                        Ok(pad_width(&format!("0x{address:x}"), options))
+                    }
+                    FmtTrait::DebugNoop => Ok(String::new()),
+                    _ => Err(unsupported(format!(
+                        "{trait_:?} formatting for a pointer that denotes no data"
+                    ))),
+                };
+            }
+        }
         // References format as their pointee for every trait here.
         if matches!(value, Value::Ref(_)) {
             let pointee = self.resolve_value(frames, value)?;
