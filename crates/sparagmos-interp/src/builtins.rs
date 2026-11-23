@@ -539,10 +539,10 @@ pub enum Builtin {
     /// `RawVecInner::with_capacity_in`, which has no converted
     /// body, so the constructor is modelled here like the other
     /// `String` constructors. The requested capacity is not
-    /// represented (the same convention as `Vec::with_capacity`,
-    /// including not modelling the capacity-overflow panic);
-    /// nothing a caller can observe changes, because `capacity`
-    /// itself is uniformly the explicit `StringCapacity` error.
+    /// represented (and the capacity-overflow panic is not
+    /// modelled); nothing a caller can observe changes, because
+    /// `capacity` itself is uniformly the explicit
+    /// `StringCapacity` error.
     StringWithCapacity,
     /// `String::len(&String)`: the byte length of the string data.
     StringLen,
@@ -962,9 +962,10 @@ pub enum Builtin {
     /// `Vec::is_empty(&vec)`.
     VecIsEmpty,
     /// `Vec::with_capacity(cap)` / `Vec::with_capacity_in(cap, alloc)`:
-    /// an empty vector. The allocation is not observable in this
-    /// value model, which does not represent capacity (the same
-    /// reason `Vec::capacity` is not modelled).
+    /// the empty vector holding the requested capacity as
+    /// uninitialised storage (the storage extent is the model's
+    /// capacity; see the execution arm for the materialisation
+    /// limit).
     VecWithCapacity,
     /// `std::vec::from_elem(elem, n)`: a vector of `n` copies of
     /// `elem` (the `vec![x; n]` form). Values are immutable in this
@@ -8650,9 +8651,15 @@ impl<'a> Interpreter<'a> {
             Builtin::VecWithCapacity => {
                 // One argument (`with_capacity`) or two
                 // (`with_capacity_in`: capacity and the allocator,
-                // a zero-sized handle here). The requested capacity
-                // has no representation in the value model, so the
-                // result is the empty vector, as for `Vec::new`.
+                // a zero-sized handle here). The requested
+                // capacity is the vector's initial storage extent
+                // (see `vec_stored_len`): the result is the empty
+                // vector holding that many uninitialised slots,
+                // so growth within the capacity does not happen,
+                // exactly as the real allocation behaves. A
+                // capacity past the materialisation limit keeps
+                // the empty vector: its storage cannot be
+                // accounted element by element.
                 if vals.len() != 1 && vals.len() != 2 {
                     return Err(InterpError::type_mismatch(
                         format!("builtin {name}"),
@@ -8660,10 +8667,20 @@ impl<'a> Interpreter<'a> {
                         format!("{} argument(s)", vals.len()),
                     ));
                 }
-                Ok(Value::Enum {
-                    variant: 0,
-                    fields: Vec::new(),
-                })
+                let cap = match &vals[0] {
+                    Value::Uint(n) => usize::try_from(*n).unwrap_or(usize::MAX),
+                    Value::Int(n) if *n >= 0 => {
+                        usize::try_from(*n).unwrap_or(usize::MAX)
+                    }
+                    _ => 0,
+                };
+                if cap == 0 || cap > MAX_VEC_SET_LEN_ELEMENTS {
+                    return Ok(Value::Enum {
+                        variant: 0,
+                        fields: Vec::new(),
+                    });
+                }
+                Ok(vec_with_len(vec![Value::Uninit; cap], 0))
             }
             Builtin::VecFromElem => {
                 arity(2)?;
@@ -14914,6 +14931,25 @@ fn value_fingerprint(value: &Value) -> u64 {
             self.vec_deque_elements(b.as_ref())?,
         ) {
             return Ok(ea.len() == eb.len() && self.seq_equal(frames, &ea, &eb)?);
+        }
+        // A vector value in its sparse form (declared length
+        // below the stored elements: the spare capacity a
+        // shrink or a regrowth leaves behind) compares by its
+        // logical element sequence, as the type's own
+        // `PartialEq` does: the storage past the length is not
+        // part of the value's identity, so a sparse vector and
+        // the plain aggregate form of the same elements are
+        // equal. A sparse vector whose length runs past its
+        // stored elements has no element list to compare and
+        // keeps the structural comparison below.
+        if matches!(&*a, Value::SparseVec { .. })
+            || matches!(&*b, Value::SparseVec { .. })
+        {
+            if let (Ok(ea), Ok(eb)) = (value_elements(&a), value_elements(&b)) {
+                return Ok(
+                    ea.len() == eb.len() && self.seq_equal(frames, &ea, &eb)?
+                );
+            }
         }
         // A `dyn Trait` value denotes its concrete pointee: two
         // trait objects compare equal when their concrete types

@@ -6215,6 +6215,11 @@ impl<'a> Interpreter<'a> {
                 {
                     return written;
                 }
+                if let Some(written) =
+                    self.write_vec_buf_slot(frames, body, place, &value)
+                {
+                    return written;
+                }
                 let target = self.resolve_place(frames, body, place)?;
                 self.shaped_store(frames, &target, value, shape)
             }
@@ -7354,7 +7359,8 @@ impl<'a> Interpreter<'a> {
                     // completes the wrapper chain first: the
                     // value read here is the pointee the pointer
                     // denotes, not the vector's element list.
-                    if buf_depth > 0 {
+                    let was_in_chain = buf_depth > 0;
+                    if was_in_chain {
                         if let Some(base) = buf_base.take() {
                             cur = self.buf_chain_pointer(frames, &base)?;
                         }
@@ -7371,93 +7377,122 @@ impl<'a> Interpreter<'a> {
                             .and_then(fat_slice_elem_is_string_carrier),
                         _ => None,
                     };
-                    cur_ty = match cur_ty {
-                        Some(Ty::Ref(pointee)) => Some((*pointee).clone()),
-                        _ => None,
-                    };
-                    let resolved = self.deref_value(frames, &value)?;
-                    // A raw allocation block holds its elements
-                    // as a tuple: a dereference of its base
-                    // pointer denotes the first element, not the
-                    // block as a whole, whenever the steps that
-                    // follow address the element itself — the
-                    // dereference is the last step, or a
-                    // structural step (field, downcast, union
-                    // field) follows, which can only address the
-                    // pointee's own structure, never the block's
-                    // tuple. A sequence step (index, subslice)
-                    // instead continues the block's flat
-                    // sequence, so no entry is inserted for it
-                    // and the flat reading the sequence machinery
-                    // relies on is unchanged. The entry is
-                    // inserted before the wrapper peels below so
-                    // they judge the value at the element
-                    // position. Fat pointers are exempt: they
-                    // carry their own projection, so the resolved
-                    // form is never the bare block.
-                    let resolved = if deref_elem0 && matches!(value, Value::Ref(_)) {
-                        let next_is_structural = matches!(
-                            place.projection.get(step_idx + 1),
-                            Some(
-                                ProjectionElem::Field(_)
-                                    | ProjectionElem::Downcast(_)
-                                    | ProjectionElem::UnionField { .. },
-                            )
-                        );
-                        match &resolved {
-                            Resolved::Alloc { id, projection }
-                                if (is_last || next_is_structural)
-                                    && projection.is_empty()
-                                    && self.is_elem_block(*id)
-                                    && matches!(
-                                        self.alloc_base(*id).ok().as_ref(),
-                                        Some(Value::Tuple(_) | Value::Bytes(_))
-                                    ) =>
-                            {
-                                Resolved::Alloc {
-                                    id: *id,
-                                    projection: vec![RefProj::Index(0)],
-                                }
-                            }
-                            _ => resolved,
-                        }
+                    // A dereference of a wrapper-typed reference
+                    // whose target is a vector's buffer pointer
+                    // re-enters the wrapper chain at the depth
+                    // the wrapper type names (see
+                    // `vec_buf_chain_reentry`): the reference a
+                    // collected body passes across a call (a
+                    // `&mut RawVec` handed to `grow_one`, a
+                    // `&mut RawVecInner` in `grow_amortized`)
+                    // denotes the vector's bookkeeping, not its
+                    // first element, and the field steps that
+                    // follow it are the chain's bookkeeping
+                    // steps, judged by the same arms as a walk
+                    // that entered the chain from the vector
+                    // place itself.
+                    let reentry = if was_in_chain {
+                        None
                     } else {
-                        resolved
+                        self.vec_buf_chain_reentry(
+                            frames,
+                            &value,
+                            pointee_ty.as_ref(),
+                        )?
                     };
-                    let resolved = match &pointee_ty {
-                        Some(pointee) => {
-                            self.peel_maybe_uninit_entry(frames, resolved, pointee)
+                    match reentry {
+                        Some((base, depth)) => {
+                            buf_base = Some(base.clone());
+                            buf_depth = depth;
+                            cur_ty = None;
+                            base
                         }
                         None => {
-                            // A dereference of an ADT-typed
-                            // place (a `Box` local) carries no
-                            // pointee type in this walk. When the
-                            // next step indexes, the position must
-                            // be array storage, whose own value
-                            // form is a tuple/byte block -- never a
-                            // one-field enum -- so a one-field enum
-                            // there is a wrapper layer the index
-                            // would otherwise consume as an
-                            // element (see `peel_wrapper_for_index`).
-                            let next_is_index = matches!(
-                                place.projection.get(step_idx + 1),
-                                Some(
-                                    ProjectionElem::Index(_)
-                                        | ProjectionElem::ConstantIndex { .. }
-                                        | ProjectionElem::Subslice { .. },
-                                )
-                            );
-                            if next_is_index
-                                && matches!(cur_ty, Some(Ty::Adt(..)))
-                            {
-                                self.peel_wrapper_for_index(frames, resolved)
+                            let resolved = self.deref_value(frames, &value)?;
+                            // A raw allocation block holds its elements
+                            // as a tuple: a dereference of its base
+                            // pointer denotes the first element, not the
+                            // block as a whole, whenever the steps that
+                            // follow address the element itself — the
+                            // dereference is the last step, or a
+                            // structural step (field, downcast, union
+                            // field) follows, which can only address the
+                            // pointee's own structure, never the block's
+                            // tuple. A sequence step (index, subslice)
+                            // instead continues the block's flat
+                            // sequence, so no entry is inserted for it
+                            // and the flat reading the sequence machinery
+                            // relies on is unchanged. The entry is
+                            // inserted before the wrapper peels below so
+                            // they judge the value at the element
+                            // position. Fat pointers are exempt: they
+                            // carry their own projection, so the resolved
+                            // form is never the bare block.
+                            let resolved = if deref_elem0 && matches!(value, Value::Ref(_)) {
+                                let next_is_structural = matches!(
+                                    place.projection.get(step_idx + 1),
+                                    Some(
+                                        ProjectionElem::Field(_)
+                                            | ProjectionElem::Downcast(_)
+                                            | ProjectionElem::UnionField { .. },
+                                    )
+                                );
+                                match &resolved {
+                                    Resolved::Alloc { id, projection }
+                                        if (is_last || next_is_structural)
+                                            && projection.is_empty()
+                                            && self.is_elem_block(*id)
+                                            && matches!(
+                                                self.alloc_base(*id).ok().as_ref(),
+                                                Some(Value::Tuple(_) | Value::Bytes(_))
+                                            ) =>
+                                    {
+                                        Resolved::Alloc {
+                                            id: *id,
+                                            projection: vec![RefProj::Index(0)],
+                                        }
+                                    }
+                                    _ => resolved,
+                                }
                             } else {
                                 resolved
-                            }
+                            };
+                            let resolved = match &pointee_ty {
+                                Some(pointee) => {
+                                    self.peel_maybe_uninit_entry(frames, resolved, pointee)
+                                }
+                                None => {
+                                    // A dereference of an ADT-typed
+                                    // place (a `Box` local) carries no
+                                    // pointee type in this walk. When the
+                                    // next step indexes, the position must
+                                    // be array storage, whose own value
+                                    // form is a tuple/byte block -- never a
+                                    // one-field enum -- so a one-field enum
+                                    // there is a wrapper layer the index
+                                    // would otherwise consume as an
+                                    // element (see `peel_wrapper_for_index`).
+                                    let next_is_index = matches!(
+                                        place.projection.get(step_idx + 1),
+                                        Some(
+                                            ProjectionElem::Index(_)
+                                                | ProjectionElem::ConstantIndex { .. }
+                                                | ProjectionElem::Subslice { .. },
+                                        )
+                                    );
+                                    if next_is_index
+                                        && matches!(cur_ty, Some(Ty::Adt(..)))
+                                    {
+                                        self.peel_wrapper_for_index(frames, resolved)
+                                    } else {
+                                        resolved
+                                    }
+                                }
+                            };
+                            cur_ty = pointee_ty;
+                            resolved
                         }
-                    };
-                    cur_ty = pointee_ty;
-                    resolved
+                    }
                 }
             };
         }
@@ -7857,6 +7892,87 @@ impl<'a> Interpreter<'a> {
             }
         };
         Ok(Resolved::Value(Value::Ref(target), Vec::new()))
+    }
+
+    /// Re-entry into a `Vec`'s buffer wrapper chain through a
+    /// reference (see `resolve_place_mode`'s `Deref` arm): when
+    /// the dereferenced value is a vector's buffer pointer — the
+    /// target a chain walk produces, the vector place with a
+    /// trailing first-element step — and the reference's pointee
+    /// type names a wrapper of the chain, the denoted place is
+    /// the vector place itself and the chain depth is the
+    /// wrapper's depth in the chain. `None` for every other
+    /// reference: an ordinary element pointer (the pointee type
+    /// names no wrapper), a wrapper over storage that is not a
+    /// vector value, a pointer whose target is not the vector
+    /// place's first element.
+    fn vec_buf_chain_reentry(
+        &self,
+        frames: &[Frame],
+        value: &Value,
+        pointee: Option<&Ty>,
+    ) -> InterpResult<Option<(Resolved, usize)>> {
+        let Some(depth) = pointee.and_then(buf_chain_depth) else {
+            return Ok(None);
+        };
+        let Value::Ref(target) = value else {
+            return Ok(None);
+        };
+        // The buffer pointer a reference formation produced over
+        // a value-resolved chain place arrives wrapped in a
+        // value target holding the pointer itself; the denoted
+        // target is the pointer's own.
+        let target = match target {
+            RefTarget::Value(inner, proj) if proj.is_empty() => match &**inner {
+                Value::Ref(inner_target) => inner_target,
+                _ => return Ok(None),
+            },
+            other => other,
+        };
+        let base: Resolved = match target {
+            RefTarget::Place {
+                frame,
+                local,
+                projection,
+            } => {
+                if projection.last() != Some(&RefProj::Index(0)) {
+                    return Ok(None);
+                }
+                let frame_pos = self.frame_pos(frames, *frame)?;
+                Resolved::Place {
+                    frame_pos,
+                    local: *local,
+                    projection: projection[..projection.len() - 1].to_vec(),
+                }
+            }
+            RefTarget::Static { name, projection } => {
+                if projection.last() != Some(&RefProj::Index(0)) {
+                    return Ok(None);
+                }
+                Resolved::Static {
+                    name: name.clone(),
+                    projection: projection[..projection.len() - 1].to_vec(),
+                }
+            }
+            RefTarget::Alloc { id, projection } => {
+                if projection.last() != Some(&RefProj::Index(0)) {
+                    return Ok(None);
+                }
+                Resolved::Alloc {
+                    id: *id,
+                    projection: projection[..projection.len() - 1].to_vec(),
+                }
+            }
+            _ => return Ok(None),
+        };
+        // The base must currently hold a vector value: a
+        // wrapper-typed reference over any other storage is an
+        // ordinary aggregate reference.
+        let held = self.read_resolved(frames, &base)?;
+        if crate::builtins::vec_stored_len(&held).is_none() {
+            return Ok(None);
+        }
+        Ok(Some((base, depth)))
     }
 
     /// The length carried by the fat pointer a place's final
@@ -11954,6 +12070,9 @@ impl<'a> Interpreter<'a> {
         if let Some(written) = self.write_vec_len_slot(frames, body, place, &value) {
             return written;
         }
+        if let Some(written) = self.write_vec_buf_slot(frames, body, place, &value) {
+            return written;
+        }
         let target = self.resolve_place_mode(frames, body, place, false)?;
         // A direct deref of a byte pointer (see `read_place`):
         // the byte view of the base value's storage owns the
@@ -11970,6 +12089,113 @@ impl<'a> Interpreter<'a> {
             }
         }
         self.write_resolved(frames, &target, value)
+    }
+
+    /// A write to a `Vec`'s buffer bookkeeping slots through a
+    /// wrapper reference (see `vec_buf_chain_reentry`): the
+    /// shape a collected `RawVecInner` body takes when it
+    /// stores the regrown buffer pointer and capacity
+    /// (`grow_amortized`'s `(*self).0 = ...; (*self).1 = ...`,
+    /// and the same stores one `RawVec` field step further
+    /// out). Neither slot is storage in the element-list value.
+    /// The buffer pointer is derived from the vector place
+    /// itself, so storing it changes nothing: the elements do
+    /// not move when the allocation is regrown — the fresh
+    /// allocation the allocator produced is simply not where
+    /// the model keeps them, and every later pointer read is
+    /// answered from the place again. The capacity is the
+    /// extent of the element storage, so storing it applies
+    /// that extent to the vector value: slots past the length
+    /// are the spare capacity the next append overwrites, and
+    /// a shrink drops the spare slots past the new extent (the
+    /// declared length itself is never cut by a capacity
+    /// store). `None` when the place is not such a slot (or
+    /// the stored capacity is past the model's materialisation
+    /// limit, mirroring the allocation model's own limit in
+    /// `Builtin::RustAlloc`).
+    fn write_vec_buf_slot(
+        &self,
+        frames: &mut Vec<Frame>,
+        body: &Body,
+        place: &Place,
+        value: &Value,
+    ) -> Option<InterpResult<()>> {
+        let local_ty = body.local_ty(place.local)?;
+        let Ty::Ref(pointee) = local_ty else {
+            return None;
+        };
+        let depth = buf_chain_depth(pointee)?;
+        let proj = &place.projection;
+        if proj.first() != Some(&ProjectionElem::Deref) {
+            return None;
+        }
+        let mut steps: &[ProjectionElem] = &proj[1..];
+        if depth == 1 {
+            // A `RawVec` reference: the inner field step comes
+            // first, and the slots are the inner's own fields.
+            match steps.first() {
+                Some(ProjectionElem::Field(0)) => steps = &steps[1..],
+                _ => return None,
+            }
+        } else if depth != 2 {
+            return None;
+        }
+        enum Slot {
+            Cap,
+            Ptr,
+        }
+        let slot = match steps {
+            [ProjectionElem::Field(1)]
+            | [ProjectionElem::Field(1), ProjectionElem::Field(0)] => Slot::Cap,
+            [ProjectionElem::Field(0)]
+            | [ProjectionElem::Field(0), ProjectionElem::Field(0)]
+            | [
+                ProjectionElem::Field(0),
+                ProjectionElem::Field(0),
+                ProjectionElem::Field(0),
+            ] => Slot::Ptr,
+            _ => return None,
+        };
+        let frame = frames.last()?;
+        let ref_value = frame.locals.get(place.local.0)?.clone();
+        let (base, _) = match self.vec_buf_chain_reentry(frames, &ref_value, Some(pointee)) {
+            Ok(Some(pair)) => pair,
+            Ok(None) => return None,
+            Err(e) => return Some(Err(e)),
+        };
+        match slot {
+            Slot::Ptr => Some(Ok(())),
+            Slot::Cap => {
+                let new_cap = cap_value_count(value)?;
+                if new_cap > (1 << 28) {
+                    return None;
+                }
+                Some(self.modify_resolved(frames, &base, |slot| {
+                    let (mut elems, len) =
+                        match std::mem::replace(slot, Value::Uninit) {
+                            Value::Enum { fields, .. } => {
+                                let len = fields.len();
+                                (fields, len)
+                            }
+                            Value::SparseVec { elems, len } => (
+                                elems,
+                                usize::try_from(len).unwrap_or(usize::MAX),
+                            ),
+                            other => {
+                                return Err(InterpError::type_mismatch(
+                                    "Vec capacity slot write",
+                                    "vector value",
+                                    other.kind_name(),
+                                ));
+                            }
+                        };
+                    let stored = new_cap.max(len);
+                    elems.resize(stored, Value::Uninit);
+                    *slot = crate::builtins::vec_with_len(elems, len);
+                    Ok(())
+                }))
+            }
+        }
     }
 
     /// A write to a `Vec`'s length slot, when `place` denotes
@@ -15399,6 +15625,26 @@ pub(crate) fn ptr_cast_units_value(value: Value, from_size: u64) -> Value {
     }
 }
 
+/// The depth a buffer-wrapper type sits at in a `Vec`'s buffer
+/// wrapper chain (see `resolve_place_mode`): the `Vec`'s buffer
+/// field is the `RawVec` (depth 1), whose inner field is the
+/// `RawVecInner` (depth 2), whose pointer field is the `Unique`
+/// (depth 3), whose pointer field is the `NonNull` (depth 4)
+/// around the buffer pointer itself. Matched on the defining
+/// path, with or without the generic arguments the rendered
+/// name carries.
+fn buf_chain_depth(ty: &Ty) -> Option<usize> {
+    let Ty::Adt(name) = ty else { return None };
+    let base = name.split('<').next().unwrap_or(name.as_str());
+    match base {
+        "alloc::raw_vec::RawVec" => Some(1),
+        "alloc::raw_vec::RawVecInner" => Some(2),
+        "core::ptr::unique::Unique" => Some(3),
+        "core::ptr::non_null::NonNull" => Some(4),
+        _ => None,
+    }
+}
+
 /// Whether the type is a `Vec` ADT instance, under either its
 /// `std` or its `alloc` spelling.
 pub(crate) fn is_vec_adt_ty(ty: &Ty) -> bool {
@@ -15410,6 +15656,21 @@ pub(crate) fn is_vec_adt_ty(ty: &Ty) -> bool {
                 || name.starts_with("alloc::vec::Vec<")
         }
         _ => false,
+    }
+}
+
+/// The element count a stored capacity value carries: the
+/// integer itself, or the single field of the one-field
+/// aggregate (`Cap`) wrapping it.
+fn cap_value_count(value: &Value) -> Option<usize> {
+    match value {
+        Value::Uint(n) => usize::try_from(*n).ok(),
+        Value::Int(n) if *n >= 0 => usize::try_from(*n).ok(),
+        Value::Enum { fields, .. } if fields.len() == 1 => {
+            cap_value_count(&fields[0])
+        }
+        Value::Tuple(fields) if fields.len() == 1 => cap_value_count(&fields[0]),
+        _ => None,
     }
 }
 

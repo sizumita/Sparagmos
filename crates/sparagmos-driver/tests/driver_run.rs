@@ -2291,6 +2291,152 @@ fn run_mode_vec_with_capacity_push_and_reserve() {
 }
 
 
+const VEC_INSERT_GROW_SRC: &str = r#"
+fn main() {
+    let mut v = vec![1, 2, 3];
+    v.insert(3, 4);
+    println!("{:?} len={} cap={}", v, v.len(), v.capacity());
+    v.insert(1, 99);
+    println!("{:?}", v);
+    v.insert(0, 0);
+    println!("{:?}", v);
+}
+"#;
+
+#[test]
+fn run_mode_vec_insert_positions_with_growth() {
+    // `Vec::insert` runs its collected body: the capacity
+    // check and the regrowth walk the buffer wrapper chain
+    // (`RawVec` / `RawVecInner`) through references handed
+    // across calls, and the chain's bookkeeping slots are the
+    // vector's own storage extent and declared length in this
+    // model. End, middle and start inserts over a growing
+    // vector land exactly as natively, capacity included.
+    let dir = temp_dir("vecinsertgrow");
+    let src = fixture(&dir, "vecinsertgrow.rs", VEC_INSERT_GROW_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Vec::insert with growth must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[1, 2, 3, 4] len=4 cap=6\n[1, 99, 2, 3, 4]\n[0, 1, 99, 2, 3, 4]\n"
+    );
+}
+
+const VEC_INSERT_RESERVED_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<i32> = Vec::with_capacity(16);
+    v.push(10);
+    v.push(20);
+    v.push(30);
+    v.insert(1, 15);
+    println!("{:?} cap={}", v, v.capacity());
+    assert_eq!(v, vec![10, 15, 20, 30]);
+    let mut s = vec![String::from("a"), String::from("c")];
+    s.insert(1, String::from("b"));
+    assert_eq!(s, vec![String::from("a"), String::from("b"), String::from("c")]);
+    println!("ok");
+}
+"#;
+
+#[test]
+fn run_mode_vec_insert_within_capacity_and_equality() {
+    // An insert inside the reserved capacity does not grow:
+    // `with_capacity` materialises the requested storage
+    // extent, so the capacity stays 16 and the elements shift
+    // in place. Whole-vector equality after a mutation
+    // compares the logical element sequence: the sparse form
+    // a growth or a shrink leaves behind (declared length
+    // below the stored elements) equals the plain aggregate
+    // form of the same elements.
+    let dir = temp_dir("vecinsertreserved");
+    let src = fixture(&dir, "vecinsertreserved.rs", VEC_INSERT_RESERVED_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Vec::insert within capacity must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[10, 15, 20, 30] cap=16\nok\n"
+    );
+}
+
+const VEC_INSERT_NESTED_SRC: &str = r#"
+fn main() {
+    let mut v = vec![vec![1, 2], vec![4]];
+    v.insert(1, vec![3]);
+    println!("{:?}", v);
+    let mut t = (vec![1, 3], 7);
+    t.0.insert(1, 2);
+    println!("{:?}", t);
+}
+"#;
+
+#[test]
+fn run_mode_vec_insert_nested_and_tuple_field() {
+    // The inserted element may itself be a vector, and the
+    // mutated vector may live inside another aggregate: the
+    // chain re-entry judges the place the buffer pointer
+    // denotes by the value it currently holds, not by the
+    // declared type of the local that happens to contain it.
+    let dir = temp_dir("vecinsertnested");
+    let src = fixture(&dir, "vecinsertnested.rs", VEC_INSERT_NESTED_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Vec::insert on nested/tuple-field vectors must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[[1, 2], [3], [4]]\n([1, 2, 3], 7)\n"
+    );
+}
+
+const VEC_INSERT_SHRINK_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<i32> = Vec::with_capacity(16);
+    v.push(1);
+    v.push(2);
+    v.insert(1, 9);
+    println!("{:?} cap={}", v, v.capacity());
+    v.shrink_to_fit();
+    println!("{:?} cap={}", v, v.capacity());
+    v.insert(3, 5);
+    println!("{:?} cap={}", v, v.capacity());
+}
+"#;
+
+#[test]
+fn run_mode_vec_insert_after_shrink_to_fit() {
+    // After a shrink the storage extent is the length itself,
+    // so the next insert grows again from there: the capacity
+    // slot writes of both paths (the shrink's truncation and
+    // the regrowth's amortised capacity) rebuild the vector's
+    // storage extent exactly.
+    let dir = temp_dir("vecinsertshrink");
+    let src = fixture(&dir, "vecinsertshrink.rs", VEC_INSERT_SHRINK_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Vec::insert after shrink_to_fit must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[1, 9, 2] cap=16\n[1, 9, 2] cap=3\n[1, 9, 2, 5] cap=6\n"
+    );
+}
+
 const STRING_WITH_CAPACITY_SRC: &str = r#"
 fn main() {
     let mut s = String::with_capacity(16);
