@@ -91,6 +91,23 @@ pub enum InterpError {
     UnsupportedRvalue { kind: String },
     /// A place projection this interpreter does not implement yet.
     UnsupportedProjection { kind: String },
+    /// A guest `fmt` implementation body returned
+    /// `Err(fmt::Error)`. The failure is the guest's own
+    /// behavior, not an interpreter limitation: the formatting
+    /// sinks native composes through panic on it (a `write_fmt`
+    /// to a stream whose own writes did not fail), so a context
+    /// modelling such a sink turns this into the panic native
+    /// raises there. It travels as its own variant, distinct
+    /// from the unsupported family, so those contexts can
+    /// recognize it; anywhere else it ends the run like any
+    /// other error.
+    FmtReturnedError {
+        /// The formatting trait whose implementation failed
+        /// (`Debug`, `Display`, ...).
+        trait_: String,
+        /// The type whose implementation failed.
+        ty: String,
+    },
     /// A call returned into a caller that had no continuation block.
     MissingContinuation { func: String },
     /// Execution fell off the end of a function without a terminator.
@@ -211,6 +228,9 @@ impl fmt::Display for InterpError {
             InterpError::UnsupportedRvalue { kind } => write!(f, "unsupported rvalue: {kind}"),
             InterpError::UnsupportedProjection { kind } => {
                 write!(f, "unsupported projection: {kind}")
+            }
+            InterpError::FmtReturnedError { trait_, ty } => {
+                write!(f, "the {trait_} implementation for {ty} returned an error")
             }
             InterpError::MissingContinuation { func } => {
                 write!(

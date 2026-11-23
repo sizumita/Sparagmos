@@ -5421,6 +5421,137 @@ fn exit_code_value(value: &sparagmos_interp::Value) -> Option<i32> {
     }
 }
 
+/// Whether the entry body at `entry_index` returns
+/// `core::result::Result` (its local 0 is that ADT): a
+/// `fn main() -> Result<_, _>`, whose `Termination::report`
+/// the driver applies itself (see `execute`).
+fn entry_returns_result(c: &Collected, entry_index: usize) -> bool {
+    let Some((_, body)) = c.bodies.get(entry_index) else {
+        return false;
+    };
+    let Some(decl) = body.local_decls.first() else {
+        return false;
+    };
+    let sparagmos_mir::Ty::Adt(def, _) = &decl.ty else {
+        return false;
+    };
+    c.def_names
+        .get(def.index as usize)
+        .map(|n| n == "core::result::Result" || n == "std::result::Result")
+        .unwrap_or(false)
+}
+
+/// The outcome of applying `Termination::report` to a returned
+/// `Result` value, following the standard library's own
+/// delegation: `Err(e)` prints `Error: {e:?}` and exits with
+/// `ExitCode::FAILURE`; `Ok(v)` reports exactly as `v`'s own
+/// `Termination` does -- `()` succeeds silently, an `ExitCode`
+/// payload yields its code, a nested `Result` recurses.
+enum TerminationReport<'a> {
+    /// The report ends the process with this code, printing
+    /// nothing.
+    Code(i32),
+    /// The report prints `Error: {payload:?}` -- the payload,
+    /// rendered under the type tag of the `Err` type at the
+    /// level that produced it -- drops the payload, and exits
+    /// with `ExitCode::FAILURE`. The `Err` type itself rides
+    /// along so the executing interpreter can build the
+    /// payload's drop glue from it.
+    Error(
+        &'a sparagmos_interp::Value,
+        String,
+        &'a sparagmos_mir::Ty,
+    ),
+}
+
+/// `Termination::report` for the entry's returned value, walked
+/// along the entry's declared return type `ty` (a
+/// `core::result::Result` ADT; see [`entry_result_ty`]): the
+/// value alone does not say which of its payloads are themselves
+/// `Termination` values, the type does. `None` when the value
+/// does not have the one-field-per-variant shape its type
+/// declares, or when an `Ok` payload's type has no `Termination`
+/// reading the driver models -- an unhandled payload is
+/// classified unsupported, never reported as a success with the
+/// wrong exit code.
+fn result_report<'a>(
+    c: &Collected,
+    names: &std::collections::HashMap<sparagmos_mir::DefId, String>,
+    ty: &'a sparagmos_mir::Ty,
+    value: &'a sparagmos_interp::Value,
+) -> Option<TerminationReport<'a>> {
+    let sparagmos_mir::Ty::Adt(def, args) = ty else {
+        return None;
+    };
+    let is_result = c
+        .def_names
+        .get(def.index as usize)
+        .map(|n| n == "core::result::Result" || n == "std::result::Result")
+        .unwrap_or(false);
+    if !is_result {
+        return None;
+    }
+    let sparagmos_interp::Value::Enum { variant, fields } = value else {
+        return None;
+    };
+    let [payload] = fields.as_slice() else {
+        return None;
+    };
+    match variant {
+        1 => {
+            let err_ty = args.get(1)?;
+            Some(TerminationReport::Error(
+                payload,
+                sparagmos_interp::builtins::ty_tag(err_ty, names),
+                err_ty,
+            ))
+        }
+        0 => ok_payload_report(c, names, args.first()?, payload),
+        _ => None,
+    }
+}
+
+/// `Termination::report` for an `Ok` payload, delegated to the
+/// payload type's own `Termination` impl, as
+/// `Result<T, E>::report` delegates `Ok(value)` to
+/// `T::report()`.
+fn ok_payload_report<'a>(
+    c: &Collected,
+    names: &std::collections::HashMap<sparagmos_mir::DefId, String>,
+    ty: &'a sparagmos_mir::Ty,
+    value: &'a sparagmos_interp::Value,
+) -> Option<TerminationReport<'a>> {
+    match ty {
+        // `()` reports success and prints nothing.
+        sparagmos_mir::Ty::Tuple(ts) if ts.is_empty() => {
+            matches!(value, sparagmos_interp::Value::Unit).then_some(TerminationReport::Code(0))
+        }
+        sparagmos_mir::Ty::Adt(def, _) => {
+            let name = c.def_names.get(def.index as usize)?;
+            if name == "std::process::ExitCode" || name.ends_with("::ExitCode") {
+                exit_code_value(value).map(TerminationReport::Code)
+            } else if name == "core::result::Result" || name == "std::result::Result" {
+                result_report(c, names, ty, value)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The declared return type of the entry body at `entry_index`
+/// (its local 0), when it is an ADT: the type the
+/// [`result_report`] `Termination` walk follows.
+fn entry_result_ty<'a>(c: &'a Collected, entry_index: usize) -> Option<&'a sparagmos_mir::Ty> {
+    let (_, body) = c.bodies.get(entry_index)?;
+    let decl = body.local_decls.first()?;
+    let sparagmos_mir::Ty::Adt(..) = &decl.ty else {
+        return None;
+    };
+    Some(&decl.ty)
+}
+
 /// The session's effective overflow-checks setting, resolved from
 /// the final rustc argument list the way rustc resolves it
 /// (`Session::overflow_checks`): the last `-C overflow-checks`
@@ -6304,11 +6435,28 @@ fn execute(
         tool_interception,
         ..sparagmos_interp::InterpConfig::default()
     };
-    let run = sparagmos_interp::interpret_mir_captured_with_config(
+    // A `Result` entry's `Termination` report renders its `Err`
+    // payload against the interpreter that executed the entry:
+    // the payload may point into that run's allocations and
+    // statics, which a detached rendering after the run cannot
+    // resolve. The report closure names the payload and its
+    // type tag (see `result_report`); the report's exit code is
+    // applied below, from the same walk over the returned value.
+    let report = |value: &sparagmos_interp::Value| {
+        let ty = entry_result_ty(c, entry_index)?;
+        match result_report(c, &program.fn_names, ty, value) {
+            Some(TerminationReport::Error(payload, tag, err_ty)) => {
+                Some((payload.clone(), tag, err_ty.clone()))
+            }
+            _ => None,
+        }
+    };
+    let run = sparagmos_interp::interpret_mir_captured_with_report(
         &program,
         &entry,
         entry_args,
         config,
+        report,
     );
     // The guest's stdout is this process's stdout, whatever the
     // outcome was; the guest's stderr likewise goes to stderr.
@@ -6346,6 +6494,43 @@ fn execute(
         }
         Ok(sparagmos_interp::Value::Uint(code)) if entry_arg_count == 2 => {
             code as i32
+        }
+        Ok(ref value) if entry_returns_result(c, entry_index) => {
+            // The entry reported through `Termination` (a
+            // `fn main() -> Result<_, _>`): `lang_start` applies
+            // `Termination::report` to the returned value
+            // natively -- `Ok` delegates to the payload's own
+            // report, `Err` writes `Error: {err:?}` to stderr
+            // and exits with `ExitCode::FAILURE`. The driver
+            // applies the same report to the value the entry
+            // returned; the `Err` payload's Debug text was
+            // rendered by the executing interpreter during the
+            // run (see the `interpret_mir_captured_with_report`
+            // call above).
+            match entry_result_ty(c, entry_index)
+                .and_then(|ty| result_report(c, &program.fn_names, ty, value))
+            {
+                Some(TerminationReport::Code(code)) => code,
+                Some(TerminationReport::Error(..)) => {
+                    // The report's `Error: ...` line is already
+                    // in the captured stderr, written by the
+                    // interpreter that executed the entry at the
+                    // report's native position -- after the
+                    // entry returned, before its thread's TLS
+                    // destructors ran (with the value's
+                    // structural form standing in when the
+                    // payload does not render even against the
+                    // live state). Only the exit code remains
+                    // to apply.
+                    1
+                }
+                None => {
+                    eprintln!(
+                        "sparagmos-driver run: unsupported: entry `{entry_name}` returned a malformed Result value"
+                    );
+                    2
+                }
+            }
         }
         Ok(other) => {
             eprintln!(
@@ -7236,6 +7421,12 @@ fn execute_jit(c: &Collected, guest_args: &[String]) -> i32 {
     if entry_returns_exit_code(c, entry_index) {
         eprintln!(
             "sparagmos-driver run-jit: unsupported: entry returning `std::process::ExitCode` is not supported by JIT execution"
+        );
+        return 2;
+    }
+    if entry_returns_result(c, entry_index) {
+        eprintln!(
+            "sparagmos-driver run-jit: unsupported: entry returning `core::result::Result` is not supported by JIT execution"
         );
         return 2;
     }

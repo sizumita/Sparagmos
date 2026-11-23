@@ -361,6 +361,15 @@ pub(crate) struct FmtCapture {
     pub width: u16,
     pub precision: u16,
     pub indent: usize,
+    /// Whether writes to this capture stream straight into the
+    /// interpreter's captured stderr instead of accumulating in
+    /// `buffer`: the shape of a `Termination` report rendering,
+    /// whose formatter natively writes to stderr as the payload's
+    /// `Debug` body runs, interleaved with the body's own stderr
+    /// writes. Only the report rendering's own payload body
+    /// capture streams (see `Interpreter::fmt_stream_arm`); a
+    /// streaming capture's `buffer` stays empty.
+    pub stream: bool,
     /// The rendered type whose `fmt` body this capture serves
     /// (the pointee tag the dispatch was invoked with). The
     /// finisher and builder builtins read the type's recorded
@@ -855,6 +864,16 @@ pub struct Interpreter<'a> {
     formatters: std::cell::RefCell<HashMap<u64, FmtCapture>>,
     /// The id the next captured formatter gets.
     next_formatter: std::cell::RefCell<u64>,
+    /// The one-shot stream arm for captured formatters (see
+    /// [`FmtCapture::stream`]): while set, the next capture a
+    /// guest `fmt` body dispatch creates streams, and creating it
+    /// clears the arm. The detached `Debug` rendering a
+    /// `Termination` report performs arms it, so the payload's
+    /// own `Debug` body writes through a streaming capture, as
+    /// natively; structural composition suppresses the arm while
+    /// it composes (its subvalue bodies buffer into the composed
+    /// text instead), so no other capture can take it.
+    pub(crate) fmt_stream_arm: bool,
     /// `core::fmt` builder states (see [`FmtBuilderState`]),
     /// keyed by the id inside the builder handle values.
     fmt_builders: std::cell::RefCell<HashMap<u64, FmtBuilderState>>,
@@ -1574,6 +1593,7 @@ impl<'a> Interpreter<'a> {
             next_command: std::cell::RefCell::new(1),
             formatters: std::cell::RefCell::new(HashMap::new()),
             next_formatter: std::cell::RefCell::new(1),
+            fmt_stream_arm: false,
             fmt_builders: std::cell::RefCell::new(HashMap::new()),
             next_fmt_builder: std::cell::RefCell::new(1),
             va_lists: std::cell::RefCell::new(HashMap::new()),
@@ -1691,6 +1711,29 @@ impl<'a> Interpreter<'a> {
 
     /// Run `entry` with `args` and return the value of its return place.
     pub fn run(&mut self, entry: &str, args: Vec<Value>) -> InterpResult<Value> {
+        self.run_with_report(entry, args, |_, _, _| Ok(None))
+    }
+
+    /// Like [`Interpreter::run`], but when the entry returns
+    /// normally, `report` is applied to the returned value before
+    /// the entry thread's TLS destructors run -- the native
+    /// order, in which `lang_start` applies a `Termination`
+    /// report first and the thread's TLS teardown follows (and
+    /// the only point at which a report rendering that itself
+    /// touches TLS still sees that TLS alive). The text the
+    /// report returns joins the guest's stderr at that point, so
+    /// it precedes whatever the destructors print. A guest
+    /// outcome the report itself produces -- a panic in a
+    /// `Debug` body it executes, a `std::process::exit` --
+    /// replaces the entry's result, exactly as it replaces the
+    /// report's own outcome natively; the destructors still run,
+    /// as they do for the entry's own outcomes.
+    pub fn run_with_report(
+        &mut self,
+        entry: &str,
+        args: Vec<Value>,
+        report: impl FnOnce(&mut Self, &mut Vec<Frame>, &Value) -> InterpResult<Option<String>>,
+    ) -> InterpResult<Value> {
         self.steps = 0;
         self.next_frame_id = 0;
         self.output.clear();
@@ -1725,6 +1768,20 @@ impl<'a> Interpreter<'a> {
             call_once_env_drop: None,
         }];
         let result = self.drive_frames(&mut frames, 0);
+        // The termination report applies here: after the entry
+        // has returned, before its thread's TLS teardown (see
+        // [`Interpreter::run_with_report`]).
+        let result = match result {
+            Ok(value) => match report(self, &mut frames, &value) {
+                Ok(Some(text)) => {
+                    self.push_error_output(&text);
+                    Ok(value)
+                }
+                Ok(None) => Ok(value),
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e),
+        };
         // Program exit runs the entry thread's registered TLS
         // destructors (the registrations wrap
         // `__cxa_thread_atexit`, whose entries run at exit),
