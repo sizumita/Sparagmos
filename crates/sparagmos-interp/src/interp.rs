@@ -788,6 +788,17 @@ pub struct Interpreter<'a> {
     /// the new frame (see `Frame::incoming_asm`). `None` at
     /// every other time.
     pending_asm_incoming: Option<([u64; 48], [bool; 48])>,
+    /// The architectural register state a naked body leaves
+    /// behind for the asm `call` step that entered it: set by
+    /// `exec_inline_asm` when a naked block finishes, and taken
+    /// by `exec_asm_call` when the `call_sync` that ran the body
+    /// returns, so the calling block continues with the state
+    /// the callee actually established (see `exec_asm_call`).
+    /// The second array marks the registers the body's steps
+    /// changed relative to the seeded file they started from;
+    /// registers the body never touched are not the callee's
+    /// to impose on the caller. `None` at every other time.
+    pending_asm_outgoing: Option<([u64; 48], [bool; 48])>,
     /// The guest's panic hook, installed by `std::panic::set_hook`
     /// (the boxed `dyn Fn` value as the guest handed it over);
     /// `None` is the default hook, which this runtime does not
@@ -1596,6 +1607,7 @@ impl<'a> Interpreter<'a> {
             drop_continuations: Vec::new(),
             glue_unwind_panic: None,
             pending_asm_incoming: None,
+            pending_asm_outgoing: None,
             resume_signaled: false,
             panic_hook: std::cell::RefCell::new(None),
             last_panic_stamp: std::cell::RefCell::new(None),
@@ -3119,7 +3131,9 @@ impl<'a> Interpreter<'a> {
     /// uninitialized error rather than a fabricated zero.
     /// A naked block entered through an asm `call` step instead
     /// starts from the calling block's register file (see
-    /// `Frame::incoming_asm`).
+    /// `Frame::incoming_asm`), and a naked block leaves its
+    /// outgoing register file behind for that calling block
+    /// (see `Interpreter::pending_asm_outgoing`).
     fn exec_inline_asm(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -3210,6 +3224,17 @@ impl<'a> Interpreter<'a> {
                 }
             }
         }
+        // The seeded register file, snapshotted before the
+        // steps run: a naked block's outgoing state (below) is
+        // measured against it, so only registers the program
+        // itself changed are reported as established by the
+        // body. The seedings above restate values the caller
+        // already placed — an argument register's seeding may
+        // even narrow what the caller established — and those
+        // are the caller's state to keep, not the callee's to
+        // impose on the way out.
+        let seeded_arch = arch;
+        let seeded_written = arch_written;
         let mut written = vec![false; regs.len()];
         let mut outcome = AsmOutcome::Fallthrough;
         for step in steps {
@@ -3219,7 +3244,7 @@ impl<'a> Interpreter<'a> {
                     break;
                 }
                 AsmStep::Call { sig } => {
-                    self.exec_asm_call(frames, &mut arch, &arch_written, sig)?;
+                    self.exec_asm_call(frames, &mut arch, &mut arch_written, sig)?;
                     // The call may have rewritten any register:
                     // resync the slots of bound operands with the
                     // register file's post-call state.
@@ -3279,6 +3304,22 @@ impl<'a> Interpreter<'a> {
             frames.last_mut().expect("frame").locals[0] = value;
             }
         }
+        if naked_shape {
+            // A naked body leaves its register file behind for
+            // the asm `call` step that entered it (see
+            // `Interpreter::pending_asm_outgoing`): the calling
+            // block continues with the architectural state this
+            // body actually established. Only registers the
+            // steps changed relative to the seeded file are
+            // marked — a register the body never touched keeps
+            // the calling block's own state.
+            let mut out_written = [false; 48];
+            for r in 0..48 {
+                out_written[r] =
+                    arch_written[r] && (!seeded_written[r] || arch[r] != seeded_arch[r]);
+            }
+            self.pending_asm_outgoing = Some((arch, out_written));
+        }
         Ok(outcome)
     }
 
@@ -3288,7 +3329,12 @@ impl<'a> Interpreter<'a> {
     /// value back into the file. The registers the ABI lets the
     /// callee clobber are zeroed afterwards: their contents are
     /// unspecified, and zero keeps a later read from observing a
-    /// stale value as if it were live. A panic in the callee
+    /// stale value as if it were live. A naked callee instead
+    /// hands back its outgoing register state (see
+    /// `Interpreter::pending_asm_outgoing`), which replaces the
+    /// zeroing: the registers its body changed take the values
+    /// it left in them, and the registers it never touched keep
+    /// this block's own state. A panic in the callee
     /// propagates: the enclosing frame's unwind table routes it
     /// exactly like a panic raised at a call site in the asm
     /// block.
@@ -3296,7 +3342,7 @@ impl<'a> Interpreter<'a> {
         &mut self,
         frames: &mut Vec<Frame>,
         arch: &mut [u64; 48],
-        arch_written: &[bool; 48],
+        arch_written: &mut [bool; 48],
         sig: &sparagmos_mir::AsmCallSig,
     ) -> InterpResult<()> {
         // Architectural indices: rax rcx rdx rbx rsp rbp rsi rdi
@@ -3346,12 +3392,47 @@ impl<'a> Interpreter<'a> {
         } else {
             None
         };
+        // Likewise, clear any outgoing state an earlier naked
+        // body left behind, so the state taken after the call
+        // is this callee's alone; the saved value is restored
+        // afterwards, so nested asm calls compose.
+        let saved_outgoing = if callee_is_naked {
+            self.pending_asm_outgoing.take()
+        } else {
+            None
+        };
         let result = self.call_sync(frames, &sig.name, args);
         if callee_is_naked {
             self.pending_asm_incoming = saved_incoming;
         }
+        let outgoing = if callee_is_naked {
+            let taken = self.pending_asm_outgoing.take();
+            self.pending_asm_outgoing = saved_outgoing;
+            taken
+        } else {
+            None
+        };
         let result = result?;
         let mut ret_reg: Option<usize> = None;
+        if let Some((out_arch, out_written)) = outgoing {
+            // A naked callee's outgoing architectural state
+            // replaces the clobber model below: the registers
+            // its steps changed take the values the body left
+            // in them, and the registers it never touched keep
+            // this block's own state — a native `call` preserves
+            // whatever the callee does not overwrite, and
+            // zeroing the clobber set would fabricate values
+            // for registers the body demonstrably wrote. The
+            // return-value scatter below still runs afterwards,
+            // so the return register keeps the normalization
+            // the declared return scalar prescribes.
+            for r in 0..48 {
+                if out_written[r] {
+                    arch[r] = out_arch[r];
+                    arch_written[r] = true;
+                }
+            }
+        }
         if let Some(ret) = &sig.ret {
             let idx = match ret {
                 sparagmos_mir::AsmScalar::Float { .. } => 16,
@@ -3360,18 +3441,20 @@ impl<'a> Interpreter<'a> {
             arch[idx] = asm_scalar_bits(&result, ret)?;
             ret_reg = Some(idx);
         }
-        let (gp_clobbers, xmm_clobbers): (&[usize], std::ops::Range<usize>) = match sig.abi {
-            sparagmos_mir::AsmAbi::SysV64 => (&[0, 1, 2, 6, 7, 8, 9, 10, 11], 16..48),
-            sparagmos_mir::AsmAbi::Win64 => (&[0, 1, 2, 8, 9, 10, 11], 16..22),
-        };
-        for &r in gp_clobbers {
-            if Some(r) != ret_reg {
-                arch[r] = 0;
+        if outgoing.is_none() {
+            let (gp_clobbers, xmm_clobbers): (&[usize], std::ops::Range<usize>) = match sig.abi {
+                sparagmos_mir::AsmAbi::SysV64 => (&[0, 1, 2, 6, 7, 8, 9, 10, 11], 16..48),
+                sparagmos_mir::AsmAbi::Win64 => (&[0, 1, 2, 8, 9, 10, 11], 16..22),
+            };
+            for &r in gp_clobbers {
+                if Some(r) != ret_reg {
+                    arch[r] = 0;
+                }
             }
-        }
-        for i in xmm_clobbers {
-            if Some(i) != ret_reg {
-                arch[i] = 0;
+            for i in xmm_clobbers {
+                if Some(i) != ret_reg {
+                    arch[i] = 0;
+                }
             }
         }
         Ok(())

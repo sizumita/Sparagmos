@@ -12074,6 +12074,91 @@ fn run_mode_asm_sym_call_to_naked_fn_rsp_read_stays_a_named_error() {
     );
 }
 
+const ASM_SYM_NAKED_OUTGOING_SRC: &str = r#"
+use std::arch::{asm, naked_asm};
+
+#[unsafe(naked)]
+pub extern "sysv64" fn set_r10() -> u64 {
+    naked_asm!("mov r10, 42", "mov rax, 1", "ret");
+}
+
+fn main() {
+    let via_bound: u64;
+    let via_step: u64;
+    let ret: u64;
+    unsafe {
+        asm!(
+            "call {helper}",
+            helper = sym set_r10,
+            lateout("rax") ret,
+            lateout("r10") via_bound,
+        );
+        asm!(
+            "call {helper}",
+            "mov {out}, r10",
+            helper = sym set_r10,
+            out = lateout(reg) via_step,
+        );
+    }
+    println!("{ret} {via_bound} {via_step}");
+}
+"#;
+
+#[test]
+fn run_mode_asm_sym_call_to_naked_fn_propagates_outgoing_registers() {
+    // A `sym` call into a naked function hands the callee's
+    // outgoing register state back to the calling block: the
+    // helper writes `r10`, which is not its return register,
+    // and the caller observes 42 both through an output bound
+    // to `r10` and through a step that reads `r10` after the
+    // call. The declared return value still comes back in
+    // `rax`. Natively this prints `1 42 42`.
+    run_ok(
+        "asm-sym-naked-outgoing",
+        ASM_SYM_NAKED_OUTGOING_SRC,
+        "1 42 42\n",
+    );
+}
+
+const ASM_SYM_NAKED_PRESERVE_SRC: &str = r#"
+use std::arch::{asm, naked_asm};
+
+#[unsafe(naked)]
+pub extern "sysv64" fn five() -> u64 {
+    naked_asm!("mov rax, 5", "ret");
+}
+
+fn main() {
+    let kept: u64;
+    let ret: u64;
+    unsafe {
+        asm!(
+            "call {helper}",
+            helper = sym five,
+            in("r10") 7u64,
+            lateout("rax") ret,
+            lateout("r10") kept,
+        );
+    }
+    println!("{ret} {kept}");
+}
+"#;
+
+#[test]
+fn run_mode_asm_sym_call_to_naked_fn_preserves_untouched_registers() {
+    // The outgoing hand-back covers only the registers the
+    // callee's body actually changed: a register the body
+    // never writes keeps the calling block's own state across
+    // the call, exactly as a native `call` preserves whatever
+    // the callee does not overwrite. Natively this prints
+    // `5 7`.
+    run_ok(
+        "asm-sym-naked-preserve",
+        ASM_SYM_NAKED_PRESERVE_SRC,
+        "5 7\n",
+    );
+}
+
 #[test]
 fn convert_mode_inline_asm_outside_class_converts() {
     // The same out-of-class block converts in full: conversion is
