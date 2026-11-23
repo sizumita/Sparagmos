@@ -21569,3 +21569,68 @@ fn run_mode_non_utf8_path_display() {
         "display() renders the lossy content and len() reads the byte length"
     );
 }
+
+const VECDEQUE_DEBUG_SRC: &str = r#"
+use std::collections::VecDeque;
+
+#[derive(Debug)]
+struct Wrap {
+    items: VecDeque<i32>,
+}
+
+fn main() {
+    let mut d: VecDeque<i32> = VecDeque::with_capacity(4);
+    for i in 0..4 { d.push_back(i); }
+    d.pop_front();
+    d.pop_front();
+    d.push_back(4);
+    d.push_back(5);
+    println!("{:?}", d);
+    println!("{:#?}", d);
+    let e: VecDeque<i32> = VecDeque::new();
+    println!("{:?}", e);
+    println!("{:?}", VecDeque::from(vec![7, 8, 9]));
+    println!("{:?}", VecDeque::from([10, 11]));
+    let mut g: VecDeque<String> = VecDeque::new();
+    g.push_back("a".to_string());
+    g.push_front("z".to_string());
+    println!("{:?}", g);
+    let w = Wrap { items: VecDeque::from([3, 1, 4]) };
+    println!("{:?}", w);
+    println!("{:?}", Box::new(VecDeque::from([7])));
+}
+"#;
+
+#[test]
+fn run_mode_vecdeque_debug_list_format() {
+    // A `VecDeque` value is the ring-buffer aggregate (wrapped
+    // head, length, buffer); its `Debug` is the `debug_list` of
+    // the logical element sequence, so the structural fmt engine
+    // renders the sequence, not the aggregate's fields.
+    let dir = temp_dir("vecdeque-debug");
+    let src = fixture(&dir, "vecdeque_debug.rs", VECDEQUE_DEBUG_SRC);
+    let out = run_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "VecDeque Debug program must exit 0; stderr={stderr}"
+    );
+    let expected = "\
+[2, 3, 4, 5]
+[
+    2,
+    3,
+    4,
+    5,
+]
+[]
+[7, 8, 9]
+[10, 11]
+[\"z\", \"a\"]
+Wrap { items: [3, 1, 4] }
+[7]
+";
+    assert_eq!(stdout, expected, "VecDeque Debug output must be the list form");
+}

@@ -26877,12 +26877,14 @@ impl<'a> Interpreter<'a> {
     /// reaches this formatter unless it itself formats a field
     /// with `{:?}`.
     ///
-    /// Two std shapes the value model does not store in declared
+    /// Three std shapes the value model does not store in declared
     /// shape are recognised by tag first: a `Vec` value's fields
-    /// are its elements (it prints as the list it is), and a `Box`
-    /// value's one field is the pointee reference (its `Debug`
-    /// forwards to the pointee). An ADT with no recorded shape
-    /// stays an explicit unsupported error.
+    /// are its elements (it prints as the list it is), a `VecDeque`
+    /// value is the ring-buffer aggregate whose logical element
+    /// sequence prints as the same list, and a `Box` value's one
+    /// field is the pointee reference (its `Debug` forwards to the
+    /// pointee). An ADT with no recorded shape stays an explicit
+    /// unsupported error.
     fn format_debug_adt(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -26900,6 +26902,27 @@ impl<'a> Interpreter<'a> {
                 return self.format_debug_seq_items(
                     frames, fields, options, indent, '[', ']', &tys,
                 );
+            }
+            "VecDeque" => {
+                // A `VecDeque` value is the real aggregate
+                // (wrapped head, length, ring buffer), not an
+                // element list; its `Debug` is the `debug_list`
+                // of its logical element sequence, so render that
+                // sequence through the same sequence formatter a
+                // `Vec` uses. A value whose buffer slots cannot
+                // be read back is not a well-formed deque state
+                // and keeps the recorded-shape rendering below.
+                let aggregate = Value::Enum {
+                    variant,
+                    fields: fields.to_vec(),
+                };
+                if let Some(elements) = self.vec_deque_elements(&aggregate)? {
+                    let elem = first_generic_arg(tag).unwrap_or("");
+                    let tys: Vec<&str> = elements.iter().map(|_| elem).collect();
+                    return self.format_debug_seq_items(
+                        frames, &elements, options, indent, '[', ']', &tys,
+                    );
+                }
             }
             "Box" if fields.len() == 1 => {
                 let elem = first_generic_arg(tag).unwrap_or("");
