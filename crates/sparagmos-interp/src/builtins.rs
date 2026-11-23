@@ -24313,9 +24313,12 @@ fn check_executable(candidate: &std::path::Path) -> Result<(), i32> {
 /// (relative to the child's working directory when one is set);
 /// any other program is searched along the effective `PATH`
 /// (the command's own `PATH` entry wins over the inherited one,
-/// as in std's environment capture). `Ok` means the program
-/// would start; `Err` is the `errno` the failed spawn reports.
-fn resolve_program(state: &crate::interp::CommandState) -> Result<(), i32> {
+/// as in std's environment capture). `Ok` is the path the
+/// search settled on -- the program the invocation denotes,
+/// which a bare name under a command-specific `PATH` owes to
+/// the search, not to the working directory; `Err` is the
+/// `errno` the failed spawn reports.
+fn resolve_program(state: &crate::interp::CommandState) -> Result<std::path::PathBuf, i32> {
     use std::os::unix::ffi::OsStrExt;
     let program = std::ffi::OsStr::from_bytes(&state.program);
     if state.program.contains(&b'/') {
@@ -24329,7 +24332,7 @@ fn resolve_program(state: &crate::interp::CommandState) -> Result<(), i32> {
                 None => std::path::PathBuf::from(program),
             }
         };
-        return check_executable(&candidate);
+        return check_executable(&candidate).map(|()| candidate);
     }
     // The effective PATH: the inherited environment with the
     // command's entries applied in order.
@@ -24348,7 +24351,7 @@ fn resolve_program(state: &crate::interp::CommandState) -> Result<(), i32> {
     for dir in std::env::split_paths(std::ffi::OsStr::from_bytes(&search)) {
         let candidate = dir.join(program);
         match check_executable(&candidate) {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(candidate),
             Err(ERRNO_PERMISSION_DENIED) => denied = true,
             Err(_) => {}
         }
@@ -24381,7 +24384,7 @@ fn process_spawn_error(state: &crate::interp::CommandState) -> Option<Value> {
         }
     }
     match resolve_program(state) {
-        Ok(()) => None,
+        Ok(_) => None,
         Err(code) => Some(io_os_error_value(code)),
     }
 }
@@ -24808,6 +24811,18 @@ fn tool_outcome(
     } else {
         return Ok(None);
     };
+    // The path the spawn resolution settled on rides along:
+    // the host side looks its answer up by it, so a bare
+    // program name invoked under a command-specific `PATH`
+    // reaches the artifact that search found, not a
+    // namesake in the working directory (see
+    // `ToolRunRequest::resolved_program`). Both callers run
+    // this only after the spawn gate has accepted the
+    // command, so the resolution is the one that succeeded.
+    use std::os::unix::ffi::OsStrExt as _;
+    let resolved_program = resolve_program(state)
+        .ok()
+        .map(|path| path.as_os_str().as_bytes().to_vec());
     let request = crate::interp::ToolRunRequest {
         program: state.program.clone(),
         args: state.args.clone(),
@@ -24815,6 +24830,7 @@ fn tool_outcome(
         envs: state.envs.clone(),
         env_clear: state.env_clear,
         cwd: state.cwd.clone(),
+        resolved_program,
     };
     match (runner.0)(&request) {
         Ok(outcome) => Ok(Some(outcome)),

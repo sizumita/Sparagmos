@@ -117,8 +117,9 @@ denominator. Runs on every push to `main` and on manual dispatch.
 - Inside a stage-3 recipe run, the driver's tool interception
   answers the recipe's compiler invocations with its own
   conversion machinery and records each produced artifact
-  (path, source and its bytes, edition, crate type, the
-  library bindings and compilation options the producing
+  (path, source tree, edition, crate type, the
+  library bindings -- each pinned to the dependency tree
+  the build bound -- and compilation options the producing
   invocation carried, and the environment it ran under),
   leaving a placeholder file
   at the artifact's path -- executable, for a binary -- so the
@@ -130,8 +131,10 @@ denominator. Runs on every push to `main` and on manual dispatch.
   outcome is the interpreter's exit code and output. The run
   is reconstructed from the producing invocation, not from
   the file system as it later stands: the conversion reads
-  the recorded source (or its recorded bytes, once the
-  recipe has rewritten or deleted the file), the program's
+  the recorded source tree (or its recorded snapshot, once
+  the recipe has rewritten or deleted any of its files),
+  the artifact a bare program name denotes is the one the
+  invocation's own `PATH` search finds, the program's
   argv[0] is the name the recipe invoked it under, the
   re-conversion runs under the producing invocation's
   compilation environment (so `option_env!` and its kin see

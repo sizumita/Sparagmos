@@ -5689,6 +5689,110 @@ fn session_overflow_checks(args: &[String]) -> bool {
     opt_is_zero
 }
 
+/// The source tree one build converted: every file under
+/// the crate root's directory at the moment of the build,
+/// as (path relative to that directory, bytes) pairs, the
+/// root itself among them under its file name. A crate is
+/// more than its root file -- `mod` files and `include!`
+/// inputs live beside it -- so an artifact denoting "the
+/// program its build produced" must denote the tree, not
+/// the root alone: rewriting only a module file after the
+/// build must not change what an earlier artifact runs,
+/// and rewriting or deleting the root must not orphan the
+/// artifact while its modules survive in the snapshot.
+type SourceTree = Vec<(std::path::PathBuf, Vec<u8>)>;
+
+/// The bounds past which a directory is not read as a
+/// crate's source tree: past them the snapshot keeps the
+/// root alone (the root-only behaviour) rather than
+/// copying a tree the build could not have read whole.
+const SOURCE_TREE_MAX_FILES: usize = 4096;
+const SOURCE_TREE_MAX_BYTES: usize = 64 << 20;
+const SOURCE_TREE_MAX_DEPTH: usize = 32;
+
+/// Snapshot the source tree rooted at `root` (see
+/// `SourceTree`): the root's own bytes and, recursively,
+/// every regular file under the root's directory, in
+/// deterministic (sorted) order.
+fn snapshot_source_tree(root: &std::path::Path) -> SourceTree {
+    let root_name = root
+        .file_name()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("source.rs"));
+    let root_bytes = std::fs::read(root).unwrap_or_default();
+    let mut tree: SourceTree = vec![(root_name, root_bytes)];
+    if let Some(base) = root.parent() {
+        let mut budget = (SOURCE_TREE_MAX_FILES, SOURCE_TREE_MAX_BYTES);
+        if !collect_source_tree(base, base, 0, &mut tree, &mut budget) {
+            // Over the bounds: keep the root alone.
+            tree.truncate(1);
+            return tree;
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    tree.retain(|(rel, _)| seen.insert(rel.clone()));
+    tree.sort();
+    tree
+}
+
+/// The recursive walk under `snapshot_source_tree`; `false`
+/// when the tree runs past the snapshot bounds.
+fn collect_source_tree(
+    base: &std::path::Path,
+    dir: &std::path::Path,
+    depth: usize,
+    tree: &mut SourceTree,
+    budget: &mut (usize, usize),
+) -> bool {
+    if depth > SOURCE_TREE_MAX_DEPTH {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        // An unreadable directory contributes nothing.
+        return true;
+    };
+    let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            if !collect_source_tree(base, &path, depth + 1, tree, budget) {
+                return false;
+            }
+        } else if path.is_file() {
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            if budget.0 == 0 || bytes.len() > budget.1 {
+                return false;
+            }
+            budget.0 -= 1;
+            budget.1 -= bytes.len();
+            let Ok(rel) = path.strip_prefix(base) else {
+                continue;
+            };
+            tree.push((rel.to_path_buf(), bytes));
+        }
+    }
+    true
+}
+
+/// Whether the tree standing at `root`'s directory still
+/// holds every file of `tree` with the bytes the build
+/// converted. Files the recipe has since ADDED beside
+/// them do not take part: an added file cannot change
+/// what the recorded conversion read -- a module the
+/// root names resolved to a recorded file at build
+/// time, or the build would have failed -- so only the
+/// recorded files' survival matters.
+fn source_tree_intact(root: &std::path::Path, tree: &SourceTree) -> bool {
+    let Some(base) = root.parent() else {
+        return false;
+    };
+    tree.iter()
+        .all(|(rel, bytes)| std::fs::read(base.join(rel)).is_ok_and(|now| now == *bytes))
+}
+
 /// One artifact a tool invocation produced, as the registry
 /// remembers it: the name it was built under, the source it was
 /// converted from, and the attributes the producing invocation
@@ -5697,12 +5801,13 @@ fn session_overflow_checks(args: &[String]) -> bool {
 struct ToolArtifact {
     name: String,
     source: std::path::PathBuf,
-    /// The source's bytes as they stood when the producing
-    /// invocation converted them: a recipe may rewrite or
-    /// delete the source file after building, and a later run
-    /// of the artifact must still execute the program its
-    /// build produced (see `ToolRegistry::effective_source`).
-    source_snapshot: Vec<u8>,
+    /// The source tree as it stood when the producing
+    /// invocation converted it (see `SourceTree`): a recipe
+    /// may rewrite or delete the source files after
+    /// building, and a later run of the artifact must still
+    /// execute the program its build produced (see
+    /// `ToolRegistry::effective_source`).
+    source_tree: SourceTree,
     edition: Option<String>,
     crate_type: Option<String>,
     /// The compilation environment the producing invocation
@@ -5724,7 +5829,7 @@ struct ToolArtifact {
     /// The dependency version each entry of `aux_specs`
     /// bound when this artifact's build linked it, in the
     /// same order: the dependency artifact's source path
-    /// and the bytes its build converted. A later run of
+    /// and the source tree its build converted. A later run of
     /// this artifact resolves its `--aux` specs against
     /// these pins, not against the registry as it then
     /// stands: the registry replaces a rebuilt artifact's
@@ -5734,7 +5839,7 @@ struct ToolArtifact {
     /// current then -- a library rebuilt after this
     /// artifact was, or another output built from the
     /// same source.
-    aux_pins: Vec<(std::path::PathBuf, Vec<u8>)>,
+    aux_pins: Vec<(std::path::PathBuf, SourceTree)>,
     /// The compilation-shaping options the producing
     /// invocation carried (its forwarded rustc arguments --
     /// `--cfg`, `--check-cfg`, codegen and lint options, and
@@ -5753,10 +5858,11 @@ struct ToolArtifact {
 #[derive(Default)]
 struct ToolRegistry {
     entries: std::sync::Mutex<Vec<(std::path::PathBuf, ToolArtifact)>>,
-    /// Source snapshots materialised to files, keyed by the
-    /// artifact's recorded source path, with the snapshot's
-    /// content hash: a rebuilt artifact at the same path with
-    /// different bytes gets a different file.
+    /// Source trees materialised to directories, keyed by
+    /// the artifact's recorded source path, with the tree's
+    /// content hash: a rebuilt artifact at the same path
+    /// with a different tree gets a different directory.
+    /// The value is the materialised root file's path.
     snapshot_files:
         std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (u64, std::path::PathBuf)>>,
 }
@@ -5768,7 +5874,7 @@ fn cloned_artifact(a: &ToolArtifact) -> ToolArtifact {
     ToolArtifact {
         name: a.name.clone(),
         source: a.source.clone(),
-        source_snapshot: a.source_snapshot.clone(),
+        source_tree: a.source_tree.clone(),
         edition: a.edition.clone(),
         crate_type: a.crate_type.clone(),
         compile_env_clear: a.compile_env_clear,
@@ -5790,25 +5896,35 @@ impl ToolRegistry {
     }
 
     /// The source a conversion of `artifact` must read: the
-    /// recorded path itself while the file still holds the
-    /// bytes the build converted (the common case, and the
-    /// one whose `file!` spellings stay the build's), and a
-    /// materialised snapshot of the recorded bytes once the
-    /// recipe has rewritten or deleted the file.
+    /// recorded path itself while every file of the recorded
+    /// tree still holds the bytes the build converted (the
+    /// common case, and the one whose `file!` spellings stay
+    /// the build's), and a materialised snapshot of the
+    /// recorded tree -- relative layout preserved, so the
+    /// root's `mod` and `include!` inputs stand beside it --
+    /// once the recipe has rewritten or deleted any of it.
     fn effective_source(&self, artifact: &ToolArtifact) -> std::path::PathBuf {
-        self.effective_source_of(&artifact.source, &artifact.source_snapshot)
+        self.effective_source_of(&artifact.source, &artifact.source_tree)
     }
 
-    /// `effective_source` for a bare (source path, bytes)
+    /// `effective_source` for a bare (source path, tree)
     /// pair: an artifact's own source, or one recorded
     /// dependency pin (see `ToolArtifact::aux_pins`).
-    fn effective_source_of(&self, source: &std::path::Path, snapshot: &[u8]) -> std::path::PathBuf {
-        if std::fs::read(source).is_ok_and(|bytes| bytes == snapshot) {
+    fn effective_source_of(
+        &self,
+        source: &std::path::Path,
+        tree: &SourceTree,
+    ) -> std::path::PathBuf {
+        if source_tree_intact(source, tree) {
             return source.to_path_buf();
         }
         use std::hash::Hasher as _;
+        use std::os::unix::ffi::OsStrExt as _;
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        hasher.write(snapshot);
+        for (rel, bytes) in tree {
+            hasher.write(rel.as_os_str().as_bytes());
+            hasher.write(bytes);
+        }
         let hash = hasher.finish();
         let mut files = self.snapshot_files.lock().unwrap();
         if let Some((h, path)) = files.get(source) {
@@ -5816,65 +5932,33 @@ impl ToolRegistry {
                 return path.clone();
             }
         }
-        let dir = std::env::temp_dir()
-            .join(format!("sparagmos-artifact-sources-{}", std::process::id()));
-        let file_name = source
+        let root_name = source
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "source.rs".to_string());
-        let path = dir.join(format!("{hash:016x}-{file_name}"));
-        if std::fs::create_dir_all(&dir).is_ok() {
-            let _ = std::fs::write(&path, snapshot);
+        let dir = std::env::temp_dir()
+            .join(format!("sparagmos-artifact-sources-{}", std::process::id()))
+            .join(format!("{hash:016x}"));
+        for (rel, bytes) in tree {
+            let target = dir.join(rel);
+            if let Some(parent) = target.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&target, bytes);
         }
+        let path = dir.join(root_name);
         files.insert(source.to_path_buf(), (hash, path.clone()));
         path
-    }
-
-    /// The recorded artifact whose build converted the
-    /// source at `path`, if any: `--aux` specs name artifacts
-    /// by their source path, where the registry's keys are
-    /// the artifact paths themselves.
-    fn get_by_source(&self, path: &std::path::Path) -> Option<ToolArtifact> {
-        self.entries
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(_, a)| a.source == path)
-            .map(|(_, a)| cloned_artifact(a))
-    }
-
-    /// One recorded `--aux` spec with its source path routed
-    /// through `effective_source`: the spec keeps the recorded
-    /// name and attributes, but the conversion it feeds reads
-    /// the bytes the named artifact's build converted.
-    fn effective_aux_spec(&self, spec: &str) -> String {
-        let Some((name, rest)) = spec.split_once('=') else {
-            return spec.to_string();
-        };
-        let (path, attrs) = match rest.split_once(';') {
-            Some((p, a)) => (p, format!(";{a}")),
-            None => (rest, String::new()),
-        };
-        match self.get_by_source(std::path::Path::new(path)) {
-            Some(art) => {
-                format!("{}={}{}", name, self.effective_source(&art).display(), attrs)
-            }
-            None => spec.to_string(),
-        }
-    }
-
-    fn effective_aux_specs(&self, specs: &[String]) -> Vec<String> {
-        specs.iter().map(|s| self.effective_aux_spec(s)).collect()
     }
 
     /// One `--aux` spec with its source path routed
     /// through a recorded dependency pin rather than the
     /// registry's current state: the conversion the spec
-    /// feeds reads the bytes the pinned build converted,
+    /// feeds reads the tree the pinned build converted,
     /// even if the dependency has since been rebuilt (at
     /// the same output path, or as another output from
     /// the same source).
-    fn pinned_aux_spec(&self, spec: &str, pin: &(std::path::PathBuf, Vec<u8>)) -> String {
+    fn pinned_aux_spec(&self, spec: &str, pin: &(std::path::PathBuf, SourceTree)) -> String {
         let Some((name, rest)) = spec.split_once('=') else {
             return spec.to_string();
         };
@@ -5891,21 +5975,23 @@ impl ToolRegistry {
     }
 
     /// `specs` with each entry routed through its
-    /// recorded pin (see `pinned_aux_spec`); a spec
-    /// without a pin (the two vectors are recorded
-    /// together, so this is only a defensive case)
-    /// resolves live, as `effective_aux_spec` does.
+    /// recorded pin (see `pinned_aux_spec`). Specs and
+    /// pins are recorded together by `tool_run`, so a
+    /// spec without a pin does not arise for a recorded
+    /// artifact; should one appear anyway it stands as
+    /// recorded -- no resolution against the registry's
+    /// current state happens anywhere on this path.
     fn pinned_aux_specs(
         &self,
         specs: &[String],
-        pins: &[(std::path::PathBuf, Vec<u8>)],
+        pins: &[(std::path::PathBuf, SourceTree)],
     ) -> Vec<String> {
         specs
             .iter()
             .enumerate()
             .map(|(i, s)| match pins.get(i) {
                 Some(pin) => self.pinned_aux_spec(s, pin),
-                None => self.effective_aux_spec(s),
+                None => s.clone(),
             })
             .collect()
     }
@@ -6146,6 +6232,90 @@ fn apply_guest_env(env: &[(Vec<u8>, Vec<u8>)]) {
     }
 }
 
+/// The literal `include!` paths a source text names, in
+/// order: `include!` followed by a string literal, the
+/// only spelling rustc accepts for the path.
+fn literal_include_paths(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut paths = Vec::new();
+    let mut i = 0;
+    while let Some(at) = text[i..].find("include!") {
+        let mut j = i + at + "include!".len();
+        i = j;
+        while j < bytes.len() && (bytes[j] as char).is_whitespace() {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b'(' {
+            continue;
+        }
+        j += 1;
+        while j < bytes.len() && (bytes[j] as char).is_whitespace() {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b'"' {
+            continue;
+        }
+        j += 1;
+        let mut path = String::new();
+        while j < bytes.len() && bytes[j] != b'"' {
+            if bytes[j] == b'\\' && j + 1 < bytes.len() {
+                j += 1;
+            }
+            path.push(bytes[j] as char);
+            j += 1;
+        }
+        if j < bytes.len() {
+            paths.push(path);
+            i = j;
+        }
+    }
+    paths
+}
+
+/// Whether the crate rooted at `root` declares a `main`
+/// function: the root's own text, or the text of a file
+/// the root splices in through a literal `include!`
+/// (transitively, each include resolved against the
+/// including file's directory). A `mod` file cannot hold
+/// the crate's entry point, but an included file is root
+/// text by other means, and a root that only includes
+/// its `main` still builds a binary under a real rustc --
+/// the root-only reading would record such a build as a
+/// library, and the artifact could never be run.
+fn crate_root_has_main(root: &std::path::Path, root_text: &str) -> bool {
+    if root_text.contains("fn main") {
+        return true;
+    }
+    let base = root.parent().unwrap_or(root);
+    let mut frontier: Vec<std::path::PathBuf> = literal_include_paths(root_text)
+        .iter()
+        .map(|rel| base.join(rel))
+        .collect();
+    let mut seen: std::collections::HashSet<std::path::PathBuf> =
+        frontier.iter().cloned().collect();
+    let mut steps = 0;
+    while let Some(path) = frontier.pop() {
+        steps += 1;
+        if steps > 64 {
+            break;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if text.contains("fn main") {
+            return true;
+        }
+        let base = path.parent().unwrap_or(&path).to_path_buf();
+        for rel in literal_include_paths(&text) {
+            let next = base.join(rel);
+            if seen.insert(next.clone()) {
+                frontier.push(next);
+            }
+        }
+    }
+    false
+}
+
 /// Answer one intercepted tool invocation (a run-make recipe's
 /// compiler call) with the driver's own conversion machinery:
 /// the invocation is re-run as this binary in convert mode over
@@ -6188,7 +6358,7 @@ fn tool_run(
     // specs are resolved through these pins, so a build
     // -- and the artifact it records -- keeps the
     // dependency builds it actually named.
-    let mut aux_pins: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
+    let mut aux_pins: Vec<(std::path::PathBuf, SourceTree)> = Vec::new();
     let mut emits: Vec<(String, Option<String>)> = Vec::new();
     let mut out_file: Option<String> = None;
     let mut out_dir: Option<String> = None;
@@ -6266,7 +6436,7 @@ fn tool_run(
                     });
                     match bound {
                         Some((name, art)) => {
-                            aux_pins.push((art.source.clone(), art.source_snapshot.clone()));
+                            aux_pins.push((art.source.clone(), art.source_tree.clone()));
                             aux.push(aux_spec_for(&name, &art));
                         }
                         None => {
@@ -6373,11 +6543,12 @@ fn tool_run(
             .unwrap_or_else(|| "crate".to_string())
     });
     let source_text = std::fs::read_to_string(&input_abs).unwrap_or_default();
-    // The bytes this build converts, snapshotted into every
-    // artifact it records: the recipe may rewrite or delete
-    // the file once the build returns, and the artifact must
-    // still denote the program this invocation produced.
-    let source_snapshot = std::fs::read(&input_abs).unwrap_or_default();
+    // The source tree this build converts, snapshotted
+    // into every artifact it records: the recipe may
+    // rewrite or delete the sources once the build returns,
+    // and the artifact must still denote the program this
+    // invocation produced.
+    let source_tree = snapshot_source_tree(&input_abs);
 
     // Registered artifacts the input declares through
     // `extern crate` items bind too (the driver's session
@@ -6387,7 +6558,7 @@ fn tool_run(
         if source_text.contains(&needle)
             && !aux.iter().any(|s| s == &aux_spec_for(&art.name, &art))
         {
-            aux_pins.push((art.source.clone(), art.source_snapshot.clone()));
+            aux_pins.push((art.source.clone(), art.source_tree.clone()));
             aux.push(aux_spec_for(&art.name, &art));
         }
     }
@@ -6455,7 +6626,7 @@ fn tool_run(
     // would have produced, so later invocations and the
     // recipe's own file checks find them.
     let types: Vec<String> = if crate_types.is_empty() {
-        let has_main = source_text.contains("fn main");
+        let has_main = crate_root_has_main(&input_abs, &source_text);
         let wants_metadata = emits.iter().any(|(k, _)| k == "metadata");
         if wants_metadata {
             vec!["rmeta".to_string()]
@@ -6491,7 +6662,7 @@ fn tool_run(
             ToolArtifact {
                 name: crate_name.clone(),
                 source: input_abs.clone(),
-                source_snapshot: source_snapshot.clone(),
+                source_tree: source_tree.clone(),
                 edition: Some(edition.clone()),
                 crate_type,
                 compile_env_clear: request.env_clear,
@@ -6614,9 +6785,10 @@ fn tool_run(
 /// The run is reconstructed from what the producing
 /// invocation carried, not from the file system as it now
 /// stands: the source it converts is the recorded path while
-/// that file still holds the build's bytes, and the recorded
-/// snapshot once the recipe has rewritten or deleted it (see
-/// `ToolRegistry::effective_source`), and its `--aux` bindings
+/// every file of its tree still holds the build's bytes, and
+/// the recorded snapshot once the recipe has rewritten or
+/// deleted any of it (see `ToolRegistry::effective_source`),
+/// and its `--aux` bindings
 /// likewise resolve against the dependency versions its build
 /// bound, not the registry's current entries (see
 /// `ToolArtifact::aux_pins`); the program's argv[0]
@@ -6654,7 +6826,24 @@ fn artifact_run(
             .map_err(|e| format!("tool interception: no working directory: {e}"))?,
     };
     let program = String::from_utf8_lossy(&request.program).into_owned();
-    let path = absolutize(&cwd, &program);
+    // The lookup follows the path the interpreter's spawn
+    // resolution settled on, not the spelled name: a bare
+    // name invoked under a command-specific `PATH` denotes
+    // the artifact that search found, not a namesake in
+    // the working directory (see
+    // `ToolRunRequest::resolved_program`). The spelled
+    // name remains what the run presents as argv[0].
+    let path = match &request.resolved_program {
+        Some(resolved) => {
+            let resolved = std::path::PathBuf::from(std::ffi::OsString::from_vec(resolved.clone()));
+            if resolved.is_absolute() {
+                resolved
+            } else {
+                cwd.join(resolved)
+            }
+        }
+        None => absolutize(&cwd, &program),
+    };
     let Some(artifact) = registry.get(&path) else {
         return Err(format!(
             "tool interception: program `{program}` is not an artifact this run produced"

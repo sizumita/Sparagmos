@@ -21815,6 +21815,254 @@ fn main() {
     assert!(out.status.success(), "running usesx failed");
     assert_eq!(String::from_utf8(out.stdout).unwrap(), "lib says 2\n");
 
+    // A binary bound through the `extern crate` scan (the
+    // recipe passes no `--extern`) keeps the library
+    // version its build bound: rebuilding the library at
+    // the same output path afterwards does not change
+    // what the earlier binary runs.
+    build(
+        &rustc,
+        "scanlib",
+        "pub fn f() -> u32 { 1 }\n",
+        &["--crate-type=rlib"],
+    );
+    build(
+        &rustc,
+        "usesscan",
+        "extern crate scanlib; fn main() { println!(\"lib says {}\", scanlib::f()); }\n",
+        &[],
+    );
+    build(
+        &rustc,
+        "scanlib",
+        "pub fn f() -> u32 { 2 }\n",
+        &["--crate-type=rlib"],
+    );
+    let out = Command::new(dir.join("usesscan")).output().unwrap();
+    assert!(out.status.success(), "running usesscan failed");
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "lib says 1\n");
+
+    // The same through a source rewrite with no rebuild:
+    // the scan-bound pin is the tree the binary's build
+    // converted, not the file as it later stands.
+    build(
+        &rustc,
+        "rewlib",
+        "pub fn f() -> u32 { 1 }\n",
+        &["--crate-type=rlib"],
+    );
+    build(
+        &rustc,
+        "usesrew",
+        "extern crate rewlib; fn main() { println!(\"lib says {}\", rewlib::f()); }\n",
+        &[],
+    );
+    std::fs::write("rewlib.rs", "pub fn f() -> u32 { 2 }\n").unwrap();
+    let out = Command::new(dir.join("usesrew")).output().unwrap();
+    assert!(out.status.success(), "running usesrew failed");
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "lib says 1\n");
+
+    // A built binary denotes its whole source tree, not
+    // just the crate root: rewriting the root AND its
+    // module file after the build changes nothing the
+    // earlier binary runs.
+    let mtree = dir.join("mtree");
+    std::fs::create_dir_all(&mtree).unwrap();
+    std::fs::write(
+        mtree.join("modprobe.rs"),
+        "mod helper; fn main() { println!(\"value {}\", helper::v()); }\n",
+    )
+    .unwrap();
+    std::fs::write(mtree.join("helper.rs"), "pub fn v() -> u32 { 1 }\n").unwrap();
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--out-dir")
+        .arg(&mtree)
+        .arg(mtree.join("modprobe.rs"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "modprobe build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::write(
+        mtree.join("modprobe.rs"),
+        "mod helper; fn main() { println!(\"value {} newroot\", helper::v()); }\n",
+    )
+    .unwrap();
+    std::fs::write(mtree.join("helper.rs"), "pub fn v() -> u32 { 2 }\n").unwrap();
+    let out = Command::new(mtree.join("modprobe")).output().unwrap();
+    assert!(out.status.success(), "running modprobe failed");
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "value 1\n");
+
+    // Modifying only the module file leaves the root's
+    // bytes untouched, and still must not change what
+    // the earlier binary runs: the snapshot compares
+    // the whole tree, not the root alone.
+    let htree = dir.join("htree");
+    std::fs::create_dir_all(&htree).unwrap();
+    std::fs::write(
+        htree.join("modprobe.rs"),
+        "mod helper; fn main() { println!(\"value {}\", helper::v()); }\n",
+    )
+    .unwrap();
+    std::fs::write(htree.join("helper.rs"), "pub fn v() -> u32 { 1 }\n").unwrap();
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--out-dir")
+        .arg(&htree)
+        .arg(htree.join("modprobe.rs"))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "htree modprobe build failed");
+    std::fs::write(htree.join("helper.rs"), "pub fn v() -> u32 { 2 }\n").unwrap();
+    let out = Command::new(htree.join("modprobe")).output().unwrap();
+    assert!(out.status.success(), "running htree modprobe failed");
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "value 1\n");
+
+    // An `include!` input is part of the tree too: the
+    // root that only includes its `main` builds a binary,
+    // and modifying only the included file afterwards
+    // does not change what it runs.
+    let itree = dir.join("itree");
+    std::fs::create_dir_all(&itree).unwrap();
+    std::fs::write(itree.join("incprobe.rs"), "include!(\"part.rs\");\n").unwrap();
+    std::fs::write(
+        itree.join("part.rs"),
+        "fn main() { println!(\"part 1\"); }\n",
+    )
+    .unwrap();
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--out-dir")
+        .arg(&itree)
+        .arg(itree.join("incprobe.rs"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "incprobe build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::write(
+        itree.join("part.rs"),
+        "fn main() { println!(\"part 2\"); }\n",
+    )
+    .unwrap();
+    let out = Command::new(itree.join("incprobe")).output().unwrap();
+    assert!(out.status.success(), "running incprobe failed");
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "part 1\n");
+
+    // Deleting the whole tree after the build does not
+    // orphan the binary: the snapshot holds every file.
+    let dtree = dir.join("dtree");
+    std::fs::create_dir_all(&dtree).unwrap();
+    std::fs::write(
+        dtree.join("modprobe.rs"),
+        "mod helper; fn main() { println!(\"value {}\", helper::v()); }\n",
+    )
+    .unwrap();
+    std::fs::write(dtree.join("helper.rs"), "pub fn v() -> u32 { 1 }\n").unwrap();
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--out-dir")
+        .arg(&dtree)
+        .arg(dtree.join("modprobe.rs"))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "dtree modprobe build failed");
+    std::fs::remove_file(dtree.join("modprobe.rs")).unwrap();
+    std::fs::remove_file(dtree.join("helper.rs")).unwrap();
+    let out = Command::new(dtree.join("modprobe")).output().unwrap();
+    assert!(out.status.success(), "running dtree modprobe failed");
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "value 1\n");
+
+    // A library's tree rides its pin the same way:
+    // modifying only the library's module file after the
+    // binary was built, or deleting the library's tree,
+    // does not change what the binary runs.
+    let tlib = dir.join("tlib");
+    std::fs::create_dir_all(&tlib).unwrap();
+    std::fs::write(
+        tlib.join("treelib.rs"),
+        "mod helper; pub fn f() -> u32 { helper::v() }\n",
+    )
+    .unwrap();
+    std::fs::write(tlib.join("helper.rs"), "pub fn v() -> u32 { 1 }\n").unwrap();
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--crate-type=rlib")
+        .arg("--out-dir")
+        .arg(&tlib)
+        .arg(tlib.join("treelib.rs"))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "treelib build failed");
+    std::fs::write(
+        tlib.join("uses.rs"),
+        "extern crate treelib; fn main() { println!(\"lib says {}\", treelib::f()); }\n",
+    )
+    .unwrap();
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--extern")
+        .arg(format!("treelib={}", tlib.join("libtreelib.rlib").display()))
+        .arg("--out-dir")
+        .arg(&tlib)
+        .arg(tlib.join("uses.rs"))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "tlib uses build failed");
+    std::fs::write(tlib.join("helper.rs"), "pub fn v() -> u32 { 2 }\n").unwrap();
+    let out = Command::new(tlib.join("uses")).output().unwrap();
+    assert!(out.status.success(), "running tlib uses failed");
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "lib says 1\n");
+    std::fs::remove_file(tlib.join("treelib.rs")).unwrap();
+    std::fs::remove_file(tlib.join("helper.rs")).unwrap();
+    let out = Command::new(tlib.join("uses")).output().unwrap();
+    assert!(out.status.success(), "running tlib uses after delete failed");
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "lib says 1\n");
+
+    // A bare program name invoked under a
+    // command-specific `PATH` denotes the artifact that
+    // search finds, not a namesake in the working
+    // directory; the spelled name stays its argv[0].
+    // Without the `PATH` entry the same bare name does
+    // not resolve at all -- the working directory is not
+    // searched.
+    let pbin = dir.join("pbin");
+    std::fs::create_dir_all(&pbin).unwrap();
+    std::fs::write(
+        pbin.join("pathprobe.rs"),
+        "fn main() { println!(\"bin prog argv0={}\", std::env::args().next().unwrap()); }\n",
+    )
+    .unwrap();
+    let out = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--out-dir")
+        .arg(&pbin)
+        .arg(pbin.join("pathprobe.rs"))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "pbin pathprobe build failed");
+    build(
+        &rustc,
+        "pathprobe",
+        "fn main() { println!(\"cwd prog\"); }\n",
+        &[],
+    );
+    let out = Command::new("pathprobe")
+        .env("PATH", &pbin)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "running pathprobe via PATH failed");
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "bin prog argv0=pathprobe\n"
+    );
+    assert!(Command::new("pathprobe").output().is_err());
+
     println!("artifact fidelity guest ok");
 }
 "#;

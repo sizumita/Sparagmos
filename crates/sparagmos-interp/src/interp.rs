@@ -100,6 +100,18 @@ pub struct ToolRunRequest {
     pub envs: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     pub env_clear: bool,
     pub cwd: Option<Vec<u8>>,
+    /// The program path the interpreter's own spawn
+    /// resolution (the process model's `execvp` search)
+    /// settled on for this invocation, when it resolved:
+    /// the path the host side must look its answer up by.
+    /// For a bare program name invoked under a
+    /// command-specific `PATH` this differs from the
+    /// spelled `program` -- the artifact the search finds
+    /// is the one the invocation denotes, not a namesake
+    /// in the working directory. `program` itself stays
+    /// as spelled: it is what the program reads as its
+    /// argv[0].
+    pub resolved_program: Option<Vec<u8>>,
 }
 
 /// The outcome of one tool invocation, from which the fabricated
