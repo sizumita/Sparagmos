@@ -7525,7 +7525,14 @@ impl<'a> Interpreter<'a> {
                     }
                 } else if target.starts_with("std::boxed::Box<") {
                     // `Box::from(value)` is `Box::new` by definition.
-                    Ok(self.new_box(value))
+                    let boxed = self.new_box(value);
+                    if let Some(ty) =
+                        generic_first_arg(target, "std::boxed::Box<")
+                            .and_then(ty_from_tag)
+                    {
+                        self.record_box_ty(&boxed, ty);
+                    }
+                    Ok(boxed)
                 } else if target.starts_with("std::cell::Cell<") {
                     // `From<T> for Cell<T>` is `Cell::new` by
                     // definition (core::cell), so the result is the
@@ -8246,7 +8253,9 @@ impl<'a> Interpreter<'a> {
             Builtin::StringIntoBoxedStr => {
                 arity(1)?;
                 let s = self.resolve_string(frames, &vals[0])?;
-                Ok(self.new_box(Value::Str(s)))
+                let boxed = self.new_box(Value::Str(s));
+                self.record_box_ty(&boxed, Ty::Str);
+                Ok(boxed)
             }
             Builtin::NoAllocShimMarker => {
                 arity(0)?;
@@ -8262,9 +8271,15 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::VecIntoBoxedSlice => {
                 arity(1)?;
-                match vals.into_iter().next().expect("arity checked") {
+                // The generic argument is the element type; the
+                // pointee is a slice of it.
+                let pointee_ty = generic_args
+                    .first()
+                    .and_then(|tag| ty_from_tag(tag))
+                    .map(|elem| Ty::Slice(Box::new(elem)));
+                let boxed = match vals.into_iter().next().expect("arity checked") {
                     Value::Enum { fields, .. } => {
-                        Ok(self.new_box(Value::Tuple(fields)))
+                        self.new_box(Value::Tuple(fields))
                     }
                     Value::SparseVec { mut elems, len, .. } => {
                         // The boxed slice holds the declared
@@ -8288,15 +8303,21 @@ impl<'a> Interpreter<'a> {
                         if elems.len() < len {
                             elems.resize(len, Value::Uninit);
                         }
-                        Ok(self.new_box(Value::Tuple(elems)))
+                        self.new_box(Value::Tuple(elems))
                     }
-                    Value::Tuple(items) => Ok(self.new_box(Value::Tuple(items))),
-                    other => Err(InterpError::type_mismatch(
-                        "Vec::into_boxed_slice",
-                        "vector value",
-                        other.kind_name(),
-                    )),
+                    Value::Tuple(items) => self.new_box(Value::Tuple(items)),
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            "Vec::into_boxed_slice",
+                            "vector value",
+                            other.kind_name(),
+                        ))
+                    }
+                };
+                if let Some(ty) = pointee_ty {
+                    self.record_box_ty(&boxed, ty);
                 }
+                Ok(boxed)
             }
             Builtin::StringPushStr => {
                 arity(2)?;
@@ -8921,6 +8942,7 @@ impl<'a> Interpreter<'a> {
                 // either world.
                 let v = vals.into_iter().next().expect("arity checked");
                 let tag = generic_args.first().map(String::as_str).unwrap_or("");
+                let pointee_ty = ty_from_tag(tag);
                 if let Some((size, align)) = self.layout_of(tag) {
                     if size > 0 {
                         if let Some(ptr) =
@@ -8938,11 +8960,18 @@ impl<'a> Interpreter<'a> {
                                 fields: vec![ptr],
                             };
                             self.record_box_layout(&boxed, size, align);
+                            if let Some(ty) = &pointee_ty {
+                                self.record_box_ty(&boxed, ty.clone());
+                            }
                             return Ok(boxed);
                         }
                     }
                 }
-                Ok(self.new_box(v))
+                let boxed = self.new_box(v);
+                if let Some(ty) = pointee_ty {
+                    self.record_box_ty(&boxed, ty);
+                }
+                Ok(boxed)
             }
             Builtin::ManuallyDropNew => {
                 arity(1)?;
@@ -9005,6 +9034,15 @@ impl<'a> Interpreter<'a> {
             Builtin::BoxNewUninit => {
                 arity(0)?;
                 let tag = generic_args.first().map(String::as_str).unwrap_or("");
+                // The tag names the *inner* type (the `T` of
+                // `Box<MaybeUninit<T>>`); the allocation's
+                // declared type is the union itself, which is
+                // what the record must carry -- recording the
+                // inner type would make the `MaybeUninit` entry
+                // gate refuse the wrapper's own positions.
+                let pointee_ty = Some(Ty::Adt(
+                    "core::mem::MaybeUninit".to_string(),
+                ));
                 match uninit_value_for_tag(tag) {
                     Some(pointee) => {
                         if let Some((size, align)) = self.layout_of(tag) {
@@ -9035,11 +9073,18 @@ impl<'a> Interpreter<'a> {
                                     self.record_box_layout(
                                         &boxed, size, align,
                                     );
+                                    if let Some(ty) = &pointee_ty {
+                                        self.record_box_ty(&boxed, ty.clone());
+                                    }
                                     return Ok(boxed);
                                 }
                             }
                         }
-                        Ok(self.new_box(pointee))
+                        let boxed = self.new_box(pointee);
+                        if let Some(ty) = pointee_ty {
+                            self.record_box_ty(&boxed, ty);
+                        }
+                        Ok(boxed)
                     }
                     None => Err(unsupported(format!(
                         "Box::new_uninit for {tag} is not runtime-supported"
@@ -12289,7 +12334,14 @@ fn value_fingerprint(value: &Value) -> u64 {
                             &Resolved::Alloc { id, projection },
                         )?;
                         let cloned = self.clone_owned_value(frames, &pointee)?;
-                        return Ok(self.new_box(cloned));
+                        let boxed = self.new_box(cloned);
+                        if let Some(ty) =
+                            generic_first_arg(self_ty, "std::boxed::Box<")
+                                .and_then(ty_from_tag)
+                        {
+                            self.record_box_ty(&boxed, ty);
+                        }
+                        return Ok(boxed);
                     }
                 }
                 // A cloned container owns its elements: a
@@ -25848,6 +25900,97 @@ fn zeroed_value_for_tag(tag: &str) -> Option<Value> {
 /// The first generic argument of a rendered generic type tag
 /// (`std::cell::RefCell<std::vec::Vec<u32>>` -> the `Vec` tag), or
 /// `None` when the tag does not start with `prefix`.
+/// The `Ty` a rendered type tag denotes, for the forms that
+/// carry one: the inverse of [`ty_tag`]'s rendering, following
+/// the rules conversion itself applies when it builds a `Ty`
+/// from a rustc type (an ADT instance is its definition's name
+/// with the generic arguments dropped, a `char` is a `u32`, a
+/// raw pointer shares the reference representation). Forms
+/// whose `Ty` carries facts the rendering does not -- a `dyn`
+/// type, a closure or coroutine type, a generic parameter, an
+/// unevaluated array length -- answer `None`, and the caller
+/// keeps the behaviour it has without a type.
+pub(crate) fn ty_from_tag(tag: &str) -> Option<Ty> {
+    let tag = tag.trim();
+    Some(match tag {
+        "bool" => Ty::Bool,
+        "char" => Ty::Uint(UintTy::U32),
+        "i8" => Ty::Int(IntTy::I8),
+        "i16" => Ty::Int(IntTy::I16),
+        "i32" => Ty::Int(IntTy::I32),
+        "i64" => Ty::Int(IntTy::I64),
+        "i128" => Ty::Int(IntTy::I128),
+        "isize" => Ty::Int(IntTy::Isize),
+        "u8" => Ty::Uint(UintTy::U8),
+        "u16" => Ty::Uint(UintTy::U16),
+        "u32" => Ty::Uint(UintTy::U32),
+        "u64" => Ty::Uint(UintTy::U64),
+        "u128" => Ty::Uint(UintTy::U128),
+        "usize" => Ty::Uint(UintTy::Usize),
+        "f16" => Ty::Float(FloatTy::F16),
+        "f32" => Ty::Float(FloatTy::F32),
+        "f64" => Ty::Float(FloatTy::F64),
+        "f128" => Ty::Float(FloatTy::F128),
+        "str" => Ty::Str,
+        "!" => Ty::Never,
+        "()" => Ty::Unit,
+        _ if tag.starts_with('[') && tag.ends_with(']') => {
+            let inner = &tag[1..tag.len() - 1];
+            match inner.rsplit_once(';') {
+                Some((elem, n)) => {
+                    let n: u64 = n.trim().parse().ok()?;
+                    Ty::Array(Box::new(ty_from_tag(elem.trim())?), n)
+                }
+                None => Ty::Slice(Box::new(ty_from_tag(inner.trim())?)),
+            }
+        }
+        _ if tag.starts_with('(') && tag.ends_with(')') => {
+            let inner = &tag[1..tag.len() - 1];
+            if inner.is_empty() {
+                Ty::Unit
+            } else {
+                let mut tys = Vec::new();
+                for part in split_top_level(inner) {
+                    let part = part.trim();
+                    if part.is_empty() {
+                        // The one-tuple's trailing comma.
+                        continue;
+                    }
+                    tys.push(ty_from_tag(part)?);
+                }
+                Ty::Tuple(tys)
+            }
+        }
+        _ if tag.starts_with('&') => {
+            let inner = tag[1..].trim_start();
+            let inner = inner.strip_prefix("mut ").unwrap_or(inner);
+            Ty::Ref(Box::new(ty_from_tag(inner)?))
+        }
+        _ if tag.starts_with("*const ") || tag.starts_with("*mut ") => {
+            let inner = tag.split_once(' ')?.1.trim();
+            Ty::Ref(Box::new(ty_from_tag(inner)?))
+        }
+        _ if tag.starts_with("dyn ") => return None,
+        _ => {
+            // An ADT instance: the definition's path, with any
+            // generic arguments dropped, exactly as conversion
+            // builds the type. ADT tags are crate-qualified
+            // paths; a bare single-segment name is a generic
+            // parameter (or another form with no `Ty` here),
+            // and a closure or coroutine definition name
+            // carries its `{closure}` / `{coroutine}` marker.
+            let base = match tag.find('<') {
+                Some(at) => &tag[..at],
+                None => tag,
+            };
+            if !base.contains("::") || base.contains('{') {
+                return None;
+            }
+            Ty::Adt(base.to_string())
+        }
+    })
+}
+
 fn generic_first_arg<'a>(tag: &'a str, prefix: &str) -> Option<&'a str> {
     let inner = tag.strip_prefix(prefix)?.strip_suffix('>')?;
     split_top_level(inner).into_iter().next()
@@ -26007,7 +26150,11 @@ impl<'a> Interpreter<'a> {
             } else {
                 self.default_value(inner)?
             };
-            return Some(self.new_box(pointee));
+            let boxed = self.new_box(pointee);
+            if let Some(ty) = ty_from_tag(inner) {
+                self.record_box_ty(&boxed, ty);
+            }
+            return Some(boxed);
         }
         if let Some(inner) = generic_first_arg(tag, "std::rc::Rc<")
             .or_else(|| generic_first_arg(tag, "std::sync::Arc<"))

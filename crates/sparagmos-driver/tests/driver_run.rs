@@ -22613,6 +22613,45 @@ fn main() {
     println!("drops={}", unsafe { DROPS });
 }
 "#;
+#[test]
+fn run_mode_box_enum_tag_byte_view_matches_native() {
+    // A byte pointer at a `Box` allocation's storage reads and
+    // writes the enum's tag span, as it does for a place: the
+    // allocation's recorded declared type lets the byte view
+    // and the `MaybeUninit` entry gate judge the position as
+    // the enum's own storage (Lane OC, #292). Before the
+    // record existed, the byte read answered the payload's
+    // first byte and the byte write spliced into the payload.
+    let dir = temp_dir("box-enum-tag-byte-view");
+    let src = fixture(&dir, "box_enum_tag_byte_view.rs", BOX_ENUM_TAG_BYTE_VIEW_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "box enum tag byte view must run with native values; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+const BOX_ENUM_TAG_BYTE_VIEW_SRC: &str = r#"
+enum E { A(u32), B(u16) }
+fn main() {
+    let b = Box::new(E::A(0x11223344));
+    let tag = unsafe { *(&*b as *const E as *const u8) };
+    assert_eq!(tag, 0);
+    let mut b2 = Box::new(E::A(0x11223344));
+    unsafe { *(&mut *b2 as *mut E as *mut u8) = 1; }
+    assert!(matches!(*b2, E::B(_)));
+    let raw = Box::into_raw(Box::new(E::A(0x11223344)));
+    let tag = unsafe { *(raw as *const u8) };
+    assert_eq!(tag, 0);
+    unsafe { *(raw as *mut u8) = 1; }
+    let b3 = unsafe { Box::from_raw(raw) };
+    assert!(matches!(*b3, E::B(_)));
+    println!("ok");
+}
+"#;
 
 #[test]
 fn run_mode_exposed_provenance_round_trip_drops_once() {
@@ -22622,3 +22661,57 @@ fn run_mode_exposed_provenance_round_trip_drops_once() {
         "v=11\nv=12\ndrops=1\n",
     );
 }
+#[test]
+fn run_mode_box_byte_add_over_adt_elements_matches_native() {
+    // A byte-denominated pointer step over a `Box<[E; N]>`
+    // lands on the element it denotes natively: the
+    // allocation's recorded array type denominates the
+    // displacement by the element size (Lane OC, #292).
+    // Before the record existed, the displaced read was an
+    // explicit "displaced from a value boundary" error.
+    let dir = temp_dir("box-byte-add-adt");
+    let src = fixture(&dir, "box_byte_add_adt.rs", BOX_BYTE_ADD_ADT_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "box byte_add over ADT elements must run with native values; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+const BOX_BYTE_ADD_ADT_SRC: &str = r#"
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum E { A(u32), B(u16) }
+fn main() {
+    let b = Box::new([E::A(11), E::B(22), E::A(33)]);
+    let mut p = b.as_ptr();
+    unsafe {
+        assert_eq!(*p, E::A(11));
+        p = p.byte_add(std::mem::size_of::<E>());
+        assert_eq!(*p, E::B(22));
+        p = p.byte_add(std::mem::size_of::<E>());
+        assert_eq!(*p, E::A(33));
+        p = p.byte_sub(2 * std::mem::size_of::<E>());
+        assert_eq!(*p, E::A(11));
+    }
+    // The same denomination over a boxed slice (a recorded
+    // slice type) and for byte-denominated writes.
+    let v = vec![E::A(11), E::B(22), E::A(33)];
+    let bs = v.into_boxed_slice();
+    let mut q = bs.as_ptr();
+    unsafe {
+        q = q.byte_add(std::mem::size_of::<E>());
+        assert_eq!(*q, E::B(22));
+    }
+    let mut w = Box::new([0u32; 4]);
+    let wp = w.as_mut_ptr();
+    unsafe {
+        *wp.byte_add(4) = 77;
+        *wp.byte_add(12) = 99;
+    }
+    assert_eq!(*w, [0, 77, 0, 99]);
+    println!("ok");
+}
+"#;

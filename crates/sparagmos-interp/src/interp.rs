@@ -915,6 +915,23 @@ pub struct Interpreter<'a> {
     /// never removed; allocation ids are never reused, so a
     /// stale entry can never alias a later allocation.
     exposed_targets: std::cell::RefCell<std::collections::HashMap<u64, RefTarget>>,
+    /// The declared type recorded for an allocation at its
+    /// creation point (see [`Interpreter::record_alloc_ty`]):
+    /// for an ordinary allocation, the pointee type it was
+    /// created to hold; for a raw element block, the element
+    /// type. A position inside an allocation has no declared
+    /// type of its own in this model (a projected place's type
+    /// chain stops at the pointer it came through), so this
+    /// record is what the `MaybeUninit` entry gate and the
+    /// byte-offset denomination consult for allocation
+    /// positions, exactly as a home local's declared type and
+    /// the program's static-type table serve the same
+    /// judgments for place and static positions. Allocations
+    /// whose creation point knows no type (the raw allocator
+    /// builtins hand out storage for a size, not a type) have
+    /// no entry, and their positions keep the value-shape
+    /// evidence they are judged by without one.
+    alloc_tys: std::cell::RefCell<HashMap<u64, Ty>>,
     /// The id the next created allocation gets.
     next_alloc: std::cell::Cell<u64>,
     /// Pre-decoded bodies for the run loop (see [`crate::decode`]),
@@ -1568,6 +1585,7 @@ impl<'a> Interpreter<'a> {
             exposed_targets: std::cell::RefCell::new(
                 std::collections::HashMap::new(),
             ),
+            alloc_tys: std::cell::RefCell::new(HashMap::new()),
             next_alloc: std::cell::Cell::new(1),
             decoded: std::cell::RefCell::new(std::collections::HashMap::new()),
             adt_instance_keys: std::cell::RefCell::new(HashMap::new()),
@@ -6458,6 +6476,16 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// Record the declared pointee type of a box the
+    /// construction builtins just created, for the judgments
+    /// that consult an allocation's declared type (see
+    /// [`Interpreter::record_alloc_ty`]).
+    pub(crate) fn record_box_ty(&self, box_value: &Value, ty: Ty) {
+        if let Some((id, _)) = box_alloc_pointer(box_value) {
+            self.record_alloc_ty(id, ty);
+        }
+    }
+
     /// Allocate through the program's guest allocator shim
     /// (`#[global_allocator]`), when the program defines one:
     /// the allocation the native entry point
@@ -7085,6 +7113,24 @@ impl<'a> Interpreter<'a> {
         self.allocs.borrow().get(&id).cloned()
     }
 
+    /// Record the declared type of allocation `id` (see the
+    /// `alloc_tys` field). A creation point that knows the
+    /// type calls this once, when the allocation is made. The
+    /// record is the allocation's own: retargeting a pointer
+    /// at the same storage (an `assume_init` transmute is the
+    /// canonical case) does not move it, because the storage
+    /// was created for the recorded type whatever the pointer
+    /// that reaches it declares.
+    pub(crate) fn record_alloc_ty(&self, id: u64, ty: Ty) {
+        self.alloc_tys.borrow_mut().insert(id, ty);
+    }
+
+    /// The declared type recorded for allocation `id`, if its
+    /// creation point knew one.
+    pub(crate) fn alloc_ty(&self, id: u64) -> Option<Ty> {
+        self.alloc_tys.borrow().get(&id).cloned()
+    }
+
     pub(crate) fn new_box(&self, pointee: Value) -> Value {
         let id = self.alloc_insert(pointee);
         Value::Enum {
@@ -7172,6 +7218,7 @@ impl<'a> Interpreter<'a> {
     pub(crate) fn free_alloc(&self, id: u64) {
         self.allocs.borrow_mut().remove(&id);
         self.elem_blocks.borrow_mut().remove(&id);
+        self.alloc_tys.borrow_mut().remove(&id);
     }
 
     /// Set the discriminant of the ADT value `value` to `variant`,
@@ -9002,13 +9049,15 @@ impl<'a> Interpreter<'a> {
         // The position's own declared type, where the model
         // records it, outranks the stored form: a place with no
         // projection is its home local itself, whose declared
-        // type the home body's table carries, and a static's
-        // declared type is in the program's table. When that
-        // type is an ADT other than `MaybeUninit` itself, an
-        // enum stored at the position is that ADT's own value,
-        // never a wrapper layer. Positions whose home type the
-        // model does not record (allocations, projected places)
-        // keep the stored-form evidence below.
+        // type the home body's table carries, a static's
+        // declared type is in the program's table, and an
+        // allocation's is in the record its creation point left
+        // (see the `alloc_tys` field). When that type is an ADT
+        // other than `MaybeUninit` itself, an enum stored at
+        // the position is that ADT's own value, never a wrapper
+        // layer. Positions whose home type the model does not
+        // record (an allocation created without a type, a
+        // projected place) keep the stored-form evidence below.
         let home_is_foreign_adt = match &resolved {
             Resolved::Place {
                 frame_pos,
@@ -9026,6 +9075,13 @@ impl<'a> Interpreter<'a> {
             {
                 self.program.static_tys.get(name).is_some_and(|ty| {
                     matches!(ty, Ty::Adt(_)) && !is_maybe_uninit_ty(ty)
+                })
+            }
+            Resolved::Alloc { id, projection }
+                if projection.is_empty() =>
+            {
+                self.alloc_ty(*id).is_some_and(|ty| {
+                    matches!(ty, Ty::Adt(_)) && !is_maybe_uninit_ty(&ty)
                 })
             }
             _ => false,
@@ -11059,6 +11115,68 @@ impl<'a> Interpreter<'a> {
         variant.fields.get(idx).map(|field| field.ty.clone())
     }
 
+    /// Absorb a pointer offset into an element index for an
+    /// allocation whose declared type its creation point
+    /// recorded (see the `alloc_tys` field): the recorded type
+    /// is a sequence (an array or a slice), so a byte
+    /// displacement over the allocation is denominated by the
+    /// sequence's element size, exactly as a static array's
+    /// offset is denominated by the program's recorded static
+    /// type. The position must sit at the sequence itself: an
+    /// optional trailing index or byte-offset step composes
+    /// into the byte position first, and any other step means
+    /// the position is inside a sub-value, whose denomination
+    /// is not the sequence's. A displacement that lands
+    /// between elements, or outside the recorded array's
+    /// bounds (one past the end included, as a pointer there
+    /// may be formed), answers `None` and the caller carries
+    /// the displacement as before.
+    fn alloc_typed_offset_absorb(
+        &self,
+        id: u64,
+        projection: &[RefProj],
+        disp: Option<i128>,
+    ) -> Option<Vec<RefProj>> {
+        let ty = self.alloc_ty(id)?;
+        let (elem, len) = match &ty {
+            Ty::Array(elem, n) => (self.ty_size(elem)?, Some(*n)),
+            Ty::Slice(elem) => (self.ty_size(elem)?, None),
+            _ => return None,
+        };
+        if elem == 0 {
+            return None;
+        }
+        let elem = i128::from(elem);
+        let disp = disp?;
+        let (head, cur) = match projection.split_last() {
+            Some((RefProj::Index(i), head)) => {
+                (head, i128::try_from(*i).ok()?.checked_mul(elem)?)
+            }
+            Some((RefProj::ByteOffset(d), head)) => (head, *d),
+            None => (projection, 0),
+            _ => return None,
+        };
+        if !head.is_empty() {
+            return None;
+        }
+        let total = cur.checked_add(disp)?;
+        if total < 0 || total % elem != 0 {
+            return None;
+        }
+        let idx = total / elem;
+        if let Some(n) = len {
+            if idx > i128::from(n) {
+                return None;
+            }
+        }
+        let idx = usize::try_from(idx).ok()?;
+        Some(if idx == 0 && projection.is_empty() {
+            Vec::new()
+        } else {
+            vec![RefProj::Index(idx)]
+        })
+    }
+
     /// The value of a pointer offset (see [`Rvalue::PtrOffset`]):
     /// `base` advanced by `count` elements of `elem_size` bytes
     /// each (the size may be unknown, in which case only the
@@ -11317,6 +11435,11 @@ impl<'a> Interpreter<'a> {
                     self.alloc_offset_absorb(id, &projection, elem_size, disp, count)
                 {
                     return absorbed.map(|projection| RefTarget::Alloc { id, projection });
+                }
+                if let Some(projection) =
+                    self.alloc_typed_offset_absorb(id, &projection, disp)
+                {
+                    return Ok(RefTarget::Alloc { id, projection });
                 }
                 let base = self.alloc_base(id).ok();
                 let projection = self.offset_projection(
@@ -13435,10 +13558,15 @@ impl<'a> Interpreter<'a> {
     }
 
     /// The base value, declared base type, and error context
-    /// of a place/static target, for the byte view (see
-    /// [`Self::byte_view_read`]). `None` for targets the view
-    /// does not judge (an allocation, a constant aggregate) and
-    /// for a base whose declared type is not recorded.
+    /// of a place/static/allocation target, for the byte view
+    /// (see [`Self::byte_view_read`]). `None` for targets the
+    /// view does not judge (a constant aggregate, a raw
+    /// element block) and for a base whose declared type is
+    /// not recorded: a place's is in its home body's table, a
+    /// static's in the program's, and an allocation's in the
+    /// record its creation point left (see the `alloc_tys`
+    /// field) -- the same three sources the `MaybeUninit`
+    /// entry gate consults.
     fn byte_view_base<'t>(
         &self,
         frames: &[Frame],
@@ -13475,6 +13603,28 @@ impl<'a> Interpreter<'a> {
                     base_ty,
                     func,
                     format!("static {name}"),
+                ))
+            }
+            Resolved::Alloc { id, projection } => {
+                // A raw element block's record, when one
+                // exists, is its element type, which does not
+                // denominate the block's whole storage; the
+                // block's positions keep the element paths.
+                if self.is_elem_block(*id) {
+                    return None;
+                }
+                let base = self.alloc_base(*id).ok()?;
+                let base_ty = self.alloc_ty(*id)?;
+                let func = frames
+                    .last()
+                    .map(|f| f.func.clone())
+                    .unwrap_or_else(|| "<allocation>".to_string());
+                Some((
+                    projection,
+                    base,
+                    base_ty,
+                    func,
+                    format!("allocation #{id}"),
                 ))
             }
             _ => None,
@@ -13726,6 +13876,10 @@ impl<'a> Interpreter<'a> {
                 name: name.clone(),
                 projection: Vec::new(),
             },
+            Resolved::Alloc { id, .. } => Resolved::Alloc {
+                id: *id,
+                projection: Vec::new(),
+            },
             _ => return None,
         };
         Some(self.write_resolved(frames, &base_target, base))
@@ -13816,6 +13970,18 @@ impl<'a> Interpreter<'a> {
                     format!("static {name}"),
                 )
             }
+            Resolved::Alloc { id, projection } => {
+                if self.is_elem_block(*id) {
+                    return None;
+                }
+                let base_ty = self.alloc_ty(*id)?;
+                (
+                    projection,
+                    base_ty,
+                    "<allocation>".to_string(),
+                    format!("allocation #{id}"),
+                )
+            }
             _ => return None,
         };
         let pos = match self.byte_view_position(&base_ty, projection, extra)? {
@@ -13842,6 +14008,11 @@ impl<'a> Interpreter<'a> {
             Resolved::Static { name, .. } => {
                 let mut store = self.statics.borrow_mut();
                 let slot = store.get_mut(name)?;
+                self.splice_storage_byte(slot, &layout, pos, byte)?
+            }
+            Resolved::Alloc { id, .. } => {
+                let mut store = self.allocs.borrow_mut();
+                let slot = store.get_mut(id)?;
                 self.splice_storage_byte(slot, &layout, pos, byte)?
             }
             _ => return None,
