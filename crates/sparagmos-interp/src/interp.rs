@@ -709,6 +709,16 @@ pub struct Interpreter<'a> {
     /// the guest deallocator with the pointee's layout, which the
     /// box value itself does not carry.
     box_layouts: std::cell::RefCell<std::collections::HashMap<u64, (u128, u128)>>,
+    /// Fat pointer values flattened through a fat pointer
+    /// shape, by their 128-bit pattern: the pattern's words do
+    /// not denote the value on their own (the data word is a
+    /// synthetic address and a `dyn` metadata word is a vtable
+    /// identity, not a number), so construction looks the
+    /// pattern up here first and returns the very value that
+    /// flattened to it. Only a pattern no value registered is
+    /// fabricated from its words, and only where the words
+    /// carry the value (a length metadata).
+    fat_values: std::cell::RefCell<std::collections::HashMap<u128, Value>>,
     /// Whether the lazy stdout buffer allocation has been
     /// modelled (see `note_stdout_use`): std's stdout handle
     /// allocates its line buffer through the global allocator on
@@ -1196,6 +1206,67 @@ fn compare_projections(a: &[RefProj], b: &[RefProj]) -> Option<std::cmp::Orderin
     }
 }
 
+/// The metadata word a `dyn` fat pointer flattens to: a
+/// stable identity for the (concrete type, trait bounds) pair
+/// the vtable serves, in the same synthetic-address space
+/// [`synthetic_address`] assigns. The word names the vtable
+/// rather than denoting storage; only the interpreter's
+/// fat-value table turns a pattern carrying it back into the
+/// pointer value it came from.
+fn vtable_word(concrete: &str, traits: &[String]) -> u128 {
+    fn fnv1a(bytes: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+    let key = format!("vtable:{concrete}:{}", traits.join("+"));
+    0x1_0000_0000u128 + u128::from(fnv1a(key.as_bytes()) & 0xFF_FFFF_FFFF_F000)
+}
+
+/// The data word a string value's fat pointer flattens to:
+/// an identity for the string's bytes in the synthetic
+/// address space. A string constant's storage has no other
+/// address in this model, and equal contents pool to one
+/// constant natively, so the bytes are the identity.
+fn str_data_word(s: &str) -> u128 {
+    fn fnv1a(bytes: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+    let mut key = b"str:".to_vec();
+    key.extend_from_slice(s.as_bytes());
+    0x1_0000_0000u128 + u128::from(fnv1a(&key) & 0xFF_FFFF_FFFF_F000)
+}
+
+/// The data word a fat pointer flattens to: the base
+/// pointer's synthetic address where it has one. A base the
+/// address space does not cover (a byte string: a constant
+/// slice's storage in this model) gets an identity word
+/// keyed by the base value's own representation, the keying
+/// `synthetic_address` itself uses for its targets.
+fn data_word(base: &Value) -> u128 {
+    fn fnv1a(bytes: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+    if let Some(addr) = synthetic_address(base) {
+        return addr;
+    }
+    let key = format!("fatbase:{base:?}");
+    0x1_0000_0000u128 + u128::from(fnv1a(key.as_bytes()) & 0xFF_FFFF_FFFF_F000)
+}
+
 #[test]
 fn synthetic_addresses_do_not_collide_at_scale() {
     // A few thousand distinct allocation targets (a realistic
@@ -1394,6 +1465,7 @@ impl<'a> Interpreter<'a> {
             ),
             pending_string_buffer: std::cell::RefCell::new(None),
             box_layouts: std::cell::RefCell::new(std::collections::HashMap::new()),
+            fat_values: std::cell::RefCell::new(std::collections::HashMap::new()),
             stdout_buffer_modelled: std::cell::Cell::new(false),
             output: String::new(),
             error_output: String::new(),
@@ -16169,6 +16241,88 @@ impl<'a> Interpreter<'a> {
                     format!("variant {variant}"),
                 )),
             },
+            (ScalarShape::FatPtr(meta), value) => {
+                // A fat pointer held behind a value reference
+                // (an element of a constant aggregate) flattens
+                // as the fat value the reference denotes.
+                let value = match value {
+                    Value::Ref(RefTarget::Value(inner, projection))
+                        if projection.is_empty() =>
+                    {
+                        inner.as_ref()
+                    }
+                    _ => value,
+                };
+                let (data, meta_word) = match (meta, value) {
+                    (crate::ir::FatMeta::Len, Value::FatRef { base, len }) => {
+                        (data_word(base), *len & bit_mask(64))
+                    }
+                    (crate::ir::FatMeta::Len, Value::Str(s)) => {
+                        (str_data_word(s), s.len() as u128)
+                    }
+                    (
+                        crate::ir::FatMeta::Vtable,
+                        Value::DynRef {
+                            base,
+                            concrete,
+                            traits,
+                            ..
+                        },
+                    ) => (data_word(base), vtable_word(concrete, traits)),
+                    (
+                        crate::ir::FatMeta::Len,
+                        Value::Ref(RefTarget::Alloc { id, projection }),
+                    ) if projection.is_empty() => {
+                        // A fat pointer whose pointee lives in
+                        // the allocation store (a box's
+                        // pointer): the pointer itself is the
+                        // thin store reference, and the length
+                        // is the stored pointee's length.
+                        let len = match self.allocs.borrow().get(id) {
+                            Some(Value::Tuple(items)) => {
+                                items.len() as u128
+                            }
+                            Some(Value::FatRef { len, .. }) => *len,
+                            Some(Value::SparseVec { len, .. }) => *len,
+                            Some(Value::Str(s)) => s.len() as u128,
+                            Some(Value::Bytes(b)) => b.len() as u128,
+                            _ => {
+                                return Err(InterpError::type_mismatch(
+                                    "transmute",
+                                    "a fat pointer into the allocation store",
+                                    value.kind_name(),
+                                ))
+                            }
+                        };
+                        (data_word(value), len)
+                    }
+                    _ => {
+                        return Err(InterpError::type_mismatch(
+                            "transmute",
+                            "a fat pointer value of the shape's metadata kind",
+                            value.kind_name(),
+                        ))
+                    }
+                };
+                let bits = (data & bit_mask(64)) | (meta_word << 64);
+                // The pattern alone does not denote the value
+                // (see the `fat_values` field): register it, so
+                // constructing the same pattern returns this
+                // very pointer.
+                self.fat_values.borrow_mut().insert(bits, value.clone());
+                Ok(bits)
+            }
+            (ScalarShape::Fields(fields), Value::Tuple(items))
+                if items.len() == fields.len() =>
+            {
+                let mut out = 0u128;
+                let mut offset = 0u32;
+                for (item, field) in items.iter().zip(fields.iter()) {
+                    out |= self.flatten_scalar(item, field)? << offset;
+                    offset += field.bits();
+                }
+                Ok(out)
+            }
             (_, other) => Err(InterpError::type_mismatch(
                 "transmute",
                 "a value of the source shape",
@@ -16253,6 +16407,42 @@ impl<'a> Interpreter<'a> {
                         fields: vec![payload],
                     })
                 }
+            }
+            ScalarShape::FatPtr(meta) => {
+                // A pattern a flattened value registered
+                // reconstructs that very value (see the
+                // `fat_values` field); an unregistered pattern
+                // is fabricated from its words only where the
+                // words carry the value -- a length metadata
+                // does, a vtable identity does not.
+                if let Some(v) = self.fat_values.borrow().get(&bits) {
+                    return Ok(v.clone());
+                }
+                match meta {
+                    crate::ir::FatMeta::Len => Ok(Value::FatRef {
+                        base: Box::new(Value::Ref(RefTarget::Address(
+                            bits as u64,
+                        ))),
+                        len: bits >> 64,
+                    }),
+                    crate::ir::FatMeta::Vtable => {
+                        Err(InterpError::type_mismatch(
+                            "transmute to a dyn fat pointer",
+                            "a bit pattern a flattened dyn value registered",
+                            format!("bit pattern {bits:#x}"),
+                        ))
+                    }
+                }
+            }
+            ScalarShape::Fields(fields) => {
+                let mut items = Vec::with_capacity(fields.len());
+                let mut offset = 0u32;
+                for field in fields {
+                    let part = (bits >> offset) & bit_mask(field.bits());
+                    items.push(self.construct_scalar(part, field)?);
+                    offset += field.bits();
+                }
+                Ok(Value::Tuple(items))
             }
             ScalarShape::FieldlessEnum {
                 bits: width,

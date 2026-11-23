@@ -3296,7 +3296,10 @@ impl<'a> Converter<'a> {
     /// pointer exception in [`Self::deref_vector_shape`]).
     fn shape_contains_ptr(shape: &ir::ScalarShape) -> bool {
         match shape {
-            ir::ScalarShape::Ptr => true,
+            ir::ScalarShape::Ptr | ir::ScalarShape::FatPtr(_) => true,
+            ir::ScalarShape::Fields(fields) => {
+                fields.iter().any(Self::shape_contains_ptr)
+            }
             ir::ScalarShape::Array(elem, _) => Self::shape_contains_ptr(elem),
             ir::ScalarShape::AdtField { inner, .. } => Self::shape_contains_ptr(inner),
             ir::ScalarShape::NicheEnum { inner, .. } => Self::shape_contains_ptr(inner),
@@ -5851,8 +5854,9 @@ let inner = match (&src, target) {
 
     /// The [`ir::ScalarShape`] of a type whose every bit is
     /// accounted for by scalar leaves (integers, floats, `bool`,
-    /// `char`, arrays of those, and one-payload-field ADTs over
-    /// those), or `None` for any other type. `depth` bounds the
+    /// `char`, arrays and tuples of those, fat pointers, and
+    /// one-payload-field ADTs over those), or `None` for any
+    /// other type. `depth` bounds the
     /// ADT nesting: a sized type cannot actually recurse without
     /// indirection (which has no scalar shape and ends the chain
     /// first), so the bound is only belt and braces.
@@ -5886,11 +5890,22 @@ let inner = match (&src, target) {
             // pointer (the `NonNull` chain) through the ADT arm
             // below, and a niche-encoded enum over one (the
             // `Option<NonNull<T>>` family) through
-            // `niche_enum_shape`. Fat pointers carry a metadata
-            // half this single-word shape cannot account for and
-            // stay shapeless.
+            // `niche_enum_shape`.
             mir::Ty::RawPtr(..) | mir::Ty::Ref(..) if is_thin_ptr_ty(ty) => {
                 Some(S::Ptr)
+            }
+            // A fat pointer flattens to its two words (see
+            // [`ir::ScalarShape::FatPtr`]): the data pointer's
+            // synthetic address in the low word and the metadata
+            // in the high word -- an element count for a slice
+            // or string pointee, a vtable identity for a `dyn`
+            // pointee.
+            mir::Ty::RawPtr(..) | mir::Ty::Ref(..) if is_fat_ptr_ty(ty) => {
+                let meta = match ptr_pointee(ty) {
+                    Some(mir::Ty::Dynamic(..)) => ir::FatMeta::Vtable,
+                    _ => ir::FatMeta::Len,
+                };
+                Some(S::FatPtr(meta))
             }
             mir::Ty::Array(elem, mir::ArrayLen::Known(n)) => {
                 let elem = self.scalar_shape(elem, depth + 1)?;
@@ -5899,6 +5914,27 @@ let inner = match (&src, target) {
                     return None;
                 }
                 Some(S::Array(Box::new(elem), *n))
+            }
+            // A tuple of scalar-shaped elements flattens field
+            // by field in declaration order.
+            mir::Ty::Tuple(ts) => {
+                if ts.is_empty() {
+                    return None;
+                }
+                let mut fields = Vec::with_capacity(ts.len());
+                let mut total = 0u32;
+                for t in ts {
+                    let s = self.scalar_shape(t, depth + 1)?;
+                    total = total.checked_add(s.bits())?;
+                    if total > 128 {
+                        return None;
+                    }
+                    fields.push(s);
+                }
+                if total == 0 {
+                    return None;
+                }
+                Some(S::Fields(fields))
             }
             mir::Ty::Adt(def, args) => {
                 // A `MaybeUninit<T>` value holds its payload at
