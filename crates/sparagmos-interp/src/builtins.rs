@@ -34,9 +34,9 @@ use sparagmos_mir as mir;
 use crate::error::{InterpError, InterpResult};
 use crate::interp::{
     box_alloc_pointer, channel_handle_id, eval_binary, eval_unary, float_to_int,
-    float_to_uint, impl_qualified_self_type, rc_handle_id, round_to_f16,
-    synthetic_address, FmtBuilderKind, FmtBuilderState, FmtCapture, Frame,
-    Interpreter, Resolved,
+    float_to_uint, impl_qualified_self_type, project_value, rc_handle_id,
+    round_to_f16, synthetic_address, FmtBuilderKind, FmtBuilderState, FmtCapture,
+    Frame, Interpreter, Resolved,
 };
 use crate::ir::{BinOp, Body, FloatTy, IntTy, Operand, Ty, UintTy, UnOp};
 use crate::value::{FmtArguments, FmtTrait, PanicPayload, RefProj, RefTarget, Value};
@@ -9021,11 +9021,12 @@ impl<'a> Interpreter<'a> {
                         local,
                         projection,
                     } => {
-                        let base = self.read_resolved(frames, &Resolved::Place {
+                        let target = Resolved::Place {
                             frame_pos,
                             local,
                             projection: projection.clone(),
-                        })?;
+                        };
+                        let base = self.read_resolved(frames, &target)?;
                         let len = match fat_len {
                             Some(len) => len,
                             None => base.len().ok_or_else(|| {
@@ -9040,6 +9041,27 @@ impl<'a> Interpreter<'a> {
                             return Err(InterpError::panic(format!(
                                 "index out of bounds: the len is {len} but the index is {idx}"
                             )));
+                        }
+                        // An element-entry suffix (see
+                        // `element_entry_suffix`): the element is
+                        // the entered position advanced by the
+                        // index, under the fat length's bound
+                        // (checked above) — pushing the index onto
+                        // the entered element would address inside
+                        // element zero instead.
+                        if fat_len.map_or(false, |len| {
+                            self.entry_suffix_denotes_elements(frames, &target, len)
+                        }) {
+                            if let Some(projection) =
+                                advance_entry_projection(&projection, idx)
+                            {
+                                let frame_id = frames[frame_pos].id;
+                                return Ok(Value::Ref(RefTarget::Place {
+                                    frame: frame_id,
+                                    local,
+                                    projection,
+                                }));
+                            }
                         }
                         match base {
                             // Array (tuple) elements and vector
@@ -9064,10 +9086,11 @@ impl<'a> Interpreter<'a> {
                         }
                     }
                     Resolved::Static { name, projection } => {
-                        let base = self.read_resolved(frames, &Resolved::Static {
+                        let target = Resolved::Static {
                             name: name.clone(),
                             projection: projection.clone(),
-                        })?;
+                        };
+                        let base = self.read_resolved(frames, &target)?;
                         let len = base.len().ok_or_else(|| {
                             InterpError::type_mismatch(
                                 "IndexMut::index_mut",
@@ -9079,6 +9102,18 @@ impl<'a> Interpreter<'a> {
                             return Err(InterpError::panic(format!(
                                 "index out of bounds: the len is {len} but the index is {idx}"
                             )));
+                        }
+                        if fat_len.map_or(false, |len| {
+                            self.entry_suffix_denotes_elements(frames, &target, len)
+                        }) {
+                            if let Some(projection) =
+                                advance_entry_projection(&projection, idx)
+                            {
+                                return Ok(Value::Ref(RefTarget::Static {
+                                    name,
+                                    projection,
+                                }));
+                            }
                         }
                         match base {
                             Value::Tuple(_) | Value::Enum { .. } => {
@@ -9093,10 +9128,11 @@ impl<'a> Interpreter<'a> {
                         }
                     }
                     Resolved::Alloc { id, projection } => {
-                        let base = self.read_resolved(frames, &Resolved::Alloc {
+                        let target = Resolved::Alloc {
                             id,
                             projection: projection.clone(),
-                        })?;
+                        };
+                        let base = self.read_resolved(frames, &target)?;
                         let len = base.len().ok_or_else(|| {
                             InterpError::type_mismatch(
                                 "IndexMut::index_mut",
@@ -9108,6 +9144,15 @@ impl<'a> Interpreter<'a> {
                             return Err(InterpError::panic(format!(
                                 "index out of bounds: the len is {len} but the index is {idx}"
                             )));
+                        }
+                        if fat_len.map_or(false, |len| {
+                            self.entry_suffix_denotes_elements(frames, &target, len)
+                        }) {
+                            if let Some(projection) =
+                                advance_entry_projection(&projection, idx)
+                            {
+                                return Ok(Value::Ref(RefTarget::Alloc { id, projection }));
+                            }
                         }
                         match base {
                             Value::Tuple(_) => {
@@ -12877,6 +12922,29 @@ fn value_fingerprint(value: &Value) -> u64 {
                     projection: projection.clone(),
                 };
                 let base = self.read_resolved(frames, &target)?;
+                // An element-entry suffix (see
+                // `element_entry_suffix`) whose entered element
+                // is not itself a sequence: the element is the
+                // entered position advanced by the index. (A
+                // sequence at the entered position is a slice
+                // over an element's own array field — the plain
+                // reading below; without the fat length the two
+                // shapes cannot be told apart here.)
+                if !matches!(
+                    base,
+                    Value::Tuple(_)
+                        | Value::SparseVec { .. }
+                        | Value::Bytes(_)
+                        | Value::Str(_)
+                ) {
+                    if let Some(projection) = advance_entry_projection(projection, idx) {
+                        return Ok(Value::Ref(RefTarget::Place {
+                            frame: *frame,
+                            local: *local,
+                            projection,
+                        }));
+                    }
+                }
                 let mut projection = projection.clone();
                 match base {
                     Value::Tuple(_) => projection.push(RefProj::Index(idx)),
@@ -12900,6 +12968,23 @@ fn value_fingerprint(value: &Value) -> u64 {
                     projection: projection.clone(),
                 };
                 let base = self.read_resolved(frames, &target)?;
+                // See the place arm: an element-entry suffix
+                // over a non-sequence entered element advances
+                // the entered position.
+                if !matches!(
+                    base,
+                    Value::Tuple(_)
+                        | Value::SparseVec { .. }
+                        | Value::Bytes(_)
+                        | Value::Str(_)
+                ) {
+                    if let Some(projection) = advance_entry_projection(projection, idx) {
+                        return Ok(Value::Ref(RefTarget::Static {
+                            name: name.clone(),
+                            projection,
+                        }));
+                    }
+                }
                 let mut projection = projection.clone();
                 match base {
                     Value::Tuple(_) => projection.push(RefProj::Index(idx)),
@@ -15205,6 +15290,29 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         if matches!(target, Resolved::Value(..)) {
             return Ok(None);
         }
+        // A target ending in an element-entry suffix (see
+        // `element_entry_suffix`) already denotes an entered
+        // element of its container: the element reference is
+        // that position advanced by the index, under the fat
+        // length's bound — the entered element's own length and
+        // shape say nothing about the sequence, so without a fat
+        // length the snapshot path answers instead.
+        let target_projection = match &target {
+            Resolved::Place { projection, .. }
+            | Resolved::Static { projection, .. }
+            | Resolved::Alloc { projection, .. }
+            | Resolved::Value(_, projection) => projection.clone(),
+        };
+        let has_suffix = element_entry_suffix(&target_projection).is_some();
+        if has_suffix && fat_len.is_none() {
+            return Ok(None);
+        }
+        let entry_suffix = match fat_len {
+            Some(len) => {
+                has_suffix && self.entry_suffix_denotes_elements(frames, &target, len)
+            }
+            None => false,
+        };
         // The base is only inspected (its length and form): read
         // it by borrowing, so indexing a vector does not clone
         // every element before returning one element's reference.
@@ -15220,6 +15328,27 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
             return Err(InterpError::panic(format!(
                 "index out of bounds: the len is {len} but the index is {idx}"
             )));
+        }
+        if entry_suffix {
+            // The bounds check above ran against the fat length.
+            let Some(projection) = advance_entry_projection(&target_projection, idx) else {
+                return Ok(None);
+            };
+            let refr = match target {
+                Resolved::Place {
+                    frame_pos, local, ..
+                } => Value::Ref(RefTarget::Place {
+                    frame: frames[frame_pos].id,
+                    local,
+                    projection,
+                }),
+                Resolved::Static { name, .. } => {
+                    Value::Ref(RefTarget::Static { name, projection })
+                }
+                Resolved::Alloc { id, .. } => Value::Ref(RefTarget::Alloc { id, projection }),
+                Resolved::Value(..) => unreachable!("returned above"),
+            };
+            return Ok(Some(refr));
         }
         if !matches!(
             &*base,
@@ -15342,6 +15471,16 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                         }
                         return Ok((SliceElems::Values(Cow::Owned(elems)), *len));
                     }
+                    // A base ending in an element-entry suffix
+                    // denotes one entered element of its
+                    // container; the slice's elements are the
+                    // container's elements from that index on,
+                    // each entered the same way.
+                    if let Some(elems) =
+                        self.entered_sequence_elements(frames, &target, *len)?
+                    {
+                        return Ok((elems, *len));
+                    }
                 }
                 let base = self.resolve_ref(frames, base)?;
                 let elems = elements_of(base)?.truncated(*len as usize);
@@ -15366,6 +15505,123 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
     /// receiver's stored elements, over the sparse form of the
     /// range (see `Value::SparseVec`). A `str` receiver yields
     /// the sub-string, with char-boundary checks as in core.
+    /// Whether a target ending in an element-entry suffix
+    /// denotes its container's elements entered by the suffix
+    /// (the transparent-wrapper pointer cast reading), as
+    /// opposed to a sequence the base denotes directly through
+    /// a genuine field step — a slice over an element's array
+    /// field ends in the same projection shape, and there the
+    /// field step is the sequence's own storage. The cast
+    /// reading is declared only when both judgements agree: the
+    /// container's span from the suffix's index covers the fat
+    /// length, and the target's own value is not itself a
+    /// sequence of exactly the fat length (the direct reading's
+    /// shape). Any shape this cannot judge answers no, keeping
+    /// the plain reading.
+    fn entry_suffix_denotes_elements(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        fat_len: u128,
+    ) -> bool {
+        let projection = match target {
+            Resolved::Place { projection, .. }
+            | Resolved::Static { projection, .. }
+            | Resolved::Alloc { projection, .. }
+            | Resolved::Value(_, projection) => projection,
+        };
+        let Some((container_proj, start, _)) = element_entry_suffix(projection) else {
+            return false;
+        };
+        let container = resolved_with_projection(target, container_proj);
+        let Ok(container) = self.read_resolved(frames, &container) else {
+            return false;
+        };
+        let Some(count) = container.len() else {
+            return false;
+        };
+        if start as u128 + fat_len > count {
+            return false;
+        }
+        let Ok(value) = self.read_resolved(frames, target) else {
+            return false;
+        };
+        // A target value that is itself a sequence of exactly
+        // the fat length is the direct reading's shape.
+        let target_is_the_sequence = matches!(
+            value,
+            Value::Tuple(_) | Value::SparseVec { .. } | Value::Bytes(_) | Value::Str(_)
+        ) && value.len() == Some(fat_len);
+        !target_is_the_sequence
+    }
+
+    /// The elements a fat pointer denotes when its base target
+    /// ends in an element-entry suffix (see
+    /// [`element_entry_suffix`]): the elements of the container
+    /// the base sits in, from the suffix's index on, each entered
+    /// by the suffix's field steps — the reading the base's own
+    /// value (the first entered element alone) cannot give.
+    /// `Ok(None)` when the base does not have that shape, or its
+    /// container is not a sequence the entry can be distributed
+    /// over (the caller keeps its plain reading).
+    fn entered_sequence_elements(
+        &self,
+        frames: &[Frame],
+        target: &Resolved,
+        len: u128,
+    ) -> InterpResult<Option<SliceElems<'static>>> {
+        let projection = match target {
+            Resolved::Place { projection, .. }
+            | Resolved::Static { projection, .. }
+            | Resolved::Alloc { projection, .. }
+            | Resolved::Value(_, projection) => projection,
+        };
+        let Some((container_proj, start, entry)) = element_entry_suffix(projection) else {
+            return Ok(None);
+        };
+        if !self.entry_suffix_denotes_elements(frames, target, len) {
+            return Ok(None);
+        }
+        let container = resolved_with_projection(target, container_proj);
+        let Ok(value) = self.read_resolved(frames, &container) else {
+            return Ok(None);
+        };
+        let want = usize::try_from(len).unwrap_or(usize::MAX);
+        match value {
+            Value::Tuple(items) => {
+                if items.len() < start || items.len() - start < want {
+                    return Ok(None);
+                }
+                let mut out = Vec::with_capacity(want);
+                for item in &items[start..start + want] {
+                    out.push(project_value(
+                        item.clone(),
+                        &entry,
+                        "slice elements",
+                        "fat pointer base",
+                    )?);
+                }
+                Ok(Some(SliceElems::Values(Cow::Owned(out))))
+            }
+            Value::SparseVec { elems, .. } => {
+                let mut stored = Vec::new();
+                for elem in elems.iter().skip(start).take(want) {
+                    stored.push(project_value(
+                        elem.clone(),
+                        &entry,
+                        "slice elements",
+                        "fat pointer base",
+                    )?);
+                }
+                Ok(Some(SliceElems::Sparse {
+                    stored: Cow::Owned(stored),
+                    len: want,
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn index_range(
         &self,
         frames: &[Frame],
@@ -15446,6 +15702,53 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
     /// place/static receiver and over the same base for a fat
     /// receiver. A fat receiver whose base is a materialised copy
     /// has no storage to alias and stays explicitly unsupported.
+    /// The base reference for a range window over a slice
+    /// receiver: normally the base with a subslice step
+    /// appended (see `subslice_ref`). A base ending in an
+    /// element-entry suffix that denotes its container's
+    /// elements (see `entry_suffix_denotes_elements`) windows
+    /// the container instead: the entry index advances by the
+    /// window's start and no subslice step is appended — a
+    /// subslice step after the entry steps would window the
+    /// first entered element rather than the sequence.
+    fn windowed_base(
+        &self,
+        frames: &[Frame],
+        base: &Value,
+        start: usize,
+        sub_len: usize,
+        receiver_len: usize,
+        name: &str,
+    ) -> InterpResult<Value> {
+        if let Value::Ref(target_ref) = base {
+            let projection = match target_ref {
+                RefTarget::Place { projection, .. }
+                | RefTarget::Static { projection, .. }
+                | RefTarget::Alloc { projection, .. }
+                | RefTarget::Value(_, projection) => Some(projection),
+                _ => None,
+            };
+            if let Some(projection) = projection {
+                if element_entry_suffix(projection).is_some() {
+                if let Ok(target) = self.deref_value(frames, base) {
+                    if self.entry_suffix_denotes_elements(
+                        frames,
+                        &target,
+                        receiver_len as u128,
+                    ) {
+                        if let Some(projection) =
+                            advance_entry_projection(projection, start)
+                        {
+                            return Ok(ref_with_projection(base, projection));
+                        }
+                    }
+                }
+            }
+            }
+        }
+        subslice_ref(base, start, sub_len, name)
+    }
+
     fn index_range_mut(
         &self,
         frames: &[Frame],
@@ -15519,7 +15822,7 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
         match receiver {
             Value::FatRef { base, .. } => match &**base {
                 Value::Ref(_) => {
-                    let base = subslice_ref(base, start, sub_len, name)?;
+                    let base = self.windowed_base(frames, base, start, sub_len, len, name)?;
                     Ok(Value::FatRef {
                         base: Box::new(base),
                         len: sub_len as u128,
@@ -15531,7 +15834,7 @@ fn cmp_discriminant(discriminants: Option<&[i128]>, variant: u32) -> i128 {
                 ))),
             },
             Value::Ref(_) => {
-                let base = subslice_ref(receiver, start, sub_len, name)?;
+                let base = self.windowed_base(frames, receiver, start, sub_len, len, name)?;
                 Ok(Value::FatRef {
                     base: Box::new(base),
                     len: sub_len as u128,
@@ -19479,6 +19782,65 @@ fn primitive_overflow_message(op: BinOp) -> &'static str {
     }
 }
 
+/// The element-entry suffix of a projection: a trailing run of
+/// field-0 entry steps preceded by the index step that selects
+/// the first entered element. This is the shape a fat pointer's
+/// base takes after a transparent-wrapper pointer cast into a
+/// sequence (a `*const [MaybeUninit<T>]` \u{2192} `*const [T]` cast:
+/// the base denotes the container's element at that index,
+/// entered by the field steps — see the `FatRef` arm of
+/// `ptr_field_value`). Returns the container projection (the
+/// steps before the index step), the index, and the entry steps.
+fn element_entry_suffix(projection: &[RefProj]) -> Option<(Vec<RefProj>, usize, Vec<RefProj>)> {
+    let mut end = projection.len();
+    while end > 0 && matches!(projection[end - 1], RefProj::Field(0)) {
+        end -= 1;
+    }
+    if end == projection.len() || end == 0 {
+        return None;
+    }
+    let RefProj::Index(first) = projection[end - 1] else {
+        return None;
+    };
+    Some((
+        projection[..end - 1].to_vec(),
+        first,
+        projection[end..].to_vec(),
+    ))
+}
+
+/// The projection denoting element `idx` of the sequence a
+/// projection with an element-entry suffix denotes: the suffix's
+/// index step advances by `idx`, the entry steps stay after it.
+fn advance_entry_projection(projection: &[RefProj], idx: usize) -> Option<Vec<RefProj>> {
+    let (mut out, first, entry) = element_entry_suffix(projection)?;
+    out.push(RefProj::Index(first.checked_add(idx)?));
+    out.extend(entry);
+    Some(out)
+}
+
+/// A resolved target with its projection replaced.
+fn resolved_with_projection(target: &Resolved, projection: Vec<RefProj>) -> Resolved {
+    match target {
+        Resolved::Place {
+            frame_pos, local, ..
+        } => Resolved::Place {
+            frame_pos: *frame_pos,
+            local: *local,
+            projection,
+        },
+        Resolved::Static { name, .. } => Resolved::Static {
+            name: name.clone(),
+            projection,
+        },
+        Resolved::Alloc { id, .. } => Resolved::Alloc {
+            id: *id,
+            projection,
+        },
+        Resolved::Value(value, _) => Resolved::Value(value.clone(), projection),
+    }
+}
+
 /// Whether a resolved target denotes one element of a container
 /// (its projection ends at an index step): a fat pointer over
 /// such a target denotes the elements from that position on, not
@@ -19583,6 +19945,29 @@ fn int_uint_cmp(x: i128, y: u128) -> Ordering {
 /// carries the step in its projection, like the other targets:
 /// reads through it stay exact, and writes through it are
 /// refused by the write path, as for any constant.
+/// A reference value with its projection replaced.
+fn ref_with_projection(value: &Value, projection: Vec<RefProj>) -> Value {
+    match value {
+        Value::Ref(RefTarget::Place {
+            frame, local, ..
+        }) => Value::Ref(RefTarget::place(*frame, *local, projection)),
+        Value::Ref(RefTarget::Static {
+            name: static_name, ..
+        }) => Value::Ref(RefTarget::Static {
+            name: static_name.clone(),
+            projection,
+        }),
+        Value::Ref(RefTarget::Alloc { id, .. }) => Value::Ref(RefTarget::Alloc {
+            id: *id,
+            projection,
+        }),
+        Value::Ref(RefTarget::Value(v, _)) => {
+            Value::Ref(RefTarget::Value(v.clone(), projection))
+        }
+        other => other.clone(),
+    }
+}
+
 fn subslice_ref(value: &Value, offset: usize, len: usize, _name: &str) -> InterpResult<Value> {
     let step = RefProj::Subslice { offset, len };
     match value {

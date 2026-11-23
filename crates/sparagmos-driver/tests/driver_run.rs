@@ -17825,3 +17825,61 @@ fn run_mode_maybe_uninit_ptr_read_then_assume_init_errors() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr={stderr}");
 }
+const ASSUME_INIT_SLICE_SRC: &str = r#"
+use std::mem::MaybeUninit;
+fn main() {
+    let a: [MaybeUninit<i32>; 3] =
+        [MaybeUninit::new(10), MaybeUninit::new(20), MaybeUninit::new(30)];
+    let s = unsafe { &*(&a as *const [MaybeUninit<i32>] as *const [i32]) };
+    // Every element of a slice whose element type changed across
+    // a pointer cast is readable: by index, by iteration, and by
+    // raw pointer offset.
+    println!("len={} sum={}", s.len(), s.iter().sum::<i32>());
+    println!("idx={} {} {}", s[0], s[1], s[2]);
+    println!("last={:?} count={}", s.last(), s.iter().count());
+    let q = s.as_ptr();
+    unsafe {
+        println!("raw={} {} {}", *q, *q.add(1), *q.add(2));
+    }
+    let v = s.to_vec();
+    println!("vec={:?}", v);
+}
+"#;
+
+#[test]
+fn run_mode_assume_init_slice_reads_all_elements() {
+    run_ok(
+        "assume-init-slice",
+        ASSUME_INIT_SLICE_SRC,
+        "len=3 sum=60\nidx=10 20 30\nlast=Some(30) count=3\nraw=10 20 30\nvec=[10, 20, 30]\n",
+    );
+}
+
+const ASSUME_INIT_SLICE_MUT_SRC: &str = r#"
+use std::mem::MaybeUninit;
+fn main() {
+    let mut a: [MaybeUninit<(i32, i32)>; 4] = [
+        MaybeUninit::new((1, 2)),
+        MaybeUninit::new((3, 4)),
+        MaybeUninit::new((5, 6)),
+        MaybeUninit::new((7, 8)),
+    ];
+    let s = unsafe { &mut *(&mut a as *mut [MaybeUninit<(i32, i32)>] as *mut [(i32, i32)]) };
+    // A write through the cast slice lands in the addressed
+    // element, not in element zero's payload.
+    s[1].0 = 99;
+    let sub = &mut s[1..4];
+    sub[2].1 = 66;
+    let t = unsafe { &*(&a as *const [MaybeUninit<(i32, i32)>] as *const [(i32, i32)]) };
+    println!("e0={:?} e1={:?} e2={:?} e3={:?}", t[0], t[1], t[2], t[3]);
+}
+"#;
+
+#[test]
+fn run_mode_assume_init_slice_mut_writes_addressed_elements() {
+    run_ok(
+        "assume-init-slice-mut",
+        ASSUME_INIT_SLICE_MUT_SRC,
+        "e0=(1, 2) e1=(99, 4) e2=(5, 6) e3=(7, 66)\n",
+    );
+}

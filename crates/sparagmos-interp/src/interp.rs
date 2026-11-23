@@ -7662,6 +7662,34 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// Whether a fat pointer's base sits at the sequence
+    /// container itself: its target value is the element
+    /// aggregate (a tuple of elements, a sparse sequence, a byte
+    /// string) and its projection does not already end at an
+    /// element position (an index step). See the `FatRef` arm of
+    /// [`Self::ptr_field_value`].
+    fn fat_base_denotes_sequence(&self, frames: &[Frame], base: &Value) -> bool {
+        let Ok(target) = self.deref_value(frames, base) else {
+            return false;
+        };
+        let projection = match &target {
+            Resolved::Place { projection, .. }
+            | Resolved::Static { projection, .. }
+            | Resolved::Alloc { projection, .. }
+            | Resolved::Value(_, projection) => projection,
+        };
+        if matches!(projection.last(), Some(RefProj::Index(_))) {
+            return false;
+        }
+        matches!(
+            self.read_resolved(frames, &target),
+            Ok(Value::Tuple(_)
+                | Value::SparseVec { .. }
+                | Value::Bytes(_)
+                | Value::Str(_))
+        )
+    }
+
     /// The pointer a transparent-wrapper cast produces (see
     /// [`Rvalue::PtrField`]): the operand pointer with a field-0
     /// projection appended, so it denotes the wrapper's only
@@ -7711,7 +7739,29 @@ impl<'a> Interpreter<'a> {
             Value::Ref(RefTarget::Null) | Value::Ref(RefTarget::Address(_)) => Ok(value),
             Value::FatRef { base, len } => match *base {
                 Value::Ref(_) => {
-                    let base = self.ptr_field_value(frames, body, *base, depth)?;
+                    // A fat pointer's base denotes the sequence's
+                    // first element position. When the base sits at
+                    // the sequence container itself (its target is
+                    // the element aggregate), the entry the cast
+                    // denotes is into the first element, so the
+                    // position is first re-expressed as that
+                    // element (an index step) — the shape the
+                    // projection composition machinery (pointer
+                    // offsets, fat index composition) already
+                    // ranges over when it advances the position to
+                    // the later elements. A base that already ends
+                    // at an element position, and one whose target
+                    // is a single wrapper aggregate around the
+                    // sequence (a whole-buffer
+                    // `MaybeUninit<[T; N]>`), keeps the plain field
+                    // entry: there the field step enters the
+                    // wrapper, not an element.
+                    let base = if self.fat_base_denotes_sequence(frames, &base) {
+                        fat_base_first_element(*base)
+                    } else {
+                        *base
+                    };
+                    let base = self.ptr_field_value(frames, body, base, depth)?;
                     Ok(Value::FatRef {
                         base: Box::new(base),
                         len,
@@ -14422,6 +14472,47 @@ fn compose_projection(
         }
     }
     out
+}
+
+/// A fat pointer's base re-expressed at the sequence's first
+/// element: an index step appended to the base reference's
+/// projection (see `Interpreter::fat_base_denotes_sequence`).
+/// A base that is not a reference passes through unchanged (the
+/// caller only routes reference bases here).
+fn fat_base_first_element(base: Value) -> Value {
+    match base {
+        Value::Ref(RefTarget::Place {
+            frame,
+            local,
+            mut projection,
+        }) => {
+            projection.push(RefProj::Index(0));
+            Value::Ref(RefTarget::Place {
+                frame,
+                local,
+                projection,
+            })
+        }
+        Value::Ref(RefTarget::Static {
+            name,
+            mut projection,
+        }) => {
+            projection.push(RefProj::Index(0));
+            Value::Ref(RefTarget::Static { name, projection })
+        }
+        Value::Ref(RefTarget::Alloc {
+            id,
+            mut projection,
+        }) => {
+            projection.push(RefProj::Index(0));
+            Value::Ref(RefTarget::Alloc { id, projection })
+        }
+        Value::Ref(RefTarget::Value(v, mut projection)) => {
+            projection.push(RefProj::Index(0));
+            Value::Ref(RefTarget::Value(v, projection))
+        }
+        other => other,
+    }
 }
 
 /// The run-time half of [`Rvalue::PtrCastUnits`]: rewrite a
