@@ -4754,6 +4754,39 @@ impl<'a> Converter<'a> {
                 }
             }
         }
+        // The same one-payload wrapper crossings for a
+        // one-element tuple: a tuple with a single field is a
+        // one-field wrapper whose payload sits at field 0, so a
+        // transmute to exactly the field's type reads the field
+        // out, and the reverse transmute wraps the value into
+        // the tuple. (Tuples carry no scalar shape in this
+        // model, so the shape arms above never see these
+        // crossings.)
+        if let Some(mir::Ty::Tuple(ts)) = &src {
+            if ts.len() == 1 && ts[0] == *target {
+                if let Some(op) =
+                    self.field_operand(body, operand, v, 0, &ts[0])
+                {
+                    return ir::Rvalue::Use(op);
+                }
+            }
+        }
+        if let mir::Ty::Tuple(ts) = target {
+            if ts.len() == 1 {
+                // A constant operand carries no place type; its
+                // declared type stands in for the equality check
+                // alone (the value itself is wrapped as it
+                // stands, as the ADT wrap above wraps it).
+                let src_ty = src
+                    .clone()
+                    .or_else(|| constant_recorded_ty(operand));
+                if let Some(src_ty) = &src_ty {
+                    if ts[0] == *src_ty {
+                        return ir::Rvalue::AggregateTuple(vec![v.clone()]);
+                    }
+                }
+            }
+        }
         // An ADT carrying an integer scalar (a
         // `NonZero<usize>`, or a transparent wrapper chain
         // over an integer) transmuted into a transparent
