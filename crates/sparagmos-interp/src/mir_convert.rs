@@ -7765,10 +7765,12 @@ let inner = match (&src, target) {
                             // whose element types differ by one
                             // `MaybeUninit` / `UnsafeCell` layer
                             // (`<[MaybeUninit<T>]>::assume_init`
-                            // and its kin): the fat pointer is
-                            // unchanged, but the elements in
-                            // storage change representation, so
-                            // the cast rewrites them in place.
+                            // and its kin): the fat pointer and
+                            // the storage it denotes are both
+                            // unchanged; the representation
+                            // difference between the two element
+                            // views is reconciled at the access
+                            // points (see the rvalue's docs).
                             if wrap {
                                 ir::Rvalue::WrapSliceElems(v)
                             } else {
