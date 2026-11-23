@@ -28631,6 +28631,83 @@ fn debug_mode_cast_reinterprets_array_elements() {
     }
 }
 
+const DEBUG_CAST_SCALAR_SRC: &str = r#"fn main() {
+    let a: u32 = 1065353216;
+    let r: &u32 = &a;
+    zzz();
+    let _ = r;
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_cast_reinterprets_scalar_pointee() {
+    // A pointer cast that changes the scalar pointee type
+    // re-reads the target storage through the target layout
+    // at the dereference: the `u32` bits of 1.0f32 print as
+    // `1`, not as the integer they spell in the source type.
+    // A target wider than the storage, and a change the
+    // scalar layouts cannot express, are explicit errors
+    // rather than wrong values.
+    let dir = temp_dir("debug-cast-scalar");
+    let src = fixture(&dir, "cast_scalar.rs", DEBUG_CAST_SCALAR_SRC);
+    let out = debug_driver(
+        &dir,
+        &src,
+        "break 4\nrun\nprint *(r as *const f32)\nprint *(r as *const u32)\nprint *(r as *const f64)\nprint *(r as *const f16)\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in [
+        "$1 = 1",
+        "$2 = 1065353216",
+        "cast to a 8-byte pointee over 4 bytes of backing storage",
+        "cast changing pointee type from u32 to f16 is not supported",
+    ] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+}
+
+const DEBUG_CAST_PTR_TYPE_SRC: &str = r#"fn main() {
+    let a: [i32; 2] = [1, 2];
+    let r: &[i32; 2] = &a;
+    zzz();
+    let _ = r;
+}
+fn zzz() {}
+"#;
+
+#[test]
+fn debug_mode_whatis_keeps_array_pointer_cast_type() {
+    // A type query over a cast to an array pointer names the
+    // cast's own type, pointer layer included; the array
+    // view the cast materializes is the pointee's form, and
+    // only a dereference consumes the pointer layer.
+    let dir = temp_dir("debug-cast-ptr-type");
+    let src = fixture(&dir, "cast_ptr_type.rs", DEBUG_CAST_PTR_TYPE_SRC);
+    let out = debug_driver(
+        &dir,
+        &src,
+        "break 4\nrun\nwhatis (r as *const [i32; 2])\nwhatis (r as *mut [i32; 2])\nwhatis *(r as *const [i32; 2])\nprint *(r as *const [i32; 2])\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "debug session failed: {stdout}");
+    for want in [
+        "type = *const [i32; 2]",
+        "type = *mut [i32; 2]",
+        "type = [i32; 2]",
+        "$1 = [1, 2]",
+    ] {
+        assert!(
+            stdout.contains(want),
+            "missing `{want}` in debug transcript: {stdout}"
+        );
+    }
+}
+
 const DEBUG_PTR_QUALIFIERS_SRC: &str = r#"struct S { p: *mut i32, q: *const i32 }
 struct R<'a> { r: &'a mut i32 }
 fn main() {

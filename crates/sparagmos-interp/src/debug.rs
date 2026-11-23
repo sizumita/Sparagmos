@@ -997,6 +997,20 @@ struct EvaluatedValue {
     desc: Option<Desc>,
     char: bool,
     tag: Option<String>,
+    /// The type a trailing cast step spelled, pointer layer
+    /// included, when the cast's materialized view carries a
+    /// descriptor of a different form: a cast to an array
+    /// pointer views the pointee's elements under the array
+    /// descriptor, but the expression's type keeps the pointer
+    /// layer until a dereference consumes it.
+    cast_type: Option<Desc>,
+    /// A scalar pointee reinterpretation a cast step recorded
+    /// but has not yet applied: the cast changed a pointer's
+    /// pointee type while the target storage still holds the
+    /// source type's bytes, and the dereference that consumes
+    /// the pointer re-reads those bytes through the target
+    /// layout. `(source, target)`.
+    pending_cast: Option<(Desc, Desc)>,
 }
 
 /// Resolve a print expression's base name: a variable of the
@@ -1118,6 +1132,8 @@ fn resolve_local_base(
         // recorded it in the debug variable table.
         char: char_hint,
         tag: entry.ty.clone(),
+        cast_type: None,
+        pending_cast: None,
     }))
 }
 
@@ -1177,6 +1193,8 @@ fn resolve_static_base(
         desc,
         char,
         tag,
+        cast_type: None,
+        pending_cast: None,
     })
 }
 
@@ -1617,6 +1635,53 @@ fn reinterpret_cast(
     Some(Ok(Value::Tuple(out)))
 }
 
+/// Whether a descriptor names a scalar type, the family a
+/// byte reinterpretation can express.
+fn is_scalar_desc(desc: &Desc) -> bool {
+    matches!(
+        desc,
+        Desc::Int(_) | Desc::Float(_) | Desc::Bool | Desc::Char
+    )
+}
+
+/// Re-read a scalar pointee value's storage bytes through a
+/// different scalar layout: the dereference side of a pointer
+/// cast that changed the pointee type, whose target storage
+/// still holds the source type's bytes. A change the scalar
+/// layouts cannot express, and a target wider than the
+/// storage the source type occupies, are explicit errors
+/// rather than wrong values.
+fn reinterpret_scalar_pointee(
+    value: &Value,
+    source: &Desc,
+    target: &Desc,
+) -> Result<Value, String> {
+    let unsupported = || {
+        format!(
+            "cast changing pointee type from {} to {} is not supported",
+            desc_type_name(source).unwrap_or_else(|| "?".into()),
+            desc_type_name(target).unwrap_or_else(|| "?".into()),
+        )
+    };
+    let bytes = match scalar_value_bytes(value, source) {
+        Some(bytes) => bytes,
+        None => return Err(unsupported()),
+    };
+    let Some(width) = desc_scalar_width(target) else {
+        return Err(unsupported());
+    };
+    if bytes.len() < width {
+        return Err(format!(
+            "cast to a {width}-byte pointee over {} bytes of backing storage",
+            bytes.len()
+        ));
+    }
+    match scalar_value_from_bytes(&bytes[..width], target) {
+        Some(value) => Ok(value),
+        None => Err(unsupported()),
+    }
+}
+
 /// Apply a cast step (`as *const [T; N]` and kin): a pointer
 /// cast retargets the descriptor; an array cast views the
 /// pointee's elements as an array value (the form the slice
@@ -1702,6 +1767,11 @@ fn evaluate_expr(
                 if matches!(ev.desc, Some(Desc::Array(..) | Desc::Slice(_)))
                     && matches!(ev.value, Value::Tuple(_))
                 {
+                    // The dereference consumes the pointer
+                    // layer a cast spelled, and the spelled
+                    // type with it (the loop's step bookkeeping
+                    // below does not run on this path).
+                    ev.cast_type = None;
                     continue;
                 }
                 let resolved = interp
@@ -1722,6 +1792,17 @@ fn evaluate_expr(
                     }
                     _ => None,
                 };
+                // A cast step that changed the pointee's
+                // scalar type recorded a reinterpretation for
+                // this dereference: the storage still holds
+                // the source type's bytes, and the value is
+                // re-read through the target layout (the
+                // reading a native debugger applies) rather
+                // than rendered under the target descriptor
+                // unchanged.
+                if let Some((source, target)) = ev.pending_cast.take() {
+                    ev.value = reinterpret_scalar_pointee(&ev.value, &source, &target)?;
+                }
                 // The char hint is recorded for the variable as
                 // declared: a `char` local, or a reference to a
                 // char (whose pointee the hint then describes).
@@ -1790,6 +1871,16 @@ fn evaluate_expr(
                 ev.char = false;
             }
             ExprStep::Cast(target) => {
+                // A cast that changes a pointer's scalar
+                // pointee type leaves the target storage
+                // holding the source type's bytes: record the
+                // reinterpretation for the dereference that
+                // consumes the pointer (see the `Deref` arm).
+                // A chain of such casts composes back to the
+                // first cast's source, the type the storage
+                // actually holds.
+                let source_pointee = ev.desc.as_ref().and_then(pointer_pointee).cloned();
+                let target_pointee = pointer_pointee(target).cloned();
                 let (v, d) = apply_cast(
                     interp,
                     frames,
@@ -1800,11 +1891,40 @@ fn evaluate_expr(
                 ev.value = v;
                 ev.desc = d;
                 ev.char = false;
+                let new_pending = match (source_pointee, target_pointee) {
+                    (Some(source), Some(target_inner))
+                        if is_scalar_desc(&source) && is_scalar_desc(&target_inner) =>
+                    {
+                        let source = match &ev.pending_cast {
+                            Some((first, mid)) if *mid == source => first.clone(),
+                            _ => source,
+                        };
+                        if source == target_inner {
+                            None
+                        } else {
+                            Some((source, target_inner))
+                        }
+                    }
+                    _ => None,
+                };
+                ev.pending_cast = new_pending;
             }
         }
         // The recorded tag describes the base value's declared
         // type; after a step it no longer describes the value.
         ev.tag = None;
+        // A cast step's spelled type and pending pointee
+        // reinterpretation describe the expression only until
+        // a later step consumes them: a dereference applies
+        // (and clears) the reinterpretation, and any step
+        // other than a cast drops the spelled type.
+        if !matches!(step, ExprStep::Cast(_) | ExprStep::Deref) {
+            ev.pending_cast = None;
+        }
+        ev.cast_type = match step {
+            ExprStep::Cast(target) => Some(target.clone()),
+            _ => None,
+        };
     }
     Ok(ev)
 }
@@ -2030,6 +2150,16 @@ fn expr_type_name(ev: &EvaluatedValue) -> Option<String> {
     if let Some(tag) = &ev.tag {
         return Some(dwarf_type_name(tag));
     }
+    // A trailing cast step's spelled type, pointer layer
+    // included: the cast's materialized view carries the
+    // pointee's descriptor (an array view for an array
+    // pointer), but the expression's type is the cast's own
+    // until a dereference consumes the pointer layer.
+    if let Some(cast) = &ev.cast_type {
+        if let Some(name) = desc_type_name(cast) {
+            return Some(name);
+        }
+    }
     ev.desc.as_ref().and_then(desc_type_name)
 }
 
@@ -2157,7 +2287,12 @@ fn type_only_value(
     let expr = parse_expr(expr_text).ok()?;
     let base = resolve_base(interp, ctl, frames, &expr).ok()?;
     let mut desc = base.desc.clone();
+    let mut cast_type: Option<Desc> = None;
     for step in &expr.steps {
+        cast_type = match step {
+            ExprStep::Cast(target) => Some(target.clone()),
+            _ => None,
+        };
         desc = match (step, desc) {
             (
                 ExprStep::Deref,
@@ -2209,6 +2344,8 @@ fn type_only_value(
         } else {
             None
         },
+        cast_type,
+        pending_cast: None,
     })
 }
 
