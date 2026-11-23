@@ -7906,6 +7906,28 @@ impl<'a> Interpreter<'a> {
                             }
                             _ => stepped,
                         }
+                    } else if *idx == 0
+                        && self.position_is_bare_wrapper_field(frames, &cur, &cur_ty)
+                    {
+                        // The position's declared type is a
+                        // one-field wrapper (a single-field
+                        // struct, or a one-element tuple over an
+                        // array) whose storage holds the field's
+                        // value bare -- the form a transmute or
+                        // pointer cast between the wrapper and
+                        // its field leaves behind, the storage
+                        // having been written through the field's
+                        // own type. Field 0 of the wrapper IS
+                        // that stored value, so the step does
+                        // not move (see
+                        // `position_is_bare_wrapper_field`).
+                        buf_depth = 0;
+                        buf_base = None;
+                        cur_ty = match &cur_ty {
+                            Some(Ty::Tuple(ts)) => ts.first().cloned(),
+                            _ => None,
+                        };
+                        cur
                     } else {
                         buf_depth = 0;
                         buf_base = None;
@@ -8179,7 +8201,24 @@ impl<'a> Interpreter<'a> {
                             };
                             let resolved = match &pointee_ty {
                                 Some(pointee) => {
-                                    self.peel_maybe_uninit_entry(frames, resolved, pointee)
+                                    let resolved = self.peel_maybe_uninit_entry(
+                                        frames, resolved, pointee,
+                                    );
+                                    // A one-element tuple stored
+                                    // where the pointee is the
+                                    // tuple's own array element
+                                    // type: the tuple is a
+                                    // one-field wrapper around the
+                                    // array the steps that follow
+                                    // address (see
+                                    // `enter_tuple_wrapped_sequence`).
+                                    match pointee {
+                                        Ty::Array(elem, n) => self
+                                            .enter_tuple_wrapped_sequence(
+                                                frames, resolved, elem, *n,
+                                            ),
+                                        _ => resolved,
+                                    }
                                 }
                                 None => {
                                     // A dereference of an ADT-typed
@@ -8266,6 +8305,178 @@ impl<'a> Interpreter<'a> {
     /// unreadable or absent stored value keeps the unentered
     /// resolution, so error behaviour on uninitialised storage
     /// is unchanged.
+    /// Whether the position `cur` denotes is a one-field
+    /// wrapper's field stored bare: the position's declared
+    /// type, where the walk tracks it, is a struct with a
+    /// single field (or a one-element tuple over an array),
+    /// and the value stored at the position is the field's own
+    /// value form -- a tuple of elements or a byte block,
+    /// never the wrapper's own aggregate (an ADT value is an
+    /// enum in this model, and a tuple wrapper's own form is a
+    /// one-element tuple holding the field). That is the
+    /// storage a transmute or pointer cast between the wrapper
+    /// and its field leaves behind: the storage was written
+    /// through the field's type, so a `Field(0)` step at the
+    /// position denotes the stored value itself, not its
+    /// first element. (The scalar and string forms of the same
+    /// situation are answered inside the projectors; the
+    /// sequence forms are ambiguous there -- a bare tuple is
+    /// also a tuple value's own form -- so this step is judged
+    /// here, where the declared type is known.)
+    fn position_is_bare_wrapper_field(
+        &self,
+        frames: &[Frame],
+        cur: &Resolved,
+        cur_ty: &Option<Ty>,
+    ) -> bool {
+        match cur_ty {
+            Some(Ty::Adt(name)) => {
+                let Some(shape) = self.debug_shape_for_def(name) else {
+                    return false;
+                };
+                if shape.kind != sparagmos_mir::AdtShapeKind::Struct
+                    || shape.variants.len() != 1
+                    || shape.variants[0].fields.len() != 1
+                {
+                    return false;
+                }
+                matches!(
+                    self.read_resolved(frames, cur),
+                    Ok(Value::Tuple(_) | Value::Bytes(_))
+                )
+            }
+            Some(Ty::Tuple(ts))
+                if ts.len() == 1 && matches!(ts[0], Ty::Array(..)) =>
+            {
+                match self.read_resolved(frames, cur) {
+                    Ok(Value::Bytes(_)) => true,
+                    Ok(Value::Tuple(items)) => items.len() != 1,
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// The entry for the dereference of an array-typed
+    /// reference whose target holds a one-element tuple around
+    /// the array: the tuple is a one-field wrapper whose only
+    /// field is the array itself (a `([T; N],)` value viewed
+    /// through the `&[T; N]` a transmute formed), so the steps
+    /// that follow address the tuple's single item, as
+    /// `enter_wrapper_field` arranges. A stored tuple whose
+    /// length is the array's own length is the array's genuine
+    /// form and is not entered; a one-element array stays
+    /// ambiguous with its wrapper and keeps the genuine
+    /// reading.
+    ///
+    /// A one-item tuple is ALSO the array's own sparse prefix
+    /// when only its first element is materialised -- a nested
+    /// array whose first row alone is written stores exactly
+    /// that shape (a one-row tuple holding the row) -- so the
+    /// entry is refused when the single item is already
+    /// plausible as one element of the declared array: the
+    /// stored form is then consistent as a prefix of the
+    /// declared array type, and entering it would insert a
+    /// field step the place does not have, leaving the
+    /// following index steps to address the first element's
+    /// own parts instead of the array's elements. The wrapper
+    /// reading stands only when the item cannot be an element:
+    /// a tuple or byte block is never a scalar element, so
+    /// the `([u8; N],)` shape still enters.
+    fn enter_tuple_wrapped_sequence(
+        &self,
+        frames: &[Frame],
+        resolved: Resolved,
+        elem: &Ty,
+        len: u64,
+    ) -> Resolved {
+        if len == 1 {
+            return resolved;
+        }
+        let Ok(stored) = self.read_resolved(frames, &resolved) else {
+            return resolved;
+        };
+        let Value::Tuple(items) = &stored else {
+            return resolved;
+        };
+        if items.len() == 1
+            && matches!(items[0], Value::Tuple(_) | Value::Bytes(_))
+            && !self.value_plausible_for_ty(&items[0], elem, 0)
+        {
+            enter_wrapper_field(resolved)
+        } else {
+            resolved
+        }
+    }
+
+    /// Whether `value` is plausible as a value of `ty`, judged
+    /// on the value's own form alone (the type-level mirror of
+    /// [`Self::value_plausible_for_tag`]). Conservative in the
+    /// same way: a slot not yet written is plausible for every
+    /// type, a form this judgment does not model keeps the
+    /// benefit of the doubt, and `false` is answered only on a
+    /// clear mismatch -- a scalar, reference or ADT value is
+    /// never a bare tuple or byte block, and a tuple or array
+    /// value is never a bare scalar.
+    fn value_plausible_for_ty(&self, value: &Value, ty: &Ty, depth: usize) -> bool {
+        if matches!(value, Value::Uninit) || depth > 4 {
+            return true;
+        }
+        match (ty, value) {
+            (Ty::Array(elem, n), Value::Tuple(items)) => {
+                items.len() as u64 <= *n
+                    && items
+                        .iter()
+                        .all(|item| self.value_plausible_for_ty(item, elem, depth + 1))
+            }
+            // A byte block is an array's flat storage form,
+            // whatever the element type: the bytes are
+            // reinterpreted under the declared element type on
+            // every read.
+            (Ty::Array(..), Value::Bytes(_)) => true,
+            (Ty::Tuple(ts), Value::Tuple(items)) => {
+                items.len() <= ts.len()
+                    && items
+                        .iter()
+                        .zip(ts.iter())
+                        .all(|(item, t)| self.value_plausible_for_ty(item, t, depth + 1))
+            }
+            (Ty::Uint(_), Value::Uint(_)) => true,
+            (Ty::Int(_), Value::Int(_)) => true,
+            (Ty::Bool, Value::Bool(_)) => true,
+            (Ty::Float(_), Value::Float(_) | Value::Float128(_)) => true,
+            (Ty::Unit, Value::Unit) => true,
+            (Ty::Str, Value::Str(_) | Value::Bytes(_)) => true,
+            (
+                Ty::Ref(_),
+                Value::Ref(_) | Value::FatRef { .. } | Value::DynRef { .. },
+            ) => true,
+            (Ty::FnPtr | Ty::FnDef(_), Value::FnPtr(_)) => true,
+            (Ty::Closure(..), Value::Closure { .. }) => true,
+            (Ty::Coroutine(_), Value::Coroutine { .. }) => true,
+            (Ty::Adt(name), Value::Enum { variant, fields }) => {
+                match self.debug_shape_for_def(name) {
+                    Some(shape) => {
+                        shape.kind == sparagmos_mir::AdtShapeKind::Union
+                            || self.plausible_adt_enum(*variant, fields, shape, depth)
+                    }
+                    None => true,
+                }
+            }
+            (Ty::Adt(name), Value::Unit) => self
+                .debug_shape_for_def(name)
+                .is_none_or(|shape| {
+                    shape
+                        .variants
+                        .iter()
+                        .any(|variant| variant.fields.is_empty())
+                }),
+            (Ty::Slice(_) | Ty::Dynamic(_) | Ty::Never, _) => true,
+            _ => false,
+        }
+    }
+
     fn peel_maybe_uninit_entry(
         &self,
         frames: &[Frame],

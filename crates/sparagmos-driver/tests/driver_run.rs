@@ -20272,3 +20272,117 @@ fn run_mode_nested_by_value_iteration_drops_zst_payloads() {
         "every nested element's payload destructor runs in order"
     );
 }
+
+const SINGLE_ARRAY_FIELD_PUN_SRC: &str = r#"
+struct S([u8; 4]);
+struct W([u32; 2]);
+fn main() {
+    let a: [u8; 4] = [11, 22, 33, 44];
+    let r: &S = unsafe { std::mem::transmute(&a) };
+    println!("ref {} {} {} {}", r.0[0], r.0[1], r.0[2], r.0[3]);
+    let f: [u8; 4] = r.0;
+    println!("field {} {} {} {}", f[0], f[1], f[2], f[3]);
+    let w: [u32; 2] = [0x11223344, 0x55667788];
+    let p = &w as *const [u32; 2] as *const W;
+    let w2 = unsafe { &*p };
+    println!("ptr {:x} {:x}", w2.0[0], w2.0[1]);
+    let mut b: [u8; 4] = [0, 0, 0, 0];
+    let m: &mut S = unsafe { std::mem::transmute(&mut b) };
+    m.0[2] = 77;
+    println!("mut {} {} {} {}", b[0], b[1], b[2], b[3]);
+    m.0 = [9, 8, 7, 6];
+    println!("whole {} {} {} {}", b[0], b[1], b[2], b[3]);
+    let bx: Box<[u8; 4]> = Box::new([5, 6, 7, 8]);
+    let bs: Box<S> = unsafe { std::mem::transmute(bx) };
+    println!("box {} {} {} {}", bs.0[0], bs.0[1], bs.0[2], bs.0[3]);
+    let t = ([11u8, 22, 33, 44],);
+    let tr: &[u8; 4] = unsafe { std::mem::transmute(&t) };
+    println!("tup {} {} {} {}", tr[0], tr[1], tr[2], tr[3]);
+    let br: &([u8; 4],) = unsafe { std::mem::transmute(&a) };
+    println!("back {} {} {} {}", br.0[0], br.0[1], br.0[2], br.0[3]);
+}
+"#;
+
+#[test]
+fn run_mode_single_array_field_pun_reference_views() {
+    // A struct (or one-element tuple) whose only field is an
+    // array is layout-identical to the array, and a reference,
+    // raw pointer or box transmuted or cast between the two
+    // views denotes the same storage: the storage keeps the
+    // form it was written with (the bare array), so reading
+    // the wrapper's field through the other view must read
+    // the array itself -- its elements at their indices, the
+    // whole field as the whole array -- not the first element
+    // and that element's bytes. Writes through the wrapper
+    // view land in the array's elements.
+    run_ok(
+        "arrayfieldpun",
+        SINGLE_ARRAY_FIELD_PUN_SRC,
+        "ref 11 22 33 44\nfield 11 22 33 44\nptr 11223344 55667788\nmut 0 0 77 0\nwhole 9 8 7 6\nbox 5 6 7 8\ntup 11 22 33 44\nback 11 22 33 44\n",
+    );
+}
+
+const ONE_ELEMENT_TUPLE_TRANSMUTE_SRC: &str = r#"
+fn main() {
+    let t = ([3u8, 1, 4, 1],);
+    let a: [u8; 4] = unsafe { std::mem::transmute(t) };
+    println!("out {} {} {} {}", a[0], a[1], a[2], a[3]);
+    let b: ([u8; 4],) = unsafe { std::mem::transmute([9u8, 9, 9, 9]) };
+    println!("in {} {} {} {}", b.0[0], b.0[1], b.0[2], b.0[3]);
+    let s = (42u32,);
+    let x: u32 = unsafe { std::mem::transmute(s) };
+    println!("scalar {}", x);
+    let s2: (u32,) = unsafe { std::mem::transmute(7u32) };
+    println!("wrapped {}", s2.0);
+}
+"#;
+
+#[test]
+fn run_mode_one_element_tuple_transmute_crossings() {
+    // A one-element tuple is a one-field wrapper, with the
+    // same transmute crossings the one-field struct has: to
+    // exactly the field's type it reads the field out, and
+    // from exactly the field's type it wraps the value into
+    // the tuple.
+    run_ok(
+        "onetupletransmute",
+        ONE_ELEMENT_TUPLE_TRANSMUTE_SRC,
+        "out 3 1 4 1\nin 9 9 9 9\nscalar 42\nwrapped 7\n",
+    );
+}
+
+const SPARSE_NESTED_ARRAY_SRC: &str = r#"
+use std::alloc::{alloc, Layout};
+
+fn main() {
+    unsafe {
+        let layout = Layout::new::<[[u32; 2]; 2]>();
+        let p = alloc(layout) as *mut [[u32; 2]; 2];
+        (*p)[0] = [11, 22];
+        println!("row {:?}", (*p)[0]);
+        println!("elem {}", (*p)[0][1]);
+        let q = p as *const [u32; 2];
+        println!("via_row_ptr {}", (*q)[1]);
+        (*p)[0][1] = 99;
+        println!("written {:?}", (*p)[0]);
+        println!("via_row_ptr_after {}", (*q)[1]);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_sparse_nested_array_prefix_is_not_a_tuple_wrapper() {
+    // A nested array whose first row alone is materialised
+    // stores as a one-item tuple holding the row -- the same
+    // shape a one-element tuple wrapper around the whole array
+    // has. The dereference of the array pointer must keep the
+    // genuine reading (the tuple is the array's own sparse
+    // prefix): reading the row reads the row, indexing through
+    // it reaches the row's elements, and writes through the
+    // array view land in the row the row view reads back.
+    run_ok(
+        "sparsenestedarray",
+        SPARSE_NESTED_ARRAY_SRC,
+        "row [11, 22]\nelem 22\nvia_row_ptr 22\nwritten [11, 99]\nvia_row_ptr_after 99\n",
+    );
+}
