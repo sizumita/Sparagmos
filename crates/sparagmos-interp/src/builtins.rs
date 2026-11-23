@@ -3809,11 +3809,16 @@ fn exec_float16_method(
         // (payload preserved), while the host `f64` library
         // floor / ceil / trunc return a signaling NaN unchanged.
         // For `f16` inputs the `f32` results are exact, so no
-        // finite result changes.
+        // finite result changes. `round_ties_even` at `f64`
+        // precision likewise leaves a signaling NaN unchanged on
+        // this host, so it takes the `f32` path too; `round` and
+        // `fract` at `f64` already quiet signaling NaNs and match
+        // the native results bit for bit (measured over the f16
+        // probe battery), so they stay at `f64`.
         O::Floor => round(x32.floor() as f64),
         O::Ceil => round(x32.ceil() as f64),
         O::Round => round(x.round()),
-        O::RoundTiesEven => round(x.round_ties_even()),
+        O::RoundTiesEven => round(x32.round_ties_even() as f64),
         O::Trunc => round(x32.trunc() as f64),
         O::Fract => round(x.fract()),
         O::Recip => round(x.recip()),
