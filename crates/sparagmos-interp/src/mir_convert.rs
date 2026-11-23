@@ -1268,7 +1268,7 @@ fn is_pointer_constant(v: &ir::Operand) -> bool {
                 | ir::Constant::VTablePtr(_)
                 | ir::Constant::FatPtr { .. }
                 | ir::Constant::FnDef(_)
-                | ir::Constant::Closure(_)
+                | ir::Constant::Closure(..)
         )
     )
 }
@@ -1341,9 +1341,11 @@ fn value_to_constant(v: &Value) -> Option<ir::Constant> {
                 variant: *variant,
                 fields,
             }),
-        Value::Closure { def, env } if env.is_empty() => {
-            Some(ir::Constant::Closure(def.clone()))
-        }
+        Value::Closure { def, env } => env
+            .iter()
+            .map(value_to_constant)
+            .collect::<Option<Vec<_>>>()
+            .map(|env| ir::Constant::Closure(def.clone(), env)),
         Value::FnPtr(name) => Some(ir::Constant::FnDef(name.clone())),
         _ => None,
     }
@@ -2199,8 +2201,8 @@ impl<'a> Converter<'a> {
     /// with the instantiation's arguments substituted for the
     /// definition's parameters — a variant with an uninhabited
     /// field type can never be constructed, so `Option<Empty>`
-    /// still has the single value `None`); zero-capture closures;
-    /// function items. Enums with two or more inhabited variants
+    /// still has the single value `None`); closures whose
+    /// captures are all single-valued; function items. Enums with two or more inhabited variants
     /// are excluded (the type does not determine the variant), as
     /// are unions with more than one field (the type does not
     /// determine the active field; a single-field union's value
@@ -2485,11 +2487,21 @@ impl<'a> Converter<'a> {
                     None => UniqueValue::Uninhabited,
                 }
             }
-            mir::Ty::Closure(def, args) => match args.get(2) {
-                Some(mir::Ty::Tuple(ts)) if ts.is_empty() => {
+            mir::Ty::Closure(def, args) => match args.last() {
+                Some(mir::Ty::Tuple(ts)) => {
+                    let mut env = Vec::with_capacity(ts.len());
+                    for t in ts {
+                        match self.unique_value(t, depth + 1) {
+                            UniqueValue::One(v) => env.push(v),
+                            UniqueValue::Uninhabited => {
+                                return UniqueValue::Uninhabited
+                            }
+                            UniqueValue::Many => return UniqueValue::Many,
+                        }
+                    }
                     UniqueValue::One(Value::Closure {
                         def: self.def_display_name(def),
-                        env: Vec::new(),
+                        env,
                     })
                 }
                 _ => UniqueValue::Many,
@@ -3351,11 +3363,13 @@ impl<'a> Converter<'a> {
             }
             // A closure in constant position is a value too (the
             // zero-sized closure constant a `ClosureFnPointer` cast
-            // coerces, or a stored closure value): with an empty
-            // captured environment it becomes the closure value
-            // naming the body. A constant whose environment is not
-            // empty cannot be materialised here — the captured
-            // values are not part of the type constant — and stays
+            // coerces, or a stored closure value). A type constant
+            // carries no stored bytes, so the value is materialised
+            // from the type alone: the captured environment is
+            // materialised exactly when every captured value is
+            // the unique value of its type (a non-capturing closure
+            // trivially qualifies). A capture whose type has
+            // several values cannot be materialised here and stays
             // an explicit unsupported naming the closure.
             mir::ConstKind::Ty(mir::Ty::Closure(def, args)) => {
                 // The upvars tuple is the closure type's LAST
@@ -3365,19 +3379,27 @@ impl<'a> Converter<'a> {
                 // constant inside a generic context (e.g. the
                 // closure inside `Sum::sum`) was misread as
                 // capturing an environment it does not have.
-                let upvars = match args.last() {
-                    Some(mir::Ty::Tuple(ts)) => ts.len(),
-                    _ => usize::MAX,
+                let env = match args.last() {
+                    Some(mir::Ty::Tuple(ts)) => ts
+                        .iter()
+                        .map(|t| {
+                            self.zst_value(t, 0)
+                                .and_then(|v| value_to_constant(&v))
+                        })
+                        .collect::<Option<Vec<_>>>(),
+                    _ => None,
                 };
-                if upvars == 0 {
-                    Ok(ir::Constant::Closure(self.body_key(def)))
-                } else {
-                    Err(ConvertError::UnsupportedConstant {
+                match env {
+                    Some(env) => Ok(ir::Constant::Closure(
+                        self.body_key(def),
+                        env,
+                    )),
+                    None => Err(ConvertError::UnsupportedConstant {
                         kind: format!(
                             "closure constant {} with a captured environment",
                             self.def_display_name(def)
                         ),
-                    })
+                    }),
                 }
             }
             mir::ConstKind::Ty(t) => Err(ConvertError::UnsupportedConstant {
@@ -3924,7 +3946,7 @@ impl<'a> Converter<'a> {
                 ir::Constant::FnDef(self.body_key(def))
             }
             mir::ConstValue::Closure(def) => {
-                ir::Constant::Closure(self.body_key(def))
+                ir::Constant::Closure(self.body_key(def), Vec::new())
             }
             mir::ConstValue::IntPtr(addr) => ir::Constant::IntPtr(*addr),
             mir::ConstValue::VTablePtr(id) => ir::Constant::VTablePtr(*id),
@@ -6338,7 +6360,8 @@ let inner = match (&src, target) {
                     // operands alike — the driver preserves the
                     // closure type of zero-sized closure constants,
                     // and constant conversion resolves it to the
-                    // closure value (a captured environment stays an
+                    // closure value (an environment whose values
+                    // the capture types do not determine stays an
                     // explicit unsupported there).
                     mir::CastKind::PointerCoercion(
                         mir::PointerCoercion::ClosureFnPointer,

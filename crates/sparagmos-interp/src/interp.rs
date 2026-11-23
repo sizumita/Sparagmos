@@ -13853,9 +13853,12 @@ impl<'a> Interpreter<'a> {
                 len: u128::from(*meta),
             },
             Constant::FnDef(name) => Value::FnPtr(name.clone()),
-            Constant::Closure(def) => Value::Closure {
+            Constant::Closure(def, env) => Value::Closure {
                 def: def.clone(),
-                env: Vec::new(),
+                env: env
+                    .iter()
+                    .map(|c| self.eval_constant(c))
+                    .collect::<InterpResult<Vec<_>>>()?,
             },
             Constant::Str(s) => Value::Str(s.clone()),
             Constant::Bytes(b) => Value::Bytes(b.clone()),
