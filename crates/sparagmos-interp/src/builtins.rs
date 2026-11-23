@@ -26899,7 +26899,12 @@ impl<'a> Interpreter<'a> {
     ) -> InterpResult<String> {
         if let Value::DynRef { base, .. } = value {
             let resolved = self.resolve_value(frames, base)?;
-            let shaped = if let Some(id) = rc_handle_id(&resolved) {
+            // As in `format_value`'s `DynRef` arm, the handle
+            // shaping needs the allocation's contents to license
+            // it (`rc_inner_id`): the resolved value's shape
+            // alone cannot tell a reference-counted handle from
+            // a plain aggregate that shares it (a `CString`).
+            let shaped = if let Some(id) = self.rc_inner_id(&resolved) {
                 Value::Ref(RefTarget::Alloc {
                     id,
                     projection: vec![RefProj::Field(2)],
@@ -27598,8 +27603,16 @@ impl<'a> Interpreter<'a> {
                 // pointee reference) and an `Rc`/`Arc` base is the
                 // handle, so shape the value the way method
                 // dispatch shapes its receiver (see
-                // `ref_shaped_receiver` in the interpreter).
-                let pointee = if let Some(id) = rc_handle_id(&pointee) {
+                // `ref_shaped_receiver` in the interpreter). The
+                // handle shaping is licensed by the allocation's
+                // contents, not by the value's shape alone
+                // (`rc_inner_id`): a plain value can share the
+                // handle's shape -- a `CString` is a one-field
+                // aggregate over a one-field box aggregate over
+                // an allocation pointer -- and reading such a
+                // value as a handle would name a byte inside its
+                // buffer instead of the value itself.
+                let pointee = if let Some(id) = self.rc_inner_id(&pointee) {
                     Value::Ref(RefTarget::Alloc {
                         id,
                         projection: vec![RefProj::Field(2)],
@@ -28068,7 +28081,7 @@ impl<'a> Interpreter<'a> {
                 if fields.len() == 1 {
                     fields[0].clone()
                 } else {
-                    Self::dyn_data_pointer(value)
+                    self.dyn_data_pointer(value)
                 }
             }
             _ => {
