@@ -25875,3 +25875,165 @@ fn run_mode_transmute_niche_range_wraps_at_shifted_scalar() {
         "2 1 1344\n0 65114\n",
     );
 }
+
+
+
+const EXTERN_STATIC_CONVERT_SRC: &str = r#"
+pub mod inner {
+    extern "C" {
+        pub static GLOBAL1: u8;
+        pub static mut GLOBAL2: u32;
+        pub static GLOBAL3: [u8; 1];
+    }
+    pub fn call() {
+        let _a = std::ptr::addr_of!(GLOBAL1);
+        let _b = std::ptr::addr_of_mut!(GLOBAL2);
+        let _c = std::ptr::addr_of!(GLOBAL3);
+    }
+}
+fn main() { inner::call(); }
+"#;
+
+#[test]
+fn convert_mode_extern_static_reference_converts() {
+    // A foreign static (an `extern` block item) has no
+    // initializer; asking the compiler to evaluate one ICEs
+    // inside the typeck query and used to crash the whole
+    // conversion (exit 101). The conversion must instead
+    // complete, with the reference denoting the static's
+    // program-level storage.
+    let dir = temp_dir("extern-static-convert");
+    let src = fixture(&dir, "case.rs", EXTERN_STATIC_CONVERT_SRC);
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "conversion must complete; stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("internal compiler error"),
+        "no compiler ICE may be involved; stderr={stderr}"
+    );
+    let main_line = stdout
+        .lines()
+        .find(|l| l.contains("::main:"))
+        .expect("summary lists main");
+    assert!(
+        main_line.contains("[converted]"),
+        "main is converted: {main_line}"
+    );
+    let target = stdout
+        .lines()
+        .find(|l| l.starts_with("target-crate converted:"))
+        .expect("summary reports the target crate counts");
+    assert!(
+        target.contains("skipped: 0"),
+        "the target crate converts completely: {target}"
+    );
+}
+
+const EXTERN_STATIC_INIT_SRC: &str = r#"
+extern "C" { static EXT_STAT: u32; }
+static R: &u32 = unsafe { &EXT_STAT };
+fn main() {
+    println!("nonnull={}", !std::ptr::addr_of!(*R).is_null());
+    println!("same={}", std::ptr::addr_of!(*R) == std::ptr::addr_of!(EXT_STAT));
+}
+"#;
+
+#[test]
+fn convert_mode_extern_static_in_static_initializer_converts() {
+    // The same reference reached through another static's
+    // initializer allocation (the shape of a vtable or a
+    // pointer table naming an extern static).
+    let dir = temp_dir("extern-static-init");
+    let src = fixture(&dir, "case.rs", EXTERN_STATIC_INIT_SRC);
+    let out = summarize_driver(&src);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "conversion must complete; stderr={stderr}"
+    );
+    let target = stdout
+        .lines()
+        .find(|l| l.starts_with("target-crate converted:"))
+        .expect("summary reports the target crate counts");
+    assert!(
+        target.contains("skipped: 0"),
+        "the target crate converts completely: {target}"
+    );
+}
+
+#[test]
+fn run_mode_extern_static_initializer_reference_resolves() {
+    run_ok(
+        "extern-static-init-run",
+        EXTERN_STATIC_INIT_SRC,
+        "nonnull=true\nsame=true\n",
+    );
+}
+
+const EXTERN_STATIC_RUN_SRC: &str = r#"
+extern "C" {
+    static EXT_STAT: u32;
+    static mut EXT_MUT: u32;
+}
+fn main() {
+    let a = std::ptr::addr_of!(EXT_STAT);
+    let b = std::ptr::addr_of!(EXT_STAT);
+    println!("same={} nonnull={}", a == b, !a.is_null());
+    unsafe {
+        std::ptr::addr_of_mut!(EXT_MUT).write(42);
+        println!("roundtrip={}", std::ptr::addr_of!(EXT_MUT).read());
+    }
+}
+"#;
+
+#[test]
+fn run_mode_extern_static_address_identity_and_roundtrip() {
+    // The storage identity is observable (same address, not
+    // null) and the guest's own writes read back, even though
+    // the static's initial contents are not the interpreter's
+    // to invent.
+    run_ok(
+        "extern-static-run",
+        EXTERN_STATIC_RUN_SRC,
+        "same=true nonnull=true\nroundtrip=42\n",
+    );
+}
+
+const EXTERN_STATIC_READ_SRC: &str = r#"
+extern "C" { static EXT_STAT: u32; }
+fn main() {
+    let v = unsafe { std::ptr::addr_of!(EXT_STAT).read() };
+    println!("value={}", v);
+}
+"#;
+
+#[test]
+fn run_mode_extern_static_unwritten_read_is_explicit_error() {
+    // Reading storage the guest never wrote must meet the
+    // explicit uninitialized-read error, not a fabricated
+    // value and not a crash.
+    let dir = temp_dir("extern-static-read");
+    let src = fixture(&dir, "case.rs", EXTERN_STATIC_READ_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "the read is an explicit unsupported outcome; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("read of uninitialized place static"),
+        "the error names the uninitialized static read; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("EXT_STAT"),
+        "the error names the static; stderr={stderr}"
+    );
+}

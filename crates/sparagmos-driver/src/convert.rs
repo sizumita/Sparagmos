@@ -83,6 +83,27 @@ pub fn drop_glue_lang_item_defined() -> bool {
         .is_some()
 }
 
+/// Whether the static `def` is a foreign static (an item of an
+/// `extern` block). A foreign static has no initializer by
+/// construction, and asking the compiler to evaluate one ICEs
+/// inside the typeck query ("can't type-check body of ..."):
+/// evaluating a static initializer goes through the item's MIR
+/// body, which a foreign item does not have. The ICE diagnostic
+/// poisons the whole compilation even when the panic itself is
+/// contained, so the evaluation must not be attempted — callers
+/// handle the storage without it (a reference decoded against
+/// an uninitialized seed, or no decode at all).
+/// Outside a compilation callback there is no context to ask;
+/// the static is reported non-foreign, preserving the caller's
+/// plain behavior.
+fn static_is_foreign(def: &mir::mono::StaticDef) -> bool {
+    let Some(tcx) = compiler_tcx() else {
+        return false;
+    };
+    let internal = rustc_public::rustc_internal::internal(tcx, def.def_id());
+    tcx.is_foreign_item(internal)
+}
+
 /// Per-run converter state (DefId assignment) plus per-function error bag.
 pub struct Converter {
     def_ids: HashMap<rustc_public::DefId, u32>,
@@ -1057,6 +1078,9 @@ impl Converter {
         let Ok(def) = mir::mono::StaticDef::try_from(item.clone()) else {
             return;
         };
+        if static_is_foreign(&def) {
+            return;
+        }
         let Ok(alloc) = def.eval_initializer() else {
             return;
         };
@@ -3637,6 +3661,9 @@ impl Converter {
                 Some(sm::ConstValue::Ref(Box::new(block)))
             }
             mir::alloc::GlobalAlloc::Static(def) => {
+                if static_is_foreign(&def) {
+                    return None;
+                }
                 let init = def.eval_initializer().ok()?;
                 let block = self.decode_erased_alloc(&init, target_off, depth + 1)?;
                 Some(sm::ConstValue::Ref(Box::new(block)))
@@ -3777,6 +3804,63 @@ impl Converter {
         }
     }
 
+    /// Decode a reference whose provenance names a foreign
+    /// static (an item of an `extern` block). A foreign static
+    /// has no initializer to decode — asking the compiler for
+    /// one ICEs (see `static_is_foreign`) — so the reference
+    /// denotes the static's program-level storage with an
+    /// uninitialized seed: address-only uses (the common case:
+    /// `addr_of!`, raw-pointer casts, comparisons) observe the
+    /// storage's identity, writes through a mutable reference
+    /// land in the store like any other static's, and reads of
+    /// never-written storage meet the interpreter's
+    /// uninitialized-read error instead of an invented value.
+    /// A pointee whose decoded form IS the contents (a `str`)
+    /// cannot be represented this way and stays undecodable,
+    /// as does an interior slice reference (the same
+    /// restriction `decode_static_slice_ref` applies).
+    fn decode_foreign_static_ref(
+        &mut self,
+        def: &mir::mono::StaticDef,
+        inner: &rustc_public::ty::Ty,
+        alloc: &Allocation,
+        offset: usize,
+        target_off: usize,
+        depth: usize,
+    ) -> Option<sm::ConstValue> {
+        let def_id = self.crate_def_id(def);
+        match inner.kind() {
+            TyKind::RigidTy(RigidTy::Slice(elem)) => {
+                if target_off != 0
+                    || matches!(elem.kind(), TyKind::RigidTy(RigidTy::Uint(SmirUintTy::U8)))
+                {
+                    return None;
+                }
+                let count = read_uint_at(alloc, offset + PTR_SIZE, PTR_SIZE)? as usize;
+                Some(sm::ConstValue::StaticRef {
+                    def: def_id,
+                    value: Box::new(sm::ConstValue::Uninit),
+                    projection: Vec::new(),
+                    len: Some(count as u64),
+                })
+            }
+            TyKind::RigidTy(RigidTy::Str) => None,
+            _ => {
+                let projection = if target_off == 0 {
+                    Vec::new()
+                } else {
+                    self.static_offset_path(&def.ty(), target_off, inner, depth)?
+                };
+                Some(sm::ConstValue::StaticRef {
+                    def: def_id,
+                    value: Box::new(sm::ConstValue::Uninit),
+                    projection,
+                    len: None,
+                })
+            }
+        }
+    }
+
     fn decode_ref(
         &mut self,
         inner: &rustc_public::ty::Ty,
@@ -3840,6 +3924,10 @@ impl Converter {
             // and writes through the program-level statics store
             // instead of a per-constant snapshot.
             mir::alloc::GlobalAlloc::Static(def) => {
+                if static_is_foreign(&def) {
+                    return self
+                        .decode_foreign_static_ref(&def, inner, alloc, offset, target_off, depth);
+                }
                 let init = def.eval_initializer().ok()?;
                 (init, Some(def))
             }
