@@ -8691,7 +8691,7 @@ impl<'a> Interpreter<'a> {
                         fields: Vec::new(),
                     });
                 }
-                Ok(vec_with_len(vec![Value::Uninit; cap], 0))
+                Ok(vec_with_len(vec![Value::Uninit; cap], 0, &Value::Uninit))
             }
             Builtin::VecFromElem => {
                 arity(2)?;

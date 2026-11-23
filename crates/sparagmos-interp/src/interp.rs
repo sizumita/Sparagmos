@@ -12893,7 +12893,7 @@ impl<'a> Interpreter<'a> {
                         };
                     let stored = new_cap.max(len);
                     elems.resize(stored, Value::Uninit);
-                    *slot = crate::builtins::vec_with_len(elems, len);
+                    *slot = crate::builtins::vec_with_len(elems, len, &Value::Uninit);
                     Ok(())
                 }))
             }
