@@ -11564,7 +11564,7 @@ impl<'a> Interpreter<'a> {
         frames: &[Frame],
         target: &Resolved,
         index: usize,
-        elem: Option<&Ty>,
+        _elem: Option<&Ty>,
     ) -> InterpResult<Option<Resolved>> {
         // A byte-denominated allocation target (see
         // `elem_block_projection`) reads its elements at the
