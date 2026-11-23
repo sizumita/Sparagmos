@@ -22318,6 +22318,48 @@ fn run_mode_libc_signed_char_bytes() {
     );
 }
 
+const COMPARE_BYTES_SIGNED_SRC: &str = r#"
+#![feature(core_intrinsics)]
+use std::intrinsics::compare_bytes;
+
+fn main() {
+    let a: [i8; 4] = [1, -128, 3, 0];
+    let b: [i8; 4] = [1, 127, 3, 0];
+    let c: [i8; 4] = [1, -128, 3, 0];
+    let d: [i8; 4] = [1, -128, 2, 0];
+    unsafe {
+        let gt = compare_bytes(a.as_ptr().cast(), b.as_ptr().cast(), 4);
+        let eq = compare_bytes(a.as_ptr().cast(), c.as_ptr().cast(), 4);
+        let lt = compare_bytes(b.as_ptr().cast(), a.as_ptr().cast(), 4);
+        let tail = compare_bytes(a.as_ptr().cast(), d.as_ptr().cast(), 4);
+        println!("gt={} eq={} lt={} tail={}", gt > 0, eq == 0, lt < 0, tail > 0);
+    }
+}
+"#;
+
+#[test]
+fn run_mode_compare_bytes_signed_elements() {
+    // `compare_bytes` over signed-element storage: an `i8`
+    // element holding a byte above 127 keeps its bit pattern
+    // (0x80 compares above 0x7f), instead of being rejected
+    // as a type mismatch -- the same acceptance `read_c_str`
+    // already gives the libc string scans.
+    let dir = temp_dir("compare-bytes-signed");
+    let src = fixture(&dir, "compare_bytes_signed.rs", COMPARE_BYTES_SIGNED_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "compare_bytes over signed bytes must execute; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "gt=true eq=true lt=true tail=true\n",
+        "unsigned byte order over the signed elements' bit patterns"
+    );
+}
+
 const LIBC_WIDE_ELEM_SRC: &str = r#"
 use std::ffi::{c_char, c_long};
 
