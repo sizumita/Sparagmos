@@ -9167,6 +9167,16 @@ impl<'a> Interpreter<'a> {
                     }
                 }
                 ProjectionElem::ConstantIndex { offset, from_end } => {
+                    // The array length the tracked type carries,
+                    // captured before the state resets below clear
+                    // it: the storage may never have been
+                    // materialised (a `Box::new_uninit` pointee's
+                    // array field no write has reached), in which
+                    // case the type is the only length there is.
+                    let ty_len = match &cur_ty {
+                        Some(Ty::Array(_, n)) => Some(*n as u128),
+                        _ => None,
+                    };
                     buf_depth = 0;
                     buf_base = None;
                     cur_ty = None;
@@ -9177,16 +9187,29 @@ impl<'a> Interpreter<'a> {
                     // length when the place was reached through a
                     // fat pointer (the value resolved at an
                     // element position has no length of its own
-                    // to ask), otherwise the resolved value's own.
-                    let len = match fat_cap {
-                        Some(cap) => cap,
-                        None => self.read_resolved(frames, &cur)?.len().ok_or_else(|| {
-                            InterpError::type_mismatch(
-                                format!("constant index into {place}"),
-                                "array, slice or string value",
-                                "value without a length",
-                            )
-                        })?,
+                    // to ask), otherwise the array type's length
+                    // when the types track one, otherwise the
+                    // resolved value's own. An unmaterialised
+                    // array has no value to take the length from:
+                    // the index is a compiler-checked constant,
+                    // so resolution proceeds without the bound
+                    // and the use of the place materialises the
+                    // storage (a write) or reports the
+                    // uninitialised read (a read), as it would
+                    // for any other unwritten slot.
+                    let len = match fat_cap.or(ty_len) {
+                        Some(cap) => Some(cap),
+                        None => match self.read_resolved(frames, &cur) {
+                            Ok(v) => Some(v.len().ok_or_else(|| {
+                                InterpError::type_mismatch(
+                                    format!("constant index into {place}"),
+                                    "array, slice or string value",
+                                    "value without a length",
+                                )
+                            })?),
+                            Err(InterpError::UninitializedRead { .. }) => None,
+                            Err(e) => return Err(e),
+                        },
                     };
                     let via_fat = fat_cap.is_some_and(|cap| {
                         !self.deref_denotes_storage(frames, &cur, cap, fat_elem_string)
@@ -9199,20 +9222,39 @@ impl<'a> Interpreter<'a> {
                         }
                         _ => None,
                     };
-                    let idx = if *from_end {
-                        len.checked_sub(*offset as u128).ok_or_else(|| {
-                            index_oob(len as usize, *offset as usize)
-                        })?
-                    } else if *offset as u128 >= len {
-                        return Err(index_oob(len as usize, *offset as usize));
-                    } else {
-                        *offset as u128
+                    let idx = match len {
+                        Some(len) => {
+                            if *from_end {
+                                len.checked_sub(*offset as u128).ok_or_else(|| {
+                                    index_oob(len as usize, *offset as usize)
+                                })?
+                            } else if *offset as u128 >= len {
+                                return Err(index_oob(len as usize, *offset as usize));
+                            } else {
+                                *offset as u128
+                            }
+                        }
+                        None => {
+                            if *from_end {
+                                return Err(InterpError::type_mismatch(
+                                    format!("constant index into {place}"),
+                                    "array value of known length",
+                                    "unmaterialised array indexed from the end",
+                                ));
+                            }
+                            *offset as u128
+                        }
                     };
                     let idx = usize::try_from(idx).map_err(|_| {
                         InterpError::UnsupportedProjection {
-                            kind: format!(
-                                "index {idx} past the end of the stored value (length {len})"
-                            ),
+                            kind: match len {
+                                Some(len) => format!(
+                                    "index {idx} past the end of the stored value (length {len})"
+                                ),
+                                None => format!(
+                                    "index {idx} past the end of the stored value"
+                                ),
+                            },
                         }
                     })?;
                     match via_fat.then(|| compose_fat_index(&cur, idx)).flatten() {
@@ -9228,6 +9270,13 @@ impl<'a> Interpreter<'a> {
                     }
                 }
                 ProjectionElem::Subslice { from, to, from_end } => {
+                    // The array length the tracked type carries,
+                    // captured before the state resets below clear
+                    // it (see the constant-index arm).
+                    let ty_len = match &cur_ty {
+                        Some(Ty::Array(_, n)) => Some(*n as u128),
+                        _ => None,
+                    };
                     buf_depth = 0;
                     buf_base = None;
                     cur_ty = None;
@@ -9237,24 +9286,50 @@ impl<'a> Interpreter<'a> {
                     // The range is resolved against the length the
                     // base place currently has: the fat length when
                     // the base was reached through a fat deref,
-                    // otherwise the base value's own length. The
+                    // otherwise the array type's length when the
+                    // types track one (the storage may never have
+                    // been materialised), otherwise the base
+                    // value's own length. As for a constant index
+                    // (see there), an unmaterialised array's length
+                    // is unknown here and the range the MIR carries
+                    // is taken as written; the use of the place
+                    // materialises or reports, as appropriate. The
                     // resolved step carries an absolute offset and
                     // element count, so later steps (and reference
                     // targets formed from this place) need no
                     // knowledge of the MIR range shape.
-                    let len = match fat_cap {
-                        Some(cap) => cap,
-                        None => self.read_resolved(frames, &cur)?.len().ok_or_else(|| {
-                            InterpError::type_mismatch(
-                                format!("subslice of {place}"),
-                                "array, slice or string value",
-                                "value without a length",
-                            )
-                        })?,
+                    let len = match fat_cap.or(ty_len) {
+                        Some(cap) => Some(cap),
+                        None => match self.read_resolved(frames, &cur) {
+                            Ok(v) => Some(v.len().ok_or_else(|| {
+                                InterpError::type_mismatch(
+                                    format!("subslice of {place}"),
+                                    "array, slice or string value",
+                                    "value without a length",
+                                )
+                            })?),
+                            Err(InterpError::UninitializedRead { .. }) => None,
+                            Err(e) => return Err(e),
+                        },
                     };
                     fat_cap = None;
                     fat_elem_string = None;
-                    let (offset, sub_len) = subslice_offset_len(*from, *to, *from_end, len)?;
+                    let (offset, sub_len) = match len {
+                        Some(len) => subslice_offset_len(*from, *to, *from_end, len)?,
+                        None => {
+                            if *from_end {
+                                return Err(InterpError::type_mismatch(
+                                    format!("subslice of {place}"),
+                                    "array value of known length",
+                                    "unmaterialised array sliced from the end",
+                                ));
+                            }
+                            (
+                                *from as usize,
+                                (*to as usize).saturating_sub(*from as usize),
+                            )
+                        }
+                    };
                     cur_ty = match &cur_ty {
                         Some(Ty::Array(elem, _)) | Some(Ty::Slice(elem)) => {
                             Some(Ty::Slice(elem.clone()))
