@@ -325,6 +325,70 @@ fn run_mode_promoted_ref_constant() {
     );
 }
 
+/// Build a guest source holding a 5,000-element byte table
+/// (past the driver's element-wise constant bound of 4,096):
+/// `decl` declares the table (with `ELEMS` as the element list)
+/// and a `read_at` accessor over it; `main` sums the table and
+/// prints the sum plus two spot reads.
+fn large_byte_table_src(decl: &str) -> String {
+    let elems: Vec<String> = (0..5000).map(|i| (i % 251).to_string()).collect();
+    let mut src = decl.replace("ELEMS", &elems.join(", "));
+    src.push_str("fn main() { let mut sum: u32 = 0;");
+    src.push_str(" for i in 0..5000 { sum += read_at(i) as u32; }");
+    src.push_str(" println!(\"{} {} {}\", sum, read_at(0), read_at(4999)); }");
+    src
+}
+
+#[test]
+fn run_mode_large_byte_table_static() {
+    // A static byte table past the element-wise constant bound
+    // materialises as the raw bytes and reads back exactly.
+    let src = large_byte_table_src(
+        "static TABLE: [u8; 5000] = [ELEMS]; fn read_at(i: usize) -> u8 { TABLE[i] }",
+    );
+    let dir = temp_dir("large-byte-table");
+    let src = fixture(&dir, "large_byte_table.rs", &src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "large byte table must run; stderr={stderr}"
+    );
+    let expect_sum: u32 = (0..5000).map(|i| i % 251).sum();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{expect_sum} 0 {}\n", 4999 % 251),
+        "decoded table values must match the source program"
+    );
+}
+
+#[test]
+fn run_mode_large_byte_table_wrapped_static() {
+    // The same table inside an alignment-wrapper newtype -- the
+    // shape of the `unicode_ident` XID tables, whose reference
+    // constants reached the converter as `ByRef` identities
+    // before byte arrays past the bound materialised.
+    let src = large_byte_table_src(
+        "#[repr(C, align(64))] struct Align64<T>(T); static LEAF: Align64<[u8; 5000]> = Align64([ELEMS]); fn read_at(i: usize) -> u8 { LEAF.0[i] }",
+    );
+    let dir = temp_dir("large-byte-table-wrapped");
+    let src = fixture(&dir, "large_byte_table_wrapped.rs", &src);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "wrapped large byte table must run; stderr={stderr}"
+    );
+    let expect_sum: u32 = (0..5000).map(|i| i % 251).sum();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{expect_sum} 0 {}\n", 4999 % 251),
+        "decoded table values must match the source program"
+    );
+}
+
 #[test]
 fn run_mode_materialised_constant_shapes() {
     // Struct constants, a reference into the middle of an array
