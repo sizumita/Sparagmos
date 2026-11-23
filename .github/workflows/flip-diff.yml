@@ -9,8 +9,9 @@ name: Flip Diff
 # this one.
 #
 # Triggering:
-# - Add a label named `flip-diff:<kw1,kw2,...>` to a pull request; the
-#   keywords are matched as substrings of the test paths.
+# - Add a label named `flip-diff:<kw1+kw2+...>` to a pull request; the
+#   keywords are matched as substrings of the test paths. (`+` is the
+#   separator because label names cannot contain commas.)
 # - Or run the workflow manually (workflow_dispatch). The dispatch
 #   form takes the target explicitly (a PR number, or a head ref plus
 #   a base ref), so it also works for pull requests whose branch does
@@ -105,13 +106,13 @@ jobs:
             head_ref="${head_ref:-${{ github.sha }}}"
             base_ref="${base_ref:-main}"
           else
-            keywords="$(echo "$LABELS_JSON" | jq -r '[.[] | select(startswith("flip-diff:"))][0] // "" | ltrimstr("flip-diff:")')"
+            keywords="$(echo "$LABELS_JSON" | jq -r '[.[] | select(startswith("flip-diff:"))][0] // "" | ltrimstr("flip-diff:") | gsub("\\+"; ",")')"
             pr_number="$PR_NUMBER"
             head_ref="$PR_HEAD_SHA"
             base_ref="$PR_BASE_SHA"
           fi
           if [ -z "$keywords" ]; then
-            echo "::error::no flip-diff keywords resolved (label flip-diff:<kw,...> or dispatch input required)"
+            echo "::error::no flip-diff keywords resolved (label flip-diff:<kw1+kw2+...> or dispatch input required)"
             exit 1
           fi
           echo "keywords=$keywords" >> "$GITHUB_OUTPUT"

@@ -44,9 +44,10 @@ metric-2(b) subset: the subset runner runs once with the base driver
 and once with the head driver, and each record that flips is reported
 as a gain or a loss (a record passes when its bucket is empty).
 
-To request it, add a label named `flip-diff:<kw1,kw2,...>` to the PR.
+To request it, add a label named `flip-diff:<kw1+kw2+...>` to the PR
+(the separator is `+` because label names cannot contain commas).
 The keywords are matched as substrings of the test paths, so
-`flip-diff:path,os-str,ffi` selects every record whose path mentions
+`flip-diff:path+os-str+ffi` selects every record whose path mentions
 one of them (a few hundred to a couple of thousand records is the
 intended scale).
 
