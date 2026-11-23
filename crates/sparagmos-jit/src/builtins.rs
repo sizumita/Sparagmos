@@ -184,6 +184,33 @@ pub enum FloatOp {
     Max,
     ToBits,
     FromBits,
+    Exp,
+    Exp2,
+    ExpM1,
+    Ln,
+    Ln1p,
+    Log,
+    Log2,
+    Log10,
+    Sin,
+    Cos,
+    Tan,
+    Asin,
+    Acos,
+    Atan,
+    Atan2,
+    SinCos,
+    Sinh,
+    Cosh,
+    Tanh,
+    Asinh,
+    Acosh,
+    Atanh,
+    Cbrt,
+    Hypot,
+    MulAdd,
+    DivEuclid,
+    RemEuclid,
 }
 
 impl FloatOp {
@@ -218,6 +245,33 @@ impl FloatOp {
             20 => O::Max,
             21 => O::ToBits,
             22 => O::FromBits,
+            23 => O::Exp,
+            24 => O::Exp2,
+            25 => O::ExpM1,
+            26 => O::Ln,
+            27 => O::Ln1p,
+            28 => O::Log,
+            29 => O::Log2,
+            30 => O::Log10,
+            31 => O::Sin,
+            32 => O::Cos,
+            33 => O::Tan,
+            34 => O::Asin,
+            35 => O::Acos,
+            36 => O::Atan,
+            37 => O::Atan2,
+            38 => O::SinCos,
+            39 => O::Sinh,
+            40 => O::Cosh,
+            41 => O::Tanh,
+            42 => O::Asinh,
+            43 => O::Acosh,
+            44 => O::Atanh,
+            45 => O::Cbrt,
+            46 => O::Hypot,
+            47 => O::MulAdd,
+            48 => O::DivEuclid,
+            49 => O::RemEuclid,
             _ => return None,
         })
     }
@@ -412,8 +466,7 @@ pub fn lookup(canonical: &str) -> Option<Builtin> {
 /// ...) to its builtin. The methods live partly in `core` and partly
 /// in `std`; both prefixes name the same inherent impls, so either
 /// is accepted for every modelled method. A float method this
-/// registry does not model (e.g. `sin_cos`, which returns a tuple)
-/// stays an explicit unsupported call.
+/// registry does not model stays an explicit unsupported call.
 fn float_method(canonical: &str) -> Option<Builtin> {
     let (method, f32) = if let Some(rest) = canonical
         .strip_prefix("core::f32::<impl f32>::")
@@ -459,6 +512,33 @@ fn float_method_named(method: &str) -> Option<FloatOp> {
         "max" => O::Max,
         "to_bits" => O::ToBits,
         "from_bits" => O::FromBits,
+        "exp" => O::Exp,
+        "exp2" => O::Exp2,
+        "exp_m1" => O::ExpM1,
+        "ln" => O::Ln,
+        "ln_1p" => O::Ln1p,
+        "log" => O::Log,
+        "log2" => O::Log2,
+        "log10" => O::Log10,
+        "sin" => O::Sin,
+        "cos" => O::Cos,
+        "tan" => O::Tan,
+        "asin" => O::Asin,
+        "acos" => O::Acos,
+        "atan" => O::Atan,
+        "atan2" => O::Atan2,
+        "sin_cos" => O::SinCos,
+        "sinh" => O::Sinh,
+        "cosh" => O::Cosh,
+        "tanh" => O::Tanh,
+        "asinh" => O::Asinh,
+        "acosh" => O::Acosh,
+        "atanh" => O::Atanh,
+        "cbrt" => O::Cbrt,
+        "hypot" => O::Hypot,
+        "mul_add" => O::MulAdd,
+        "div_euclid" => O::DivEuclid,
+        "rem_euclid" => O::RemEuclid,
         _ => return None,
     };
     Some(op)
@@ -1610,31 +1690,43 @@ extern "C" fn host_next_range_inclusive(
 /// methods are (the interpreter computes them the same way, for the
 /// same reason). Arguments: (receiver bits, second argument bits —
 /// the other operand of `min` / `max` / `powf`, or the `i32`
-/// exponent of `powi` —, op code, f32 flag, _). The result word is
-/// the result's canonical slot form: a float's bit pattern (an
-/// `f32` pattern in the low 32 bits), 0 / 1 for the predicates, the
-/// integer bit pattern for `to_bits`.
+/// exponent of `powi` —, op code, f32 flag, third argument bits —
+/// the addend of `mul_add`). The result word is the result's
+/// canonical slot form: a float's bit pattern (an `f32` pattern in
+/// the low 32 bits), 0 / 1 for the predicates, the integer bit
+/// pattern for `to_bits`. `sin_cos` is the one two-word result:
+/// the pair (sin bits, cos bits).
 extern "C" fn host_float_method(
     ctx: *mut BuiltinCtx,
     x: i64,
     y: i64,
     op_code: i64,
     f32_flag: i64,
-    _pad: i64,
+    z: i64,
 ) -> HostRet {
     let ctx = unsafe { &mut *ctx };
     let Some(op) = FloatOp::from_code(op_code) else {
         return ctx.fail("float method op out of range");
     };
+    if op == FloatOp::SinCos {
+        let (s, c) = if f32_flag != 0 {
+            let (s, c) = f32::from_bits(x as u32).sin_cos();
+            (s.to_bits() as i64, c.to_bits() as i64)
+        } else {
+            let (s, c) = f64::from_bits(x as u64).sin_cos();
+            (s.to_bits() as i64, c.to_bits() as i64)
+        };
+        return HostRet::pair(s, c);
+    }
     let result = if f32_flag != 0 {
-        float_method_f32(op, x, y)
+        float_method_f32(op, x, y, z)
     } else {
-        float_method_f64(op, x, y)
+        float_method_f64(op, x, y, z)
     };
     HostRet::one(result)
 }
 
-fn float_method_f64(op: FloatOp, x: i64, y: i64) -> i64 {
+fn float_method_f64(op: FloatOp, x: i64, y: i64, z: i64) -> i64 {
     use FloatOp as O;
     let v = f64::from_bits(x as u64);
     let bits = |f: f64| f.to_bits() as i64;
@@ -1662,10 +1754,40 @@ fn float_method_f64(op: FloatOp, x: i64, y: i64) -> i64 {
         O::Max => bits(v.max(f64::from_bits(y as u64))),
         O::ToBits => v.to_bits() as i64,
         O::FromBits => x,
+        O::Exp => bits(v.exp()),
+        O::Exp2 => bits(v.exp2()),
+        O::ExpM1 => bits(v.exp_m1()),
+        O::Ln => bits(v.ln()),
+        O::Ln1p => bits(v.ln_1p()),
+        O::Log => bits(v.log(f64::from_bits(y as u64))),
+        O::Log2 => bits(v.log2()),
+        O::Log10 => bits(v.log10()),
+        O::Sin => bits(v.sin()),
+        O::Cos => bits(v.cos()),
+        O::Tan => bits(v.tan()),
+        O::Asin => bits(v.asin()),
+        O::Acos => bits(v.acos()),
+        O::Atan => bits(v.atan()),
+        O::Atan2 => bits(v.atan2(f64::from_bits(y as u64))),
+        O::SinCos => unreachable!("sin_cos returns a pair; host_float_method serves it"),
+        O::Sinh => bits(v.sinh()),
+        O::Cosh => bits(v.cosh()),
+        O::Tanh => bits(v.tanh()),
+        O::Asinh => bits(v.asinh()),
+        O::Acosh => bits(v.acosh()),
+        O::Atanh => bits(v.atanh()),
+        O::Cbrt => bits(v.cbrt()),
+        O::Hypot => bits(v.hypot(f64::from_bits(y as u64))),
+        O::MulAdd => bits(v.mul_add(
+            f64::from_bits(y as u64),
+            f64::from_bits(z as u64),
+        )),
+        O::DivEuclid => bits(v.div_euclid(f64::from_bits(y as u64))),
+        O::RemEuclid => bits(v.rem_euclid(f64::from_bits(y as u64))),
     }
 }
 
-fn float_method_f32(op: FloatOp, x: i64, y: i64) -> i64 {
+fn float_method_f32(op: FloatOp, x: i64, y: i64, z: i64) -> i64 {
     use FloatOp as O;
     let v = f32::from_bits(x as u32);
     let bits = |f: f32| f.to_bits() as i64;
@@ -1693,6 +1815,36 @@ fn float_method_f32(op: FloatOp, x: i64, y: i64) -> i64 {
         O::Max => bits(v.max(f32::from_bits(y as u32))),
         O::ToBits => v.to_bits() as i64,
         O::FromBits => x & 0xFFFF_FFFF,
+        O::Exp => bits(v.exp()),
+        O::Exp2 => bits(v.exp2()),
+        O::ExpM1 => bits(v.exp_m1()),
+        O::Ln => bits(v.ln()),
+        O::Ln1p => bits(v.ln_1p()),
+        O::Log => bits(v.log(f32::from_bits(y as u32))),
+        O::Log2 => bits(v.log2()),
+        O::Log10 => bits(v.log10()),
+        O::Sin => bits(v.sin()),
+        O::Cos => bits(v.cos()),
+        O::Tan => bits(v.tan()),
+        O::Asin => bits(v.asin()),
+        O::Acos => bits(v.acos()),
+        O::Atan => bits(v.atan()),
+        O::Atan2 => bits(v.atan2(f32::from_bits(y as u32))),
+        O::SinCos => unreachable!("sin_cos returns a pair; host_float_method serves it"),
+        O::Sinh => bits(v.sinh()),
+        O::Cosh => bits(v.cosh()),
+        O::Tanh => bits(v.tanh()),
+        O::Asinh => bits(v.asinh()),
+        O::Acosh => bits(v.acosh()),
+        O::Atanh => bits(v.atanh()),
+        O::Cbrt => bits(v.cbrt()),
+        O::Hypot => bits(v.hypot(f32::from_bits(y as u32))),
+        O::MulAdd => bits(v.mul_add(
+            f32::from_bits(y as u32),
+            f32::from_bits(z as u32),
+        )),
+        O::DivEuclid => bits(v.div_euclid(f32::from_bits(y as u32))),
+        O::RemEuclid => bits(v.rem_euclid(f32::from_bits(y as u32))),
     }
 }
 
@@ -2398,7 +2550,29 @@ mod tests {
             })
         );
         assert_eq!(lookup("std::thread::spawn"), None);
-        assert_eq!(lookup("core::f64::<impl f64>::sin_cos"), None);
+        assert_eq!(
+            lookup("core::f64::<impl f64>::sin_cos"),
+            Some(Builtin::FloatMethod {
+                f32: false,
+                op: FloatOp::SinCos
+            })
+        );
+        assert_eq!(
+            lookup("std::f32::<impl f32>::exp"),
+            Some(Builtin::FloatMethod {
+                f32: true,
+                op: FloatOp::Exp
+            })
+        );
+        assert_eq!(
+            lookup("core::f64::<impl f64>::mul_add"),
+            Some(Builtin::FloatMethod {
+                f32: false,
+                op: FloatOp::MulAdd
+            })
+        );
+        // Still unstable in Rust 1.100.0, hence unmodelled.
+        assert_eq!(lookup("core::f64::<impl f64>::maximum"), None);
     }
 
     #[test]
@@ -2549,6 +2723,48 @@ mod tests {
                 0,
             );
             assert_eq!(r.first, 3.375f64.to_bits() as i64);
+            let r = host_float_method(
+                cp,
+                1.25f64.to_bits() as i64,
+                0,
+                FloatOp::Exp.code(),
+                0,
+                0,
+            );
+            assert_eq!(r.first, 1.25f64.exp().to_bits() as i64);
+            // mul_add reads its addend from the third argument slot.
+            let r = host_float_method(
+                cp,
+                1.5f64.to_bits() as i64,
+                2.0f64.to_bits() as i64,
+                FloatOp::MulAdd.code(),
+                0,
+                0.5f64.to_bits() as i64,
+            );
+            assert_eq!(r.first, 3.5f64.to_bits() as i64);
+            // sin_cos returns the (sin, cos) pair.
+            let r = host_float_method(
+                cp,
+                0.7f64.to_bits() as i64,
+                0,
+                FloatOp::SinCos.code(),
+                0,
+                0,
+            );
+            let (s, c) = 0.7f64.sin_cos();
+            assert_eq!(r.first, s.to_bits() as i64);
+            assert_eq!(r.second, c.to_bits() as i64);
+            let r = host_float_method(
+                cp,
+                0.7f32.to_bits() as i64,
+                0,
+                FloatOp::SinCos.code(),
+                1,
+                0,
+            );
+            let (s, c) = 0.7f32.sin_cos();
+            assert_eq!(r.first, s.to_bits() as i64);
+            assert_eq!(r.second, c.to_bits() as i64);
         }
     }
 }

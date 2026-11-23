@@ -152,6 +152,33 @@ fn registry_covers_float_methods_at_both_widths_and_prefixes() {
         ("max", true, O::Max),
         ("to_bits", false, O::ToBits),
         ("from_bits", true, O::FromBits),
+        ("exp", false, O::Exp),
+        ("exp2", true, O::Exp2),
+        ("exp_m1", false, O::ExpM1),
+        ("ln", true, O::Ln),
+        ("ln_1p", false, O::Ln1p),
+        ("log", true, O::Log),
+        ("log2", false, O::Log2),
+        ("log10", true, O::Log10),
+        ("sin", false, O::Sin),
+        ("cos", true, O::Cos),
+        ("tan", false, O::Tan),
+        ("asin", true, O::Asin),
+        ("acos", false, O::Acos),
+        ("atan", true, O::Atan),
+        ("atan2", false, O::Atan2),
+        ("sin_cos", true, O::SinCos),
+        ("sinh", false, O::Sinh),
+        ("cosh", true, O::Cosh),
+        ("tanh", false, O::Tanh),
+        ("asinh", true, O::Asinh),
+        ("acosh", false, O::Acosh),
+        ("atanh", true, O::Atanh),
+        ("cbrt", false, O::Cbrt),
+        ("hypot", true, O::Hypot),
+        ("mul_add", false, O::MulAdd),
+        ("div_euclid", true, O::DivEuclid),
+        ("rem_euclid", false, O::RemEuclid),
     ];
     for (method, _flip, op) in cases {
         for prefix in ["core", "std"] {
@@ -169,11 +196,11 @@ fn registry_covers_float_methods_at_both_widths_and_prefixes() {
 
 #[test]
 fn registry_leaves_unmodelled_float_methods_unsupported() {
-    // `sin_cos` returns a tuple, `exp` and friends are not modelled:
-    // they must stay explicit unsupported calls, not silent matches.
-    assert_eq!(lookup("core::f64::<impl f64>::sin_cos"), None);
-    assert_eq!(lookup("std::f64::<impl f64>::exp"), None);
-    assert_eq!(lookup("std::f32::<impl f32>::ln"), None);
+    // `maximum` / `minimum` are still unstable library features in
+    // Rust 1.100.0 and are not modelled: they must stay explicit
+    // unsupported calls, not silent matches.
+    assert_eq!(lookup("core::f64::<impl f64>::maximum"), None);
+    assert_eq!(lookup("std::f32::<impl f32>::minimum"), None);
     // A non-float inherent impl is untouched by the float dispatch.
     assert_eq!(lookup("core::i32::<impl i32>::abs"), None);
 }
@@ -473,7 +500,511 @@ fn unmodelled_float_method_call_is_an_error_not_a_silent_value() {
     prog.add("main", body);
     prog.fn_names = HashMap::from([(
         METHOD_DEF,
-        "std::f64::<impl f64>::exp".to_string(),
+        "std::f64::<impl f64>::maximum".to_string(),
     )]);
     assert!(interpret_mir(&prog, "main", vec![]).is_err());
+}
+
+// ----- the transcendental / libm family ------------------------------------
+
+#[test]
+fn f64_transcendental_unary_methods() {
+    // Every value is compared against the host method, which is the
+    // definition core/std themselves use on this platform.
+    let cases: &[(&str, f64)] = &[
+        ("exp", 1.25),
+        ("exp2", 9.5),
+        ("exp_m1", 0.75),
+        ("ln", 2.5),
+        ("ln_1p", 0.5),
+        ("log2", 1024.0),
+        ("log10", 0.001),
+        ("sin", 0.7),
+        ("cos", 0.7),
+        ("tan", 0.7),
+        ("asin", 0.3),
+        ("acos", 0.3),
+        ("atan", 1.5),
+        ("sinh", 0.9),
+        ("cosh", 0.9),
+        ("tanh", 0.9),
+        ("asinh", 1.2),
+        ("acosh", 1.5),
+        ("atanh", 0.4),
+        ("cbrt", -8.0),
+    ];
+    for (method, x) in cases {
+        let name = format!("core::f64::<impl f64>::{method}");
+        let expected = match *method {
+            "exp" => x.exp(),
+            "exp2" => x.exp2(),
+            "exp_m1" => x.exp_m1(),
+            "ln" => x.ln(),
+            "ln_1p" => x.ln_1p(),
+            "log2" => x.log2(),
+            "log10" => x.log10(),
+            "sin" => x.sin(),
+            "cos" => x.cos(),
+            "tan" => x.tan(),
+            "asin" => x.asin(),
+            "acos" => x.acos(),
+            "atan" => x.atan(),
+            "sinh" => x.sinh(),
+            "cosh" => x.cosh(),
+            "tanh" => x.tanh(),
+            "asinh" => x.asinh(),
+            "acosh" => x.acosh(),
+            "atanh" => x.atanh(),
+            "cbrt" => x.cbrt(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            run_method(&name, f64_ty(), vec![const_f64(*x)]),
+            Value::Float(expected),
+            "{method}({x})"
+        );
+    }
+    // Exact anchors and NaN behaviour.
+    assert_eq!(
+        run_method("core::f64::<impl f64>::exp", f64_ty(), vec![const_f64(0.0)]),
+        Value::Float(1.0)
+    );
+    assert_eq!(
+        run_method("core::f64::<impl f64>::cbrt", f64_ty(), vec![const_f64(-8.0)]),
+        Value::Float(-2.0)
+    );
+    match run_method(
+        "core::f64::<impl f64>::ln",
+        f64_ty(),
+        vec![const_f64(-1.0)],
+    ) {
+        Value::Float(v) => assert!(v.is_nan(), "ln(-1) is NaN"),
+        other => panic!("expected a float, got {other:?}"),
+    }
+    match run_method(
+        "core::f64::<impl f64>::sin",
+        f64_ty(),
+        vec![const_f64(f64::INFINITY)],
+    ) {
+        Value::Float(v) => assert!(v.is_nan(), "sin(inf) is NaN"),
+        other => panic!("expected a float, got {other:?}"),
+    }
+}
+
+#[test]
+fn f32_transcendental_methods_compute_at_f32_width() {
+    assert_eq!(
+        run_method("std::f32::<impl f32>::exp", f32_ty(), vec![const_f32(1.25)]),
+        Value::Float(1.25f32.exp() as f64)
+    );
+    assert_eq!(
+        run_method("std::f32::<impl f32>::sin", f32_ty(), vec![const_f32(0.7)]),
+        Value::Float(0.7f32.sin() as f64)
+    );
+    assert_eq!(
+        run_method("core::f32::<impl f32>::ln", f32_ty(), vec![const_f32(2.5)]),
+        Value::Float(2.5f32.ln() as f64)
+    );
+    assert_eq!(
+        run_method(
+            "core::f32::<impl f32>::hypot",
+            f32_ty(),
+            vec![const_f32(3.0), const_f32(4.0)]
+        ),
+        Value::Float(5.0)
+    );
+}
+
+#[test]
+fn f64_log_atan2_hypot_div_euclid() {
+    assert_eq!(
+        run_method(
+            "core::f64::<impl f64>::log",
+            f64_ty(),
+            vec![const_f64(1000.0), const_f64(10.0)]
+        ),
+        Value::Float(1000.0f64.log(10.0))
+    );
+    assert_eq!(
+        run_method(
+            "core::f64::<impl f64>::atan2",
+            f64_ty(),
+            vec![const_f64(1.0), const_f64(2.0)]
+        ),
+        Value::Float(1.0f64.atan2(2.0))
+    );
+    assert_eq!(
+        run_method(
+            "core::f64::<impl f64>::hypot",
+            f64_ty(),
+            vec![const_f64(3.0), const_f64(4.0)]
+        ),
+        Value::Float(5.0)
+    );
+    // div_euclid rounds the quotient towards negative infinity,
+    // unlike the truncating `/` operator.
+    assert_eq!(
+        run_method(
+            "core::f64::<impl f64>::div_euclid",
+            f64_ty(),
+            vec![const_f64(-7.5), const_f64(2.0)]
+        ),
+        Value::Float(-4.0)
+    );
+    // The adjustment keys on the (dividend-signed) remainder:
+    // 7.5 % -2.0 is +1.5, so the truncated quotient stands.
+    assert_eq!(
+        run_method(
+            "core::f64::<impl f64>::div_euclid",
+            f64_ty(),
+            vec![const_f64(7.5), const_f64(-2.0)]
+        ),
+        Value::Float(-3.0)
+    );
+}
+
+#[test]
+fn f64_mul_add_is_the_fused_operation() {
+    for (a, b, c) in [
+        (0.1f64, 0.2f64, 0.3f64),
+        (1.5, -2.25, 0.75),
+        (1.0e300, 1.0e-300, -1.0),
+    ] {
+        assert_eq!(
+            run_method(
+                "core::f64::<impl f64>::mul_add",
+                f64_ty(),
+                vec![const_f64(a), const_f64(b), const_f64(c)]
+            ),
+            Value::Float(a.mul_add(b, c)),
+            "mul_add({a}, {b}, {c})"
+        );
+    }
+    assert_eq!(
+        run_method(
+            "std::f32::<impl f32>::mul_add",
+            f32_ty(),
+            vec![const_f32(1.5), const_f32(2.0), const_f32(0.5)]
+        ),
+        Value::Float(1.5f32.mul_add(2.0, 0.5) as f64)
+    );
+}
+
+#[test]
+fn f64_sin_cos_returns_the_pair() {
+    let pair_ty = mir::Ty::Tuple(vec![f64_ty(), f64_ty()]);
+    let (s, c) = 0.7f64.sin_cos();
+    assert_eq!(
+        run_method(
+            "core::f64::<impl f64>::sin_cos",
+            pair_ty,
+            vec![const_f64(0.7)]
+        ),
+        Value::Tuple(vec![Value::Float(s), Value::Float(c)])
+    );
+    let pair32_ty = mir::Ty::Tuple(vec![f32_ty(), f32_ty()]);
+    let (s, c) = 0.7f32.sin_cos();
+    assert_eq!(
+        run_method(
+            "std::f32::<impl f32>::sin_cos",
+            pair32_ty,
+            vec![const_f32(0.7)]
+        ),
+        Value::Tuple(vec![
+            Value::Float(s as f64),
+            Value::Float(c as f64)
+        ])
+    );
+}
+
+// ----- f32 / f64 rem_euclid ------------------------------------------------------
+
+#[test]
+fn rem_euclid_at_both_widths() {
+    for (a, b) in [(7.5f64, 2.0), (-7.5, 2.0), (7.5, -2.0), (-7.5, -2.0)] {
+        assert_eq!(
+            run_method(
+                "core::f64::<impl f64>::rem_euclid",
+                f64_ty(),
+                vec![const_f64(a), const_f64(b)]
+            ),
+            Value::Float(a.rem_euclid(b)),
+            "f64 rem_euclid({a}, {b})"
+        );
+        assert_eq!(
+            run_method(
+                "std::f32::<impl f32>::rem_euclid",
+                f32_ty(),
+                vec![const_f32(a as f32), const_f32(b as f32)]
+            ),
+            Value::Float((a as f32).rem_euclid(b as f32) as f64),
+            "f32 rem_euclid({a}, {b})"
+        );
+    }
+}
+
+// ----- f16 methods ---------------------------------------------------------------
+//
+// Expected values are raw `f16` bit patterns measured against the
+// native Rust 1.100.0 implementations. The `f16` executor must
+// reproduce the intermediate `f16` roundings of the native
+// definitions; evaluating the whole operation in `f64` and
+// rounding once at the end is a different function (see
+// `f16_div_euclid_rounds_the_quotient_before_truncating`).
+
+fn f16_ty() -> mir::Ty {
+    mir::Ty::Float(mir::FloatTy::F16)
+}
+
+fn const_f16(bits: u16) -> mir::Operand {
+    mir::Operand::constant(mir::Constant::from_value(mir::ConstValue::Scalar(
+        mir::Scalar::Float {
+            bits: bits as u128,
+            ty: mir::FloatTy::F16,
+        },
+    )))
+}
+
+/// Run one `f16` method and return the result's raw bits.
+fn run_f16(name: &str, args: Vec<mir::Operand>) -> u16 {
+    match run_method(name, f16_ty(), args) {
+        Value::Float(v) => sparagmos_interp::f128::f64_to_f16_bits(v),
+        other => panic!("{name} must return a float, got {other:?}"),
+    }
+}
+
+#[test]
+fn registry_resolves_f16_methods() {
+    use FloatOp as O;
+    for (method, op) in [
+        ("div_euclid", O::DivEuclid),
+        ("rem_euclid", O::RemEuclid),
+        ("exp", O::Exp),
+        ("mul_add", O::MulAdd),
+    ] {
+        for prefix in ["core", "std"] {
+            let name = format!("{prefix}::f16::<impl f16>::{method}");
+            assert_eq!(
+                lookup(&name),
+                Some(Builtin::Float16Method { op }),
+                "{name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn f16_div_euclid_rounds_the_quotient_before_truncating() {
+    // 1.0 / 0.2000732421875 is about 4.99817: the `f16` division
+    // rounds it to 5.0 before the truncation in core's definition,
+    // so the result is 5.0 (0x4500). An all-`f64` evaluation
+    // truncates 4.99817 first and returns 4.0.
+    assert_eq!(
+        run_f16(
+            "core::f16::<impl f16>::div_euclid",
+            vec![const_f16(0x3c00), const_f16(0x3267)]
+        ),
+        0x4500
+    );
+    // Negative dividend: the rounded quotient is -5.0, the
+    // remainder is negative, so the adjustment steps to -6.0.
+    assert_eq!(
+        run_f16(
+            "core::f16::<impl f16>::div_euclid",
+            vec![const_f16(0xbc00), const_f16(0x3267)]
+        ),
+        0xc600
+    );
+    // Negative divisor: -4.99817 truncates to -4 and no
+    // adjustment applies (the remainder is positive).
+    assert_eq!(
+        run_f16(
+            "std::f16::<impl f16>::div_euclid",
+            vec![const_f16(0x3c00), const_f16(0xb267)]
+        ),
+        0xc500
+    );
+    // Large quotient: the -1 adjustment itself rounds at `f16`
+    // precision (-21841 is not representable; -21840 is).
+    assert_eq!(
+        run_f16(
+            "core::f16::<impl f16>::div_euclid",
+            vec![const_f16(0xfbff), const_f16(0x4200)]
+        ),
+        0xf555
+    );
+    // Exact division: no adjustment.
+    assert_eq!(
+        run_f16(
+            "core::f16::<impl f16>::div_euclid",
+            vec![const_f16(0x4a00), const_f16(0x4000)]
+        ),
+        0x4600
+    );
+}
+
+#[test]
+fn f16_rem_euclid_follows_the_core_definition() {
+    // Same operands as the div_euclid case: the exact remainder
+    // of 1.0 % 0.2000732421875 is already non-negative.
+    assert_eq!(
+        run_f16(
+            "core::f16::<impl f16>::rem_euclid",
+            vec![const_f16(0x3c00), const_f16(0x3267)]
+        ),
+        0x3264
+    );
+    // Negative dividend: the negative remainder is lifted by
+    // |rhs|, and that sum rounds to `f16`.
+    assert_eq!(
+        run_f16(
+            "core::f16::<impl f16>::rem_euclid",
+            vec![const_f16(0xbc00), const_f16(0x3267)]
+        ),
+        0x0e00
+    );
+    // -65504 rem_euclid 3: remainder -2 lifts to exactly 1.0.
+    assert_eq!(
+        run_f16(
+            "core::f16::<impl f16>::rem_euclid",
+            vec![const_f16(0xfbff), const_f16(0x4200)]
+        ),
+        0x3c00
+    );
+}
+
+#[test]
+fn f16_log_rounds_both_logarithms_first() {
+    // std defines log as self.ln() / base.ln() at `f16`
+    // precision: ln(1024) and ln(2) round to `f16` before the
+    // division, so log2(1024) comes out as 0x48ff, not 10.0.
+    assert_eq!(
+        run_f16(
+            "core::f16::<impl f16>::log",
+            vec![const_f16(0x6400), const_f16(0x4000)]
+        ),
+        0x48ff
+    );
+}
+
+#[test]
+fn f16_powi_runs_the_power_loop_at_f16_precision() {
+    // (1025 * 2^-18)^-2: the exact value rounds to 0x7bfc, and
+    // so do the `f32` and `f64` evaluations; the native `f16`
+    // power loop squares at `f16` precision (through a subnormal
+    // intermediate) and lands four ulps lower.
+    assert_eq!(
+        run_f16(
+            "core::f16::<impl f16>::powi",
+            vec![const_f16(0x1c01), const_i32(-2)]
+        ),
+        0x7bf8
+    );
+}
+
+#[test]
+fn f16_atanh_follows_the_std_formula() {
+    // For tiny inputs the formula's `f16` subtraction and
+    // division shift the result one ulp above the input; a
+    // direct libm evaluation at any wider precision returns the
+    // input itself.
+    assert_eq!(
+        run_f16("core::f16::<impl f16>::atanh", vec![const_f16(0x0c01)]),
+        0x0c02
+    );
+    assert_eq!(
+        run_f16("core::f16::<impl f16>::atanh", vec![const_f16(0x3c00)]),
+        0x7c00
+    );
+}
+
+#[test]
+fn f16_mul_add_is_exact() {
+    // The exact product-sum tips over the rounding boundary
+    // thanks to the subnormal addend; an `f32` fused
+    // multiply-add rounds the sum to `f32` first and lands one
+    // ulp lower (0x4962).
+    assert_eq!(
+        run_f16(
+            "core::f16::<impl f16>::mul_add",
+            vec![const_f16(0x3b2e), const_f16(0x4a00), const_f16(0x0001)]
+        ),
+        0x4963
+    );
+}
+
+#[test]
+fn f16_degree_radian_conversion_uses_the_f16_constants() {
+    // 1.0 in degrees is exactly core's `f16` multiplier.
+    assert_eq!(
+        run_f16("core::f16::<impl f16>::to_degrees", vec![const_f16(0x3c00)]),
+        0x5329
+    );
+    // 200.0 in radians, measured natively.
+    assert_eq!(
+        run_f16("core::f16::<impl f16>::to_radians", vec![const_f16(0x5a40)]),
+        0x42fc
+    );
+}
+
+#[test]
+fn f16_libm_family_matches_native_values() {
+    // Spot values measured against the native implementations;
+    // the exhaustive bit-pattern sweep lives outside the unit
+    // tests.
+    let unary: &[(&str, u16, u16)] = &[
+        ("exp", 0x3c00, 0x4170),
+        ("ln", 0x4000, 0x398c),
+        ("cbrt", 0x4c00, 0x410a),
+        ("atan2", 0x3c00, 0x376b), // binary; second operand added below
+    ];
+    for (method, input, expected) in unary {
+        let name = format!("core::f16::<impl f16>::{method}");
+        let args = if *method == "atan2" {
+            vec![const_f16(*input), const_f16(0x4000)]
+        } else {
+            vec![const_f16(*input)]
+        };
+        assert_eq!(run_f16(&name, args), *expected, "{name}");
+    }
+    assert_eq!(
+        run_f16(
+            "core::f16::<impl f16>::hypot",
+            vec![const_f16(0x4200), const_f16(0x4400)]
+        ),
+        0x4500
+    );
+    assert_eq!(
+        run_f16(
+            "core::f16::<impl f16>::powf",
+            vec![const_f16(0x4000), const_f16(0x4a00)]
+        ),
+        0x6c00
+    );
+    assert_eq!(
+        run_f16(
+            "core::f16::<impl f16>::powi",
+            vec![const_f16(0x4000), const_i32(-2)]
+        ),
+        0x3400
+    );
+    assert_eq!(
+        run_f16(
+            "core::f16::<impl f16>::mul_add",
+            vec![const_f16(0x4000), const_f16(0x4200), const_f16(0x3c00)]
+        ),
+        0x4700
+    );
+    let pair_ty = mir::Ty::Tuple(vec![f16_ty(), f16_ty()]);
+    assert_eq!(
+        run_method(
+            "core::f16::<impl f16>::sin_cos",
+            pair_ty,
+            vec![const_f16(0x3c00)]
+        ),
+        Value::Tuple(vec![
+            Value::Float(sparagmos_interp::f128::f16_bits_to_f64(0x3abb)),
+            Value::Float(sparagmos_interp::f128::f16_bits_to_f64(0x3853)),
+        ])
+    );
 }
