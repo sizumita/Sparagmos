@@ -21201,3 +21201,124 @@ fn run_mode_arc_handle_in_struct_field_still_releases() {
         "a real handle aggregate in a struct field is still released"
     );
 }
+const VEC_CAPACITY_GROWTH_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<i32> = Vec::new();
+    for i in 0..5 {
+        v.push(i);
+    }
+    println!("push5 cap {} spare {}", v.capacity(), v.spare_capacity_mut().len());
+    let mut b: Vec<u8> = Vec::new();
+    b.push(1);
+    println!("u8 push1 cap {}", b.capacity());
+    let mut w: Vec<i32> = Vec::with_capacity(1);
+    w.push(1);
+    w.push(2);
+    println!("withcap1 push2 cap {}", w.capacity());
+    let mut r = vec![1, 2, 3];
+    r.reserve(1);
+    println!("reserve cap {}", r.capacity());
+    let mut e = vec![1, 2, 3];
+    e.reserve_exact(1);
+    println!("reserve_exact cap {}", e.capacity());
+    let mut t = vec![1, 2, 3];
+    println!("try_reserve ok {}", t.try_reserve(20).is_ok());
+    println!("try_reserve cap {}", t.capacity());
+}
+"#;
+
+#[test]
+fn run_mode_vec_capacity_growth_matches_rawvec() {
+    // Capacity is the storage extent in this model, and growth
+    // follows RawVec's rules exactly: an append that outgrows
+    // the storage doubles it (floored at the minimum non-zero
+    // capacity for the element size -- 8 for bytes, 4 for
+    // 4-byte elements), `reserve` grows amortized,
+    // `reserve_exact` to the exact requirement, and a
+    // successful `try_reserve` grows like `reserve`. The
+    // answers are observable through `capacity()` and
+    // `spare_capacity_mut().len()`, as natively.
+    let dir = temp_dir("veccapacitygrowth");
+    let src = fixture(&dir, "veccapacitygrowth.rs", VEC_CAPACITY_GROWTH_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Vec capacity growth must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "push5 cap 8 spare 3\nu8 push1 cap 8\nwithcap1 push2 cap 4\nreserve cap 6\nreserve_exact cap 4\ntry_reserve ok true\ntry_reserve cap 23\n"
+    );
+}
+
+const VEC_SPARE_WRITE_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<i32> = Vec::with_capacity(8);
+    v.push(10);
+    v.push(20);
+    let spare = v.spare_capacity_mut();
+    println!("spare {}", spare.len());
+    spare[0].write(30);
+    spare[1].write(40);
+    unsafe { v.set_len(4) };
+    println!("v = {:?}", v);
+    println!("idx {}", v[2]);
+    println!("pop {:?}", v.pop());
+}
+"#;
+
+#[test]
+fn run_mode_vec_spare_capacity_write_then_set_len_readback() {
+    // Elements written through the spare-capacity slice are
+    // stored as `MaybeUninit` payload slots; once `set_len`
+    // declares them, every read of them -- indexing, the
+    // vector's own Debug list, `pop` -- sees the payload, as
+    // natively. (Formatting a spare-written element goes
+    // through the fmt engine's storage-wrapper unwrap.)
+    let dir = temp_dir("vecsparewrite");
+    let src = fixture(&dir, "vecsparewrite.rs", VEC_SPARE_WRITE_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "spare-capacity write + set_len readback must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "spare 6\nv = [10, 20, 30, 40]\nidx 30\npop Some(40)\n"
+    );
+}
+
+const VEC_ZST_CAPACITY_SRC: &str = r#"
+fn main() {
+    let mut v: Vec<()> = Vec::with_capacity(10);
+    println!("cap {}", v.capacity());
+    println!("spare {}", v.spare_capacity_mut().len());
+    v.push(());
+    println!("cap {}", v.capacity());
+}
+"#;
+
+#[test]
+fn run_mode_vec_zero_sized_element_capacity() {
+    // A zero-sized element's allocation is the dangling
+    // pointer: std's capacity for it is `usize::MAX` by
+    // definition, not the storage extent the model holds.
+    let dir = temp_dir("veczstcapacity");
+    let src = fixture(&dir, "veczstcapacity.rs", VEC_ZST_CAPACITY_SRC);
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "ZST Vec capacity must terminate normally; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "cap 18446744073709551615\nspare 18446744073709551615\ncap 18446744073709551615\n"
+    );
+}
+

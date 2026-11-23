@@ -998,10 +998,15 @@ pub enum Builtin {
     /// produces a different value is not run per copy.
     VecFromElem,
     /// `Vec::reserve(&mut vec, additional)` /
-    /// `Vec::reserve_exact(&mut vec, additional)`: no-ops. Growing
-    /// the allocation is not observable in this value model, which
-    /// does not represent capacity (the same convention as
-    /// `Vec::with_capacity`).
+    /// `Vec::reserve_exact(&mut vec, additional)`: grow the
+    /// element storage to the capacity RawVec would reach for
+    /// the requirement -- amortized for `reserve`, the exact
+    /// requirement for `reserve_exact` (see
+    /// `vec_ensure_capacity`). Capacity in this model is the
+    /// storage extent (see `vec_stored_len`), so the growth is
+    /// the padding of the storage with uninitialised slots:
+    /// observable exactly where the real allocation's growth is
+    /// (the `capacity` and `spare_capacity_mut` answers).
     VecReserve,
     /// `Vec::try_reserve(&mut vec, additional)` /
     /// `Vec::try_reserve_exact(&mut vec, additional)`:
@@ -1012,9 +1017,9 @@ pub enum Builtin {
     /// `TryReserveError::CapacityOverflow`, decided by the exact
     /// std rule: the required element count `len + additional`
     /// must fit `isize::MAX / size_of::<T>()` elements (any count
-    /// up to `usize::MAX` for a zero-sized element). The two
-    /// spellings differ only in the capacity they would reach,
-    /// which the value model does not represent. An element type
+    /// up to `usize::MAX` for a zero-sized element). On success
+    /// the storage grows as the corresponding `reserve`
+    /// spelling's does (see `vec_ensure_capacity`). An element type
     /// whose layout the model does not know stays an explicit
     /// unsupported error rather than a guessed verdict.
     VecTryReserve,
@@ -1091,7 +1096,10 @@ pub enum Builtin {
     SliceToVec,
     /// `Vec::capacity(&vec)`: the extent of the element
     /// storage the value holds (see `vec_stored_len`) — the
-    /// allocation this model can name. The collected body
+    /// allocation this model can name. A zero-sized element
+    /// type is the exception: its allocation is the dangling
+    /// pointer, and std's capacity for it is `usize::MAX` by
+    /// definition, not an extent. The collected body
     /// projects the `RawVec` capacity field off the abstract
     /// aggregate and fails, so the entry point is modelled
     /// here; the buffer chain's capacity slot in place
@@ -6787,8 +6795,8 @@ impl<'a> Interpreter<'a> {
             Builtin::StringFromUtf8 => {
                 arity(1)?;
                 let resolved = self.resolve_value(frames, &vals[0])?;
-                let bytes = match &resolved {
-                    Value::Enum { fields, .. } => fields
+                let byte_elements = |elements: &[Value]| {
+                    elements
                         .iter()
                         .map(|f| match f {
                             Value::Uint(v) => Ok(*v as u8),
@@ -6799,7 +6807,24 @@ impl<'a> Interpreter<'a> {
                                 other.kind_name(),
                             )),
                         })
-                        .collect::<InterpResult<Vec<u8>>>()?,
+                        .collect::<InterpResult<Vec<u8>>>()
+                };
+                let bytes = match &resolved {
+                    Value::Enum { fields, .. } => byte_elements(fields)?,
+                    // The sparse form: the declared length is
+                    // the vector's content; the stored tail past
+                    // it is spare capacity, not bytes.
+                    Value::SparseVec { elems, len, .. } => {
+                        let len = usize::try_from(*len).unwrap_or(usize::MAX);
+                        if len > elems.len() {
+                            return Err(InterpError::type_mismatch(
+                                "String::from_utf8 argument",
+                                "byte vector value",
+                                resolved.kind_name(),
+                            ));
+                        }
+                        byte_elements(&elems[..len])?
+                    }
                     other => {
                         return Err(InterpError::type_mismatch(
                             "String::from_utf8 argument",
@@ -8819,7 +8844,11 @@ impl<'a> Interpreter<'a> {
                 arity(2)?;
                 let target = self.deref_value(frames, &vals[0])?;
                 let (elems, _) = self.slice_elements(frames, &vals[1])?;
+                let elem_tag = generic_args.first().map(String::as_str).unwrap_or("");
+                let uninit_elem = uninit_elem_value_for_tag(elem_tag);
+                let elem_size = self.layout_of(elem_tag).map_or(8, |(size, _)| size as usize);
                 self.modify_resolved(frames, &target, |slot| {
+                    vec_ensure_capacity(slot, elems.len(), false, &uninit_elem, elem_size);
                     vec_append_in_place(slot, &elems, "Vec::extend_from_slice")?;
                     Ok(Value::Unit)
                 })
@@ -8830,7 +8859,11 @@ impl<'a> Interpreter<'a> {
                 let mut vals = vals.into_iter();
                 let _ = vals.next();
                 let elem = vals.next().expect("arity checked");
+                let elem_tag = generic_args.first().map(String::as_str).unwrap_or("");
+                let uninit_elem = uninit_elem_value_for_tag(elem_tag);
+                let elem_size = self.layout_of(elem_tag).map_or(8, |(size, _)| size as usize);
                 self.modify_resolved(frames, &target, |slot| {
+                    vec_ensure_capacity(slot, 1, false, &uninit_elem, elem_size);
                     vec_append_in_place(slot, &[elem], "Vec::push")?;
                     Ok(Value::Unit)
                 })
@@ -8940,7 +8973,29 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::VecReserve => {
                 arity(2)?;
-                Ok(Value::Unit)
+                let additional = match &vals[1] {
+                    Value::Uint(n) => usize::try_from(*n).unwrap_or(usize::MAX),
+                    // A `usize` argument whose high bit is set
+                    // materialises as a sign-extended signed
+                    // value; its bit pattern is the count.
+                    Value::Int(v) => (*v as u64) as usize,
+                    other => {
+                        return Err(InterpError::type_mismatch(
+                            format!("builtin {name}"),
+                            "additional capacity (usize)",
+                            other.kind_name(),
+                        ));
+                    }
+                };
+                let elem_tag = generic_args.first().map(String::as_str).unwrap_or("");
+                let uninit_elem = uninit_elem_value_for_tag(elem_tag);
+                let elem_size = self.layout_of(elem_tag).map_or(8, |(size, _)| size as usize);
+                let target = self.deref_value(frames, &vals[0])?;
+                let exact = name.ends_with("reserve_exact");
+                self.modify_resolved(frames, &target, |slot| {
+                    vec_ensure_capacity(slot, additional, exact, &uninit_elem, elem_size);
+                    Ok(Value::Unit)
+                })
             }
             Builtin::VecTryReserve => {
                 arity(2)?;
@@ -8990,6 +9045,25 @@ impl<'a> Interpreter<'a> {
                         }],
                     })
                 } else {
+                    // Success grows the storage as the
+                    // corresponding `reserve` spelling does.
+                    let uninit_elem = uninit_elem_value_for_tag(elem_tag);
+                    let elem_size =
+                        usize::try_from(elem_size).unwrap_or(usize::MAX);
+                    let additional =
+                        usize::try_from(additional).unwrap_or(usize::MAX);
+                    let target = self.deref_value(frames, &vals[0])?;
+                    let exact = name.ends_with("try_reserve_exact");
+                    self.modify_resolved(frames, &target, |slot| {
+                        vec_ensure_capacity(
+                            slot,
+                            additional,
+                            exact,
+                            &uninit_elem,
+                            elem_size,
+                        );
+                        Ok(Value::Unit)
+                    })?;
                     Ok(Value::Enum {
                         variant: 0,
                         fields: vec![Value::Unit],
@@ -9127,7 +9201,11 @@ impl<'a> Interpreter<'a> {
                     iter_ty,
                     vals.into_iter().nth(1).expect("arity checked"),
                 )?;
+                let elem_tag = generic_args.first().map(String::as_str).unwrap_or("");
+                let uninit_elem = uninit_elem_value_for_tag(elem_tag);
+                let elem_size = self.layout_of(elem_tag).map_or(8, |(size, _)| size as usize);
                 self.modify_resolved(frames, &target, |slot| {
+                    vec_ensure_capacity(slot, items.len(), false, &uninit_elem, elem_size);
                     vec_append_in_place(slot, &items, "Vec::extend_trusted")?;
                     Ok(Value::Unit)
                 })
@@ -9151,6 +9229,13 @@ impl<'a> Interpreter<'a> {
             }
             Builtin::VecCapacity => {
                 arity(1)?;
+                // A zero-sized element's capacity is `usize::MAX`
+                // by definition (the `RawVecInner` rule), not the
+                // storage extent.
+                let elem_tag = generic_args.first().map(String::as_str).unwrap_or("");
+                if self.layout_of(elem_tag).is_some_and(|(size, _)| size == 0) {
+                    return Ok(Value::Uint(usize::MAX as u128));
+                }
                 // Only the storage extent is read: resolve by
                 // borrowing, as `Vec::len` does.
                 let value = self.resolve_ref(frames, &vals[0])?;
@@ -21895,6 +21980,184 @@ pub(crate) fn vec_stored_len(value: &Value) -> Option<u128> {
     }
 }
 
+/// The minimum non-zero capacity of a `RawVec` for an element
+/// of `elem_size` bytes: std's `MIN_NON_ZERO_CAP` (8 for
+/// byte-sized elements, 4 up to a 1024-byte element, 1 above).
+fn rawvec_min_non_zero_cap(elem_size: usize) -> usize {
+    if elem_size == 1 {
+        8
+    } else if elem_size <= 1024 {
+        4
+    } else {
+        1
+    }
+}
+
+/// The capacity RawVec's amortized growth reaches when
+/// `required` elements must fit over a current capacity of
+/// `cap`: twice the current capacity or the requirement,
+/// whichever is larger, floored at the minimum non-zero
+/// capacity -- the floor applies at every growth, not only the
+/// first allocation (growing a capacity-1 vector of 4-byte
+/// elements reaches 4, not 2).
+fn rawvec_amortized_capacity(cap: usize, required: usize, elem_size: usize) -> usize {
+    cap.saturating_mul(2)
+        .max(required)
+        .max(rawvec_min_non_zero_cap(elem_size))
+}
+
+/// Grow the element storage of the vector value in `slot` to
+/// `target` slots by padding with `uninit_elem`, the element
+/// type's uninitialised form: the storage change RawVec's
+/// reallocation performs in this model, where the capacity a
+/// vector reports is the extent of the storage it holds (see
+/// `vec_stored_len`). The declared length is untouched; the
+/// padded slots are the spare capacity the next append
+/// overwrites. A vector whose declared length runs past its
+/// stored elements (the unmaterialised form) has no storage to
+/// grow and is left as it stands.
+fn vec_grow_storage(slot: &mut Value, target: usize, uninit_elem: &Value) {
+    match slot {
+        Value::Enum { fields, .. } => {
+            if target > fields.len() {
+                let len = fields.len();
+                let elems = {
+                    let mut padded = std::mem::take(fields);
+                    padded.resize(target, uninit_elem.clone());
+                    padded
+                };
+                *slot = Value::SparseVec {
+                    elems,
+                    len: len as u128,
+                    cap: target as u128,
+                };
+            }
+        }
+        Value::SparseVec { elems, len, cap } => {
+            if *len <= elems.len() as u128 && target > elems.len() {
+                elems.resize(target, uninit_elem.clone());
+                *cap = (*cap).max(target as u128);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Move the capacity slot of a real-aggregate vector value
+/// (see `vec_real_aggregate_parts`) to `cap`: the navigation
+/// mirrors `Interpreter::real_vec_cap`, writing the count back
+/// in the shape the slot already holds (a bare count or the
+/// one-field `UsizeNoHighBit` wrapper around one).
+fn set_real_vec_cap(slot: &mut Value, cap: usize) {
+    let Value::Enum { fields, .. } = slot else {
+        return;
+    };
+    let Some(buf) = fields.first_mut() else {
+        return;
+    };
+    let Value::Enum {
+        fields: buf_fields, ..
+    } = buf
+    else {
+        return;
+    };
+    let Some(inner) = buf_fields.first_mut() else {
+        return;
+    };
+    let Value::Enum {
+        fields: inner_fields,
+        ..
+    } = inner
+    else {
+        return;
+    };
+    let Some(cap_slot) = inner_fields.get_mut(1) else {
+        return;
+    };
+    match cap_slot {
+        Value::Uint(n) => *n = cap as u128,
+        Value::Int(n) => *n = cap as i128,
+        Value::Enum { fields, .. } if fields.len() == 1 => match &mut fields[0] {
+            Value::Uint(n) => *n = cap as u128,
+            Value::Int(n) => *n = cap as i128,
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
+/// Ensure the vector value in `slot` holds storage for
+/// `additional` elements past its declared length, growing the
+/// storage the way RawVec grows the allocation: amortized
+/// (`reserve`, the appends) or to the exact requirement (the
+/// `*_exact` spellings). A requirement the storage already
+/// meets changes nothing, and a target past the materialisation
+/// limit is not accounted -- the same stance `Vec::with_capacity`
+/// takes toward a capacity past the limit: the storage the
+/// model can hold is the allocation it reports.
+fn vec_ensure_capacity(
+    slot: &mut Value,
+    additional: usize,
+    exact: bool,
+    uninit_elem: &Value,
+    elem_size: usize,
+) {
+    // A vector in its real aggregate form (the `Vec { buf, len }`
+    // aggregate a converted body builds field by field, e.g. the
+    // buffer `join_generic_copy` fills through raw pointers) is
+    // not the element list its outer `Enum` shape suggests: the
+    // two fields are the `RawVec` and the length, and the
+    // capacity lives in the buffer chain's own slot (see
+    // `vec_real_aggregate_parts`). Growth there is the
+    // reallocation's bookkeeping: the capacity slot moves to the
+    // reached capacity, and the element storage behind the
+    // buffer pointer grows on the writes that use it, as
+    // allocation storage does. A capacity the chain does not
+    // expose leaves the value as it stands.
+    if let Some((_, agg_len)) = vec_real_aggregate_parts(slot) {
+        let Some(cap) = Interpreter::real_vec_cap(slot) else {
+            return;
+        };
+        let cap = usize::try_from(cap).unwrap_or(usize::MAX);
+        let required = agg_len.saturating_add(additional);
+        if required <= cap {
+            return;
+        }
+        let target = if exact {
+            required
+        } else {
+            rawvec_amortized_capacity(cap, required, elem_size)
+        };
+        if target > MAX_VEC_SET_LEN_ELEMENTS {
+            return;
+        }
+        set_real_vec_cap(slot, target);
+        return;
+    }
+    let (len, cap) = match &*slot {
+        Value::Enum { fields, .. } => (fields.len(), fields.len()),
+        Value::SparseVec { elems, len, cap } => {
+            let len = usize::try_from(*len).unwrap_or(usize::MAX);
+            let cap = usize::try_from(*cap).unwrap_or(usize::MAX);
+            (len, cap.max(elems.len()))
+        }
+        _ => return,
+    };
+    let required = len.saturating_add(additional);
+    if required <= cap {
+        return;
+    }
+    let target = if exact {
+        required
+    } else {
+        rawvec_amortized_capacity(cap, required, elem_size)
+    };
+    if target > MAX_VEC_SET_LEN_ELEMENTS {
+        return;
+    }
+    vec_grow_storage(slot, target, uninit_elem);
+}
+
 /// Append `items` to the vector value in `slot`, in place:
 /// slots the storage already holds past the length (the spare
 /// capacity a length shrink left behind) are overwritten in
@@ -25822,6 +26085,32 @@ impl<'a> Interpreter<'a> {
                 }
             }
         }
+        // A one-field wrapper aggregate around a scalar, tuple
+        // or array payload, formatted as the payload type: the
+        // storage form raw storage leaves behind (a
+        // `MaybeUninit` / `ManuallyDrop` payload slot, an
+        // `UnsafeCell`), where the model's value for the type
+        // is the payload itself -- a vector element written
+        // through `spare_capacity_mut` and read back after
+        // `set_len` is the canonical case. The wrapper is
+        // transparent to the type's own formatting, exactly as
+        // it is to a typed place's store (see
+        // `normalize_for_ty`); the payload is the value at its
+        // own declared width, so formatting it under the tag
+        // reinterprets nothing. ADT tags are excluded: a
+        // one-field aggregate may be the ADT's own value (a
+        // newtype, a one-variant enum).
+        if let Value::Enum {
+            variant: 0,
+            fields,
+        } = value
+        {
+            if fields.len() == 1 {
+                if let Some(payload) = storage_wrapper_payload(&fields[0], pointee_tag(ty)) {
+                    return self.format_value(frames, &payload, trait_, ty, options, indent);
+                }
+            }
+        }
         // References format as their pointee for every trait here.
         if matches!(value, Value::Ref(_)) {
             let pointee = self.resolve_value(frames, value)?;
@@ -27294,6 +27583,70 @@ fn finish_int(negative: bool, mut digits: String, prefix: &str, options: &FmtOpt
 
 /// A type tag with any reference / raw-pointer layers stripped:
 /// the tag of the value a fmt argument ultimately formats.
+/// The payload a one-field storage wrapper denotes when the
+/// wrapped value is formatted as the type `tag`, if the type's
+/// own value form is never a one-field aggregate: a scalar's
+/// value is the scalar, a tuple's the tuple of its arity, an
+/// array's the element tuple (or the byte form of a `u8`
+/// array). The payload kind must be the type's own kind -- a
+/// wrapper around anything else is not this type's storage
+/// form and stays the aggregate it is.
+fn storage_wrapper_payload(field: &Value, tag: &str) -> Option<Value> {
+    let payload = match field {
+        Value::Bool(_) if tag == "bool" => field,
+        Value::Int(_)
+            if matches!(tag, "i8" | "i16" | "i32" | "i64" | "i128" | "isize") =>
+        {
+            field
+        }
+        Value::Uint(_)
+            if matches!(
+                tag,
+                "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "char"
+            ) =>
+        {
+            field
+        }
+        Value::Float(_) if matches!(tag, "f16" | "f32" | "f64" | "f128") => field,
+        Value::Str(_) if tag == "str" => field,
+        Value::Tuple(items)
+            if tag.starts_with('(')
+                && tuple_elem_tags(tag, items.len())
+                    .iter()
+                    .all(|part| !part.is_empty()) =>
+        {
+            field
+        }
+        Value::Tuple(items) if array_tag_len(tag) == Some(items.len()) => field,
+        Value::Bytes(bytes)
+            if array_tag_len(tag) == Some(bytes.len()) && slice_elem_tag(tag) == "u8" =>
+        {
+            field
+        }
+        _ => return None,
+    };
+    Some(payload.clone())
+}
+
+/// The element count of an array type tag (`[i32; 3]` -> 3);
+/// `None` for a slice tag or a non-array tag.
+fn array_tag_len(tag: &str) -> Option<usize> {
+    let inner = tag.strip_prefix('[')?.strip_suffix(']')?;
+    // An array length sits behind a top-level `;`.
+    let mut depth = 0i32;
+    for (i, c) in inner.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth -= 1,
+            ';' if depth == 0 => {
+                return inner[i + 1..].trim().parse().ok();
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn pointee_tag(ty: &str) -> &str {
     let mut ty = ty;
     loop {
