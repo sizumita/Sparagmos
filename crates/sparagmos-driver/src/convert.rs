@@ -1507,7 +1507,36 @@ fn match_impl_self_ty(
         return false;
     };
     match ikind {
-        TyKind::Param(param) => bind_impl_arg(bindings, param.index, GenericArgKind::Type(*target)),
+        TyKind::Param(param) => {
+            // The target is written in the frame the
+            // screen is walking, so a parameter there is
+            // first resolved through the ambient frame --
+            // the type form of the resolution the constant
+            // match performs for its target (see
+            // `match_impl_const`) -- and a parameter the
+            // ambient frame leaves unresolved stays a
+            // parameter. Without it, an implementation
+            // parameter appearing in both the self type
+            // and another trait argument binds the
+            // concrete value through the self type and is
+            // then compared against the target's
+            // unresolved parameter, rejecting an
+            // applicable implementation.
+            let resolved;
+            let target = match guarded_ty_kind(target) {
+                Some(TyKind::Param(tparam)) => {
+                    match ambient.and_then(|a| a.0.get(tparam.index as usize)) {
+                        Some(GenericArgKind::Type(bound)) => {
+                            resolved = *bound;
+                            &resolved
+                        }
+                        _ => target,
+                    }
+                }
+                _ => target,
+            };
+            bind_impl_arg(bindings, param.index, GenericArgKind::Type(*target))
+        }
         TyKind::RigidTy(irigid) => {
             if impl_self == target {
                 return true;

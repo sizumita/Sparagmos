@@ -2536,6 +2536,101 @@ fn run_mode_dyn_bound_projection_lifetime_arg_runs() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
 }
 
+const DYN_BOUND_PROJECTION_TYPE_ARG_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+struct Wrap<A>(A);
+trait Carrier<A> {
+    type Item: Trait + ?Sized;
+}
+impl<A> Carrier<A> for Wrap<A> {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<S: Carrier<A>, A> {
+    field: <<S as Carrier<A>>::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<Wrap<u32>, u32> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_type_arg_runs() {
+    // The implementation parameter appears in both the
+    // self type and the trait argument: `Carrier<A> for
+    // Wrap<A>`. Matching the implementation against the
+    // projection `<S as Carrier<A>>::Item` in the
+    // holder's frame binds `A` to `u32` through the self
+    // type, then compared that binding against the
+    // holder's unresolved parameter `A` in the trait
+    // argument and rejected the implementation, so the
+    // screen rejected the holder and main. Resolving the
+    // target type argument through the ambient frame
+    // first reaches `dyn Trait<Assoc = u32>`, whose
+    // binding the outer projection normalizes through --
+    // natively the program prints 42.
+    let dir = temp_dir("dyn-bound-projection-type-arg");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_type_arg.rs",
+        DYN_BOUND_PROJECTION_TYPE_ARG_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the type-arg projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+const DYN_BOUND_PROJECTION_NESTED_TYPE_ARG_SRC: &str = r#"
+trait Trait {
+    type Assoc;
+}
+struct Wrap<A>(A);
+trait Carrier<A> {
+    type Item: Trait + ?Sized;
+}
+impl<A> Carrier<Wrap<A>> for Wrap<A> {
+    type Item = dyn Trait<Assoc = u32>;
+}
+struct Holder<S: Carrier<Wrap<A>>, A> {
+    field: <<S as Carrier<Wrap<A>>>::Item as Trait>::Assoc,
+}
+fn main() {
+    let h = Holder::<Wrap<u32>, u32> { field: 42 };
+    println!("{}", h.field);
+}
+"#;
+
+#[test]
+fn run_mode_dyn_bound_projection_nested_type_arg_runs() {
+    // The type parameter rides in a nested position:
+    // the trait argument is the ADT `Wrap<A>`, whose own
+    // type argument is the holder's parameter. The match
+    // descends into the ADT's arguments, where the same
+    // ambient resolution applies -- natively the program
+    // prints 42.
+    let dir = temp_dir("dyn-bound-projection-nested-type-arg");
+    let src = fixture(
+        &dir,
+        "dyn_bound_projection_nested_type_arg.rs",
+        DYN_BOUND_PROJECTION_NESTED_TYPE_ARG_SRC,
+    );
+    let out = run_driver(&src);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the nested type-arg projection program runs; stderr={stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
 const DYN_BOUND_PROJECTION_ASSOC_DEFAULT_SRC: &str = r#"
 #![feature(associated_type_defaults)]
 trait Trait {
