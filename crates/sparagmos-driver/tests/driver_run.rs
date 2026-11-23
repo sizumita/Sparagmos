@@ -21557,6 +21557,110 @@ fn run_mode_tool_interception_runs_built_binaries() {
     assert_eq!(stdout, "artifact guest ok\n", "stderr={stderr}");
 }
 
+const ARTIFACT_FIDELITY_GUEST_SRC: &str = r#"
+use std::process::Command;
+
+fn build(rustc: &str, name: &str, src: &str, extra: &[&str]) {
+    std::fs::write(format!("{name}.rs"), src).unwrap();
+    let mut cmd = Command::new(rustc);
+    cmd.arg("--edition=2021").arg("--out-dir").arg(".");
+    for a in extra {
+        cmd.arg(a);
+    }
+    cmd.arg(format!("{name}.rs"));
+    let out = cmd.output().unwrap();
+    assert!(
+        out.status.success(),
+        "build of {name} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn main() {
+    let rustc = std::env::args().nth(1).unwrap();
+    let src0 = std::env::args().next().unwrap();
+    let dir = std::path::Path::new(&src0).parent().unwrap().to_path_buf();
+    std::env::set_current_dir(&dir).unwrap();
+
+    // The producing invocation's compilation options ride
+    // along: a binary built with `--cfg foo` runs its cfg
+    // branch when the recipe executes it.
+    build(
+        &rustc,
+        "cfgprobe",
+        "fn main() { if cfg!(foo) { println!(\"cfg foo on\"); } else { println!(\"cfg foo off\"); } }\n",
+        &["--cfg", "foo"],
+    );
+    let out = Command::new(dir.join("cfgprobe")).output().unwrap();
+    assert!(out.status.success(), "running cfgprobe failed");
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "cfg foo on\n");
+
+    // A built program's exit code 2 is the program's own,
+    // not a driver failure: both the `process::exit` form
+    // and the `ExitCode` form reach the recipe as code 2.
+    build(&rustc, "exit2", "fn main() { std::process::exit(2); }\n", &[]);
+    let out = Command::new(dir.join("exit2")).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    build(
+        &rustc,
+        "exit2b",
+        "fn main() -> std::process::ExitCode { std::process::ExitCode::from(2) }\n",
+        &[],
+    );
+    let out = Command::new(dir.join("exit2b")).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+
+    // The built program's stderr is relayed byte for byte:
+    // no newline is invented, CRLF survives, and a guest
+    // line that begins with the driver's own prefix is
+    // still the guest's.
+    build(&rustc, "errprobe", "fn main() { eprint!(\"error\"); }\n", &[]);
+    let out = Command::new(dir.join("errprobe")).output().unwrap();
+    assert_eq!(out.stderr, b"error".to_vec());
+    build(
+        &rustc,
+        "errprobe2",
+        "fn main() { eprint!(\"a\\r\\nb\\n\"); eprintln!(\"sparagmos-driver impostor\"); }\n",
+        &[],
+    );
+    let out = Command::new(dir.join("errprobe2")).output().unwrap();
+    assert_eq!(
+        out.stderr,
+        b"a\r\nb\nsparagmos-driver impostor\n".to_vec()
+    );
+
+    // A panicking built program: its own stderr comes
+    // first, then the panic report, and the code is the
+    // panic code.
+    build(
+        &rustc,
+        "panicprobe",
+        "fn main() { eprintln!(\"before panic\"); panic!(\"artifact boom\"); }\n",
+        &[],
+    );
+    let out = Command::new(dir.join("panicprobe")).output().unwrap();
+    assert_eq!(out.status.code(), Some(101));
+    assert_eq!(
+        String::from_utf8(out.stderr).unwrap(),
+        "before panic\nthread 'main' panicked: artifact boom\n"
+    );
+
+    println!("artifact fidelity guest ok");
+}
+"#;
+
+#[test]
+fn run_mode_tool_interception_built_binary_fidelity() {
+    let dir = temp_dir("tool-artifact-fidelity");
+    let src = fixture(&dir, "artifact_fidelity_guest.rs", ARTIFACT_FIDELITY_GUEST_SRC);
+    let driver = env!("CARGO_BIN_EXE_sparagmos-driver");
+    let out = run_driver_extra(&src, &["--tool-program", driver, "--guest-arg", driver]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert_eq!(stdout, "artifact fidelity guest ok\n", "stderr={stderr}");
+}
+
 const NEVER_BUILT_GUEST_SRC: &str = r#"
 fn main() {
     let src0 = std::env::args().next().unwrap();

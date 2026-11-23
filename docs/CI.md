@@ -118,13 +118,14 @@ denominator. Runs on every push to `main` and on manual dispatch.
   answers the recipe's compiler invocations with its own
   conversion machinery and records each produced artifact
   (path, source, edition, crate type, and the library bindings
-  the producing invocation carried), leaving a placeholder file
+  and compilation options the producing invocation carried),
+  leaving a placeholder file
   at the artifact's path -- executable, for a binary -- so the
   recipe's file and spawn checks find it. When the recipe then
   executes a binary it produced earlier in the same run, the
   interception answers that too: the recorded source is run
   through the driver in run mode with the recorded bindings
-  and the recipe's arguments, and the fabricated process
+  and options and the recipe's arguments, and the fabricated process
   outcome is the interpreter's exit code and output. This is a
   deliberate reading of "execute the built binary": what is
   judged is the program's input/output behaviour under

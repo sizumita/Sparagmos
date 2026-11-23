@@ -5705,6 +5705,15 @@ struct ToolArtifact {
     /// hands to the run subprocess so the artifact's source
     /// converts against the same libraries its build used.
     aux_specs: Vec<String>,
+    /// The compilation-shaping options the producing
+    /// invocation carried (its forwarded rustc arguments --
+    /// `--cfg`, `--check-cfg`, codegen and lint options, and
+    /// the rest of that family): what a later run of the
+    /// artifact (see `artifact_run`) replays through
+    /// `--rustc-arg` so the recorded source converts under
+    /// the same configuration its build used, not merely
+    /// against the same libraries.
+    rustc_args: Vec<String>,
 }
 
 /// The artifact registry of one run (see `execute`): artifact
@@ -5729,6 +5738,7 @@ impl ToolRegistry {
                 edition: a.edition.clone(),
                 crate_type: a.crate_type.clone(),
                 aux_specs: a.aux_specs.clone(),
+                rustc_args: a.rustc_args.clone(),
             })
     }
 
@@ -5755,6 +5765,7 @@ impl ToolRegistry {
                         edition: a.edition.clone(),
                         crate_type: a.crate_type.clone(),
                         aux_specs: a.aux_specs.clone(),
+                        rustc_args: a.rustc_args.clone(),
                     },
                 )
             })
@@ -6231,6 +6242,7 @@ fn tool_run(
                 edition: Some(edition.clone()),
                 crate_type,
                 aux_specs: aux.clone(),
+                rustc_args: forward.clone(),
             },
         );
     };
@@ -6327,37 +6339,32 @@ fn tool_run(
     })
 }
 
-/// The run subprocess's stderr with the driver's own report
-/// lines removed (the `sparagmos-driver ...` lines the run
-/// entry point writes about itself): what remains is the guest
-/// program's own stderr, which is what a real child's stderr
-/// would have carried.
-fn run_child_stream(stderr: &[u8]) -> Vec<u8> {
-    let text = String::from_utf8_lossy(stderr);
-    let mut out = String::new();
-    for line in text.lines() {
-        if !line.starts_with("sparagmos-driver") {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    out.into_bytes()
-}
-
 /// Answer one invocation of a program the guest itself
 /// produced earlier in this run (a run-make recipe running a
 /// binary it just built): the artifact registry knows the
-/// path, so the run is this driver binary in run mode over the
-/// recorded source, with the `--aux` bindings the producing
-/// invocation carried and the guest's arguments as the
-/// program's own. This is the stage-3 harness's reading of
-/// "execute the built binary": the program's input/output and
-/// exit code are the interpreter's, not a native binary's
-/// (see docs/CI.md). Programs the registry does not know, and
+/// path, so the run is this driver binary in run mode over
+/// the recorded source, with the `--aux` bindings and the
+/// compilation-shaping options the producing invocation
+/// carried and the guest's arguments as the program's own.
+/// This is the stage-3 harness's reading of "execute the
+/// built binary": the program's input/output and exit code
+/// are the interpreter's, not a native binary's (see
+/// docs/CI.md). Programs the registry does not know, and
 /// artifacts that are not binaries, stay unsupported -- as
-/// does a recorded program the driver cannot itself run (the
-/// subprocess's exit 2 names the reason), so the harness keeps
-/// sorting those recipes as unsupported rather than failed.
+/// does a recorded program the driver cannot itself run, so
+/// the harness keeps sorting those recipes as unsupported
+/// rather than failed.
+///
+/// The subprocess keeps the two stderr channels apart: the
+/// recorded program's own stderr travels through the file
+/// named by `--guest-stderr-file` and is relayed byte for
+/// byte, while the subprocess's stderr carries only the
+/// driver's own lines. That separation is also what tells a
+/// driver failure from the program's own exit: the run
+/// subprocess exits 2 both when it cannot run the recorded
+/// program and when the program itself exits 2, but only
+/// the driver failure reports a `sparagmos-driver` line on
+/// its stderr.
 fn artifact_run(
     request: &sparagmos_interp::ToolRunRequest,
     registry: &ToolRegistry,
@@ -6381,6 +6388,16 @@ fn artifact_run(
             "tool interception: artifact `{program}` is not a binary this run produced"
         ));
     }
+    // The recorded program's stderr gets its own channel
+    // (a scratch file this run names), so nothing of it is
+    // filtered or rewritten on its way to the recipe.
+    static ARTIFACT_RUN_SEQ: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    let seq = ARTIFACT_RUN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let stderr_path = std::env::temp_dir().join(format!(
+        "sparagmos-artifact-stderr-{}-{seq}",
+        std::process::id()
+    ));
     let mut tail = vec!["run".to_string(), artifact.source.display().to_string()];
     if let Some(edition) = &artifact.edition {
         tail.push("--edition".to_string());
@@ -6390,30 +6407,48 @@ fn artifact_run(
         tail.push("--aux".to_string());
         tail.push(spec.clone());
     }
+    for tok in &artifact.rustc_args {
+        tail.push("--rustc-arg".to_string());
+        tail.push(tok.clone());
+    }
+    tail.push("--guest-stderr-file".to_string());
+    tail.push(stderr_path.display().to_string());
     for arg in &request.args {
         tail.push("--guest-arg".to_string());
         tail.push(String::from_utf8_lossy(arg).into_owned());
     }
-    let (code, stdout, stderr) = run_convert_subprocess(exe, &tail, &cwd, request)?;
+    let outcome = run_convert_subprocess(exe, &tail, &cwd, request);
+    let guest_stderr = std::fs::read(&stderr_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&stderr_path);
+    let (code, stdout, stderr) = outcome?;
     if code == 2 {
-        // The recorded program itself could not be run (a
-        // conversion-side failure in the subprocess): the
-        // recipe's invocation is unsupported, with the
-        // subprocess's own named reason when it gave one.
+        // Exit 2 is both the subprocess's driver-failure code
+        // and a code the recorded program itself may exit
+        // with; the driver's own stderr channel tells them
+        // apart (see the doc comment above). A driver failure
+        // makes the recipe's invocation unsupported, with the
+        // subprocess's own named reason when it gave one; no
+        // driver line means the program ran and chose 2.
         let text = String::from_utf8_lossy(&stderr);
-        let reason = text
-            .lines()
-            .find_map(|line| line.strip_prefix("sparagmos-driver run: unsupported: "))
-            .map(|rest| rest.to_string())
-            .unwrap_or_else(|| "the recorded program could not be run".to_string());
-        return Err(format!(
-            "tool interception: running artifact `{program}`: {reason}"
-        ));
+        let reason = text.lines().find_map(|line| {
+            line.strip_prefix("sparagmos-driver run: unsupported: ")
+                .or_else(|| line.strip_prefix("sparagmos-driver: compilation failed: "))
+                .map(|rest| rest.to_string())
+        });
+        let driver_failed = reason.is_some()
+            || text.lines().any(|line| line.starts_with("sparagmos-driver"));
+        if driver_failed {
+            let reason =
+                reason.unwrap_or_else(|| "the recorded program could not be run".to_string());
+            return Err(format!(
+                "tool interception: running artifact `{program}`: {reason}"
+            ));
+        }
     }
     Ok(sparagmos_interp::ToolRunOutcome {
         exit_code: code,
         stdout,
-        stderr: run_child_stream(&stderr),
+        stderr: guest_stderr,
     })
 }
 
@@ -6580,6 +6615,7 @@ fn execute(
     guest_args: &[String],
     overflow_checks: bool,
     tool_programs: &[String],
+    guest_stderr_file: Option<&str>,
 ) -> i32 {
     let built = match build_program(c, input, guest_args) {
         Ok(b) => b,
@@ -6659,16 +6695,42 @@ fn execute(
         report,
     );
     // The guest's stdout is this process's stdout, whatever the
-    // outcome was; the guest's stderr likewise goes to stderr.
+    // outcome was; the guest's stderr likewise goes to stderr,
+    // unless the caller named a separate channel for it (an
+    // artifact run answering a recipe: see `artifact_run`), in
+    // which case this process's stderr carries only the
+    // driver's own lines.
     {
         use std::io::Write;
         let mut out = std::io::stdout().lock();
         let _ = out.write_all(run.stdout.as_bytes());
         let _ = out.flush();
-        let mut err = std::io::stderr().lock();
-        let _ = err.write_all(run.stderr.as_bytes());
-        let _ = err.flush();
+        let mut relay_to_stderr = true;
+        if let Some(path) = guest_stderr_file {
+            relay_to_stderr = std::fs::write(path, run.stderr.as_bytes()).is_err();
+        }
+        if relay_to_stderr {
+            let mut err = std::io::stderr().lock();
+            let _ = err.write_all(run.stderr.as_bytes());
+            let _ = err.flush();
+        }
     }
+    // Lines this entry point renders onto the guest's stderr
+    // itself (the panic and abort reports below): they are
+    // part of the guest's stream, so with a separate guest
+    // stderr channel they join it there, after the output
+    // already relayed, instead of this process's stderr.
+    let guest_report_line = |line: &str| {
+        use std::io::Write as _;
+        if let Some(path) = guest_stderr_file {
+            if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
+                if writeln!(file, "{line}").is_ok() {
+                    return;
+                }
+            }
+        }
+        eprintln!("{line}");
+    };
     match run.result {
         Ok(sparagmos_interp::Value::Unit) => 0,
         Ok(ref value) if entry_returns_exit_code(c, entry_index) => {
@@ -6749,7 +6811,7 @@ fn execute(
             message,
             ..
         })) => {
-            eprintln!("thread 'main' panicked: {message}");
+            guest_report_line(&format!("thread 'main' panicked: {message}"));
             101
         }
         Err(sparagmos_interp::MirRunError::Interp(sparagmos_interp::InterpError::Abort {
@@ -6758,7 +6820,7 @@ fn execute(
             // A panic that escaped a cleanup (a native double
             // panic aborts the process): the guest-panic exit, with
             // the abort reason on stderr.
-            eprintln!("thread 'main' aborted: {message}");
+            guest_report_line(&format!("thread 'main' aborted: {message}"));
             101
         }
         Err(e) => {
@@ -7947,6 +8009,7 @@ fn driver_main() {
     let mut aux_lib_specs: Vec<(String, std::path::PathBuf)> = Vec::new();
     let mut tool_programs: Vec<String> = Vec::new();
     let mut dump_path: Option<String> = None;
+    let mut guest_stderr_file: Option<String> = None;
     let mut edition = "2021".to_string();
     let mut sysroot: Option<String> = None;
     let mut rustc_args: Vec<String> = Vec::new();
@@ -7958,6 +8021,13 @@ fn driver_main() {
                 i += 1;
                 dump_path = Some(argv.get(i).cloned().unwrap_or_else(|| {
                     eprintln!("--dump needs a path");
+                    std::process::exit(2);
+                }));
+            }
+            "--guest-stderr-file" => {
+                i += 1;
+                guest_stderr_file = Some(argv.get(i).cloned().unwrap_or_else(|| {
+                    eprintln!("--guest-stderr-file needs a path");
                     std::process::exit(2);
                 }));
             }
@@ -8041,7 +8111,7 @@ fn driver_main() {
                 }));
             }
             "-h" | "--help" => {
-    println!("usage: sparagmos-driver [run|run-jit|jit-compile|debug] <file.rs> [--aux <name>=<file.rs>[;crate-type=<type>][;edition=<ed>]] [--aux-lib <name>=<rlib>] [--tool-program <path>] [--rustc-arg <arg>] [--guest-arg <arg>] [--dump <path>] [--edition <ed>] [--sysroot <path>] [--debug-script <path>] [--debug-dialect <gdb|lldb>]");
+    println!("usage: sparagmos-driver [run|run-jit|jit-compile|debug] <file.rs> [--aux <name>=<file.rs>[;crate-type=<type>][;edition=<ed>]] [--aux-lib <name>=<rlib>] [--tool-program <path>] [--rustc-arg <arg>] [--guest-arg <arg>] [--dump <path>] [--guest-stderr-file <path>] [--edition <ed>] [--sysroot <path>] [--debug-script <path>] [--debug-dialect <gdb|lldb>]");
                 return;
             }
             other if input.is_none() && !other.starts_with('-') => {
@@ -8344,6 +8414,7 @@ fn driver_main() {
                     &guest_args,
                     overflow_checks,
                     &tool_programs,
+                    guest_stderr_file.as_deref(),
                 ));
             }
             print_convert_report(&c, &input);
